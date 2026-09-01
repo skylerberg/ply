@@ -657,6 +657,7 @@ fn fingerprint(n: u8) -> SourceFingerprint {
         kind: DefKind::Fn,
         members: Vec::new(),
         deps: Vec::new(),
+        reuse: n & 1 == 1,
     });
     fp.tests.push(CachedTest {
         name: "active_users excludes inactive".to_string(),
@@ -2031,6 +2032,7 @@ fn pin_fingerprint() -> SourceFingerprint {
                 kind: DefKind::Fn,
                 members: vec![],
                 deps: vec![ply_span::Symbol::new("store.db.get")],
+                reuse: false,
             },
             DefEntry {
                 name: ply_span::Symbol::new("user.User"),
@@ -2044,6 +2046,7 @@ fn pin_fingerprint() -> SourceFingerprint {
                     span: FileSpan { start: 60, end: 66 },
                 }],
                 deps: vec![],
+                reuse: false,
             },
         ],
         tests: vec![CachedTest {
@@ -2157,7 +2160,7 @@ fn the_front_end_entry_encoding_is_pinned() {
     assert_eq!(found, pinned.to_vec(), "{BUMP}");
 }
 
-const PINNED_FINGERPRINT: &str = "99414f47e9627b5d6c9338a58bcd7ee837ebad9ef16ee4071cdb7f291e2df139";
+const PINNED_FINGERPRINT: &str = "912fc010fb16672c71bc56d7e7c282f42cade04c66e2aedd65903422d4df1d66";
 const PINNED_DEF: &str = "edbd2fa35344f8a5fd38f3e745727cd96ca1d7c57255560c0064004b249c6aab";
 const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
@@ -2292,6 +2295,7 @@ fn lookup_finds_a_definition_by_full_name_simple_name_or_hash_prefix() {
         kind: DefKind::Fn,
         members: Vec::new(),
         deps: Vec::new(),
+        reuse: false,
     });
     store.put_source(&file, fp);
 
@@ -2356,6 +2360,7 @@ fn lookup_returns_every_match_rather_than_refusing() {
             kind: DefKind::Fn,
             members: Vec::new(),
             deps: Vec::new(),
+            reuse: false,
         });
         store.put_source(&root.path().join(format!("{module}.ply")), fp);
     }
@@ -2523,6 +2528,7 @@ fn opening_a_ten_thousand_definition_cache_is_under_the_budget() {
                 kind: DefKind::Fn,
                 members: Vec::new(),
                 deps: Vec::new(),
+                reuse: false,
             });
             store.put_def(
                 hash,

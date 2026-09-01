@@ -346,6 +346,7 @@ where nothing else is grammatical, and are ordinary identifiers everywhere else.
 | `set` | between `effect` and a name, in `effect set X = {..}` |
 | `law` | at item position, followed by a string or by `/host` |
 | `derive` | at item position, followed by an identifier |
+| `reuse` | at item position (after `pub`, if any), followed by `fn` |
 | `for` | in `derive <deriver> for <Type>` |
 | `where` | after a signature's row (constraints), or after a `law`'s binders (guard) |
 | `derivable` | inside a `where` constraint |
@@ -1054,6 +1055,30 @@ lets you not remember one.
 
 **Run `ply check --costs`** to see it per `push` site: every copy is reported
 with its cause and, where a source edit removes it, the edit.
+
+**`reuse fn` turns that report into an obligation.** A function marked `reuse`
+promises that every `push` in its body reuses its list for every reason the
+body controls, and `ply check` refuses the program with `E0127` when the cost
+checker cannot show it — naming the append, the promise, and the edit that
+would keep it. The promise says nothing about callers: an append onto the
+function's own parameter keeps it whatever a caller does with what it passed,
+because that copy is the caller's to remove (§13.3, §13.8), and a multi-shot
+handler that copies at run time is the semantics, not a broken promise.
+
+```ply
+reuse fn collect(xs: List<Int>, n: Int) -> List<Int> =
+  if n == 0 { xs } else { collect(push(xs, n), n - 1) }   // kept: xs is a parameter at its last use
+
+reuse fn grow(xs: List<Int>, n: Int) -> List<Int> = {
+  let ys = push(xs, n);
+  if len(xs) < 0 { xs } else { ys }                       // E0127: xs is read again after the append
+}
+```
+
+`ply test` and `ply run` refuse a broken promise among the modules they parse;
+`ply check` parses every module a promise needs and checks all of them. The
+standard library's lexer, parser and encoder loops are marked, so a compiler
+upgrade that made one of them copy would fail to build.
 
 ### 6.8 Effect performs, `handle`, `with_cell`, `with_region`, `simulate`
 
@@ -2275,17 +2300,19 @@ $ ply std
 
    MODULE      DEFINITIONS  TESTS  BYTES
    std.config  15           5      4810
-   std.db      292          34     110031
+   std.db      292          34     110073
    std.fs      25           9      12652
    std.hash    32           5      8970
-   std.http    166          53     102893
-   std.json    137          38     55871
+   std.http    166          53     102957
+   std.json    137          38     55912
    std.net     7            3      3720
-   std.router  105          31     44920
+   std.router  105          31     44919
    std.signal  7            2      1416
-   std.trace   39           10     12212
+   std.trace   39           10     12218
 
-   digest: b3:1fac787cc3a8
+   `import std.<name>` to use one; `ply std --show <name>` prints its source
+
+   digest: b3:2b15c1c16074
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`
@@ -2804,6 +2831,10 @@ and then emits exactly one JSON object on stdout and nothing else.
 
 ### `ply check [path]`
 
+A program that declares a `reuse fn` is checked whole: every module is parsed
+whatever the front-end cache says, and a promise the cost checker cannot show
+is `E0127` with exit code 2 (§6.7).
+
 | flag | meaning |
 | --- | --- |
 | `--types` | print the inferred signature and footprint of every definition |
@@ -2929,6 +2960,7 @@ program.
 | `E0124` | a positional argument after a named one |
 | `E0125` | a parameter left unfilled by a call that used a name (plain under-application stays `E0202`) |
 | `E0126` | a top-level `fn` that left a parameter type or its return type to inference — the diagnostic names the type it would have given |
+| `E0127` | a `reuse fn` with an append its body cannot keep in place: the list is read again, captured, or held by a cell or map — the diagnostic names the append, the promise and the fix |
 
 ### Types
 
