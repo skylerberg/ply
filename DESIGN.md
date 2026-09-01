@@ -498,6 +498,18 @@ spec changed, and whether the obligations still hold — and the row that matter
 is *implementation changed, spec unchanged*, where the review is reading the
 obligations rather than the diff.
 
+**That row is why a signature is written rather than inferred.** A definition's
+published type is part of what a reviewer holds fixed, so it cannot be a summary
+derived from the body it describes — under full inference, editing a body
+silently republishes the claim and the row becomes a coincidence. Every
+parameter type and return type on a top-level `fn` is therefore mandatory
+(`E0126`), and the diagnostic names the type inference would have given so the
+fix is the text of the error. The **effect row is the deliberate exception**: it
+is derived from what a body calls rather than chosen, so it stays inferred
+unless written, and a written one is checked as an upper bound (§1). Infer what
+is mechanical; write what is meant. `docs/GUIDE.md` §5.9 is the user-facing
+statement of the split.
+
 **What this is not**: a general-purpose theorem prover, an SMT integration, or a
 termination checker. `requires` is a filter on the domain of the `ensures`
 clauses beside it, not a contract checked at every call site.

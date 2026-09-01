@@ -223,6 +223,17 @@ fn tvar(name: &str) -> TypeExpr {
     TypeExpr::Var(id(name))
 }
 
+/// A written function type with no effect row. Rows stay inferred, so a
+/// signature only writes one when the row itself is what is under test.
+fn fn_ty(params: Vec<TypeExpr>, ret: TypeExpr) -> TypeExpr {
+    TypeExpr::Fn {
+        params,
+        ret: Box::new(ret),
+        effects: None,
+        span: any(),
+    }
+}
+
 fn row(atoms: &[(&str, Mode, Option<&str>)], tail: Option<&str>) -> RowExpr {
     RowExpr {
         atoms: atoms
@@ -432,15 +443,35 @@ fn wall_effect() -> Item {
     )
 }
 
+/// The principal type is now *written*: `fn id<a>(x: a) -> a = x`. Inference no
+/// longer discovers `<a>(a) -> a` from the body — `E0126` asks the author for it
+/// — so what this asserts moved with the rule. The scheme published to callers
+/// is the one that was declared, and generalization at a top-level definition
+/// still turns the declared `a` into a quantifier every call site instantiates.
 #[test]
 fn identity_gets_its_principal_type() {
-    let out = check(vec![func("id", &["x"], var("x")).item()]);
+    let out = check(vec![
+        func("id", &["x"], var("x"))
+            .generics(&["a"], &[])
+            .param_types(vec![Some(tvar("a"))])
+            .ret(tvar("a"))
+            .item(),
+    ]);
     assert_eq!(sig(&out, "id"), "<a>(a) -> a");
     assert_eq!(footprint(&out, "id"), "{}");
 }
 
+/// This was `let_bound_polymorphism_allows_two_instantiations`, and it asserted
+/// the opposite of what it asserts now: `let f = |x| x` generalized, so `f(1)`
+/// and `f(true)` in one body both checked and `main` published `() -> Bool`.
+///
+/// Local generalization is gone. A `let` binds monomorphically, so the first use
+/// pins the binder and the second instantiation is `E0201`. A helper that is
+/// meant to be polymorphic is a `fn`, where the polymorphism is written into a
+/// signature and is therefore reviewable, rather than a property of a local the
+/// compiler inferred on the reader's behalf.
 #[test]
-fn let_bound_polymorphism_allows_two_instantiations() {
+fn a_let_bound_lambda_may_not_be_used_at_two_types() {
     let body = block(
         vec![
             let_("f", lambda(&["x"], var("x"))),
@@ -448,8 +479,14 @@ fn let_bound_polymorphism_allows_two_instantiations() {
         ],
         Some(call("f", vec![ex(ExprKind::Lit(Lit::Bool(true)))])),
     );
-    let out = check(vec![func("main", &[], body).item()]);
-    assert_eq!(sig(&out, "main"), "() -> Bool");
+    let diags = check_err(vec![func("main", &[], body).ret(con("Int", vec![])).item()]);
+    assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
+    assert!(
+        !has_code(&diags, codes::MISSING_SIGNATURE),
+        "the signature is written: the mistake under test is the second \
+         instantiation, not a missing annotation:\n{}",
+        render(&diags)
+    );
 }
 
 #[test]
@@ -458,7 +495,15 @@ fn a_monomorphic_lambda_parameter_is_not_generalized() {
         vec![Stmt::Expr(call("f", vec![int(1)]))],
         Some(call("f", vec![bool_lit(true)])),
     );
-    let diags = check_err(vec![func("twice", &["f"], body).item()]);
+    let diags = check_err(vec![
+        func("twice", &["f"], body)
+            .param_types(vec![Some(fn_ty(
+                vec![con("Int", vec![])],
+                con("Int", vec![]),
+            ))])
+            .ret(con("Int", vec![]))
+            .item(),
+    ]);
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
 
@@ -482,6 +527,7 @@ fn a_perform_contributes_its_atom_to_the_row() {
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
     ]);
     assert_eq!(footprint(&out, "read_one"), "{db.read[users]}");
@@ -497,12 +543,14 @@ fn rows_accumulate_through_application_and_composition() {
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
         func(
             "writer",
             &[],
             perform("db", "put", Some("orders"), vec![int(1), int(2)]),
         )
+        .ret(con("Unit", vec![]))
         .item(),
         func(
             "both",
@@ -512,6 +560,7 @@ fn rows_accumulate_through_application_and_composition() {
                 Some(call("writer", vec![])),
             ),
         )
+        .ret(con("Unit", vec![]))
         .item(),
     ]);
     assert_eq!(
@@ -541,8 +590,11 @@ fn effect_polymorphism_threads_a_row_variable_through_a_higher_order_function() 
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
-        func("use_it", &[], call("apply", vec![var("reader")])).item(),
+        func("use_it", &[], call("apply", vec![var("reader")]))
+            .ret(con("Int", vec![]))
+            .item(),
     ]);
     assert_eq!(sig(&out, "apply"), "<a | e>(() -> a / e) -> a / e");
     assert_eq!(footprint(&out, "apply"), "{}");
@@ -560,6 +612,8 @@ fn the_prelude_map_stays_effect_polymorphic_and_pure_at_a_pure_call() {
                 vec![var("xs"), lambda(&["x"], add(var("x"), var("x")))],
             ),
         )
+        .param_types(vec![Some(con("List", vec![con("Int", vec![])]))])
+        .ret(con("List", vec![con("Int", vec![])]))
         .item(),
     ]);
     assert_eq!(sig(&out, "doubled"), "(List<Int>) -> List<Int>");
@@ -575,6 +629,7 @@ fn a_handler_subtracts_the_atoms_it_discharges() {
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
         func(
             "isolated",
@@ -584,6 +639,7 @@ fn a_handler_subtracts_the_atoms_it_discharges() {
                 vec![clause("db", "get", Some("users"), &["k"], int(7))],
             ),
         )
+        .ret(con("Int", vec![]))
         .item(),
     ]);
     assert_eq!(footprint(&out, "reader"), "{db.read[users]}");
@@ -602,6 +658,7 @@ fn a_clause_that_calls_its_own_continuation_infers_a_closed_row() {
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
         func(
             "resumed",
@@ -618,6 +675,7 @@ fn a_clause_that_calls_its_own_continuation_infers_a_closed_row() {
                 )],
             ),
         )
+        .ret(con("Int", vec![]))
         .item(),
     ]);
     assert_eq!(footprint(&out, "resumed"), "{}");
@@ -638,6 +696,7 @@ fn resuming_zero_once_or_twice_gives_one_footprint() {
                 &[],
                 perform("db", "get", Some("users"), vec![int(1)]),
             )
+            .ret(con("Int", vec![]))
             .item(),
             func(
                 "handled",
@@ -654,6 +713,7 @@ fn resuming_zero_once_or_twice_gives_one_footprint() {
                     )],
                 ),
             )
+            .ret(con("Int", vec![]))
             .item(),
         ]
     };
@@ -682,6 +742,7 @@ fn a_general_clause_returns_the_handles_result_not_the_operations() {
                 &[],
                 perform("db", "get", Some("users"), vec![int(1)]),
             )
+            .ret(con("Int", vec![]))
             .item(),
             func(
                 "handled",
@@ -700,6 +761,7 @@ fn a_general_clause_returns_the_handles_result_not_the_operations() {
                     call("int_to_string", vec![var("x")]),
                 ),
             )
+            .ret(con("String", vec![]))
             .item(),
         ]
     };
@@ -720,6 +782,7 @@ fn a_handler_only_subtracts_the_resource_it_names() {
             &[],
             perform("db", "get", Some("orders"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
         func(
             "still_dirty",
@@ -729,6 +792,7 @@ fn a_handler_only_subtracts_the_resource_it_names() {
                 vec![clause("db", "get", Some("users"), &["k"], int(7))],
             ),
         )
+        .ret(con("Int", vec![]))
         .item(),
     ]);
     assert_eq!(footprint(&out, "still_dirty"), "{db.read[orders]}");
@@ -748,6 +812,7 @@ fn a_handler_clause_adds_its_own_effects_to_the_result() {
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
         func(
             "backed_by_socket",
@@ -763,6 +828,7 @@ fn a_handler_clause_adds_its_own_effects_to_the_result() {
                 )],
             ),
         )
+        .ret(con("Int", vec![]))
         .item(),
     ]);
     assert_eq!(footprint(&out, "backed_by_socket"), "{net.read}");
@@ -775,21 +841,28 @@ fn with_cell_discharges_the_cell_atoms_of_its_own_region() {
         Some(call("cell_get", vec![var("c")])),
     );
     let out = check(vec![
-        func("counted", &[], with_cell("users", int(0), "c", body)).item(),
+        func("counted", &[], with_cell("users", int(0), "c", body))
+            .ret(con("Int", vec![]))
+            .item(),
     ]);
     assert_eq!(footprint(&out, "counted"), "{}");
     assert_eq!(sig(&out, "counted"), "() -> Int");
 }
 
+/// The escaping value is bound to a `let` rather than returned, so the
+/// definition's own return type is writable (`E0126`) and the only diagnostic
+/// left is the one under test.
 #[test]
 fn a_cell_may_not_outlive_the_region_that_discharges_its_atoms() {
+    let body = block(
+        vec![let_("leaked", with_cell("users", var("x"), "c", var("c")))],
+        Some(int(0)),
+    );
     let diags = check_err(vec![
-        func(
-            "escaped",
-            &["x"],
-            with_cell("users", var("x"), "c", var("c")),
-        )
-        .item(),
+        func("escaped", &["x"], body)
+            .param_types(vec![Some(con("Int", vec![]))])
+            .ret(con("Int", vec![]))
+            .item(),
     ]);
     let d = only(&diags, codes::TYPE_MISMATCH);
     assert_eq!(d.message, "the cell escapes its `with_cell[users]` region");
@@ -802,6 +875,14 @@ fn a_cell_may_not_outlive_the_region_that_discharges_its_atoms() {
 
 #[test]
 fn a_region_escape_is_caught_however_the_cell_is_wrapped() {
+    // The region's value is bound to a `let`, so each definition's own return
+    // type stays writable and the escape is the only thing being reported.
+    let escaping = |name: &str, region: Expr| {
+        func(name, &[], block(vec![let_("held", region)], Some(int(0))))
+            .ret(con("Int", vec![]))
+            .item()
+    };
+
     let in_a_list = with_cell(
         "users",
         int(0),
@@ -811,7 +892,7 @@ fn a_region_escape_is_caught_however_the_cell_is_wrapped() {
         }),
     );
     assert!(has_code(
-        &check_err(vec![func("f", &[], in_a_list).item()]),
+        &check_err(vec![escaping("f", in_a_list)]),
         codes::TYPE_MISMATCH
     ),);
 
@@ -824,13 +905,13 @@ fn a_region_escape_is_caught_however_the_cell_is_wrapped() {
         }),
     );
     assert!(has_code(
-        &check_err(vec![func("g", &[], in_a_record).item()]),
+        &check_err(vec![escaping("g", in_a_record)]),
         codes::TYPE_MISMATCH
     ),);
 
     let in_a_closure = with_cell("users", int(0), "c", lambda(&["_ignored"], var("c")));
     assert!(has_code(
-        &check_err(vec![func("h", &[], in_a_closure).item()]),
+        &check_err(vec![escaping("h", in_a_closure)]),
         codes::TYPE_MISMATCH
     ),);
 }
@@ -843,6 +924,7 @@ fn a_region_that_returns_a_plain_value_is_accepted() {
             &[],
             with_cell("users", int(1), "c", call("cell_get", vec![var("c")])),
         )
+        .ret(con("Int", vec![]))
         .item(),
     ]);
     assert_eq!(sig(&out, "f"), "() -> Int");
@@ -868,7 +950,9 @@ fn nested_regions_keep_their_cells_apart() {
             ),
         ),
     );
-    let out = check(vec![func("nested", &[], good).item()]);
+    let out = check(vec![
+        func("nested", &[], good).ret(con("Int", vec![])).item(),
+    ]);
     assert_eq!(footprint(&out, "nested"), "{}");
     assert_eq!(sig(&out, "nested"), "() -> Int");
 
@@ -883,7 +967,9 @@ fn nested_regions_keep_their_cells_apart() {
             call("cell_set", vec![var("c"), bool_lit(false)]),
         ),
     );
-    let diags = check_err(vec![func("confused", &[], bad).item()]);
+    let diags = check_err(vec![
+        func("confused", &[], bad).ret(con("Unit", vec![])).item(),
+    ]);
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
 
@@ -973,6 +1059,7 @@ fn a_handled_atom_stops_being_evidence_for_the_determinism_check() {
 fn a_cell_whose_region_is_unknown_is_a_resource_error() {
     let def = func("peek", &["c"], call("cell_get", vec![var("c")]))
         .param_types(vec![Some(con("Cell", vec![con("Int", vec![])]))])
+        .ret(con("Int", vec![]))
         .item();
     let diags = check_err(vec![def]);
     let d = only(&diags, codes::RESOURCE_REQUIRED);
@@ -998,8 +1085,11 @@ fn a_handler_inside_a_cell_region_keeps_the_test_isolated() {
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
-        func("isolated", &[], with_cell("users", int(0), "c", handled)).item(),
+        func("isolated", &[], with_cell("users", int(0), "c", handled))
+            .ret(con("Int", vec![]))
+            .item(),
     ]);
     assert_eq!(footprint(&out, "isolated"), "{}");
 }
@@ -1125,7 +1215,9 @@ fn test_nondet_opts_out_of_the_determinism_check() {
 
 #[test]
 fn e0412_points_through_a_call_when_the_perform_is_indirect() {
-    let helper = func("stamp", &[], perform("wall", "now", None, vec![])).item();
+    let helper = func("stamp", &[], perform("wall", "now", None, vec![]))
+        .ret(con("Int", vec![]))
+        .item();
     let body = block(
         vec![],
         Some(ex_at(
@@ -1150,7 +1242,9 @@ fn e0412_points_through_a_call_when_the_perform_is_indirect() {
 
 #[test]
 fn a_missing_resource_label_is_reported_at_the_perform() {
-    let def = func("f", &[], perform_at("db", "get", None, vec![int(1)], 12)).item();
+    let def = func("f", &[], perform_at("db", "get", None, vec![int(1)], 12))
+        .ret(con("Int", vec![]))
+        .item();
     let diags = check_err(vec![db_effect(), def]);
     let d = only(&diags, codes::RESOURCE_REQUIRED);
     assert_eq!(d.primary_span().unwrap().start, 12);
@@ -1163,7 +1257,9 @@ fn a_missing_resource_label_is_reported_at_the_perform() {
 
 #[test]
 fn a_resource_label_on_a_plain_operation_is_rejected() {
-    let def = func("f", &[], perform("wall", "now", Some("wall"), vec![])).item();
+    let def = func("f", &[], perform("wall", "now", Some("wall"), vec![]))
+        .ret(con("Int", vec![]))
+        .item();
     let diags = check_err(vec![wall_effect(), def]);
     assert!(
         has_code(&diags, codes::RESOURCE_REQUIRED),
@@ -1184,6 +1280,7 @@ fn unknown_effects_and_operations_are_reported_at_their_own_idents() {
             args: vec![],
         }),
     )
+    .ret(con("Int", vec![]))
     .item();
     let bad_op = func(
         "b",
@@ -1195,6 +1292,7 @@ fn unknown_effects_and_operations_are_reported_at_their_own_idents() {
             args: vec![],
         }),
     )
+    .ret(con("Int", vec![]))
     .item();
     let diags = check_err(vec![db_effect(), bad_effect, bad_op]);
     assert_eq!(
@@ -1220,6 +1318,7 @@ fn an_operation_call_with_the_wrong_arity_is_reported() {
         &[],
         perform("db", "get", Some("users"), vec![int(1), int(2)]),
     )
+    .ret(con("Int", vec![]))
     .item();
     let diags = check_err(vec![db_effect(), def]);
     let d = only(&diags, codes::ARITY_MISMATCH);
@@ -1230,9 +1329,17 @@ fn an_operation_call_with_the_wrong_arity_is_reported() {
 fn several_independent_errors_are_reported_in_one_run() {
     let items = vec![
         db_effect(),
-        func("a", &[], var("missing_one")).item(),
-        func("b", &[], var("missing_two")).item(),
-        func("c", &[], add(bool_lit(true), int(1))).item(),
+        func("a", &[], var("missing_one"))
+            .ret(con("Int", vec![]))
+            .item(),
+        func("b", &[], var("missing_two"))
+            .ret(con("Int", vec![]))
+            .item(),
+        // `true + 1` answers its left operand's type, so `Bool` is what the
+        // signature has to claim for the arithmetic to be the only mistake.
+        func("c", &[], add(bool_lit(true), int(1)))
+            .ret(con("Bool", vec![]))
+            .item(),
     ];
     let diags = check_err(items);
     assert_eq!(
@@ -1267,6 +1374,8 @@ fn mutual_recursion_is_generalized_as_one_component() {
             )),
         }),
     )
+    .param_types(vec![Some(con("Int", vec![]))])
+    .ret(con("Bool", vec![]))
     .item();
     let is_odd = func(
         "is_odd",
@@ -1288,6 +1397,8 @@ fn mutual_recursion_is_generalized_as_one_component() {
             )),
         }),
     )
+    .param_types(vec![Some(con("Int", vec![]))])
+    .ret(con("Bool", vec![]))
     .item();
     let out = check(vec![is_even, is_odd]);
     assert_eq!(sig(&out, "is_even"), "(Int) -> Bool");
@@ -1301,15 +1412,24 @@ fn a_recursive_function_keeps_the_atoms_it_performs() {
         then_branch: Box::new(perform("db", "get", Some("users"), vec![int(0)])),
         else_branch: Box::new(call("looper", vec![])),
     });
-    let out = check(vec![db_effect(), func("looper", &[], body).item()]);
+    let out = check(vec![
+        db_effect(),
+        func("looper", &[], body).ret(con("Int", vec![])).item(),
+    ]);
     assert_eq!(footprint(&out, "looper"), "{db.read[users]}");
 }
 
 #[test]
 fn a_definition_used_before_it_is_written_still_generalizes() {
     let out = check(vec![
-        func("caller", &[], call("later", vec![int(1)])).item(),
-        func("later", &["x"], var("x")).item(),
+        func("caller", &[], call("later", vec![int(1)]))
+            .ret(con("Int", vec![]))
+            .item(),
+        func("later", &["x"], var("x"))
+            .generics(&["a"], &[])
+            .param_types(vec![Some(tvar("a"))])
+            .ret(tvar("a"))
+            .item(),
     ]);
     assert_eq!(sig(&out, "later"), "<a>(a) -> a");
     assert_eq!(sig(&out, "caller"), "() -> Int");
@@ -1349,8 +1469,13 @@ fn sum_types_give_constructors_and_exhaustiveness() {
         ],
     });
     let out = check(vec![
-        func("unwrap_or_zero", &["o"], full).item(),
-        func("wrap", &[], call("Some", vec![int(3)])).item(),
+        func("unwrap_or_zero", &["o"], full)
+            .param_types(vec![Some(con("Option", vec![con("Int", vec![])]))])
+            .ret(con("Int", vec![]))
+            .item(),
+        func("wrap", &[], call("Some", vec![int(3)]))
+            .ret(con("Option", vec![con("Int", vec![])]))
+            .item(),
     ]);
     assert_eq!(sig(&out, "unwrap_or_zero"), "(Option<Int>) -> Int");
     assert_eq!(sig(&out, "wrap"), "() -> Option<Int>");
@@ -1367,7 +1492,12 @@ fn sum_types_give_constructors_and_exhaustiveness() {
             int(0),
         )],
     });
-    let diags = check_err(vec![func("partial", &["o"], partial).item()]);
+    let diags = check_err(vec![
+        func("partial", &["o"], partial)
+            .param_types(vec![Some(con("Option", vec![con("Int", vec![])]))])
+            .ret(con("Int", vec![]))
+            .item(),
+    ]);
     let d = only(&diags, codes::NON_EXHAUSTIVE_MATCH);
     assert!(
         d.labels[0].message.contains("Some"),
@@ -1376,16 +1506,26 @@ fn sum_types_give_constructors_and_exhaustiveness() {
     );
 }
 
+/// The fixture used to be `fn omega(x) = x(x)`, and there is no signature to
+/// write for it: the type its parameter needs is the one the occurs check
+/// refuses to build. A top-level `fn` writes its types now (`E0126`), so the
+/// self-application moved into a lambda — whose binder is still inferred and
+/// still unconstrained, which is the situation the check exists for.
 #[test]
 fn the_occurs_check_rejects_self_application() {
-    let def = func("omega", &["x"], call("x", vec![var("x")])).item();
-    let diags = check_err(vec![def]);
+    let body = block(
+        vec![let_("omega", lambda(&["x"], call("x", vec![var("x")])))],
+        Some(int(0)),
+    );
+    let diags = check_err(vec![func("f", &[], body).ret(con("Int", vec![])).item()]);
     assert!(has_code(&diags, codes::OCCURS_CHECK), "{}", render(&diags));
 }
 
 #[test]
 fn calling_a_non_function_is_reported_as_such() {
-    let def = func("f", &[], app(int(1), vec![int(2)])).item();
+    let def = func("f", &[], app(int(1), vec![int(2)]))
+        .ret(con("Int", vec![]))
+        .item();
     let diags = check_err(vec![def]);
     assert!(
         has_code(&diags, codes::NOT_A_FUNCTION),
@@ -1397,8 +1537,10 @@ fn calling_a_non_function_is_reported_as_such() {
 #[test]
 fn duplicate_definitions_are_reported_once_and_the_first_wins() {
     let items = vec![
-        func("f", &[], int(1)).item(),
-        func("f", &[], bool_lit(true)).item(),
+        func("f", &[], int(1)).ret(con("Int", vec![])).item(),
+        func("f", &[], bool_lit(true))
+            .ret(con("Bool", vec![]))
+            .item(),
     ];
     let diags = check_err(items);
     assert_eq!(
@@ -1427,7 +1569,14 @@ fn a_function_and_a_constructor_may_not_share_a_name() {
         body: TypeDefBody::Sum(vec![variant("Tag", 40)]),
         span: any(),
     }));
-    let items = vec![func("Tag", &["x"], var("x")).named_at(10).item(), sum];
+    let items = vec![
+        func("Tag", &["x"], var("x"))
+            .named_at(10)
+            .param_types(vec![Some(con("Int", vec![]))])
+            .ret(con("Int", vec![]))
+            .item(),
+        sum,
+    ];
 
     let diags = check_err(items);
     let d = only(&diags, codes::DUPLICATE_DEFINITION);
@@ -1467,7 +1616,14 @@ fn a_constructor_and_a_later_function_are_reported_against_the_function() {
         }]),
         span: any(),
     }));
-    let items = vec![sum, func("Tag", &["x"], var("x")).named_at(40).item()];
+    let items = vec![
+        sum,
+        func("Tag", &["x"], var("x"))
+            .named_at(40)
+            .param_types(vec![Some(con("Int", vec![]))])
+            .ret(con("Int", vec![]))
+            .item(),
+    ];
 
     let diags = check_err(items);
     let d = only(&diags, codes::DUPLICATE_DEFINITION);
@@ -1501,7 +1657,7 @@ fn a_type_an_effect_and_a_function_may_all_share_one_name() {
             false,
             vec![op("get", Mode::Read, true, vec![], con("Int", vec![]))],
         ),
-        func("thing", &[], int(1)).item(),
+        func("thing", &[], int(1)).ret(con("Int", vec![])).item(),
     ]);
     assert_eq!(sig(&out, "thing"), "() -> Int");
 }
@@ -1533,6 +1689,7 @@ fn a_type_alias_is_expanded_and_a_cyclic_one_is_caught() {
         alias,
         func("bump", &["n"], add(var("n"), int(1)))
             .param_types(vec![Some(con("Count", vec![]))])
+            .ret(con("Count", vec![]))
             .item(),
     ]);
     assert_eq!(sig(&out, "bump"), "(Int) -> Int");
@@ -1548,6 +1705,7 @@ fn a_type_alias_is_expanded_and_a_cyclic_one_is_caught() {
         cyclic,
         func("f", &["x"], var("x"))
             .param_types(vec![Some(con("Loop", vec![]))])
+            .ret(con("Int", vec![]))
             .item(),
     ]);
     assert!(has_code(&diags, codes::UNKNOWN_TYPE), "{}", render(&diags));
@@ -1567,12 +1725,14 @@ fn a_generic_effect_operation_is_instantiated_per_call_site() {
             &[],
             perform("store", "echo", Some("k"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
         func(
             "as_bool",
             &[],
             perform("store", "echo", Some("k"), vec![bool_lit(true)]),
         )
+        .ret(con("Bool", vec![]))
         .item(),
     ]);
     assert_eq!(sig(&out, "as_int"), "() -> Int / {store.read[k]}");
@@ -1589,6 +1749,7 @@ fn a_handler_clause_must_return_the_operations_result_type() {
             vec![clause("db", "get", Some("users"), &["k"], bool_lit(true))],
         ),
     )
+    .ret(con("Int", vec![]))
     .item();
     let diags = check_err(vec![db_effect(), def]);
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
@@ -1605,7 +1766,9 @@ fn a_return_clause_changes_the_result_type_of_the_handle() {
             span: any(),
         })),
     });
-    let out = check(vec![func("f", &[], handled).item()]);
+    let out = check(vec![
+        func("f", &[], handled).ret(con("String", vec![])).item(),
+    ]);
     assert_eq!(sig(&out, "f"), "() -> String");
 }
 
@@ -1618,6 +1781,7 @@ fn a_test_footprint_reaches_through_the_functions_it_calls() {
             &[],
             perform("db", "get", Some("users"), vec![int(1)]),
         )
+        .ret(con("Int", vec![]))
         .item(),
         test_def(
             "reads users",
@@ -1633,7 +1797,16 @@ fn a_test_footprint_reaches_through_the_functions_it_calls() {
 #[test]
 fn an_unconstrained_row_variable_in_a_test_closes_to_empty() {
     let out = check(vec![
-        func("apply", &["f"], call("f", vec![])).item(),
+        func("apply", &["f"], call("f", vec![]))
+            .generics(&["a"], &["e"])
+            .param_types(vec![Some(TypeExpr::Fn {
+                params: vec![],
+                ret: Box::new(tvar("a")),
+                effects: Some(row(&[], Some("e"))),
+                span: any(),
+            })])
+            .ret(tvar("a"))
+            .item(),
         test_def(
             "pure",
             false,
@@ -1655,7 +1828,10 @@ fn a_handler_that_forwards_to_the_real_effect_stays_honest() {
             perform_at("wall", "now", None, vec![], 30),
         )],
     );
-    let out = check(vec![wall_effect(), func("f", &[], body.clone()).item()]);
+    let out = check(vec![
+        wall_effect(),
+        func("f", &[], body.clone()).ret(con("Int", vec![])).item(),
+    ]);
     assert_eq!(footprint(&out, "f"), "{wall.read}");
 
     let diags = check_err(vec![wall_effect(), test_def("forwarding", false, body)]);
@@ -1674,6 +1850,7 @@ fn a_cell_builtin_cannot_escape_as_a_value_or_be_redefined() {
         &[],
         block(vec![let_("g", var("cell_get"))], Some(int(1))),
     )
+    .ret(con("Int", vec![]))
     .item();
     let diags = check_err(vec![as_value]);
     assert!(
@@ -1682,7 +1859,10 @@ fn a_cell_builtin_cannot_escape_as_a_value_or_be_redefined() {
         render(&diags)
     );
 
-    let redefined = func("cell_get", &["c"], int(0)).item();
+    let redefined = func("cell_get", &["c"], int(0))
+        .param_types(vec![Some(con("Int", vec![]))])
+        .ret(con("Int", vec![]))
+        .item();
     let diags = check_err(vec![redefined]);
     assert!(
         has_code(&diags, codes::DUPLICATE_DEFINITION),
@@ -1697,7 +1877,7 @@ fn a_shadowing_local_takes_precedence_over_a_prelude_name() {
         vec![let_("len", lambda(&["x"], var("x")))],
         Some(call("len", vec![bool_lit(true)])),
     );
-    let out = check(vec![func("f", &[], body).item()]);
+    let out = check(vec![func("f", &[], body).ret(con("Bool", vec![])).item()]);
     assert_eq!(sig(&out, "f"), "() -> Bool");
 }
 
@@ -1928,7 +2108,10 @@ fn a_refutable_record_field_does_not_make_the_arm_irrefutable() {
 #[test]
 fn comparing_two_functions_is_rejected_before_it_can_run() {
     let diags = check_err(vec![
-        func("f", &["x"], var("x")).item(),
+        func("f", &["x"], var("x"))
+            .param_types(vec![Some(con("Int", vec![]))])
+            .ret(con("Int", vec![]))
+            .item(),
         func(
             "cmp",
             &[],
@@ -1938,6 +2121,7 @@ fn comparing_two_functions_is_rejected_before_it_can_run() {
                 rhs: Box::new(var("f")),
             }),
         )
+        .ret(con("Bool", vec![]))
         .item(),
     ]);
     let d = only(&diags, codes::TYPE_MISMATCH);
@@ -1952,7 +2136,10 @@ fn a_function_buried_in_a_compared_value_is_still_rejected() {
         })
     };
     let diags = check_err(vec![
-        func("f", &["x"], var("x")).item(),
+        func("f", &["x"], var("x"))
+            .param_types(vec![Some(con("Int", vec![]))])
+            .ret(con("Int", vec![]))
+            .item(),
         func(
             "cmp",
             &[],
@@ -1962,6 +2149,7 @@ fn a_function_buried_in_a_compared_value_is_still_rejected() {
                 rhs: Box::new(boxed("f")),
             }),
         )
+        .ret(con("Bool", vec![]))
         .item(),
     ]);
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
@@ -1983,6 +2171,9 @@ fn comparing_ordinary_values_stays_legal() {
                 })),
             }),
         )
+        .generics(&["t"], &[])
+        .param_types(vec![Some(tvar("t")), Some(tvar("t"))])
+        .ret(con("Bool", vec![]))
         .item(),
     ]);
     assert_eq!(sig(&out, "cmp"), "<a>(a, a) -> Bool");
@@ -2370,7 +2561,7 @@ fn identical_definitions_in_two_modules_are_kept_apart_by_key_alone() {
 
 #[test]
 fn a_single_module_check_still_leaves_every_name_bare() {
-    let out = check(vec![func("f", &[], int(1)).item()]);
+    let out = check(vec![func("f", &[], int(1)).ret(con("Int", vec![])).item()]);
     assert!(out.defs.contains_key(&Symbol::new("f")));
     assert_eq!(out.modules.len(), 1);
     assert!(out.modules[&Symbol::new("")].name.is_anonymous());
@@ -2466,13 +2657,19 @@ fn task_spawn_answers_a_task_and_join_unwraps_it() {
         )],
         Some(perform("task", "join", None, vec![var("t")])),
     );
-    let out = check(vec![func("f", &[], simulate(body)).item()]);
+    let out = check(vec![
+        func("f", &[], simulate(body))
+            .ret(con("Int", vec![]))
+            .item(),
+    ]);
     assert_eq!(sig(&out, "f"), "() -> Int / {sim.read}");
 }
 
 #[test]
 fn joining_something_that_is_not_a_task_is_a_type_error() {
-    let def = func("f", &[], perform("task", "join", None, vec![int(1)])).item();
+    let def = func("f", &[], perform("task", "join", None, vec![int(1)]))
+        .ret(con("Int", vec![]))
+        .item();
     let diags = check_err(vec![def]);
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
@@ -2480,12 +2677,24 @@ fn joining_something_that_is_not_a_task_is_a_type_error() {
 #[test]
 fn every_prelude_operation_types_at_its_declared_signature() {
     let out = check(vec![
-        func("y", &[], perform("task", "yield", None, vec![])).item(),
-        func("n", &[], perform("clock", "now", None, vec![])).item(),
-        func("s", &[], perform("clock", "sleep", None, vec![int(5)])).item(),
-        func("r", &[], perform("random", "next", None, vec![])).item(),
-        func("b", &[], perform("random", "below", None, vec![int(6)])).item(),
-        func("d", &[], perform("sim", "seed", None, vec![])).item(),
+        func("y", &[], perform("task", "yield", None, vec![]))
+            .ret(con("Unit", vec![]))
+            .item(),
+        func("n", &[], perform("clock", "now", None, vec![]))
+            .ret(con("Int", vec![]))
+            .item(),
+        func("s", &[], perform("clock", "sleep", None, vec![int(5)]))
+            .ret(con("Unit", vec![]))
+            .item(),
+        func("r", &[], perform("random", "next", None, vec![]))
+            .ret(con("Int", vec![]))
+            .item(),
+        func("b", &[], perform("random", "below", None, vec![int(6)]))
+            .ret(con("Int", vec![]))
+            .item(),
+        func("d", &[], perform("sim", "seed", None, vec![]))
+            .ret(con("Int", vec![]))
+            .item(),
     ]);
     assert_eq!(sig(&out, "y"), "() -> Unit / {task.write}");
     assert_eq!(sig(&out, "n"), "() -> Int / {clock.read}");
@@ -2508,7 +2717,10 @@ fn the_effects_of_a_spawned_body_land_in_the_spawners_row() {
         vec![let_("t", perform("task", "spawn", None, vec![spawned]))],
         Some(perform("task", "join", None, vec![var("t")])),
     );
-    let out = check(vec![db_effect(), func("f", &[], body).item()]);
+    let out = check(vec![
+        db_effect(),
+        func("f", &[], body).ret(con("Unit", vec![])).item(),
+    ]);
     assert_eq!(footprint(&out, "f"), "{db.write[orders], task.write}");
 }
 
@@ -2529,7 +2741,10 @@ fn two_spawns_of_different_resources_union_rather_than_unify() {
         ],
         Some(perform("task", "join", None, vec![var("a")])),
     );
-    let out = check(vec![db_effect(), func("f", &[], body).item()]);
+    let out = check(vec![
+        db_effect(),
+        func("f", &[], body).ret(con("Unit", vec![])).item(),
+    ]);
     assert_eq!(
         footprint(&out, "f"),
         "{db.write[north], db.write[south], task.write}"
@@ -2547,7 +2762,11 @@ fn a_region_discharges_task_clock_and_random_and_publishes_the_seed() {
         ],
         Some(int(0)),
     );
-    let out = check(vec![func("f", &[], simulate(body)).item()]);
+    let out = check(vec![
+        func("f", &[], simulate(body))
+            .ret(con("Int", vec![]))
+            .item(),
+    ]);
     assert_eq!(footprint(&out, "f"), "{sim.read}");
 }
 
@@ -2559,7 +2778,12 @@ fn a_region_discharges_nothing_a_user_declared() {
         vec![Stmt::Expr(perform("task", "yield", None, vec![]))],
         Some(perform("wall", "now", None, vec![])),
     );
-    let out = check(vec![wall_effect(), func("f", &[], simulate(body)).item()]);
+    let out = check(vec![
+        wall_effect(),
+        func("f", &[], simulate(body))
+            .ret(con("Int", vec![]))
+            .item(),
+    ]);
     assert_eq!(footprint(&out, "f"), "{sim.read, wall.read}");
 }
 
@@ -2586,7 +2810,7 @@ fn a_region_discharges_the_five_simulated_atoms_and_no_cell() {
             Some(call("cell_get", vec![var("c")])),
         )),
     );
-    let out = check(vec![func("f", &[], body).item()]);
+    let out = check(vec![func("f", &[], body).ret(con("Int", vec![])).item()]);
     assert_eq!(footprint(&out, "f"), "{sim.read}");
 }
 
@@ -2671,7 +2895,11 @@ fn a_task_in_a_regions_result_type_is_e0413() {
         vec![],
         Some(perform("task", "spawn", None, vec![lambda(&[], int(1))])),
     );
-    let diags = check_err(vec![func("f", &[], simulate_at(body, 12)).item()]);
+    let diags = check_err(vec![
+        func("f", &[], simulate_at(body, 12))
+            .ret(con("Task", vec![con("Int", vec![])]))
+            .item(),
+    ]);
     let d = only(&diags, codes::TASK_ESCAPES_SCOPE);
     assert!(
         d.labels
@@ -2686,7 +2914,11 @@ fn a_task_in_a_regions_result_type_is_e0413() {
 fn a_task_nested_inside_the_result_value_is_also_e0413() {
     let spawn = perform("task", "spawn", None, vec![lambda(&[], int(1))]);
     let body = block(vec![], Some(ex(ExprKind::List { items: vec![spawn] })));
-    let diags = check_err(vec![func("f", &[], simulate(body)).item()]);
+    let diags = check_err(vec![
+        func("f", &[], simulate(body))
+            .ret(con("List", vec![con("Task", vec![con("Int", vec![])])]))
+            .item(),
+    ]);
     assert!(
         has_code(&diags, codes::TASK_ESCAPES_SCOPE),
         "{}",
@@ -2697,7 +2929,11 @@ fn a_task_nested_inside_the_result_value_is_also_e0413() {
 #[test]
 fn a_region_inside_a_region_is_e0416_lexically() {
     let inner = simulate_at(block(vec![], Some(int(1))), 40);
-    let diags = check_err(vec![func("f", &[], simulate_at(inner, 10)).item()]);
+    let diags = check_err(vec![
+        func("f", &[], simulate_at(inner, 10))
+            .ret(con("Int", vec![]))
+            .item(),
+    ]);
     let d = only(&diags, codes::NESTED_SIMULATION);
     assert_eq!(d.primary_span().unwrap().start, 10);
     assert!(
@@ -2709,7 +2945,9 @@ fn a_region_inside_a_region_is_e0416_lexically() {
 
 #[test]
 fn a_region_that_reaches_one_through_a_call_is_e0416_as_well() {
-    let inner = func("inner", &[], simulate(block(vec![], Some(int(1))))).item();
+    let inner = func("inner", &[], simulate(block(vec![], Some(int(1)))))
+        .ret(con("Int", vec![]))
+        .item();
     let reached = ex_at(
         ExprKind::App {
             func: Box::new(var("inner")),
@@ -2718,7 +2956,9 @@ fn a_region_that_reaches_one_through_a_call_is_e0416_as_well() {
         },
         71,
     );
-    let outer = func("outer", &[], simulate_at(reached, 70)).item();
+    let outer = func("outer", &[], simulate_at(reached, 70))
+        .ret(con("Int", vec![]))
+        .item();
     let diags = check_err(vec![inner, outer]);
     let d = only(&diags, codes::NESTED_SIMULATION);
     assert_eq!(d.primary_span().unwrap().start, 70);
@@ -2801,7 +3041,11 @@ fn a_modules_own_clock_shadows_the_prelude() {
 
 #[test]
 fn a_byte_literal_has_its_own_type_and_never_unifies_with_a_string() {
-    let out = check(vec![func("m", &[], bytes_lit(b"GET")).item()]);
+    let out = check(vec![
+        func("m", &[], bytes_lit(b"GET"))
+            .ret(con("Bytes", vec![]))
+            .item(),
+    ]);
     assert_eq!(sig(&out, "m"), "() -> Bytes");
 
     let mixed = check_err(vec![
@@ -2810,6 +3054,7 @@ fn a_byte_literal_has_its_own_type_and_never_unifies_with_a_string() {
             &[],
             call("string_concat", vec![bytes_lit(b"a"), str_lit("b")]),
         )
+        .ret(con("String", vec![]))
         .item(),
     ]);
     only(&mixed, codes::TYPE_MISMATCH);
@@ -2848,13 +3093,17 @@ fn the_bytes_and_string_builtins_have_the_types_the_contract_states() {
         ("string_contains", "(String, String) -> Bool"),
         ("string_find", "(String, String) -> Int"),
     ];
-    // `fn probe_f() = f` returns the builtin itself, so the printed signature
-    // of the probe carries the builtin's whole type.
-    let items: Vec<Item> = expected
+    // `fn probe_f() -> <ty> = f` returns the builtin itself, so the printed
+    // signature of the probe carries the builtin's whole type. The probe's own
+    // return type has to be written now (`E0126`), and the table already holds
+    // it in Ply's own syntax — so the probes are written as source rather than
+    // assembled as a `TypeExpr`, and the table doubles as the text a reader
+    // would have to write to name each builtin.
+    let src: String = expected
         .iter()
-        .map(|(name, _)| func(&format!("probe_{name}"), &[], var(name)).item())
+        .map(|(name, ty)| format!("fn probe_{name}() -> {ty} = {name}\n"))
         .collect();
-    let out = check(items);
+    let out = check_src(&src);
     for (name, ty) in expected {
         assert_eq!(
             sig(&out, &format!("probe_{name}")),
@@ -2904,7 +3153,11 @@ fn a_written_task_type_annotation_agrees_with_what_spawn_answers() {
         }],
         Some(perform("task", "join", None, vec![var("t")])),
     );
-    let out = check(vec![func("f", &[], simulate(body)).item()]);
+    let out = check(vec![
+        func("f", &[], simulate(body))
+            .ret(con("Int", vec![]))
+            .item(),
+    ]);
     assert_eq!(sig(&out, "f"), "() -> Int / {sim.read}");
 }
 
@@ -2922,7 +3175,11 @@ fn a_task_of_the_wrong_element_type_is_rejected() {
         }],
         Some(perform("task", "join", None, vec![var("t")])),
     );
-    let diags = check_err(vec![func("f", &[], simulate(body)).item()]);
+    let diags = check_err(vec![
+        func("f", &[], simulate(body))
+            .ret(con("Bool", vec![]))
+            .item(),
+    ]);
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
 
@@ -2930,10 +3187,14 @@ fn a_task_of_the_wrong_element_type_is_rejected() {
 /// closure reaches a region carries the seed with no new analysis.
 #[test]
 fn the_seed_atom_propagates_through_an_ordinary_call() {
-    let helper = func("run", &[], simulate(block(vec![], Some(int(1))))).item();
+    let helper = func("run", &[], simulate(block(vec![], Some(int(1)))))
+        .ret(con("Int", vec![]))
+        .item();
     let out = check(vec![
         helper,
-        func("caller", &[], call("run", vec![])).item(),
+        func("caller", &[], call("run", vec![]))
+            .ret(con("Int", vec![]))
+            .item(),
         test_def("through a call", false, call("run", vec![])),
     ]);
     assert_eq!(footprint(&out, "caller"), "{sim.read}");
@@ -3441,13 +3702,23 @@ fn every_law_and_clause_in_the_example_corpus_is_pure() {
     );
 }
 
+/// This was written against `fn f(x) ensures result > x = x + 1` and named for
+/// it — "a clause sees the types the body forced on an unannotated signature":
+/// the signature was inferred, and the point was that a clause is typed against
+/// whatever the *body* settled on rather than against nothing.
+///
+/// A top-level `fn` has no unannotated signature any more (`E0126`), so that
+/// premise is gone. What the test was really checking survives unchanged — a
+/// clause is typed against the definition's interface, `result` included, and
+/// a clause that disagrees with it is a mismatch rather than an accepted
+/// claim — and is restated against the written signature.
 #[test]
-fn a_clause_sees_the_types_the_body_forced_on_an_unannotated_signature() {
-    let out = check_src("fn f(x) ensures result > x = x + 1");
+fn a_clause_is_typed_against_the_written_signature() {
+    let out = check_src("fn f(x: Int) -> Int ensures result > x = x + 1");
     assert_eq!(sig(&out, "f"), "(Int) -> Int");
     assert_eq!(def(&out, "f").spec.len(), 1);
 
-    let diags = check_src_err("fn f(x) ensures result == \"grown\" = x + 1");
+    let diags = check_src_err("fn f(x: Int) -> Int ensures result == \"grown\" = x + 1");
     only(&diags, codes::TYPE_MISMATCH);
 }
 

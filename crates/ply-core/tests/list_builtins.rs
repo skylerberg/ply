@@ -65,12 +65,16 @@ fn footprint(out: &CheckOutput, name: &str) -> String {
         .to_string()
 }
 
-/// `fn probe_f() = f` returns the builtin itself, so the printed signature of
-/// the probe carries the builtin's whole type.
+/// `fn probe_at<a>() -> T = list_at` returns the builtin itself, so the printed
+/// signature of the probe carries the builtin's whole type. The return
+/// type is *written* (`MISSING_SIGNATURE`), which makes this stronger than it
+/// was when it was read off inference: the builtin must now unify with the
+/// contract's type rather than merely print as it.
 #[test]
 fn list_at_has_the_type_the_contract_states() {
-    let out = ok("fn probe_at() = list_at\n");
-    assert_eq!(sig(&out, "probe_at"), "() -> (List<a>, Int) -> Option<a>");
+    let want = "(List<a>, Int) -> Option<a>";
+    let out = ok(&format!("fn probe_at<a>() -> {want} = list_at\n"));
+    assert_eq!(sig(&out, "probe_at"), format!("() -> {want}"));
 }
 
 /// The element type is the list's, in both directions.
