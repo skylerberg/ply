@@ -7,7 +7,7 @@ use crate::handler;
 use crate::machine::{Machine, apply_unary, short_circuits};
 use crate::semantics::{err_let_mismatch, err_no_such_field, strict_binary};
 use crate::value::{Fields, Value, type_error};
-use ply_span::Diagnostic;
+use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::BinOp;
 use std::sync::Arc;
 
@@ -238,8 +238,7 @@ impl Machine<'_> {
                 done.push((fields[next - 1].0.clone(), value));
                 match fields.get(next) {
                     None => {
-                        let map: Fields = done.into_iter().collect();
-                        self.go_return(Value::Record(Arc::new(map)));
+                        self.go_return(Value::Record(Arc::new(Fields::from_unsorted(done))));
                     }
                     Some((_, code)) => {
                         let code = code.clone();
@@ -254,6 +253,95 @@ impl Machine<'_> {
                             code.span,
                         )?;
                         self.go_eval(code, module);
+                    }
+                }
+            }
+
+            Frame::UpdateField {
+                base,
+                copies,
+                sets,
+                mut done,
+                next,
+                module,
+                span,
+            } => {
+                done.push(value);
+                match sets.get(next) {
+                    Some((_, code)) => {
+                        let code = code.clone();
+                        crate::rc::note_carry();
+                        self.push(
+                            Frame::UpdateField {
+                                base,
+                                copies,
+                                sets,
+                                done,
+                                next: next + 1,
+                                module,
+                                span,
+                            },
+                            span,
+                        )?;
+                        self.go_eval(code, module);
+                    }
+                    None => {
+                        self.push(
+                            Frame::UpdateApply {
+                                copies,
+                                sets,
+                                done,
+                                span,
+                            },
+                            span,
+                        )?;
+                        self.go_eval(base, module);
+                    }
+                }
+            }
+
+            // The base arrives after the written fields. When the literal names exactly the base's
+            // fields — the shape `{..b, f: e}` always has — the record is updated in place if
+            // nothing else holds it, and cloned once if something does; a literal that copies
+            // fewer fields than the base holds is built as written.
+            Frame::UpdateApply {
+                copies,
+                sets,
+                mut done,
+                span,
+            } => {
+                let mut value = value;
+                match &mut value {
+                    Value::Record(record) => {
+                        if let Some(missing) = copies.iter().find(|c| record.get(&c.name).is_none())
+                        {
+                            return Err(err_no_such_field(missing, record));
+                        }
+                        let exact = record.len() == copies.len() + sets.len()
+                            && sets.iter().all(|(n, _)| record.get(n).is_some());
+                        if exact {
+                            let fields = Arc::make_mut(record);
+                            for ((name, _), v) in sets.iter().zip(done.drain(..)) {
+                                fields.set(name, v);
+                            }
+                            crate::argv::give(done);
+                            self.go_return(value);
+                        } else {
+                            let mut out: Vec<(Symbol, Value)> =
+                                Vec::with_capacity(copies.len() + sets.len());
+                            for c in copies.iter() {
+                                let v = record.get(&c.name).cloned().expect("checked above");
+                                out.push((c.name.clone(), v));
+                            }
+                            for ((name, _), v) in sets.iter().zip(done.drain(..)) {
+                                out.push((name.clone(), v));
+                            }
+                            crate::argv::give(done);
+                            self.go_return(Value::Record(Arc::new(Fields::from_unsorted(out))));
+                        }
+                    }
+                    other => {
+                        return Err(type_error(span, "field access", "a record", other));
                     }
                 }
             }

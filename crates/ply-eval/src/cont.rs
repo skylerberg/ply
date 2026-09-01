@@ -144,6 +144,27 @@ pub enum Frame {
         module: usize,
     },
 
+    /// A record update's written fields, waiting for `sets[next - 1]`; the base comes last. The
+    /// values go into a pooled vector — the names are `sets`' — so an update allocates nothing
+    /// of its own.
+    UpdateField {
+        base: Code,
+        copies: Rc<Vec<Ident>>,
+        sets: Rc<Vec<(Symbol, Code)>>,
+        done: Vec<Value>,
+        next: usize,
+        module: usize,
+        span: Span,
+    },
+
+    /// Waiting for a record update's base, with the written fields already evaluated.
+    UpdateApply {
+        copies: Rc<Vec<Ident>>,
+        sets: Rc<Vec<(Symbol, Code)>>,
+        done: Vec<Value>,
+        span: Span,
+    },
+
     FieldAccess {
         field: Ident,
         base_span: Span,

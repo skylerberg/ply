@@ -82,6 +82,7 @@ struct Helpers {
     ctor_is: FuncId,
     ctor_arg: FuncId,
     record: FuncId,
+    record_update: FuncId,
     field: FuncId,
     no_fuel: FuncId,
 }
@@ -298,6 +299,7 @@ impl Jit {
             ctor_is: declare(&mut module, "rt_ctor_is", 3, true)?,
             ctor_arg: declare(&mut module, "rt_ctor_arg", 3, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
+            record_update: declare(&mut module, "rt_record_update", 5, true)?,
             field: declare(&mut module, "rt_field", 3, true)?,
             no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
         };
@@ -466,6 +468,9 @@ fn count_nodes(code: &Code) -> usize {
         }
         NodeKind::Record { fields, .. } => {
             n += fields.iter().map(|(_, e)| count_nodes(e)).sum::<usize>()
+        }
+        NodeKind::RecordUpdate { base, sets, .. } => {
+            n += count_nodes(base) + sets.iter().map(|(_, e)| count_nodes(e)).sum::<usize>()
         }
         NodeKind::Field { base, .. } => n += count_nodes(base),
         NodeKind::List { items } => n += items.iter().map(count_nodes).sum::<usize>(),
@@ -916,6 +921,31 @@ impl Fx<'_, '_> {
             }
 
             NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, scope),
+
+            NodeKind::RecordUpdate { base, copies, sets } => {
+                let mut names = Vec::with_capacity(copies.len() + sets.len());
+                let mut handles = Vec::with_capacity(sets.len());
+                for (name, value) in sets.iter() {
+                    let v = self.expr(value, scope)?;
+                    let h = self.boxed(v);
+                    names.push(name.clone());
+                    handles.push(h);
+                }
+                names.extend(copies.iter().map(|c| c.name.clone()));
+                let base = self.expr(base, scope)?;
+                let base = self.boxed(base);
+                let shape = self.jit.shapes.len();
+                self.jit.shapes.push(names);
+                let ptr = self.spill(&handles);
+                let shape = self.builder.ins().iconst(types::I64, shape as i64);
+                let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+                let v = self.helper(self.jit.helpers.record_update, &[shape, base, ptr, n]);
+                self.check();
+                Ok(Val {
+                    kind: Kind::Boxed,
+                    v,
+                })
+            }
 
             NodeKind::App { func, args, .. } => self.app(func, args, scope),
 

@@ -774,6 +774,14 @@ impl Walk<'_, '_> {
                 Owner::Fresh
             }
 
+            NodeKind::RecordUpdate { base, sets, .. } => {
+                for (_, value) in sets.iter() {
+                    self.walk(value, st);
+                }
+                self.walk(base, st);
+                Owner::Fresh
+            }
+
             NodeKind::Field { base, field } => {
                 // A projection takes the field out when the record arrives at one owner — the
                 // machine probes uniqueness at the access — and clones it otherwise, so the field
