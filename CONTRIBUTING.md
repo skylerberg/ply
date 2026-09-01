@@ -134,11 +134,12 @@ and compares every `needs` result against `success`, so a job that is skipped �
 because something it needed was skipped, or because a matrix produced no legs —
 turns the required check red rather than reporting green over nothing run.
 
-**`fmt` and `clippy` gate the expensive jobs.** They start immediately alongside
-`plan`; everything that pays a dependency build waits on them. The trade is
-deliberate: a green run is slower by however long lint takes, and a real test
-failure surfaces later. It is worth it only while lint and formatting are a
-common failure — **if test failures start dominating, take the gating out.**
+**`fmt` and `clippy` run alongside the test jobs, not ahead of them.** They are
+required by the `ci` aggregate, so a lint slip is still a red check; what they
+no longer do is hold every shard back by their own wall clock on a green run.
+Watch a run with `gh pr checks <n> --watch --fail-fast`, which exits at the
+first failed check, so a formatting slip surfaces when `fmt` finishes rather
+than when the last shard does.
 
 **The test job is sharded**, because one runner running everything is too slow.
 `.github/ci-shards.sh` holds the partition and `verify` fails if a workspace
