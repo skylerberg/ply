@@ -400,6 +400,20 @@ the representation — 190 elements for twenty whole-list appends, pinned in
 `slot_resolution::a_copying_append_reports_how_much_it_copied`. Under `imbl` the same program
 reports a number that shrinks rather than a boolean that stops meaning anything.
 
+**And that is not sufficient, which is worth stating precisely because it looked sufficient.**
+`elements_copied` is computable today because `push`'s copying arm knows the length it copied.
+`imbl::Vector` exposes no such thing: its only sharing-related method is `ptr_eq`, which compares
+two vectors rather than asking whether one is uniquely owned, so an append cannot report either
+whether it rewrote or how much it moved. Under S5 the seven assertions reading those counters are
+not made *vacuous*, they are made **unmeasurable**, and the difference matters — a vacuous assertion
+can be re-pointed at the same quantity, an unmeasurable one has to be re-pointed at a different one.
+
+What survives the swap is allocation count, which the global allocator can observe and
+`w6-alloc` already does. So S5's remaining prerequisite is those assertions moving from "did this
+append copy" to "what did this append allocate", and that is a change to what the record
+*guarantees* about reuse rather than to how it measures it. It is the last thing standing between
+the pricing in §10.1 and the swap.
+
 The index cost is real and is now measurable via `list_at`. ADR 0027 §7 warns that
 a peek is almost all interpreter dispatch, so it must be priced through the
 backend or not at all; G3 says so rather than waiving it.
@@ -639,7 +653,8 @@ small lists, and G2 is measured there. That number needs the change to exist, so
 | **S4b** | slot resolution at lowering, verified against the names | done — no runtime change; the assignment the rewrite switches to is wrong-checked first |
 | **S4c** | clause and `return` bodies copy in their free variables rather than extending the prompt scope | done, behind the probe — removes §4.1's addressing obstacle |
 | **S4** | §4, slot frames — the machine reads by index | gated on **G1**, then **G2** |
-| **S5a** | the append counter measures volume, not a boolean | done — the instrument S5 would otherwise make vacuous |
+| **S5a** | the append counter measures volume, not a boolean | done — necessary, and not sufficient: see §5 |
+| **S5b** | the reuse assertions move from "did it copy" to "what did it allocate" | **next** — `imbl` can report neither of the counters they read |
 | **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |
