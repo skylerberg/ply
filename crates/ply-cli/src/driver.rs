@@ -993,6 +993,7 @@ impl<'s> Driver<'s> {
         };
         let merged = HashOutput {
             defs: hashes.defs.clone(),
+            own: hashes.own.clone(),
             decls: hashes.decls.clone(),
             tests: Vec::new(),
             laws: Vec::new(),
@@ -1403,10 +1404,24 @@ impl<'s> Driver<'s> {
             .iter()
             .map(|t| (t.key.clone(), t.footprint.clone()))
             .collect();
+        // Taken here because this is where a whole `DefInfo` is in hand. Its
+        // three parts have to come from one of them: `DefConstraint::param` is
+        // an index into that scheme's own `ty_vars`, and `interface_hash`
+        // canonicalizes internally, which reorders them.
+        let ifaces: BTreeMap<Symbol, DefHash> = check
+            .defs
+            .iter()
+            .map(|(name, info)| {
+                (
+                    name.clone(),
+                    ply_hash::interface_hash(&info.scheme, &info.footprint, &info.constraints),
+                )
+            })
+            .collect();
         let fingerprints: Vec<(usize, SourceFingerprint)> = (0..self.files.len())
             .filter(|&i| self.files[i].parse)
             .filter_map(|i| {
-                self.fingerprint_of(i, hashes, &table, &exports, &footprints)
+                self.fingerprint_of(i, hashes, &table, &exports, &footprints, &ifaces)
                     .map(|f| (i, f))
             })
             .collect();
@@ -1487,6 +1502,7 @@ impl<'s> Driver<'s> {
         table: &BTreeMap<Symbol, DefHash>,
         exports: &BTreeMap<Symbol, Vec<NameRef>>,
         footprints: &BTreeMap<Symbol, Footprint>,
+        ifaces: &BTreeMap<Symbol, DefHash>,
     ) -> Option<SourceFingerprint> {
         let file = &self.files[i];
         let ast = file.ast.as_ref()?;
@@ -1544,9 +1560,16 @@ impl<'s> Driver<'s> {
                 Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => continue,
             };
             let deps = hashes.deps.get(&name).cloned().unwrap_or_default();
+            // A `type` or `effect` is in neither map: its signature comes from
+            // its own text and reaches no body, so its hash already answers
+            // both questions. Gate 2 re-derives declarations anyway.
+            let own = hashes.own.get(&name).copied().unwrap_or(hash);
+            let iface = ifaces.get(&name).copied().unwrap_or(hash);
             fingerprint.defs.push(DefEntry {
                 name,
                 hash,
+                own,
+                iface,
                 span: FileSpan::of(item.span()),
                 kind,
                 members,

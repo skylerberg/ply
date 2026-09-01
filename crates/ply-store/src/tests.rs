@@ -651,6 +651,8 @@ fn fingerprint(n: u8) -> SourceFingerprint {
     fp.defs.push(DefEntry {
         name: ply_span::Symbol::new("active_users"),
         hash: hash(n),
+        own: hash(n.wrapping_add(50)),
+        iface: hash(n.wrapping_add(60)),
         span: FileSpan { start: 10, end: 42 },
         kind: DefKind::Fn,
         members: Vec::new(),
@@ -2023,6 +2025,8 @@ fn pin_fingerprint() -> SourceFingerprint {
             DefEntry {
                 name: ply_span::Symbol::new("user.active_users"),
                 hash: hash(2),
+                own: hash(8),
+                iface: hash(9),
                 span: FileSpan { start: 10, end: 42 },
                 kind: DefKind::Fn,
                 members: vec![],
@@ -2031,6 +2035,8 @@ fn pin_fingerprint() -> SourceFingerprint {
             DefEntry {
                 name: ply_span::Symbol::new("user.User"),
                 hash: hash(3),
+                own: hash(10),
+                iface: hash(11),
                 span: FileSpan { start: 50, end: 80 },
                 kind: DefKind::Type,
                 members: vec![Member {
@@ -2151,7 +2157,7 @@ fn the_front_end_entry_encoding_is_pinned() {
     assert_eq!(found, pinned.to_vec(), "{BUMP}");
 }
 
-const PINNED_FINGERPRINT: &str = "02e7e6340261171838cb49303958e371ae61d01db729090dec71f8fa7896a003";
+const PINNED_FINGERPRINT: &str = "99414f47e9627b5d6c9338a58bcd7ee837ebad9ef16ee4071cdb7f291e2df139";
 const PINNED_DEF: &str = "edbd2fa35344f8a5fd38f3e745727cd96ca1d7c57255560c0064004b249c6aab";
 const PINNED_TYPE_DECL: &str = "563d17593d11975f979c1714dbf0845f19433439fd5517b15d8d7750dd2d6d91";
 const PINNED_EFFECT_DECL: &str = "0b5bc11329b83fd823d762923323c2373dfb1e9e985756570dd709013e1a004d";
@@ -2280,6 +2286,8 @@ fn lookup_finds_a_definition_by_full_name_simple_name_or_hash_prefix() {
     fp.defs.push(DefEntry {
         name: ply_span::Symbol::new("user.active_users"),
         hash: hash(9),
+        own: hash(19),
+        iface: hash(29),
         span: FileSpan { start: 10, end: 42 },
         kind: DefKind::Fn,
         members: Vec::new(),
@@ -2342,6 +2350,8 @@ fn lookup_returns_every_match_rather_than_refusing() {
         fp.defs.push(DefEntry {
             name: ply_span::Symbol::new(format!("{module}.place")),
             hash: hash(n),
+            own: hash(n.wrapping_add(50)),
+            iface: hash(n.wrapping_add(60)),
             span: FileSpan { start: 0, end: 1 },
             kind: DefKind::Fn,
             members: Vec::new(),
@@ -2504,6 +2514,8 @@ fn opening_a_ten_thousand_definition_cache_is_under_the_budget() {
             fp.defs.push(DefEntry {
                 name: name.clone(),
                 hash,
+                own: hash,
+                iface: hash,
                 span: FileSpan {
                     start: n,
                     end: n + 10,

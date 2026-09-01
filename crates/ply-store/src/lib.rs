@@ -41,7 +41,7 @@ pub use schema::fingerprint as schema_fingerprint;
 pub const RUNTIME_VERSION: &str = "0.14.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
-pub const FRONTEND_VERSION: &str = "0.18.0";
+pub const FRONTEND_VERSION: &str = "0.19.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 pub const PROVER_VERSION: &str = "0.6.0";

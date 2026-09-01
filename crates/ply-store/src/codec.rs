@@ -541,6 +541,8 @@ pub(crate) fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
         w.tag(tag::DEF_ENTRY);
         w.symbol(&def.name);
         w.def_hash(def.hash);
+        w.def_hash(def.own);
+        w.def_hash(def.iface);
         put_span(&mut w, def.span);
         put_kind(&mut w, def.kind);
         w.count(def.members.len());
@@ -595,6 +597,8 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
         r.tag(tag::DEF_ENTRY, WHAT)?;
         let name = r.symbol(WHAT)?;
         let hash = r.def_hash(WHAT)?;
+        let own = r.def_hash(WHAT)?;
+        let iface = r.def_hash(WHAT)?;
         let span = get_span(&mut r)?;
         let kind = get_kind(&mut r)?;
         let count = r.count(WHAT)?;
@@ -611,6 +615,8 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
         defs.push(DefEntry {
             name,
             hash,
+            own,
+            iface,
             span,
             kind,
             members,
