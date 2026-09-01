@@ -764,11 +764,10 @@ fn an_index_record_pointed_at_a_frame_of_another_kind_is_refused() {
     );
 }
 
-/// Every byte of a stored fingerprint, mutated one at a time with the frame checksum repaired — a
-/// drifted encoder, simulated exhaustively.
-#[test]
-fn no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say() {
-    let root = TempRoot::new("fingerprint-mutations");
+/// Every byte of a stored fingerprint, flipped under `mask` one at a time with the frame checksum
+/// repaired — a drifted encoder, simulated exhaustively.
+fn no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say(mask: u8) {
+    let root = TempRoot::new(&format!("fingerprint-mutations-{mask:02x}"));
     let mut store = root.open();
     store.put_source(&root.source_file(), fingerprint());
     store.flush().expect("it should flush");
@@ -778,41 +777,54 @@ fn no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say() {
     let pristine_data = read(&root.data_file());
     let (offset, len) = frame_of(&root.data_file(), KIND_SOURCE);
 
-    let scratch = TempRoot::new("fingerprint-mutations-scratch");
+    let scratch = TempRoot::new(&format!("fingerprint-mutations-scratch-{mask:02x}"));
     let mut decoded = 0usize;
 
     for i in 0..len {
-        for mask in [0x01u8, 0x80, 0xff] {
-            write(&root.index_file(), &pristine_index);
-            let mut bytes = pristine_data.clone();
-            bytes[offset + FRAME_HEADER + i] ^= mask;
-            let payload = bytes[offset + FRAME_HEADER..offset + FRAME_HEADER + len].to_vec();
-            bytes[offset + 5..offset + FRAME_HEADER]
-                .copy_from_slice(&frame_checksum(KIND_SOURCE, &payload));
-            write(&root.data_file(), &bytes);
+        write(&root.index_file(), &pristine_index);
+        let mut bytes = pristine_data.clone();
+        bytes[offset + FRAME_HEADER + i] ^= mask;
+        let payload = bytes[offset + FRAME_HEADER..offset + FRAME_HEADER + len].to_vec();
+        bytes[offset + 5..offset + FRAME_HEADER]
+            .copy_from_slice(&frame_checksum(KIND_SOURCE, &payload));
+        write(&root.data_file(), &bytes);
 
-            let store = root.open();
-            let Some(back) = store.fingerprint(&root.source_file()) else {
-                continue;
-            };
-            decoded += 1;
+        let store = root.open();
+        let Some(back) = store.fingerprint(&root.source_file()) else {
+            continue;
+        };
+        decoded += 1;
 
-            let mut fresh = scratch.open();
-            fresh.clear().expect("the scratch cache should clear");
-            fresh.put_source(&scratch.source_file(), (*back).clone());
-            fresh.flush().expect("the scratch cache should flush");
-            assert_eq!(
-                payload_of(&scratch.data_file(), KIND_SOURCE),
-                payload,
-                "byte {i} ^ {mask:#04x} decoded into a value that re-encodes differently"
-            );
-        }
+        let mut fresh = scratch.open();
+        fresh.clear().expect("the scratch cache should clear");
+        fresh.put_source(&scratch.source_file(), (*back).clone());
+        fresh.flush().expect("the scratch cache should flush");
+        assert_eq!(
+            payload_of(&scratch.data_file(), KIND_SOURCE),
+            payload,
+            "byte {i} ^ {mask:#04x} decoded into a value that re-encodes differently"
+        );
     }
 
     assert!(
         decoded > 0,
-        "the mutations must at least sometimes be accepted, or this proves nothing"
+        "the mutations under {mask:#04x} must at least sometimes be accepted, or this proves nothing"
     );
+}
+
+#[test]
+fn no_low_bit_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say() {
+    no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say(0x01);
+}
+
+#[test]
+fn no_high_bit_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say() {
+    no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say(0x80);
+}
+
+#[test]
+fn no_whole_byte_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say() {
+    no_mutation_of_a_fingerprint_decodes_into_something_it_does_not_say(0xff);
 }
 
 // exemplars never reach
