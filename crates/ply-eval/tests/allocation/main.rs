@@ -20,6 +20,7 @@ mod accumulator_shape;
 mod cell_write_cost;
 mod fixture_open_cost;
 mod link_reuse;
+mod list_pattern_rest;
 mod literal_sharing;
 mod lowering_sharing;
 mod record_update_reuse;

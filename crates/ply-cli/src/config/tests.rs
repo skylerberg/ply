@@ -192,12 +192,12 @@ fn key(name: &str, shape_name: &str, required: bool, default: Option<&str>) -> V
 
 #[allow(clippy::arc_with_non_send_sync)]
 fn empty_list() -> Value {
-    Value::List(Arc::new(Vec::new()))
+    Value::list(Vec::new())
 }
 
 #[allow(clippy::arc_with_non_send_sync)]
 fn spec_value(keys: Vec<Value>) -> Value {
-    record(&[("keys", Value::List(Arc::new(keys)))])
+    record(&[("keys", Value::list(keys))])
 }
 
 #[test]
