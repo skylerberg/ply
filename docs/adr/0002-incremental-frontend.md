@@ -80,7 +80,8 @@ A `DefHash` is transitive by construction — a reference normalizes to the
 referent's hash — so editing one definition's body moves every transitive
 caller's hash and gate 2 rechecks the whole caller cone. Measured on
 `examples/desk.ply`: changing one string literal inside one function body, its
-signature untouched, rechecks 61 definitions, of which one changed.
+signature untouched, rechecked 61 definitions, of which one had changed. Under
+the cutoff below the same edit rechecks 1.
 
 That was not waste while signatures were inferred. A caller's type could depend
 on a callee's body, so the cone was the honest answer. Written signatures
@@ -118,6 +119,15 @@ stale interface and report a diagnostic a from-scratch check would not.
 
 The invariant below is unchanged and still decides every ambiguous case: a
 missing entry, an absent fingerprint or a wave that cannot tell means recheck.
+
+Two costs are accepted rather than hidden. An own hash is written in names, so
+renaming a callee moves its callers' own hashes and buys a recheck nothing
+needed — the same trade gate 1 makes when it re-parses a file that was only
+reformatted. And a wave that restored any interface and then failed is thrown
+away and re-run restoring none, because a diagnostic raised against a restored
+interface can be one a from-scratch check would not raise; a type error
+therefore costs two checks, which is the "refusing only ever costs time" side of
+the invariant landing on the edit-and-fix loop.
 
 ### The ordering constraint
 

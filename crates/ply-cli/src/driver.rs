@@ -226,6 +226,8 @@ struct Driver<'s> {
     sources: SourceMap,
     files: Vec<FileState>,
     by_module: IndexMap<Symbol, usize>,
+    /// Definitions an earlier wave proved cannot be restored whatever gate 2 otherwise says.
+    widened: BTreeSet<Symbol>,
     phases: Phases,
 }
 
@@ -319,6 +321,7 @@ impl<'s> Driver<'s> {
             sources,
             files,
             by_module,
+            widened: BTreeSet::new(),
             phases,
         };
         driver.load_fingerprints();
@@ -374,17 +377,78 @@ impl<'s> Driver<'s> {
             }
         };
 
-        let gate_two = self.decide_rechecks(&hashes);
-        let started = Instant::now();
-        let check =
-            check_program_with(&program, &resolved, &gate_two.known).map_err(|diagnostics| {
-                LoadError {
+        // Gate 2 keys on a definition's own text, which a callee's edit does not move, so a wave
+        // can hand a caller an interface its callee no longer has. Whether it did is only knowable
+        // once the callee has been checked, so the run widens and repeats: only the wave that
+        // widens to nothing was checked against interfaces this run would produce, and only its
+        // output and its diagnostics may escape.
+        let (check, cached) = loop {
+            let gate = self.decide_rechecks(&hashes);
+            let started = Instant::now();
+            let outcome = check_program_with(&program, &resolved, &gate.known);
+            self.phases.check += started.elapsed();
+            let more = match &outcome {
+                Ok(check) => self.callers_of_moved(check, &gate, &hashes),
+                // A diagnostic raised while any interface is restored can be one a from-scratch
+                // check would not raise, and an error carries no interfaces to compare, so the
+                // only honest next wave restores none.
+                Err(_) => hashes
+                    .defs
+                    .keys()
+                    .filter(|name| gate.cached.contains(*name))
+                    .cloned()
+                    .collect(),
+            };
+            if more.is_empty() {
+                let check = outcome.map_err(|diagnostics| LoadError {
                     sources: self.sources.clone(),
                     diagnostics,
-                }
-            })?;
-        self.phases.check += started.elapsed();
-        self.merge(program, resolved, hashes, bodies, check, gate_two.cached)
+                })?;
+                break (check, gate.cached);
+            }
+            self.widened.extend(more);
+        };
+        self.merge(program, resolved, hashes, bodies, check, cached)
+    }
+
+    /// Definitions gate 2 restored that call one whose published interface turned out to have
+    /// moved. Empty means the fixed point: nothing was checked against a stale interface.
+    fn callers_of_moved(
+        &self,
+        check: &CheckOutput,
+        gate: &GateTwo,
+        hashes: &HashOutput,
+    ) -> BTreeSet<Symbol> {
+        let mut stored: BTreeMap<&Symbol, DefHash> = BTreeMap::new();
+        for file in &self.files {
+            for entry in file.cached_defs() {
+                stored.insert(&entry.name, entry.iface);
+            }
+        }
+        let mut moved = BTreeSet::new();
+        for (name, info) in &check.defs {
+            if gate.cached.contains(name) {
+                continue;
+            }
+            let fresh = iface_of(info);
+            if stored.get(name) != Some(&fresh) {
+                moved.insert(name.clone());
+            }
+        }
+        if moved.is_empty() {
+            return BTreeSet::new();
+        }
+        gate.cached
+            .iter()
+            .filter(|name| hashes.defs.contains_key(*name))
+            .filter(|name| {
+                hashes
+                    .deps
+                    .get(*name)
+                    .is_some_and(|deps| deps.iter().any(|dep| moved.contains(dep)))
+            })
+            .cloned()
+            .collect()
     }
 
     /// A parsed module's imports must be parsed too: `resolve` needs every module a reference can
@@ -762,6 +826,13 @@ impl<'s> Driver<'s> {
             return true;
         }
 
+        let stored: BTreeMap<&Symbol, &DefEntry> = file
+            .fingerprint
+            .iter()
+            .flat_map(|f| f.defs.iter())
+            .map(|entry| (&entry.name, entry))
+            .collect();
+
         let mut rechecked = false;
         for item in &ast.items {
             let Some(ident) = item.name() else { continue };
@@ -776,13 +847,21 @@ impl<'s> Driver<'s> {
                 continue;
             };
             let held = match item {
-                Item::Fn(_) => store.def_of(hash, &name).and_then(|cached| {
-                    same_witness(&cached.names, witness).then(|| KnownDef {
-                        scheme: cached.scheme.clone(),
-                        footprint: cached.footprint.clone(),
-                        performed: cached.performed.clone(),
-                    })
-                }),
+                Item::Fn(_) => stored
+                    .get(&name)
+                    .filter(|_| !self.widened.contains(&name))
+                    .filter(|entry| hashes.own.get(&name) == Some(&entry.own))
+                    .and_then(|entry| {
+                        // By the stored hash, not this run's: the point of the gate is that this
+                        // run's has been allowed to move.
+                        let cached = store.def_of(entry.hash, &name)?;
+                        let witness = restated(witness, &name, hash, entry.hash);
+                        same_witness(&cached.names, &witness).then(|| KnownDef {
+                            scheme: cached.scheme.clone(),
+                            footprint: cached.footprint.clone(),
+                            performed: cached.performed.clone(),
+                        })
+                    }),
                 _ => {
                     let unmoved = store
                         .decl_of(hash, &name)
@@ -1404,19 +1483,10 @@ impl<'s> Driver<'s> {
             .iter()
             .map(|t| (t.key.clone(), t.footprint.clone()))
             .collect();
-        // Taken here because this is where a whole `DefInfo` is in hand. Its
-        // three parts have to come from one of them: `DefConstraint::param` is
-        // an index into that scheme's own `ty_vars`, and `interface_hash`
-        // canonicalizes internally, which reorders them.
         let ifaces: BTreeMap<Symbol, DefHash> = check
             .defs
             .iter()
-            .map(|(name, info)| {
-                (
-                    name.clone(),
-                    ply_hash::interface_hash(&info.scheme, &info.footprint, &info.constraints),
-                )
-            })
+            .map(|(name, info)| (name.clone(), iface_of(info)))
             .collect();
         let fingerprints: Vec<(usize, SourceFingerprint)> = (0..self.files.len())
             .filter(|&i| self.files[i].parse)
@@ -1818,6 +1888,34 @@ fn simple_name(module: &ModuleName, qualified: &Symbol) -> Symbol {
         Some(rest) => Symbol::new(rest),
         None => qualified.clone(),
     }
+}
+
+/// Everything a caller can observe of a definition, taken over exactly the `DefInfo`
+/// [`Driver::write_back`] stores, so a wave's fresh key and a stored one are comparable.
+///
+/// All three parts come from one `DefInfo`: `DefConstraint::param` indexes that scheme's `ty_vars`.
+fn iface_of(info: &DefInfo) -> DefHash {
+    ply_hash::interface_hash(
+        &canonicalize_scheme(&info.scheme),
+        &info.footprint,
+        &info.constraints,
+    )
+}
+
+/// The witness this run would write, with the definition's own hash put back to the one the stored
+/// interface was written under: gate 2 keys on `own`, so that entry is the one a callee's edit is
+/// allowed to have moved, and every other entry is not.
+fn restated(witness: &[NameRef], name: &Symbol, fresh: DefHash, stored: DefHash) -> Vec<NameRef> {
+    witness
+        .iter()
+        .map(|n| {
+            if n.name == *name && n.hash == fresh {
+                NameRef::new(name.clone(), stored)
+            } else {
+                n.clone()
+            }
+        })
+        .collect()
 }
 
 /// Two witnesses agree when they name the same declarations with the same hashes.

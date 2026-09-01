@@ -801,6 +801,18 @@ made them.
 12. Every entry into the spike's backend cost O(the *previous* entry's peak arena).
 17. `spikes/ply-parser` was in no CI job and its differential was red.
 
+19. **A canonicalized `Scheme` is hashed against un-canonicalized
+   `DefConstraint`s.** `ply_hash::interface_hash` and `Driver::write_back` both
+   pair a scheme put through `canonicalize_scheme` with the constraint list as
+   published. Canonicalization sorts `ty_vars`, and a `DefConstraint::param` is
+   an index into that list, so a constraint can be attributed to the wrong
+   quantifier. Two signatures differing by an exact swap of constrained
+   quantifiers therefore collide, and the cost is a recheck that never happens
+   rather than a wrong type. Predates the early cutoff — `write_back` hashed the
+   pair this way before gate 2 read it — and the cutoff made both call sites
+   consistent rather than correct. The fix is to permute `param` alongside the
+   sort, or to canonicalize the pair together.
+
 ## Style
 
 **Rust.** `cargo fmt` defaults; `cargo clippy --all-targets` clean. Edition
