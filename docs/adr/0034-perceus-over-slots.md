@@ -299,6 +299,49 @@ under it is on ADR 0021's critical path for reasons independent of `push`.
 verbatim: the static analysis may be wrong, and when it is the program is slow and
 never incorrect. `Own` is **not** promoted to a permission.
 
+### §4.1 What the machine has to become, since every alternative to it is now priced
+
+Nine measurements narrow this to one design, and it is **not** the "frame carries a narrowed scope"
+that §4 and its probes kept reaching for. That framing is what made every attempt cost something:
+`release` rebuilds (+101%), `keep_only` re-collects (+88%), a heap window allocates once per carry,
+and narrowing only where it can pay still costs +5.8%. A window is an allocation however rarely it
+is built.
+
+**The frame should not narrow anything. A last use should move the value out of its slot.**
+
+That is Perceus' rule, and `Env::take_unique` is already the attempt at it — it fails today for a
+reason that is now precisely stated: it "refuses at the first shared link", and a pending frame has
+cloned the chain's head, so every link is shared and it refuses every time. The chain is what makes
+sharing all-or-nothing.
+
+With slots the same rule is a write:
+
+1. **The machine owns one slot stack.** `Machine` holds `Vec<Option<Value>>`; an activation is a
+   window into it. Nothing per-scope is allocated and nothing is reference counted.
+2. **A frame records a base index, not a scope.** The `Env` threaded through fourteen `Frame`
+   variants in `cont.rs` becomes `(base, len)`. Carrying is then free, and *narrowing disappears as
+   an operation* rather than becoming cheap.
+3. **A read marked [`crate::rc::Own::Owned`] takes the value out of its slot**, leaving it empty.
+   `slots.rs` has already resolved which slot, verified over 12 shipped modules and 1,682
+   occurrences. The pending frame sees the empty slot too, which is correct: `Owned` is exactly the
+   claim that nothing after this point reads the binding.
+4. **A closure copies its free variables** out of the window. Done — §11 S4a.
+5. **A capture copies the windows it took**, and each resumption restores them. This is the cost
+   the design pays, and §10.1's census is what says it is affordable: 12.4 carries per capture, and
+   the average capture is 3.5 frames deep.
+
+**What makes step 3 work is step 1**, and only step 1: a value can be moved out of a slot exactly
+when the slot array has one owner, and the array has one owner exactly when it is the machine's
+rather than each frame's. That is the whole content of the rewrite, and it is why the pieces do not
+land separately — steps 1 and 2 are inert without 3, and 3 is unsound without 1.
+
+**What it must not break, and where that would show.** `resumption_semantics_audit` and
+`exploration_soundness` hold the multi-shot rules: ADR 0005 §3 threads *state* across resumptions
+while each resumption re-enters with the scope it captured. A persistent chain gets that for free; a
+mutable stack gets it only if step 5 is right about which of the two a slot is. That boundary is the
+single most likely place for this to be wrong, and it is why it wants its own change with those
+suites run first rather than last.
+
 ---
 
 ## §5 Decision 2 — the worst case becomes bounded
