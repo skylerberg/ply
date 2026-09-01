@@ -8,6 +8,8 @@ mod solve;
 mod term;
 
 #[cfg(test)]
+mod bits;
+#[cfg(test)]
 mod numerics;
 #[cfg(test)]
 mod tests;
@@ -388,10 +390,31 @@ fn children(node: &term::Node) -> Vec<term::TermId> {
     }
 }
 
+/// The heads [`int_ranges`] declines to call atoms.
+///
+/// The bit operators are here for the same reason `(/)` is rather than the
+/// reason `(+)` is: a shift is a value only where its count is a bit position,
+/// so `MIN <= x << n <= MAX` is a theorem about the shifts that have an answer
+/// and not about every one that can be written. `(&)`, `(|)`, `(^)` and `(~)`
+/// do have the unconditional width and lose a little reach by sitting here,
+/// which is the price of one rule over an operator set instead of a rule with
+/// four exceptions in it.
 fn is_operator_symbol(name: &str) -> bool {
     matches!(
         name,
-        term::ADD | term::SUB | term::MUL | term::DIV | term::REM | term::CONCAT
+        term::ADD
+            | term::SUB
+            | term::MUL
+            | term::DIV
+            | term::REM
+            | term::CONCAT
+            | term::BIT_AND
+            | term::BIT_OR
+            | term::BIT_XOR
+            | term::BIT_NOT
+            | term::SHL
+            | term::SHR
+            | term::USHR
     )
 }
 

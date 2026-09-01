@@ -774,6 +774,12 @@ fn bin_op_name(op: BinOp) -> &'static str {
         BinOp::And => "and",
         BinOp::Or => "or",
         BinOp::Concat => "concat",
+        BinOp::BitAnd => "bitand",
+        BinOp::BitOr => "bitor",
+        BinOp::BitXor => "bitxor",
+        BinOp::Shl => "shl",
+        BinOp::Shr => "shr",
+        BinOp::Ushr => "ushr",
     }
 }
 
@@ -781,6 +787,7 @@ fn un_op_name(op: UnOp) -> &'static str {
     match op {
         UnOp::Neg => "neg",
         UnOp::Not => "not",
+        UnOp::BitNot => "bitnot",
     }
 }
 

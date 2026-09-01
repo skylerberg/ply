@@ -117,6 +117,8 @@ struct Parser {
     /// Inside an `if`/`match` scrutinee a `{` starts the arm block, never a record or block
     /// expression.
     no_brace: bool,
+    /// Inside a lambda's parameter list, where a `|` closes the list rather than being bit-or.
+    no_pipe: bool,
     depth: u32,
     /// Whether the file declared an `effect set` or named one in a row.
     uses_effect_sets: bool,
@@ -135,6 +137,7 @@ impl Parser {
             pos: 0,
             diags,
             no_brace: false,
+            no_pipe: false,
             depth: 0,
             uses_effect_sets: false,
             uses_record_update: false,
@@ -157,6 +160,20 @@ impl Parser {
 
     fn prev_span(&self) -> Span {
         self.tokens[self.pos.saturating_sub(1)].span
+    }
+
+    /// Whether the `n` tokens after the cursor repeat the one at it with nothing between them,
+    /// which is the whole difference between `>>` and the error `a > > b` has always been.
+    fn joined(&self, n: usize) -> bool {
+        let here = &self.tokens[self.pos];
+        (1..=n).all(|i| match self.tokens.get(self.pos + i) {
+            Some(t) => {
+                t.kind == here.kind
+                    && t.span.source == here.span.source
+                    && t.span.start == self.tokens[self.pos + i - 1].span.end
+            }
+            None => false,
+        })
     }
 
     fn advance(&mut self) -> Span {
@@ -1340,13 +1357,31 @@ impl Parser {
         r
     }
 
+    /// The operator at the cursor, its binding power, and how many tokens it spans; only a shift
+    /// is wider than one, because `>>` is not lexed and `Map<Int, List<Int>>` is why.
+    fn peek_bin_op(&self) -> Option<(BinOp, u8, usize)> {
+        // A lambda's parameter list ends in a `|`, and a parameter's default is an expression, so
+        // `|x = 1| x` would otherwise read the closing pipe as bit-or and swallow the body.
+        if self.no_pipe && matches!(self.kind(), TokenKind::Pipe) {
+            return None;
+        }
+        match self.kind() {
+            TokenKind::Gt if self.joined(2) => Some((BinOp::Ushr, SHIFT_BP, 3)),
+            TokenKind::Gt if self.joined(1) => Some((BinOp::Shr, SHIFT_BP, 2)),
+            TokenKind::Lt if self.joined(1) => Some((BinOp::Shl, SHIFT_BP, 2)),
+            k => bin_op(k).map(|(op, bp)| (op, bp, 1)),
+        }
+    }
+
     fn bin_expr(&mut self, min_bp: u8) -> PResult<Expr> {
         let mut lhs = self.unary_expr()?;
-        while let Some((op, bp)) = bin_op(self.kind()) {
+        while let Some((op, bp, width)) = self.peek_bin_op() {
             if bp < min_bp {
                 break;
             }
-            self.advance();
+            for _ in 0..width {
+                self.advance();
+            }
             let rhs = self.bin_expr(bp + 1)?;
             let span = lhs.span.to(rhs.span);
             lhs = Expr {
@@ -1372,6 +1407,7 @@ impl Parser {
         let op = match self.kind() {
             TokenKind::Minus => UnOp::Neg,
             TokenKind::Bang => UnOp::Not,
+            TokenKind::Tilde => UnOp::BitNot,
             _ => return self.postfix_expr(),
         };
         let start = self.advance();
@@ -1826,11 +1862,17 @@ impl Parser {
             Vec::new()
         } else {
             self.advance();
-            let params = self.comma_list(&TokenKind::Pipe, Self::param)?;
+            let saved = std::mem::replace(&mut self.no_pipe, true);
+            let params = self.comma_list(&TokenKind::Pipe, Self::param);
+            self.no_pipe = saved;
+            let params = params?;
             self.expect(&TokenKind::Pipe, "`|` to close the lambda parameters")?;
             params
         };
-        let body = self.expr()?;
+        let saved = std::mem::replace(&mut self.no_pipe, false);
+        let body = self.expr();
+        self.no_pipe = saved;
+        let body = body?;
         let span = start.to(body.span);
         Ok(Expr {
             kind: ExprKind::Lambda {
@@ -2332,6 +2374,12 @@ fn is_block_like(kind: &ExprKind) -> bool {
     )
 }
 
+/// The one binding power no token carries on its own, since a shift is assembled from adjacent
+/// `Gt`/`Lt` by [`Parser::peek_bin_op`].
+const SHIFT_BP: u8 = 7;
+
+/// Loosest to tightest, 1 to 10; the numbers renumbered when the bit operators took four levels
+/// but no existing operator's relative order moved, so no program's parse tree did either.
 fn bin_op(k: &TokenKind) -> Option<(BinOp, u8)> {
     Some(match k {
         TokenKind::PipePipe => (BinOp::Or, 1),
@@ -2342,12 +2390,15 @@ fn bin_op(k: &TokenKind) -> Option<(BinOp, u8)> {
         TokenKind::Le => (BinOp::Le, 3),
         TokenKind::Gt => (BinOp::Gt, 3),
         TokenKind::Ge => (BinOp::Ge, 3),
-        TokenKind::PlusPlus => (BinOp::Concat, 4),
-        TokenKind::Plus => (BinOp::Add, 5),
-        TokenKind::Minus => (BinOp::Sub, 5),
-        TokenKind::Star => (BinOp::Mul, 6),
-        TokenKind::Slash => (BinOp::Div, 6),
-        TokenKind::Percent => (BinOp::Rem, 6),
+        TokenKind::Pipe => (BinOp::BitOr, 4),
+        TokenKind::Caret => (BinOp::BitXor, 5),
+        TokenKind::Amp => (BinOp::BitAnd, 6),
+        TokenKind::PlusPlus => (BinOp::Concat, 8),
+        TokenKind::Plus => (BinOp::Add, 9),
+        TokenKind::Minus => (BinOp::Sub, 9),
+        TokenKind::Star => (BinOp::Mul, 10),
+        TokenKind::Slash => (BinOp::Div, 10),
+        TokenKind::Percent => (BinOp::Rem, 10),
         _ => return None,
     })
 }

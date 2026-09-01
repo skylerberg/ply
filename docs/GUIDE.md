@@ -365,6 +365,7 @@ their meaning.
 | form | type | notes |
 | --- | --- | --- |
 | `42`, `1_000_000` | `Int` | 64-bit signed. `_` separators anywhere between digits. A literal that does not fit is a lex error. |
+| `0xFF`, `0xdead_beef` | `Int` | The same type and the same value as the decimal spelling — `0xFF` and `255` are one literal and one definition hash. The bound is 64 bits *as a bit pattern*, so `0xFFFF_FFFF_FFFF_FFFF` is `-1`. No hex `Float` and no hex `Decimal`. |
 | `1.5`, `1e9`, `2.5e-3` | `Float` | IEEE-754 binary64. A fraction or an exponent is what makes a literal a `Float`. |
 | `1.50m`, `0m`, `12345m` | `Decimal` | Base-10, exact. Up to 28 fractional digits and a 96-bit mantissa. No exponent form. |
 | `"text"` | `String` | UTF-8. May not span a line break. |
@@ -402,10 +403,14 @@ From loosest to tightest:
 | 1 | `\|\|` | left | `Bool` |
 | 2 | `&&` | left | `Bool` |
 | 3 | `==` `!=` `<` `<=` `>` `>=` | left | see below |
-| 4 | `++` | left | `String` |
-| 5 | `+` `-` | left | `Int`, `Float` or `Decimal` |
-| 6 | `*` `/` `%` | left | `Int`, `Float` or `Decimal` |
-| — | unary `-`, unary `!` | prefix | numeric / `Bool` |
+| 4 | `\|` | left | `Int` |
+| 5 | `^` | left | `Int` |
+| 6 | `&` | left | `Int` |
+| 7 | `<<` `>>` `>>>` | left | `Int` |
+| 8 | `++` | left | `String` |
+| 9 | `+` `-` | left | `Int`, `Float` or `Decimal` |
+| 10 | `*` `/` `%` | left | `Int`, `Float` or `Decimal` |
+| — | unary `-`, unary `!`, unary `~` | prefix | numeric / `Bool` / `Int` |
 | — | `f(x)`, `r.field`, `e.op[r](x)`, `e?` | postfix | |
 
 Notes that matter:
@@ -424,7 +429,21 @@ Notes that matter:
   decimals is not in general a decimal, so the operator would have to round, and
   a rounding nobody wrote down is the defect the type exists to prevent. Use
   `decimal_div(a, b, scale, mode)`. `%` on `Decimal` *is* allowed.
-* `&&` and `||` short-circuit.
+* `&&` and `||` short-circuit. The **bitwise** operators are `&`, `|`, `^` and
+  unary `~`, and they are defined at `Int` and nowhere else — a `&` between two
+  `Bool`s is `E0201`, not a non-short-circuiting `&&`. They operate on the
+  two's-complement bit pattern, so `~0` is `-1`.
+* The shifts are `<<`, `>>` (arithmetic, sign-propagating) and `>>>` (logical,
+  zero-filling). A count outside `0..=63` **raises** `E0502`, for the reason a
+  zero divisor does: there is no answer, and C's undefined behaviour, Rust's
+  panic and Java's silent mask by 63 are three different inventions of one.
+  `<<` is the one place arithmetic is *not* checked — it discards the bits
+  shifted out rather than raising, because a shift is a bit operation and a
+  hash's mixing step is defined to drop them (ADR 0033 §2.2).
+* **`>>` is not a token.** It is two adjacent `>`, joined only where an operator
+  can appear, which is what lets `Map<Int, List<Int>>` keep closing on two of
+  them. `a > > b` is still the syntax error it always was, because the two must
+  be written together.
 * `::` qualifies a name through a module binder (`items::price_of`). It is not an
   operator and cannot be chained: a module binder is a single name.
 * `.` is field access, unless it is followed by an operation name and then a `[`
@@ -528,7 +547,7 @@ checked against it.
 
 | type | values |
 | --- | --- |
-| `Int` | 64-bit signed integers. Arithmetic is **checked**: overflow raises `E0502` rather than wrapping. |
+| `Int` | 64-bit signed integers. Arithmetic is **checked**: overflow raises `E0502` rather than wrapping. Two exceptions, both deliberate: `<<` discards the bits it shifts out, and `wrap_add`/`wrap_sub`/`wrap_mul` (§13.10) wrap by definition. |
 | `Float` | IEEE-754 binary64. `NaN != NaN`; not orderable as a map key. |
 | `Decimal` | Exact base-10 with a scale. Money. `+`, `-`, `*`, `%` are exact or they raise; `/` is `E0209`. |
 | `Bool` | `true`, `false` |
@@ -2116,6 +2135,7 @@ bytes_at(b, i) -> Int                         // 0..=255; raises out of range
 bytes_slice(b, start, end) -> Bytes           // never clamped
 bytes_concat(a, b) -> Bytes
 bytes_concat_all(bs: List<Bytes>) -> Bytes    // one allocation over the whole list
+byte_of_int(n) -> Bytes                       // one byte; raises outside 0..=255
 bytes_of_string(s) -> Bytes
 string_of_bytes(b) -> String                  // raises on invalid UTF-8
 string_of_bytes_lossy(b) -> String            // substitutes U+FFFD
@@ -2179,11 +2199,30 @@ rate-limited, so a program that loops it over candidates recovers the value.
 Presence is deliberately observable: an operator must be able to tell a missing
 credential from a wrong one.
 
+### 13.10 Wrapping arithmetic
+
+```
+wrap_add(a: Int, b: Int) -> Int
+wrap_sub(a: Int, b: Int) -> Int
+wrap_mul(a: Int, b: Int) -> Int
+```
+
+Two's complement, modulo 2^64, and the only arithmetic in the language that
+cannot raise. `+`, `-` and `*` stay checked, which is the point: the easy
+spelling is the safe one, and a step that is *defined* to wrap — a 64-bit mixing
+function, a linear congruential generator — says so in the name it calls rather
+than in a comment beside an operator that means something else.
+
+You will reach for these less often than you expect. Arithmetic on values masked
+to 32 bits cannot overflow an `Int` at all, so `std.hash`'s BLAKE3 — the one
+thing in this tree written to need them — uses none: it masks with `& 0xFFFF_FFFF`
+and adds with `+`.
+
 ---
 
 ## 14. The standard library
 
-Eight modules ship compiled into the `ply` binary. They are not part of your
+Ten modules ship compiled into the `ply` binary. They are not part of your
 project: loading is demand-driven, `ply test` does not select their tests unless
 you pass `--std`, and `ply prove` does not count their definitions in your
 coverage line unless you pass `--std` there too. That is deliberate — a project's
@@ -2191,11 +2230,13 @@ test and obligation counts must not change with a compiler upgrade.
 
 ```
 $ ply std
-   8 modules · 768 definitions · shipped with this compiler
+   10 modules · 825 definitions · shipped with this compiler
 
    MODULE      DEFINITIONS  TESTS  BYTES
    std.config  15           5      4810
    std.db      292          34     110031
+   std.fs      25           9      12652
+   std.hash    32           5      8970
    std.http    166          53     102893
    std.json    137          38     55871
    std.net     7            3      3720
@@ -2203,7 +2244,7 @@ $ ply std
    std.signal  7            2      1416
    std.trace   39           10     12212
 
-   digest: b3:cc32db3e3fc6
+   digest: b3:1fac787cc3a8
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`
@@ -2429,6 +2470,96 @@ the terminal. Reaching an operation under `ply test` is `E0424`; the remedy is t
 handle it over a `Stop` value, and `running()`, `draining(ms)`, `stopping_step`,
 `deadline_step` and `has_time_for` are what the module ships for that.
 
+### 14.9 `std.fs` — the filesystem, rooted
+
+```ply
+pub nondet effect fs {
+  read  read_file[r](path: String) -> Option<Bytes>
+  read  list_dir[r](path: String) -> Option<List<String>>
+  read  exists[r](path: String) -> Bool
+  read  file_size[r](path: String) -> Option<Int>
+  read  modified_ms[r](path: String) -> Option<Int>
+  write write_file[r](path: String, body: Bytes) -> Bool
+  write create_dir[r](path: String) -> Bool
+  write remove[r](path: String) -> Bool
+  write rename[r](from: String, to: String) -> Bool
+}
+```
+
+**A resource label is a root, and the root is the capability.**
+`fs.read_file[src]("a.ply")` reads somewhere under whatever `src` names, and what
+it names is bound beside the run — `ply run build.ply --host --fs src=./crates
+--fs out=./target` — never in the program. A path written into a definition would
+put a filesystem location into its hash and into a store designed never to
+forget, and the same program would then mean two things on two machines.
+
+Three consequences, and the third is the one that pays:
+
+1. an operation naming a label no root is bound to is `E0451`, naming the label
+   and the flag that would bind it;
+2. a path that escapes its root — `..` anywhere in it, an absolute path, or a
+   symlink that resolves outside — is `E0452`, refused before the syscall;
+3. **two roots that do not overlap do not conflict**, so tests over `src` and
+   tests over `out` run concurrently, and two readers of one root run
+   concurrently while a writer serialises against both. That is §9.4's
+   readers-writers rule applied to directories for free.
+
+`nondet` is load-bearing exactly as it is in `std.net`: a `det` test that reaches
+an operation here is `E0412` until a handler discharges it, and what a test
+handles it with is the **twin** this module also ships — `mem_empty`, `mem_of`,
+`mem_read`, `mem_write`, `mem_list`, `mem_create_dir`, `mem_remove`,
+`mem_rename` and `mem_modified` over a `MemFs` value, so an in-memory filesystem
+is one implementation everybody shares rather than one per test file.
+
+Both import forms, because the test names two things: `fs` the effect and `fs`
+the module its twin lives in. They are different namespaces (§4.4), so one name
+serves both.
+
+```ply
+import std.fs
+import std.fs (fs)
+
+test "the manifest names every source file" {
+  let tree = fs::mem_of([{path: "a.ply", body: b"fn f() -> Int = 1"}]);
+  handle {
+    assert_eq(fs.read_file[src]("a.ply"), Some(b"fn f() -> Int = 1"))
+  } with {
+    fs.read_file[src](p) -> fs::mem_read(tree, p),
+  }
+}
+```
+
+What v1 refuses, each because a compiler driver does not need it: file handles
+and streaming (a read is whole-file, and a file over the bound is `E0453`), a
+recursive walk (`list_dir` answers one directory), permissions and modes,
+watching, `stdin`/`stdout`, and `argv`. `rename` is within one root, which is
+what makes a cache write atomic — write under a temporary name, then rename into
+place.
+
+### 14.10 `std.hash` — BLAKE3, written in Ply
+
+```ply
+pub fn blake3(input: Bytes) -> Bytes     // 32 bytes, for input of any length
+```
+
+The hash this language's own content addressing is defined by (§2.3), written in
+the language rather than exposed as a builtin — so the function deciding what a
+definition *is* is a definition you can read. It is also the demonstration that
+§3.5's operators and §13.10's builtins are enough to write real bit-level code:
+before ADR 0033 this module could not have existed.
+
+**It is an interpreted hash and it is slower than the compiler's own by orders
+of magnitude**, which is a property of where it runs rather than of the code:
+seven rounds of eight mixing functions per 64-byte block, each round an ordinary
+Ply call. Reach for it when a hash is what you need and the input is small. `ply`
+itself hashes in Rust, and ADR 0033 §3 carries the measurement and the bar it
+was taken against.
+
+What holds it to the truth is `crates/ply-eval/tests/blake3_differential.rs`,
+which hashes the same input with this module and with the `blake3` crate the
+compiler links, at every structural boundary the algorithm has — the block, the
+chunk, and the tree above it. Zero disagreements, or the suite is red.
+
 ---
 
 ## 15. The host boundary
@@ -2549,6 +2680,31 @@ dropped requests.
 
 ---
 
+### 15.7 Filesystem roots
+
+`--fs NAME=PATH`, repeatable, and refused without `--host` the way `--tls` is.
+Each root is resolved **once**, before anything runs: a path that does not exist
+or is not a directory is `E0454` there rather than a failure on the first write.
+The resolved path is what every confinement check is against, and `ply hosts`
+prints it:
+
+```
+   filesystem
+   out  /home/you/project/target
+   src  /home/you/project/crates
+```
+
+A run that bound none prints `none — an \`fs\` operation is E0451 until \`--fs
+NAME=PATH\` binds its label`, for the same reason the credentials block says so.
+
+**What the digest covers is the root names and not the paths.** A path is where
+one machine was pointed — absolute, canonical, different in a checkout and in CI
+— so hashing it would make the digest disagree between two runs of the same
+command over the same program. Binding a root or removing one moves the digest;
+pointing an existing one somewhere else does not. The listing above is the
+instrument for that, and this is the same trade §15.3 makes for a certificate
+fingerprint.
+
 ## 16. Building and shipping
 
 ```
@@ -2631,13 +2787,14 @@ and then emits exactly one JSON object on stdout and nothing else.
 | `--host` | bind the real host handlers |
 | `--std` | also select the tests the shipped modules declare |
 | `--seed`, `--sim`, `--seeds`, `--sim-budget`, `--sim-steps`, `--measure-reduction` | §10.4 |
-| `--tls`, `--db`, `--config`, `--set`, `--config-schema`, `--db-schema` | §15 |
+| `--tls`, `--fs`, `--db`, `--config`, `--set`, `--config-schema`, `--db-schema` | §15 |
 | `--json` | |
 
 ### `ply run [path]`
 
-`--host`, `--seed`, the TLS/db/config flags, `--trace`,
-`--drain-ms`, `--drain-lead-ms`, `--json`. A `.plyx` path is run out of its own
+`--host`, `--seed`, the TLS/db/config flags, `--fs NAME=PATH` (§15.7,
+repeatable, refused without `--host`), `--trace`, `--drain-ms`,
+`--drain-lead-ms`, `--json`. A `.plyx` path is run out of its own
 verified definitions rather than out of a source tree it may not be next to.
 
 `ply run` explores exactly one interleaving whatever `--seed` says — exploration
@@ -2808,6 +2965,10 @@ program.
 | `E0448` | a region forced `unique` across which a continuation capture is reachable (there is no surface syntax for the annotation yet; the kind is inferred) |
 | `E0449` | a handle into a region reaching a runtime boundary |
 | `E0450` | a compiled backend that cannot be attached |
+| `E0451` | an `fs` operation named a resource label no `--fs` bound a root to |
+| `E0452` | a path that leaves the root its label names |
+| `E0453` | a whole-file read of a file over the bound |
+| `E0454` | a `--fs NAME=PATH` root that does not resolve, or is not a directory |
 
 ### Running
 
@@ -2884,6 +3045,10 @@ rather than left to be discovered.
   a `Result` or a domain type.
 * **No modules-as-values, no first-class effects, no abstraction over a resource
   label.** Labels are ground identifiers in the source.
+
+* **No unsigned integer type.** `Int` is signed, and the bit operators (§3.5)
+  work on its two's-complement pattern; `>>` and `>>>` are both in the language
+  because there is no `UInt` to choose between them for you.
 * **No `unsafe`, no FFI.** Everything below the boundary is in the compiler's
   trusted computing base, which `ply hosts` prints in full.
 * **Nothing in a spec may name mutable state**, so a function whose whole job is
@@ -2891,6 +3056,12 @@ rather than left to be discovered.
   uncovered in `ply prove`'s first line. That is the honest artifact.
 
 ### 19.3 Runtime and platform gaps
+
+* **The filesystem is whole-file and rooted, and nothing more.** `std.fs`
+  (§14.9) has no file handles and no streaming — a read is the whole file, and
+  one over the bound is `E0453` — no recursive walk, no permissions or modes, no
+  watching, no `stdin`/`stdout`, and no `argv`. A program reaches only what is
+  under a root the run bound.
 
 * **No cancellation, no backpressure, no load shedding.** A request still live at
   the drain deadline loses its connection with no response and the process exits

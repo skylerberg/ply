@@ -104,6 +104,8 @@ pub(crate) mod tag {
     pub const CONSTRAINT: u8 = 95;
 }
 
+/// An explicit table rather than a discriminant cast: appending a row is free, renumbering one
+/// invalidates every cached result in every store.
 pub(crate) fn binop_byte(op: BinOp) -> u8 {
     match op {
         BinOp::Add => 1,
@@ -120,6 +122,12 @@ pub(crate) fn binop_byte(op: BinOp) -> u8 {
         BinOp::And => 12,
         BinOp::Or => 13,
         BinOp::Concat => 14,
+        BinOp::BitAnd => 15,
+        BinOp::BitOr => 16,
+        BinOp::BitXor => 17,
+        BinOp::Shl => 18,
+        BinOp::Shr => 19,
+        BinOp::Ushr => 20,
     }
 }
 
@@ -127,6 +135,7 @@ pub(crate) fn unop_byte(op: UnOp) -> u8 {
     match op {
         UnOp::Neg => 1,
         UnOp::Not => 2,
+        UnOp::BitNot => 3,
     }
 }
 

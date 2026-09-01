@@ -718,6 +718,18 @@ pub enum BinOp {
     And,
     Or,
     Concat,
+    /// The bit operators of `docs/adr/0033-bits-and-files.md` §2, defined at
+    /// `Int` only. `Shl` discards what it shifts out — the one deliberate
+    /// exception to checked arithmetic — and a shift count outside `0..=63`
+    /// raises. Appended rather than filed beside `And`/`Or` so that
+    /// `ply_hash::normalize::binop_byte` can append its bytes too: an existing
+    /// byte that moves is every cached result invalidated.
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
+    Ushr,
 }
 
 impl BinOp {
@@ -738,6 +750,12 @@ impl BinOp {
             BinOp::And => "&&",
             BinOp::Or => "||",
             BinOp::Concat => "++",
+            BinOp::BitAnd => "&",
+            BinOp::BitOr => "|",
+            BinOp::BitXor => "^",
+            BinOp::Shl => "<<",
+            BinOp::Shr => ">>",
+            BinOp::Ushr => ">>>",
         }
     }
 }
@@ -746,6 +764,10 @@ impl BinOp {
 pub enum UnOp {
     Neg,
     Not,
+    /// Prefix `~`: the two's-complement complement of an `Int`. `!` stays
+    /// `Bool`-only, so neither operator can be written where the other is meant
+    /// (ADR 0033 §2.2).
+    BitNot,
 }
 
 #[derive(Debug)]

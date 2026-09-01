@@ -1,10 +1,9 @@
 //! The `net` effect and the two handlers that serve it.
 
-mod pool;
 mod sim;
 mod socket;
 
-pub use pool::MAX_BLOCKING_OPERATIONS;
+pub use crate::pool::MAX_BLOCKING_OPERATIONS;
 pub use sim::SimNet;
 pub use socket::TcpHost;
 
