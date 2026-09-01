@@ -78,6 +78,15 @@ toolchain pin, promotes nothing: `grep -c cranelift Cargo.lock` still answers
 > months of tree-churn later. The two null arms are within 0.2%, so the series
 > is sensitive to the 8.7% it reports.
 >
+> **Third take, 2026-08-31 — ADR 0032 §2.** On the same corpus and command,
+> after the seam's fragment was closed, a 10-block counterbalanced series reads
+> `--backend cranelift` at **0.938×** on min user CPU (3.04 s against 2.85 s),
+> with a 0.702% null control. Same sign, same order, a slightly larger loss —
+> and ADR 0032 §1 finds the reason the two entry lines below differ so wildly:
+> `scalar_signature` in `ply-codegen/backend.rs` registers on an `Int | Bool`
+> signature test that lever 1 never reached, so it drops 467 of the 489 bodies
+> the fixpoint compiles. The 89,912 below is that filter, not the seam's.
+>
 > **And the code generator on the real front end is 0.9685× — a 3.2% net loss,
 > not a 176% one.** The withdrawn figure was dominated by fixed cost on a short
 > window: `examples/` is a 468 ms run carrying 382 ms of fixpoint plus per-worker
