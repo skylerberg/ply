@@ -1532,15 +1532,3 @@ fn qualified(resolved: &Resolved, module: usize, name: &Symbol) -> Option<Symbol
         .and_then(|scope| scope.get(Namespace::Value, name))
         .map(|b| b.qualified.clone())
 }
-
-/// Every site in a report, keyed by span, for a caller comparing against
-/// [`crate::rc::sites`].
-pub fn by_span(defs: &[&Definition]) -> FxHashMap<Span, Site> {
-    let mut out = FxHashMap::default();
-    for def in defs {
-        for site in &def.sites {
-            out.insert(site.span, site.clone());
-        }
-    }
-    out
-}

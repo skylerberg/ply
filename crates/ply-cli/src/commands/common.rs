@@ -322,29 +322,6 @@ pub fn counters_json(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> V
     })
 }
 
-/// The one-line human projection of [`counters_json`].
-///
-/// Printed beside the handshakes because it answers the same kind of question:
-/// what did this run actually do. `in_place` leads because it is the one an
-/// author can act on: it is the share of container updates the machine
-/// performed without copying.
-pub fn counters_line(stats: &ply_eval::rc::Stats, engine: ply_eval::Engine) -> String {
-    let pct = |v: Option<f64>| match v {
-        Some(v) => format!("{:.1}%", v * 100.0),
-        None => "n/a".to_string(),
-    };
-    format!(
-        "counters    {} · in place {} of {} ({}) · moved {} of {} · elided {}",
-        engine.as_str(),
-        stats.updates_in_place,
-        stats.updates,
-        pct(engine_in_place(stats, engine)),
-        stats.takes_moved,
-        stats.takes_attempted,
-        pct(stats.elided()),
-    )
-}
-
 /// [`ply_eval::rc::Stats::in_place`] where it says something about the program,
 /// and `None` where it says something about the evaluator. See
 /// [`counters_json`].
