@@ -1,14 +1,10 @@
-//! Every integration test in this crate, as one binary.
+//! Every integration test in this crate, as one binary: cargo links one per
+//! `.rs` directly under `tests/`, and the link dominates the build.
 //!
-//! Cargo links a separate binary per .rs directly under `tests/`, and the
-//! link dominates the build. These are modules of one target instead; the
-//! tests and their names are unchanged apart from the module prefix.
-//!
-//! A test that reads process-global state stays a binary of its own alongside
-//! this one, because everything else in here runs in the same process and in
-//! parallel. Two kinds so far: a `#[global_allocator]`, where the count would
-//! include the other tests' allocations, and `ply_eval::census`, whose
-//! accumulator is a `static` the whole binary writes to.
+//! A test that reads process-global state keeps a binary of its own beside this
+//! one, because everything in here shares a process and runs in parallel — a
+//! `#[global_allocator]`, whose count would include every other test's, and
+//! `ply_eval::census`, whose accumulator is a `static` the whole binary writes.
 
 mod constant_memo_service;
 mod differential_sweep;
