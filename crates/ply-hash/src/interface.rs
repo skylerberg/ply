@@ -34,6 +34,8 @@ mod tag {
 /// Quantified variables are renumbered here rather than by the caller, because
 /// `generalize` hands out whatever numbers the run's counter reached: hash a
 /// scheme raw and every interface reads as changed, so the cutoff never fires.
+/// Pass the scheme as published — a `DefConstraint::param` indexes its
+/// `ty_vars`, so canonicalizing first names the wrong quantifier.
 pub fn interface_hash(
     scheme: &Scheme,
     footprint: &Footprint,
