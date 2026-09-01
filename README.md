@@ -277,22 +277,19 @@ writes its whole state back through a persistent map. Tests that use the double
 for speed will be disappointed; they use it for isolation and determinism, which
 it does deliver.
 
-**The tracing sink's cost turns on how the caller writes it.** `std.trace`'s
-`Sink` appends with `push`; a collecting twin holding N records costs N pushes
-and **zero** whole-list copies *if the caller threads the sink in last position
-too*, and one whole-list copy per record if it does not.
+**The tracing sink is linear.** `std.trace`'s `Sink` appends with `push`; a
+collecting twin holding N records costs N pushes and zero whole-list copies,
+wherever the caller threads the sink.
 
 > **The mechanism, because "appends with `push`" alone teaches the wrong
 > lesson.** `push` grows a `List` **in place** when the caller is its last owner
 > (`crates/ply-eval/src/builtins.rs`, `Arc::get_mut`) and copies the whole array
-> only when something else can still see it. Which branch runs is decided by
-> **position**: `rc::carry` (`crates/ply-eval/src/rc.rs`) hands a pending frame a
-> live clone of the scope whenever any sub-expression of the enclosing node
-> remains, and never asks what those remaining sub-expressions read. So the
-> lesson "avoid `push`" is not available — `push` is the language's sole list
-> primitive and `trace.ply`'s own `cons` is written out of it. Last position is
-> **necessary and not sufficient**.
-> `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts it.
+> only when something else can still see it. Since ADR 0034 the machine moves a
+> binding's value out of its slot at its last use, so sole ownership arrives at
+> the append wherever the caller wrote it — a copy means a genuine second
+> owner, such as a binding read again after the append or a cell still holding
+> the list. `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs` asserts
+> the standard library's accumulators stay linear.
 **`bytes_slice` and `bytes_split` copy.** `Value::Bytes` is `Arc<[u8]>` with no
 slicing, so taking a sub-slice allocates. Response write counts and copies were
 **not measured**.
@@ -319,7 +316,7 @@ and [ADR 0030](docs/adr/0030-compiled-code-on-the-front-end.md) carry the series
 and the conditions; do not re-derive the ratios here, and do not read a loss on
 one workload as a bound on the idea.
 **The request-path allocation count is large.** One `/health` request makes
-**742 allocations and 89,666 bytes** to produce a 107-byte response.
+**743 allocations and 90,770 bytes** to produce a 107-byte response.
 
 **The profile has a −7.8% residue.** The layer table above sums to 638.96µs
 against a measured total of 592.64µs, because six of the rungs are taken in

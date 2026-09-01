@@ -202,14 +202,8 @@ pub struct Arm {
 }
 
 pub enum Stmt {
-    Let {
-        pat: Pat,
-        value: Code,
-        span: Span,
-    },
-    Expr {
-        code: Code,
-    },
+    Let { pat: Pat, value: Code, span: Span },
+    Expr { code: Code },
 }
 
 impl Stmt {
@@ -968,6 +962,9 @@ mod tests {
             !Rc::ptr_eq(&first.code, &third.code),
             "a different body was answered from the previous one's entry"
         );
-        assert!(Rc::ptr_eq(&third.code, &cache.of(&[], &params, &other).code));
+        assert!(Rc::ptr_eq(
+            &third.code,
+            &cache.of(&[], &params, &other).code
+        ));
     }
 }

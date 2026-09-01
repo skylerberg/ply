@@ -327,7 +327,12 @@ impl Jit {
             jit.funcs
                 .insert((*name).to_string(), (id, def.params.len(), module_index));
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
-            bodies.push(((*name).to_string(), params, lower(&def.body).code, module_index));
+            bodies.push((
+                (*name).to_string(),
+                params,
+                lower(&def.body).code,
+                module_index,
+            ));
         }
         Ok((jit, bodies, started))
     }
@@ -1298,13 +1303,7 @@ impl Fx<'_, '_> {
 
     /// The refutable half of a pattern: leave the current block for `hit` when it matches and
     /// `miss` when it does not.
-    fn test_pattern(
-        &mut self,
-        pat: &Pat,
-        value: Val,
-        hit: Block,
-        miss: Block,
-    ) -> Result<()> {
+    fn test_pattern(&mut self, pat: &Pat, value: Val, hit: Block, miss: Block) -> Result<()> {
         match pat {
             Pat::Wildcard => {
                 self.builder.ins().jump(hit, &[]);
@@ -1492,12 +1491,7 @@ impl Fx<'_, '_> {
     }
 
     /// The bindings a pattern makes, emitted in the block that has already committed to the arm.
-    fn bind_pattern(
-        &mut self,
-        pat: &Pat,
-        value: Val,
-        scope: &mut Scope,
-    ) -> Result<()> {
+    fn bind_pattern(&mut self, pat: &Pat, value: Val, scope: &mut Scope) -> Result<()> {
         match pat {
             Pat::Wildcard => {}
             Pat::Var { name: id, .. } => {

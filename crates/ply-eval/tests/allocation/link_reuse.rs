@@ -3,7 +3,7 @@
 
 use crate::counting::charge;
 use ply_eval::{Frame, Next, Stack, Value};
-use ply_span::{Span, Symbol};
+use ply_span::Span;
 
 fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
     let (out, allocs, _) = charge(f);

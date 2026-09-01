@@ -1027,22 +1027,15 @@ which is inside what that measurement could resolve; at 128,000, where it can,
 are what you have, not because you were promised a speed-up.
 
 `push` grows the list in place when the caller is its last owner, and copies
-otherwise. Which branch you get is decided by *position*, and the rule
-**compounds at every enclosing node** on the path up from the `push`: an
-accumulator is linear only if it sits in the last position of its record
-literal, *and* that literal in the last position of the call it is an argument
-to, and so on outwards. `{..s, toks: push(s.toks, t)}` is the linear spelling of
-the literal — and `go({..s, toks: push(s.toks, t)}, i)` is quadratic anyway,
-because the literal is not last in the call.
+otherwise. The machine moves a binding's value out of its slot at its last use
+(ADR 0034), so *where* the append sits — in a call, in a record literal, first
+or last — decides nothing: an accumulator threaded through a loop is linear
+however you spell it. What still copies is a genuine second owner — a binding
+you read again after the append, a value a closure captured, a cell's contents,
+a map's entry, a caller that keeps reading what it passed.
 
-**Do not work this out by hand. Run `ply check --costs`**, which answers it per
-`push` site and names the edit.
-
-> This subsection is scheduled for **deletion, not further correction**.
-> `docs/adr/0034-perceus-over-slots.md` argues the rule is an artifact of the
-> evaluator's environment representation rather than a property of the language,
-> and deletes these paragraphs when its gate goes green.
-> `crates/ply-eval/tests/suite/position_invariance_g1.rs` is the gate.
+**Run `ply check --costs`** to see it per `push` site: every copy is reported
+with its cause and, where a source edit removes it, the edit.
 
 ### 6.8 Effect performs, `handle`, `with_cell`, `with_region`, `simulate`
 
@@ -3114,10 +3107,10 @@ rather than left to be discovered.
   their rows conflicts, because allocation draws from one bump pointer.
 * A task that reads shared state and writes it back with no scheduler operation
   in between runs both as one step, and no schedule separates them.
-* An accumulator written anywhere but the last position of its enclosing
-  expression copies instead of growing in place — and "enclosing expression"
-  means *every* node above it, not just the nearest one. Do not work it out by
-  hand: `ply check --costs` answers it per site.
+* An append copies only when something else still owns the list — a binding
+  read again after the `push`, a closure's capture, a cell or map entry, a
+  caller that keeps reading what it passed. Position in the enclosing
+  expression decides nothing: `ply check --costs` names each copy's cause.
 * `string_find` raises when the needle is absent; guard with `string_contains`.
 * `bytes_at` and `string_slice` **raise** out of range. `list_at` does not — it
   answers `None`. The two containers are indexed by different conventions on

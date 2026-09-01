@@ -343,7 +343,11 @@ impl Live {
                 s.dup_emitted += u64::from(!last);
             });
         }
-        if last && tracked { Own::Owned } else { Own::Borrowed }
+        if last && tracked {
+            Own::Owned
+        } else {
+            Own::Borrowed
+        }
     }
 
     /// Records a read of one field, and answers what the projection may take: the whole value when

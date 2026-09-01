@@ -69,9 +69,7 @@ impl Cause {
             ),
             Cause::Cell => Some("`cell_update`"),
             Cause::MapEntry => Some("`map_update`"),
-            Cause::Capture => {
-                Some("bind the list before the closure captures it, or capture less")
-            }
+            Cause::Capture => Some("bind the list before the closure captures it, or capture less"),
             Cause::CallerKeeps => Some("the edit is at the call site: the caller keeps the list"),
             Cause::Element | Cause::Program | Cause::Call | Cause::Handler | Cause::Closure => None,
         }
