@@ -354,7 +354,7 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
     for (name, value) in names.into_iter().zip(args) {
         map.insert(name, value);
     }
-    ctx.push(Value::Record(Arc::new(map)))
+    ctx.push(Value::Record(Arc::new(map.into_iter().collect())))
 }
 
 /// One field of a record, with the two failures the interpreter has here kept as failures rather
@@ -406,7 +406,7 @@ pub unsafe extern "C" fn rt_record_has(ctx: *mut Ctx, value: i64, index: i64) ->
     let ctx = unsafe { &mut *ctx };
     let name = ctx.tables.fields[index as usize].clone();
     match ctx.read(value) {
-        Value::Record(fields) => i64::from(fields.contains_key(&name)),
+        Value::Record(fields) => i64::from(fields.get(&name).is_some()),
         _ => 0,
     }
 }

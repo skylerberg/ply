@@ -3,7 +3,6 @@ use crate::cli::{Cli, Command};
 use clap::Parser;
 use ply_eval::Value;
 use ply_span::SourceId;
-use std::collections::BTreeMap;
 
 // --- the command line -------------------------------------------------------
 
@@ -160,7 +159,7 @@ fn record(fields: &[(&str, Value)]) -> Value {
         fields
             .iter()
             .map(|(k, v)| (Symbol::new(*k), v.clone()))
-            .collect::<BTreeMap<_, _>>(),
+            .collect(),
     ))
 }
 
