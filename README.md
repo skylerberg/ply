@@ -605,7 +605,8 @@ escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
 `cargo test --workspace` takes about **three minutes** on an unloaded machine,
-and all of it passes.
+and all of it passes. (That reading predates #65; `docs/ONBOARDING.md` §2 has
+its provenance and says what has not been re-taken.)
 
 **It is deliberately not described here by a test count.** This paragraph used
 to carry one, re-taken through a chain of nested blocks each recording what the
