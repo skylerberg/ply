@@ -4,12 +4,40 @@ Instructions for agents working in this repository. `CONTRIBUTING.md` is the
 full contract and this file does not replace it — read §"The one rule" and
 §"Writing a claim down" before writing anything down.
 
+## Numbers, and the failure mode they cause here
+
+**Do not add a figure to a prose document unless a test reads it.** Wall clocks,
+test counts, target counts, package counts, line counts, percentages and
+speedups all go stale the moment somebody commits, nothing in this tree checks
+them, and every hand re-take costs a reader and buys nothing. Put the figure
+where the command wrote it — a `benches/*.json`, an ADR, the tool's own output —
+and give prose the *shape*: which layer dominates, which way a trade goes, what
+will bite you.
+
+**Correct in place. Do not record what a number used to be.** Git has that. This
+repository ran the opposite convention for a long time; correction blocks grew to
+a quarter of every major document and nested four deep, and the ritual of writing
+one *feels* like the rigor §"The one rule" demands, so it gets performed instead
+of the rigor. Keep a note beside a claim only when the note would otherwise be
+**redone**: a rejected alternative with its reason, a trap, or a measurement
+taken for the wrong question. If a note could ever need a note of its own, it
+should not have been a note.
+
+**And the reason this matters more for you than for a human reader.** A wall of
+precise figures invites *refining the figure*. Several of the decisions in this
+repository — whether a code generator is worth building, whether to shard CI,
+whether a representation change pays — turn on **which workload is being
+measured** and on where the time actually is, not on the third significant digit
+of a ratio. When a number disappoints, ask what would have to be different for it
+to matter at all before you try to move it. Changing the paradigm is usually the
+available win; re-deriving the ratio on the same workload settles nothing.
+
 ## Keep `docs/GUIDE.md` current
 
 `docs/GUIDE.md` is the user-facing manual: the one document somebody reads to
 learn how to *write* Ply, as opposed to `DESIGN.md` (why each mechanism exists)
 or `docs/ONBOARDING.md` (clone to first change). It transcribes **surface** —
-signatures, keywords, flags, codes, counts — so it is exactly the document that
+signatures, keywords, flags, codes — so it is exactly the document that
 goes stale silently, and staleness in it is worse than in the others: a reader
 consulting it has by definition not read the source.
 

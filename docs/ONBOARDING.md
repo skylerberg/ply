@@ -28,31 +28,16 @@ Read in this order:
 
 ## Provenance
 
-Everything below was measured on **2026-08-17**:
+Everything below was measured on an Apple M-series machine, `aarch64-apple-darwin`,
+10 cores, macOS 15.7.3 / Darwin 24.6.0, `rustc 1.93.1`, PostgreSQL 18.3.
 
-| | |
-| --- | --- |
-| machine | Apple M-series, `aarch64-apple-darwin`, 10 cores, 32 GiB |
-| OS | macOS 15.7.3 (`sw_vers`), Darwin 24.6.0 (`uname -r`) — `ply-corpus` prints the Darwin release and labels it "macOS 24.6.0", which is why that string appears in its output |
-| toolchain | `rustc 1.93.1 (01f6ddf75 2026-02-11)`, `cargo 1.93.1` |
-| postgres | PostgreSQL 18.3 (Homebrew), running on `:5432` |
-
-Your wall clocks will differ. The **counts** — 5,000 tests selected down to
-157, 7 obligations, 25 host handlers, 29 agreeing requests — should not. If one
-differs on your machine, that is a finding; open it as one. Each is a property
-of what the language does, and each was re-taken on 2026-08-21 unchanged:
-`ply prove examples/desk.ply` → 7, `ply hosts examples/desk.ply --host` → 25,
-`examples/same-tests.sh` → 29.
-
-> **A fifth count used to head that list — how many tests the suite runs — and
-> it was dropped on 2026-08-31.** It is the only one of the five that ever
-> moved, and it moved on every reading: 3,566, 3,584, 3,597, 3,644, 3,661,
-> 3,690, 3,696, 3,878. That is not a reproducibility check that kept catching
-> something, it is a number that grows whenever anyone adds a test, and each
-> re-take was hand work that nothing in the tree would have failed without.
-> The four above are different in kind: they answer "does this machine agree
-> with mine about what Ply *does*", and the answer has been yes every time.
-
+Your wall clocks will differ, and this file gives them as magnitudes for that
+reason. Four **counts** should not differ, because each is a property of what the
+language does rather than of how big the tree has got — `ply prove
+examples/desk.ply` → 7 obligations, `ply hosts examples/desk.ply --host` → 25
+host handlers, `examples/same-tests.sh` → 29 agreeing requests, and
+`ply-corpus bench` selecting 5,000 tests down to 157. If one of those differs on
+your machine, that is a finding; open it as one.
 ## 0. What Ply is, in ninety seconds
 
 A research language whose thesis is that the verification loop should collapse
@@ -92,34 +77,14 @@ Measured cold, into an empty `CARGO_TARGET_DIR`. A cold build prints **157**
 | debug | `cargo build --workspace` | **16.8s** | 16.56s |
 | release | `cargo build --workspace --release` | **58.3s** | 53.85s |
 
-> **A plain build got bigger on 2026-08-31, and this is what changed.** The
-> workspace gained `crates/ply-codegen`, a cranelift code generator behind
-> `ply test --backend cranelift`, and `crates/ply-cli` depends on it
-> **unconditionally — there is no feature flag to turn it off**. `Cargo.lock`
-> went from 250 packages to **282**: 31 cranelift-attributable dependencies plus
-> the crate itself.
+> **cranelift is an unconditional dependency.** `crates/ply-cli` depends on
+> `crates/ply-codegen` with **no feature flag to turn it off**, so a plain build
+> compiles a code generator whether or not you will use one.
 >
-> **Nothing above about the toolchain changes.** cranelift 0.132.3 declares
-> `rust-version = "1.93.0"`, which is below the 1.93.1 this sentence already
-> says works, so `cargo build`, `cargo test` and `cargo clippy` still need
-> exactly one toolchain and it is the one you have. (0.133 and later require
-> 1.94.0. The pins in `crates/ply-codegen/Cargo.toml` are deliberate and say so;
-> bumping past 0.132 is a toolchain decision, not a dependency bump.)
->
-> **What it costs.** The marginal build time of the whole cranelift tree,
-> measured by cleaning exactly the 32 packages the change added and rebuilding:
-> **16.26 s wall / 63.01 s user** release, **18.55 s / 95.54 s** debug, min of 3
-> windows each, on the machine in §Provenance. The null control — cleaning
-> `ply-codegen` alone with cranelift left built — is 0.70 s, so the window is
-> measuring cranelift and not the crate. Load was 6.4–9.9 throughout, above this
-> project's 4.0 measuring gate, so treat these as observations rather than
-> figures; the decision they informed had a pre-registered threshold of 60 s and
-> is not close.
->
-> **The four cold rows in the table above have NOT been re-taken since**, so
-> expect them to be low by roughly the marginal figures. They are left rather
-> than adjusted, because a number arrived at by adding two measurements taken
-> under different conditions is worse than a number with a caveat.
+> **The version pin is a toolchain decision, not a dependency bump.** cranelift
+> 0.132.3 declares `rust-version = "1.93.0"`, at or below the toolchain this
+> repository already needs; 0.133 and later require 1.94.0. The pins in
+> `crates/ply-codegen/Cargo.toml` are deliberate and say so.
 
 Warm (nothing changed) is **0.11s** debug and **0.15s** release, re-measured;
 this line said 0.25s for both, which is the right order of magnitude and was not
@@ -155,391 +120,84 @@ treat 13.7s as the first-run cost and not as what you will see.
 
 There is no `rustfmt.toml` and no `clippy.toml`; both run on defaults.
 
-### `crates/ply-codegen-spike` builds again, and since 2026-08-31 on the pinned toolchain
+### `crates/ply-codegen-spike` is outside the workspace
 
-> **Corrected in place (cranelift port, 2026-08-31).** This heading read
-> *"`crates/ply-codegen-spike` builds again, but only on `+1.94.0`"*, and the
-> `+1.94.0` in every command below it was load-bearing while cranelift 0.134.3
-> was the dependency. **The crate now depends on cranelift 0.132.3, which
-> declares `rust-version = "1.93.0"`, so it builds on the default 1.93.1 and
-> `+1.94.0` is no longer needed anywhere in this repository.** Drop the prefix
-> from every invocation quoted below; they are otherwise unchanged, and the
-> transcripts are left as they were taken. `.github/workflows/ci.yml`'s `spike`
-> job is on 1.93.1 with the rest.
->
-> One thing that section does not tell you and item 18 of `CONTRIBUTING.md`
-> §"Things known to be broken" does: `cargo test --release` here is green while
-> `mcts --dir benches/kernel --only agreement` exits 1 with 42 disagreements.
+It builds on the pinned toolchain — no `+1.94.0` prefix anywhere in this
+repository any more — and `cargo test --release` from inside the crate is green.
 
-> **Corrected (R4 integration pass, 2026-08-21). This section said the spike
-> "no longer compiles, on any toolchain available here", and that half of it is
-> now false.** The heading read *"`crates/ply-codegen-spike` does not build. Do
-> not start there."* R4 repaired the two `E0164`s, then widened
-> `NodeKind::Lit` underneath the spike and repaired that too, because ADR 0018
-> §1 needed the spike to answer at all. Re-taken, from
-> `crates/ply-codegen-spike/`:
->
-> ```
-> $ cargo +1.94.0 build --release
->     Finished `release` profile [optimized] target(s) in 1m 19s
-> $ cargo +1.94.0 test --release
-> test result: ok. 8 passed; 0 failed; ...      # tests/spike.rs
-> test result: ok. 7 passed; 0 failed; ...      # tests/mcts_kernel.rs
-> ```
->
-> (**The two counts were swapped here and in `CONTRIBUTING.md` §"Things known
-> to be broken" item 1** — this block read `7 … # tests/spike.rs` and
-> `8 … # tests/mcts_kernel.rs`. Re-taken 2026-08-21 by the second regression
-> audit against this tree: `spike.rs` is 8 and `mcts_kernel.rs` is 7, plus
-> three zero-test unit targets, so the crate runs 15 tests in five targets.)
->
-> And the command ADR 0016 gives for its own spike half runs, once you name a
-> binary — the crate ships two now, so the invocation at
-> `docs/adr/0016-w6-performance.md:827` needs `--bin ply-codegen-spike` added
-> or it dies with *"could not determine which binary to run"*:
->
-> ```
-> $ cargo +1.94.0 run --release --manifest-path crates/ply-codegen-spike/Cargo.toml \
->       --bin ply-codegen-spike -- --half /tmp/spike-check.json
-> ...
-> wrote /tmp/spike-check.json
-> ```
->
-> **The first wall below stands, verbatim and re-run** — the default `stable`
-> toolchain still refuses, so `+1.94.0` is not optional. **The second wall,
-> the two `E0164`s, is gone.** It is left printed below because it is what the
-> drift looked like and it is the thing that will happen again: the crate is
-> still outside the workspace, so `cargo build --workspace`, `cargo test
-> --workspace` and `cargo clippy --workspace --all-targets` still do not
-> compile it, and R4 broke it a second time in exactly this way before noticing.
-> It is also not clippy-clean and never was: 13 `not_unsafe_ptr_arg_deref`
-> errors in `src/rt.rs` (the JIT's calling convention) and 6 warnings, none of
-> which the project's stated gate reaches.
+**The thing to know is structural, not the transcript.** The crate declares its
+own `[workspace]`, so `cargo build --workspace`, `cargo test --workspace` and
+`cargo clippy --workspace --all-targets` do not compile one line of it. It has
+bit-rotted that way twice, each time discovered long after the change that broke
+it. CI gives it a job of its own for exactly that reason, and
+`.github/ci-shards.sh verify` fails if a crate ends up in no job at all.
 
-`crates/` holds fourteen directories but the workspace has **thirteen members**.
-`ply-codegen-spike` declares its own `[workspace]` so `cargo build --workspace`
-and `cargo test --workspace` never touch it — that is deliberate (ADR 0016 §3.5
-wants deleting it to be `rm -r` and nothing else).
+Two live caveats:
 
-What is *not* deliberate is that **it no longer compiles**, on any toolchain
-available here. Two independent walls, both reproduced:
-
-```
-$ cd crates/ply-codegen-spike && cargo test --release
-error: rustc 1.93.1 is not supported by the following packages:
-  cranelift-assembler-x64@0.134.3 requires rustc 1.94.0
-  cranelift-assembler-x64@0.134.3 requires rustc 1.94.0
-  cranelift-assembler-x64@0.134.3 requires rustc 1.94.0
-  cranelift-assembler-x64-meta@0.134.3 requires rustc 1.94.0
-  ... 22 further lines, 26 in all over 17 distinct packages, ending
-  wasmtime-internal-jit-icache-coherence@47.0.3 requires rustc 1.94.0
-Either upgrade rustc or select compatible dependency versions with
-`cargo update <name>@<current-ver> --precise <compatible-ver>`
-
-$ cargo +1.94.0 test --release          # a 1.94.0 toolchain is installed here
-error[E0164]: expected tuple struct or tuple variant, found struct variant `Stmt::Expr`
-   --> src/jit.rs:371:21
-error[E0164]: expected tuple struct or tuple variant, found struct variant `Stmt::Expr`
-   --> src/jit.rs:739:25
-error: could not compile `ply-codegen-spike` (lib) due to 2 previous errors
-error: could not compile `ply-codegen-spike` (lib test) due to 2 previous errors
-```
-
-(This block used to abridge the first wall as one `cranelift-codegen` line plus
-"… (23 more)". Both halves of that were wrong: the list is **26** lines, and the
-package it opens with is `cranelift-assembler-x64`. `cranelift-codegen` is in
-there, on lines 7–9. Re-taken above.)
-
-`ply_eval::code::Stmt::Expr` became a struct variant `{ code, dead }`
-(`crates/ply-eval/src/code.rs:121-124`) and the spike still matches it as a tuple
-variant. Nothing compiles the spike, so nothing caught the drift.
-
-The command ADR 0016 gives for reproducing its own spike half —
-`cargo +1.94.0 run --release --manifest-path crates/ply-codegen-spike/Cargo.toml
--- --half benches/w6-spike.json`, at `docs/adr/0016-w6-performance.md:827` —
-fails with the same two `E0164`s. ADR 0016 records the *toolchain* wall twice, at
-lines 764–767 and 1105–1106; the source-incompatibility wall is newer and is
-recorded nowhere in the repository but here. **ADR 0016's `11.67x`, `1.71x` and
-the §9.2 census are therefore not re-takeable from this tree** — note that
-`11.67x` is still *checkable*, because `benches/w6-spike.json` holds the five
-input pairs it was computed from and `ply-corpus w6` recomputes it from the file
-(§8). What cannot be done is measuring the spike again. The ladder half
-(`benches/w6-ladder.json`) is unaffected and does reproduce — see §7.
-
-> **Corrected (R4, 2026-08-21): the spike *was* measured again, and the
-> `read_line` half did not move.** The paragraph above is what was true before
-> R4 and its reasoning was sound; what it concluded is not true of this tree.
-> `benches/w6-spike-r4.json` is the re-take, and the conservative minimum ADR
-> 0016 publishes as `11.67x` — `min(interpreter_best_micros ÷
-> spike_worst_micros)` over the file's five inputs, which is **not** a field in
-> either file — recomputes to **11.68×** over the R4 file and **11.67×** over
-> the older one. Both recomputed here from the shipped JSON rather than quoted.
->
-> Two cautions the re-take earned. **That expression is load-sensitive**: it
-> divides a *best* by a *worst* over separate repeats rather than pairing them
-> inside one window, and a fresh half taken on this machine while a
-> `cargo test --workspace` was running came back at **7.38×** on the same
-> function. `benches/README.md` §"Every ratio is taken inside one window" is
-> the harness that does not have this problem, and the `mcts` half is built on
-> it. **And 11.68× is not a ceiling for a compute kernel**: ADR 0018 §1 asked
-> for exactly that comparison and the answer is in `benches/adr0018-mcts.json`
-> — 52.58× where the fragment runs, 0.998× end to end, and 4.86× as the
-> Amdahl ceiling, because the interpreter cannot call compiled code.
-> `docs/adr/0019-value-representation.md` §5 is the write-up.
-
+- It is **not clippy-clean** and never was; the project's stated gate does not
+  reach it.
+- `cargo test --release` green does **not** mean the spike agrees with the
+  interpreters. `mcts --dir benches/kernel --only agreement` exits 1. See
+  `CONTRIBUTING.md` §"Things known to be broken".
 ## 2. Test
 
 ```
 cargo test --workspace
 ```
 
-Measured as `/usr/bin/time -p cargo test --locked --workspace --no-fail-fast`,
-from an already-built `target/`, at a 1-minute load below §"Gate on an idle
-machine"'s threshold of 4: **182.29s real, 226.88s user, 24.85s sys**, and
-**178.1s** of in-target time summed from the `test result:` lines.
+**Budget a few minutes on an unloaded machine, and do not run it under load.**
+The wall clock on this command has ranged from three minutes to nearly thirty
+across its history, and the slow readings are the machine rather than the tree —
+in the worst of them *user time was below real time*, which is a run spending
+minutes waiting for cores rather than using them.
 
-**Budget three minutes**, and do not run it under load. It said *ten* until
-2026-08-31.
+No test count is given here on purpose. It changes on every commit that adds a
+test, nothing in the tree checks it, and every re-take this file used to carry
+found it stale without anything having failed. What matters at this command is
+that nothing failed.
 
-> **Provenance, and what has not been re-taken.** That reading is the merge of
-> #64. #65 landed after it and touches the compiled seam, and the figure has
-> **not** been re-taken against that tree — the machine was at a load average
-> of 53 with another session's builds on it, and a wall clock taken there is
-> the load and not the tree, which is the whole lesson of the block below.
-> Re-take it on an idle machine rather than trusting this line to the second.
-
-**This section deliberately does not record how many tests there are.** It used
-to, in a table row and a chain of blocks re-taking it, and the number was found
-stale on every one of those re-takes — never by anything failing, and the last
-time by fifteen binaries and 182 tests. Nothing in the tree checks it, so
-keeping it current was hand work that bought nothing. §Provenance keeps the
-counts that have earned their place by *not* moving.
-
-> **The wall clock's spread is the thing to know about, and most of it is the
-> machine rather than the tree.** Readings on this one command, oldest first:
-> 339s, 324.5s, 352.4s, 359.7s, 399.6s, 406.9s, 569.3s, 1,087.3s, 1,735.2s,
-> and now 182.3s. The two worst are not the tree getting slower — 1,087.3s was
-> taken at a load average of 4 to 12, and 1,735.2s at **24 to 43** with several
-> unrelated builds running, where *user time below real time* is the giveaway
-> that the run spent minutes waiting for cores rather than using them. Take
-> this figure on an idle machine or do not take it.
->
-> The drop to 182.3s is two changes. `[profile.dev] opt-level = 2` landed after
-> the 569.3s reading; that is the root `Cargo.toml`'s measurement, not this
-> one. The second was measured here **on one tree, both ways** — the same
-> commit with `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted and
-> then restored — at **250.5s without it against 182.3s with it**. No
-> intermediate tree was re-taken and nothing here claims one was.
-
-> **One target used to be most of it.** `r4_value_construction` attributes
-> every allocation to the code that asked for it over 20-, 200- and
-> 400-request windows, and it read **70.9s under `cargo test` (debug) against
-> 25.6s under `cargo test --release`** — it is not `ignored`, and the numbers
-> it is documented to print are the release ones.
->
-> > **Fixed 2026-08-31 rather than budgeted around.** The backtrace is still
-> > captured per allocation; what was *resolved* per allocation now is not.
-> > `Backtrace::force_capture()` followed by `format!("{bt}")` symbolicates
-> > every frame on the stack, and the set of code addresses that allocate is
-> > small and fixed, so the same names were being resolved hundreds of
-> > thousands of times. Memoising the resolve per address takes this target
-> > from **46.2s to 6.7s** inside a workspace run, and `w6_alloc_sites` —
-> > which does the same thing, and which cranelift shipping had pushed to
-> > 40.4s — from **40.4s to 2.6s**. Every figure the two files report is **byte
-> > for byte identical** across the change, checked by diffing their
-> > `--nocapture` output rather than by trusting that the assertions still
-> > pass. The debug/release gap above is therefore much smaller than 2.8x now
-> > and **has not been re-taken**: its release side is a 2026-08-21 reading
-> > against the old code.
->
-> An earlier draft of that block said **255.2s** for the debug side. That was
-> the target's `finished in` line from a run taken while a `cargo build
-> --release` competed for the machine — a reading of the load, not of the
-> target, against 70.88s for the same line unloaded. It is left here because a
-> 3.6x error in the one figure a block exists to warn about is worse than no
-> warning, and because it is the same lesson as the spread above.
-
+Two sections follow that are worth reading before you trust a green run.
 ### Five things a green suite does not prove
 
-> **This section read "Four things a green suite does not prove", and said the
-> gaps "are enumerated in `ROADMAP.md`'s preamble table".** There are five, and
-> the table enumerates four. The fifth is `PLY_TEST_DB`, below. Checked before
-> this change was made: `grep -rn PLY_TEST_DB` over the whole repository
-> returned **four** hits, all four inside
-> `crates/ply-host/src/db/pool/tests.rs` — no ADR, no `ROADMAP.md` row, no
-> mention in this file — which is presumably why nothing counted it. (Re-run it
-> today and you also get this section, `CONTRIBUTING.md` and
-> `.github/workflows/ci.yml`.) Found 2026-08-24 while wiring CI.
+`cargo test --workspace` green is weaker than it looks, and the reason is always
+the same: **a gate that is closed makes its tests pass without running them.**
 
-`cargo test --workspace` green is weaker than it looks. Four of the five gaps
-are enumerated in `ROADMAP.md`'s preamble table. Two of them will bite you here:
+| gate | what goes quiet | how to open it |
+| --- | --- | --- |
+| `PLY_PG_URL` unset | the live postgres tests pass without a server | set it at a real database |
+| `PLY_TEST_DB` unset | the `ply-host` pool tests pass, printing *nothing* | set it; a *wrong* value is loud, only a missing one is silent |
+| no `initdb`/`postgres`/`psql` on `PATH` | the cluster-gated suites skip | install postgres |
+| not Unix | `#![cfg(unix)]` files are not compiled at all — no notice whatsoever | run on Linux or macOS |
+| `crates/ply-codegen-spike` | outside the workspace, so `--workspace` never builds it | `cd` in and build it |
 
-**Ten postgres tests skip unless you set `PLY_PG_URL`.** They *pass* without
-running. Measured, both ways:
+The worst of these is `PLY_TEST_DB`, because it prints no skip line at all — not
+on stdout, not on stderr. The tests report as passing and nothing distinguishes
+that from a run against a live database.
 
-```
-$ cargo test -p ply-host --lib db::scope::tests::live
-test result: ok. 10 passed; 0 failed; ... finished in 0.00s
-
-$ PLY_PG_URL=postgres://localhost/postgres cargo test -p ply-host --lib db::scope::tests::live
-test result: ok. 10 passed; 0 failed; ... finished in 0.04s
-```
-
-Same line, same count, and the only tell is the wall clock. `ROADMAP.md`'s
-preamble table says this gate "says so, on stderr of a passing test" — **it does
-not, under `cargo test`.** Cargo captures the output of a passing test, so under
-a normal `cargo test --workspace` run the notice is invisible; the whole-workspace
-run above contains the string `skipped:` **zero** times — re-checked against both
-its stdout and its stderr. You only see it with `--nocapture`:
-
-```
-$ cargo test -p ply-host --lib db::scope::tests::live -- --nocapture
-skipped: PLY_PG_URL is unset, so the scope table was not run against real postgres
-```
-
-> **Corrected: the clause "and nothing in the repository sets it" is no longer
-> true.** That is the withdrawn text, verbatim, and it stood in the bolded
-> sentence above until 2026-08-24.
-> `.github/workflows/ci.yml`'s `test-postgres` job sets it, at a
-> `postgres:18.6` service container, and fails the run if any of the ten prints
-> its skip notice. Nothing sets it *locally*, which is what the paragraph is
-> about and which is unchanged: on your machine these ten still pass in 0.00s
-> without running.
-
-To actually run them:
-
-```
-PLY_PG_URL=postgres://localhost/postgres cargo test -p ply-host
-```
-
-Measured: **38s, 281 passed, 0 failed**; re-taken at 36.4s with the same 281/0
-(253 + 2 + 1 + 2 + 5 + 1 + 15 + 2 across nine targets, one of which is a 31.5s
-pool test). The gate is
-`crates/ply-host/src/db/scope/tests/live.rs:101`; it creates and drops scratch
-tables named `ply_scope_<pid>_<n>` in whatever database you name, so point it at
-one you do not mind that happening in.
-
-**`crates/ply-cli/tests/w5_shutdown.rs` is `#![cfg(unix)]`** and on a non-Unix
-host is not compiled and prints nothing at all. Every W5 shutdown claim is
-unproven there, silently.
-
-The other two gates in the table are `cluster::available()`
-(`crates/ply-host/tests/support/cluster.rs:39` — `ROADMAP.md` cites `:38`, which
-is the blank line above it; skips without `initdb` or `postgres` on `PATH`, and
-says so on stderr) and the codegen spike's own workspace (§1).
-
-**The fifth gate is `PLY_TEST_DB`, and it is the quietest of them.**
-`crates/ply-host/src/db/pool/tests.rs:25` reads it, and every pool test that
-needs a server returns early without it — with **no notice at all**, not even
-the stderr line the other two print. Deliberately, per the comment at
-`crates/ply-host/src/db/pool/tests.rs:30-31`: *"Deliberately not a `panic!`: a
-developer without postgres running must be able to `cargo test -p ply-host` and
-get a green, honest result."* The cost is that
-there is nothing to grep for. Measured 2026-08-24, `cargo test -p ply-host --lib
-db::pool`:
-
-```
-$ cargo test -p ply-host --lib db::pool
-test result: ok. 26 passed; 0 failed; ... finished in 0.00s
-
-$ PLY_TEST_DB='postgresql://ply@127.0.0.1:55432/ply?sslmode=disable' \
-    cargo test -p ply-host --lib db::pool
-test result: ok. 26 passed; 0 failed; ... finished in 0.94s
-
-$ PLY_TEST_DB=postgres://ply@127.0.0.1:55432/ply \
-    cargo test -p ply-host --lib db::pool     # server not running
-test result: FAILED. 6 passed; 20 failed; ... finished in 0.02s
-```
-
-> **The second figure read `1.55s` here, and `1.35s` in `ROADMAP.md`, for the
-> same measurement.** Neither had been re-taken; both are replaced by the block
-> above, taken 2026-08-24 against a local postgres 18.3. The third invocation is
-> new — nobody had run the pointed-at-nothing case.
-
-Same count and same line for the first two, and the wall clock is the only tell
-between them — the same shape as `PLY_PG_URL` and without even the captured
-stderr. **The third is the useful one.** `db/pool/tests.rs:41` does
-`Reactor::start(config).expect("the test database is reachable")`, so pointing
-`PLY_TEST_DB` at a server that is not there is a loud `E0431` failure, not a
-quiet skip. CI sets the variable at the same container it points `PLY_PG_URL`
-at and pre-flights it with `test -n` and a `psql SELECT 1`: a missing value
-fails the pre-flight, a wrong one fails the tests. What CI still cannot do is
-prove after the fact that these 26 took the live path the way it can for the
-ten.
-
-### Thirteen tests are wall-clock sensitive and run by default
-
-> **This section read "One test is wall-clock sensitive and runs by default".**
-> That is the withdrawn text. The count reached thirteen on 2026-08-24 and the
-> way it got there is more useful than the number — see below. The one test it
-> named is real and is still the clearest example.
+**The lesson generalises past this list.** When you add a test that depends on
+something the environment may not have, make the absent case *loud*. A skip
+notice on stderr is the minimum; a CI step that fails when it finds that notice
+is what actually holds. Asserting the test count does not substitute — a gated
+test returns early and passes, so the count is right with nothing behind it.
+### Some tests assert on a wall clock and run by default
 
 `ply-eval/tests/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
-asserts on a timing growth ratio and is **not** in the `ignored` set. It passed
-here, and passed again on the audit's re-run. On a machine busy compiling
-something else it has been seen to fail. If it is your only failure, re-run on a
-quiet machine before you believe it.
+asserts on a timing growth ratio and is **not** in the `ignored` set. It passes
+on a quiet machine and has been seen to fail on one busy compiling something
+else. **If it is your only failure, re-run before you believe it.**
 
-Twelve more assert a performance figure the same way. The full list is
-`.github/ci-shards.sh`'s `DEFERRED` table; CI runs all thirteen alone on a
-runner, one at a time, single-threaded, and the parallel shards skip them.
+Several more assert a performance figure the same way. `.github/ci-shards.sh`'s
+`DEFERRED` table is the list, and it is maintained by *running the shards*, not
+by surveying the tree — two surveys declared themselves complete and each was
+proved wrong within the hour by a shard going red on a test neither had found.
+One of them reads no Rust clock at all; it parses milliseconds out of `ply
+test`'s own output, so no timing vocabulary appears in it.
 
-**How the list is actually maintained: by running the shards.** Two surveys were
-done and each was refuted by the next shard run within the hour, so do not trust
-the next survey either.
-
-The first survey grepped `crates/*/tests` for `Instant::now` and found seven.
-Running the corpus shard's own command, with three other `cargo test
---workspace` runs in flight, then failed at
-`crates/ply-corpus/src/measure.rs:861`:
-
-```
-the fourth resumption cost 5680.8965 us against 2196.552 us for a whole
-one-resumption call
-```
-
-`four.marginal_micros < one.micros * 2.0`, in a unit test in `src/` — a place
-that grep could not reach. Re-surveying `crates/*/src` took the list to twelve.
-
-The second survey keyed on a timing vocabulary — `Instant`, `elapsed`,
-`Duration`, `_nanos`, `_micros`. The cli-eval shard then failed at
-`crates/ply-cli/tests/w3_http_audit.rs:714`:
-
-```
-four times the escapes cost 1655.9ms against 143.6ms for k, which is 11.5x
-```
-
-`four <= one * 9.0`, in a test that reads no Rust clock at all — it parses
-milliseconds out of `ply test`'s own output. None of the vocabulary appears in
-it. That took the list to thirteen. Its doc comment says the 9x threshold was
-picked "so that a slow or contended machine cannot make it red"; the machine was
-contended and it went red at 11.5x. Run alone it passes three times out of three.
-
-Nothing was wrong with the code in either case. That is the failure a shared
-runner produces, and it is why the list is thirteen rather than one — and why
-thirteen is a running count rather than a result.
-
-The five `ignored` tests, verbatim from the run: three timing benchmarks in
-`ply-corpus/tests/http_cost.rs`, each of which prints its own recipe —
-
-```
-test the_cost_of_a_head_is_linear_in_the_number_of_fields ... ignored, timing;
-  run with `cargo test -p ply-corpus --test http_cost -- --ignored --nocapture`
-```
-
-— a fourth of the same shape that R4 added in `ply-eval`'s lib tests —
-
-```
-test interp::tests::a_cached_mention_against_the_allocation_it_replaces ... ignored, timing;
-  run with `cargo test -p ply-eval --release --lib
-  interp::tests::a_cached_mention_against_the_allocation_it_replaces -- --ignored --nocapture`
-```
-
-— and one doc-test, `crates/ply-host/src/db/pool.rs - db::pool::job (line 107)`.
-That matches `README.md`'s "four are timing benchmarks … and the fifth is a
-doc-test, not a benchmark." (This paragraph said *four* and named three
-benchmarks; R4 added the fourth.)
-
+CI runs every deferred test alone, single-threaded, on its own runner, and the
+parallel shards skip them. If you add a test that asserts on elapsed time, add
+it to that table too — and prefer asserting on a *count* (allocations, copies,
+passes) over a duration wherever the question allows it, because a count does
+not depend on what else the machine is doing.
 ## 3. Run the examples
 
 All four commands below were run and their output is what is shown.
@@ -656,16 +314,6 @@ specific binary; it does not skip the freshness check.
 ```
 ./examples/same-tests.sh
 ```
-
-> **It now says so rather than dying (2026-08-27).** The script's first act is
-> `.github/binary-is-current.sh`, which exits 2 with the `cargo build` line to
-> run when the binary is missing *or* is not built from this tree. The second
-> half matters more than the first: `desk.ply` imports all eight `std` modules
-> and those are `include_str!`ed into `ply`, so editing one changes what this
-> comparison means while moving no `.rs` file at all. Run
-> `.github/binary-is-current.sh` yourself before any measurement taken with a
-> pre-built binary — `CONTRIBUTING.md` §"The binary is an instrument too" is
-> the reproduction and the rule it replaces.
 
 ~~Measured: **4.6s**~~ — withdrawn rather than updated. That figure named a run
 that did no building, and the script does now. It was not re-taken here: the
@@ -943,235 +591,69 @@ about it.
 
 ### There is CI, and what it does and does not settle
 
-> **This section read "There is no CI" and that was true when it was written.**
-> The withdrawn text, verbatim: *"**`.github/` does not exist.** No workflow, no
-> hook, no pipeline. Every "the test suite asserts it" in every document means
-> *someone has to run `cargo test --workspace` locally, and nobody is watching
-> whether they did.* Assume nothing has been run since the last person who said
-> so."* `.github/workflows/ci.yml` was added 2026-08-24. What follows is
-> re-taken. `CONTRIBUTING.md` §"There is CI, and it is younger than most of this
-> file" lists the jobs.
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets -- -D
+warnings` and the whole test suite run on every pull request and every push to
+`main`. `examples/same-tests.sh` runs too, which is W4's exit criterion.
 
-**What it settles.** `cargo fmt --all --check`, `cargo clippy --workspace
---all-targets -- -D warnings` and the whole test suite run on every pull
-request, and on every push to `main`. So do four of the five gates §2 describes
-— the ones that return a *passing* result when their dependency is absent:
+**What earns CI its keep is the gates**, not the suite. Four of the five §2
+describes are the ones that return a *passing* result when their dependency is
+absent, and CI forces each open:
 
-> **Corrected 2026-08-30: "every push" was accurate and was also a bug.** The
-> withdrawn wording: *"run on every push and every pull request."* Unfiltered,
-> a push to a branch with a PR open ran the entire workflow twice, because the
-> `concurrency` group keys on `github.ref` and the two triggers do not share
-> one. `push` is now filtered to the default branch. A branch with no PR open
-> yet gets no CI, which is the case this gives up.
+- **`PLY_PG_URL`** is set at a postgres service container, and the job runs the
+  live tests with `--nocapture` and fails if it finds the notice a skipped one
+  prints. Three things make that work and all three were wrong at some point:
+  cargo captures the notice on a *passing* test, so `--nocapture` is needed to
+  emit it; the notice is an `eprintln!`, so the step needs `2>&1` or the grep
+  reads a stream it cannot appear on; and asserting the test *count* does not
+  substitute, because the tests return early and pass, so the count is right
+  with no server anywhere.
+- **`initdb`, `postgres` and `psql`** are put on `PATH` where
+  `cluster::available()` looks, and the job fails if they are absent.
+- **`#![cfg(unix)]`** compiles, because the runner is Linux, and a step fails if
+  that binary reports zero tests.
+- **`crates/ply-codegen-spike`** gets a job of its own, because it declares its
+  own `[workspace]` and `--workspace` has never reached it. Not a skip — a crate
+  nothing builds. It has bit-rotted twice with nothing to say so.
 
-- `PLY_PG_URL` is set at a `postgres:18.6` service container, and the job then
-  runs the ten live tests with `--nocapture` and **fails if it finds the notice
-  a skipped one prints**. Three things make that work and all three were wrong
-  at some point while it was written: cargo captures the notice on a passing
-  test, so `--nocapture` is needed to emit it at all; the notice is an
-  `eprintln!`, so the step needs `2>&1` to get it into the file the grep reads,
-  and without that the grep cannot fire whatever it matches; and the
-  `10 passed` assertion beside it does *not* substitute, because the ten tests
-  return early and pass, so that line reads `10 passed` with no server
-  anywhere. Measured with `PLY_PG_URL` unset: stdout alone carries **0**
-  notices, `2>&1` carries **10**.
-- `initdb`, `postgres` and `psql` are put on `PATH` where
-  `cluster::available()` looks, and the job fails if they are not there. It then
-  runs a cluster-gated binary and greps for the same notice.
-- `#![cfg(unix)]` compiles, because the runner is `ubuntu-24.04`, and a step
-  fails if that binary reports zero tests.
-- `crates/ply-codegen-spike` is built and tested in a job of its own, on a
-  pinned 1.94.0, because `cranelift 0.134.3` needs it. That gate is not a skip —
-  the crate declares its own `[workspace]`, so `--workspace` has never reached
-  it — and it has bit-rotted twice with nothing to say so.
+**And one check that is not a gate in that sense.** The tree checks in
+`crates/ply-span/tests/armed.rs` run a second time by name, so that a rename or
+a stray filter turns CI red rather than quietly reducing what CI checks. A test
+that stops running reports nothing, and reporting nothing is indistinguishable
+from passing — which is the failure this whole section is organised around.
+### Exactly one test reads a prose document
 
-`examples/same-tests.sh` runs too, which is W4's exit criterion and was
-previously a thing you had to remember.
-
-**And one check that is not a gate in that sense.** Six **tree checks** run a
-second time, by name, in the shard that holds `ply-span`. They are the tests in
-`crates/ply-span/tests/armed.rs` that fail when a registered diagnostic code, or
-a variant of a covered enum, is declared and constructed nowhere — the defect
-`CONTRIBUTING.md` §"The shape it keeps taking" catalogues six instances of. They
-already ran inside `cargo test -p ply-span`; the second run is by `--exact` name
-with a `test result: ok. 1 passed` assertion, because `cargo test --exact` over
-a name nothing defines reports `0 passed; 11 filtered out` and exits **0**, so a
-renamed or deleted check would otherwise stop checking in silence.
-`.github/ci-shards.sh verify` catches the rename earlier, in the `plan` job.
-What this does **not** settle: the checks are lexical. They prove a construction
-site exists in production source, never that it can execute — so a mechanism of
-the W1 kind, advertised and unreachable, is still **not enforced** by anything.
-That file's header lists the rest of the gaps.
-
-**What it does not settle.** Four things, and they are why this section is not
-just the list above.
-
-1. **Nothing changed on your machine.** The gates skip locally exactly as
-   before. CI is a second reader, not a replacement for the outer loop.
-2. **The fifth gate has no positive proof, even in CI — but it is better
-   guarded than that sounds.** `PLY_TEST_DB` is set at the same container, and
-   the pool tests print nothing when it is missing, so there is no notice to
-   grep and no log line that shows after the fact that the 26 took the live
-   path. What there *is*: a wrong value is loud. Measured 2026-08-24 —
-   `PLY_TEST_DB` set at an unreachable server gives **20 of 26 FAILED** with
-   `E0431` in 0.02s, because `db/pool/tests.rs:41` does
-   `.expect("the test database is reachable")`. Unset gives 26 passed in 0.00s
-   and set-and-reachable gives 26 passed in 0.94s. So only the *missing* case is
-   silent, and the job's `test -n` pre-flight fails on that. §2 has the rest.
-3. **CI checks the tree, not the prose.** §"Exactly one test reads a prose
-   document" below is unchanged: one sentence of `README.md` is enforced and the
-   rest is not. Every number in this file is a number someone typed, and CI
-   would not notice if it went stale.
-4. **The toolchain is unpinned, except for the spike.** Nothing in the
-   repository names a version, so CI's `stable` is whatever stable is on the day
-   it runs, and a release that adds a clippy lint turns the `clippy` job red
-   with no change to the tree. That is a deliberate trade — the alternative is
-   not noticing new lints, and `CONTRIBUTING.md` §"The loop" says zero warnings
-   is the gate — and `ci.yml`'s header names the line to edit to take the other
-   side of it.
-
-**And one thing it does not settle that is specific to how it was built.** Some
-of the workflow's commands were run on the machine in §Provenance and some were
-not; `ci.yml` was then edited again, so "all of them were run" is not a sentence
-this section is entitled to. `CONTRIBUTING.md` §"There is CI" carries the ledger
-of which commands have an exit code against the current file, which one failed,
-and which were stopped unfinished when the machine reached load 27 — read that
-rather than assuming this section rests on a complete pass, because it does not.
-
-Nothing in `ci.yml` has ever run on GitHub Actions: the runner image, the
-service container, the `apt-get` fallback and the cache action are the parts
-only a push can exercise, and the first push is where they get tested.
-
-### Exactly one test reads a prose document, and it reads one sentence of it
-
-> **This section read "No test reads any prose document" and that was true when
-> it was written.** A regression audit on 2026-08-17 found `README.md`'s
-> request-path allocation figure stale for the second time in one milestone —
-> the second time *inside the block correcting the first* — and armed the one
-> sentence rather than writing the finding down again. What follows is re-taken.
-
-Checked: `grep -rn '\.md"' crates/*/tests crates/*/src` filtered to file-opening
-calls returns **one** hit,
-`crates/ply-corpus/tests/w6_report_allocations.rs:163
-the_readme_still_describes_this_request_path`. It reads `README.md`'s *"One
+`crates/ply-corpus/tests/w6_report_allocations.rs`'s
+`the_readme_still_describes_this_request_path` reads `README.md`'s *"One
 `/health` request makes N allocations and M bytes"* and compares both numbers
-against a freshly counted 200-request window, within **1%** — a tighter band than
-the factor of two the test beside it holds `benches/w6-ladder.json` to, because
-that file is a dated artifact and this sentence is present tense about this tree.
-Run it: `cargo test -p ply-corpus --test w6_report_allocations -- --nocapture`
-prints both sides, and the count is the same in debug and release because an
-allocation count does not vary with a profile.
+against a freshly counted window, within 1%. Run it with
+`cargo test -p ply-corpus --test w6_report_allocations -- --nocapture` and it
+prints both sides. The count does not vary with the build profile.
 
 Nothing else. No test opens `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` or any
-ADR, and no other sentence of `README.md` is read. Every other number, signature
-and guarantee in the prose surface is unenforced by the suite — **26,322 lines**
-across
-`README.md`, `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` and the **nineteen** ADRs
-(`cat DESIGN.md ROADMAP.md CONTRACTS.md README.md docs/adr/*.md | wc -l`), or
-**28,484** counting `benches/README.md`, `CONTRIBUTING.md` and this file. Both
-figures move whenever anyone edits any of those files, so re-take them rather
-than quoting them. (They read 24,951 and 26,777 over seventeen ADRs, before
-0018 and 0019 existed and before R4's integration pass edited five of the other
-documents; re-taken 2026-08-21.)
+ADR, and no other sentence of `README.md` is read.
 
-> **Re-taken again 2026-08-21, by the regression audit after R4**, whose own
-> correction blocks in `ROADMAP.md` and `docs/adr/0019-value-representation.md`
-> moved them: **26,385** and **28,558**, by the two `wc -l` pipelines above —
-> the second figure counts this file, so it counts this block too, and was
-> re-taken after the block was written rather than before. This is the third
-> pair of numbers this paragraph has carried in one day, which is the
-> paragraph's own point.
+**So treat every other number in the prose surface as unenforced.** That is the
+reason this project keeps its documents thin on figures: an unenforced number
+does not stay true, nobody finds out when it stops, and the effort of keeping it
+current is spent whether or not it was worth anything. If a number matters
+enough to write down, arm it the way that test does; if it does not, leave it in
+the file the command wrote.
+### How claims are written here
 
-> **And a fourth pair, 2026-08-21, from the second regression audit**, which
-> added ADR 0019 §7, correction blocks in `ROADMAP.md`, `CONTRACTS.md`,
-> `docs/adr/0012-w2-contract.md`, `CONTRIBUTING.md`, `README.md` and this file:
-> **26,685** and **28,933**, same two pipelines, re-taken after these blocks
-> were written. The ADR total is **16,353** (`cat docs/adr/*.md | wc -l`).
+A number belongs where it was taken — in the file the command wrote, or in the
+ADR that argues from it. This document carries **shapes and procedures**: which
+command to run, which way a trade goes, what will bite you. Where it does give a
+figure, expect a magnitude rather than a decimal.
 
-So the checked/written boundary is:
-
-**CHECKED — machine-verified against the tree, will fail if the tree moves:**
-
-- The two *guarded* measurement files, and only those. `benches/` holds
-  **five** since R4 (`ls benches/*.json`) — `w6-ladder-r3.json` is the post-R3
-  re-take, `w6-spike-r4.json` the R4 re-take of the spike's `read_line` half,
-  and `adr0018-mcts.json` the compute-kernel re-pricing ADR 0018 §1 asked for.
-  **Nothing reads any of those three**, which `benches/README.md` states rather
-  than leaves to be discovered; they are measurements, not guards. (This line
-  said "three since R3" and was correct when written; R4 added two files.)
-  `benches/w6-ladder.json`
-  and `benches/w6-spike.json` are read by
-  `ply-corpus/tests/w6_report_integrity.rs:304
-  the_shipped_ladder_still_describes_the_tree_it_ships_in` and
-  `ply-corpus/tests/w6_report_allocations.rs:115
-  the_shipped_allocation_evidence_still_describes_this_request_path`. Both run
-  under `cargo test --workspace`. Read the doc comment at
-  `w6_report_integrity.rs:280-302` — it opens *"the staleness guard, and the one
-  this audit exists because nothing had"* — for what they actually assert: rung
-  *shape* as a fraction of the framing rung in every profile, and absolute
-  microseconds **in release only, within a factor of four either way**. That band
-  is deliberately wide and is not a tight guard.
-- **One sentence of `README.md`** — its request-path allocation count, both
-  numbers, within 1%, by `w6_report_allocations.rs:163
-  the_readme_still_describes_this_request_path`. See the section above for why
-  that one and nothing else.
-- Behavioural invariants stated as tests, e.g. the rename invariant at
-  `ply-cli/tests/cli.rs:145`. How many of the suite's tests pin a documented
-  guarantee rather than an implementation detail is **not measured and no
-  document claims a figure for it.**
-- Anything you can re-run from this file. The loop numbers, the selection table,
-  the obligation counts, the host-handler counts and `same-tests.sh`'s 29
-  agreements all reproduced in this audit.
-
-**WRITTEN — true when someone typed it, unverified since:**
-
-- Every prose claim in `README.md` bar the one sentence above, and every one in
-  `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md`
-  and the **nineteen** ADRs (`ls docs/adr/*.md | wc -l`; this said seventeen).
-- `CONTRACTS.md` in particular is a **construction** document, not an API
-  reference. Its own preamble says so: *"Crates are implemented concurrently
-  against them, so a signature here is a promise other crates have already been
-  written to call."* It describes what was to be built, and the tree has moved
-  under it — `World` occurs **37 times on 33 lines** (`grep -o '\bWorld\b'
-  CONTRACTS.md | wc -l` against `grep -c World CONTRACTS.md`; this line said "33
-  times", which is the line count, not the occurrence count) and the type it
-  means is gone. Be precise about "gone", because `CONTRACTS.md:1516`'s own
-  correction block is not: it says *"there is no `ply_eval::world`, no `World`
-  and no `CellId` in `crates/`"*, and `grep -rn '\bWorld\b' crates/*/src`
-  returns **20 hits**. Nine of them are a real, live, *unrelated* type —
-  `ply_corpus::model::World` (`crates/ply-corpus/src/model.rs:269`), a struct in
-  the corpus generator's cost model — and the other eleven are doc comments in
-  `ply-eval` and `ply-test` explaining what the removed type used to do
-  (`task_regions.rs` ×7, `arena.rs:760`, `ply-test/src/region.rs` ×2,
-  `ply-test/src/schedule.rs:4`). What is actually true is the narrower claim,
-  and it does check out: there is no `ply_eval::world` module
-  (`ls crates/ply-eval/src/world*` → no matches), no `ply_eval` `World`, and no
-  `CellId` type anywhere — the only two `CellId` strings in the tree are prose
-  at `crates/ply-eval/src/escape.rs:9` and `:29`. There is a
-  correction block at `CONTRACTS.md:1516` with a translation table
-  (`World` → `TaskRegions`/`Arena`, `World::cells` → `Arena::slots`, and so on),
-  but the stale signature at `:1535` is nineteen lines below it. Read upward for
-  a correction block before you believe any signature there.
-- ADR 0016's spike numbers, which as of §1 above cannot be re-taken at all.
-
-### How the corrections are written, and why
-
-Where an audit found a false claim, the convention is to **correct in place and
-keep the original beside the measurement** rather than delete. `README.md` uses
-`> **Corrected: …**` blocks; `ROADMAP.md` uses `> **Audit note …**`. A withdrawn
-claim that was silently removed teaches nobody. Follow the convention — see
-`CONTRIBUTING.md` §"Writing a claim down".
-
+Corrections are made in place. The record of what a number used to be is git's
+job, and putting it in prose costs every future reader while helping none of
+them. Keep a note beside a claim only when it would otherwise be *redone*: a
+rejected alternative, a trap, or a measurement taken for the wrong question.
 ## 8. What to work on, and why M9 is deferred
 
 **Start at `ROADMAP.md` §"What is next"** (the last section of the file). It is
 the current queue and it is ordered on purpose: each item moves the number the
 next one is judged against.
-
-> **Re-taken after R4 (2026-08-21). Items 0, 1 and 3 below all state something
-> the tree has since moved, and the list is left standing with the corrections
-> attached because `ROADMAP.md` §"What is next" carries the same corrections and
-> the two must not drift apart.**
 
 0. **Decide the regions question.** R3 ended on a decision rule fixed before it
    started and the rule fired against the design: `/health` still allocates
@@ -1180,26 +662,18 @@ next one is judged against.
    baseline is in `benches/w6-ladder.json`'s `boxing on hot paths` alternative.
    `ROADMAP.md` §R3 is the record.
 
-   > **1,082 was R3's reading; the same command reads 773.4 here**, three runs
-   > byte-identical, after R4's two levers. That is now *below* the pre-region
-   > 1,035 — and it does **not** settle this item, because R4 changed how a
-   > value is built and not whether a region is the right memory model. Nobody
-   > has taken a number for what the forkable world cost.
-
 1. Unboxed primitive representation, and monomorphization. R3's attribution
    points here: `frame::dispatch < Machine::step < Machine::call` is **45.5%** of
    what a request allocates, per `cargo test -p ply-corpus --release --test
    w6_alloc_sites -- --nocapture`.
 
-   > **"Unboxed primitive representation" was never a thing this tree could
-   > do.** `Int`, `Bool`, `Float`, `Unit`, `Decimal`, `Cell` and `Task` are
-   > inline variants of a 32-byte `Value` and allocate nothing; ADR 0019 §4
-   > *rejects* narrowing `Value` with the number that would have justified it,
-   > which is zero. `frame::dispatch` at 45.5% is a **frame** ranking and the
-   > frame is three different things — attributed by the value instead
-   > (`cargo test -p ply-corpus --release --test r4_value_construction --
-   > --nocapture`) its bulk was the call-argument vector, now handled.
-   > **Monomorphization is untouched and still open.**
+> **"Unboxed primitive representation" is not a lever here.** `Int`, `Bool`,
+> `Float`, `Unit`, `Decimal`, `Cell` and `Task` are already inline variants of a
+> `Value` and allocate nothing; ADR 0019 §4 *rejects* narrowing `Value`, with the
+> number that would have justified it, which is zero. A profile that ranks
+> `frame::dispatch` high is ranking a **frame**, and the frame is three different
+> things — attributed by value instead, its bulk was the call-argument vector,
+> which is handled. **Monomorphization is untouched and still open.**
 
 2. Evidence passing and handler specialization.
 3. Re-measure codegen's ceiling — **before** re-arguing M9. The *ladder* half has
@@ -1208,13 +682,14 @@ next one is judged against.
    The *spike* half still cannot be re-taken, because the spike does not build;
    see §1. `ROADMAP.md` §"What is next" item 3 now records that blocker.
 
-   > **The spike builds and the ceiling was measured.**
-   > `benches/w6-spike-r4.json` is the re-take of the `read_line` half and
-   > `benches/adr0018-mcts.json` is the same instrument pointed at a compute
-   > kernel that is 81.0% inside the compiled fragment. End to end it is
-   > **0.998×** — nothing — and the Amdahl ceiling is **4.86×**, because **the
-   > interpreter cannot enter compiled code**. That sentence is a prerequisite
-   > for every codegen lever and it is in no ADR yet.
+> **The ceiling is fragment coverage, not entry.** This block used to say the
+> interpreter *cannot enter* compiled code; it can, and does — `--backend
+> cranelift` is a real JIT in the shipped binary. What decides whether that is
+> worth anything is how much of a program falls inside the compiled fragment: on
+> a compute kernel it is most of it and the win is large, on a program built out
+> of the standard library it is a fraction of a percent and compiling costs more
+> than entering saves. That is the lever to argue about, and ADRs 0026 and 0030
+> carry the series.
 
 Plus two small recorded obligations: delete `crates/ply-codegen-spike` per ADR
 0016 §3.5, and fix `Machine::constant` refusing the memo inside any open
@@ -1236,15 +711,13 @@ than re-arguable. Run it:
 ./target/release/ply-corpus w6 benches/w6-ladder.json benches/w6-spike.json
 ```
 
-> **Two ladders exist since R3, and the line above renders the older one on
-> purpose** — it is the W6 file the verdict quoted below came off, kept because
-> it is also the only record of the pre-region allocation baseline. For the
-> current tree substitute `benches/w6-ladder-r3.json`, taken 2026-08-18: the
-> verdict is the same (`keep deferring M9`) and the numbers inside it move a
-> little — share 35%, ceiling **1.53x**, projection **1.46x**. **Do not run
-> `ply-corpus w6 benches/*.json`**: `w6` merges last-wins and the glob sorts
-> `-r3` first, so it silently renders the older file. `benches/README.md`
-> §"There are two ladders" is the full note.
+> **Two ladders exist and the line above renders the older one on purpose** — it
+> is the file the verdict quoted below came off, kept because it is also the only
+> record of the pre-region allocation baseline. For the current tree substitute
+> `benches/w6-ladder-r3.json`; the verdict is the same. **Do not run `ply-corpus
+> w6 benches/*.json`**: `w6` merges last-wins and the glob sorts `-r3` first, so
+> it silently renders the older file. `benches/README.md` §"There are two
+> ladders" is the full note.
 
 That prints the verdict, its inputs, and — the part that matters — the exact
 condition that reopens it. The verdict block, **abridged** (marked as such
@@ -1321,9 +794,8 @@ Everything here cost this audit real time. In descending order of cost.
    the grep that shows it. §4.
 6. **`grep conflict` matches 51 files** across two unrelated conflict notions.
    §6.
-7. **`PLY_PG_URL` is set by nothing *locally*** — the withdrawn wording was
-   "is set by nothing", and CI has set it since 2026-08-24 — so ten postgres
-   tests still pass without running on your machine. `ROADMAP.md`'s gate table
+7. **`PLY_PG_URL` is set by nothing *locally*.** CI sets it; your machine does
+   not, so the live postgres tests pass without running on your machine. `ROADMAP.md`'s gate table
    says that skip "says so, on stderr of a passing test", which is **not true
    under `cargo test`**: cargo captures it, so the default run tells you
    nothing. A fifth gate, `PLY_TEST_DB`, hides 26 more and prints nothing at
@@ -1352,7 +824,7 @@ Everything here cost this audit real time. In descending order of cost.
     `README.md:499` and the workspace root `Cargo.toml:22` declare
     `MIT OR Apache-2.0`.~~ **Fixed 2026-08-27**: `LICENSE-MIT` and
     `LICENSE-APACHE` are at the root, checked against three independent copies
-    each out of `~/.cargo/registry`. Two corrections to the withdrawn text
+    each out of `~/.cargo/registry`.
     itself. ~~`README.md:499`~~ was already stale when it was written — the file
     is 663 lines (658 then; this change added five below `## License`) and the
     licence is at **`README.md:656`**; line 499 is about type aliases. And the
