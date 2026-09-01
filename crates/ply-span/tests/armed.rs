@@ -13,7 +13,7 @@ const UNARMED_CODES: &[(&str, &str)] = &[
     (
         "DB_SCHEMA_MISMATCH",
         "E0435. Reserved for a schema verification that was specified and never \
-         built. NOT fixed and NOT blessed: docs/adr/0014-w4-contract.md s8 says \
+         built. NOT fixed and NOT blessed: the database design says \
          \"E0435 and E0438 are registered and reserved but never emitted\", \
          and CONTRIBUTING.md \
          s\"Do not state a guarantee you have not armed\" carries it as its \
@@ -22,7 +22,7 @@ const UNARMED_CODES: &[(&str, &str)] = &[
     ),
     (
         "DB_UNMODELLED_SIDE_EFFECT",
-        "E0438. Same reservation, and docs/adr/0014-w4-contract.md s8 calls \
+        "E0438. Same reservation, and the database design calls \
          it \"the more serious of the two absences\". NOT fixed. Both codes are \
          in crates/ply-eval/src/host.rs's RESERVED_CODES, so a handler cannot \
          answer with either — a real, armed restriction (is_reserved_code), and \
@@ -64,7 +64,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
         "AssertionKind::RecursionLimit",
         "CONTRIBUTING.md item 14, and row 4 of the catalogue in \
          CONTRIBUTING.md s\"The shape it keeps taking\". \
-         crates/ply-eval/src/limit.rs:82 quotes the withdrawn claim that ADR \
+         crates/ply-eval/src/limit.rs:82 quotes a withdrawn claim that the failure \
          0004's RecursionLimit \"still classifies it\" and records that nothing \
          does. See AssertionKind::Bool.",
     ),
@@ -1683,7 +1683,7 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
         "{unlisted:?} installs a compiled backend and is not listed in BACKEND_INSTALLERS.\n\n\
              A run with a backend attached is a third execution strategy, and a cached `Pass` is \
              a claim about the authoritative engine. Every route that can install one owes both \
-             halves of ADR 0026 \u{a7}4.6: the command must not READ the cache (a clause \
+             halves of the cache rule: the command must not READ the cache (a clause \
              `cache_bypassed` can see) and the runner must not WRITE it (`Record::Backend`).\n\
              Add the route here with the reason it is safe, and a test that has been seen to \
              fail. Do NOT loosen this gate to make the entry disappear."
@@ -1704,7 +1704,7 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
     assert!(
         contains(&bypassed, b"backend"),
         "`cache_bypassed` cannot see whether a backend was installed, so a backend run would \
-         read the result cache: ADR 0026 \u{a7}4.6.\ncache_bypassed reads: {}",
+         read the result cache: the cache rule.\ncache_bypassed reads: {}",
         String::from_utf8_lossy(&bypassed)
     );
 
@@ -1732,7 +1732,7 @@ fn between(text: &[u8], open: &[u8], close: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Two ADRs may not share a number.
+/// Two decision records may not share a number.
 #[test]
 fn no_two_adrs_share_a_number() {
     let dir = workspace_root().join("docs/adr");
@@ -1750,7 +1750,7 @@ fn no_two_adrs_share_a_number() {
     }
     assert!(
         !seen.is_empty(),
-        "no ADRs found — this test is reading the wrong directory"
+        "no records found — this test is reading the wrong directory"
     );
     let clashes: Vec<String> = seen
         .iter()
@@ -1759,9 +1759,8 @@ fn no_two_adrs_share_a_number() {
         .collect();
     assert!(
         clashes.is_empty(),
-        "two ADRs share a number, so a citation of the form `ADR {}` is ambiguous \
+        "two records share a number, so a reference to that number is ambiguous \
          and one of them has to be renumbered:\n  {}",
-        clashes[0].split(':').next().unwrap_or("NNNN"),
         clashes.join("\n  ")
     );
 }

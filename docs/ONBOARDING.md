@@ -103,7 +103,7 @@ nor writes the result cache. `ply test --help` has the grammar;
 costs, including the workload where it is a **net loss**.
 
 **Use the release binary for anything you intend to time.** The debug
-interpreter is dominated by `debug_assertions`; ADR 0016 §1.6 refuses to mix the
+interpreter is dominated by `debug_assertions`; ADR 0011 refuses to mix the
 two profiles in one comparison and so should you.
 
 **Lint and format are clean and there is no configuration to install:**
@@ -669,7 +669,7 @@ purpose: each item moves the number the next one is judged against.
 
 > **"Unboxed primitive representation" is not a lever here.** `Int`, `Bool`,
 > `Float`, `Unit`, `Decimal`, `Cell` and `Task` are already inline variants of a
-> `Value` and allocate nothing; ADR 0019 §4 *rejects* narrowing `Value`, with the
+> `Value` and allocate nothing; ADR 0019 *rejects* narrowing `Value`, with the
 > number that would have justified it, which is zero. A profile that ranks
 > `frame::dispatch` high is ranking a **frame**, and the frame is three different
 > things — attributed by value instead, its bulk was the call-argument vector,
@@ -691,11 +691,10 @@ purpose: each item moves the number the next one is judged against.
 > than entering saves. That is the lever to argue about, and ADRs 0026 and 0030
 > carry the series.
 
-Plus two small recorded obligations: delete `crates/ply-codegen-spike` per ADR
-0016 §3.5, and fix `Machine::constant` refusing the memo inside any open
+Plus two small recorded obligations: delete `crates/ply-codegen-spike` per ADR 0011, and fix `Machine::constant` refusing the memo inside any open
 scheduler region, which costs a spawning service 1.77x on `/health`.
 
-> **Do not delete the spike yet.** ADR 0016 §3.5 wants it gone, and it is the
+> **Do not delete the spike yet.** ADR 0011 wants it gone, and it is the
 > only instrument in the repository that can price a code generator — ADR 0018
 > §1 could not have been answered without it. Deleting it and then re-arguing
 > M9 from a file is the failure mode this whole section exists to prevent.
@@ -735,12 +734,12 @@ M9: keep deferring M9
   - over its repeats that share runs 35.1%–35.4%
   - the spike compiled `std.http.read_line` and held 11.67x on its weakest
     input, which projects 1.48x end to end
-  - 6 of ADR 0016 §4's 7 cheaper levers are not priced, and a cheaper lever
+  - 6 of ADR 0011's 7 cheaper levers are not priced, and a cheaper lever
     that has not been priced is on its own a reason to keep deferring: [… the
     six levers and their descriptions follow on this same line …]
   M9 reopens when the interpreter share reaches 50% (it is 35%, a 1.55x
   ceiling), and the projection reaches 1.50x (it is 1.48x), and the 6 unpriced
-  lever(s) in ADR 0016 §4 are priced and the best of them measures at or below
+  lever(s) in ADR 0011 are priced and the best of them measures at or below
   1.24x end to end
 ```
 
@@ -751,7 +750,7 @@ decision turns on. Note that the block does not line-wrap in reality — each
 bullet is one long line.)
 
 Three of four criteria fail — C1 share, C2 ceiling and C3 nothing-cheaper, with
-only C4 correctness passing (ADR 0016 lines 1149–1152 tabulate them) — and the
+only C4 correctness passing (ADR 0011 lines 1149–1152 tabulate them) — and the
 unpriced-lever criterion is independently sufficient on its own. The command
 also prints `this report is incomplete` with **twelve** named reasons (re-counted
 from the run above; this line said seven). They are six about the measurement —
@@ -761,7 +760,7 @@ to 9.74µs, so *its printed 5.84µs did not resolve its own sign*; and the −46
 residue — plus one line for each of the six unpriced levers. That is the house
 style: the report argues against itself in its own output.
 
-`ADR 0016` is where the decision lives; `ROADMAP.md` §M9 is the summary. **Do
+`ADR 0011` is where the decision lives; `ROADMAP.md` §M9 is the summary. **Do
 not re-argue M9 from the numbers in either.** Re-measure.
 
 ## 9. Traps

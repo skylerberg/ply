@@ -1,5 +1,5 @@
 #!/bin/sh
-# The ladder behind the numbers in `docs/adr/0020-self-hosting-the-front-end.md` §3.
+# The ladder behind the self-hosting spike's nesting numbers.
 #
 #   ./bench.sh [path-to-ply-binary]
 #

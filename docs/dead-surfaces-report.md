@@ -369,17 +369,17 @@ let tier = match (self.culprit, self.ran, self.depth) {
 
 **Three of the five tiers are unreachable and the secondary sort key is a
 constant.** The ranking that ships is: culprits first, then everything else by
-`Derived`-ness and then by name. ADR 0004 §6 specifies five tiers and says
+`Derived`-ness and then by name. ADR 0004 specifies five tiers and says
 "innermost first"; two tiers ship.
 
 ### 1.2 What the decision record promised, and what a reader believes today
 
-**ADR 0004 §5 "The causal slice"** (`docs/adr/0004-machine-shaped-failure.md` §5)
+**ADR 0004 "The causal slice"** (`docs/adr/0004-machine-shaped-failure.md` §5)
 specifies `stack`, `entered` and `observed`, and closes: *"`ply-eval` gains the
 recorder; the hook is `Interp::apply` for named closures and the perform site for
 atoms."*
 
-**ADR 0004 §7** prints an example failure object with a populated `causal_slice`,
+**ADR 0004** prints an example failure object with a populated `causal_slice`,
 then justifies each field in a 20-row table (`0004:403-422`).
 
 **`CONTRACTS.md:1315`** heads the type's section **"Causal slice — landed in
@@ -419,10 +419,9 @@ binary writes.** The four the correction names (412–415), plus:
   `null`. **The comparison the row asks for cannot be performed.**
 - **410 and 411, the `assertion` rows** — section 2 of this report.
 
-**What a reader of the docs believes today, in one sentence each.** From ADR 0004
-§7: that a failure report names the path through the source to the failure, the
+**What a reader of the docs believes today, in one sentence each.** From ADR 0004: that a failure report names the path through the source to the failure, the
 call counts along it, which handler fired, and which suspects did not run. From
-ADR 0004 §6: that suspects are sorted innermost-first. From `CONTRACTS.md:1315`:
+ADR 0004: that suspects are sorted innermost-first. From `CONTRACTS.md:1315`:
 that the causal slice has landed. From `ply test --help`: that `--trace always`
 will *"trace the first execution too"*. **All five are false of the shipped
 binary**, and only the first is corrected anywhere.
@@ -480,7 +479,7 @@ Nothing in `ply_eval` records a call. `Trace` holds a `Footprint` and a `u64`
 
 | what | where | risk |
 | --- | --- | --- |
-| `Enter`/`Return` events with the qualified name and the caller's span | `Interp::apply` (`crates/ply-eval/src/interp.rs:722`) **and** `Machine::apply` (`crates/ply-eval/src/machine.rs:1861`) — CONTRACTS.md:1382 names only the first, and Ply has had two engines since | a push and a pop per call on both hot paths. ADR 0004 §5 anticipates this and is why tracing is specified to run on a **re-run** |
+| `Enter`/`Return` events with the qualified name and the caller's span | `Interp::apply` (`crates/ply-eval/src/interp.rs:722`) **and** `Machine::apply` (`crates/ply-eval/src/machine.rs:1861`) — CONTRACTS.md:1382 names only the first, and Ply has had two engines since | a push and a pop per call on both hot paths. ADR 0004 anticipates this and is why tracing is specified to run on a **re-run** |
 | a traced re-run, and the reproduction check | `ply-test/src/lib.rs`, `diagnose.rs`; `Options::trace` finally read | a second execution of a failing test, per failure |
 | `truncated` handling all the way to the artifact | already written (`slice.rs:220-241`, `report.rs:455`) | none — this half is built |
 | **the result-cache question** | unanswered anywhere in the record | a traced re-run is a second execution strategy. Whether its result may enter the cache is the same question §3 asks about a backend, and it is **not** settled by any ADR. If the answer changes evaluation semantics, house rule 9 requires bumping `RUNTIME_VERSION` (`crates/ply-store/src/lib.rs:83`, currently `0.11.2`) with a reason. **Flagged as open, not answered here.** |
@@ -591,7 +590,7 @@ field that has never existed, which is a milestone, not a fix.
 | | files touched | tests that go red | documents to correct | new risk |
 | --- | --- | --- | --- | --- |
 | ARM `observed` only | 2-3 (`ply-test/src/lib.rs`, `diagnose.rs`, and `commands/test.rs` if `footprint.observed` is re-plumbed off the slice) | **6** — `cli.rs:1643`, `:1645`, `test.rs:2017`, `:2020`, `tests.rs:1835`, `:2010`; two of them must be *rewritten* rather than deleted, to keep `null` and `[]` apart | 3 (`slice.rs:47-67` again, ADR 0004 rows 414 and 419) | the trap above: the first real output contains atoms in no declared row |
-| ARM everything | + `ply-eval/src/interp.rs`, `machine.rs`, `trace.rs`, `slice.rs`, `report.rs`, `commands/test.rs` | the same **6** | + ADR 0004 §5/§6, `CONTRACTS.md:1382` | a push and a pop per call in both engines; result-cache question unanswered; possible `RUNTIME_VERSION` bump |
+| ARM everything | + `ply-eval/src/interp.rs`, `machine.rs`, `trace.rs`, `slice.rs`, `report.rs`, `commands/test.rs` | the same **6** | + ADR 0004, `CONTRACTS.md:1382` | a push and a pop per call in both engines; result-cache question unanswered; possible `RUNTIME_VERSION` bump |
 | DELETE everything | 8 source files | **6**, deleted rather than fixed, plus the 4 `SliceBuilder` tests in `bisect_audit.rs` | 10 sections across 4 documents | `SCHEMA_VERSION` 4 → 5, breaking for artifact consumers |
 
 The split recommendation costs the least and closes the most: it removes the
@@ -601,7 +600,7 @@ and leaves the
 expensive half as an explicit, costed deferral rather than as dead code that
 reads like a feature.
 
-**If the split is rejected, DELETE beats full ARM.** ADR 0004 §7's own standard
+**If the split is rejected, DELETE beats full ARM.** ADR 0004's own standard
 is *"A field an agent cannot act on is noise … a field that cannot answer it
 should be deleted rather than defended."* Nine rows currently fail that test.
 
@@ -699,7 +698,7 @@ $ sed -n '1523,1533p' crates/ply-test/src/lib.rs
 **So `AssertionKind::RecursionLimit` is a symptom, not a surface.** Constructing
 one variant of a type that nothing constructs changes nothing. The dead surface is
 `Assertion` — `kind`, `expected`, `actual`, `first_difference.path`, `message` —
-the whole ADR 0004 §7 `assertion` object.
+the whole ADR 0004 `assertion` object.
 
 **Third, measured, on the failure the item is actually about.** S4, pre-registered
 as an amendment before it was run, five runs of the audit's own `RUNAWAY` program
@@ -908,7 +907,7 @@ crates/ply-codegen-spike/tests/mutations.rs:539:            .contains("recursion
 >
 > Split by workspace, because §3.1 establishes that `crates/ply-codegen-spike`
 > declares its own `[workspace]` and `cargo test --workspace` never reaches it,
-> and ADR 0016 §3.5 says it is thrown away whatever the verdict:
+> and ADR 0011 says it is thrown away whatever the verdict:
 >
 > | | occurrences | files | `#[test]` fns | of those, depend on the string |
 > | --- | --- | --- | --- | --- |
@@ -937,7 +936,7 @@ crates/ply-codegen-spike/tests/mutations.rs:539:            .contains("recursion
 
 ### 2.2 What the decision record promised
 
-**ADR 0004 §7**'s example object (`0004:355-362`) shows a populated `assertion`,
+**ADR 0004**'s example object (`0004:355-362`) shows a populated `assertion`,
 and two rows of its table justify it:
 
 | row | what it promises |
@@ -950,8 +949,7 @@ diagnostic"* as part of what `ply-eval` gains. **`CONTRACTS.md:1334`** lists the
 enum: `pub enum AssertionKind { Eq, Bool, Panic, Runtime, UnhandledEffect,
 RecursionLimit }`.
 
-**Neither ADR 0004 nor `CONTRACTS.md` carries any correction for this.** ADR
-0004's 2026-08-24 correction block covers `causal_slice` and does not mention
+**Neither ADR 0004 nor `CONTRACTS.md` carries any correction for this.** ADR 0004's 2026-08-24 correction block covers `causal_slice` and does not mention
 `assertion`.
 
 **What a reader believes today:** that `failures[].assertion.kind` is the field to
@@ -997,7 +995,7 @@ actually classifies unless they are rewritten.
 
 **`SCHEMA_VERSION` bumps 4 → 5** — a field leaves.
 
-**Documents to correct in place:** ADR 0004 §7's example object (`0004:355-362`)
+**Documents to correct in place:** ADR 0004's example object (`0004:355-362`)
 and rows 410–411; `CONTRACTS.md:1334`; `CONTRIBUTING.md` item 14 and its row in
 §"The shape it keeps taking"; `crates/ply-eval/src/limit.rs:80-95`, whose
 correction block exists only to explain why the phrase "recursion limit" is kept.
@@ -1038,9 +1036,9 @@ built.
 | | files touched | tests red | documents | note |
 | --- | --- | --- | --- | --- |
 | ARM, kind + message only | 4-5 (`ply-eval` failure sites, a channel, `ply-test/src/lib.rs`, `slice.rs`) | 3 | ADR 0004 rows 410-411 still need correcting — partially armed is still wrong | the honest minimum |
-| ARM, full payload | + a `Value` renderer and a structural diff in `ply-eval` | 3 | rows 410-411 corrected by being made true | the largest of the three; ADR 0004 §7 is the only design |
+| ARM, full payload | + a `Value` renderer and a structural diff in `ply-eval` | 3 | rows 410-411 corrected by being made true | the largest of the three; ADR 0004 is the only design |
 | DELETE | 3 (`slice.rs`, `lib.rs`, `report.rs`) | 3, deleted | 5 sections in 3 documents | `SCHEMA_VERSION` 4 → 5; pairs naturally with §1's delete, one bump for both |
-| the code-based assertion DELETE should carry with it | 7 test files in 3 crates (`ply-cli`, `ply-eval`, `ply-test`) in the main workspace; 3 more in `ply-codegen-spike`, which is its own workspace and is to be thrown away (§3.1, ADR 0016 §3.5) | 0 — the additions are assertions beside existing passing ones | none | **corrected 2026-08-27**: this row said "four tests" before §2.1's third correction; it is 10 tests in 7 files in the maintained tree, 14 in 10 counting the spike. Purely additive, and the CLI-level ones can assert `E0501` vs `E0502` directly, which `failure_classification_audit.rs:231` already does |
+| the code-based assertion DELETE should carry with it | 7 test files in 3 crates (`ply-cli`, `ply-eval`, `ply-test`) in the main workspace; 3 more in `ply-codegen-spike`, which is its own workspace and is to be thrown away (§3.1, ADR 0011) | 0 — the additions are assertions beside existing passing ones | none | **corrected 2026-08-27**: this row said "four tests" before §2.1's third correction; it is 10 tests in 7 files in the maintained tree, 14 in 10 counting the spike. Purely additive, and the CLI-level ones can assert `E0501` vs `E0502` directly, which `failure_classification_audit.rs:231` already does |
 
 > **Correction in place (2026-08-27).** The row above is new, and the two
 > sentences it replaces in §2.5's headline and one-line reason read *"keep the
@@ -1068,10 +1066,10 @@ built.
 > table of contents does not cost an ARM that has already been paid for.
 >
 > * **2026-08-28.** `ply_eval::backend::Reference` — a tree-walking backend —
->   and `ply test --backend`. ADR 0026 §4.5 and §4.6.
+>   and `ply test --backend`. ADR 0026 and §4.6.
 > * **2026-08-31.** `crates/ply-codegen` — a **cranelift JIT** in the shipping
 >   workspace, `ply test --backend cranelift`, 31 cranelift packages in
->   `Cargo.lock`, no feature flag and no second toolchain. ADR 0026 §4.7 and
+>   `Cargo.lock`, no feature flag and no second toolchain. ADR 0026 and
 >   §4.9.
 >
 > Three specific rows below are now false and are named rather than edited,
@@ -1083,14 +1081,14 @@ built.
 >   there are two shipping implementors, and the spike builds on 1.93.1 since
 >   it moved to cranelift 0.132.3.
 > * §3.3's *"the result-cache rule, armed | unwritten"* — it is written, in both
->   of ADR 0026 §4.6's stages, and each has been watched to fail.
+>   of ADR 0026's stages, and each has been watched to fail.
 > * §3.3's *"**Tests that would go red:** none, directly — which is itself the
 >   finding. There is no test asserting the CLI *cannot* attach a backend"* —
 >   there are 28, in `crates/ply-cli/tests/suite/backend.rs`, asserting what happens
 >   when it does.
 >
 > §3.4's DELETE-A costing is the part that survives intact and is still the best
-> account of what `rm -r crates/ply-codegen-spike` costs; ADR 0026 §4.7 records
+> account of what `rm -r crates/ply-codegen-spike` costs; ADR 0026 records
 > the deletion condition as met and names the two open findings that hold it.
 
 ### 3.1 What is actually there
@@ -1155,7 +1153,7 @@ files containing a set_compiled CALL                     6
 > survives untouched:** every one of the 42 is a test or the spike's harness, and
 > `crates/ply-cli` contains zero. Handed on, not fixed here.
 
-**What the seam costs and what it buys, from the record.** ADR 0016 §3.5's
+**What the seam costs and what it buys, from the record.** ADR 0011's
 correction block records the cost: *"a public `Compiled` trait,
 `Machine::set_compiled`, three counters on `Machine`, and a branch in
 `Machine::enter_code` taken on every interpreted call — none of it with a shipping
@@ -1184,7 +1182,7 @@ pinned to rustc 1.94.0 because cranelift requires it.
 
 ### 3.2 What the decision record promised, and what it forbids
 
-**ADR 0016 §3.5 "What the spike may not do"** (`0016:564-599`) — three sentences
+**ADR 0011 "What the spike may not do"** (`0016:564-599`) — three sentences
 that bear directly on any recommendation here:
 
 > It may **not** be wired into `ply run`, `ply test` or any other command.
@@ -1199,10 +1197,10 @@ And its own in-place correction (`0016:574-590`), which is the honest half:
 > and R5 is what made it untrue.** … What is false is *"nothing else in the
 > workspace knows it existed"*. After R5, `crates/ply-eval` carries `compiled.rs`
 > … all of it surviving the `rm -r`. That is a deliberate change made by R5 under
-> ADR 0018 §0's "make the interpreter able to enter compiled code", and no ADR
+> ADR 0018's "make the interpreter able to enter compiled code", and no ADR
 > recorded the amendment until this block.
 
-**ADR 0016 §11** (`0016:1309-1315`) records the deletion as still owed:
+**ADR 0011** (`0016:1309-1315`) records the deletion as still owed:
 
 > **One obligation is outstanding.** §3.5 and "Not in W6" require that the spike be
 > deleted when W6 closes. It has not been … so `rm -r crates/ply-codegen-spike` is
@@ -1214,10 +1212,10 @@ And its own in-place correction (`0016:574-590`), which is the honest half:
 > **This does not re-open M9 and nothing here argues that it does.** The 6.199× is
 > measured at a seam **no shipping command can reach** … What this item now owes is
 > not another ratio. It is a decision about whether a backend is ever reachable
-> from a shipping command, which is M9 with an ADR, and ADR 0016 §3.5 still
+> from a shipping command, which is M9 with an ADR, and ADR 0011 still
 > requires the spike be deleted rather than promoted.
 
-**What a reader believes today.** From ADR 0016 §3.5 unaugmented: that deferring
+**What a reader believes today.** From ADR 0011 unaugmented: that deferring
 M9 costs `rm -r` and one dependency line, and that nothing in the workspace knows
 the spike existed. That is corrected in place — a reader who reads the block
 learns the truth. From `compiled.rs`'s own §"What polices this seam": that the
@@ -1236,9 +1234,9 @@ ARM here means: wire a backend into `ply-cli` so `set_compiled` has a shipping
 caller.
 
 **Three documents forbid it without an ADR first, and this report is not
-overruling them.** ADR 0016 §3.5 says a backend *"may **not** be wired into `ply
+overruling them.** ADR 0011 says a backend *"may **not** be wired into `ply
 run`, `ply test` or any other command"* and that the spike *"may **not** be kept
-because it works"*; ADR 0016 §11 records the deletion as owed; `ROADMAP.md`'s item
+because it works"*; ADR 0011 records the deletion as owed; `ROADMAP.md`'s item
 3 says what this owes *"is a decision about whether a backend is ever reachable
 from a shipping command, which is M9 with an ADR"*. **A recommendation to wire the
 seam is a recommendation to do something the record forbids until an ADR says
@@ -1264,9 +1262,8 @@ passing whatever the CLI did.
 **Two different deletions hide under one word, and conflating them is the mistake
 this section exists to prevent.**
 
-**DELETE-A: `rm -r crates/ply-codegen-spike`.** This is what ADR 0016 §3.5 and §11
-require. R5 verified it leaves the workspace green **by performing it** — ADR
-0016 §3.5's correction records `cargo build --workspace --all-targets` and `cargo
+**DELETE-A: `rm -r crates/ply-codegen-spike`.** This is what ADR 0011 and §11
+require. R5 verified it leaves the workspace green **by performing it** — ADR 0011's correction records `cargo build --workspace --all-targets` and `cargo
 test --workspace --no-fail-fast` green at 155 test binaries, 3,680 passed, 0
 failed, and `grep -c cranelift Cargo.lock` at 0. Confirmed structurally here: the
 root `Cargo.toml` `members` list does not name it, and the crate carries its own
@@ -1275,14 +1272,14 @@ root `Cargo.toml` `members` list does not name it, and the crate carries its own
 - **What goes:** 10,083 lines, five cranelift dependencies, one CI job at 1.94.0.
 - **What does NOT go:** `crates/ply-eval/src/compiled.rs` — 578 production lines
   plus ~1,485 of tests — `Machine::set_compiled`, the three counters, and the
-  `enter_code` branch. ADR 0016 §3.5's own correction says exactly this: *"all of
+  `enter_code` branch. ADR 0011's own correction says exactly this: *"all of
   it surviving the `rm -r`."* **DELETE-A does not remove the dead seam. It removes
   the only two real implementors of it.**
 - **Capability lost:** the ability to re-take §9.1's and §9.2's numbers, which
   `ROADMAP:1140-1144` records as already unavailable in `benches/w6-spike.json`
   and which `ROADMAP:1145-1147` records as already un-re-takeable on this
   toolchain. So the loss is thinner than it looks — but it is not nothing, and it
-  is exactly what ADR 0016 §11 means by *"Its measurements survive in
+  is exactly what ADR 0011 means by *"Its measurements survive in
   `benches/w6-spike.json`, which is what the decision reads."*
 
 **DELETE-B: remove the seam too** — `compiled.rs`, `Machine::set_compiled`, the
@@ -1292,7 +1289,7 @@ counters, the `enter_code` branch.
   `differential_corpus.rs` and 3 in `equivalence_audit.rs` that install backends.
 - **Capability lost:** the *measured* result R5 obtained — 6.199× end to end with
   2,162 native entries against 0.998× with zero — becomes un-reproducible, and
-  ADR 0018 §0's prerequisite ("make the interpreter able to enter compiled code")
+  ADR 0018's prerequisite ("make the interpreter able to enter compiled code")
   is un-built. That is a real loss and it is upstream of any future M9.
 - **`RUNTIME_VERSION` question:** removing the `enter_code` branch changes no
   observable evaluation result on a machine with no backend (`compiled: None` at
@@ -1305,7 +1302,7 @@ counters, the `enter_code` branch.
 **DELETE-A and keep the seam, deliberately.** That is what the tree does *today*,
 by accident: the spike is present but un-buildable on this toolchain, the seam is
 present and unreachable, and no document ratifies either state. An ADR could
-ratify it on purpose — the seam is retained as ADR 0018 §0's prerequisite, with a
+ratify it on purpose — the seam is retained as ADR 0018's prerequisite, with a
 written statement that it is unreachable from any command, that the result-cache
 rule is therefore vacuous, and that arming it is M9's first step. That converts a
 dead surface into a **documented, costed deferral**, which is the difference this
@@ -1323,21 +1320,21 @@ it is unreachable and why — the third option, not DELETE-B and not ARM.**
 
 *One-line reason:* the deletion is an outstanding obligation the record names
 twice and a reviewer has already executed successfully, while the seam is the
-only built artefact of ADR 0018 §0's prerequisite and deleting it would throw away
+only built artefact of ADR 0018's prerequisite and deleting it would throw away
 the one measured 6.199× that a future M9 ADR has to argue from.
 
 **Rough cost each way.**
 
 | | files touched | tests red | documents | note |
 | --- | --- | --- | --- | --- |
-| ARM (wire a backend) | `ply-cli` + a backend implementor + the cache rule | 0 red, **which is the problem** | needs a **new ADR** (M9) before any of it; ADR 0016 §3.5 and ROADMAP item 3 forbid it otherwise | largest by far; the cache rule is a silent-wrong-answer risk |
-| DELETE-A | `rm -r` one directory; one CI job; `CONTRIBUTING.md` item 1 | 0 — verified by R5 performing it | ADR 0016 §11 closes; `ROADMAP.md`'s "two smaller obligations" loses one; `benches/README.md`'s `+1.94.0` commands | ~15 minutes of work that has been owed since W6 closed |
-| DELETE-B (also the seam) | `compiled.rs`, `machine.rs`, 2 test files in `ply-eval` | 9 backend tests deleted, 36 `compiled::` tests deleted | + ADR 0018 §0's prerequisite becomes un-built; ADR 0016 §3.5's correction needs a further correction | throws away R5's only reachable result |
-| **DELETE-A + ratify the seam** | `rm -r`, one CI job, **one new short ADR** | 0 | ADR 0016 §11 closes; the seam leaves this catalogue by being documented rather than by being armed | **recommended** |
+| ARM (wire a backend) | `ply-cli` + a backend implementor + the cache rule | 0 red, **which is the problem** | needs a **new ADR** (M9) before any of it; ADR 0011 and ROADMAP item 3 forbid it otherwise | largest by far; the cache rule is a silent-wrong-answer risk |
+| DELETE-A | `rm -r` one directory; one CI job; `CONTRIBUTING.md` item 1 | 0 — verified by R5 performing it | ADR 0011 closes; `ROADMAP.md`'s "two smaller obligations" loses one; `benches/README.md`'s `+1.94.0` commands | ~15 minutes of work that has been owed since W6 closed |
+| DELETE-B (also the seam) | `compiled.rs`, `machine.rs`, 2 test files in `ply-eval` | 9 backend tests deleted, 36 `compiled::` tests deleted | + ADR 0018's prerequisite becomes un-built; ADR 0011's correction needs a further correction | throws away R5's only reachable result |
+| **DELETE-A + ratify the seam** | `rm -r`, one CI job, **one new short ADR** | 0 | ADR 0011 closes; the seam leaves this catalogue by being documented rather than by being armed | **recommended** |
 
 **What this recommendation is not.** It is not a claim that M9 should advance;
 `ROADMAP.md` is explicit that *"every cheaper lever that lands makes M9's case
-weaker"*. It is not a recommendation to promote the spike, which ADR 0016 §3.5
+weaker"*. It is not a recommendation to promote the spike, which ADR 0011
 forbids in those words. It is the smallest action that closes an obligation and
 stops a dead surface reading like a live feature.
 

@@ -40,7 +40,7 @@ impl ValueDomain {
         }
     }
 
-    /// ADR 0007 §6 condition 5.
+    /// The concurrency-law conditions condition 5.
     pub fn covers_every_value(&self) -> bool {
         matches!(self, ValueDomain::Enumerated { .. })
     }
@@ -70,7 +70,7 @@ impl ValueDomain {
     fn vacuity(&self) -> VacuityKind {
         match *self {
             // Enumerating a finite domain and keeping nothing *decides* the guard unsatisfiable,
-            // which is §5.1(f) applied to the guard rather than to the body.
+            // which is exhaustive enumeration applied to the guard rather than to the body.
             ValueDomain::Enumerated { .. } => VacuityKind::ProvedUnsatisfiable,
             ValueDomain::Sampled { generated, .. } => VacuityKind::NoCaseKept { generated },
         }
@@ -317,7 +317,7 @@ impl Totals {
             failure: self.failure.clone(),
             ..Exploration::default()
         };
-        // The five of ADR 0007 §6, and then the sixth: a search that entered no region emptied a
+        // The five of the concurrency-law conditions, and then the sixth: a search that entered no region emptied a
         // frontier it never filled.
         crate::interleaving_proves(plan, &exploration, domain.covers_every_value())
             && self.observed
@@ -478,7 +478,7 @@ fn race_site(site: &ply_eval::RaceSite) -> String {
     format!("{}  {definition}   {}", site.task, site.access)
 }
 
-/// What ADR 0007 §11's concurrency-law condition test asserts, as a function so that the assertion
+/// What the differential tier audit's concurrency-law condition test asserts, as a function so that the assertion
 /// is one call rather than a re-derivation that can drift from the thing it audits.
 pub fn audit_interleaving_proof(
     obligation: &Obligation,
@@ -826,7 +826,7 @@ mod tests {
         assert_eq!(again.discharge.tier(), None);
     }
 
-    /// ADR 0007 §6's condition 5, and the required test that goes with it: the same law with a
+    /// The concurrency-law conditions's condition 5, and the required test that goes with it: the same law with a
     /// binder is `property` however exhaustive the schedules were.
     #[test]
     fn an_exhaustive_search_over_sampled_values_is_never_proved() {

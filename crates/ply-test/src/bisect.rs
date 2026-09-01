@@ -1511,7 +1511,7 @@ mod tests {
         assert_eq!(out.groups, vec![vec![sym("callee"), sym("x")]]);
     }
 
-    /// The case the ADR insists is common: a mixture that does not typecheck is not evidence, so
+    /// The case that is common: a mixture that does not typecheck is not evidence, so
     /// the search walks around it, keeps the pair it could not separate, and refuses to call the
     /// result minimal.
     #[test]

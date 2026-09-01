@@ -47,7 +47,7 @@ fn unit(source: &str) -> (&'static Loaded, &'static Cranelift) {
 }
 
 /// Arithmetic, comparison, `if`, `let`, a `match` on literals, recursion, and a call between two
-/// members — the fragment ADR 0016 §3.2 pins, in one module.
+/// members — the fragment the spike's fragment pins, in one module.
 const ARITHMETIC: &str = r#"
 fn double(x: Int) -> Int = x * 2
 

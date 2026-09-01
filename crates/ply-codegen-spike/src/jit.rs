@@ -1,4 +1,4 @@
-//! The fragment of ADR 0016 §3.2, compiled with Cranelift.
+//! The fragment of the spike's fragment, compiled with Cranelift.
 
 use crate::program::Loaded;
 use crate::rt::{self, Ctx, Tables};
@@ -352,7 +352,7 @@ impl Jit {
             module_index,
         };
 
-        // The prologue `ply_eval::limit` needs and ADR 0019 §5 item 6 records as missing: one
+        // The prologue `ply_eval::limit` needs and the fragment's gaps item 6 records as missing: one
         // nested call is spent here and given back on the normal return, so a compiled recursion is
         // bounded by the same number the machine bounds an interpreted one by.
         let fuel = fx.load_fuel();
@@ -1139,14 +1139,14 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Concat => self.refuse("`++`"),
-            // ADR 0033 §2's bit operators, refused as a set rather than lowered
+            // the operator decision's bit operators, refused as a set rather than lowered
             // as six instructions. `&`, `|` and `^` really are one instruction
             // each; the shifts are not, because a count outside `0..=63` raises
-            // (§2.2) where Cranelift's `ishl` silently masks it to the low six
+            // where Cranelift's `ishl` silently masks it to the low six
             // bits. A native shift here would therefore answer where the
             // interpreter refuses, and this spike's whole claim is that its
             // ratio is measured over a fragment on which the two backends
-            // agree. Refusing by name is what §3.2 asks for when they do not.
+            // agree. Refusing by name is what the fragment asks for when they do not.
             BinOp::BitAnd
             | BinOp::BitOr
             | BinOp::BitXor

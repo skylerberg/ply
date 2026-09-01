@@ -320,7 +320,7 @@ fn an_alias_in_the_select_list_is_a_name_and_not_a_clause() {
     );
 }
 
-/// The second half of §2.4.
+/// The second half of where the table set comes from.
 #[test]
 fn a_function_the_scanner_will_not_vouch_for_is_refused() {
     for sql in [
@@ -423,7 +423,7 @@ fn malformed_input_is_a_diagnostic_and_never_a_panic() {
     }
 }
 
-/// Not a proof, and the ADR says so: a value is structurally safe because it crosses in a `Bind`,
+/// Not a proof, and the design says so: a value is structurally safe because it crosses in a `Bind`,
 /// and statement text is the program's own to get right.
 #[test]
 fn the_injection_payloads_that_change_a_statements_shape_are_refusals() {

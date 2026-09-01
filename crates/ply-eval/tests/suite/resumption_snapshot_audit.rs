@@ -79,7 +79,7 @@ fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {
     }
 }
 
-/// ADR 0017 §3's two-resumption example with the `handle` written *outside* the `with_cell` instead
+/// The region-kind rule's two-resumption example with the `handle` written *outside* the `with_cell` instead
 /// of inside it.
 const HANDLE_ENCLOSES: &str = r#"
 effect amb { read flip[coin]() -> Bool }
@@ -182,7 +182,7 @@ fn f() -> Int =
     );
     assert_eq!(kind_of(&tail, "trace"), RegionKind::Shared);
 
-    // `with_region[r]` with a cell allocated into it — ADR 0017 §3's own syntax.
+    // `with_region[r]` with a cell allocated into it — the region syntax.
     let with_region = format!(
         r#"{AMB}
 fn f() -> Int =
@@ -236,7 +236,7 @@ fn f() -> List<Int> =
     assert_eq!(kind_of(&callback, "r"), RegionKind::Shared);
 }
 
-/// ADR 0017 §3: "forcing `unique` where a capture is reachable is a compile error naming the
+/// The region-kind rule: "forcing `unique` where a capture is reachable is a compile error naming the
 /// capture site".
 #[test]
 fn forcing_unique_over_a_capture_an_enclosing_handle_answers_is_refused() {

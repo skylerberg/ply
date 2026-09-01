@@ -402,7 +402,7 @@ law \"two writers land twice\"{header} {{
     )
 }
 
-/// ADR 0007 §6's five conditions plus the sixth, one case each.
+/// The concurrency-law conditions's five conditions plus the sixth, one case each.
 #[test]
 fn a_concurrency_law_is_proved_only_when_both_domains_were_covered() {
     let ground = Run::of(&concurrency_law("", "1"));

@@ -135,7 +135,7 @@ fn the_exit_codes_are_the_shell_convention() {
 
 // sockets ---------------------------------------------------------------------------
 
-/// The exit criterion of ADR 0015 §4.3, at the boundary: a program's accept loop ends because
+/// The exit criterion of the drain, at the boundary: a program's accept loop ends because
 /// `accept` answered `0`, and not one line of it changed.
 #[test]
 fn accept_answers_zero_once_the_run_has_stopped_accepting() {
@@ -161,7 +161,7 @@ fn accept_answers_zero_once_the_run_has_stopped_accepting() {
 }
 
 /// The listener handle stays usable after the drain closed it, because `examples/desk.ply` closes
-/// it after the loop returns and §4.3 claims that program needs no source change.
+/// it after the loop returns, which is why that program needs no source change.
 #[test]
 fn the_program_can_still_close_a_listener_the_drain_closed() {
     let host = Arc::new(TcpHost::new());

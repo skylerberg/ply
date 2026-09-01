@@ -132,7 +132,7 @@ fn a_malformed_connection_string_is_e0431_and_is_never_echoed() {
     }
 }
 
-/// ADR 0014 §10: TLS to postgres is not wired up in W4, so a word that promised encryption would be
+/// The trusted computing base listing: TLS to postgres is not wired up in W4, so a word that promised encryption would be
 /// a label that lies — and this project's whole posture is that a label is a truth claim.
 #[test]
 fn an_sslmode_that_promises_encryption_names_the_decision_that_refused_it() {
@@ -148,7 +148,7 @@ fn an_sslmode_that_promises_encryption_names_the_decision_that_refused_it() {
         .expect("ply runs");
     let rendered = stderr_of(&output);
     assert!(rendered.contains("E0431"), "{rendered}");
-    assert!(rendered.contains("ADR 0014 §10"), "{rendered}");
+    assert!(rendered.contains("a word that lies"), "{rendered}");
 }
 
 /// A `--json` command emits exactly one object on stdout, and a start-up refusal is not an

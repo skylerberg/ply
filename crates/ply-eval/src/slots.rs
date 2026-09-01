@@ -1,6 +1,6 @@
 //! Every binding in a barrier gets an index, and every variable occurrence resolves to one.
 //!
-//! ADR 0034 §4's prerequisite. The measurements in §4 leave one shape standing — a frame that holds
+//! The slot rewrite's prerequisite. The measurements leave one shape standing — a frame that holds
 //! values by index, so that narrowing what it holds is clearing slots rather than building a scope —
 //! and this is the half of that which can be checked before any of it runs. Nothing here changes
 //! evaluation: `Env` still answers every lookup by name. What this buys is that when the machine

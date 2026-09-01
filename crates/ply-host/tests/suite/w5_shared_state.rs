@@ -1,4 +1,4 @@
-//! An adversarial audit of the three host states W5 adds, against ADR 0015 §7.
+//! An adversarial audit of the three host states W5 adds, against the shared states.
 
 // A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; that is
 // `ply-eval`'s design and this is the same allow, for the same reason, that `ply-host` itself
@@ -173,7 +173,7 @@ fn span_id(value: &Value) -> i64 {
     }
 }
 
-/// A `Span` a program built for itself, which is what §1.3 says an id is: an ordinary record,
+/// A `Span` a program built for itself, which is what a span id is: an ordinary record,
 /// forgeable, and `E0445` when it names nothing this task holds.
 fn forged(id: i64, channel: &str) -> Value {
     Value::Record(Arc::new(
@@ -197,7 +197,7 @@ fn rendered(diagnostic: &Diagnostic) -> String {
 
 // what is not shared ---------------------------------------------------------------------------
 
-/// The property §7 rests on: the span *stack* is keyed on the machine and the task, so two entry
+/// The property the shared states rest on: the span *stack* is keyed on the machine and the task, so two entry
 /// points recording on channels that do not conflict cannot nest into each other.
 #[test]
 fn two_entry_points_on_disjoint_channels_never_nest_into_each_other() {
@@ -288,7 +288,7 @@ fn a_teardown_closes_only_the_entry_point_that_ended() {
     assert_eq!(d.trace.open_spans(), 0);
 }
 
-/// The question ADR 0015 §1.3 answers with "the handler keeps the stack, per task": a task that is
+/// The question span nesting answers with "the handler keeps the stack, per task": a task that is
 /// suspended across other tasks' whole span lifetimes resumes into the span it opened, and not into
 /// whichever one was opened last.
 #[test]

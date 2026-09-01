@@ -70,7 +70,7 @@ fn upto(n: Int) -> Int = if n == 0 { once(0) } else { once(n) + upto(n - 1) }
 test "a region per iteration" { assert_eq(upto(99), 4950) }
 "#;
 
-/// The shape ADR 0005 §2 charged one retained world entry per iteration for, and which R1's wiring
+/// The shape the persistent world this replaced charged one retained world entry per iteration for, and which R1's wiring
 /// still charged one arena slot per iteration for.
 #[test]
 fn a_region_in_a_loop_costs_one_slot_rather_than_one_per_iteration() {
@@ -114,7 +114,7 @@ fn a_capture_inside_a_region_pins_it() {
     );
     assert_eq!(
         machine.allocations, 1,
-        "one cell served both resumptions — ADR 0017 §3's two-resumption example"
+        "one cell served both resumptions — the region-kind rule's two-resumption example"
     );
 }
 
@@ -143,7 +143,8 @@ test "a continuation outlives the region whose cell it reads" {
 }
 "#;
 
-/// ADR 0005 required test 6, at the reclamation event R2 added.
+/// The escape case — a continuation resumed after the region that made its cell
+/// returned — at the reclamation event R2 added.
 #[test]
 fn a_close_a_live_continuation_can_reach_is_deferred_rather_than_taken() {
     let compiled = Compiled::new(PARKED);

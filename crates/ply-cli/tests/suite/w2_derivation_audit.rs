@@ -193,7 +193,7 @@ fn a_derivation_composed_through_the_module_binder_is_canonical() {
     );
 }
 
-/// `derive ord for T` emits `compare(a, b)` as a **bare** name, and ADR 0001 says a module's own
+/// `derive ord for T` emits `compare(a, b)` as a **bare** name, and the module rules says a module's own
 /// items shadow the prelude.
 #[test]
 fn a_derived_ord_is_the_languages_order_and_not_the_modules() {

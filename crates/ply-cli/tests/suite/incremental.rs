@@ -783,7 +783,7 @@ test "the default crosses the module boundary" {
 }
 "#;
 
-/// **The stale-expansion hazard ADR 0023 refused record update over, checked where defaults do
+/// **The stale-expansion hazard record update refused record update over, checked where defaults do
 /// cross the boundary.**
 #[test]
 fn editing_a_cross_module_default_agrees_and_refuses_the_importer() {

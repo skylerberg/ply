@@ -16,7 +16,7 @@
 #
 # So on a fresh clone it died at step 1 with "No such file or directory", and
 # on a tree where somebody had built once it measured whatever binary happened
-# to be lying there. `docs/adr/0020` §0 is what that costs: a whole ADR's
+# to be lying there. the self-hosting spike is what that costs: a whole record's
 # measurements taken against a binary built 54 seconds after an unattributed
 # source edit. `--no-build` skips the build; it does not skip the check.
 #

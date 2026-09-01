@@ -473,7 +473,7 @@ test "a fractional value is not silently truncated into an Int field" {
     );
 }
 
-/// `Float`'s JSON encoding is **partial on finite values**, not only on the non-finite ones ADR
+/// `Float`'s JSON encoding is **partial on finite values**, not only on the non-finite ones the numeric design names
 /// 0012 names: a number needing more than 28 significant digits of scale, or larger than
 /// `Decimal`'s maximum, has no `Number` to become.
 #[test]

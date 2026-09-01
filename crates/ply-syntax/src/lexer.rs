@@ -114,7 +114,7 @@ pub enum TokenKind {
     Percent,
 
     /// `&`, `^` and `~` are the bit operators of
-    /// `docs/adr/0033-bits-and-files.md` §2. `&` was a character the lexer
+    /// `&` was a character the lexer
     /// reached only to reject; `^` and `~` were in the token set nowhere, so
     /// neither can collide. `&&` and `||` still munch first, so `|| body` is
     /// still a nullary lambda and `TokenKind::Pipe` still separates a sum
@@ -1073,7 +1073,7 @@ mod tests {
 
     /// The one munch the lexer deliberately does *not* do. `Map<Int, List<Int>>`
     /// closes with two `>` that must stay two tokens, so a shift is assembled by
-    /// the expression parser out of adjacent ones (ADR 0033 §2) and never here.
+    /// the expression parser out of adjacent ones (the operator decision) and never here.
     #[test]
     fn angle_brackets_never_munch_into_a_shift() {
         assert_eq!(
@@ -1098,7 +1098,7 @@ mod tests {
         );
     }
 
-    /// Was `a_lone_ampersand_is_reported_and_skipped`. ADR 0033 §2 makes the
+    /// Was `a_lone_ampersand_is_reported_and_skipped`. the operator decision makes the
     /// character real, so the diagnostic that said Ply has no bitwise `&` is
     /// gone and this is the assertion that it is gone.
     #[test]

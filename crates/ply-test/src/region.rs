@@ -73,8 +73,8 @@ mod tests {
     use super::*;
     use ply_eval::arena::Slot;
 
-    /// A fixture of `cells` integer cells, reached through a list of handles — the shape ADR 0005
-    /// §2's `Fixture` names and the only way a test can get at group state at all.
+    /// A fixture of `cells` integer cells, reached through a list of handles — the shape the control-stack design
+    /// The `Fixture` names and the only way a test can get at group state at all.
     fn seeded(cells: usize) -> impl FnOnce(&mut TaskRegions) -> Value {
         move |regions| {
             Value::list(

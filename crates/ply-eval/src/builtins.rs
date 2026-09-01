@@ -824,7 +824,7 @@ pub fn call(
         // The order `Map` iterates in, so a derived `OrdDict` and a map's own key order are one
         // order rather than two that can drift.
         Builtin::Compare | Builtin::CompareValues => {
-            // The runtime backstop ADR 0015 §2.2 asks for.
+            // The runtime backstop the secret representation asks for.
             crate::value::secret_has_no_order(&args[0], b.name(), span)?;
             crate::value::secret_has_no_order(&args[1], b.name(), span)?;
             Ok(Step::Done(Value::ctor(
@@ -881,7 +881,7 @@ pub fn call(
         Builtin::CellSet => {
             let slot = args[0].as_cell(span, "`cell_set`")?;
             // Reported rather than refused: refusing would change what a legal program means, and
-            // ADR 0017 §4 accepts the leak and asks only that it be said out loud.
+            // the reference-counting pass accepts the leak and asks only that it be said out loud.
             crate::rc::cell_cycle(slot, &args[1], span);
             let mut args = args;
             if cells.set(slot, args.remove(1)) {
@@ -974,7 +974,7 @@ pub fn call(
         }
 
         // One bit per call, constant time over the compared bytes, and not rate limited — a loop
-        // over candidates recovers the value, which is the program's to prevent (§2.5 (3)).
+        // over candidates recovers the value, which is the program's to prevent.
         Builtin::SecretVerify => {
             let Value::Secret(held) = &args[0] else {
                 return Err(type_error(span, "`secret_verify`", "Secret", &args[0]));
@@ -1913,7 +1913,7 @@ mod tests {
         );
     }
 
-    /// ADR 0013 §4's builtin.
+    /// The limits's builtin.
     #[test]
     fn concat_all_joins_every_piece_in_order() {
         let empty = done(Builtin::BytesConcatAll, vec![Value::list(vec![])]).unwrap();
@@ -2841,7 +2841,7 @@ mod tests {
 
     /// The three that answer where `+`, `-` and `*` raise, at the boundaries
     /// that are the only reason they exist. A value below 2^32 needs none of
-    /// them — ADR 0033 §2.2 says so — so every case here is at or across the
+    /// them — the shift semantics says so — so every case here is at or across the
     /// 64-bit edge.
     #[test]
     fn the_wrapping_builtins_are_modulo_two_to_the_sixty_fourth() {

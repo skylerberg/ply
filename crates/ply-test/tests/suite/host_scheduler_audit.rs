@@ -398,7 +398,7 @@ test/nondet "one socket, one send" {
     assert_eq!(report.results[0].recorded, Some(ply_test::Record::Host));
 }
 
-/// ADR 0011 §7 refuses a host operation inside a `simulate` region with `E0425`, on the ground that
+/// The footprint check refuses a host operation inside a `simulate` region with `E0425`, on the ground that
 /// "DPOR re-runs a test whole per interleaving; a region that reaches a socket would send one
 /// packet per interleaving explored and call the result a proof".
 const SEND_BESIDE_A_REGION: &str = r#"

@@ -109,7 +109,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # `ply-codegen` sits with `ply-cli` on purpose rather than by balance: the
 # tests that decide whether a code generator is policeable are
 # `crates/ply-cli/tests/suite/backend.rs`, and a partition that could run one
-# without the other would let half of ADR 0026 s4.5's condition go green alone.
+# without the other would let half of the backend decision s4.5's condition go green alone.
 # It also costs that shard almost nothing to run -- its own suite is 12 tests
 # in ~4.4s -- and the cranelift packages behind it are a build `ply-cli` pays
 # anyway.
@@ -137,12 +137,12 @@ POSTGRES_SHARD=postgres
 #
 # The reason attached to the one entry below was rewritten on 2026-08-28,
 # because the old one had stopped being true. It read: "its own workspace on
-# purpose, per ADR 0016 3.5, so that deferring M9 deletes it with rm -r". R5
+# purpose, per the codegen spike, so that deferring M9 deletes it with rm -r". R5
 # falsified that: `rm -r crates/ply-codegen-spike` leaves the whole compiled
 # seam standing in `crates/ply-eval/src/compiled.rs`, so the deletion no longer
-# buys what ADR 0016 3.5 said it buys, and performing it today would remove the
+# buys what the codegen spike said it buys, and performing it today would remove the
 # only implementation of `Compiled` in existence and leave the declaration
-# behind. ADR 0026 4.7 amends 3.5 accordingly and makes the deletion
+# behind. the backend authorisation amends 3.5 accordingly and makes the deletion
 # conditional on something checkable, which is what the entry now records.
 #
 # The reproduction was done on 2026-08-28 and the condition came back NOT
@@ -170,11 +170,11 @@ POSTGRES_SHARD=postgres
 #
 # What holds the entry is no longer the condition. It is that deleting the crate
 # deletes the only instrument for two open things: CONTRIBUTING.md item 18's 42
-# unexplained agreement disagreements, and ADR 0018 0.5's 6.199x, which nothing
-# else produces. ADR 0026 4.7 records both and says item 18 should carry the
+# unexplained agreement disagreements, and the compute-kernel record's 6.199x, which nothing
+# else produces. the backend authorisation records both and says item 18 should carry the
 # deletion.
 declare -a KNOWN_OUTSIDE=(
-  "ply-codegen-spike:its own workspace on purpose; ADR 0026 4.7's deletion condition -- ALL EIGHT wrong backends reproduced in the workspace -- was MET on 2026-08-31 by crates/ply-codegen, so what keeps this crate is no longer the condition but the two open findings only it can measure: CONTRIBUTING.md item 18's 42 agreement disagreements and ADR 0018 0.5's 6.199x kernel figure. Closing item 18 is what should carry the rm -r"
+  "ply-codegen-spike:its own workspace on purpose; the backend authorisation's deletion condition -- ALL EIGHT wrong backends reproduced in the workspace -- was MET on 2026-08-31 by crates/ply-codegen, so what keeps this crate is no longer the condition but the two open findings only it can measure: CONTRIBUTING.md item 18's 42 agreement disagreements and the compute-kernel record's 6.199x kernel figure. Closing item 18 is what should carry the rm -r"
 )
 
 # Tests whose assertion reads a wall clock, as `package:target:test`, where
@@ -291,10 +291,10 @@ declare -a SPIKE_JOBS=(
 # there is nothing for a job to assert, and a benchmark whose output is a number
 # is not a check. `spikes/ply-lexer` is different and its entry says so.
 declare -a SPIKES_OUTSIDE_CI=(
-  "ply-lexer:it HAS a differential and a run.sh and it is BROKEN -- as of 2026-08-30 \`spikes/ply-lexer/run.sh\` does not reach a single test because its harness does not compile: \`non-exhaustive patterns: &ply_syntax::lexer::TokenKind::Question not covered\` at src/lib.rs:66, the identical bit-rot the parser spike one directory over was just repaired for. It is cited by ADR 0020 6.1, ADR 0021 and ADR 0022 for throughput figures that cannot currently be re-taken. Adding a job here would only report a red that is already known; the entry exists so that the red is written down where CI is configured rather than only in a session transcript. Fix the spike, then move it to SPIKE_JOBS"
-  "ply-lexer-nesting:three files -- main.ply, nesting.ply, bench.sh -- and no harness, no fixtures and no differential. It measures how deep a fold nests; its output is a number for ADR 0022, not a pass or a fail"
+  "ply-lexer:it HAS a differential and a run.sh and it is BROKEN -- as of 2026-08-30 \`spikes/ply-lexer/run.sh\` does not reach a single test because its harness does not compile: \`non-exhaustive patterns: &ply_syntax::lexer::TokenKind::Question not covered\` at src/lib.rs:66, the identical bit-rot the parser spike one directory over was just repaired for. It is cited by the self-hosting spike, the bootstrap goal and the call-ceiling decision for throughput figures that cannot currently be re-taken. Adding a job here would only report a red that is already known; the entry exists so that the red is written down where CI is configured rather than only in a session transcript. Fix the spike, then move it to SPIKE_JOBS"
+  "ply-lexer-nesting:three files -- main.ply, nesting.ply, bench.sh -- and no harness, no fixtures and no differential. It measures how deep a fold nests; its output is a number for the call-ceiling decision, not a pass or a fail"
   "ply-lexer-rc:same shape -- main.ply, fieldorder.ply, bench.sh. It measures what building a container anywhere but last in a record literal costs, which is spikes/ply-lexer/GAPS.md 1's measurement. A number, not a check"
-  "ply-lexer-throughput:same shape -- main.ply, lexer.ply, bench.sh. It measures tokens per second for ADR 0020 6.1. A number, not a check"
+  "ply-lexer-throughput:same shape -- main.ply, lexer.ply, bench.sh. It measures tokens per second for the self-hosting spike. A number, not a check"
 )
 
 shard_packages() {

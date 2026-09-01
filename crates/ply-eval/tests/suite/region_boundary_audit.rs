@@ -1,4 +1,4 @@
-//! Escape enforcement at the runtime boundaries ADR 0017 §2's brand cannot see.
+//! Escape enforcement at the runtime boundaries the brand cannot see.
 
 // A `Value`'s shared payloads are `Arc` and are deliberately thread-confined, which is the crate's
 // own allow rather than something these fixtures choose.
@@ -45,7 +45,7 @@ fn bound(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> H
     registry.bind(&compiled.check).expect("the registry binds")
 }
 
-/// ADR 0017 §2's open route, and ADR 0005 required test 6: a continuation parked in an enclosing
+/// The brand's open route, and the escape case: a continuation parked in an enclosing
 /// region's cell and resumed after the region whose cell it reads has returned.
 const PARKED: &str = r#"
 effect amb { read flip[coin]() -> Bool }
@@ -93,7 +93,7 @@ test/nondet "the answer comes back" {
 }
 "#;
 
-/// ADR 0017 §2 records one route as open and this milestone does not close it.
+/// The escape brand records one route as open and this milestone does not close it.
 #[test]
 fn the_documented_open_route_still_behaves_as_adr_0017_section_2_says() {
     let compiled = Compiled::new(PARKED);
@@ -497,8 +497,8 @@ fn a_law_cannot_quantify_over_a_record_that_reaches_a_region() {
     );
 }
 
-/// A value crossing into a task is deliberately *not* refused — ADR 0017 §2 excludes `task.spawn`
-/// from a bare `with_cell`'s rule because a cell reaching a task is how tasks share memory — and §3
+/// A value crossing into a task is deliberately *not* refused — the escape brand excludes `task.spawn`
+/// from a bare `with_cell`'s rule because a cell reaching a task is how tasks share memory — and the region-kind rule
 /// is what makes that safe: a `task` operation anywhere in a region infers `shared`, and a shared
 /// region's slots outlive its close.
 #[test]

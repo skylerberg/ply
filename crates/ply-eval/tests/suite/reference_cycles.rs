@@ -1,4 +1,4 @@
-//! Why the leak ADR 0017 §4 accepts is not reachable yet, pinned so that the day it becomes
+//! Why the leak the reference-counting pass accepts is not reachable yet, pinned so that the day it becomes
 //! reachable is a failing test rather than a silent leak.
 
 use crate::fixture::Compiled;
@@ -19,7 +19,7 @@ test "a cell that reaches itself" {
     );
     assert!(
         diags.iter().any(|d| d.code == codes::OCCURS_CHECK),
-        "a cell stored inside its own contents would be the leak §4 accepts, and the occurs \
+        "a cell stored inside its own contents would be the leak the reference-counting pass accepts, and the occurs \
          check is what stops it being written: {diags:#?}"
     );
 }

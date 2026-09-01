@@ -217,7 +217,7 @@ fn a_measured_input_carries_four_times_and_an_agreement() {
     assert!(r.spike_best_micros > 0.0);
 }
 
-/// The seven operators of ADR 0033 §2, each refused by the operator it is.
+/// The seven operators of the operator decision, each refused by the operator it is.
 ///
 /// The refusal is what the spike is claiming, so it is what a test has to hold.
 /// `&`, `|` and `^` would each be one Cranelift instruction and the temptation

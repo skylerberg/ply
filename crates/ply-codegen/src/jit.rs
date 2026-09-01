@@ -1,4 +1,4 @@
-//! The fragment of ADR 0016 §3.2, compiled with Cranelift.
+//! The fragment of the spike's fragment, compiled with Cranelift.
 
 use crate::rt::{self, Ctx, Tables};
 use crate::source::Source;
@@ -363,7 +363,7 @@ impl Jit {
             module_index,
         };
 
-        // The prologue `ply_eval::limit` needs and ADR 0019 §5 item 6 records as missing: one
+        // The prologue `ply_eval::limit` needs and the fragment's gaps item 6 records as missing: one
         // nested call is spent here and given back on the normal return, so a compiled recursion is
         // bounded by the same number the machine bounds an interpreted one by.
         let fuel = fx.load_fuel();

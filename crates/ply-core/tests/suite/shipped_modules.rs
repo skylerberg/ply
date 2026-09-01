@@ -18,7 +18,7 @@ fn every_shipped_module_checks() {
     assert!(out.modules.contains_key(&Symbol::new("std.http")));
 }
 
-/// The claim ADR 0013 §2 rests on.
+/// The claim HTTP framing rests on.
 #[test]
 fn framing_is_pure() {
     let out = shipped();

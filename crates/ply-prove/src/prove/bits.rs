@@ -62,7 +62,7 @@ fn a_bit_operator_is_a_function_of_its_operands() {
     proof(&f, "a masked value is a value");
 }
 
-/// A shift count outside `0..=63` raises (ADR 0033 §2.2), so a shift is a value only where its
+/// A shift count outside `0..=63` raises (the shift semantics), so a shift is a value only where its
 /// count is a bit position — and the fragment decides that condition, so the guarded restatement is
 /// back in reach.
 #[test]

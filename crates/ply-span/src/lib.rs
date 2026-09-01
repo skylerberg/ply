@@ -367,7 +367,7 @@ pub mod codes {
     pub const REGION_ESCAPE: &str = "E0446";
     /// Two regions in scope at once under one name.
     pub const REGION_ALREADY_OPEN: &str = "E0447";
-    /// A region declared `unique` across which a continuation capture is reachable — ADR 0017 §3.
+    /// A region declared `unique` across which a continuation capture is reachable.
     pub const REGION_KIND_REFUSED: &str = "E0448";
     /// A value reaching a runtime boundary carrying a handle into a region — a `Cell`, a `Task` or
     /// a continuation — where no type is left for [`REGION_ESCAPE`] to look at: a host operation's
@@ -378,7 +378,7 @@ pub mod codes {
     pub const BACKEND_UNAVAILABLE: &str = "E0450";
     /// A `fs` operation named a resource label the run bound no root to.
     ///
-    /// The label *is* the capability (ADR 0033 §4): `fs.read_file[src]` says
+    /// The label *is* the capability (the rooted filesystem effect): `fs.read_file[src]` says
     /// "somewhere under whatever `src` names", and what it names is
     /// `--fs src=./crates` beside the run rather than a path inside the
     /// program — a path in the program would put a filesystem location into a
@@ -439,8 +439,8 @@ pub mod codes {
     pub const CONFIG_UNDECLARED: &str = "W0607";
     /// The drain deadline expired with connections still in flight.
     pub const DRAIN_INCOMPLETE: &str = "W0608";
-    /// A value was made to reach itself, so reference counting will never free it: ADR 0017 §4 does
-    /// not collect cycles and accepts the leak.
+    /// A value was made to reach itself, so reference counting will never free it. Cycles are not
+    /// collected, and the leak is accepted.
     pub const REFERENCE_CYCLE: &str = "W0610";
     /// Spans were still open when an entry point ended, so teardown closed them rather than the
     /// program.

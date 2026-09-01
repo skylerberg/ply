@@ -481,15 +481,15 @@ impl Spike {
     }
 }
 
-/// One entry of ADR 0016 §4's table, **in code**.
+/// One entry of the cheaper levers's table, **in code**.
 pub struct Lever {
     /// The key an [`Alternative`] carries in its `name` to answer for this lever.
     pub name: &'static str,
-    /// What the change is, in the ADR's words.
+    /// What the change is, in one sentence.
     pub what: &'static str,
 }
 
-/// ADR 0016 §4's seven levers.
+/// The cheaper levers's seven levers.
 pub const LEVERS: [Lever; 7] = [
     Lever {
         name: "more native builtins",
@@ -498,7 +498,7 @@ pub const LEVERS: [Lever; 7] = [
     },
     Lever {
         name: "the frame push",
-        what: "ADR 0005's four heap allocations per frame push, priced by the engine substitution \
+        what: "the control-stack design's four heap allocations per frame push, priced by the engine substitution \
                and by an allocation count",
     },
     Lever {
@@ -568,13 +568,13 @@ impl Alternative {
     }
 }
 
-/// Every §4 lever this file does not price, as the sentence C3 fails on.
+/// Every cheaper lever this file does not price, as the sentence C3 fails on.
 pub fn c3_gaps(alternatives: &[Alternative]) -> Vec<String> {
     let mut gaps = Vec::new();
     for lever in &LEVERS {
         match alternatives.iter().find(|a| a.name == lever.name) {
             None => gaps.push(format!(
-                "`{}` is in ADR 0016 §4 and this report says nothing about it: {}",
+                "`{}` is in the cheaper levers and this report says nothing about it: {}",
                 lever.name, lever.what
             )),
             Some(entry) if !entry.priced => gaps.push(format!(
@@ -857,7 +857,7 @@ pub fn decide(
     let gaps = c3_gaps(alternatives);
     if !gaps.is_empty() {
         decision.reasons.push(format!(
-            "{} of ADR 0016 §4's {} cheaper levers {} not priced, and a cheaper lever that has not \
+            "{} of the cheaper levers's {} cheaper levers {} not priced, and a cheaper lever that has not \
              been priced is on its own a reason to keep deferring: {}",
             gaps.len(),
             LEVERS.len(),
@@ -868,14 +868,14 @@ pub fn decide(
         // them no better than half M9's projected gain.
         let priced = if e > 1.0 {
             format!(
-                "the {} unpriced lever(s) in ADR 0016 §4 are priced and the best of them measures \
+                "the {} unpriced lever(s) in the cheaper levers are priced and the best of them measures \
                  at or below {:.2}x end to end",
                 gaps.len(),
                 1.0 + (e - 1.0) / criteria.alternative_margin
             )
         } else {
             format!(
-                "the {} unpriced lever(s) in ADR 0016 §4 are priced — though at a {e:.2}x \
+                "the {} unpriced lever(s) in the cheaper levers are priced — though at a {e:.2}x \
                  projection no alternative's ratio would let M9 through",
                 gaps.len()
             )
@@ -964,7 +964,7 @@ pub fn decide(
             criteria.min_spike
         ));
         decision.reopens_at =
-            "decided for this workload; scheduling it is a milestone with an ADR".to_string();
+            "decided for this workload; scheduling it is a milestone of its own".to_string();
         return decision;
     }
     if k >= criteria.gray_spike {
@@ -1167,7 +1167,7 @@ impl Report {
         for alternative in &self.alternatives {
             if alternative.lever().is_none() {
                 findings.push(format!(
-                    "`{}` answers for no lever in ADR 0016 §4, so nothing C3 asks about is priced \
+                    "`{}` answers for no lever in the cheaper levers, so nothing C3 asks about is priced \
                      by it",
                     alternative.name
                 ));
@@ -1521,7 +1521,7 @@ mod tests {
         }
     }
 
-    /// Every §4 lever priced, with `best` the ratio of the best of them.
+    /// Every cheaper lever priced, with `best` the ratio of the best of them.
     fn roster(best: f64) -> Vec<Alternative> {
         LEVERS
             .iter()
@@ -1802,7 +1802,7 @@ mod tests {
         assert!(decision.reasons[0].contains("negative"));
     }
 
-    /// ADR 0026 §4.2, in code: the ladder answers about what it measured.
+    /// The withdrawal of the ladder, in code: the ladder answers about what it measured.
     #[test]
     fn a_verdict_names_the_workload_it_was_taken_on_and_never_names_a_milestone() {
         let full = report(full_points());
@@ -1895,7 +1895,7 @@ mod tests {
         );
     }
 
-    /// **C3 is checked against ADR 0016 §4, not against the file.**
+    /// **C3 is checked against the cheaper levers, not against the file.**
     #[test]
     fn a_report_that_prices_no_lever_at_all_defers_and_names_all_seven() {
         let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();

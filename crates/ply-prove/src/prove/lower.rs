@@ -55,7 +55,7 @@ const TOTAL_BUILTINS: &[&str] = &[
     "float_of_decimal",
     "decimal_of_float",
     "int_of_decimal",
-    // The wrapping arithmetic (ADR 0033 §2.2). Total by construction: they
+    // The wrapping arithmetic (the shift semantics). Total by construction: they
     // exist because `+`, `-` and `*` raise on overflow and a mixing step needs
     // an answer there, so there is no input any of them declines. Uninterpreted
     // still — `wrap_add(x, 0) == x` is `property` — and being total is what
@@ -277,7 +277,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
     /// `a << n`, `a >> n` and `a >>> n` raise unless `n` is a bit position of
     /// an `Int`. Every count is one or none of them, so this is the whole of
     /// the condition — a shift itself refuses nothing else, and `<<` discarding
-    /// what leaves the word is deliberate rather than a raise (ADR 0033 §2.2).
+    /// what leaves the word is deliberate rather than a raise (the shift semantics).
     fn require_shift_count(&mut self, count: TermId) {
         let zero = self.terms.int_lit(0);
         let width = self.terms.int_lit(63);
@@ -686,7 +686,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 self.terms.force_int(rhs);
                 self.blocked(Blocker::BitOperator);
                 // A shift is a value only where its count is a bit position
-                // (ADR 0033 §2.2), which is a condition this fragment decides
+                // (the shift semantics), which is a condition this fragment decides
                 // — so a shift under a guard that bounds its count is in
                 // reach, the way a division under one that establishes its
                 // divisor is. `&`, `|` and `^` refuse no input and owe nothing.

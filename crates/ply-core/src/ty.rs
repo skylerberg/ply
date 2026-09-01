@@ -257,7 +257,7 @@ impl Type {
     }
 }
 
-/// The builtin type constructor W5 §2 is about.
+/// The builtin type constructor the secret containment claim is about.
 pub const SECRET: &str = "Secret";
 
 impl fmt::Display for Type {

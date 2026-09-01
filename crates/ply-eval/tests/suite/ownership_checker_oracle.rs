@@ -1,5 +1,5 @@
-//! The ownership checker, judged against the counters rather than against itself — ADR 0025
-//! §Decision 2b.
+//! The ownership checker, judged against the counters rather than against itself — the ownership design
+//! the per-site falsifier.
 
 use ply_eval::costs::{Cause, Costs, DefKind, Definition, Verdict};
 use ply_eval::rc;
@@ -158,7 +158,7 @@ struct Tally {
     defs_needing_edit: usize,
     /// No append copies but at least one is undecidable.
     defs_undecided: usize,
-    /// Of `defs_needing_edit`, the ones whose only copying causes are positional — ADR 0025's P1
+    /// Of `defs_needing_edit`, the ones whose only copying causes are positional — the ownership design's P1
     /// and P2 are evaluator changes that remove these with **no source edit at all**.
     edit_position: usize,
     /// Of `defs_needing_edit`, the ones that need a mechanical library migration and nothing else:
@@ -358,13 +358,13 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
 
     println!(
         "\n=== THE ANNOTATION BURDEN ===\n\
-         ADR 0025 has no annotation, so its burden is zero by construction and reporting\n\
+         This design has no annotation, so its burden is zero by construction and reporting\n\
          that would be vacuous. What is counted here is the honest translation: a FORCED\n\
          SOURCE EDIT. A definition is `clean` when every append in it reuses — nothing to\n\
          write, nothing to move. It needs an `edit` when an append copies, and the cause\n\
          table below says which edit.\n\n\
          The three `edit` columns are what a reader has to see before the total:\n\
-           pos  — only positional causes. ADR 0025's P1 and P2 are EVALUATOR changes;\n\
+           pos  — only positional causes. The carry and parameter fixes are EVALUATOR changes;\n\
                   they remove these with no source edit at all. MEASURED as copying\n\
                   today, PROJECTED to zero after P1/P2 — the projection is not mine to\n\
                   claim and is labelled as one.\n\
@@ -486,8 +486,8 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
     }
 
     println!(
-        "\n=== ADR 0025 §Decision 2b, measured rather than argued ===\n\
-         The ADR registers, before building it: \"every `push` whose list argument the \
+        "\n=== The per-site falsifier, measured rather than argued ===\n\
+         Registered before it was built: \"every `push` whose list argument the \
          lowering\n marked `Own::Owned` must be counted in place, or the test fails\" \
          — and predicts\n that this \"will fail on the tree as it stands\". Both halves \
          are checked here."
@@ -533,7 +533,7 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
         println!("  VIOLATION {v}");
     }
     if own_violations.is_empty() {
-        println!("  (none — the ADR's predicted failure did not occur)");
+        println!("  (none — the predicted failure did not occur)");
     }
     println!(
         "the checker's own verdict covers {} sites; `Own::Owned` covers {own_total}, \
@@ -542,7 +542,7 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
     );
     assert!(
         own_executed > 0,
-        "no `Own::Owned`-marked append ran, so ADR 0025 §Decision 2b's proposal was not \
+        "no `Own::Owned`-marked append ran, so the falsifier was not \
          measured and the paragraph above says nothing"
     );
 

@@ -62,7 +62,7 @@ fn a_connection_string_that_does_not_parse_is_e0431() {
     assert_eq!(error.code, codes::DB_NOT_CONFIGURED);
 }
 
-/// ADR 0014 §10: `require` and above is `E0431` naming the paragraph, because wiring rustls into
+/// The trusted computing base listing: `require` and above is `E0431` naming the paragraph, because wiring rustls into
 /// the postgres client is a real decision about the trusted computing base rather than a line to
 /// add untested.
 #[test]
@@ -133,7 +133,7 @@ fn the_checkout_statement_sets_both_timeouts_and_resets_the_session() {
     ] {
         assert!(recycled.contains(reset), "{reset} is missing: {recycled}");
     }
-    // §4.3: the prepared-statement cache is the thing the pool exists to amortise, and `DISCARD
+    // The prepared-statement cache is the thing the pool exists to amortise, and `DISCARD
     // ALL` would drop it.
     assert!(!recycled.contains("DISCARD ALL"), "{recycled}");
     assert!(
@@ -177,7 +177,7 @@ fn a_statement_outside_a_scope_acquires_runs_and_gives_the_connection_back() {
     }
 }
 
-/// ADR 0014 §13, test 26.
+/// The required tests, test 26.
 #[test]
 fn an_exhausted_pool_is_e0437_after_the_acquire_deadline() {
     let Some(reactor) = reactor("exhaust", |c| {
@@ -272,7 +272,7 @@ fn acquiring_never_blocks_the_thread_that_asked() {
 
 // transactions.
 
-/// ADR 0014 §1.3 and §13 test 9.
+/// The scope stack.
 #[test]
 fn a_connection_whose_transaction_was_abandoned_is_safe_to_reuse() {
     let Some(reactor) = reactor("abandoned", |c| c.size = 1) else {
@@ -433,7 +433,7 @@ fn setup_table(reactor: &Reactor, table: &'static str) {
     }
 }
 
-/// The other half of §1.3: a connection whose `ROLLBACK` fails is closed and discarded rather than
+/// The other half of what closes an abandoned scope: a connection whose `ROLLBACK` fails is closed and discarded rather than
 /// returned.
 #[test]
 fn a_connection_whose_rollback_fails_is_discarded_rather_than_returned() {
@@ -562,7 +562,7 @@ fn a_connection_the_server_closed_is_detected_rather_than_handed_out() {
     }
 }
 
-/// ADR 0014 §13, test 27, asserted by reading `current_setting` through the same connection rather
+/// The required tests, test 27, asserted by reading `current_setting` through the same connection rather
 /// than by trusting the string the pool sent.
 #[test]
 fn both_server_side_timeouts_are_set_on_every_connection_at_checkout() {
@@ -984,8 +984,8 @@ impl Relay {
     }
 }
 
-/// ADR 0014 §3.2: a connect failure *during* a run is a value the program matches on and not a
-/// diagnostic, because a database that restarted is a peer that went away — and ADR 0013 §7.1
+/// The connection pool: a connect failure *during* a run is a value the program matches on and not a
+/// diagnostic, because a database that restarted is a peer that went away — and a peer's misbehaviour
 /// already decided what those are.
 #[test]
 fn a_database_that_went_away_mid_run_is_a_value_and_the_next_request_reconnects() {

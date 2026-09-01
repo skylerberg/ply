@@ -165,7 +165,7 @@ pub enum Value {
     /// A captured continuation.
     Continuation(Rc<Continuation>),
     /// A credential, and a **distinct variant** rather than a `Ctor { name: "Secret", .. }`, which
-    /// is the single most important line of ADR 0015 §2: a `Ctor` is matchable, and `match s {
+    /// is the single most important line of the secret containment claim: a `Ctor` is matchable, and `match s {
     /// Secret(plain) -> plain }` would be a one-line escape from every guarantee below.
     Secret(Arc<Value>),
 }

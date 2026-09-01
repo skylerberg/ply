@@ -1,5 +1,5 @@
 //! The postgres [`Driver`]: the piece that joins the scanner, the type mapping, the scope table and
-//! the connection pool into something a Ply `db` operation resolves to.
+//! The connection pool into something a Ply `db` operation resolves to.
 
 use super::handler::{Driver, Statement};
 use super::pool::{self, Cleanup, LeaseId, Opened, Outcome, Reactor};
@@ -93,8 +93,8 @@ fn aborted_or_ok(commit: bool, poisoned: bool) -> Value {
     opened_ok()
 }
 
-/// A peer that went away, which ADR 0014 §3.2 makes a value rather than a diagnostic: a database
-/// that restarted is a peer, and ADR 0013 §7.1 already decided what those are.
+/// A peer that went away, which the connection pool makes a value rather than a diagnostic: a database
+/// that restarted is a peer, and a peer's misbehaviour already decided what those are.
 fn unreachable(why: &str) -> Value {
     failed(&DbError::connection(why.to_string()))
 }
@@ -497,7 +497,7 @@ pub use sqlstate::{
 };
 
 /// What the shutdown coordinator asks the database for: one number, for one line of output and for
-/// the drain's own report.
+/// The drain's own report.
 impl crate::signal::Transactions for Postgres {
     fn open_scopes(&self) -> usize {
         Postgres::open_scopes(self)

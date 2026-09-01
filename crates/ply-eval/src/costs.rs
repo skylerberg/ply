@@ -1,4 +1,4 @@
-//! Whether an append copies, decided before the program runs — ADR 0025 §Decision 2.
+//! Whether an append copies, decided before the program runs — the ownership design.
 
 use crate::builtins::Builtin;
 use crate::code::{self, Code, NodeKind, Stmt};
@@ -129,7 +129,7 @@ pub struct Site {
     /// `None` at a [`Verdict::Reuses`] site, which has no cause to name.
     pub cause: Option<Cause>,
     /// Whether the lowering marked this append's **list argument** [`Own::Owned`] — the property
-    /// ADR 0025 §Decision 2b proposed to assert on, recorded here so that proposal can be measured
+    /// The ownership design proposed to assert on, recorded here so that proposal can be measured
     /// rather than argued.
     pub own_marked: bool,
 }

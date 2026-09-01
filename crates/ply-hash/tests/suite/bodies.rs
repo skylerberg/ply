@@ -337,7 +337,7 @@ fn prefixes(a, p) = -a + ~a + (if !p { 1 } else { 0 })
 "#;
 
 /// The comment above `body::binop_of` called its table "pinned by a round-trip
-/// test over every operator" and no such test existed; ADR 0033 added six
+/// test over every operator" and no such test existed; the bit and filesystem surface added six
 /// operators to `binop_byte` and one to `unop_byte`, and the inverse is a
 /// second hand-written list, so an omission there is not a compile error — it
 /// is `W0602` at decode time, on a body that hashed and stored perfectly well.

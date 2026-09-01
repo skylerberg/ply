@@ -1,4 +1,4 @@
-//! Which of ADR 0017 §3's two kinds each region in a program is.
+//! Which of the region-kind rule's two kinds each region in a program is.
 
 use crate::arena::RegionKind;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -13,7 +13,7 @@ pub enum Cause {
     /// A handler clause with a `resume` binder, which may resume any number of times.
     Clause { effect: Symbol, op: Symbol },
     /// A tail-resumptive clause, whose continuation reaches no binder and is spliced above the
-    /// region's close, so it is not on its own a reason to be `shared` — ADR 0034 §8.
+    /// region's close, so it is not on its own a reason to be `shared` — the tail-resumptive refinement.
     TailClause { effect: Symbol, op: Symbol },
     /// A `perform` no `handle` inside the region answers.
     Escapes { effect: Symbol, op: Symbol },
@@ -551,7 +551,7 @@ impl<'a> Analysis<'a> {
                 self.walk(init, ctx, out);
                 let bound = vec![binder.name.clone()];
                 // A cell written inside the region of the same brand is a value allocated in *that*
-                // region — ADR 0017 §1 — so it opens nothing.
+                // region — the region model — so it opens nothing.
                 if ctx.brands.contains(&resource.name) {
                     self.scoped(bound, |a| a.walk(body, ctx, out));
                 } else {
@@ -720,7 +720,7 @@ impl<'a> Analysis<'a> {
     }
 }
 
-/// ADR 0017 §3: forcing `unique` where a capture is reachable is a compile error naming the capture
+/// The region-kind rule: forcing `unique` where a capture is reachable is a compile error naming the capture
 /// site.
 fn refuse_unique(found: &Found, site: &CaptureSite) -> Diagnostic {
     let mut d = Diagnostic::error(

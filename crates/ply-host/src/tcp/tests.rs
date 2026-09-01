@@ -99,7 +99,7 @@ fn bytes(v: Value) -> Vec<u8> {
         .to_vec()
 }
 
-/// `recv` and `send` answer an `Option` since ADR 0013 §7.2, where `None` is a deadline.
+/// `recv` and `send` answer an `Option` since deadlines as arguments, where `None` is a deadline.
 fn inside(v: Value) -> Value {
     match &v {
         Value::Ctor { name, args } if name.as_str() == "Some" => args[0].clone(),
@@ -605,7 +605,7 @@ fn a_connection_closed_mid_read_reads_empty_rather_than_failing() {
     peer.join().expect("the peer finished");
 }
 
-/// The substitution ADR 0008 §5 is about: one driver, two bindings, no change to what it performs.
+/// The substitution the simulated twin is about: one driver, two bindings, no change to what it performs.
 #[test]
 fn the_socket_and_the_script_answer_the_same_program() {
     let script = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));

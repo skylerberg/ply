@@ -1,4 +1,4 @@
-//! ADR 0015 §2 at the evaluator: what a credential renders as, what comparing two of them does, and
+//! The secret containment claim at the evaluator: what a credential renders as, what comparing two of them does, and
 //! what happens when one reaches the host boundary.
 
 // A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; that is
@@ -217,7 +217,7 @@ test "the three builtins" {
     );
 }
 
-/// §2.5 (2), stated as a test rather than only as prose: the plaintext the secret was built from is
+/// The second of the routes secrets do not close, stated as a test rather than only as prose: the plaintext the secret was built from is
 /// still in scope and is still a `String`.
 #[test]
 fn the_plaintext_the_secret_was_built_from_is_not_consumed() {

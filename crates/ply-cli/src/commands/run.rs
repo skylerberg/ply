@@ -122,7 +122,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     if !args.json {
         print_binding(&hosts, style);
     }
-    // ADR 0015 §4.5: `--drain-ms` should exceed the program's own `body_timeout_ms +
+    // a request live at the deadline: `--drain-ms` should exceed the program's own `body_timeout_ms +
     // write_timeout_ms`, and the run cannot check that because `http::Limits` is a Ply value it
     // never sees — so the number is printed where it can be compared by eye against the one in the
     // program.
@@ -163,7 +163,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
 
     let counters_value = counters_json(&ply_eval::rc::stats());
 
-    // A cycle among escaped values is never collected (ADR 0017 §4), so the run that built one is
+    // A cycle among escaped values is never collected (the reference-counting pass), so the run that built one is
     // the only place a reader can be told it is there.
     let mut config_warnings = config_warnings;
     let cycles = ply_eval::rc::take_cycles();
@@ -263,7 +263,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     }
 }
 
-/// ADR 0015 §4.4's pinned order: every open transaction rolled back and never committed, every open
+/// The teardown order's pinned order: every open transaction rolled back and never committed, every open
 /// span closed `Abandoned`, the sink flushed, the pool closed.
 pub(crate) fn teardown(
     hosts: &Hosts,

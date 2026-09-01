@@ -1,4 +1,4 @@
-//! **ADR 0034 §10 G1 — position invariance, registered before the measurement.**
+//! **the gate G1 — position invariance, registered before the measurement.**
 
 use ply_eval::rc;
 use ply_eval::{Machine, TaskRegions};
@@ -10,12 +10,12 @@ use ply_syntax::resolve::{Resolved, resolve};
 /// The thresholds, pinned before the numbers exist.
 #[derive(Clone, Copy, Debug)]
 struct Criteria {
-    /// ADR 0034 §10 G1, first bullet: `|in_place_rate(canonical) −
+    /// the gate G1, first bullet: `|in_place_rate(canonical) −
     /// in_place_rate(pessimal)| ≤ 0.02` for **every** pair. Two spellings of one
     /// computation may not differ in cost by more than measurement noise, and
     /// there is no noise in an append count, so this is nearly an equality.
     max_position_gap: f64,
-    /// ADR 0034 §10 G1, second bullet: `in_place_rate(canonical) ≥ 0.95` for
+    /// the gate G1, second bullet: `in_place_rate(canonical) ≥ 0.95` for
     /// every pair whose canonical form is linear today. Without it the first
     /// bullet is satisfiable by making the canonical form as slow as the
     /// pessimal one, which is the wrong direction to converge in.
@@ -52,7 +52,7 @@ struct Pair {
     canonical_linear_today: bool,
 }
 
-/// ADR 0025 §Context rows 1 and 2 — `go(i + 1, push(acc, i))` at 200 / 200
+/// the ownership design rows 1 and 2 — `go(i + 1, push(acc, i))` at 200 / 200
 /// against `go(push(acc, i), i + 1)` at 0 / 200. The two functions differ in
 /// parameter order because that is the shape: the growing argument moves, and
 /// nothing else about the computation does.
@@ -74,7 +74,7 @@ test "the growing argument is first in the call" {
 }
 "#;
 
-/// ADR 0025 §Context rows 3 and 4 — the same loop with the accumulator inside a
+/// the ownership design rows 3 and 4 — the same loop with the accumulator inside a
 /// record, the growing field last against first in the literal. This is the
 /// rule as `docs/GUIDE.md` §6.7 states it.
 const RECORD_FIELD_CANONICAL: &str = r#"
@@ -97,7 +97,7 @@ test "the growing field is first in its literal" {
 }
 "#;
 
-/// ADR 0025 §Context row **five**, which is the finding: the growing field is
+/// the ownership design row **five**, which is the finding: the growing field is
 /// last in its literal — the documented rule, applied correctly — and the
 /// record is not last in the enclosing call, so the program is quadratic
 /// anyway. The rule compounds at every enclosing node on the path from the
@@ -113,12 +113,12 @@ test "the growing field is last and its record is first in the call" {
 }
 "#;
 
-/// ADR 0025 §Context cause 1 — *"an accumulator threaded as a `let` binding is
+/// the ownership design cause 1 — *"an accumulator threaded as a `let` binding is
 /// reused; the identical accumulator threaded as a parameter is not"*, measured
 /// there as 1 of 1 against 0 of 1 on
 /// `{ let t = push(xs, 1); let u = 7; len(t) + u }`. Those three statements are
 /// reproduced verbatim in both members — with the binding that produces `xs`
-/// added ahead of them, since ADR 0025's fragment does not say where `xs` comes
+/// added ahead of them, since the ownership design's fragment does not say where `xs` comes
 /// from and that is the whole of what this pair varies: a statement binder here,
 /// a parameter there.
 const PARAM_VS_LET_CANONICAL: &str = r#"
@@ -154,7 +154,7 @@ test "the accumulator arrives as a parameter" {
 }
 "#;
 
-/// ADR 0025 §Context row 6 — the `fold` accumulator, which is the shape the
+/// the ownership design row 6 — the `fold` accumulator, which is the shape the
 /// standard library is written in, at 200 / 200.
 const FOLD_CLOSURE_CANONICAL: &str = r#"
 fn keep_last(i: Int, a: List<Int>) -> List<Int> = a
@@ -184,35 +184,35 @@ fn corpus() -> Vec<Pair> {
     vec![
         Pair {
             name: "call argument",
-            provenance: "ADR 0025 §Context rows 1-2",
+            provenance: "the ownership design rows 1-2",
             canonical: CALL_ARG_CANONICAL,
             pessimal: CALL_ARG_PESSIMAL,
             canonical_linear_today: true,
         },
         Pair {
             name: "record field",
-            provenance: "ADR 0025 §Context rows 3-4",
+            provenance: "the ownership design rows 3-4",
             canonical: RECORD_FIELD_CANONICAL,
             pessimal: RECORD_FIELD_PESSIMAL,
             canonical_linear_today: true,
         },
         Pair {
             name: "compounding: field last, record first",
-            provenance: "ADR 0025 §Context rows 3, 5",
+            provenance: "the ownership design rows 3, 5",
             canonical: RECORD_FIELD_CANONICAL,
             pessimal: COMPOUNDING_PESSIMAL,
             canonical_linear_today: true,
         },
         Pair {
             name: "let binding against parameter",
-            provenance: "ADR 0025 §Context cause 1",
+            provenance: "the ownership design cause 1",
             canonical: PARAM_VS_LET_CANONICAL,
             pessimal: PARAM_VS_LET_PESSIMAL,
             canonical_linear_today: true,
         },
         Pair {
             name: "fold closure accumulator",
-            provenance: "ADR 0025 §Context row 6",
+            provenance: "the ownership design row 6",
             canonical: FOLD_CLOSURE_CANONICAL,
             pessimal: FOLD_CLOSURE_PESSIMAL,
             canonical_linear_today: true,
@@ -320,7 +320,7 @@ fn measure_corpus(c: &Criteria) -> Vec<(Pair, Measured)> {
     assert_eq!(
         pairs.len(),
         EXPECTED_PAIRS,
-        "the corpus is {} pairs where {EXPECTED_PAIRS} is what ADR 0034 §10's table and §14 \
+        "the corpus is {} pairs where {EXPECTED_PAIRS} is what the gate's table and its provenance \
          report; a bar over fewer shapes than it claims is not the bar that was registered",
         pairs.len(),
     );
@@ -368,9 +368,9 @@ fn print_table(rows: &[(Pair, Measured)]) {
     }
 }
 
-/// **ADR 0034 §10 G1.** Two spellings of one computation cost the same.
+/// **the gate G1.** Two spellings of one computation cost the same.
 #[test]
-#[ignore = "ADR 0034 §10 G1: red until §11 S4 (slot frames) lands, and armed by having been \
+#[ignore = "the gate G1: red until slot frames land, and armed by having been \
             shown red — see every_pair_is_pinned_to_what_it_costs_today for today's numbers. \
             Run it with `cargo test -p ply-eval --test suite position_invariance -- --ignored \
             --nocapture`."]
@@ -412,7 +412,7 @@ fn the_same_computation_costs_the_same_in_either_order() {
     }
     assert!(
         failures.is_empty(),
-        "ADR 0034 §10 G1 is not met on {} of {} pairs:\n  - {}",
+        "the gate G1 is not met on {} of {} pairs:\n  - {}",
         failures.len(),
         rows.len(),
         failures.join("\n  - "),
@@ -443,8 +443,8 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
             assert_ne!(
                 digest(a.pessimal),
                 digest(b.pessimal),
-                "`{}` and `{}` are the same pessimal program, so one of the two shapes ADR 0034 \
-                 §10 reports a row for is not being measured",
+                "`{}` and `{}` are the same pessimal program, so one of the two shapes the slot rewrite \
+                 the gate reports a row for is not being measured",
                 a.name,
                 b.name,
             );
@@ -464,7 +464,7 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
     // Taken on this tree 2026-08-31. The second and third rows share a
     // canonical digest on purpose: the compounding pair is the record-field
     // canonical with only the *outer* node moved, which is the whole of what
-    // ADR 0025 §Context row five says.
+    // the ownership design row five says.
     let expected: [(&str, &str, &str); EXPECTED_PAIRS] = [
         ("call argument", "b3:2a168234d2a1", "b3:dc587bf7bfb2"),
         ("record field", "b3:031f75989bca", "b3:a52314fd4b69"),
@@ -518,9 +518,9 @@ fn every_pair_is_pinned_to_what_it_costs_today() {
             (200, 200, 1),
             (0, 200, 1),
         ),
-        // `(200, 200, 1)` under `PLY_ADR0034_PROBE=1`, which is ADR 0025's P2: a parameter may
+        // `(200, 200, 1)` under `PLY_the slot rewrite_PROBE=1`, which is the ownership design's P2: a parameter may
         // then appear in a `Dead` set. Off by default, because P2 costs more allocations on the
-        // request path than it saves there — ADR 0034 §11 S3 — so this pin is the default tree's.
+        // request path than it saves there — the sequence S3 — so this pin is the default tree's.
         ("let binding against parameter", (200, 200, 1), (0, 200, 1)),
         ("fold closure accumulator", (200, 200, 1), (0, 200, 1)),
     ];

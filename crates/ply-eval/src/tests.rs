@@ -1158,7 +1158,7 @@ fn filter_requires_a_boolean_predicate() {
 
 /// `range` takes two arguments and always did to the checker; this suite used to call it with one,
 /// which is how a builtin can be covered here and unreachable from every program the checker
-/// accepts (ADR 0029).
+/// accepts (default arguments).
 #[test]
 fn range_builds_half_open_intervals_and_refuses_runaways() {
     assert_eq!(

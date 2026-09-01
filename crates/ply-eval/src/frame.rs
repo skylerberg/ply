@@ -94,7 +94,7 @@ impl Machine<'_> {
                     return self.apply(value, Vec::new(), span);
                 }
                 let first = args[0].clone();
-                // ADR 0034 §11 S4: the frame carries the scope minus what
+                // the sequence S4: the frame carries the scope minus what
                 // argument 0 is the last reader of, rather than all of it.
                 // `dead` is empty unless the probe is armed, and then this is
                 // `carry` exactly.

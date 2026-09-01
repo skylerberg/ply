@@ -230,7 +230,7 @@ fn request(stream: &mut TcpStream) -> String {
     String::from_utf8_lossy(&answer).to_string()
 }
 
-/// The exit criterion of ADR 0015 §4.3, end to end and with the source unchanged: a request in
+/// The exit criterion of the drain, end to end and with the source unchanged: a request in
 /// flight when the signal arrives gets its response, the accept loop then ends because `accept`
 /// answered `0`, and the run exits `0`.
 #[test]
@@ -265,7 +265,7 @@ fn a_request_in_flight_at_the_signal_gets_its_response_and_the_run_exits_zero() 
         output.contains("stopping"),
         "a stopping service prints what it is doing\n\n{output}"
     );
-    // ADR 0015 §6: every number an operator reads is a fact the run already holds.
+    // what an operator sees: every number an operator reads is a fact the run already holds.
     assert!(
         output.contains("1 listener(s) closed"),
         "the banner reports the listener the run actually closed\n\n{output}"
@@ -446,8 +446,9 @@ test/nondet "a stop reaches the program" {
     }
 }
 
-/// The same service with a task per connection, which is the shape a real one has and the shape ADR
-/// 0015 §4.5 is about: `desk.ply`'s in-flight count at a signal is exactly one, and a service that
+/// The same service with a task per connection, which is the shape a real one has
+/// and the shape the drain's unfinished-request case is about: `desk.ply`'s
+/// in-flight count at a signal is exactly one, and a service that
 /// spawns per connection has N.
 const CONCURRENT: &str = r#"
 import std.net

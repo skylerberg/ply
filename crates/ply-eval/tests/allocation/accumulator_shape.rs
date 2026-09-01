@@ -1,4 +1,4 @@
-//! Whether an accumulator is linear or quadratic, measured in allocations — ADR 0034 §5, S5b.
+//! Whether an accumulator is linear or quadratic, measured in allocations — the bounded worst case, S5b.
 //!
 //! `stdlib_accumulator_cost` asks the same question of `rc::Stats`: how many appends copied. That
 //! counter is computable because `push`'s copying arm knows the length it copied, and it stops
@@ -68,7 +68,7 @@ fn quadratic(n: usize) -> String {
 
 /// Doubling `n` roughly doubles a linear accumulator and roughly quadruples a quadratic one.
 ///
-/// The two programs differ only in which argument the append is, which is the whole of ADR 0034's
+/// The two programs differ only in which argument the append is, which is the whole of the slot rewrite's
 /// subject. Bounds are loose because the measured region carries a fixed cost — lowering, the
 /// machine, the test harness — that does not scale with `n`; what they have to separate is 2× from
 /// 4×, and they do.
@@ -100,7 +100,7 @@ fn a_quadratic_accumulator_grows_faster_than_a_linear_one() {
     );
 }
 
-// The stdlib accumulators are deliberately not measured here, and ADR 0034 §5 records why: a probe
+// The stdlib accumulators are deliberately not measured here, and the bounded worst case records why: a probe
 // that imports `std.json` charges roughly 11 MB of module-level and memoised work that does not
 // scale with the probe, and two runs of it are not independent — the second is measured against a
 // warm memo and a warm interner. Doubling the subject read 0.98x, and *fell* between k = 500 and

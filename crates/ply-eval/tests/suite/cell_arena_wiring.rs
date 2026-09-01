@@ -160,7 +160,7 @@ fn a_cell_written_inside_a_resumption_is_read_after_it() {
     );
 }
 
-/// ADR 0017 §3's two-resumption example, and the integer the whole section turns on: the trace cell
+/// The region-kind rule's two-resumption example, and the integer the whole section turns on: the trace cell
 /// reads **2**, because one cell serves both resumptions and `k(false)` observes what `k(true)`
 /// wrote.
 #[test]
@@ -244,7 +244,7 @@ fn resume_it(saved: Saved) -> Int = {
 }
 "#;
 
-/// The one route ADR 0017 §2's brand does not close: a continuation parked in a cell, carried out
+/// The one route the brand does not close: a continuation parked in a cell, carried out
 /// of the run that made it, and resumed in the next one.
 #[test]
 fn a_cell_carried_across_two_entry_points_is_named_rather_than_read() {
@@ -296,7 +296,7 @@ fn the_arena_takes_no_chunk_for_an_entry_point_it_has_already_sized() {
     );
 }
 
-/// A `with_cell` in a loop is the shape ADR 0005 §2 charged one retained world entry per iteration
+/// A `with_cell` in a loop is the shape the persistent world this replaced charged one retained world entry per iteration
 /// for, and which R1's wiring still charged one arena slot per iteration for.
 #[test]
 fn a_region_in_a_loop_costs_one_slot_however_many_iterations_run() {

@@ -107,7 +107,7 @@ pub struct Machine<'a> {
     /// so one seeded fixture serves every test in a run without any of them observing another's
     /// writes.
     regions: TaskRegions,
-    /// Which of ADR 0017 §3's two kinds each region in this program is.
+    /// Which of the region-kind rule's two kinds each region in this program is.
     region_kinds: crate::region_kind::Kinds,
     /// What this entry point performed, which is not what its row said it could.
     trace: Trace,
@@ -519,7 +519,7 @@ impl<'a> Machine<'a> {
     /// `compiled::CarriedTypes` cleared of reaching any of those three at any
     /// depth. Asking again is not a second opinion; it is the same question
     /// asked of the value instead of the type, which is precisely the
-    /// **O(value) walk per call** ADR 0030 and [`crate::census`] measured as
+    /// **O(value) walk per call** the front-end measurements and [`crate::census`] measured as
     /// unaffordable on a real front end and which the type gate exists to avoid.
     ///
     /// It is **not** a check being dropped for speed. The boundary this refuses
@@ -1130,7 +1130,7 @@ impl<'a> Machine<'a> {
         };
 
         // Inside a production region the performing task leaves the enabled set and the others keep
-        // running — which is the whole of ADR 0008 §8.
+        // running — which is the whole of the blocking rule.
         if let Some(region) = self.host_region() {
             let Some(segments) = self.stack.sim_depth() else {
                 return Err(err_task_lost_its_region(span, &operation));

@@ -13,7 +13,7 @@ use std::fmt;
 pub const HANDLER_PREFIX: &str = "ply_host::db::";
 
 /// The SQL scanner `ply hosts` discloses. It is a parser inside the trusted
-/// computing base, which ADR 0013's rule says is the line worth a human's
+/// computing base, which the HTTP design's rule says is the line worth a human's
 /// attention.
 pub const SCANNER: &str = "ply_host::db::scan";
 
@@ -30,7 +30,7 @@ pub const ACCEPTED: &str = ply_host::db::scan::ACCEPTED;
 /// The connection string, when `--db` did not carry one.
 ///
 /// Consulted only under `--host`: the environment can say *which* database a
-/// bound run uses and can never cause a binding, which is what keeps ADR 0011's
+/// bound run uses and can never cause a binding, which is what keeps the host boundary contract's
 /// "a reviewer reads `--host` in the command" true.
 pub const URL_ENV: &str = "PLY_DB_URL";
 
@@ -109,7 +109,7 @@ impl Eq for Secret {}
 
 /// `sslmode`, restricted to what W4 configures.
 ///
-/// `require` and above are `E0431` naming ADR 0014 §10: wiring rustls into
+/// `require` and above are `E0431` naming the trusted computing base listing: wiring rustls into
 /// `tokio-postgres` is a real trusted-computing-base decision that belongs
 /// beside W5's secrets, and accepting the word while not encrypting would be a
 /// label that lies.
@@ -243,7 +243,7 @@ impl DbUrl {
                             return Err(format!(
                                 "`sslmode={other}` is not configurable in W4: TLS to postgres \
                                  is not wired up, so only `disable` and `prefer` are accepted \
-                                 and anything stronger would be a word that lies (ADR 0014 §10)"
+                                 and anything stronger would be a word that lies"
                             ));
                         }
                     }
@@ -403,7 +403,7 @@ pub const DEFAULT_ACQUIRE_MS: u64 = ply_host::db::pool::DEFAULT_ACQUIRE_MS;
 pub const DEFAULT_STATEMENT_MS: u64 = ply_host::db::pool::DEFAULT_STATEMENT_MS;
 pub const DEFAULT_IDLE_TXN_MS: u64 = ply_host::db::pool::DEFAULT_IDLE_TXN_MS;
 pub const DEFAULT_CONNECT_MS: u64 = ply_host::db::pool::DEFAULT_CONNECT_MS;
-/// ADR 0014 §4.3. Not in the pool's defaults: the statement cache is a property
+/// Statement preparation. Not in the pool's defaults: the statement cache is a property
 /// of a connection rather than of the pool.
 pub const DEFAULT_STATEMENT_CACHE: u32 = 256;
 
@@ -634,7 +634,7 @@ fn err_two_passwords(source: Source) -> Diagnostic {
 
 /// Resolving `--db-schema <module>.<fn>` against the program.
 ///
-/// A schema is a value (ADR 0014 §7): there is no migration tool, no version
+/// A schema is a value (migrations, out of scope): there is no migration tool, no version
 /// table and no ordering across deploys. What W4 owns is the check that the
 /// database the run is pointed at is the one the program describes, and the
 /// first half of that check — that the program describes one at all — is here,
@@ -871,7 +871,7 @@ pub struct ServerFacts {
 ///
 /// It exists for the same reason W3's `transport` block does: a fact the rows
 /// cannot carry and a reviewer must not have to derive. The **collation** is
-/// printed because ADR 0014 §5.3 makes it the twin's largest silent divergence,
+/// printed because what the twin does not model makes it the twin's largest silent divergence,
 /// and the **scanner** because it is a parser inside the trusted computing base.
 #[derive(Clone, Debug)]
 pub struct Database {
@@ -921,7 +921,7 @@ impl Database {
             .collect()
     }
 
-    /// `db.rollback` reaching the binding is a defect: ADR 0014 §1.1 handles it
+    /// `db.rollback` reaching the binding is a defect: transactions as handlers handles it
     /// in Ply, inside `transaction`, and a bound one would mean an abort that
     /// discarded no continuation.
     ///
@@ -1156,14 +1156,14 @@ mod tests {
         }
     }
 
-    /// ADR 0014 §10: TLS to postgres is not wired up, so a word that promised
+    /// The trusted computing base listing: TLS to postgres is not wired up, so a word that promised
     /// encryption would be a word that lies.
     #[test]
     fn an_sslmode_stronger_than_prefer_is_refused_by_name() {
         for mode in ["require", "verify-ca", "verify-full", "allow"] {
             let why = DbUrl::parse(&format!("postgres://ply@h:5432/d?sslmode={mode}"))
                 .expect_err("`{mode}` is not configurable");
-            assert!(why.contains("ADR 0014 §10"), "{why}");
+            assert!(why.contains("a word that lies"), "{why}");
         }
         assert!(DbUrl::parse("postgres://ply@h:5432/d?sslmode=prefer").is_ok());
         assert!(DbUrl::parse("postgres://ply@h:5432/d?sslmode=disable").is_ok());
@@ -1260,7 +1260,7 @@ mod tests {
 
     // --- resolution ---------------------------------------------------------
 
-    /// ADR 0011's rule is untouched: the environment says *which* database, and
+    /// The host boundary contract's rule is untouched: the environment says *which* database, and
     /// only `--host` decides that there is one.
     #[test]
     fn the_environment_supplies_the_url_and_never_the_binding() {

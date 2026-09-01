@@ -168,7 +168,7 @@ arm "an unclosed list pattern loses the label on its opening bracket" patterns \
 
 echo
 echo "== the bail guards: withdrawn, because there are none =="
-echo "   > **Withdrawn (ADR 0028, 2026-08-30).** Four mutations stood here"
+echo "   > **Withdrawn (the try operator, 2026-08-30).** Four mutations stood here"
 echo "   > under two headings, \`== the bail guards: 6 of 50 are killable ==\`"
 echo "   > and \`== equivalent mutants: the other 44 ==\`. One was an \`arm\`"
 echo "   > (the guard on \`ty_record\`s close result) and three were"

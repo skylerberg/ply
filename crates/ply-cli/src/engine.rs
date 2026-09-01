@@ -577,7 +577,7 @@ impl<'a> Prover<'a> {
 
         if kept == 0 {
             // Enumerating a finite domain and keeping nothing *decides* the guard unsatisfiable —
-            // §5.1(f) applied to the guard rather than to the body.
+            // exhaustive enumeration applied to the guard rather than to the body.
             return Discharge::Vacuous(Vacuity {
                 guard: claim.guard_span(obligation.span),
                 kind: VacuityKind::ProvedUnsatisfiable,

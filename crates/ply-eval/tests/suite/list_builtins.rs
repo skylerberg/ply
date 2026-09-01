@@ -4,7 +4,7 @@ use crate::fixture::Compiled;
 
 /// Every `test` in the source, all of which must pass.
 /// Every position of a three-element list, plus the two derivations the builtin is meant to make
-/// expressible — `head` and `last`, which ADR 0027 §3 declines to ship as names of their own.
+/// expressible — `head` and `last`, which the refusal of head and last declines to ship as names of their own.
 #[test]
 fn an_index_inside_the_list_answers_that_element() {
     let source = r#"
@@ -136,7 +136,7 @@ test "a pure peek and an effectful index expression" {
 
 /// A user definition of the name shadows the builtin, which is what keeps
 /// `crates/ply-std/ply/json.ply` and `db.ply` — each of which ships an `nth` of its own — free to
-/// keep theirs, and is the reason ADR 0027 §6 declines the bare name `nth`.
+/// keep theirs, and is the reason the naming decision declines the bare name `nth`.
 #[test]
 fn a_module_may_shadow_the_name() {
     let source = r#"

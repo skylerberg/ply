@@ -311,7 +311,7 @@ fn a_self_performing_handler_with_nothing_outside_it_is_unhandled_under_both_cla
     }
 }
 
-/// ADR 0005 §3.2, "resumes zero times".
+/// The two-resumption example, "resumes zero times".
 #[test]
 fn a_clause_that_drops_its_continuation_keeps_the_writes_made_before_the_perform() {
     let e = with_cell_(
@@ -344,7 +344,7 @@ fn a_clause_that_drops_its_continuation_keeps_the_writes_made_before_the_perform
     assert_eq!(run.cell(0), 1, "the write after the perform never ran");
 }
 
-/// ADR 0005 §3.2, "resumes once" — the case that decides the design.
+/// The two-resumption example, "resumes once" — the case that decides the design.
 #[test]
 fn a_resumption_sees_the_write_the_clause_made_before_calling_it() {
     let e = with_cell_(
@@ -386,7 +386,7 @@ fn a_resumption_sees_the_write_the_clause_made_before_calling_it() {
     assert_eq!(run.cell(0), 5);
 }
 
-/// ADR 0005 §3.2, "resumes twice".
+/// The two-resumption example, "resumes twice".
 #[test]
 fn two_resumptions_run_against_one_threaded_world() {
     let e = with_cell_(
@@ -429,7 +429,7 @@ fn two_resumptions_run_against_one_threaded_world() {
     );
 }
 
-/// ADR 0005 §3.3: per-branch state is the handler's job, and four lines of it.
+/// per-resumption state, built by the handler: per-branch state is the handler's job, and four lines of it.
 #[test]
 fn a_handler_that_restores_the_cell_gives_each_branch_the_same_starting_state() {
     let e = with_cell_(
@@ -620,7 +620,7 @@ fn an_inner_handler_that_does_not_name_the_operation_falls_through() {
     assert_eq!(run(&e).int(), 7);
 }
 
-/// ADR 0005's escape case, and required test 6: this is a success, not an error.
+/// The control-stack design's escape case, and required test 6: this is a success, not an error.
 #[test]
 fn a_continuation_captured_in_a_cell_region_still_reads_the_cell_after_the_region_returned() {
     let region = with_cell_(
