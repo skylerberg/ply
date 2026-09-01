@@ -1,7 +1,6 @@
 //! What one request allocates, exactly, layer by layer.
 
 use ply_eval::Value;
-use ply_span::Span;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
@@ -169,29 +168,5 @@ fn entering_the_machine_allocates_a_bounded_amount() {
         per_call < 100.0,
         "one call into the machine allocated {per_call:.1} times, which is no longer a boundary \
          cost but a layer"
-    );
-}
-
-/// The two engines answer the same value on the same request path, which is what makes the W6
-/// engine substitution a ratio rather than a comparison between two programs.
-#[test]
-fn both_engines_answer_the_request_path_alike() {
-    let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
-    let bench = loaded
-        .full("w6_bench")
-        .expect("the driver declares w6_bench");
-    let args = vec![Value::Int(3), Value::Int(16)];
-    let mut interp = ply_eval::Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
-    let tree = interp
-        .call(&bench, args.clone(), Span::DUMMY)
-        .expect("the tree-walker runs the request path");
-    let mut machine = ply_eval::Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
-    let control = machine
-        .call(&bench, args, Span::DUMMY)
-        .expect("the machine runs the request path");
-    assert_eq!(
-        tree, control,
-        "the engines disagree on the request path, so the W6 engine row would be a ratio between \
-         two different programs"
     );
 }

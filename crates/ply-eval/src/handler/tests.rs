@@ -1,10 +1,9 @@
 //! Effect handlers end to end, on the machine that runs them.
 
 use super::*;
+use crate::build;
 use crate::code::{Node, NodeKind, Stmt};
-use crate::differential;
 use crate::machine::{Machine, Progress};
-use crate::{Interp, build};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{BinOp, Ident, Item, Lit, Mode, Pattern, PatternKind, QName};
 
@@ -23,7 +22,7 @@ fn node(kind: NodeKind) -> Code {
 }
 
 fn lit(l: Lit) -> Code {
-    let value = crate::interp::literal(&l);
+    let value = crate::semantics::literal(&l);
     node(NodeKind::Lit(l, value))
 }
 
@@ -236,18 +235,11 @@ impl Outcome {
     }
 }
 
-/// Runs an AST on both engines and fails on any divergence in value, diagnostic, footprint or final
-/// world.
+/// An expression in a program of its own, evaluated to whatever it answers.
 #[track_caller]
-fn both_engines(items: Vec<Item>, e: &ply_syntax::ast::Expr) -> Result<Value, Diagnostic> {
+fn standalone(items: Vec<Item>, e: &ply_syntax::ast::Expr) -> Result<Value, Diagnostic> {
     let (program, resolved) = build::standalone(items);
-    let mut walked = Interp::for_program(&program, &resolved);
-    let mut stepped = Machine::for_program(&program, &resolved);
-
-    if let Some(d) = differential::compare_expr(&mut walked, &mut stepped, "handler", e) {
-        panic!("{d}");
-    }
-    stepped.eval_expr_for_test(e)
+    Machine::for_program(&program, &resolved).eval_expr_for_test(e)
 }
 
 #[test]
@@ -715,12 +707,12 @@ fn a_continuation_applied_to_the_wrong_number_of_arguments_is_an_arity_mismatch(
 }
 
 #[test]
-fn an_unhandled_operation_reports_exactly_what_the_tree_walker_reports() {
+fn an_unhandled_operation_is_an_unhandled_effect() {
     let e = build::handle(
         build::perform("state", "get", None, vec![]),
         vec![build::clause("state", "put", None, &["v"], build::int(0))],
     );
-    let d = both_engines(
+    let d = standalone(
         vec![build::effect_def(
             "state",
             &[("get", Mode::Read, false), ("put", Mode::Write, false)],
@@ -732,12 +724,12 @@ fn an_unhandled_operation_reports_exactly_what_the_tree_walker_reports() {
 }
 
 #[test]
-fn a_clause_arity_mismatch_reports_exactly_what_the_tree_walker_reports() {
+fn a_clause_arity_mismatch_is_an_arity_mismatch() {
     let e = build::handle(
         build::perform("state", "get", None, vec![]),
         vec![build::clause("state", "get", None, &["k"], build::int(0))],
     );
-    let d = both_engines(
+    let d = standalone(
         vec![build::effect_def("state", &[("get", Mode::Read, false)])],
         &e,
     )
@@ -746,12 +738,12 @@ fn a_clause_arity_mismatch_reports_exactly_what_the_tree_walker_reports() {
 }
 
 #[test]
-fn a_missing_resource_label_reports_exactly_what_the_tree_walker_reports() {
+fn a_missing_resource_label_is_a_resource_required() {
     let e = build::handle(
         build::perform("db", "get", None, vec![build::int(0)]),
         vec![build::clause("db", "get", None, &["k"], build::int(0))],
     );
-    let d = both_engines(
+    let d = standalone(
         vec![build::effect_def("db", &[("get", Mode::Read, true)])],
         &e,
     )
@@ -760,12 +752,12 @@ fn a_missing_resource_label_reports_exactly_what_the_tree_walker_reports() {
 }
 
 #[test]
-fn an_operation_the_effect_does_not_declare_reports_exactly_what_the_tree_walker_reports() {
+fn an_operation_the_effect_does_not_declare_is_an_unknown_operation() {
     let e = build::handle(
         build::perform("state", "peek", None, vec![]),
         vec![build::clause("state", "peek", None, &[], build::int(0))],
     );
-    let d = both_engines(
+    let d = standalone(
         vec![build::effect_def("state", &[("get", Mode::Read, false)])],
         &e,
     )
@@ -774,7 +766,7 @@ fn an_operation_the_effect_does_not_declare_reports_exactly_what_the_tree_walker
 }
 
 #[test]
-fn a_handled_program_agrees_with_the_tree_walker() {
+fn a_handler_that_reads_and_writes_a_cell_answers_through_its_return_clause() {
     let e = build::with_cell(
         "s",
         build::int(1),
@@ -811,7 +803,7 @@ fn a_handled_program_agrees_with_the_tree_walker() {
             build::bin(BinOp::Mul, build::var("x"), build::int(2)),
         ),
     );
-    let v = both_engines(
+    let v = standalone(
         vec![build::effect_def(
             "state",
             &[("get", Mode::Read, false), ("put", Mode::Write, false)],

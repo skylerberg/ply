@@ -384,7 +384,7 @@ pub mod schema {
             .values()
             .find(|d| d.name.as_str() == name)
             .ok_or_else(|| unknown(check, name))?;
-        let value = ply_eval::Interp::new(program, resolved, check)
+        let value = ply_eval::Machine::new(program, resolved, check)
             .call(name, Vec::new(), def.span)
             .map_err(|failure| {
                 Diagnostic::error(

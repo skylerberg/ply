@@ -3,7 +3,7 @@
 use crate::rng::Rng;
 use anyhow::{Context, Result, bail};
 use ply_core::{EffectAtom, Footprint};
-use ply_eval::{EngineChoice, Plan};
+use ply_eval::Plan;
 use ply_span::Symbol;
 use ply_store::Store;
 use ply_syntax::ast::Mode;
@@ -354,7 +354,7 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
                 &loaded.check,
                 &hashes,
                 &mut store,
-                EngineChoice::Machine,
+                false,
                 ply_test::Search::of(&plan.selection),
                 ply_test::Hosting::hermetic(),
             )

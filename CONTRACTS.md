@@ -246,17 +246,17 @@ pub fn hash_program(program: &Program, resolved: &Resolved, check: &CheckOutput)
     -> Result<HashOutput, Vec<Diagnostic>>;
 
 // ply-eval
-impl<'a> Interp<'a> {
+impl<'a> Machine<'a> {
     pub fn new(program: &'a Program, resolved: &'a Resolved, check: &'a CheckOutput) -> Self;
 }
 
 // ply-test — three later parameters have been appended; the shipped signature is
-// what is written here. `engine` came with the machine (`--engine`), `search`
+// what is written here. `audit_backend` came with `--audit-backend`, `search`
 // with M7's plan and `hosts` with W1's binding, each of which a caller has to
 // state per run rather than per crate.
 pub fn run(selection: &Selection, program: &Program, resolved: &Resolved,
            check: &CheckOutput, hashes: &HashOutput, store: &mut Store,
-           engine: EngineChoice, search: Search, hosts: Hosting<'_>) -> RunReport;
+           audit_backend: bool, search: Search, hosts: Hosting<'_>) -> RunReport;
 ```
 
 `CheckOutput` gained `modules: IndexMap<Symbol, ModuleInfo>`. `DefInfo`,
@@ -466,10 +466,10 @@ Requirements:
   scheduler resolves), and an argument handed to an entry point from outside the
   program. `E0449` joins `RESERVED_CODES` — it is the machine's verdict about its
   own memory, so a handler may not mint it. Both engines check at the same point
-  with the same message, or the refusal would itself be an `--engine both`
+  with the same message, or the refusal would itself be an `--audit-backend`
   divergence. `ply_eval::escape` documents what every other boundary ADR 0017 §2
   names does instead, and which one route stays open.
-- **A region's slots go back at its lexical close**, on both engines and for both
+- **A region's slots go back at its lexical close**, for both
   kinds. What the kind decides is a claim about that close rather than whether it
   happens: a close no live continuation can reach truncates the arena, and one a
   continuation captured across the region can still reach retains its slots until
@@ -973,8 +973,8 @@ sites anyway. Do not add callers.
 
 **Superseded.** `Value` is stated in full under "The control stack and the world"
 below and grows again under W1, W2 and W5; `Cell(Rc<RefCell<Value>>)` in
-particular is gone, and `Interp::new` takes the three-argument form given under
-"Changed signatures" above. The block is the M2 record.
+particular is gone, and `Interp` itself is gone — see §"Deleted with the
+tree-walker". The block is the M2 record.
 
 ```rust
 pub enum Value {
@@ -1005,19 +1005,19 @@ impl<'a> Interp<'a> {
 - Recursion depth must be bounded and produce a diagnostic, not a stack overflow.
 - **A loop is not a recursion.** `map`, `filter`, `fold`, `iterate`, `map_fold`
   and `bytes_position` are driven by a step protocol — `Step::Apply` answered by
-  a `Frame` the machine pushes and pops, and a host loop on the tree-walker — so
-  each costs **depth 1** however many rounds it runs, on both engines. A driver
-  that nested would put the two engines' counts back into disagreement, which is
-  the defect ADR 0005 §7.1 removed tail-call elision to prevent. ADR 0022.
+  a `Frame` the machine pushes and pops — so each costs **depth 1** however many
+  rounds it runs. A driver that nested would make the bound a function of how a
+  loop is spelled, which is the defect ADR 0005 §7.1 removed tail-call elision to
+  prevent. ADR 0022.
 - Prelude builtins: `assert`, `assert_eq`, `len`, `push`, `list_at`, `map`,
   `filter`, `fold`, `iterate`, `range`, `int_to_string`, `string_concat`,
   `cell_get`, `cell_set`, `panic`, plus the `Bytes` and text builtins in the
   host-boundary section below.
   A failing `assert`/`assert_eq` is `ASSERTION_FAILED` with a structured
   expected/actual message.
-- An `Interp` must be usable from a worker thread. If `Value` holds `Rc`, keep
+- An evaluator must be usable from a worker thread. If `Value` holds `Rc`, keep
   each interpreter and every value it produces confined to one thread and do not
-  implement `Send` for it — the scheduler hands each worker its own `Interp`.
+  implement `Send` for it — the scheduler hands each worker its own.
 
 ---
 
@@ -1396,7 +1396,7 @@ impl Store {
 `PassRecord::closure`. Dropping those silently downgrades every future bisection
 to `no_bodies`.
 
-`ply-eval` gains the tracer — hooked at `Interp::apply` for named closures and at
+`ply-eval` gains the tracer — hooked where a named closure is applied and at
 the perform site for atoms, both of which already hold the qualified name — and a
 structured `Assertion` payload alongside the diagnostic. `ply-core` and `ply-eval`
 must both accept a hash-linked definition graph so a hybrid can be checked and
@@ -1734,7 +1734,7 @@ Two do not: see the note after the block.
 //
 //     /// A resource limit on the heap the frames live on. Not the bound a
 //     /// runaway recursion hits — that is `limit::DEFAULT_MAX_CALLS`, which
-//     /// both engines share and which a recursion reaches first, since a call
+//     /// the machine bounds and which a recursion reaches first, since a call
 //     /// costs a frame.
 //     pub const DEFAULT_MAX_FRAMES: usize = 1_000_000;
 //
@@ -1771,15 +1771,13 @@ impl<'a> Machine<'a> {
 `set_base_world` and `world` **do not exist**: they went with `World`. A machine's
 cell state is its `Arena`, seeded per entry point from a `Fixture` the runner
 holds — `ply_test::region::GroupRegion` above, and `Machine::cells`, which the
-`Evaluator` trait `--engine both` compares through also names.
+`Evaluator` trait `--audit-backend` compares through also names.
 
 The machine has also grown entry points this block predates, each introduced
 where its milestone is: `set_seed` / `simulated` (M7), `set_host_binding` /
 `set_declared_footprint` / `set_re_executed` / `host_ops` / `host_use` (W1).
 
-The entry points mirror `Interp`'s exactly, which is what makes `Engine` a
-drop-in. The transition rules are ADR 0005 §1.3 and are normative — in
-particular:
+The transition rules are ADR 0005 §1.3 and are normative — in particular:
 
 - `W` is threaded through capture and through resumption **unchanged**;
 - a tail-resumptive clause runs on the post-capture stack with a `Frame::Resume`
@@ -1787,29 +1785,13 @@ particular:
 - a clause body runs on the stack *below* its own handler, so a clause that
   performs the operation it handles reaches the next handler out.
 
-### `ply-eval::Engine` — landed
+### `ply-eval::Engine` — deleted
 
-```rust
-pub enum Engine { Treewalk, Machine }   // Default = Machine
-impl Engine {
-    pub fn as_str(self) -> &'static str;
-    pub fn parse(s: &str) -> Option<Engine>;
-}
-```
-
-The default is the authoritative engine and flipping it is a `RUNTIME_VERSION`
-bump, which is why it is written here: a cached `Pass` is a claim about what the
-authoritative engine did. It is `Machine` as of `RUNTIME_VERSION` 0.4.0.
-
-`Interp` gains `world()` and `set_base_world(World)`; every entry point forks
-from the base world rather than starting from an empty one. `Machine` carries the
-same two.
-
-Neither type holds an `Engine`. The choice is made once per run, by `ply-test`'s
-executor, which constructs an `Interp` or a `Machine` as its `Worker` — the
-`Executor` trait already exists for exactly this and already carries no `Send`
-bound. A field inside the evaluator would put a branch on the hot path for a
-decision that is fixed before the first test starts.
+`Engine` and `EngineChoice` selected between two evaluators for one milestone.
+There is one evaluator now, so both are gone along with `Interp` and `--engine`;
+see §"Deleted with the tree-walker". A cached `Pass` is a claim about what the
+machine answered on its own, which is what `--backend` implying `--no-cache`
+keeps true.
 
 ### `ply-syntax` — not implemented
 
@@ -1953,7 +1935,7 @@ system.
 ```rust
 /// The most nested calls a program may hold at once. Both engines answer to it
 /// and phrase the diagnostic identically, because a divergence on a deeply
-/// recursive program fails `--engine both` on every corpus that has one.
+/// recursive program fails `--audit-backend` on every corpus that has one.
 pub const DEFAULT_MAX_CALLS: usize = 10_000;
 
 /// The deepest a *value* may nest before a structural walk over it — comparing
@@ -1973,23 +1955,22 @@ applies is decided by what bounds the depth:
   `MAX_VALUE_DEPTH`, because nothing else bounds how deep a value can be built;
 - **dropping a value** — `Value`'s `Drop` dismantles iteratively, because a bound
   cannot help: a value has to be dropped whatever its depth;
-- **depth of source** — `Interp::eval`, `code::lower`, `Expr::clone`,
+- **depth of source** — `code::lower`, `Expr::clone`,
   `Infer::infer` and `collect_refs` *grow* the host stack rather than refuse, as
   the parser and the normalizer already do. A bound here would reject on one
   engine a program the front end accepted, which is an `E0503` divergence on
   every corpus with a long operator chain in it.
 
 `Stack::calls()` is the machine's count — the `Frame::Call`s pending, O(1)
-through push, pop, capture and splice — and `Interp` counts its own nesting the
-same way. A tail call is charged like any other: eliding it left a
-tail-recursive runaway unbounded on the machine while the tree-walker diagnosed
-it, which is ADR 0005 §7.1.
+through push, pop, capture and splice. A tail call is charged like any other:
+eliding it left a tail-recursive runaway unbounded rather than a diagnostic,
+which is ADR 0005 §7.1.
 
 ### The constant memo — `ply-eval::memo`
 
 A definition with **no parameters**, an **empty published row** and no
-`where derivable(..)` constraint is a constant, and both engines evaluate it at
-most once per `Machine` or `Interp`. The rule reads the published row rather
+`where derivable(..)` constraint is a constant, and the evaluator evaluates it at
+most once per `Machine`. The rule reads the published row rather
 than the inferred body row: a definition annotated wider than it performs is
 left alone, because the annotation is the reviewable artifact and a rule that
 disagreed with it would be a rule nobody could check by reading a signature.
@@ -1998,7 +1979,7 @@ Nothing about this is observable in a value, an atom, a trace or a world — tha
 is the argument for doing it. One thing is: the calls pending underneath a
 second reference to a constant, which is why it is in this section and why it
 moved `RUNTIME_VERSION` to `0.11.2`. Both engines therefore have to keep the
-memo or neither may, or `--engine both` reports `E0503` on any program that
+memo or neither may, or `--audit-backend` reports `E0503` on any program that
 reaches a constant from near the bound.
 
 Three rules make it exact:
@@ -2020,7 +2001,7 @@ Three rules make it exact:
   anyway. A service whose accept loop spawns therefore memoizes nothing, which
   is measured below and is a defect rather than a rule.
 - **No `CheckOutput`, no memo.** `Machine::for_program` and
-  `Interp::for_program` evaluate without a check pass and have no published row
+  `Machine::for_program` evaluates without a check pass and has no published row
   to read, so they remember nothing.
 
 `examples/desk.ply`'s `table()` is what this was measured on: eleven route
@@ -2054,49 +2035,38 @@ Cleared at every entry point, so it describes one test. It records a `perform`,
 building its atom exactly as inference builds the declared one; `cell_get` /
 `cell_set` are builtins over a `CellId` that carries no resource label, and the
 world comparison covers them. `Evaluator::observed_footprint` and
-`observed_performs` are how `--engine both` reads it, and a corpus whose
+`observed_performs` are how `--audit-backend` reads it, and a corpus whose
 `footprints_compared` is short of `compared` fails the audit.
 
-### `ply-cli` — not implemented
+### `ply-cli`
 
 ```
---engine <treewalk|machine|both>    default machine
+--backend <spec>       attach a compiled backend to the machine
+--audit-backend        also run each test without it, and compare
 ```
 
-On `ply test`, `ply run` and `ply check`. `both` runs each test on each engine and
-compares, per test:
+On `ply test`. `--audit-backend` runs each test twice — once with the backend
+attached and once without — and compares, per test:
 
 - the `Result<(), Diagnostic>` by **full JSON serialization** — code, severity,
   message, every label with its span, every note. Not "both failed";
 - the observed footprint from the tracer;
 - the final cell state, as the `(Slot, rendered Value)` sequence from
-  `Arena::slots` — `World::cells` when this was written — **and** the two arenas'
-  reclamation, which `differential::compare_outcomes` checks beside the contents.
-  Two engines that agree on every live cell and disagree about which slots came
-  back are two engines with different memory models, which is what ADR 0017 §3
-  makes a claim about.
+  `Arena::slots` **and** the two arenas' reclamation, which
+  `differential::compare_outcomes` checks beside the contents.
 
-A mismatch **fails the run** with a diagnostic naming the test and both outcomes.
-Never a warning: a divergence between two evaluators of one language is made
-sticky by the cache.
+A mismatch **fails the run** with a diagnostic naming the test and both outcomes,
+and the blame is the backend's: `Machine::compiled_answer` hands it no route back
+into the machine, so a wrong answer is the only thing it can contribute. Never a
+warning: a wrong answer is made sticky by the cache.
 
-A clause with a `resume` binder is machine-only. The tree-walker must refuse it
-with `E0504` (`MACHINE_ONLY_CLAUSE`), naming the clause and saying which engine
-runs it — never approximate it as tail-resumptive. Its own code because a
-consumer has to tell a refusal to start from a program that ran and failed, and
-`ply_eval::is_machine_only` is how the two are separated. Under
-`both` such a test runs once, on the machine — `differential::Compared::Refused`
-and `Report::machine_only` keep it out of what was compared — and `--explain`
-records it as `machine-only`.
-
-Four codes now partition a failing run, and confusing any two of them costs
+Three codes partition a failing run, and confusing any two of them costs
 something specific:
 
 | code | whose fault | what `ply-test` does |
 | --- | --- | --- |
 | `E0501` / `E0502` | the program's — an assertion, `panic`, division by zero, the recursion limit, a value past `MAX_VALUE_DEPTH` | attributes it: suspects, bisection, culprit |
-| `E0503` `ENGINE_DIVERGENCE` | Ply's — two evaluators of one language disagree | `Status::Panicked`, `Skipped::Panicked`, no bisection |
-| `E0504` | neither; this engine declined to start | reports it; the other engine answers |
+| `E0503` `ENGINE_DIVERGENCE` | Ply's — a compiled backend and the machine disagree | `Status::Panicked`, `Skipped::Panicked`, no bisection |
 | `E0505` `INTERNAL_ERROR` | Ply's — an evaluator invariant broke | `Status::Panicked`, `Skipped::Panicked`, no bisection |
 
 `Failure::defect` is the observed answer wherever there is one to observe: a run
@@ -2107,63 +2077,60 @@ defect in Ply and switch M5 off for the whole class.
 
 `E0503` is the one exception, and only because there is nothing to observe: the
 divergence is a comparison the audit *made*, handed back as an ordinary `Err`
-rather than as an unwind. Whatever the program means, at most one of the two
-answers is it and nothing in the definition graph decides which — so bisecting it
-would name whichever definition the disagreement happened to run through.
+rather than as an unwind. Bisecting it would name whichever definition the
+disagreement happened to run through.
 
-`ply check --engine treewalk` refuses the same program, and that verdict may not
-depend on the front-end cache: gate 1 skips a file whose bytes did not change, so
-`ply check` parses any skipped module whose source mentions `resume` before it
-scans. A refusal derived from the modules a run happened to parse makes `ply
-check` exit 2 cold and 0 warm over untouched source.
-
-`--engine` other than the default implies `--no-cache` in both directions: a
-`Pass` in the store is a claim about the authoritative engine, and a
-non-authoritative one may neither read nor write one. Flipping the default is a
-`RUNTIME_VERSION` bump.
+`--backend` implies `--no-cache` in both directions: a `Pass` in the store is a
+claim about what the evaluator answered on its own, and a run that entered
+compiled code may neither read nor write one.
 
 `ply test` also prints `isolated: n of m` in its summary.
 
-**`--engine both` reports its own coverage.** The oracle cannot compare a test
-only one engine can run: a clause binding a continuation is `E0504` on the
-tree-walker (required test 3 below) and a searched test is replayed per
-interleaving on a machine built for the schedule. Both exclusions are correct;
-leaving them uncounted is not, because `0 failed, n passed` under two engines
-reads as two engines having agreed about *n* tests. So `RunReport` carries
+**`--audit-backend` reports its own coverage.** The oracle cannot compare every
+test. A searched test is replayed per interleaving on machines built for the
+schedule, so the pair never runs on it; and a test that reaches a host handler is
+run once on purpose, because a handler is not a function and a second machine
+would send the packet twice. Both exclusions are correct; leaving them uncounted
+is not, because `0 failed, n passed` with a backend attached reads as the backend
+having answered correctly for *n* tests. So `RunReport` carries
 `audit: Option<AuditSummary>` — `{ compared, unaudited }` — and `TestResult`
 carries `audited: Option<bool>`, both **absent rather than zeroed** when no
-oracle ran. `ply test` prints `audited n of m · k ran on one engine only`, and
-`--json` carries the same under `audit` and `tests[].audited` (added within
-`schema_version` 4: nothing changed meaning and nothing left). The excluded
-tests are exactly the ones that bind a continuation or schedule a task, which is
-what a change to the memory model moves, so this is ADR 0017 §6's reporting rule
-applied to the oracle rather than to the schedule.
+oracle ran. `ply test` prints `audited n of m · k ran unpaired`, and `--json`
+carries the same under `audit` and `tests[].audited`.
 
-### Deleted with the machine
+### Deleted with the tree-walker
 
-Each of these is a workaround for the native stack, and the explicit stack is
-what retires it. They go in the change that deletes the tree-walker, which
-follows the flip rather than accompanying it: `--engine both` is what would
-catch a bad flip, so it outlives the flip by one change.
+Each of these was a workaround for the native stack, and the explicit control
+stack is what retired it. All are gone.
 
 | deleted | why |
 | --- | --- |
-| `grow()`, `stacker::maybe_grow`, the `stacker` dependency | a Ply call costs one `Frame::Call` on the heap |
-| `Interp`'s own nesting counter | the bound is `DEFAULT_MAX_CALLS` on `Stack::calls()`, which both engines already share |
-| `#[inline(never)]` on the `eval_*` arms | they keep the recursive `eval` frame small |
-| `Interp`, `Engine`, `--engine` | one milestone of two evaluators, then one |
-| `tests::recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack` | it asserts a property that stops existing, not one that fails |
+| `Interp`, `Engine`, `EngineChoice`, `--engine` | one milestone of two evaluators, then one |
+| `Interp`'s own nesting counter | the bound is `DEFAULT_MAX_CALLS` on `Stack::calls()` |
+| `#[inline(never)]` on the `eval_*` arms | they kept the recursive `eval` frame small |
+| `E0504` `MACHINE_ONLY_CLAUSE`, `is_machine_only`, `machine_only_clauses` | nothing refuses a clause any more |
+| `tests::recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack` | it asserted a property that stopped existing, not one that fails |
+
+**`grow()` and the `stacker` dependency stayed, and this table used to say they
+went.** They are not the evaluator's: `ply_eval::limit::grow` has about forty
+call sites in value comparison, canonicalization, lowering, region-kind
+inference, the cost walk and the escape check, and every one of them is a
+structural walk over a value or an AST that recurses natively whatever runs the
+program. `MAX_VALUE_DEPTH` is 10,000, so a value that deep is exactly what the
+segmented stack is for. The other crates' copies — `ply-syntax`, `ply-core`,
+`ply-hash`, `ply-store`, `ply-prove` — are front-end recursion and were never in
+scope.
 
 The **semantic** limit stays: a runaway recursion is a diagnostic, not an
 out-of-memory kill. Its message keeps the phrase "recursion limit" so ADR 0004's
-`AssertionKind::RecursionLimit` still classifies it, and it can now name the
-innermost `Call` frames.
+`AssertionKind::RecursionLimit` still classifies it, and it names the innermost
+`Call` frames.
 
 ### Workspace
 
 `rpds = "1.2.1"` — the persistent `RedBlackTreeMap` a `World` is, parameterized
 over the shared-pointer kind so it uses `Rc` and non-atomic refcounts, matching
-the existing decision that an `Interp` is confined to one thread. It iterates in
+the existing decision that an evaluator is confined to one thread. It iterates in
 key order, which the byte-identical-artifact rule needs.
 
 The dependency stayed when the world went; what it backs now is `Value::Map`
@@ -2181,11 +2148,9 @@ its own work and being the allocator's.
 
 Numbered as in ADR 0005; `(landed)` marks the ones already passing.
 
-1. Every `ply-eval` unit test passes on both engines, compared by full
-   diagnostic equality.
-2. `--engine both` over `examples/`, `tests/fixtures/` and the generated corpus
+1. Every `ply-eval` unit test passes.
+2. `--audit-backend` over `examples/`, `tests/fixtures/` and the generated corpus
    reports zero divergences.
-3. A tree-walker asked to run a `resume` clause refuses and does not evaluate it.
 4. Forking a world and writing to the fork leaves the original unchanged.
    *(landed)*
 5. Two tests that both retain `cell.write[users]` run in one group and neither
@@ -2604,8 +2569,8 @@ interleaving. `Executor::execute` is therefore **unchanged**, and so are
 grouping, panic containment and the per-test cache rules.
 
 `ply_test::sim::seed_run` and `ply_test::sim::interleaving_of` are the whole of
-the seam, which is why `Evaluator` gains nothing: the tree-walker refuses a
-region outright and has no interleaving to report.
+the seam, which is why `Evaluator` gains nothing: a searched test is replayed
+per interleaving on machines the worker never keeps.
 
 The scheduler is a **native prompt**: a delimiter on the M6 stack whose clauses
 are Rust. `Segment` gains a native form and `Stack::find_handler` consults both;
@@ -2654,9 +2619,6 @@ Six rules an implementer must get exactly right:
 
 `ply run` explores exactly one interleaving — the one its seed names. Exploration
 is a test-time activity.
-
-`simulate` is **machine-only**: the tree-walker refuses it with `E0504` exactly as
-it refuses a `resume` clause, and `machine_only_clauses` learns to scan for it.
 
 ### Exploration — landed in `ply-eval::explore`
 
@@ -2903,9 +2865,8 @@ let the milestone ship broken rather than merely incomplete.
 34. Under `random`, widening 64 roots to 128 runs 64 tests, not 128.
 35. Under `dpor`, an exhausted search writes no `Pass`.
 36. A bisection over a simulated failure runs every hybrid at the failing seed.
-37. `simulate` under `--engine treewalk` is `E0504` and does not evaluate.
-38. Under `--engine both` a test containing `simulate` runs once, on the machine,
-    and `--explain` records it as `machine-only`.
+37. Under `--audit-backend` a test containing `simulate` runs once and
+    `--explain` records it as `searched`.
 39. Adding, removing or reordering a `simulate` region changes the enclosing
     definition's hash; reformatting it does not.
 40. `--sim-budget 1` and `--sim-budget 256` deliver the same value and final
@@ -3402,9 +3363,8 @@ claims are independent and `proved` needs both. The certificate rule is
 `ExhaustiveInterleaving`, deliberately distinct so an audit can find every
 execution-derived proof and check it against 1–5.
 
-Everything else about the region is ADR 0006's, unchanged: machine-only under
-`--engine treewalk` (E0504), no nesting (E0416), no escaping `Task` (E0413),
-stuck is E0414, a divergent replay is E0415.
+Everything else about the region is ADR 0006's, unchanged: no nesting (E0416),
+no escaping `Task` (E0413), stuck is E0414, a divergent replay is E0415.
 
 ### Caching
 
@@ -3575,7 +3535,7 @@ let the milestone ship a wrong `proved` rather than merely an incomplete one:
   never unfolded.
 - **33**: **the differential tier audit.** Every corpus obligation reported
   `proved` survives 1,000 sampled cases across 8 roots; a refutation is a defect
-  in Ply, classified like E0415 and never bisected. This is `--engine both` for
+  in Ply, classified like E0415 and never bisected. This is `--audit-backend` for
   the prover and it exists for the same reason.
 - **35**: a concurrency law with one `Int` binder is `property` even at
   `exhaustive: true`.
@@ -3864,8 +3824,8 @@ from `HostHandler::call` is passed through `ply_eval::host::attribute`, which
 appends a note naming the handler path and the operation, and replaces a code in
 `RESERVED_CODES` with `E0502`. The reserved set is the codes that decide
 classification — `E0505`, `E0503`, `E0415` — plus the ones the boundary and the
-machine raise about their own state: `E0413`, `E0414`, `E0416`, `E0421`–`E0428`,
-`E0504`. Without the rewrite a handler could report its own failure as a defect
+machine raise about their own state: `E0413`, `E0414`, `E0416`, `E0421`–`E0428`.
+Without the rewrite a handler could report its own failure as a defect
 in Ply, which sends the reader to file a bug against the language and suppresses
 the diagnosis that would have found the handler. `HostRuntime::poll`, `park` and
 `block_on` are **not** rewritten: their failures really are about the reactor's
@@ -4149,9 +4109,9 @@ meant. `ply_test`'s defect predicate therefore reads
 `HOST_FOOTPRINT_ESCAPE` alongside `INTERNAL_ERROR` and the two divergence codes.
 
 **Every command that runs an entry point states the claim**, `ply test`
-included: `InterpExecutor::arm_footprint_check` is called before each test on all
-three machine paths — `Engines::Machine`, `Engines::Both`, and once per
-interleaving in `search`. It is restated per test rather than per worker, because
+included: `InterpExecutor::arm_footprint_check` is called before each test on
+every machine path — `Engines::One`, both halves of `Engines::Audited`, and once
+per interleaving in `search`. It is restated per test rather than per worker, because
 one `Machine` serves many tests and a claim that outlived its entry point would
 judge the next test by the last one's row. A check nothing installs is not a
 defence: it was unarmed in `ply test` once, and a `det`, world-isolated test
@@ -4525,7 +4485,7 @@ incomplete.
 32. A `forall (b: Bytes)` law is discharged rather than `E0418`, and its
     counterexample shrinks toward `b""`.
 33. A `Bytes` pattern matches exactly and a `Bytes` never equals a `Str`.
-34. `--engine both` on a corpus containing `Bytes` reports no `E0503`.
+34. `--audit-backend` on a corpus containing `Bytes` reports no `E0503`.
 35. A production-scheduled run and a simulated one of the same program produce
     the same value, and only the simulated one reports an `Exploration`.
 36. A `simulate` entered while a `Policy::Host` region is live is `E0416`.
@@ -4654,7 +4614,7 @@ say so.
 
 **`map_keys` is ascending by that order, always.** Not insertion order, not hash
 order, not unspecified. Content addressing, the result cache, seeded replay and
-`--engine both` all assume a value has one canonical form, and every failure a
+`--audit-backend` all assume a value has one canonical form, and every failure a
 hash-ordered map would produce is a green result or a red result over correct
 code.
 
@@ -5195,7 +5155,7 @@ broken rather than merely incomplete.
 20. `bytes_scan` never examines more than `max` bytes, asserted by a counting
     harness rather than by timing; `bytes_position` calls its predicate once for a
     match at index 0 of a megabyte buffer.
-21. `--engine both` on a corpus using every new builtin reports no `E0503`.
+21. `--audit-backend` on a corpus using every new builtin reports no `E0503`.
 22. `Store::open` at 10,000 definitions stays under 5 ms.
 23. Incremental and `--no-incremental` agree byte-for-byte over a corpus using
     every W2 feature, across the full mutation sequence.
@@ -5857,7 +5817,7 @@ ship broken rather than merely incomplete.
     and a TLS listener.
 18. Incremental and `--no-incremental` agree byte-for-byte across the full
     mutation sequence, with `effect set` edits added.
-19. `--engine both` reports no `E0503`; `E0412` still fires; `ply test` is
+19. `--audit-backend` reports no `E0503`; `E0412` still fires; `ply test` is
     hermetic without `--host` and says so; `Store::open` at 10,000 definitions
     stays under 5 ms.
 
@@ -6618,21 +6578,15 @@ are printed and both are in `--json`.
 
 ### Amendments to W1
 
-**`--engine both` degrades to one engine on a host-backed test, silently.** The
-obvious worry is wrong and the real one is quieter, so both are stated.
-`Engines::Both` does **not** execute a host operation twice: `Interp` holds the
-binding "only in order to *refuse* at it", so the tree-walker's arm ends at the
-first host operation with `err_machine_only_host` (`E0504`),
-`execute_directly` returns the machine's answer, and the insert happens once.
-Checked against the code rather than assumed; W4 changes nothing about it. What
-is wrong is the reporting: such a test gets **no differential audit at all** and
-the run still says `--engine both`, so the command whose purpose is "two engines
-agree" quietly means "one engine ran" for exactly the tests a database makes
-interesting. `--explain` now reports `engine: machine (host, not audited)`, the
-summary carries `audited: n of m`, and `--json` carries the same. This is
-`Isolation::Host` and `Skipped::Host`'s argument — declare the guarantee
-inapplicable where it cannot hold and keep the number honest — applied where W1
-left it implicit.
+**`--audit-backend` runs a host-backed test once, and counts it unpaired.** A
+host handler is not a function: a second machine would charge the card twice,
+send the packet twice, insert the row twice. So `execute_directly` runs the plain
+machine, asks whether it reached the boundary, and returns without running the
+backed one if it did. The run gets no differential audit for that test, which is
+correct and must not be silent: the summary carries `audited: n of m · k ran
+unpaired` and `--json` carries the same. This is `Isolation::Host` and
+`Skipped::Host`'s argument — declare the guarantee inapplicable where it cannot
+hold and keep the number honest.
 
 **`end_entry_point` is called on every exit.** The hook is worthless unless it is
 called on the diagnostic and budget-exhaustion paths too. `InterpExecutor` calls
@@ -6777,7 +6731,7 @@ ship broken rather than merely incomplete.
 22. Renaming a top-level function selects zero tests and moving a definition
     between modules changes no hash, on a corpus with `db` rows, `derive row` and
     a `law/host`; incremental and `--no-incremental` agree byte-for-byte.
-23. `--engine both` reports no `E0503`; a host-backed test performs its
+23. `--audit-backend` reports no `E0503`; a host-backed test performs its
     statements **exactly once** across both arms and is reported `host, not
     audited`, with `audited: n of m` excluding it.
 24. `E0412` still fires; `ply test` is hermetic without `--host`; an effect-set
@@ -7522,7 +7476,7 @@ Read `ply_store`'s own doc comments, which do:
 
 | constant | as shipped | what moved it after W5 |
 | --- | --- | --- |
-| `RUNTIME_VERSION` | `0.11.2` | `0.11.1`: `map_of_entries` / `map_merge` refuse a `Secret` key rather than ordering it, and a span id is minted per entry point rather than per run. `0.11.2`: both engines memoize a nullary pure definition — no value moves, but the calls pending under a second reference to one do (see "The constant memo") |
+| `RUNTIME_VERSION` | `0.11.2` | `0.11.1`: `map_of_entries` / `map_merge` refuse a `Secret` key rather than ordering it, and a span id is minted per entry point rather than per run. `0.11.2`: a nullary pure definition is memoized — no value moves, but the calls pending under a second reference to one do (see "The constant memo") |
 | `FRONTEND_VERSION` | `0.15.0` | `0.14.0`: a handler clause for a polymorphic operation is universally quantified, so a clause answering a concrete type for an operation declared `-> a` is `E0201` where it was accepted. `0.15.0`: ADR 0017's region surface — `with_region[r]`, the escape check on resolved types, and a variant field declared as a concrete `Cell` becoming `E0446` |
 | `PROVER_VERSION` | `0.5.0` | unchanged since W4 |
 | `BODY_ENCODING` | `7` | unchanged since W4 |
@@ -7663,8 +7617,8 @@ ship broken rather than merely incomplete.
     between modules changes no hash, on a corpus with `trace`, `config`, `signal`
     and `Secret` rows; incremental and `--no-incremental` agree byte-for-byte;
     `E0412` still fires; `ply test` is hermetic without `--host`; bisection names
-    the correct culprit and `--engine both` reports no `E0503` with a `Secret`
-    round-tripping identically on both engines; a seeded race is found against
+    the correct culprit and `--audit-backend` reports no `E0503` with a `Secret`
+    round-tripping identically; a seeded race is found against
     the twin **with tracing installed** and replayed exactly; an alias containing
     `trace` and `config` atoms hashes as its expansion; `Store::open` at 10,000
     definitions stays under 5 ms; `ply prove` reports honest tiers and
@@ -7785,7 +7739,7 @@ that stopped being true is worse than one that was never printed. So:
 1. Two tests naming one region label are coloured apart; two tests naming
    different labels are one group. The cost is the collisions, never the count.
 2. A group of tests on distinct labels runs concurrently and none of them
-   observes another's cells, over repeated rounds, under `--engine both`.
+   observes another's cells, over repeated rounds, under `--audit-backend`.
 3. After every test, the world its worker holds carries that test's writes and
    nothing else, and the group's region is back at its mark.
 4. The group's fixture is built once, and test *k* opens the region on test
@@ -7890,8 +7844,8 @@ parameter and `desk` also declares `fn shelf`. The eleven are real:
 `desk.under` is `handle { .. } with { signal.stopping() -> false }` under an
 empty published row, and the other ten reach it.
 
-**What the gate costs the seam today: nothing measurable.** With the tree-walking
-backend of `differential_corpus.rs` attached over every corpus in the tree
+**What the gate costs the seam today: nothing measurable.** With the
+nested-machine backend of `differential_corpus.rs` attached over every corpus in the tree
 except the new fixture, the counters read **18,772 entered / 101,567 declined
 over 1,011 tests** with the gate and **18,772 / 101,567** without it — the same
 numbers, because every call those eleven definitions make in this corpus is
@@ -8211,7 +8165,7 @@ is that the emitted order is the corpus's and that reversing it is visible.
 
 ### `ply-eval` and the machine — landed
 
-**Nothing.** Both evaluators have evaluated `Match` since W1, so `--engine both`
+**Nothing.** Both evaluators have evaluated `Match` since W1, so `--audit-backend`
 compares two engines running a tree a human could have typed. There is no new
 node to disagree about, no unwind, no frame kind, and nothing to get wrong at a
 `handle` boundary. `interp.rs` and `code.rs` carry `unreachable!` arms; the
@@ -8255,7 +8209,7 @@ the_fixtures_produce_the_codes_they_are_named_for`.
 Taken twice, byte-identical; binary verified fresh by
 `.github/binary-is-current.sh`, which covers `.rs`, `.ply` and dep-info — the
 `.rs`-only shape of that check is what the record-update entry above records
-being caught by. `ply test --engine both` is `0 failed, 176 passed` over
+being caught by. `ply test --audit-backend` is `0 failed, 176 passed` over
 `crates/ply-std/ply` and `0 failed, 186 passed` over `examples`, on both sides.
 
 **Zero moved is a claim about the gate as much as about the change.** With the

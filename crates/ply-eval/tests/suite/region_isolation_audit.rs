@@ -3,7 +3,7 @@
 
 use ply_core::{CheckOutput, Footprint, check_program};
 use ply_eval::arena::Slot;
-use ply_eval::{Engine, Fixture, Interp, Machine, TaskRegions, Value};
+use ply_eval::{Fixture, Machine, TaskRegions, Value};
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -45,10 +45,6 @@ impl Compiled {
         Machine::new(&self.program, &self.resolved, &self.check)
     }
 
-    fn interp(&self) -> Interp<'_> {
-        Interp::new(&self.program, &self.resolved, &self.check)
-    }
-
     fn index_of(&self, name: &str) -> usize {
         self.check
             .tests
@@ -61,24 +57,8 @@ impl Compiled {
         &self.check.tests[self.index_of(name)].footprint
     }
 
-    /// An isolation defect that only one engine has is still a defect, so nothing here is believed
-    /// until both engines say it.
-    fn run_both(&self, name: &str) -> Result<(), Diagnostic> {
-        let index = self.index_of(name);
-        let machine = self.machine().eval_test(index);
-        let treewalk = self.interp().eval_test(index);
-        match (&machine, &treewalk) {
-            (Ok(()), Ok(())) => Ok(()),
-            (Err(m), Err(t)) => {
-                assert_eq!(
-                    m.message, t.message,
-                    "the engines disagree about why {name:?} failed"
-                );
-                Err(machine.unwrap_err())
-            }
-            (Ok(()), Err(t)) => panic!("only the tree-walker failed {name:?}: {t:#?}"),
-            (Err(m), Ok(())) => panic!("only the machine failed {name:?}: {m:#?}"),
-        }
+    fn run(&self, name: &str) -> Result<(), Diagnostic> {
+        self.machine().eval_test(self.index_of(name))
     }
 }
 
@@ -333,7 +313,7 @@ fn a_cell_carried_out_through_a_continuation_reads_this_runs_world() {
         .eval_test(index)
         .expect("the resumed read answers the region's initial value");
     compiled
-        .run_both("two regions in one test are two cells")
+        .run("two regions in one test are two cells")
         .expect("a second region is a second cell, not the first one again");
 }
 
@@ -755,10 +735,9 @@ fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
     assert!(!is_send!(ply_eval::Env));
     assert!(!is_send!(ply_eval::Fixture));
     assert!(!is_send!(Machine<'static>));
-    assert!(!is_send!(Interp<'static>));
     // The sanity half: the probe reports `true` for something that is `Send`.
     assert!(is_send!(Slot));
-    assert!(is_send!(Engine));
+    assert!(is_send!(ply_span::Span));
 }
 
 /// Autoref specialization: the inherent method exists only when `T: Send`, and the trait method on

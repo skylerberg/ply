@@ -1,7 +1,7 @@
 //! One `Value` per constructor per thread, and what that may not change.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Arena, Interp, Machine, RegionKind, Value, values_equal};
+use ply_eval::{Arena, Machine, RegionKind, Value, values_equal};
 use ply_span::{SourceId, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -44,19 +44,12 @@ pub fn ranked(ignored: Int) -> Int = rank(Red) + rank(Green)
 pub fn built(ignored: Int) -> List<Boxed> = [Box(1), Box(2)]
 "#;
 
-/// Both engines run every case here: `ctor_value` is shared by the two, so a cache in it is a
-/// change to both, and `--engine both` reporting no divergence is what the change is allowed to
-/// cost.
-fn on_both(c: &Compiled, name: &str) -> [Value; 2] {
-    let call = |v: Result<Value, ply_span::Diagnostic>| match v {
+fn answered(c: &Compiled, name: &str) -> Value {
+    let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
+    match machine.call(name, vec![Value::Int(0)], Span::DUMMY) {
         Ok(value) => value,
         Err(d) => panic!("`{name}` raised: {d:#?}"),
-    };
-    let mut interp = Interp::new(&c.program, &c.resolved, &c.check);
-    let walked = call(interp.call(name, vec![Value::Int(0)], Span::DUMMY));
-    let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
-    let stepped = call(machine.call(name, vec![Value::Int(0)], Span::DUMMY));
-    [walked, stepped]
+    }
 }
 
 #[track_caller]
@@ -68,32 +61,34 @@ fn pair(value: &Value) -> (&Value, &Value) {
 }
 
 #[test]
-fn two_mentions_of_a_nullary_constructor_are_one_value_on_both_engines() {
+fn two_mentions_of_a_nullary_constructor_are_one_value() {
     let c = compile(SOURCE);
-    for (engine, answered) in ["treewalk", "machine"].iter().zip(on_both(&c, "m.twice")) {
+    let answered = answered(&c, "m.twice");
+    {
         let (first, second) = pair(&answered);
         match (first, second) {
             (Value::Ctor { args: x, .. }, Value::Ctor { args: y, .. }) => assert!(
                 Arc::ptr_eq(x, y),
-                "on {engine} two mentions of `Red` answered with two values, so `ctor_value` \
-                 built the second rather than sharing the first"
+                "two mentions of `Red` answered with two values, so `ctor_value` built the \
+                 second rather than sharing the first"
             ),
-            _ => panic!("on {engine} a mention of `Red` did not evaluate to a `Ctor`"),
+            _ => panic!("a mention of `Red` did not evaluate to a `Ctor`"),
         }
     }
 }
 
 #[test]
-fn two_mentions_of_a_constructor_of_arity_one_are_one_closure_on_both_engines() {
+fn two_mentions_of_a_constructor_of_arity_one_are_one_closure() {
     let c = compile(SOURCE);
-    for (engine, answered) in ["treewalk", "machine"].iter().zip(on_both(&c, "m.boxes")) {
+    let answered = answered(&c, "m.boxes");
+    {
         let (first, second) = pair(&answered);
         match (first, second) {
             (Value::Closure(x), Value::Closure(y)) => assert!(
                 Arc::ptr_eq(x, y),
-                "on {engine} two mentions of `Box` answered with two closures"
+                "two mentions of `Box` answered with two closures"
             ),
-            _ => panic!("on {engine} a mention of `Box` did not evaluate to a closure"),
+            _ => panic!("a mention of `Box` did not evaluate to a closure"),
         }
     }
 }
@@ -103,15 +98,14 @@ fn two_mentions_of_a_constructor_of_arity_one_are_one_closure_on_both_engines() 
 #[test]
 fn a_shared_constructor_still_matches_and_still_compares_equal() {
     let c = compile(SOURCE);
-    for answered in on_both(&c, "m.ranked") {
-        assert_eq!(
-            answered,
-            Value::Int(3),
-            "a shared constructor selected a different arm than a fresh one"
-        );
-    }
-    for answered in on_both(&c, "m.twice") {
-        let (first, second) = pair(&answered);
+    assert_eq!(
+        answered(&c, "m.ranked"),
+        Value::Int(3),
+        "a shared constructor selected a different arm than a fresh one"
+    );
+    {
+        let twice = answered(&c, "m.twice");
+        let (first, second) = pair(&twice);
         let fresh = Value::ctor("m.Red", Vec::new());
         assert!(
             values_equal(first, second, Span::DUMMY).expect("two `Ctor`s compare")
@@ -126,7 +120,7 @@ fn a_shared_constructor_still_matches_and_still_compares_equal() {
 #[test]
 fn a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds() {
     let c = compile(SOURCE);
-    let [_, shared] = on_both(&c, "m.twice");
+    let shared = answered(&c, "m.twice");
     let (held, _) = pair(&shared);
     let held = held.clone();
 
@@ -142,7 +136,7 @@ fn a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds() {
         values_equal(&held, &fresh, Span::DUMMY).expect("two `Ctor`s compare"),
         "a region's close reached inside a value the cache is still handing out"
     );
-    let [_, again] = on_both(&c, "m.twice");
+    let again = answered(&c, "m.twice");
     let (after, _) = pair(&again);
     assert!(
         values_equal(after, &fresh, Span::DUMMY).expect("two `Ctor`s compare"),
@@ -154,22 +148,23 @@ fn a_region_closing_under_a_shared_constructor_reclaims_nothing_it_holds() {
 #[test]
 fn applying_one_shared_constructor_twice_builds_two_values() {
     let c = compile(SOURCE);
-    for (engine, answered) in ["treewalk", "machine"].iter().zip(on_both(&c, "m.built")) {
+    let answered = answered(&c, "m.built");
+    {
         let (first, second) = pair(&answered);
         match (first, second) {
             (Value::Ctor { args: x, .. }, Value::Ctor { args: y, .. }) => {
                 assert!(
                     !Arc::ptr_eq(x, y),
-                    "on {engine} `Box(1)` and `Box(2)` share one argument vector"
+                    "`Box(1)` and `Box(2)` share one argument vector"
                 );
-                assert_eq!(x.as_ref(), &vec![Value::Int(1)], "on {engine}");
-                assert_eq!(y.as_ref(), &vec![Value::Int(2)], "on {engine}");
+                assert_eq!(x.as_ref(), &vec![Value::Int(1)]);
+                assert_eq!(y.as_ref(), &vec![Value::Int(2)]);
             }
-            _ => panic!("on {engine} an applied `Box` did not evaluate to a `Ctor`"),
+            _ => panic!("an applied `Box` did not evaluate to a `Ctor`"),
         }
         assert!(
             !values_equal(first, second, Span::DUMMY).expect("two `Ctor`s compare"),
-            "on {engine} `Box(1)` and `Box(2)` are one value"
+            "`Box(1)` and `Box(2)` are one value"
         );
     }
 }
@@ -180,7 +175,8 @@ fn applying_one_shared_constructor_twice_builds_two_values() {
 fn a_shared_constructor_is_the_same_map_key_as_a_fresh_one() {
     let c = compile(SOURCE);
     let fresh = Value::ctor("m.Red", Vec::new());
-    for (engine, answered) in ["treewalk", "machine"].iter().zip(on_both(&c, "m.twice")) {
+    let answered = answered(&c, "m.twice");
+    {
         let (shared, _) = pair(&answered);
 
         let keyed_by_shared = Value::map([(shared.clone(), Value::Int(1))]);
@@ -194,7 +190,8 @@ fn a_shared_constructor_is_the_same_map_key_as_a_fresh_one() {
             };
             assert!(
                 m.get(probe).is_some(),
-                "on {engine}, {label}: the two order differently, so one program's map has two                  entries where it wrote one"
+                "{label}: the two order differently, so one program's map has two entries \
+                 where it wrote one"
             );
         }
 
@@ -208,11 +205,7 @@ fn a_shared_constructor_is_the_same_map_key_as_a_fresh_one() {
         let Value::Map(m) = &both_spellings else {
             unreachable!("built by `Value::map`")
         };
-        assert_eq!(
-            m.size(),
-            1,
-            "on {engine} a shared `Red` and a fresh one are two keys"
-        );
-        assert_eq!(shared.render(), fresh.render(), "on {engine}");
+        assert_eq!(m.size(), 1, "a shared `Red` and a fresh one are two keys");
+        assert_eq!(shared.render(), fresh.render());
     }
 }

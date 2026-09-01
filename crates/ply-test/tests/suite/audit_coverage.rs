@@ -1,7 +1,7 @@
-//! What `--engine both` actually compared, as a number the run reports.
+//! What `--audit-backend` actually compared, as a number the run reports.
 
 use ply_core::CheckOutput;
-use ply_eval::{EngineChoice, Plan};
+use ply_eval::Plan;
 use ply_hash::HashOutput;
 use ply_span::SourceId;
 use ply_store::Store;
@@ -61,21 +61,24 @@ impl Compiled {
     }
 }
 
-fn report(src: &str, engine: EngineChoice) -> ply_test::RunReport {
+fn report(src: &str, audit: bool) -> ply_test::RunReport {
     let compiled = Compiled::new(src);
     let root = TempRoot::new();
     let mut store = root.store();
     let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
-    let report = ply_test::run(
+    let fragment = ply_eval::Fragment::over(&compiled.program, &compiled.resolved, &compiled.check);
+    let executor =
+        ply_test::InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+            .with_backend_audit(audit)
+            .with_backend(fragment, ply_eval::BackendSpec::honest())
+            .with_search(ply_test::Search::of(&selection))
+            .with_hosts(ply_test::Hosting::hermetic());
+    let report = ply_test::run_with(
         &selection,
-        &compiled.program,
-        &compiled.resolved,
         &compiled.check,
         &compiled.hashes,
         &mut store,
-        engine,
-        ply_test::Search::of(&selection),
-        ply_test::Hosting::hermetic(),
+        &executor,
     );
     assert_eq!(report.failed, 0, "{:#?}", report.failures);
     report
@@ -92,12 +95,12 @@ effect counter {
   write bump[shard]() -> Unit
 }
 
-// Both engines run this one.
+// The pair runs this one.
 test "plain arithmetic" {
   assert_eq(1 + 1, 2)
 }
 
-// `resume k` is E0504 on the tree-walker: it never runs.
+// A multi-shot resumption: the pair runs it like any other.
 test "a clause that binds its continuation" {
   with_cell[trace](0) { c -> {
     let total = handle {
@@ -113,8 +116,8 @@ test "a clause that binds its continuation" {
   } }
 }
 
-// A searched test: replayed per interleaving on a machine built for the
-// schedule, which the tree-walker never sees.
+// A searched test: replayed per interleaving on machines built for the
+// schedule, which the pair never runs.
 test "two tasks over one shard" {
   with_cell[tally](0) { t ->
     handle {
@@ -134,20 +137,20 @@ test "two tasks over one shard" {
 
 #[test]
 fn the_oracle_counts_the_tests_it_compared_and_the_tests_it_could_not() {
-    let report = report(MIXED, EngineChoice::Both);
-    let audit = report.audit.expect("`both` runs an oracle");
+    let report = report(MIXED, true);
+    let audit = report.audit.expect("`--audit-backend` runs an oracle");
     assert_eq!(audit.total(), 3, "{audit:?}");
     assert_eq!(
         (audit.compared, audit.unaudited),
-        (1, 2),
-        "only the plain test is reachable by both engines: {audit:?}"
+        (2, 1),
+        "the searched test is the one the pair cannot reach: {audit:?}"
     );
 }
 
 /// Which tests, not only how many.
 #[test]
-fn the_unaudited_tests_are_the_multi_shot_one_and_the_searched_one() {
-    let report = report(MIXED, EngineChoice::Both);
+fn the_unaudited_test_is_the_searched_one() {
+    let report = report(MIXED, true);
     let audited: Vec<(&str, Option<bool>)> = report
         .results
         .iter()
@@ -158,7 +161,7 @@ fn the_unaudited_tests_are_the_multi_shot_one_and_the_searched_one() {
         "{audited:?}"
     );
     assert!(
-        audited.contains(&("a clause that binds its continuation", Some(false))),
+        audited.contains(&("a clause that binds its continuation", Some(true))),
         "{audited:?}"
     );
     assert!(
@@ -167,36 +170,23 @@ fn the_unaudited_tests_are_the_multi_shot_one_and_the_searched_one() {
     );
 }
 
-/// A run with one engine reports **no** coverage rather than a coverage of zero.
+/// A run with no audit reports **no** coverage rather than a coverage of zero.
 #[test]
-fn a_single_engine_run_has_no_coverage_to_report() {
-    for engine in [EngineChoice::Machine, EngineChoice::Treewalk] {
-        // The tree-walker refuses the multi-shot test outright, so a single engine is asked about
-        // the one program both can run.
-        let report = report(
-            "test \"plain arithmetic\" { assert_eq(1 + 1, 2) }\n",
-            engine,
-        );
-        assert!(report.audit.is_none(), "{engine:?}: {:?}", report.audit);
-        assert!(
-            report.results.iter().all(|r| r.audited.is_none()),
-            "{engine:?}"
-        );
-    }
+fn an_unaudited_run_has_no_coverage_to_report() {
+    let report = report("test \"plain arithmetic\" { assert_eq(1 + 1, 2) }\n", false);
+    assert!(report.audit.is_none(), "{:?}", report.audit);
+    assert!(report.results.iter().all(|r| r.audited.is_none()));
 }
 
 /// The line the run prints, and its silence when there is nothing to say.
 #[test]
 fn the_summary_line_appears_only_where_there_is_a_coverage() {
-    let both = report(MIXED, EngineChoice::Both);
+    let both = report(MIXED, true);
     let summary = both.summary().join("\n");
-    assert!(summary.contains("audited 1 of 3"), "{summary}");
-    assert!(summary.contains("2 ran on one engine only"), "{summary}");
+    assert!(summary.contains("audited 2 of 3"), "{summary}");
+    assert!(summary.contains("1 ran unpaired"), "{summary}");
 
-    let one = report(
-        "test \"plain arithmetic\" { assert_eq(1 + 1, 2) }\n",
-        EngineChoice::Machine,
-    );
+    let one = report("test \"plain arithmetic\" { assert_eq(1 + 1, 2) }\n", false);
     assert!(
         !one.summary().join("\n").contains("audited"),
         "{:?}",
@@ -208,15 +198,15 @@ fn the_summary_line_appears_only_where_there_is_a_coverage() {
 /// is fully audited, and the number says so rather than being pinned at whatever the mixed corpus
 /// happens to produce.
 #[test]
-fn a_corpus_both_engines_can_run_is_fully_audited() {
+fn a_corpus_with_no_searched_test_is_fully_audited() {
     let report = report(
         "test \"a\" { assert_eq(1, 1) }\ntest \"b\" { assert_eq(2, 2) }\n",
-        EngineChoice::Both,
+        true,
     );
-    let audit = report.audit.expect("`both` runs an oracle");
+    let audit = report.audit.expect("`--audit-backend` runs an oracle");
     assert_eq!((audit.compared, audit.unaudited), (2, 0), "{audit:?}");
     assert!(
-        !report.summary().join("\n").contains("one engine only"),
+        !report.summary().join("\n").contains("unpaired"),
         "nothing was skipped, so nothing is apologized for"
     );
 }

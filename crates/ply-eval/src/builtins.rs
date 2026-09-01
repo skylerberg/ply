@@ -1,9 +1,9 @@
-//! The prelude, in one definition per builtin that both engines run.
+//! The prelude, in one definition per builtin.
 
 use crate::arena::{Arena, Slot};
 use crate::cont::Frame;
-use crate::interp::{Interp, arity_error};
 use crate::map;
+use crate::semantics::arity_error;
 use crate::value::{Decimal, Value, Vector, first_difference, type_error, values_equal};
 use ply_span::{Diagnostic, Span, codes};
 use rust_decimal::RoundingStrategy;
@@ -848,7 +848,7 @@ pub fn call(
             let scale = decimal_scale(&args[2], span, "decimal_div")?;
             let mode = rounding(&args[3], span, "decimal_div")?;
             if b.is_zero() {
-                return Err(crate::interp::err_zero_divisor(span, "`decimal_div`"));
+                return Err(crate::semantics::err_zero_divisor(span, "`decimal_div`"));
             }
             let quotient = a
                 .checked_div(b)
@@ -1508,31 +1508,6 @@ fn not_a_builtin_step() -> Diagnostic {
     .primary(Span::DUMMY, "please report this")
 }
 
-impl Interp<'_> {
-    /// The tree-walker's driver for the step protocol.
-    pub(crate) fn call_builtin(
-        &mut self,
-        b: Builtin,
-        args: Vec<Value>,
-        span: Span,
-    ) -> Result<Value, Diagnostic> {
-        let mut step = call(b, args, self.cells_mut(), span)?;
-        loop {
-            match step {
-                Step::Done(v) => return Ok(v),
-                Step::Apply {
-                    callee,
-                    args,
-                    frame,
-                } => {
-                    let answer = self.apply(callee, args, span)?;
-                    step = advance(frame, answer)?;
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1540,6 +1515,7 @@ mod tests {
         bin, block, callv, clause, discard, effect_def, handle, int, lam, letv, list, perform,
         standalone, var, with_cell,
     };
+    use crate::machine::Machine;
     use crate::task_regions::TaskRegions;
     use ply_syntax::ast::{BinOp, Expr, Item, Mode};
 
@@ -2810,7 +2786,7 @@ mod tests {
 
     fn run(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {
         let (program, resolved) = standalone(items);
-        Interp::for_program(&program, &resolved).eval_expr_for_test(&e)
+        Machine::for_program(&program, &resolved).eval_expr_for_test(&e)
     }
 
     fn state() -> Item {

@@ -1703,10 +1703,8 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
     let bypassed = between(&cli.text, b"fn cache_bypassed(", b"\n}");
     assert!(
         contains(&bypassed, b"backend"),
-        "`cache_bypassed` cannot see whether a backend was installed, so a backend run on the \
-         DEFAULT engine would read the result cache. `--engine both` already bypasses it, which \
-         is exactly why this must not rest on the engine: ADR 0026 \u{a7}4.6 names that interlock \
-         as a trap.\ncache_bypassed reads: {}",
+        "`cache_bypassed` cannot see whether a backend was installed, so a backend run would \
+         read the result cache: ADR 0026 \u{a7}4.6.\ncache_bypassed reads: {}",
         String::from_utf8_lossy(&bypassed)
     );
 

@@ -4,7 +4,7 @@ use ply_codegen_spike::entry::{admissible, enterable, refusals_over, scalar_sign
 use ply_codegen_spike::jit::Opts;
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
-use ply_eval::{Interp, Machine, Value, compare_answers};
+use ply_eval::{Machine, Value, compare_answers};
 use ply_span::Span;
 use std::path::PathBuf;
 
@@ -64,21 +64,6 @@ fn agree(harness: &mut Harness, name: &str, args: &[Value]) -> Option<String> {
     let hybrid = harness.hybrid_outcome(name, args);
     compare_answers(&harness.machine, &harness.hybrid, name, &expected, &hybrid)
         .map(|d| format!("with a backend attached, {d}"))
-}
-
-/// And against the tree-walker, which is the independent implementation `--engine both` already
-/// polices.
-fn agree_with_treewalk(
-    loaded: &'static Loaded,
-    harness: &mut Harness,
-    name: &str,
-    args: &[Value],
-) -> Option<String> {
-    let expected = harness.interpret_outcome(name, args);
-    let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
-    let walked = interp.call(name, args.to_vec(), Span::DUMMY);
-    compare_answers(&interp, &harness.machine, name, &walked, &expected)
-        .map(|d| format!("the tree-walker {d}"))
 }
 
 fn entries(harness: &Harness) -> u64 {
@@ -217,9 +202,6 @@ fn a_native_body_runs_under_a_live_handler_stack() {
         if let Some(d) = agree(&mut harness, "effects.handled", &args) {
             panic!("`effects.handled({n})`: {d}");
         }
-        if let Some(d) = agree_with_treewalk(loaded, &mut harness, "effects.handled", &args) {
-            panic!("`effects.handled({n})`: {d}");
-        }
         assert!(
             entries(&harness) > before,
             "`effects.handled({n})` entered no compiled code, so nothing ran under the handler"
@@ -303,9 +285,6 @@ fn a_definition_that_opens_its_own_region_is_refused_by_the_fragment() {
         let args = vec![Value::Int(n)];
         let before = entries(&harness);
         if let Some(d) = agree(&mut harness, "cells.counted", &args) {
-            panic!("`cells.counted({n})`: {d}");
-        }
-        if let Some(d) = agree_with_treewalk(loaded, &mut harness, "cells.counted", &args) {
             panic!("`cells.counted({n})`: {d}");
         }
         assert!(
@@ -430,9 +409,6 @@ fn a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer() {
             if let Some(d) = agree(&mut harness, name, &args) {
                 panic!("`{name}({n})`: {d}");
             }
-            if let Some(d) = agree_with_treewalk(loaded, &mut harness, name, &args) {
-                panic!("`{name}({n})`: {d}");
-            }
         }
     }
     // And the most direct form of the same thing: a `Float` handed straight to a compiled body,
@@ -502,9 +478,6 @@ fn a_higher_order_builtin_is_refused_by_name() {
         if let Some(d) = agree(&mut harness, "callbacks.tripled", &args) {
             panic!("`callbacks.tripled({n})`: {d}");
         }
-        if let Some(d) = agree_with_treewalk(loaded, &mut harness, "callbacks.tripled", &args) {
-            panic!("`callbacks.tripled({n})`: {d}");
-        }
     }
 }
 
@@ -535,7 +508,7 @@ fn an_interpreted_recursion_entering_compiled_code_at_every_depth_is_bounded() {
         "the machine answered `{message}` rather than its own bound"
     );
     if let Some(d) = compare_answers(&machine, &hybrid, "deep.countdown", &expected, &actual) {
-        panic!("the two engines did not raise the same diagnostic at the bound: {d}");
+        panic!("the two sides did not raise the same diagnostic at the bound: {d}");
     }
     let (entered, _) = hybrid.compiled_counts();
     assert!(
@@ -558,7 +531,7 @@ fn an_interpreted_recursion_entering_compiled_code_at_every_depth_is_bounded() {
         "the machine's own bound moved"
     );
     if let Some(d) = compare_answers(&machine, &hybrid, "deep.countdown", &expected, &actual) {
-        panic!("the two engines did not raise the same diagnostic at the shipped bound: {d}");
+        panic!("the two sides did not raise the same diagnostic at the shipped bound: {d}");
     }
 }
 
@@ -748,9 +721,6 @@ fn a_compiled_failure_arrives_as_the_machines_own_diagnostic() {
         if let Some(d) = agree(&mut harness, name, args) {
             panic!("`{name}`: {d}");
         }
-        if let Some(d) = agree_with_treewalk(loaded, &mut harness, name, args) {
-            panic!("`{name}`: {d}");
-        }
         assert!(
             harness.bodies.declines().failed > before,
             "`{name}` did not fail inside the fragment, so this case never reached the boundary"
@@ -839,9 +809,6 @@ fn a_nullary_constructor_pattern_is_a_test_and_not_a_binding() {
         let args = vec![Value::Int(n)];
         let before = entries(&harness);
         if let Some(d) = agree(&mut harness, "pure.tagged", &args) {
-            panic!("`pure.tagged({n})`: {d}");
-        }
-        if let Some(d) = agree_with_treewalk(loaded, &mut harness, "pure.tagged", &args) {
             panic!("`pure.tagged({n})`: {d}");
         }
         let answered = harness

@@ -741,7 +741,7 @@ fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Durati
         &loaded.check,
         &loaded.hashes,
         store,
-        ply_eval::EngineChoice::Machine,
+        false,
         ply_test::Search::of(&selection),
         ply_test::Hosting::hermetic(),
     );

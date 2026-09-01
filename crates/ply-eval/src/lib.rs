@@ -21,7 +21,6 @@ pub mod explore;
 mod frame;
 pub mod handler;
 pub mod host;
-mod interp;
 pub mod limit;
 pub mod machine;
 pub mod map;
@@ -31,6 +30,7 @@ pub mod rc;
 pub mod region;
 pub mod region_kind;
 pub mod sched;
+mod semantics;
 pub mod sim;
 pub mod task_regions;
 pub mod trace;
@@ -56,7 +56,6 @@ pub use cont::{
 pub use costs::{Cause as CostCause, Costs, DefKind as CostDefKind, Verdict as CostVerdict};
 pub use differential::{
     Compared, Detail, Divergence, Evaluator, Report, compare_answers, compare_outcomes,
-    is_machine_only, machine_only_clause, machine_only_clauses,
 };
 pub use env::{Env, Slot as ScopeSlot};
 pub use escape::{Boundary, Escapee, Handle};
@@ -72,7 +71,6 @@ pub use explore::{
     Dependence, Explored, Interleaving, Simulation, Verdict, explore, explore_under,
     measure_reduction,
 };
-pub use interp::Interp;
 pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use machine::{Machine, Progress};
 pub use rc::{Own, Stats as RcStats};
@@ -87,85 +85,6 @@ pub use value::{
     Closure, ClosureKind, Decimal, Map, SECRET_REDACTED, Value, Vector, constant_time_eq,
     first_difference, values_equal,
 };
-
-/// The default is the engine whose results are authoritative.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum Engine {
-    Treewalk,
-    /// Explicit control stack, region-allocated state, multi-shot continuations.
-    #[default]
-    Machine,
-}
-
-impl Engine {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Engine::Treewalk => "treewalk",
-            Engine::Machine => "machine",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<Engine> {
-        match s {
-            "treewalk" => Some(Engine::Treewalk),
-            "machine" => Some(Engine::Machine),
-            _ => None,
-        }
-    }
-}
-
-/// What a `--engine` flag selects.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum EngineChoice {
-    Treewalk,
-    #[default]
-    Machine,
-    Both,
-}
-
-impl EngineChoice {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            EngineChoice::Treewalk => "treewalk",
-            EngineChoice::Machine => "machine",
-            EngineChoice::Both => "both",
-        }
-    }
-
-    pub fn parse(s: &str) -> Option<EngineChoice> {
-        match s {
-            "treewalk" => Some(EngineChoice::Treewalk),
-            "machine" => Some(EngineChoice::Machine),
-            "both" => Some(EngineChoice::Both),
-            _ => None,
-        }
-    }
-
-    /// The engine whose verdict is reported.
-    pub fn primary(self) -> Engine {
-        match self {
-            EngineChoice::Treewalk => Engine::Treewalk,
-            EngineChoice::Machine => Engine::Machine,
-            EngineChoice::Both => Engine::default(),
-        }
-    }
-
-    pub fn auditor(self) -> Option<Engine> {
-        match self {
-            EngineChoice::Both => Some(match Engine::default() {
-                Engine::Treewalk => Engine::Machine,
-                Engine::Machine => Engine::Treewalk,
-            }),
-            _ => None,
-        }
-    }
-
-    /// A cached `Pass` is a claim about what the authoritative engine did, so a run that is not
-    /// purely that engine may neither read one nor write one.
-    pub fn bypasses_cache(self) -> bool {
-        self.primary() != Engine::default() || self.auditor().is_some()
-    }
-}
 
 #[cfg(test)]
 mod build;

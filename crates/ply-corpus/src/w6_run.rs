@@ -696,53 +696,6 @@ pub fn at(
         .cloned()
 }
 
-/// The same request under the tree-walking evaluator and under the control-stack machine.
-pub fn engines(repo: &Path, iterations: u32, repeats: usize) -> Result<Vec<w6::EnginePoint>> {
-    let loaded = program(repo)?;
-    let name = loaded.full("w6_bench")?;
-    let args = vec![Value::Int(3), Value::Int(iterations as i64)];
-    let mut out = Vec::new();
-    // The two engines must answer the same value on the same path, or the row is a ratio between
-    // two different programs.
-    let mut agreed: Option<Value> = None;
-    for engine in [ply_eval::Engine::Treewalk, ply_eval::Engine::Machine] {
-        let mut best = f64::MAX;
-        for _ in 0..repeats.max(1) {
-            let started = Instant::now();
-            let answered = match engine {
-                ply_eval::Engine::Treewalk => {
-                    let mut interp =
-                        ply_eval::Interp::new(&loaded.program, &loaded.resolved, &loaded.check);
-                    interp.share_region_kinds(loaded.shared_region_kinds());
-                    interp.call(&name, args.clone(), Span::DUMMY)
-                }
-                ply_eval::Engine::Machine => {
-                    let mut machine = loaded.machine();
-                    machine.call(&name, args.clone(), Span::DUMMY)
-                }
-            };
-            let taken = started.elapsed();
-            let value =
-                answered.map_err(|d| anyhow::anyhow!("the request path raised: {}", d.message))?;
-            match &agreed {
-                None => agreed = Some(value),
-                Some(first) if *first == value => {}
-                Some(first) => bail!(
-                    "the engines disagree on the request path: {first} against {value}; the row \
-                     would be a ratio between two different programs"
-                ),
-            }
-            best = best.min(micros(taken) / iterations as f64);
-        }
-        out.push(w6::EnginePoint {
-            engine: engine.as_str().to_string(),
-            per_request_micros: best,
-            requests: iterations,
-        });
-    }
-    Ok(out)
-}
-
 /// What one `/health` request allocates, from the binary that can count it.
 pub fn allocations(repo: &Path, given: Option<PathBuf>) -> Result<Option<(f64, f64)>> {
     let counter = match given {
@@ -964,7 +917,6 @@ pub fn report(
     stack: &InProcess,
     served: &[Served],
     sequential: &[Served],
-    engines: Vec<w6::EnginePoint>,
     levers: &Levers,
 ) -> Result<w6::Report> {
     let route = "items (1 select)";
@@ -1157,11 +1109,10 @@ pub fn report(
             total_worst_micros: Some(total.per_request_worst_micros),
         },
         points,
-        engines: engines.clone(),
         spike: None,
-        alternatives: alternatives(stack, &engines, levers),
+        alternatives: alternatives(stack, levers),
         offerings,
-        limits: limits(stack, &engines, levers, &total, health_plain.as_ref()),
+        limits: limits(stack, levers, &total, health_plain.as_ref()),
     })
 }
 
@@ -1180,12 +1131,7 @@ pub struct Levers {
     pub allocations: Option<(f64, f64)>,
 }
 
-fn alternatives(
-    stack: &InProcess,
-    engines: &[w6::EnginePoint],
-    levers: &Levers,
-) -> Vec<w6::Alternative> {
-    let spread = w6::engine_spread(engines);
+fn alternatives(stack: &InProcess, levers: &Levers) -> Vec<w6::Alternative> {
     LEVER_PROSE
         .iter()
         .map(|(name, what, cost)| {
@@ -1227,14 +1173,6 @@ fn alternatives(
                         );
                     }
                 }
-                "the frame push" => {
-                    if let Some((ratio, fast, slow)) = &spread {
-                        alternative.what = format!(
- "{what} The tree-walker runs the same pure request path {ratio:.2}x faster than the control-stack \
-  machine ({slow} against {fast}), which bounds what a cheaper frame representation is worth."
-                        );
-                    }
-                }
                 _ => {}
             }
             alternative
@@ -1270,8 +1208,7 @@ const LEVER_PROSE: [(&str, &str, &str); 7] = [
         "caching derived work",
         "`table()` rebuilds the route table from its pattern strings on every request, and a derived \
   codec dictionary is a record built per call.",
-        "A memo in front of a pure function changes when a route table can be edited, and both engines \
-  have to keep it or `--engine both` reports E0503.",
+        "A memo in front of a pure function changes when a route table can be edited.",
     ),
     (
         "connection and statement reuse",
@@ -1288,7 +1225,6 @@ const LEVER_PROSE: [(&str, &str, &str); 7] = [
 
 fn limits(
     stack: &InProcess,
-    engines: &[w6::EnginePoint],
     levers: &Levers,
     total: &Served,
     health_plain: Option<&Served>,
@@ -1369,16 +1305,6 @@ fn limits(
             stack.items_endpoint_micros, stack.items_scan_micros
         )),
     });
-    if let Some((ratio, fast, slow)) = w6::engine_spread(engines) {
-        limits.push(w6::Limit {
-            what: "--engine both costs more than two runs".to_string(),
- why: "The divergence guarantee runs the program twice, and the two engines are not the same speed."
-                .to_string(),
-            evidence: Some(format!(
-                "The {fast} runs the pure request path {ratio:.2}x faster than the {slow}."
-            )),
-        });
-    }
     limits.push(w6::Limit {
         what: "No cancellation, no backpressure, no load shedding".to_string(),
  why: "ADR 0011 left cancellation unresolved through W5, and W4's promise of backpressure was \

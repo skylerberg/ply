@@ -403,12 +403,8 @@ pub mod codes {
     /// A program-level failure the language defines: `panic`, division by zero, integer overflow, a
     /// resource limit.
     pub const RUNTIME_ERROR: &str = "E0502";
-    /// Never a warning: the result cache would record whichever engine ran first and never
-    /// recompute it.
+    /// A compiled backend answered something the machine would not have.
     pub const ENGINE_DIVERGENCE: &str = "E0503";
-    /// A handler clause the tree-walker cannot express.
-    pub const MACHINE_ONLY_CLAUSE: &str = "E0504";
-    /// Ply broke one of its own invariants.
     pub const INTERNAL_ERROR: &str = "E0505";
     /// `W` rather than `E`: cache trouble is never a fault in the user's program, so these are
     /// always warnings.
@@ -674,7 +670,6 @@ mod tests {
             ("ASSERTION_FAILED", codes::ASSERTION_FAILED, "E0501"),
             ("RUNTIME_ERROR", codes::RUNTIME_ERROR, "E0502"),
             ("ENGINE_DIVERGENCE", codes::ENGINE_DIVERGENCE, "E0503"),
-            ("MACHINE_ONLY_CLAUSE", codes::MACHINE_ONLY_CLAUSE, "E0504"),
             ("INTERNAL_ERROR", codes::INTERNAL_ERROR, "E0505"),
             ("CACHE_UNREADABLE", codes::CACHE_UNREADABLE, "W0601"),
             ("CACHE_CORRUPT", codes::CACHE_CORRUPT, "W0602"),

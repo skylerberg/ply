@@ -237,28 +237,6 @@ This one, in its serializer, is not documented anywhere I could find.
 > were fixed: `std.trace`'s `append` and `std.router`'s `numbered`. `std.db` was
 > not measured.
 >
-> > **"Linear" was engine-conditional and this block did not say so. Corrected
-> > 2026-08-27 by counting on both engines.** The sentence above read *"the
-> > serializer is linear"* with no engine named, and the rule this whole section
-> > states — a growing container must be built in the last sub-expression of its
-> > enclosing node — is the **machine engine's rule**. On `--engine treewalk` the
-> > position makes no difference and every shape is quadratic, because the
-> > tree-walker runs no reference counting at all: it evaluates the AST, which
-> > carries no `Own` (that field is on the lowered `code::Node`, and lowering is
-> > the step this engine does not have); `Interp::lookup` answers every `Var`
-> > with `v.clone()`; and `interp.rs` has no `Env::take_unique` and no
-> > `rc::carry` call site. The accumulator is at two owners at every `push`,
-> > `Arc::get_mut` fails, and the four-column table above would be four equal
-> > columns there.
-> >
-> > Counted on the shipped modules after the fix — machine copies against
-> > tree-walker copies: `escape_runs` **0** against **k + 1** at k = 1,000
-> > through 8,000; `numbered` **0/0/0** against **200/400/800**; `append`
-> > **0/0/0** against **200/400/800**. All three of the fixes named in this
-> > block are the machine engine's. `--engine both` compares answers and not
-> > cost, so it never had an opinion about any of them; the disclosure carries
-> > its own assertion instead, in
-> > `stdlib_accumulator_cost.rs::all_three_fixes_are_the_machine_engines_only`.
 
 ### Cost to me
 
@@ -445,7 +423,7 @@ max_calls crates/ply-cli/src/` returns **one** line —
 > `Outcome::Pass`, so raising the bound is monotone and safe while *lowering* it
 > would let the cache answer `Pass` for a program that would now raise — ADR
 > 0022 §5. **"There is no loop" is now false**: `iterate(seed, budget, step)` is
-> an early-terminating loop that is depth 1 on both engines, so the
+> an early-terminating loop that is depth 1, so the
 > `fold(range(0, n + 1), ..)` shape below — 140,108 of desk.ply's 159,684 steps
 > being no-ops, 87% of the loop — is no longer the only way to write one.
 `engine.rs:244`, `Machine::new(..).with_max_calls(DEFAULT_MAX_CALLS)` — plus
@@ -701,7 +679,7 @@ parallel family of ten more names. Verbose, not blocking.
 
 I never reached for `with_cell` or `with_region`. The fold accumulator is
 enough, `lex` and `dump` are pure, and that purity is worth something concrete
-here — a pure `dump` is cacheable and `--engine both`-able.
+here — a pure `dump` is cacheable and auditable against a backend.
 
 The cell route exists and I priced its shape while looking at §1: a
 `bytes_position(src, 0, |b| ...)` loop with a cell would iterate bytes without

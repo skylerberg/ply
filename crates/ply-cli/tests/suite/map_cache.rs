@@ -58,15 +58,15 @@ fn a_test_over_maps_built_in_different_orders_passes_and_then_caches() {
     );
 }
 
-/// Both engines, over the same program, with the cache bypassed.
+/// The same program with the cache bypassed, so a map-valued answer is recomputed rather than read
+/// back.
 #[test]
-fn both_engines_agree_about_a_map() {
+fn a_map_valued_program_passes_with_the_cache_bypassed() {
     let dir = project(SOURCE);
     let out = ply(dir.path())
-        .args(["test", "--engine", "both"])
+        .args(["test", "--no-cache"])
         .output()
         .unwrap();
     let text = text_of(&out);
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(!text.contains("E0503"), "{text}");
 }

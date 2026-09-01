@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 use std::fmt;
 
 use crate::arena::Slot;
-use crate::interp::arity_error;
+use crate::semantics::arity_error;
 use crate::value::Value;
 
 /// The repro artifact.

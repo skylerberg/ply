@@ -1,7 +1,7 @@
 //! A cell is a slot in the region that allocated it.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Interp, Machine};
+use ply_eval::Machine;
 use ply_span::{SourceId, Span, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -31,10 +31,6 @@ impl Compiled {
         Machine::new(&self.program, &self.resolved, &self.check)
     }
 
-    fn treewalk(&self) -> Interp<'_> {
-        Interp::new(&self.program, &self.resolved, &self.check)
-    }
-
     fn index_of(&self, name: &str) -> usize {
         self.check
             .tests
@@ -60,21 +56,7 @@ fn arena_after(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
     machine.cells().stats()
 }
 
-/// The same on the tree-walker, so a claim about the cell path is a claim about both engines
-/// wherever the tree-walker can express the program.
-fn treewalk_arena_after(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
-    let index = compiled.index_of(name);
-    let mut interp = compiled.treewalk();
-    interp
-        .eval_test(index)
-        .unwrap_or_else(|d| panic!("{name:?} must run on the tree-walker: {d:#?}"));
-    assert_eq!(
-        interp.cells().live(),
-        0,
-        "{name:?} closed every region it opened on the tree-walker too"
-    );
-    interp.cells().stats()
-}
+// ------------------------------------------------- 1. the allocation is a bump
 
 const NESTED: &str = r#"
 test "one region one cell" {
@@ -121,16 +103,12 @@ fn a_with_cell_allocates_a_slot_in_the_arena_and_gives_it_back_at_the_close() {
 fn reads_and_writes_cross_region_nesting_in_both_directions() {
     let compiled = Compiled::new(NESTED);
     let name = "an inner region reads and writes the outer one's cell";
-    for stats in [
-        arena_after(&compiled, name),
-        treewalk_arena_after(&compiled, name),
-    ] {
-        assert_eq!(stats.allocations, 2);
-        assert_eq!(
-            stats.peak_live, 2,
-            "the inner region nests inside the outer"
-        );
-    }
+    let stats = arena_after(&compiled, name);
+    assert_eq!(stats.allocations, 2);
+    assert_eq!(
+        stats.peak_live, 2,
+        "the inner region nests inside the outer"
+    );
 }
 
 /// Nesting is not the only shape: two regions in sequence are two bumps, and the second reuses the
@@ -140,10 +118,8 @@ fn reads_and_writes_cross_region_nesting_in_both_directions() {
 fn two_regions_in_sequence_reuse_one_position() {
     let compiled = Compiled::new(NESTED);
     let name = "a sibling region does not see its neighbour's cell";
-    for stats in [
-        arena_after(&compiled, name),
-        treewalk_arena_after(&compiled, name),
-    ] {
+    {
+        let stats = arena_after(&compiled, name);
         assert_eq!(stats.allocations, 2, "two regions, two bumps");
         assert_eq!(
             stats.peak_live, 1,

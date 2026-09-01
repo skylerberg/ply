@@ -1,7 +1,7 @@
 //! Exercises the contract entry point on real source: parse, resolve, check, evaluate.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::Interp;
+use ply_eval::Machine;
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -54,8 +54,8 @@ impl Compiled {
         }
     }
 
-    fn interp(&self) -> Interp<'_> {
-        Interp::new(&self.program, &self.resolved, &self.check)
+    fn machine(&self) -> Machine<'_> {
+        Machine::new(&self.program, &self.resolved, &self.check)
     }
 }
 
@@ -66,16 +66,16 @@ fn single() -> Compiled {
 #[test]
 fn a_handled_effect_evaluates_through_the_checked_module() {
     let compiled = single();
-    let mut interp = compiled.interp();
-    assert_eq!(interp.test_count(), 2);
-    interp.eval_test(0).expect("the handled test should pass");
+    let mut machine = compiled.machine();
+    assert_eq!(machine.test_count(), 2);
+    machine.eval_test(0).expect("the handled test should pass");
 }
 
 #[test]
 fn a_failing_test_yields_an_assertion_diagnostic() {
     let compiled = single();
     let diag = compiled
-        .interp()
+        .machine()
         .eval_test(1)
         .expect_err("the test should fail");
     assert_eq!(diag.code, ply_span::codes::ASSERTION_FAILED);
@@ -116,7 +116,7 @@ fn a_handler_discharges_an_effect_declared_in_another_module() {
         "app.the imported effect is handled here"
     );
     compiled
-        .interp()
+        .machine()
         .eval_test(0)
         .expect("the cross-module handler should discharge `store.db`");
 }
@@ -147,7 +147,7 @@ fn a_handler_clause_body_resolves_where_the_handler_was_written() {
         ),
     ]);
     compiled
-        .interp()
+        .machine()
         .eval_test(0)
         .expect("the clause body must resolve `fixture` in `app`, not in `store`");
 }
@@ -166,17 +166,17 @@ fn same_named_definitions_in_two_modules_do_not_collide() {
             "pub fn answer() -> Int = 2\npub fn wrapped() -> Int = answer()\n",
         ),
     ]);
-    let mut interp = compiled.interp();
+    let mut machine = compiled.machine();
     let at = ply_span::Span::DUMMY;
     assert_eq!(
-        interp
+        machine
             .call("alpha.wrapped", Vec::new(), at)
             .unwrap()
             .render(),
         "1"
     );
     assert_eq!(
-        interp
+        machine
             .call("beta.wrapped", Vec::new(), at)
             .unwrap()
             .render(),
@@ -201,18 +201,21 @@ fn constructors_from_two_modules_are_distinct_values() {
              pub fn mine() -> Int = match Wrapped(2) { Wrapped(n) -> n }\n",
         ),
     ]);
-    let mut interp = compiled.interp();
+    let mut machine = compiled.machine();
     let at = ply_span::Span::DUMMY;
     assert_eq!(
-        interp.call("beta.theirs", Vec::new(), at).unwrap().render(),
+        machine
+            .call("beta.theirs", Vec::new(), at)
+            .unwrap()
+            .render(),
         "1"
     );
     assert_eq!(
-        interp.call("beta.mine", Vec::new(), at).unwrap().render(),
+        machine.call("beta.mine", Vec::new(), at).unwrap().render(),
         "2"
     );
     assert_eq!(
-        interp.call("alpha.make", Vec::new(), at).unwrap().render(),
+        machine.call("alpha.make", Vec::new(), at).unwrap().render(),
         "alpha.Wrapped(1)"
     );
 }

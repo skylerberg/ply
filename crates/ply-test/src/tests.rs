@@ -90,7 +90,7 @@ impl Program {
             &self.check,
             &self.hashes,
             store,
-            ply_eval::EngineChoice::Both,
+            false,
             Search::of(selection),
             crate::Hosting::hermetic(),
         )
@@ -524,7 +524,7 @@ test "both branches" {
 }
 "#;
 
-/// ADR 0005 §6: under `both` a machine-only test runs once, on the machine.
+/// A multi-shot program runs and caches with no flags at all.
 #[test]
 fn a_test_only_the_machine_can_run_is_not_reported_as_a_divergence() {
     let root = TempRoot::new();

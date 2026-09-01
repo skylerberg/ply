@@ -1,6 +1,6 @@
 //! ADR 0017 §4 asked of whole programs rather than of synthetic expressions.
 
-use ply_eval::{Interp, Machine, rc};
+use ply_eval::{Machine, rc};
 use ply_span::{SourceId, SourceMap};
 use ply_syntax::ast::ModuleName;
 use ply_syntax::parse_program;
@@ -34,13 +34,7 @@ fn passes(src: &str) -> rc::Stats {
             );
         }
     }
-    let stats = rc::stats();
-
-    let mut interp = Interp::for_program(&program, &resolved);
-    for i in 0..count {
-        let _ = interp.eval_test(i);
-    }
-    stats
+    rc::stats()
 }
 
 /// The world is an owner no analysis of a scope can see: `xs` and the cell hold one `Arc`, and the

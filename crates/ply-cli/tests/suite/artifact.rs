@@ -201,25 +201,6 @@ fn an_artifact_runs_to_the_same_value_as_its_source() {
     assert!(artifact_value.contains("42"), "{artifact_value}");
 }
 
-/// `--engine both` over an artifact is the claim that decoding a body did not change what it does,
-/// and a deployed program is not a place to relax it.
-#[test]
-fn an_artifact_runs_on_both_engines_without_divergence() {
-    let dir = project(PROGRAM);
-    ply(dir.path())
-        .args(["build", ".", "-o", "m.plyx"])
-        .assert()
-        .success();
-    let output = ply(dir.path())
-        .args(["run", "m.plyx", "--engine", "both", "--json"])
-        .output()
-        .unwrap();
-    let report = json_of(&output);
-    assert_eq!(report["ok"], true, "{report}");
-    assert_eq!(report["value"], "42");
-    assert_eq!(report["located"], false);
-}
-
 /// A run out of an artifact is hermetic for the same reason a run out of source is: nothing is
 /// bound unless `--host` is written in the command.
 #[test]

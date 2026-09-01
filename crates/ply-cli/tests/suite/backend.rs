@@ -68,17 +68,12 @@ fn ply(dir: &Path) -> Command {
     cmd
 }
 
-/// One `ply test --engine both -j 1 --json` run with `backend` installed.
+/// One `ply test --backend .. --audit-backend -j 1 --json` run.
 fn run(dir: &Path, backend: Option<&str>) -> Value {
     let mut cmd = ply(dir);
-    cmd.arg("test")
-        .arg("--engine")
-        .arg("both")
-        .arg("-j")
-        .arg("1")
-        .arg("--json");
+    cmd.arg("test").arg("-j").arg("1").arg("--json");
     if let Some(backend) = backend {
-        cmd.arg("--backend").arg(backend);
+        cmd.arg("--backend").arg(backend).arg("--audit-backend");
     }
     let out = cmd.output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
@@ -308,7 +303,7 @@ fn a_backend_run_reads_no_cached_pass() {
     assert_eq!(
         u64_at(&report, &["summary", "cached"]),
         0,
-        "a backend run believed a pass the authoritative engine earned: {report}"
+        "a backend run believed a pass an unbacked run earned: {report}"
     );
     assert!(
         u64_at(&report, &["backend", "entered"]) > 0,
@@ -362,20 +357,16 @@ fn a_backend_run_writes_no_pass() {
 /// A flag that is accepted and does nothing is `CONTRIBUTING.md` §"The one rule"'s defect shape, so
 /// the engine that cannot host a backend refuses it rather than ignoring it.
 #[test]
-fn the_backend_flag_is_refused_by_an_engine_with_no_compiled_path() {
+fn auditing_a_backend_that_was_not_asked_for_is_refused() {
     let dir = project(CORPUS);
     let out = ply(dir.path())
         .arg("test")
-        .arg("--engine")
-        .arg("treewalk")
-        .arg("--backend")
-        .arg("reference")
-        .arg("--json")
+        .arg("--audit-backend")
         .output()
         .unwrap();
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["ok"], Value::Bool(false), "{report}");
-    assert_eq!(report["diagnostics"][0]["code"], "E0450", "{report}");
+    assert_ne!(out.status.code(), Some(0));
+    let text = String::from_utf8(out.stderr).unwrap();
+    assert!(text.contains("--backend"), "{text}");
 }
 
 #[test]
@@ -431,7 +422,7 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
     let plain = run(dir.path(), Some("reference"));
     assert!(
         plain["backend"]["units"].is_null(),
-        "the tree-walker reported a compilation: {}",
+        "`reference` reported a compilation, and it compiles nothing: {}",
         plain["backend"]
     );
 }
@@ -469,7 +460,7 @@ fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
     );
 }
 
-/// The registry-miss path, over a backend whose registry is much smaller than the tree-walker's.
+/// The registry-miss path, over a backend whose registry is much smaller than `reference`'s.
 #[test]
 fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
     let dir = project(CORPUS);
@@ -546,7 +537,7 @@ test "a runaway" { assert_eq(spin(0), 0) }
     /// Runs one arm as a child and reports whether it ended, and how.
     fn arm(dir: &Path, backend: &str, limit: Duration) -> Option<std::process::ExitStatus> {
         let mut child = Raw::new(assert_cmd::cargo::cargo_bin("ply"))
-            .args(["test", "--engine", "both", "-j", "1", "--color", "never"])
+            .args(["test", "-j", "1", "--color", "never", "--audit-backend"])
             .arg("--backend")
             .arg(backend)
             .current_dir(dir)
@@ -617,7 +608,7 @@ test "a runaway" { assert_eq(spin(0), 0) }
     // over heap-grown frames does NOT come back.
     assert!(
         arm(dir.path(), "wrong:exceeds-budget", Duration::from_secs(10)).is_none(),
-        "the tree-walker's unbounded runaway now terminates. That is a change in `Reference` and \
+        "`reference`'s unbounded runaway now terminates. That is a change in `Reference` and \
          it makes ADR 0026 §4.7's account of why this configuration lived nowhere obsolete — \
          update that section rather than this assertion"
     );
@@ -641,7 +632,7 @@ fn a_code_generator_run_reads_no_cached_pass() {
          that had nothing to ignore: {again}"
     );
 
-    // The default engine, deliberately: `--engine both` already bypasses the cache, so a backend
+    // No `--audit-backend`, deliberately, so `--backend` is the only thing that could bypass the
     // installed on that path would be cache-safe for a reason that has nothing to do with backends.
     let out = ply(dir.path())
         .arg("test")
@@ -657,7 +648,7 @@ fn a_code_generator_run_reads_no_cached_pass() {
     assert_eq!(
         u64_at(&report, &["summary", "cached"]),
         0,
-        "a code generator run believed a pass the authoritative engine earned: {report}"
+        "a code generator run believed a pass an unbacked run earned: {report}"
     );
     assert!(
         u64_at(&report, &["backend", "entered"]) > 0,
@@ -711,9 +702,9 @@ fn a_code_generator_run_writes_no_pass() {
 
 // --- The grammar -------------------------------------------------------------
 
-/// A corruption may name the backend it wraps, and a bare `wrong:` still means the tree-walker.
+/// A corruption may name the backend it wraps, and a bare `wrong:` still means `reference`.
 #[test]
-fn a_bare_wrong_prefix_still_names_the_tree_walker() {
+fn a_bare_wrong_prefix_still_names_the_reference_backend() {
     let dir = project(CORPUS);
     let bare = run(dir.path(), Some("wrong:off-by-one"));
     assert_eq!(bare["backend"]["name"], "reference", "{bare}");
