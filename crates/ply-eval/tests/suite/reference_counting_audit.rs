@@ -1,7 +1,7 @@
 //! The reference-counting pass asked of whole programs rather than of synthetic expressions.
 
 use ply_eval::{Machine, rc};
-use ply_span::{SourceId, SourceMap};
+use ply_span::{SourceId, SourceMap, codes};
 use ply_syntax::ast::ModuleName;
 use ply_syntax::parse_program;
 use ply_syntax::resolve::resolve;
@@ -266,5 +266,153 @@ test "grown" { assert_eq(len(grow(50, [])), 50) }
         (stats.updates, stats.updates_in_place),
         (50, 50),
         "a parameter accumulator must be reused as a `let` one is"
+    );
+}
+
+/// Runs every test in `src` and answers the diagnostic the first failing one raised.
+#[track_caller]
+fn fails(src: &str) -> ply_span::Diagnostic {
+    let mut map = SourceMap::new();
+    let id: SourceId = map.add("rc.ply", src.to_string());
+    let mut program = match parse_program([(id, ModuleName::from_dotted("rc"), src)]) {
+        Ok(p) => p,
+        Err(ds) => panic!("the probe must parse: {ds:#?}\n{src}"),
+    };
+    let resolved = resolve(&mut program).expect("the probe must resolve");
+    let mut machine = Machine::for_program(&program, &resolved);
+    for i in 0..machine.test_count() {
+        if let Err(d) = machine.eval_test(i) {
+            return d;
+        }
+    }
+    panic!("every test passed, and one was expected to fail\n{src}");
+}
+
+/// The fused update, which is the only route to an in-place append on a cell's contents: the
+/// contents leave the arena for the length of the function, so `push` sees one owner. The same
+/// loop through `cell_get` / `cell_set` copies the whole list every round — that is the cause
+/// the cost checker names `cell`, and this is the fix it recommends.
+#[test]
+fn a_cell_update_rewrites_the_cells_list_in_place() {
+    let stats = passes(
+        r#"
+test "sixty-four appends through the fused update" {
+  with_cell[r]([]) { c -> {
+    map(range(0, 64), |i| cell_update(c, |xs| push(xs, i)));
+    assert_eq(len(cell_get(c)), 64)
+  } }
+}
+"#,
+    );
+    assert_eq!(
+        (stats.updates, stats.updates_in_place),
+        (64, 64),
+        "every append through `cell_update` found the list at one owner: {stats:?}"
+    );
+}
+
+/// The read-during-update hole ADR 0024 named — a perform between the take and the set exposes the
+/// emptied slot — is closed by refusing the read loudly rather than answering the placeholder.
+#[test]
+fn a_read_of_a_cell_during_its_update_is_refused() {
+    let d = fails(
+        r#"
+effect peek {
+  read now[k]() -> Int
+}
+
+test "the handler reads the cell the update holds" {
+  with_cell[r]([1, 2]) { c -> {
+    handle {
+      cell_update(c, |xs| push(xs, peek.now[k]()))
+    } with {
+      peek.now[k]() -> len(cell_get(c)),
+      return x -> x
+    }
+  } }
+}
+"#,
+    );
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert!(
+        d.message.contains("cell_update"),
+        "the refusal names the update holding the contents: {}",
+        d.message
+    );
+}
+
+#[test]
+fn a_nested_update_of_the_same_cell_is_refused() {
+    let d = fails(
+        r#"
+test "an update inside its own update" {
+  with_cell[r](1) { c -> cell_update(c, |n| { cell_update(c, |m| m + 1); n + 1 }) }
+}
+"#,
+    );
+    assert_eq!(d.code, codes::RUNTIME_ERROR);
+    assert!(d.message.contains("cell_update"), "{}", d.message);
+}
+
+/// Multi-shot, which is what "soleness at runtime" has to survive: the update took the contents
+/// once, before the capture, so each resumption is handed the snapshot's copy of *those* contents,
+/// computes its own answer and stores it — the second overwrites the first, exactly as a
+/// `cell_set` after a resumed perform would under ADR 0005's threaded world — and no resumption
+/// reads a slot the machine has moved out of.
+#[test]
+fn a_cell_update_resumed_twice_stores_each_resumptions_answer() {
+    let stats = passes(
+        r#"
+effect amb {
+  read flip[coin]() -> Bool
+}
+
+test "two resumptions through one update" {
+  with_cell[r]([1]) { c -> {
+    let out = handle {
+      cell_update(c, |xs| push(xs, if amb.flip[coin]() { 10 } else { 20 }));
+      len(cell_get(c))
+    } with {
+      amb.flip[coin]() resume k -> k(true) + k(false),
+      return x -> x
+    };
+    assert_eq(out, 2 + 2);
+    assert_eq(cell_get(c), [1, 20])
+  } }
+}
+"#,
+    );
+    assert_eq!(stats.updates, 2, "one append per resumption: {stats:?}");
+}
+
+/// `map_update` is `cell_update`'s shape over one entry: the value leaves the map before the
+/// function sees it, so a map nothing else holds hands its entry over at one owner.
+#[test]
+fn a_map_update_rewrites_the_entrys_list_in_place_when_the_map_is_sole() {
+    let stats = passes(
+        r#"
+fn fill(m: Map<String, List<Int>>, i: Int) -> Map<String, List<Int>> =
+  if i == 64 { m } else { fill(map_update(m, "k", |xs| push(xs, i)), i + 1) }
+
+test "sixty-four appends under one key" {
+  let m = fill(map_insert(map_new(), "k", []), 0);
+  assert_eq(len(map_values(m)), 1);
+  match map_get(m, "k") {
+    Some(xs) -> assert_eq(len(xs), 64),
+    None -> assert(false)
+  }
+}
+
+test "an absent key leaves the map as it was" {
+  let m = map_update(map_insert(map_new(), "a", 1), "b", |n| n + 1);
+  assert_eq(map_get(m, "b"), None);
+  assert_eq(map_get(m, "a"), Some(1))
+}
+"#,
+    );
+    assert_eq!(
+        (stats.updates, stats.updates_in_place),
+        (64, 64),
+        "every append under the key found the list at one owner: {stats:?}"
     );
 }

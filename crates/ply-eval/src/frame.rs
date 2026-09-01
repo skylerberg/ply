@@ -364,12 +364,21 @@ impl Machine<'_> {
                 self.go_return(value);
             }
 
+            Frame::CellUpdateStep { slot, span } => {
+                crate::rc::cell_cycle(slot, &value, span);
+                if !self.regions_mut().arena_mut().put_back(slot, value) {
+                    return Err(crate::builtins::no_such_cell(span, slot));
+                }
+                self.go_return(Value::Unit);
+            }
+
             step @ (Frame::MapStep { .. }
             | Frame::FilterStep { .. }
             | Frame::FoldStep { .. }
             | Frame::MapFoldStep { .. }
             | Frame::BytesPositionStep { .. }
-            | Frame::IterateStep { .. }) => {
+            | Frame::IterateStep { .. }
+            | Frame::MapUpdateStep { .. }) => {
                 let span = builtin_step_span(&step);
                 let next = advance(step, value)?;
                 return self.run_builtin_step(next, span);
@@ -386,7 +395,8 @@ fn builtin_step_span(frame: &Frame) -> ply_span::Span {
         | Frame::FoldStep { span, .. }
         | Frame::MapFoldStep { span, .. }
         | Frame::BytesPositionStep { span, .. }
-        | Frame::IterateStep { span, .. } => *span,
+        | Frame::IterateStep { span, .. }
+        | Frame::MapUpdateStep { span, .. } => *span,
         _ => ply_span::Span::DUMMY,
     }
 }

@@ -80,6 +80,8 @@ pub enum Builtin {
     MapOfEntries,
     MapMerge,
     MapFold,
+    /// `CellUpdate`'s shape over one map entry.
+    MapUpdate,
     DecimalDiv,
     DecimalRound,
     DecimalOfInt,
@@ -93,6 +95,10 @@ pub enum Builtin {
     CompareValues,
     CellGet,
     CellSet,
+    /// The fused update: takes the cell's contents out of the arena, applies the function, and
+    /// stores the answer. Sole ownership established at runtime, which is what an append inside
+    /// the function needs and what no analysis of the caller can prove.
+    CellUpdate,
     Panic,
     /// The only introduction of a [`Value::Secret`].
     SecretOfString,
@@ -160,6 +166,7 @@ impl Builtin {
             "map_of_entries" => Builtin::MapOfEntries,
             "map_merge" => Builtin::MapMerge,
             "map_fold" => Builtin::MapFold,
+            "map_update" => Builtin::MapUpdate,
             "iterate" => Builtin::Iterate,
             "decimal_div" => Builtin::DecimalDiv,
             "decimal_round" => Builtin::DecimalRound,
@@ -171,6 +178,7 @@ impl Builtin {
             "decimal_to_string" => Builtin::DecimalToString,
             "cell_get" => Builtin::CellGet,
             "cell_set" => Builtin::CellSet,
+            "cell_update" => Builtin::CellUpdate,
             "panic" => Builtin::Panic,
             "secret_of_string" => Builtin::SecretOfString,
             "secret_verify" => Builtin::SecretVerify,
@@ -239,6 +247,7 @@ impl Builtin {
             Builtin::MapOfEntries => "map_of_entries",
             Builtin::MapMerge => "map_merge",
             Builtin::MapFold => "map_fold",
+            Builtin::MapUpdate => "map_update",
             Builtin::DecimalDiv => "decimal_div",
             Builtin::DecimalRound => "decimal_round",
             Builtin::DecimalOfInt => "decimal_of_int",
@@ -249,6 +258,7 @@ impl Builtin {
             Builtin::DecimalToString => "decimal_to_string",
             Builtin::CellGet => "cell_get",
             Builtin::CellSet => "cell_set",
+            Builtin::CellUpdate => "cell_update",
             Builtin::Panic => "panic",
             Builtin::SecretOfString => "secret_of_string",
             Builtin::SecretVerify => "secret_verify",
@@ -296,6 +306,7 @@ impl Builtin {
             | Builtin::Filter
             | Builtin::StringConcat
             | Builtin::CellSet
+            | Builtin::CellUpdate
             | Builtin::BytesAt
             | Builtin::BytesConcat
             | Builtin::BytesIndexOf
@@ -329,6 +340,7 @@ impl Builtin {
             | Builtin::StringSlice
             | Builtin::MapInsert
             | Builtin::MapFold
+            | Builtin::MapUpdate
             | Builtin::DecimalRound => (3, 3),
             Builtin::BytesScan | Builtin::BytesScanUntil | Builtin::DecimalDiv => (4, 4),
         }
@@ -345,6 +357,8 @@ impl Builtin {
                 | Builtin::Iterate
                 | Builtin::BytesPosition
                 | Builtin::MapFold
+                | Builtin::CellUpdate
+                | Builtin::MapUpdate
         )
     }
 
@@ -406,6 +420,7 @@ impl Builtin {
             Builtin::MapOfEntries,
             Builtin::MapMerge,
             Builtin::MapFold,
+            Builtin::MapUpdate,
             Builtin::DecimalDiv,
             Builtin::DecimalRound,
             Builtin::DecimalOfInt,
@@ -418,6 +433,7 @@ impl Builtin {
             Builtin::CompareValues,
             Builtin::CellGet,
             Builtin::CellSet,
+            Builtin::CellUpdate,
             Builtin::Panic,
             Builtin::SecretOfString,
             Builtin::SecretVerify,
@@ -852,6 +868,21 @@ pub fn call(
             let k = args.remove(1);
             Ok(Step::Done(map::remove(args.remove(0), &k, span)?))
         }
+        // An absent key leaves the map as it was, for `map_remove`'s reason.
+        Builtin::MapUpdate => {
+            let mut args = args;
+            let f = args.remove(2);
+            let key = args.remove(1);
+            let (map, taken) = map::take(args.remove(0), &key, span)?;
+            Ok(match taken {
+                Some(value) => Step::Apply {
+                    callee: f,
+                    args: vec![value],
+                    frame: Frame::MapUpdateStep { map, key, span },
+                },
+                None => Step::Done(map),
+            })
+        }
         Builtin::MapLen => Ok(Step::Done(map::len(&args[0], span)?)),
         Builtin::MapKeys => Ok(Step::Done(map::keys(&args[0], span)?)),
         Builtin::MapValues => Ok(Step::Done(map::values(&args[0], span)?)),
@@ -872,6 +903,9 @@ pub fn call(
 
         Builtin::CellGet => {
             let slot = args[0].as_cell(span, "`cell_get`")?;
+            if cells.is_taken(slot) {
+                return Err(cell_in_update(span, slot, "cell_get"));
+            }
             match cells.get(slot) {
                 Some(v) => Ok(Step::Done(v.clone())),
                 None => Err(no_such_cell(span, slot)),
@@ -880,6 +914,9 @@ pub fn call(
 
         Builtin::CellSet => {
             let slot = args[0].as_cell(span, "`cell_set`")?;
+            if cells.is_taken(slot) {
+                return Err(cell_in_update(span, slot, "cell_set"));
+            }
             // Reported rather than refused: refusing would change what a legal program means, and
             // the reference-counting pass accepts the leak and asks only that it be said out loud.
             crate::rc::cell_cycle(slot, &args[1], span);
@@ -889,6 +926,23 @@ pub fn call(
             } else {
                 Err(no_such_cell(span, slot))
             }
+        }
+
+        // The contents leave the arena for the length of the call, so a `push` inside the function
+        // sees one owner; the machine puts the answer back at `Frame::CellUpdateStep`.
+        Builtin::CellUpdate => {
+            let slot = args[0].as_cell(span, "`cell_update`")?;
+            if cells.is_taken(slot) {
+                return Err(cell_in_update(span, slot, "cell_update"));
+            }
+            let Some(current) = cells.take(slot) else {
+                return Err(no_such_cell(span, slot));
+            };
+            Ok(Step::Apply {
+                callee: args[1].clone(),
+                args: vec![current],
+                frame: Frame::CellUpdateStep { slot, span },
+            })
         }
 
         // `/` on `Decimal` is `E0209` precisely so that a division names its scale and its rounding
@@ -1144,6 +1198,8 @@ pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
             Continued(seed) => return next_iterate(f, seed, budget, left, span),
             Stopped(r) => Step::Done(r),
         },
+
+        Frame::MapUpdateStep { map, key, span } => Step::Done(map::insert(map, key, answer, span)?),
 
         Frame::BytesPositionStep {
             f,
@@ -1538,9 +1594,23 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     diag
 }
 
+/// A cell whose contents a `cell_update` is holding, reached before the update stored its answer:
+/// through an effect the function performed, or a nested update of the same cell.
+#[cold]
+#[inline(never)]
+pub(crate) fn cell_in_update(span: Span, slot: Slot, what: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::RUNTIME_ERROR,
+        format!("`{what}` reached cell {slot} while a `cell_update` holds its contents"),
+    )
+    .primary(span, "the cell is being updated here")
+    .note("`cell_update` takes the contents out of the region for the length of its function, so nothing can read or write them until it stores the answer")
+    .note("perform the read or write after the update, or outside the function you pass to it")
+}
+
 /// A cell whose region has closed.
 #[cold]
-fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
+pub(crate) fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("cell {slot} does not belong to the region this code is running in"),
@@ -2689,11 +2759,13 @@ mod tests {
             names,
             [
                 "bytes_position",
+                "cell_update",
                 "filter",
                 "fold",
                 "iterate",
                 "map",
-                "map_fold"
+                "map_fold",
+                "map_update"
             ]
         );
     }
@@ -2784,6 +2856,7 @@ mod tests {
                 "bytes_starts_with",
                 "cell_get",
                 "cell_set",
+                "cell_update",
                 "compare",
                 "compare_values",
                 "decimal_div",
@@ -2812,6 +2885,7 @@ mod tests {
                 "map_new",
                 "map_of_entries",
                 "map_remove",
+                "map_update",
                 "map_values",
                 "panic",
                 "push",
@@ -3021,5 +3095,26 @@ mod tests {
         );
         let d = run(vec![state()], e).unwrap_err();
         assert_eq!(d.code, codes::UNHANDLED_EFFECT);
+    }
+
+    #[test]
+    fn map_update_applies_the_function_to_a_present_key_and_leaves_an_absent_one_alone() {
+        let m = done(
+            Builtin::MapInsert,
+            vec![map::new(), Value::str("k"), Value::Int(1)],
+        )
+        .unwrap();
+        let out = drive(
+            Builtin::MapUpdate,
+            vec![m.clone(), Value::str("k"), f()],
+            |args| Value::Int(args[0].as_int(Span::DUMMY, "test").unwrap() + 41),
+        )
+        .unwrap();
+        assert_eq!(out.render(), "{\"k\": 42}");
+        let untouched = drive(Builtin::MapUpdate, vec![m, Value::str("z"), f()], |_| {
+            panic!("`map_update` called its function on an absent key")
+        })
+        .unwrap();
+        assert_eq!(untouched.render(), "{\"k\": 1}");
     }
 }

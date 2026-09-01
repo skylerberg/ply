@@ -287,6 +287,9 @@ pub struct Arena {
     /// Every slot a close has reclaimed, in the order it was reclaimed, and `None` when nothing
     /// asked for one.
     journal: Option<Vec<(Slot, Value)>>,
+    /// Slots whose contents a `cell_update` has taken out and not yet put back. A read or write
+    /// of one in the meantime is refused rather than answered with the placeholder.
+    taken: Vec<Slot>,
 }
 
 impl Default for Arena {
@@ -307,6 +310,7 @@ impl Arena {
             next_region: 0,
             stats: Stats::default(),
             journal: None,
+            taken: Vec::new(),
         }
     }
 
@@ -427,6 +431,32 @@ impl Arena {
 
     pub fn contains(&self, slot: Slot) -> bool {
         self.resolve(slot).is_some()
+    }
+
+    /// Whether a `cell_update` currently holds this slot's contents.
+    pub fn is_taken(&self, slot: Slot) -> bool {
+        self.taken.contains(&slot)
+    }
+
+    /// Moves the slot's contents out for a `cell_update`, leaving the slot marked as taken so
+    /// that nothing reads the placeholder. `None` when the slot is stale or already taken.
+    pub fn take(&mut self, slot: Slot) -> Option<Value> {
+        if self.is_taken(slot) {
+            return None;
+        }
+        let index = self.resolve(slot)?;
+        self.taken.push(slot);
+        Some(std::mem::replace(
+            &mut self.chunks[chunk_of(index)][offset_of(index)],
+            Value::Unit,
+        ))
+    }
+
+    /// Stores a `cell_update`'s answer and clears the mark. `false` when the slot's region has
+    /// closed in the meantime; the mark is cleared either way.
+    pub fn put_back(&mut self, slot: Slot, value: Value) -> bool {
+        self.taken.retain(|s| *s != slot);
+        self.set(slot, value)
     }
 
     /// Closes `region` and every region nested inside it.
