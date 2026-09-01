@@ -3,7 +3,7 @@
 //!
 //! §2 says that returning a branded value, storing it in an outer structure,
 //! capturing it in a closure that outlives the region, or sending it to another
-//! task "are all the same error". `tests/regions.rs` walks the routes the
+//! task "are all the same error". `tests/suite/regions.rs` walks the routes the
 //! implementation was written against; this file walks the ones it was not, and
 //! the two sections below are the two answers it got.
 //!
@@ -124,7 +124,7 @@ fn storing_from_a_lambda_written_inside_the_region_is_an_escape() {
 }
 
 /// W2's hole was a check that ran before alias resolution. One alias is pinned
-/// in `tests/regions.rs`; a chain of them is the version where an expansion that
+/// in `tests/suite/regions.rs`; a chain of them is the version where an expansion that
 /// stopped after a single step would answer differently.
 #[test]
 fn a_chain_of_type_aliases_does_not_hide_a_cell_in_an_operation() {
@@ -160,7 +160,7 @@ type H = | Held(Rec)",
     names(&d, "Held");
 }
 
-/// `tests/regions.rs` pins one polymorphic call. A mutually recursive pair is
+/// `tests/suite/regions.rs` pins one polymorphic call. A mutually recursive pair is
 /// where the two definitions are generalized against each other, which is the
 /// point an inference bug would drop the brand on the floor.
 #[test]
@@ -300,7 +300,7 @@ fn inside() -> Int = with_cell[k](0) { c -> touches(cell_get(c)) }",
 
 /// ADR 0017 §2, the closure clause, applied to the region ADR 0017 §1 says a
 /// `with_cell` is. The identical program under `with_region[r]` is `E0446`
-/// (`tests/regions.rs::a_closure_that_captured_the_cell_is_an_escape`); here it
+/// (`tests/suite/regions.rs::a_closure_that_captured_the_cell_is_an_escape`); here it
 /// checks, and `leak()()` reads a cell whose region closed.
 ///
 /// `mentions_region` is `brand_in` with the `Type::Fn` effect-row case missing,

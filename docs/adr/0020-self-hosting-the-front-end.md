@@ -1151,7 +1151,7 @@ Ranked, what would change the answer:
    compared against a binary kept aside from before the edit, on both engines:
    one sha256 across all four captures.
 
-   The gate is `crates/ply-eval/tests/stdlib_accumulator_cost.rs::encoding_a_
+   The gate is `crates/ply-eval/tests/suite/stdlib_accumulator_cost.rs::encoding_a_
    string_of_escapes_copies_the_accumulator_a_constant_number_of_times`, which
    asserts a **count** and so needs no `DEFERRED` row. It was seen red on the
    shipped defect before the fix existed, and red again on a deliberate revert.
@@ -1180,7 +1180,7 @@ Ranked, what would change the answer:
    the raisable ceiling is refused, by ADR 0022 (2026-08-27).** `iterate(seed,
    budget, step)` is an early-terminating loop that is depth 1 on both engines
    — asserted at
-   `crates/ply-eval/tests/equivalence_audit.rs:2194`, which runs 500,000 steps
+   `crates/ply-eval/tests/suite/equivalence_audit.rs:2194`, which runs 500,000 steps
    under `with_max_calls(8)` while the same loop written as tail recursion
    raises at the same cap. A bare `--max-calls` flag is refused because results
    are cached as `(RUNTIME_VERSION, DefHash) -> Outcome` and shipping code

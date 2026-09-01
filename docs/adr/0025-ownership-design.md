@@ -219,7 +219,7 @@ the closest available question:
 Two of its inputs are whole-program and neither is inside the hashed dependency
 closure of the definition: whether *any* capture is written *anywhere*, and
 whether a name denotes a definition or a local. `a_capture_in_an_unrelated_module_makes_a_region_shared`
-in `crates/ply-eval/tests/region_kind_inference.rs` is the program that pins it.
+in `crates/ply-eval/tests/suite/region_kind_inference.rs` is the program that pins it.
 Adding a `handle` to a module a definition neither names nor reaches flips the
 answer — and moves no hash.
 
@@ -277,7 +277,7 @@ belongs in that slot is a **count**, not a type, because the honest form of this
 guarantee is a cost.
 
 **2b. The falsifier, and this is the part that stops the result being vacuous.**
-`crates/ply-eval/tests/reference_counting_cost.rs` already prints in-place rates
+`crates/ply-eval/tests/suite/reference_counting_cost.rs` already prints in-place rates
 per corpus with a floor. It gains a per-site assertion: **every `push` whose list
 argument the lowering marked `Own::Owned` must be counted in place, or the test
 fails, naming the site.** This is grafted from the **regions** proposal's

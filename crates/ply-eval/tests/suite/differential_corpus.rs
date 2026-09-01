@@ -828,7 +828,7 @@ fn a_definition_that_performs_is_never_offered_to_a_wrong_backend() {
 /// honest backend never has to decline for want of budget and there is no
 /// decline for the corruption to replace. It is checked from the shipping
 /// command instead, on a corpus built to outrun the bound —
-/// `crates/ply-cli/tests/backend.rs`'s `DEEP` — and that is the only place in
+/// `crates/ply-cli/tests/suite/backend.rs`'s `DEEP` — and that is the only place in
 /// this workspace where this corruption fires.
 ///
 /// Asserted rather than skipped, because "the corpus cannot exercise this" and

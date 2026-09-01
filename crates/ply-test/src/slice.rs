@@ -61,7 +61,7 @@ pub struct CausalSlice {
     /// > conclude "a branch was not taken" from a declared atom that is absent
     /// > here, but may **not** conclude that an atom present here was declared.
     /// >
-    /// > Nothing outside `ply-test/tests/bisect_audit.rs` builds one of these
+    /// > Nothing outside `ply-test/tests/suite/bisect_audit.rs` builds one of these
     /// > yet — see `CONTRIBUTING.md` §"Things known to be broken" item 15 —
     /// > so the correction is to the contract rather than to an output anyone
     /// > has seen.

@@ -347,7 +347,7 @@ So `r` is measured.
 
 It timed `Reference::enter` with `Instant::now()` inside `ply-eval`. That crate
 may not read the host's clock at all, and
-`crates/ply-eval/tests/simulated_handlers.rs`'s
+`crates/ply-eval/tests/suite/simulated_handlers.rs`'s
 `the_evaluator_reads_no_host_clock_and_no_host_entropy` bans the type by name
 from every non-test line of it — *"a simulated run must be a function of its
 definitions and its seed"*. It went **red** on the edit. The clock is gone from
@@ -664,7 +664,7 @@ call after a per-definition precompute.**
 > > kind alone. Measured over `examples/` and `tests/fixtures/`: it changes
 > > **388** answers and **237 of 1,127** tests report it, the first as
 > > `E0502 \`bytes_concat_all\` expects Bytes, but got Cell`. **890 tests do
-> > not.** Through the shipping command on `crates/ply-cli/tests/backend.rs`'s
+> > not.** Through the shipping command on `crates/ply-cli/tests/suite/backend.rs`'s
 > > corpus it fires twice and **one** of the two is caught — the other is
 > > `assert_eq(len(pair(7)), 2)`, and a list with a forged cell in its head is
 > > still two long, which is the measure of what a corpus has to *look at*.
@@ -676,7 +676,7 @@ call after a per-definition precompute.**
 > >
 > > **A registry gap closed that something was standing in.** `Mutation::Unoffered`
 > > needs a definition that is *offered* and has no body.
-> > `crates/ply-cli/tests/backend.rs`'s corpus had exactly one, `pair(Int) ->
+> > `crates/ply-cli/tests/suite/backend.rs`'s corpus had exactly one, `pair(Int) ->
 > > List<Int>`, and a container return is now inside the fragment. Two tests
 > > **failed** rather than passing quietly —
 > > `an_answer_for_a_definition_the_backend_has_no_body_for_is_caught_by_ply_test`
@@ -808,8 +808,8 @@ call after a per-definition precompute.**
 > > workload that enters one call per file cannot police a corruption of a scalar
 > > answer, because it never asks for one.** Nothing about the seam got weaker:
 > > all three still fire and are still caught over `examples/` and
-> > `tests/fixtures/` in `crates/ply-eval/tests/differential_corpus.rs` (15
-> > tests) and through `ply test` in `crates/ply-cli/tests/backend.rs` (15). But
+> > `tests/fixtures/` in `crates/ply-eval/tests/suite/differential_corpus.rs` (15
+> > tests) and through `ply test` in `crates/ply-cli/tests/suite/backend.rs` (15). But
 > > anyone who reads W1's green as evidence about those three is reading a
 > > vacuous pass, and that is exactly the defect class `CONTRIBUTING.md` §"The
 > > one rule" names.
@@ -868,7 +868,7 @@ call after a per-definition precompute.**
 >
 > **What polices this widening**, because a coverage number is worthless if the
 > entries stop being checked. All eight wrong backends over
-> `crates/ply-eval/tests/differential_corpus.rs`: 14 passed. Through the
+> `crates/ply-eval/tests/suite/differential_corpus.rs`: 14 passed. Through the
 > shipping command on this workload, `ply test <W1> --backend wrong:<m>`: six of
 > seven **13 failed, 0 passed**, and the seventh (`exceeds-budget=2`) fires 0
 > times and is reported as not-fired exactly as §7 reports it. `--engine both

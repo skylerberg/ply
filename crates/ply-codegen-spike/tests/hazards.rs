@@ -982,7 +982,7 @@ fn the_hook_is_off_inside_a_simulate_region() {
 /// > it is unreachable today and this test does not arm it. What this test arms
 /// > is the `PatternKind::Ctor` lowering underneath it.
 ///
-/// The program is `crates/ply-cli/tests/prover_soundness_audit.rs`'s `or_else`
+/// The program is `crates/ply-cli/tests/suite/prover_soundness_audit.rs`'s `or_else`
 /// unchanged, because the shape was already written in this repository.
 #[test]
 fn a_nullary_constructor_pattern_is_a_test_and_not_a_binding() {

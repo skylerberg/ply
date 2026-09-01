@@ -92,8 +92,8 @@ pub(crate) const NAMED_CALLS: usize = 6;
 /// > 'AssertionKind::' --include=*.rs` finds `Eq` built at `slice.rs:326` and no
 /// > other variant built anywhere. So the phrase is load-bearing only for
 /// > whatever matches on the string, which is four tests
-/// > (`ply-cli/tests/failure_classification_audit.rs`,
-/// > `ply-test/tests/hybrid.rs`, `ply-test/src/tests.rs`,
+/// > (`ply-cli/tests/suite/failure_classification_audit.rs`,
+/// > `ply-test/tests/suite/hybrid.rs`, `ply-test/src/tests.rs`,
 /// > `ply-eval/src/tests.rs`). Kept as-is because those match on it; recorded
 /// > because a variant that exists to classify and never does is this
 /// > repository's `E0435` pattern, and `CONTRIBUTING.md` §"Things known to be

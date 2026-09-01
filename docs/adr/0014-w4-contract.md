@@ -1608,12 +1608,12 @@ that `#[test]`s in one binary do not race for one cluster — the count of
 
 | gate site | phases |
 | --- | --- |
-| `crates/ply-host/tests/db_transaction_audit.rs:205` `transactions_the_pool_and_parameters_under_adversarial_conditions` | **17** |
-| `crates/ply-host/tests/db_driver.rs:142` `the_driver_speaks_to_a_real_postgres` | 10, one of which (`the_driver_serves_a_transaction`) runs 6 more |
-| `crates/ply-host/tests/w5_drain_audit.rs:180` `the_drain_answers_its_remaining_questions` | 4 |
-| `crates/ply-host/tests/w5_shutdown.rs:132` `the_drain_never_commits_and_never_leaks` | 4 |
-| `crates/ply-host/tests/host_park.rs:99` `a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding` | 1 |
-| `crates/ply-host/tests/host_park.rs:164` `the_two_facilities_mint_tokens_that_cannot_collide` | 1 |
+| `crates/ply-host/tests/suite/db_transaction_audit.rs:205` `transactions_the_pool_and_parameters_under_adversarial_conditions` | **17** |
+| `crates/ply-host/tests/suite/db_driver.rs:142` `the_driver_speaks_to_a_real_postgres` | 10, one of which (`the_driver_serves_a_transaction`) runs 6 more |
+| `crates/ply-host/tests/suite/w5_drain_audit.rs:180` `the_drain_answers_its_remaining_questions` | 4 |
+| `crates/ply-host/tests/suite/w5_shutdown.rs:132` `the_drain_never_commits_and_never_leaks` | 4 |
+| `crates/ply-host/tests/suite/host_park.rs:99` `a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding` | 1 |
+| `crates/ply-host/tests/suite/host_park.rs:164` `the_two_facilities_mint_tokens_that_cannot_collide` | 1 |
 
 Required tests depending on gate A: **1, 2, 3, 4, 5, 6, 9, 10, 12 (the
 `HostUse` half), 18, 19, 20, 25, 26, 27, 28, 29**, and W5's 28, 29, 30 and 31.

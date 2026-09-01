@@ -336,13 +336,13 @@ Each of these is load-bearing for something below. None is measured today.
    calls pending under a second reference, and with them what `E0502` fires on.
    The same sentence is available for this change and would be as wrong.
    *Settled by:* ~~`--engine both` over every corpus on disk
-   (`crates/ply-eval/tests/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`),
-   plus `crates/ply-eval/tests/constant_memo.rs` unchanged.~~
+   (`crates/ply-eval/tests/suite/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`),
+   plus `crates/ply-eval/tests/suite/constant_memo.rs` unchanged.~~
    **Corrected (regression audit, 2026-08-21):** that settles the *literal*
    half and nothing about the constructor half, because both engines call
    `interp::ctor_value` and read one memo — see the correction block in §2.
    What settles the constructor half is
-   `crates/ply-eval/tests/ctor_value_sharing.rs` in full, plus
+   `crates/ply-eval/tests/suite/ctor_value_sharing.rs` in full, plus
    `constant_memo.rs` unchanged; `--engine both` remains the evidence for the
    literals and for §1.
 4. **That a record's field count stays small.** §3's flat layout is a linear
@@ -381,7 +381,7 @@ Three specific ways a change here could break it, and what catches each:
 
 | the move | what it would do | what catches it |
 | --- | --- | --- |
-| folding `Secret` into `Ctor` to save the variant, or giving it a tag a pattern can name | makes the payload matchable | `crates/ply-eval/tests/secrets.rs::a_secret_is_never_equal_to_its_payload` and the `E0206` refusals around it |
+| folding `Secret` into `Ctor` to save the variant, or giving it a tag a pattern can name | makes the payload matchable | `crates/ply-eval/tests/suite/secrets.rs::a_secret_is_never_equal_to_its_payload` and the `E0206` refusals around it |
 | a new rendering path that descends into a compound before `Value::write`'s `Secret` arm sees it | prints a credential | `secrets.rs::a_secret_renders_redacted_whatever_it_holds`, `::a_nested_secret_renders_redacted`, `::a_failing_assertion_prints_no_payload` |
 | a pool or an intern table that keeps a `Value` after the call that carried it returned | leaves a credential in a buffer the next call reads from | `crates/ply-eval/src/argv.rs::tests::a_secret_handed_back_is_not_held_by_the_pool`, which asserts on the `Arc` count and fails for any keep-without-clear |
 
@@ -592,10 +592,10 @@ thing most likely to sink this.
   here: `a_warm_frame_push_allocates_nothing` is the assertion to copy, and
   `the_pools_upper_bound_is_stated_in_bytes` is the bound to copy.
 - `crates/ply-eval/tests/region_reclamation_audit.rs` and
-  `crates/ply-eval/tests/use_after_free_audit.rs` in full: if a pooled vector
+  `crates/ply-eval/tests/suite/use_after_free_audit.rs` in full: if a pooled vector
   holds a `Cell`, `a_slot_reclaimed_late_reads_nothing_rather_than_the_next_regions_value`
   is where it surfaces.
-- `crates/ply-eval/tests/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`.
+- `crates/ply-eval/tests/suite/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`.
 
 > **Corrected (regression audit, 2026-08-21). The last bullet cannot see the
 > case this lever is most likely to break, and it is left standing above
@@ -604,12 +604,12 @@ thing most likely to sink this.
 > the tree-walker's *refusal* and compares no value at all for any program that
 > resumes a continuation — and multi-shot resumption is exactly where one
 > `Frame::AppArgs` becomes two, each finishing a buffer taken from the free
-> list. `crates/ply-eval/tests/resumption_semantics_audit.rs` states that
+> list. `crates/ply-eval/tests/suite/resumption_semantics_audit.rs` states that
 > blindness as a finding against ADR 0017 (`fn both`'s doc comment); it is the
 > same blindness here and this ADR did not carry it.
 >
 > **What does audit it**, and asserts the values `--engine both` cannot:
-> `crates/ply-eval/tests/value_semantics_audit.rs::an_argument_vector_split_by_two_resumptions_carries_each_resumptions_own_arguments`
+> `crates/ply-eval/tests/suite/value_semantics_audit.rs::an_argument_vector_split_by_two_resumptions_carries_each_resumptions_own_arguments`
 > — a continuation captured *inside an argument list* and resumed twice, at
 > every arity the free list serves and one it does not, with positional
 > encodings so that a shifted, duplicated or stale argument is a different
@@ -679,7 +679,7 @@ check rather than a symmetry requirement.
 > calls it, as does `machine.rs:2093`. So §2 *did* change the tree-walker, and
 > the two engines answer a constructor mention **from one memo**: measured, not
 > reasoned, by
-> `crates/ply-eval/tests/value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`,
+> `crates/ply-eval/tests/suite/value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`,
 > which asserts `Arc::ptr_eq` **true** across the two engines for the nullary
 > `Ctor` and for the constructor closure. Comparing the two is comparing a value
 > against itself.
@@ -694,7 +694,7 @@ check rather than a symmetry requirement.
 > This is the failure class `CONTRIBUTING.md` §"The one rule" lists twice (M8,
 > W5): a mitigation named in a document that is structurally incapable of
 > firing. **What actually audits the memo is
-> `crates/ply-eval/tests/ctor_value_sharing.rs`**, whose own note on `on_both`
+> `crates/ply-eval/tests/suite/ctor_value_sharing.rs`**, whose own note on `on_both`
 > says why it can — *"`ctor_value` is shared by the two, so a cache in it is a
 > change to both"* — and which checks the properties that survive sharing: the
 > shared value matches the arm a fresh one matched, is `values_equal` to a fresh
@@ -716,26 +716,26 @@ constructor mention.
 
 **The tests that catch it breaking.**
 
-- `crates/ply-eval/tests/ctor_value_sharing.rs` in full. **This is the file that
+- `crates/ply-eval/tests/suite/ctor_value_sharing.rs` in full. **This is the file that
   audits item 2**, and the correction block above is why it is first rather than
   last: it asserts the properties that survive one memo being read by both
   engines, which is what `--engine both` cannot do.
-- `crates/ply-eval/tests/constant_memo.rs` in full, unchanged — in particular
+- `crates/ply-eval/tests/suite/constant_memo.rs` in full, unchanged — in particular
   `a_nullary_pure_definition_is_evaluated_once_and_both_engines_agree` and
   `a_constant_built_behind_a_handler_is_remembered_with_its_value_intact`.
-- `crates/ply-eval/tests/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`
+- `crates/ply-eval/tests/suite/differential_corpus.rs::the_two_engines_agree_on_every_corpus_on_disk`
   and `::the_two_engines_agree_on_examples` — **independent evidence for item 1
   and for item 2's literals only**, per the correction block above.
-- `crates/ply-eval/tests/value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`,
+- `crates/ply-eval/tests/suite/value_semantics_audit.rs::both_engines_answer_a_constructor_mention_from_one_memo_and_a_literal_from_two`,
   which pins which of the two halves `--engine both` can see, so that this row
   cannot go stale silently in either direction.
-- `crates/ply-eval/tests/resumption_semantics_audit.rs::two_resumptions_thread_one_world_rather_than_snapshotting_per_branch`
+- `crates/ply-eval/tests/suite/resumption_semantics_audit.rs::two_resumptions_thread_one_world_rather_than_snapshotting_per_branch`
   — the two-resumption cell reads 2, and a shared constant reached through a
   resumed continuation is where that would stop being true.
-- `crates/ply-eval/tests/secrets.rs` in full: a `Secret` is never built from a
+- `crates/ply-eval/tests/suite/secrets.rs` in full: a `Secret` is never built from a
   literal today, and an intern table that admitted one would be a credential
   with program lifetime.
-- `crates/ply-eval/tests/map_order.rs::the_iteration_order_is_pinned` and
+- `crates/ply-eval/tests/suite/map_order.rs::the_iteration_order_is_pinned` and
   `::a_second_process_iterates_in_the_same_order` — a shared key is still a key.
 
 **Versioning.** No stored type moves. No rendered byte moves — the same `Value`
@@ -784,10 +784,10 @@ unsorted slice rather than fail. `Value::write`'s `Record` arm renders in the
 same order, and that output is stored. So the sort is load-bearing at three
 places and is the whole risk of this change.
 
-**The tests that catch it breaking.** `crates/ply-eval/tests/map_order.rs`
-(a record inside a map key), `crates/ply-eval/tests/secrets.rs::a_failing_assertion_prints_no_payload`
+**The tests that catch it breaking.** `crates/ply-eval/tests/suite/map_order.rs`
+(a record inside a map key), `crates/ply-eval/tests/suite/secrets.rs::a_failing_assertion_prints_no_payload`
 (a record holding a `Secret` renders), the derivation audits under
-`crates/ply-cli/tests/derivation_determinism_audit.rs`, and — for the ordering
+`crates/ply-cli/tests/suite/derivation_determinism_audit.rs`, and — for the ordering
 itself — a new test asserting two records built by different field orders are
 one value, which is `map_order.rs::two_insertion_orders_build_one_value` for
 records and does not exist.
@@ -1024,7 +1024,7 @@ disagreement. It was the language. Re-run on this tree, the body is one string
 either way and it is the canonical spelling, measured rather than reasoned:
 `{"prices":[{"key":1.5,"value":"bolt"},{"key":2,"value":"nut"}]}` from both
 insertion orders, asserted by
-`crates/ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`,
+`crates/ply-cli/tests/suite/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`,
 which runs the program under `ply test` and again under `--engine both`. (The
 `2` is `2.00m`'s canonical spelling, and the entry shape is `{key, value}`
 records rather than pairs, which is what `map_json` writes — take the body from
@@ -1075,10 +1075,10 @@ a run that was not reproducible in the first place, and a cache entry keyed by a
 hash that did not move still describes the same *verdict*. A reader who
 disagrees should bump it; the argument is here to be disagreed with.
 
-**The tests.** `crates/ply-eval/tests/map_order.rs::an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way`
+**The tests.** `crates/ply-eval/tests/suite/map_order.rs::an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way`
 carries verbatim what it asserted from W2 until this change, and
 `::a_decimal_anywhere_under_a_key_is_canonical` is the compound half.
-`crates/ply-eval/tests/value_semantics_audit.rs` holds the three tests that
+`crates/ply-eval/tests/suite/value_semantics_audit.rs` holds the three tests that
 found it — `two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map`,
 `map_insert_over_an_equal_decimal_key_reads_back_one_canonical_spelling`,
 `a_record_key_holding_a_decimal_is_canonical_in_the_compound_key_too` — each

@@ -34,7 +34,7 @@
 //! and restoring at a resumption discards the clause's own write before the
 //! computation that asked for it runs, which makes `put(5); get()` answer `0`
 //! and the canonical cell-backed state handler unwritable.
-//! `crates/ply-eval/tests/region_meaning_audit.rs` holds the programs that
+//! `crates/ply-eval/tests/suite/region_meaning_audit.rs` holds the programs that
 //! distinguish the two, and every one of them asserts the threaded answer.
 //!
 //! What a `shared` region buys is therefore reclamation safety rather than

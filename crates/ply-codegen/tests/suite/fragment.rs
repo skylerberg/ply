@@ -1,7 +1,7 @@
 //! What the code generator compiles, what it refuses, and that what it answers
 //! is what the interpreter answers.
 //!
-//! `crates/ply-cli/tests/backend.rs` is the other half and it asks a different
+//! `crates/ply-cli/tests/suite/backend.rs` is the other half and it asks a different
 //! question: whether a *wrong* backend is caught from a command a user runs.
 //! This file asks whether the right one is right, over Ply source, through the
 //! same `ply_eval::Compiled` seam the machine uses.

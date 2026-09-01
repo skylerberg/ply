@@ -658,7 +658,7 @@ fn two_decimals_that_are_one_map_key_render_two_strings_and_build_one_map() {
 /// **Before `canonical_key` they were two bodies**, differing in the key's
 /// spelling, for a pair of maps a test had proved equal; the assertion here is
 /// that they are now one.
-/// `ply-cli/tests/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`
+/// `ply-cli/tests/suite/derivation_determinism_audit.rs::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last`
 /// is the same claim through a real `derive json` codec, whose body is the one
 /// to read rather than a sentence about it.
 #[test]

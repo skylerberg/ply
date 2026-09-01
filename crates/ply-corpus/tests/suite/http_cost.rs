@@ -139,7 +139,7 @@ fn many_fields(fields: usize) -> Vec<u8> {
 /// hand-written parser. 8 KB of field the parser never reads must cost what 0
 /// bytes of it cost, to within the noise of an unoptimized interpreter.
 #[test]
-#[ignore = "timing; run with `cargo test -p ply-corpus --test http_cost -- --ignored --nocapture`"]
+#[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
 fn the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read() {
     let bench = Bench::open();
     let calls = 2_000;
@@ -164,7 +164,7 @@ fn the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read() {
 /// The other axis, and the one a smuggling-safe parser is allowed to pay for:
 /// cost rises with the number of fields, and rises *linearly*.
 #[test]
-#[ignore = "timing; run with `cargo test -p ply-corpus --test http_cost -- --ignored --nocapture`"]
+#[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
 fn the_cost_of_a_head_is_linear_in_the_number_of_fields() {
     let bench = Bench::open();
     let calls = 2_000;
@@ -227,7 +227,7 @@ fn accept_loop(l: Int, count: Int) -> Int / {net.write[listener], net.write[conn
 /// the sweeps above do not is the whole path: the head parse, the framing
 /// decision, the (empty) body read, the response encode and the write.
 #[test]
-#[ignore = "timing; run with `cargo test -p ply-corpus --test http_cost -- --ignored --nocapture`"]
+#[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
 fn a_whole_request_through_the_host_boundary() {
     use ply_host::tcp::{Net, SimNet};
     use std::sync::Arc;

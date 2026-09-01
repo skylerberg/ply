@@ -1086,7 +1086,7 @@ pub fn call(
 ///
 /// `i as usize` would answer the same thing for every input — `-1` becomes
 /// `2^64 - 1`, which `get` refuses on any list that fits in memory — and that
-/// mutant is recorded as equivalent in `crates/ply-eval/tests/list_builtins.rs`
+/// mutant is recorded as equivalent in `crates/ply-eval/tests/suite/list_builtins.rs`
 /// rather than as a hole, because a test written to kill it would be a test of
 /// this line's spelling.
 fn at(xs: &[Value], i: i64) -> Option<&Value> {

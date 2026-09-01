@@ -358,7 +358,7 @@ windows, 2,162 native entries.** Pre-registered verdict **`entry-paid-off`**.
 > >
 > > What it does settle is a smaller thing this ADR could not: **the fragment
 > > over this kernel is intact under 0.132.3 and under a fresh implementation of
-> > the seam.** `crates/ply-codegen/tests/kernel.rs` compiles all 44 of the
+> > the seam.** `crates/ply-codegen/tests/suite/kernel.rs` compiles all 44 of the
 > > kernel's definitions as one closed unit with **zero refusals**, registers 25
 > > of them as enterable, and the search answers through compiled code. The
 > > blocked instrument above is still blocked and item 18 is still open.

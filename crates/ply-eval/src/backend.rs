@@ -193,7 +193,7 @@
 //! > 635,637 offers, because `String`, `Float` and `Decimal` are outside the
 //! > fragment in both directions (ADR 0019 §5 item 4). That is what
 //! > [`Mutation::Unoffered`] still lives in, and
-//! > `crates/ply-cli/tests/backend.rs` had to be given a `String`-returning
+//! > `crates/ply-cli/tests/suite/backend.rs` had to be given a `String`-returning
 //! > definition when `pair(Int) -> List<Int>` moved inside the fragment and left
 //! > it with nothing to bite on. Both of that file's tests on the gap failed
 //! > rather than passing quietly, which is the whole value of `fired`.
@@ -274,7 +274,7 @@ pub struct Fragment {
 /// Atomic because the workers are threads and the numbers are the run's rather
 /// than a worker's. They are what makes "the corruption fired" checkable
 /// *before* "the corruption was caught", which is the middle step of
-/// `crates/ply-cli/tests/backend.rs`'s three and the one usually missing.
+/// `crates/ply-cli/tests/suite/backend.rs`'s three and the one usually missing.
 #[derive(Default)]
 pub struct Counters {
     offered: AtomicU64,
@@ -498,7 +498,7 @@ pub trait Provider: Send + Sync {
     /// **`None` rather than a zeroed [`Compilation`], and the difference is not
     /// cosmetic.** [`Fragment`] builds an `Interp` per worker and could count
     /// them, but it could not time them: this crate may not read the host's
-    /// clock at all — `crates/ply-eval/tests/simulated_handlers.rs`'s
+    /// clock at all — `crates/ply-eval/tests/suite/simulated_handlers.rs`'s
     /// `the_evaluator_reads_no_host_clock_and_no_host_entropy` bans the type by
     /// name from this source, and it has caught a measurement before (ADR 0030
     /// §4). A zero here would read as "the tree-walker takes no time to build",
@@ -897,7 +897,7 @@ impl Compiled for Reference {
 /// > and the answer's top-level kind, so a record whose declared type cannot
 /// > hold a cell can nonetheless come back holding one if a backend puts one
 /// > there. This mutation is that backend. What catches it is measured in
-/// > `crates/ply-eval/tests/differential_corpus.rs` rather than asserted here.
+/// > `crates/ply-eval/tests/suite/differential_corpus.rs` rather than asserted here.
 ///
 /// The last one is not a backend defect and cannot be demonstrated by a backend
 /// alone: `compiled::admit` refuses any definition whose published
@@ -1159,7 +1159,7 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
 /// §4.5 is a condition on *any* backend, and it is discharged per backend: the
 /// count of how many of the eight are caught is a property of the backend under
 /// them, because what a corruption can bite depends on which definitions the
-/// backend has a body for. `crates/ply-cli/tests/backend.rs` runs the whole
+/// backend has a body for. `crates/ply-cli/tests/suite/backend.rs` runs the whole
 /// table against each installed backend rather than against one, for exactly
 /// that reason.
 pub struct Mutant {

@@ -2188,7 +2188,7 @@ fn comparing_ordinary_values_stays_legal() {
 /// generated definition as an unknown name.
 ///
 /// Expansion failing is a defect in a fixture rather than a case under test —
-/// the derivers' own negative cases live in `ply-core/tests/derivation.rs`,
+/// the derivers' own negative cases live in `ply-core/tests/suite/derivation.rs`,
 /// against `ply_derive::expand_program` directly.
 fn parse_program(files: &[(&str, &str)]) -> Program {
     let mut program = Program {

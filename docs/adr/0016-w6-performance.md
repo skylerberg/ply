@@ -671,7 +671,7 @@ another is that input's, so the weakest one is the claim.
   > the protection is the thing this section could not have asked for in W6,
   > because nothing implemented `Compiled` then: ADR 0026 §4.5's condition that
   > a backend be **policeable** before it is fast, discharged for this backend
-  > in `crates/ply-cli/tests/backend.rs` — eight of eight configurations
+  > in `crates/ply-cli/tests/suite/backend.rs` — eight of eight configurations
   > accounted for, each seen to fire and each seen to be caught.
 - It may **not** report a ratio whose two sides did different work — for
   instance an interpreter column that includes `Machine::call` entry where the
@@ -902,7 +902,7 @@ The ones whose absence would let W6 report a number that is not what it says.
 > §8–§11 is unverified by any suite a reader is likely to run. The ladder half
 > is unaffected: `benches/w6-ladder.json`, every share, the Amdahl projection
 > and `w6::decide` are exercised by `crates/ply-corpus/src/w6.rs` and by
-> `crates/ply-corpus/tests/w6_report_integrity.rs` inside the workspace. Note
+> `crates/ply-corpus/tests/suite/w6_report_integrity.rs` inside the workspace. Note
 > also that the verdict does not turn on the spike's magnitude — §2's C2 fails
 > at 1.48x against 1.50x, and the six unpriced levers defer it independently —
 > so this gap weakens the *evidence for deferring*, not the deferral.
@@ -1495,7 +1495,7 @@ Three consequences, all of them in this document's own claims:
   one of the seven levers was built rather than priced, and this take prices what
   it was worth: §8.1 and the `caching derived work` row of §10.
 - Two guards now stand where nothing did.
-  `crates/ply-corpus/tests/w6_report_integrity.rs` re-takes the cheap half of the
+  `crates/ply-corpus/tests/suite/w6_report_integrity.rs` re-takes the cheap half of the
   ladder in release and compares it against the shipped file; the fix for a
   failure is to re-take, and the message says so with the command.
   `crates/ply-corpus/tests/w6_report_allocations.rs` does the same in

@@ -9,7 +9,7 @@
 //!
 //! This file is the shipping half of that: the same source, through
 //! `ply_codegen::Cranelift`, asserting what the fragment reaches. It is the
-//! counterweight to `tests/fragment.rs`'s census over the standard library,
+//! counterweight to `tests/suite/fragment.rs`'s census over the standard library,
 //! and the contrast between the two is the finding rather than either number
 //! alone —
 //!
@@ -85,7 +85,7 @@ fn kernel() -> (&'static Program, &'static Cranelift) {
 ///
 /// Every one of its definitions is arithmetic, comparison, `if`, `let`, a
 /// record field read, a list or map operation, and calls to each other. The
-/// standard-library census in `tests/fragment.rs` is the opposite case and the
+/// standard-library census in `tests/suite/fragment.rs` is the opposite case and the
 /// two are quoted together wherever either is.
 #[test]
 fn the_whole_kernel_is_inside_the_fragment() {

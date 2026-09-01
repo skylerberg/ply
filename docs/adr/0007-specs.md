@@ -1437,7 +1437,7 @@ The tier contract:
     survives 1,000 sampled cases across 8 roots. A refutation **and a raise** are
     each classified as a defect in Ply.
     *Enforced by `every_proof_a_generated_corpus_produces_survives_a_wide_sample`
-    (`crates/ply-corpus/tests/tier_audit.rs:26`), verified in the 2026-08-17
+    (`crates/ply-corpus/tests/suite/tier_audit.rs:26`), verified in the 2026-08-17
     docs pass. It sweeps seeds 1..=6, re-samples at `cases: 1_000` over
     `roots: 0..8`, and `disagreement` treats both `Discharge::Refuted` and
     `Gap::Raised` as defects, which is the `i64`-versus-ℤ shape §5.1(a)

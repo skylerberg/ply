@@ -16,8 +16,7 @@
 //! The test is a stopwatch, which is usually the wrong instrument — but the
 //! defect *is* a wait, so what has to be asserted is that one ended.
 
-mod support;
-
+use crate::support::cluster::{self, Cluster};
 use ply_core::ty::Resource;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
 use ply_host::db::scope::Owner;
@@ -27,7 +26,6 @@ use ply_host::tls::Credentials;
 use ply_host::{Host, db::PoolConfig};
 use ply_span::{Span, Symbol};
 use std::time::{Duration, Instant};
-use support::cluster::{self, Cluster};
 
 const ALONE: Owner = (MachineId(0), None);
 

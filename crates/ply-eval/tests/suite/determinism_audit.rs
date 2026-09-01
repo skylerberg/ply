@@ -941,7 +941,7 @@ test "the second region's shape depends on what the first raced to" {
 /// still pass.
 #[test]
 fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
-    let source = include_str!("../src/machine.rs");
+    let source = include_str!("../../src/machine.rs");
     let body = source
         .split_once("mod tests")
         .map(|(body, _)| body)

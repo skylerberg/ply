@@ -124,7 +124,7 @@ impl Compiled {
 /// The `cell` atoms reach the footprint through a **declared row** rather than
 /// through a cell smuggled out of its region. ADR 0017 §2 closed every carrier
 /// that used to take one out — a closure carrying it in its effect row was the
-/// last, and `ply-core/tests/region_escape_audit.rs` is where each is pinned —
+/// last, and `ply-core/tests/suite/region_escape_audit.rs` is where each is pinned —
 /// so a written annotation is now the only way a `cell` atom reaches a published
 /// footprint at all. The call sits *outside* the region on purpose: a region
 /// discharges its own label, so calling it inside would discharge the atoms the
