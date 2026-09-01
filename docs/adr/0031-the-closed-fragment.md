@@ -407,7 +407,23 @@ Bfo − r_fo                          1.350 s      model-free residue outside `e
 ```
 
 **2.10× against 56.8×.** The gap between them is the price of the three refusals
-above, and it is the largest single number left in this line of work. What it
+above, and it is the largest single number left in this line of work.
+
+> **Amended 2026-08-31 — ADR 0032 §3–5.** The `Bfo` arm above was taken by
+> narrowing `Reference` with `PLY_BACKEND_ONLY`, because no real code generator
+> could be put in that position. One can now: `PLY_CODEGEN_REGISTER=all`
+> reproduces this arm's entry line — `495152 of 1049245 offers entered · 554093
+> declined` — with **222** definitions against 220, on cranelift rather than on
+> a narrowed tree-walker. It reads **0.604×**, not 2.104×.
+>
+> The arithmetic here is not withdrawn; what it prices is. **2.10× is an
+> *infinitely fast* backend's number at 495,152 entries, and no real backend
+> reaches it, because the boundary is paid 495,152 times whatever is on the far
+> side.** Read `Bfo`'s ceiling as a bound the entry *count* makes unreachable
+> rather than as a target. ADR 0032 §4 states the rule the two workloads fix:
+> widening a registry helps when it lets the machine enter *higher* and hurts
+> when it only adds *leaves* — on `benches/kernel` the same widening collapses
+> 2,974 entries to 63 and is worth 10.0×. What it
 would take is written in ADR 0030 §10.2 and is not a seam change: giving the
 backend a callback *into the machine* breaks `Machine::compiled_answer`'s
 `&self`, moves the `Frame::Call` push above `enter`, makes the bailout no longer
