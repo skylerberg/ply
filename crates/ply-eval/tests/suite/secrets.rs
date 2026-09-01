@@ -1,4 +1,4 @@
-//! the secret containment claim at the evaluator: what a credential renders as, what comparing two of them does, and
+//! The secret containment claim at the evaluator: what a credential renders as, what comparing two of them does, and
 //! what happens when one reaches the host boundary.
 
 // A `Value::Record` holds `Arc<BTreeMap<Symbol, Value>>` and a `Value` is not `Send`; that is

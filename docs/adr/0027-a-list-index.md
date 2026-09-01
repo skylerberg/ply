@@ -256,7 +256,7 @@ is asymptotically unusable.**
 ## What this deliberately does not do
 
 **The spike is not ported**, so the tree gains a builtin with **zero call
-sites** — the shape ADR 0025's ill-posed criterion warns about, **filed as
+sites** — the shape ADR 0024's ill-posed criterion warns about, **filed as
 explicit follow-up rather than smuggled in here.**
 
 **No byte-defaulting variant.** The standard library asks for one and the

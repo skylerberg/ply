@@ -79,7 +79,7 @@ fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {
     }
 }
 
-/// the region-kind rule's two-resumption example with the `handle` written *outside* the `with_cell` instead
+/// The region-kind rule's two-resumption example with the `handle` written *outside* the `with_cell` instead
 /// of inside it.
 const HANDLE_ENCLOSES: &str = r#"
 effect amb { read flip[coin]() -> Bool }
@@ -236,7 +236,7 @@ fn f() -> List<Int> =
     assert_eq!(kind_of(&callback, "r"), RegionKind::Shared);
 }
 
-/// the region-kind rule: "forcing `unique` where a capture is reachable is a compile error naming the
+/// The region-kind rule: "forcing `unique` where a capture is reachable is a compile error naming the
 /// capture site".
 #[test]
 fn forcing_unique_over_a_capture_an_enclosing_handle_answers_is_refused() {

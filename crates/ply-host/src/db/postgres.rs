@@ -1,5 +1,5 @@
 //! The postgres [`Driver`]: the piece that joins the scanner, the type mapping, the scope table and
-//! the connection pool into something a Ply `db` operation resolves to.
+//! The connection pool into something a Ply `db` operation resolves to.
 
 use super::handler::{Driver, Statement};
 use super::pool::{self, Cleanup, LeaseId, Opened, Outcome, Reactor};
@@ -497,7 +497,7 @@ pub use sqlstate::{
 };
 
 /// What the shutdown coordinator asks the database for: one number, for one line of output and for
-/// the drain's own report.
+/// The drain's own report.
 impl crate::signal::Transactions for Postgres {
     fn open_scopes(&self) -> usize {
         Postgres::open_scopes(self)

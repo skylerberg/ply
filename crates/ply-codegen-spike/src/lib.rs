@@ -1,4 +1,4 @@
-//! the codegen spike's spike, and nothing else.
+//! The codegen spike's spike, and nothing else.
 
 pub mod entry;
 pub mod jit;

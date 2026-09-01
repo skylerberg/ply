@@ -474,7 +474,7 @@ fn an_evaluation_that_raises_is_a_gap_rather_than_a_refutation() {
 
 // --- Concurrency laws -------------------------------------------------------
 
-/// the concurrency-law conditions's condition 5, which is the one an implementer drops: an exhaustive interleaving
+/// Condition 5 of a concurrency law, which is the one an implementer drops: an exhaustive interleaving
 /// search over *sampled values* proves something about those values and nothing about the law.
 #[test]
 fn a_concurrency_law_over_a_binder_is_property_however_exhaustive_the_search() {
@@ -676,7 +676,8 @@ fn disagreement(discharge: &Discharge) -> Option<String> {
     }
 }
 
-/// The tier cost of a **raising** accessor, which is the argument the total `list_at` rests on — and which that record briefly struck as wrong before an
+/// The tier cost of a **raising** accessor, which is the argument the total
+/// `list_at` rests on — and which was briefly struck as wrong before an
 /// adversarial review restored it.
 #[test]
 fn a_total_index_reaches_property_where_a_raising_one_is_a_gap() {

@@ -121,7 +121,7 @@ fn a_shared_analysis_answers_what_a_private_one_answers() {
     assert_eq!(machine.region_kinds().len(), private.len());
 }
 
-/// the region-kind rule as amended, run off a shared analysis.
+/// The region-kind rule as amended, run off a shared analysis.
 #[test]
 fn the_two_resumption_trace_cell_still_reads_two_under_a_shared_analysis() {
     let compiled = Compiled::new(

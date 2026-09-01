@@ -1,4 +1,4 @@
-//! the kernel re-pricing's kernel, and the claims the measurement rests on.
+//! The kernel re-pricing's kernel, and the claims the measurement rests on.
 
 use ply_codegen_spike::entry::{admissible, enterable, refusals_over, scalar_signature};
 use ply_codegen_spike::jit::Opts;
@@ -392,7 +392,7 @@ fn a_runaway_recursion_is_the_machines_diagnostic_and_not_a_crash() {
     }
 }
 
-/// the unboxing lever wants `Int`, `Bool` **and `Float`** unboxed.
+/// The unboxing lever wants `Int`, `Bool` **and `Float`** unboxed.
 #[test]
 fn the_fragment_accepts_float_arithmetic_and_then_fails_on_it_at_run_time() {
     let dir = std::env::temp_dir().join(format!("ply-float-probe-{}", std::process::id()));

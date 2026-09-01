@@ -820,7 +820,7 @@ fn randomized_graphs_are_emitted_in_reverse_topological_order() {
 
 // --- `law/host` -------------------------------------------------------------
 
-/// a law that may reach the world: `law/host` is part of the law's own hash, written after `tag::LAW` exactly as
+/// A law that may reach the world: `law/host` is part of the law's own hash, written after `tag::LAW` exactly as
 /// `TestDef::nondet` is written after `tag::TEST`.
 #[test]
 fn declaring_a_law_host_changes_the_law_and_no_definition() {

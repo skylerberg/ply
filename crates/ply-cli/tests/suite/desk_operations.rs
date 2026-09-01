@@ -93,7 +93,7 @@ fn desk_types() -> String {
 
 // --- liveness and readiness -------------------------------------------------
 
-/// health and readiness as routes, and the reason the two routes exist rather than one.
+/// Health and readiness as routes, and the reason the two routes exist rather than one.
 #[test]
 fn health_has_no_row_and_ready_names_what_it_verifies() {
     let types = desk_types();
@@ -239,7 +239,7 @@ fn the_desks_credential_reaches_no_line_of_a_whole_test_run() {
     );
 }
 
-/// the closed exfiltration routes as a fixture: every route out of a `Secret` is a compile error, and this is the
+/// The closed exfiltration routes as a fixture: every route out of a `Secret` is a compile error, and this is the
 /// list.
 #[test]
 fn every_route_out_of_a_secret_is_a_compile_error() {
@@ -314,7 +314,7 @@ fn the_desks_laws_still_hold_over_a_service_that_records_and_authenticates() {
 
 // --- what an operator reads before starting it ------------------------------
 
-/// the host listing's two new blocks, over the desk.
+/// The host listing's two new blocks, over the desk.
 #[test]
 fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
     let desk = repo("examples/desk.ply");
@@ -340,7 +340,7 @@ fn hosts_prints_where_records_go_which_channels_exist_and_what_a_signal_does() {
     off.silent_about("→ nothing · level");
 }
 
-/// the host listing's digest rule, which is the whole reason the blocks are hashed rather than only
+/// The host listing's digest rule, which is the whole reason the blocks are hashed rather than only
 /// printed: a structural change to the trusted computing base breaks CI, and a deployment's own
 /// configuration does not.
 #[test]

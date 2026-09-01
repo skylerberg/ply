@@ -197,7 +197,7 @@ fn a_cell_written_inside_a_resumption_is_read_after_it() {
     );
 }
 
-/// the region-kind rule's two-resumption example, and the integer the whole section turns on: the trace cell
+/// The region-kind rule's two-resumption example, and the integer the whole section turns on: the trace cell
 /// reads **2**, because one cell serves both resumptions and `k(false)` observes what `k(true)`
 /// wrote.
 #[test]

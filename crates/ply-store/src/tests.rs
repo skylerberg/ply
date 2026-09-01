@@ -1484,7 +1484,7 @@ fn re_recording_the_same_baseline_writes_nothing() {
     );
 }
 
-/// the failure artifact's silent-wrongness path: prune deletes the baselines, and every later failure degrades
+/// The failure artifact's silent-wrongness path: prune deletes the baselines, and every later failure degrades
 /// to `no_bodies` with no error to explain it.
 #[test]
 fn pruning_keeps_the_bodies_a_baseline_names_even_when_no_file_declares_them() {

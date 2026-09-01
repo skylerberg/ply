@@ -272,7 +272,7 @@ fn a_backend_is_never_offered_a_definition_that_performs() {
 
 // --- The result-cache rule --------------------------------------------------
 
-/// the cache rule, both stages, on the path where neither is an accident.
+/// The cache rule, both stages, on the path where neither is an accident.
 #[test]
 fn a_backend_run_reads_no_cached_pass() {
     let dir = project(CORPUS);
@@ -616,7 +616,7 @@ test "a runaway" { assert_eq(spin(0), 0) }
 
 // --- The result-cache rule, over the code generator --------------------------
 
-/// the cache rule again, on the backend that arrived after it was written.
+/// The cache rule again, on the backend that arrived after it was written.
 #[test]
 fn a_code_generator_run_reads_no_cached_pass() {
     let dir = project(CORPUS);

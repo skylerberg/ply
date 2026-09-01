@@ -202,7 +202,7 @@ fn consume() -> Int = with_cell[k](0) { other ->
     );
 }
 
-/// A footprint's resource is the region's **name** (host effects having no region isolation), so a caller whose own region is
+/// A footprint's resource is the region's **name**, so a caller whose own region is
 /// spelled `k` discharges `cell.read[k]` out of everything its region encloses.
 #[test]
 fn only_a_written_row_can_put_a_foreign_regions_atom_in_a_callers_row() {
@@ -240,7 +240,7 @@ fn inside() -> Int = with_cell[k](0) { c -> touches(cell_get(c)) }",
 
 // --- the routes out of a bare `with_cell` -----------------------------------
 
-/// the escape brand, the closure clause, applied to the region the region model says a `with_cell` is.
+/// The brand's closure clause, applied to the region a `with_cell` opens.
 #[test]
 fn a_closure_capturing_a_bare_with_cells_cell_is_an_escape() {
     let d = code(

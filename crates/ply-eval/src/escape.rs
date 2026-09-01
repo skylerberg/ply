@@ -121,7 +121,7 @@ impl Boundary<'_> {
         match self {
             Boundary::HostArgument { path, .. } => Cow::Owned(format!(
                 "`{path}` is a host handler, and a host handler outlives every region the program \
-                 opens (the host boundary)"
+                 opens"
             )),
             Boundary::HostAnswer { path, .. } => Cow::Owned(format!(
                 "`{path}` is outside the program, so a handle it produced names no region this \

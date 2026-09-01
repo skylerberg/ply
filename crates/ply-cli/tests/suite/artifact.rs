@@ -584,7 +584,8 @@ fn a_rename_moves_a_name_and_no_hash() {
 
 // --- what the command prints ---------------------------------------------------
 
-/// the refusal of incremental transfer refused incremental transfer because the binary is the part that actually changes.
+/// Incremental transfer was refused because the binary is the part that actually
+/// changes.
 #[test]
 fn the_build_prints_the_artifacts_size_beside_the_binarys() {
     let dir = project(PROGRAM);
@@ -784,7 +785,7 @@ fn an_entry_point_that_takes_an_argument_is_refused() {
 
 /// The gap `ply build` and the shutdown sequence each left on the other's side: a run from a
 /// `.plyx` bound no signal handler, so a readiness route that consults `signal.stopping()` — which
-/// health and readiness as routes says is *the* thing a readiness route checks — answered `E0424` in the deployed
+/// The thing a readiness route checks — answered `E0424` in the deployed
 /// form and `false` in the source form.
 #[test]
 fn an_artifact_run_binds_the_signal_handler_a_source_run_binds() {

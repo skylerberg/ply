@@ -174,7 +174,8 @@ test "a continuation outlives the region whose cell it reads" {
 }
 "#;
 
-/// the escape case — a continuation resumed after the region that made its cell returned, at the reclamation event R2 added.
+/// The escape case — a continuation resumed after the region that made its cell
+/// returned — at the reclamation event R2 added.
 #[test]
 fn a_close_a_live_continuation_can_reach_is_deferred_rather_than_taken() {
     let compiled = Compiled::new(PARKED);

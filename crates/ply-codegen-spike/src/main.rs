@@ -1,4 +1,4 @@
-//! the codegen spike's spike, run.
+//! The codegen spike's spike, run.
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::jit::{Jit, Opts};

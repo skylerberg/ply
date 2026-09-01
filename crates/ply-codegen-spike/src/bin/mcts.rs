@@ -1,4 +1,4 @@
-//! the kernel re-pricing — re-pricing the codegen spike's codegen spike against a compute kernel.
+//! The kernel re-pricing — re-pricing the codegen spike's codegen spike against a compute kernel.
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::entry::{Declines, admissible, enterable, refusals_over};

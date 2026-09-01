@@ -96,7 +96,7 @@ mod tests {
         assert!(v.is_empty(), "take handed out a vector holding {}", v.len());
     }
 
-    /// the secret containment claim: a credential may not sit in a buffer the next call reads from.
+    /// The secret containment claim: a credential may not sit in a buffer the next call reads from.
     #[test]
     fn a_secret_handed_back_is_not_held_by_the_pool() {
         let payload = Arc::new(Value::str("hunter2"));

@@ -811,7 +811,7 @@ test/nondet "reads a clock inside the production region" {
     );
 }
 
-/// the blocking rule, which is the reason `HostAnswer::Pending` exists at all: a task waiting on a token
+/// The blocking rule, which is the reason `HostAnswer::Pending` exists at all: a task waiting on a token
 /// leaves the enabled set, and the others keep running.
 #[test]
 fn a_task_pending_on_a_host_token_parks_and_the_others_run() {

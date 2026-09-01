@@ -4259,7 +4259,7 @@ impl<'a> Checker<'a> {
         (result_ty, row)
     }
 
-    /// the region model: a cell is a value allocated in `r`.
+    /// The region model: a cell is a value allocated in `r`.
     fn infer_with_cell(
         &mut self,
         e: &Expr,
@@ -4486,7 +4486,7 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
-    /// the escape brand, asked once the module is solved for the reason [`Checker::check_simulations`]
+    /// The escape brand, asked once the module is solved for the reason [`Checker::check_simulations`]
     /// is asked then: the brand a value carries is routinely still an unsolved variable while the
     /// region around it is being walked, and a check that ran at the closing brace would answer
     /// about a type that had not been decided yet.

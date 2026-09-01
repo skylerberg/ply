@@ -1,4 +1,4 @@
-//! Reference counting for the values that outlive their region — the reference-counting pass.
+//! Reference counting for the values that outlive their region.
 
 use crate::arena::Slot;
 use crate::env::Env;

@@ -315,7 +315,7 @@ fn two_operators_that_overflowed_are_not_one_term() {
     not_proved(&f, "an overflowing sum is itself");
 }
 
-/// the decidable fragment(a) reasons over ℤ.
+/// The decidable fragment(a) reasons over ℤ.
 #[test]
 fn arithmetic_is_proved_only_where_the_result_is_an_int() {
     let f = fixture(BOUNDARIES);

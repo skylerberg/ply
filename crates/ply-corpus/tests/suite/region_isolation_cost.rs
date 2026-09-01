@@ -1,4 +1,4 @@
-//! region isolation's number, taken against real projects rather than against footprints somebody typed.
+//! Region isolation's number, taken against real projects rather than against footprints somebody typed.
 
 use ply_core::Footprint;
 use ply_corpus::regions::{self, Corpus, Hypothetical};

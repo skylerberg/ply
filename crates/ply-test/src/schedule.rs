@@ -247,7 +247,7 @@ mod tests {
         assert!(!is_seeded(&Footprint::empty()));
     }
 
-    /// the isolation rule's property, preserved with its population changed: what is free to add is a test
+    /// The isolation rule's property, preserved with its population changed: what is free to add is a test
     /// that names nothing, not a test whose state used to be forked.
     #[test]
     fn adding_isolated_simulated_tests_changes_no_group_count() {

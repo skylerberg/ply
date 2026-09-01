@@ -358,13 +358,13 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
 
     println!(
         "\n=== THE ANNOTATION BURDEN ===\n\
-         the ownership design has no annotation, so its burden is zero by construction and reporting\n\
+         This design has no annotation, so its burden is zero by construction and reporting\n\
          that would be vacuous. What is counted here is the honest translation: a FORCED\n\
          SOURCE EDIT. A definition is `clean` when every append in it reuses — nothing to\n\
          write, nothing to move. It needs an `edit` when an append copies, and the cause\n\
          table below says which edit.\n\n\
          The three `edit` columns are what a reader has to see before the total:\n\
-           pos  — only positional causes. the ownership design's P1 and P2 are EVALUATOR changes;\n\
+           pos  — only positional causes. The carry and parameter fixes are EVALUATOR changes;\n\
                   they remove these with no source edit at all. MEASURED as copying\n\
                   today, PROJECTED to zero after P1/P2 — the projection is not mine to\n\
                   claim and is labelled as one.\n\
@@ -486,7 +486,7 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
     }
 
     println!(
-        "\n=== the ownership design, measured rather than argued ===\n\
+        "\n=== The per-site falsifier, measured rather than argued ===\n\
          Registered before it was built: \"every `push` whose list argument the \
          lowering\n marked `Own::Owned` must be counted in place, or the test fails\" \
          — and predicts\n that this \"will fail on the tree as it stands\". Both halves \
@@ -542,7 +542,7 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
     );
     assert!(
         own_executed > 0,
-        "no `Own::Owned`-marked append ran, so the ownership design's proposal was not \
+        "no `Own::Owned`-marked append ran, so the falsifier was not \
          measured and the paragraph above says nothing"
     );
 

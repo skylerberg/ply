@@ -546,7 +546,7 @@ comments record why each of the three non-obvious ones (`rustls`,
 ordering. Pick the next free one — and **nothing you have to
 remember decides this any more**: `ply-span:armed:no_two_adrs_share_a_number`
 fails when two files share a number, so the check catches you rather than a
-reader finding an ambiguous `ADR NNNN` citation months later.
+reader finding an ambiguous reference months later.
 
 > **Do not pick an ADR number by counting the directory, or by reading the open
 > pull requests.** Both have failed here, the second one twice: branches are
@@ -556,10 +556,17 @@ reader finding an ambiguous `ADR NNNN` citation months later.
 > repository can follow. `no_two_adrs_share_a_number` in
 > `crates/ply-span/tests/armed.rs` is what catches the collision now.
 
-ADR 0005 is superseded in part by ADR 0017, and it is the model for how to record
-that: 0005's *title* does not say so, but its header carries
-`Status: accepted — … §2's persistent forkable world is **superseded by ADR 0017**` and `Superseded in part by: docs/adr/0017-regions.md (§2 only)`, and §2
-itself opens with a `> **Superseded by ADR 0017.**` block. Do that in both files.
+A record superseded in part says so in its own opening, and the record that
+supersedes it says which part. ADR 0005 is the model: its opening says the
+forkable state it introduced is superseded by ADR 0017, the section that carried
+it says what replaced each piece, and ADR 0017 says what it had to preserve. Do
+it in both files.
+
+**References between records name the record, not a section.** A section number
+is the part that drifts — a rewrite moves every one of them at once — and
+nothing in the tree checks them. Code comments name no record at all: a comment
+that needs a decision behind it states the property instead, so that reading the
+comment is enough.
 
 **Amend an ADR in place; do not append a note saying what it used to say.** This
 directory ran the opposite convention and §"Correct in place" is the general
@@ -568,10 +575,6 @@ amends, because a reader who reaches the sentence has already believed it. What
 stays beside a claim is the small class §"Writing a claim down" names — a
 rejected alternative with its reason, a trap, a wrong-instrument correction.
 
-**An ADR's section numbers are an API.** They are cited by number from every
-other document and from source comments, so **renumbering or deleting a section
-breaks citations silently.** Trim a section's body to a line if it is spent;
-leave its heading where it is.
 
 An ADR here is expected to state the criteria *before* the measurement, in code
 where possible. `ply_corpus::w6::Criteria::default()` is the model: eight
@@ -756,8 +759,8 @@ original ones and the gaps are where closures used to be.
     with no `_` arm — which is the design working, not failing: the build stops
     rather than the comparison going quietly green. What failed is that
     **nothing ran the build**. That spike is in no CI job, and the figures ADR
-    0020 §6.1, ADR 0021 and ADR 0022 quote from it — the lexer's throughput, the
-    whole basis of §6.2's multiplier — cannot be re-taken until it is fixed.
+    0020, ADR 0021 and ADR 0022 quote from it — the lexer's throughput, and the
+    whole basis of its multiplier — cannot be re-taken until it is fixed.
     Its `lexer.ply` also still has no arm for byte 63, so `?` lexes as an
     error there.
 

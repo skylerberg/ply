@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(regions.live(), 0);
     }
 
-    /// the escape case — a continuation resumed after the region that made its cell returned, at the allocator: a continuation captured inside a `shared` region
+    /// The escape case at the allocator: a continuation captured inside a `shared` region
     /// and resumed after its lexical close still reads the cell.
     #[test]
     fn a_shared_regions_close_keeps_the_slots_a_live_continuation_can_reach() {

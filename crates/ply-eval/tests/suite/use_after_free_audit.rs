@@ -86,7 +86,7 @@ fn codes_of(diags: &[Diagnostic]) -> Vec<&str> {
     diags.iter().map(|d| d.code).collect()
 }
 
-/// the escape brand's list, walked to the end.
+/// The escape brand's list, walked to the end.
 #[test]
 fn every_carrier_out_of_a_region_is_refused_before_it_can_dangle() {
     let carriers: &[(&str, &str)] = &[
@@ -330,7 +330,7 @@ pub fn attack() -> Int =
     assert_eq!(stats.slots_reclaimed_late, 1);
 }
 
-/// the escape brand's one open route — a continuation parked in an enclosing region's cell, where a
+/// The escape brand's one open route — a continuation parked in an enclosing region's cell, where a
 /// nominal constructor's field type erases the brand — with a second region placed where the freed
 /// slot would be.
 #[test]

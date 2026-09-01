@@ -220,7 +220,7 @@ fn an_included_set_counts_the_definitions_that_reach_it() {
     );
 }
 
-/// the cost of an over-broad alias: `--explain` must print the same bytes for a warm run and a cold one, or the
+/// The cost of an over-broad alias: `--explain` must print the same bytes for a warm run and a cold one, or the
 /// reviewing command's output is a function of what the cache held.
 #[test]
 fn explain_prints_the_same_bytes_whether_gate_one_parsed_the_file_or_skipped_it() {
@@ -376,7 +376,7 @@ fn the_example_service_reads_as_a_map_of_the_api_to_what_it_touches() {
 
 // --- ply prove --------------------------------------------------------------
 
-/// the cost of an over-broad alias: the footprint is the frame condition, so an annotation wider than the body
+/// The cost of an over-broad alias: the footprint is the frame condition, so an annotation wider than the body
 /// promises less about less — at the same tier and with no other sign that anything was lost.
 #[test]
 fn prove_explain_names_what_an_over_broad_row_gave_up() {

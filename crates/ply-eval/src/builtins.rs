@@ -1862,7 +1862,7 @@ mod tests {
         );
     }
 
-    /// the limits's builtin.
+    /// The limits's builtin.
     #[test]
     fn concat_all_joins_every_piece_in_order() {
         let empty = done(Builtin::BytesConcatAll, vec![Value::list(vec![])]).unwrap();

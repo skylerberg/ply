@@ -709,7 +709,7 @@ impl<'a> Analysis<'a> {
     }
 }
 
-/// the region-kind rule: forcing `unique` where a capture is reachable is a compile error naming the capture
+/// The region-kind rule: forcing `unique` where a capture is reachable is a compile error naming the capture
 /// site.
 fn refuse_unique(found: &Found, site: &CaptureSite) -> Diagnostic {
     let mut d = Diagnostic::error(
