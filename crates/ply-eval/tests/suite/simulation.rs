@@ -1,12 +1,4 @@
 //! The machine's simulated regions, end to end.
-//!
-//! `sim`, `sched` and `explore` are each testable on their own and each is
-//! tested there. This file is the seam between them and the evaluator, which is
-//! the part no unit test reaches: a `simulate` region on the control stack, one
-//! world threaded through every task, and a step's access set assembled from
-//! what the run actually touched. Every claim the milestone makes about
-//! reduction is a claim about *that* set, so a hole here is a smaller number
-//! rather than a failing test.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::explore::{Interleaving, Verdict};
@@ -64,8 +56,6 @@ fn passed(i: &Interleaving) -> bool {
     matches!(i.verdict, Verdict::Passed)
 }
 
-// ---------------------------------------------------------------- concurrency
-
 const LOST_UPDATE: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -96,11 +86,7 @@ test "two increments" {
 }
 "#;
 
-/// ADR 0006's first required test. The `clock.now()` between the read and the
-/// write of one counter is the scheduling point — §3.3: a step ends at a
-/// *scheduler-visible* perform, and `counter.*` is answered by a handler outside
-/// the region — so some interleaving loses an update, and the search finds it
-/// rather than hoping a seed does.
+/// ADR 0006's first required test.
 #[test]
 fn the_search_finds_the_lost_update() {
     let compiled = compile(LOST_UPDATE);
@@ -124,9 +110,7 @@ fn the_search_finds_the_lost_update() {
     );
 }
 
-/// The same program under one seed that happens to serialize the two tasks. The
-/// point is that a green run at one seed is a claim about that seed only, which
-/// is what makes the search rather than the seed the unit of confidence.
+/// The same program under one seed that happens to serialize the two tasks.
 #[test]
 fn one_interleaving_can_pass_a_program_the_search_fails() {
     let compiled = compile(LOST_UPDATE);
@@ -181,9 +165,9 @@ test "two shards that share nothing" {
 }
 "#;
 
-/// The payoff, and the number the milestone is claimed on: two tasks whose
-/// footprints do not conflict commute, so every order of their steps reaches the
-/// same world and exactly one of those orders is run.
+/// The payoff, and the number the milestone is claimed on: two tasks whose footprints do not
+/// conflict commute, so every order of their steps reaches the same world and exactly one of those
+/// orders is run.
 #[test]
 fn tasks_touching_disjoint_resources_explore_one_interleaving() {
     let compiled = compile(DISJOINT);
@@ -241,8 +225,7 @@ test "two writers to one resource" {
 }
 "#;
 
-/// The other side of the same predicate. Two writers to one resource do not
-/// commute, so both orders are real and both are run.
+/// The other side of the same predicate.
 #[test]
 fn two_writers_to_one_resource_explore_both_orders() {
     let compiled = compile(CONTENDED);
@@ -255,10 +238,8 @@ fn two_writers_to_one_resource_explore_both_orders() {
     );
 }
 
-// ------------------------------------------------------------- seed and replay
-
-/// ADR 0006 §10's first validation: comparing outcomes alone would pass on a run
-/// whose interleaving differed and whose assertions happened not to notice.
+/// ADR 0006 §10's first validation: comparing outcomes alone would pass on a run whose interleaving
+/// differed and whose assertions happened not to notice.
 #[test]
 fn the_same_seed_twice_produces_the_same_steps_and_the_same_world() {
     let compiled = compile(CONTENDED);
@@ -287,10 +268,8 @@ fn the_same_seed_twice_produces_the_same_steps_and_the_same_world() {
     );
 }
 
-/// The two streams are independent, so adding a draw to a program must not shift
-/// the interleaving at any scheduling point that precedes it. Entangled streams
-/// would make a change to the data a change to the schedule, and a bisection
-/// over it name the wrong definition.
+/// The two streams are independent, so adding a draw to a program must not shift the interleaving
+/// at any scheduling point that precedes it.
 #[test]
 fn a_later_draw_does_not_shift_an_earlier_choice() {
     let without = compile(CONTENDED);
@@ -301,8 +280,8 @@ fn a_later_draw_does_not_shift_an_earlier_choice() {
     let seed = Seed::root(11);
     let before: Vec<u16> = without.at(&seed).steps.iter().map(|s| s.choice).collect();
     let after: Vec<u16> = with.at(&seed).steps.iter().map(|s| s.choice).collect();
-    // The draw is in the root's last step, so every scheduling point that
-    // precedes it is shared and must agree choice for choice.
+    // The draw is in the root's last step, so every scheduling point that precedes it is shared and
+    // must agree choice for choice.
     let shared = before.len().min(after.len()) - 1;
     assert!(shared > 2, "the fixture must have points before the draw");
     assert_eq!(
@@ -311,8 +290,6 @@ fn a_later_draw_does_not_shift_an_earlier_choice() {
         "a `random` draw must not move the `sched` stream"
     );
 }
-
-// ------------------------------------------------------------------- the clock
 
 const SLEEPER: &str = r#"
 test "a long sleep costs no wall clock" {
@@ -328,8 +305,8 @@ test "a long sleep costs no wall clock" {
 }
 "#;
 
-/// Thirty simulated seconds is a jump rather than a wait, and the region's
-/// virtual duration is a function of its sleeps rather than of the machine.
+/// Thirty simulated seconds is a jump rather than a wait, and the region's virtual duration is a
+/// function of its sleeps rather than of the machine.
 #[test]
 fn a_long_sleep_is_a_jump() {
     let compiled = compile(SLEEPER);
@@ -374,10 +351,8 @@ test "a deadline cannot fire while the worker can still run" {
 }
 "#;
 
-/// Time moves only when nothing is runnable, so a simulated timeout never
-/// pre-empts work that could still complete. The worker always logs first, under
-/// every interleaving — which is the exact opposite of a wall-clock timeout,
-/// whose whole failure mode is firing because the machine was busy.
+/// Time moves only when nothing is runnable, so a simulated timeout never pre-empts work that could
+/// still complete.
 #[test]
 fn a_timeout_never_fires_while_anything_can_run() {
     let compiled = compile(TIMEOUT);
@@ -389,8 +364,6 @@ fn a_timeout_never_fires_while_anything_can_run() {
     );
     assert!(explored.exploration.exhaustive);
 }
-
-// ------------------------------------------------------------------- structure
 
 const OUTLIVES: &str = r#"
 effect log {
@@ -412,8 +385,8 @@ test "a task still runnable when the body returns is run to completion" {
 }
 "#;
 
-/// The handler is the scope: a task that outlives every join still finishes
-/// inside the region that made it, which is the whole of the structure rule.
+/// The handler is the scope: a task that outlives every join still finishes inside the region that
+/// made it, which is the whole of the structure rule.
 #[test]
 fn a_task_that_outlives_every_join_still_finishes_inside_the_region() {
     let compiled = compile(OUTLIVES);
@@ -448,10 +421,8 @@ test "two tasks waiting on each other stop the region" {
 }
 "#;
 
-/// The region ends when its last task ends, so a wait that nothing can satisfy
-/// is a diagnostic rather than a hang. That question is decidable at all only
-/// because spawn is structured: the set of live tasks is finite and known at
-/// every scheduling point.
+/// The region ends when its last task ends, so a wait that nothing can satisfy is a diagnostic
+/// rather than a hang.
 #[test]
 fn a_join_cycle_is_a_diagnostic_and_not_a_hang() {
     let compiled = compile(DEADLOCK);
@@ -469,10 +440,8 @@ fn a_join_cycle_is_a_diagnostic_and_not_a_hang() {
     );
 }
 
-// -------------------------------------------------------------------- the plan
-
-/// The budget is a search parameter, not a semantics: raising it changes only
-/// the thoroughness of a test, never the value a region delivers.
+/// The budget is a search parameter, not a semantics: raising it changes only the thoroughness of a
+/// test, never the value a region delivers.
 #[test]
 fn the_budget_does_not_change_what_a_passing_program_means() {
     let compiled = compile(DISJOINT);
@@ -500,9 +469,8 @@ fn once_runs_exactly_one_interleaving() {
     );
 }
 
-/// The region's value is the seed's, and a task handle is a key rather than a
-/// pointer: two spawns in one region get distinct ids and joining answers the
-/// body's value.
+/// The region's value is the seed's, and a task handle is a key rather than a pointer: two spawns
+/// in one region get distinct ids and joining answers the body's value.
 #[test]
 fn a_region_delivers_the_value_its_body_returned() {
     let compiled = compile(
@@ -522,8 +490,8 @@ test "join answers the body" {
     assert!(machine.simulated().is_some());
 }
 
-/// A `simulate` region is machine-only, so the tree-walker refuses it by name
-/// rather than running one unnamed interleaving that the cache would then keep.
+/// A `simulate` region is machine-only, so the tree-walker refuses it by name rather than running
+/// one unnamed interleaving that the cache would then keep.
 #[test]
 fn the_tree_walker_refuses_a_region() {
     let compiled = compile(OUTLIVES);
@@ -536,8 +504,8 @@ fn the_tree_walker_refuses_a_region() {
     assert!(ply_eval::is_machine_only(&refused));
 }
 
-/// Values that cross the boundary are ordinary values: the world a region wrote
-/// through is the machine's, threaded, and it survives the region.
+/// Values that cross the boundary are ordinary values: the world a region wrote through is the
+/// machine's, threaded, and it survives the region.
 #[test]
 fn the_world_a_region_wrote_survives_it() {
     let compiled = compile(OUTLIVES);
@@ -555,13 +523,8 @@ fn the_world_a_region_wrote_survives_it() {
     );
 }
 
-// ------------------------------------------------- more than one region
-
-/// Two regions in sequence — only *nesting* is `E0416` — are one choice
-/// sequence, so the record the search reads covers both of them.
-///
-/// A record covering one of the two is the whole of what makes the search's
-/// input describe one region and its `exhaustive: true` a claim about both.
+/// Two regions in sequence — only *nesting* is `E0416` — are one choice sequence, so the record the
+/// search reads covers both of them.
 #[test]
 fn two_regions_in_sequence_are_one_record_and_one_choice_sequence() {
     let compiled = compile(
@@ -600,10 +563,8 @@ test "two regions" {
     );
 }
 
-/// A `resume k` clause outside the region delivers the region's value onto the
-/// stack the resumption spliced it over, not onto the one `simulate` was entered
-/// on. Restoring the entry stack drops whatever the clause still had pending —
-/// silently, and with a wrong world.
+/// A `resume k` clause outside the region delivers the region's value onto the stack the resumption
+/// spliced it over, not onto the one `simulate` was entered on.
 #[test]
 fn a_region_resumed_from_a_clause_keeps_the_clauses_pending_work() {
     let compiled = compile(
@@ -634,9 +595,6 @@ test "the clause has work after the resumption" {
         .expect("the work after `k(1)` must still run");
 }
 
-/// ADR 0006 §1.6. A handler that discards the region's continuation destroys its
-/// tasks unfinished, so every step past that point is missing from the recording
-/// and a search over it would report `exhaustive` about schedules it cut short.
 #[test]
 fn abandoning_a_region_is_a_diagnostic_rather_than_a_truncated_trace() {
     let compiled = compile(
@@ -669,10 +627,7 @@ test "the handler never resumes" {
     assert!(refused.message.contains("abandoned"), "{}", refused.message);
 }
 
-/// ADR 0006 §1.6. A second resumption re-enters a region whose scheduler has
-/// already ended. Forking a live scheduler needs the world snapshot ADR 0005
-/// refused, so this is the diagnostic §1.5 promises rather than a dropped
-/// resumption nobody is told about.
+/// ADR 0006 §1.6.
 #[test]
 fn resuming_a_region_that_already_ended_is_a_diagnostic() {
     let compiled = compile(
@@ -707,10 +662,7 @@ test "resumed twice across a region" {
     );
 }
 
-/// A `handle` written inside the region encloses the tasks it lexically
-/// contains. `spawn`'s row puts the spawned body's effects in the spawner's row,
-/// so the enclosing handler is what discharges them and the program type-checks;
-/// a task run on the region's entry stack would find no handler at run time.
+/// A `handle` written inside the region encloses the tasks it lexically contains.
 #[test]
 fn a_task_runs_under_the_handlers_written_inside_the_region() {
     let compiled = compile(
@@ -743,9 +695,6 @@ test "a handler inside the region" {
         .expect("the handler inside the region covers its tasks");
 }
 
-/// ADR 0006 §6.1. `with_cell` takes the next id from the world's own counter, so
-/// two tasks that each allocate reach two different worlds depending on their
-/// order — which is exactly what "not dependent" is required to rule out.
 #[test]
 fn a_cell_allocation_is_an_access_of_the_step_that_made_it() {
     let compiled = compile(
@@ -777,20 +726,6 @@ test "two tasks that each allocate" {
 }
 
 /// **A scheduling point inside an `iterate` step.**
-///
-/// `iterate`'s loop is a `Frame::IterateStep` on the machine's control stack,
-/// and a `perform` inside its step is a scheduling point like any other — so a
-/// task suspended mid-loop must resume with its **countdown intact**, across a
-/// capture and a splice it does not control. `Frame::FoldStep` needs the same
-/// property and does not imply it: a fold's position is an index into a list
-/// that still exists, and this one is a number that lives only in the frame.
-///
-/// Two tasks, three rounds each, one shared cell, searched exhaustively. Every
-/// interleaving must finish and leave the counter between 3 (every read but the
-/// last lost) and 6 (none lost).
-///
-/// **Seen to fail:** with `next_iterate` decrementing the countdown by two, the
-/// budget runs out mid-loop and this goes red.
 #[test]
 fn two_iterate_loops_interleave_and_each_keeps_its_own_countdown() {
     let c = compile(ITERATE_TASKS);
@@ -801,8 +736,8 @@ fn two_iterate_loops_interleave_and_each_keeps_its_own_countdown() {
         explored.diagnostic.map(|d| d.message)
     );
     assert!(explored.exploration.exhaustive);
-    // More than one interleaving, or the search found no scheduling point
-    // inside the loop and the case is asserting nothing.
+    // More than one interleaving, or the search found no scheduling point inside the loop and the
+    // case is asserting nothing.
     assert!(
         explored.exploration.explored > 1,
         "one interleaving is not a search: {}",

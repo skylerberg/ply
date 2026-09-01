@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 pub const MANIFEST: &str = "corpus.json";
 
 /// A source edit a benchmark can apply and undo with a textual substitution.
-/// `find` is a whole definition, so it is unique within `path`; `replace`
-/// changes that definition's hash without changing what it returns.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EditSite {
     pub path: String,
@@ -24,16 +22,14 @@ pub struct EditSite {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RenameSite {
-    /// The definition's simple name, unique corpus-wide, so a benchmark can
-    /// rename it with a plain textual substitution across every file.
+    /// The definition's simple name, unique corpus-wide, so a benchmark can rename it with a plain
+    /// textual substitution across every file.
     pub symbol: String,
     pub replacement: String,
 }
 
-/// What the concurrent half of a corpus looks like, so a measurement can plot
-/// exploration against contention without re-deriving it from the source.
-/// `contention` is measured from the corpus that was written rather than copied
-/// from the spec, because the two differ whenever the shard count rounds.
+/// What the concurrent half of a corpus looks like, so a measurement can plot exploration against
+/// contention without re-deriving it from the source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConcurrencyProfile {
     pub tests: usize,
@@ -44,22 +40,15 @@ pub struct ConcurrencyProfile {
     pub contention: f64,
 }
 
-/// What the specified half of a corpus looks like, so a measurement can price
-/// discharge against definition count and report a tier distribution without
-/// re-deriving either from the source.
-///
-/// `decided` / `sampled` / `gaps` are what the **generator built** each
-/// obligation to be discharged by. They are an expectation to compare a run
-/// against, in both directions, and nothing here may be read back as a tier: a
-/// tier is computed from the evidence a discharge carries and from nothing else.
+/// What the specified half of a corpus looks like, so a measurement can price discharge against
+/// definition count and report a tier distribution without re-deriving either from the source.
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct SpecProfile {
     /// Generated definitions carrying an `ensures`, specimens included.
     pub specified_definitions: usize,
     /// Definitions carrying none — the review surface the corpus is modelling.
     pub unspecified_definitions: usize,
-    /// One per `ensures` clause and one per law. A `requires` is not an
-    /// obligation: it filters the domain of the clauses beside it.
+    /// One per `ensures` clause and one per law.
     pub obligations: usize,
     pub laws: usize,
     pub specimens: usize,
@@ -85,8 +74,7 @@ pub struct Manifest {
     pub distinct_resources: usize,
     pub mean_out_degree: f64,
     pub max_call_weight: u32,
-    /// A widely depended upon definition: editing it invalidates most of the
-    /// corpus.
+    /// A widely depended upon definition: editing it invalidates most of the corpus.
     pub hub_edit: EditSite,
     /// A definition nothing else calls: editing it invalidates almost nothing.
     pub leaf_edit: EditSite,
@@ -126,8 +114,6 @@ pub fn write(root: &Path, spec: &CorpusSpec, corpus: &Corpus) -> Result<Written>
 }
 
 /// Refuses a directory that holds anything other than a corpus this tool wrote.
-/// The generator deletes what it finds, and deleting a user's source tree
-/// because they typed the wrong `--out` is not a recoverable mistake.
 fn prepare(root: &Path) -> Result<()> {
     if root.exists() {
         if !root.is_dir() {
@@ -240,12 +226,8 @@ fn reverse_edges(corpus: &Corpus) -> Vec<Vec<DefId>> {
     callers
 }
 
-/// The most, or least, directly depended upon one-line definition that some
-/// test roots at — editing one nothing tests selects nothing, which measures
-/// only that the run happened. Direct callers stand in for transitive ones so
-/// this stays linear at ten thousand definitions; the transitive count is then
-/// measured once, for the winner. Ties break on the lowest id, so the choice
-/// follows the seed rather than iteration order.
+/// The most, or least, directly depended upon one-line definition that some test roots at — editing
+/// one nothing tests selects nothing, which measures only that the run happened.
 fn pick(
     corpus: &Corpus,
     callers: &[Vec<DefId>],

@@ -1,24 +1,4 @@
-//! How a run is told what its configuration is, and what it refuses before it
-//! starts.
-//!
-//! ADR 0015 §3. `ply_host::config` owns the sources, the precedence and the
-//! resolution; this module owns the three things that need the *program* in
-//! hand — resolving `--config-schema <module>.<fn>`, materialising the
-//! `ConfigSpec` it names, and turning the result into the block `ply hosts`
-//! prints.
-//!
-//! Two rules decide every signature below:
-//!
-//! - **A missing, malformed or wrongly-shaped value is a start-up refusal, not
-//!   a first-request failure.** Everything here runs before `Hosts::open`, so
-//!   `E0440`, `E0441` and `E0442` are raised while nothing is bound and no
-//!   client has been told the service was listening. A service that starts and
-//!   then dies on its first request is worse than one that refuses to start.
-//! - **Configuration may supply a value and may never cause a binding.** ADR
-//!   0011's rule, unweakened: without `--host` no source is opened at all,
-//!   whatever the environment holds, and `--set`, `--config` and
-//!   `--config-schema` are refused rather than silently ignored — the same
-//!   treatment `--tls` gets, for the same reason.
+//! How a run is told what its configuration is, and what it refuses before it starts.
 
 use clap::Args;
 use ply_core::CheckOutput;
@@ -450,9 +430,7 @@ pub mod schema {
         let Some(Value::Ctor { name: shape, .. }) = field("shape") else {
             return Err(malformed(name, &format!("`{key}` has no `shape`")));
         };
-        // Qualified, so a `SText` that some other module declared is not read as
-        // `std.config`'s. A constructor's identity in a `Value` is its
-        // program-wide name.
+        // Qualified, so a `SText` that some other module declared is not read as `std.config`'s.
         let Some(shape) = shape
             .as_str()
             .strip_prefix(ply_host::config::MODULE)

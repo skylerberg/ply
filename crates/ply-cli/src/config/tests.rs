@@ -37,10 +37,7 @@ fn the_three_sources_parse_and_repeat() {
     assert_eq!(args.config.schema.as_deref(), Some("desk.config"));
 }
 
-/// Configuration configures a *binding*. Without `--host` there is none, so an
-/// argument that would be silently ignored is refused instead — the rule `--tls`
-/// and `--db` already follow, and the reason ADR 0011's "a reviewer reads
-/// `--host` in the command or the run reached nothing" stays true.
+/// Configuration configures a *binding*.
 #[test]
 fn configuration_without_host_is_refused_rather_than_ignored() {
     for flag in [
@@ -60,9 +57,6 @@ fn configuration_without_host_is_refused_rather_than_ignored() {
     }
 }
 
-/// Every command that can bind a handler can be told what its configuration is.
-/// A suite whose host tests read configuration and a `ply hosts` that cannot
-/// report it would disagree about what the run trusts.
 #[test]
 fn every_binding_command_accepts_configuration() {
     for command in ["run", "test", "prove", "hosts"] {
@@ -88,8 +82,8 @@ fn a_hermetic_run_opens_no_source() {
     assert!(!Configuration::default().is_opened());
 }
 
-/// A `--config-schema` that is not `<module>.<fn>` is refused before any program
-/// is loaded, with the form rather than with a hunt.
+/// A `--config-schema` that is not `<module>.<fn>` is refused before any program is loaded, with
+/// the form rather than with a hunt.
 #[test]
 fn a_config_schema_that_is_not_a_qualified_name_is_refused() {
     for bad in ["config", "desk.", ".config", "desk..config", "1desk.config"] {
@@ -127,8 +121,8 @@ fn a_nullary_pure_function_returning_a_spec_resolves() {
     );
 }
 
-/// Each refusal says what is wrong with the *argument*, because the fix is a
-/// different argument rather than an edit to the program.
+/// Each refusal says what is wrong with the *argument*, because the fix is a different argument
+/// rather than an edit to the program.
 #[test]
 fn a_schema_function_that_is_not_one_is_refused_with_the_reason() {
     let program = check(SPEC_SOURCE);
@@ -142,8 +136,8 @@ fn a_schema_function_that_is_not_one_is_refused_with_the_reason() {
     }
 }
 
-/// An operator who mistyped the module prefix should not have to run a second
-/// command to find out what they meant.
+/// An operator who mistyped the module prefix should not have to run a second command to find out
+/// what they meant.
 #[test]
 fn an_unknown_schema_function_lists_the_candidates() {
     let program = check(SPEC_SOURCE);
@@ -158,10 +152,8 @@ fn an_unknown_schema_function_lists_the_candidates() {
 
 // --- decoding the value it returns ------------------------------------------
 
-// A `Value` pins `Arc` for its shared payloads and `Rc` for shared code, so none
-// of these `Arc`s can ever be `Send`. That is `ply-eval`'s design rather than an
-// oversight here, and this is the same allow, for the same reason, that
-// `ply-eval`, `ply-host` and `ply-prove` carry at the crate level.
+// A `Value` pins `Arc` for its shared payloads and `Rc` for shared code, so none of these `Arc`s
+// can ever be `Send`.
 #[allow(clippy::arc_with_non_send_sync)]
 fn record(fields: &[(&str, Value)]) -> Value {
     Value::Record(Arc::new(
@@ -242,9 +234,8 @@ fn a_config_spec_decodes_into_the_keys_the_run_resolves() {
     );
 }
 
-/// A `ConfigSpec` that decoded partially would silently drop a required key and
-/// turn `E0441` into the `None` at first use it exists to prevent. Every shape
-/// that is not one is refused instead.
+/// A `ConfigSpec` that decoded partially would silently drop a required key and turn `E0441` into
+/// the `None` at first use it exists to prevent.
 #[test]
 fn a_value_that_is_not_a_config_spec_is_refused_rather_than_partly_read() {
     let cases: Vec<(&str, Value)> = vec![
@@ -273,10 +264,8 @@ fn a_value_that_is_not_a_config_spec_is_refused_rather_than_partly_read() {
     }
 }
 
-/// A constructor's identity in a `Value` is its **program-wide** name, so a
-/// `SText` some other module declared is not read as `std.config`'s. Otherwise
-/// the first project to declare its own `SSecret` would get a key the run
-/// treated as a credential and the program did not.
+/// A constructor's identity in a `Value` is its **program-wide** name, so a `SText` some other
+/// module declared is not read as `std.config`'s.
 #[test]
 fn a_shape_from_another_module_is_not_one_of_std_configs() {
     let value = spec_value(vec![record(&[
@@ -324,9 +313,8 @@ fn configured(set: &[&str], keys: Vec<(&str, Shape, bool, Option<&str>)>) -> Con
     }
 }
 
-/// The whole point of the `keys` line: the value for a plain key, `****` for a
-/// credential, and the winning source beside each. Nothing a report prints may
-/// carry a secret's bytes, in any projection.
+/// The whole point of the `keys` line: the value for a plain key, `****` for a credential, and the
+/// winning source beside each.
 #[test]
 fn no_projection_of_a_report_carries_a_secrets_value() {
     let configuration = configured(
@@ -355,8 +343,8 @@ fn no_projection_of_a_report_carries_a_secrets_value() {
     assert!(json.contains("\"secret\":true"), "{json}");
 }
 
-/// A run that named no schema says so rather than printing a block of zeroes
-/// that reads like a run configured with nothing.
+/// A run that named no schema says so rather than printing a block of zeroes that reads like a run
+/// configured with nothing.
 #[test]
 fn a_run_with_no_schema_says_what_that_costs() {
     let sources = Sources::read_with(&["K=v".to_string()], &[], &[], &|_| {
@@ -388,9 +376,8 @@ fn digest(configuration: &Configuration) -> String {
     out
 }
 
-/// A key that appears, a key that changes shape and a schema function that moves
-/// are all structural changes to what the run requires of its environment, and
-/// CI should break on each.
+/// A key that appears, a key that changes shape and a schema function that moves are all structural
+/// changes to what the run requires of its environment, and CI should break on each.
 #[test]
 fn the_digest_covers_a_keys_name_and_shape() {
     let base = configured(
@@ -417,9 +404,6 @@ fn the_digest_covers_a_keys_name_and_shape() {
     assert_ne!(digest(&base), digest(&added));
 }
 
-/// And covers none of the deployment's own configuration. A digest that moved
-/// when a region changed is a digest people learn to ignore, which is the whole
-/// value of the line gone.
 #[test]
 fn the_digest_does_not_cover_a_resolved_value_or_the_source_that_won() {
     let from_set = configured(
@@ -436,8 +420,8 @@ fn the_digest_does_not_cover_a_resolved_value_or_the_source_that_won() {
     assert_eq!(digest(&from_set), digest(&from_default));
 }
 
-/// A hermetic run contributes nothing, so no existing corpus's digest moves for
-/// want of a block it has nothing to put in.
+/// A hermetic run contributes nothing, so no existing corpus's digest moves for want of a block it
+/// has nothing to put in.
 #[test]
 fn a_run_with_no_schema_contributes_nothing_to_the_digest() {
     assert!(digest(&Configuration::default()).is_empty());

@@ -1,12 +1,4 @@
 //! The before column of W2's headline number has to be a twin, not a guess.
-//!
-//! W1's source is not in the tree any more, so `serve::Parser::W1Folds` is a
-//! reconstruction: `examples/hello.ply` with `index_of`, `head_end` and
-//! `all_upper` written as a `fold` over `range`. A benchmark comparing two
-//! programs that disagree about what a request means is not a benchmark, so
-//! this runs the example's own tests — every malformed head, every split
-//! packet, every boundary — against the reconstruction. Sixteen assertions
-//! about behaviour standing behind one assertion about speed.
 
 use ply_corpus::serve::{Endpoint, Parser};
 use ply_eval::{EngineChoice, Plan};

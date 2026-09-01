@@ -1,36 +1,4 @@
-//! How a run is told which database to talk to, and what it may say about it
-//! afterwards.
-//!
-//! ADR 0014 §3 and §7. Three rules decide every signature below, and the first
-//! one is the reason this module exists at all rather than the connection
-//! string being an ordinary `String` threaded through the CLI.
-//!
-//! - **A password never becomes text this program can print.** It is held in
-//!   [`Secret`], whose `Display` and `Debug` are `****` and which has no
-//!   `Serialize`, and the only way back out is [`Secret::expose`] — one function
-//!   a reviewer can grep for. That matters more here than anywhere else in the
-//!   system: a diagnostic's message reaches the *result cache*, the store is
-//!   content-addressed and designed never to forget, and a password written
-//!   into it cannot be taken back out. This is the same sentence ADR 0013 §6
-//!   writes about a private key, applied to the second kind of credential the
-//!   web track acquires.
-//! - **The environment may supply the value; only `--host` may cause a
-//!   binding.** ADR 0011's rule is that a reviewer reads `--host` in the command
-//!   or the run reached nothing, and nothing here weakens it: without `--host`
-//!   no database is opened whatever the environment holds. What the environment
-//!   is for is the *secret*, because an argument is visible in `ps` and in a
-//!   shell history and a `--db` carrying a password would push operators into
-//!   putting one there.
-//! - **The string is parsed once.** [`DbUrl`] is handed to the driver as fields
-//!   rather than as text, so the driver never re-parses what this module already
-//!   read. Two parsers that disagree about which database a run opened is the
-//!   hazard ADR 0013 §2 exists to prevent, and it is worse here than for a URL:
-//!   the disagreement would be about identity, not about framing.
-//!
-//! The contract is **silent on the environment** — ADR 0014 §3.2 and the
-//! CONTRACTS table specify `--db URL` and nothing else, and neither document
-//! says where a password comes from. [`URL_ENV`] and [`PASSWORD_ENV`] are this
-//! module's answer and are flagged as an addition rather than a reading.
+//! How a run is told which database to talk to, and what it may say about it afterwards.
 
 use ply_core::CheckOutput;
 use ply_core::ty::Type;

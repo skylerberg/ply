@@ -1,40 +1,4 @@
-//! A deliberately wrong backend, so that "0 disagreements" can be read as
-//! evidence.
-//!
-//! R5's agreement result is 2,396 generated cases over 29 functions and 24
-//! whole-kernel searches with no disagreement. A corpus that tests nothing
-//! reports exactly that, and this project has shipped a green result over
-//! unexplored space more than once. The only way to tell the two apart is to
-//! break the thing on purpose and watch a named case go red.
-//!
-//! [`Mutant`] wraps a real [`SpikeBodies`] and corrupts what it answers. It is
-//! **inert unless a caller asks for a mutation**: nothing constructs one on the
-//! default path, `mcts` builds one only for `--mutate`, and the tests in
-//! `tests/mutations.rs` build one per case and assert that the same comparison
-//! the corpus uses reports it.
-//!
-//! What each mutation is for, and what it is meant to prove:
-//!
-//! | mutation | the claim it attacks |
-//! | --- | --- |
-//! | [`Mutation::OffByOne`] | a compiled arithmetic result is checked, not assumed |
-//! | [`Mutation::Inverted`] | so is a compiled comparison |
-//! | [`Mutation::Stale`] | an answer is tied to *this* call's arguments |
-//! | [`Mutation::WrongType`] | the seam marshals a kind as well as a value |
-//! | [`Mutation::Unoffered`] | a backend may not answer for a body it does not have |
-//! | [`Mutation::ExceedsBudget`] | `budget` is the machine's bound and not a hint |
-//! | [`Mutation::Answers`] | a call the machine must never offer at all |
-//!
-//! The last one is not a backend defect and cannot be demonstrated by a backend
-//! alone: `Machine::compiled_answer` refuses any definition whose published
-//! effect row is non-empty, so a backend is never asked. What a `Mutant` can do
-//! is stand ready to answer one and count how often it was asked — zero, while
-//! that gate holds.
-//!
-//! What each of them found — which case caught it, which corpus did not, and the
-//! two blind spots the exercise turned up — is tabulated in
-//! `tests/mutations.rs`, whose tests are the standing form of the same
-//! experiment.
+//! A deliberately wrong backend, so that "0 disagreements" can be read as evidence.
 
 use crate::entry::SpikeBodies;
 use anyhow::{Result, bail};
@@ -46,32 +10,15 @@ use std::process::{Command, ExitStatus};
 use std::rc::Rc;
 
 /// How a run that might not come back ended.
-///
-/// [`Mutation::ExceedsBudget(None)`](Mutation::ExceedsBudget) is not a wrong
-/// answer: it is a native recursion with no bound, and the process is gone —
-/// `fatal runtime error: stack overflow`, exit 134 — before any comparison runs.
-/// No harness *inside* that process can report it, because there is no inside
-/// left, which is why `CONTRIBUTING.md` §"Things known to be broken" item 13
-/// recorded it as caught by nothing. The harness that can report it is the one
-/// that started it.
 #[derive(Debug)]
 pub enum Ended {
-    /// The run finished and said what it found, whatever that was.
     Exited(ExitStatus),
-    /// The run was killed. On Unix this is the signal; everywhere else it is
-    /// whatever the platform says about a process that did not exit.
     Killed(String),
 }
 
 impl Ended {
-    /// The disagreement a killed run *is*, phrased the way the corpus phrases
-    /// one — or `None` when the run came back and can speak for itself.
-    ///
-    /// A machine with no backend answers this call with a diagnostic. A machine
-    /// with this backend answers nothing at all, ever, and takes the reporter
-    /// with it. That is the largest disagreement available and it is scored as
-    /// one: the alternative is a harness whose most catastrophic case is its
-    /// quietest.
+    /// The disagreement a killed run *is*, phrased the way the corpus phrases one — or `None` when
+    /// the run came back and can speak for itself.
     pub fn as_disagreement(&self) -> Option<String> {
         match self {
             Ended::Exited(_) => None,
@@ -84,9 +31,6 @@ impl Ended {
 }
 
 /// Runs `command` to completion and says whether it came back.
-///
-/// The only reason this exists is that a `SIGSEGV` in a child is data and a
-/// `SIGSEGV` in yourself is not.
 pub fn run_guarded(command: &mut Command) -> Result<(Ended, String)> {
     let out = command.output()?;
     let text = format!(
@@ -97,9 +41,8 @@ pub fn run_guarded(command: &mut Command) -> Result<(Ended, String)> {
     Ok((ended(out.status), text))
 }
 
-/// The same question of a status somebody else waited on: a run whose output is
-/// streaming to the terminal is waited on with `status`, and there is nothing to
-/// capture.
+/// The same question of a status somebody else waited on: a run whose output is streaming to the
+/// terminal is waited on with `status`, and there is nothing to capture.
 pub fn ended(status: ExitStatus) -> Ended {
     #[cfg(unix)]
     {
@@ -117,8 +60,7 @@ pub fn ended(status: ExitStatus) -> Ended {
 /// One way of being wrong.
 #[derive(Clone)]
 pub enum Mutation {
-    /// The honest answer, so a harness can check that the wrapper itself changes
-    /// nothing. Every mutation result is read against this.
+    /// The honest answer, so a harness can check that the wrapper itself changes nothing.
     None,
     /// `Int(n)` becomes `Int(n + 1)`: the arithmetic is off by one.
     OffByOne,
@@ -126,24 +68,15 @@ pub enum Mutation {
     Inverted,
     /// This call answers what the *previous* entered call answered.
     Stale,
-    /// The same information in the wrong kind — `Bool` where the definition
-    /// returns `Int`, and `Int` where it returns `Bool`. Both are crossable, so
-    /// the seam carries them and whatever notices has to be downstream of it.
+    /// The same information in the wrong kind — `Bool` where the definition returns `Int`, and
+    /// `Int` where it returns `Bool`.
     WrongType,
-    /// Answers for a name this backend has no compiled body for, instead of
-    /// declining. The invented answer is the first `Int` argument, which is the
-    /// shape a plausible bug takes — a registry that answered for the wrong
-    /// entry point would look like this rather than like `Int(0)`.
+    /// Answers for a name this backend has no compiled body for, instead of declining.
     Unoffered,
-    /// Runs the body with more fuel than the machine allowed instead of
-    /// declining. `None` is unlimited; `Some(k)` is `k` times the budget, which
-    /// is the bounded form — a native runaway with unlimited fuel has no bound
-    /// at all and takes the process down with it.
+    /// Runs the body with more fuel than the machine allowed instead of declining.
     ExceedsBudget(Option<u32>),
-    /// Answers this value for the target name whatever the machine asked, and
-    /// whether or not a body exists. The only mutation that can accept a call
-    /// the machine must decline — and it only ever gets the chance if the gate
-    /// in `Machine::compiled_answer` is removed.
+    /// Answers this value for the target name whatever the machine asked, and whether or not a body
+    /// exists.
     Answers(Value),
 }
 
@@ -171,11 +104,8 @@ impl Mutation {
     }
 }
 
-/// Parses `--mutate`'s argument: `<mutation>[@<function>]`, plus `=<int>` for
-/// the two that carry a number.
-///
-/// Named rather than positional so a run's provenance says what was broken:
-/// `off-by-one@mcts.ucb` in a log is a reproducible experiment.
+/// Parses `--mutate`'s argument: `<mutation>[@<function>]`, plus `=<int>` for the two that carry a
+/// number.
 pub fn parse(spec: &str) -> Result<(Mutation, Option<String>)> {
     let (head, target) = match spec.split_once('@') {
         Some((head, target)) => (head, Some(target.to_string())),
@@ -209,17 +139,13 @@ pub fn parse(spec: &str) -> Result<(Mutation, Option<String>)> {
 pub struct Mutant {
     inner: Rc<SpikeBodies>,
     mutation: Mutation,
-    /// The one definition to corrupt, or every one of them. A whole-corpus
-    /// mutation says whether the corpus notices *at all*; a targeted one says
-    /// whether it notices *that function*, which is the coverage question.
+    /// The one definition to corrupt, or every one of them.
     target: Option<Symbol>,
     offered: Cell<u64>,
-    /// Offers of the target name specifically — the count that says whether a
-    /// gate in `Machine::compiled_answer` held.
+    /// Offers of the target name specifically — the count that says whether a gate in
+    /// `Machine::compiled_answer` held.
     offered_target: Cell<u64>,
-    /// Calls whose answer this wrapper actually changed. A mutation that never
-    /// fired proves nothing about the corpus that did not catch it, so every
-    /// test asserts on this before it asserts on a disagreement.
+    /// Calls whose answer this wrapper actually changed.
     fired: Cell<u64>,
     previous: RefCell<Option<Value>>,
 }
@@ -311,13 +237,13 @@ impl Compiled for Mutant {
                 let stale = self.previous.borrow_mut().replace(value.clone());
                 match stale {
                     Some(stale) if stale.render() != value.render() => self.fire(stale),
-                    // The first entry, or a repeat of the last answer: nothing to
-                    // be stale about, so this call is honest and is not counted.
+                    // The first entry, or a repeat of the last answer: nothing to be stale about,
+                    // so this call is honest and is not counted.
                     _ => Some(value),
                 }
             }
-            // A body that fits its budget answers the same either way; the
-            // mutation is only visible where the honest backend declined.
+            // A body that fits its budget answers the same either way; the mutation is only visible
+            // where the honest backend declined.
             (Mutation::ExceedsBudget(times), None) => {
                 let fuel = match times {
                     None => i64::MAX,

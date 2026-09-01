@@ -1,21 +1,4 @@
 //! Where the time actually goes.
-//!
-//! **This harness drives the from-scratch front end only** — [`crate::pipeline`]
-//! parses and checks everything on every run. Its `warm` number is therefore the
-//! cost of the *result* cache alone, and says nothing about the front-end cache
-//! that `ply test` uses. For that, measure `ply test --json`, whose
-//! `front_end.phases` reports the same breakdown for the path a user is on.
-//!
-//! The scenarios exist because the total is the least interesting number a
-//! compiler with a perfect cache can report:
-//!
-//! - `cold` — nothing cached; every test runs.
-//! - `warm` — nothing changed; every test is a cache hit and the front end is
-//!   the entire cost. The number the thesis lives or dies on.
-//! - `rename` — a top-level definition renamed; selection is observed rather
-//!   than asserted, so a regression shows up as a number.
-//! - `edit-leaf` — one definition's body changed; only its dependents re-run.
-//! - `edit-hub` — the same, for a definition most of the corpus reaches.
 
 use crate::pipeline::{Front, Phase, Timings, front};
 use crate::write::{EditSite, read_manifest};
@@ -58,12 +41,10 @@ pub struct Report {
 }
 
 pub struct Options {
-    /// Repetitions per scenario; the fastest is reported, because a slower run
-    /// only ever means the machine did something else as well.
+    /// Repetitions per scenario; the fastest is reported, because a slower run only ever means the
+    /// machine did something else as well.
     pub repeats: usize,
-    /// Which evaluator the `execute` phase is measuring. The two engines have
-    /// to be compared on one harness for the wall-clock exit criterion to mean
-    /// anything.
+    /// Which evaluator the `execute` phase is measuring.
     pub engine: EngineChoice,
 }
 
@@ -90,8 +71,7 @@ pub fn run(root: &Path, options: &Options) -> Result<Report> {
         None,
     )?);
 
-    // The cold scenario left a full cache behind, which is exactly the state
-    // `warm` is about.
+    // The cold scenario left a full cache behind, which is exactly the state `warm` is about.
     scenarios.push(measure(
         root,
         options,
@@ -150,17 +130,15 @@ pub fn run(root: &Path, options: &Options) -> Result<Report> {
     })
 }
 
-/// What the cache must look like at the start of every repeat. Without this a
-/// second repeat measures the state the first repeat's run left behind — an
-/// edit would look free because its dependents were already re-proved.
+/// What the cache must look like at the start of every repeat.
 enum Reset {
     None,
     Clear,
     Restore,
 }
 
-/// A copy of the cache directory, kept in memory so restoring it cannot itself
-/// be measured as disk work in the run that follows.
+/// A copy of the cache directory, kept in memory so restoring it cannot itself be measured as disk
+/// work in the run that follows.
 struct CacheSnapshot {
     dir: PathBuf,
     files: Vec<(PathBuf, Vec<u8>)>,
@@ -199,9 +177,8 @@ enum Mutation {
     Edit(EditSite),
 }
 
-/// A mutation is applied before the measurement and undone after it, so every
-/// scenario starts from the same tree and the order they run in does not leak
-/// into the numbers.
+/// A mutation is applied before the measurement and undone after it, so every scenario starts from
+/// the same tree and the order they run in does not leak into the numbers.
 #[derive(Debug)]
 struct Applied {
     files: Vec<(PathBuf, String)>,
@@ -266,8 +243,8 @@ fn measure(
     let applied = mutation.as_ref().map(|m| apply(root, m)).transpose()?;
     let result = measure_inner(root, options, name, note, reset, snapshot.as_ref());
 
-    // The tree and the cache are both put back, or the next scenario starts
-    // from a state no one chose.
+    // The tree and the cache are both put back, or the next scenario starts from a state no one
+    // chose.
     if let Some(applied) = applied {
         applied.undo()?;
     }
@@ -508,9 +485,9 @@ mod tests {
         applied.undo().unwrap();
     }
 
-    /// With more than one repeat, an edit scenario has to re-prove its
-    /// dependents every time: if the cache is not restored, every repeat after
-    /// the first is a warm run and the fastest one is reported.
+    /// With more than one repeat, an edit scenario has to re-prove its dependents every time: if
+    /// the cache is not restored, every repeat after the first is a warm run and the fastest one is
+    /// reported.
     #[test]
     fn an_edit_scenario_reselects_on_every_repeat() {
         let dir = tempfile::tempdir().unwrap();

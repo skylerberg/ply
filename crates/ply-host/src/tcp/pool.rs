@@ -1,20 +1,4 @@
 //! Where a host operation goes when it has to wait.
-//!
-//! ADR 0008 §8: a blocking host handler stalls every task the scheduler owns, so
-//! an operation that waits runs on a dedicated pool and answers
-//! [`HostAnswer::Pending`](ply_eval::HostAnswer::Pending) immediately. This is
-//! that pool.
-//!
-//! It is `std::thread` rather than `tokio::task::spawn_blocking` so its bound is
-//! a number someone chose and a reviewer can read, and it is one thread per
-//! outstanding operation rather than a fixed set of workers behind a queue —
-//! because a queue in front of N workers deadlocks silently the moment N
-//! operations are parked in `accept`, and W1 has no cancellation to break it
-//! with. Exceeding [`MAX_BLOCKING_OPERATIONS`] is a diagnostic naming the
-//! operation, which is the loud failure the quiet one would have replaced.
-//!
-//! A `Value` holds `Rc` and belongs to one thread, so a job produces plain data
-//! and the polling thread — the machine's — builds the `Value`.
 
 use ply_eval::{Pending, Value};
 use ply_span::{Diagnostic, Span, codes};
@@ -24,25 +8,16 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 /// How many host operations may be waiting at once, across every socket.
-///
-/// One real thread each. The number decides how many connections a runaway
-/// program can hold open, which is the reason it is stated here rather than
-/// inherited from a runtime's default.
 pub const MAX_BLOCKING_OPERATIONS: usize = 64;
 
-/// What a job hands back. Not a [`Value`]: a `Value` holds `Rc` and never
-/// crosses a thread.
+/// What a job hands back.
 pub enum Done {
     Int(i64),
-    /// `net.recv`'s answer. `None` is the deadline expiring and `Some` is what
-    /// the peer sent, empty when it has stopped sending — the one rule
-    /// `std.net` states once and everything above it reads.
+    /// `net.recv`'s answer.
     MaybeBytes(Option<Vec<u8>>),
     /// `net.send`'s answer, under the same rule.
     MaybeInt(Option<i64>),
-    /// The operation failed in a way that is neither the peer's doing nor a
-    /// deadline. Rendered against the `perform`'s span by whoever polls, so a
-    /// host error points at Ply source rather than at Rust.
+    /// The operation failed in a way that is neither the peer's doing nor a deadline.
     Failed(String),
 }
 
@@ -67,8 +42,8 @@ struct Shared {
     next: AtomicU64,
 }
 
-/// Clone-free by design: the pool is owned by the handler that submits to it,
-/// and the jobs hold an [`Arc`] of the shared state instead.
+/// Clone-free by design: the pool is owned by the handler that submits to it, and the jobs hold an
+/// [`Arc`] of the shared state instead.
 pub struct Pool {
     shared: Arc<Shared>,
 }
@@ -85,8 +60,8 @@ impl Pool {
             shared: Arc::new(Shared {
                 state: Mutex::new(State::default()),
                 finished: Condvar::new(),
-                // Token 0 is never minted, so a zeroed `Pending` is a token this
-                // pool does not own rather than its first job.
+                // Token 0 is never minted, so a zeroed `Pending` is a token this pool does not own
+                // rather than its first job.
                 next: AtomicU64::new(1),
             }),
         }
@@ -142,7 +117,7 @@ impl Pool {
         Ok(Pending { token, label })
     }
 
-    /// Whether this pool minted the token. What a composed runtime routes on.
+    /// Whether this pool minted the token.
     pub fn owns(&self, pending: &Pending) -> bool {
         let state = lock(&self.shared.state);
         state.waiting.contains_key(&pending.token) || state.done.contains_key(&pending.token)
@@ -158,9 +133,6 @@ impl Pool {
     }
 
     /// Block until at least one outstanding operation has finished.
-    ///
-    /// Called by a scheduler with nothing enabled. Waiting with nothing
-    /// outstanding would be a deadlock, so it is a diagnostic instead.
     pub fn park(&self) -> Result<(), Diagnostic> {
         let mut state = lock(&self.shared.state);
         if state.waiting.is_empty() && state.done.is_empty() {
@@ -177,13 +149,6 @@ impl Pool {
     }
 
     /// The same, for at most `bound`, and `Ok` whether or not anything resolved.
-    ///
-    /// What a drain parks on. The deadline that bounds a shutdown is checked
-    /// between scheduling decisions, so a park that waited for a token would let
-    /// one request blocked on a `recv` its peer will never answer outlast the
-    /// whole drain — and the run would sit there with nothing to read. Waiting
-    /// with nothing outstanding is legal here and not in [`Pool::park`]: during
-    /// a drain a wait for the deadline is the point rather than a deadlock.
     pub fn park_until(&self, bound: Duration) -> Result<(), Diagnostic> {
         let state = lock(&self.shared.state);
         if state.done.is_empty() {
@@ -193,19 +158,15 @@ impl Pool {
     }
 
     /// Drive until this token resolves.
-    ///
-    /// The only place a Ply computation blocks a real thread, reached when there
-    /// is no scheduler region to park the performing task in.
     pub fn block_on(&self, pending: Pending) -> Result<Value, Diagnostic> {
         let mut state = lock(&self.shared.state);
         loop {
             match take(&mut state, pending.token) {
                 Taken::Ready(result) => return result,
                 Taken::Unknown => return Err(unknown_token(&pending)),
-                // Waiting on the condvar rather than on this token specifically:
-                // a wake for another token re-checks and waits again, which is
-                // correct and — because the result stays in `done` until its own
-                // poll consumes it — cannot spin.
+                // Waiting on the condvar rather than on this token specifically: a wake for another
+                // token re-checks and waits again, which is correct and — because the result stays
+                // in `done` until its own poll consumes it — cannot spin.
                 Taken::Waiting => state = wait(&self.shared.finished, state),
             }
         }
@@ -231,8 +192,8 @@ fn take(state: &mut State, token: u64) -> Taken {
             Taken::Unknown
         };
     };
-    // A finished job's `Waiting` entry is what carries the span its failure is
-    // reported at, so it is removed here and not when the job completes.
+    // A finished job's `Waiting` entry is what carries the span its failure is reported at, so it
+    // is removed here and not when the job completes.
     let waiting = state.waiting.remove(&token);
     let (span, what) = match &waiting {
         Some(w) => (w.span, w.what),
@@ -250,8 +211,8 @@ fn take(state: &mut State, token: u64) -> Taken {
     })
 }
 
-/// The prelude's `Option`, built on the polling thread because a `Value` holds
-/// `Rc` and never crosses one.
+/// The prelude's `Option`, built on the polling thread because a `Value` holds `Rc` and never
+/// crosses one.
 fn option(v: Option<Value>) -> Value {
     match v {
         Some(v) => Value::ctor("Some", vec![v]),
@@ -268,9 +229,7 @@ fn unknown_token(pending: &Pending) -> Diagnostic {
     .note("a pending token belongs to the facility that answered the operation; polling the wrong one loses the result rather than waiting for it")
 }
 
-/// A poisoned lock means a job thread panicked. The state behind it is two maps
-/// and neither has an invariant a panic can break, so recovering is correct and
-/// propagating the panic would take out the machine's thread as well.
+/// A poisoned lock means a job thread panicked.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

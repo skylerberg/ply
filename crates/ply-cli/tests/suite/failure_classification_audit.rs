@@ -1,20 +1,4 @@
 //! An adversarial audit of the defect/program-error split, through the binary.
-//!
-//! Two directions cost an agent its time, and they cost it differently. A
-//! legitimate program error reported as a defect in Ply sends the agent to file
-//! a bug about its own broken code and — worse — suppresses the bisection that
-//! would have named the edit. A defect in Ply reported as an ordinary red test
-//! sends the agent hunting through source that is correct, with a suspect set
-//! that invented a culprit for something no change caused.
-//!
-//! `ply-test`'s unit tests pin the classifier on a synthetic executor. These
-//! run the real evaluator over real source, because the classifier's input is
-//! whatever code an evaluator happens to attach to a failure, and that is a
-//! property of nine files rather than of the one `match`.
-//!
-//! Where a case shows the system getting it wrong the test is named
-//! `documents_` and its doc comment says what the right answer is. Those pin
-//! present behaviour so a fix is visible as a diff; they are not endorsements.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -63,8 +47,8 @@ fn sole_failure(dir: &TempDir) -> Value {
     failure
 }
 
-/// The whole claim, in one place: the program is at fault, the run says so, and
-/// nothing about the failure took bisection off the table.
+/// The whole claim, in one place: the program is at fault, the run says so, and nothing about the
+/// failure took bisection off the table.
 fn assert_program_error(failure: &Value, what: &str) {
     assert_eq!(
         failure["defect"], false,
@@ -86,11 +70,6 @@ fn assert_program_error(failure: &Value, what: &str) {
 
 // --- every language-defined runtime failure is the program's ----------------
 
-/// The table the fix is really about. Each of these is a failure the language
-/// *defines*: an edit can introduce it, an edit can remove it, and it bisects
-/// like an assertion. Reading `panicked` off the runtime-error code would put
-/// every row here on the wrong side at once, so they are asserted together
-/// rather than one test per row.
 #[test]
 fn every_language_defined_runtime_failure_is_a_program_error() {
     let cases: &[(&str, &str, &str)] = &[
@@ -150,15 +129,8 @@ fn every_language_defined_runtime_failure_is_a_program_error() {
             "assertion failed",
         ),
         (
-            // One argument written, two passed: `message` defaults to `None`
-            // and `ply_syntax::defaults` splices it in before this runs.
-            //
-            // This comment used to say the opposite — that the evaluator took
-            // an optional message "but the checker's signature does not, so
-            // the two-argument form is a type error rather than a red test".
-            // That was true, and was the only place in the tree that said so.
-            // ADR 0029 closed it by widening the signature rather than by
-            // deleting the arm.
+            // One argument written, two passed: `message` defaults to `None` and
+            // `ply_syntax::defaults` splices it in before this runs.
             "a failing assert",
             "fn no() -> Bool = false\n\
              test \"holds\" { assert(no()) }\n",
@@ -192,10 +164,7 @@ fn every_language_defined_runtime_failure_is_a_program_error() {
     }
 }
 
-/// A clause body is ordinary code that happens to run under a `handle`. A
-/// failure raised there is the program's for exactly the same reasons, and the
-/// handler machinery must not launder it into something the runner reads as an
-/// evaluator fault.
+/// A clause body is ordinary code that happens to run under a `handle`.
 #[test]
 fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
     let cases: &[(&str, &str)] = &[
@@ -228,10 +197,7 @@ fn a_failure_inside_a_handler_clause_body_is_still_the_programs() {
     }
 }
 
-/// Both engines and the audit that runs them together classify a resource
-/// limit the same way. A divergence here would be `E0503`, which the classifier
-/// reads as an ordinary red test — a divergence is Ply's fault by definition, so
-/// that is the one code that ought to set `defect` and does not.
+/// Both engines and the audit that runs them together classify a resource limit the same way.
 #[test]
 fn the_recursion_limit_is_one_program_error_on_every_engine() {
     const RUNAWAY: &str = "fn spin(n: Int) -> Int = spin(n + 1)\n\
@@ -265,10 +231,8 @@ fn the_recursion_limit_is_one_program_error_on_every_engine() {
 
 // --- the consequence: these failures are actually bisected ------------------
 
-/// Two independent edits, one benign; only *running* a mixture can say which
-/// one caused the failure. Every fixture below shares this shape so that a
-/// verdict of `sole` — which needs no evaluator — cannot be mistaken for the
-/// search having worked.
+/// Two independent edits, one benign; only *running* a mixture can say which one caused the
+/// failure.
 fn assert_bisected_to(dir: &TempDir, culprit: &str, innocent: &str) {
     let v = json_of(&ply(dir.path()).args(["test", "--json"]).output().unwrap());
     let failure = &v["failures"][0];
@@ -308,10 +272,6 @@ fn total(a: Int, b: Int) -> Int = scale(a, b) + step(3)
 test \"total is scaled\" { assert_eq(total(2, 3), 6) }
 ";
 
-/// The failure the fix exists for, end to end. Before it, this run printed
-/// "this is a defect in Ply" over a base case somebody deleted and refused to
-/// bisect — so the one artifact that names the edit was withheld from the one
-/// failure whose cause is hardest to eyeball.
 #[test]
 fn runaway_recursion_introduced_by_an_edit_is_bisected_to_the_culprit() {
     let dir = project(RECURSION);
@@ -363,9 +323,7 @@ test \"the picked shape has an area\" { assert_eq(report(0), 3) }
 ";
 
 /// A `match` that stops covering a case is a *compile* error — see
-/// `a_match_that_stops_being_exhaustive_never_reaches_the_runner`. The runtime
-/// half of `E0205` is a refutable `let` whose scrutinee changed shape, which is
-/// the pattern-match failure an edit can actually introduce.
+/// `a_match_that_stops_being_exhaustive_never_reaches_the_runner`.
 #[test]
 fn a_pattern_that_stops_matching_is_bisected_to_the_culprit() {
     let dir = project(MATCHING);
@@ -382,11 +340,8 @@ fn a_pattern_that_stops_matching_is_bisected_to_the_culprit() {
     assert_bisected_to(&dir, "m.pick", "m.shift");
 }
 
-/// Exhaustiveness is decided statically, so an edit that drops an arm never
-/// produces a red test to bisect: `ply test` exits 2 with `E0205` and runs
-/// nothing. Asserted because the alternative — a runtime `E0205` that reaches
-/// the classifier — is what the pattern-match row of the audit would otherwise
-/// be about, and a reader has to know which of the two this build does.
+/// Exhaustiveness is decided statically, so an edit that drops an arm never produces a red test to
+/// bisect: `ply test` exits 2 with `E0205` and runs nothing.
 #[test]
 fn a_match_that_stops_being_exhaustive_never_reaches_the_runner() {
     const EXHAUSTIVE: &str = "\
@@ -413,10 +368,8 @@ test \"the picked shape has an area\" { assert_eq(area(pick(1)), 1) }
     );
 }
 
-/// A recursion limit used to set `defect`, and `defect` is per failure — but a
-/// reader who has only ever seen it in a one-test project cannot tell a
-/// per-failure flag from a per-run one. Two red tests in one run, one of each
-/// kind, and the ordinary regression must still be bisected.
+/// A recursion limit used to set `defect`, and `defect` is per failure — but a reader who has only
+/// ever seen it in a one-test project cannot tell a per-failure flag from a per-run one.
 #[test]
 fn a_runaway_recursion_costs_a_sibling_failure_nothing() {
     const BOTH: &str = "\
@@ -452,10 +405,8 @@ test \"step bottoms out\" { assert_eq(step(3), 0) }
     }
 }
 
-/// `test/nondet` is the one skip that outranks having a perfectly good
-/// baseline: its outcome is not a function of the definition set, so a
-/// mixture's answer would be evidence about nothing. A runtime limit inside one
-/// must land on `nondet` and not on `panicked`.
+/// `test/nondet` is the one skip that outranks having a perfectly good baseline: its outcome is not
+/// a function of the definition set, so a mixture's answer would be evidence about nothing.
 #[test]
 fn a_nondet_test_that_hits_a_runtime_limit_is_skipped_as_nondet() {
     let dir = project(
@@ -468,9 +419,8 @@ fn a_nondet_test_that_hits_a_runtime_limit_is_skipped_as_nondet() {
     assert_eq!(failure["culprit"]["skipped"], "nondet", "{failure}");
 }
 
-/// `--bisect never` is the only skip that says nothing about the failure, so it
-/// has to win over every other reason — including a runtime limit, which no
-/// longer has a reason of its own.
+/// `--bisect never` is the only skip that says nothing about the failure, so it has to win over
+/// every other reason — including a runtime limit, which no longer has a reason of its own.
 #[test]
 fn bisect_never_outranks_the_reason_a_runtime_limit_would_have_given() {
     let dir = project(RECURSION);
@@ -490,8 +440,7 @@ fn bisect_never_outranks_the_reason_a_runtime_limit_would_have_given() {
     assert_eq!(v["failures"][0]["defect"], false, "{}", v["failures"][0]);
 }
 
-/// A first-ever red test has no earlier definition set, whatever it failed
-/// with. `never_passed` and not `panicked`, and no definition named.
+/// A first-ever red test has no earlier definition set, whatever it failed with.
 #[test]
 fn a_first_ever_runtime_limit_is_skipped_as_never_passed() {
     let dir = project(
@@ -507,11 +456,9 @@ fn a_first_ever_runtime_limit_is_skipped_as_never_passed() {
     );
 }
 
-/// `no_bodies` is "go and stop pruning" and `no_hybrids` is "this build cannot
-/// do it at all" — a consumer acts on them differently, so a cache with its
-/// body store removed must produce the first and not the second. A runtime
-/// limit is used as the failure so that the two skips being distinguished is
-/// tested on the class the fix moved into scope.
+/// `no_bodies` is "go and stop pruning" and `no_hybrids` is "this build cannot do it at all" — a
+/// consumer acts on them differently, so a cache with its body store removed must produce the first
+/// and not the second.
 #[test]
 fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
     let dir = project(RECURSION);
@@ -543,20 +490,7 @@ fn a_pruned_body_store_says_no_bodies_and_not_no_hybrids() {
 
 // --- a user program may never abort the process ------------------------------
 
-/// **A legal program used to kill the run.** The recursion limit is 10,000
-/// nested calls and this program stays under it: it builds a 9,800-deep value,
-/// which the evaluator constructs and traverses happily. `assert_eq` then
-/// compared the two with `ply_eval::value::values_equal`, which recursed on the
-/// host stack with no bound at all, and a rayon worker's 2 MiB stack did not
-/// survive it.
-///
-/// The process aborted. Not a panic — `catch_unwind` never saw it — so there was
-/// no diagnostic, no `defect` flag, no bisection, and every other test's result
-/// in that run went with it. The classifier was not wrong there so much as never
-/// consulted, which is the third and worst answer.
-///
-/// So the sibling test is the other half of the assertion: whatever this one
-/// does, the run has to still be a run.
+/// **A legal program used to kill the run.**
 #[test]
 fn a_value_the_call_limit_permits_is_compared_rather_than_aborting_the_run() {
     let dir = project(
@@ -572,11 +506,8 @@ fn a_value_the_call_limit_permits_is_compared_rather_than_aborting_the_run() {
     assert_eq!(v["summary"]["passed"], 2, "{v}");
 }
 
-/// Past the bound the answer is a diagnostic, not an abort — and the bound is
-/// only reachable by *iteration*, since a value built by recursion is at most as
-/// deep as the recursion that built it. It classifies as the program error it is:
-/// bisectable, not a defect in Ply, and identical on both engines because both
-/// share the walk that raises it.
+/// Past the bound the answer is a diagnostic, not an abort — and the bound is only reachable by
+/// *iteration*, since a value built by recursion is at most as deep as the recursion that built it.
 #[test]
 fn a_value_deeper_than_the_bound_is_an_ordinary_program_error() {
     const DEEP: &str = "\
@@ -611,16 +542,8 @@ test \"deep values compare\" { assert_eq(stack(20000), stack(20000)) }
     }
 }
 
-/// The same hole reached without any recursion in the *program*: 3,000 terms of
-/// `+` is a depth the front end checks and hashes without complaint, and `ply
-/// run` evaluates on the main thread. Only `ply test` died, because its workers
-/// have a 2 MiB stack and nothing on the evaluator's expression path is bounded
-/// by the call limit — the limit counts calls, and this program makes none.
-///
-/// Answered by growing rather than by a bound: the parser, inference and
-/// normalization already accept any depth, so refusing here would reject on the
-/// machine a program `ply check` and `ply run` accept — an `E0503` divergence on
-/// every corpus with a long operator chain in it.
+/// The same hole reached without any recursion in the *program*: 3,000 terms of `+` is a depth the
+/// front end checks and hashes without complaint, and `ply run` evaluates on the main thread.
 #[test]
 fn a_deeply_nested_expression_runs_rather_than_aborting_the_run() {
     let mut source = String::from("fn deep() -> Int = 1");

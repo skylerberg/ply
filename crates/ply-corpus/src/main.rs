@@ -377,10 +377,9 @@ fn serve(args: ServeArgs) -> Result<()> {
         };
         for &headers in &args.load_headers {
             for &parser in parsers {
-                // The sequential endpoint is `examples/hello.ply` as written,
-                // and it serves one connection at a time however many arrive —
-                // so it is reported at concurrency 1 alone. Sweeping it would
-                // measure a queue.
+                // The sequential endpoint is `examples/hello.ply` as written, and it serves one
+                // connection at a time however many arrive — so it is reported at concurrency 1
+                // alone.
                 load.push(ply_corpus::serve::load(
                     &args.repo,
                     &ply,
@@ -617,10 +616,8 @@ fn w4(args: W4Args) -> Result<()> {
     }
     if !args.no_pool {
         out.pool = w4::pool(&args.db, &args.pool_sizes, 8, args.operations, args.repeats)?;
-        // A pool acquire is a *deadline*, not a capacity check: a pool of one
-        // with eight open scopes queues and completes if the deadline is
-        // generous, and refuses if it is not. Both rows are here because the
-        // first is the one a reader assumes is a failure and is not.
+        // A pool acquire is a *deadline*, not a capacity check: a pool of one with eight open
+        // scopes queues and completes if the deadline is generous, and refuses if it is not.
         for (pool, concurrency, acquire) in [
             (1, 8, 5000),
             (1, 32, 5000),
@@ -739,9 +736,9 @@ fn w5(args: W5Args) -> Result<()> {
         )?;
     }
     if !args.no_deploy {
-        // One definition's body, and one that nothing in `desk.ply` reads at
-        // start-up, so the second build differs in exactly one leaf and its
-        // dependents rather than in the shape of the program.
+        // One definition's body, and one that nothing in `desk.ply` reads at start-up, so the
+        // second build differs in exactly one leaf and its dependents rather than in the shape of
+        // the program.
         out.deploy = Some(w5::deploy(
             &args.repo,
             &ply,
@@ -962,8 +959,8 @@ fn w6_ladder(args: W6LadderArgs) -> Result<()> {
         &args.api_key,
         args.served_repeats,
     )?;
-    // The other loop, reported once, separately and labelled — which is what
-    // §1.6 asks of whichever loop the ladder is not read off.
+    // The other loop, reported once, separately and labelled — which is what §1.6 asks of whichever
+    // loop the ladder is not read off.
     let other_rows = w6_run::served(
         &args.repo,
         &ply,
@@ -1233,8 +1230,8 @@ fn measure(args: MeasureArgs) -> Result<()> {
     if let Some(root) = &args.corpus {
         out.throughput = Some(measure::throughput(root, &engines, args.repeats)?);
         if !args.only_throughput {
-            // Scheduling clears the cache, so the store is timed before it
-            // rather than over the empty one it leaves behind.
+            // Scheduling clears the cache, so the store is timed before it rather than over the
+            // empty one it leaves behind.
             out.store_open = Some(measure::store_open(root, args.repeats)?);
             out.scheduling = Some(measure::scheduling(root)?);
         }

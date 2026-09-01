@@ -1,20 +1,4 @@
 //! `refdump <file.ply>` — the reference dump for one file, on stdout.
-//!
-//! The differential lives in `tests/agreement.rs`; this exists so that a
-//! disagreement can be inspected without a test harness in the way, and so the
-//! arming script can diff one side without running the other.
-//!
-//!   refdump <file>             the dump
-//!   refdump --nodes <file>     the node count
-//!   refdump --tags <file>      the distinct node tags, one per line
-//!   refdump --bundle <file>    every fixture in a bundle, dumps joined by `~`
-//!   refdump --bundle-tags <f>  the distinct tags over a whole bundle
-//!
-//! > **Withdrawn 2026-08-30.** A sixth mode stood here: *"`refdump
-//! > --unexpanded <f>`   the dump with `effect_set::expand` projected out"*.
-//! > Every dump this binary prints is now unexpanded — `reference_dump` enters
-//! > at `ply_syntax::parse_unexpanded` — so the flag would name the only
-//! > behaviour there is. `../GAPS.md` §11R.D.
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

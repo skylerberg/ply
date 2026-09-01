@@ -1,20 +1,5 @@
-//! The stored form of a definition body: DESIGN.md §3's `Definition`, the one
-//! element of `Hash -> (Definition, Type, Footprint)` the store never held.
-//!
-//! The bytes are the normalizer's, unchanged. That is the whole design: a second
-//! encoding would be a second thing to keep in step with normalization, and the
-//! first time the two disagreed a body would decode into a definition with a
-//! different hash than the one it is filed under. Reusing the stream also makes
-//! a body **self-checking** — `blake3` of a solo definition's bytes *is* its key
-//! — which no separate encoding could offer.
-//!
-//! The price is that the stream is lossy about names on purpose, so decoding
-//! yields an *evaluable* definition rather than the user's source: locals come
-//! back as `_l<level>`, definitions as `d<hash16>`, spans as [`Span::DUMMY`], and
-//! the program is resolved from its own synthesized namespace. That is the point
-//! rather than a defect — a historical definition set has to be reconstructable
-//! without knowing what anything is called *now*, because the names moved and the
-//! hashes did not.
+//! The stored form of a definition body: DESIGN.md §3's `Definition`, the one element of `Hash ->
+//! (Definition, Type, Footprint)` the store never held.
 
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -24,32 +9,19 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::DefHash;
 use crate::normalize::{binop_byte, mode_byte, tag, unop_byte};
 
-/// The generation of the encoding below. A decoder refuses bytes written under
-/// any other value, because a stream this compact cannot tell a shape change
-/// from a plausible one.
-///
-/// 6 is ADR 0012's 5 plus one: a cyclic component's payload is laid out in class
-/// order rather than sorted by bytes, and a generation-5 payload read as one
-/// would wire the cycle to whichever member happened to sort first.
-///
-/// 7 is `law_def` writing a host flag after its tag, as `test_def` writes
-/// `nondet`. The blast radius is bounded and the required test pins the
-/// boundary: **every law's hash moves once and re-discharges once, and no
-/// non-law definition's normalized bytes change at all.** A milestone that moved
-/// definition hashes for a law's sake would have got the layering wrong.
+/// The generation of the encoding below.
 pub const BODY_ENCODING: u32 = 7;
 
-/// `Decimal`'s bounds, which are the type's rather than a policy: a sign, a
-/// 96-bit mantissa and a scale of `0..=28`.
+/// `Decimal`'s bounds, which are the type's rather than a policy: a sign, a 96-bit mantissa and a
+/// scale of `0..=28`.
 const MAX_DECIMAL_SCALE: u32 = 28;
 const MAX_DECIMAL_MANTISSA: u128 = (1u128 << 96) - 1;
 
-/// A definition that is its own strongly connected component: the payload is its
-/// normalized bytes and `blake3(payload)` is the key.
+/// A definition that is its own strongly connected component: the payload is its normalized bytes
+/// and `blake3(payload)` is the key.
 const KIND_SOLO: u8 = 0;
-/// A member of a mutually recursive component: the payload is the *component's*
-/// bytes — every member, so the cycle can be rebuilt — and the key is
-/// `blake3(blake3(payload) ‖ class_le_u32)`.
+/// A member of a mutually recursive component: the payload is the *component's* bytes — every
+/// member, so the cycle can be rebuilt — and the key is `blake3(blake3(payload) ‖ class_le_u32)`.
 const KIND_MEMBER: u8 = 1;
 
 fn local_name(level: u32) -> String {
@@ -71,17 +43,14 @@ fn ident(name: impl Into<Symbol>) -> Ident {
     }
 }
 
-/// Sixteen hex characters rather than the full sixty-four: long enough that a
-/// collision across a project's definitions is not a thing that happens, short
-/// enough that a diagnostic about a reconstructed program is readable. Every
-/// synthesized name is checked for collision anyway, so a truncation that did
-/// collide is reported rather than silently aliasing two definitions.
+/// Sixteen hex characters rather than the full sixty-four: long enough that a collision across a
+/// project's definitions is not a thing that happens, short enough that a diagnostic about a
+/// reconstructed program is readable.
 fn short_name(prefix: char, hash: DefHash) -> Symbol {
     Symbol::new(format!("{prefix}{}", &hash.to_hex()[..16]))
 }
 
-/// A member of a component, given the component's own hash. This is the key a
-/// component's members are filed under, and must stay the one the hasher uses.
+/// A member of a component, given the component's own hash.
 pub(crate) fn member_hash(component: DefHash, class: u32) -> DefHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(&component.0);
@@ -89,8 +58,8 @@ pub(crate) fn member_hash(component: DefHash, class: u32) -> DefHash {
     DefHash(*hasher.finalize().as_bytes())
 }
 
-/// One definition's canonical body bytes, in the envelope that makes them
-/// self-checking against the [`DefHash`] they are filed under.
+/// One definition's canonical body bytes, in the envelope that makes them self-checking against the
+/// [`DefHash`] they are filed under.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct StoredBody(Vec<u8>);
 
@@ -115,8 +84,7 @@ impl StoredBody {
         StoredBody(out)
     }
 
-    /// Bytes read back from a store. `None` when they are not a body envelope at
-    /// all, which is the first of the three checks a stored body gets.
+    /// Bytes read back from a store.
     pub fn from_bytes(bytes: Vec<u8>) -> Option<StoredBody> {
         let body = StoredBody(bytes);
         body.shape()?;
@@ -155,9 +123,7 @@ impl StoredBody {
         }
     }
 
-    /// The one `DefHash` these bytes may be filed under. A body store that
-    /// checks this cannot corrupt silently: a body is a function of its hash, so
-    /// disagreement is never a difference of opinion.
+    /// The one `DefHash` these bytes may be filed under.
     pub fn key(&self) -> Option<DefHash> {
         match self.shape()? {
             Shape::Solo(bytes) => Some(DefHash::of(bytes)),
@@ -173,9 +139,7 @@ impl StoredBody {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct BodySet {
     defs: IndexMap<DefHash, StoredBody>,
-    /// Parallel to [`crate::HashOutput::tests`]. Kept apart from `defs` because a
-    /// test has no name a reference can reach, so nothing is ever reconstructed
-    /// *because* of one.
+    /// Parallel to [`crate::HashOutput::tests`].
     tests: Vec<StoredBody>,
 }
 
@@ -226,8 +190,7 @@ pub struct Reconstruction {
     /// Hash -> the program-wide name this program declares it under.
     pub names: IndexMap<DefHash, Symbol>,
     pub kinds: IndexMap<DefHash, ItemKind>,
-    /// Parallel to [`BodySet::tests`]: `<module>.<label>`, the key a test's
-    /// result is cached under.
+    /// Parallel to [`BodySet::tests`]: `<module>.<label>`, the key a test's result is cached under.
     pub test_keys: Vec<Symbol>,
 }
 
@@ -241,8 +204,7 @@ impl Reconstruction {
     }
 }
 
-/// The module a reconstructed program's tests live in. Not hex, so it cannot
-/// collide with a unit's module name.
+/// The module a reconstructed program's tests live in.
 const TEST_MODULE: &str = "ply_tests";
 
 fn corrupt(message: impl Into<String>) -> Diagnostic {
@@ -275,14 +237,8 @@ struct Unit {
     binder: Symbol,
 }
 
-/// A program-wide name per hash — `store.orders.place` — which is what a
-/// deployable artifact carries beside the bodies.
-///
-/// Supplying one restores the names a reconstruction would otherwise synthesize.
-/// That is not cosmetic: **a host handler is registered against an effect's
-/// program-wide name**, so a program rebuilt under synthesized names can bind
-/// nothing, and neither `--db-schema` nor `--config-schema` can name a function
-/// in it.
+/// A program-wide name per hash — `store.orders.place` — which is what a deployable artifact
+/// carries beside the bodies.
 pub type Namespace = BTreeMap<DefHash, Symbol>;
 
 struct Layout {
@@ -292,18 +248,11 @@ struct Layout {
 }
 
 /// What a unit is called, once every unit is known.
-///
-/// All or nothing, deliberately. A mixture — some definitions under their own
-/// names, some under `d<hash16>` — would make the names in a diagnostic depend
-/// on which definitions happened to be nameable, which is exactly the kind of
-/// answer that varies with something a reader cannot see. So a namespace is used
-/// only when it names every definition consistently, and any conflict falls back
-/// to the synthesized naming that always works.
 fn naming(units: &[Unit], namespace: &Namespace) -> Option<Vec<(ModuleName, Vec<Symbol>)>> {
     let mut out: Vec<(ModuleName, Vec<Symbol>)> = Vec::with_capacity(units.len());
-    // A qualifier is a module's last segment, so two modules sharing one cannot
-    // both be referred to from a third — the same ambiguity `import` has in
-    // source, and not one worth inventing a disambiguation for here.
+    // A qualifier is a module's last segment, so two modules sharing one cannot both be referred to
+    // from a third — the same ambiguity `import` has in source, and not one worth inventing a
+    // disambiguation for here.
     let mut binders: BTreeMap<Symbol, ModuleName> = BTreeMap::new();
     let mut taken: BTreeSet<Symbol> = BTreeSet::new();
 
@@ -314,8 +263,8 @@ fn naming(units: &[Unit], namespace: &Namespace) -> Option<Vec<(ModuleName, Vec<
             let qualified = namespace.get(hash)?;
             let (prefix, name) = qualified.as_str().rsplit_once('.')?;
             let owner = ModuleName::from_dotted(prefix);
-            // A component's members are mutually recursive, so they were
-            // declared in one module; anything else did not come from a program.
+            // A component's members are mutually recursive, so they were declared in one module;
+            // anything else did not come from a program.
             if *module.get_or_insert_with(|| owner.clone()) != owner {
                 return None;
             }
@@ -337,9 +286,8 @@ fn naming(units: &[Unit], namespace: &Namespace) -> Option<Vec<(ModuleName, Vec<
     Some(out)
 }
 
-/// Unpacks the blob a component is hashed from: a count, then each member's
-/// encoding length-prefixed, in ascending byte order. Anything else was not
-/// written by this program.
+/// Unpacks the blob a component is hashed from: a count, then each member's encoding
+/// length-prefixed, in ascending byte order.
 fn unpack(payload: &[u8]) -> Option<Vec<Vec<u8>>> {
     let mut cursor = Cursor::new(payload);
     let count = cursor.u32().ok()?;
@@ -348,10 +296,8 @@ fn unpack(payload: &[u8]) -> Option<Vec<Vec<u8>>> {
         let len = cursor.u32().ok()? as usize;
         members.push(cursor.bytes(len).ok()?.to_vec());
     }
-    // Class order, not byte order: a member's position *is* its class, which is
-    // what lets a decoded intra-component reference name a member. Two equal
-    // entries would be two classes the hasher could not have separated, so they
-    // are corruption rather than a redundancy to fold away.
+    // Class order, not byte order: a member's position *is* its class, which is what lets a decoded
+    // intra-component reference name a member.
     let mut distinct: Vec<&[u8]> = members.iter().map(Vec::as_slice).collect();
     distinct.sort_unstable();
     distinct.dedup();
@@ -420,9 +366,8 @@ impl Layout {
             return Err(diags);
         }
 
-        // Module order decides nothing — resolution keys on names — but a
-        // reconstruction that is not byte-identical run to run is not one an
-        // artifact can be diffed against.
+        // Module order decides nothing — resolution keys on names — but a reconstruction that is
+        // not byte-identical run to run is not one an artifact can be diffed against.
         let mut units: Vec<Unit> = units.into_values().collect();
         units.sort_by(|a, b| a.id.cmp(&b.id));
 
@@ -457,23 +402,12 @@ impl Layout {
 }
 
 /// Rebuilds a checkable, evaluable program from stored bodies.
-///
-/// The set has to be closed under reference: a body names its referents by hash
-/// and nothing else, so a referent that is not here has no name the program
-/// could give it.
 pub fn reconstruct(bodies: &BodySet) -> Result<Reconstruction, Vec<Diagnostic>> {
     reconstruct_relinked(bodies, &BTreeMap::new())
 }
 
-/// [`reconstruct`], under the names the definitions were built with rather than
-/// under synthesized ones.
-///
-/// This is what a deployed artifact uses, and it is not a nicety. A host handler
-/// is registered against an effect's *program-wide name* (`std.db.db`), and
-/// `--db-schema` and `--config-schema` name a function the same way, so a
-/// program rebuilt under `d<hash16>` can bind nothing and be configured by
-/// nothing. Bisection deliberately does not use this: a historical definition
-/// set has to be rebuildable without knowing what anything is called now.
+/// [`reconstruct`], under the names the definitions were built with rather than under synthesized
+/// ones.
 pub fn reconstruct_named(
     bodies: &BodySet,
     namespace: &Namespace,
@@ -481,20 +415,7 @@ pub fn reconstruct_named(
     reconstruct_with(bodies, &BTreeMap::new(), namespace)
 }
 
-/// [`reconstruct`], with every stored reference rewritten through `relink`
-/// before it is resolved.
-///
-/// This is what makes a *hybrid* program possible. A body names its referents by
-/// hash, so a caller kept at its baseline names its callee's baseline hash, and a
-/// mixture that swapped the callee alone would silently keep measuring the
-/// baseline. Redirecting the reference as it is decoded is the only safe place to
-/// do it: the byte stream is not scannable for a 32-byte pattern without being
-/// decoded, and decoding it is this.
-///
-/// A relinked definition is by construction *not* the definition its key names,
-/// so the key check [`reconstruct`] applies is skipped: it would fail on every
-/// mixture. Each body still had to verify against its own key on the way into
-/// the store, and the caller typechecks what comes out.
+/// [`reconstruct`], with every stored reference rewritten through `relink` before it is resolved.
 pub fn reconstruct_relinked(
     bodies: &BodySet,
     relink: &BTreeMap<DefHash, DefHash>,
@@ -510,9 +431,8 @@ fn reconstruct_with(
     let layout = Layout::build(bodies, namespace)?;
     let mut missing: BTreeSet<DefHash> = BTreeSet::new();
     let mut diags: Vec<Diagnostic> = Vec::new();
-    // Keyed by name rather than pushed per unit: with a namespace restored, two
-    // units may belong to one module, and two `Module`s of one name is not a
-    // program.
+    // Keyed by name rather than pushed per unit: with a namespace restored, two units may belong to
+    // one module, and two `Module`s of one name is not a program.
     let mut modules: IndexMap<ModuleName, Module> = IndexMap::new();
     let mut names: IndexMap<DefHash, Symbol> = IndexMap::new();
     let mut kinds: IndexMap<DefHash, ItemKind> = IndexMap::new();
@@ -548,9 +468,8 @@ fn reconstruct_with(
             }
         }
 
-        // A module never imports itself, whatever a reference inside it asked
-        // for: a unit whose referent turned out to be a sibling in the same
-        // module contributed nothing to resolve.
+        // A module never imports itself, whatever a reference inside it asked for: a unit whose
+        // referent turned out to be a sibling in the same module contributed nothing to resolve.
         imports.remove(&unit.module);
         let module = modules
             .entry(unit.module.clone())
@@ -579,12 +498,7 @@ fn reconstruct_with(
         let mut items = Vec::with_capacity(bodies.tests.len());
         let mut imports: BTreeSet<ModuleName> = BTreeSet::new();
         for (i, body) in bodies.tests.iter().enumerate() {
-            // Per test, not per module. A slot is a de Bruijn level into *one
-            // component's* effect enumeration and each test is its own
-            // component, so two tests that reach different effect sets number
-            // them differently and neither is wrong. Sharing one map across the
-            // module reads that as one effect at two slots and refuses a corpus
-            // that is perfectly well formed.
+            // Per test, not per module.
             let mut slots: BTreeMap<DefHash, u32> = BTreeMap::new();
             let Some(Shape::Solo(bytes)) = body.shape() else {
                 diags.push(corrupt(format!(
@@ -596,9 +510,9 @@ fn reconstruct_with(
             let mut decoder = Decoder {
                 c: Cursor::new(bytes),
                 layout: &layout,
-                // A test belongs to no unit, so an intra-component reference
-                // cannot occur in one; `unit` is only ever consulted through
-                // `REF_INDEX`, which `Decoder::node_ref` rejects here.
+                // A test belongs to no unit, so an intra-component reference cannot occur in one;
+                // `unit` is only ever consulted through `REF_INDEX`, which `Decoder::node_ref`
+                // rejects here.
                 unit: usize::MAX,
                 values: 0,
                 ty_params: 0,
@@ -646,20 +560,10 @@ fn reconstruct_with(
 }
 
 impl Reconstruction {
-    /// Re-hashes what was rebuilt and requires every definition to come out as
-    /// the key its body was filed under.
-    ///
-    /// This is not a belt-and-braces check, it is the contract: a body that
-    /// decodes into a *different* definition is worse than one that was never
-    /// stored, because everything downstream would go on believing it is the
-    /// definition that hash names. Anything the encoding cannot carry surfaces
-    /// here as a refusal rather than as a program that quietly differs.
+    /// Re-hashes what was rebuilt and requires every definition to come out as the key its body was
+    /// filed under.
     fn verify(&self, bodies: &BodySet) -> Result<(), Vec<Diagnostic>> {
-        // `resolve` also fills defaults and named arguments, which needs the
-        // program mutably. On a *reconstructed* program that is a no-op — the
-        // encoding only ever held calls that were already positional and fully
-        // applied — so the copy it expands is equal to the one hashed below,
-        // and re-hashing the original is still the round-trip this checks.
+        // `resolve` also fills defaults and named arguments, which needs the program mutably.
         let mut expanded = self.program.clone();
         let resolved = ply_syntax::resolve(&mut expanded).map_err(|diags| {
             vec![
@@ -773,9 +677,7 @@ impl<'a> Cursor<'a> {
         Ok(i128::from_le_bytes(raw))
     }
 
-    /// The bit pattern, so a NaN payload and the sign of a zero survive the
-    /// round trip. Decoding through the numeric value would make two definitions
-    /// with distinct hashes decode to one.
+    /// The bit pattern, so a NaN payload and the sign of a zero survive the round trip.
     fn float(&mut self) -> Decoded<f64> {
         let raw: [u8; 8] = self.bytes(8)?.try_into().expect("eight bytes");
         Ok(f64::from_bits(u64::from_le_bytes(raw)))
@@ -807,9 +709,8 @@ impl<'a> Cursor<'a> {
     }
 }
 
-/// The parser bounds nesting, but a left-leaning operator chain is parsed
-/// iteratively and is still an arbitrarily deep tree, so this walk is as
-/// unbounded as the normalizer's.
+/// The parser bounds nesting, but a left-leaning operator chain is parsed iteratively and is still
+/// an arbitrarily deep tree, so this walk is as unbounded as the normalizer's.
 fn grow<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
@@ -824,13 +725,10 @@ struct Decoder<'a> {
     ty_params: u32,
     row_params: u32,
     imports: &'a mut BTreeSet<ModuleName>,
-    /// Effect hash -> the slot it was seen at. Two slots for one hash means the
-    /// definition can tell two effects apart that share a declaration, which a
-    /// hash-keyed store cannot reconstruct.
+    /// Effect hash -> the slot it was seen at.
     slots: &'a mut BTreeMap<DefHash, u32>,
     missing: &'a mut BTreeSet<DefHash>,
-    /// Where a stored reference is redirected before it is resolved. Empty for
-    /// every reconstruction that is not a mixture of two eras.
+    /// Where a stored reference is redirected before it is resolved.
     relink: &'a BTreeMap<DefHash, DefHash>,
 }
 
@@ -848,8 +746,8 @@ impl Decoder<'_> {
         }
     }
 
-    /// Everything is `pub`: a reconstructed program is one namespace of
-    /// synthesized names, and visibility is metadata the encoding erased.
+    /// Everything is `pub`: a reconstructed program is one namespace of synthesized names, and
+    /// visibility is metadata the encoding erased.
     fn fn_def(&mut self, name: Symbol) -> Decoded<FnDef> {
         self.c.expect(tag::FN, "a function")?;
         let type_count = self.c.u32()?;
@@ -894,20 +792,19 @@ impl Decoder<'_> {
             ret,
             effects,
             constraints,
-            // Provenance, erased by normalization: a decoded definition cannot
-            // say whether a human or a `derive` wrote the form it decodes.
+            // Provenance, erased by normalization: a decoded definition cannot say whether a human
+            // or a `derive` wrote the form it decodes.
             derived: None,
-            // A spec is erased by normalization, so a body decoded from its hash
-            // carries none. A hybrid runs definitions, not claims about them.
+            // A spec is erased by normalization, so a body decoded from its hash carries none.
             spec: Vec::new(),
             body,
             span: Span::DUMMY,
         })
     }
 
-    /// Comes back sorted by `(parameter level, deriver)`, which is how the
-    /// normalizer wrote it and is one of the semantics-preserving rewrites a
-    /// decoded definition is only equal to its original up to.
+    /// Comes back sorted by `(parameter level, deriver)`, which is how the normalizer wrote it and
+    /// is one of the semantics-preserving rewrites a decoded definition is only equal to its
+    /// original up to.
     fn constraints(&mut self) -> Decoded<Vec<Constraint>> {
         let count = self.c.u32()?;
         self.repeat(count, |d| {
@@ -1006,9 +903,8 @@ impl Decoder<'_> {
         })
     }
 
-    /// Trailing bytes mean the stream was written by something that does not
-    /// agree with this decoder about a shape, which is exactly the failure the
-    /// encoding version exists to catch.
+    /// Trailing bytes mean the stream was written by something that does not agree with this
+    /// decoder about a shape, which is exactly the failure the encoding version exists to catch.
     fn end(&mut self) -> Decoded<()> {
         if self.c.done() {
             Ok(())
@@ -1020,10 +916,7 @@ impl Decoder<'_> {
         }
     }
 
-    /// `count` comes off the stream, so it may be anything. Every element costs
-    /// at least its tag byte, so the bytes left are an upper bound on how many
-    /// there can be — reserving beyond that turns a corrupt length prefix into
-    /// an allocation failure, which is an abort rather than a diagnostic.
+    /// `count` comes off the stream, so it may be anything.
     fn repeat<T>(&mut self, count: u32, f: impl Fn(&mut Self) -> Decoded<T>) -> Decoded<Vec<T>> {
         let mut out = Vec::with_capacity(self.hint(count));
         for _ in 0..count {
@@ -1045,10 +938,6 @@ impl Decoder<'_> {
     }
 
     /// One `fn` parameter's annotation and default.
-    ///
-    /// Shares its first byte with [`Self::opt`]: a parameter with no default
-    /// opens with `NONE`/`SOME` exactly as it did before defaults existed,
-    /// which is what keeps every hash written before them valid.
     fn param_slot(&mut self) -> Decoded<(Option<TypeExpr>, Option<Expr>)> {
         match self.c.u8()? {
             tag::NONE => Ok((None, None)),
@@ -1088,16 +977,15 @@ impl Decoder<'_> {
         }
     }
 
-    /// The name the reconstructed program gives a referenced definition, and the
-    /// import that makes it reachable from the module being built.
+    /// The name the reconstructed program gives a referenced definition, and the import that makes
+    /// it reachable from the module being built.
     fn qname_of(&mut self, hash: DefHash, name: Option<Symbol>) -> QName {
         let Some(&(unit, class)) = self.layout.by_hash.get(&hash) else {
             return QName::bare(ident(name.unwrap_or_else(|| short_name('d', hash))));
         };
         let target = name.unwrap_or_else(|| self.layout.units[unit].names[class].clone());
-        // Modules rather than units: with a namespace restored, two units may
-        // land in one module, and a module that imported itself to reach its own
-        // definition would not resolve.
+        // Modules rather than units: with a namespace restored, two units may land in one module,
+        // and a module that imported itself to reach its own definition would not resolve.
         let module = &self.layout.units[unit].module;
         if self
             .layout
@@ -1154,15 +1042,9 @@ impl Decoder<'_> {
         }
     }
 
-    /// An effect reference carries its slot in the enclosing component's effect
-    /// enumeration alongside the declaration's hash, because two effects may
-    /// declare byte-identical operations and still be different capabilities.
-    ///
-    /// A reconstruction can only use the hash: nothing keyed by a hash can hand
-    /// back which of two identical declarations was meant. Where the encoding
-    /// *does* record that a definition told two of them apart — the same hash at
-    /// two slots — reconstructing it would silently merge two capabilities into
-    /// one, so it is refused instead.
+    /// An effect reference carries its slot in the enclosing component's effect enumeration
+    /// alongside the declaration's hash, because two effects may declare byte-identical operations
+    /// and still be different capabilities.
     fn effect_ref(&mut self) -> Decoded<QName> {
         match self.c.bytes.get(self.c.pos) {
             Some(&tag::FREE) | Some(&tag::FREE_QUALIFIED) => self.free_ref(),
@@ -1281,9 +1163,7 @@ impl Decoder<'_> {
         })?;
         Ok(RowExpr {
             atoms,
-            // A decoded body is the normalized form, where an alias name was
-            // erased. There is nothing to restore and nothing that depended on
-            // it.
+            // A decoded body is the normalized form, where an alias name was erased.
             aliases: Vec::new(),
             tail,
             span: Span::DUMMY,
@@ -1323,8 +1203,8 @@ impl Decoder<'_> {
                         let param = Param {
                             name: ident(local_name(self.values)),
                             ty,
-                            // A lambda parameter cannot carry one, so the
-                            // encoding has none to hold.
+                            // A lambda parameter cannot carry one, so the encoding has none to
+                            // hold.
                             default: None,
                             span: Span::DUMMY,
                         };
@@ -1342,8 +1222,8 @@ impl Decoder<'_> {
                 ExprKind::App {
                     func,
                     args: self.repeat(count, Self::expr)?,
-                    // The encoding never held a named argument: `resolve`
-                    // placed every one before anything hashed.
+                    // The encoding never held a named argument: `resolve` placed every one before
+                    // anything hashed.
                     named: Vec::new(),
                 }
             }
@@ -1531,10 +1411,9 @@ impl Decoder<'_> {
             tag::LIT_DECIMAL => {
                 let mantissa = self.c.i128()?;
                 let scale = self.c.u32()?;
-                // The lexer refuses these bounds, so no body this repository
-                // wrote can carry one — which is exactly why a stream that does
-                // is refused rather than turned into a value the evaluator would
-                // have to invent.
+                // The lexer refuses these bounds, so no body this repository wrote can carry one —
+                // which is exactly why a stream that does is refused rather than turned into a
+                // value the evaluator would have to invent.
                 if scale > MAX_DECIMAL_SCALE || mantissa.unsigned_abs() > MAX_DECIMAL_MANTISSA {
                     return Err(bad(format!(
                         "mantissa {mantissa} at scale {scale} is not a `Decimal`"
@@ -1597,8 +1476,8 @@ impl Decoder<'_> {
     }
 }
 
-/// The normalizer's byte table is the source of truth; this is its inverse,
-/// pinned by a round-trip test over every operator.
+/// The normalizer's byte table is the source of truth; this is its inverse, pinned by a round-trip
+/// test over every operator.
 fn binop_of(byte: u8) -> Decoded<BinOp> {
     const ALL: [BinOp; 14] = [
         BinOp::Add,

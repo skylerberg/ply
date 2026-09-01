@@ -1,16 +1,4 @@
 //! The front-end cache: `path -> SourceFingerprint` and `DefHash -> interface`.
-//!
-//! The result cache answers "has this test already passed". This one answers
-//! "has this definition already been compiled".
-//!
-//! The two maps have opposite invalidation characters, and every method here
-//! depends on the difference:
-//!
-//! - `defs` / `decls` are keyed by content, so an entry is never wrong for its
-//!   key and merging two processes' entries is always safe.
-//! - `sources` is keyed by a path, which says nothing about what is at that path
-//!   now. An entry is therefore never trusted until its `content_hash` has been
-//!   checked against the bytes actually on disk.
 
 use crate::canonical::{canonicalize_decl_body, canonicalize_scheme};
 use crate::codec;
@@ -31,15 +19,12 @@ use std::sync::{Arc, Mutex};
 pub(crate) const FRONTEND_FILE: &str = idx::INDEX_FILE;
 pub(crate) const FRONTEND_DATA_FILE: &str = idx::DATA_FILE;
 
-/// The prefix a flush's temp files carry, so that an abandoned one is swept
-/// without touching anything else in the cache directory.
+/// The prefix a flush's temp files carry, so that an abandoned one is swept without touching
+/// anything else in the cache directory.
 pub(crate) const FRONTEND_STEM: &str = "frontend";
 
-/// A byte range within one source file, which is what a span degrades to once it
-/// leaves the process. [`Span`] carries a [`SourceId`], and a `SourceId` is an
-/// index into the run's `SourceMap` — adding or removing a file shifts every
-/// later id, so persisting one would silently point diagnostics at the wrong
-/// file.
+/// A byte range within one source file, which is what a span degrades to once it leaves the
+/// process.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct FileSpan {
     pub start: u32,
@@ -47,10 +32,8 @@ pub struct FileSpan {
 }
 
 impl FileSpan {
-    /// A dummy span has no file to be relative to, so it degrades to the empty
-    /// range and rebases onto a real offset 0 rather than back to
-    /// [`Span::DUMMY`]. Nothing worth persisting carries one — every definition
-    /// and test in a fingerprint has a real extent.
+    /// A dummy span has no file to be relative to, so it degrades to the empty range and rebases
+    /// onto a real offset 0 rather than back to [`Span::DUMMY`].
     pub fn of(span: Span) -> FileSpan {
         if span.is_dummy() {
             FileSpan { start: 0, end: 0 }
@@ -83,17 +66,9 @@ impl NameRef {
     }
 }
 
-/// A cached interface is written in terms of *names* — `Scheme` holds
-/// `Type::Con(Symbol, ..)` and a `Footprint` holds effect labels — while a
-/// `DefHash` erases them, which is exactly what makes renaming free. So a hash
-/// does not by itself determine the interface: `type A = | X(Int)` and
-/// `type B = | Y(Int)` hash alike, and `fn f(a: A) -> Int` and
-/// `fn g(b: B) -> Int` hash alike while having different schemes.
-///
-/// Every entry therefore records the names its interface mentions and the hash
-/// each denoted when it was written, and is usable only while all of them still
-/// hold. Renaming a type costs a recheck of the definitions that mention it —
-/// it still changes no `DefHash`, so it still selects no test.
+/// A cached interface is written in terms of *names* — `Scheme` holds `Type::Con(Symbol, ..)` and a
+/// `Footprint` holds effect labels — while a `DefHash` erases them, which is exactly what makes
+/// renaming free.
 pub fn witness_holds(
     names: &[NameRef],
     mut resolve: impl FnMut(&Symbol) -> Option<DefHash>,
@@ -109,10 +84,7 @@ pub enum DefKind {
     Effect,
 }
 
-/// A variant of a `type`, or an operation of an `effect`. Aligned with the
-/// `ctors` / `ops` of the [`CachedDecl`] under the same hash — by name for an
-/// operation, whose declaration order a hash erases, and by position for a
-/// variant, whose order a hash keeps.
+/// A variant of a `type`, or an operation of an `effect`.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct Member {
     pub name: Symbol,
@@ -129,9 +101,6 @@ pub struct DefEntry {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub members: Vec<Member>,
     /// The names this definition mentions directly, in normalization order.
-    /// A skipped file still has to contribute its slice of the reference graph:
-    /// `HashOutput`'s `deps` and `closure` are what a failing test's suspect set
-    /// is derived from, and a hole in them is a suspect nobody names.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<Symbol>,
 }
@@ -148,26 +117,21 @@ pub struct CachedTest {
     pub deps: Vec<Symbol>,
 }
 
-/// A module this file imports, with a digest of the exports it was compiled
-/// against. Gate 1's cheap module-granular check; see [`exports_digest`].
+/// A module this file imports, with a digest of the exports it was compiled against.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct ImportEdge {
     pub module: Symbol,
     pub exports: ContentHash,
 }
 
-/// `content_hash` is over the file's **raw bytes**, not over anything derived
-/// from parsing it: gate 1 has to decide whether to parse before it has anything
-/// a parse would produce.
+/// `content_hash` is over the file's **raw bytes**, not over anything derived from parsing it: gate
+/// 1 has to decide whether to parse before it has anything a parse would produce.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct SourceFingerprint {
     pub content_hash: ContentHash,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub imports: Vec<ImportEdge>,
-    /// Every top-level name this file mentions but does not declare, and what it
-    /// resolved to. Gate 1's exact check: a file whose bytes are unchanged and
-    /// whose every external name still denotes the same definition cannot
-    /// compile to anything different.
+    /// Every top-level name this file mentions but does not declare, and what it resolved to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<NameRef>,
     pub defs: Vec<DefEntry>,
@@ -186,15 +150,13 @@ impl SourceFingerprint {
         }
     }
 
-    /// Gate 1's first condition. A fingerprint says what the file at this path
-    /// compiled to *then*, and nothing about what is there now, so it must not
-    /// be believed until this returns `true`.
+    /// Gate 1's first condition.
     pub fn matches_bytes(&self, bytes: &[u8]) -> bool {
         self.content_hash == ContentHash::of(bytes)
     }
 
-    /// The `(name, hash)` pairs this file publishes, sorted — the input
-    /// [`exports_digest`] is defined over.
+    /// The `(name, hash)` pairs this file publishes, sorted — the input [`exports_digest`] is
+    /// defined over.
     pub fn exports(&self) -> Vec<NameRef> {
         let mut out: Vec<NameRef> = self
             .defs
@@ -208,16 +170,14 @@ impl SourceFingerprint {
         out
     }
 
-    /// Every hash this fingerprint refers to, so a garbage collector can tell a
-    /// live interface from an abandoned one.
+    /// Every hash this fingerprint refers to, so a garbage collector can tell a live interface from
+    /// an abandoned one.
     pub fn referenced_hashes(&self) -> impl Iterator<Item = DefHash> + '_ {
         self.defs.iter().map(|d| d.hash)
     }
 }
 
-/// A stable digest over a module's exported `(name, hash)` pairs. Sorted and
-/// length-prefixed so that reordering a file's items, or reordering the files
-/// within a module, cannot change it.
+/// A stable digest over a module's exported `(name, hash)` pairs.
 pub fn exports_digest(exports: &[NameRef]) -> ContentHash {
     let mut sorted: Vec<&NameRef> = exports.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name).then(a.hash.cmp(&b.hash)));
@@ -239,18 +199,10 @@ pub fn exports_digest(exports: &[NameRef]) -> ContentHash {
 pub struct CachedDef {
     pub scheme: Scheme,
     pub footprint: Footprint,
-    /// What row inference computed for the body, which a declared row may be
-    /// wider than. Stored because gate 1 restores a skipped file's definitions
-    /// without walking a body, and `ply check --explain` must print the same
-    /// bytes warm as cold — otherwise the reviewing command's output is a
-    /// function of what the cache held.
-    ///
-    /// Provenance: it enters no hash, no cache key, no scheduling decision and
-    /// no determinism verdict.
+    /// What row inference computed for the body, which a declared row may be wider than.
     #[serde(default)]
     pub performed: Footprint,
-    /// The `effect set` names the row was written with, in source order. Also
-    /// provenance, and also stored so `--explain` does not depend on the cache.
+    /// The `effect set` names the row was written with, in source order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub row_aliases: Vec<Symbol>,
     /// See [`witness_holds`].
@@ -259,9 +211,8 @@ pub struct CachedDef {
 }
 
 impl CachedDef {
-    /// `performed` starts equal to `footprint`, which is what it is for a
-    /// definition with no annotation and the honest reading of "nothing narrower
-    /// is known".
+    /// `performed` starts equal to `footprint`, which is what it is for a definition with no
+    /// annotation and the honest reading of "nothing narrower is known".
     pub fn new(scheme: Scheme, footprint: Footprint) -> CachedDef {
         CachedDef {
             scheme,
@@ -291,9 +242,7 @@ impl CachedDef {
         witness_holds(&self.names, resolve)
     }
 
-    /// What [`crate::Store::put_def`] stores. Applied there rather than left to
-    /// callers, so that no run can ever persist a scheme numbered by whatever
-    /// its global counter reached.
+    /// What [`crate::Store::put_def`] stores.
     pub fn canonicalized(self) -> CachedDef {
         CachedDef {
             scheme: canonicalize_scheme(&self.scheme),
@@ -305,8 +254,8 @@ impl CachedDef {
     }
 }
 
-/// A witness is a set, so two callers recording the same one in different orders
-/// must not produce different bytes on disk.
+/// A witness is a set, so two callers recording the same one in different orders must not produce
+/// different bytes on disk.
 fn canonical_names(mut names: Vec<NameRef>) -> Vec<NameRef> {
     names.sort_by(|a, b| a.name.cmp(&b.name).then(a.hash.cmp(&b.hash)));
     names.dedup();
@@ -314,11 +263,6 @@ fn canonical_names(mut names: Vec<NameRef>) -> Vec<NameRef> {
 }
 
 /// The published interface of one `type` or `effect`, keyed by its [`DefHash`].
-///
-/// Separate from [`CachedDef`] because a declaration has no scheme or footprint
-/// of its own, and because a file that declares one cannot be skipped by gate 1
-/// unless its signatures can be restored without parsing — nearly every real
-/// file declares something, so this is not an optional extra.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct CachedDecl {
     pub body: DeclBody,
@@ -372,10 +316,9 @@ pub struct CachedCtor {
     pub scheme: Scheme,
 }
 
-/// The operation's name is stored beside its signature because normalization
-/// sorts an effect's operations away — reordering them in source moves no
-/// `DefHash`, so a restore that paired them by position would hand every
-/// operation its neighbour's mode and signature.
+/// The operation's name is stored beside its signature because normalization sorts an effect's
+/// operations away — reordering them in source moves no `DefHash`, so a restore that paired them by
+/// position would hand every operation its neighbour's mode and signature.
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 pub struct CachedOp {
     pub name: Symbol,
@@ -385,9 +328,8 @@ pub struct CachedOp {
     pub ret: Type,
 }
 
-/// The name an interface was written for: the one entry of its witness that
-/// names something at the interface's own hash. `None` for an entry with no
-/// witness, which is then the only entry its hash can hold.
+/// The name an interface was written for: the one entry of its witness that names something at the
+/// interface's own hash.
 pub fn self_name(names: &[NameRef], hash: DefHash) -> Option<&Symbol> {
     names.iter().find(|n| n.hash == hash).map(|n| &n.name)
 }
@@ -399,21 +341,16 @@ pub fn declares(names: &[NameRef], name: &Symbol, hash: DefHash) -> bool {
     }
 }
 
-/// One entry as this run holds it: the bytes a flush would append, beside the
-/// value they decode to. Keeping the bytes is what lets a re-derived entry be
-/// recognized as already stored by comparison rather than by decoding what is on
-/// disk — the encoding is deterministic, so equal values have equal bytes.
+/// One entry as this run holds it: the bytes a flush would append, beside the value they decode to.
 struct Staged<T> {
     bytes: Vec<u8>,
     value: Arc<T>,
-    /// Whether an index record for the same slot is being replaced, so that
-    /// counting entries does not count the old and the new one both.
+    /// Whether an index record for the same slot is being replaced, so that counting entries does
+    /// not count the old and the new one both.
     supersedes: bool,
 }
 
-/// A hash and the name the interface filed under it was written for. Several
-/// definitions can share a `DefHash` — that is the design, not a collision — and
-/// their interfaces still differ, so the name is part of the key.
+/// A hash and the name the interface filed under it was written for.
 type Slot = (DefHash, Option<Symbol>);
 
 #[derive(Default)]
@@ -433,10 +370,7 @@ impl Pending {
     }
 }
 
-/// Entries decoded during this run, keyed by where their frame lies. An entry is
-/// decoded at most once however often it is asked for, which is what makes
-/// decode-on-demand cheaper than the whole-document parse it replaces rather
-/// than merely later.
+/// Entries decoded during this run, keyed by where their frame lies.
 #[derive(Default)]
 struct Memo {
     defs: BTreeMap<u64, Arc<CachedDef>>,
@@ -446,9 +380,7 @@ struct Memo {
     names: BTreeMap<u64, Arc<Vec<NameRef>>>,
 }
 
-/// What a `prune` decided, held until a flush can act on it. Reads honour it
-/// straight away: a caller that pruned and then asked must not be answered with
-/// what it just dropped.
+/// What a `prune` decided, held until a flush can act on it.
 #[derive(Clone, Default)]
 struct Retained {
     sources: Option<BTreeSet<String>>,
@@ -555,9 +487,8 @@ impl Cached for SourceFingerprint {
     }
 }
 
-/// What [`Frontend::put_body`] did, so that the conflict — which means a body's
-/// encoding depends on something its key does not cover — is reported by the
-/// caller that holds the warning list.
+/// What [`Frontend::put_body`] did, so that the conflict — which means a body's encoding depends on
+/// something its key does not cover — is reported by the caller that holds the warning list.
 pub(crate) enum StoredBody {
     Added,
     Unchanged,
@@ -571,8 +502,8 @@ pub(crate) struct Frontend {
     retained: Retained,
     schema: ContentHash,
     memo: Mutex<Memo>,
-    /// Filled by a *read* that found a frame it could not believe, which is why
-    /// it is behind a lock rather than owned by the caller.
+    /// Filled by a *read* that found a frame it could not believe, which is why it is behind a lock
+    /// rather than owned by the caller.
     warnings: Mutex<Vec<Diagnostic>>,
 }
 
@@ -594,8 +525,8 @@ fn guard<T>(lock: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     lock.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The name an index record's interface was written for, read from its witness
-/// without decoding the scheme behind it.
+/// The name an index record's interface was written for, read from its witness without decoding the
+/// scheme behind it.
 fn frame_self_name(data: &Data, at: Located, kind: u8, tag: u8, hash: DefHash) -> Option<Symbol> {
     let payload = data.frame(at, kind).ok()?;
     let names = codec::peek_names(tag, payload).ok()?;
@@ -603,9 +534,7 @@ fn frame_self_name(data: &Data, at: Located, kind: u8, tag: u8, hash: DefHash) -
 }
 
 impl Frontend {
-    /// Opens both files, or degrades to an empty cache and says why. Decodes no
-    /// entry and builds no map: the cost is one read of the index plus one pass
-    /// over it for the checksum.
+    /// Opens both files, or degrades to an empty cache and says why.
     pub(crate) fn open(index_path: &Path, data_path: &Path) -> (Frontend, Vec<Diagnostic>) {
         let mut frontend = Frontend::default();
         let schema = frontend.schema;
@@ -617,8 +546,8 @@ impl Frontend {
                     frontend.data = data;
                 }
                 Err(CacheError::Missing) if index.is_empty() => {}
-                // Named against the index either way: the two files are one
-                // cache, and the index is the one a reader was told about.
+                // Named against the index either way: the two files are one cache, and the index is
+                // the one a reader was told about.
                 Err(CacheError::Missing) => {
                     warnings.push(CacheError::Unpaired.into_diagnostic(index_path))
                 }
@@ -638,8 +567,8 @@ impl Frontend {
         guard(&self.warnings).clone()
     }
 
-    /// One warning per distinct degradation: a corrupt entry that a run consults
-    /// a hundred times is one fact about the cache, not a hundred.
+    /// One warning per distinct degradation: a corrupt entry that a run consults a hundred times is
+    /// one fact about the cache, not a hundred.
     fn refuse(&self, what: &str) {
         let message = format!("the front-end cache is corrupt: {what}");
         let mut warnings = guard(&self.warnings);
@@ -687,8 +616,7 @@ impl Frontend {
         found
     }
 
-    /// Every interface stored under this hash, index order first. A slot the
-    /// pending set replaces is left out, so a caller never sees both.
+    /// Every interface stored under this hash, index order first.
     fn interfaces<T: Interface>(&self, hash: DefHash) -> Vec<Arc<T>> {
         let mut out = Vec::new();
         if !self.retained.hash(hash) {
@@ -822,10 +750,7 @@ impl Frontend {
         self.decode_at::<DefBody>(slot.at)
     }
 
-    /// A body is name-free, so it is a function of its hash and one hash has one
-    /// body. A second, *different* body is that assumption failing, and which of
-    /// the two is wrong is exactly what nobody knows at that point — so the one
-    /// already stored stays.
+    /// A body is name-free, so it is a function of its hash and one hash has one body.
     pub(crate) fn put_body(&mut self, hash: DefHash, body: DefBody) -> StoredBody {
         let bytes = codec::encode_body(&body);
         if let Some(staged) = self.pending.bodies.get(&hash) {
@@ -974,29 +899,16 @@ impl Frontend {
         guard(&self.warnings).clear();
     }
 
-    /// What the data file holds that nothing in the index names: superseded
-    /// records, and anything a prune left behind. Reclaimed only when a person
-    /// asks, because the entries most likely to be garbage — a commented-out
-    /// function, the other side of a branch — are the ones most likely to come
-    /// back.
+    /// What the data file holds that nothing in the index names: superseded records, and anything a
+    /// prune left behind.
     pub(crate) fn garbage_bytes(&self) -> u64 {
         self.index
             .data_len()
             .saturating_sub(DATA_HEADER + self.index.live_bytes())
     }
 
-    /// Drops every fingerprint outside `keep`, and every interface and body
-    /// neither a surviving fingerprint nor `roots` declares. Nothing leaves the
-    /// disk until a flush.
-    ///
-    /// `roots` are hashes retained regardless of what any file declares now,
-    /// which is what keeps a definition that no longer exists in source
-    /// reconstructable.
-    /// Deadness can only change when a fingerprint does, so a run that changed
-    /// none of them has nothing to recompute — and recomputing it would mean
-    /// decoding every fingerprint in the project on a run that had no work to
-    /// do. Exposed separately because the caller's `roots` are expensive to
-    /// gather and pointless when the answer is no.
+    /// Drops every fingerprint outside `keep`, and every interface and body neither a surviving
+    /// fingerprint nor `roots` declares.
     pub(crate) fn prune_would_change(&self, keep: &BTreeSet<String>) -> bool {
         let surviving = self
             .source_keys()
@@ -1042,8 +954,8 @@ impl Frontend {
             decls: before.decls - after.decls,
             bodies: before.bodies - after.bodies,
         };
-        // A prune that drops nothing must leave the cache clean, or every run
-        // over an unchanged project rewrites the index.
+        // A prune that drops nothing must leave the cache clean, or every run over an unchanged
+        // project rewrites the index.
         if pruned == Pruned::default() {
             self.retained = was;
         }
@@ -1060,10 +972,6 @@ impl Frontend {
     }
 
     /// Appends this run's entries and rewrites the index over them.
-    ///
-    /// The caller must hold the cache lock: two processes appending to one file
-    /// interleave frames, which is corruption, where a lost update is only a
-    /// recheck.
     pub(crate) fn flush(
         &mut self,
         dir: &Path,
@@ -1071,8 +979,8 @@ impl Frontend {
         data_path: &Path,
     ) -> anyhow::Result<()> {
         let schema = self.schema;
-        // The index on disk may be newer than the one mapped at open, and its
-        // `data_len` and nonce are the authoritative ones.
+        // The index on disk may be newer than the one mapped at open, and its `data_len` and nonce
+        // are the authoritative ones.
         let disk = idx::read_index(index_path, schema).ok().and_then(|index| {
             let (nonce, data_len) = (index.nonce(), index.data_len());
             Data::open(data_path, nonce, data_len, schema)
@@ -1172,13 +1080,8 @@ impl Frontend {
         Ok(())
     }
 
-    /// Copies what the index names into a fresh data file, which is the only
-    /// thing that ever shrinks an append-only file.
-    ///
-    /// The data file is renamed before the index that names it, so a reader that
-    /// arrives between the two finds a nonce that does not pair and degrades to
-    /// an empty cache — never to a wrong offset. That window is why this is a
-    /// command a person runs rather than something a build does.
+    /// Copies what the index names into a fresh data file, which is the only thing that ever
+    /// shrinks an append-only file.
     pub(crate) fn compact(
         &mut self,
         dir: &Path,
@@ -1263,13 +1166,7 @@ impl Frontend {
     }
 }
 
-/// The cache key for a source file: its path relative to the store root, with
-/// `/` separators.
-///
-/// Relative so that a cache survives the checkout moving, and so that
-/// `ply test .` and `ply test /abs/path` agree. A path that cannot be expressed
-/// that way — not UTF-8, or escaping the root — yields `None`, and a file
-/// keyed `None` simply never takes the fast path.
+/// The cache key for a source file: its path relative to the store root, with `/` separators.
 pub(crate) fn source_key(root: &Path, path: &Path) -> Option<String> {
     use std::path::Component;
     let rel = path.strip_prefix(root).unwrap_or(path);

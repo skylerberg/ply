@@ -1,23 +1,4 @@
 //! What the spec tier actually buys, measured on a project rather than argued.
-//!
-//! `ply prove` reports a tier per obligation because that is what a reviewer
-//! needs. Three questions a reviewer does not ask, and a contributor does:
-//!
-//! - **the distribution.** How much of a real program's specification lands at
-//!   `proved`, and how much at `property`. A low proved fraction is a result,
-//!   not a bug, and hiding it would make this crate the marketing tool ADR 0007
-//!   §9.3 refuses to ship.
-//! - **the reach.** Of the obligations the static fragment did *not* decide,
-//!   which construct took them out of it. That histogram is the answer to
-//!   "where would I extend the prover", and nothing else in the system reports
-//!   it.
-//! - **the shrink.** What a counterexample cost before shrinking and after. A
-//!   shrinker that does not visibly reduce is not earning its place, and the
-//!   only way to know is to measure the pair.
-//!
-//! Nothing here re-implements a discharge: it drives the same [`Prover`] the
-//! command does, at the same plan, so a number taken here is a number a user
-//! would get.
 
 use anyhow::{Result, bail};
 use ply_cli::engine::{Prover, Reach};
@@ -39,9 +20,7 @@ pub struct Discharged {
     pub obligations: usize,
     pub tiers: Tiers,
     pub reach: ReachTable,
-    /// Why an obligation was not attempted at all, most common first. A
-    /// different population from the one the fragment failed to decide: nothing
-    /// here reached a tier by any route.
+    /// Why an obligation was not attempted at all, most common first.
     pub gaps: Vec<(String, usize)>,
     pub shrinks: Vec<Shrink>,
     pub discharge_millis: f64,
@@ -55,10 +34,8 @@ pub struct Tiers {
     pub refuted: usize,
     pub vacuous: usize,
     pub unattempted: usize,
-    /// `proved` obligations whose certificate came from execution — ground
-    /// evaluation, a covered finite domain, an emptied interleaving frontier —
-    /// rather than from a static argument. Reported apart because the two are
-    /// different claims that share a word.
+    /// `proved` obligations whose certificate came from execution — ground evaluation, a covered
+    /// finite domain, an emptied interleaving frontier — rather than from a static argument.
     pub proved_by_execution: usize,
 }
 
@@ -69,10 +46,6 @@ impl Tiers {
 }
 
 /// What the static fragment answered, over the obligations it was asked.
-///
-/// A concurrency law is not in any of these counts: it is decided by execution,
-/// and asking the static fragment about it would measure a question nobody put
-/// to it.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ReachTable {
     pub attempted: usize,
@@ -80,9 +53,7 @@ pub struct ReachTable {
     pub open: usize,
     pub budget_spent: usize,
     pub guard_unsatisfiable: usize,
-    /// Why an undecided obligation left the fragment, most common first. One
-    /// entry per obligation per distinct blocker, so an obligation calling the
-    /// same recursive definition twice counts once.
+    /// Why an undecided obligation left the fragment, most common first.
     pub blockers: Vec<(String, usize)>,
 }
 
@@ -220,8 +191,7 @@ fn reach(prover: &Prover<'_>, obligations: &[Obligation], plan: &ProvePlan) -> R
     table
 }
 
-/// A blocker's kind, without the definition it names. The name is what a
-/// contributor would look up; the kind is what a distribution is over.
+/// A blocker's kind, without the definition it names.
 fn label(blocker: &Blocker) -> String {
     match blocker {
         Blocker::RecursiveCall(_) => "recursive call (needs induction)",

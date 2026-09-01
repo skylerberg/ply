@@ -1,34 +1,4 @@
 //! The staleness guard that cannot be blamed on a machine.
-//!
-//! `w6_report_integrity.rs` compares the shipped ladder's *times* against a
-//! fresh take, and a reader is entitled to ask whether a wall clock on a busy
-//! laptop proves anything. This asks the same question in allocations, which
-//! are counted rather than timed: the same program on any machine makes the
-//! same number of them, so a difference here is a difference in the program.
-//!
-//! The number under test is the one ADR 0016 publishes as the size of a whole
-//! lever — what one `/health` request allocates to produce a 107-byte response
-//! — and which `benches/w6-ladder.json` carries in the `boxing on hot paths`
-//! alternative. A lever's size is what C3 is decided against.
-//!
-//! The count in the file is produced by `w6-alloc`, which `ply-corpus
-//! w6-ladder` runs and folds in, so re-taking the ladder re-takes this too.
-//!
-//! A `#[global_allocator]` is a whole-binary decision, which is why this is its
-//! own test binary rather than an assertion inside `w6_report_integrity.rs`.
-//!
-//! # The second test reads `README.md`, and it is the only test in the tree that
-//! reads a prose document
-//!
-//! It exists because that figure went stale twice in one milestone and the
-//! second time it went stale **inside the correction block written for the first
-//! time**. `README.md` §"Where this is not competitive" is what
-//! `CONTRIBUTING.md` §"Say how it was checked, or say it was not" holds up as
-//! the model for honest reporting, and it carried a present-tense count of
-//! 1,035 after the tree made 1,122, then a present-tense 1,122 after R3 took the
-//! tree to 1,082. Both were found by an adversarial reader rather than by
-//! anything that runs. `docs/ONBOARDING.md` §7's checked/written boundary moves
-//! by exactly this one line.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
@@ -87,11 +57,6 @@ fn number_before(text: &str, after: &str) -> Option<f64> {
 }
 
 /// What one `/health` request allocates, in a 200-request window.
-///
-/// 200 because that is the window every published figure was taken at, and the
-/// byte count may only be read at the window its baseline was taken at:
-/// `bytes_per_request` *rises* with the window, undiagnosed —
-/// `CONTRIBUTING.md` §"Things known to be broken" item 8.
 fn per_request() -> (f64, f64) {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service compiles");
     let request = ply_corpus::w6_run::head();
@@ -107,10 +72,6 @@ fn per_request() -> (f64, f64) {
 }
 
 /// What the shipped report says a request allocates, against what one does.
-///
-/// The band is a factor of two either way. Allocation counts do move with a
-/// refactor, and this is not a performance assertion — it is an assertion that
-/// the file and the program are describing the same request.
 #[test]
 fn the_shipped_allocation_evidence_still_describes_this_request_path() {
     let text = std::fs::read_to_string(repo().join("benches/w6-ladder.json"))
@@ -149,20 +110,6 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
 }
 
 /// What `README.md` says a request allocates, against what one does.
-///
-/// The band is **1%**, not the factor of two above, and the difference is
-/// deliberate: `benches/w6-ladder.json` is a dated artifact and its figure is
-/// past tense, while this sentence is present tense about this tree. A refactor
-/// that moves the count by one allocation moves what the README says, and the
-/// only thing that has ever caught that here is a reader.
-///
-/// Re-take it with `./target/release/w6-alloc --repo . --requests 200` and
-/// correct the sentence in place. Do not leave the old figure beside the new
-/// one — `CONTRIBUTING.md` §"Correct in place; git holds what it used to say".
-///
-/// The line number in the message below drifts with every edit above it in
-/// `README.md` — it moved 363 → 387 on 2026-08-27 — so the marker this searches
-/// for, not the number, is what finds the sentence.
 #[test]
 fn the_readme_still_describes_this_request_path() {
     let text = std::fs::read_to_string(repo().join("README.md")).expect("the repository ships one");

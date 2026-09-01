@@ -1,10 +1,4 @@
-//! The stop flag, the phase machine, and the one thing that gets a parked
-//! `accept` to return.
-//!
-//! Every test here is over real sockets or over the coordinator's own state.
-//! Nothing asserts what the *driver believes*: the question a drain has to
-//! answer is what the kernel and the client saw, and the driver's bookkeeping is
-//! not evidence about the driver.
+//! The stop flag, the phase machine, and the one thing that gets a parked `accept` to return.
 
 use super::*;
 use crate::tcp::{Net, TcpHost};
@@ -25,9 +19,7 @@ fn bounds(lead_ms: u64, drain_ms: u64) -> Bounds {
     }
 }
 
-/// Block until the phase machine has run, or give up. The coordinator runs on a
-/// thread of its own so that the signal reactor stays free to notice a second
-/// signal, which means every test has to wait for it rather than assume it.
+/// Block until the phase machine has run, or give up.
 fn until_stopped_accepting(shutdown: &Arc<Shutdown>) {
     let until = Instant::now() + Duration::from_secs(5);
     while !shutdown.stopped_accepting() && Instant::now() < until {
@@ -62,12 +54,10 @@ fn int(value: &Value) -> i64 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The flag and the clock
-// ---------------------------------------------------------------------------
+// clock ---------------------------------------------------------------------------
 
-/// `-1` is "no stop has been requested", and it is a number rather than an
-/// `Option` because every call site compares it against a duration.
+/// `-1` is "no stop has been requested", and it is a number rather than an `Option` because every
+/// call site compares it against a duration.
 #[test]
 fn a_running_service_has_no_deadline() {
     let shutdown = Shutdown::new(Bounds::default());
@@ -77,10 +67,7 @@ fn a_running_service_has_no_deadline() {
     assert!(shutdown.elapsed().is_none());
 }
 
-/// The drain starts when accept stops, not when the signal arrived. Charging the
-/// lead to the drain would silently shorten the drain by the lead, and a
-/// deployment that asked for a two second lead and a thirty second drain would
-/// get twenty-eight.
+/// The drain starts when accept stops, not when the signal arrived.
 #[test]
 fn the_lead_is_not_charged_to_the_drain() {
     let shutdown = Shutdown::new(bounds(150, 5_000));
@@ -123,9 +110,7 @@ fn a_drain_that_runs_out_says_so() {
     );
 }
 
-/// A second signal means a person has decided to stop waiting. The coordinator
-/// reports it rather than starting a second phase machine; the caller — never a
-/// signal handler — is what exits.
+/// A second signal means a person has decided to stop waiting.
 #[test]
 fn a_second_signal_is_refused_rather_than_started_again() {
     let shutdown = Shutdown::new(bounds(0, 5_000));
@@ -148,12 +133,10 @@ fn the_exit_codes_are_the_shell_convention() {
     assert_eq!(Signal::Terminate.exit_code(), 143);
 }
 
-// ---------------------------------------------------------------------------
-// Phase 2, over real sockets
-// ---------------------------------------------------------------------------
+// sockets ---------------------------------------------------------------------------
 
-/// The exit criterion of ADR 0015 §4.3, at the boundary: a program's accept loop
-/// ends because `accept` answered `0`, and not one line of it changed.
+/// The exit criterion of ADR 0015 §4.3, at the boundary: a program's accept loop ends because
+/// `accept` answered `0`, and not one line of it changed.
 #[test]
 fn accept_answers_zero_once_the_run_has_stopped_accepting() {
     let host = Arc::new(TcpHost::new());
@@ -177,10 +160,8 @@ fn accept_answers_zero_once_the_run_has_stopped_accepting() {
     );
 }
 
-/// The listener handle stays usable after the drain closed it, because
-/// `examples/desk.ply` closes it after the loop returns and §4.3 claims that
-/// program needs no source change. A `net.close` that became `E0502` would make
-/// that claim false in the last line of the program.
+/// The listener handle stays usable after the drain closed it, because `examples/desk.ply` closes
+/// it after the loop returns and §4.3 claims that program needs no source change.
 #[test]
 fn the_program_can_still_close_a_listener_the_drain_closed() {
     let host = Arc::new(TcpHost::new());
@@ -194,9 +175,7 @@ fn the_program_can_still_close_a_listener_the_drain_closed() {
         .expect("the program's own `net.close` still succeeds");
 }
 
-/// The one that would otherwise hang the drain. An idle service is parked in
-/// `accept` with no client coming, and a blocking `accept` returns for a
-/// connection and for nothing else — so the drain dials the listener itself.
+/// The one that would otherwise hang the drain.
 #[test]
 fn a_parked_accept_returns_when_the_run_stops_accepting() {
     let host = Arc::new(TcpHost::new());
@@ -242,10 +221,8 @@ fn a_parked_accept_returns_when_the_run_stops_accepting() {
     );
 }
 
-/// A client that connects in the instant the run stops accepting gets a closed
-/// connection rather than half a response. The lead phase is what a deployment
-/// uses to take the instance out of rotation; a connection that arrives after it
-/// is one a retry can fix, and a truncated response is one it cannot.
+/// A client that connects in the instant the run stops accepting gets a closed connection rather
+/// than half a response.
 #[test]
 fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     let host = Arc::new(TcpHost::new());
@@ -282,9 +259,7 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     if let Ok(stream) = &mut client {
         let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
         let mut buffer = [0u8; 16];
-        // End of stream or a reset. What a client must never see here is a
-        // partial response, and a run that answered one would have had to accept
-        // the connection into the socket table to write it.
+        // End of stream or a reset.
         let read = stream.read(&mut buffer);
         assert!(
             matches!(&read, Ok(0) | Err(_)),
@@ -299,8 +274,8 @@ fn a_connection_accepted_at_the_stop_is_closed_rather_than_served() {
     );
 }
 
-/// Idempotent, because a second signal, a `Drop` and an explicit teardown can
-/// all reach it and none of them may raise on the others' account.
+/// Idempotent, because a second signal, a `Drop` and an explicit teardown can all reach it and none
+/// of them may raise on the others' account.
 #[test]
 fn stopping_twice_closes_the_listeners_once() {
     let host = TcpHost::new();
@@ -314,8 +289,8 @@ fn stopping_twice_closes_the_listeners_once() {
     );
 }
 
-/// The addresses survive the close, because the drain dials them *after* it has
-/// closed them and a closed entry holds no socket to ask.
+/// The addresses survive the close, because the drain dials them *after* it has closed them and a
+/// closed entry holds no socket to ask.
 #[test]
 fn the_drain_can_still_name_a_listener_it_closed() {
     let listener = TcpListener::bind("127.0.0.1:0").expect("a loopback port");
@@ -337,14 +312,8 @@ fn the_drain_can_still_name_a_listener_it_closed() {
     );
 }
 
-// ---------------------------------------------------------------------------
-// The registrations
-// ---------------------------------------------------------------------------
-
-/// Both operations are reads of a flag, so replaying one changes nothing outside
-/// the program and neither waits on a peer. `Repeatable` is the column that
-/// silently re-opens multi-shot resumption over the boundary, so it is asserted
-/// rather than assumed.
+/// Both operations are reads of a flag, so replaying one changes nothing outside the program and
+/// neither waits on a peer.
 #[test]
 fn the_registrations_declare_what_a_reviewer_relies_on() {
     let shutdown = Shutdown::new(Bounds::default());
@@ -413,8 +382,8 @@ fn the_handler_answers_the_flag_and_the_clock() {
     assert_eq!(answer(stopping), Value::Bool(true));
     assert!(int(&answer(deadline)) > 0);
 
-    // Arity is inference's, so reaching the handler with the wrong count means
-    // the evaluator was handed a module that was never checked.
+    // Arity is inference's, so reaching the handler with the wrong count means the evaluator was
+    // handed a module that was never checked.
     let extra = [Value::Unit];
     match stopping.call(&Nothing, &request(&atom, &declaration, &extra)) {
         Err(d) => assert_eq!(d.code, codes::INTERNAL_ERROR),

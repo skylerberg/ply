@@ -1,5 +1,5 @@
-//! The two files M8 adds, and the one property that makes them affordable:
-//! neither is read at [`Store::open`].
+//! The two files M8 adds, and the one property that makes them affordable: neither is read at
+//! [`Store::open`].
 
 use ply_hash::DefHash;
 use ply_span::Symbol;
@@ -10,9 +10,9 @@ use ply_store::{
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// A unique directory under the system temp dir, removed on drop — the same
-/// device this crate's unit tests use, and for the same reason: a
-/// dev-dependency for one `mkdir` is not worth the build time.
+/// A unique directory under the system temp dir, removed on drop — the same device this crate's
+/// unit tests use, and for the same reason: a dev-dependency for one `mkdir` is not worth the build
+/// time.
 struct TempRoot(PathBuf);
 
 impl TempRoot {
@@ -96,10 +96,7 @@ fn an_obligation_survives_a_flush_and_a_reopen_with_its_evidence_intact() {
     assert_eq!(store.obligations_len(), 2);
 }
 
-/// The recorded tier is written down so that a disagreement with the evidence is
-/// *detectable*. Nothing here computes a tier — that belongs beside the rule —
-/// but the label has to survive the round trip byte for byte or the check on the
-/// other side has nothing to compare against.
+/// The recorded tier is written down so that a disagreement with the evidence is *detectable*.
 #[test]
 fn the_recorded_tier_survives_the_round_trip() {
     let dir = TempRoot::new("t");
@@ -143,9 +140,7 @@ fn a_file_written_by_another_prover_is_discarded_whole() {
     );
 }
 
-/// The budget `Store::open` has predates all three lazily-read files. A corrupt
-/// file that produces no warning until it is *asked* something is the sharpest
-/// available evidence that opening did not read it.
+/// The budget `Store::open` has predates all three lazily-read files.
 #[test]
 fn neither_file_is_read_at_open() {
     let dir = TempRoot::new("t");
@@ -193,9 +188,7 @@ fn a_review_record_is_keyed_by_name_and_sorts_its_specs() {
     assert_eq!(store.review_records_len(), 1);
 }
 
-/// `ply cache clear` means "prove everything again". It does **not** mean "throw
-/// away what a person accepted": that is the one thing in the cache directory no
-/// amount of CPU can reproduce.
+/// `ply cache clear` means "prove everything again".
 #[test]
 fn clearing_the_cache_discards_the_obligations_and_keeps_the_review_baseline() {
     let dir = TempRoot::new("t");
@@ -216,8 +209,8 @@ fn clearing_the_cache_discards_the_obligations_and_keeps_the_review_baseline() {
     );
 }
 
-/// Two runs must not discard each other's work, so a flush merges rather than
-/// replaces — the same rule the result cache follows, under the same lock.
+/// Two runs must not discard each other's work, so a flush merges rather than replaces — the same
+/// rule the result cache follows, under the same lock.
 #[test]
 fn a_flush_merges_with_what_another_run_wrote() {
     let dir = TempRoot::new("t");
@@ -235,10 +228,9 @@ fn a_flush_merges_with_what_another_run_wrote() {
     assert_eq!(store.obligation(key(2)), Some(&sample(200)));
 }
 
-/// The reason there are two version constants: a prover that learns a new rule
-/// must upgrade a tier without invalidating a single test result, and a change
-/// to evaluation must invalidate results without touching a proof that never ran
-/// a program. Discarding one file must therefore leave the other standing.
+/// The reason there are two version constants: a prover that learns a new rule must upgrade a tier
+/// without invalidating a single test result, and a change to evaluation must invalidate results
+/// without touching a proof that never ran a program.
 #[test]
 fn discarding_the_obligations_leaves_every_test_result_where_it_was() {
     let dir = TempRoot::new("t");
@@ -265,8 +257,8 @@ fn discarding_the_obligations_leaves_every_test_result_where_it_was() {
     assert!(store.knows_definition(key(6)));
 }
 
-/// A run that answered every question from the cache has nothing to write, and
-/// must not rewrite the file to say so.
+/// A run that answered every question from the cache has nothing to write, and must not rewrite the
+/// file to say so.
 #[test]
 fn re_recording_what_is_already_stored_is_not_a_write() {
     let dir = TempRoot::new("t");

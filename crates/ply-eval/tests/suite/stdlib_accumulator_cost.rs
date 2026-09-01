@@ -1,39 +1,5 @@
-//! Whether the standard library's own accumulators copy, counted rather than
-//! timed — **and on which of the two engines they do not**.
-//!
-//! ADR 0020 §4.1 found `std.json`'s string serializer quadratic in the number of
-//! escapes in one string — client-influenced input, in shipped code — and
-//! `spikes/ply-lexer/GAPS.md` §1 gives the rule it breaks: a growing container
-//! must be built in the **last sub-expression of its enclosing node**, or the
-//! pending frame carries the scope, the accumulator is at two owners, and `push`
-//! takes its copying branch (`builtins.rs:456-473`). A survey with this counter
-//! found the same shape at three sites and all three were fixed: `json.ply`'s
-//! `escape_runs`, `router.ply`'s `numbered`, `trace.ply`'s `append`.
-//!
-//! **The rule, and therefore the fix, is the machine engine's.** The
-//! tree-walker runs no reference counting at all: `Interp::lookup` answers every
-//! `Var` with `v.clone()`, `Own` exists only on `code::Node` — which lowering
-//! produces and the tree-walker has no lowering step — and neither
-//! `Env::take_unique` nor `rc::carry` has a call site in `interp.rs`. So the
-//! accumulator is at two owners at *every* `push` whatever position it is
-//! written in, `Arc::get_mut` fails, and all three sites stay quadratic there.
-//! That is not a suspicion; it is
-//! `all_three_fixes_are_the_machine_engines_only` below, which pins one copy
-//! per element on the tree-walker so that the day somebody makes it reuse, this
-//! file fails and names the documents to correct.
-//!
-//! The property is stated as a **count, not a duration**. `rc::stats` is
-//! deterministic — two runs of one program agree to the digit whatever the
-//! machine is doing — so this belongs in the parallel shards rather than in
-//! `.github/ci-shards.sh`'s `DEFERRED` table, which exists for tests whose
-//! assertion reads a wall clock.
-//!
-//! **This raises a shipped bound and says so.** `escape_runs` holds one frame
-//! per escape against `limit::DEFAULT_MAX_CALLS` (10,000), so `ply test` cannot
-//! encode a string of more than 9,993 escapes at all. The two largest sizes here
-//! run with `with_max_calls` raised to 200,000, which is what lets the count be
-//! read well past the depth the clock can reach. It buys reach, not headroom:
-//! the shipped ceiling is unchanged and no shipped program gets these sizes.
+//! Whether the standard library's own accumulators copy, counted rather than timed — **and on which
+//! of the two engines they do not**.
 
 use ply_eval::{Interp, Machine, TaskRegions, rc};
 use ply_span::{SourceMap, Symbol};
@@ -41,13 +7,8 @@ use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
 use ply_syntax::resolve::{Resolved, resolve};
 
-/// A probe that encodes a string of `k` characters, against `std.json` as it
-/// ships — `ply_std::source`, not a copy of the shape.
-///
-/// `byte` is what every character of the subject is: `\"` when the point is to
-/// make every position an escape, an ordinary letter when the point is that
-/// none of them is. The encoded length is asserted inside the probe, so a
-/// probe that silently encodes something else fails rather than being counted.
+/// A probe that encodes a string of `k` characters, against `std.json` as it ships —
+/// `ply_std::source`, not a copy of the shape.
 fn json_probe(k: usize, byte: &str, encoded_width: usize) -> String {
     format!(
         r#"
@@ -67,14 +28,6 @@ test "enc" {{
 }
 
 /// `std.router`'s `numbered`, driven through the public `well_formed`.
-///
-/// Nothing but `numbered` performs a `push` here: the table is `map` over
-/// `range` and each pattern is a list literal, both of which allocate their
-/// answer whole, and `well_formed`'s fold calls `concat_faults` with the empty
-/// fault list of a well-formed table. The probe asserts the table *is* well
-/// formed, so one that started reporting faults would fail rather than be
-/// counted with the pushes those faults cost. Confirmed by the count itself:
-/// exactly `n` pushes for `n` routes, no slack used.
 fn router_probe(n: usize) -> String {
     format!(
         r#"
@@ -95,11 +48,6 @@ test "wf" {{
 }
 
 /// `std.trace`'s `append`, driven through the public `event_step`.
-///
-/// The sink is the **last** argument of `fill` on purpose. Written
-/// `fill(event_step(s, ..), n - 1)` this probe would be quadratic for a reason
-/// that is the probe's and not `append`'s — `GAPS.md` §1 is about the caller as
-/// much as the callee — and the count would be measuring this file.
 fn trace_probe(n: usize) -> String {
     format!(
         r#"
@@ -119,12 +67,8 @@ test "tr" {{
     )
 }
 
-/// The probe, plus `roots` and everything they import, transitively — against
-/// the modules as they ship (`ply_std::source`), never a copy of the shape.
-///
-/// Transitively, because `std.router` imports `std.http` which imports
-/// `std.net`, and a module left out is an unresolved name rather than a
-/// different measurement.
+/// The probe, plus `roots` and everything they import, transitively — against the modules as they
+/// ship (`ply_std::source`), never a copy of the shape.
 fn load(src: &str, roots: &[&str]) -> (Program, Resolved) {
     let mut map = SourceMap::new();
     let probe_id = map.add("probe.ply", src.to_string());
@@ -161,34 +105,29 @@ fn load(src: &str, roots: &[&str]) -> (Program, Resolved) {
     (program, resolved)
 }
 
-/// The pushes one run performed, and how many of them copied the accumulator
-/// rather than rewriting it.
+/// The pushes one run performed, and how many of them copied the accumulator rather than rewriting
+/// it.
 struct Counted {
     updates: u64,
     copies: u64,
 }
 
-/// One accumulator site: what to call it, how to drive it at a size, and the
-/// sizes to drive it at.
+/// One accumulator site: what to call it, how to drive it at a size, and the sizes to drive it at.
 type Site = (&'static str, fn(usize, Engine) -> Counted, &'static [usize]);
 
 /// Which evaluator the counters are taken on.
-///
-/// Ply ships two and `--engine both` is the audit that catches one drifting from
-/// the other, so a cost claim naming neither is a claim about half the product.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Engine {
     Machine,
     Treewalk,
 }
 
-/// Counters are per thread and cumulative, so this takes them either side of the
-/// one test rather than resetting them — a reset would discard whatever a
-/// neighbouring test on this thread had counted.
+/// Counters are per thread and cumulative, so this takes them either side of the one test rather
+/// than resetting them — a reset would discard whatever a neighbouring test on this thread had
+/// counted.
 fn count(program: &Program, resolved: &Resolved, engine: Engine) -> Counted {
-    // By module and ordinal, never by index into the whole program: `std.json`
-    // ships 37 tests of its own, so `eval_test(0)` counts one of those and
-    // `test_count()` is 38. The first shape of this test did exactly that.
+    // By module and ordinal, never by index into the whole program: `std.json` ships 37 tests of
+    // its own, so `eval_test(0)` counts one of those and `test_count()` is 38.
     let probe = Symbol::from("probe");
     let before = rc::stats();
     let outcome = match engine {
@@ -205,10 +144,8 @@ fn count(program: &Program, resolved: &Resolved, engine: Engine) -> Counted {
     };
     let after = rc::stats();
 
-    // The signature failure here is a green count over a program that never ran:
-    // a probe that fails to run performs no pushes and would sail past a
-    // `copies <= 8` bound. The run has to have succeeded for the count to mean
-    // anything.
+    // The signature failure here is a green count over a program that never ran: a probe that fails
+    // to run performs no pushes and would sail past a `copies <= 8` bound.
     outcome.unwrap_or_else(|d| {
         panic!("the probe did not run on {engine:?}, so its counters measure nothing: {d:#?}")
     });
@@ -238,29 +175,18 @@ fn trace_on(n: usize, engine: Engine) -> Counted {
 /// Every escape in the subject, so `k` is the number of escapes.
 const ESCAPE: &str = "\\\"";
 
-/// The sizes the `json` claim is read at. The last two are past the shipped call
-/// ceiling and are reachable only because `count` raises it.
+/// The sizes the `json` claim is read at.
 const SIZES: [usize; 6] = [1_000, 2_000, 4_000, 8_000, 16_000, 32_000];
 
-/// The sizes the `router` and `trace` claims are read at — the ones ADR 0020 §7
-/// item 3 reports the survey's before-counts at.
+/// The sizes the `router` and `trace` claims are read at — the ones ADR 0020 §7 item 3 reports the
+/// survey's before-counts at.
 const TABLE_SIZES: [usize; 3] = [200, 400, 800];
 
-/// Slack for pushes that are not the accumulator's — a probe's own scaffolding
-/// and whatever the callee does around it. A **constant**, deliberately: the
-/// defect makes this number a function of the size, so any constant refuses it.
-/// All three probes in fact use none of it.
+/// Slack for pushes that are not the accumulator's — a probe's own scaffolding and whatever the
+/// callee does around it.
 const SLACK: u64 = 8;
 
 /// **`std.json`'s string serializer must not copy its accumulator per escape.**
-///
-/// The bound is a constant against a `k` that grows 32-fold, so the quadratic
-/// this was written against — one whole-accumulator copy per escape, ADR 0020
-/// §7 item 3 — fails it at every size by three orders of magnitude, and no
-/// threshold-tuning makes the two outcomes close.
-///
-/// **On the machine engine.** The tree-walker still copies once per escape and
-/// `all_three_fixes_are_the_machine_engines_only` is where that is pinned.
 #[test]
 fn encoding_a_string_of_escapes_copies_the_accumulator_a_constant_number_of_times() {
     println!("{:>8} {:>10} {:>10}", "k", "updates", "copies");
@@ -269,8 +195,8 @@ fn encoding_a_string_of_escapes_copies_the_accumulator_a_constant_number_of_time
         let counted = encode_on(k, ESCAPE, 2, Engine::Machine);
         println!("{:>8} {:>10} {:>10}", k, counted.updates, counted.copies);
 
-        // Proves the encode reached the accumulator loop rather than answering
-        // early: one push per escape is the shape, whatever the copying does.
+        // Proves the encode reached the accumulator loop rather than answering early: one push per
+        // escape is the shape, whatever the copying does.
         assert!(
             counted.updates >= k as u64,
             "k = {k} performed only {} pushes, so this is not measuring `escape_runs`",
@@ -280,11 +206,8 @@ fn encoding_a_string_of_escapes_copies_the_accumulator_a_constant_number_of_time
             failures.push(format!("k = {k}: {} copies", counted.copies));
         }
     }
-    // The module's headline property, which the fix had to leave alone: "a string
-    // with no escapes costs one pass and one copy" (`json.ply`, above
-    // `escape_runs`). One `push`, whatever the length — a fix that bought the
-    // linear shape by splitting every clean string into pieces would show up
-    // here as a count that grows.
+    // The module's headline property, which the fix had to leave alone: "a string with no escapes
+    // costs one pass and one copy" (`json.ply`, above `escape_runs`).
     for k in [1_000usize, 32_000] {
         let clean = encode_on(k, "a", 1, Engine::Machine);
         println!(
@@ -312,16 +235,6 @@ fn encoding_a_string_of_escapes_copies_the_accumulator_a_constant_number_of_time
 }
 
 /// **The other two sites the survey fixed, gated at last.**
-///
-/// ADR 0020 §7 item 3 records that the same counter found the same shape in
-/// `router.ply`'s `numbered` (the growing field first of two, on the build-time
-/// table check) and `trace.ply`'s `append` (first of three, on a serving path),
-/// and that both were fixed — but nothing asserted it afterwards. The nearest
-/// test, `ply-corpus`'s `what_the_route_table_costs_to_rebuild`, prints a
-/// microsecond figure and asserts nothing at all, so "it passed" was never
-/// evidence about either.
-///
-/// One bound per site, each armed against a revert of **its own** literal.
 #[test]
 fn the_route_table_and_the_trace_sink_do_not_copy_their_accumulators_either() {
     println!("{:>8} {:>10} {:>10}  site", "n", "updates", "copies");
@@ -340,9 +253,8 @@ fn the_route_table_and_the_trace_sink_do_not_copy_their_accumulators_either() {
                 n, counted.updates, counted.copies
             );
 
-            // Same guard as the `json` bound above, and for the same reason: a
-            // probe that answered early would perform no pushes and sail past a
-            // constant.
+            // Same guard as the `json` bound above, and for the same reason: a probe that answered
+            // early would perform no pushes and sail past a constant.
             assert!(
                 counted.updates >= n as u64,
                 "n = {n} performed only {} pushes, so this is not measuring {site}",
@@ -365,39 +277,8 @@ fn the_route_table_and_the_trace_sink_do_not_copy_their_accumulators_either() {
     );
 }
 
-/// **The three fixes hold on the machine engine and on that engine only, and
-/// this is what says so.**
-///
-/// Ply ships two evaluators and `--engine both` exists to catch one drifting
-/// from the other. It compares *answers* — diagnostics, footprints, cell state
-/// — so a divergence in **cost** passes it silently, and that is exactly what
-/// these three fixes are. Measured here rather than argued: on the tree-walker
-/// every `push` copies, so `copies == updates` at all three sites, at every
-/// size, after the fix as before it.
-///
-/// The mechanism, read off `crates/ply-eval/`:
-///
-/// - the machine stamps each `Var` with [`ply_eval::Own`] during lowering
-///   (`code.rs`, `lower_node`) from `rc::Live`'s backward walk, and moves the
-///   value out of the scope at an `Own::Owned` occurrence (`machine.rs`, the
-///   `NodeKind::Var` arm, `Env::take_unique`);
-/// - a frame that will not read its scope again carries `Env::empty()` instead
-///   (`rc::carry`, eight call sites in `frame.rs`, `machine.rs`, `handler.rs`);
-/// - the tree-walker does **neither**. It evaluates the AST, which has no `own`
-///   field because only lowering produces one; `Interp::lookup` answers
-///   `Slot::Live(v) => Ok(v.clone())` unconditionally; `interp.rs` contains no
-///   `take_unique` and no `carry`; and `Interp::eval` holds its scope by shared
-///   reference, so the caller's bindings are live for the whole of every
-///   subexpression by construction.
-///
-/// So the accumulator is at two owners at every `push` there — the binding plus
-/// the argument clone — `Arc::get_mut` fails, and position cannot help.
-///
-/// **This test is a disclosure with an assertion under it.** It fails if the
-/// tree-walker ever starts reusing, which is good news and still a failure,
-/// because the six documents its message names would then all be wrong. A
-/// disclosure nothing asserts is a claim waiting to go stale, which is the
-/// defect class this repository spends most of its review budget on.
+/// **The three fixes hold on the machine engine and on that engine only, and this is what says
+/// so.**
 #[test]
 fn all_three_fixes_are_the_machine_engines_only() {
     println!(

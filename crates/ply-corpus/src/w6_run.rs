@@ -1,14 +1,4 @@
 //! Taking the W6 ladder, so that `w6.rs` only has to assemble and judge it.
-//!
-//! ADR 0016 §1.1 is the whole method: every rung is **two absolutes taken in
-//! one arena in one run**, differing in one substitution. Nothing here is timed
-//! from inside the machine. The two arenas are kept apart on purpose —
-//! [`in_process`] takes rungs 1–6 with no syscall variance in the middle of a
-//! parse, [`served`] takes rungs 7–9 by moving a flag on the real binary — and
-//! the seam between them is printed as the residue rather than smoothed over.
-//!
-//! What is measured here and what is quoted: nothing is quoted. Every number in
-//! the report this produces was taken by this file in one run on one machine.
 
 use anyhow::{Context, Result, bail};
 use ply_eval::Value;
@@ -28,18 +18,10 @@ fn micros(d: Duration) -> f64 {
     d.as_secs_f64() * 1e6
 }
 
-/// The route the ladder is built around. One `select`, a list of records
-/// through a derived JSON encoder — the shape a real read endpoint has.
-/// The route the served rungs above the socket are taken on: one `select`, a
-/// list of records through a derived JSON encoder, which is the shape a real
-/// read endpoint has. The lower rungs cannot be taken on it (see [`ROUTE`]).
+/// The route the ladder is built around.
 const DB_ROUTE: &str = "/items";
 
 /// Requests one connection carries, on every rung that has a connection.
-///
-/// The served rows this ladder is read against reuse a connection, so the rungs
-/// do too: connection set-up is a per-connection cost and putting it inside a
-/// per-request layer would price a regime the total is not in.
 const PER_CONN: u32 = 32;
 
 /// A script of connections each carrying [`PER_CONN`] requests.
@@ -49,17 +31,10 @@ fn keep_alive_script(request: &[u8], requests: u32) -> Vec<Vec<Vec<u8>>> {
         .collect()
 }
 
-/// The route rungs 1–6 are taken on. `/health` rather than `/items` for the
-/// reason ADR 0016 §1.2 anticipates: a pure call to the `/items` handler needs
-/// a store, and the only store available in process is `std.db`'s memory
-/// engine, whose SQL scanner would land inside the `endpoint` layer and is on
-/// no served request path. `/items` is priced separately, and the served rungs
-/// are taken on it.
+/// The route rungs 1–6 are taken on.
 const ROUTE: &str = "/health";
 
-/// The service with the ladder's driver appended, exactly as the rungs measure
-/// it. Public so a test can count what a request allocates without a second
-/// copy of the program under measurement.
+/// The service with the ladder's driver appended, exactly as the rungs measure it.
 pub fn program(repo: &Path) -> Result<w3::Loaded> {
     let service = w3::Service::open(repo)?;
     let source = format!("{}{DRIVER}", service.source(w3::Variant::Sequential)?);
@@ -67,30 +42,12 @@ pub fn program(repo: &Path) -> Result<w3::Loaded> {
 }
 
 /// The head every in-process rung answers.
-///
-/// No `Connection: close`: the rungs reuse a connection for [`PER_CONN`]
-/// requests, as the served rows do, and the client closes it when it has had
-/// them. A head that asked the service to close would price a connection
-/// set-up per request that the total this ladder is read against does not pay.
 pub fn head() -> Vec<u8> {
     w3::request("GET", ROUTE, None, false, 0, 0)
 }
 
-/// The four in-Ply loops rungs 2, 3 and 4 are read off, and the empty one that
-/// says what the loop itself costs.
-///
-/// One `Machine::call` runs `n` iterations, so the twin's fixture — a `MemDb`
-/// built from the seed shelf — is paid once and amortized rather than landing
-/// inside a layer. `w6_empty` is what separates it: taken at two counts it
-/// gives the fixture and the loop scaffold their own numbers, and both are
-/// reported rather than folded into `endpoint`.
-///
-/// Each loop adds exactly one thing to the one below it and nothing else, which
-/// is what makes the difference a layer:
-///
-/// - `w6_endpoint` calls the route's handler,
-/// - `w6_framed` adds `parse_head` before it and `encode` after it,
-/// - `w6_routed` adds `route_of`, which builds the ten-route table and matches.
+/// The four in-Ply loops rungs 2, 3 and 4 are read off, and the empty one that says what the loop
+/// itself costs.
 const DRIVER: &str = r#"
 
 // --- W6: the in-process ladder's driver -------------------------------------
@@ -225,11 +182,6 @@ fn w6_items(mode: Int, n: Int) -> Int =
 "#;
 
 /// What the in-process half measured, in the units the ladder wants.
-///
-/// Every rung carries the best of its repeats **and the worst**, because a
-/// layer is a difference between two of these and a difference of two best-of
-/// numbers has no width. The `_worst_` fields are what
-/// [`w6::Rung::layer_low_micros`] and the share's band are read off.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct InProcess {
     /// One `Machine::call` on a function returning a constant.
@@ -240,15 +192,10 @@ pub struct InProcess {
     pub routed_worst_micros: f64,
     pub sim_worst_micros: f64,
     pub socket_worst_micros: f64,
-    /// The floor answering the response `/items` returns, which is what the
-    /// measured total serves. The `/health`-sized floor is beside it, because a
-    /// multiple whose numerator and denominator answer different bytes is not a
-    /// multiple.
+    /// The floor answering the response `/items` returns, which is what the measured total serves.
     pub items_floor_micros: f64,
     pub items_response_bytes: usize,
-    /// The in-Ply loop's own per-iteration cost, and the twin fixture the loop
-    /// is wrapped in. Neither is a rung; both are reported because rungs 2–4
-    /// are read off a loop and a reader is owed what the loop cost.
+    /// The in-Ply loop's own per-iteration cost, and the twin fixture the loop is wrapped in.
     pub loop_micros: f64,
     pub fixture_micros: f64,
     pub endpoint_micros: f64,
@@ -260,14 +207,10 @@ pub struct InProcess {
     pub socket_micros: f64,
     /// The same accept/recv/send/close in Rust, answering the same bytes.
     pub floor_micros: f64,
-    /// The routing rung with the route table hoisted out of the loop, and
-    /// `table()` on its own. The first says what caching the table would buy a
-    /// request; the second says what building it costs.
+    /// The routing rung with the route table hoisted out of the loop, and `table()` on its own.
     pub cached_micros: f64,
     pub table_micros: f64,
     /// `/items` over the twin: the handler, and the twin's SQL scan under it.
-    /// Neither is a rung — `/items` is served against postgres — and both are
-    /// reported because the difference is what the in-memory store costs.
     pub items_endpoint_micros: f64,
     pub items_scan_micros: f64,
     pub requests: u32,
@@ -278,10 +221,6 @@ pub struct InProcess {
 }
 
 /// The best and the worst of one measurement's repeats.
-///
-/// Best-of is what a rung is read off — everything a run adds to the cost of
-/// the work is additive — and worst-of is what says how much of the difference
-/// between two rungs is the layer and how much is the machine.
 #[derive(Clone, Copy, Debug)]
 struct Repeated {
     best: f64,
@@ -309,7 +248,7 @@ impl Repeated {
     }
 }
 
-/// Rungs 1–6 and the floor. One thread, the machine engine, no CLI, no child.
+/// Rungs 1–6 and the floor.
 pub fn in_process(
     repo: &Path,
     requests: u32,
@@ -342,9 +281,9 @@ pub fn in_process(
         Ok(seen)
     };
 
-    // Two counts of the empty loop separate the fixture from the scaffold: the
-    // slope is what one iteration costs and the intercept is what building the
-    // `MemDb` cost, and neither has to be assumed.
+    // Two counts of the empty loop separate the fixture from the scaffold: the slope is what one
+    // iteration costs and the intercept is what building the `MemDb` cost, and neither has to be
+    // assumed.
     let empty_one = mode(0, iterations)?.best;
     let empty_half = mode(0, iterations / 2)?.best;
     let per_iteration = (empty_one - empty_half) / (iterations - iterations / 2) as f64;
@@ -419,14 +358,8 @@ pub fn in_process(
     })
 }
 
-/// The whole service over a real listener, in this process: the same
-/// `run_memory` the `SimNet` rung calls, with `ply_host`'s TCP handler under it
-/// instead of the twin.
-///
-/// The connection carries [`PER_CONN`] requests, because the served total this
-/// ladder is read against does. A rung that opened a connection per request
-/// would carry an accept, a close and a `serve_connection` set-up the total does
-/// not pay, and the difference would land in the residue as a negative number.
+/// The whole service over a real listener, in this process: the same `run_memory` the `SimNet` rung
+/// calls, with `ply_host`'s TCP handler under it instead of the twin.
 fn over_socket(loaded: &w3::Loaded, request: &[u8], requests: u32) -> Result<Duration> {
     let port = reserve_port()?;
     let host = Arc::new(ply_host::Host::new());
@@ -470,9 +403,8 @@ fn over_socket(loaded: &w3::Loaded, request: &[u8], requests: u32) -> Result<Dur
     Ok(taken)
 }
 
-/// The denominator: the same accept, read, write and close in Rust, answering
-/// the bytes the service answers, driven by the same client over connections
-/// carrying the same number of requests.
+/// The denominator: the same accept, read, write and close in Rust, answering the bytes the service
+/// answers, driven by the same client over connections carrying the same number of requests.
 fn rust_floor(request: &[u8], response: &[u8], requests: u32) -> Result<Duration> {
     let listener = TcpListener::bind("127.0.0.1:0").context("binding the floor's listener")?;
     let port = listener.local_addr()?.port();
@@ -491,8 +423,8 @@ fn rust_floor(request: &[u8], response: &[u8], requests: u32) -> Result<Duration
                 break;
             }
             at += read;
-            // One head per `\r\n\r\n`, which is all the floor has to find: the
-            // requests carry no body.
+            // One head per `\r\n\r\n`, which is all the floor has to find: the requests carry no
+            // body.
             while let Some(end) = find(&buf[..at], b"\r\n\r\n") {
                 socket.write_all(response)?;
                 answered += 1;
@@ -517,19 +449,13 @@ fn find(hay: &[u8], needle: &[u8]) -> Option<usize> {
     hay.windows(needle.len()).position(|w| w == needle)
 }
 
-/// Connections a rung opens to make `requests` of them, rounded up so the two
-/// sides of a pair answer the same count.
+/// Connections a rung opens to make `requests` of them, rounded up so the two sides of a pair
+/// answer the same count.
 fn connections_for(requests: u32) -> u32 {
     requests.div_ceil(PER_CONN).max(1)
 }
 
-/// [`PER_CONN`] requests down one connection, then the next connection. The
-/// thread starts before the listener is bound, so it retries: a benchmark that
-/// raced the bind would report a refusal as a server defect.
-///
-/// The response is framed by `Content-Length`, which is what every route the
-/// ladder measures answers with. A client that read to end of stream instead
-/// would be a client that cannot reuse a connection.
+/// [`PER_CONN`] requests down one connection, then the next connection.
 fn spawn_client(
     port: u16,
     request: Vec<u8>,
@@ -591,13 +517,8 @@ fn spawn_client(
     })
 }
 
-/// One phase, run on its own for as long as it is asked to, so a sampling
-/// profiler sees that phase and nothing else.
-///
-/// A profiler's attribution is not a ladder rung — ADR 0016 keeps it out of the
-/// tables for that reason — but "which function inside the interpreter" is a
-/// question no substitution answers, and a blended sample over five phases
-/// answers it about the blend.
+/// One phase, run on its own for as long as it is asked to, so a sampling profiler sees that phase
+/// and nothing else.
 pub fn only(repo: &Path, phase: &str, requests: u32, rounds: usize) -> Result<f64> {
     let loaded = program(repo)?;
     let request = head();
@@ -632,8 +553,6 @@ pub fn only(repo: &Path, phase: &str, requests: u32, rounds: usize) -> Result<f6
     Ok(best)
 }
 
-// ------------------------------------------------------------------- served
-
 /// One served configuration, as a rate and a per-request cost.
 #[derive(Clone, Debug, serde::Serialize)]
 pub struct Served {
@@ -645,9 +564,7 @@ pub struct Served {
     pub requests: u32,
     pub per_second: f64,
     pub per_request_micros: f64,
-    /// The same configuration's slowest repeat. Two served rungs whose
-    /// difference is 1% of either side need this or the difference is two
-    /// selections' noise printed to two decimals.
+    /// The same configuration's slowest repeat.
     pub per_request_worst_micros: f64,
     pub repeats: usize,
     pub p50_micros: f64,
@@ -655,8 +572,8 @@ pub struct Served {
     pub p99_micros: f64,
 }
 
-/// The same sweep taken `repeats` times, merged into one row per configuration
-/// carrying its best and its worst.
+/// The same sweep taken `repeats` times, merged into one row per configuration carrying its best
+/// and its worst.
 fn merged(rounds: Vec<Vec<Served>>) -> Vec<Served> {
     let mut out: Vec<Served> = Vec::new();
     for round in rounds {
@@ -689,12 +606,6 @@ fn merged(rounds: Vec<Vec<Served>>) -> Vec<Served> {
 }
 
 /// Rungs 7–9, the offering rows and the measured total, all from one sweep.
-///
-/// `w5::tracing` already starts the real binary with the store, the transport
-/// and the sink each moved on their own, which is exactly the three
-/// substitutions left: `--tls`, `--db` and `--trace`. Nothing new is built for
-/// them, and every row below is a client's observation rather than a claim
-/// about where a server's time went.
 #[allow(clippy::too_many_arguments)]
 pub fn served(
     repo: &Path,
@@ -749,17 +660,10 @@ pub fn served(
 }
 
 /// Rows within this much of the best throughput are the same measurement.
-///
-/// The throughput curve over concurrency is flat on one core — W6 measures it
-/// as flat — so "the concurrency that maximizes throughput" picks whichever
-/// point noise favoured, and the rung read off it inherits that choice. Inside
-/// the band the tie goes to the **lowest** concurrency, which is the one whose
-/// latency is a service rather than a queue.
 const FLAT: f64 = 0.05;
 
-/// The row of a served sweep a rung is read off: the concurrency that maximizes
-/// throughput (ADR 0016 §1.4), with a flat curve resolved to its lowest
-/// concurrency rather than to its luckiest.
+/// The row of a served sweep a rung is read off: the concurrency that maximizes throughput (ADR
+/// 0016 §1.4), with a flat curve resolved to its lowest concurrency rather than to its luckiest.
 pub fn best(points: &[Served], stack: &str, sink: &str, route: &str) -> Option<Served> {
     let matching: Vec<&Served> = points
         .iter()
@@ -777,11 +681,6 @@ pub fn best(points: &[Served], stack: &str, sink: &str, route: &str) -> Option<S
 }
 
 /// One served row at a named concurrency.
-///
-/// Every rung above the socket is a difference between two served rows, so both
-/// sides are taken at the concurrency the total was read off: a difference
-/// between two independently selected rows carries both selections' noise, and
-/// the `tls` and `tracing` layers are around 1% of either side.
 pub fn at(
     points: &[Served],
     stack: &str,
@@ -797,22 +696,14 @@ pub fn at(
         .cloned()
 }
 
-// ------------------------------------------------------------------ engines
-
-/// The same request under the tree-walking evaluator and under the
-/// control-stack machine.
-///
-/// The cheapest empirical bound on how much of a request is dispatch: if
-/// swapping one whole interpreter for another barely moves it, a third one will
-/// not either.
+/// The same request under the tree-walking evaluator and under the control-stack machine.
 pub fn engines(repo: &Path, iterations: u32, repeats: usize) -> Result<Vec<w6::EnginePoint>> {
     let loaded = program(repo)?;
     let name = loaded.full("w6_bench")?;
     let args = vec![Value::Int(3), Value::Int(iterations as i64)];
     let mut out = Vec::new();
-    // The two engines must answer the same value on the same path, or the row
-    // is a ratio between two different programs. `--engine both` polices this
-    // over a corpus; here it is asserted on the one call the row is read off.
+    // The two engines must answer the same value on the same path, or the row is a ratio between
+    // two different programs.
     let mut agreed: Option<Value> = None;
     for engine in [ply_eval::Engine::Treewalk, ply_eval::Engine::Machine] {
         let mut best = f64::MAX;
@@ -853,11 +744,6 @@ pub fn engines(repo: &Path, iterations: u32, repeats: usize) -> Result<Vec<w6::E
 }
 
 /// What one `/health` request allocates, from the binary that can count it.
-///
-/// `w6-alloc` is a sibling of this binary for the same reason `ply` is: a
-/// counting global allocator is a whole-binary decision, and this is where the
-/// clocks are. A missing binary is `None` and an audit line rather than a
-/// failure — the ladder is still a ladder without it.
 pub fn allocations(repo: &Path, given: Option<PathBuf>) -> Result<Option<(f64, f64)>> {
     let counter = match given {
         Some(path) => path
@@ -893,23 +779,12 @@ pub fn allocations(repo: &Path, given: Option<PathBuf>) -> Result<Option<(f64, f
     )))
 }
 
-// ------------------------------------------------- the constant memo, priced
-
 /// Definitions the control may not disable.
-///
-/// `main` is the entry point and `config` and `schema` are named on the command
-/// line — `--config-schema desk.config`, `--db-schema desk.schema` — so a dead
-/// parameter on any of them is a service that does not start rather than a
-/// service without the memo. None of the three is on the request path, so the
-/// comparison is unaffected.
 const NOT_DISABLED: [&str; 3] = ["main", "config", "schema"];
 
-/// The same source with every nullary definition of its own given a dead
-/// parameter, which is the narrowest edit that puts a definition outside the
-/// constant memo's rule without changing what it computes.
-///
-/// A qualified call — `router::table()`, `json::empty()` — is left alone: the
-/// name belongs to another module, which this rewrite does not touch.
+/// The same source with every nullary definition of its own given a dead parameter, which is the
+/// narrowest edit that puts a definition outside the constant memo's rule without changing what it
+/// computes.
 pub fn without_constants(source: &str) -> String {
     let mut nullary: Vec<String> = Vec::new();
     for line in source.lines() {
@@ -932,8 +807,8 @@ pub fn without_constants(source: &str) -> String {
         }
     }
     let mut out = source.to_string();
-    // Declarations first: a call-site rewrite cannot tell `fn table()` from
-    // `table()` by the character in front of it.
+    // Declarations first: a call-site rewrite cannot tell `fn table()` from `table()` by the
+    // character in front of it.
     for name in &nullary {
         out = out.replace(
             &format!("fn {name}() "),
@@ -946,8 +821,8 @@ pub fn without_constants(source: &str) -> String {
     out
 }
 
-/// `name()` becomes `name(0)` wherever the character before it can start an
-/// identifier reference and is not part of a longer name or a module path.
+/// `name()` becomes `name(0)` wherever the character before it can start an identifier reference
+/// and is not part of a longer name or a module path.
 fn replace_calls(source: &str, name: &str) -> String {
     let needle = format!("{name}()");
     let mut out = String::with_capacity(source.len());
@@ -968,14 +843,8 @@ fn replace_calls(source: &str, name: &str) -> String {
     out
 }
 
-/// What the constant memo is worth **end to end on the served workload**, which
-/// is the only shape ADR 0016 §4 accepts as a price.
-///
-/// The control is a source substitution rather than a flag, so both sides are
-/// the same binary with the same engine: the memo cannot be switched off
-/// without splitting the cache on a flag, which ADR 0016 §2.2 is the argument
-/// against. The two are served alternately in one sweep, because a run of the
-/// shipped service now and the control in ten minutes is two measurements.
+/// What the constant memo is worth **end to end on the served workload**, which is the only shape
+/// ADR 0016 §4 accepts as a price.
 #[allow(clippy::too_many_arguments)]
 pub fn memo_lever(
     repo: &Path,
@@ -1001,12 +870,9 @@ pub fn memo_lever(
 
     let routes: [(&'static str, &'static str); 2] =
         [("health (no db)", ROUTE), ("items (1 select)", DB_ROUTE)];
-    // Both accept loops, because on this tree the answer depends on which one
-    // is under the service: `task.spawn` opens a production region for the life
-    // of the server and `Machine::constant` refuses the memo inside an open
-    // region, so a spawning service memoizes nothing. A lever priced on one
-    // loop and quoted for the other would be a number about a program the
-    // reader is not running.
+    // Both accept loops, because on this tree the answer depends on which one is under the service:
+    // `task.spawn` opens a production region for the life of the server and `Machine::constant`
+    // refuses the memo inside an open region, so a spawning service memoizes nothing.
     let mut priced: Vec<LoopPrice> = Vec::new();
     for loop_variant in [variant, other] {
         let mut with = Repeated::new();
@@ -1090,18 +956,7 @@ pub struct LoopPrice {
     pub health_without: f64,
 }
 
-// ------------------------------------------------------------------- report
-
-/// Everything the ladder half of the report carries: the whole file, not a
-/// fragment of one.
-///
-/// The alternatives, the limits and the `not_measured` list are **built here**,
-/// from the roster ADR 0016 §4 pins in `w6::LEVERS` and from the numbers this
-/// run took. They used to be arguments, every caller passed `Vec::new()`, and
-/// the shipped file was assembled by hand afterwards — so the command a
-/// staleness guard tells a contributor to run emitted a report that priced
-/// nothing and therefore advanced M9. A file this command cannot reproduce is a
-/// file nobody can re-take.
+/// Everything the ladder half of the report carries: the whole file, not a fragment of one.
 #[allow(clippy::too_many_arguments)]
 pub fn report(
     machine: String,
@@ -1123,8 +978,8 @@ pub fn report(
     let total = best(served, tls, json, route).with_context(|| {
         format!("the served sweep has no `{tls}` x `{json}` x `{route}` row to read the total off")
     })?;
-    // Every other served rung is taken at the total's concurrency, so a layer
-    // is one flag moved rather than one flag moved and two rows selected.
+    // Every other served rung is taken at the total's concurrency, so a layer is one flag moved
+    // rather than one flag moved and two rows selected.
     let c = total.concurrency;
     let need = |stack: &str, sink: &str, route: &str| -> Result<Served> {
         at(served, stack, sink, route, c).with_context(|| {
@@ -1205,13 +1060,7 @@ pub fn report(
             stack.requests,
         ),
         from_served(w6::Layer::Tls, DB_ROUTE, &tls_with, &tls_without),
-        // ADR 0016 §1.2 pins this rung's `without` as `run_memory`. It is taken
-        // here as `/health` on the same postgres binary instead, and the
-        // measured reason is in the report: the twin's `without` would put
-        // `std.db`'s in-Ply SQL scanner — which no served request runs — inside
-        // the layer, and the difference would price the scanner rather than the
-        // database. The substitution as the ADR specifies it is measured and
-        // reported beside it.
+        // ADR 0016 §1.2 pins this rung's `without` as `run_memory`.
         from_served(
             w6::Layer::Database,
             "/items against /health",
@@ -1221,10 +1070,8 @@ pub fn report(
         from_served(w6::Layer::Tracing, DB_ROUTE, &trace_with, &trace_without),
     ];
 
-    // A row answering `/items` is read against the floor replaying `/items`'
-    // response and a row answering `/health` against `/health`'s. The multiple
-    // is what a request costs over the same bytes with no interpreter under
-    // them, and a `/items` row over a `/health` floor is neither.
+    // A row answering `/items` is read against the floor replaying `/items`' response and a row
+    // answering `/health` against `/health`'s.
     let floor_for = |route_label: &str| {
         if route_label == health {
             1e6 / stack.floor_micros
@@ -1318,16 +1165,11 @@ pub fn report(
     })
 }
 
-/// What the ladder run priced of ADR 0016 §4, as measured numbers rather than
-/// as prose.
-///
-/// Only the levers this harness actually takes a number for appear; the rest of
-/// the roster is answered as unpriced, which is what C3 reads.
+/// What the ladder run priced of ADR 0016 §4, as measured numbers rather than as prose.
 #[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct Levers {
-    /// The served end-to-end ratio of the shipped service against the same
-    /// service with its nullary constants disabled, on the ladder's own
-    /// workload, and the same on `/health`.
+    /// The served end-to-end ratio of the shipped service against the same service with its nullary
+    /// constants disabled, on the ladder's own workload, and the same on `/health`.
     pub memo_items: Option<f64>,
     pub memo_health: Option<f64>,
     /// How the two were measured, for the evidence column.
@@ -1357,9 +1199,9 @@ fn alternatives(
             };
             match *name {
                 "caching derived work" => {
-                    // Both routes, because the ratio C3 reads is `/items`' and
-                    // the one the limits section reads is `/health`'s; a run
-                    // that took only one of them priced neither.
+                    // Both routes, because the ratio C3 reads is `/items`' and the one the limits
+                    // section reads is `/health`'s; a run that took only one of them priced
+                    // neither.
                     if let (Some(items), Some(_health)) = (levers.memo_items, levers.memo_health) {
                         alternative.priced = true;
                         alternative.end_to_end = items;
@@ -1400,9 +1242,7 @@ fn alternatives(
         .collect()
 }
 
-/// The roster's prose and cost column. The names are `w6::LEVERS`' names, and a
-/// test asserts they still are — a lever whose name drifted would answer for
-/// nothing.
+/// The roster's prose and cost column.
 const LEVER_PROSE: [(&str, &str, &str); 7] = [
     (
         "more native builtins",
@@ -1631,16 +1471,14 @@ fn not_measured(stack: &InProcess, levers: &Levers) -> Vec<String> {
     out
 }
 
-/// The date, without a dependency for it. A provenance line wants the day a
-/// number was taken and nothing finer.
+/// The date, without a dependency for it.
 fn chrono_date() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let days = secs / 86_400;
-    // Civil-from-days, Howard Hinnant's algorithm. Four lines rather than a
-    // crate, because this is the only date this binary prints.
+    // Civil-from-days, Howard Hinnant's algorithm.
     let z = days as i64 + 719_468;
     let era = z.div_euclid(146_097);
     let doe = z.rem_euclid(146_097);
@@ -1654,8 +1492,8 @@ fn chrono_date() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-/// The `ply` binary a served row drives, defaulting to this binary's sibling so
-/// a release measurement never silently serves from a debug build.
+/// The `ply` binary a served row drives, defaulting to this binary's sibling so a release
+/// measurement never silently serves from a debug build.
 pub fn ply_binary(given: Option<PathBuf>) -> Result<PathBuf> {
     if let Some(path) = given {
         return Ok(path);

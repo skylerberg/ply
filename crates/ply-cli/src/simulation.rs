@@ -1,19 +1,11 @@
 //! Turning the simulation flags into the plan a run is cached under.
-//!
-//! Every field of a `Plan` is in a seeded test's cache key, so this is the one
-//! place a flag becomes a claim. Two rules follow and both are enforced here
-//! rather than left to the reader: a flag that cannot mean anything under the
-//! chosen mode is refused rather than ignored, and `--seed` names one
-//! interleaving and therefore excludes every flag that would widen the search.
 
 use crate::cli::{ProveOptions, SimOptions};
 use ply_eval::sim::{DEFAULT_BUDGET, DEFAULT_RANDOM_ROOTS, DEFAULT_STEPS};
 use ply_eval::{Plan, Seed, SimMode};
 use ply_prove::{DEFAULT_CASES, DEFAULT_PROVE_BUDGET, DEFAULT_SHRINK_BUDGET, ProvePlan};
 
-/// The seeds a plan starts from, when the user did not say. `dpor` already
-/// enumerates equivalence classes from one seed, so a second explores the same
-/// ones in a different order; `random` is a sample, so it needs many.
+/// The seeds a plan starts from, when the user did not say.
 fn default_seeds(mode: SimMode) -> u32 {
     match mode {
         SimMode::Random => DEFAULT_RANDOM_ROOTS,
@@ -36,8 +28,8 @@ pub fn plan(options: &SimOptions) -> Plan {
         mode,
         roots: (0..u64::from(seeds)).collect(),
         budget: match mode {
-            // `random` is one interleaving per seed by definition, and `once`
-            // is the one the seed names. Only `dpor` has a budget to spend.
+            // `random` is one interleaving per seed by definition, and `once` is the one the seed
+            // names.
             SimMode::Random | SimMode::Once => 1,
             SimMode::Dpor => options.sim_budget.unwrap_or(DEFAULT_BUDGET),
         },
@@ -47,12 +39,7 @@ pub fn plan(options: &SimOptions) -> Plan {
     .normalized()
 }
 
-/// What an obligation weaker than a proof is discharged against, and therefore
-/// cached under.
-///
-/// The simulation flags are folded in unchanged: a concurrency law is
-/// discharged by exactly the search ADR 0006 specifies, so widening
-/// `--sim-budget` re-opens a sampled law exactly as it re-runs a seeded test.
+/// What an obligation weaker than a proof is discharged against, and therefore cached under.
 pub fn prove_plan(options: &ProveOptions, simulation: &SimOptions) -> ProvePlan {
     let roots = options.prove_roots.unwrap_or(1);
     ProvePlan {
@@ -65,8 +52,7 @@ pub fn prove_plan(options: &ProveOptions, simulation: &SimOptions) -> ProvePlan 
     .normalized()
 }
 
-/// The plan `ply run` evaluates under: exactly one interleaving, the one the
-/// seed names. Exploration is a test-time activity, so there is no mode here.
+/// The plan `ply run` evaluates under: exactly one interleaving, the one the seed names.
 pub fn run_plan(seed: Option<&Seed>) -> Plan {
     Plan::once(seed.cloned().unwrap_or_default())
 }
@@ -126,8 +112,8 @@ mod tests {
         assert_eq!(built.seeds(), vec![Seed::at(7, vec![3, 0, 2])]);
     }
 
-    /// The step bound is not a widening: a replay still needs one, and it is the
-    /// only search flag `--seed` leaves alone.
+    /// The step bound is not a widening: a replay still needs one, and it is the only search flag
+    /// `--seed` leaves alone.
     #[test]
     fn a_replay_keeps_its_step_bound() {
         let built = plan(&SimOptions {
@@ -139,8 +125,8 @@ mod tests {
         assert_eq!(built.mode, SimMode::Once);
     }
 
-    /// A flag that cannot mean anything is refused rather than ignored: a
-    /// silently dropped `--sim-budget` reads as a search that was widened.
+    /// A flag that cannot mean anything is refused rather than ignored: a silently dropped
+    /// `--sim-budget` reads as a search that was widened.
     #[test]
     fn a_budget_under_random_is_refused() {
         assert!(
@@ -196,8 +182,8 @@ mod tests {
         }
     }
 
-    /// `--measure-reduction` reports a number; it does not change what was
-    /// searched, so it must not split the cache.
+    /// `--measure-reduction` reports a number; it does not change what was searched, so it must not
+    /// split the cache.
     #[test]
     fn measuring_the_reduction_does_not_change_the_plan() {
         assert_eq!(

@@ -1,13 +1,5 @@
-//! The stdlib path: `import std.net` from a project, and what it does — and
-//! does not do — to content addressing.
-//!
-//! Two claims carry the milestone and both are asserted here rather than argued
-//! for. **A stdlib definition hashes like any other**, so copying a shipped
-//! module's source into a project produces byte-identical `DefHash`es that share
-//! its cache entries. And **nothing about `std` enters a cache key**, so a
-//! program importing nothing from it loads nothing, and a compiler whose stdlib
-//! moved re-runs only what the change reached — reported as a number rather than
-//! implied.
+//! The stdlib path: `import std.net` from a project, and what it does — and does not do — to
+//! content addressing.
 
 use assert_cmd::prelude::*;
 use ply_cli::driver;
@@ -45,8 +37,8 @@ fn std_net() -> ModuleName {
     ModuleName::from_dotted("std.net")
 }
 
-/// A project that reaches a socket through the imported declaration and handles
-/// every atom it can perform, so its test is `det` and cacheable.
+/// A project that reaches a socket through the imported declaration and handles every atom it can
+/// perform, so its test is `det` and cacheable.
 const IMPORTER: &str = "\
 import std.net (net)
 
@@ -84,8 +76,6 @@ fn hash_of(loaded: &Loaded, name: &str) -> String {
 
 // --- Resolution -------------------------------------------------------------
 
-/// Required test 1. The wall W1 left: a program could not import the module the
-/// host handlers are registered against.
 #[test]
 fn a_project_module_can_import_std_net_and_it_checks() {
     let dir = tempfile::tempdir().unwrap();
@@ -97,8 +87,8 @@ fn a_project_module_can_import_std_net_and_it_checks() {
         "the shipped module is not in the program: {:?}",
         loaded.check.modules.keys().collect::<Vec<_>>()
     );
-    // The effect's program-wide name is what `ply_host::tcp` registers against,
-    // and it is qualified by the module that declares it like any other.
+    // The effect's program-wide name is what `ply_host::tcp` registers against, and it is qualified
+    // by the module that declares it like any other.
     assert!(
         loaded
             .check
@@ -120,8 +110,8 @@ fn a_project_module_can_import_std_net_and_it_checks() {
     assert_eq!(touch.footprint.to_string(), "{std.net.net.write[listener]}");
 }
 
-/// And it runs: `ply test` goes green over the in-memory handlers, which is the
-/// end-to-end claim the resolution above only sets up.
+/// And it runs: `ply test` goes green over the in-memory handlers, which is the end-to-end claim
+/// the resolution above only sets up.
 #[test]
 fn a_project_that_imports_std_net_tests_green() {
     let dir = tempfile::tempdir().unwrap();
@@ -133,9 +123,7 @@ fn a_project_that_imports_std_net_tests_green() {
     assert!(text.contains("the imported effect is handled"), "{text}");
 }
 
-/// The handler binds against the shipped declaration, so `ply hosts` names the
-/// qualified effect. A program declaring its own `net` gets no binding at all,
-/// which is now the right answer for the right reason: the fix is an import.
+/// The handler binds against the shipped declaration, so `ply hosts` names the qualified effect.
 #[test]
 fn ply_hosts_binds_the_shipped_declaration_under_its_qualified_name() {
     let dir = tempfile::tempdir().unwrap();
@@ -160,8 +148,8 @@ fn ply_hosts_binds_the_shipped_declaration_under_its_qualified_name() {
         "got:\n{text}"
     );
 
-    // A program that declares its own `net` instead reaches no handler: the
-    // registration names `std.net.net` and nothing else answers to it.
+    // A program that declares its own `net` instead reaches no handler: the registration names
+    // `std.net.net` and nothing else answers to it.
     let other = tempfile::tempdir().unwrap();
     write(
         other.path(),
@@ -180,9 +168,8 @@ fn ply_hosts_binds_the_shipped_declaration_under_its_qualified_name() {
     );
 }
 
-/// Required test 2, in the loader: `std` is reserved, so a project file that
-/// would claim it is refused against the file rather than silently shadowing or
-/// being shadowed.
+/// Required test 2, in the loader: `std` is reserved, so a project file that would claim it is
+/// refused against the file rather than silently shadowing or being shadowed.
 #[test]
 fn a_project_file_under_std_is_e0113_against_the_file() {
     let dir = tempfile::tempdir().unwrap();
@@ -201,8 +188,8 @@ fn a_project_file_under_std_is_e0113_against_the_file() {
     assert!(err.sources.get(span.source).is_some());
 }
 
-/// A file named `std.ply` claims the root itself, which is the same error and
-/// is easy to miss when the rule is written as a prefix check.
+/// A file named `std.ply` claims the root itself, which is the same error and is easy to miss when
+/// the rule is written as a prefix check.
 #[test]
 fn a_project_file_named_std_is_also_e0113() {
     let dir = tempfile::tempdir().unwrap();
@@ -216,8 +203,8 @@ fn a_project_file_named_std_is_also_e0113() {
     load(ok.path()).expect("`stdlib` is an ordinary module name");
 }
 
-/// A `std.x` this build does not ship names what it does, rather than reporting
-/// that a module is missing from a project the user cannot add it to.
+/// A `std.x` this build does not ship names what it does, rather than reporting that a module is
+/// missing from a project the user cannot add it to.
 #[test]
 fn importing_a_module_that_does_not_ship_lists_the_ones_that_do() {
     let dir = tempfile::tempdir().unwrap();
@@ -236,9 +223,6 @@ fn importing_a_module_that_does_not_ship_lists_the_ones_that_do() {
 
 // --- Content addressing ------------------------------------------------------
 
-/// Required test 3. Demand-driven loading is what makes this true: a program
-/// that imports nothing from `std` is the program it was before the stdlib
-/// existed, down to the file list.
 #[test]
 fn a_program_importing_nothing_from_std_loads_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -258,9 +242,6 @@ fn a_program_importing_nothing_from_std_loads_nothing() {
     assert_eq!(loaded.files.len(), 1, "{:?}", loaded.files);
 }
 
-/// Required test 4, and the sharpest statement of the rule: **no `std` marker
-/// enters a hash**. The same source in a project and in the stdlib is the same
-/// computation, so it is the same definition and shares its cache entry.
 #[test]
 fn copying_a_shipped_module_into_a_project_produces_identical_hashes() {
     let shipped = tempfile::tempdir().unwrap();
@@ -286,16 +267,16 @@ fn copying_a_shipped_module_into_a_project_produces_identical_hashes() {
         hash_of(&copied, "mine.net"),
         "an effect declaration is a declaration like any other"
     );
-    // And the definition that *reaches* it: a reference contributes the
-    // referent's hash, so the importer is one definition in both programs.
+    // And the definition that *reaches* it: a reference contributes the referent's hash, so the
+    // importer is one definition in both programs.
     assert_eq!(
         hash_of(&shipped, "app.touch"),
         hash_of(&copied, "app.touch")
     );
 }
 
-/// The pseudo-path is what lets gate 1 key an embedded module on the bytes it
-/// was compiled from, with no new mechanism and no file on disk.
+/// The pseudo-path is what lets gate 1 key an embedded module on the bytes it was compiled from,
+/// with no new mechanism and no file on disk.
 #[test]
 fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -331,8 +312,6 @@ fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
     );
 }
 
-/// Required test 43, on this corpus: the two paths agree byte for byte with a
-/// shipped module in the program, warm and cold.
 #[test]
 fn incremental_and_full_agree_over_a_program_that_imports_std() {
     let dir = tempfile::tempdir().unwrap();
@@ -360,8 +339,6 @@ fn incremental_and_full_agree_over_a_program_that_imports_std() {
     );
 }
 
-/// Required test 44, on this corpus. A rename is a namespace edit, and the
-/// namespace is metadata over hashes — including across the stdlib boundary.
 #[test]
 fn renaming_a_project_definition_that_calls_std_moves_no_hash() {
     let dir = tempfile::tempdir().unwrap();
@@ -385,8 +362,6 @@ fn renaming_a_project_definition_that_calls_std_moves_no_hash() {
 
 // --- Selection ---------------------------------------------------------------
 
-/// Required test 6. Without this a project's test count changes with a compiler
-/// upgrade, for tests the project did not write and cannot fix.
 #[test]
 fn a_shipped_modules_tests_are_not_a_projects() {
     let dir = tempfile::tempdir().unwrap();
@@ -405,9 +380,8 @@ fn a_shipped_modules_tests_are_not_a_projects() {
     let v: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout))
         .unwrap_or_else(|e| panic!("{e}: {}", output(&out)));
     assert_eq!(v["selection"]["total"], 1, "{v}");
-    // Not counted as filtered out either: a shipped test was never in this
-    // project's denominator, and reporting it as excluded would invite someone
-    // to go looking for it.
+    // Not counted as filtered out either: a shipped test was never in this project's denominator,
+    // and reporting it as excluded would invite someone to go looking for it.
     assert_eq!(v["selection"]["filtered_out"], 0, "{v}");
 
     let out = ply(dir.path())
@@ -418,15 +392,15 @@ fn a_shipped_modules_tests_are_not_a_projects() {
         .unwrap_or_else(|e| panic!("{e}: {}", output(&out)));
     assert_eq!(v["selection"]["total"], 1 + shipped, "{v}");
     assert_eq!(v["exit_code"], 0, "{v}");
-    // And the run above wrote **nothing** about them: the project's test was
-    // cached by it, the shipped one was not, so `--std` still has work to do.
+    // And the run above wrote **nothing** about them: the project's test was cached by it, the
+    // shipped one was not, so `--std` still has work to do.
     assert_eq!(v["selection"]["cached"], 1, "{v}");
     assert_eq!(v["selection"]["selected"], shipped, "{v}");
 }
 
-/// `ply run` in a directory holding a shipped module still has one entry point:
-/// `main` is a project's, and a stdlib `main` would make the command ambiguous
-/// in a directory the user did not write.
+/// `ply run` in a directory holding a shipped module still has one entry point: `main` is a
+/// project's, and a stdlib `main` would make the command ambiguous in a directory the user did not
+/// write.
 #[test]
 fn entry_points_exclude_the_shipped_modules() {
     let dir = tempfile::tempdir().unwrap();
@@ -446,7 +420,6 @@ fn entry_points_exclude_the_shipped_modules() {
 
 // --- `ply std` and the digest -------------------------------------------------
 
-/// The listing and the one line CI pins.
 #[test]
 fn ply_std_lists_the_modules_and_prints_a_stable_digest() {
     let dir = tempfile::tempdir().unwrap();
@@ -476,8 +449,8 @@ fn ply_std_lists_the_modules_and_prints_a_stable_digest() {
     let v: Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert_eq!(v["digest"], once.trim());
 
-    // Every shipped module, in the table's order, which is the order `ply-std`'s
-    // own suite pins as sorted and unique.
+    // Every shipped module, in the table's order, which is the order `ply-std`'s own suite pins as
+    // sorted and unique.
     let listed: Vec<&str> = v["modules"]
         .as_array()
         .expect("an array of modules")
@@ -495,9 +468,6 @@ fn ply_std_lists_the_modules_and_prints_a_stable_digest() {
     }
 }
 
-/// Required test 7's second half. Correctness came free — the hashes moved
-/// exactly as far as the change reached — so what is owed is visibility, and a
-/// count of zero has to be reported as zero rather than implied.
 #[test]
 fn a_cache_written_under_another_digest_warns_once_and_says_how_much_moved() {
     let dir = tempfile::tempdir().unwrap();
@@ -525,8 +495,8 @@ fn a_cache_written_under_another_digest_warns_once_and_says_how_much_moved() {
     let rendered = format!("{:?}", warnings[0]);
     assert!(rendered.contains("b3:000000000000"), "{rendered}");
     assert!(rendered.contains(&ply_std::digest_short()), "{rendered}");
-    // Nothing actually moved: the sources this build ships are the ones it
-    // compiled the last run with, only the recorded digest was a lie.
+    // Nothing actually moved: the sources this build ships are the ones it compiled the last run
+    // with, only the recorded digest was a lie.
     assert!(
         rendered.contains("no definition this program reaches changed"),
         "{rendered}"
@@ -547,9 +517,7 @@ fn a_cache_written_under_another_digest_warns_once_and_says_how_much_moved() {
     );
 }
 
-/// A cold cache has nothing to compare against, so it says nothing. Warning on
-/// a first run would make every new project start with a diagnostic about a
-/// change that did not happen.
+/// A cold cache has nothing to compare against, so it says nothing.
 #[test]
 fn a_cold_cache_does_not_warn_about_the_stdlib() {
     let dir = tempfile::tempdir().unwrap();
@@ -567,9 +535,7 @@ fn a_cold_cache_does_not_warn_about_the_stdlib() {
     );
 }
 
-/// The shipped sources may import only `std.*`. It is Ply's fault when they do
-/// not, so the diagnostic says so and does not send a reader into their own
-/// tree. The invariant itself is checked over the real table in `ply-std`.
+/// The shipped sources may import only `std.*`
 #[test]
 fn a_shipped_module_importing_outside_std_is_ply_s_fault() {
     let d = ply_std::foreign_import(&std_net(), &Symbol::new("app"), ply_span::Span::DUMMY);
@@ -578,11 +544,6 @@ fn a_shipped_module_importing_outside_std_is_ply_s_fault() {
     assert!(rendered.contains("not in this program"), "{rendered}");
 }
 
-/// Required test 5's second half, run against the mechanism a stdlib edit goes
-/// through: a `std` definition hashes like a project one, so changing one moves
-/// exactly its own hash, its dependents' and the tests reaching them — and
-/// nothing else. That is what makes a compiler upgrade's cost visible and
-/// bounded rather than a whole-project rebuild.
 #[test]
 fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
     let dir = tempfile::tempdir().unwrap();
@@ -604,8 +565,7 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
     );
 
     let before = load(dir.path()).unwrap();
-    // The edit a compiler upgrade would make: one definition's body, nothing
-    // else in the module.
+    // The edit a compiler upgrade would make: one definition's body, nothing else in the module.
     write(
         dir.path(),
         "mine.ply",
@@ -626,8 +586,8 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
         hash_of(&after, "reader.read_all"),
         "a reference contributes the referent's hash, so a caller moves with it"
     );
-    // Everything else stands: the effect declaration, the module's other
-    // definitions, and a module that reaches none of them.
+    // Everything else stands: the effect declaration, the module's other definitions, and a module
+    // that reaches none of them.
     for name in ["mine.net", "mine.head", "mine.tail", "elsewhere.untouched"] {
         assert_eq!(hash_of(&before, name), hash_of(&after, name), "{name}");
     }
@@ -647,8 +607,6 @@ fn editing_one_shipped_definition_moves_exactly_what_reaches_it() {
 }
 
 /// `ply cache compact` walks the files on disk, and a shipped module has none.
-/// Its entries are live all the same — this binary still ships it — so dropping
-/// them would cost the next run a reparse of the whole stdlib for nothing.
 #[test]
 fn compaction_keeps_the_shipped_modules_it_loaded() {
     let dir = tempfile::tempdir().unwrap();
@@ -690,13 +648,7 @@ fn compaction_keeps_the_shipped_modules_it_loaded() {
     );
 }
 
-/// The compiler's own suite for what it ships. A project's `ply test` does not
-/// select a shipped module's tests, so without this they would be checked and
-/// never run — and a shipped module is source, so a defect in one reaches every
-/// user of it as a wrong answer rather than as a red test.
-///
-/// Every shipped module at once, and `--std`: the laws are included, because a
-/// `property` over the codecs is a large part of what says the stdlib works.
+/// The compiler's own suite for what it ships.
 #[test]
 fn the_shipped_modules_own_tests_and_laws_all_pass() {
     let dir = tempfile::tempdir().unwrap();
@@ -731,10 +683,7 @@ fn the_shipped_modules_own_tests_and_laws_all_pass() {
     );
 }
 
-/// A project's `ply prove` reports what the project claimed. The shipped
-/// modules' laws are not a project's, for the reason its tests are not: a
-/// project's obligation count and the denominator of its coverage line must not
-/// move because the compiler was upgraded.
+/// A project's `ply prove` reports what the project claimed.
 #[test]
 fn a_shipped_modules_laws_are_not_a_projects() {
     let dir = tempfile::tempdir().unwrap();
@@ -767,9 +716,9 @@ fn a_shipped_modules_laws_are_not_a_projects() {
         "`--std` adds nothing: {all:#}"
     );
 
-    // And the coverage denominator is the project's definitions, not the
-    // stdlib's — an unspecified count of two hundred shipped functions is a
-    // reader's reason to stop reading the line that matters most.
+    // And the coverage denominator is the project's definitions, not the stdlib's — an unspecified
+    // count of two hundred shipped functions is a reader's reason to stop reading the line that
+    // matters most.
     assert_eq!(mine["coverage"]["definitions"], 1, "{mine:#}");
     assert!(
         all["coverage"]["definitions"].as_u64().unwrap() > 100,
@@ -777,13 +726,10 @@ fn a_shipped_modules_laws_are_not_a_projects() {
     );
 }
 
-/// `observe_definitions` withholds every definition an unresolved test reached,
-/// and a shipped module's tests are never resolved without `--std` — so
-/// `std.router`'s and `std.http`'s definitions were never recorded, stayed
-/// permanently "changed", and landed in the suspect set of every failure in
-/// every project that imported them. ADR 0004 says the suspects are what
-/// *changed* since the last pass; 48 unchanged stdlib definitions and none of
-/// the two that moved is that promise inverted.
+/// `observe_definitions` withholds every definition an unresolved test reached, and a shipped
+/// module's tests are never resolved without `--std` — so `std.router`'s and `std.http`'s
+/// definitions were never recorded, stayed permanently "changed", and landed in the suspect set of
+/// every failure in every project that imported them.
 #[test]
 fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
     let dir = tempfile::tempdir().unwrap();
@@ -838,21 +784,6 @@ fn a_shipped_definition_the_project_never_touched_is_not_a_suspect() {
 }
 
 // --- The `Limits` mispairing guard ------------------------------------------
-//
-// `std.http`'s `Limits` (`http.ply`) is the record ADR 0013 §4 puts every bound a
-// program runs under into, and all thirteen of its fields are `Int`. Adding a
-// field to it is already a **type error** at every site that spells the record
-// out — `unify.rs` compares record key sets exactly and Ply has no width
-// subtyping — so the hazard was never a forgotten field. It is a **mispairing**:
-// `max_body: state.limits.max_chunk_size` type-checks and is a silently wrong
-// bound in an HTTP server.
-//
-// Every site that used to spell `Limits` out is now a record update, and what
-// that buys is asserted below rather than argued: **every bound a definition
-// does not deliberately vary is copied from the bound of the same name**.
-// Checked on the tree the compiler actually uses, so it covers a regression to
-// the longhand as well as a broken expansion — and a field added to `Limits`
-// tomorrow is covered without these tests changing.
 
 use ply_syntax::ast::{Expr, ExprKind, Ident, Item, Module, Stmt, TypeDefBody, TypeExpr};
 
@@ -883,8 +814,8 @@ fn limits_fields(module: &Module) -> Vec<String> {
     fields.iter().map(|(n, _)| n.name.to_string()).collect()
 }
 
-/// A dotted path rendered back to source — `state.limits.max_body` — or `None`
-/// for anything that is not one.
+/// A dotted path rendered back to source — `state.limits.max_body` — or `None` for anything that is
+/// not one.
 fn dotted(e: &Expr) -> Option<String> {
     match &e.kind {
         ExprKind::Var(v) if v.is_bare() => Some(v.name.name.to_string()),
@@ -900,8 +831,8 @@ fn read_of_base(e: &Expr, base: &str) -> Option<String> {
     (!rest.contains('.')).then(|| rest.to_string())
 }
 
-/// The record literal `func` evaluates to: the value of `let <binder>` when one
-/// is named, otherwise the block's tail.
+/// The record literal `func` evaluates to: the value of `let <binder>` when one is named, otherwise
+/// the block's tail.
 fn limits_literal<'a>(module: &'a Module, func: &str, binder: Option<&str>) -> &'a [(Ident, Expr)] {
     let body = module
         .items
@@ -934,10 +865,8 @@ fn limits_literal<'a>(module: &'a Module, func: &str, binder: Option<&str>) -> &
     fields
 }
 
-/// Asserts that `func` builds a full-width `Limits` in which every field it does
-/// not deliberately vary is `base.<that same field>`. `varied` is the exact list
-/// of the ones that do differ, in emitted order, each paired with the field of
-/// `base` it reads instead — or `None` when it reads something else entirely.
+/// Asserts that `func` builds a full-width `Limits` in which every field it does not deliberately
+/// vary is `base.<that same field>`.
 #[track_caller]
 fn copies_every_limit_it_does_not_vary(
     func: &str,
@@ -976,9 +905,7 @@ fn copies_every_limit_it_does_not_vary(
     );
 }
 
-/// **The guard the `chunk_trailers` rewrite is worth.** One bound is deliberately
-/// swapped — the header-block bound takes the trailer bound — and the other
-/// twelve are copies.
+/// **The guard the `chunk_trailers` rewrite is worth.**
 #[test]
 fn chunk_trailers_copies_every_limit_it_does_not_replace() {
     copies_every_limit_it_does_not_vary(
@@ -989,10 +916,6 @@ fn chunk_trailers_copies_every_limit_it_does_not_replace() {
     );
 }
 
-/// The three test helpers that used to re-spell `Limits` by hand. Each now
-/// varies the bounds its name promises and copies the rest from
-/// `default_limits()`, so twelve or six unwritten bounds cannot be mispaired at
-/// all — there is nothing written to mispair.
 #[test]
 fn the_limits_helpers_vary_only_the_bounds_they_are_named_for() {
     copies_every_limit_it_does_not_vary(
@@ -1023,11 +946,9 @@ fn the_limits_helpers_vary_only_the_bounds_they_are_named_for() {
     );
 }
 
-/// `limits_with` is the one converted site where a mispairing survives the
-/// rewrite, because the seven bounds it *does* write are seven `Int` parameters
-/// and `max_chunk_size: chunk_line` type-checks. The remaining guard is the
-/// naming convention, so it is asserted rather than trusted: each written bound
-/// takes the parameter its own name is `max_`-prefixed from.
+/// `limits_with` is the one converted site where a mispairing survives the rewrite, because the
+/// seven bounds it *does* write are seven `Int` parameters and `max_chunk_size: chunk_line`
+/// type-checks.
 #[test]
 fn limits_with_pairs_each_bound_with_the_parameter_named_after_it() {
     let module = shipped_http();

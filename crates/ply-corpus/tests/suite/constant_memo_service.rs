@@ -1,16 +1,5 @@
-//! What remembering a nullary pure definition is worth on the desk, and what
-//! it costs in meaning: nothing.
-//!
-//! The control is a **source substitution**, not a flag: the same service with
-//! every nullary definition of its own given a dead parameter, which is the
-//! narrowest edit that puts a definition outside the rule without changing
-//! what it computes. Both variants are parsed once and driven alternately in
-//! this process, so a run of the two is one measurement rather than two — the
-//! only shape that survives a machine somebody else is also building on.
-//!
-//! The assertion is the point and the timing is the reason: byte-for-byte
-//! identical responses on every route the twin can answer, and the ratio
-//! printed beside them.
+//! What remembering a nullary pure definition is worth on the desk, and what it costs in meaning:
+//! nothing.
 
 use anyhow::Result;
 use ply_corpus::{w3, w6_run};
@@ -25,8 +14,8 @@ fn repo() -> PathBuf {
         .to_path_buf()
 }
 
-/// The requests the twin answers without a credential: a constant route, a
-/// routing miss, a method that is refused, and the one that reads the store.
+/// The requests the twin answers without a credential: a constant route, a routing miss, a method
+/// that is refused, and the one that reads the store.
 fn script() -> Vec<(&'static str, Vec<u8>)> {
     vec![
         ("/health", w3::request("GET", "/health", None, false, 0, 0)),
@@ -64,8 +53,8 @@ fn script() -> Vec<(&'static str, Vec<u8>)> {
 fn variants() -> Result<(w3::Loaded, w3::Loaded)> {
     let service = w3::Service::open(&repo())?;
     let source = service.source(w3::Variant::Sequential)?;
-    // The ladder's own rewrite, so the control this test asserts on and the
-    // control `w6-ladder` prices the lever against are one program.
+    // The ladder's own rewrite, so the control this test asserts on and the control `w6-ladder`
+    // prices the lever against are one program.
     let control = w6_run::without_constants(&source);
     assert_ne!(source, control, "the rewrite found nothing to disable");
     Ok((w3::Loaded::parse(&source)?, w3::Loaded::parse(&control)?))
@@ -89,15 +78,12 @@ fn remembering_a_constant_changes_no_byte_of_any_response() {
     }
 }
 
-/// Alternating, best-of, in one process. Printed rather than asserted on a
-/// threshold: a ratio is a measurement and a machine under load is entitled to
-/// produce a worse one without failing a build.
+/// Alternating, best-of, in one process.
 #[test]
 fn what_remembering_the_constants_is_worth_per_request() {
     let (memoized, control) = variants().expect("both variants load");
-    // `limits().max_keep_alive` is 100, so a connection carrying more requests
-    // than that would be closed part way and the divisor would be a fiction.
-    // Thirty-two is what the ladder's served rows reuse a connection for.
+    // `limits().max_keep_alive` is 100, so a connection carrying more requests than that would be
+    // closed part way and the divisor would be a fiction.
     let per_conn = 32usize;
     let connections = 16usize;
     let requests = per_conn * connections;
@@ -132,16 +118,6 @@ fn what_remembering_the_constants_is_worth_per_request() {
 }
 
 /// The rung the ladder reads routing off, and the definition this began with.
-///
-/// **This asserts nothing, and something once leaned on it.** It prints
-/// microseconds and returns, so it passes whatever `router.ply` costs — and
-/// `PREREGISTRATION.md` §7.7 nonetheless offered "it is the test nearest that
-/// change; it passed" as evidence that the survey's fix to `numbered` held. It
-/// would have passed with that fix reverted, and that sentence is withdrawn
-/// there. What gates the cost is a count, in `ply-eval`'s
-/// `stdlib_accumulator_cost.rs::the_route_table_and_the_trace_sink_do_not_copy_
-/// their_accumulators_either`; leave the assertion there, where the statistic is
-/// deterministic, rather than putting a threshold on a clock here.
 #[test]
 fn what_the_route_table_costs_to_rebuild() {
     let loaded = w6_run::program(&repo()).expect("the ladder's driver loads");

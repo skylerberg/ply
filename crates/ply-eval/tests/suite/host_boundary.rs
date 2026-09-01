@@ -1,15 +1,4 @@
 //! The host effect boundary, end to end through the machine.
-//!
-//! `host.rs`'s unit tests cover registration — what a registry refuses before a
-//! single Ply expression evaluates. This file covers the other half: what
-//! happens when a `perform` walks the whole control stack, finds nothing, and
-//! reaches the boundary.
-//!
-//! Every test here has a counting handler behind it, because the question these
-//! tests exist to answer is never "did the program produce a value" but "how
-//! many times did the packet go out". A boundary that sends twice and returns
-//! the right number is the exact defect this milestone is built to prevent, and
-//! it is invisible to an assertion on the value.
 
 use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_core::{CheckOutput, check_program};
@@ -23,8 +12,6 @@ use ply_syntax::ast::{Mode, ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-// ------------------------------------------------------------------- fixtures
 
 struct Compiled {
     program: Program,
@@ -52,10 +39,6 @@ impl Compiled {
 }
 
 /// A host handler that answers the ordinal of its own call.
-///
-/// Returning the count rather than a constant is what lets a Ply-level assertion
-/// see a replay: a handler that answered `0` every time would make "sent once"
-/// and "sent twice" the same program.
 #[derive(Default)]
 struct Counter {
     calls: AtomicU64,
@@ -74,8 +57,7 @@ impl HostHandler for Counter {
     }
 }
 
-/// A handler that never completes on the spot, which is every operation that
-/// waits.
+/// A handler that never completes on the spot, which is every operation that waits.
 struct Waits;
 
 impl HostHandler for Waits {
@@ -87,8 +69,7 @@ impl HostHandler for Waits {
     }
 }
 
-/// A runtime whose tokens are already resolved. Enough to exercise the machine's
-/// side of the pending path without a reactor in the test.
+/// A runtime whose tokens are already resolved.
 struct Resolved7;
 
 impl HostRuntime for Resolved7 {
@@ -105,11 +86,8 @@ impl HostRuntime for Resolved7 {
     }
 }
 
-/// `effect` is the name the `effect` declaration writes — `net` — while the
-/// program is module `t`, so every atom below is `t.net`. The asymmetry is the
-/// rule: a registration is a fixed line in the trusted computing base and cannot
-/// know the consumer's module, and an atom is what scheduling reads and must be
-/// program-wide.
+/// `effect` is the name the `effect` declaration writes — `net` — while the program is module `t`,
+/// so every atom below is `t.net`.
 fn op(effect: &str, name: &str, linearity: Linearity) -> HostOp {
     HostOp {
         effect: Symbol::new(effect),
@@ -140,8 +118,6 @@ fn diagnostic(outcome: Result<(), Diagnostic>) -> Diagnostic {
     outcome.expect_err("the program was expected to fail")
 }
 
-// ------------------------------------------------------------------- programs
-
 /// One host-backed operation, performed once, with nothing to shadow it.
 const SEND: &str = r#"
 nondet effect net {
@@ -153,12 +129,7 @@ test/nondet "the packet goes out" {
 }
 "#;
 
-// ------------------------------------------------------------------- hermetic
-
-/// The default is the guarantee. A suite that acquires a live dependency by not
-/// thinking about it is what E0424 exists to make impossible, and the message
-/// has to name the handler that would have served the operation or the reader
-/// cannot act on it.
+/// The default is the guarantee.
 #[test]
 fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
     let compiled = compile(SEND);
@@ -182,9 +153,9 @@ fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
     assert!(machine.host_use().is_none());
 }
 
-/// E0424 and E0303 call for opposite responses — pass `--host` or write a test
-/// double, versus file a bug — so an operation nothing registered must keep the
-/// old code rather than acquire the new one.
+/// E0424 and E0303 call for opposite responses — pass `--host` or write a test double, versus file
+/// a bug — so an operation nothing registered must keep the old code rather than acquire the new
+/// one.
 #[test]
 fn an_operation_no_handler_claims_is_still_e0303() {
     let compiled = compile(SEND);
@@ -242,9 +213,7 @@ fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
     assert!(used.atoms.contains(&atom("t.net", "socket", Mode::Write)));
 }
 
-/// The binding is the handler of **last resort**. If it were consulted before
-/// the stack, a test double would stop shadowing a real socket and every
-/// hermetic guarantee above it would be worth nothing.
+/// The binding is the handler of **last resort**.
 #[test]
 fn a_handler_in_scope_shadows_the_host() {
     let compiled = compile(
@@ -275,11 +244,8 @@ test/nondet "the double answers" {
     assert!(machine.host_use().is_none());
 }
 
-// ------------------------------------------------------------------ linearity
-
-/// The exact program that would otherwise send the packet twice: a multi-shot
-/// Ply handler installed *around* a host operation, so the captured control
-/// contains the `perform`.
+/// The exact program that would otherwise send the packet twice: a multi-shot Ply handler installed
+/// *around* a host operation, so the captured control contains the `perform`.
 const MULTI_SHOT_OVER_HOST: &str = r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -324,10 +290,8 @@ fn a_second_resumption_across_an_at_most_once_operation_is_refused() {
     );
 }
 
-/// `Repeatable` is what keeps the rule's over-approximation tight, and it is a
-/// claim the handler author makes: this replays without changing anything
-/// outside the program. The same program then resumes twice and performs the
-/// operation twice, deliberately.
+/// `Repeatable` is what keeps the rule's over-approximation tight, and it is a claim the handler
+/// author makes: this replays without changing anything outside the program.
 #[test]
 fn the_same_program_with_a_repeatable_operation_resumes_twice() {
     let compiled = compile(MULTI_SHOT_OVER_HOST);
@@ -356,10 +320,8 @@ fn the_same_program_with_a_repeatable_operation_resumes_twice() {
     );
 }
 
-/// The rule refuses a second resumption only when an irreversible operation
-/// happened *after* the capture. A continuation captured downstream of the last
-/// send replays nothing, and refusing it would be a false positive on ordinary
-/// control.
+/// The rule refuses a second resumption only when an irreversible operation happened *after* the
+/// capture.
 #[test]
 fn a_continuation_captured_after_the_last_send_resumes_twice() {
     let compiled = compile(
@@ -398,9 +360,9 @@ test/nondet "captured after the send" {
     assert_eq!(counter.calls(), 1);
 }
 
-/// The whole reason W1 leaves M6 alone: in a hermetic run the counter is zero
-/// for the life of the entry point, so the refusal condition is unreachable and
-/// no existing multi-shot program can change behaviour.
+/// The whole reason W1 leaves M6 alone: in a hermetic run the counter is zero for the life of the
+/// entry point, so the refusal condition is unreachable and no existing multi-shot program can
+/// change behaviour.
 #[test]
 fn hermetic_multi_shot_is_untouched() {
     let compiled = compile(
@@ -421,11 +383,7 @@ test "three resumptions" {
     assert_eq!(machine.host_ops(), 0);
 }
 
-// ----------------------------------------------------------------- simulation
-
-/// DPOR re-runs the region whole for every schedule it explores. A region that
-/// reaches a socket sends one packet per interleaving and then reports the
-/// result as a proof over every interleaving.
+/// DPOR re-runs the region whole for every schedule it explores.
 #[test]
 fn a_host_operation_inside_a_simulate_region_is_refused() {
     for source in [
@@ -466,9 +424,9 @@ test/nondet "reached through a call" {
     }
 }
 
-/// E0425 is the terminal answer, so it is reported even when nothing is bound:
-/// telling a hermetic run to pass `--host` when `--host` would then refuse it
-/// costs the reader a round trip to learn nothing.
+/// E0425 is the terminal answer, so it is reported even when nothing is bound: telling a hermetic
+/// run to pass `--host` when `--host` would then refuse it costs the reader a round trip to learn
+/// nothing.
 #[test]
 fn a_host_operation_inside_a_region_is_refused_hermetically_too() {
     let compiled = compile(
@@ -495,10 +453,6 @@ test/nondet "hermetic, in a region" {
 }
 
 /// Lock 2 of the three that keep `simulate` and the production scheduler apart.
-/// `Stack::find_handler` walks the stack innermost-first and the binding is
-/// consulted only when it answers `None`, so a `task.spawn` inside a region
-/// reaches the seeded scheduler *always* — with no ordering to get wrong and no
-/// special case anywhere.
 #[test]
 fn a_spawn_inside_a_region_reaches_the_seeded_scheduler_even_when_task_is_bound() {
     let compiled = compile(
@@ -542,12 +496,7 @@ test/nondet "the region's own scheduler answers" {
     );
 }
 
-// ------------------------------------------------------------ footprint check
-
-/// The one mechanical defence in the system against a footprint that
-/// under-reports. It cannot catch a handler that opens a file behind Ply's back
-/// — nothing can — but it does catch one answering outside the row the run was
-/// scheduled and isolated against.
+/// The one mechanical defence in the system against a footprint that under-reports.
 #[test]
 fn an_answer_outside_the_declared_footprint_is_refused() {
     let compiled = compile(SEND);
@@ -591,9 +540,9 @@ fn an_answer_inside_the_declared_footprint_is_allowed() {
     machine.eval_test(0).expect("the atom is declared");
 }
 
-/// The claim is the caller's and it is made once per entry point, so the reset
-/// every entry point performs may not quietly drop it — a footprint check that
-/// silently stops checking is worse than no check at all.
+/// The claim is the caller's and it is made once per entry point, so the reset every entry point
+/// performs may not quietly drop it — a footprint check that silently stops checking is worse than
+/// no check at all.
 #[test]
 fn the_declared_footprint_survives_the_next_entry_point() {
     let compiled = compile(SEND);
@@ -614,11 +563,8 @@ fn the_declared_footprint_survives_the_next_entry_point() {
     );
 }
 
-// -------------------------------------------------------------------- pending
-
-/// Outside a scheduler region a `Pending` has nowhere to park, so the machine
-/// drives the runtime until the token resolves. That is the only place a Ply
-/// computation blocks a real thread.
+/// Outside a scheduler region a `Pending` has nowhere to park, so the machine drives the runtime
+/// until the token resolves.
 #[test]
 fn a_pending_answer_outside_a_region_blocks_and_returns_the_value() {
     let compiled = compile(
@@ -645,9 +591,8 @@ test/nondet "waits" {
     assert_eq!(machine.host_ops(), 1);
 }
 
-/// A machine with a binding and no reactor is a legitimate configuration — a
-/// clock read never touches one — so this must be a diagnostic rather than a
-/// panic or a hang.
+/// A machine with a binding and no reactor is a legitimate configuration — a clock read never
+/// touches one — so this must be a diagnostic rather than a panic or a hang.
 #[test]
 fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
     let compiled = compile(SEND);
@@ -664,11 +609,9 @@ fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
     assert!(d.message.contains("net.send[socket]"), "{}", d.message);
 }
 
-// ------------------------------------------------------------------ isolation
-
-/// A binding is a runtime decision, and nothing about it may reach the front
-/// end: a `det` test performing a `nondet` operation is E0412 with a binding and
-/// without one, and never runs either way.
+/// A binding is a runtime decision, and nothing about it may reach the front end: a `det` test
+/// performing a `nondet` operation is E0412 with a binding and without one, and never runs either
+/// way.
 #[test]
 fn a_binding_does_not_move_an_e0412_verdict() {
     let source = r#"
@@ -695,9 +638,7 @@ test "a det test reaching a socket" {
     );
 }
 
-/// The counter is per entry point. A count that crossed one would refuse a
-/// second resumption in a test that never went near the host, on the strength of
-/// a packet another test sent.
+/// The counter is per entry point.
 #[test]
 fn the_host_operation_count_does_not_cross_an_entry_point() {
     let compiled = compile(
@@ -762,10 +703,8 @@ fn a_span_from_the_perform_reaches_the_handler() {
     machine.eval_test(0).expect("passes");
 }
 
-// ------------------------------------------------- the production scheduler
-
-/// The registrations `ply_host::sched` makes, as a fixture: three `task`
-/// operations, `Repeatable`, over the singleton resource `Any` resolves to.
+/// The registrations `ply_host::sched` makes, as a fixture: three `task` operations, `Repeatable`,
+/// over the singleton resource `Any` resolves to.
 fn task_registry(handler: Arc<dyn HostHandler>) -> HostRegistry {
     registry_of(
         ["spawn", "join", "yield"]
@@ -776,10 +715,6 @@ fn task_registry(handler: Arc<dyn HostHandler>) -> HostRegistry {
 }
 
 /// The whole point of the production scheduler: it is reachable from a program.
-///
-/// The registered handler must never be *called* — a task is a suspended machine
-/// state and a handler is handed only values — so the counter staying at zero is
-/// half the assertion, and the answer being 3 is the other half.
 #[test]
 fn a_bound_task_perform_opens_a_production_region_rather_than_calling_a_handler() {
     let compiled = compile(
@@ -810,8 +745,7 @@ test/nondet "two tasks and a join" {
     );
 }
 
-/// Lock 3. Nothing is bound without `--host`, and `task.*` reaching the boundary
-/// unbound is E0424 rather than a scheduler nobody asked for.
+/// Lock 3.
 #[test]
 fn a_hermetic_run_never_opens_a_production_region() {
     let compiled = compile(
@@ -830,9 +764,7 @@ test/nondet "spawns" {
     assert!(d.message.contains("task.spawn"), "{}", d.message);
 }
 
-/// The two schedulers do not nest in *either* order. The region a `task.*`
-/// opened carries a `SimId` like any other, so the existing `holds_sim` check is
-/// what refuses a `simulate` entered inside it — no second rule to keep in step.
+/// The two schedulers do not nest in *either* order.
 #[test]
 fn a_simulate_inside_a_production_region_is_refused() {
     let compiled = compile(
@@ -855,10 +787,7 @@ test/nondet "a region inside the production one" {
     );
 }
 
-/// A production region answers `task` and nothing else. A `clock.now` inside one
-/// given the seeded table's virtual time would answer zero and only move when
-/// every task is asleep — a wrong answer no assertion would go red on, which is
-/// the failure mode this milestone is about.
+/// A production region answers `task` and nothing else.
 #[test]
 fn a_production_region_never_answers_clock_from_the_seeded_table() {
     let compiled = compile(
@@ -876,23 +805,17 @@ test/nondet "reads a clock inside the production region" {
     let mut machine = compiled.machine();
     machine.set_host_binding(Arc::new(binding));
     // Nothing registers `clock`, so it reaches the boundary and is unhandled.
-    // What matters is that it was not answered `0` by a virtual clock the
-    // production region has no business owning.
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
         codes::UNHANDLED_EFFECT
     );
 }
 
-/// ADR 0008 §8, which is the reason `HostAnswer::Pending` exists at all: a task
-/// waiting on a token leaves the enabled set, and the others keep running. If it
-/// blocked the thread instead, two tasks where one waits on what the other must
-/// produce would hang with no diagnostic.
+/// ADR 0008 §8, which is the reason `HostAnswer::Pending` exists at all: a task waiting on a token
+/// leaves the enabled set, and the others keep running.
 #[test]
 fn a_task_pending_on_a_host_token_parks_and_the_others_run() {
-    /// Never completes on the spot. What resolves the token is the runtime, and
-    /// only on a later poll, which is what forces the performing task to leave
-    /// the enabled set rather than be woken by the poll that parked it.
+    /// Never completes on the spot.
     struct Once;
 
     impl HostHandler for Once {
@@ -956,8 +879,8 @@ test/nondet "the sibling runs while one task waits" {
     );
 }
 
-/// Outside a region there is nowhere to park, so the machine drives the runtime
-/// until the token resolves. That path has to stay, and stay distinguishable.
+/// Outside a region there is nowhere to park, so the machine drives the runtime until the token
+/// resolves.
 #[test]
 fn a_pending_outside_a_region_blocks_the_one_thread_it_is_allowed_to() {
     let compiled = compile(

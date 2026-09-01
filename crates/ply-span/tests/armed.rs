@@ -1,32 +1,14 @@
-//! The gate for the defect `CONTRIBUTING.md` §"The shape it keeps taking:
-//! declared, registered, raised nowhere" counts: a mechanism named everywhere a
-//! reader would look for it and constructed nowhere.
-//!
-//! The check that section used to recommend — `grep -rn '<TypeName>::<Variant>'`,
-//! then read the hits for one that is not a test — does not separate a *mention*
-//! from a *construction*. `E0435 DB_SCHEMA_MISMATCH`, that section's own first
-//! row, is mentioned in production at `crates/ply-eval/src/host.rs` in a table of
-//! codes a handler may not answer with. A file-granularity sweep therefore
-//! reports it as referenced outside tests, and reports it green. It is dead.
-//!
-//! So this file scans for the *constructor* instead. It is lexical: it reads
-//! source text, not a compiled program, and what it proves is that a
-//! construction site exists in production source — never that the site can
-//! execute. §"What this gate does not cover" at the bottom of this file is the
-//! complete list of what that leaves out, and it is meant to be read.
+//! The gate for the defect `CONTRIBUTING.md` §"The shape it keeps taking: declared, registered,
+//! raised nowhere" counts: a mechanism named everywhere a reader would look for it and constructed
+//! nowhere.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-// ---------------------------------------------------------------- allowlists
-
-/// Registered codes that no production source constructs, each with the reason
-/// it is allowed to stay that way. An entry is not absolution: it makes
-/// "reserved on purpose" and "we forgot" stop looking identical, which is the
-/// whole point of the gate. `no_allowlist_entry_has_outlived_its_reason` fails
-/// if a code here becomes armed or stops being registered.
+/// Registered codes that no production source constructs, each with the reason it is allowed to
+/// stay that way.
 const UNARMED_CODES: &[(&str, &str)] = &[
     (
         "DB_SCHEMA_MISMATCH",
@@ -48,8 +30,7 @@ const UNARMED_CODES: &[(&str, &str)] = &[
     ),
 ];
 
-/// Variants of a covered enum that no production source constructs. Same
-/// contract as `UNARMED_CODES`.
+/// Variants of a covered enum that no production source constructs.
 const UNARMED_VARIANTS: &[(&str, &str)] = &[
     (
         "Severity::Note",
@@ -109,18 +90,7 @@ const UNARMED_VARIANTS: &[(&str, &str)] = &[
     ),
 ];
 
-/// Functions that take a code and hand it to `Diagnostic::error`/`warning`
-/// unchanged. A call to one of these with a literal `codes::NAME` first
-/// argument arms that code.
-///
-/// This list is not a convenience. `every_diagnostic_constructor_call_names_its_code_literally`
-/// fails on any constructor call whose first argument is not a literal
-/// `codes::` path and whose enclosing function is not listed here — because an
-/// unlisted wrapper would disarm the rule for every code that only reaches the
-/// constructor through it, and the gate would go green over the gap. That is
-/// not hypothetical: with this list empty, `E0002 UNTERMINATED_STRING` is
-/// reported dead, and it is not dead — it reaches `Diagnostic::error` through
-/// `Lexer::error` from four sites in `lexer.rs`.
+/// Functions that take a code and hand it to `Diagnostic::error`/`warning` unchanged.
 const CODE_INDIRECTION: &[Indirection] = &[Indirection {
     file: "crates/ply-syntax/src/lexer.rs",
     function: "error",
@@ -129,11 +99,7 @@ const CODE_INDIRECTION: &[Indirection] = &[Indirection {
              nothing else with the code. Private to the lexer.",
 }];
 
-/// Covered enum names that more than one covered enum declares. A reference
-/// written `Name::Variant` cannot be attributed to one of them by a lexical
-/// scan, so a hit arms the variant in *both* — a false negative, in a named and
-/// enumerated case rather than a silent one. `ambiguous_enum_names_are_declared`
-/// fails if a collision appears that is not listed here.
+/// Covered enum names that more than one covered enum declares.
 const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[(
     "Reason",
     "crates/ply-test/src/lib.rs's Reason (why a test was selected) and \
@@ -146,8 +112,8 @@ const AMBIGUOUS_ENUM_NAMES: &[(&str, &str)] = &[(
 struct Indirection {
     file: &'static str,
     function: &'static str,
-    /// Read by `no_allowlist_entry_has_outlived_its_reason`, so that an entry
-    /// here cannot be added without one.
+    /// Read by `no_allowlist_entry_has_outlived_its_reason`, so that an entry here cannot be added
+    /// without one.
     reason: &'static str,
 }
 
@@ -157,14 +123,8 @@ const COVERED_ENUM_ROOTS: &[&str] = &["crates/ply-test/src"];
 /// Individually covered enums outside `COVERED_ENUM_ROOTS`, as `(file, name)`.
 const COVERED_ENUMS: &[(&str, &str)] = &[("crates/ply-span/src/lib.rs", "Severity")];
 
-// ------------------------------------------------------------------ scanning
-
-/// Replaces the contents of comments, string literals, raw string literals and
-/// character literals with spaces, preserving every byte offset and every
-/// newline. A `codes::X` inside a doc comment is a mention, and several are:
-/// `crates/ply-eval/src/limit.rs:83` quotes a withdrawn claim about
-/// `AssertionKind::RecursionLimit` in a `>` block, and that is exactly the
-/// house convention for a correction. It must not arm anything.
+/// Replaces the contents of comments, string literals, raw string literals and character literals
+/// with spaces, preserving every byte offset and every newline.
 fn blank_literals_and_comments(src: &[u8]) -> Vec<u8> {
     let mut out = src.to_vec();
     let n = src.len();
@@ -286,19 +246,7 @@ fn char_literal_end(src: &[u8], i: usize) -> Option<usize> {
     (src.get(i + 1 + width) == Some(&b'\'')).then_some(i + 2 + width)
 }
 
-/// Blanks every `#[cfg(test)]` item. A `#[cfg(test)] mod x;` declaration is the
-/// one exception: the module *resolver* is what excludes the file it names, and
-/// blanking the declaration would hide it from the resolver.
-///
-/// The walk to the item's body steps over balanced `(..)` and `[..]`, because a
-/// `;` inside a type is not the end of a declaration. It used to stop at the
-/// first `;` outright, and `crates/ply-eval/src/argv.rs`'s
-/// `#[cfg(test)] fn kept() -> [usize; CLASSES]` is exactly the shape that
-/// defeats that: the `;` in the array type arrived before the body's `{`, so
-/// the function was left unblanked and a test-only body was scanned as
-/// production. Nothing in that body armed anything, so the tree stayed honest
-/// by luck; `a_cfg_test_item_is_not_production_whatever_its_header_looks_like`
-/// is what keeps it honest on purpose.
+/// Blanks every `#[cfg(test)]` item.
 fn blank_cfg_test_blocks(text: &[u8]) -> Vec<u8> {
     const ATTR: &[u8] = b"#[cfg(test)]";
     let mut out = text.to_vec();
@@ -328,10 +276,8 @@ fn blank_cfg_test_blocks(text: &[u8]) -> Vec<u8> {
         } else if header_declares_a_module(&text[i + ATTR.len()..j]) {
             i += ATTR.len();
         } else {
-            // A `;`-terminated item that is not a module declaration — a
-            // `const`, a `static`, a `type`, a `use`. Test-only source like any
-            // other, and a `const K: E = E::Ghost;` here would otherwise read
-            // as a production construction of `E::Ghost`.
+            // A `;`-terminated item that is not a module declaration — a `const`, a `static`, a
+            // `type`, a `use`.
             blank(&mut out, i, j + 1);
             i = j + 1;
         }
@@ -339,8 +285,7 @@ fn blank_cfg_test_blocks(text: &[u8]) -> Vec<u8> {
     out
 }
 
-/// Whether an item header between `#[cfg(test)]` and its `;` is a `mod`
-/// declaration.
+/// Whether an item header between `#[cfg(test)]` and its `;` is a `mod` declaration.
 fn header_declares_a_module(header: &[u8]) -> bool {
     let mut i = 0;
     while i < header.len() {
@@ -422,17 +367,8 @@ fn line_of(text: &[u8], offset: usize) -> usize {
         + 1
 }
 
-// ------------------------------------------------------------ pattern regions
-
-/// Byte ranges that are pattern positions or `use` paths — the two places a
-/// `Type::Variant` can appear without anything being constructed.
-///
-/// A match arm is the hard case and the one a naive scan gets wrong. The first
-/// prototype of this gate reported `Event::Enter` and `Event::Perform` as armed
-/// because its arm-skipping mishandled a block-bodied arm with no trailing
-/// comma — `crates/ply-test/src/slice.rs:217-244` is exactly that shape.
-/// `arm_bodies_are_expressions_and_arm_heads_are_patterns` is the test that
-/// holds this honest.
+/// Byte ranges that are pattern positions or `use` paths — the two places a `Type::Variant` can
+/// appear without anything being constructed.
 fn pattern_and_use_regions(text: &[u8]) -> Vec<(usize, usize)> {
     let mut out = Vec::new();
     scan(text, 0, text.len(), &mut out);
@@ -471,8 +407,8 @@ fn scan(text: &[u8], lo: usize, hi: usize, out: &mut Vec<(usize, usize)>) {
                     i = end;
                 }
             }
-            // `if let`, `while let` and a plain `let` are the same shape: a
-            // pattern between the keyword and the `=`.
+            // `if let`, `while let` and a plain `let` are the same shape: a pattern between the
+            // keyword and the `=`.
             b"let" => {
                 let mut j = end;
                 while j < hi {
@@ -562,8 +498,8 @@ fn scan_match(text: &[u8], brace: usize, close: usize, out: &mut Vec<(usize, usi
         }
         match state {
             Arm::Head => {
-                // A pattern's own groups — tuple, slice and struct patterns —
-                // are inside the head range, so they need no separate marking.
+                // A pattern's own groups — tuple, slice and struct patterns — are inside the head
+                // range, so they need no separate marking.
                 if matches!(c, b'(' | b'[' | b'{') {
                     i = delim_close(text, i).min(end);
                 } else if c == b'=' && text.get(i + 1) == Some(&b'>') {
@@ -605,9 +541,8 @@ fn scan_match(text: &[u8], brace: usize, close: usize, out: &mut Vec<(usize, usi
     }
 }
 
-/// A block body ends at its own `}`, with the comma after it optional; any
-/// other body ends at the next comma outside a group. Both recurse, because an
-/// arm body is an expression and may hold another `match`.
+/// A block body ends at its own `}`, with the comma after it optional; any other body ends at the
+/// next comma outside a group.
 fn consume_arm_body(text: &[u8], i: usize, end: usize, out: &mut Vec<(usize, usize)>) -> usize {
     let mut i = skip_ws(text, i, end);
     if text.get(i) == Some(&b'{') {
@@ -631,8 +566,6 @@ fn consume_arm_body(text: &[u8], i: usize, end: usize, out: &mut Vec<(usize, usi
     if i < end { i + 1 } else { i }
 }
 
-// ------------------------------------------------------------ the source tree
-
 struct Source {
     rel: String,
     text: Vec<u8>,
@@ -653,8 +586,8 @@ fn workspace_root() -> PathBuf {
         .expect("the workspace root is two directories above crates/ply-span")
 }
 
-/// Package names from `[workspace] members`, read out of the root manifest as
-/// text — the same source `.github/ci-shards.sh` reads, for the same reason.
+/// Package names from `[workspace] members`, read out of the root manifest as text — the same
+/// source `.github/ci-shards.sh` reads, for the same reason.
 fn workspace_members(root: &Path) -> Vec<String> {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).expect("a workspace manifest");
     let list = manifest
@@ -742,13 +675,8 @@ fn attributes_include_cfg_test(text: &[u8], mod_at: usize) -> bool {
     }
 }
 
-/// Walks `mod` declarations from every crate root and returns the production
-/// files: everything reachable without passing through a `#[cfg(test)] mod`.
-/// This resolution is load-bearing rather than tidy.
-/// `crates/ply-core/src/numerics.rs` carries no marker of its own and is
-/// test-only solely because `crates/ply-core/src/lib.rs` says
-/// `#[cfg(test)] mod numerics;`. A filename heuristic would have read its
-/// `assert_eq!(diags[0].code, codes::DECIMAL_DIVISION)` as an arming.
+/// Walks `mod` declarations from every crate root and returns the production files: everything
+/// reachable without passing through a `#[cfg(test)] mod`.
 fn production_sources(root: &Path) -> Vec<Source> {
     let mut reached: BTreeMap<PathBuf, bool> = BTreeMap::new();
     let mut queue: Vec<(PathBuf, bool)> = Vec::new();
@@ -772,8 +700,8 @@ fn production_sources(root: &Path) -> Vec<Source> {
 
     while let Some((path, test_only)) = queue.pop() {
         match reached.get(&path) {
-            // A module reachable by both a production and a test path is
-            // production: it compiles into the library.
+            // A module reachable by both a production and a test path is production: it compiles
+            // into the library.
             Some(&seen) if seen == test_only || !seen => continue,
             _ => {}
         }
@@ -785,10 +713,7 @@ fn production_sources(root: &Path) -> Vec<Source> {
              module it names silently drops out of the production set",
             path.display()
         );
-        // Blanking recognises `#[cfg(test)]` exactly. A combination spells the
-        // same thing and would not be blanked, so a test-only body would be
-        // read as production. There are none today; this is that fact asserted
-        // rather than grepped once and remembered.
+        // Blanking recognises `#[cfg(test)]` exactly.
         for spelling in [b"cfg(all(test".as_slice(), b"cfg(any(test".as_slice()] {
             assert!(
                 !contains(&blank_literals_and_comments(&raw), spelling),
@@ -856,11 +781,7 @@ fn find_all(haystack: &[u8], needle: &[u8]) -> Vec<usize> {
         .collect()
 }
 
-// ------------------------------------------------------------- the registries
-
-/// `NAME -> ("E0435", line)` for every `pub const` in `ply_span::codes`. Read
-/// from the raw text, because the number is inside a string literal that
-/// `blank_literals_and_comments` would erase.
+/// `NAME -> ("E0435", line)` for every `pub const` in `ply_span::codes`.
 fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
     let raw = std::fs::read(root.join("crates/ply-span/src/lib.rs")).expect("ply-span's lib.rs");
     let blanked = blank_literals_and_comments(&raw);
@@ -880,8 +801,8 @@ fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
         let start = open + start;
         let name_at = skip_ws(&blanked, start + b"pub const".len(), close);
         let (name, name_end) = ident_at(&blanked, name_at);
-        // `skip_ws` over `blanked` would walk straight over the blanked string
-        // literal and land on the `;`. Offsets are shared, so seek in `raw`.
+        // `skip_ws` over `blanked` would walk straight over the blanked string literal and land on
+        // the `;`.
         let value_at = match blanked[name_end..close].iter().position(|b| *b == b'=') {
             Some(eq) => skip_ws(&raw, name_end + eq + 1, close),
             None => continue,
@@ -905,9 +826,8 @@ fn declared_codes(root: &Path) -> BTreeMap<String, (String, usize)> {
     out
 }
 
-/// The `(name, codes::NAME, "E0001")` rows of the registry table in ply-span's
-/// own test module, read as text — an integration test cannot call into a
-/// `#[cfg(test)]` module.
+/// The `(name, codes::NAME, "E0001")` rows of the registry table in ply-span's own test module,
+/// read as text — an integration test cannot call into a `#[cfg(test)]` module.
 fn registry_rows(root: &Path) -> BTreeSet<String> {
     let raw = std::fs::read(root.join("crates/ply-span/src/lib.rs")).expect("ply-span's lib.rs");
     let blanked = blank_literals_and_comments(&raw);
@@ -926,8 +846,8 @@ fn registry_rows(root: &Path) -> BTreeSet<String> {
         .collect()
 }
 
-/// Every `Diagnostic::error`/`warning` call in production, as
-/// `(source index, offset, first argument as written)`.
+/// Every `Diagnostic::error`/`warning` call in production, as `(source index, offset, first
+/// argument as written)`.
 fn constructor_calls(sources: &[Source]) -> Vec<(usize, usize, String)> {
     let mut out = Vec::new();
     for (idx, source) in sources.iter().enumerate() {
@@ -1006,8 +926,6 @@ fn armed_codes(sources: &[Source]) -> BTreeSet<String> {
     armed
 }
 
-// ------------------------------------------------------------- covered enums
-
 struct CoveredEnum {
     name: String,
     file: String,
@@ -1082,9 +1000,8 @@ fn covered_enums(sources: &[Source]) -> Vec<CoveredEnum> {
     out
 }
 
-/// Every `Ident::Ident` in production that is not a pattern and not a `use`
-/// path, as `(before, after, source index)`. Built once: the alternative is a
-/// substring sweep per variant per file, which is quadratic in the tree.
+/// Every `Ident::Ident` in production that is not a pattern and not a `use` path, as `(before,
+/// after, source index)`.
 fn path_occurrences(sources: &[Source]) -> BTreeSet<(String, String, usize)> {
     let mut out = BTreeSet::new();
     for (idx, source) in sources.iter().enumerate() {
@@ -1114,9 +1031,8 @@ fn path_occurrences(sources: &[Source]) -> BTreeSet<(String, String, usize)> {
     out
 }
 
-/// Whether any production source builds `Enum::Variant` somewhere that is not a
-/// pattern and not a `use` path. `Self::Variant` counts only inside the file
-/// that declares the enum: elsewhere `Self` is some other type.
+/// Whether any production source builds `Enum::Variant` somewhere that is not a pattern and not a
+/// `use` path.
 fn variant_is_armed(tree: &Tree, covered: &CoveredEnum, variant: &str) -> bool {
     (0..tree.sources.len()).any(|idx| {
         tree.paths
@@ -1128,8 +1044,7 @@ fn variant_is_armed(tree: &Tree, covered: &CoveredEnum, variant: &str) -> bool {
     })
 }
 
-/// Everything the gates read, scanned once. Five tests over 167 files would
-/// otherwise re-read, re-blank and re-mask the tree five times.
+/// Everything the gates read, scanned once.
 struct Tree {
     sources: Vec<Source>,
     declared: BTreeMap<String, (String, usize)>,
@@ -1162,8 +1077,6 @@ fn tree() -> &'static Tree {
         }
     })
 }
-
-// ------------------------------------------------------------------ the gates
 
 fn how_to_fix(what: &str, list: &str) -> String {
     format!(
@@ -1296,9 +1209,8 @@ fn every_variant_of_a_covered_enum_is_constructed_in_production() {
     }
 }
 
-/// Without this, one new pass-through wrapper disarms the rule for every code
-/// that only reaches the constructor through it, and both gates go green over
-/// the gap.
+/// Without this, one new pass-through wrapper disarms the rule for every code that only reaches the
+/// constructor through it, and both gates go green over the gap.
 #[test]
 fn every_diagnostic_constructor_call_names_its_code_literally() {
     let Tree { sources, calls, .. } = tree();
@@ -1342,11 +1254,7 @@ fn every_diagnostic_constructor_call_names_its_code_literally() {
     );
 }
 
-/// The mirror defect: declared and *not* registered. `every_registered_code_has_its_published_number`
-/// in ply-span's own test module asserts that no code moved and that no two share
-/// a number — it never asserts the table is total, so before this gate existed a
-/// constant could be added to `codes` and registered nowhere. One was:
-/// `REFERENCE_CYCLE` (`W0610`), 83 constants against 82 rows.
+/// The mirror defect: declared and *not* registered.
 #[test]
 fn the_code_registry_table_is_total_over_the_codes_module() {
     let Tree { declared, rows, .. } = tree();
@@ -1379,8 +1287,7 @@ fn the_code_registry_table_is_total_over_the_codes_module() {
     );
 }
 
-/// An allowlist that outlives its reason is the same defect wearing the
-/// gate's own clothes.
+/// An allowlist that outlives its reason is the same defect wearing the gate's own clothes.
 #[test]
 fn no_allowlist_entry_has_outlived_its_reason() {
     let tree = tree();
@@ -1482,7 +1389,6 @@ fn no_allowlist_entry_has_outlived_its_reason() {
 }
 
 /// Two covered enums with the same name cannot be told apart by a lexical scan.
-/// Listed rather than left to be discovered.
 #[test]
 fn ambiguous_enum_names_are_declared() {
     let covered = &tree().covered;
@@ -1521,13 +1427,6 @@ fn ambiguous_enum_names_are_declared() {
     );
 }
 
-// -------------------------------------------------- the scanner's own tests
-//
-// A scanner with no tests of its own is one more unexamined green, and this one
-// has already been wrong: an early prototype called `Event::Enter` and
-// `Event::Perform` armed because it mishandled a block-bodied match arm with no
-// trailing comma.
-
 fn mask_of(src: &str) -> Vec<bool> {
     let text = blank_cfg_test_blocks(&blank_literals_and_comments(src.as_bytes()));
     let mut masked = vec![false; text.len()];
@@ -1556,8 +1455,8 @@ fn assert_pattern(src: &str, needle: &str, expected: bool) {
 
 #[test]
 fn arm_bodies_are_expressions_and_arm_heads_are_patterns() {
-    // The exact shape that fooled the prototype: a block-bodied arm with no
-    // trailing comma, followed by another arm.
+    // The exact shape that fooled the prototype: a block-bodied arm with no trailing comma,
+    // followed by another arm.
     assert_pattern(
         "fn f(e: E) { match e { E::A => { g(); } E::B => { h(); } } }",
         "E::B",
@@ -1668,10 +1567,8 @@ fn cfg_test_items_and_modules_are_not_production() {
     assert!(mod_declarations(b"mod inline { fn f() {} }").is_empty());
 }
 
-/// The walk from `#[cfg(test)]` to the item's body used to stop at the first
-/// `;`, which a header can contain without ending anything. That read a
-/// test-only function body as production, and it was live in the tree:
-/// `crates/ply-eval/src/argv.rs`'s `#[cfg(test)] fn kept() -> [usize; CLASSES]`.
+/// The walk from `#[cfg(test)]` to the item's body used to stop at the first `;`, which a header
+/// can contain without ending anything.
 #[test]
 fn a_cfg_test_item_is_not_production_whatever_its_header_looks_like() {
     // A `;` inside an array type in the return position.
@@ -1691,8 +1588,8 @@ fn a_cfg_test_item_is_not_production_whatever_its_header_looks_like() {
         b"GHOST"
     ));
 
-    // `;`-terminated items that are not modules are test-only source too, and a
-    // `const` initialiser is a construction wherever it is written.
+    // `;`-terminated items that are not modules are test-only source too, and a `const` initialiser
+    // is a construction wherever it is written.
     for src in [
         "#[cfg(test)]\nconst K: E = E::GHOST;\nfn after() {}",
         "#[cfg(test)]\nstatic K: E = E::GHOST;\nfn after() {}",
@@ -1710,8 +1607,8 @@ fn a_cfg_test_item_is_not_production_whatever_its_header_looks_like() {
         );
     }
 
-    // ... and a `mod` declaration is still the exception, however it is spelled,
-    // because the resolver reads it to decide the file it names is test-only.
+    // ... and a `mod` declaration is still the exception, however it is spelled, because the
+    // resolver reads it to decide the file it names is test-only.
     for src in [
         "#[cfg(test)]\nmod tests;",
         "#[cfg(test)]\npub(crate) mod delta_tests;",
@@ -1751,61 +1648,9 @@ fn a_codes_path_is_recognised_however_it_is_qualified() {
     assert_eq!(code_from_path("other::X"), None);
 }
 
-// ------------------------------------ what this gate does not cover
-//
-// Named here so nobody has to infer it from a green run. Every clause is a
-// place this gate is silent, not a place it has looked.
-//
-//   * REACHABILITY. The gate proves a construction site exists in production
-//     source. It does not prove the site can execute. Rows 2 and 3 of the
-//     catalogue in CONTRIBUTING.md — W1's footprint check and M8's mitigation —
-//     are unreachable-code defects and this gate would NOT have caught either.
-//     A `Diagnostic::error(codes::X, ..)` behind an `if false` is armed as far
-//     as this file is concerned.
-//   * TYPES WITH NO PRODUCER. Row 5 of the catalogue, `CausalSlice` /
-//     `SliceBuilder`, is caught only indirectly: `Event`'s three variants are
-//     flagged, which is the same evidence by another route. There is no general
-//     "public constructor called only from tests" rule here, because for a
-//     library crate that has a large legitimate-API false-positive surface.
-//   * ENUMS OUTSIDE THE COVERED SET. `COVERED_ENUM_ROOTS` plus `COVERED_ENUMS`
-//     is `crates/ply-test/src` and `ply_span::Severity`, and nothing else. A
-//     workspace-wide sweep flags around forty more variants, most of them clap
-//     `Subcommand`/`ValueEnum` arms that derive-generated code constructs
-//     invisibly; widening the set would flood the allowlist with false
-//     positives and train readers to stop reading it.
-//   * DERIVE AND SERDE CONSTRUCTION. A variant built only by a derive macro or
-//     only by `Deserialize` looks dead here. `Severity` is exactly that risk and
-//     its allowlist row says so.
-//   * PROSE. A milestone report's claim that something is checked is not
-//     machine-checkable from source, and this gate does not try.
-//   * `crates/ply-codegen-spike` AND `spikes/`. Excluded: the spike declares its
-//     own `[workspace]` (ADR 0016 s3.5) and is meant to be deletable with
-//     `rm -r`. The exclusion changes nothing today — the spike's only code use
-//     is `Diagnostic::error(codes::RUNTIME_ERROR, ..)` in its `src/rt.rs`, and
-//     `RUNTIME_ERROR` has many arming sites inside the workspace.
-//   * AMBIGUOUS ENUM NAMES. See `AMBIGUOUS_ENUM_NAMES`.
-//   * CONFIGURATION OTHER THAN `#[cfg(test)]`. A `#[cfg(feature = "..")]` item
-//     is scanned as production whether or not the feature is ever enabled —
-//     which is the reachability gap above, by another route. Only the exact
-//     spelling `#[cfg(test)]` is treated as test-only; `cfg(all(test, ..))` and
-//     `cfg(any(test, ..))` are asserted absent in `production_sources` rather
-//     than handled, so one appearing fails the gate instead of quietly
-//     widening what counts as production.
-
-// ----------------------------------------------- the compiled-backend tripwire
-
-/// Production files that install a compiled backend, and the reason each is
-/// allowed to, in the shape `UNARMED_CODES` uses and for the same reason: a
-/// route that appears without anybody deciding it should must look different
-/// from one that was decided on.
-///
-/// ADR 0026 §4.6 stage one. Until this arc, `Machine::set_compiled` had **no**
-/// production caller at all — every one of its 42 call sites was a test or
-/// `crates/ply-codegen-spike`'s own harness — and the rule that a backend run
-/// must not populate the result cache was, in `compiled.rs`'s own words,
-/// "unenforced *because it is unreachable*". It is reachable now, so the rule
-/// is armed, and this is the half that fires on **a new route** rather than on
-/// a wrong answer.
+/// Production files that install a compiled backend, and the reason each is allowed to, in the
+/// shape `UNARMED_CODES` uses and for the same reason: a route that appears without anybody
+/// deciding it should must look different from one that was decided on.
 const BACKEND_INSTALLERS: &[(&str, &str)] = &[(
     "crates/ply-test/src/lib.rs",
     "`InterpExecutor::machine_lowering`, installing what `InterpExecutor::with_backend` \
@@ -1816,25 +1661,6 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[(
 )];
 
 /// A backend installed by a route the cache rule does not know about.
-///
-/// `Machine::set_compiled`'s own doc comment stated this rule and its own
-/// unenforceability in one breath — *"That rule is **not enforced** for a
-/// backend — it is unreachable … The day a flag can, that line moves in the same
-/// change."* That day is this change, and this is what stops the next route
-/// arriving without the line moving with it.
-///
-/// **Seen to fail.** Adding `machine.set_compiled(backend);` to
-/// `crates/ply-cli/src/commands/run.rs` — a production file, a shipping command,
-/// and one with no cache rule at all — turns this red with *"installs a compiled
-/// backend and is not listed in BACKEND_INSTALLERS"*. Removing the
-/// `args.backend.is_some()` clause from `cache_bypassed` turns it red with the
-/// second assertion. Both were run.
-///
-/// What it does **not** prove is that the rule works, only that whoever adds a
-/// route is told about it. The rule working is
-/// `crates/ply-cli/tests/suite/backend.rs`'s `a_backend_run_reads_no_cached_pass` and
-/// `a_backend_run_writes_no_pass`, which are behavioural and are the ones that
-/// go red if the enforcement is wrong rather than merely absent.
 #[test]
 fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
     let Tree { sources, .. } = tree();
@@ -1869,9 +1695,7 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
          row — an excuse that outlives its fact is what this file exists to prevent."
     );
 
-    // The two halves, read off the production source that owes them. Lexical,
-    // like everything else here, and it proves the clause is present rather
-    // than that it is right.
+    // The two halves, read off the production source that owes them.
     let cli = sources
         .iter()
         .find(|s| s.rel == "crates/ply-cli/src/commands/test.rs")
@@ -1911,18 +1735,6 @@ fn between(text: &[u8], open: &[u8], close: &[u8]) -> Vec<u8> {
 }
 
 /// Two ADRs may not share a number.
-///
-/// **Advice failed twice before this test existed.** `CONTRIBUTING.md` §"Adding
-/// things" said to number an ADR by counting the directory; two branches then
-/// wrote `0022` without seeing each other. It was corrected to say counting is
-/// "necessary and is not sufficient — read the open pull requests"; two
-/// branches then wrote `0027` without seeing each other, because both were
-/// created before either pull request existed, so there was nothing to read.
-///
-/// A rule a contributor has to remember, in a repository whose changes are
-/// written in parallel worktrees that cannot see one another, is not a rule.
-/// This is the same move `every_registered_code_is_constructed_in_production`
-/// makes for the code registry: stop advising, and check.
 #[test]
 fn no_two_adrs_share_a_number() {
     let dir = workspace_root().join("docs/adr");

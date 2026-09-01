@@ -1,9 +1,4 @@
 //! Both engines over the corpora that exist on disk.
-//!
-//! The hand-written unit tests agree on the shapes somebody thought to write
-//! down. Real source is where a disagreement is actually found, so this points
-//! the harness at `examples/` and `tests/fixtures/` and refuses to pass if it
-//! compared nothing — an all-skipped run and a clean run must not look alike.
 
 use ply_eval::differential::compare_tests;
 use ply_eval::{Fixture, Interp, Machine};
@@ -47,8 +42,7 @@ fn subdirectories(dir: &Path) -> Vec<PathBuf> {
     out
 }
 
-/// The `std.*` modules one source names. A module that does not parse names
-/// nothing: the caller's own parse is what reports that.
+/// The `std.*` modules one source names.
 fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<ModuleName> {
     let Ok(module) = ply_syntax::parse_module(id, name.clone(), text) else {
         return Vec::new();
@@ -61,9 +55,8 @@ fn std_imports(id: ply_span::SourceId, name: &ModuleName, text: &str) -> Vec<Mod
         .collect()
 }
 
-/// A fixture is often a deliberately broken program, so anything that does not
-/// parse or resolve is not this test's business and is counted as skipped
-/// rather than failed.
+/// A fixture is often a deliberately broken program, so anything that does not parse or resolve is
+/// not this test's business and is counted as skipped rather than failed.
 fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
     let mut map = SourceMap::new();
     let mut loaded = Vec::new();
@@ -74,9 +67,9 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
         let id = map.add(path, text.clone());
         loaded.push((id, name, text));
     }
-    // Demand-driven, exactly as `ply`'s own loader is: a corpus that imports
-    // nothing from `std` gets nothing, so a one-file fixture stays the program
-    // it is rather than acquiring the stdlib's definitions and tests.
+    // Demand-driven, exactly as `ply`'s own loader is: a corpus that imports nothing from `std`
+    // gets nothing, so a one-file fixture stays the program it is rather than acquiring the
+    // stdlib's definitions and tests.
     let mut next = 0;
     while next < loaded.len() {
         let (id, name, text) = &loaded[next];
@@ -98,9 +91,8 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
         .map(|(id, name, text)| (*id, name.clone(), text.as_str()))
         .collect();
     let mut program = parse_program(inputs).ok()?;
-    // A `derive` declares no name and every walker skips it, so a harness that
-    // forgets to expand runs a program whose generated definitions silently do
-    // not exist.
+    // A `derive` declares no name and every walker skips it, so a harness that forgets to expand
+    // runs a program whose generated definitions silently do not exist.
     if !ply_derive::expand_program(&mut program).is_empty() {
         return None;
     }
@@ -108,9 +100,8 @@ fn load(root: &Path, files: &[PathBuf]) -> Option<(Program, Resolved)> {
     Some((program, resolved))
 }
 
-/// Every directory that is one program, plus every stray top-level fixture as a
-/// program of its own — which is what they are, since a fixture in
-/// `tests/fixtures` names nothing in its neighbour.
+/// Every directory that is one program, plus every stray top-level fixture as a program of its own
+/// — which is what they are, since a fixture in `tests/fixtures` names nothing in its neighbour.
 fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
     let mut out = Vec::new();
 
@@ -157,9 +148,8 @@ fn the_two_engines_agree_on_every_corpus_on_disk() {
         atoms += machine.trace().performs();
 
         assert!(report.is_clean(), "{label}\n{report}");
-        // A green run whose footprint axis never ran is what let two engines
-        // performing different atoms pass this audit. Zero compared footprints
-        // is therefore a failure, not a footnote.
+        // A green run whose footprint axis never ran is what let two engines performing different
+        // atoms pass this audit.
         assert_eq!(
             report.footprints_compared, report.compared,
             "{label}: an engine stopped reporting what it performed\n{report}"
@@ -177,9 +167,7 @@ fn the_two_engines_agree_on_every_corpus_on_disk() {
     );
 }
 
-/// A refusal is not agreement, so the harness must count it apart. Pinned on a
-/// real fixture: a corpus only one engine can run passing for an audited one is
-/// the failure mode `--engine both` exists to prevent.
+/// A refusal is not agreement, so the harness must count it apart.
 #[test]
 fn a_machine_only_fixture_is_counted_apart_from_what_was_compared() {
     let root = workspace_root();
@@ -211,22 +199,8 @@ fn a_machine_only_fixture_is_counted_apart_from_what_was_compared() {
     assert_eq!(refused.code, ply_span::codes::MACHINE_ONLY_CLAUSE);
 }
 
-/// The corpus half of `CONTRIBUTING.md` §"Things known to be broken" item 11,
-/// pinned on its fixture rather than left to the sweep above.
-///
-/// The sweep runs every corpus on disk and would keep passing if this fixture
-/// were deleted, renamed or quietly made pure — which is the shape of failure
-/// this repository produces most. So the coverage is asserted here: the fixture
-/// exists, it declares an effect, its two self-handling definitions publish
-/// **empty** rows, the backend can answer both of them, and neither is offered.
-///
-/// The last of those is what makes the test bite. `backends::TreeWalker` runs a
-/// definition on its own `Interp` with no handler stack, so it can answer a
-/// definition that discharges its own operations and cannot answer one that
-/// performs into its caller. Delete the effects gate and this fixture is
-/// entered, the machine records neither atom, and `compare_tests` reports
-/// `observed footprint — left {..tally.read[log], ..tally.write[log]},
-/// right {}`.
+/// The corpus half of `CONTRIBUTING.md` §"Things known to be broken" item 11, pinned on its fixture
+/// rather than left to the sweep above.
 #[test]
 fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered() {
     let root = workspace_root();
@@ -261,10 +235,8 @@ fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_en
          effects gate is unexercised again"
     );
 
-    // The other effect gate, on the same corpus: `measured` is what performs
-    // into its caller, so its row is not empty and `Gate::PublishedRow` is what
-    // refuses it. Asserted on the row rather than on the gate because a corpus
-    // run counts declines without recording which gate produced one.
+    // The other effect gate, on the same corpus: `measured` is what performs into its caller, so
+    // its row is not empty and `Gate::PublishedRow` is what refuses it.
     let measured = check
         .defs
         .get(&ply_span::Symbol::new("self_handled_effect.measured"))
@@ -288,8 +260,8 @@ fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_en
         "the fixture performed nothing, so agreeing on its footprint proves nothing"
     );
 
-    // The control is the point: `doubled` *is* entered, so the two refusals
-    // above are this gate rather than a backend that answers nothing here.
+    // The control is the point: `doubled` *is* entered, so the two refusals above are this gate
+    // rather than a backend that answers nothing here.
     let (entered, _) = machine.compiled_counts();
     assert!(
         entered > 0,
@@ -298,9 +270,8 @@ fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_en
     );
 }
 
-/// `examples/` is the corpus the milestone's exit criterion names, so it gets
-/// its own assertion rather than being one entry in a loop that would still
-/// pass if it silently stopped loading.
+/// `examples/` is the corpus the milestone's exit criterion names, so it gets its own assertion
+/// rather than being one entry in a loop that would still pass if it silently stopped loading.
 #[test]
 fn the_two_engines_agree_on_examples() {
     let root = workspace_root();
@@ -318,11 +289,6 @@ fn the_two_engines_agree_on_examples() {
 }
 
 /// The same corpora, with a backend attached.
-///
-/// `crates/ply-eval/src/compiled.rs` holds hand-built doubles over hand-built
-/// programs. This is the same seam over real source at corpus scale, which is
-/// where ADR 0018 §0's 1,344 green cases would have been the wrong instrument:
-/// the counters below fail the test if the seam was never reached.
 mod backends {
     use ply_eval::{Compiled, Interp, Value};
     use ply_span::{Span, Symbol};
@@ -360,19 +326,8 @@ mod backends {
         }
     }
 
-    /// A backend whose "compiled code" is the tree-walker, over its own copy of
-    /// the program with its own world.
-    ///
-    /// It is not a JIT and does not pretend to be one. What it is, is a backend
-    /// that answers the right value for every call this boundary admits, which
-    /// makes the *accept* path testable against real source: every gate, the
-    /// `Frame::Call` push, the constant memo and the argument-vector hand-back
-    /// run for thousands of calls instead of the dozen a hand-built double
-    /// reaches. A wrong answer here is a defect in the seam.
-    ///
-    /// The program is leaked because a backend may not borrow — see the
-    /// `compiled` field on `Machine`. A test binary that leaks one AST is a
-    /// better trade than a seam nobody entered.
+    /// A backend whose "compiled code" is the tree-walker, over its own copy of the program with
+    /// its own world.
     pub struct TreeWalker {
         program: *const Program,
         inner: RefCell<Interp<'static>>,
@@ -417,9 +372,9 @@ fn a_backend_that_declines_everything_changes_nothing_over_every_corpus_on_disk(
         let Some((program, resolved)) = load(&dir, &files) else {
             continue;
         };
-        // `Machine::for_program` carries no `CheckOutput`, and the purity gate
-        // reads the published row: without one the hook is inert and this test
-        // would be green over a seam it never reached.
+        // `Machine::for_program` carries no `CheckOutput`, and the purity gate reads the published
+        // row: without one the hook is inert and this test would be green over a seam it never
+        // reached.
         let Ok(check) = ply_core::check_program(&program, &resolved) else {
             continue;
         };
@@ -496,41 +451,12 @@ fn a_backend_that_answers_correctly_agrees_over_every_corpus_on_disk() {
 }
 
 // --- The eight wrong backends, at corpus scale ------------------------------
-//
-// ADR 0026 §6 item 3, and the condition §4.7 puts on deleting
-// `crates/ply-codegen-spike`: *"the eight wrong backends of `tests/mutations.rs`,
-// reproduced over the `Compiled` doubles in `crates/ply-eval/tests/`, running
-// under `cargo test --workspace`, with a corpus that has been seen to fail."*
-//
-// The doubles above are what made the *accept* path testable on real source.
-// These are what make it testable that a wrong answer on real source would be
-// **noticed** — which is a different claim, and the one `CONTRIBUTING.md` §"The
-// one rule" says this project keeps failing to check. Every test here follows
-// `mutations.rs`'s three steps and asserts the middle one first: the corruption
-// fired, and only then that something reported it.
-//
-// The backend is `ply_eval::Reference` rather than a hand-built double, because
-// `Mutation::Unoffered` needs a backend that can *miss* — one that answers
-// everything has no registry gap to corrupt — and because it is the same
-// backend `ply test --backend` installs, so a corruption caught here is caught
-// by a command a user can run.
-//
-// # Measured sensitivity
-//
-// Printed by every test below rather than asserted as a magic number, because
-// §4.7's condition names measured sensitivity and a count that is asserted is a
-// count nobody re-takes. What is asserted is that each corruption fired and that
-// at least one test reported it.
 
 use ply_eval::{BackendSpec, Fragment, Mutation, Offers};
 use std::sync::OnceLock;
 
-/// The corpora, loaded once and leaked, so that eight backends over one corpus
-/// cost one AST rather than eight.
-///
-/// `Fragment::over_static` is what makes that possible: a backend may not borrow
-/// (see `Machine`'s `compiled` field), and a caller that already holds a leaked
-/// program has paid for that once.
+/// The corpora, loaded once and leaked, so that eight backends over one corpus cost one AST rather
+/// than eight.
 type Loaded = (
     String,
     &'static Program,
@@ -561,23 +487,16 @@ fn corpus() -> &'static [Loaded] {
 /// What one corruption did over every corpus on disk.
 struct Sweep {
     compared: usize,
-    /// Tests where the machine with the backend and the machine without it
-    /// answered differently. This is the number that says the corpus can see.
+    /// Tests where the machine with the backend and the machine without it answered differently.
     diverged: usize,
     entered: u64,
     offers: Offers,
-    /// The first disagreement, whole, because a count nobody can read is a count
-    /// nobody checks.
+    /// The first disagreement, whole, because a count nobody can read is a count nobody checks.
     first: Option<String>,
 }
 
-/// Every corpus, twice: once on a machine with no backend and once on a machine
-/// with `spec` attached, compared against each other.
-///
-/// Against the plain **machine** rather than against the tree-walker, and that
-/// is the whole of the care this needs: a divergence reported here is the
-/// backend's and nothing else's, which is the same arrangement
-/// `ply test --engine both --backend ..` runs.
+/// Every corpus, twice: once on a machine with no backend and once on a machine with `spec`
+/// attached, compared against each other.
 fn sweep(spec: BackendSpec) -> Sweep {
     let mut out = Sweep {
         compared: 0,
@@ -651,13 +570,8 @@ fn fires_and_is_caught(name: &str, mutation: Mutation, target: Option<&str>) -> 
     sweep
 }
 
-/// The control every other test here is read against: the wrapper is the
-/// backend, and the backend is honest.
-///
-/// Without this a red result below could be the *presence* of a backend rather
-/// than the corruption. The offer and entry counts are asserted for the reason
-/// `mutations.rs` asserts them: a green result over a seam nobody reached is the
-/// exact shape of vacuous pass this project produces most.
+/// The control every other test here is read against: the wrapper is the backend, and the backend
+/// is honest.
 #[test]
 fn the_honest_backend_changes_no_answer_over_every_corpus_on_disk() {
     let sweep = sweep(BackendSpec::honest());
@@ -678,16 +592,7 @@ fn the_honest_backend_changes_no_answer_over_every_corpus_on_disk() {
         sweep.offers.offered,
         sweep.compared
     );
-    // The `Bytes` widening of `compiled::crossable` (2026-08-30), asserted
-    // rather than assumed. A widening nothing on disk exercises leaves every
-    // test in this file green over a seam it did not reach, which is the
-    // vacuous pass `CONTRIBUTING.md` §"The one rule" names — and it is exactly
-    // the shape this widening could take, since `Bytes` is a kind a corpus
-    // might never pass to a named function at all.
-    //
-    // Both directions, because they are two mechanisms: `admit`'s `crossable`
-    // test on the arguments, and `Machine::compiled_answer`'s on the answer.
-    // Before the widening both of these were 0 by construction.
+    // The `Bytes` widening of `compiled::crossable` (2026-08-30), asserted rather than assumed.
     assert!(
         sweep.offers.bytes_in > 0,
         "no call carrying a `Bytes` argument was offered over {} tests, so the widening of \
@@ -701,9 +606,9 @@ fn the_honest_backend_changes_no_answer_over_every_corpus_on_disk() {
          arguments and no returns",
         sweep.offers.bytes_in
     );
-    // The 2026-08-31 widening of the ANSWER test, asserted for the reason the
-    // two above are: a return type nothing on disk returns leaves every green
-    // in this file a green over a seam the change did not reach.
+    // The 2026-08-31 widening of the ANSWER test, asserted for the reason the two above are: a
+    // return type nothing on disk returns leaves every green in this file a green over a seam the
+    // change did not reach.
     assert!(
         sweep.offers.containers_out > 0,
         "not one entered call answered a `List`, `Map`, `Record` or `Ctor` over {} tests, so \
@@ -723,22 +628,8 @@ fn the_honest_backend_changes_no_answer_over_every_corpus_on_disk() {
     );
 }
 
-/// The ninth wrong backend, and the one the 2026-08-31 answer widening made
-/// possible: a container answer of exactly the right kind with a
-/// [`ply_eval::Value::Cell`] in its first position.
-///
-/// This is not one of ADR 0026 §4.5's eight. It exists because the widening
-/// gave up a *structural* claim — while the answer test read the answer's
-/// discriminant, no `Value::Cell` could come back at all — and replaced it with
-/// a claim about the declared return type plus the answer's top-level kind. A
-/// backend that respects the kind and not the interior is the shape that
-/// difference makes reachable, and a limit named in a header with nothing
-/// standing on it is a limit nobody re-checks.
-///
-/// What it says, and what it does not: a red here means the corpus *notices*,
-/// not that the seam refused. `Machine::compiled_answer` believes this answer —
-/// `compiled::CarriedTypes::answer_crosses` reads a kind — and what reports it
-/// is the independent engine, exactly as for a wrong `Int`.
+/// The ninth wrong backend, and the one the 2026-08-31 answer widening made possible: a container
+/// answer of exactly the right kind with a [`ply_eval::Value::Cell`] in its first position.
 #[test]
 fn a_handle_forged_into_a_container_answer_is_caught_over_the_corpus() {
     fires_and_is_caught("handle", Mutation::Handle, None);
@@ -754,13 +645,8 @@ fn an_inverted_compiled_comparison_is_caught_over_the_corpus() {
     fires_and_is_caught("inverted", Mutation::Inverted, None);
 }
 
-/// The one corruption that is invisible to a single call: every answer it gives
-/// was a correct answer to *some* call, so only a corpus that varies its
-/// arguments can see it.
-///
-/// ADR 0026 §7 named this as the mutation most likely not to survive the move
-/// out of the spike, because the spike's corpus *generates* cases and this one
-/// runs real programs. It survives, and the number it survives by is printed.
+/// The one corruption that is invisible to a single call: every answer it gives was a correct
+/// answer to *some* call, so only a corpus that varies its arguments can see it.
 #[test]
 fn a_stale_compiled_answer_is_caught_over_the_corpus() {
     fires_and_is_caught("stale", Mutation::Stale, None);
@@ -772,36 +658,12 @@ fn a_wrong_kinded_compiled_answer_is_caught_over_the_corpus() {
 }
 
 /// A backend answering for a definition it has no body for.
-///
-/// The gap this lives in is real on this corpus rather than constructed:
-/// `compiled::admit` gates on the shape of the **arguments** and never on the
-/// return type, so every `Int -> List<..>`, `Int -> String` and `Int -> Record`
-/// in `examples/` is offered and must be declined.
-///
-/// > **Narrowed, not closed, by the `Bytes` widening (2026-08-30).** The gap
-/// > used to hold every `Int -> Bytes` too, and `std.router.hex_char` alone was
-/// > 65,560 calls of it; those are now inside the fragment and answered. What
-/// > is left is `String`, `Float`, `Decimal`, `List`, `Map`, `Record`, `Ctor`
-/// > and every polymorphic return, which is still most of `examples/`. This
-/// > test is what fails the day the fragment grows to cover the whole of what
-/// > the seam offers — at which point `Unoffered` has nothing to invent an
-/// > answer for and stops being a corruption, and something else has to police
-/// > the registry.
 #[test]
 fn an_answer_for_a_definition_with_no_body_is_caught_over_the_corpus() {
     fires_and_is_caught("unoffered", Mutation::Unoffered, None);
 }
 
 /// Accepting a call the machine must never offer.
-///
-/// **Not caught, and that is the finding rather than a gap** — the same one
-/// `crates/ply-codegen-spike/tests/mutations.rs` records. `handled` and
-/// `wrapper` in `tests/fixtures/self_handled_effect.ply` perform under a
-/// `handle` of their own, publish empty rows, and are refused by
-/// `Gate::InternalEffects`; a backend standing ready to answer one is never
-/// asked. What stands is the offer count, which is the fact the gate makes true,
-/// and the control beside it — the seam *was* reached — is what stops the zero
-/// being a backend nobody consulted.
 #[test]
 fn a_definition_that_performs_is_never_offered_to_a_wrong_backend() {
     let sweep = sweep(BackendSpec {
@@ -822,18 +684,6 @@ fn a_definition_that_performs_is_never_offered_to_a_wrong_backend() {
 }
 
 /// Running past the machine's call budget instead of declining.
-///
-/// **Not fired on this corpus, and the reason is worth writing down**: nothing
-/// in `examples/` or `tests/fixtures/` recurses past `DEFAULT_MAX_CALLS`, so the
-/// honest backend never has to decline for want of budget and there is no
-/// decline for the corruption to replace. It is checked from the shipping
-/// command instead, on a corpus built to outrun the bound —
-/// `crates/ply-cli/tests/suite/backend.rs`'s `DEEP` — and that is the only place in
-/// this workspace where this corruption fires.
-///
-/// Asserted rather than skipped, because "the corpus cannot exercise this" and
-/// "the corpus stopped exercising this" must not look alike: if a corpus ever
-/// does outrun the bound, this test fails and says so.
 #[test]
 fn the_budget_corruption_has_nothing_to_bite_on_this_corpus_and_says_so() {
     let sweep = sweep(BackendSpec {

@@ -1,6 +1,5 @@
-//! The dumper at the bottom exists so a test asserts the *whole* shape of a
-//! parse rather than poking at one field; a wrong nesting anywhere shows up as
-//! a string diff.
+//! The dumper at the bottom exists so a test asserts the *whole* shape of a parse rather than
+//! poking at one field; a wrong nesting anywhere shows up as a string diff.
 
 use crate::ast::*;
 use crate::parser::{parse, parse_program, parse_recovering};
@@ -371,8 +370,7 @@ fn a_clause_may_bind_its_continuation() {
     );
 }
 
-/// `resume` is a keyword only between a clause's `)` and its `->`. A program
-/// that already binds it as an ordinary name has to keep working.
+/// `resume` is a keyword only between a clause's `)` and its `->`.
 #[test]
 fn resume_is_contextual_and_stays_an_ordinary_identifier_elsewhere() {
     assert!(crate::lexer::is_ident("resume"));
@@ -440,8 +438,8 @@ fn regions_nest() {
     );
 }
 
-/// Contextual exactly as `with_cell` is, so a program that already binds
-/// `with_region` as an ordinary name is unaffected.
+/// Contextual exactly as `with_cell` is, so a program that already binds `with_region` as an
+/// ordinary name is unaffected.
 #[test]
 fn with_region_is_only_special_before_a_bracket() {
     assert_eq!(expr("with_region"), "with_region");
@@ -449,8 +447,8 @@ fn with_region_is_only_special_before_a_bracket() {
     assert_eq!(expr("with_region + 1"), "(+ with_region 1)");
 }
 
-/// The body is a block, and `{` after `]` opens it even where a bare `{` would
-/// have opened the enclosing construct's.
+/// The body is a block, and `{` after `]` opens it even where a bare `{` would have opened the
+/// enclosing construct's.
 #[test]
 fn a_region_body_is_a_block_in_no_brace_position() {
     assert_eq!(
@@ -474,9 +472,8 @@ fn simulate_is_only_special_before_a_brace() {
     assert_eq!(expr("simulate.now()"), "(perform simulate.now)");
 }
 
-/// Where a `{` opens the enclosing construct rather than an expression,
-/// `simulate` is an ordinary name — otherwise a variable of that name would
-/// silently swallow the `if`'s branch.
+/// Where a `{` opens the enclosing construct rather than an expression, `simulate` is an ordinary
+/// name — otherwise a variable of that name would silently swallow the `if`'s branch.
 #[test]
 fn simulate_is_a_name_again_where_a_brace_cannot_start_an_expression() {
     assert_eq!(
@@ -1154,9 +1151,8 @@ fn dump_item_body(i: &Item) -> String {
             format!("{s} {})", dump_expr(&l.body))
         }
         Item::Derive(d) => format!("(derive {} {})", d.deriver, d.target.name),
-        // The expansion, not the members as written: the expansion is what
-        // every row naming this set was given, and the members are a way of
-        // spelling it.
+        // The expansion, not the members as written: the expansion is what every row naming this
+        // set was given, and the members are a way of spelling it.
         Item::EffectSet(d) => format!("(effect-set {} {})", d.name.name, dump_atoms(&d.expansion)),
     }
 }
@@ -1351,9 +1347,8 @@ fn dump_expr(e: &Expr) -> String {
                 .collect();
             format!("(rec {})", fs.join(" "))
         }
-        // Only reachable from `dump_expr` on a tree taken before
-        // `record_update::expand` ran, which the parser's own tests do on
-        // purpose to check what was parsed rather than what it became.
+        // Only reachable from `dump_expr` on a tree taken before `record_update::expand` ran, which
+        // the parser's own tests do on purpose to check what was parsed rather than what it became.
         ExprKind::RecordUpdate { base, fields } => {
             let fs: Vec<_> = fields
                 .iter()
@@ -1362,8 +1357,8 @@ fn dump_expr(e: &Expr) -> String {
             format!("(update {} {})", dump_expr(base), fs.join(" "))
         }
         ExprKind::Field { base, field } => format!("(field {} {})", dump_expr(base), field.name),
-        // Only reachable on a tree taken before `try_op::expand` ran, which the
-        // parser's own tests do on purpose.
+        // Only reachable on a tree taken before `try_op::expand` ran, which the parser's own tests
+        // do on purpose.
         ExprKind::Try { operand } => format!("(try {})", dump_expr(operand)),
         ExprKind::List { items } => {
             let is: Vec<_> = items.iter().map(dump_expr).collect();
@@ -1516,8 +1511,8 @@ fn the_anonymous_module_leaves_names_bare() {
 
 #[test]
 fn a_qualified_name_never_collides_with_one_a_module_could_declare() {
-    // `.` cannot be lexed inside an identifier, so no source-writable name can
-    // equal a qualified one.
+    // `.` cannot be lexed inside an identifier, so no source-writable name can equal a qualified
+    // one.
     let qualified = ModuleName::from_dotted("store.orders").qualify(&Symbol::new("place"));
     assert!(!crate::lexer::is_ident(qualified.as_str()));
 }
@@ -2148,8 +2143,6 @@ fn each_input_to_parse_program_becomes_its_own_module() {
     assert!(program.find(&ModuleName::from_dotted("c")).is_none());
 }
 
-// ---------------------------------------------------------------- effect sets
-
 #[test]
 fn a_row_written_with_a_set_carries_the_sets_atoms() {
     assert_eq!(
@@ -2162,8 +2155,8 @@ fn a_row_written_with_a_set_carries_the_sets_atoms() {
     );
 }
 
-/// The alias survives beside the atoms it stood for: erased by normalization,
-/// so it moves no hash, and kept so `--explain` can say how the row was written.
+/// The alias survives beside the atoms it stood for: erased by normalization, so it moves no hash,
+/// and kept so `--explain` can say how the row was written.
 #[test]
 fn a_row_keeps_the_set_names_it_was_written_with() {
     let m = ok("effect set Web = {log.write}\nfn f() -> Int / {Web, clock.read} = 1");
@@ -2190,8 +2183,8 @@ fn a_set_may_name_another_set() {
     );
 }
 
-/// Declaration order is not dependency order, and expansion is a fixed point
-/// rather than a fold over the file.
+/// Declaration order is not dependency order, and expansion is a fixed point rather than a fold
+/// over the file.
 #[test]
 fn a_set_may_name_one_declared_after_it() {
     assert_eq!(
@@ -2249,8 +2242,8 @@ fn a_set_expands_inside_a_let_annotation() {
     assert!(dumped.contains("(fn () -> Int / {log.write})"), "{dumped}");
 }
 
-/// `effect set` is only a set when a name follows `set`; `effect set { .. }` is
-/// still an ordinary effect that happens to be called `set`.
+/// `effect set` is only a set when a name follows `set`; `effect set { .. }` is still an ordinary
+/// effect that happens to be called `set`.
 #[test]
 fn an_effect_may_still_be_named_set() {
     assert_eq!(
@@ -2295,8 +2288,8 @@ fn a_pub_effect_set_is_refused() {
     assert!(ds[0].message.contains("cannot be `pub`"), "{ds:#?}");
 }
 
-/// A member is an atom or another set, never a whole effect: "every atom of
-/// `db`" is every resource label anywhere in the program.
+/// A member is an atom or another set, never a whole effect: "every atom of `db`" is every resource
+/// label anywhere in the program.
 #[test]
 fn a_set_naming_a_whole_effect_is_refused_with_the_reason() {
     let ds = errs(
@@ -2363,8 +2356,8 @@ fn two_sets_with_one_name_are_a_duplicate_definition() {
     assert!(ds[0].message.contains("effect set `Web`"), "{ds:#?}");
 }
 
-/// A set name lives in no namespace `resolve` knows about — expansion has erased
-/// it before `resolve` runs — so it collides with nothing.
+/// A set name lives in no namespace `resolve` knows about — expansion has erased it before
+/// `resolve` runs — so it collides with nothing.
 #[test]
 fn a_set_name_may_be_reused_by_a_type() {
     let m = ok("type Web = Int\neffect set Web = {log.write}\nfn f() -> Int / {Web} = 1");
@@ -2398,7 +2391,6 @@ fn a_trailing_comma_in_a_set_is_accepted() {
 }
 
 /// Every `.ply` file under `dir`, skipping dotted directories and `target`.
-/// Shared by the two escape guards, which must both walk the whole corpus.
 fn collect_ply(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -2421,10 +2413,6 @@ fn collect_ply(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 // --- The `?` operator --------------------------------------------------------
 
 /// Whether an unexpanded [`ExprKind::Try`] is anywhere in the tree.
-///
-/// Written out rather than reusing a generic walker for
-/// [`has_record_update`]'s reason: the match is exhaustive with no `_`, so the
-/// next expression kind added to the language has to decide here too.
 fn has_try(m: &Module) -> bool {
     fn e(x: &Expr) -> bool {
         match &x.kind {
@@ -2491,8 +2479,8 @@ fn codes_of(src: &str) -> Vec<&'static str> {
     errs(src).iter().map(|d| d.code).collect()
 }
 
-/// A `fn` returning `Result` whose body is `f(x)?`, and a mode-establishing
-/// preamble every fixture below shares.
+/// A `fn` returning `Result` whose body is `f(x)?`, and a mode-establishing preamble every fixture
+/// below shares.
 const PRE: &str = "type E = {msg: String}\nfn g(n: Int) -> Result<Int, E> = Ok(n)\n";
 
 #[test]
@@ -2512,12 +2500,9 @@ fn an_option_returning_function_gets_the_option_constructors() {
     );
 }
 
-/// The shape every conversion in the corpus takes: the `let`'s own pattern
-/// becomes the success arm's binder and the `let` itself is gone, so the sugar
-/// and the hand-written `match` are one definition.
-///
-/// The general rule would emit `Ok(t) -> { let a = t; ... }` here, which is a
-/// *different* definition with a different hash. That is what this pins.
+/// The shape every conversion in the corpus takes: the `let`'s own pattern becomes the success
+/// arm's binder and the `let` itself is gone, so the sugar and the hand-written `match` are one
+/// definition.
 #[test]
 fn a_let_bound_try_puts_its_own_pattern_on_the_success_arm() {
     assert_eq!(
@@ -2529,9 +2514,7 @@ fn a_let_bound_try_puts_its_own_pattern_on_the_success_arm() {
     );
 }
 
-/// The parser spike's §3 "pair" shape, spelled without a tuple. This is the
-/// feature the brief's cautionary tale is about: record destructuring exists and
-/// composes with `?` for free, because the `let`'s pattern is what moves.
+/// The parser spike's §3 "pair" shape, spelled without a tuple.
 #[test]
 fn a_try_composes_with_record_destructuring() {
     assert_eq!(
@@ -2545,9 +2528,8 @@ fn a_try_composes_with_record_destructuring() {
     );
 }
 
-/// The block splits at the statement carrying the `?`, and everything after it
-/// — statements *and* tail — becomes the success arm's body. Statements before
-/// it do not move, which is why they need no purity condition.
+/// The block splits at the statement carrying the `?`, and everything after it — statements *and*
+/// tail — becomes the success arm's body.
 #[test]
 fn a_block_splits_at_the_statement_carrying_the_try() {
     assert_eq!(
@@ -2559,8 +2541,8 @@ fn a_block_splits_at_the_statement_carrying_the_try() {
     );
 }
 
-/// Two `?`s in one run nest, outer first, and each success arm's body is itself
-/// a return position — which is what keeps the continuation in tail position.
+/// Two `?`s in one run nest, outer first, and each success arm's body is itself a return position —
+/// which is what keeps the continuation in tail position.
 #[test]
 fn two_tries_in_a_row_nest_in_the_order_written() {
     assert_eq!(
@@ -2573,9 +2555,8 @@ fn two_tries_in_a_row_nest_in_the_order_written() {
     );
 }
 
-/// `parse_or(ts)?` in the argument of a call whose function is a bare name: the
-/// prefix is one `Var`, which is pure, so the lift is admitted and the
-/// continuation stays a tail call. `db.ply:1000` is this shape exactly.
+/// `parse_or(ts)?` in the argument of a call whose function is a bare name: the prefix is one
+/// `Var`, which is pure, so the lift is admitted and the continuation stays a tail call.
 #[test]
 fn a_try_in_a_call_argument_with_a_pure_prefix_is_lifted() {
     assert_eq!(
@@ -2584,8 +2565,8 @@ fn a_try_in_a_call_argument_with_a_pure_prefix_is_lifted() {
     );
 }
 
-/// A branch of an `if` in return position is a return position of its own, so a
-/// `?` there stays inside the branch and is never lifted across the condition.
+/// A branch of an `if` in return position is a return position of its own, so a `?` there stays
+/// inside the branch and is never lifted across the condition.
 #[test]
 fn a_try_in_a_return_position_branch_stays_in_the_branch() {
     assert_eq!(
@@ -2597,8 +2578,8 @@ fn a_try_in_a_return_position_branch_stays_in_the_branch() {
     );
 }
 
-/// The condition, by contrast, runs unconditionally, so the `if` node itself is
-/// the region root and the whole `if` moves into the success arm.
+/// The condition, by contrast, runs unconditionally, so the `if` node itself is the region root and
+/// the whole `if` moves into the success arm.
 #[test]
 fn a_try_in_a_condition_wraps_the_whole_if() {
     assert_eq!(
@@ -2610,13 +2591,8 @@ fn a_try_in_a_condition_wraps_the_whole_if() {
     );
 }
 
-/// Postfix, in the tightest tier alongside `f(x)` and `r.field`: `g(n)?.msg` is
-/// `(g(n)?).msg`, `-x?` is `-(x?)` and `a == b?` is `a == (b?)`. Ply has no
-/// ternary, so nothing else can claim the token.
-///
-/// Read off the **expanded** tree, because that is the only tree a test can see:
-/// what is scrutinised says where the `?` bound. A `?` that bound looser would
-/// put the whole `g(n).msg`, `-x` or `a == b` into the scrutinee instead.
+/// Postfix, in the tightest tier alongside `f(x)` and `r.field`: `g(n)?.msg` is `(g(n)?).msg`,
+/// `-x?` is `-(x?)` and `a == b?` is `a == (b?)`
 #[test]
 fn question_binds_tighter_than_field_access_and_unary_minus() {
     let pre = "type E = {msg: Int}\n\
@@ -2656,9 +2632,8 @@ fn question_binds_tighter_than_field_access_and_unary_minus() {
 
 // --- What `?` refuses, and with which code ----------------------------------
 
-/// `?` reads the mode off the enclosing function's **written** return type,
-/// because the parser has no types. Everything that has no such type is refused
-/// with a note naming the actual rule, rather than one message for six causes.
+/// `?` reads the mode off the enclosing function's **written** return type, because the parser has
+/// no types.
 #[test]
 fn a_try_with_no_readable_return_type_is_e0118() {
     for (what, src) in [
@@ -2709,10 +2684,9 @@ fn a_try_with_no_readable_return_type_is_e0118() {
     }
 }
 
-/// An alias chain in this file is followed; one that leaves it is not, for
-/// `record_update`'s reason — gate 1 skips a file whose bytes are unchanged, so
-/// a meaning read across a module boundary could go stale in a file that never
-/// moved.
+/// An alias chain in this file is followed; one that leaves it is not, for `record_update`'s reason
+/// — gate 1 skips a file whose bytes are unchanged, so a meaning read across a module boundary
+/// could go stale in a file that never moved.
 #[test]
 fn a_local_alias_to_result_is_followed_and_a_foreign_one_is_not() {
     assert_eq!(
@@ -2729,10 +2703,8 @@ fn a_local_alias_to_result_is_followed_and_a_foreign_one_is_not() {
     );
 }
 
-/// GUIDE §5.7: constructor names are not reserved, so a module may declare its
-/// own `Ok` — and expanding a `?` in one would build a `match` naming *that*
-/// constructor. No corpus module does it; every `?` in one that does is refused
-/// rather than silently captured.
+/// GUIDE §5.7: constructor names are not reserved, so a module may declare its own `Ok` — and
+/// expanding a `?` in one would build a `match` naming *that* constructor.
 #[test]
 fn a_module_that_declares_its_own_ok_refuses_every_try() {
     assert_eq!(
@@ -2743,15 +2715,9 @@ fn a_module_that_declares_its_own_ok_refuses_every_try() {
     );
 }
 
-/// The four names the expansion emits are not reserved, and a `type` is not the
-/// only way to bind one: `import m (Err)` binds `Err` **unqualified**, in the
-/// same `Namespace::Value` a declared constructor lives in. A module that does
-/// it captures the synthesized `match` exactly as a declaring one does, so it is
-/// refused for the same reason and with the same code.
-///
-/// **Found by review, and it was a real hole**: before this, such a module
-/// expanded and the author got `E0201`/`E0205` on a `match` they never wrote,
-/// pointing at their own `?`.
+/// The four names the expansion emits are not reserved, and a `type` is not the only way to bind
+/// one: `import m (Err)` binds `Err` **unqualified**, in the same `Namespace::Value` a declared
+/// constructor lives in.
 #[test]
 fn a_module_that_imports_ok_or_err_unqualified_refuses_every_try() {
     let lib = "pub type Weird<a, e> = Err(e) | Fine(a)\n";
@@ -2777,16 +2743,8 @@ fn a_module_that_imports_ok_or_err_unqualified_refuses_every_try() {
     .expect("an unqualified import binds nothing the expansion emits");
 }
 
-/// A statement whose whole value is a `?` binds nothing, so the success arm
-/// takes a **wildcard** and the statement itself is gone.
-///
-/// This is a canonicality rule and nothing else pins it: no `.ply` in the corpus
-/// writes a bare `e?;`, so the corpus hash gate is silent here, and dropping the
-/// case entirely leaves a compiler that still runs the program correctly while
-/// emitting `Ok(?0) -> { ?0; rest }` — **a different definition with a different
-/// hash**. Verified by deleting the arm: every one of the 354 tests in
-/// `ply-syntax`, `ply-core/try_op`, `ply-hash/audit` and `ply-eval/equivalence_audit`
-/// stayed green and `f`'s digest moved.
+/// A statement whose whole value is a `?` binds nothing, so the success arm takes a **wildcard**
+/// and the statement itself is gone.
 #[test]
 fn a_bare_try_statement_binds_nothing_and_keeps_the_wildcard() {
     assert_eq!(
@@ -2798,33 +2756,22 @@ fn a_bare_try_statement_binds_nothing_and_keeps_the_wildcard() {
     );
 }
 
-/// `sequence` walks a call's parts **left to right**, and that direction is the
-/// whole of the impure-prefix rule for the one shape GUIDE §6.10 spells out:
-/// "`g(h(x), k(x)?)` is `E0119` — `h(x)` is written before the `?` and the
-/// expansion would evaluate it after."
-///
-/// Both directions are asserted, because only the pair pins an *order*. The
-/// refusal alone is satisfied by a scan that refuses everything, and the lift
-/// alone by a scan that lifts everything.
-///
-/// **Found by review as an unarmed gate.** Reversing the iteration reddened
-/// nothing across all four suites, and `a_try_with_an_impure_prefix_is_e0119`
-/// cannot reach it: every prefix it writes is a `Binary` left operand, which
-/// `scan` handles on a different arm.
+/// `sequence` walks a call's parts **left to right**, and that direction is the whole of the
+/// impure-prefix rule for the one shape GUIDE §6.10 spells out: "`g(h(x), k(x)?)` is `E0119` —
+/// `h(x)` is written before the `?` and the expansion would evaluate it after."
 #[test]
 fn a_call_argument_scan_stops_at_an_impure_argument_and_not_before_one() {
     let pre =
         format!("{PRE}fn side(n: Int) -> Int = n + 1\nfn two(a: Int, b: Int) -> Int = a + b\n");
-    // Impure to the *left* of the `?`: refused, because the lift would run
-    // `g(n)` before `side(n)`.
+    // Impure to the *left* of the `?`: refused, because the lift would run `g(n)` before `side(n)`.
     assert_eq!(
         codes_of(&format!(
             "{pre}fn f(n: Int) -> Result<Int, E> = Ok(two(side(n), g(n)?))"
         )),
         vec![codes::TRY_POSITION]
     );
-    // Impure to the *right* of it: lifted, because nothing moves across
-    // anything — `g(n)` already runs first.
+    // Impure to the *right* of it: lifted, because nothing moves across anything — `g(n)` already
+    // runs first.
     assert_eq!(
         body_of(&format!(
             "{pre}fn f(n: Int) -> Result<Int, E> = Ok(two(g(n)?, side(n)))"
@@ -2834,13 +2781,7 @@ fn a_call_argument_scan_stops_at_an_impure_argument_and_not_before_one() {
     );
 }
 
-/// GUIDE §6.10 names six barriers a `?` may not cross and says every one is
-/// `E0118`. `a_try_with_no_readable_return_type_is_e0118` covers three of them;
-/// these are the other three, each with its own `under(..)` string in `sweep`.
-///
-/// **Found by review**: dropping the `handle`-clause barrier — so that a `?`
-/// there fell through to the position refusal and answered `E0119` — reddened
-/// nothing.
+/// GUIDE §6.10 names six barriers a `?` may not cross and says every one is `E0118`.
 #[test]
 fn a_try_inside_a_handler_or_a_cell_is_e0118() {
     let eff = "effect ctr { write bump() -> Int }\n";
@@ -2881,19 +2822,9 @@ fn a_try_inside_a_handler_or_a_cell_is_e0118() {
     }
 }
 
-/// The float is the whole risk, and this is the rule that closes it: expansion
-/// lifts the operand to the head of its region, so anything evaluated before it
-/// must be reorderable — which is `is_pure`, the predicate normalization already
-/// uses to license reordering a run of `let`s.
-///
-/// **Six prefixes, and the last four are the ones that test the predicate.**
-/// A suite written only over a call and a `perform` says nothing about whether
-/// `is_pure` was consulted at all: `scan` answers `Impure` for an `App` and a
-/// `Perform` *structurally*, without asking. Replacing the predicate with
-/// `|_| true` leaves both of those cases refused and every one of the other
-/// tests in this file green — which is exactly what it did, and is why the four
-/// below exist. Each puts the impurity somewhere only `is_pure` looks: inside a
-/// branch, inside an arm, behind a `&&`, and inside a nested block.
+/// The float is the whole risk, and this is the rule that closes it: expansion lifts the operand to
+/// the head of its region, so anything evaluated before it must be reorderable — which is
+/// `is_pure`, the predicate normalization already uses to license reordering a run of `let`s.
 #[test]
 fn a_try_with_an_impure_prefix_is_e0119() {
     let eff = "effect ctr { read now() -> Int }\n";
@@ -2946,9 +2877,7 @@ fn a_try_with_an_impure_prefix_is_e0119() {
     }
 }
 
-/// Nothing conditional may sit between the region root and the `?`. Lifting one
-/// out of a branch would run its operand on a path that does not reach it, and
-/// the row would not notice: a row is a set and does not see order.
+/// Nothing conditional may sit between the region root and the `?`
 #[test]
 fn a_try_behind_a_conditional_is_e0119() {
     for src in [
@@ -2970,12 +2899,8 @@ fn a_try_behind_a_conditional_is_e0119() {
     }
 }
 
-/// The expansion has no `let` left to carry the annotation on, and a written
-/// annotation must not evaporate. Measured cost: zero — the whole corpus has
-/// three annotated `let`s and none is on a convertible site.
-///
-/// A `?` *inside* an annotated `let`'s value is fine, because the `let` survives
-/// the split: only the case where the `?` is the whole value is refused.
+/// The expansion has no `let` left to carry the annotation on, and a written annotation must not
+/// evaporate.
 #[test]
 fn a_try_that_is_the_whole_value_of_an_annotated_let_is_e0119() {
     assert_eq!(
@@ -2994,17 +2919,6 @@ fn a_try_that_is_the_whole_value_of_an_annotated_let_is_e0119() {
 }
 
 /// **The guard behind every `unreachable!` arm downstream.**
-///
-/// `ply-hash`, `ply-core` and `ply-eval` each carry an arm for
-/// [`ExprKind::Try`] that panics, because hashing, typing or evaluating a `?` as
-/// anything but the `match` it stands for would be a second account of what it
-/// means. Those arms are safe only because the node cannot escape
-/// `parse_module`, and "cannot" is this project's most dangerous word.
-///
-/// **The appended file is not a nicety.** No `.ply` in the tree wrote a `?`
-/// before this change, so without it the guard would pass whether or not the
-/// expansion ran at all — which is the record-update guard's own comment, and
-/// the same trap.
 #[test]
 fn no_try_survives_parse_module_anywhere_in_the_tree() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3069,9 +2983,7 @@ law \"l\" forall (n: Int) { g(n)? == n }
     );
 }
 
-/// `parse_expr` has no `fn` around it and so no written return type. What it
-/// must not do is hand an unexpanded node to a caller — `ply-prove` parses spec
-/// clauses this way — so it refuses instead.
+/// `parse_expr` has no `fn` around it and so no written return type.
 #[test]
 fn parse_expr_refuses_a_try_rather_than_leaking_one() {
     let d = crate::parser::parse_expr(SRC, "g(1)?")
@@ -3082,11 +2994,6 @@ fn parse_expr_refuses_a_try_rather_than_leaking_one() {
 // --- Record update -----------------------------------------------------------
 
 /// Whether an unexpanded [`ExprKind::RecordUpdate`] is anywhere in the tree.
-///
-/// Written out rather than reusing a generic walker so that the match is
-/// exhaustive with no `_` arm: the next expression kind added to the language
-/// has to decide here too, and a guard that silently stopped looking inside a
-/// new construct would be worth nothing.
 fn has_record_update(m: &Module) -> bool {
     fn e(x: &Expr) -> bool {
         match &x.kind {
@@ -3141,18 +3048,6 @@ fn has_record_update(m: &Module) -> bool {
 }
 
 /// **The guard behind every `unreachable!` arm downstream.**
-///
-/// `ply-hash`, `ply-core` and `ply-eval` each carry an arm for
-/// [`ExprKind::RecordUpdate`] that panics, because hashing, typing or lowering
-/// the sugar as if it were a plain record would drop the base's untouched fields
-/// — a wrong value, silently. Those arms are safe only because the node cannot
-/// escape `parse_module`, and "cannot" is this project's most dangerous word.
-/// So it is checked, over every `.ply` file in the repository plus a file that
-/// deliberately uses the syntax, on both parse entry points that return a
-/// `Module`.
-///
-/// Broken fixtures are included on purpose: `parse_recovering` hands back a
-/// partial tree, and the expansion has to run on the error path too.
 #[test]
 fn no_record_update_survives_parse_module_anywhere_in_the_tree() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3168,9 +3063,9 @@ fn no_record_update_survives_parse_module_anywhere_in_the_tree() {
         root.display()
     );
 
-    // The corpus does not yet use the syntax everywhere, so a file that does is
-    // appended: a guard that only ever saw programs without record updates would
-    // pass whether or not expansion ran at all.
+    // The corpus does not yet use the syntax everywhere, so a file that does is appended: a guard
+    // that only ever saw programs without record updates would pass whether or not expansion ran at
+    // all.
     const USES_IT: &str = "\
 type L = {a: Int, b: Int}
 type W = {lim: L, n: Int}
@@ -3218,9 +3113,7 @@ law \"c\" forall (l: L) where g({..l, a: 1}).a == 1 { g({..l, b: 2}).b == 2 }
     );
 }
 
-/// `parse_expr` has no module around it and so no shape to resolve. What it must
-/// not do is hand an unexpanded node to a caller — `ply-prove` parses spec
-/// clauses this way — so it refuses instead.
+/// `parse_expr` has no module around it and so no shape to resolve.
 #[test]
 fn parse_expr_refuses_a_record_update_rather_than_leaking_one() {
     let d = crate::parser::parse_expr(SRC, "{..s, a: 1}")
@@ -3243,18 +3136,9 @@ fn a_record_update_parses_as_copies_then_writes() {
     );
 }
 
-/// The copies are sorted **by name**, and `a`/`b`/`c` cannot say so: every
-/// one-character field set orders identically under any comparator that compares
-/// length first and name second, so a suite written only in single letters
-/// passes whichever of the two ran.
-///
-/// **Both length directions, and that is not belt-and-braces.** One mixed-length
-/// pair rules out only the direction it happens to disagree with: `ab`/`b` puts
-/// the *longer* name first alphabetically, so a shortest-first comparator emits
-/// `b, ab` and fails — while a longest-first one emits `ab, b`, which is also
-/// what sorting by name emits, and passes. `a`/`bb` is the mirror pair and fails
-/// the other way. A comparator keyed on length in either direction is caught only
-/// by having both.
+/// The copies are sorted **by name**, and `a`/`b`/`c` cannot say so: every one-character field set
+/// orders identically under any comparator that compares length first and name second, so a suite
+/// written only in single letters passes whichever of the two ran.
 #[test]
 fn copies_are_sorted_by_name_and_not_by_length() {
     for (src, want, wrong) in [
@@ -3291,10 +3175,7 @@ fn a_record_update_with_no_written_fields_copies_every_field() {
     assert_eq!(dump_expr(&f.body), "(rec (a (field s a)) (b (field s b)))");
 }
 
-/// The sharpest trap in the pass. A binder that shadows an annotated one must
-/// *remove* the annotation, not keep it: expanding `{..s}` against the outer
-/// `s`'s shape would emit a record of some other type's width, and the reader
-/// would be looking at a diagnostic about a literal they did not write.
+/// The sharpest trap in the pass.
 #[test]
 fn a_shadowing_binder_refuses_rather_than_using_the_outer_type() {
     for src in [
@@ -3310,8 +3191,8 @@ fn a_shadowing_binder_refuses_rather_than_using_the_outer_type() {
     }
 }
 
-/// The outer binder is still the one in scope while the *value* of a `let` is
-/// elaborated, so `let s = {..s, a: 1}` updates the record it shadows.
+/// The outer binder is still the one in scope while the *value* of a `let` is elaborated, so `let s
+/// = {..s, a: 1}` updates the record it shadows.
 #[test]
 fn a_let_value_sees_the_binder_it_shadows() {
     let m = ok("type R = {a: Int, b: Int}\nfn f(s: R) -> R = { let s: R = {..s, a: 1}; s }");
@@ -3374,8 +3255,8 @@ fn a_second_base_and_a_three_dot_spelling_are_parse_errors() {
     }
 }
 
-/// `{x}` is still a block and `{x: e}` is still a record: adding `..` to the
-/// lookahead must not have moved either.
+/// `{x}` is still a block and `{x: e}` is still a record: adding `..` to the lookahead must not
+/// have moved either.
 #[test]
 fn the_brace_disambiguation_is_unchanged() {
     assert_eq!(expr("{x}"), "(block x)");
@@ -3383,8 +3264,8 @@ fn the_brace_disambiguation_is_unchanged() {
     assert_eq!(expr("{x, y}"), "(rec (x x) (y y))");
 }
 
-/// Whether any call in the module still carries a named argument, or any
-/// parameter a default that was never matched against a call.
+/// Whether any call in the module still carries a named argument, or any parameter a default that
+/// was never matched against a call.
 fn has_named_argument(m: &Module) -> bool {
     fn e(x: &Expr) -> bool {
         crate::effect_set::grow(|| match &x.kind {
@@ -3440,17 +3321,6 @@ fn has_named_argument(m: &Module) -> bool {
 }
 
 /// **The invariant four other crates are built on.**
-///
-/// `ply-hash`, `ply-core`, `ply-eval` and `ply-prove` all read
-/// `ExprKind::App`'s positional `args` and none of them reads `named`, on the
-/// strength of `defaults::expand` having placed every one. That is what makes
-/// `f(x, m: 1)` and `f(x, 1)` one definition rather than two, and it is the
-/// same guarantee `parse_module` gives record update — checked the same way,
-/// over the same corpus.
-///
-/// The appended source is not decoration. The tree's own `.ply` files use no
-/// named arguments yet, so a guard that saw only them would pass whether or not
-/// the pass ran at all.
 #[test]
 fn no_named_argument_survives_resolve_anywhere_in_the_tree() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3514,8 +3384,8 @@ test \"t\" { assert_eq(a(), \"helloada!\") }
     );
 }
 
-/// The other half: a call that omitted an argument really did gain the default,
-/// rather than being left short for someone else to trip over.
+/// The other half: a call that omitted an argument really did gain the default, rather than being
+/// left short for someone else to trip over.
 #[test]
 fn an_omitted_argument_is_filled_with_the_default() {
     let module = parse(
@@ -3540,27 +3410,6 @@ fn an_omitted_argument_is_filled_with_the_default() {
 }
 
 /// **`parse_unexpanded` is for one spike, and this is what keeps it there.**
-///
-/// [`crate::parse_unexpanded`] hands out a tree with `ExprKind::Try` and
-/// `ExprKind::RecordUpdate` still in it. Every crate downstream of this one has
-/// an `unreachable!()` arm for both, on the strength of
-/// `no_try_survives_parse_module_anywhere_in_the_tree` and its record-update
-/// twin — and those two guards are about [`crate::parse_recovering`]. They say
-/// nothing whatever about this entry point, which is precisely why it is
-/// `#[doc(hidden)]` and why a caller inside the workspace would be a defect
-/// rather than a use.
-///
-/// So the guard here is not about trees at all: it reads the workspace's own
-/// Rust and fails if the name appears anywhere but the two places it is allowed
-/// to. `spikes/ply-parser` is outside the cargo workspace and is not walked.
-///
-/// **The limit, stated rather than left to be discovered.** This is lexical. A
-/// caller reaching the function through a re-export under another name, or
-/// through `parser::` by a path this grep does not spell, would not be seen.
-/// It catches the case that will actually happen — somebody finds a public
-/// function and calls it — and it is the same class of check as
-/// `crates/ply-span/tests/armed.rs`, whose header says the same thing about
-/// itself.
 #[test]
 fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3620,10 +3469,9 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     }
     assert!(
         saw_the_definition,
-        // ASCII only, and not by preference: `spikes/ply-parser/mine-fixtures.py`
-        // mines every string literal in this file into its fixture bundle and
-        // asserts each is printable ASCII, so an em dash here stops the corpus
-        // generator with a bare `AssertionError`. Found by running it.
+        // ASCII only, and not by preference: `spikes/ply-parser/mine-fixtures.py` mines every
+        // string literal in this file into its fixture bundle and asserts each is printable ASCII,
+        // so an em dash here stops the corpus generator with a bare `AssertionError`.
         "no file under {} names `parse_unexpanded`, so either it has been renamed or this \
          walk stopped reaching the crate that defines it; either way the check below is \
          vacuous",

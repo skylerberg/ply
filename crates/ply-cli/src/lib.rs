@@ -1,5 +1,4 @@
-//! The `ply` binary. Every command is two projections of the same run: lines for
-//! a person and, under `--json`, exactly one object on stdout for an agent.
+//! The `ply` binary.
 
 pub mod artifact;
 pub mod cli;
@@ -23,15 +22,9 @@ use style::Style;
 pub const EXIT_OK: i32 = 0;
 /// At least one test failed, or `main` raised.
 pub const EXIT_FAILED: i32 = 1;
-/// The program did not get as far as running: a bad path, a syntax error, a
-/// type error.
+/// The program did not get as far as running: a bad path, a syntax error, a type error.
 pub const EXIT_COMPILE_ERROR: i32 = 2;
 /// The drain deadline expired with requests still in flight.
-///
-/// Its own code and not [`EXIT_FAILED`], because a deployment must be able to
-/// tell a clean stop from one that dropped requests: a rolling restart that
-/// reports success while losing six requests per instance is the failure the
-/// whole drain exists to make visible. `0` means nothing was lost.
 pub const EXIT_DRAIN_INCOMPLETE: i32 = 3;
 
 pub fn execute(cli: Cli) -> i32 {

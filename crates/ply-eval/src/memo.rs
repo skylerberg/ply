@@ -1,28 +1,4 @@
 //! What a nullary pure definition evaluated to, remembered for the run.
-//!
-//! A definition with no parameters and an empty published row is a constant:
-//! nothing it can reach reads the world, so its value is a function of the
-//! program alone. That is the same fact content addressing rests on, and it
-//! makes re-evaluating one per call redundant work rather than an
-//! optimization opportunity that has to be argued for.
-//!
-//! Both engines consult this, because a memo one engine keeps and the other
-//! does not is a resource bound the two disagree on, and `--engine both` would
-//! be reporting the disagreement as `E0503`.
-//!
-//! Three rules keep it honest. The published row is what is read — the
-//! reviewable artifact, not the inferred body row — so a definition annotated
-//! wider than it performs is left alone rather than quietly treated as pure.
-//! The **first** completed evaluation wins: a value reached by resuming a
-//! continuation captured inside the body is a resumption's value, not the
-//! definition's. And the value has to be **world-independent**, which an empty
-//! row does not imply: `with_cell` discharges its own atoms, so a definition
-//! that allocates a cell and hands out something reaching it publishes `{}` and
-//! is a constant by the row rule while its value is a key into *this run's*
-//! world. Memoizing one hands the next test a cell its world never allocated —
-//! `E0505` when the id is not there and a silently wrong read when it is, which
-//! is the cross-test interference the whole isolation story rests on not
-//! happening.
 
 use crate::value::{ClosureKind, Value};
 use ply_core::CheckOutput;
@@ -80,16 +56,9 @@ impl Memo {
 }
 
 /// Whether the value means the same thing in a world it was not produced in.
-///
-/// A [`Value::Cell`] and a [`Value::Task`] are keys into the run that made them,
-/// so neither may be remembered; a closure is walked, because what it captured
-/// is what it can hand out later. Everything this cannot decide — a captured
-/// continuation, whose whole control stack would have to be walked, or a value
-/// nested deeper than the budget — answers `false`, which costs a re-evaluation
-/// and never a wrong read.
 fn world_independent(value: &Value, depth: u32) -> bool {
-    /// Deep enough for any value a constant plausibly builds, and finite so a
-    /// cyclic value (`reference_cycles.rs`) terminates rather than recursing.
+    /// Deep enough for any value a constant plausibly builds, and finite so a cyclic value
+    /// (`reference_cycles.rs`) terminates rather than recursing.
     const MAX_DEPTH: u32 = 64;
 
     if depth >= MAX_DEPTH {
@@ -122,28 +91,6 @@ fn world_independent(value: &Value, depth: u32) -> bool {
 }
 
 /// Whether `name`'s *published* row claims it reads nothing of the world.
-///
-/// For the memo the caller has already established that the closure takes no
-/// parameters; this is the rest of it. It is also the necessary — never
-/// sufficient — first of the two purity gates `compiled::admit` reads before
-/// entering a compiled body: see this module's note for what an empty row still
-/// permits, and `compiled.rs` for why an allocation it still permits is
-/// unobservable outside a `simulate` region.
-///
-/// `constraints` disqualifies a `where derivable(..)` definition. Evaluation is
-/// type-erased, so such a definition is a constant too, but the exclusion costs
-/// nothing and keeps the rule readable as a sentence about the signature.
-///
-/// This rule is **not** enough for the compiled seam, and deliberately still is
-/// enough here. A definition that performs its operations and discharges them
-/// under its own `handle` publishes an empty row and clears this. Entering a
-/// native body for it loses every atom it would have recorded, which is why
-/// `compiled::admit` reads a second fact
-/// (`ply_core::DefInfo::internally_effectful`) beside this one. Substituting a
-/// remembered **value** does not: the first call ran the body and
-/// `ply_eval::Trace` recorded its atoms, so what a memo hit costs is a repeat of
-/// the same atoms and not the footprint. Both engines consult this memo, so
-/// `--engine both` sees the same count on both sides either way.
 pub(crate) fn pure_by_published_row(check: Option<&CheckOutput>, name: &Symbol) -> bool {
     check
         .and_then(|check| check.defs.get(name))
@@ -166,8 +113,8 @@ mod tests {
         assert!(matches!(memo.lookup(None, &name()), Lookup::Ignore));
     }
 
-    /// The slot is reached without a `CheckOutput` by seeding it directly,
-    /// because what is under test is the state machine and not the rule.
+    /// The slot is reached without a `CheckOutput` by seeding it directly, because what is under
+    /// test is the state machine and not the rule.
     #[test]
     fn a_pending_slot_is_filled_once_and_the_first_value_wins() {
         let mut memo = Memo::default();

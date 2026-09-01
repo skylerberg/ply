@@ -16,12 +16,7 @@ fn eval(e: Expr) -> Result<Value, Diagnostic> {
     eval_in(Vec::new(), e)
 }
 
-/// A machine whose only binding limit is the frame ceiling. `max_calls` is
-/// raised out of the way deliberately: at the ceiling's real order of magnitude
-/// a body pends far more than 250,000 frames only after more than 10,000 nested
-/// calls, so a default machine answers `recursion limit of 10000 nested calls
-/// exceeded` and the ceiling under test never fires. Isolating the bound is the
-/// whole point of the helper.
+/// A machine whose only binding limit is the frame ceiling.
 fn eval_frames(items: Vec<Item>, e: Expr, max: usize) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(items);
     Machine::for_program(&program, &resolved)
@@ -77,8 +72,8 @@ fn state_effect() -> Item {
     )
 }
 
-/// `down` is tail-recursive: its recursive call is the whole of the branch it
-/// sits in, so nothing is pending when it is made.
+/// `down` is tail-recursive: its recursive call is the whole of the branch it sits in, so nothing
+/// is pending when it is made.
 fn tail_recursive() -> Item {
     fn_def(
         "down",
@@ -91,8 +86,7 @@ fn tail_recursive() -> Item {
     )
 }
 
-/// `sum` is not: the addition is waiting on the call, so every level has to be
-/// kept.
+/// `sum` is not: the addition is waiting on the call, so every level has to be kept.
 fn non_tail_recursive() -> Item {
     fn_def(
         "sum",
@@ -160,8 +154,8 @@ fn unary_operators_negate_and_invert() {
     ));
 }
 
-/// The right operand must not be evaluated at all, which `panic` proves by
-/// being a diagnostic if it ever runs.
+/// The right operand must not be evaluated at all, which `panic` proves by being a diagnostic if it
+/// ever runs.
 #[test]
 fn logical_operators_short_circuit() {
     let boom = callv("panic", vec![string("evaluated")]);
@@ -526,16 +520,8 @@ fn a_refutable_let_that_fails_is_a_diagnostic() {
     assert_eq!(d.code, codes::NON_EXHAUSTIVE_MATCH);
 }
 
-/// A frame ceiling that is asked for is enforced, and it is a diagnostic rather
-/// than a native-stack abort — which is the whole reason the knob exists.
-///
-/// > **Renamed and re-pointed (2026-08-24).** This was
-/// > `deep_non_tail_recursion_is_a_diagnostic_not_a_crash` and it asserted
-/// > `d.message.contains("recursion limit")`. Deep non-tail recursion is
-/// > bounded by `DEFAULT_MAX_CALLS` and always was; what this actually
-/// > exercises is the frame ceiling `eval_frames` sets, which is no longer a
-/// > default and no longer says "recursion limit" — saying it is what let a
-/// > resource guard read as a statement about the program.
+/// A frame ceiling that is asked for is enforced, and it is a diagnostic rather than a native-stack
+/// abort — which is the whole reason the knob exists.
 #[test]
 fn a_frame_ceiling_that_was_asked_for_is_a_diagnostic_not_a_crash() {
     let d = match eval_frames(
@@ -559,8 +545,8 @@ fn a_frame_ceiling_that_was_asked_for_is_a_diagnostic_not_a_crash() {
     );
 }
 
-/// At the ceiling's real order of magnitude, where reporting the failure means
-/// unwinding a stack of a quarter of a million frames rather than sixty.
+/// At the ceiling's real order of magnitude, where reporting the failure means unwinding a stack of
+/// a quarter of a million frames rather than sixty.
 #[test]
 fn the_frame_ceiling_holds_at_the_scale_it_is_set_for() {
     let out = eval_frames(
@@ -576,17 +562,8 @@ fn the_frame_ceiling_holds_at_the_scale_it_is_set_for() {
     );
 }
 
-/// A plain machine does not acquire a small ceiling by accident: 9,000 levels of
-/// `sum` pend about 18,000 frames and none of them is refused.
-///
-/// Named for what it checks rather than for what it is about. It does **not**
-/// show that a plain machine has *no* ceiling — 18,000 frames would have passed
-/// under the 1,000,000 default this change removed, so this test is green either
-/// way. The absence of the default is armed at the only scale that can arm it,
-/// by `equivalence_audit.rs::the_two_engines_and_a_backend_agree_however_many_
-/// frames_a_body_pends`, which crosses 1,000,000 pending frames and costs
-/// gigabytes to do it. What this one is worth is the cheap half: a regression
-/// setting some *small* default here fails in milliseconds.
+/// A plain machine does not acquire a small ceiling by accident: 9,000 levels of `sum` pend about
+/// 18,000 frames and none of them is refused.
 #[test]
 fn a_machine_nobody_asked_for_a_ceiling_does_not_acquire_a_small_one() {
     let out = eval_in(vec![non_tail_recursive()], callv("sum", vec![int(9_000)]));
@@ -609,15 +586,7 @@ fn the_frame_ceiling_diagnostic_names_the_innermost_calls() {
     assert!(named.contains("`sum`"), "{named}");
 }
 
-/// A tail call is charged against the call budget exactly once, like every
-/// other call.
-///
-/// It used to reuse the frame it would have returned through, which made a
-/// tail-recursive loop run in constant space — and made a tail-recursive
-/// *runaway* unbounded, where the tree-walker diagnosed it in milliseconds.
-/// Two engines that ship together answer one program one way, so the elision
-/// went. Charged once and not twice is what is left to assert: `down(n)` fits
-/// in `n + 1` calls and does not fit in `n`.
+/// A tail call is charged against the call budget exactly once, like every other call.
 #[test]
 fn a_tail_call_costs_exactly_one_call() {
     let out = eval_calls(vec![tail_recursive()], callv("down", vec![int(200)]), 201);
@@ -664,10 +633,8 @@ fn sequential_calls_do_not_accumulate_frames() {
     assert!(matches!(out, Ok(Value::Int(1100))), "{out:?}");
 }
 
-/// Nothing about a Ply call touches the native stack, so a recursion far deeper
-/// than any host frame budget still returns a value on a thread whose stack is
-/// a quarter of a mebibyte. The call budget is raised for it because this is
-/// about the native stack and not about the semantic bound.
+/// Nothing about a Ply call touches the native stack, so a recursion far deeper than any host frame
+/// budget still returns a value on a thread whose stack is a quarter of a mebibyte.
 #[test]
 fn deep_recursion_does_not_touch_the_native_stack() {
     let total = std::thread::Builder::new()
@@ -850,9 +817,8 @@ fn map_filter_and_fold_drive_user_closures() {
     assert_eq!(ok_int(total), 10);
 }
 
-/// `map`'s loop is a frame rather than host recursion, so the callback can
-/// perform an effect and the clause that answers it is reached through the
-/// stack like any other.
+/// `map`'s loop is a frame rather than host recursion, so the callback can perform an effect and
+/// the clause that answers it is reached through the stack like any other.
 #[test]
 fn a_closure_passed_to_map_may_perform_an_effect() {
     let items = vec![state_effect()];
@@ -906,9 +872,8 @@ fn call_invokes_a_definition_by_its_program_wide_name() {
     assert!(machine.call("nope", Vec::new(), Span::DUMMY).is_err());
 }
 
-/// Every expression form, run on both engines and compared by the same
-/// full-equality rule `--engine both` uses. A divergence here is the defect the
-/// differential harness exists to catch, caught at unit-test cost.
+/// Every expression form, run on both engines and compared by the same full-equality rule `--engine
+/// both` uses.
 #[test]
 fn the_two_engines_agree_on_every_expression_form() {
     let items = vec![
@@ -1090,8 +1055,6 @@ fn the_two_engines_agree_on_every_expression_form() {
     assert!(found.is_empty(), "{}", found.join("\n"));
 }
 
-// ------------------------------------------------------- lowering, once each
-
 #[track_caller]
 fn answer(machine: &mut Machine<'_>) -> i64 {
     match machine.call("f", Vec::new(), sp()) {
@@ -1100,9 +1063,8 @@ fn answer(machine: &mut Machine<'_>) -> i64 {
     }
 }
 
-/// Lowering is a property of the syntax, so a machine built next over the same
-/// program reads what this one lowered. A search builds one per interleaving and
-/// `ply test` one per pool thread per group, which is what this is worth.
+/// Lowering is a property of the syntax, so a machine built next over the same program reads what
+/// this one lowered.
 #[test]
 fn a_second_machine_over_one_program_lowers_nothing_the_first_already_did() {
     let (program, resolved) = standalone(vec![
@@ -1127,9 +1089,8 @@ fn a_second_machine_over_one_program_lowers_nothing_the_first_already_did() {
     );
 }
 
-/// A bisection rebuilds a program whose definitions carry the names of the ones
-/// they replace, so a cache keyed on a body's address must be refused rather
-/// than consulted across two programs. The answer here is the running program's.
+/// A bisection rebuilds a program whose definitions carry the names of the ones they replace, so a
+/// cache keyed on a body's address must be refused rather than consulted across two programs.
 #[test]
 fn a_machine_refuses_a_lowering_taken_over_a_different_program() {
     let (one, one_resolved) = standalone(vec![fn_def("f", &[], int(1))]);
@@ -1151,8 +1112,8 @@ fn a_machine_refuses_a_lowering_taken_over_a_different_program() {
     );
 }
 
-/// `eval_test` lowered the body it was about to run on every call and cached
-/// nothing, so a worker re-running a test paid the traversal again.
+/// `eval_test` lowered the body it was about to run on every call and cached nothing, so a worker
+/// re-running a test paid the traversal again.
 #[test]
 fn a_test_run_twice_is_lowered_once() {
     let (program, resolved) = standalone(vec![test_def("t", bin(BinOp::Add, int(1), int(2)))]);

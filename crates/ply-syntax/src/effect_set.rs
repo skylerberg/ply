@@ -1,28 +1,10 @@
 //! `effect set` expansion, which happens inside the parser.
-//!
-//! An unexpanded [`RowExpr`] never escapes [`crate::parse_module`], so there is
-//! no pass ordering to get wrong, no crate that can forget to run the expander,
-//! and no path where a row is checked with its sets ignored.
-//!
-//! Expansion reads **this module's own `effect set` items and nothing else**,
-//! which is what makes it a function of the file. Gate 1 skips a file whose raw
-//! bytes are unchanged; a set expanding across a module boundary would let an
-//! edit in the declaring module leave a stale published row behind in a file
-//! that never moved, and a stored footprint that under-reports is a scheduling
-//! and isolation defect that produces a green result.
-//!
-//! The set's *name* is erased here. Only its atoms survive, spliced into the row
-//! they were named from, so `/ {Web}` and `/ {<Web's atoms>}` are one definition
-//! with one hash.
 
 use crate::ast::*;
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Symbol, codes};
 
 /// Expands every row in the module and fills in each set's `expansion`.
-///
-/// Only called when the file wrote an `effect set` or named one in a row, so a
-/// program that uses neither pays nothing.
 pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     let mut sets = Sets::collect(module, diags);
     sets.resolve_includes(diags);
@@ -33,8 +15,8 @@ pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     walk_module_rows(module, &mut |row| {
         let mut atoms = Vec::new();
         for alias in &row.aliases {
-            // `None` is a set that was refused; the diagnostic is already
-            // recorded, and splicing nothing in is the only expansion there is.
+            // `None` is a set that was refused; the diagnostic is already recorded, and splicing
+            // nothing in is the only expansion there is.
             if let Some(i) = sets.lookup(alias, diags) {
                 atoms.extend(sets.defs[i].expansion.iter().cloned());
             }
@@ -47,14 +29,13 @@ pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
 struct Sets {
     defs: Vec<EffectSetDef>,
     by_name: IndexMap<Symbol, usize>,
-    /// One entry per set, parallel to `defs`: where each of its `includes`
-    /// resolved to, or `None` for one already reported.
+    /// One entry per set, parallel to `defs`: where each of its `includes` resolved to, or `None`
+    /// for one already reported.
     edges: Vec<Vec<Option<usize>>>,
-    /// A set that is part of a cycle. It has no expansion, and naming it
-    /// contributes nothing rather than looping.
+    /// A set that is part of a cycle.
     cyclic: Vec<bool>,
-    /// The effects the module declares, so `{db}` can be told that a member is
-    /// an atom rather than merely that no set is called `db`.
+    /// The effects the module declares, so `{db}` can be told that a member is an atom rather than
+    /// merely that no set is called `db`.
     effect_names: Vec<Symbol>,
 }
 
@@ -180,8 +161,8 @@ impl Sets {
         d
     }
 
-    /// Marks every set on a cycle, and every set that reaches one, and reports
-    /// each cycle once with its members in the order they contain each other.
+    /// Marks every set on a cycle, and every set that reaches one, and reports each cycle once with
+    /// its members in the order they contain each other.
     fn find_cycles(&mut self, diags: &mut Vec<Diagnostic>) {
         #[derive(Clone, Copy, PartialEq)]
         enum Color {
@@ -192,8 +173,8 @@ impl Sets {
         let mut color = vec![Color::White; self.defs.len()];
         let mut path: Vec<usize> = Vec::new();
 
-        // Explicit stack: a file may declare arbitrarily many sets, and a chain
-        // of them must not decide whether the parser overflows.
+        // Explicit stack: a file may declare arbitrarily many sets, and a chain of them must not
+        // decide whether the parser overflows.
         for root in 0..self.defs.len() {
             if color[root] != Color::White {
                 continue;
@@ -260,17 +241,15 @@ impl Sets {
             .note("expansion is a fixed point, and a cycle has none: break it by inlining the atoms one of these sets needs")
     }
 
-    /// Every set's atoms after its `includes` are followed, in first-appearance
-    /// order and deduplicated by written form. Order decides nothing — the row
-    /// encoder sorts — but it is what a reader of `--explain` sees.
+    /// Every set's atoms after its `includes` are followed, in first-appearance order and
+    /// deduplicated by written form.
     fn expand_all(&mut self) {
         let mut done = vec![false; self.defs.len()];
         for root in 0..self.defs.len() {
             if done[root] || self.cyclic[root] {
                 continue;
             }
-            // Post-order over the acyclic remainder, so a set's includes are
-            // expanded before it is.
+            // Post-order over the acyclic remainder, so a set's includes are expanded before it is.
             let mut work = vec![(root, false)];
             while let Some((node, visited)) = work.pop() {
                 if done[node] || self.cyclic[node] {
@@ -303,8 +282,8 @@ impl Sets {
             let Some(&i) = self.by_name.get(&d.name.name) else {
                 continue;
             };
-            // A duplicate name binds to the first declaration, so only that one
-            // takes the expansion; the second was refused and keeps nothing.
+            // A duplicate name binds to the first declaration, so only that one takes the
+            // expansion; the second was refused and keeps nothing.
             if seen.insert(d.name.name.clone(), i).is_some() {
                 continue;
             }
@@ -313,14 +292,8 @@ impl Sets {
     }
 }
 
-/// Two members that are the same atom are one atom, and the survivors are put
-/// in written-form order.
-///
-/// Sorted rather than left in first-appearance order so that reordering a set's
-/// members, or splitting one set into two, produces the same expansion —
-/// including for `--explain`, which prints it, and for the atoms this splices
-/// into a row. The row encoder sorts too, but by its own encoding, and a reader
-/// comparing two `--explain` outputs should not have to know that.
+/// Two members that are the same atom are one atom, and the survivors are put in written-form
+/// order.
 fn canonicalize(atoms: &mut Vec<AtomExpr>) {
     let key = |a: &AtomExpr| {
         (
@@ -418,8 +391,8 @@ fn walk_type(t: &mut TypeExpr, f: &mut impl FnMut(&mut RowExpr)) {
     })
 }
 
-/// A `let` binding and a lambda parameter carry types, and a type carries a
-/// function type, so a row can appear at any depth of any body.
+/// A `let` binding and a lambda parameter carry types, and a type carries a function type, so a row
+/// can appear at any depth of any body.
 fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
     grow(|| match &mut e.kind {
         ExprKind::Lit(_) | ExprKind::Var(_) => {}
@@ -484,9 +457,8 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
                 walk_expr(v, f);
             }
         }
-        // Row expansion runs before record-update expansion, so it walks the
-        // sugar rather than its expansion. The base is a path and carries no
-        // row; a replacement value is an arbitrary expression and can.
+        // Row expansion runs before record-update expansion, so it walks the sugar rather than its
+        // expansion.
         ExprKind::RecordUpdate { base, fields } => {
             walk_expr(base, f);
             for (_, v) in fields {
@@ -494,10 +466,7 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
             }
         }
         ExprKind::Field { base, .. } => walk_expr(base, f),
-        // Row expansion runs before `?` expansion too, so it walks through the
-        // sugar. A `?` carries no row of its own — it is a `match` by the time
-        // anything else looks — but its operand is an ordinary expression and
-        // can.
+        // Row expansion runs before `?` expansion too, so it walks through the sugar.
         ExprKind::Try { operand } => walk_expr(operand, f),
         ExprKind::List { items } => {
             for i in items {

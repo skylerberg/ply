@@ -1,14 +1,4 @@
 //! What fraction of a real program's calls can cross the compiled seam.
-//!
-//! `Machine::compiled_counts` counts entries and declines *after* `admit` has
-//! cleared a call, so its denominator is the admitted set rather than the
-//! program. `differential_corpus.rs`'s "calls offered" is the same denominator:
-//! a backend's `enter` is reached only for a call every gate already passed.
-//! This file supplies the missing denominator — every call to a function body —
-//! and the gate that refused each one.
-//!
-//! The cross-check that makes it non-vacuous: over the same corpus, in the same
-//! process, the census's `admitted` must equal a declining backend's `offered`.
 
 use ply_eval::differential::compare_tests;
 use ply_eval::{Fixture, Interp, Machine};
@@ -125,8 +115,8 @@ fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
     out
 }
 
-/// Declines everything and counts what it was handed — which is what `admit`
-/// cleared, and nothing else.
+/// Declines everything and counts what it was handed — which is what `admit` cleared, and nothing
+/// else.
 struct Declining {
     program: usize,
     offered: Cell<u64>,
@@ -201,33 +191,6 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
     assert_eq!(body - admitted, refused, "the gate histogram does not sum");
 
     // The two halves of the argument test, separated over a corpus.
-    //
-    // `Gate::ArgumentType` decides an argument from its definition's declared
-    // parameter type and `Gate::ArgumentShape` decides it from the value's
-    // discriminant, and on a program the checker accepted the second refuses
-    // nothing the first admits: a value whose declared type is `Int` is a
-    // `Value::Int`. That is an argument about the type system, so it is read off
-    // a corpus rather than believed — `type_gated_shipping` is the type gate
-    // asked with the kind test removed, and any gap between it and `admitted` is
-    // defence in depth actually firing on real source, which is a fact worth
-    // seeing rather than a failure.
-    //
-    // Seen to fail, and by the corruption that can move the two apart rather
-    // than by the one a reader reaches for first. Deleting `Denotes::matches`
-    // from `CarriedTypes::args_cross` — so a declared type licenses a value of
-    // **any** kind — leaves this assertion GREEN, because both sides read the
-    // same `args_cross` and move together; that was tried first and is recorded
-    // so nobody tries it again. What is red is a corruption of the OTHER half:
-    //
-    //   `Value::Record(_)` removed from `compiled::crossable_argument_kind`
-    //     -> 882207 == 859104, "the kind gate refused 23103 call(s) the
-    //        declared types admitted"
-    //   `CarriedTypes::args_cross` stubbed to `true`
-    //     -> 1293678 == 1207996, 85682 apart
-    //
-    // Both measured on this corpus on 2026-08-31, with `Compiling ply-eval`
-    // confirmed in the output and the file restored and digest-checked after.
-    // The vacuity assertion below reds under the stub too, one assertion later.
     let type_gated = ply_eval::census::type_gated_shipping();
     assert_eq!(
         type_gated,
@@ -237,28 +200,6 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
     );
 
     // The two ends of the seam's one table, over a corpus.
-    //
-    // `admitted_carried_sig` reads `CarriedTypes`'s per-definition `Denotes`,
-    // computed once when the table was built; `carried_sig_walked` calls
-    // `CarriedTypes::carries` on every declared parameter and on the declared
-    // return type at the call. They are the same predicate by two routes, and
-    // the point of counting both is that a per-definition PRECOMPUTE has a
-    // failure mode a per-call walk does not — it can be stale, or built from a
-    // different `CheckOutput`, and nothing about a run says so.
-    //
-    // Seen to fail, by a corruption that touches ONE route: `CarriedTypes::over`
-    // filling `Sig::ret` with `Some(Denotes::Int)` instead of
-    // `table.denotes(ret)`, so every definition's return looks carried to the
-    // precompute and the walk disagrees. Measured 2026-08-31 with `Compiling
-    // ply-eval` confirmed and the file restored and digest-checked after:
-    //
-    //   "the declared-type walk and the per-definition precompute disagree over
-    //    this corpus by 200930 call(s)"  left: 681277  right: 882207
-    //
-    // A corruption of `CarriedTypes::carries` itself would NOT red this: both
-    // routes read that function, so they move together. That is the shape of
-    // what this assertion can and cannot see, and it is why it is a
-    // precompute-versus-walk check rather than a check on the rule.
     let walked = ply_eval::census::carried_sig_walked();
     assert_eq!(
         walked,

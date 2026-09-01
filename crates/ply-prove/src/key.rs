@@ -1,18 +1,10 @@
 //! What an obligation's result is cached under.
-//!
-//! One rule, and it is ADR 0006 §8.1's rule with one word changed: **a proof is
-//! not a search.** A sampled discharge is a claim about the plan that sampled
-//! it, so it is keyed by the plan and re-runs when the plan widens — reading one
-//! under a wider plan would let `--prove-cases 10` satisfy a run that asked for
-//! a thousand. A proof is a claim about every input satisfying the guard, so it
-//! is valid under every plan and costs nothing forever.
 
 use crate::{ProvePlan, Tier};
 use ply_hash::DefHash;
 
-/// Domain tag, so a plan-keyed result cannot collide with the bare obligation
-/// key, which is itself a `blake3` over normalized bytes. The same device as
-/// `ply_hash::spec_hash` and `ply_test::sim_key`.
+/// Domain tag, so a plan-keyed result cannot collide with the bare obligation key, which is itself
+/// a `blake3` over normalized bytes.
 const PLAN_DOMAIN: &[u8] = b"ply.prove.key.1";
 
 /// The key everything weaker than a proof is written under.
@@ -25,11 +17,6 @@ pub fn prove_key(key: DefHash, plan: &ProvePlan) -> DefHash {
 }
 
 /// Where a discharge of this tier belongs.
-///
-/// `None` is not a "no tier" convenience: a refutation, a vacuity and a gap are
-/// never written at all, so a caller holding one has nothing to ask this
-/// function and gets the plan key rather than a bare one — the conservative
-/// direction, since a bare key is the one that survives a widening.
 pub fn result_key(key: DefHash, tier: Option<Tier>, plan: &ProvePlan) -> DefHash {
     match tier {
         Some(Tier::Proved) => key,
@@ -45,8 +32,8 @@ mod tests {
         DefHash([7; 32])
     }
 
-    /// The rule that stops a run under one plan from reading a discharge another
-    /// plan earned, and the one whose absence is silent.
+    /// The rule that stops a run under one plan from reading a discharge another plan earned, and
+    /// the one whose absence is silent.
     #[test]
     fn a_sampled_discharge_is_never_written_under_the_bare_key() {
         let plan = ProvePlan::default();
@@ -89,8 +76,8 @@ mod tests {
         assert_ne!(prove_key(key(), &narrow), prove_key(key(), &deeper));
     }
 
-    /// A wider shrink budget can only produce a smaller counterexample, and
-    /// failures are never cached, so it cannot change a cached claim.
+    /// A wider shrink budget can only produce a smaller counterexample, and failures are never
+    /// cached, so it cannot change a cached claim.
     #[test]
     fn the_shrink_budget_does_not_move_a_key() {
         let narrow = ProvePlan::default();
@@ -107,8 +94,8 @@ mod tests {
         assert_ne!(prove_key(DefHash([1; 32]), &plan), prove_key(key(), &plan));
     }
 
-    /// An unknown tier takes the plan key: the bare key is the one that survives
-    /// a widening, so it is the one nothing may be written under by accident.
+    /// An unknown tier takes the plan key: the bare key is the one that survives a widening, so it
+    /// is the one nothing may be written under by accident.
     #[test]
     fn an_absent_tier_takes_the_conservative_key() {
         let plan = ProvePlan::default();

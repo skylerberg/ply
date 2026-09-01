@@ -16,18 +16,14 @@ use ply_syntax::resolve::{Namespace, Resolved, Scope, resolve};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::{BTreeMap, BTreeSet};
 
-/// The effect under which `with_cell` regions publish their atoms. Reserved:
-/// a user `effect cell` would silently gain the power to observe region state.
+/// The effect under which `with_cell` regions publish their atoms.
 const CELL: &str = "cell";
 
-/// Bound in an `ensures` clause to the definition's return value, beside the
-/// parameters rather than inside them. Not a keyword: a definition with no
-/// `ensures` may still call a parameter `result`.
+/// Bound in an `ensures` clause to the definition's return value, beside the parameters rather than
+/// inside them.
 const RESULT: &str = "result";
 
-/// Names no `type` item may claim, with their arities. The prelude's ADTs are
-/// appended by [`builtin_types`] rather than repeated here, so the one table in
-/// `prelude` decides both what exists and what is reserved.
+/// Names no `type` item may claim, with their arities.
 const BUILTIN_TYPE_CONS: &[(&str, usize)] = &[
     ("Int", 0),
     ("Bool", 0),
@@ -40,8 +36,8 @@ const BUILTIN_TYPE_CONS: &[(&str, usize)] = &[
     ("Map", 2),
     ("Cell", 1),
     (prelude::TASK_TYPE, 1),
-    // A builtin rather than a `std` record, because `type Secret<a> = {value: a}`
-    // is one field access from useless and a project could declare its own.
+    // A builtin rather than a `std` record, because `type Secret<a> = {value: a}` is one field
+    // access from useless and a project could declare its own.
     (crate::ty::SECRET, 1),
 ];
 
@@ -73,17 +69,14 @@ pub fn check_program_with(
         c.check_fns(&program.modules[i]);
         c.check_specs(&program.modules[i]);
     }
-    // Load order, not dependency order: this position is the same index
-    // `HashOutput::tests` and `HashOutput::laws` are built on, and those walk
-    // the program.
+    // Load order, not dependency order: this position is the same index `HashOutput::tests` and
+    // `HashOutput::laws` are built on, and those walk the program.
     for (i, module) in program.modules.iter().enumerate() {
         c.module = i;
         c.check_tests(module);
         c.check_laws(module);
     }
     // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
-    // Nothing here is generalized, so the position only has to be after every
-    // expression has been walked.
     c.settle_numerics();
     c.check_comparisons();
     c.check_map_keys();
@@ -92,8 +85,8 @@ pub fn check_program_with(
     c.attribute_generated(program);
     c.check_simulations();
     c.check_regions();
-    // Last, because it is the only pass that needs every module's `DefInfo` to
-    // exist: it answers a question about a definition's callees.
+    // Last, because it is the only pass that needs every module's `DefInfo` to exist: it answers a
+    // question about a definition's callees.
     c.mark_internal_effects(program);
     if c.diags.iter().any(|d| d.severity == Severity::Error) {
         Err(deduplicated(c.diags))
@@ -110,19 +103,6 @@ pub fn check_program_with(
 }
 
 /// Diagnostics that render identically are one diagnostic to a reader.
-///
-/// Order is preserved and only exact repeats are dropped — same code, same
-/// severity, same message, and every label the same span and text. Two
-/// complaints a reader cannot tell apart are not two pieces of information.
-///
-/// The case that made this worth doing is a parameter default with a type
-/// error. It is checked once where it is written and again in each call that
-/// omitted it — the splice is a copy, so each copy fails the same unification —
-/// and every one of them points at the same text, because a spliced default
-/// keeps the span it was written at. That is `1 + <call sites>` renderings of
-/// one mistake. Nothing downstream may know which argument came from a default
-/// (ADR 0029 keeps that knowledge inside `ply_syntax::defaults`), so the fix
-/// belongs here, where the question is only whether two diagnostics differ.
 fn deduplicated(diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
     let key = |d: &Diagnostic| {
         (
@@ -140,16 +120,8 @@ fn deduplicated(diags: Vec<Diagnostic>) -> Vec<Diagnostic> {
     diags.into_iter().filter(|d| seen.insert(key(d))).collect()
 }
 
-/// How many arguments the prelude's signature for `name` takes, or `None` if
-/// the prelude declares no such name.
-///
-/// Exists so that a *third* table over the builtins can be checked against this
-/// one. Their arities live in `ply_eval::builtins`, their defaults in
-/// `ply_syntax::defaults`, and their types here; for the whole of this
-/// language's history `assert` and `range` disagreed between the first two and
-/// this one, and no well-typed program could reach the arms the disagreement
-/// stranded. `ply_eval`, which can see all three, is the only place that test
-/// can live, and this is what it reads.
+/// How many arguments the prelude's signature for `name` takes, or `None` if the prelude declares
+/// no such name.
 pub fn prelude_arity(name: &str) -> Option<usize> {
     let program = Program {
         modules: Vec::new(),
@@ -159,16 +131,16 @@ pub fn prelude_arity(name: &str) -> Option<usize> {
     let c = Checker::new(&program, &resolved, &known);
     match &c.env.lookup(&Symbol::new(name))?.ty {
         Type::Fn { params, .. } => Some(params.len()),
-        // A prelude name that is not a function — none today, and a count is
-        // not the question to ask of one.
+        // A prelude name that is not a function — none today, and a count is not the question to
+        // ask of one.
         _ => None,
     }
 }
 
 pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
     let mut program = Program::single(module.clone());
-    // A `derive` is expanded before anything is resolved, here as in the
-    // driver: what resolution and inference see is ordinary definitions.
+    // A `derive` is expanded before anything is resolved, here as in the driver: what resolution
+    // and inference see is ordinary definitions.
     let diags = ply_derive::expand_program(&mut program);
     if !diags.is_empty() {
         return Err(diags);
@@ -181,15 +153,13 @@ pub fn check_module(module: &Module) -> Result<CheckOutput, Vec<Diagnostic>> {
 struct TypeDecl {
     params: Vec<Symbol>,
     alias: Option<TypeExpr>,
-    /// An alias body is written in its own module's scope, so expanding one at a
-    /// use site in another module has to resolve its names back there.
+    /// An alias body is written in its own module's scope, so expanding one at a use site in
+    /// another module has to resolve its names back there.
     owner: usize,
     span: Span,
 }
 
-/// Where an atom entered the current definition's row. `direct` marks a literal
-/// `eff.op(..)` expression, whose span is worth more to a reader than the span of
-/// a call that merely propagates the atom.
+/// Where an atom entered the current definition's row.
 #[derive(Clone, Debug)]
 struct PerformSite {
     atom: EffectAtom,
@@ -197,10 +167,8 @@ struct PerformSite {
     direct: bool,
 }
 
-/// A `Map` type as it was written or instantiated, with everything
-/// [`Checker::check_map_keys`] needs to judge it once the module is solved. The
-/// assumptions travel with the site because they belong to the signature the
-/// site sits in, and the check runs long after that signature is out of scope.
+/// A `Map` type as it was written or instantiated, with everything [`Checker::check_map_keys`]
+/// needs to judge it once the module is solved.
 struct MapKeySite {
     span: Span,
     scope: u32,
@@ -209,12 +177,8 @@ struct MapKeySite {
     params: Vec<(TyVar, Symbol)>,
 }
 
-/// A reference that instantiated a parameter its callee constrained, with
-/// everything [`Checker::check_constraints`] needs once the module is solved.
-///
-/// The whole point of the constraint is that this is where the error lands: an
-/// agent that gets "`(Int) -> Int` has no JSON encoding" at the call it wrote
-/// fixes the call, and one that gets it from inside an expansion searches.
+/// A reference that instantiated a parameter its callee constrained, with everything
+/// [`Checker::check_constraints`] needs once the module is solved.
 struct ConstraintSite {
     span: Span,
     deriver: Deriver,
@@ -225,8 +189,8 @@ struct ConstraintSite {
     callee_span: Span,
     /// The constraints in force at the call, so a body may assume its own.
     assumed: FxHashSet<TyVar>,
-    /// The enclosing signature's type parameters, so "add `where derivable(json,
-    /// a)`" can name `a` rather than a variable number.
+    /// The enclosing signature's type parameters, so "add `where derivable(json, a)`" can name `a`
+    /// rather than a variable number.
     params: Vec<(TyVar, Symbol)>,
 }
 
@@ -237,8 +201,8 @@ fn clone_adt(a: &Adt) -> Adt {
     }
 }
 
-/// Every map below is keyed by the program-wide name, so two modules may
-/// declare the same simple name without either one being rewritten.
+/// Every map below is keyed by the program-wide name, so two modules may declare the same simple
+/// name without either one being rewritten.
 struct Checker<'a> {
     program: &'a Program,
     resolved: &'a Resolved,
@@ -258,91 +222,62 @@ struct Checker<'a> {
     modules: IndexMap<Symbol, ModuleInfo>,
     ty_params: FxHashMap<Symbol, Type>,
     row_params: FxHashMap<Symbol, RowVar>,
-    /// The type parameters the signature being checked declared `where
-    /// derivable(D, ·)` for, by deriver. A `Map` key that is one of the `ord`
-    /// ones is well-formed, and the body may assume it: that is what "checked
-    /// at the signature, not at the use" means, and it is why omitting the
-    /// clause is an error on the signature rather than a mystery at a call.
+    /// The type parameters the signature being checked declared `where derivable(D, ·)` for, by
+    /// deriver.
     assumed: FxHashMap<Deriver, FxHashSet<TyVar>>,
-    /// Effect operation signatures have no generic list of their own, so a type
-    /// variable appearing in one is implicitly quantified over the operation.
+    /// Effect operation signatures have no generic list of their own, so a type variable appearing
+    /// in one is implicitly quantified over the operation.
     auto_ty_params: bool,
     alias_stack: Vec<Symbol>,
     /// Written atoms already refused, by span.
-    ///
-    /// An `effect set` is expanded by the parser, so one atom written once in a
-    /// set is spliced into every row that names it. Without this, an effect the
-    /// program does not declare produces one identical diagnostic per row —
-    /// pointing, correctly, at the one place there is to fix.
     refused_atoms: FxHashSet<Span>,
     performs: Vec<PerformSite>,
-    /// Operand types of `==` / `!=`, checked once the whole module is solved
-    /// because the type at a comparison is often still a variable when it is
-    /// first seen.
+    /// Operand types of `==` / `!=`, checked once the whole module is solved because the type at a
+    /// comparison is often still a variable when it is first seen.
     comparisons: Vec<(Span, Type)>,
-    /// Every `Map` key type this run has seen written or instantiated, checked
-    /// once the module is solved for the same reason `comparisons` is: the key
-    /// is usually still a variable where the map first appears, and `Map<Float,
-    /// v>` is only visible once unification has pinned it.
+    /// Every `Map` key type this run has seen written or instantiated, checked once the module is
+    /// solved for the same reason `comparisons` is: the key is usually still a variable where the
+    /// map first appears, and `Map<Float, v>` is only visible once unification has pinned it.
     map_keys: Vec<MapKeySite>,
-    /// Ticks once per definition, test and law. A deferred check dedupes on it
-    /// rather than on a span, because one bad type is usually recorded twice —
-    /// at the annotation that wrote it and at the call that instantiated it —
-    /// and two errors for one edit is two things to read and one thing to fix.
+    /// Ticks once per definition, test and law.
     scope: u32,
-    /// The published `where` clauses of every definition checked so far,
-    /// including the ones restored from a cached interface. A call site is
-    /// checked against these, which is what makes the error local to the call
-    /// rather than to something the callee does three definitions deeper.
+    /// The published `where` clauses of every definition checked so far, including the ones
+    /// restored from a cached interface.
     constraints: IndexMap<Symbol, Vec<DefConstraint>>,
-    /// Call sites instantiating a constrained parameter, judged once the module
-    /// is solved for the same reason `map_keys` is: the type argument at a call
-    /// is routinely still a variable when the call is first walked.
+    /// Call sites instantiating a constrained parameter, judged once the module is solved for the
+    /// same reason `map_keys` is: the type argument at a call is routinely still a variable when
+    /// the call is first walked.
     constrained_uses: Vec<ConstraintSite>,
-    /// Arithmetic and ordered comparisons whose operand type has yet to be
-    /// pinned to one of the three numeric types. Drained by
-    /// [`Checker::settle_numerics`] before the definition around them is
-    /// generalized.
+    /// Arithmetic and ordered comparisons whose operand type has yet to be pinned to one of the
+    /// three numeric types.
     numerics: Vec<Numeric>,
-    /// `simulate` regions, checked for the same reason: a region's result type
-    /// and the row of what it calls are both routinely unsolved while its own
-    /// definition is still being walked.
+    /// `simulate` regions, checked for the same reason: a region's result type and the row of what
+    /// it calls are both routinely unsolved while its own definition is still being walked.
     simulations: Vec<Simulation>,
-    /// The `with_region[r]` scopes enclosing the expression being walked,
-    /// innermost last. `with_cell[r]` consults it to decide whether it opens a
-    /// region of its own or allocates into one that is already open.
+    /// The `with_region[r]` scopes enclosing the expression being walked, innermost last.
     open_regions: Vec<OpenRegion>,
-    /// Closed regions, checked by [`Checker::check_regions`] once the module is
-    /// solved.
+    /// Closed regions, checked by [`Checker::check_regions`] once the module is solved.
     regions: Vec<RegionSite>,
-    /// How many `simulate` regions enclose the expression being walked. A task
-    /// cannot outlive the scheduler that runs it, so a region that opened before
-    /// the enclosing `simulate` did is one a spawned task can outlive.
+    /// How many `simulate` regions enclose the expression being walked.
     simulate_depth: u32,
     /// What each definition carrying clauses has its clauses typed against.
-    /// Recorded where the signature is built rather than rebuilt in
-    /// [`Checker::check_specs`], so that a clause cannot report a second copy of
-    /// a signature error the body already reported.
     spec_envs: FxHashMap<Symbol, SpecEnv>,
-    /// The clause being walked, so `result` outside an `ensures` can say where
-    /// it is bound instead.
+    /// The clause being walked, so `result` outside an `ensures` can say where it is bound instead.
     spec_kind: Option<SpecKind>,
-    /// Set while a definition a `derive` generated is being checked. A failure
-    /// inside one is Ply's problem to explain, not the user's to decode: the
-    /// body is not in the file and there is nothing at its span to edit.
+    /// Set while a definition a `derive` generated is being checked.
     derived: Option<Derived>,
 }
 
-/// One use of an operator that is defined at more than one numeric type, kept
-/// until the operand type is known.
+/// One use of an operator that is defined at more than one numeric type, kept until the operand
+/// type is known.
 struct Numeric {
     span: Span,
     op: BinOp,
     ty: Type,
 }
 
-/// Where a spec expression sits, which decides both how it is named in a
-/// diagnostic and — the part that matters — what its row may carry.
+/// Where a spec expression sits, which decides both how it is named in a diagnostic and — the part
+/// that matters — what its row may carry.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SpecSite {
     Requires,
@@ -359,11 +294,7 @@ impl SpecSite {
         }
     }
 
-    /// Only a law body has an exception, and it is exactly `{sim.read}`. A
-    /// pre/post condition is a claim about one call, not about a search, and
-    /// there is no seed at a call site to name; a guard decides which values the
-    /// law is a claim about, and a domain that depends on a seed is a different
-    /// domain per run.
+    /// Only a law body has an exception, and it is exactly `{sim.read}`.
     fn allowed(self) -> BTreeSet<EffectAtom> {
         match self {
             SpecSite::LawBody => [prelude::seed_atom()].into(),
@@ -390,8 +321,8 @@ impl SpecSite {
     }
 }
 
-/// The scope a definition's clauses see: its own parameters and result, and the
-/// generic names its annotations were written in.
+/// The scope a definition's clauses see: its own parameters and result, and the generic names its
+/// annotations were written in.
 struct SpecEnv {
     ty_params: FxHashMap<Symbol, Type>,
     row_params: FxHashMap<Symbol, RowVar>,
@@ -404,26 +335,21 @@ struct OpenRegion {
     name: Symbol,
     source: RegionSource,
     span: Span,
-    /// [`Checker::simulate_depth`] where the region opened. A `task.spawn`
-    /// reached at this same depth is scheduled by a `simulate` that started
-    /// before the region did and therefore outlives it.
+    /// [`Checker::simulate_depth`] where the region opened.
     simulate_depth: u32,
     spawns: Vec<SpawnSite>,
     handoffs: Vec<HandoffSite>,
 }
 
-/// How a region was written. ADR 0017 §1 makes both of these regions and the
-/// four escape checks run on both; what differs is only what the exit
-/// diagnostic says, because a bare `with_cell`'s escaping value is always the
-/// cell and has said so since before regions existed.
+/// How a region was written.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RegionSource {
     WithRegion,
     WithCell,
 }
 
-/// One closed region — a `with_region[r]` or a `with_cell[r]` that opened one of
-/// its own — as [`Checker::check_regions`] revisits it.
+/// One closed region — a `with_region[r]` or a `with_cell[r]` that opened one of its own — as
+/// [`Checker::check_regions`] revisits it.
 struct RegionSite {
     name: Symbol,
     source: RegionSource,
@@ -431,18 +357,14 @@ struct RegionSite {
     span: Span,
     body_span: Span,
     body_ty: Type,
-    /// Every position the body's value leaves through. All of them carry
-    /// `body_ty`; what the list buys is a label on the expression that produced
-    /// the value rather than on the whole region.
+    /// Every position the body's value leaves through.
     exits: Vec<Span>,
     outer: Vec<OuterBinding>,
     spawns: Vec<SpawnSite>,
     handoffs: Vec<HandoffSite>,
 }
 
-/// A name that was in scope before a region opened, and where the region's body
-/// first mentions it. A brand reaching this type is a store into something that
-/// outlives the region.
+/// A name that was in scope before a region opened, and where the region's body first mentions it.
 struct OuterBinding {
     name: Symbol,
     ty: Type,
@@ -456,12 +378,6 @@ struct SpawnSite {
 }
 
 /// An argument handed to a user-declared operation inside a region.
-///
-/// The perform site and the handler instantiate the operation's signature
-/// separately, so a declared type variable in an argument position is a hole the
-/// brand falls through: the handler receives the value at a variable of its own
-/// and may store or return it, and no type there mentions the region. The type
-/// recorded is the argument's, at the site that wrote it.
 struct HandoffSite {
     span: Span,
     /// `sink.put`, for the diagnostic.
@@ -561,8 +477,8 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// The order below is normative rather than an optimization: a local always
-    /// wins, and a module's own items always shadow the prelude.
+    /// The order below is normative rather than an optimization: a local always wins, and a
+    /// module's own items always shadow the prelude.
     fn value_key(&mut self, q: &QName) -> Option<ValueKey> {
         if !q.is_bare() {
             let name = self.global(Namespace::Value, q)?;
@@ -594,9 +510,9 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// `cell_get` / `cell_set` are call forms rather than schemes, so the
-    /// application rule has to recognise them before inferring the callee — and
-    /// silently, since a local or a module item of that name is not one.
+    /// `cell_get` / `cell_set` are call forms rather than schemes, so the application rule has to
+    /// recognise them before inferring the callee — and silently, since a local or a module item of
+    /// that name is not one.
     fn cell_form(&self, q: &QName) -> Option<Mode> {
         if !q.is_bare() || self.env.depth_of(q.symbol()) != Some(0) {
             return None;
@@ -611,16 +527,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Silent counterpart to [`Checker::global`], for the second look a
-    /// diagnostic needs after the reference has already been resolved once.
-    /// The program-wide name a constructor reference denotes, falling back to
-    /// the prelude's — which no module declares, so nothing qualifies it.
-    ///
-    /// A module that declares its own `Some` shadows the prelude's, exactly as
-    /// one declaring its own `len` does.
-    ///
-    /// Reporting, through [`Checker::global`]: a qualified constructor that is
-    /// private is `E0107` and the prelude fallback must not swallow it.
+    /// Silent counterpart to [`Checker::global`], for the second look a diagnostic needs after the
+    /// reference has already been resolved once.
     fn ctor_name(&mut self, q: &QName) -> Option<Symbol> {
         if let Some(name) = self.global(Namespace::Value, q) {
             return Some(name);
@@ -628,9 +536,8 @@ impl<'a> Checker<'a> {
         self.prelude_ctor(q)
     }
 
-    /// [`Checker::ctor_name`] without the diagnostic, for the passes that only
-    /// ask which constructor a pattern *covers*. The reference has already been
-    /// reported by the pass that bound it.
+    /// [`Checker::ctor_name`] without the diagnostic, for the passes that only ask which
+    /// constructor a pattern *covers*.
     fn covered_ctor(&self, q: &QName) -> Option<Symbol> {
         self.declared_value(q).or_else(|| self.prelude_ctor(q))
     }
@@ -653,8 +560,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The name a reference denotes, program-wide. Locals are the caller's
-    /// business: they win over everything here, and are looked up first.
+    /// The name a reference denotes, program-wide.
     fn global(&mut self, ns: Namespace, q: &QName) -> Option<Symbol> {
         if q.is_bare()
             && let Some(binding) = self.scope().get(ns, q.symbol())
@@ -680,14 +586,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The prelude's ADTs, as constructors in the value namespace and entries in
-    /// `ctors`.
-    ///
-    /// They are registered exactly as a module's are, so exhaustiveness, pattern
-    /// binding, the property generator and the prover's case split all see them
-    /// through the paths they already use. Their program-wide name is the bare
-    /// one — no module declares them — which is the same convention the prelude's
-    /// effects and functions follow.
+    /// The prelude's ADTs, as constructors in the value namespace and entries in `ctors`.
     fn install_prelude_adts(&mut self) {
         for (name, info) in prelude::ctors() {
             self.env.bind_global(name.clone(), info.scheme.clone());
@@ -702,12 +601,8 @@ impl<'a> Checker<'a> {
         let c = self.fresh.ty_var();
         let e = self.fresh.row_var();
         let (ta, tb, tc, re) = (Type::Var(a), Type::Var(b), Type::Var(c), Row::open(e));
-        // `map_fold`'s accumulator needs a third variable; `a` and `b` are the
-        // key and the value everywhere below, which is what keeps the twelve
-        // signatures readable side by side. `iterate` reuses `a` as its seed and
-        // `b` as the value its step stops with — two, because a loop that could
-        // only stop with its own seed would have to run one more round to
-        // report anything it computed.
+        // `map_fold`'s accumulator needs a third variable; `a` and `b` are the key and the value
+        // everywhere below, which is what keeps the twelve signatures readable side by side.
         let map_ty = Type::map(ta.clone(), tb.clone());
         let entry_ty = Type::Record(BTreeMap::from([
             (Symbol::new("key"), ta.clone()),
@@ -735,10 +630,7 @@ impl<'a> Checker<'a> {
             };
 
         let entries: Vec<(&str, Scheme)> = vec![
-            // Two parameters, the second defaulted to `None` by
-            // `ply_syntax::defaults`. The evaluator has carried the message
-            // arm since the first commit; until this signature widened, no
-            // well-typed program could reach it.
+            // Two parameters, the second defaulted to `None` by `ply_syntax::defaults`.
             (
                 "assert",
                 mono(
@@ -776,11 +668,7 @@ impl<'a> Checker<'a> {
                     Row::empty(),
                 ),
             ),
-            // The list index, in the shape `json.ply:800` and `db.ply:604`
-            // already recurse by hand. Total — it refuses no index — which is
-            // what puts it in `TOTAL_BUILTINS` where a raising index could not
-            // go. `bytes_at` raises; ADR 0027 §2 is why the two containers are
-            // indexed by different conventions.
+            // The list index, in the shape `json.ply:800` and `db.ply:604` already recurse by hand.
             (
                 "list_at",
                 poly(
@@ -883,20 +771,14 @@ impl<'a> Checker<'a> {
                 "bytes_concat",
                 mono(vec![Type::bytes(), Type::bytes()], Type::bytes()),
             ),
-            // One allocation over the whole list. Folding `bytes_concat` across
-            // a read loop's answers copies the accumulated prefix once per read,
-            // which is quadratic in the size of a message a peer chooses.
+            // One allocation over the whole list.
             (
                 "bytes_concat_all",
                 mono(vec![Type::list(Type::bytes())], Type::bytes()),
             ),
             ("bytes_of_string", mono(vec![Type::string()], Type::bytes())),
             ("bytes_is_utf8", mono(vec![Type::bytes()], Type::bool())),
-            // The searching builtins. W1's request path scanned its head five
-            // times, each scan a `fold` over `range` that boxed an `Int` per
-            // byte and could not stop early; these are the same searches with
-            // the pass count and the allocation removed, which is an algorithm
-            // rather than a constant factor.
+            // The searching builtins.
             (
                 "bytes_index_of",
                 mono(
@@ -930,10 +812,9 @@ impl<'a> Checker<'a> {
                     Type::list(Type::bytes()),
                 ),
             ),
-            // The byte class is a `Bytes` of its members rather than an enum,
-            // so it is totally general with no closed set to extend and the
-            // membership bitmap costs the set's length rather than the
-            // buffer's.
+            // The byte class is a `Bytes` of its members rather than an enum, so it is totally
+            // general with no closed set to extend and the membership bitmap costs the set's length
+            // rather than the buffer's.
             (
                 "bytes_scan",
                 mono(
@@ -971,8 +852,8 @@ impl<'a> Checker<'a> {
                 "string_of_bytes_lossy",
                 mono(vec![Type::bytes()], Type::string()),
             ),
-            // `len` is `(List<a>) -> Int` and Ply has no type-directed
-            // dispatch, so a String's length needs its own name.
+            // `len` is `(List<a>) -> Int` and Ply has no type-directed dispatch, so a String's
+            // length needs its own name.
             ("string_len", mono(vec![Type::string()], Type::int())),
             (
                 "string_slice",
@@ -1007,11 +888,7 @@ impl<'a> Checker<'a> {
                 "string_find",
                 mono(vec![Type::string(), Type::string()], Type::int()),
             ),
-            // The canonical total order over values, which is the order `Map`
-            // iterates in. `derive ord` produces a dictionary that calls this
-            // rather than a walk of its own, because two definitions of one
-            // type's order are two things that can disagree — and the one a map
-            // uses is not negotiable.
+            // The canonical total order over values, which is the order `Map` iterates in.
             (
                 "compare",
                 poly(
@@ -1022,11 +899,7 @@ impl<'a> Checker<'a> {
                     Row::empty(),
                 ),
             ),
-            // The same order, under a name a module may not declare — see
-            // [`is_reserved_builtin`]. `derive ord` emits *this* call, because
-            // a generated body that named `compare` would name whatever the
-            // deriving module bound to it, and a dictionary built out of that
-            // is the second order §2 rests on not existing.
+            // The same order, under a name a module may not declare — see [`is_reserved_builtin`].
             (
                 "compare_values",
                 poly(
@@ -1037,10 +910,7 @@ impl<'a> Checker<'a> {
                     Row::empty(),
                 ),
             ),
-            // `Map`. Every `k` carries `derivable(ord, k)`, which is not in the
-            // `Scheme` — it is checked where a concrete key type appears, by
-            // `check_map_keys`, because a constraint on a *builtin* has no
-            // signature the user can read the requirement off.
+            // `Map`.
             (
                 "map_new",
                 poly(vec![a, b], vec![], vec![], map_ty.clone(), Row::empty()),
@@ -1145,13 +1015,7 @@ impl<'a> Checker<'a> {
                     Row::empty(),
                 ),
             ),
-            // The only impure one, and only because it threads its function's
-            // row. It visits entries in ascending key order, and the keys are
-            // canonical (`ply_eval::value::canonical_key` — ascending order
-            // alone was not enough, because two spellings of one `Decimal` are
-            // one key and two strings), so a fold over a map is a function of
-            // the map's contents rather than of how it was built — which is
-            // what makes a seeded replay take the same branch.
+            // The only impure one, and only because it threads its function's row.
             (
                 "map_fold",
                 poly(
@@ -1170,10 +1034,9 @@ impl<'a> Checker<'a> {
                     re.clone(),
                 ),
             ),
-            // The scale and the rounding mode are arguments because `/` on
-            // `Decimal` is `E0209`: an operator would have to round, and a
-            // rounding nobody wrote down is the defect the type exists to
-            // prevent. Here it is written down.
+            // The scale and the rounding mode are arguments because `/` on `Decimal` is `E0209`: an
+            // operator would have to round, and a rounding nobody wrote down is the defect the type
+            // exists to prevent.
             (
                 "decimal_div",
                 mono(
@@ -1227,16 +1090,12 @@ impl<'a> Checker<'a> {
                     Row::empty(),
                 ),
             ),
-            // The only introduction. It does not consume its argument — Ply is a
-            // value language — so containment starts where the `Secret` starts,
-            // which ADR 0015 §2.5 (2) states rather than hides.
+            // The only introduction.
             (
                 SECRET_OF_STRING,
                 mono(vec![Type::string()], Type::secret(Type::string())),
             ),
-            // The elimination, and it answers one bit. Constant-time over the
-            // compared bytes; not rate-limited, so a program that loops it over
-            // candidates recovers the value (§2.5 (3)).
+            // The elimination, and it answers one bit.
             (
                 SECRET_VERIFY,
                 mono(
@@ -1244,8 +1103,8 @@ impl<'a> Checker<'a> {
                     Type::bool(),
                 ),
             ),
-            // Presence is deliberately observable: an operator must be able to
-            // tell a missing credential from a wrong one.
+            // Presence is deliberately observable: an operator must be able to tell a missing
+            // credential from a wrong one.
             (
                 SECRET_IS_EMPTY,
                 poly(
@@ -1261,11 +1120,7 @@ impl<'a> Checker<'a> {
             self.env.bind_global(Symbol::new(name), scheme);
         }
 
-        // The two builtins with a `where` clause. `Float` has no total order the
-        // language can honour — `NaN != NaN`, so a key would have no position
-        // the next lookup could find it at — and this is what refuses it at the
-        // call rather than letting `total_cmp` answer where a program can see it
-        // disagree with `==`.
+        // The two builtins with a `where` clause.
         for name in ["compare", "compare_values"] {
             self.constraints.insert(
                 Symbol::new(name),
@@ -1276,9 +1131,9 @@ impl<'a> Checker<'a> {
             );
         }
 
-        // `cell_get` / `cell_set` are handled as call forms rather than schemes:
-        // the atom they perform names the region of their argument, which no
-        // row expressible in `Row` can be polymorphic in.
+        // `cell_get` / `cell_set` are handled as call forms rather than schemes: the atom they
+        // perform names the region of their argument, which no row expressible in `Row` can be
+        // polymorphic in.
         let cell_ty = Type::Con(Symbol::new("Cell"), vec![Type::Var(b), ta.clone()]);
         self.env.bind_global(
             Symbol::new("cell_get"),
@@ -1472,21 +1327,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A declaration whose type mentions a `Cell`, which is the one place a
-    /// brand can go where nothing can see it again.
-    ///
-    /// A variant's field types and an operation's signature are converted
-    /// **once**, when the declaration is collected, and the region argument a
-    /// written `Cell<T>` gets is a fresh variable that the surrounding scheme
-    /// does not quantify. So the first `with_cell[r]` value that reaches one
-    /// solves that single variable to `r` for the whole program, and the value's
-    /// own type is then the bare `Foo` — a brand with nowhere to appear, and
-    /// every escape through it invisible.
-    ///
-    /// Making the declaration generic in the cell keeps the brand in the type
-    /// argument, where every check in this file already looks, so that is what
-    /// the note says. Written through an alias it is the same refusal, because
-    /// the check is on the converted type rather than on what was spelled.
+    /// A declaration whose type mentions a `Cell`, which is the one place a brand can go where
+    /// nothing can see it again.
     fn reject_declared_cell(&mut self, ty: &Type, span: Span, owner: &Symbol, what: &str) {
         if !mentions_cell(ty) {
             return;
@@ -1509,10 +1351,8 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Functions and constructors share one namespace, so one module cannot
-    /// declare both under a name. It takes a pass of its own because the two
-    /// kinds are collected into separate tables: neither can see the other, and
-    /// the later binder silently wins, leaving the constructor unreachable.
+    /// Functions and constructors share one namespace, so one module cannot declare both under a
+    /// name.
     fn check_value_namespace(&mut self, module: &Module) {
         let mut seen: FxHashMap<Symbol, (Span, bool)> = FxHashMap::default();
         for item in &module.items {
@@ -1532,8 +1372,8 @@ impl<'a> Checker<'a> {
             };
             for (name, is_fn) in declared {
                 match seen.get(&name.name) {
-                    // Two of a kind is already reported where that kind's table
-                    // is built, in that kind's own wording.
+                    // Two of a kind is already reported where that kind's table is built, in that
+                    // kind's own wording.
                     Some(&(_, was_fn)) if was_fn == is_fn => {}
                     Some(&(first, _)) => self.value_collision(module, name, first, is_fn),
                     None => {
@@ -1571,9 +1411,7 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// The prelude occupies four program-wide names. Only an anonymous module
-    /// can claim one — anywhere else the declaration is `<module>.clock` and
-    /// shadows the prelude by the ordinary resolution order.
+    /// The prelude occupies four program-wide names.
     fn prelude_collision(&mut self, name: &Ident, qualified: &Symbol) {
         self.diags.push(
             Diagnostic::error(
@@ -1673,9 +1511,8 @@ impl<'a> Checker<'a> {
                 return self.fresh.ty();
             }
             if name.symbol().as_str() == "Cell" {
-                // A written `Cell<T>` says nothing about which region the cell
-                // came from, so leave the region open and let unification with a
-                // `with_cell` binder decide it.
+                // A written `Cell<T>` says nothing about which region the cell came from, so leave
+                // the region open and let unification with a `with_cell` binder decide it.
                 let region = self.fresh.ty();
                 return Type::Con(Symbol::new("Cell"), vec![region, args[0].clone()]);
             }
@@ -1694,8 +1531,8 @@ impl<'a> Checker<'a> {
             return self.fresh.ty();
         };
 
-        // Declared but not collected: the declaration itself was rejected, and
-        // that diagnostic is the one worth reading.
+        // Declared but not collected: the declaration itself was rejected, and that diagnostic is
+        // the one worth reading.
         let Some(decl) = self.types.get(&qualified).cloned() else {
             return self.fresh.ty();
         };
@@ -1760,11 +1597,6 @@ impl<'a> Checker<'a> {
     }
 
     /// A reference a *generated* body emits that does not resolve.
-    ///
-    /// Reported as `E0206` against the `derive`, never as a bare `E0101`
-    /// pointing at source the user never wrote. It means one of two things and
-    /// the note says which: a field's type has no derivation of its own, or the
-    /// module cannot see the deriver's runtime module.
     fn unresolved_in_derived(&mut self, q: &QName, what: &str) -> bool {
         let Some(derived) = self.derived.clone() else {
             return false;
@@ -1794,8 +1626,8 @@ impl<'a> Checker<'a> {
         true
     }
 
-    /// A module that exports this name, so a missing `import` reads as a missing
-    /// import rather than a missing definition.
+    /// A module that exports this name, so a missing `import` reads as a missing import rather than
+    /// a missing definition.
     fn exporter(&self, ns: Namespace, name: &Symbol) -> Option<ModuleName> {
         let me = self.module;
         self.resolved
@@ -1900,12 +1732,8 @@ impl<'a> Checker<'a> {
         None
     }
 
-    /// `cell` is not in [`Checker::effects`] — it is the builtin regions
-    /// perform under, and no declaration produces it.
-    ///
-    /// The prelude effects are, and are consulted last: a module's own items and
-    /// its imports shadow them, which is the ordinary resolution order and what
-    /// leaves `examples/clock.ply`'s `effect clock` uninvolved.
+    /// `cell` is not in [`Checker::effects`] — it is the builtin regions perform under, and no
+    /// declaration produces it.
     fn effect_name(&mut self, q: &QName) -> Option<Symbol> {
         if q.is_bare() && q.symbol().as_str() == CELL {
             return Some(Symbol::new(CELL));
@@ -1937,10 +1765,8 @@ impl<'a> Checker<'a> {
             format!("unknown effect `{}`", q.symbol()),
         )
         .primary(q.span, "not declared");
-        // `d.encode(x)` is `effect.op(args)` by the grammar, and a dictionary is
-        // a record of functions, so the language's central idiom for one reads
-        // as a perform. Nothing here can tell them apart without scope, but this
-        // can say which one the user meant.
+        // `d.encode(x)` is `effect.op(args)` by the grammar, and a dictionary is a record of
+        // functions, so the language's central idiom for one reads as a perform.
         if q.is_bare() && self.env.depth_of(q.symbol()).is_some() {
             self.diags.push(
                 d.note(format!(
@@ -1968,13 +1794,8 @@ impl<'a> Checker<'a> {
         self.diags.push(d);
     }
 
-    /// A `derive` whose definitions are not in `items` means expansion did not
-    /// run over this module.
-    ///
-    /// Nothing downstream can notice on its own: `Item::Derive` declares no
-    /// name, so every walker is right to skip it, and the result is a
-    /// definition that silently does not exist. One list, and this is what
-    /// checks that it is the list.
+    /// A `derive` whose definitions are not in `items` means expansion did not run over this
+    /// module.
     fn check_expanded(&mut self, module: &Module) {
         for item in &module.items {
             let Item::Derive(def) = item else { continue };
@@ -2040,9 +1861,8 @@ impl<'a> Checker<'a> {
             fns.push(def);
         }
 
-        // Only a bare reference can reach a definition in this same module: a
-        // qualified one names an imported module, and a module cannot import
-        // itself. So mutual recursion stays a within-module question.
+        // Only a bare reference can reach a definition in this same module: a qualified one names
+        // an imported module, and a module cannot import itself.
         let adj: Vec<Vec<usize>> = fns
             .iter()
             .map(|d| {
@@ -2077,10 +1897,9 @@ impl<'a> Checker<'a> {
                 performed.push(self.check_fn_body(fns[i], &sigs[slot]));
                 self.record_spec_env(fns[i], &names[slot], &sigs[slot]);
             }
-            // After the whole component, not after each member: a caller in the
-            // group can be what pins a callee's operand type, and defaulting one
-            // body at a time would decide `Int` before the other body said
-            // `Decimal`.
+            // After the whole component, not after each member: a caller in the group can be what
+            // pins a callee's operand type, and defaulting one body at a time would decide `Int`
+            // before the other body said `Decimal`.
             self.settle_numerics();
             // After `settle_numerics` for the same reason it runs after the
             // whole component: the type this reports is the one a reader would
@@ -2099,9 +1918,8 @@ impl<'a> Checker<'a> {
                 let scheme = generalize(&self.subst, &mut self.env, &sigs[slot].fn_ty);
                 let row = self.subst.resolve_row(&sigs[slot].published_row);
                 self.env.bind_global(names[slot].clone(), scheme.clone());
-                // The clauses are read against the signature's own parameters,
-                // which `signature` left in `ty_params` and `check_fn_body`
-                // restored.
+                // The clauses are read against the signature's own parameters, which `signature`
+                // left in `ty_params` and `check_fn_body` restored.
                 self.ty_params = sigs[slot].ty_params.clone();
                 let constraints = self.published_constraints(def, &scheme);
                 self.ty_params.clear();
@@ -2119,8 +1937,8 @@ impl<'a> Checker<'a> {
                         row_aliases: row_aliases(def),
                         constraints,
                         spec: Vec::new(),
-                        // Lowered by `mark_internal_effects` once every module
-                        // is walked, and only for a definition it cleared.
+                        // Lowered by `mark_internal_effects` once every module is walked, and only
+                        // for a definition it cleared.
                         internally_effectful: true,
                         span: def.span,
                     },
@@ -2129,17 +1947,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Publishes a mutually recursive group straight from the interfaces the
-    /// caller supplied, without walking a single body. All or nothing: the
-    /// members of a group are typed together, so one of them missing means the
-    /// group has to be inferred.
-    ///
-    /// The scheme's quantified variables are renumbered onto this run's counter
-    /// first. A stored scheme is canonicalized, so its variables start at zero,
-    /// and this run has almost certainly already bound those numbers to
-    /// something else — leaving them alone would let `generalize` resolve them
-    /// through the substitution and read a variable that was never this
-    /// scheme's.
+    /// Publishes a mutually recursive group straight from the interfaces the caller supplied,
+    /// without walking a single body.
     fn publish_known(
         &mut self,
         module: &Module,
@@ -2153,14 +1962,8 @@ impl<'a> Checker<'a> {
         for (slot, &i) in comp.iter().enumerate() {
             let entry = self.known.defs[&names[slot]].clone();
             let scheme = self.adopt(&entry.scheme);
-            // A spec is erased from the definition's hash, so a spec edit does
-            // not move it and gate 2 skips a definition whose clause is new.
-            // The clauses are typed anyway, against the restored interface. A
-            // `where` clause is *not* erased, but it is read from the same
-            // source the interface was published from, so it is recovered here
-            // rather than stored: a caller that changed must be checked against
-            // the constraints its callee actually declares, and a callee whose
-            // file was skipped is one no parsed module can reach.
+            // A spec is erased from the definition's hash, so a spec edit does not move it and gate
+            // 2 skips a definition whose clause is new.
             let mut constraints = Vec::new();
             if !fns[i].spec.is_empty() || !fns[i].constraints.is_empty() {
                 let sig = self.signature(fns[i]);
@@ -2184,9 +1987,8 @@ impl<'a> Checker<'a> {
                     row_aliases: row_aliases(fns[i]),
                     constraints,
                     spec: Vec::new(),
-                    // A restored interface says nothing about this, and the
-                    // body is right here — `mark_internal_effects` walks it
-                    // like any other.
+                    // A restored interface says nothing about this, and the body is right here —
+                    // `mark_internal_effects` walks it like any other.
                     internally_effectful: true,
                     span: fns[i].span,
                 },
@@ -2214,9 +2016,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A tail that no parameter or result type mentions can never be filled in
-    /// by a caller, so leaving it quantified would publish a function as
-    /// effect-polymorphic when it is simply pure.
+    /// A tail that no parameter or result type mentions can never be filled in by a caller, so
+    /// leaving it quantified would publish a function as effect-polymorphic when it is simply pure.
     fn close_unreachable_row(&mut self, sig: &Signature) {
         let Type::Fn {
             params,
@@ -2291,10 +2092,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The parameters a signature declared derivable, by deriver, as the type
-    /// variables they became. A clause naming something the generic list does
-    /// not bind contributes nothing here — that is [`Checker::check_where`]'s
-    /// business, and swallowing it here would turn one error into two.
+    /// The parameters a signature declared derivable, by deriver, as the type variables they
+    /// became.
     fn constraints_in_force(
         &self,
         constraints: &[Constraint],
@@ -2312,8 +2111,8 @@ impl<'a> Checker<'a> {
         self.assumed.get(&deriver).cloned().unwrap_or_default()
     }
 
-    /// The type parameters of the signature being walked, so a diagnostic can
-    /// name the one a missing clause is about.
+    /// The type parameters of the signature being walked, so a diagnostic can name the one a
+    /// missing clause is about.
     fn rigid_params(&self) -> Vec<(TyVar, Symbol)> {
         self.ty_params
             .iter()
@@ -2324,9 +2123,7 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
-    /// A `where` clause naming a parameter the signature does not bind. The
-    /// grammar admits only an identifier, so this is the whole of what can go
-    /// wrong with one.
+    /// A `where` clause naming a parameter the signature does not bind.
     fn check_where(&mut self, def: &FnDef) {
         for c in &def.constraints {
             if self.ty_params.contains_key(&c.param.name) {
@@ -2359,9 +2156,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The same, for a definition restored from a cached interface: the scheme
-    /// came back with quantified variables of its own, and unifying it with the
-    /// signature just built is what says which of them each parameter is.
+    /// The same, for a definition restored from a cached interface: the scheme came back with
+    /// quantified variables of its own, and unifying it with the signature just built is what says
+    /// which of them each parameter is.
     fn recovered_constraints(
         &mut self,
         def: &FnDef,
@@ -2388,12 +2185,8 @@ impl<'a> Checker<'a> {
         out
     }
 
-    /// The published form of a signature's `where` clauses: the deriver and the
-    /// position of the parameter in the generalized scheme.
-    ///
-    /// Sorted and deduplicated, exactly as the hash encodes them, so that
-    /// reordering two clauses or writing one twice publishes the same interface
-    /// as writing them once in the other order.
+    /// The published form of a signature's `where` clauses: the deriver and the position of the
+    /// parameter in the generalized scheme.
     fn published_constraints(&self, def: &FnDef, scheme: &Scheme) -> Vec<DefConstraint> {
         let mut out: Vec<DefConstraint> = def
             .constraints
@@ -2414,8 +2207,8 @@ impl<'a> Checker<'a> {
         out
     }
 
-    /// Answers the row the body itself performed, which is the published row
-    /// only when there is no annotation to widen it.
+    /// Answers the row the body itself performed, which is the published row only when there is no
+    /// annotation to widen it.
     fn check_fn_body(&mut self, def: &FnDef, sig: &Signature) -> Row {
         self.derived = def.derived.clone();
         self.scope = sig.scope;
@@ -2424,11 +2217,9 @@ impl<'a> Checker<'a> {
         self.assumed = self.constraints_in_force(&def.constraints);
         self.performs.clear();
 
-        // Defaults first, *outside* the scope the parameters are bound in: a
-        // default is copied into call sites, where this function's parameters
-        // do not exist, so it must not be able to see them here either.
-        // `ply_syntax::defaults` refuses one that names a sibling parameter
-        // outright; this is the half that gives the value a type.
+        // Defaults first, *outside* the scope the parameters are bound in: a default is copied into
+        // call sites, where this function's parameters do not exist, so it must not be able to see
+        // them here either.
         for (p, t) in def.params.iter().zip(&sig.params) {
             let Some(default) = &p.default else { continue };
             let (got, _) = self.infer(default);
@@ -2463,8 +2254,8 @@ impl<'a> Checker<'a> {
         body_row
     }
 
-    /// A `/ {...}` annotation bounds the inferred row from above: everything the
-    /// body can do must be listed, but the annotation may list more.
+    /// A `/ {...}` annotation bounds the inferred row from above: everything the body can do must
+    /// be listed, but the annotation may list more.
     fn check_upper_bound(&mut self, def: &FnDef, declared: &Row, inferred: &Row) {
         let ann_span = def.effects.as_ref().map(|r| r.span).unwrap_or(def.span);
         let inferred = self.subst.resolve_row(inferred);
@@ -2554,15 +2345,9 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Clauses are typed after every definition in the module is published,
-    /// rather than beside the body they are attached to: a clause may name
-    /// anything the module can reach, while a body's SCC decides only what the
-    /// body itself reaches. Every module this one imports was checked earlier in
-    /// `Resolved::order`, so every name a clause can write is already bound.
-    ///
-    /// This pass runs whether or not gate 2 skipped the definition. A spec is
-    /// erased from the definition's hash, so a spec edit does not move it, and
-    /// skipping here would leave a new clause never typed.
+    /// Clauses are typed after every definition in the module is published, rather than beside the
+    /// body they are attached to: a clause may name anything the module can reach, while a body's
+    /// SCC decides only what the body itself reaches.
     fn check_specs(&mut self, module: &Module) {
         for item in &module.items {
             let Item::Fn(def) = item else { continue };
@@ -2622,11 +2407,8 @@ impl<'a> Checker<'a> {
         row.to_footprint()
     }
 
-    /// `result` is introduced beside the parameters, so a definition that has
-    /// both is reported rather than silently resolved. Shadowing the parameter
-    /// would change what an existing postcondition means depending on a
-    /// parameter name; shadowing `result` would make the postcondition
-    /// unwritable with no diagnostic.
+    /// `result` is introduced beside the parameters, so a definition that has both is reported
+    /// rather than silently resolved.
     fn check_result_shadow(&mut self, def: &FnDef) {
         let Some(ensures) = def.spec.iter().find(|c| c.kind == SpecKind::Ensures) else {
             return;
@@ -2650,14 +2432,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A spec expression's row must be empty. A claim that can perform an effect
-    /// can change what it observes, and an obligation that writes to the
-    /// resource it judges reports the post-state it caused.
-    ///
-    /// The one exception belongs to [`SpecSite::LawBody`], which may carry
-    /// `sim.read` — a read of an input no program can write, and the only way a
-    /// claim about every interleaving can be stated. It is structural rather
-    /// than a parameter so that a guard cannot be handed it by mistake.
+    /// A spec expression's row must be empty.
     fn check_spec_purity(&mut self, site: SpecSite, at: Span, row: &Row) {
         let allowed = site.allowed();
         for atom in row.atoms.difference(&allowed) {
@@ -2741,9 +2516,8 @@ impl<'a> Checker<'a> {
         self.row_params.clear();
         self.performs.clear();
 
-        // A binder's type may name a type variable, which is quantified over the
-        // law: the prover reads one as an uninterpreted sort, so a proof over it
-        // holds for every instantiation.
+        // A binder's type may name a type variable, which is quantified over the law: the prover
+        // reads one as an uninterpreted sort, so a proof over it holds for every instantiation.
         self.auto_ty_params = true;
         let types: Vec<Type> = def.binders.iter().map(|b| self.law_binder(b)).collect();
         self.auto_ty_params = false;
@@ -2773,9 +2547,8 @@ impl<'a> Checker<'a> {
                 &ty,
                 "a `where` guard states a proposition",
             );
-            // Exactly pure, unlike the body: the guard decides which values the
-            // law is a claim about, and a domain that depends on a seed is a
-            // different domain per run.
+            // Exactly pure, unlike the body: the guard decides which values the law is a claim
+            // about, and a domain that depends on a seed is a different domain per run.
             let row = self.subst.resolve_row(&row);
             self.check_spec_purity(SpecSite::Where, guard.span, &row);
         }
@@ -2789,11 +2562,8 @@ impl<'a> Checker<'a> {
             "a law states a proposition",
         );
         let row = self.subst.resolve_row(&row);
-        // A `law/host`'s body may carry any row: it says so in its own
-        // declaration, which is what makes it auditable. The guard above is
-        // unaffected — it stays pure whatever the law is, because a guard
-        // decides the domain and a guard that could act would be choosing which
-        // cases to be judged on.
+        // A `law/host`'s body may carry any row: it says so in its own declaration, which is what
+        // makes it auditable.
         if !def.host {
             self.check_spec_purity(SpecSite::LawBody, def.body.span, &row);
         }
@@ -2824,10 +2594,8 @@ impl<'a> Checker<'a> {
         self.row_params.clear();
     }
 
-    /// A binder's type has to be one the generator can inhabit, or the law is a
-    /// claim nobody can ever check. Refused where it is written rather than
-    /// reported as a gap when it is discharged, because that is where the author
-    /// can still do something about it.
+    /// A binder's type has to be one the generator can inhabit, or the law is a claim nobody can
+    /// ever check.
     fn law_binder(&mut self, binder: &Binder) -> Type {
         if let Some(span) = self.handler_mention(&binder.ty) {
             self.handler_quantification(span);
@@ -2858,11 +2626,7 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// A handler is syntax rather than a value, so there is nothing for a binder
-    /// to range over. Recognised by the name it would have to be written under,
-    /// because the type it needs does not exist and the errors that absence
-    /// produces — an unknown type, or a stray type variable — say nothing about
-    /// why.
+    /// A handler is syntax rather than a value, so there is nothing for a binder to range over.
     fn handler_mention(&self, te: &TypeExpr) -> Option<Span> {
         let named = |name: &Symbol, span: Span| -> Option<Span> {
             let handler = matches!(name.as_str(), "Handler" | "handler");
@@ -2906,9 +2670,7 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Whether the generator can inhabit this type. Walks a user type's declared
-    /// fields as well as its arguments, so a record holding a `Cell` is refused
-    /// with the same message the `Cell` itself would get.
+    /// Whether the generator can inhabit this type.
     fn ungeneratable(&self, ty: &Type, seen: &mut FxHashSet<Symbol>) -> Option<String> {
         match ty {
             Type::Var(_) => None,
@@ -2926,9 +2688,8 @@ impl<'a> Checker<'a> {
                             .to_string(),
                     );
                 }
-                // A generator that minted credentials and a shrinker that
-                // printed counterexamples is a leak by construction, and the
-                // code for both already exists.
+                // A generator that minted credentials and a shrinker that printed counterexamples
+                // is a leak by construction, and the code for both already exists.
                 if name.as_str() == crate::ty::SECRET {
                     return Some(
                         "a `Secret` is a credential: quantifying over one would have the \
@@ -2978,10 +2739,9 @@ impl<'a> Checker<'a> {
                 .and_then(Option::as_ref);
             position += 1;
 
-            // A cached footprint carries the determinism verdict with it: an
-            // effect's `nondet` marker is part of its declaration's hash, so a
-            // test whose hash is unchanged cannot have acquired a nondeterminism
-            // that was absent when it was checked.
+            // A cached footprint carries the determinism verdict with it: an effect's `nondet`
+            // marker is part of its declaration's hash, so a test whose hash is unchanged cannot
+            // have acquired a nondeterminism that was absent when it was checked.
             let footprint = match cached {
                 Some(entry) => entry.footprint.clone(),
                 None => {
@@ -3022,10 +2782,9 @@ impl<'a> Checker<'a> {
                 continue;
             }
             let effect = atom.effect.clone();
-            // The language ships a handler for three of these, so pointing at
-            // `handle .. with { .. }` would send a reader to write by hand what
-            // `simulate` already installs — and with none of its ordering
-            // semantics.
+            // The language ships a handler for three of these, so pointing at `handle .. with { ..
+            // }` would send a reader to write by hand what `simulate` already installs — and with
+            // none of its ordering semantics.
             let remedy = if prelude::is_simulated(atom) {
                 "handle it here, e.g. `simulate { <body> }`".to_string()
             } else {
@@ -3064,8 +2823,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A suggestion has to be writable where it is suggested: the program-wide
-    /// `store.db` is not syntax, `store::db` or a bare `db` is.
+    /// A suggestion has to be writable where it is suggested: the program-wide `store.db` is not
+    /// syntax, `store::db` or a bare `db` is.
     fn as_written(&self, effect: &Symbol) -> String {
         let scope = self.scope();
         if let Some((name, _)) = scope.effects.iter().find(|(_, b)| &b.qualified == effect) {
@@ -3131,8 +2890,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Atoms discharged by a handler cannot be the reason a test is
-    /// nondeterministic, so their perform sites stop being evidence.
+    /// Atoms discharged by a handler cannot be the reason a test is nondeterministic, so their
+    /// perform sites stop being evidence.
     fn discharge(&mut self, range: std::ops::Range<usize>, handled: &BTreeSet<EffectAtom>) {
         let start = range.start;
         let kept: Vec<PerformSite> = self
@@ -3143,10 +2902,8 @@ impl<'a> Checker<'a> {
         self.performs.splice(start..start, kept);
     }
 
-    /// A left-leaning operator chain is parsed iteratively, so the parser's
-    /// nesting limit does not bound this walk and a generated definition can
-    /// nest deeper than the native stack. Overflowing is an abort, which no
-    /// caller can catch and report.
+    /// A left-leaning operator chain is parsed iteratively, so the parser's nesting limit does not
+    /// bound this walk and a generated definition can nest deeper than the native stack.
     fn infer(&mut self, e: &Expr) -> (Type, Row) {
         const RED_ZONE: usize = 256 * 1024;
         const NEW_SEGMENT: usize = 2 * 1024 * 1024;
@@ -3180,10 +2937,8 @@ impl<'a> Checker<'a> {
                     Some(scheme) => {
                         let scheme = scheme.clone();
                         let (ty, args) = instantiate_with(&scheme, &mut self.fresh);
-                        // There is no map literal, so a map value comes from a
-                        // reference — a builtin or a user function — or from a
-                        // written annotation. Noting both is what makes the key
-                        // check total without a walk over every solved type.
+                        // There is no map literal, so a map value comes from a reference — a
+                        // builtin or a user function — or from a written annotation.
                         self.note_map_keys(q.span, &ty);
                         self.note_constraints(q.span, &key.name, &args);
                         (ty, Row::empty())
@@ -3198,9 +2953,8 @@ impl<'a> Checker<'a> {
             ExprKind::Unary { op, operand } => {
                 let (t, row) = self.infer(operand);
                 if let UnOp::Neg = op {
-                    // Negation is the only way to write `-0.0`, so it settles at
-                    // whichever numeric type its operand has, exactly as a
-                    // binary operator does.
+                    // Negation is the only way to write `-0.0`, so it settles at whichever numeric
+                    // type its operand has, exactly as a binary operator does.
                     self.numerics.push(Numeric {
                         span: e.span,
                         op: BinOp::Sub,
@@ -3238,9 +2992,9 @@ impl<'a> Checker<'a> {
                 )
             }
 
-            // `named` is empty: `defaults::expand` cleared it in `resolve`,
-            // and `no_named_argument_survives_resolve_anywhere_in_the_tree`
-            // is what makes that an invariant rather than a hope.
+            // `named` is empty: `defaults::expand` cleared it in `resolve`, and
+            // `no_named_argument_survives_resolve_anywhere_in_the_tree` is what makes that an
+            // invariant rather than a hope.
             ExprKind::App { func, args, .. } => self.infer_app(e, func, args),
 
             ExprKind::If {
@@ -3290,23 +3044,16 @@ impl<'a> Checker<'a> {
                 (Type::Record(map), row)
             }
 
-            // A record update's type is its base's type, and that is arranged by
-            // expansion rather than by a rule here: by the time inference runs,
-            // `{..s, a: 1}` *is* the literal that copies `s`'s other fields, so
-            // the width is checked by the same exact-key-set unification every
-            // record literal meets. Inferring the sugar here as if it were a
-            // plain record would silently type a record of the wrong width.
+            // A record update's type is its base's type, and that is arranged by expansion rather
+            // than by a rule here: by the time inference runs, `{..s, a: 1}` *is* the literal that
+            // copies `s`'s other fields, so the width is checked by the same exact-key-set
+            // unification every record literal meets.
             ExprKind::RecordUpdate { .. } => unreachable!(
                 "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_record_update_survives_parse_module_anywhere_in_the_tree`"
             ),
 
-            // There is deliberately no typing rule for `?`, and no row rule
-            // either. By the time inference runs, `e?` *is* the `match` its
-            // longhand would have been, so its type and its row are that
-            // `match`'s — which is the point: a rule here would have to thread
-            // the enclosing function's return type and its row, and would be a
-            // second account of what `?` means.
+            // There is deliberately no typing rule for `?`, and no row rule either.
             ExprKind::Try { .. } => unreachable!(
                 "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_try_survives_parse_module_anywhere_in_the_tree`"
@@ -3424,11 +3171,9 @@ impl<'a> Checker<'a> {
         let (lt, lrow) = self.infer(lhs);
         let (rt, rrow) = self.infer(rhs);
         let row = self.join(e.span, lrow, rrow);
-        // Three numeric types, and no type-directed dispatch to pick between
-        // them, so the operand type is unified across the two sides here and
-        // *which* of the three it is is settled once the enclosing definition
-        // has been inferred. Deciding it at the node would read `x + 1.0` as
-        // `Int` arithmetic on the way to the right operand.
+        // Three numeric types, and no type-directed dispatch to pick between them, so the operand
+        // type is unified across the two sides here and *which* of the three it is is settled once
+        // the enclosing definition has been inferred.
         let arithmetic = matches!(
             op,
             BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem
@@ -3473,14 +3218,8 @@ impl<'a> Checker<'a> {
         (result, row)
     }
 
-    /// Decides which numeric type each `+`, `-`, `*`, `/`, `%`, `<`, `<=`, `>`
-    /// or `>=` was applied at, now that the definition around it has been
-    /// inferred.
-    ///
-    /// **Called before generalization, and that is the point.** An operand type
-    /// nothing pinned defaults to `Int`; leaving it open would publish
-    /// `fn add(a, b) = a + b` as `<t>(t, t) -> t`, a signature whose body works
-    /// at three types and whose declaration claims every one.
+    /// Decides which numeric type each `+`, `-`, `*`, `/`, `%`, `<`, `<=`, `>` or `>=` was applied
+    /// at, now that the definition around it has been inferred.
     fn settle_numerics(&mut self) {
         for entry in std::mem::take(&mut self.numerics) {
             let ty = self.subst.resolve_ty(&entry.ty);
@@ -3498,9 +3237,6 @@ impl<'a> Checker<'a> {
             match (name.as_str(), entry.op) {
                 ("Int" | "Float", _) => {}
                 // The one place W2 refuses what every other language allows.
-                // The exact quotient of two decimals is not a decimal, so `/`
-                // would have to round — and a rounding nobody wrote down is the
-                // defect this type exists to prevent.
                 ("Decimal", BinOp::Div) => self.diags.push(
                     Diagnostic::error(codes::DECIMAL_DIVISION, "`/` is not defined on `Decimal`")
                         .primary(
@@ -3655,13 +3391,8 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// Notes every `Map` in `ty` so that [`Checker::check_map_keys`] can judge
-    /// its key type once the module is solved.
-    ///
-    /// Called where a type is *written* and where a scheme is *instantiated*,
-    /// which between them is every way a `Map` can enter a program: there is no
-    /// map literal, so a map value comes from a builtin or from an annotation
-    /// and from nowhere else.
+    /// Notes every `Map` in `ty` so that [`Checker::check_map_keys`] can judge its key type once
+    /// the module is solved.
     fn note_map_keys(&mut self, span: Span, ty: &Type) {
         fn walk(ty: &Type, out: &mut Vec<Type>) {
             match ty {
@@ -3704,19 +3435,6 @@ impl<'a> Checker<'a> {
     }
 
     /// `derivable(D, T)` over the `derive`'s target as a **solved** type.
-    ///
-    /// The deriver's own walk runs before resolution, so it reads the field's
-    /// spelling and an alias is opaque to it: `type MyUnit = Unit` inside an
-    /// `Option` reaches `option_json(unit_json())`, which writes `Some(())` and
-    /// `None` as the same bytes, and the syntactic walk cannot see it. Here an
-    /// alias is already expanded, so the one predicate answers for both
-    /// spellings.
-    ///
-    /// Only for a target the deriver accepted — a `derive` it already refused
-    /// has its diagnostic, and a second one naming the same field is noise —
-    /// and only for a target with no parameters, whose instantiations are what
-    /// the generated signature's `where derivable(D, ·)` covers at the call
-    /// site.
     fn check_derives(&mut self, program: &Program) {
         let adts = self.adt_shapes();
         let lookup = |name: &Symbol| adts.get(name).map(clone_adt);
@@ -3776,11 +3494,6 @@ impl<'a> Checker<'a> {
     }
 
     /// The `derive` target as a solved type, for a target with no parameters.
-    ///
-    /// An alias body is converted here rather than read as `Type::Con`, and any
-    /// diagnostic that conversion produces is dropped: the declaration was
-    /// already converted where it is written, and reporting it twice would name
-    /// the `derive` for a mistake in the `type`.
     fn derive_target(&mut self, module: &Module, target: &Symbol) -> Option<Type> {
         let qualified = module.name.qualify(target);
         let decl = self.types.get(&qualified).cloned()?;
@@ -3802,16 +3515,8 @@ impl<'a> Checker<'a> {
         Some(expanded)
     }
 
-    /// Anything a generated definition failed on, other than a name it could not
-    /// see, is **Ply's** fault.
-    ///
-    /// Derivation is total and structural: if generation succeeded, checking
-    /// must succeed. The user did not write the body, cannot see it and cannot
-    /// fix it, so calling one of these their error would send them looking in
-    /// their own tree. This runs last so that it catches the deferred checks —
-    /// constraints, map keys, comparisons — as well as the direct ones, and it
-    /// keys on span because a generated definition's every span is its
-    /// `derive`'s.
+    /// Anything a generated definition failed on, other than a name it could not see, is **Ply's**
+    /// fault.
     fn attribute_generated(&mut self, program: &Program) {
         let mut spans: FxHashSet<Span> = FxHashSet::default();
         for module in &program.modules {
@@ -3848,13 +3553,6 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Notes a reference that instantiated a parameter its callee constrained.
-    ///
-    /// Only a reference: a constraint is a claim about a type argument, and a
-    /// type argument is chosen exactly where a scheme is instantiated. A
-    /// recursive call inside the definition's own group is bound
-    /// monomorphically and instantiates nothing, which is right — it passes the
-    /// very parameter the clause is about.
     fn note_constraints(&mut self, span: Span, callee: &Symbol, args: &[Type]) {
         let Some(constraints) = self.constraints.get(callee) else {
             return;
@@ -3880,12 +3578,6 @@ impl<'a> Checker<'a> {
     }
 
     /// `where derivable(D, a)` at the call sites that instantiate `a`.
-    ///
-    /// This is the one axis on which structural reflection is genuinely worse
-    /// than typeclasses: an error deep inside an expansion is a search, and a
-    /// search inside an edit loop is what an agent pays for. There is no
-    /// resolution and no instance selection here — it is a predicate on a type,
-    /// checked at a boundary, which is C++'s concepts and nothing more.
     fn check_constraints(&mut self) {
         let sites = std::mem::take(&mut self.constrained_uses);
         if sites.is_empty() {
@@ -3904,9 +3596,8 @@ impl<'a> Checker<'a> {
             let Err(blocked) = crate::derivable::derivable(site.deriver, &ty, &cx) else {
                 continue;
             };
-            // A flexible variable is a type argument nothing pinned rather than
-            // one that is wrong — the call is ambiguous, and whatever pins it
-            // later is what this check is about.
+            // A flexible variable is a type argument nothing pinned rather than one that is wrong —
+            // the call is ambiguous, and whatever pins it later is what this check is about.
             if let Why::Unconstrained(v) = blocked.why
                 && !self.subst.is_rigid_ty(v)
             {
@@ -3965,15 +3656,8 @@ impl<'a> Checker<'a> {
         self.diags.extend(diags);
     }
 
-    /// A `Map` key type must be ordered — exactly `derivable(ord, k)`, the same
-    /// predicate `derive ord` walks.
-    ///
-    /// The whole reason `Map` is a language primitive rather than a library is
-    /// that its iteration order is canonical, and an order is only canonical if
-    /// every key it holds has one. `Float` is the case that makes this concrete:
-    /// `total_cmp` is a total order on the *Rust* value, and NaN still is not
-    /// equal to itself in the language, so a `Map<Float, v>` would be a lookup
-    /// that fails to find what it just inserted.
+    /// A `Map` key type must be ordered — exactly `derivable(ord, k)`, the same predicate `derive
+    /// ord` walks.
     fn check_map_keys(&mut self) {
         let sites = std::mem::take(&mut self.map_keys);
         if sites.is_empty() {
@@ -3992,10 +3676,8 @@ impl<'a> Checker<'a> {
             let Err(blocked) = ordered(&key, &cx) else {
                 continue;
             };
-            // An unsolved *flexible* variable is a key nothing pinned, not a key
-            // that is wrong: `let m = map_new(); map_len(m)` never names one.
-            // A rigid one came from a generic list, and that is the signature
-            // the constraint belongs on.
+            // An unsolved *flexible* variable is a key nothing pinned, not a key that is wrong:
+            // `let m = map_new(); map_len(m)` never names one.
             if let Why::Unconstrained(v) = blocked.why
                 && !self.subst.is_rigid_ty(v)
             {
@@ -4043,10 +3725,7 @@ impl<'a> Checker<'a> {
         self.diags.extend(diags);
     }
 
-    /// Every sum type this run declared, flattened for
-    /// [`derivable`](crate::derivable::derivable). Built once per check rather
-    /// than per site: it is a scan of `ctors`, and a program with a thousand
-    /// constructors has no business paying for it per `Map`.
+    /// Every sum type this run declared, flattened for [`derivable`](crate::derivable::derivable).
     fn adt_shapes(&self) -> FxHashMap<Symbol, Adt> {
         let mut out: FxHashMap<Symbol, Adt> = FxHashMap::default();
         for ctor in self.ctors.values() {
@@ -4059,8 +3738,7 @@ impl<'a> Checker<'a> {
         out
     }
 
-    /// Equality is structural, and there is no structural equality on a
-    /// function.
+    /// Equality is structural, and there is no structural equality on a function.
     fn check_comparisons(&mut self) {
         for (span, ty) in std::mem::take(&mut self.comparisons) {
             let resolved = self.subst.resolve_ty(&ty);
@@ -4277,12 +3955,9 @@ impl<'a> Checker<'a> {
 
         let atom = EffectAtom::new(info.name.clone(), res, op_info.mode);
         self.record(atom.clone(), e.span, true);
-        // The operation's own row, which only a prelude operation has: it is how
-        // the effects of a `task.spawn` body reach the row of the code that
-        // spawned it, and therefore the test's footprint and the conflict graph.
-        // Resolved first, exactly as an application resolves a callee's row —
-        // two spawns whose tails have already been solved to different closed
-        // rows must union, not unify.
+        // The operation's own row, which only a prelude operation has: it is how the effects of a
+        // `task.spawn` body reach the row of the code that spawned it, and therefore the test's
+        // footprint and the conflict graph.
         let op_row = self.subst.resolve_row(&op_row);
         for atom in &op_row.atoms {
             self.record(atom.clone(), e.span, false);
@@ -4386,9 +4061,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// One code path for both kinds of operation: a user-declared one has no
-    /// scheme, so its signature is built here with an empty row, and today's
-    /// rule is this rule at that row.
+    /// One code path for both kinds of operation: a user-declared one has no scheme, so its
+    /// signature is built here with an empty row, and today's rule is this rule at that row.
     fn op_scheme(&self, op: &OpInfo) -> Scheme {
         match &op.scheme {
             Some(scheme) => scheme.clone(),
@@ -4404,8 +4078,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A perform site's view of an operation: fresh variables the call is free
-    /// to pin, exactly as a call to a polymorphic function is.
+    /// A perform site's view of an operation: fresh variables the call is free to pin, exactly as a
+    /// call to a polymorphic function is.
     fn instantiate_op(&mut self, op: &OpInfo) -> (Vec<Type>, Type, Row) {
         let scheme = self.op_scheme(op);
         match instantiate(&scheme, &mut self.fresh) {
@@ -4418,28 +4092,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A **handler clause's** view of the same operation: the operation's own
-    /// type variables are rigid, so the clause is checked once against every
-    /// instantiation a perform site could choose.
-    ///
-    /// This is not a refinement, it is the soundness of the construct. A row
-    /// carries atoms and no types, so a `handle` sees only that its body may
-    /// perform `db.read[t]` — never which `a` a perform three definitions deeper
-    /// unified the operation's `-> a` with. Instantiating the clause with
-    /// ordinary fresh variables therefore lets the *clause* choose a type
-    /// nothing ever unifies with the caller's: for `read fetch[k](s) -> a`, the
-    /// clause `fetch[k](s) -> s` answers a `Secret<String>` while
-    /// `vault.fetch[k](s)` at a site that wanted a `String` is happily typed
-    /// `String`, and `ply check` accepts a program that laundered a credential
-    /// into an unrelated type. Rigid variables are what say "for every `a`",
-    /// which is the obligation a clause actually carries.
-    ///
-    /// The cost, stated: an operation whose return type is a variable the
-    /// parameters do not determine can only be handled by a clause that produces
-    /// one from a parameter, and no clause can produce a `List<a>` out of
-    /// nothing. That is correct — such an operation is unsound, not merely
-    /// awkward — and `examples/store.ply` was rewritten to declare what each of
-    /// its tables holds rather than to rely on it.
+    /// A **handler clause's** view of the same operation: the operation's own type variables are
+    /// rigid, so the clause is checked once against every instantiation a perform site could
+    /// choose.
     fn instantiate_op_for_clause(&mut self, op: &OpInfo) -> (Vec<Type>, Type, Row) {
         let scheme = self.op_scheme(op);
         let ty_vars: Vec<TyVar> = scheme.ty_vars.iter().map(|_| self.fresh.ty_var()).collect();
@@ -4475,18 +4130,15 @@ impl<'a> Checker<'a> {
         let (body_ty, body_row) = self.infer(body);
         let after_body = self.performs.len();
 
-        // One `ρ_κ` per `handle` and not one per clause: every clause's
-        // continuation is the same residual computation. Allocated only when a
-        // clause actually binds one, so that a program without any general
-        // clause produces the identical variable numbering it did before.
+        // One `ρ_κ` per `handle` and not one per clause: every clause's continuation is the same
+        // residual computation.
         let general = clauses.iter().any(|c| c.resume.is_some());
         let continuation_row = general.then(|| self.fresh.row_var());
         let result_var = general.then(|| self.fresh.ty());
 
         let mut handled: BTreeSet<EffectAtom> = BTreeSet::new();
-        // Keyed on what `Stack::find_handler` dispatches on, which is the
-        // operation and not its atom. `net.recv[conn]`, `net.send[conn]` and
-        // `net.close[conn]` are one atom and three reachable clauses.
+        // Keyed on what `Stack::find_handler` dispatches on, which is the operation and not its
+        // atom.
         let mut selected: BTreeSet<(Symbol, Symbol, Resource)> = BTreeSet::new();
         let mut clause_rows = Row::empty();
         for clause in clauses {
@@ -4498,9 +4150,9 @@ impl<'a> Checker<'a> {
             else {
                 continue;
             };
-            // A prelude operation's own row is not the clause's to carry: the
-            // clause receives the argument and whatever it does with it — call
-            // the spawned body, or not — is already in the clause's own row.
+            // A prelude operation's own row is not the clause's to carry: the clause receives the
+            // argument and whatever it does with it — call the spawned body, or not — is already in
+            // the clause's own row.
             let (params, ret, _) = self.instantiate_op_for_clause(&op_info);
             if params.len() != clause.params.len() {
                 self.diags.push(
@@ -4563,10 +4215,9 @@ impl<'a> Checker<'a> {
             }
             let (clause_ty, clause_row) = self.infer(&clause.body);
             self.env.pop();
-            // A general clause's body *is* the `handle`'s answer, so it is
-            // checked against the result rather than against the operation's
-            // return type; the tail-resumptive form is the one whose body has to
-            // be something the perform site can receive.
+            // A general clause's body *is* the `handle`'s answer, so it is checked against the
+            // result rather than against the operation's return type; the tail-resumptive form is
+            // the one whose body has to be something the perform site can receive.
             match (&clause.resume, &result_var) {
                 (Some(_), Some(result)) => {
                     self.expect(
@@ -4583,10 +4234,9 @@ impl<'a> Checker<'a> {
                         &clause_ty,
                         "a handler clause returns the operation's result",
                     );
-                    // The one mismatch whose cause is not visible in the two
-                    // types: the operation is polymorphic, so the clause owes an
-                    // answer for *every* instantiation and the type it was
-                    // checked against is a variable it may not choose.
+                    // The one mismatch whose cause is not visible in the two types: the operation
+                    // is polymorphic, so the clause owes an answer for *every* instantiation and
+                    // the type it was checked against is a variable it may not choose.
                     if !ok && !op_free_vars(&op_info).is_empty() {
                         self.note_universal_clause(&info, &op_info);
                     }
@@ -4627,20 +4277,6 @@ impl<'a> Checker<'a> {
     }
 
     /// ADR 0017 §1: a cell is a value allocated in `r`.
-    ///
-    /// Written inside `with_region[r]` the cell belongs to that region and is
-    /// discharged and checked there, so it may outlive this `{ .. }` and not the
-    /// region. Written on its own, `with_cell[r]` **is** the region — so it
-    /// opens one, files a [`RegionSite`] like any other, and is held to all four
-    /// of [`Checker::check_regions`]'s rules rather than only to the shape of
-    /// its own result type.
-    ///
-    /// That last part is the fix for the route ADR 0017 lists first among the
-    /// ways this could go wrong: a closure that captured the cell need not
-    /// mention it in its parameters or its result, only in its effect row, and
-    /// filing no site meant nothing ever looked at the row, at what the body
-    /// stored into an enclosing binding, at what it spawned, or at what it
-    /// handed to an operation.
     fn infer_with_cell(
         &mut self,
         e: &Expr,
@@ -4653,9 +4289,8 @@ impl<'a> Checker<'a> {
         let region = Type::con(&region_type_name(resource.name.as_str()));
         let cell = Type::Con(Symbol::new("Cell"), vec![region, init_ty]);
 
-        // A cell allocated into an enclosing region of the same brand belongs to
-        // that region: it opens nothing here and is checked at that region's
-        // boundary.
+        // A cell allocated into an enclosing region of the same brand belongs to that region: it
+        // opens nothing here and is checked at that region's boundary.
         if self.region_is_open(&resource.name) {
             self.env.push();
             self.env.bind(binder.name.clone(), Scheme::mono(cell));
@@ -4716,20 +4351,8 @@ impl<'a> Checker<'a> {
         self.open_regions.iter().any(|r| &r.name == name)
     }
 
-    /// Files a `task.spawn` argument against every open `with_region[r]` the
-    /// spawned task could outlive. A region that opened *after* the enclosing
-    /// `simulate` is not one of them: that scheduler ends inside the region, and
-    /// so does every task it is running.
-    ///
-    /// A bare `with_cell[r]` is deliberately excluded. "A cell reaching a task
-    /// is how tasks share memory" is CONTRACTS §`simulate`'s rule and ADR 0005's
-    /// monotone world made it sound; refusing it would change what a landed
-    /// program means from "runs" to "does not compile", which ADR 0017's
-    /// governing property forbids. It is also safe under ADR 0017 §3 as amended:
-    /// a `task` operation anywhere in a region makes it `shared`
-    /// (`region_kind::Cause::Task`), and a `shared` region's slots outlive its
-    /// close for exactly this reason. `with_region` keeps the stricter rule
-    /// because it is new syntax with no program depending on the loose one.
+    /// Files a `task.spawn` argument against every open `with_region[r]` the spawned task could
+    /// outlive.
     fn note_spawn(&mut self, info: &EffectInfo, op: &OpInfo, args: &[Expr], tys: &[Type]) {
         if info.name.as_str() != prelude::TASK || op.name.as_str() != prelude::SPAWN_OP {
             return;
@@ -4748,15 +4371,9 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Files every argument of a user-declared operation against every open
-    /// region, because the handler that receives it can be installed anywhere —
-    /// including outside the region, or in another definition entirely.
-    ///
-    /// `task` is excluded because [`Checker::note_spawn`] already decides it more
-    /// precisely: the handler is the enclosing `simulate` and the region knows
-    /// whether that scheduler started inside it. `cell` never reaches here at
-    /// all — [`Checker::resolve_op`] refuses a written `cell.read[r]`, so the
-    /// only cell operations are the builtins the region itself discharges.
+    /// Files every argument of a user-declared operation against every open region, because the
+    /// handler that receives it can be installed anywhere — including outside the region, or in
+    /// another definition entirely.
     fn note_handoff(&mut self, info: &EffectInfo, op: &OpInfo, args: &[Expr], tys: &[Type]) {
         if info.name.as_str() == prelude::TASK || self.open_regions.is_empty() {
             return;
@@ -4773,18 +4390,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// ```text
-    /// Γ ⊢ body : T / ρ_b        no value branded `r` reaches an exit of `body`
-    /// ─────────────────────────────────────────────────────────────────────────
-    /// Γ ⊢ with_region[r] { body } : T / (ρ_b \ {cell.read[r], cell.write[r]})
-    /// ```
-    ///
-    /// The premise is not decidable here — a brand routinely reaches an exit
-    /// type only once the definition around the region has been solved — so the
-    /// region records what it would have to look at and
-    /// [`Checker::check_regions`] asks the question at the end of the run. The
-    /// row half is not deferrable, because the atoms have to be off the
-    /// `performs` list before the enclosing definition's row is judged.
+    /// ```text Γ ⊢ body : T / ρ_b no value branded `r` reaches an exit of `body` { body } : T /
+    /// (ρ_b \ {cell.read[r], cell.write[r]}) ```.
     fn infer_with_region(&mut self, region: &Ident, body: &Expr) -> (Type, Row) {
         if let Some(open) = self
             .open_regions
@@ -4835,9 +4442,9 @@ impl<'a> Checker<'a> {
         .into();
         self.discharge(mark..self.performs.len(), &handled);
 
-        // Every exit carries the region's own result type — a branch, an arm, a
-        // `return` clause and a nested region's tail are all unified with it —
-        // so what the walk buys is the span to report at, not a second type.
+        // Every exit carries the region's own result type — a branch, an arm, a `return` clause and
+        // a nested region's tail are all unified with it — so what the walk buys is the span to
+        // report at, not a second type.
         let mut exits = Vec::new();
         region_exits(body, &mut exits);
         let exits = exits.iter().map(|x| x.span).collect();
@@ -4858,18 +4465,8 @@ impl<'a> Checker<'a> {
         (body_ty, row)
     }
 
-    /// The bindings a region could store into: everything the definition being
-    /// checked has in scope when the region opens, paired with where each is
-    /// first named inside it.
-    ///
-    /// Only bindings whose type still has an unsolved variable are kept. A
-    /// binding already solved to a type with no variable in it cannot acquire a
-    /// brand, and keeping them all would make every region pay for the whole
-    /// enclosing scope.
-    ///
-    /// The global scope is excluded: a top-level scheme is generalized before it
-    /// is bound, so its variables are quantified and unification inside a region
-    /// reaches a fresh copy rather than the scheme itself.
+    /// The bindings a region could store into: everything the definition being checked has in scope
+    /// when the region opens, paired with where each is first named inside it.
     fn outer_bindings(&mut self, body: &Expr) -> Vec<OuterBinding> {
         let mut kept: Vec<(Symbol, Type)> = Vec::new();
         for (name, scheme) in self.env.locals() {
@@ -4906,10 +4503,9 @@ impl<'a> Checker<'a> {
             .collect()
     }
 
-    /// ADR 0017 §2, asked once the module is solved for the reason
-    /// [`Checker::check_simulations`] is asked then: the brand a value carries
-    /// is routinely still an unsolved variable while the region around it is
-    /// being walked, and a check that ran at the closing brace would answer
+    /// ADR 0017 §2, asked once the module is solved for the reason [`Checker::check_simulations`]
+    /// is asked then: the brand a value carries is routinely still an unsolved variable while the
+    /// region around it is being walked, and a check that ran at the closing brace would answer
     /// about a type that had not been decided yet.
     fn check_regions(&mut self) {
         for site in std::mem::take(&mut self.regions) {
@@ -4920,16 +4516,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The value the region evaluates to. Reported at each position it leaves
-    /// through — a branch, an arm, a nested region's tail — rather than at the
-    /// whole body, so the label sits on the expression that produced it.
-    ///
-    /// Asked here rather than at the closing brace for the reason
-    /// [`Checker::check_regions`] gives: the brand a value carries is routinely
-    /// still an unsolved variable while the region is being walked, so the
-    /// question is asked once the module is solved and the type is resolved. W2
-    /// found the analogous hole reachable through a type alias precisely because
-    /// the check ran too early.
+    /// The value the region evaluates to.
     fn check_region_exits(&mut self, site: &RegionSite) {
         let ty = self.subst.resolve_ty(&site.body_ty);
         if !brand_in(&ty, site.name.as_str()) {
@@ -4977,10 +4564,7 @@ impl<'a> Checker<'a> {
     }
 
     /// The same escape out of a bare `with_cell[r]`, which has reported it under
-    /// [`codes::TYPE_MISMATCH`] since before `with_region` existed. The code and
-    /// the wording stay put; what changed is that `brand_in` now looks at a
-    /// function type's effect row, so a closure that carries the cell only in
-    /// its row is caught rather than accepted.
+    /// [`codes::TYPE_MISMATCH`] since before `with_region` existed.
     fn report_escaping_cell(&mut self, site: &RegionSite, ty: &Type) {
         let mut printer = Printer::new();
         let shown = printer.ty(ty);
@@ -5007,9 +4591,9 @@ impl<'a> Checker<'a> {
             .push(d.note("read the cell inside the region and return the value instead"));
     }
 
-    /// A store into something the region did not create — the case the exit type
-    /// cannot see, because the region's own result is then `Unit` and the brand
-    /// is sitting in a binding that predates it.
+    /// A store into something the region did not create — the case the exit type cannot see,
+    /// because the region's own result is then `Unit` and the brand is sitting in a binding that
+    /// predates it.
     fn check_region_stores(&mut self, site: &RegionSite) {
         for binding in &site.outer {
             let ty = self.subst.resolve_ty(&binding.ty);
@@ -5046,11 +4630,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// A task outlives the region that spawned it whenever the scheduler does,
-    /// and the scheduler is the enclosing `simulate`. A `simulate` opened
-    /// *inside* the region ends before the region does and is therefore safe;
-    /// one opened outside it is not, and a branded value reaching that spawn is
-    /// an escape into another task.
+    /// A task outlives the region that spawned it whenever the scheduler does, and the scheduler is
+    /// the enclosing `simulate`.
     fn check_region_spawns(&mut self, site: &RegionSite) {
         for spawn in &site.spawns {
             let ty = self.subst.resolve_ty(&spawn.ty);
@@ -5084,18 +4665,8 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The route no other check can see, because at the far end of it there is
-    /// no type left to look at.
-    ///
-    /// An operation is declared once for the whole program, so
-    /// [`Checker::reject_declared_cell`] already refuses one that names a `Cell`.
-    /// A declaration that names a *type variable* instead says nothing about
-    /// cells and is not refused — and the perform site and the handler
-    /// instantiate that variable independently, in different definitions. The
-    /// perform site solves its copy to `Cell[r]<Int>`; the handler's copy stays a
-    /// variable it may generalize, store into a binding that outlives the region,
-    /// or answer the whole `handle` with. Nothing the handler holds mentions `r`,
-    /// so the escape is invisible there and has to be refused here.
+    /// The route no other check can see, because at the far end of it there is no type left to look
+    /// at.
     fn check_region_handoffs(&mut self, site: &RegionSite) {
         for handoff in &site.handoffs {
             let ty = self.subst.resolve_ty(&handoff.ty);
@@ -5139,17 +4710,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// The `handle` rule with a fixed clause set, plus one atom of its own:
-    ///
-    /// ```text
-    /// Γ ⊢ simulate { body } : T / ( (ρ_b \ {task.*, clock.*, random.*}) ∪ {sim.read} )
-    /// ```
-    ///
-    /// The seeded scheduler's clauses read and write only state created at the
-    /// region's entry and destroyed at its exit, so the `⋃ row(clause_i)` term a
-    /// hand-written handler owes is empty and the only thing added is the seed.
-    /// `cell` is deliberately not discharged: a `with_cell` outside a region
-    /// holding state the tasks inside share is how tasks share memory.
+    /// The `handle` rule with a fixed clause set, plus one atom of its own.
     fn infer_simulate(&mut self, e: &Expr, body: &Expr) -> (Type, Row) {
         let mark = self.performs.len();
         self.simulate_depth += 1;
@@ -5172,56 +4733,8 @@ impl<'a> Checker<'a> {
         (body_ty, row)
     }
 
-    /// Fills in [`DefInfo::internally_effectful`] for every definition in the
-    /// program: which of them can execute a `perform` their published row does
-    /// not show.
-    ///
-    /// Every `DefInfo` is constructed with the flag **set**, and this is the
-    /// only thing that clears it. So the answer to "was this definition
-    /// walked?" and the answer to "may a compiled body be entered for it?" are
-    /// the same answer, and a definition this pass never reaches keeps the
-    /// conservative one.
-    ///
-    /// # Why it is transitive
-    ///
-    /// An atom performed inside a call either escapes — and the published row
-    /// carries it, which is the gate `Machine::compiled_answer` already had —
-    /// or it is discharged by a `handle` in the call's dynamic extent, and then
-    /// nothing published records it at all. The `handle` that discharges it can
-    /// be anywhere in that extent, not only in the body that performed. So a
-    /// definition whose own body mentions neither `perform` nor `handle` still
-    /// performs, invisibly, when something it calls discharges its own
-    /// operations. Measured rather than reasoned: with
-    /// `fn handled(x) = handle { touch(x) } with { .. }` and
-    /// `fn wrapper(x) = handled(x)`, inference publishes an empty `footprint`
-    /// *and* an empty `performed` for both, and running `wrapper` records
-    /// `state.read` in `ply_eval::Trace`.
-    ///
-    /// # What is and is not an edge
-    ///
-    /// A reference is an edge when it denotes a definition of this program.
-    /// A builtin, a constructor and a prelude name are not: the only route to
-    /// `ply_eval::Trace::record` in either engine is an `ExprKind::Perform`
-    /// (`machine.rs`'s `State::Perform`, `interp.rs`'s `perform`), which is
-    /// source this pass walks. `with_cell` is deliberately not an effect here
-    /// for the same reason `Trace` does not record one — a cell atom carries no
-    /// resource label to reconstruct, and the two engines' arenas are compared
-    /// slot by slot instead.
-    ///
-    /// Locals other than the definition's own parameters are not resolved away,
-    /// so a lambda parameter or a `let` binder that shadows a definition's name
-    /// contributes that definition's edge. That costs a definition its entry and
-    /// never the other way round. Measured on `examples/` rather than guessed
-    /// at, and it is why the parameter set is subtracted at all: without that
-    /// one step **29** of the 953 empty-row definitions there are marked, and
-    /// with it **11**. The eighteen were spurious in one shape —
-    /// `desk.item_named(shelf, ..)` is `fold` over its own parameter and `desk`
-    /// also declares `fn shelf`. The eleven that remain are real: `desk.under`
-    /// is `handle { .. } with { signal.stopping() -> false }` and publishes an
-    /// empty row, and the other ten reach it.
-    ///
-    /// A `requires` / `ensures` clause is not walked: it is erased before
-    /// evaluation and cannot perform (`E0412`).
+    /// Fills in [`DefInfo::internally_effectful`] for every definition in the program: which of
+    /// them can execute a `perform` their published row does not show.
     fn mark_internal_effects(&mut self, program: &Program) {
         let mut index: FxHashMap<Symbol, usize> = FxHashMap::default();
         let mut names: Vec<Symbol> = Vec::new();
@@ -5229,16 +4742,9 @@ impl<'a> Checker<'a> {
             for item in &module.items {
                 let Item::Fn(def) = item else { continue };
                 let name = module.name.qualify(&def.name.name);
-                // A module declaring the same name twice is `E0105`, and this
-                // pass runs *before* the diagnostic is reported —
-                // `check_program_with` collects and reports at the end. So the
-                // second `fn f` reuses the first one's node rather than
-                // claiming an index no vector has, and the two bodies' effects
-                // merge, which is the conservative direction.
-                // `a_definition_declared_twice_is_a_diagnostic_even_when_one_of_them_handles_an_effect`
-                // is what fails without this: a pure duplicate is survivable
-                // because `&&` short-circuits the out-of-bounds read, and one
-                // written with `handle` is not.
+                // A module declaring the same name twice is `E0105`, and this pass runs *before*
+                // the diagnostic is reported — `check_program_with` collects and reports at the
+                // end.
                 if !index.contains_key(&name) {
                     index.insert(name.clone(), names.len());
                     names.push(name);
@@ -5247,8 +4753,8 @@ impl<'a> Checker<'a> {
         }
 
         let mut effects = vec![false; names.len()];
-        // Callee -> callers, because propagation runs from a definition that
-        // performs outwards to everything that can reach it.
+        // Callee -> callers, because propagation runs from a definition that performs outwards to
+        // everything that can reach it.
         let mut callers: Vec<Vec<usize>> = vec![Vec::new(); names.len()];
         let mut pending: Vec<usize> = Vec::new();
         for (m, module) in program.modules.iter().enumerate() {
@@ -5263,13 +4769,9 @@ impl<'a> Checker<'a> {
                     effects[at] = true;
                     pending.push(at);
                 }
-                // A parameter shadows a definition of the same name for the
-                // whole body — an inner binder only shadows it further — so a
-                // bare reference to one never denotes the global. Dropping
-                // those is the one narrowing available without a scope-aware
-                // walk, and it is worth having: `desk.item_named(shelf, sku)`
-                // is `fold` over its own parameter, and `desk` also declares
-                // `fn shelf`.
+                // A parameter shadows a definition of the same name for the whole body — an inner
+                // binder only shadows it further — so a bare reference to one never denotes the
+                // global.
                 let params: FxHashSet<&Symbol> = def.params.iter().map(|p| &p.name.name).collect();
                 for q in &refs.names {
                     if q.is_bare() && params.contains(q.symbol()) {
@@ -5301,9 +4803,7 @@ impl<'a> Checker<'a> {
         }
     }
 
-    /// Nesting and task escape, asked once the module is solved. Both questions
-    /// are about a row and a type that a region's own definition routinely
-    /// leaves unsolved while it is being walked.
+    /// Nesting and task escape, asked once the module is solved.
     fn check_simulations(&mut self) {
         let seed = prelude::seed_atom();
         let sites: Vec<Simulation> = std::mem::take(&mut self.simulations);
@@ -5461,11 +4961,8 @@ impl<'a> Checker<'a> {
                         )
                         .primary(name.span, "not found")
                         .note("constructors come from a `type` declaration with variants");
-                        // A builtin type constructor has no `type` item to read,
-                        // so the general note above sends the reader looking for
-                        // a declaration that cannot exist. For `Secret` the
-                        // absence is the mechanism, and saying so is the whole
-                        // difference between a puzzle and an answer.
+                        // A builtin type constructor has no `type` item to read, so the general
+                        // note above sends the reader looking for a declaration that cannot exist.
                         if let Some((builtin, _)) = builtin_types()
                             .iter()
                             .find(|(b, _)| *b == name.symbol().as_str())
@@ -5608,12 +5105,8 @@ impl<'a> Checker<'a> {
         a.union(&b)
     }
 
-    /// Whether the two unified, so a caller can stop rather than report a second
-    /// diagnostic about a type the first one already explained.
-    /// Why a clause for a polymorphic operation cannot answer a concrete type.
-    ///
-    /// Attached to the mismatch rather than raised beside it, because there is
-    /// one mistake here and the reader needs one thing to read.
+    /// Whether the two unified, so a caller can stop rather than report a second diagnostic about a
+    /// type the first one already explained.
     fn note_universal_clause(&mut self, info: &EffectInfo, op: &OpInfo) {
         let Some(last) = self.diags.pop() else { return };
         let written = self.as_written(&info.name);
@@ -5734,9 +5227,8 @@ impl<'a> Checker<'a> {
         self.diags.push(d);
     }
 
-    /// Candidates are the simple names this module can actually write, not the
-    /// program-wide ones: suggesting `store.orders.place` for `plce` would name
-    /// something the file cannot say.
+    /// Candidates are the simple names this module can actually write, not the program-wide ones:
+    /// suggesting `store.orders.place` for `plce` would name something the file cannot say.
     fn nearest_name(&self, name: &Symbol) -> Option<Symbol> {
         let mut best: Option<(usize, Symbol)> = None;
         for c in self.scope().values.keys() {
@@ -5752,8 +5244,8 @@ impl<'a> Checker<'a> {
     }
 }
 
-/// A resolved value reference: the [`TypeEnv`] key it denotes, and whether it
-/// landed on the prelude rather than on a local or a module item.
+/// A resolved value reference: the [`TypeEnv`] key it denotes, and whether it landed on the prelude
+/// rather than on a local or a module item.
 struct ValueKey {
     name: Symbol,
     prelude: bool,
@@ -5767,10 +5259,7 @@ struct Signature {
     ret: Type,
     declared: Option<Row>,
     published_row: Row,
-    /// The `Checker::scope` this signature was built under. A body is the same
-    /// definition as its signature, and the two are walked in separate passes
-    /// over a mutually recursive group, so the body restores it rather than
-    /// taking whatever the counter reached in between.
+    /// The `Checker::scope` this signature was built under.
     scope: u32,
 }
 
@@ -5786,9 +5275,7 @@ fn lit_type(l: &Lit) -> Type {
     }
 }
 
-/// The `effect set` names this definition's row was written with, in source
-/// order. Only names a set could have: the parser has already refused a
-/// qualified one, so nothing here needs qualifying.
+/// The `effect set` names this definition's row was written with, in source order.
 fn row_aliases(def: &FnDef) -> Vec<Symbol> {
     def.effects
         .as_ref()
@@ -5796,9 +5283,9 @@ fn row_aliases(def: &FnDef) -> Vec<Symbol> {
         .unwrap_or_default()
 }
 
-/// A written effect row inside a `forall` binder's type, which the row
-/// conversion would otherwise report as an unbound row variable — a message
-/// about the generic list of a definition that is not there.
+/// A written effect row inside a `forall` binder's type, which the row conversion would otherwise
+/// report as an unbound row variable — a message about the generic list of a definition that is not
+/// there.
 fn written_row_reason(te: &TypeExpr) -> Option<String> {
     match te {
         TypeExpr::Var(_) | TypeExpr::Unit { .. } => None,
@@ -5837,21 +5324,16 @@ fn is_cell_builtin(name: &Symbol) -> bool {
     matches!(name.as_str(), "cell_get" | "cell_set")
 }
 
-/// The builtin a generated `OrdDict` is built out of, reserved so that no module
-/// can supply it.
+/// The builtin a generated `OrdDict` is built out of, reserved so that no module can supply it.
 pub const COMPARE_VALUES: &str = "compare_values";
 
-/// The three builtins over [`ty::SECRET`](crate::ty::SECRET), and the whole of
-/// what a program may do with a credential. There is no `secret_expose`, no
-/// `secret_len` and no `String` in any return type, so the only plaintext that
-/// leaves is one a host operation was handed whole — which is `E0439`.
+/// The three builtins over [`ty::SECRET`](crate::ty::SECRET), and the whole of what a program may
+/// do with a credential.
 pub const SECRET_OF_STRING: &str = "secret_of_string";
 pub const SECRET_VERIFY: &str = "secret_verify";
 pub const SECRET_IS_EMPTY: &str = "secret_is_empty";
 
-/// Why a derivation refused a `Secret`, in the wording all three call sites
-/// print. One function because three copies of a security claim are three things
-/// that can drift apart.
+/// Why a derivation refused a `Secret`, in the wording all three call sites print.
 fn secret_notes(mut d: Diagnostic, deriver: Deriver) -> Diagnostic {
     d = d.note(ply_derive::rules::Refusal::Secret(deriver).reason());
     match ply_derive::rules::Refusal::Secret(deriver).note() {
@@ -5910,23 +5392,8 @@ fn contains_fn(t: &Type) -> bool {
     }
 }
 
-/// Whether a **resolved** type carries region `r`'s brand, by either of the two
-/// routes a brand travels.
-///
-/// The first is the type itself: the brand is a nullary constructor no lexer can
-/// produce, sitting where a `Cell`'s region argument goes, and a walk into every
-/// type argument, record field and function position finds it wherever it was
-/// put — a list element, a `Map` key, a constructor's type argument, a returned
-/// closure's result. Running on the resolved type is what closes the alias
-/// route: `conv_type` expands an alias before a `Type` exists, so `Map<Key, Int>`
-/// and `Map<String, Int>` are the same type here and get the same answer.
-///
-/// The second is a function's effect row. A closure that captured a value
-/// allocated in `r` need not mention `r` in its parameters or its result — but
-/// reading or writing that value is a `cell.read[r]` / `cell.write[r]` atom, and
-/// the atom is in the closure's row whether the read is written in the closure
-/// or in something the closure calls. That is what makes a capture visible to a
-/// check that only ever looks at types.
+/// Whether a **resolved** type carries region `r`'s brand, by either of the two routes a brand
+/// travels.
 fn brand_in(t: &Type, region: &str) -> bool {
     match t {
         Type::Var(_) => false,
@@ -5946,9 +5413,9 @@ fn brand_in(t: &Type, region: &str) -> bool {
     }
 }
 
-/// Whether the brand reached this type through a function's row rather than
-/// through its shape, which is the difference between "you returned the cell"
-/// and "you returned something that reads it".
+/// Whether the brand reached this type through a function's row rather than through its shape,
+/// which is the difference between "you returned the cell" and "you returned something that reads
+/// it".
 fn carries_brand_in_row(t: &Type, region: &str) -> bool {
     match t {
         Type::Var(_) => false,
@@ -5966,9 +5433,7 @@ fn carries_brand_in_row(t: &Type, region: &str) -> bool {
     }
 }
 
-/// Only `cell` atoms are region-scoped. A `db.read[users]` names a table and a
-/// region named `users` names memory; treating the two as one label would refuse
-/// programs for a collision of spelling.
+/// Only `cell` atoms are region-scoped.
 fn row_brands(row: &Row, region: &str) -> bool {
     row.atoms.iter().any(|a| {
         a.effect.as_str() == CELL
@@ -5976,14 +5441,6 @@ fn row_brands(row: &Row, region: &str) -> bool {
     })
 }
 
-/// The positions a region body's value leaves through.
-///
-/// Every one of them is unified with the region's own result type, so the walk
-/// decides *where* an escape is reported and never *whether* one happened. A
-/// tail-resumptive clause is not an exit: its body has the operation's return
-/// type, not the `handle`'s. A `handle` with a `return` clause exits through the
-/// clause and not through the body, because a `return x -> 0` discards whatever
-/// the body produced.
 fn region_exits<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
@@ -6022,11 +5479,7 @@ fn region_exits<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
     })
 }
 
-/// Whether a declared type could carry a brand. The written row counts: a `cell`
-/// atom is writable in an annotation — a cell that outlives its region through a
-/// continuation puts one in a published footprint — so a field declared
-/// `() -> Int / {cell.read[r]}` is a closure-shaped hiding place for exactly the
-/// same reason a field declared `Cell<Int>` is a cell-shaped one.
+/// Whether a declared type could carry a brand.
 fn mentions_cell(t: &Type) -> bool {
     match t {
         Type::Var(_) => false,
@@ -6047,8 +5500,8 @@ fn mentions_cell(t: &Type) -> bool {
 fn is_irrefutable(p: &Pattern) -> bool {
     match &p.kind {
         PatternKind::Wildcard | PatternKind::Var(_) => true,
-        // A record is a product: naming fields never rules a value out, and the
-        // field set is checked against the type separately.
+        // A record is a product: naming fields never rules a value out, and the field set is
+        // checked against the type separately.
         PatternKind::Record { fields, .. } => fields.iter().all(|(_, f)| is_irrefutable(f)),
         PatternKind::List { items, rest } => {
             items.is_empty() && rest.as_deref().is_some_and(is_irrefutable)
@@ -6139,22 +5592,12 @@ fn edit_distance(a: &str, b: &str) -> usize {
     prev[b.len()]
 }
 
-/// What one walk of a body answers: the names it mentions, and whether it is
-/// written with an effect operation at all.
-///
-/// One walk rather than two because the second question is asked of every
-/// definition in the program by [`Checker::mark_internal_effects`], and because
-/// [`collect_refs_inner`] is an exhaustive `match` with no wildcard arm — so a
-/// new [`ExprKind`] fails to compile here rather than silently answering
-/// `false` for a form that can perform. That is the whole reason the flag lives
-/// in this walker instead of one of its own.
+/// What one walk of a body answers: the names it mentions, and whether it is written with an effect
+/// operation at all.
 #[derive(Default)]
 struct Refs<'a> {
     names: Vec<&'a QName>,
-    /// A `perform` or a `handle` written anywhere in this body, lambdas
-    /// included. Not a claim that either one runs: a `perform` inside a lambda
-    /// nothing calls sets this too, which costs a definition its entry into a
-    /// compiled body and never the other way round.
+    /// A `perform` or a `handle` written anywhere in this body, lambdas included.
     effects: bool,
 }
 
@@ -6170,8 +5613,8 @@ impl<'a> Refs<'a> {
     }
 }
 
-/// Grows for the same reason [`Infer::infer`] does: it walks the same tree, so a
-/// chain deep enough to need the growth there needs it here too.
+/// Grows for the same reason [`Infer::infer`] does: it walks the same tree, so a chain deep enough
+/// to need the growth there needs it here too.
 fn collect_refs<'a>(e: &'a Expr, out: &mut Refs<'a>) {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;

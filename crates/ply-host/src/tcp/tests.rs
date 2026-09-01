@@ -1,10 +1,4 @@
 //! What the socket handler claims, and whether it is telling the truth.
-//!
-//! Two halves. The first is about the registration — the declared footprint, the
-//! determinism flag and the linearity flag — because a wrong entry there is the
-//! failure this milestone exists to make loud, and it is wrong before a byte
-//! moves. The second runs the protocol, over a real loopback socket and over the
-//! script, and asks the two for the same answers.
 
 use super::*;
 use ply_core::CheckOutput;
@@ -18,10 +12,8 @@ use std::net::{Shutdown, SocketAddr, TcpStream};
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
 
-/// A registration is resolved against the atoms the **program** performs, and
-/// the shipped declaration names no resource label on its own. So the fixture is
-/// the declaration plus a driver that performs every operation under the two
-/// labels these tests use — which is `examples/echo.ply` in miniature.
+/// A registration is resolved against the atoms the **program** performs, and the shipped
+/// declaration names no resource label on its own.
 const DRIVER: &str = r#"
 fn every_op(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
   let l = net.listen[listener](port);
@@ -40,13 +32,9 @@ fn int_or_zero(answer: Option<Int>) -> Int =
   match answer { Some(n) -> n, None -> 0 }
 "#;
 
-/// Checked under the module name it ships as, because an effect's name is
-/// qualified: the same text loaded anonymously declares `net` rather than
-/// `std.net.net` and would not bind, which is the drift [`EFFECT`] exists to
-/// pin.
-/// The shipped declaration and the driver, as one module: mutation tests edit
-/// this text so that a rename lands on both sides of it, which is the whole
-/// point of asserting that a rename is caught.
+/// Checked under the module name it ships as, because an effect's name is qualified: the same text
+/// loaded anonymously declares `net` rather than `std.net.net` and would not bind, which is the
+/// drift [`EFFECT`] exists to pin.
 fn fixture() -> String {
     format!("{DECLARATION}{DRIVER}")
 }
@@ -67,9 +55,8 @@ fn atom(resource: &str) -> EffectAtom {
     EffectAtom::new(EFFECT, Resource::Named(Symbol::new(resource)), Mode::Write)
 }
 
-/// One `perform`, as the machine would make it: resolve the triple, call the
-/// handler, and drive a pending answer to a value the way an entry point with no
-/// scheduler around it does.
+/// One `perform`, as the machine would make it: resolve the triple, call the handler, and drive a
+/// pending answer to a value the way an entry point with no scheduler around it does.
 fn perform(
     binding: &HostBinding,
     rt: &dyn HostRuntime,
@@ -112,11 +99,7 @@ fn bytes(v: Value) -> Vec<u8> {
         .to_vec()
 }
 
-/// `recv` and `send` answer an `Option` since ADR 0013 §7.2, where `None` is a
-/// deadline. Every assertion below is about the value inside a `Some`; a `None`
-/// reaching one of them is a deadline that expired in a test that set the
-/// timeout to five seconds, which is a failure worth naming rather than
-/// unwrapping past.
+/// `recv` and `send` answer an `Option` since ADR 0013 §7.2, where `None` is a deadline.
 fn inside(v: Value) -> Value {
     match &v {
         Value::Ctor { name, args } if name.as_str() == "Some" => args[0].clone(),
@@ -143,9 +126,7 @@ fn the_declaration_binds_and_names_exactly_the_atoms_the_program_performs() {
     );
 }
 
-/// The claim `ply hosts` puts in front of a reviewer. `Any` expands per label,
-/// never per registration, so a handler that serves every socket still lists the
-/// sockets it got.
+/// The claim `ply hosts` puts in front of a reviewer.
 #[test]
 fn the_listing_is_one_row_per_triple_and_never_a_star() {
     let binding = bind(Arc::new(TcpHost::new()));
@@ -164,9 +145,9 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
             "std.net.net.close[listener] std.net.net.write[listener] ply_host::tcp::close",
             "std.net.net.listen[conn] std.net.net.write[conn] ply_host::tcp::listen",
             "std.net.net.listen[listener] std.net.net.write[listener] ply_host::tcp::listen",
-            // Its own line with its own path, which is the whole of how "this
-            // program can serve TLS" is disclosed: the row it contributes is an
-            // ordinary `net.write[..]`, so nothing else in the listing says it.
+            // Its own line with its own path, which is the whole of how "this program can serve
+            // TLS" is disclosed: the row it contributes is an ordinary `net.write[..]`, so nothing
+            // else in the listing says it.
             "std.net.net.listen_tls[conn] std.net.net.write[conn] ply_host::tls::listen",
             "std.net.net.listen_tls[listener] std.net.net.write[listener] ply_host::tls::listen",
             "std.net.net.recv[conn] std.net.net.write[conn] ply_host::tcp::recv",
@@ -177,18 +158,14 @@ fn the_listing_is_one_row_per_triple_and_never_a_star() {
     );
 }
 
-/// The whole reason every operation is `[s]`: two sockets a program labels apart
-/// are two resources, so the conflict graph lets the tasks holding them run at
-/// once. Two accepted at one source site share a label and do contend, which is
-/// the honest limit of a ground resource label.
+/// The whole reason every operation is `[s]`: two sockets a program labels apart are two resources,
+/// so the conflict graph lets the tasks holding them run at once.
 #[test]
 fn two_labelled_sockets_do_not_conflict_and_one_label_does() {
     assert!(!atom("conn").conflicts_with(&atom("listener")));
     assert!(atom("conn").conflicts_with(&atom("conn")));
 }
 
-/// ADR 0008 §5. Not asserted in prose: `register` is one function, so the twin
-/// cannot drift from the socket in any column the signature owns.
 #[test]
 fn the_twin_declares_the_same_signature_and_differs_only_where_it_must() {
     let socket = bind(Arc::new(TcpHost::new()));
@@ -209,9 +186,7 @@ fn the_twin_declares_the_same_signature_and_differs_only_where_it_must() {
     assert!(script.listing().rows.iter().all(|r| !r.blocking));
 }
 
-/// The flag the machine's E0426 rule keys on. A `Repeatable` socket operation
-/// would let a captured continuation send a packet twice, and there is no
-/// operation here whose replay changes nothing outside the program.
+/// The flag the machine's E0426 rule keys on.
 #[test]
 fn no_operation_claims_to_be_repeatable() {
     for net in [
@@ -227,9 +202,8 @@ fn no_operation_claims_to_be_repeatable() {
     }
 }
 
-/// The arrow points from the declaration to the handler: the source says
-/// `nondet` or the handler is refused. This is what keeps E0412 — and therefore
-/// the cache key — ignorant of whether `--host` was passed.
+/// The arrow points from the declaration to the handler: the source says `nondet` or the handler is
+/// refused.
 #[test]
 fn a_declaration_without_nondet_refuses_the_handler() {
     let weakened = fixture().replacen("nondet effect net", "effect net", 1);
@@ -245,8 +219,7 @@ fn a_declaration_without_nondet_refuses_the_handler() {
     );
 }
 
-/// A rename on either side. The Rust table is the claim and the declaration is
-/// the authority, so the two meeting is checked before anything runs.
+/// A rename on either side.
 #[test]
 fn an_operation_renamed_in_the_source_is_refused_at_bind_time() {
     let renamed = fixture().replace("recv", "read_bytes");
@@ -274,9 +247,7 @@ fn the_script_serves_listen_accept_recv_send_close() {
     assert_eq!(net.sent(served.conn), RESPONSE);
 }
 
-/// A `recv` shorter than `max` is ordinary, and the bytes it did not take are
-/// still there. A program that treats a short answer as the whole message is
-/// wrong against both handlers.
+/// A `recv` shorter than `max` is ordinary, and the bytes it did not take are still there.
 #[test]
 fn a_partial_read_leaves_the_rest_for_the_next_one() {
     let net = Arc::new(SimNet::new(vec![vec![b"abcdefghijk".to_vec()]]));
@@ -312,9 +283,7 @@ fn a_partial_read_leaves_the_rest_for_the_next_one() {
     );
 }
 
-/// A second `recv` is a second read, not a replay: the bytes the first one took
-/// are gone. This is the whole reason every operation is `AtMostOnce` and why
-/// resuming a continuation across one has to be refused.
+/// A second `recv` is a second read, not a replay: the bytes the first one took are gone.
 #[test]
 fn a_second_read_takes_the_next_bytes_and_never_the_same_ones() {
     let net = Arc::new(SimNet::new(vec![vec![b"one".to_vec(), b"two".to_vec()]]));
@@ -384,10 +353,7 @@ fn a_closed_handle_is_a_diagnostic_rather_than_another_socket() {
     assert_eq!(again.code, codes::RUNTIME_ERROR);
 }
 
-/// A read bound arrives from the program, so it is an untrusted number. Capping
-/// it is legal — a short answer always is — but the cap has to happen before the
-/// cast, because a wrap to zero would answer empty and empty is how the program
-/// learns the peer went away.
+/// A read bound arrives from the program, so it is an untrusted number.
 #[test]
 fn an_absurd_read_bound_is_capped_rather_than_wrapped() {
     let net = Arc::new(SimNet::new(vec![vec![b"hi".to_vec()]]));
@@ -449,9 +415,6 @@ fn a_listener_and_a_connection_are_not_interchangeable() {
 }
 
 /// The handler's one mechanical defence against misreporting its own footprint.
-/// The runtime schedules on the label and the handler acts on the handle, and
-/// nothing else connects the two: one socket under two labels would be two atoms
-/// that do not conflict over a resource that does.
 #[test]
 fn one_socket_under_two_labels_is_refused() {
     let net = Arc::new(SimNet::new(vec![vec![b"hi".to_vec()]]));
@@ -482,8 +445,8 @@ fn one_socket_under_two_labels_is_refused() {
     );
 }
 
-/// Zero is refused rather than clamped, because an empty answer already means
-/// the peer has stopped sending.
+/// Zero is refused rather than clamped, because an empty answer already means the peer has stopped
+/// sending.
 #[test]
 fn a_read_of_no_bytes_is_refused() {
     let net = Arc::new(SimNet::new(vec![vec![b"hi".to_vec()]]));
@@ -559,9 +522,8 @@ fn a_loopback_connection_is_served_end_to_end() {
     assert_eq!(net.outstanding(), 0, "every blocking operation was reaped");
 }
 
-/// The peer sends more than one `recv` asks for and keeps the connection open,
-/// so what comes back is short by construction. How short is the kernel's
-/// business — the claim is that the bytes it did not take are still there.
+/// The peer sends more than one `recv` asks for and keeps the connection open, so what comes back
+/// is short by construction.
 #[test]
 fn a_real_partial_read_returns_what_it_can_and_the_rest_next_time() {
     let net = Arc::new(TcpHost::new());
@@ -572,8 +534,8 @@ fn a_real_partial_read_returns_what_it_can_and_the_rest_next_time() {
     let peer = std::thread::spawn(move || {
         let mut stream = TcpStream::connect(addr).expect("the peer connects");
         stream.write_all(b"abcdefghijk").expect("the peer writes");
-        // Held open, so the reads below end because `max` ran out rather than
-        // because the stream did.
+        // Held open, so the reads below end because `max` ran out rather than because the stream
+        // did.
         std::thread::sleep(std::time::Duration::from_millis(200));
         stream
     });
@@ -643,10 +605,7 @@ fn a_connection_closed_mid_read_reads_empty_rather_than_failing() {
     peer.join().expect("the peer finished");
 }
 
-/// The substitution ADR 0008 §5 is about: one driver, two bindings, no change to
-/// what it performs. Chunk boundaries are deliberately not compared — TCP does
-/// not preserve them, so a claim about them would be a claim the socket handler
-/// cannot keep — but the byte stream, the handles and the byte counts are.
+/// The substitution ADR 0008 §5 is about: one driver, two bindings, no change to what it performs.
 #[test]
 fn the_socket_and_the_script_answer_the_same_program() {
     let script = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));
@@ -721,8 +680,8 @@ struct Served {
     sent: i64,
 }
 
-/// The program both bindings serve: bind, take one connection, read until the
-/// peer is done, answer, close.
+/// The program both bindings serve: bind, take one connection, read until the peer is done, answer,
+/// close.
 fn serve_once(binding: &HostBinding, rt: &dyn HostRuntime) -> Served {
     let listener = listen(binding, rt);
     let served = serve_accepted(binding, rt, listener);
@@ -810,18 +769,8 @@ fn open(binding: &HostBinding, rt: &dyn HostRuntime) -> (i64, i64) {
 }
 
 // --- TLS, at the boundary ---------------------------------------------------
-//
-// What `ply_host::tls` does with a record layer is asserted in its own suite.
-// What is asserted here is the half that belongs to the boundary: the operation
-// binds, the credential is resolved at the perform site, the twin refuses the
-// same name the socket handler refuses, and a service whose listener is
-// `net.listen_tls` runs hermetically over the script with no change to its
-// source.
 
-/// The same shape as [`DRIVER`], with the one line that differs: the listener is
-/// created over TLS. Everything after it is byte-identical, which is the claim
-/// ADR 0013 §6.1 makes — a TLS connection is the same resource, read and written
-/// by the same code.
+/// The same shape as [`DRIVER`], with the one line that differs: the listener is created over TLS.
 const TLS_DRIVER: &str = r#"
 fn serve_tls(port: Int, payload: Bytes) -> Int / {net.write[listener], net.write[conn]} = {
   let l = net.listen_tls[listener](port, "api");
@@ -850,9 +799,8 @@ fn bind_tls(net: Arc<dyn Net>) -> HostBinding {
         .expect("the declaration and the registration agree")
 }
 
-/// `E0429` at the perform site, from both implementations, listing what the run
-/// was configured with — because the fix is a `--tls` argument rather than an
-/// edit to the program.
+/// `E0429` at the perform site, from both implementations, listing what the run was configured with
+/// — because the fix is a `--tls` argument rather than an edit to the program.
 #[test]
 fn a_credential_the_run_does_not_hold_is_refused_by_both_implementations() {
     let socket = Arc::new(TcpHost::new());
@@ -886,10 +834,9 @@ fn unconfigured(binding: &HostBinding, rt: &dyn HostRuntime) -> Diagnostic {
     .expect_err("no credential was configured")
 }
 
-/// The twin resolves the credential it was configured with and then serves an
-/// ordinary listener: above the boundary a TLS connection carries the same
-/// decrypted bytes, so a service is exercised hermetically here without its
-/// source moving.
+/// The twin resolves the credential it was configured with and then serves an ordinary listener:
+/// above the boundary a TLS connection carries the same decrypted bytes, so a service is exercised
+/// hermetically here without its source moving.
 #[test]
 fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
     let net = Arc::new(SimNet::with_credentials(
@@ -911,8 +858,8 @@ fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
     answer(&binding, net.as_ref(), conn);
     assert_eq!(net.sent(conn), RESPONSE);
 
-    // The same script over a plaintext listener answers the same program, which
-    // is what "TLS is not a separate effect" means at this level.
+    // The same script over a plaintext listener answers the same program, which is what "TLS is not
+    // a separate effect" means at this level.
     let plain = Arc::new(SimNet::new(vec![vec![REQUEST.to_vec()]]));
     let binding = bind_tls(plain.clone());
     let listener = listen(&binding, plain.as_ref());
@@ -922,8 +869,7 @@ fn the_script_serves_a_tls_listener_for_a_service_that_never_changed() {
     assert_eq!(plain.sent(other), net.sent(conn));
 }
 
-/// `recv` until the peer stops sending, under the deadline every W3 read
-/// carries. `None` would be that deadline expiring, and a script never has one.
+/// `recv` until the peer stops sending, under the deadline every W3 read carries.
 fn drain_tls(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) -> Vec<u8> {
     let mut got = Vec::new();
     loop {
@@ -955,8 +901,7 @@ fn answer(binding: &HostBinding, rt: &dyn HostRuntime, conn: i64) {
     assert_eq!(int(sent_some(written)), RESPONSE.len() as i64);
 }
 
-/// The payload of a `Some`. `None` is a deadline, which nothing in these tests
-/// sets and which would be a defect if one arrived.
+/// The payload of a `Some`.
 fn sent_some(value: Value) -> Value {
     match &value {
         Value::Ctor { name, args } if name.as_str() == "Some" && args.len() == 1 => args[0].clone(),
@@ -964,9 +909,9 @@ fn sent_some(value: Value) -> Value {
     }
 }
 
-/// Without `--host`, `net.listen_tls` is `E0424` like every other host
-/// operation — and it must name the handler that would have served it, which is
-/// the TLS one rather than the plaintext listener's.
+/// Without `--host`, `net.listen_tls` is `E0424` like every other host operation — and it must name
+/// the handler that would have served it, which is the TLS one rather than the plaintext
+/// listener's.
 #[test]
 fn a_hermetic_run_names_the_tls_handler_it_did_not_bind() {
     let hermetic = HostBinding::hermetic_with(registry(Arc::new(TcpHost::new())));

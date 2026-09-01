@@ -1,85 +1,15 @@
 //! `?` expansion, which happens inside the parser.
-//!
-//! `e?` is sugar. An unexpanded [`ExprKind::Try`] never escapes
-//! [`crate::parse_module`]: this pass rewrites every one into the `match` the
-//! corpus already hand-writes 129 times, so the two spellings are **one
-//! definition with one hash** rather than two definitions computing one value.
-//!
-//! ```text
-//! region  C[e?]   ==>   match e { Err(er) -> Err(er), Ok(x) -> C[x] }
-//!                       match e { None    -> None,    Some(x) -> C[x] }
-//! ```
-//!
-//! and for a `?` that is the whole value of a `let`, the block splits at that
-//! statement and the `let`'s own pattern becomes the success arm's binder:
-//!
-//! ```text
-//! { s..; let p = e?; rest }  ==>  { s..; match e { Err(er) -> Err(er),
-//!                                                  Ok(p)   -> { rest } } }
-//! ```
-//!
-//! ## Why here, and not in the evaluators
-//!
-//! A first-class early-return node would be six pieces of *semantics* — an
-//! unwind in `interp.rs`, an unwind in the control-stack machine, a typing rule
-//! threading the enclosing function's return type and its row, a normalization
-//! tag, a `ply-prove` lowering — which is ADR 0001's "four implementations, four
-//! chances to disagree", and it would buy a construct that is not equal to any
-//! longhand. Under expansion neither evaluator learns anything, `--engine both`
-//! compares two engines running a tree a human could have typed, and **there is
-//! no row rule for `?` because there is no `?` after the parser**: the pass
-//! introduces a `match` and two constructor applications, all pure, so the row
-//! of `C[e?]` is the row of the longhand, character for character.
-//!
-//! Expansion also preserves tail calls. `json.ply`'s `array_items` and the whole
-//! `parse_or`/`parse_and`/`parse_not` chain in `db.ply` recurse per element, and
-//! the continuation lands in the `Ok` arm's tail — exactly where it is today.
-//!
-//! ## Why the enclosing function's *written* return type
-//!
-//! The parser has no types: the driver hashes before it infers (ADR 0002,
-//! `driver.rs`, parse -> resolve -> hash -> gate 2 -> infer), which is why
-//! ADR 0023 put record-update expansion here too. So `?` cannot be resolved from
-//! the scrutinee's type. What is available is the same thing record update
-//! reads — text written in this file — and this pass follows only this module's
-//! own `type` aliases, for the reason `record_update` gives: gate 1 skips a file
-//! whose bytes are unchanged, so a meaning read across a module boundary could
-//! go stale in a file that never moved.
-//!
-//! ## The canonical arm order is measured, not chosen
-//!
-//! `normalize.rs` writes match arms in source order (unlike record fields, which
-//! it sorts), so arm order decides whether converting the corpus moves 129
-//! hashes or zero. The corpus writes the failure arm **first, 129 times to 3**
-//! for `Result` and 11 to 6 for `Option`. Failure first, for both, one rule.
-//!
-//! ## The shape of the pass
-//!
-//! Three stages per `fn`, in this order, and the order is what keeps each stage
-//! simple:
-//!
-//! 1. **the mode**, read off the written `->`. Unreadable means every `?` in the
-//!    body is `E0118` and nothing else runs.
-//! 2. **lifting** — [`Cx::ret`] walks the return positions and lifts every `?`
-//!    the position rules admit. Nothing is refused here.
-//! 3. **one refusal sweep** over the whole body. Every `?` still standing after
-//!    stage 2 is one the rules rejected, so the sweep needs no context beyond
-//!    whether it is under a lambda, a handler or a region — which decides
-//!    between `E0118` and `E0119`.
 
 use crate::ast::*;
 use crate::effect_set::grow;
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
-/// How deep an alias chain may be followed before the pass gives up. A bound
-/// rather than a cycle check, for [`crate::record_update`]'s reason: this runs
-/// before anything has rejected `type A = B` / `type B = A`, so a refusal here
-/// is a diagnostic where a loop would be a hang.
+/// How deep an alias chain may be followed before the pass gives up.
 const MAX_ALIAS_DEPTH: u32 = 16;
 
-/// Which pair of constructors the expansion names, read off the enclosing
-/// function's written return type.
+/// Which pair of constructors the expansion names, read off the enclosing function's written return
+/// type.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Result,
@@ -103,31 +33,27 @@ impl Mode {
     }
 }
 
-/// Why a `?` has no meaning where it is written. Each variant carries what the
-/// note has to say: "`?` is not allowed here" on its own tells a reader nothing
-/// about which of these rules they hit.
+/// Why a `?` has no meaning where it is written.
 #[derive(Clone)]
 enum Why {
     /// The enclosing `fn` wrote no `->`.
     NoReturnType,
     /// It wrote one, and its head is neither `Result` nor `Option`.
     NotResultOrOption(Symbol),
-    /// A type parameter, a generic alias, or an inline type with no head
-    /// constructor to read.
+    /// A type parameter, a generic alias, or an inline type with no head constructor to read.
     Unreadable,
     /// A cross-module type or alias: `m::T`.
     CrossModule,
     /// An alias chain longer than [`MAX_ALIAS_DEPTH`].
     TooDeep,
-    /// Not inside a `fn` at all: a `test`, a `law`, a `requires`/`ensures`, or a
-    /// bare expression handed to [`crate::parse_expr`].
+    /// Not inside a `fn` at all: a `test`, a `law`, a `requires`/`ensures`, or a bare expression
+    /// handed to [`crate::parse_expr`].
     NotInAFunction(&'static str),
-    /// This module declares its own `Ok`/`Err`/`Some`/`None`, which would
-    /// capture the expansion. GUIDE §5.7: constructor names are not reserved.
+    /// This module declares its own `Ok`/`Err`/`Some`/`None`, which would capture the expansion.
     Shadowed(Symbol),
-    /// The same capture, reached the other way: `import m (Err)` binds `Err`
-    /// unqualified, in [`crate::resolve::Namespace::Value`] alongside every
-    /// other constructor, so the expansion would name *that* one.
+    /// The same capture, reached the other way: `import m (Err)` binds `Err` unqualified, in
+    /// [`crate::resolve::Namespace::Value`] alongside every other constructor, so the expansion
+    /// would name *that* one.
     ShadowedByImport(Symbol),
 }
 
@@ -167,8 +93,7 @@ impl Why {
     }
 }
 
-/// Rewrites every `?` in the module. Only called when the file wrote one, so a
-/// program that uses none pays nothing.
+/// Rewrites every `?` in the module.
 pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     let types = collect_types(module);
     let shadowed = shadowing_ctor(module);
@@ -186,13 +111,7 @@ pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     module.items = items;
 }
 
-/// The same pass for an expression parsed with no module around it
-/// ([`crate::parse_expr`]).
-///
-/// Every `?` refuses, because there is no enclosing `fn` and therefore no
-/// written return type to read a mode off. That is the correct outcome and not a
-/// gap: what must not happen is an unexpanded [`ExprKind::Try`] reaching a crate
-/// whose only arm for one is `unreachable!`.
+/// The same pass for an expression parsed with no module around it ([`crate::parse_expr`]).
 pub(crate) fn expand_bare(e: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let types = IndexMap::new();
     let mut cx = Cx {
@@ -205,9 +124,7 @@ pub(crate) fn expand_bare(e: &mut Expr, diags: &mut Vec<Diagnostic>) {
     cx.sweep(e, Some(&Why::NotInAFunction("a bare expression")), None);
 }
 
-/// This module's own `type` items, by simple name. First wins: a duplicate is
-/// `E0105` from inference, and a module that has one is rejected whichever of
-/// the two this picks.
+/// This module's own `type` items, by simple name.
 fn collect_types(module: &Module) -> IndexMap<Symbol, TypeDef> {
     let mut out = IndexMap::new();
     for item in &module.items {
@@ -220,20 +137,6 @@ fn collect_types(module: &Module) -> IndexMap<Symbol, TypeDef> {
 }
 
 /// A binding in this module whose name the expansion would emit.
-///
-/// GUIDE §5.7 is explicit that constructor names are *not* reserved — a module
-/// may declare its own `Stop`, at the cost of the prelude's — so a module
-/// declaring `Err` is writable today, and expanding a `?` in it would build a
-/// `match` naming that module's constructor instead of the prelude's. No corpus
-/// module does it; every `?` in one that does is refused rather than captured.
-///
-/// **A `type` declaration is not the only way to bind one of these four names.**
-/// `import m (Err)` binds `Err` unqualified — constructors live in
-/// `resolve::Namespace::Value` beside functions, and `bind_name` binds whatever
-/// namespace the target declares the name in — so an importing module captures
-/// the expansion exactly as a declaring one does. Checking only `Item::Type`
-/// left that case to fail as a cascade of `E0201`/`E0205` on a synthesized
-/// `match` the author never wrote.
 fn shadowing_ctor(module: &Module) -> Option<Why> {
     for import in &module.imports {
         if let ImportKind::Names(names) = &import.kind {
@@ -267,18 +170,13 @@ struct Cx<'a> {
     types: &'a IndexMap<Symbol, TypeDef>,
     shadowed: Option<Why>,
     diags: &'a mut Vec<Diagnostic>,
-    /// The mode of the `fn` being walked. Set for the whole of stage 2.
+    /// The mode of the `fn` being walked.
     mode: Option<Mode>,
     /// Counts the binders this pass has synthesized in the current item.
     fresh: u32,
 }
 
 /// A `?` the scan reached, lifted out of the expression it was written in.
-///
-/// `at` is the span of the `?` *including* its operand — what a reader would
-/// underline — and it is what the synthesized `match` carries, so a type error
-/// in the expansion is reported on the `?` rather than on whatever region
-/// happened to enclose it.
 struct Lift {
     operand: Expr,
     binder: Ident,
@@ -286,31 +184,24 @@ struct Lift {
 }
 
 /// What one step of the evaluation-order scan found.
-///
-/// Boxed because an [`Expr`] dwarfs the other two variants, which carry nothing.
 enum Scan {
-    /// A `?` was reached unconditionally with a pure prefix, and has been
-    /// replaced in place by a reference to its binder.
+    /// A `?` was reached unconditionally with a pure prefix, and has been replaced in place by a
+    /// reference to its binder.
     Found(Box<Lift>),
-    /// Nothing found, and everything scanned is pure — the scan may continue to
-    /// the right.
+    /// Nothing found, and everything scanned is pure — the scan may continue to the right.
     Pure,
-    /// Nothing found, and something impure was passed. Nothing to the right of
-    /// it may be lifted across it.
+    /// Nothing found, and something impure was passed.
     Impure,
 }
 
 impl Cx<'_> {
-    // ----------------------------------------------------------------- items
-
     fn item(&mut self, item: &mut Item) {
         self.fresh = 0;
         self.mode = None;
         match item {
             Item::Fn(d) => {
-                // A spec is a claim *about* the definition rather than part of
-                // it — normalization erases it — and it has no return type of
-                // its own.
+                // A spec is a claim *about* the definition rather than part of it — normalization
+                // erases it — and it has no return type of its own.
                 for s in &mut d.spec {
                     let what = match s.kind {
                         SpecKind::Requires => "a `requires` clause",
@@ -328,9 +219,7 @@ impl Cx<'_> {
                     Ok(m) => {
                         self.mode = Some(m);
                         self.ret(&mut d.body);
-                        // Stage 3. Every `?` still standing is one the position
-                        // rules rejected; the sweep only has to say whether a
-                        // barrier or a position is the reason.
+                        // Stage 3.
                         self.sweep(&mut d.body, None, None);
                         self.mode = None;
                     }
@@ -348,8 +237,7 @@ impl Cx<'_> {
         }
     }
 
-    /// The head constructor of a written return type, following this module's
-    /// own aliases.
+    /// The head constructor of a written return type, following this module's own aliases.
     fn mode_of(&self, ty: &TypeExpr, depth: u32) -> Result<Mode, Why> {
         if depth > MAX_ALIAS_DEPTH {
             return Err(Why::TooDeep);
@@ -359,15 +247,14 @@ impl Cx<'_> {
             TypeExpr::Con { name, .. } => {
                 let sym = &name.name.name;
                 match sym.as_str() {
-                    // The prelude's — and a module that declared its own was
-                    // refused before this ran.
+                    // The prelude's — and a module that declared its own was refused before this
+                    // ran.
                     "Result" => return Ok(Mode::Result),
                     "Option" => return Ok(Mode::Option),
                     _ => {}
                 }
                 match self.types.get(sym) {
-                    // Not declared here and not the prelude's: a builtin, or an
-                    // imported type. `E0102` names it if it is neither.
+                    // Not declared here and not the prelude's: a builtin, or an imported type.
                     None => Err(Why::NotResultOrOption(sym.clone())),
                     Some(d) if !d.params.is_empty() => Err(Why::Unreadable),
                     Some(d) => match &d.body {
@@ -376,8 +263,8 @@ impl Cx<'_> {
                     },
                 }
             }
-            // A lowercase bare name is a type parameter bound by an enclosing
-            // `<..>`, never a declared type.
+            // A lowercase bare name is a type parameter bound by an enclosing `<..>`, never a
+            // declared type.
             TypeExpr::Var(_) => Err(Why::Unreadable),
             TypeExpr::Record { .. } | TypeExpr::Fn { .. } | TypeExpr::Unit { .. } => {
                 Err(Why::Unreadable)
@@ -385,20 +272,12 @@ impl Cx<'_> {
         }
     }
 
-    // -------------------------------------------------------- return position
-
     /// `e` is in **return position**: its value is the enclosing function's.
-    ///
-    /// A return position is the function body, the tail of a block in return
-    /// position, both branches of an `if` in return position, and every arm body
-    /// of a `match` in return position. Nothing else is one — which is why
-    /// `if c { a? } else { b }` keeps its `?` inside the branch when the `if` is
-    /// the body, and is refused when the `if` is a `let`'s value.
     fn ret(&mut self, e: &mut Expr) {
         grow(|| match &e.kind {
             ExprKind::Block { .. } => self.block(e),
-            // A branch is a return position of its own, so it is walked first;
-            // the condition is what the `if` node itself is the region root for.
+            // A branch is a return position of its own, so it is walked first; the condition is
+            // what the `if` node itself is the region root for.
             ExprKind::If { .. } => {
                 let ExprKind::If {
                     then_branch,
@@ -419,9 +298,8 @@ impl Cx<'_> {
                 let ExprKind::Match { arms, .. } = &mut e.kind else {
                     unreachable!("just matched")
                 };
-                // A guard runs only when the arms above it did not match, so it
-                // is conditional and can never be a region root. Left for the
-                // sweep.
+                // A guard runs only when the arms above it did not match, so it is conditional and
+                // can never be a region root.
                 for arm in arms {
                     self.ret(&mut arm.body);
                 }
@@ -434,12 +312,8 @@ impl Cx<'_> {
         })
     }
 
-    /// Lifts every `?` that `find` can reach out of `e`, wrapping `e` in one
-    /// `match` per lift and leaving the rewritten `e` as the success arm's body.
-    ///
-    /// `find` is a closure rather than a fixed walk because a region root is not
-    /// always the whole node: for an `if` in return position it is the condition
-    /// alone, and for a `match` it is the scrutinee alone.
+    /// Lifts every `?` that `find` can reach out of `e`, wrapping `e` in one `match` per lift and
+    /// leaving the rewritten `e` as the success arm's body.
     fn region(&mut self, e: &mut Expr, find: &mut dyn FnMut(&mut Cx, &mut Expr) -> Scan) {
         grow(|| {
             let Scan::Found(lift) = find(self, e) else {
@@ -470,14 +344,7 @@ impl Cx<'_> {
         })
     }
 
-    // --------------------------------------------------------------- blocks
-
-    /// A block in return position. Statements are visited in order; the first
-    /// one carrying a liftable `?` splits the block, and everything after it
-    /// becomes the success arm's body — the ordinary do-notation shape.
-    ///
-    /// Statements *before* the split are untouched and still run first, so they
-    /// need no purity condition: nothing moves across them.
+    /// A block in return position.
     fn block(&mut self, e: &mut Expr) {
         let ExprKind::Block { stmts, tail } = &mut e.kind else {
             unreachable!("only called on a block")
@@ -493,21 +360,18 @@ impl Cx<'_> {
         }
     }
 
-    /// Tries to split the block at statement `i`. On success `stmts` has been
-    /// truncated to what stays before the split, `tail` has been taken, and the
-    /// returned expression is the block's new tail.
+    /// Tries to split the block at statement `i`.
     fn split_at(
         &mut self,
         stmts: &mut Vec<Stmt>,
         tail: &mut Option<Box<Expr>>,
         i: usize,
     ) -> Option<Expr> {
-        // `consumes` says whether the statement itself is swallowed by the
-        // split, which is the case exactly when the `?` was the whole of it and
-        // its binder moved onto the success arm.
+        // `consumes` says whether the statement itself is swallowed by the split, which is the case
+        // exactly when the `?` was the whole of it and its binder moved onto the success arm.
         let (operand, at, pat, consumes) = match &mut stmts[i] {
-            // `let x: T = e?;` has no `let` left to carry `T` on after the
-            // split, and a written annotation must not evaporate.
+            // `let x: T = e?;` has no `let` left to carry `T` on after the split, and a written
+            // annotation must not evaporate.
             Stmt::Let {
                 ty: Some(_),
                 value,
@@ -518,9 +382,7 @@ impl Cx<'_> {
                 self.annotated_let(value, span);
                 return None;
             }
-            // The shape every conversion in the corpus takes. Without this case
-            // the general one would emit `Ok(t) -> { let p = t; rest }`, which
-            // is a different definition with a different hash.
+            // The shape every conversion in the corpus takes.
             Stmt::Let {
                 pat,
                 ty: None,
@@ -550,16 +412,13 @@ impl Cx<'_> {
                 tail: tail.take(),
             },
         };
-        // The success arm's body is a block in return position, so it is walked
-        // as one and the next `?` in the run splits it again.
+        // The success arm's body is a block in return position, so it is walked as one and the next
+        // `?` in the run splits it again.
         self.block(&mut body);
         Some(self.wrap(operand, at, pat, body))
     }
 
-    /// A statement whose whole value is a `?`. The `?`'s own operand is scanned
-    /// first, because an inner `?` is evaluated before the outer one: `let x =
-    /// f(a?)?;` lifts `a` now and comes back for the outer one on the next walk
-    /// of the rewritten block.
+    /// A statement whose whole value is a `?`
     fn take_try_stmt(
         &mut self,
         value: &mut Expr,
@@ -615,22 +474,8 @@ impl Cx<'_> {
         unwrap_try(value);
     }
 
-    // --------------------------------------------------------------- the scan
-
-    /// Walks `e` in evaluation order looking for the first `?` that may be
-    /// lifted to the head of the region.
-    ///
-    /// Two conditions, checked structurally and with no types:
-    ///
-    /// 1. **unconditional** — the walk never enters an `if` branch, a `match`
-    ///    arm or guard, the right operand of `&&`/`||`, a nested block, or a
-    ///    lambda, handler or region body;
-    /// 2. **pure prefix** — everything evaluated before it is [`is_pure`], the
-    ///    predicate normalization uses to license reordering a run of `let`s. It
-    ///    is the same question — *may this be reordered* — so it is deliberately
-    ///    the same predicate rather than a second one that could drift.
-    ///
-    /// A `?` the walk stops short of is not silently kept: the sweep refuses it.
+    /// Walks `e` in evaluation order looking for the first `?` that may be lifted to the head of
+    /// the region.
     fn scan(&mut self, e: &mut Expr) -> Scan {
         grow(|| self.scan_inner(e))
     }
@@ -640,13 +485,12 @@ impl Cx<'_> {
             ExprKind::Lit(_) | ExprKind::Var(_) => Scan::Pure,
 
             ExprKind::Try { operand } => {
-                // The operand is evaluated before the `?` acts, so an inner `?`
-                // is lifted first.
+                // The operand is evaluated before the `?` acts, so an inner `?` is lifted first.
                 if let found @ Scan::Found(_) = self.scan(operand) {
                     return found;
                 }
-                // The operand's *own* impurity is no reason to refuse: it is the
-                // thing being unwrapped, not something evaluated before it.
+                // The operand's *own* impurity is no reason to refuse: it is the thing being
+                // unwrapped, not something evaluated before it.
                 let binder = self.fresh_binder(e.span);
                 let span = e.span;
                 let operand = std::mem::replace(operand.as_mut(), Expr {
@@ -673,9 +517,9 @@ impl Cx<'_> {
             ExprKind::Unary { operand, .. } => self.scan(operand),
 
             ExprKind::App { func, args, named } => {
-                // Named arguments scan after the positional ones because that
-                // is the order they were written in; `defaults::expand` has not
-                // run yet and cannot, so this is the only order there is.
+                // Named arguments scan after the positional ones because that is the order they
+                // were written in; `defaults::expand` has not run yet and cannot, so this is the
+                // only order there is.
                 match self.sequence(
                     std::iter::once(func.as_mut())
                         .chain(args.iter_mut())
@@ -694,17 +538,15 @@ impl Cx<'_> {
             ExprKind::List { items } => self.sequence(items.iter_mut()),
             ExprKind::Field { base, .. } => self.scan(base),
 
-            // Unreachable inside `parse_module`, where `record_update::expand`
-            // has already run — walked rather than `unreachable!`ed because a
-            // conservative walk cannot panic and cannot be wrong: the base is a
-            // path, and the written values are evaluated left to right.
+            // Unreachable inside `parse_module`, where `record_update::expand` has already run —
+            // walked rather than `unreachable!`ed because a conservative walk cannot panic and
+            // cannot be wrong: the base is a path, and the written values are evaluated left to
+            // right.
             ExprKind::RecordUpdate { base, fields } => self.sequence(
                 std::iter::once(base.as_mut()).chain(fields.iter_mut().map(|(_, v)| v)),
             ),
 
-            // Conditional from here down. The scan stops and the sub-expression
-            // contributes only its purity; a `?` inside one is refused, because
-            // lifting it would run its operand on a path that does not reach it.
+            // Conditional from here down.
             ExprKind::If {
                 cond,
                 then_branch,
@@ -723,13 +565,12 @@ impl Cx<'_> {
                 ),
             },
 
-            // A nested block is not entered: lifting a `?` out of one would take
-            // it out of the scope of the block's own binders, so
-            // `{ let a = f(); a? }` would stop meaning what it says. A block in
-            // *return* position is reached by `ret`, never by the scan.
+            // A nested block is not entered: lifting a `?` out of one would take it out of the
+            // scope of the block's own binders, so `{ let a = f(); a? }` would stop meaning what it
+            // says.
             ExprKind::Block { .. }
-            // A lambda body is not evaluated here at all, and a handler, a cell,
-            // a region and a `simulate` are barriers a `?` may not cross.
+            // A lambda body is not evaluated here at all, and a handler, a cell, a region and a
+            // `simulate` are barriers a `?` may not cross.
             | ExprKind::Lambda { .. }
             | ExprKind::Handle { .. }
             | ExprKind::WithCell { .. }
@@ -738,8 +579,7 @@ impl Cx<'_> {
         }
     }
 
-    /// Sub-expressions left to right, stopping at the first `?` and at the first
-    /// impure one.
+    /// Sub-expressions left to right, stopping at the first `?` and at the first impure one.
     fn sequence<'e>(&mut self, parts: impl Iterator<Item = &'e mut Expr>) -> Scan {
         let mut acc = Scan::Pure;
         for p in parts {
@@ -751,17 +591,8 @@ impl Cx<'_> {
         acc
     }
 
-    // ---------------------------------------------------------------- refusal
-
-    /// Refuses every `?` left in `e` and unwraps it, so that no
-    /// [`ExprKind::Try`] escapes the parser.
-    ///
-    /// `scope` is `Some` when the whole expression is somewhere `?` has no
-    /// meaning at all — a `test`, a `law`, a spec, a `fn` whose return type this
-    /// file cannot read — and `None` when a mode was established and the `?`
-    /// simply stood where it could not be lifted from. `barrier` overrides both:
-    /// a `?` under a lambda, a handler or a region is refused for *that*, which
-    /// is the rule the writer actually hit.
+    /// Refuses every `?` left in `e` and unwraps it, so that no [`ExprKind::Try`] escapes the
+    /// parser.
     fn sweep(&mut self, e: &mut Expr, scope: Option<&Why>, barrier: Option<&'static str>) {
         grow(|| {
             if matches!(e.kind, ExprKind::Try { .. }) {
@@ -902,11 +733,8 @@ impl Cx<'_> {
         );
     }
 
-    // ------------------------------------------------------------- synthesis
-
-    /// `match operand { <failure>, <success>(pat) -> body }`, **failure arm
-    /// first** — the order the corpus writes 129 times to 3, and the reason a
-    /// converted site keeps its hash.
+    /// `match operand { <failure>, <success>(pat) -> body }`, **failure arm first** — the order the
+    /// corpus writes 129 times to 3, and the reason a converted site keeps its hash.
     fn wrap(&mut self, operand: Expr, at: Span, pat: Pattern, body: Expr) -> Expr {
         let mode = self.mode.expect("a mode is established before any lift");
         let span = at;
@@ -954,13 +782,6 @@ impl Cx<'_> {
     }
 
     /// A binder no source can collide with.
-    ///
-    /// A `?` cannot occur in an identifier, which is what [`ModuleName::qualify`]
-    /// relies on for the same purpose. A synthesized binder named `t` would
-    /// **capture** a `t` the author wrote in the expression it wraps, and the
-    /// capture would type-check wherever the two happened to agree. Binder names
-    /// are erased by de Bruijn levelling in `ply_hash::normalize`, so the
-    /// counter costs no hash.
     fn fresh_binder(&mut self, span: Span) -> Ident {
         let name = Symbol::new(format!("?{}", self.fresh));
         self.fresh += 1;
@@ -1000,9 +821,7 @@ fn ctor_pattern(name: &'static str, args: Vec<Pattern>, span: Span) -> Pattern {
     }
 }
 
-/// `e?` becomes `e`. The diagnostic is already recorded and the module will not
-/// compile, but `parse_recovering` hands the tree back regardless, and every
-/// crate downstream of this one answers an [`ExprKind::Try`] with `unreachable!`.
+/// `e?` becomes `e`.
 fn unwrap_try(e: &mut Expr) {
     let ExprKind::Try { operand } = &mut e.kind else {
         return;

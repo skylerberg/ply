@@ -1,33 +1,4 @@
 //! The fragment of ADR 0016 §3.2, compiled with Cranelift.
-//!
-//! What is compiled natively: `Int` and `Bool` arithmetic, comparison, the
-//! short-circuiting operators, `if`, `let`, `block`, and `match` on literal
-//! patterns. What stays boxed: every value. What stays in the interpreter:
-//! every builtin, every effect, and every Ply function outside the compiled set.
-//!
-//! Anything else is **refused by name**. A spike that silently fell back to the
-//! interpreter for part of a body would report a ratio for a program it did not
-//! compile, which is the one failure mode that would make the number worthless.
-//!
-//! # Provenance, and what changed
-//!
-//! Ported from `crates/ply-codegen-spike/src/jit.rs` on 2026-08-31, close to
-//! unchanged: `crate::program::Loaded` became [`crate::source::Source`], which
-//! is the same three accessors over a program a shipping command already
-//! loaded rather than one this file loads for itself, and the type this module
-//! produces was renamed `Compiled` -> [`Unit`] so that `ply_eval::Compiled` —
-//! the trait it is offered through — can be named without qualification. That
-//! is the whole diff.
-//!
-//! **The paragraph above is now a claim about a shipping crate rather than
-//! about a spike, and it is a stronger claim in one place.** A silent fallback
-//! would have made a *number* worthless; it would now make an *answer* wrong,
-//! because `ply_eval::Machine` enters this code and believes what it returns.
-//! What stops it is the same mechanism — [`Denotes::Uncompiled`] refuses the
-//! caller at compile time, so the compiled set is closed under calls — and
-//! `crates/ply-codegen/tests/suite/fragment.rs`'s
-//! `the_compiled_set_is_closed_under_calls` is what checks it by compiling the
-//! fixpoint's answer a second time and asserting it refuses nothing.
 
 use crate::rt::{self, Ctx, Tables};
 use crate::source::Source;
@@ -53,7 +24,7 @@ use std::rc::Rc;
 /// A compiled function: `extern "C" fn(ctx, args) -> handle`.
 pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 
-/// What the fragment refused, and where. Loud on purpose (§3.2).
+/// What the fragment refused, and where.
 #[derive(Debug)]
 pub struct Refused {
     pub function: String,
@@ -109,38 +80,12 @@ struct Helpers {
 }
 
 /// One compiled program, and the tables its runtime context needs.
-///
-/// It owns the [`JITModule`], so every [`Entry`] handed out lives exactly as
-/// long as this does. Nothing frees the executable pages — `JITModule` unmaps
-/// only through `unsafe fn free_memory(self)` and nothing calls it — so dropping
-/// one leaks. That is a spike, not a design; it is written down here because the
-/// bare `fn` pointer [`Unit::entry`] returns carries no lifetime and would
-/// otherwise look safe.
-///
-/// > **"That is a spike, not a design" no longer excuses it, 2026-08-31.** This
-/// > type is in a shipping binary now, so the leak is a property of `ply test
-/// > --backend cranelift` and is stated as one rather than deferred: **one unit
-/// > per worker per group is compiled and none is freed until the process
-/// > exits.** Over `examples/` at the default `-j` that is 18 units in a run
-/// > lasting about a second.
-/// >
-/// > Why it is tolerated rather than fixed here, and what would change it.
-/// > `free_memory` is an `unsafe fn` because it invalidates every function
-/// > pointer the module handed out, and [`crate::backend::Bodies`] hands them to
-/// > a machine — so a correct `Drop` needs a proof that no [`Entry`] outlives
-/// > the `Unit`, which this type does not carry (`Bodies`'s `_code` field is the
-/// > informal version of it). The bound is `units × code size` for the life of
-/// > one command invocation, and `ply` is a command rather than a server.
-/// > **It would stop being tolerable the moment a long-running process installs
-/// > a backend** — `ply serve` does not and may not, per ADR 0026 §4.7 — or the
-/// > moment units are compiled per test rather than per worker.
 pub struct Unit {
     module: JITModule,
     entries: HashMap<String, (FuncId, usize)>,
     tables: Rc<Tables>,
     pub nodes: HashMap<String, usize>,
-    /// Nanoseconds spent in `cranelift`, from the first declaration to
-    /// `finalize_definitions`.
+    /// Nanoseconds spent in `cranelift`, from the first declaration to `finalize_definitions`.
     pub compile_nanos: u128,
 }
 
@@ -159,7 +104,7 @@ impl Unit {
         &self.tables
     }
 
-    /// A context wired to this program's tables. One per thread of calls.
+    /// A context wired to this program's tables.
     pub fn context(&self) -> Ctx {
         Ctx::new(self.tables.clone())
     }
@@ -168,10 +113,8 @@ impl Unit {
 /// What the compiler is allowed to do beyond lowering the fragment.
 #[derive(Clone, Copy)]
 pub struct Opts {
-    /// Whether a `Str`, `Bytes` or nullary-constructor literal becomes a
-    /// constant in the code object. A real backend would; the interpreter
-    /// cannot, because a literal is a node it re-evaluates. Switching it off is
-    /// how the spike reports the two halves of its win separately.
+    /// Whether a `Str`, `Bytes` or nullary-constructor literal becomes a constant in the code
+    /// object.
     pub fold_literals: bool,
 }
 
@@ -211,11 +154,8 @@ fn helper_sig(module: &JITModule, params: usize, returns: bool) -> Signature {
 type Body = (String, Vec<Symbol>, Code, usize);
 
 impl Jit {
-    /// Compiles `names` as one unit: a call between two of them is a direct
-    /// call, and a call to anything else refuses the caller.
-    ///
-    /// The compiled set is therefore **closed under calls** — which is the whole
-    /// of what R5 changed here. See [`Denotes::Uncompiled`].
+    /// Compiles `names` as one unit: a call between two of them is a direct call, and a call to
+    /// anything else refuses the caller.
     pub fn compile(loaded: &'static Source, names: &[&str]) -> Result<Unit> {
         Jit::compile_with(loaded, names, Opts::default())
     }
@@ -263,24 +203,14 @@ impl Jit {
         })
     }
 
-    /// Every refusal `names` produces when they are offered **as one unit**,
-    /// rather than the first one.
-    ///
-    /// [`Jit::compile_with`] fails the whole unit on the first construct outside
-    /// the fragment, which is right for a measurement and useless for deciding
-    /// *which* functions a unit could hold. A caller closing a candidate set
-    /// under calls needs all of them, because dropping one function can refuse
-    /// its callers on the next round.
-    ///
-    /// Nothing is finalized and no [`Unit`] is produced: a refused function
-    /// is declared and never defined, and finalizing that is an error.
+    /// Every refusal `names` produces when they are offered **as one unit**, rather than the first
+    /// one.
     pub fn refusals(loaded: &'static Source, names: &[&str], opts: Opts) -> Result<Vec<Refused>> {
         let (mut jit, bodies, _) = Jit::prepare(loaded, names, opts)?;
         let mut out = Vec::new();
         for (name, params, body, module_index) in &bodies {
-            // A fresh context per function: `FunctionBuilder::finalize` is what
-            // returns a `FunctionBuilderContext` to a reusable state, and a
-            // refused body never reaches it.
+            // A fresh context per function: `FunctionBuilder::finalize` is what returns a
+            // `FunctionBuilderContext` to a reusable state, and a refused body never reaches it.
             let mut clif = ClifContext::new();
             let mut fctx = FunctionBuilderContext::new();
             clif.func.signature = jit.entry_signature();
@@ -293,9 +223,9 @@ impl Jit {
                 body,
                 *module_index,
             ) {
-                // A refusal is the answer this is asking for; anything else —
-                // a cranelift failure, a name that does not resolve — is a bug
-                // in the spike and must not be read as "outside the fragment".
+                // A refusal is the answer this is asking for; anything else — a cranelift failure,
+                // a name that does not resolve — is a bug in the spike and must not be read as
+                // "outside the fragment".
                 let Some(refused) = e.downcast_ref::<Refused>() else {
                     return Err(e);
                 };
@@ -317,9 +247,9 @@ impl Jit {
         sig
     }
 
-    /// Everything both drivers do before a body is lowered to instructions:
-    /// build the module, register the runtime symbols, declare every function
-    /// so that a call between two of them resolves, and lower each body.
+    /// Everything both drivers do before a body is lowered to instructions: build the module,
+    /// register the runtime symbols, declare every function so that a call between two of them
+    /// resolves, and lower each body.
     fn prepare(
         loaded: &'static Source,
         names: &[&str],
@@ -423,12 +353,9 @@ impl Jit {
             module_index,
         };
 
-        // The prologue `ply_eval::limit` needs and ADR 0019 §5 item 6 records as
-        // missing: one nested call is spent here and given back on the normal
-        // return, so a compiled recursion is bounded by the same number the
-        // machine bounds an interpreted one by. Four instructions — load,
-        // subtract, branch, store — on a path a real backend pays for a stack
-        // check anyway.
+        // The prologue `ply_eval::limit` needs and ADR 0019 §5 item 6 records as missing: one
+        // nested call is spent here and given back on the normal return, so a compiled recursion is
+        // bounded by the same number the machine bounds an interpreted one by.
         let fuel = fx.load_fuel();
         let spent = fx.builder.ins().iadd_imm(fuel, -1);
         let go = fx.builder.create_block();
@@ -460,8 +387,7 @@ impl Jit {
 
         let result = fx.expr(body, &mut scope)?;
         let handle = fx.boxed(result);
-        // The only path that gives the nested call back. `failure` does not, and
-        // must not: a failed entry is abandoned whole and `Ctx::begin` reseeds.
+        // The only path that gives the nested call back.
         let left = fx.load_fuel();
         let restored = fx.builder.ins().iadd_imm(left, 1);
         fx.store_fuel(restored);
@@ -482,8 +408,7 @@ fn declare(module: &mut JITModule, name: &str, params: usize, returns: bool) -> 
     Ok(module.declare_function(name, Linkage::Import, &sig)?)
 }
 
-/// A JIT symbol may not collide with a runtime helper's, and a Ply name holds
-/// dots.
+/// A JIT symbol may not collide with a runtime helper's, and a Ply name holds dots.
 fn mangle(name: &str) -> String {
     format!("ply${}", name.replace('.', "$"))
 }
@@ -538,31 +463,13 @@ fn count_nodes(code: &Code) -> usize {
     n
 }
 
-/// Where compiled code finds `Ctx::failed`, taken from the type rather than
-/// written down: `#[repr(C)]` fixes the layout and `offset_of!` reads it, so the
-/// two cannot drift when a field is added.
+/// Where compiled code finds `Ctx::failed`, taken from the type rather than written down:
+/// `#[repr(C)]` fixes the layout and `offset_of!` reads it, so the two cannot drift when a field is
+/// added.
 const FAILED_OFFSET: i32 = std::mem::offset_of!(Ctx, failed) as i32;
 const FUEL_OFFSET: i32 = std::mem::offset_of!(Ctx, fuel) as i32;
 
-/// Whether a compiled body may call this builtin, and what to say when it may
-/// not.
-///
-/// Each refusal closes a hazard rather than being conservative for its own sake,
-/// and each is read off `ply_eval`'s own vocabulary rather than a list somebody
-/// transcribed:
-///
-/// - [`Builtin::higher_order`] is the crate's own name for "calls user code", so
-///   `call` may answer `Step::Apply`. Running user code from inside a native
-///   frame needs the machine, and a compiled body is handed no machine — before
-///   R5 these compiled clean and raised at run time, which meant a census
-///   counted a function that could not run.
-/// - `cell_get` and `cell_set` are the only builtins that reach an arena. A
-///   compiled body's arena is not the machine's, so the access would land in the
-///   wrong world; handing over the right one would be worse, because it would
-///   skip `Machine::record_cell_access` and leave a `simulate` region's
-///   partial-order reduction pruning interleavings that race.
-/// - `secret_of_string` is the only introduction of a [`Value::Secret`], and the
-///   fragment's `slots` and constant pool both outlive the call that made one.
+/// Whether a compiled body may call this builtin, and what to say when it may not.
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
     if b.higher_order() {
         return Err(format!("`{}`, a builtin that calls user code", b.name()));
@@ -580,27 +487,12 @@ fn admissible_builtin(b: Builtin) -> Result<(), String> {
     }
 }
 
-/// What a name denotes, decided at compile time in the order
-/// `Machine::lookup` decides it at run time.
-///
-/// Every variant is handled without a wildcard where it matters ([`Fx::app`]),
-/// so a variant added later fails to compile until somebody decides whether a
-/// compiled body may reach it.
+/// What a name denotes, decided at compile time in the order `Machine::lookup` decides it at run
+/// time.
 enum Denotes {
     Local(Val),
     Compiled(FuncId, usize),
     /// A Ply function this unit did not compile.
-    ///
-    /// **This refuses the enclosing function.** It used to emit a trampoline —
-    /// `rt_call_machine`, a whole `Machine::call` entry point on a second,
-    /// privately-held machine — and that was tolerable only while nothing could
-    /// enter compiled code from inside a live machine. It can now, so a
-    /// trampoline would be a route from one machine's frame into another
-    /// machine's `reset()`: the caller's handler stack, trail, region
-    /// generations and footprint discarded, silently. Refusing the caller
-    /// instead makes the compiled set closed under calls, which is the property
-    /// `crate::backend::Bodies` needs to promise the machine that a native
-    /// body cannot reach anything the machine is holding.
     Uncompiled(String),
     Ctor(usize, usize),
     Builtin(usize),
@@ -629,11 +521,6 @@ impl Fx<'_, '_> {
     }
 
     /// The index of a field name in the unit's table, added on first use.
-    ///
-    /// Deduplicated because a body reads the same name repeatedly —
-    /// `benches/kernel`'s `expand` reads seven fields of one record twice — and
-    /// a table with a row per *occurrence* would grow with the program rather
-    /// than with its vocabulary.
     fn field_index(&mut self, name: &Symbol) -> i64 {
         if let Some(i) = self.jit.fields.iter().position(|f| f == name) {
             return i as i64;
@@ -659,8 +546,8 @@ impl Fx<'_, '_> {
             .store(MemFlags::trusted(), v, self.ctx, FUEL_OFFSET);
     }
 
-    /// After every call that can fail: one load and one branch, which is what a
-    /// real backend pays for a fallible runtime call too.
+    /// After every call that can fail: one load and one branch, which is what a real backend pays
+    /// for a fallible runtime call too.
     fn check(&mut self) {
         let failed =
             self.builder
@@ -725,8 +612,8 @@ impl Fx<'_, '_> {
         self.builder.ins().call(func, &all);
     }
 
-    /// The argument array a call is handed: one stack slot, one store per
-    /// argument, and every value boxed at the boundary.
+    /// The argument array a call is handed: one stack slot, one store per argument, and every value
+    /// boxed at the boundary.
     fn spill(&mut self, handles: &[cranelift_codegen::ir::Value]) -> cranelift_codegen::ir::Value {
         let bytes = (handles.len().max(1) * 8) as u32;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
@@ -808,8 +695,8 @@ impl Fx<'_, '_> {
         ))
     }
 
-    /// The representation an expression will produce, decided before its
-    /// branches are compiled so a join can be given a block parameter.
+    /// The representation an expression will produce, decided before its branches are compiled so a
+    /// join can be given a block parameter.
     fn kind_of(&mut self, code: &Code, scope: &Scope) -> Result<Kind> {
         Ok(match &code.kind {
             NodeKind::Lit(Lit::Int(_), _) => Kind::Int,
@@ -844,8 +731,8 @@ impl Fx<'_, '_> {
                 let b = self.kind_of(else_branch, scope)?;
                 if a == b { a } else { Kind::Boxed }
             }
-            // A block with no tail answers `Unit`, which is boxed, so it falls
-            // through to the arm below rather than restating it.
+            // A block with no tail answers `Unit`, which is boxed, so it falls through to the arm
+            // below rather than restating it.
             NodeKind::Block {
                 stmts,
                 tail: Some(t),
@@ -904,11 +791,9 @@ impl Fx<'_, '_> {
                             v,
                         })
                     }
-                    // `Int` like the rest of the fragment: `as_int` refuses a
-                    // `Float` or `Decimal` operand at run time and the entry
-                    // declines, which is what every other arithmetic node here
-                    // already does. `i64::MIN` is the one input `checked_neg`
-                    // rejects, and `ply_eval::apply_unary` raises there too.
+                    // `Int` like the rest of the fragment: `as_int` refuses a `Float` or `Decimal`
+                    // operand at run time and the entry declines, which is what every other
+                    // arithmetic node here already does.
                     UnOp::Neg => {
                         let a = self.as_int(value);
                         let overflowed = self.builder.create_block();
@@ -1066,8 +951,8 @@ impl Fx<'_, '_> {
         }
     }
 
-    /// A constant handle, as an immediate when folding is on and as a rebuilt
-    /// allocation when it is off.
+    /// A constant handle, as an immediate when folding is on and as a rebuilt allocation when it is
+    /// off.
     fn constant(&mut self, handle: i64) -> Val {
         let v = self.builder.ins().iconst(types::I64, handle);
         if self.jit.opts.fold_literals {
@@ -1084,26 +969,6 @@ impl Fx<'_, '_> {
     }
 
     /// A literal, or a refusal for the two the fragment has no arithmetic for.
-    ///
-    /// `Float` and `Decimal` are refused **here**, at the literal, because
-    /// neither of the two filters that guard this boundary reads a body:
-    /// `entry::scalar_signature` sees `Int -> Int` and the value boundary sees
-    /// an `Int` argument, so a `1.5` inside an `Int -> Int` body passed both and
-    /// was compiled, registered and offered. It could not produce a wrong answer
-    /// — the constant met `rt_unbox_int` and the entry declined — but a census
-    /// counted it as compiled and the fragment claimed a coverage it did not
-    /// have, which is the defect ADR 0018 §0 records.
-    ///
-    /// Refusing is the choice rather than building a `Float` path: a real one
-    /// widens the agreement surface by `NaN`, by `-0.0`, by float equality and
-    /// by `Decimal` precision, and the workload this fragment is being widened
-    /// for — a self-hosted front end — is field accesses and list patterns, not
-    /// floating point.
-    ///
-    /// **This closes the literal-shaped half only.** A `Float` reaching an
-    /// `Int` -> `Int` body as a *builtin's return value* is not refused by
-    /// anything here; it still meets `rt_unbox_int` and still declines. See
-    /// `tests/hazards.rs::a_float_or_decimal_literal_inside_an_int_body_is_never_a_wrong_answer`.
     fn literal(&mut self, lit: &Lit) -> Result<Val> {
         match lit {
             Lit::Int(i) => Ok(Val {
@@ -1326,13 +1191,8 @@ impl Fx<'_, '_> {
     }
 
     /// The constructor a name in *pattern* position denotes, resolved the way
-    /// `ply_eval::Machine::ctor_name` resolves it, and `None` for a name that
-    /// denotes nothing — which is what makes it a binder.
-    ///
-    /// Pattern position is not expression position: [`Fx::denotation`] consults
-    /// the local scope and the function table first, and a pattern shadows
-    /// neither. Resolving one with the other is how the two engines came to
-    /// disagree in the first place.
+    /// `ply_eval::Machine::ctor_name` resolves it, and `None` for a name that denotes nothing —
+    /// which is what makes it a binder.
     fn ctor_of(&self, q: &QName) -> Option<(usize, usize)> {
         let global = if q.is_bare() {
             self.loaded
@@ -1359,9 +1219,7 @@ impl Fx<'_, '_> {
         Some((index, self.jit.ctors[index].1))
     }
 
-    /// Whether a sub-pattern binds without being able to fail. Only these may
-    /// sit under a constructor pattern: a refutable one would need the arm's
-    /// `miss` edge from inside the block that already committed to the arm.
+    /// Whether a sub-pattern binds without being able to fail.
     fn irrefutable(&self, pat: &ply_syntax::ast::Pattern) -> bool {
         match &pat.kind {
             PatternKind::Wildcard => true,
@@ -1372,9 +1230,8 @@ impl Fx<'_, '_> {
         }
     }
 
-    /// The name a sub-pattern binds, and `None` for one that binds nothing —
-    /// a wildcard, or a bare nullary constructor, which is a test rather than a
-    /// binder ([`Fx::test_pattern`]).
+    /// The name a sub-pattern binds, and `None` for one that binds nothing — a wildcard, or a bare
+    /// nullary constructor, which is a test rather than a binder ([`Fx::test_pattern`]).
     fn binder(&self, pat: &ply_syntax::ast::Pattern) -> Option<Symbol> {
         let PatternKind::Var(id) = &pat.kind else {
             return None;
@@ -1385,18 +1242,8 @@ impl Fx<'_, '_> {
         }
     }
 
-    /// The refutable half of a pattern: leave the current block for `hit` when
-    /// it matches and `miss` when it does not.
-    ///
-    /// The `Var` arm consults the constructor table because
-    /// `ply_eval::Machine::matches` does, and the two must not diverge. It is
-    /// **unreachable from Ply source**: `ply_syntax`'s pattern parser sends
-    /// every capitalized bare name to `PatternKind::Ctor` with no arguments and
-    /// only a lowercase one to `PatternKind::Var`, so `None` never arrives here
-    /// as a `Var`. Checked by deleting the lookup and running the suite — all
-    /// green, and a direct `or_else(Some(7), 99)` still answers 7. Kept as the
-    /// cheap half of a mirror rather than advertised as a fix; the assertion
-    /// that carries this lowering is on the `Ctor` arm below.
+    /// The refutable half of a pattern: leave the current block for `hit` when it matches and
+    /// `miss` when it does not.
     fn test_pattern(
         &mut self,
         pat: &ply_syntax::ast::Pattern,
@@ -1498,9 +1345,7 @@ impl Fx<'_, '_> {
         self.builder.ins().brif(is, hit, &[], miss, &[]);
     }
 
-    /// The bindings a pattern makes, emitted in the block that has already
-    /// committed to the arm. Every case here was admitted by
-    /// [`Fx::test_pattern`], so a shape it refuses cannot arrive.
+    /// The bindings a pattern makes, emitted in the block that has already committed to the arm.
     fn bind_pattern(
         &mut self,
         pat: &ply_syntax::ast::Pattern,

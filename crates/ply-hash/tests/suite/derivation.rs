@@ -1,18 +1,4 @@
 //! What a `derive` does to a hash.
-//!
-//! A generated definition is an ordinary definition, so it gets no special case
-//! anywhere in this crate — and that is exactly the claim worth testing, because
-//! it is what decides which tests a change to a type re-selects. Four facts:
-//!
-//! - a generated definition and a hand-written one with the same normalized form
-//!   are **the same definition**, so the provenance the deriver records is erased
-//!   like a name and unlike a signature;
-//! - **renaming the type re-runs no test**, because a name is not in the hash and
-//!   the generated body does not mention one;
-//! - **renaming a variant re-runs its tests**, because the variant's name is the
-//!   JSON tag, so the generated body moved and an observable protocol changed;
-//! - reordering two fields moves the hash, because JSON object order is
-//!   observable.
 
 use ply_hash::{DefHash, HashOutput, hash_program_ast};
 use ply_span::{SourceId, Symbol};
@@ -32,9 +18,7 @@ fn program_of(files: &[(&str, &str)]) -> Program {
     program
 }
 
-/// Enough of `std.json` for `import std.json` to resolve. The names a generated
-/// body calls need not be declared: an unresolved reference normalizes as a free
-/// name, deterministically, which is all these tests compare.
+/// Enough of `std.json` for `import std.json` to resolve.
 const JSON_STUB: &str = "// std.json, as much of it as a hash needs\n";
 
 fn hashes(source: &str) -> HashOutput {
@@ -54,10 +38,7 @@ fn hash_of(source: &str, name: &str) -> DefHash {
         .unwrap_or_else(|| panic!("no definition `{key}` in {:?}", out.defs.keys()))
 }
 
-/// A `derive eq` for a one-field record, written out. If the deriver's output
-/// changes this has to change with it — which is the point: the two must be one
-/// definition, and a test that had to be *updated* to keep saying so is still
-/// saying it.
+/// A `derive eq` for a one-field record, written out.
 const HANDWRITTEN: &str = "type Order = {id: Int}\n\
                            fn by_hand() -> {eq: (Order, Order) -> Bool} = \
                            {eq: |da: Order, db: Order| da == db}";

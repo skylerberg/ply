@@ -1,20 +1,4 @@
 //! `ply run --json` reports what the reference-counting pass actually did.
-//!
-//! ADR 0020 §9 recorded the gap this closes, in the provenance of a measurement
-//! it could not take: *"No deterministic counter turned out to exist — `ply run
-//! --json` reports no step, call or allocation count — so wall clock was
-//! unavoidable and user CPU was used as the robust half."* The counters existed
-//! the whole time in `ply_eval::rc::Stats`; nothing outside `ply-eval`'s own
-//! tests could read them. So a document that needed a count timed something
-//! instead, at load 17–88, and its absolutes did not reproduce.
-//!
-//! The load-bearing assertion here is **not** that a number appears. It is that
-//! `in_place` is `null` on the tree-walker, because that engine runs no
-//! reference counting at all — `Interp::lookup` answers every `Var` with
-//! `v.clone()` and `interp.rs` holds no `rc::carry` or `take_unique` call site.
-//! A `0.0` there would read as "this program copies everything", which is true
-//! of the engine and says nothing about the program, and it is the shape a
-//! reader would act on.
 
 use std::process::Command;
 
@@ -30,8 +14,8 @@ fn run(engine: &str, src: &str) -> serde_json::Value {
     serde_json::from_slice(&out.stdout).expect("`--json` must answer one object")
 }
 
-/// A loop that appends 200 times with the growing field last, so the machine
-/// can reuse at every step and the counts are a round number a reader can check.
+/// A loop that appends 200 times with the growing field last, so the machine can reuse at every
+/// step and the counts are a round number a reader can check.
 const APPENDS: &str = "\
 fn build(n: Int) -> List<Int> =
   iterate({i: 0, out: []}, n + 1, |s: {i: Int, out: List<Int>}|
@@ -70,8 +54,8 @@ fn the_tree_walker_reports_no_in_place_ratio_because_it_counts_nothing() {
     );
 }
 
-/// `--engine both` runs two evaluators that do not count the same thing, and
-/// their sum is a figure about neither.
+/// `--engine both` runs two evaluators that do not count the same thing, and their sum is a figure
+/// about neither.
 #[test]
 fn running_both_engines_reports_no_counters_rather_than_a_blend() {
     let v = run("both", APPENDS);
@@ -83,8 +67,8 @@ fn running_both_engines_reports_no_counters_rather_than_a_blend() {
     );
 }
 
-/// Non-vacuity: the counters must move with the program, or the three tests
-/// above would pass over a surface that reports a constant.
+/// Non-vacuity: the counters must move with the program, or the three tests above would pass over a
+/// surface that reports a constant.
 #[test]
 fn the_counts_follow_the_program_rather_than_being_a_constant() {
     let ten = run("machine", &APPENDS.replace("build(200)", "build(10)"));

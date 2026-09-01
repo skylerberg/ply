@@ -1,12 +1,4 @@
 //! Observability as an effect, checked from the outside.
-//!
-//! The claims ADR 0015 §1 makes are claims about a *row* and about a
-//! *substitution*, and neither is visible from inside `ply-host`. This file is
-//! where they are asserted the way a user would see them: `ply check --types`
-//! prints which channels a definition records on, `ply test --explain` puts two
-//! channels in one concurrency group and two definitions on one channel in two,
-//! a `det` test that reaches an unhandled `trace` operation does not compile,
-//! and a test that installs the twin has an empty row and is cached.
 
 use assert_cmd::prelude::*;
 use ply_span::codes;
@@ -38,11 +30,8 @@ fn json(dir: &Path, args: &[&str]) -> Value {
         .unwrap_or_else(|e| panic!("{e}: {}", output(&out)))
 }
 
-/// Two endpoints recording on two channels, and the clause set a test installs
-/// to collect what they recorded. The `with_cell` is **inside** each test, which
-/// is the whole of ADR 0015 §7's first row: one collector around a suite is one
-/// shared cell, and two tests asserting on it are coupled exactly as W4's pooled
-/// connection coupled two the footprint graph believed were disjoint.
+/// Two endpoints recording on two channels, and the clause set a test installs to collect what they
+/// recorded.
 const SERVICE: &str = r#"
 import std.trace
 import std.trace (trace)
@@ -97,17 +86,15 @@ test "what restock records is recorded on its own channel" {
 }
 "#;
 
-/// A row says what a function records, and it says it per channel. That is the
-/// sentence the whole milestone rests on, and `ply check --types` is where a
-/// reader sees it with no flag.
+/// A row says what a function records, and it says it per channel.
 #[test]
 fn a_functions_row_names_the_channels_it_records_on() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "app.ply", SERVICE);
 
     let out = ply(dir.path()).args(["check", "--types"]).output().unwrap();
-    // Whitespace-insensitive, because a long row wraps and the claim is about
-    // the atoms rather than about the column the printer chose.
+    // Whitespace-insensitive, because a long row wraps and the claim is about the atoms rather than
+    // about the column the printer chose.
     let text: String = output(&out)
         .split_whitespace()
         .collect::<Vec<_>>()
@@ -122,15 +109,12 @@ fn a_functions_row_names_the_channels_it_records_on() {
     );
 }
 
-/// The reason the resource is a channel rather than a singleton. Two definitions
-/// recording on two channels do not conflict; two on one channel do, and the
-/// existing conflict graph is what serialises them — no new mechanism.
+/// The reason the resource is a channel rather than a singleton.
 #[test]
 fn two_channels_do_not_conflict_and_two_definitions_on_one_channel_do() {
     let dir = tempfile::tempdir().unwrap();
-    // Host-backed, so the atoms survive into the schedule rather than being
-    // discharged by a handler. `--host` is what makes these two tests reach the
-    // sink, which is the arrangement the conflict graph exists to protect.
+    // Host-backed, so the atoms survive into the schedule rather than being discharged by a
+    // handler.
     write(
         dir.path(),
         "app.ply",
@@ -174,23 +158,12 @@ test/nondet "records on items" {
         group_of("records on items"),
         "two channels do not conflict, so these two run beside each other: {explained:#}"
     );
-    // Three tests, two groups. One singleton `trace.write` would have made it
-    // one group of three, which is the cost §1.2 refuses.
+    // Three tests, two groups.
     assert_eq!(selection["parallelism"]["groups"], 2, "{explained:#}");
 }
 
-/// The span stack survives the scheduler, end to end and through the real
-/// production scheduler rather than through a Rust unit test.
-///
-/// Two tasks each open a span, yield, open a second inside it, yield again, and
-/// close both. The stack is the **driver's, per task**, so each inner span nests
-/// under its own outer one — and the check is against the tree the record list
-/// itself implies, so it would catch a driver that got the links right by
-/// accident of ordering.
-///
-/// A stack keyed on the machine alone would put `b` inside `a`. A stack the
-/// *program* maintained would need the span to survive a `task.yield`, which is
-/// a continuation the program does not hold.
+/// The span stack survives the scheduler, end to end and through the real production scheduler
+/// rather than through a Rust unit test.
 #[test]
 fn two_tasks_interleaving_spans_nest_into_their_own_and_not_each_others() {
     let dir = tempfile::tempdir().unwrap();
@@ -265,15 +238,8 @@ pub fn main() -> Int / {trace.write[http], task.write} {
     );
 }
 
-/// A continuation resumed later cannot corrupt the span tree, and the mechanism
-/// that stops it is one already in the boundary rather than one this milestone
-/// added.
-///
-/// `trace.*` registers `Linearity::AtMostOnce` because replaying a continuation
-/// across an event writes the event twice, and a duplicated span in a log is a
-/// wrong answer about what happened rather than a missing one. A second `resume`
-/// over a captured span is therefore `E0426` naming the operation — before it is
-/// performed a second time, so the count is one rather than two.
+/// A continuation resumed later cannot corrupt the span tree, and the mechanism that stops it is
+/// one already in the boundary rather than one this milestone added.
 #[test]
 fn a_continuation_resumed_twice_across_a_span_is_e0426() {
     let dir = tempfile::tempdir().unwrap();
@@ -312,9 +278,9 @@ pub fn main() -> Int / {trace.write[http]} =
     );
 }
 
-/// `nondet` on the declaration is load-bearing: a `det` test that reaches an
-/// unhandled `trace` operation does not compile, with `--host` and without it,
-/// and the only way to make it compile is to install a collecting handler.
+/// `nondet` on the declaration is load-bearing: a `det` test that reaches an unhandled `trace`
+/// operation does not compile, with `--host` and without it, and the only way to make it compile is
+/// to install a collecting handler.
 #[test]
 fn a_det_test_reaching_an_unhandled_trace_operation_is_e0412() {
     let dir = tempfile::tempdir().unwrap();
@@ -348,9 +314,6 @@ test "this cannot be deterministic" {
     }
 }
 
-/// The substitution argument, end to end. A test that installs the twin has an
-/// empty row: it is `det`, it is cached, it runs without `--host`, and its
-/// second run is a cache hit.
 #[test]
 fn a_twin_backed_tracing_test_is_det_cached_and_hermetic() {
     let dir = tempfile::tempdir().unwrap();
@@ -378,10 +341,9 @@ fn a_twin_backed_tracing_test_is_det_cached_and_hermetic() {
     assert_eq!(second["summary"]["passed"], 0, "{second:#}");
 }
 
-/// `--trace off` binds a real, listed handler rather than an empty registry, and
-/// the listing names *that* handler — because "the run is discarding records" and
-/// "the run is writing JSON" are different facts and a trusted computing base
-/// that confused them would be lying about itself.
+/// `--trace off` binds a real, listed handler rather than an empty registry, and the listing names
+/// *that* handler — because "the run is discarding records" and "the run is writing JSON" are
+/// different facts and a trusted computing base that confused them would be lying about itself.
 #[test]
 fn ply_hosts_lists_the_sink_per_channel_and_names_the_one_that_serves_the_run() {
     let dir = tempfile::tempdir().unwrap();
@@ -418,14 +380,11 @@ fn ply_hosts_lists_the_sink_per_channel_and_names_the_one_that_serves_the_run() 
             && r["blocking"] == false),
         "{listing:#}"
     );
-    // Twelve rows: six operations over the two channels this program records
-    // on. One singleton `trace.write` would have been six.
+    // Twelve rows: six operations over the two channels this program records on.
     assert_eq!(traced.len(), 12, "{listing:#}");
 }
 
-/// One JSON object per line, on **stderr**, while `--json` owns stdout. A trace
-/// line interleaved into the document would destroy it, and a consumer that has
-/// to tolerate that is a consumer that cannot use `--json` at all.
+/// One JSON object per line, on **stderr**, while `--json` owns stdout.
 #[test]
 fn a_trace_line_goes_to_stderr_and_leaves_the_json_document_on_stdout_intact() {
     let dir = tempfile::tempdir().unwrap();

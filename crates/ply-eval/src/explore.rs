@@ -1,33 +1,4 @@
 //! Footprint-guided interleaving exploration.
-//!
-//! Dynamic partial-order reduction in the backtrack-set formulation, with
-//! [`StepFootprint::conflicts_with`] — resource-granular, exact, and the same
-//! predicate that decides which tests may run concurrently — substituted for the
-//! alias analysis the literature has to approximate. Two steps that do not
-//! conflict commute, so exploring both of their orders is provably redundant;
-//! everything in this module is bookkeeping over that one fact.
-//!
-//! The scheduler is not here. This module consumes a recorded run — steps, their
-//! access sets, and the enabled set at every scheduling point — and decides
-//! which seed to run next, so a caller supplies [`Simulation`] and gets back an
-//! [`Exploration`]. That split is what lets the search be tested against a model
-//! scheduler rather than only against the machine.
-//!
-//! Two rules the code cannot state for itself:
-//!
-//! - **Pruning must never skip an interleaving that could expose a distinct
-//!   outcome.** A race the search cannot reach is worse than no search, because
-//!   it produces false confidence. Where soundness and reduction disagree here,
-//!   reduction loses; [`backtracks`] documents each place that happens.
-//! - **A step's footprint must be complete.** An empty footprint means "touched
-//!   nothing shared", and this module prunes on that. A scheduler that forgets
-//!   to record a cell access does not produce a smaller number, it produces a
-//!   wrong one — and the symptom is a *better* reduction.
-//!
-//! Nothing here may name a hash-based collection or read anything the seed does
-//! not name: which interleaving runs next is as much a part of a run's
-//! determinism as which task runs next. `hygiene` at the bottom checks the rule
-//! that is checkable.
 
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::{BTreeMap, BTreeSet};
@@ -38,53 +9,28 @@ use crate::sched::{Stamp, StepRecord, happens_before};
 use crate::sim::{Exploration, Naive, Plan, Race, RaceSite, Seed, SimMode, StepFootprint, TaskId};
 
 /// One step of one task, as the search reads it.
-///
-/// A step runs from the scheduler's resumption of a task up to and including
-/// that task's next perform, so the boundary between two steps is a scheduling
-/// point and `steps[i]` is what ran at point `i`.
-///
-/// [`StepRecord`] is the scheduler's own record of the same step and
-/// [`Step::from_record`] adopts one. The two differ in exactly the site a race
-/// is printed at, which the scheduler does not carry and the trace does.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Step {
     /// Which of the entry point's `simulate` regions took this step.
-    ///
-    /// A test may enter several regions in sequence — only *nesting* is
-    /// `E0416` — and they run one after another, never interleaved. Two steps
-    /// from different regions can therefore never be reordered, and a task id
-    /// means a different task in each, so the search must not pair them.
     pub region: SimId,
     pub task: TaskId,
-    /// Every task the scheduler could have resumed at this point, in its
-    /// canonical order. That order is part of what a seed *means* — a choice is
-    /// an index into it — so a scheduler that orders it by anything the seed
-    /// does not fix has already broken replay, and [`explore`] reports
-    /// [`codes::SIMULATION_DIVERGENCE`] when it catches that.
+    /// Every task the scheduler could have resumed at this point, in its canonical order.
     pub enabled: Vec<TaskId>,
     /// The index into `enabled` that was taken; `enabled[choice] == task`.
     pub choice: u16,
-    /// What the step touched, **excluding** the terminating `task.*` / `clock.*`
-    /// atom and **including** every cell and every `random.write`. This is the
-    /// dependence relation's whole input.
+    /// What the step touched, **excluding** the terminating `task.*` / `clock.*` atom and
+    /// **including** every cell and every `random.write`.
     pub accesses: StepFootprint,
-    /// The definition the step was inside. `None` when the run was not traced —
-    /// never guessed.
+    /// The definition the step was inside.
     pub definition: Option<Symbol>,
     pub span: Span,
-    /// The acting task's vector clock, which says which earlier steps this one
-    /// had already observed. Empty means the recording carries no
-    /// synchronization at all, and then no pair is ordered and every dependent
-    /// pair is a candidate — the behaviour this search had before clocks
-    /// existed.
+    /// The acting task's vector clock, which says which earlier steps this one had already
+    /// observed.
     pub stamp: Stamp,
 }
 
 impl Step {
-    /// Adopt the scheduler's record of a step. `definition` and `span` are where
-    /// the step was standing, which a failure artifact prints and the scheduler
-    /// does not know; `None` and [`Span::DUMMY`] are honest when the run was not
-    /// traced, and cost only the location on a race report.
+    /// Adopt the scheduler's record of a step.
     pub fn from_record(record: &StepRecord, definition: Option<Symbol>, span: Span) -> Step {
         Step {
             region: record.region,
@@ -99,9 +45,7 @@ impl Step {
     }
 }
 
-/// How one interleaving ended. A deadlock, a runtime error and a failed
-/// assertion are all `Failed`: the search's only question is whether this
-/// interleaving is the one to report.
+/// How one interleaving ended.
 #[derive(Clone, Debug)]
 pub enum Verdict {
     Passed,
@@ -134,25 +78,15 @@ impl Interleaving {
         }
     }
 
-    /// The choice sequence actually taken, which is not the seed's path: beyond
-    /// the path the `sched` stream chose, and a backtrack point is named
-    /// relative to what ran rather than to what was fixed.
+    /// The choice sequence actually taken, which is not the seed's path: beyond the path the
+    /// `sched` stream chose, and a backtrack point is named relative to what ran rather than to
+    /// what was fixed.
     fn choices(&self) -> Vec<u16> {
         self.steps.iter().map(|s| s.choice).collect()
     }
 }
 
-/// Whole-test replay at one seed. The implementer is the scheduler.
-///
-/// Three obligations, each of which the search would otherwise silently rely on:
-///
-/// - **`run` is a pure function of the definition set and `seed`.** Calling it
-///   twice with one seed must produce identical steps, identical enabled sets
-///   and an identical verdict. The search re-runs prefixes and checks this.
-/// - **The enabled set is in a canonical order** that is itself a function of
-///   the run so far. A choice is an index into it.
-/// - **Every access is in the footprint.** Pruning is sound only over a complete
-///   access set; see this module's header.
+/// Whole-test replay at one seed.
 pub trait Simulation {
     fn run(&mut self, seed: &Seed) -> Interleaving;
 }
@@ -164,12 +98,6 @@ impl<F: FnMut(&Seed) -> Interleaving> Simulation for F {
 }
 
 /// Which dependence relation the search runs over.
-///
-/// [`Dependence::All`] is not a fallback — it is the measurement. Forcing every
-/// pair dependent degenerates this search into exhaustive enumeration of every
-/// schedule respecting per-task order and enabledness, which is exactly the
-/// naive scheduler the reduction is claimed against. Same code, one flag, no
-/// second implementation to disagree with the first.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dependence {
     Exact,
@@ -185,21 +113,16 @@ impl Dependence {
     }
 }
 
-/// The budget the naive search gets under [`measure_reduction`]. Larger than a
-/// real search's, because the number being measured is how much larger the
-/// unpruned space is; when it is spent, the count is a lower bound and says so.
+/// The budget the naive search gets under [`measure_reduction`].
 pub const NAIVE_BUDGET: u32 = 4096;
 
 /// What a search produced.
 #[derive(Clone, Debug)]
 pub struct Explored {
     pub exploration: Exploration,
-    /// The failing interleaving's diagnostic. `Some` exactly when
-    /// `exploration.failure` is `Some`.
+    /// The failing interleaving's diagnostic.
     pub diagnostic: Option<Diagnostic>,
-    /// The interleavings run, in the order they were run. The evidence behind
-    /// `exploration.explored`, and what a replay of the whole search compares
-    /// against.
+    /// The interleavings run, in the order they were run.
     pub seeds: Vec<Seed>,
 }
 
@@ -210,21 +133,11 @@ impl Explored {
 }
 
 /// Run `plan` against `driver`.
-///
-/// Under [`SimMode::Once`] and [`SimMode::Random`] this is one interleaving per
-/// seed and no search — there is nothing to prune and nothing to report as
-/// exhaustive. Under [`SimMode::Dpor`] it is the search of ADR 0006 §6.2.
 pub fn explore(plan: &Plan, driver: &mut dyn Simulation) -> Explored {
     explore_under(plan, Dependence::Exact, driver)
 }
 
 /// [`explore`] with the dependence relation chosen explicitly.
-///
-/// [`Dependence::All`] is the unpruned enumeration [`measure_reduction`] counts
-/// against. It is an entry point of its own because the interesting audit is not
-/// the ratio: it is that the two searches observe the **same set of outcomes**,
-/// which is the property pruning has to preserve and the only one worth
-/// checking against a real corpus.
 pub fn explore_under(plan: &Plan, dependence: Dependence, driver: &mut dyn Simulation) -> Explored {
     let plan = plan.clone().normalized();
     match plan.mode {
@@ -233,16 +146,12 @@ pub fn explore_under(plan: &Plan, dependence: Dependence, driver: &mut dyn Simul
     }
 }
 
-/// [`explore`], then the same search again with the dependence relation forced
-/// to `true`, filling [`Exploration::naive`].
-///
-/// Off by default: the claim is a benchmark, and no ordinary run should pay
-/// double for it.
+/// [`explore`], then the same search again with the dependence relation forced to `true`, filling
+/// [`Exploration::naive`].
 pub fn measure_reduction(plan: &Plan, driver: &mut dyn Simulation) -> Explored {
     let mut explored = explore(plan, driver);
     if plan.mode != SimMode::Dpor || explored.exploration.failure.is_some() {
-        // Nothing was pruned, or both searches stopped at a failure rather than
-        // at their frontier. Neither is a ratio, so neither is reported as one.
+        // Nothing was pruned, or both searches stopped at a failure rather than at their frontier.
         return explored;
     }
     let naive_plan = Plan {
@@ -256,9 +165,7 @@ pub fn measure_reduction(plan: &Plan, driver: &mut dyn Simulation) -> Explored {
         bounded: naive.exploration.exhausted || naive.exploration.failure.is_some(),
     });
     if let Some(seed) = naive.exploration.failure {
-        // The pruned search called this program green and the unpruned one
-        // failed it. That is not a ratio to report, it is a defect in the
-        // dependence relation, and the failure is the actionable half.
+        // The pruned search called this program green and the unpruned one failed it.
         explored.exploration.failure = Some(seed);
         explored.exploration.exhaustive = false;
         explored.diagnostic = naive.diagnostic.map(|d| {
@@ -332,16 +239,13 @@ fn search(plan: &Plan, dependence: Dependence, driver: &mut dyn Simulation) -> E
     }
 }
 
-/// Where a queued interleaving came from: the run it branched off, the
-/// scheduling point it diverges at, and — when the branch was taken to reverse a
-/// specific pair of steps — which pair.
+/// Where a queued interleaving came from: the run it branched off, the scheduling point it diverges
+/// at, and — when the branch was taken to reverse a specific pair of steps — which pair.
 struct Branch {
     trace: Rc<Vec<Step>>,
     at: usize,
     choice: u16,
-    /// The step the search meant to reorder against `trace[at]`. `None` when the
-    /// branch was queued conservatively rather than to reverse an observed race,
-    /// in which case there is no pair to report and none is invented.
+    /// The step the search meant to reorder against `trace[at]`.
     against: Option<usize>,
 }
 
@@ -378,16 +282,13 @@ fn search_root(
         path: Vec::new(),
         branch: None,
     }];
-    // Every (prefix, choice) this search has run or queued. A run is a pure
-    // function of (root, path), so a claimed pair names an interleaving that has
-    // already been accounted for and re-running it would be the one kind of work
-    // this module exists to not do.
+    // Every (prefix, choice) this search has run or queued.
     let mut claimed: BTreeMap<Vec<u16>, BTreeSet<u16>> = BTreeMap::new();
 
     while let Some(work) = frontier.pop() {
         if report.explored >= budget {
-            // The frontier is not empty, so the interleavings still on it were
-            // never run and nothing may be claimed about them.
+            // The frontier is not empty, so the interleavings still on it were never run and
+            // nothing may be claimed about them.
             report.exhausted = true;
             break;
         }
@@ -461,54 +362,8 @@ fn search_root(
     report
 }
 
-/// The backtrack points a completed interleaving reveals: at scheduling point
-/// `at`, each task worth resuming instead, and the step the search means to
-/// reorder against `trace[at]`.
-///
-/// ADR 0006 §6.2 states the rule as: for each `i`, for each `j < i` that is
-/// dependent with it, from a different task, **with no step of `task(sᵢ)`
-/// between them**, and **with `task(sᵢ)` enabled at `j`**, add `task(sᵢ)` to
-/// `backtrack[j]`. Both emphasized conditions are unsound as written, and this
-/// implementation drops the first and adds an else branch to the second. Each
-/// deviation explores more interleavings than the ADR's text implies and never
-/// fewer.
-///
-/// **"No step of `task(sᵢ)` between them" loses races.** Take `main` writing a
-/// counter while `late` is blocked in a `join`, and `late` reading that counter
-/// after its barrier releases. `late`'s `join` step sits between the write and
-/// the read, so the scan stops before it reaches the write, no backtrack point
-/// is generated anywhere, and the search reports *one* interleaving and
-/// *exhaustive* over a program with an ordinary lost update in it. That is the
-/// worst failure this milestone can ship: a proof of the wrong thing. The
-/// condition is trying to express Flanagan and Godefroid's "the last transition
-/// dependent with the *next* transition of `p`", where the intervening steps of
-/// `p` are exactly what the algorithm looks past, and no per-trace pairwise scan
-/// can spell it that way. Every dependent pair from two different tasks is a
-/// backtrack point here, which is a superset of both that rule and the ADR's.
-///
-/// **`task(sᵢ)` not enabled at `j` needs the else branch.** When it had not been
-/// spawned yet, or was blocked, dropping the pair loses the race for the same
-/// reason: reaching the other order means first running some *third* task to
-/// unblock it. Adding every task enabled at `j` is what makes that reachable.
-///
-/// **A pair the join graph already ordered is not a race, and this is where
-/// that is spent.** A dependent pair whose earlier step *happens before* the
-/// later one cannot appear in the other order under any schedule, so a
-/// backtrack point for it queues an interleaving that does not exist. Nothing
-/// downstream notices — the branch runs, produces the same trace it branched
-/// from, and is counted. On the ordinary shape of a concurrent test, where the
-/// parent asserts after `join`ing every child, that pair is *every* child step
-/// against *every* parent assertion, and the else branch above then queues an
-/// alternative for each: measured over the corpus, one interleaving becomes
-/// nine hundred and ninety-two at five tasks. [`crate::sched::happens_before`]
-/// is what makes the ordering visible, and it is a filter rather than an
-/// approximation — the reversal it refuses to queue is unreachable rather than
-/// unlikely.
-///
-/// The cost of the two deviations above is duplicate work, not wrong work: two
-/// branches that name one `(prefix, choice)` collapse to one interleaving, and a
-/// branch queued conservatively carries no `against`, so it can never be
-/// reported as an observed race.
+/// The backtrack points a completed interleaving reveals: at scheduling point `at`, each task worth
+/// resuming instead, and the step the search means to reorder against `trace[at]`.
 fn backtracks(
     steps: &[Step],
     dependence: Dependence,
@@ -519,9 +374,9 @@ fn backtracks(
         for j in (0..i).rev() {
             let earlier = &steps[j];
             if earlier.region != later.region {
-                // Two regions of one entry point run in sequence, never
-                // interleaved, so no schedule puts these two in the other order
-                // — and a task id means a different task in each of them.
+                // Two regions of one entry point run in sequence, never interleaved, so no schedule
+                // puts these two in the other order — and a task id means a different task in each
+                // of them.
                 continue;
             }
             if earlier.task == later.task {
@@ -549,8 +404,8 @@ fn backtracks(
     out
 }
 
-/// A task queued twice at one point keeps whichever pair was observed, so a
-/// conservative branch never erases the race a real one names.
+/// A task queued twice at one point keeps whichever pair was observed, so a conservative branch
+/// never erases the race a real one names.
 fn record(at: &mut BTreeMap<TaskId, Option<usize>>, task: TaskId, against: Option<usize>) {
     let entry = at.entry(task).or_insert(None);
     if entry.is_none() {
@@ -558,18 +413,14 @@ fn record(at: &mut BTreeMap<TaskId, Option<usize>>, task: TaskId, against: Optio
     }
 }
 
-/// `check_recording` has already refused an enabled set too large to index, so
-/// the conversion cannot silently drop a backtrack point.
+/// `check_recording` has already refused an enabled set too large to index, so the conversion
+/// cannot silently drop a backtrack point.
 fn choice_of(enabled: &[TaskId], task: TaskId) -> Option<u16> {
     let index = enabled.iter().position(|&t| t == task)?;
     u16::try_from(index).ok()
 }
 
 /// The two steps whose reordering the failing branch was queued to perform.
-///
-/// `None` unless the search actually observed both of them contending: a branch
-/// queued conservatively, or one whose steps share no access to name, reports
-/// no race rather than a guessed one.
 fn race_of(branch: &Branch) -> Option<Race> {
     let against = branch.against?;
     let left = branch.trace.get(branch.at)?;
@@ -594,10 +445,9 @@ fn site(step: &Step, other: &Step) -> Option<RaceSite> {
     })
 }
 
-/// A recording that does not describe a schedule is Ply's fault, and it is
-/// caught before the search reasons over it: every later conclusion — which
-/// interleavings exist, which were pruned, whether the search was exhaustive —
-/// is derived from these fields.
+/// A recording that does not describe a schedule is Ply's fault, and it is caught before the search
+/// reasons over it: every later conclusion — which interleavings exist, which were pruned, whether
+/// the search was exhaustive — is derived from these fields.
 fn check_recording(seed: &Seed, steps: &[Step]) -> Result<(), Diagnostic> {
     for (i, step) in steps.iter().enumerate() {
         if step.enabled.len() > usize::from(u16::MAX) {
@@ -632,13 +482,8 @@ fn check_recording(seed: &Seed, steps: &[Step]) -> Result<(), Diagnostic> {
     Ok(())
 }
 
-/// Replay is self-checking: re-running a prefix must reproduce the enabled set
-/// at every scheduling point that prefix names.
-///
-/// A mismatch means the run was not a function of its seed, which invalidates
-/// every artifact this milestone produces — the replay a failure prints, the
-/// exhaustiveness claim, the cached pass. It is Ply's fault, not the program's,
-/// and it is the same class of defect as an engine divergence.
+/// Replay is self-checking: re-running a prefix must reproduce the enabled set at every scheduling
+/// point that prefix names.
 fn check_replay(seed: &Seed, branch: &Branch, steps: &[Step]) -> Result<(), Diagnostic> {
     for point in 0..=branch.at {
         let expected = match branch.trace.get(point) {
@@ -735,11 +580,7 @@ mod tests {
     use ply_core::{EffectAtom, Resource};
     use ply_syntax::ast::Mode;
 
-    /// A model scheduler: enough of ADR 0006 §3 to exercise the search, and
-    /// none of the machine. A task is a list of operations and one operation is
-    /// one step, so every operation here is a scheduling point. That is finer
-    /// than the machine's §3.3 granularity on purpose — the search is what is
-    /// under test, and it must be exercised on traces it could be handed.
+    /// A model scheduler: enough of ADR 0006 §3 to exercise the search, and none of the machine.
     #[derive(Clone, Debug)]
     enum Op {
         /// Read a cell into this task's register.
@@ -749,8 +590,8 @@ mod tests {
         /// `db.<mode>[resource]`.
         Perform(&'static str, Mode),
         Spawn(&'static str, Vec<Op>),
-        /// Join this task's `n`th child, by spawn order rather than by id, so a
-        /// program means the same thing under every interleaving.
+        /// Join this task's `n`th child, by spawn order rather than by id, so a program means the
+        /// same thing under every interleaving.
         Join(usize),
         Yield,
     }
@@ -763,9 +604,8 @@ mod tests {
         register: i64,
         children: Vec<usize>,
         blocked: Option<usize>,
-        /// The same vector clock the real scheduler keeps, so the search's
-        /// happens-before filter is exercised here rather than only against the
-        /// machine.
+        /// The same vector clock the real scheduler keeps, so the search's happens-before filter is
+        /// exercised here rather than only against the machine.
         clock: Stamp,
     }
 
@@ -775,11 +615,9 @@ mod tests {
         cells: BTreeMap<u32, i64>,
         expect: Vec<(u32, i64)>,
         runs: usize,
-        /// Every interleaving this model was asked for, as the task order it
-        /// produced. The evidence for "both orders were explored".
+        /// Every interleaving this model was asked for, as the task order it produced.
         traces: Vec<Vec<TaskId>>,
-        /// The final world of each interleaving. Two searches over one program
-        /// must observe the same *set* of these, whatever they explored.
+        /// The final world of each interleaving.
         outcomes: Vec<Vec<(u32, i64)>>,
     }
 
@@ -921,8 +759,8 @@ mod tests {
                     }
                     Op::Yield => {}
                 }
-                // A task blocked on a join observes everything its target did,
-                // the moment the target finishes.
+                // A task blocked on a join observes everything its target did, the moment the
+                // target finishes.
                 for i in 0..tasks.len() {
                     if let Some(on) = tasks[i].blocked
                         && Model::finished(&tasks, on)
@@ -997,9 +835,7 @@ mod tests {
             && model.traces.iter().filter_map(order).any(|x| !x)
     }
 
-    /// The headline. Two tasks whose footprints do not conflict commute, so one
-    /// interleaving is the whole story and a second would be provably redundant
-    /// work.
+    /// The headline.
     #[test]
     fn tasks_that_never_conflict_explore_exactly_one_interleaving() {
         let mut model = Model::new(vec![
@@ -1017,9 +853,8 @@ mod tests {
         assert!(explored.passed());
     }
 
-    /// ...and the same program under an unpruned search runs seventy-one, which
-    /// is the measurement the whole claim rests on. Pinned rather than bounded:
-    /// this number moving is the news, whichever direction it moves in.
+    /// ...and the same program under an unpruned search runs seventy-one, which is the measurement
+    /// the whole claim rests on.
     #[test]
     fn the_naive_count_for_the_same_program_is_larger() {
         let mut model = Model::new(vec![
@@ -1042,12 +877,8 @@ mod tests {
         assert_eq!(explored.exploration.reduction(), Some(71.0));
     }
 
-    /// Two tasks that *do* share a cell: the search runs nine interleavings
-    /// against the unpruned seventy-one. Six of the nine are the equivalence
-    /// classes — `a`'s two steps against `b`'s two — and the other three are
-    /// what §6.2's rule costs where this module refuses to trust it. The
-    /// reduction is real either way, and the overhead is measured rather than
-    /// asserted away.
+    /// Two tasks that *do* share a cell: the search runs nine interleavings against the unpruned
+    /// seventy-one.
     #[test]
     fn a_shared_cell_costs_interleavings_and_still_reduces() {
         let program = || {
@@ -1068,11 +899,7 @@ mod tests {
         assert_eq!(unpruned.exploration.explored, 71);
     }
 
-    /// Small enough to enumerate by hand. `main` spawns `a` then `b`; `a` and
-    /// `b` are one step each and touch nothing in common. With `main` first,
-    /// the schedules respecting per-task order and enabledness are
-    /// `m,m,a,b` · `m,m,b,a` · `m,a,m,b`: three, because `b` cannot run before
-    /// the spawn that creates it. The pruned search runs one.
+    /// Small enough to enumerate by hand.
     #[test]
     fn the_naive_count_is_exact_on_a_fixture_that_can_be_counted_by_hand() {
         let mut model = Model::new(vec![
@@ -1090,8 +917,8 @@ mod tests {
         );
     }
 
-    /// A budget the naive search spends is reported as a lower bound and never
-    /// as an exact number nobody observed.
+    /// A budget the naive search spends is reported as a lower bound and never as an exact number
+    /// nobody observed.
     #[test]
     fn a_spent_naive_budget_is_reported_as_a_bound() {
         let mut model = Model::new(vec![
@@ -1107,18 +934,15 @@ mod tests {
             ..Plan::default()
         };
         let mut explored = measure_reduction(&plan, &mut model);
-        // The naive budget is the larger of the plan's and NAIVE_BUDGET, so
-        // shrink the space instead of the budget by asserting on the flag.
+        // The naive budget is the larger of the plan's and NAIVE_BUDGET, so shrink the space
+        // instead of the budget by asserting on the flag.
         let naive = explored.exploration.naive.take().expect("measured");
         assert!(naive.bounded, "expected a bounded count, got {naive}");
         assert_eq!(naive.explored, NAIVE_BUDGET);
         assert!(naive.to_string().starts_with(">= "));
     }
 
-    /// Two writes to one cell. The outcome is the same either way, so the
-    /// search passes — but it must still have run both orders, because the
-    /// relation says the order is observable and the search's job is to make
-    /// that concrete rather than to argue about it.
+    /// Two writes to one cell.
     #[test]
     fn a_conflicting_pair_is_explored_in_both_orders() {
         let mut model = Model::new(vec![
@@ -1140,9 +964,8 @@ mod tests {
         );
     }
 
-    /// The lost update, as two steps of the model above: the search finds the
-    /// interleaving in which both tasks load before either stores, and reports
-    /// the seed that reproduces it.
+    /// The lost update, as two steps of the model above: the search finds the interleaving in which
+    /// both tasks load before either stores, and reports the seed that reproduces it.
     #[test]
     fn a_genuine_race_is_found_and_named() {
         let mut model = Model::new(vec![
@@ -1178,14 +1001,11 @@ mod tests {
         let again = explore(&Plan::once(seed), &mut replay);
         assert!(!again.passed());
         assert_eq!(again.exploration.explored, 1);
-        // A sampled run observed no flip, so it reports no race rather than an
-        // inferred one.
+        // A sampled run observed no flip, so it reports no race rather than an inferred one.
         assert_eq!(again.exploration.race, None);
     }
 
-    /// The pair conflicts on one resource and not on the other. The search must
-    /// separate the two: `x` is contended and its order is explored, `y` and
-    /// `z` are private and contribute nothing.
+    /// The pair conflicts on one resource and not on the other.
     #[test]
     fn footprints_that_conflict_on_one_resource_only() {
         let disjoint = vec![
@@ -1213,8 +1033,7 @@ mod tests {
         );
         assert!(contested.exploration.exhaustive);
         assert!(both_orders(&shared_write, TaskId(1), TaskId(2)));
-        // ...and still far short of the unpruned space, because `y` and `z`
-        // conflict with nothing.
+        // ...and still far short of the unpruned space, because `y` and `z` conflict with nothing.
         let mut measured = Model::new(disjoint);
         let naive = measure_reduction(&dpor(64), &mut measured)
             .exploration
@@ -1223,13 +1042,9 @@ mod tests {
         assert!(naive.explored > contested.exploration.explored);
     }
 
-    /// The property pruning has to preserve, checked directly rather than
-    /// argued: over each program, the interleavings the pruned search runs
-    /// produce **the same set of final worlds** as the interleavings an
-    /// unpruned enumeration runs. A missing outcome here is a race the search
-    /// cannot reach, which is the one defect this module must not ship, and it
-    /// is invisible in the counts — the pruned search would simply look
-    /// cheaper.
+    /// The property pruning has to preserve, checked directly rather than argued: over each
+    /// program, the interleavings the pruned search runs produce **the same set of final worlds**
+    /// as the interleavings an unpruned enumeration runs.
     #[test]
     fn pruning_preserves_every_outcome_the_unpruned_search_observes() {
         let programs: Vec<(&str, Vec<Op>)> = vec![
@@ -1310,11 +1125,6 @@ mod tests {
         }
     }
 
-    /// Required test 20, at the granularity the relation actually uses. A
-    /// read/read pair is one interleaving exactly; a read/write pair is both
-    /// orders, and costs at most one run more than the two equivalence classes
-    /// it covers — the extra one is the branch that has to run `main` far enough
-    /// to have spawned the second task at all.
     #[test]
     fn a_read_read_pair_is_one_interleaving_and_a_read_write_pair_is_both_orders() {
         let mut readers = Model::new(vec![
@@ -1337,8 +1147,8 @@ mod tests {
         assert!(both_orders(&writer, TaskId(1), TaskId(2)));
     }
 
-    /// The relation is at cell granularity, so two cells that would share one
-    /// `[r]` label are two locations and do not contend.
+    /// The relation is at cell granularity, so two cells that would share one `[r]` label are two
+    /// locations and do not contend.
     #[test]
     fn two_cells_under_one_label_do_not_contend() {
         let mut model = Model::new(vec![
@@ -1350,10 +1160,9 @@ mod tests {
         assert_eq!(explore(&dpor(64), &mut model).exploration.explored, 1);
     }
 
-    /// Tasks that appear part way through a run: the enabled set grows, so a
-    /// choice index at one scheduling point means something different from the
-    /// same index at another, and a backtrack point is only meaningful against
-    /// the enabled set that was recorded with it.
+    /// Tasks that appear part way through a run: the enabled set grows, so a choice index at one
+    /// scheduling point means something different from the same index at another, and a backtrack
+    /// point is only meaningful against the enabled set that was recorded with it.
     #[test]
     fn nested_spawns_are_explored() {
         let mut model = Model::new(vec![
@@ -1376,8 +1185,8 @@ mod tests {
             "the grandchild races the sibling and the search must reach it"
         );
         assert!(explored.exploration.race.is_some());
-        // @3 is the grandchild: spawned by @1, so it exists in no enabled set
-        // until @1 has run twice.
+        // @3 is the grandchild: spawned by @1, so it exists in no enabled set until @1 has run
+        // twice.
         let race = explored.exploration.race.expect("a race");
         assert!(
             [race.left.task, race.right.task].contains(&TaskId(3)),
@@ -1385,9 +1194,9 @@ mod tests {
         );
     }
 
-    /// A passing nested program is still enumerated to a frontier rather than
-    /// sampled: exhaustiveness is the headline, and it must survive tasks that
-    /// did not exist when the search started.
+    /// A passing nested program is still enumerated to a frontier rather than sampled:
+    /// exhaustiveness is the headline, and it must survive tasks that did not exist when the search
+    /// started.
     #[test]
     fn a_nested_spawn_that_conflicts_with_nothing_is_one_interleaving() {
         let mut model = Model::new(vec![
@@ -1407,12 +1216,7 @@ mod tests {
         assert!(explored.exploration.exhaustive);
     }
 
-    /// The soundness case ADR 0006 §6.2's pseudocode drops. `late` is blocked in
-    /// a `join` at the scheduling point where `main` loads the counter, so
-    /// `task(sᵢ) ∈ Eⱼ` is false and the literal rule adds no backtrack point at
-    /// all — leaving the lost update between `main` and `late` unreachable. The
-    /// else branch resumes the task that unblocks it instead, and the race is
-    /// found.
+    /// The soundness case ADR 0006 §6.2's pseudocode drops.
     #[test]
     fn a_race_with_a_task_that_was_blocked_at_the_backtrack_point_is_still_found() {
         for root in 0..8u64 {
@@ -1444,9 +1248,8 @@ mod tests {
         }
     }
 
-    /// The same case, as a unit of the rule rather than of the search: when the
-    /// racing task is not enabled at the backtrack point, the alternatives that
-    /// could unblock it are queued.
+    /// The same case, as a unit of the rule rather than of the search: when the racing task is not
+    /// enabled at the backtrack point, the alternatives that could unblock it are queued.
     #[test]
     fn the_backtrack_rule_queues_alternatives_when_the_racer_is_not_enabled() {
         let cell = |id: u32, mode: Mode| {
@@ -1465,8 +1268,8 @@ mod tests {
             span: Span::DUMMY,
             stamp: Stamp::new(),
         };
-        // @2 is blocked at point 0 and writes the same cell at point 2; only @1
-        // running at point 0 can ever unblock it.
+        // @2 is blocked at point 0 and writes the same cell at point 2; only @1 running at point 0
+        // can ever unblock it.
         let blocked = vec![
             step(0, &[0, 1], 0, cell(1, Mode::Write)),
             step(1, &[0, 1], 1, StepFootprint::new()),
@@ -1485,8 +1288,8 @@ mod tests {
             "@2 could not have run at point 0, so scheduling it there is not a schedule"
         );
 
-        // Where the racer *is* enabled, the pair is named exactly, and that is
-        // the pair the failure artifact prints.
+        // Where the racer *is* enabled, the pair is named exactly, and that is the pair the failure
+        // artifact prints.
         let enabled = vec![
             step(0, &[0, 1], 0, cell(1, Mode::Write)),
             step(1, &[0, 1], 1, cell(1, Mode::Write)),
@@ -1498,15 +1301,8 @@ mod tests {
         );
     }
 
-    /// The shape of nearly every concurrent test there is: spawn, join, then
-    /// assert on what the children wrote. Those reads conflict with the
-    /// children's writes and can never be reordered against them, because the
-    /// join already ordered them — so the whole assertion must cost the search
-    /// nothing.
-    ///
-    /// Without the clocks it costs a great deal. This is the regression guard
-    /// for the measured gap: two disjoint tasks are one interleaving with them
-    /// and twenty-nine without, and the number grows with the task count.
+    /// The shape of nearly every concurrent test there is: spawn, join, then assert on what the
+    /// children wrote.
     #[test]
     fn asserting_on_what_a_joined_task_wrote_costs_no_interleavings() {
         let program = || {
@@ -1531,8 +1327,8 @@ mod tests {
         );
         assert!(explored.exploration.exhaustive);
 
-        // The same program with the recording's clocks withheld, which is what
-        // this search did before it read them.
+        // The same program with the recording's clocks withheld, which is what this search did
+        // before it read them.
         struct Blind(Model);
         impl Simulation for Blind {
             fn run(&mut self, seed: &Seed) -> Interleaving {
@@ -1546,16 +1342,11 @@ mod tests {
         let mut blind = Blind(program());
         let unsynchronized = explore(&dpor(NAIVE_BUDGET), &mut blind);
         assert!(unsynchronized.passed());
-        // Pinned rather than bounded: this number moving is the news. On the
-        // real machine, where a task is several steps rather than two, the same
-        // shape costs 29 interleavings at two tasks and 992 at five.
+        // Pinned rather than bounded: this number moving is the news.
         assert_eq!(unsynchronized.exploration.explored, 6);
     }
 
-    /// A stamp orders two steps only when the later task really had observed the
-    /// earlier one. The empty case is the one that matters most: a recording
-    /// with no clocks must order nothing, or a search over it prunes reorderings
-    /// that are perfectly reachable.
+    /// A stamp orders two steps only when the later task really had observed the earlier one.
     #[test]
     fn an_absent_clock_orders_nothing_and_a_present_one_orders_what_it_saw() {
         assert!(!happens_before(&Stamp::new(), TaskId(0), &vec![3, 1]));
@@ -1570,10 +1361,7 @@ mod tests {
         assert!(!happens_before(&vec![0, 0, 2], TaskId(2), &vec![1, 1]));
     }
 
-    /// Enabledness carries synchronization, not the dependence relation. A join
-    /// keeps a task out of the enabled set, so no schedule that runs it early is
-    /// ever *generated* — as opposed to generated and then pruned, which is what
-    /// encoding the join as a conflict would produce.
+    /// Enabledness carries synchronization, not the dependence relation.
     #[test]
     fn a_joined_task_is_never_scheduled_before_its_target() {
         let mut model = Model::new(vec![
@@ -1591,9 +1379,9 @@ mod tests {
         );
     }
 
-    /// Budgets bound the search, and a search that did not empty its frontier
-    /// says so — an exhausted run proved nothing about the interleavings it did
-    /// not reach, and `Exploration::is_cacheable` is what acts on that.
+    /// Budgets bound the search, and a search that did not empty its frontier says so — an
+    /// exhausted run proved nothing about the interleavings it did not reach, and
+    /// `Exploration::is_cacheable` is what acts on that.
     #[test]
     fn a_spent_budget_is_exhausted_and_not_exhaustive() {
         let mut model = Model::new(vec![
@@ -1611,9 +1399,8 @@ mod tests {
         assert!(!explored.exploration.is_cacheable());
     }
 
-    /// The search is itself a function of the seed: two runs of one plan visit
-    /// the same interleavings in the same order. Without this the reduction
-    /// number is not reproducible and neither is the failure it reports.
+    /// The search is itself a function of the seed: two runs of one plan visit the same
+    /// interleavings in the same order.
     #[test]
     fn the_search_is_deterministic() {
         let program = || {
@@ -1634,8 +1421,7 @@ mod tests {
         assert_eq!(first.runs, second.runs);
     }
 
-    /// Every interleaving the search runs is a distinct seed. Re-running one
-    /// would be exactly the redundant work the reduction exists to delete.
+    /// Every interleaving the search runs is a distinct seed.
     #[test]
     fn no_interleaving_is_run_twice() {
         let mut model = Model::new(vec![
@@ -1652,8 +1438,8 @@ mod tests {
         assert_eq!(explored.seeds.len(), explored.exploration.explored as usize);
     }
 
-    /// A scheduler whose replay does not reproduce the recorded enabled set is
-    /// Ply's fault, and it is caught rather than silently searched over.
+    /// A scheduler whose replay does not reproduce the recorded enabled set is Ply's fault, and it
+    /// is caught rather than silently searched over.
     #[test]
     fn a_replay_that_does_not_reproduce_the_enabled_set_is_a_divergence() {
         let mut calls = 0u32;
@@ -1662,8 +1448,8 @@ mod tests {
             let enabled = if seed.is_root() {
                 vec![TaskId(0), TaskId(1)]
             } else {
-                // The replay offers a different enabled set at the point the
-                // seed names, which makes the choice mean something else.
+                // The replay offers a different enabled set at the point the seed names, which
+                // makes the choice mean something else.
                 vec![TaskId(0), TaskId(1), TaskId(2)]
             };
             let write = |resource| {
@@ -1698,8 +1484,8 @@ mod tests {
         assert!(explored.exploration.failure.is_some());
     }
 
-    /// A recording that does not describe a schedule is Ply's fault too, and it
-    /// is refused before the search draws conclusions from it.
+    /// A recording that does not describe a schedule is Ply's fault too, and it is refused before
+    /// the search draws conclusions from it.
     #[test]
     fn a_step_that_its_enabled_set_does_not_offer_is_an_internal_error() {
         let mut driver = |_: &Seed| {
@@ -1721,8 +1507,8 @@ mod tests {
         );
     }
 
-    /// `once` is the replay path: exactly the interleaving the seed names, no
-    /// search, and no claim of exhaustiveness from a sample of one.
+    /// `once` is the replay path: exactly the interleaving the seed names, no search, and no claim
+    /// of exhaustiveness from a sample of one.
     #[test]
     fn once_runs_exactly_the_interleaving_its_seed_names() {
         let mut model = Model::new(vec![
@@ -1753,19 +1539,17 @@ mod tests {
         let explored = explore(&Plan::random(16), &mut model);
         assert!(explored.exploration.explored <= 16);
         assert!(!explored.exploration.exhaustive);
-        // A sample that happens to find the race reports no race pair, because
-        // nothing flipped: there was no earlier passing interleaving to flip.
+        // A sample that happens to find the race reports no race pair, because nothing flipped:
+        // there was no earlier passing interleaving to flip.
         assert_eq!(explored.exploration.race, None);
     }
 
-    /// A pruned search that passes where the unpruned one fails means the
-    /// relation missed an access. The measurement is where that shows up, and
-    /// it must report the failure rather than a flattering ratio.
+    /// A pruned search that passes where the unpruned one fails means the relation missed an
+    /// access.
     #[test]
     fn a_failure_only_the_unpruned_search_reaches_is_reported() {
-        // A driver that lies: every step reports an empty footprint, so the
-        // exact relation prunes everything, while the program's outcome really
-        // does depend on the order.
+        // A driver that lies: every step reports an empty footprint, so the exact relation prunes
+        // everything, while the program's outcome really does depend on the order.
         struct Liar(Model);
         impl Simulation for Liar {
             fn run(&mut self, seed: &Seed) -> Interleaving {
@@ -1809,9 +1593,8 @@ mod tests {
         );
     }
 
-    /// A rule about how a type is *used* is a rule nobody enforces; a rule about
-    /// which types may be *named* is greppable. Which interleaving runs next is
-    /// as much a part of a seeded run as which task runs next.
+    /// A rule about how a type is *used* is a rule nobody enforces; a rule about which types may be
+    /// *named* is greppable.
     #[test]
     fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
         let source = include_str!("explore.rs");

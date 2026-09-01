@@ -1,31 +1,4 @@
 //! Deciding `Edited` versus `Derived`, exactly.
-//!
-//! A reference contributes the referent's hash, so editing one leaf moves the
-//! hash of every transitive dependent. Only the edited ones are worth
-//! attributing a failure to. ADR 0004 §2 fixes the test: re-normalize a
-//! definition's *current* body against the *baseline* hash table, and if the
-//! result equals its baseline hash then its own structure is unchanged and only
-//! its references moved. Both cheaper tests — "it mentions the same names", "its
-//! interface is unchanged" — are unsound, and a false `Derived` drops a real
-//! candidate and yields a confidently wrong culprit.
-//!
-//! ## What this assembles, and what it borrows
-//!
-//! `ply_hash::hash_program` computes reference hashes itself, bottom up; there
-//! is no entry point that takes a hash table and applies it, so the assembly —
-//! `ProgramIndex`, `tarjan`, `is_cyclic`, `Normalizer` — is reproduced here. The
-//! one piece that is *not* reproduced is cyclic-component hashing, which is
-//! `ply_hash::component_hashes`: a second copy of a refinement whose labels are
-//! load-bearing drifts silently, and a drifted copy stops witnessing rather than
-//! announcing itself.
-//!
-//! What keeps the rest safe is the **witness**. Before classifying anything,
-//! every definition is re-normalized against the *current* hash table, which
-//! must reproduce the hash `ply-hash` published for it. A definition whose
-//! witness fails is one this module does not understand, and it is never
-//! classified `Derived` — it stays a candidate, which costs a wider search and
-//! never a wrong answer. Drift therefore degrades the search instead of
-//! corrupting it.
 
 use super::{DefKey, Ns};
 use ply_hash::graph::{Entry, NodeBody, NodeId, ProgramIndex};
@@ -37,21 +10,13 @@ use ply_syntax::resolve::Resolved;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// What every definition in the program hashed to in one era, node by node.
-///
-/// Not a plain name lookup, and the difference is the whole point. A definition
-/// the era does not name may still have existed then under another name —
-/// renaming moves no hash — so its identity back then is what its *current* body
-/// re-normalizes to against this very table. Resolving names only would leave a
-/// renamed callee absent, and every untouched caller of it would then fail to
-/// reproduce its baseline hash and be classified `Edited` by refusal.
 #[derive(Clone, Debug, Default)]
 pub struct EraTable {
     table: HashTable,
 }
 
 impl EraTable {
-    /// Every identity this era assigns, which is what a rename has to be
-    /// recognized against.
+    /// Every identity this era assigns, which is what a rename has to be recognized against.
     pub fn image(&self) -> BTreeSet<DefHash> {
         self.table.values().copied().collect()
     }
@@ -76,11 +41,7 @@ pub struct Renormalizer<'a> {
 }
 
 impl<'a> Renormalizer<'a> {
-    /// `test_keys` is what `hashes.tests` is parallel to — the run's
-    /// `CheckOutput::tests`. It is not parallel to `program`: a run whose front
-    /// end skipped a file has no AST for it, so the two orders agree only when
-    /// every module was parsed, and a positional read silently witnesses one
-    /// test against another test's hash.
+    /// `test_keys` is what `hashes.tests` is parallel to — the run's `CheckOutput::tests`.
     pub fn new(
         program: &'a Program,
         resolved: &Resolved,
@@ -187,8 +148,7 @@ impl<'a> Renormalizer<'a> {
         Ok(me)
     }
 
-    /// Whether this module reproduces `ply-hash`'s answer for `name`. A `false`
-    /// here is what stops a drifted copy from classifying anything.
+    /// Whether this module reproduces `ply-hash`'s answer for `name`.
     pub fn witnessed(&self, name: &Symbol) -> bool {
         self.node_of(&DefKey::value(name.clone()))
             .or_else(|| self.node_of(&DefKey::decl(name.clone())))
@@ -205,11 +165,8 @@ impl<'a> Renormalizer<'a> {
         self.witnessed.iter().filter(|w| !**w).count()
     }
 
-    /// `key`'s current body, re-normalized with every reference written as
-    /// `table` says rather than as it hashes now. `None` when the name is
-    /// unknown here or its witness failed — never a guess, because the caller
-    /// reads equality with the baseline hash as proof that nobody edited this
-    /// definition.
+    /// `key`'s current body, re-normalized with every reference written as `table` says rather than
+    /// as it hashes now.
     pub fn rehash(&self, key: &DefKey, table: &EraTable) -> Option<DefHash> {
         let v = self.node_of(key)?;
         if !self.witnessed[v] {
@@ -226,9 +183,8 @@ impl<'a> Renormalizer<'a> {
         self.hash_test(t, &table.table)
     }
 
-    /// The other members of `key`'s strongly connected component, `key`
-    /// included, when it is mutually recursive. Empty otherwise, so a caller can
-    /// fuse on a non-empty answer without a second question.
+    /// The other members of `key`'s strongly connected component, `key` included, when it is
+    /// mutually recursive.
     pub fn component_of(&self, key: &DefKey) -> Vec<DefKey> {
         let Some(v) = self.node_of(key) else {
             return Vec::new();
@@ -256,13 +212,6 @@ impl<'a> Renormalizer<'a> {
     }
 
     /// What each node hashed to in the era `resolve` describes.
-    ///
-    /// Built dependency-first, because a node the era does not name is resolved
-    /// by re-normalizing it against the part of the table already built: that is
-    /// how a definition that was only *renamed* keeps the identity it had, and
-    /// with it how every untouched caller of it still reproduces its baseline
-    /// hash instead of being accused of an edit. Tarjan hands components back
-    /// dependency-first, which is what makes one pass enough.
     pub fn era_table(&self, resolve: &dyn Fn(&DefKey) -> Option<DefHash>) -> EraTable {
         let mut table = HashTable::default();
         for (ci, component) in self.components.iter().enumerate() {
@@ -331,9 +280,7 @@ impl<'a> Renormalizer<'a> {
         Some(digest(&nz.finish().0))
     }
 
-    /// Re-normalizing against the hashes the program actually has must reproduce
-    /// those hashes. Anything that does not is a definition this module encodes
-    /// differently from `ply-hash`, and it is excluded rather than guessed at.
+    /// Re-normalizing against the hashes the program actually has must reproduce those hashes.
     fn witness(&mut self, hashes: &HashOutput, test_keys: &[Symbol]) {
         let published = |key: &DefKey| -> Option<DefHash> {
             match key.ns {

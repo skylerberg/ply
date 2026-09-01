@@ -4,11 +4,7 @@ use crate::value::Value;
 use ply_span::Symbol;
 use std::rc::Rc;
 
-/// A persistent chain so a closure can capture its defining scope by cloning a
-/// single pointer.
-///
-/// Its links come from [`crate::pool`]: a scope is built and released on almost
-/// every call, and the binding a return retires is the one the next call wants.
+/// A persistent chain so a closure can capture its defining scope by cloning a single pointer.
 #[derive(Clone, Default)]
 pub struct Env {
     head: Option<Rc<Link<Binding>>>,
@@ -17,8 +13,8 @@ pub struct Env {
 pub struct Binding {
     name: Symbol,
     value: Value,
-    /// The reference-counting pass proved this binding dead here, so its value
-    /// was dropped out of the scope. See [`Env::release`].
+    /// The reference-counting pass proved this binding dead here, so its value was dropped out of
+    /// the scope.
     released: bool,
 }
 
@@ -26,11 +22,7 @@ pub struct Binding {
 #[derive(Clone, Copy)]
 pub enum Slot<'a> {
     Live(&'a Value),
-    /// Bound, but dropped by [`Env::release`] or moved out by
-    /// [`Env::take_unique`]. Reaching one is a defect in the reference-counting
-    /// pass and the machine reports it as such rather than falling through to an
-    /// outer binding of the same name, which would be a different value under
-    /// the same name and no error at all.
+    /// Bound, but dropped by [`Env::release`] or moved out by [`Env::take_unique`].
     Released,
 }
 
@@ -79,14 +71,13 @@ impl Env {
         None
     }
 
-    /// Every live value the scope binds, innermost first. Shadowed bindings are
-    /// included: a caller asking what the scope can *reach* has to see them.
+    /// Every live value the scope binds, innermost first.
     pub(crate) fn values(&self) -> impl Iterator<Item = &Value> {
         self.bindings().map(|(_, value)| value)
     }
 
-    /// [`Env::values`] with the name each value is bound under, for a caller
-    /// that has to say *which* binding it found something in.
+    /// [`Env::values`] with the name each value is bound under, for a caller that has to say
+    /// *which* binding it found something in.
     pub(crate) fn bindings(&self) -> impl Iterator<Item = (&Symbol, &Value)> {
         let mut cur = self.head.as_deref();
         std::iter::from_fn(move || {
@@ -103,21 +94,6 @@ impl Env {
     }
 
     /// Moves a binding's value out, when this scope is provably its only owner.
-    ///
-    /// This is Perceus' "a last use is a move", and the guard is what makes it
-    /// safe against a persistent scope that a closure, a prompt and a captured
-    /// continuation all share by pointer. Every link from the head down to and
-    /// including the binding must be uniquely referenced — which means the only
-    /// path to that binding is through this `Env` value, and the machine's `env`
-    /// at a `Var` node is a by-value local it drops immediately afterwards.
-    ///
-    /// The multi-shot case falls out of the same rule rather than needing one of
-    /// its own: a frame resumed from a captured continuation is *cloned* out of
-    /// a segment the continuation still holds, so its scope is shared, so
-    /// nothing in it is ever moved and both resumptions read the same value.
-    ///
-    /// `None` — refused — is always correct and costs a clone, so the caller
-    /// never has to know why.
     pub fn take_unique(&mut self, name: &Symbol) -> Option<Value> {
         let taken = self.take_unique_inner(name);
         rc::note_take(taken.is_some());
@@ -128,8 +104,8 @@ impl Env {
         let mut cur = &mut self.head;
         loop {
             let node = cur.as_mut()?;
-            // Refuses at the first shared link: past it, some other holder can
-            // still reach everything below.
+            // Refuses at the first shared link: past it, some other holder can still reach
+            // everything below.
             let link = Rc::get_mut(node)?;
             let hit = link
                 .value
@@ -148,21 +124,12 @@ impl Env {
     }
 
     /// The scope with `dead`'s bindings dropped — Perceus' `drop`.
-    ///
-    /// **Functional, never a write through a shared link.** A closure or a
-    /// prompt that captured this scope keeps every binding it captured; only the
-    /// chain returned here has them released. That is what bounds the damage a
-    /// wrong dead set can do to the continuation it was computed for, where it
-    /// is an `INTERNAL_ERROR` naming the binding.
-    ///
-    /// Only the links above the deepest released binding are rebuilt; everything
-    /// below is shared.
     pub fn release(&self, dead: &[Symbol]) -> Env {
         if dead.is_empty() {
             return self.clone();
         }
-        // Innermost first, and each name released once: an outer binding a
-        // shadowed name still reaches is not this statement's to drop.
+        // Innermost first, and each name released once: an outer binding a shadowed name still
+        // reaches is not this statement's to drop.
         let mut left = dead.len();
         let mut done: Vec<Symbol> = Vec::with_capacity(dead.len());
         let mut above: Vec<(Symbol, Option<Value>)> = Vec::new();
@@ -202,8 +169,8 @@ impl Env {
                         value,
                         released: false,
                     },
-                    // A binding released earlier stays released, and one this
-                    // call is releasing becomes so.
+                    // A binding released earlier stays released, and one this call is releasing
+                    // becomes so.
                     None => Binding {
                         name,
                         value: Value::Unit,
@@ -217,11 +184,9 @@ impl Env {
     }
 }
 
-/// Iterative, and the reason it exists at all: a scope is a chain as long as the
-/// bindings in view, the drop glue for one recurses once per link, and a
-/// thousand-deep `let` chain would abort the process on the way out. The walk
-/// stops at the first link a closure still holds, which is where the chain stops
-/// being this scope's to free.
+/// Iterative, and the reason it exists at all: a scope is a chain as long as the bindings in view,
+/// the drop glue for one recurses once per link, and a thousand-deep `let` chain would abort the
+/// process on the way out.
 impl Drop for Env {
     fn drop(&mut self) {
         let mut cur = self.head.take();

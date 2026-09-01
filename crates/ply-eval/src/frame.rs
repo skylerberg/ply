@@ -1,10 +1,4 @@
 //! What the machine does with a value it is handing back to the stack.
-//!
-//! One arm per [`Frame`]: every frame names the value it was waiting for and
-//! what it does next, so this is the whole of the `Return` half of ADR 0005
-//! §1.3. Nothing here recurses — an arm either produces a value or moves the
-//! machine to its next state — which is what keeps a Ply call off the native
-//! stack.
 
 use crate::builtins::advance;
 use crate::code::Stmt as CodeStmt;
@@ -93,13 +87,9 @@ impl Machine<'_> {
                 span,
             } => {
                 if args.is_empty() {
-                    // Perceus' rule that decides whether anything is ever reused:
-                    // the scope the arguments were evaluated in is dead here, and
-                    // dropping it *before* the call is what leaves the callee
-                    // holding the only reference to what it was handed. Dropping
-                    // it after — which is what letting it fall out of scope does
-                    // — leaves every argument at a count of two for the whole
-                    // call, and no update is ever in place.
+                    // Perceus' rule that decides whether anything is ever reused: the scope the
+                    // arguments were evaluated in is dead here, and dropping it *before* the call
+                    // is what leaves the callee holding the only reference to what it was handed.
                     drop(env);
                     return self.apply(value, Vec::new(), span);
                 }
@@ -132,8 +122,8 @@ impl Machine<'_> {
                 done.push(value);
                 match args.get(next) {
                     None => {
-                        // See `AppCallee` above: the argument scope is dropped
-                        // before the call, not after it.
+                        // See `AppCallee` above: the argument scope is dropped before the call, not
+                        // after it.
                         drop(env);
                         return self.apply(callee, done, span);
                     }
@@ -211,8 +201,8 @@ impl Machine<'_> {
                     self.go_eval(body, arm_env, module);
                     return Ok(());
                 }
-                // A rejected arm falls through to the next one with the
-                // scrutinee it was already handed, never by rematching.
+                // A rejected arm falls through to the next one with the scrutinee it was already
+                // handed, never by rematching.
                 self.push(
                     Frame::MatchArms {
                         scrutinee,
@@ -366,16 +356,11 @@ impl Machine<'_> {
                 return self.take(transition);
             }
 
-            // The region's lexical close. Whether the slots go back is the
-            // arena's call, not this frame's: a continuation captured across the
-            // region and still alive holds a pin, and the close retains rather
-            // than truncates.
+            // The region's lexical close.
             Frame::CloseRegion { region } => {
                 self.regions_mut().close_region(region);
-                // A close moves the shared bump pointer exactly as an
-                // allocation does, and two tasks whose closes the search thinks
-                // are independent reach two different arenas. `Access::Alloc` is
-                // what makes the pair dependent.
+                // A close moves the shared bump pointer exactly as an allocation does, and two
+                // tasks whose closes the search thinks are independent reach two different arenas.
                 self.record_alloc_access();
                 self.go_return(value);
             }

@@ -1,107 +1,4 @@
-//! Whether an append copies, decided before the program runs — ADR 0025
-//! §Decision 2.
-//!
-//! **A checker and nothing else.** It reads the lowered [`Code`] the machine
-//! already builds, reports a verdict per `push` site, and changes no
-//! evaluation, no representation and no runtime behaviour. `Value::List` stays
-//! `Arc<Vec<Value>>` and `builtins::push` keeps its copying fallback, so a
-//! verdict here is a *claim about* a run and never a permission granted to one.
-//! ADR 0024's promotion of [`crate::rc::Own`] to a guarantee is deliberately
-//! not made: `rc`'s dynamic guard is what keeps the answer right, and this
-//! module exists to find out what a static account of the cost is worth before
-//! anything is promoted.
-//!
-//! ## What decides it, and why it is not `Own`
-//!
-//! The obvious reading of `rc.rs` — "`push` reuses when its list argument is
-//! marked `Own::Owned`" — is wrong, and a checker built on it calls every
-//! accumulator in the tree shared. [`crate::env::Env::take_unique`] is *not*
-//! the operation that makes an append cheap. At `push(acc, x)` the machine is
-//! evaluating argument 0 of a two-argument call, so `Frame::AppArgs` is holding
-//! a clone of the scope (`rc::carry` with `remaining = true`), the chain is
-//! shared, and `take_unique` **refuses** — every time, in every program. `acc`
-//! is read with an ordinary clone.
-//!
-//! What makes the append cheap is one line later, in `frame.rs`:
-//!
-//! ```text
-//! None => { drop(env); return self.apply(callee, done, span); }
-//! ```
-//!
-//! The scope the arguments were evaluated in is dropped *before* the callee is
-//! entered. `Env`'s `Drop` walks the chain while `Rc::get_mut` succeeds, so the
-//! binding's value goes away — and the value in `done` is then the only one
-//! left. The question a checker has to answer is therefore not "was this
-//! occurrence a last use" but:
-//!
-//! > **when that scope is dropped, does the binding's value actually go away?**
-//!
-//! Four things stop it, and each is a rule below:
-//!
-//! 1. **A pending frame that carried the scope** — `rc::carry(env, true)` at
-//!    the eight sites in `frame.rs`, `machine.rs` and `handler.rs`, plus the
-//!    unconditional `env.clone()` in `Frame::BinaryRhs`, `Frame::If` and
-//!    `Frame::MatchArms`. This is the positional rule, and ADR 0025 §Context is
-//!    right that it **compounds at every enclosing node**: [`State::frontier`]
-//!    is that rule made into a number. Note what it does *not* include: an
-//!    App's own argument carry, which is gone by the time the callee runs —
-//!    see [`Walk::walk`]'s `vf`.
-//! 2. **A block's continuation** — `Frame::BlockStep` holds
-//!    `scope.release(dead)`, which shares every link outside the outermost name
-//!    in the statement's [`crate::rc::Dead`] set and rebuilds the ones inside
-//!    it. A binding no statement releases is never freed early, which is why a
-//!    function parameter used inside a block cannot be reused today.
-//! 3. **A closure over the scope** — `Value::Closure` holds the whole chain, so
-//!    a lambda written in an argument list keeps every *other* argument's
-//!    binding alive for the length of the call. This is what makes
-//!    `fold(ys, xs, |acc, y| push(acc, y))` copy on its first iteration and
-//!    only its first, and it is invisible to any rule stated on positions.
-//! 4. **The caller** — a parameter is at one owner only if whoever passed it is
-//!    not still reading it. That is not a property of this body, and
-//!    [`Costs::check`] answers it with a whole-program fixpoint over call sites
-//!    rather than with a mode on the arrow, for the reason ADR 0025 §Decision 1
-//!    measures: the caller cannot promise it either.
-//!
-//! ## What it cannot see, stated rather than hidden
-//!
-//! [`Verdict::Unknown`] is a real answer and the honest one for four shapes,
-//! all of them measured in ADR 0025 §Soundness:
-//!
-//! - a **capture** anywhere in the dynamic extent — a handler clause binding a
-//!   continuation puts a second owner on a value whose occurrence every local
-//!   rule calls unique, and no analysis of one body sees the handler its
-//!   caller installed;
-//! - a **free variable of a closure**, where the answer is whether the closure
-//!   is still held when the append runs — `json.ply`'s `collect_prices` is 100%
-//!   in place because the closure is dead by then, and nothing local says so;
-//! - the value a **call** answers, which the callee may also still hold;
-//! - anything reached through the **memo table**, which retains a value per
-//!   nullary pure definition for the whole run.
-//!
-//! Every one of those is safe today because the guard in `push` catches it.
-//! What they cost is precision, and `tests/suite/ownership_checker_oracle.rs` is
-//! where the cost is measured against the counters rather than asserted.
-//!
-//! ## How this is kept from being green over unexplored space
-//!
-//! Two test files, and neither can pass by the checker being a constant:
-//!
-//! - `tests/suite/ownership_checker_armed.rs` holds a quadratic loop and the *same
-//!   loop written linearly*, each asserted against both this module and
-//!   [`crate::rc::sites`]. Forcing every verdict to `Reuses` reddens the
-//!   quadratic; forcing every verdict to `Copies` reddens both linear controls.
-//!   Both mutations were run.
-//! - `tests/suite/ownership_checker_oracle.rs` asserts three things over the shipped
-//!   corpus: that no site the run shows copying is called `Reuses`, that
-//!   agreement with the counters stays at or above 0.80, and that **no append
-//!   the run counted is missing a verdict** — blindness would flatter every
-//!   rate. All three were shown to fail under a deliberate mutation before any
-//!   of them was believed.
-//!
-//! [`Site::own_marked`] carries the weaker signal ADR 0025 §Decision 2b
-//! proposed to assert on, so that proposal is measured beside this one rather
-//! than argued about: over the shipped corpus `Own::Owned` is right at 27 of 47
-//! executed sites, and this module's verdict is right at 90 of 94.
+//! Whether an append copies, decided before the program runs — ADR 0025 §Decision 2.
 
 use crate::builtins::Builtin;
 use crate::code::{self, Code, NodeKind, Stmt};
@@ -112,12 +9,6 @@ use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// What the checker says one `push` site will cost.
-///
-/// [`Verdict::Reuses`] is the strong claim — *this append never copies, on any
-/// execution* — because that is the only reading one observation can falsify. A
-/// site that copies on a fold's first iteration and reuses on every later one
-/// is [`Verdict::Copies`]: it does copy, and a reader deciding whether the
-/// shape is safe has to be told so.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
     Reuses,
@@ -136,40 +27,29 @@ impl Verdict {
 }
 
 /// Why a site is not `Reuses`, in the form a diagnostic can dispatch on.
-///
-/// ADR 0025 §Decision 4 asks the warning to name the reordering,
-/// `cell_update`/`map_update`, or `copy`, **in that order**, and to mention
-/// `copy` last — because inserting `copy` cannot change what a program means,
-/// which is exactly why it is how a model discharges a cost signal without
-/// understanding it. A verdict carrying only prose leaves the caller to guess
-/// which of those applies; this is the machine-readable half, and
-/// [`Cause::fix`] is the ordering.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, PartialOrd, Ord)]
 pub enum Cause {
-    /// The scope binding the list is still held by an enclosing frame, because
-    /// the append is not in the last position of every node above it.
+    /// The scope binding the list is still held by an enclosing frame, because the append is not in
+    /// the last position of every node above it.
     Position,
-    /// The list came out of a cell, whose region arena holds it for the whole
-    /// of the append.
+    /// The list came out of a cell, whose region arena holds it for the whole of the append.
     Cell,
     /// The list came out of a map, which still holds it.
     MapEntry,
-    /// A closure written in the same call captured the scope that still holds
-    /// the list.
+    /// A closure written in the same call captured the scope that still holds the list.
     Capture,
     /// The list is a parameter and a caller keeps what it passes.
     CallerKeeps,
     /// The list is an element of a list being walked, which still holds it.
     Element,
-    /// A top-level definition named outside callee position, so the program
-    /// holds it.
+    /// A top-level definition named outside callee position, so the program holds it.
     Program,
     /// The value a call answered, which the callee may also hold.
     Call,
     /// The value a handler, a `handle` or a `simulate` answered.
     Handler,
-    /// A free variable of a closure, where whether the closure is still held is
-    /// not a property of this body.
+    /// A free variable of a closure, where whether the closure is still held is not a property of
+    /// this body.
     Closure,
     /// A binding chain the analysis could not follow.
     Chain,
@@ -177,10 +57,6 @@ pub enum Cause {
 
 impl Cause {
     /// The source edit that removes the copy, or `None` where no edit does.
-    ///
-    /// `None` is the honest answer for the four undecidable causes and for
-    /// [`Cause::Element`]: the semantics require the copy there, and offering
-    /// `copy(x)` as a fix would be offering the pessimization as the cure.
     pub fn fix(self) -> Option<&'static str> {
         match self {
             Cause::Position => Some(
@@ -220,10 +96,6 @@ impl Cause {
 }
 
 /// A cause and the sentence a diagnostic would print for it.
-///
-/// The two travel together everywhere a reason does, so that rewording a reason
-/// as it propagates outward — which `interpret` and `Field` both do — cannot
-/// lose the cause.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Why {
     cause: Cause,
@@ -248,11 +120,6 @@ impl Why {
 }
 
 /// One `push` in one definition.
-///
-/// `span` is the *application* node's span, which is the span the machine hands
-/// `builtins::push` and therefore the key [`crate::rc::sites`] counts under.
-/// That is what makes a verdict falsifiable by a run rather than only
-/// reviewable by a reader.
 #[derive(Clone, Debug)]
 pub struct Site {
     pub span: Span,
@@ -261,13 +128,9 @@ pub struct Site {
     pub reason: String,
     /// `None` at a [`Verdict::Reuses`] site, which has no cause to name.
     pub cause: Option<Cause>,
-    /// Whether the lowering marked this append's **list argument**
-    /// [`Own::Owned`] — the property ADR 0025 §Decision 2b proposed to assert
-    /// on, recorded here so that proposal can be measured rather than argued.
-    ///
-    /// It is a strictly weaker signal than [`Site::verdict`] and only a `Var`
-    /// node ever carries it, so `push(s.toks, x)` is `false` however uniquely
-    /// owned `s` is. Both facts are findings and both are in the report.
+    /// Whether the lowering marked this append's **list argument** [`Own::Owned`] — the property
+    /// ADR 0025 §Decision 2b proposed to assert on, recorded here so that proposal can be measured
+    /// rather than argued.
     pub own_marked: bool,
 }
 
@@ -279,12 +142,6 @@ impl Site {
 }
 
 /// What kind of item a [`Definition`] came from.
-///
-/// A `test` body is not part of a module's interface and its cost is not what
-/// the standard library is judged on, so a report that mixes the two overstates
-/// the burden — `std.db` alone declares more appends inside `test` bodies than
-/// in every one of its functions. The split is carried here rather than parsed
-/// back out of [`Definition::name`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DefKind {
     Fn,
@@ -324,12 +181,10 @@ impl Definition {
 #[derive(Clone, Debug)]
 pub struct Report {
     defs: Vec<Definition>,
-    /// How many rounds the fixpoint took. Printed by the harness: a number at
-    /// [`MAX_ROUNDS`] means it did not converge and the answer is not one.
+    /// How many rounds the fixpoint took.
     pub rounds: usize,
-    /// Definitions whose parameters the fixpoint could not keep sole-owned, and
-    /// what spoiled each one. Kept for the message and for a reader asking
-    /// *which* caller.
+    /// Definitions whose parameters the fixpoint could not keep sole-owned, and what spoiled each
+    /// one.
     pub spoiled: Vec<(String, usize, String)>,
 }
 
@@ -344,17 +199,17 @@ impl Report {
     }
 }
 
-/// Where a value's other owners are, expressed against the scope chain so the
-/// positional question can be asked again later at a different frontier.
+/// Where a value's other owners are, expressed against the scope chain so the positional question
+/// can be asked again later at a different frontier.
 #[derive(Clone, Debug)]
 enum Owner {
     /// Nothing else can reach it.
     Fresh,
-    /// This definition's `k`th parameter, which is sole-owned exactly when
-    /// every caller hands one over and stops reading it.
+    /// This definition's `k`th parameter, which is sole-owned exactly when every caller hands one
+    /// over and stops reading it.
     Param(usize),
-    /// A clone was taken from the chain binding at this index, which therefore
-    /// still holds it — and so does whatever *that* binding holds.
+    /// A clone was taken from the chain binding at this index, which therefore still holds it — and
+    /// so does whatever *that* binding holds.
     Held(usize),
     /// Provably held by something the drop cannot reach.
     Blocked(Why),
@@ -365,12 +220,7 @@ enum Owner {
 /// [`Owner`] with the positional question answered.
 #[derive(Clone, Debug)]
 enum Res {
-    /// One owner. `via_chain` records whether it got there by way of a scope
-    /// binding that the drop will free, rather than by being freshly built —
-    /// the difference matters to exactly one rule, and getting it wrong made
-    /// the checker call `fold(xs, [], |acc, x| push(acc, x))` a copy. A value
-    /// a closure's captured chain can reach is held for the length of the
-    /// call; a value the chain never bound is not in the closure at all.
+    /// One owner.
     Unique {
         via_chain: bool,
     },
@@ -389,8 +239,8 @@ struct Binding {
 
 struct State {
     chain: Vec<Binding>,
-    /// Bindings at or inside this position are freed when the scope is dropped;
-    /// everything outside it is held by something this activation cannot drop.
+    /// Bindings at or inside this position are freed when the scope is dropped; everything outside
+    /// it is held by something this activation cannot drop.
     frontier: usize,
     /// The module the body being walked belongs to, for name resolution.
     module: usize,
@@ -416,14 +266,6 @@ pub struct Costs<'a> {
 }
 
 /// What a whole-program pass concluded about one parameter.
-///
-/// A three-point lattice, and the middle point is the one that matters. An
-/// earlier two-point version of this fixpoint — sole or not — read every
-/// argument it could not decide as "not", which walked backwards through the
-/// call graph and marked every parameter in `std.db` shared. Measured: it took
-/// agreement with the counters from 89% to 65%. "I do not know what the caller
-/// does" and "the caller keeps it" are different claims and the checker has to
-/// be able to make each.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ParamState {
     Sole,
@@ -453,8 +295,8 @@ impl ParamState {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum RetState {
     Fresh,
-    /// The body answers its `k`th parameter, so the call answers whatever the
-    /// argument at that position was worth.
+    /// The body answers its `k`th parameter, so the call answers whatever the argument at that
+    /// position was worth.
     Param(usize),
     Shared(Why),
     Unsure(Why),
@@ -495,10 +337,6 @@ impl Default for Res {
 }
 
 /// How many rounds the fixpoint is allowed.
-///
-/// It is monotone — every state only ever falls — so it converges in at most
-/// one round per parameter; the cap is a guard against a bug in that argument
-/// rather than a budget. Reaching it is reported, not swallowed.
 const MAX_ROUNDS: usize = 24;
 
 impl<'a> Costs<'a> {
@@ -521,19 +359,6 @@ impl<'a> Costs<'a> {
     }
 
     /// Walk every definition to a fixpoint, then read the verdicts off it.
-    ///
-    /// Two whole-program facts are being solved for at once, and neither can be
-    /// settled by a single traversal:
-    ///
-    /// - **what a parameter is worth**, which is a question about every call
-    ///   site of the definition and therefore about the whole program;
-    /// - **what a call answers**, because a definition that hands back one of
-    ///   its own arguments hands back whatever that argument was worth.
-    ///
-    /// Both start optimistic and only ever fall, so the iteration is monotone
-    /// and terminates. Starting optimistic is also the right reading for a
-    /// recursive definition: `fn go(acc) = go(push(acc, 1))` should not
-    /// conclude that `acc` is shared because `go` has not decided yet.
     pub fn check(&self) -> Report {
         let bodies = self.bodies();
         let mut tables = Tables {
@@ -560,8 +385,8 @@ impl<'a> Costs<'a> {
             }
             tables = next;
         }
-        // One more walk under the settled tables, so every verdict is read off
-        // the answer rather than off the round that produced it.
+        // One more walk under the settled tables, so every verdict is read off the answer rather
+        // than off the round that produced it.
         let found = self.round(&bodies, &tables);
 
         let mut spoiled: Vec<(String, usize, String)> = Vec::new();
@@ -666,8 +491,8 @@ impl<'a> Costs<'a> {
                     .map(|(k, name)| Binding {
                         name: name.clone(),
                         owner: match body.qname {
-                            // A test or a law has no caller: its binders are
-                            // whatever the harness built.
+                            // A test or a law has no caller: its binders are whatever the harness
+                            // built.
                             None => Owner::Fresh,
                             Some(_) => Owner::Param(k),
                         },
@@ -685,8 +510,7 @@ impl<'a> Costs<'a> {
             .collect()
     }
 
-    /// One step of the fixpoint: what the round just walked says the tables
-    /// should be.
+    /// One step of the fixpoint: what the round just walked says the tables should be.
     fn settle(&self, bodies: &[Body<'_>], found: &[Found], tables: &Tables) -> Tables {
         let mut params: FxHashMap<Symbol, Vec<ParamState>> = self
             .defs
@@ -835,18 +659,8 @@ struct Walk<'c, 'a> {
 }
 
 impl Walk<'_, '_> {
-    /// `vf` is the frontier the **value** this node produces is judged at,
-    /// which is not the frontier its sub-expressions are evaluated at.
-    ///
-    /// The difference is one level of `carry` and it is the whole reason a
-    /// first version of this checker called every accumulator in the tree
-    /// shared. At `push(acc, x)` the machine holds a clone of the scope while
-    /// `acc` is read — argument 0 of 2 — so a `push` *nested inside* that
-    /// argument runs with the scope shared and copies. `acc` itself does not:
-    /// the frame that carried the scope drops it before `apply`, so by the time
-    /// `push` runs its own carry is gone. An App's argument carry therefore
-    /// raises the frontier for everything inside the argument and not for the
-    /// argument's own value, and `vf` is that distinction.
+    /// `vf` is the frontier the **value** this node produces is judged at, which is not the
+    /// frontier its sub-expressions are evaluated at.
     fn walk(&mut self, code: &Code, st: &mut State, vf: usize) -> Owner {
         crate::limit::grow(|| self.walk_node(code, st, vf))
     }
@@ -865,9 +679,8 @@ impl Walk<'_, '_> {
             }
 
             NodeKind::Binary { op, lhs, rhs } => {
-                // `Frame::BinaryRhs` holds `env.clone()` unconditionally, and
-                // for `&&`/`||` `Frame::ShortCircuit` holds one over the right
-                // operand too.
+                // `Frame::BinaryRhs` holds `env.clone()` unconditionally, and for `&&`/`||`
+                // `Frame::ShortCircuit` holds one over the right operand too.
                 let outer = st.frontier;
                 st.frontier = st.carried();
                 let carried = st.frontier;
@@ -890,10 +703,8 @@ impl Walk<'_, '_> {
             NodeKind::App { func, args } => {
                 let builtin = self.builtin_of(func, st);
                 let callee = self.callee_of(func, st);
-                // `Value::Closure` holds the whole chain, so a lambda written
-                // here keeps every other argument's binding alive for the
-                // length of the call. Measured: `fold(ys, xs, |acc, y| ...)`
-                // copies on its first iteration and on no later one.
+                // `Value::Closure` holds the whole chain, so a lambda written here keeps every
+                // other argument's binding alive for the length of the call.
                 let captures = args
                     .iter()
                     .any(|a| matches!(a.kind, NodeKind::Lambda { .. }));
@@ -901,12 +712,7 @@ impl Walk<'_, '_> {
                 if !args.is_empty() {
                     st.frontier = st.carried();
                 }
-                // A callee written as a name is not the definition *escaping*:
-                // it is the call. Walking it would reach `var_owner`, which
-                // marks a definition named outside callee position as reached
-                // by something this pass cannot see — and that read every call
-                // in the tree as an escape, which put 24 of 27 undecided sites
-                // into `unknown` for no reason at all.
+                // A callee written as a name is not the definition *escaping*: it is the call.
                 if !matches!(func.kind, NodeKind::Var(_)) {
                     let callee_frontier = st.frontier;
                     self.walk(func, st, callee_frontier);
@@ -924,12 +730,8 @@ impl Walk<'_, '_> {
                         None => self.walk(arg, st, outer),
                     };
                     let mut res = resolve(owner, st, outer);
-                    // A closure holds the *chain*, not the argument list, so
-                    // only a value some binding in that chain can still reach
-                    // acquires a second owner from it. A list built here — a
-                    // literal, another `push`, a call answering something
-                    // fresh — is not in the closure and is unaffected. That
-                    // distinction is the whole of `via_chain`.
+                    // A closure holds the *chain*, not the argument list, so only a value some
+                    // binding in that chain can still reach acquires a second owner from it.
                     if captures && !matches!(arg.kind, NodeKind::Lambda { .. }) {
                         res = match res {
                             Res::Unique { via_chain: true } | Res::Param(_) => {
@@ -981,10 +783,9 @@ impl Walk<'_, '_> {
                 let outer = st.frontier;
                 st.frontier = st.carried();
                 let carried = st.frontier;
-                // `try_arms` binds the arm's pattern on top of a *clone* of the
-                // scope, so the scrutinee's source binding is still reachable
-                // for the whole arm body and is never taken. What a binder
-                // holds is therefore what the scrutinee held.
+                // `try_arms` binds the arm's pattern on top of a *clone* of the scope, so the
+                // scrutinee's source binding is still reachable for the whole arm body and is never
+                // taken.
                 let scrutinee_owner = self.walk(scrutinee, st, carried);
                 st.frontier = outer;
                 let mut joined: Option<Owner> = None;
@@ -999,8 +800,7 @@ impl Walk<'_, '_> {
                         });
                     }
                     if let Some(guard) = &arm.guard {
-                        // `Frame::MatchGuard` holds both the arm's scope and
-                        // the enclosing one.
+                        // `Frame::MatchGuard` holds both the arm's scope and the enclosing one.
                         st.frontier = st.carried();
                         let carried = st.frontier;
                         self.walk(guard, st, carried);
@@ -1037,13 +837,13 @@ impl Walk<'_, '_> {
                 }
                 st.frontier = outer;
                 let answer = match tail {
-                    // The tail runs with the scope moved into it: no block
-                    // frame is left holding one.
+                    // The tail runs with the scope moved into it: no block frame is left holding
+                    // one.
                     Some(t) => self.walk(t, st, vf),
                     None => Owner::Fresh,
                 };
-                // An answer naming a binding about to leave scope is settled
-                // here, while the index still means something.
+                // An answer naming a binding about to leave scope is settled here, while the index
+                // still means something.
                 let answer = lift_out(answer, st, depth, vf);
                 st.chain.truncate(depth);
                 answer
@@ -1065,9 +865,8 @@ impl Walk<'_, '_> {
             }
 
             NodeKind::Field { base, field } => {
-                // `Frame::FieldAccess` carries no scope and answers
-                // `v.clone()`, then drops the record it read — so the field is
-                // at one owner exactly when the record was.
+                // `Frame::FieldAccess` carries no scope and answers `v.clone()`, then drops the
+                // record it read — so the field is at one owner exactly when the record was.
                 match self.walk(base, st, vf) {
                     Owner::Blocked(why) => Owner::Blocked(why.reworded(format!(
                         "`.{}` was read out of a record something else still holds: {}",
@@ -1132,8 +931,7 @@ impl Walk<'_, '_> {
                 init, binder, body, ..
             } => {
                 let outer = st.frontier;
-                // `Frame::WithCellBody` holds the scope while the initial value
-                // is built.
+                // `Frame::WithCellBody` holds the scope while the initial value is built.
                 st.frontier = st.carried();
                 let carried = st.frontier;
                 self.walk(init, st, carried);
@@ -1162,10 +960,6 @@ impl Walk<'_, '_> {
     }
 
     /// A construct whose body may run again, later, or beside another task.
-    ///
-    /// Its scope is captured by whatever holds the body, so nothing outside it
-    /// is reachable by name and the chain restarts at its own parameters. This
-    /// is `rc::Live::open`'s rule, for the same reason.
     fn barrier(&mut self, params: &[Symbol], body: &Code, st: &mut State, owners: &[Owner]) {
         let held = std::mem::take(&mut st.chain);
         let frontier = st.frontier;
@@ -1192,14 +986,9 @@ impl Walk<'_, '_> {
     fn var_owner(&mut self, q: &QName, own: Own, st: &State, vf: usize) -> Owner {
         let bare = q.is_bare();
         if let Some(i) = bare.then(|| st.index_of(q.symbol())).flatten() {
-            // `Own::Owned` is a *move* only where `take_unique` can succeed,
-            // which is where the chain is unshared **at this occurrence** —
-            // `st.frontier`, not the frontier the value will be judged at.
-            // Confusing the two is what made the checker believe that
-            // `fold(cols, acc, |inner, c| push(inner, n))` moved `acc` out of
-            // the enclosing closure's scope: the read is argument 1 of 3, the
-            // scope is carried, the take refuses, and the binding survives to
-            // be captured. Measured, that site copies 23 of 23 times.
+            // `Own::Owned` is a *move* only where `take_unique` can succeed, which is where the
+            // chain is unshared **at this occurrence** — `st.frontier`, not the frontier the value
+            // will be judged at.
             let _ = vf;
             return if own == Own::Owned && i >= st.frontier {
                 st.chain[i].owner.clone()
@@ -1207,8 +996,8 @@ impl Walk<'_, '_> {
                 Owner::Held(i)
             };
         }
-        // A definition named outside callee position is a definition applied by
-        // something this analysis cannot see.
+        // A definition named outside callee position is a definition applied by something this
+        // analysis cannot see.
         if let Some(name) = self.costs.resolve_name(st.module, q)
             && self.costs.defs.contains_key(&name)
         {
@@ -1224,9 +1013,7 @@ impl Walk<'_, '_> {
                 "a module-qualified name denotes something the program holds",
             ));
         }
-        // A free variable of the enclosing closure. Genuinely open: the closure
-        // may be dead by the time the append runs, which is what makes
-        // `json.ply`'s `collect_prices` 100% in place.
+        // A free variable of the enclosing closure.
         Owner::Unknown(Why::new(
             Cause::Closure,
             format!(
@@ -1246,8 +1033,8 @@ impl Walk<'_, '_> {
             return None;
         }
         let name = q.symbol();
-        // A local binding or a definition of the same name shadows the builtin,
-        // exactly as `Machine::lookup` orders them.
+        // A local binding or a definition of the same name shadows the builtin, exactly as
+        // `Machine::lookup` orders them.
         if st.index_of(name).is_some() || self.costs.global(st.module, name).is_some() {
             return None;
         }
@@ -1267,12 +1054,6 @@ impl Walk<'_, '_> {
     }
 
     /// What the value a call answers is worth.
-    ///
-    /// A definition that hands back one of its own arguments hands back
-    /// whatever that argument was worth, which is why this consults the round's
-    /// return table rather than giving up on every call. `fn id(x) = x` and
-    /// `fn build() = [1,2,3]` are not the same fact and a checker that calls
-    /// both `Unknown` reports nothing.
     fn result_owner(
         &self,
         builtin: Option<Builtin>,
@@ -1301,8 +1082,8 @@ impl Walk<'_, '_> {
             };
         };
         match b {
-            // Each builds a fresh `Vec` and hands it back; `push`'s two arms
-            // both answer a list nothing else has seen.
+            // Each builds a fresh `Vec` and hands it back; `push`'s two arms both answer a list
+            // nothing else has seen.
             Builtin::Push | Builtin::Map | Builtin::Filter | Builtin::Range => Owner::Fresh,
             Builtin::CellGet => Owner::Blocked(Why::new(
                 Cause::Cell,
@@ -1313,13 +1094,7 @@ impl Walk<'_, '_> {
                 Cause::MapEntry,
                 "`map_get` answers a clone the map still holds",
             )),
-            // The same fact as `map_get`'s, over a list. `list_at` answers a
-            // fresh `Some` around an element the list still holds, and
-            // `NodeKind::Match` binds an arm's binders to *the scrutinee's*
-            // owner — so the element reaches `push` under this verdict and not
-            // under the `Some`'s. Falling through to `_ => Owner::Fresh` would
-            // have `ply review` report an in-place append over a list every
-            // element of which is shared.
+            // The same fact as `map_get`'s, over a list.
             Builtin::ListAt => Owner::Blocked(Why::new(
                 Cause::Element,
                 "`list_at` answers a clone the list still holds",
@@ -1333,15 +1108,6 @@ impl Walk<'_, '_> {
     }
 
     /// What the callback builtins hand the function they call.
-    ///
-    /// `fold`'s accumulator is *moved* into the callback — `next_fold` builds
-    /// `vec![acc, x]` and `Frame::FoldStep` keeps neither — so it arrives at
-    /// one owner **if the initial accumulator did**. Every element is the
-    /// opposite: `items.get(next).cloned()` leaves the list holding it, so
-    /// `map(xs, |x| push(x, 1))` copies whatever any other rule says.
-    ///
-    /// All five take the callback last and have a fixed arity, which is the
-    /// assumption `region_kind.rs` documents and pins.
     fn callback_owners(
         &self,
         builtin: Option<Builtin>,
@@ -1372,9 +1138,8 @@ impl Walk<'_, '_> {
         }
     }
 
-    /// A callback written at the call site, entered with the owners the builtin
-    /// is known to hand it rather than with the `Unknown` a closure of unknown
-    /// provenance gets.
+    /// A callback written at the call site, entered with the owners the builtin is known to hand it
+    /// rather than with the `Unknown` a closure of unknown provenance gets.
     fn walk_callback(&mut self, owners: &[Owner], arg: &Code, st: &mut State) -> Owner {
         let NodeKind::Lambda { params, body } = &arg.kind else {
             // Named elsewhere: its body is checked where it is defined.
@@ -1415,18 +1180,6 @@ impl Costs<'_> {
 }
 
 /// The frontier a block statement runs under.
-///
-/// `Frame::BlockStep` holds `scope.release(stmt.dead())`. `Env::release`
-/// rebuilds every link inside the outermost name it releases and shares the
-/// rest, so the reachable region begins exactly at that name. Three cases the
-/// machine distinguishes and a reader would not:
-///
-/// - an empty dead set is `self.clone()`, so **nothing** is reachable;
-/// - a dead set naming only bindings the statement is about to introduce is not
-///   found in the chain at all, `release` walks off the end, and the scope it
-///   hands the continuation shares **nothing** — every binding stays reachable;
-/// - a dead set none of whose names are in the chain is `self.clone()` again,
-///   because `release` returns early when it released nothing.
 fn statement_frontier(stmt: &Stmt, st: &State, outer: usize) -> usize {
     let dead = stmt.dead();
     if dead.is_empty() {
@@ -1446,8 +1199,8 @@ fn statement_frontier(stmt: &Stmt, st: &State, outer: usize) -> usize {
 fn resolve(owner: Owner, st: &State, vf: usize) -> Res {
     let mut owner = owner;
     let mut via_chain = false;
-    // Bounded rather than recursive: `Held` points strictly outward, so the
-    // walk is at most the depth of the chain.
+    // Bounded rather than recursive: `Held` points strictly outward, so the walk is at most the
+    // depth of the chain.
     for _ in 0..=st.chain.len() {
         match owner {
             Owner::Fresh => return Res::Unique { via_chain },
@@ -1476,8 +1229,8 @@ fn resolve(owner: Owner, st: &State, vf: usize) -> Res {
     ))
 }
 
-/// Joins two branch answers, settling anything that names a binding: the arms
-/// may name different ones and only one index fits in the answer.
+/// Joins two branch answers, settling anything that names a binding: the arms may name different
+/// ones and only one index fits in the answer.
 fn join(a: Owner, b: Owner, st: &State, vf: usize) -> Owner {
     match (resolve(a, st, vf), resolve(b, st, vf)) {
         (Res::Unique { .. }, Res::Unique { .. }) => Owner::Fresh,

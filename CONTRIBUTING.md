@@ -806,10 +806,24 @@ repository has, and it is the reason a stale test is visible.
 rebuilt something:\n{text}"` beats `assert_eq!`'s default. A failing test should
 be readable by someone who has never seen the file.
 
-**Comments explain a non-obvious *why*.** The existing code comments are dense
-and load-bearing — `crates/ply-hash/src/lib.rs`'s explanation of why the
-component loop re-encodes once more after the partition settles is the model.
-Do not add comments that restate the code or a type signature.
+**Comments explain a non-obvious *why*, and one is usually a sentence.** The
+model is `crates/ply-hash/src/lib.rs`'s explanation of why the component loop
+re-encodes once more after the partition settles: you cannot read that off the
+loop, and a reader who does not have it will delete the extra round. Do not
+restate the code or a type signature.
+
+**A definition's history does not belong in its doc comment.** Which ADR moved
+it, which milestone it shipped in, what a claim used to say and what a number
+used to be are all git's, and the same reasoning applies here as in `CLAUDE.md`
+§"Numbers, and the failure mode they cause here" — a correction block beside the
+code is a diff written by hand, badly. Comments in this tree used to carry all
+of it; they do not now, and the way that grew back last time was one careful
+paragraph at a time.
+
+**Doc comments in `crates/ply-cli/src/cli.rs`, `config.rs`, `trace.rs`, `db.rs`,
+`style.rs` and `crates/ply-corpus/src/main.rs` are `--help` text**, not
+commentary — `clap` renders them for the user. Edit them as user-facing prose,
+and do not trim them to fit a style rule about comments.
 
 **Dependencies.** Pin the latest stable version and write, in `Cargo.toml`, why
 the crate is there and why not the obvious alternative. The existing comments on

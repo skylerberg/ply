@@ -1,52 +1,4 @@
 //! Record update expansion, which happens inside the parser.
-//!
-//! `{..b, f: e}` is sugar. An unexpanded [`ExprKind::RecordUpdate`] never
-//! escapes [`crate::parse_module`]: this pass rewrites every one into the plain
-//! [`ExprKind::Record`] a reader would have written by hand, so the two
-//! spellings are **one definition with one hash** rather than two definitions
-//! computing the same value.
-//!
-//! That is the whole constraint. Ply is content-addressed — a test re-runs iff
-//! its hash is absent from the cache — so a sugar that hashed differently from
-//! its expansion would move every definition that adopted it and would split
-//! one value into two cache entries.
-//!
-//! ## Why here, and not in normalization
-//!
-//! The obvious place is `ply_hash::normalize`, and it cannot work: the driver
-//! hashes before it infers (`crates/ply-cli/src/driver.rs`, parse → resolve →
-//! hash → gate 2 → infer), which ADR 0002 pins deliberately, so normalization
-//! has no types and cannot enumerate the base's fields. Changing normalization's
-//! byte stream would also be a cache-format change, which moves every cached
-//! result everywhere.
-//!
-//! ## Why it reads only this module
-//!
-//! Expansion reads **this module's own `type` items and the type annotations
-//! written in this file, and nothing else**, for the reason `effect_set`
-//! expansion does: gate 1 (ADR 0002) skips a file whose raw bytes are unchanged.
-//! A shape read across a module boundary would let an edit in the declaring
-//! module leave a stale expansion behind in a file that never moved — and a
-//! stale expansion is a *wrong record*, not merely a stale name.
-//!
-//! The cost is a real restriction, recorded in `docs/adr/0023-record-update.md`
-//! §4 with its lift path: `{..cfg, x: 1}` where `cfg: std::http::Limits` is
-//! refused with `E0116`, because `Limits` is declared in another file.
-//!
-//! ## The canonical order
-//!
-//! Copies first, **sorted by field name**; then the written fields, in the order
-//! written. Both halves are load-bearing and neither is taste:
-//!
-//! - *Sorted, not declaration order*, because `reordering_the_fields_of_a
-//!   _record_type_is_free` (`crates/ply-hash/tests/suite/audit.rs`) is an invariant the
-//!   suite asserts. Expanding in the type's declaration order would make
-//!   reordering a `type` move the hash of every update against it.
-//! - *Written fields last*, because `spikes/ply-lexer/GAPS.md` §1 measures a
-//!   growing sub-expression in any but the last position of its enclosing node
-//!   as quadratic. Copies are pure field reads and never grow, so putting them
-//!   first is free — and it lands `{..s, toks: push(s.toks, t)}` on the linear
-//!   spelling rather than the quadratic one.
 
 use crate::ast::*;
 use crate::effect_set::grow;
@@ -54,15 +6,9 @@ use indexmap::IndexMap;
 use ply_span::{Diagnostic, Symbol, codes};
 
 /// How deep an alias chain may be followed before the pass gives up.
-///
-/// A bound rather than a cycle check because this runs in the parser, before
-/// anything has rejected `type A = B` / `type B = A`: a refusal here is a
-/// diagnostic, where a loop would be a hang.
 const MAX_ALIAS_DEPTH: u32 = 16;
 
-/// Rewrites every `{..b, f: e}` in the module into the record literal it stands
-/// for. Only called when the file wrote one, so a program that uses none pays
-/// nothing.
+/// Rewrites every `{..b, f: e}` in the module into the record literal it stands for.
 pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     let types = collect_types(module);
     let mut items = std::mem::take(&mut module.items);
@@ -77,13 +23,7 @@ pub(crate) fn expand(module: &mut Module, diags: &mut Vec<Diagnostic>) {
     module.items = items;
 }
 
-/// The same expansion for an expression parsed with no module around it
-/// ([`crate::parse_expr`]).
-///
-/// Every base refuses, because there are no `type` items and no signatures to
-/// read a shape from. That is the correct outcome and not a gap: what must not
-/// happen is an unexpanded [`ExprKind::RecordUpdate`] reaching a crate whose
-/// only arm for one is `unreachable!`.
+/// The same expansion for an expression parsed with no module around it ([`crate::parse_expr`]).
 pub(crate) fn expand_bare(e: &mut Expr, diags: &mut Vec<Diagnostic>) {
     let types = IndexMap::new();
     let mut cx = Cx {
@@ -94,9 +34,8 @@ pub(crate) fn expand_bare(e: &mut Expr, diags: &mut Vec<Diagnostic>) {
     cx.expr(e);
 }
 
-/// This module's own `type` items, by simple name, cloned so that the walk can
-/// hold the module mutably. First wins: a duplicate is `E0105` from inference,
-/// and a module that has one is rejected whichever of the two this picks.
+/// This module's own `type` items, by simple name, cloned so that the walk can hold the module
+/// mutably.
 fn collect_types(module: &Module) -> IndexMap<Symbol, TypeDef> {
     let mut out = IndexMap::new();
     for item in &module.items {
@@ -108,9 +47,7 @@ fn collect_types(module: &Module) -> IndexMap<Symbol, TypeDef> {
     out
 }
 
-/// Why a base has no shape this pass can name. Each variant carries what the
-/// note has to say, because "cannot resolve" on its own tells a reader nothing
-/// about which of these rules they hit.
+/// Why a base has no shape this pass can name.
 enum Why {
     /// In scope, but nothing wrote its type.
     Unannotated(Symbol),
@@ -180,13 +117,7 @@ enum Bound<'a> {
 struct Cx<'a> {
     types: &'a IndexMap<Symbol, TypeDef>,
     diags: &'a mut Vec<Diagnostic>,
-    /// Every binder in scope, innermost last. A frame is a mark into this vector
-    /// and is popped by truncating back to it.
-    ///
-    /// An unannotated binder is pushed as `None` rather than skipped. That is
-    /// the difference between refusing a shadowed base and expanding it against
-    /// the *outer* binder's type, which would be a wrong record that type-checks
-    /// nowhere the reader is looking.
+    /// Every binder in scope, innermost last.
     scope: Vec<(Symbol, Option<TypeExpr>)>,
 }
 
@@ -195,8 +126,8 @@ impl Cx<'_> {
         self.scope.push((name.name.clone(), ty));
     }
 
-    /// Every binder a pattern introduces, all untyped: a pattern's binders take
-    /// their types from the scrutinee, which this pass does not infer.
+    /// Every binder a pattern introduces, all untyped: a pattern's binders take their types from
+    /// the scrutinee, which this pass does not infer.
     fn bind_pattern(&mut self, p: &Pattern) {
         match &p.kind {
             PatternKind::Wildcard | PatternKind::Lit(_) => {}
@@ -222,8 +153,7 @@ impl Cx<'_> {
         }
     }
 
-    /// The written type of a path, following field projections through this
-    /// module's aliases.
+    /// The written type of a path, following field projections through this module's aliases.
     fn type_of_path(&self, e: &Expr) -> Result<TypeExpr, Why> {
         match &e.kind {
             ExprKind::Var(q) if !q.is_bare() => Err(Why::CrossModule),
@@ -243,9 +173,9 @@ impl Cx<'_> {
                     )),
                 }
             }
-            // The parser admits only `x` and `x.f...` as a base, so this is
-            // unreachable from source; it is written out rather than
-            // `unreachable!` because a refusal is the safe answer either way.
+            // The parser admits only `x` and `x.f...` as a base, so this is unreachable from
+            // source; it is written out rather than `unreachable!` because a refusal is the safe
+            // answer either way.
             _ => Err(Why::NotARecord),
         }
     }
@@ -257,8 +187,8 @@ impl Cx<'_> {
         }
         match ty {
             TypeExpr::Record { fields, .. } => Ok(fields.clone()),
-            // A lowercase bare name is a type parameter bound by an enclosing
-            // `<..>`, never a declared type.
+            // A lowercase bare name is a type parameter bound by an enclosing `<..>`, never a
+            // declared type.
             TypeExpr::Var(_) => Err(Why::Generic),
             TypeExpr::Con { name, args, .. } => {
                 if !name.is_bare() {
@@ -282,10 +212,6 @@ impl Cx<'_> {
     }
 
     /// Rewrites one update, or refuses it and leaves the written fields alone.
-    ///
-    /// On every refusal path the node still becomes an [`ExprKind::Record`]: a
-    /// diagnostic has been recorded, and letting the sugar escape the parser
-    /// would break the invariant every crate downstream relies on.
     fn expand_update(&mut self, base: Expr, written: Vec<(Ident, Expr)>) -> ExprKind {
         let shape = match self.type_of_path(&base) {
             Ok(ty) => self.record_of(&ty, 0),
@@ -335,12 +261,7 @@ impl Cx<'_> {
             .map(|(n, _)| n)
             .filter(|n| !written.iter().any(|(w, _)| w.name == n.name))
             .collect();
-        // By name, never by length. Every single-letter field set orders the
-        // same way under both, and one mixed-length pair only rules out the
-        // length direction it disagrees with, so each of these carries a pair
-        // each way: `crate::tests::copies_are_sorted_by_name_and_not_by_length`,
-        // and `ply-hash`'s `record_update_hashes_as_its_expansion` and
-        // `a_projected_base_hashes_as_its_expansion`.
+        // By name, never by length.
         copies.sort_by(|a, b| a.name.as_str().cmp(b.name.as_str()));
 
         let mut fields: Vec<(Ident, Expr)> = Vec::with_capacity(copies.len() + written.len());
@@ -392,8 +313,8 @@ impl Cx<'_> {
         }
     }
 
-    /// Children first, then this node: an update nested in another's field value
-    /// is expanded before the outer one copies it.
+    /// Children first, then this node: an update nested in another's field value is expanded before
+    /// the outer one copies it.
     fn expr(&mut self, e: &mut Expr) {
         grow(|| {
             match &mut e.kind {
@@ -443,9 +364,8 @@ impl Cx<'_> {
                     for stmt in stmts {
                         match stmt {
                             Stmt::Let { pat, ty, value, .. } => {
-                                // The value is elaborated before the binder
-                                // exists: `let s = {..s, a: 1}` updates the
-                                // outer `s`.
+                                // The value is elaborated before the binder exists: `let s = {..s,
+                                // a: 1}` updates the outer `s`.
                                 self.expr(value);
                                 match (&pat.kind, ty) {
                                     (PatternKind::Var(n), Some(t)) => {
@@ -469,13 +389,8 @@ impl Cx<'_> {
                     fields.iter_mut().for_each(|(_, v)| self.expr(v));
                 }
                 ExprKind::Field { base, .. } => self.expr(base),
-                // `try_op::expand` runs *after* this pass, so the sugar is
-                // still here and this walk goes through it. The reason once
-                // given for that order — that a `?` expanded first would have
-                // turned `let x: T = e?;` into an untyped `Ok(x)` arm binder —
-                // is withdrawn in ADR 0028 Decision 1: that shape is refused,
-                // not expanded. This arm is what makes the order free, so it
-                // stays whichever way the two are sequenced.
+                // `try_op::expand` runs *after* this pass, so the sugar is still here and this walk
+                // goes through it.
                 ExprKind::Try { operand } => self.expr(operand),
                 ExprKind::List { items } => items.iter_mut().for_each(|i| self.expr(i)),
                 ExprKind::Perform { args, .. } => args.iter_mut().for_each(|a| self.expr(a)),

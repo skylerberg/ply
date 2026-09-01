@@ -1,11 +1,4 @@
 //! Turning one failure into the artifact of ADR 0004.
-//!
-//! The artifact answers, in this order: which change caused this, what actually
-//! ran, what else could have, and what was asserted. This module owns the first
-//! three — it runs the preconditions, builds the delta, drives the search, and
-//! folds the trace and the bisection into the ranked suspect list. It decides
-//! nothing a run has no evidence for: every gate below refuses rather than
-//! guesses, because naming the wrong definition is worse than naming none.
 
 use crate::bisect::{
     Baseline, Bisection, Budget, Classify, Delta, DepEdges, Diff, Gate, Hybrid, Mode, NoHybrid,
@@ -33,20 +26,16 @@ impl Options {
     }
 }
 
-/// One failure, and everything a run knows about it that is not in the
-/// diagnostic.
+/// One failure, and everything a run knows about it that is not in the diagnostic.
 pub struct Evidence<'a> {
     /// `<module>.<label>`.
     pub key: &'a Symbol,
     pub test_hash: Option<DefHash>,
     pub nondet: bool,
-    /// The evaluator failed rather than the program — a defect in Ply, not a
-    /// change to attribute. A runtime error the language defines is not one.
+    /// The evaluator failed rather than the program — a defect in Ply, not a change to attribute.
     pub defect: bool,
-    /// The failing run reached a host handler, read off what the runtime did
-    /// rather than off the prediction selection made. Bisection re-runs a test
-    /// once per candidate set, so this is the difference between a search and a
-    /// packet sent sixty-four times.
+    /// The failing run reached a host handler, read off what the runtime did rather than off the
+    /// prediction selection made.
     pub host: bool,
     /// The raw closure ∩ changed intersection, by name.
     pub suspects: &'a [Symbol],
@@ -55,9 +44,7 @@ pub struct Evidence<'a> {
     pub slice: Option<CausalSlice>,
 }
 
-/// `hybrid` is `None` when no hybrid program can be built. `absent` says which
-/// of the reasons it was, and is reported only to a search that would have had
-/// to run one — the answers that need no mixture are unaffected either way.
+/// `hybrid` is `None` when no hybrid program can be built.
 pub fn diagnose(
     evidence: Evidence<'_>,
     options: &Options,
@@ -68,9 +55,9 @@ pub fn diagnose(
 ) -> Attribution {
     let mut attribution = Attribution::from_suspects(evidence.suspects, evidence.hashes);
 
-    // The delta is worth building whatever happens to the search: which suspects
-    // anybody actually edited is the field that shrinks an agent's reading list,
-    // and it needs a baseline rather than a hybrid.
+    // The delta is worth building whatever happens to the search: which suspects anybody actually
+    // edited is the field that shrinks an agent's reading list, and it needs a baseline rather than
+    // a hybrid.
     let gate = precheck(
         Gate::new(
             options.bisect,
@@ -110,10 +97,8 @@ pub fn diagnose(
     attribution
 }
 
-/// One cluster and an unedited test is the overwhelmingly common case — one
-/// edit — and it is decided by counting, not by evaluating. Withholding that
-/// answer because the body store is cold would make the default useless on
-/// exactly the failure it exists for.
+/// One cluster and an unedited test is the overwhelmingly common case — one edit — and it is
+/// decided by counting, not by evaluating.
 fn needs_a_hybrid(delta: &Delta) -> bool {
     match delta.clusters.len() {
         0 => false,
@@ -143,10 +128,7 @@ fn search(diff: &Diff, hybrid: &mut dyn Hybrid, budget: Budget) -> Bisection {
 }
 
 impl Attribution {
-    /// Fills in what the two configurations disagreed about. Separate from
-    /// [`Attribution::resolve`] because it is available whenever a baseline is —
-    /// no bodies, no hybrid and no trace required — and marking the `derived`
-    /// changes is most of the value on its own.
+    /// Fills in what the two configurations disagreed about.
     pub fn annotate(&mut self, delta: &Delta) {
         for suspect in &mut self.suspects {
             if let Some(change) = delta.change(&suspect.name) {
@@ -154,8 +136,8 @@ impl Attribution {
                 suspect.change = Some(change.kind);
             }
         }
-        // A candidate the search names has to be in the list it is ranked
-        // against, or `suspects[0]` is not the best guess.
+        // A candidate the search names has to be in the list it is ranked against, or `suspects[0]`
+        // is not the best guess.
         for change in &delta.changes {
             if !self.suspects.iter().any(|s| s.name == change.name) {
                 let mut extra = Suspect::new(change.name.clone(), change.after);

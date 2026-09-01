@@ -1,17 +1,4 @@
 //! A nullary pure definition is a constant, and both engines remember it.
-//!
-//! The rule is read off the **published** row, so these tests pin the three
-//! signatures that decide it: no parameters and an empty row is remembered, a
-//! parameter is not, and a declared row the body never performs is not either.
-//!
-//! The recursion budget is what makes the memo observable at all. Nothing else
-//! about it is: a constant evaluated once and a constant evaluated twice differ
-//! in no value, no atom and no trace, which is the whole argument that
-//! remembering it is a substitution rather than a change. What they do differ
-//! in is how many calls are pending underneath, so a budget the second
-//! evaluation would exceed is the one place the difference has a name — and
-//! both engines have to agree about it or `--engine both` reports `E0503` on
-//! every program with a pure nullary definition in it.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Interp, Machine, Value};
@@ -46,11 +33,8 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-/// `deep` costs 700 pending calls and `nest` costs one per step, so a budget of
-/// 1000 admits either alone and refuses `nest(400)` with a second `deep` under
-/// it. Every probe below is `<constant>() + nest(400)`: the first term is
-/// evaluated at the top, where it always fits, and the second reaches the same
-/// definition from a depth where only a remembered value does.
+/// `deep` costs 700 pending calls and `nest` costs one per step, so a budget of 1000 admits either
+/// alone and refuses `nest(400)` with a second `deep` under it.
 const BUDGET: usize = 1000;
 
 const SOURCE: &str = r#"
@@ -122,8 +106,8 @@ fn a_declared_row_the_body_never_performs_still_refuses_the_memo() {
     }
 }
 
-/// The rule has to keep the atoms: a nullary definition that performs is
-/// re-evaluated, and its handler sees every one of its calls.
+/// The rule has to keep the atoms: a nullary definition that performs is re-evaluated, and its
+/// handler sees every one of its calls.
 #[test]
 fn a_nullary_definition_that_performs_is_evaluated_on_every_call() {
     let c = compile(
@@ -159,9 +143,9 @@ test "a nullary effectful definition performs once per call" {
     }
 }
 
-/// A constant reached from inside a handler is still the same constant, and a
-/// handler that discharges an effect leaves the definition around it pure — so
-/// the value a second call sees has to be the first's.
+/// A constant reached from inside a handler is still the same constant, and a handler that
+/// discharges an effect leaves the definition around it pure — so the value a second call sees has
+/// to be the first's.
 #[test]
 fn a_constant_built_behind_a_handler_is_remembered_with_its_value_intact() {
     let c = compile(

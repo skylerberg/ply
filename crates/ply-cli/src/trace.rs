@@ -1,17 +1,4 @@
 //! Which sink a run writes its records to, and at what level.
-//!
-//! Two flags, and the one thing worth saying about them is what they do **not**
-//! do. `--trace off` does not remove a `perform`: a row is a claim about what a
-//! computation can do and it cannot be conditional on a flag, so "off" binds
-//! [`ply_host::trace::Discard`] — a real, listed member of the trusted
-//! computing base whose clause answers `Unit` — and `ply hosts` prints it.
-//! Leaving `trace` unregistered would be `E0424` at the first event, which is
-//! correct for a hermetic run and is not what "off" should mean.
-//!
-//! `--trace-level` filters **in the sink**, so it saves the record and not the
-//! perform or the `Fields` map the call site built. That is the honest
-//! statement of what it buys, and `crates/ply-host/tests/trace_cost.rs` is the
-//! number behind it.
 
 use clap::{Args, ValueEnum};
 use ply_host::trace::{Discard, Json, Level, Sink, Text, Trace};
@@ -118,9 +105,9 @@ impl TraceOptions {
         let sink: Arc<dyn Sink> = match self.sink {
             SinkArg::Json => Arc::new(Json::new(self.level.level())),
             SinkArg::Text => Arc::new(Text::new(self.level.level())),
-            // A level on a discarding sink would be a distinction with no
-            // consequence, and printing one would invite a reader to believe
-            // `--trace off --trace-level debug` writes something.
+            // A level on a discarding sink would be a distinction with no consequence, and printing
+            // one would invite a reader to believe `--trace off --trace-level debug` writes
+            // something.
             SinkArg::Off => Arc::new(Discard),
         };
         Arc::new(Trace::new(sink))

@@ -1,24 +1,14 @@
-//! The same audit as `ply-eval`'s `determinism_audit`, one level up: through the
-//! real binary, across separate processes.
-//!
-//! A unit test shares an address space, an allocator and a thread, so it cannot
-//! see the three things most likely to make a seeded run irreproducible in the
-//! field — a different process, a different worker count, and a different set of
-//! tests running beside it. Everything here is a claim about the *artifact*: the
-//! `--json` an agent is handed, which is what a repro is made of.
-//!
-//! Timings are the only thing allowed to differ, and [`scrub`] is where that
-//! exception is written down. Anything else that varies between two runs of one
-//! seed is a defect: a seed that does not reproduce makes the artifact worthless.
+//! The same audit as `ply-eval`'s `determinism_audit`, one level up: through the real binary,
+//! across separate processes.
 
 use assert_cmd::Command;
 use serde_json::{Map, Value};
 use std::path::Path;
 use tempfile::TempDir;
 
-/// A racy test, a test that is order-insensitive, and one that never simulates —
-/// so the artifact has failures, exhaustive searches and ordinary cached tests
-/// in it at once, and a difference in any of them shows.
+/// A racy test, a test that is order-insensitive, and one that never simulates — so the artifact
+/// has failures, exhaustive searches and ordinary cached tests in it at once, and a difference in
+/// any of them shows.
 const CORPUS: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -88,13 +78,6 @@ fn ply(dir: &Path) -> Command {
 }
 
 /// Everything a run is allowed to differ in, and nothing else.
-///
-/// Wall-clock timings and the worker count are the whole of the exception:
-/// timings because they measure the host, and `workers` because it is the flag
-/// being varied. `front_end` is dropped whole — it is timings and nothing an
-/// interleaving depends on. If a future field belongs here, it needs the same
-/// one-line justification, because every name added is a place a divergence can
-/// hide.
 fn scrub(value: &Value) -> Value {
     match value {
         Value::Object(fields) => Value::Object(
@@ -127,8 +110,8 @@ fn artifact(dir: &Path, args: &[&str]) -> Value {
     scrub(&json)
 }
 
-/// The result for one test, by key, so that a whole-suite artifact and a
-/// filtered one can be compared over the test they have in common.
+/// The result for one test, by key, so that a whole-suite artifact and a filtered one can be
+/// compared over the test they have in common.
 fn result_for<'a>(artifact: &'a Value, key: &str) -> &'a Value {
     artifact["results"]
         .as_array()
@@ -138,13 +121,8 @@ fn result_for<'a>(artifact: &'a Value, key: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no result for `{key}` in {artifact}"))
 }
 
-/// The claim in its plainest form: run the same command in eight separate
-/// processes and get the same artifact.
-///
-/// Separate processes rather than a loop, because an allocator's layout, a
-/// thread's identity and an environment's contents are the same within one
-/// process and not across them. This is the test that fails if any of those
-/// reaches a scheduling decision.
+/// The claim in its plainest form: run the same command in eight separate processes and get the
+/// same artifact.
 #[test]
 fn one_seed_is_one_artifact_across_separate_processes() {
     let dir = project(CORPUS);
@@ -158,10 +136,7 @@ fn one_seed_is_one_artifact_across_separate_processes() {
     }
 }
 
-/// The same, for the search rather than for one interleaving. `dpor` is the
-/// default and is where the reported counts, the exhaustiveness claim and the
-/// failing seed all come from, so it is the mode whose reproducibility the
-/// milestone actually sells.
+/// The same, for the search rather than for one interleaving.
 #[test]
 fn a_whole_search_is_one_artifact_across_separate_processes() {
     let dir = project(CORPUS);
@@ -173,8 +148,8 @@ fn a_whole_search_is_one_artifact_across_separate_processes() {
             "process {run} searched differently"
         );
     }
-    // ...and the artifact is worth comparing: it has to carry a failure with a
-    // seed in it, or this test would pass on an empty run.
+    // ...and the artifact is worth comparing: it has to carry a failure with a seed in it, or this
+    // test would pass on an empty run.
     let failures = first["failures"].as_array().expect("failures is an array");
     assert!(
         failures.iter().any(|f| f["seed"].is_string()),
@@ -182,9 +157,8 @@ fn a_whole_search_is_one_artifact_across_separate_processes() {
     );
 }
 
-/// A scheduling decision that read anything varying with thread count would show
-/// here and nowhere else. `rayon` schedules whole tests, so a worker count
-/// changes which tests share a thread and in what order they reach it.
+/// A scheduling decision that read anything varying with thread count would show here and nowhere
+/// else.
 #[test]
 fn the_worker_count_does_not_reach_a_scheduling_decision() {
     let dir = project(CORPUS);
@@ -198,9 +172,7 @@ fn the_worker_count_does_not_reach_a_scheduling_decision() {
     }
 }
 
-/// A test run alone must report exactly what it reports run beside others. If it
-/// does not, a `--filter` handed to an agent to reproduce a failure reproduces
-/// something else — which is the one thing the replay path may not do.
+/// A test run alone must report exactly what it reports run beside others.
 #[test]
 fn running_a_test_alone_reports_what_it_reports_in_company() {
     let dir = project(CORPUS);
@@ -219,9 +191,7 @@ fn running_a_test_alone_reports_what_it_reports_in_company() {
     }
 }
 
-/// The front-end cache changes what is parsed, hashed and restored rather than
-/// re-derived. None of that may reach an interleaving, and a warm cache is the
-/// state every run after the first is in.
+/// The front-end cache changes what is parsed, hashed and restored rather than re-derived.
 #[test]
 fn a_warm_front_end_cache_does_not_change_an_interleaving() {
     let dir = project(CORPUS);
@@ -235,8 +205,8 @@ fn a_warm_front_end_cache_does_not_change_an_interleaving() {
     );
 }
 
-/// The repro path, end to end: the seed a failure prints, handed back to the
-/// binary, reproduces that failure and no other.
+/// The repro path, end to end: the seed a failure prints, handed back to the binary, reproduces
+/// that failure and no other.
 #[test]
 fn the_seed_a_failure_prints_replays_that_failure() {
     let dir = project(CORPUS);
@@ -262,15 +232,12 @@ fn the_seed_a_failure_prints_replays_that_failure() {
         "seed {seed} reproduced a different failure"
     );
 
-    // Twice more, in two more processes, because a repro that works once is not
-    // a repro.
+    // Twice more, in two more processes, because a repro that works once is not a repro.
     for _ in 0..2 {
         assert_eq!(artifact(dir.path(), &["--seed", &seed]), replayed);
     }
 }
 
-/// The converse defect. If every seed named the same interleaving the search
-/// would be theatre, and it would look exactly like a search that works.
 #[test]
 fn a_seed_actually_decides_which_interleaving_runs() {
     let dir = project(CORPUS);

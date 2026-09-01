@@ -1,27 +1,4 @@
 //! A second golden pin, over the shapes the first one does not reach.
-//!
-//! `src/tests.rs` pins a record, a sum, `eq` and `ord`. Those are the common
-//! cases and they are not the ones a deriver change is most likely to move
-//! quietly. This file pins the four that carry a decision of their own:
-//!
-//! - `Map<String, v>` gets an object and every other `Map` gets an array of
-//!   pairs, chosen from the key's type after this module's aliases are followed
-//!   — one type has one wire format however it was spelled;
-//! - a type with parameters emits one dictionary parameter per parameter and the
-//!   matching `where derivable(...)` clauses;
-//! - a type parameter named `d` forces the emitter to walk its binder prefix, so
-//!   every binder in the body is renamed;
-//! - a recursive type composes through itself by name rather than by inlining.
-//!
-//! Gate 1 keys on raw file content, so a build that emits different code for the
-//! same file reuses a stale generated definition unless `FRONTEND_VERSION`
-//! moves. That is the whole reason a pin is worth its maintenance: it is the one
-//! place a deriver change is forced to be a decision.
-//!
-//! Determinism is also asserted rather than assumed — the same declaration is
-//! expanded repeatedly and the bytes compared — because "the same type produces
-//! byte-identical code" is what makes a generated definition's hash a function
-//! of the program.
 
 use ply_derive::preview;
 use ply_span::SourceId;
@@ -50,9 +27,8 @@ const MOVED: &str = "the deriver's output moved. If that is intended, update thi
                      file whose generated definition changed would be skipped and the stale one \
                      reused.";
 
-/// `Map<String, v>` is a JSON object and anything else is an array of pairs, and
-/// the deriver decides that syntactically. Both branches are pinned in one
-/// declaration so that a change to either is visible beside the other.
+/// `Map<String, v>` is a JSON object and anything else is an array of pairs, and the deriver
+/// decides that syntactically.
 #[test]
 fn the_two_map_encodings_are_pinned() {
     let g = one(&format!(
@@ -63,8 +39,8 @@ fn the_two_map_encodings_are_pinned() {
     assert_eq!(g, expected, "{MOVED}");
 }
 
-/// One dictionary parameter per type parameter, in declaration order, with the
-/// `where derivable(json, ·)` clauses that make the body's use of them sound.
+/// One dictionary parameter per type parameter, in declaration order, with the `where
+/// derivable(json, ·)` clauses that make the body's use of them sound.
 #[test]
 fn a_parameterized_types_dictionary_form_is_pinned() {
     let g = one(&format!(
@@ -74,12 +50,8 @@ fn a_parameterized_types_dictionary_form_is_pinned() {
     assert_eq!(g, expected, "{MOVED}");
 }
 
-/// A type parameter called `d` collides with the prefix the emitter reaches for
-/// first, so it walks to `d_` and every binder in the body moves with it. The
-/// generated *text* differs from the `a, b` case above; normalization erases
-/// binders, so the hash does not — which is the pair
-/// `derivation_determinism_audit.rs` asserts from the outside and this pins from
-/// the inside.
+/// A type parameter called `d` collides with the prefix the emitter reaches for first, so it walks
+/// to `d_` and every binder in the body moves with it.
 #[test]
 fn a_type_parameter_that_shadows_the_binder_prefix_is_pinned() {
     let g = one(&format!(
@@ -95,9 +67,7 @@ fn a_type_parameter_that_shadows_the_binder_prefix_is_pinned() {
     );
 }
 
-/// A recursive type composes through itself by name. Inlining would be a body
-/// that grows with the graph and a hash that no longer tracks a change to one
-/// level of it.
+/// A recursive type composes through itself by name.
 #[test]
 fn a_recursive_types_self_reference_is_pinned() {
     let g = one(&format!(
@@ -107,9 +77,8 @@ fn a_recursive_types_self_reference_is_pinned() {
     assert_eq!(g, expected, "{MOVED}");
 }
 
-/// An alias is transparent to the checker, so a key spelled through one is the
-/// same type and must reach the same codec. Anything the deriver cannot follow —
-/// a parameterised alias, another module's — keeps the total pair form.
+/// An alias is transparent to the checker, so a key spelled through one is the same type and must
+/// reach the same codec.
 #[test]
 fn a_map_key_is_classified_by_its_type_and_not_by_its_spelling() {
     let g = one(&format!(
@@ -124,10 +93,9 @@ fn a_map_key_is_classified_by_its_type_and_not_by_its_spelling() {
     );
 }
 
-/// `Option` and `Result` are structural, so they compose through the codecs
-/// `std.json` ships rather than through a generated one — and an `Option` whose
-/// payload also writes `null` is **refused** rather than emitted, because
-/// `option_json` would write `Some` and `None` as the same document.
+/// `Option` and `Result` are structural, so they compose through the codecs `std.json` ships rather
+/// than through a generated one — and an `Option` whose payload also writes `null` is **refused**
+/// rather than emitted, because `option_json` would write `Some` and `None` as the same document.
 #[test]
 fn the_structural_codecs_are_composed_by_name() {
     let g = one(&format!(
@@ -152,10 +120,8 @@ fn the_structural_codecs_are_composed_by_name() {
     }
 }
 
-/// Byte-identical across repeated expansions of one declaration, and across two
-/// declarations that differ only in a name the encoding does not contain. The
-/// first is the property a hash rests on; the second is the reason renaming a
-/// type re-runs no test.
+/// Byte-identical across repeated expansions of one declaration, and across two declarations that
+/// differ only in a name the encoding does not contain.
 #[test]
 fn expansion_is_a_function_of_the_declaration() {
     let of = |name: &str| {

@@ -1,8 +1,4 @@
 //! One pass of the compiler over a directory, with a stopwatch between phases.
-//!
-//! The compiler's own front end is not reused here: it parses, resolves and
-//! checks behind one call, and one number is what this crate exists not to
-//! report.
 
 use anyhow::{Context, Result, bail};
 use ply_core::CheckOutput;
@@ -86,8 +82,8 @@ impl Timings {
     }
 }
 
-/// Everything a run produced, so a caller can time the front end once and then
-/// select and execute against it several times.
+/// Everything a run produced, so a caller can time the front end once and then select and execute
+/// against it several times.
 #[derive(Debug)]
 pub struct Front {
     pub root: PathBuf,
@@ -98,9 +94,7 @@ pub struct Front {
     pub check: CheckOutput,
     pub hashes: HashOutput,
     pub timings: Timings,
-    /// This program's region kinds. A property of the program, so it is held
-    /// beside the program and handed to the engines below rather than inferred
-    /// once per engine — and a search builds one engine per interleaving.
+    /// This program's region kinds.
     region_kinds: ply_eval::region_kind::Kinds,
 }
 
@@ -173,9 +167,8 @@ fn timed<T>(f: impl FnOnce() -> Result<T>) -> Result<(T, Duration)> {
     Ok((value, started.elapsed()))
 }
 
-/// Diagnostics collapse to one error here on purpose: this crate compiles a
-/// corpus it generated, so a diagnostic is a defect in the generator and the
-/// first one is enough to go and look.
+/// Diagnostics collapse to one error here on purpose: this crate compiles a corpus it generated, so
+/// a diagnostic is a defect in the generator and the first one is enough to go and look.
 fn report(diagnostics: &[Diagnostic]) -> anyhow::Error {
     let shown: Vec<String> = diagnostics.iter().take(5).map(|d| d.to_string()).collect();
     anyhow::anyhow!(

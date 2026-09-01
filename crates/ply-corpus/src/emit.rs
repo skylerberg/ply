@@ -1,14 +1,9 @@
 //! [`Corpus`] to Ply source.
-//!
-//! Every arm here has a twin in [`crate::model::Corpus::eval`]. Change one and
-//! the generator's own verification pass fails, which is the intended way to
-//! find out.
 
 use crate::model::*;
 use std::fmt::Write;
 
-/// The two modules every generated one leans on. Hand-written because they are
-/// the corpus's contract with the language, not something worth randomizing.
+/// The two modules every generated one leans on.
 pub const EFFECTS_PATH: &str = "core/effects.ply";
 pub const PRIM_PATH: &str = "core/prim.ply";
 
@@ -167,13 +162,7 @@ fn row(footprint: &Footprint) -> String {
     format!(" / {{{}}}", atoms.join(", "))
 }
 
-/// The largest argument a specified definition's precondition admits. Every
-/// generated body is linear in its arguments with literal coefficients under 10,
-/// and `clamp` bounds every intermediate, so an argument under this bound can
-/// never overflow `Int` however deep the call graph goes. Without it a
-/// postcondition would be checked at `i64::MAX` — which the value generator
-/// draws on every run, by design — and come back as a raised evaluation rather
-/// than as a claim.
+/// The largest argument a specified definition's precondition admits.
 const ARG_BOUND: i64 = 1000;
 
 /// The `requires`/`ensures` pair a claim renders to, or nothing.
@@ -222,8 +211,8 @@ pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
             let _ = writeln!(s, "  {}", combine(corpus, def, &core));
             s.push_str("}\n");
         }
-        // A `match` cannot be spliced into an argument list, so a `Sum` with
-        // extras is rebuilt as a block whose `let` holds the arms.
+        // A `match` cannot be spliced into an argument list, so a `Sum` with extras is rebuilt as a
+        // block whose `let` holds the arms.
         Shape::Sum { off, f, idle } => {
             let module = &corpus.modules[here];
             let arms = format!(
@@ -255,8 +244,8 @@ pub fn emit_def(corpus: &Corpus, def: &Def) -> String {
     s
 }
 
-/// A spec clause ends a line, so the `=` that starts the body goes on the next
-/// one rather than trailing an `ensures`.
+/// A spec clause ends a line, so the `=` that starts the body goes on the next one rather than
+/// trailing an `ensures`.
 fn assign(head: &str) -> String {
     if head.contains('\n') {
         format!("{head}\n=")
@@ -340,9 +329,8 @@ fn core_expr(corpus: &Corpus, def: &Def, shape: &Shape) -> String {
     .to_string()
 }
 
-/// `base` is the caller's expression for the callee's first argument, before the
-/// call's own offset is added. A second parameter is derived from that offset so
-/// the emitter and the evaluator agree without carrying an extra field.
+/// `base` is the caller's expression for the callee's first argument, before the call's own offset
+/// is added.
 fn call_expr(corpus: &Corpus, here: ModuleId, call: Call, base: &str) -> String {
     let callee = &corpus.defs[call.target];
     let qualifier = qualify(corpus, here, call.target);
@@ -362,8 +350,8 @@ fn call_expr(corpus: &Corpus, here: ModuleId, call: Call, base: &str) -> String 
     }
 }
 
-/// A module has no binder for itself, so a same-module reference must be bare;
-/// every other one is `m::x` and so cannot be captured by a local binder.
+/// A module has no binder for itself, so a same-module reference must be bare; every other one is
+/// `m::x` and so cannot be captured by a local binder.
 fn qualify(corpus: &Corpus, here: ModuleId, target: DefId) -> String {
     let owner = corpus.defs[target].module;
     if owner == here {
@@ -433,9 +421,7 @@ fn emit_test(corpus: &Corpus, test: &Test) -> String {
     )
 }
 
-/// A definition written for its obligation. Every one is pure, so nothing here
-/// can be a gap, and every one is small, so a reader can check by eye what the
-/// generator claims about the tier it should land at.
+/// A definition written for its obligation.
 fn emit_specimen(corpus: &Corpus, specimen: &Specimen) -> String {
     let module = &corpus.modules[specimen.module];
     match specimen.kind {
@@ -476,10 +462,7 @@ fn emit_law(corpus: &Corpus, law: &Law) -> String {
     }
 }
 
-/// The specimens' own test. They carry no shape and no reference evaluation, so
-/// without this they would be the only definitions in a generated corpus that
-/// are compiled and never run — and "the corpus compiles" is not the bar this
-/// crate sets for itself.
+/// The specimens' own test.
 fn emit_specimen_test(corpus: &Corpus, module: &Module) -> String {
     let mut body = Vec::new();
     for specimen in corpus.specimens_in(module.id) {
@@ -504,10 +487,6 @@ fn emit_specimen_test(corpus: &Corpus, module: &Module) -> String {
     )
 }
 
-/// A task body. `task.yield()` between the bumps is what gives the scheduler a
-/// choice to make: an interleaving is a sequence of steps, and a step ends at a
-/// scheduler-visible perform, so a task with one bump and no yield contributes
-/// exactly one step and nothing to explore.
 fn emit_task(corpus: &Corpus, task: &TaskBody) -> String {
     let label = &corpus.shards[task.shard];
     let mut s = format!(
@@ -525,11 +504,8 @@ fn emit_task(corpus: &Corpus, task: &TaskBody) -> String {
     s
 }
 
-/// The test itself: one cell per shard, one handler clause per shard, and
-/// assertions that hold under every interleaving — the per-shard totals and the
-/// values the tasks returned. A concurrent test whose outcome depended on the
-/// order would fail the corpus's own verification pass under some seed and be
-/// useless as a fixed point to measure exploration against.
+/// The test itself: one cell per shard, one handler clause per shard, and assertions that hold
+/// under every interleaving — the per-shard totals and the values the tasks returned.
 fn emit_concurrent_test(corpus: &Corpus, test: &ConcurrentTest) -> String {
     let mut body: Vec<String> = test
         .tasks
@@ -584,9 +560,7 @@ fn emit_concurrent_test(corpus: &Corpus, test: &ConcurrentTest) -> String {
     )
 }
 
-/// One clause per atom the root definition may perform. A written resource is
-/// backed by the enclosing cell so the test observes its own writes; a read-only
-/// one is a literal, which is exactly the "no fixture, no teardown" claim.
+/// One clause per atom the root definition may perform.
 fn handler_clauses(corpus: &Corpus, test: &Test, footprint: &Footprint) -> Vec<String> {
     let mut clauses = Vec::new();
     let written_table = |t: usize| test.final_table_len.iter().any(|(i, _)| *i == t);
@@ -656,8 +630,7 @@ fn indent(text: &str, by: usize) -> String {
         .join("\n")
 }
 
-/// Indents every line but the first, for text spliced after something already
-/// on the line.
+/// Indents every line but the first, for text spliced after something already on the line.
 fn indent_tail(text: &str, by: usize) -> String {
     let pad = " ".repeat(by);
     let mut lines = text.lines();
@@ -672,11 +645,7 @@ fn escape(label: &str) -> String {
     label.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-/// Wraps a one-line definition body in another `prim::clamp`. Every generated
-/// body already yields a clamped value and `clamp` is idempotent over that
-/// range, so the definition's normalized form changes and its value does not —
-/// which is the only kind of edit a benchmark can apply without invalidating
-/// the expected values baked into every test.
+/// Wraps a one-line definition body in another `prim::clamp`.
 pub fn wrap_body(text: &str) -> Option<String> {
     let lines: Vec<&str> = text.lines().collect();
     let body = lines.last()?;
@@ -794,9 +763,8 @@ mod tests {
         }
     }
 
-    /// Handlers are granted only for what actually fires, so a definition that
-    /// declares more than a given call path performs leaves atoms behind. Without
-    /// that, every test is hermetic and the scheduler has one group to make.
+    /// Handlers are granted only for what actually fires, so a definition that declares more than a
+    /// given call path performs leaves atoms behind.
     #[test]
     fn some_tests_leave_a_declared_atom_ungranted() {
         let corpus = generate(&CorpusSpec {
@@ -832,9 +800,9 @@ mod tests {
         })
     }
 
-    /// The declared row is what the reduction reads, so a task naming a shard it
-    /// does not bump — or bumping one it does not name — is the defect that
-    /// would make a density sweep measure nothing.
+    /// The declared row is what the reduction reads, so a task naming a shard it does not bump — or
+    /// bumping one it does not name — is the defect that would make a density sweep measure
+    /// nothing.
     #[test]
     fn a_task_declares_exactly_the_one_shard_it_bumps() {
         let corpus = concurrent(0.5);
@@ -877,9 +845,8 @@ mod tests {
         }
     }
 
-    /// Every assertion the emitter writes has to be one the model computed, or
-    /// the corpus is asserting a tautology and its own verification pass proves
-    /// nothing about the scheduler.
+    /// Every assertion the emitter writes has to be one the model computed, or the corpus is
+    /// asserting a tautology and its own verification pass proves nothing about the scheduler.
     #[test]
     fn the_asserted_totals_are_the_models_and_they_add_up() {
         for density in [0.0, 0.5, 1.0] {
@@ -897,8 +864,8 @@ mod tests {
         }
     }
 
-    /// The work each task does must not move with the density, or a sweep is
-    /// comparing two different programs and calling the difference contention.
+    /// The work each task does must not move with the density, or a sweep is comparing two
+    /// different programs and calling the difference contention.
     #[test]
     fn a_task_body_is_the_same_at_every_density_but_for_the_shard_it_names() {
         let disjoint = concurrent(0.0);
@@ -935,11 +902,8 @@ mod tests {
         })
     }
 
-    /// One `requires` and one `ensures`, so a measurement pricing discharge per
-    /// obligation does not have to divide first. The precondition is what keeps
-    /// the postcondition checkable: without it the value generator draws
-    /// `i64::MAX`, the body overflows, and the obligation comes back as a raised
-    /// evaluation rather than as a claim.
+    /// One `requires` and one `ensures`, so a measurement pricing discharge per obligation does not
+    /// have to divide first.
     #[test]
     fn a_specified_definition_carries_exactly_one_clause_of_each_kind() {
         let corpus = specified();
@@ -977,9 +941,9 @@ mod tests {
         assert!(specified_count > 0);
     }
 
-    /// The benchmark's edit sites are textual, so a clause between the header and
-    /// the body must not stop one being rewritten — otherwise raising the density
-    /// would quietly shrink the pool a hub edit is chosen from.
+    /// The benchmark's edit sites are textual, so a clause between the header and the body must not
+    /// stop one being rewritten — otherwise raising the density would quietly shrink the pool a hub
+    /// edit is chosen from.
     #[test]
     fn a_clause_does_not_stop_a_one_line_body_being_rewritten() {
         let corpus = specified();
@@ -1025,9 +989,8 @@ mod tests {
         }
     }
 
-    /// Specimens carry no shape and no reference evaluation, so without their own
-    /// test they would be the only generated definitions that are compiled and
-    /// never run.
+    /// Specimens carry no shape and no reference evaluation, so without their own test they would
+    /// be the only generated definitions that are compiled and never run.
     #[test]
     fn every_specimen_is_asserted_by_the_test_its_module_carries() {
         let corpus = specified();

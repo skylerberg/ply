@@ -1,35 +1,4 @@
 //! What a database costs, on both sides of the effect boundary.
-//!
-//! `w3` priced a service whose store was an in-memory value. W4 put a real
-//! postgres behind the same `db` atoms, and this module measures the three
-//! numbers that decision is worth judging on:
-//!
-//! | section | question |
-//! | --- | --- |
-//! | [`ops`] | one statement through the boundary, against the same statement with no Ply in the path |
-//! | [`pool`] | throughput against pool size, and what exhaustion does |
-//! | [`crud`] | a route that hits the database against one that does not, under real load |
-//!
-//! **The interesting number is the delta, not the total.** A query against
-//! loopback postgres costs tens of microseconds of server and protocol time
-//! whatever language issued it, so a table that printed only "Ply did a select
-//! in N microseconds" would be a table about postgres. Every section below is
-//! therefore a *substitution*: the same statement text, the same server, the
-//! same connection count, with one layer swapped underneath. A difference
-//! between two rows is that layer and nothing else.
-//!
-//! The rungs, in the order [`ops`] prints them:
-//!
-//! | rung | what issues the statement | what it adds |
-//! | --- | --- | --- |
-//! | `rust-floor` | `tokio-postgres`, prepared once, on this harness's own runtime | the denominator: the server, the wire, and the client protocol |
-//! | `ply-postgres` | a Ply `perform` through `ply_host::db` | the scan, the footprint check, the reactor hop, the pending token and the `Value` conversion |
-//! | `ply-twin` | the same Ply, over `std.db`'s in-memory engine | no server at all: what a hermetic test pays instead |
-//!
-//! The program under measurement is `crates/ply-corpus/ply/w4.ply`, which is
-//! one table and four workloads written once and reached by both handlers. It
-//! is Ply source checked by the real front end on every run, so a workload that
-//! stopped typechecking is a failed benchmark rather than a wrong number.
 
 use anyhow::{Context, Result, bail};
 use ply_core::CheckOutput;
@@ -51,8 +20,7 @@ use crate::w3;
 /// The program the `ops` and `pool` sections run.
 const BENCH: &str = include_str!("../ply/w4.ply");
 
-/// Where `examples/desk.ply` stops being the service. Shared with [`w3`], which
-/// splits it at the same line.
+/// Where `examples/desk.ply` stops being the service.
 fn desk_service(repo: &Path) -> Result<String> {
     w3::Service::open(repo)?.source(w3::Variant::Sequential)
 }
@@ -131,9 +99,8 @@ impl Program {
             .map(|d| d.footprint.clone())
     }
 
-    /// The DDL the fixture is created with, taken from the program's own
-    /// `schema()` rather than restated here. A second copy of the schema is a
-    /// second thing to drift.
+    /// The DDL the fixture is created with, taken from the program's own `schema()` rather than
+    /// restated here.
     pub fn ddl(&self) -> Result<Vec<String>> {
         let name = self.full("ddl")?;
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
@@ -164,11 +131,6 @@ impl Program {
     }
 
     /// One call of one entry point over a real database.
-    ///
-    /// The `Host` is built per call rather than shared, because the pool, the
-    /// reactor thread and the scope table are what a run's configuration is,
-    /// and a section that swept pool size over one shared pool would be
-    /// sweeping nothing.
     fn call_on(
         &self,
         host: &Arc<ply_host::Host>,
@@ -192,9 +154,9 @@ impl Program {
         Ok((started.elapsed(), value))
     }
 
-    /// The same, keeping the diagnostic rather than the value: the exhaustion
-    /// row of [`pool`] is a refusal, and a harness that turned it into an error
-    /// string would have thrown away the code it is asserting.
+    /// The same, keeping the diagnostic rather than the value: the exhaustion row of [`pool`] is a
+    /// refusal, and a harness that turned it into an error string would have thrown away the code
+    /// it is asserting.
     fn refusal_on(
         &self,
         host: &Arc<ply_host::Host>,
@@ -226,10 +188,6 @@ impl Program {
 // --- The fixture ------------------------------------------------------------
 
 /// The one table both handlers use, created from the program's own schema.
-///
-/// Dropped and recreated per run: a benchmark that inserted into a table left
-/// over from the last one would be measuring an index that grew between two
-/// invocations.
 pub struct Fixture {
     url: String,
 }
@@ -264,8 +222,8 @@ impl Fixture {
         })
     }
 
-    /// The table as a read workload needs it: the keys the twin's own fixture
-    /// holds, and nothing a previous write workload left behind.
+    /// The table as a read workload needs it: the keys the twin's own fixture holds, and nothing a
+    /// previous write workload left behind.
     pub fn reset(&self) -> Result<()> {
         self.fill(64)
     }
@@ -281,8 +239,8 @@ impl Fixture {
                 .context("connecting to reset the fixture")?;
             let handle = tokio::spawn(connection);
             client.batch_execute("truncate part").await?;
-            // The same rows `bench.ply`'s `seeded_to` puts in the twin, by the
-            // same keys, so a parameterised select finds a row on both sides.
+            // The same rows `bench.ply`'s `seeded_to` puts in the twin, by the same keys, so a
+            // parameterised select finds a row on both sides.
             client
                 .batch_execute(&format!(
                     "insert into part (sku, name, price, n) \
@@ -329,8 +287,8 @@ impl Workload {
         }
     }
 
-    /// Whether a run of it leaves rows behind, and therefore needs the fixture
-    /// reset and a fresh key range per repeat.
+    /// Whether a run of it leaves rows behind, and therefore needs the fixture reset and a fresh
+    /// key range per repeat.
     fn writes(self) -> bool {
         matches!(self, Workload::Insert | Workload::Transaction)
     }
@@ -362,8 +320,8 @@ impl Workload {
         }
     }
 
-    /// The arguments the sequential entry point takes: the write workloads need
-    /// a key base so a repeat does not collide with the last one.
+    /// The arguments the sequential entry point takes: the write workloads need a key base so a
+    /// repeat does not collide with the last one.
     fn args(self, base: i64, count: u32) -> Vec<Value> {
         if self.writes() {
             vec![Value::Int(base), Value::Int(count as i64)]
@@ -399,11 +357,6 @@ pub struct OpPoint {
 }
 
 /// The three rungs, over four workloads, at every concurrency.
-///
-/// Concurrency on the Ply rungs is `task.spawn` on the production scheduler
-/// rather than a thread per client: that is what a service does, it is what
-/// makes a transaction scope belong to a task, and it is the only shape in
-/// which `E0437` can be reached at all.
 pub fn ops(
     url: &str,
     concurrencies: &[u32],
@@ -414,12 +367,10 @@ pub fn ops(
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
     let mut out = Vec::new();
-    // A key base that never repeats across the whole table, so no write
-    // workload ever collides with a row an earlier point inserted.
+    // A key base that never repeats across the whole table, so no write workload ever collides with
+    // a row an earlier point inserted.
     let mut base: i64 = 1;
-    // The twin's fixture is built through the twin's own scanner inside every
-    // `twin_*` call. It is a setup cost and not an operation, so it is measured
-    // once, subtracted, and printed as its own row.
+    // The twin's fixture is built through the twin's own scanner inside every `twin_*` call.
     let mut seed = Duration::MAX;
     for _ in 0..repeats.max(2) {
         let (taken, _) = program.call_pure("twin_seed", vec![])?;
@@ -476,9 +427,8 @@ pub fn ops(
             }
             out.push(point(workload, "ply-postgres", concurrency, total, live));
 
-            // The twin has no server to be concurrent against — it is a value
-            // threaded through a cell — so it is measured at the first
-            // concurrency and not swept.
+            // The twin has no server to be concurrent against — it is a value threaded through a
+            // cell — so it is measured at the first concurrency and not swept.
             if concurrency != concurrencies[0] {
                 continue;
             }
@@ -521,8 +471,8 @@ fn point(
     }
 }
 
-/// A workload that answered fewer operations than it was asked for did not run
-/// the workload, and reporting its time would be reporting a different one.
+/// A workload that answered fewer operations than it was asked for did not run the workload, and
+/// reporting its time would be reporting a different one.
 fn expect(answered: Value, want: u32, workload: Workload, rung: &str) -> Result<()> {
     match answered {
         Value::Int(n) if n == i64::from(want) => Ok(()),
@@ -544,10 +494,6 @@ fn config(url: &str, pool: usize) -> PoolConfig {
 // --- The floor --------------------------------------------------------------
 
 /// The same statements, prepared once per connection, with no Ply anywhere.
-///
-/// One current-thread runtime and `concurrency` connections, which is the shape
-/// the driver's reactor has: a floor taken on a work-stealing runtime would be
-/// a floor for a different program.
 fn floor_run(
     url: &str,
     workload: Workload,
@@ -570,9 +516,9 @@ fn floor_run(
             clients.push(client);
         }
         let started = Instant::now();
-        // Spawned rather than awaited in turn: the point of the row is that
-        // `concurrency` statements are in flight at once, which is what the Ply
-        // rung above it does with `task.spawn`.
+        // Spawned rather than awaited in turn: the point of the row is that `concurrency`
+        // statements are in flight at once, which is what the Ply rung above it does with
+        // `task.spawn`.
         let mut running = tokio::task::JoinSet::new();
         for (slot, client) in clients.into_iter().enumerate() {
             let from = base + (slot as i64) * i64::from(per);
@@ -646,14 +592,8 @@ pub struct SizePoint {
     pub per_second: f64,
 }
 
-/// One `select ... order by sku limit 1` against a table of `rows` rows, on the
-/// twin and on postgres.
-///
-/// This is the axis a per-statement comparison hides. `std.db`'s `ORDER BY` is
-/// an insertion sort over `Row`s that are `Map`s, so it is quadratic in the
-/// table and logarithmic in nothing; postgres has an index. A test suite whose
-/// fixtures are three rows never sees it, and one whose fixtures are a thousand
-/// sees nothing else.
+/// One `select ... order by sku limit 1` against a table of `rows` rows, on the twin and on
+/// postgres.
 pub fn sizes(url: &str, rows: &[u32], operations: u32, repeats: usize) -> Result<Vec<SizePoint>> {
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
@@ -716,10 +656,6 @@ pub struct PoolPoint {
 }
 
 /// Throughput against pool size, at a fixed number of concurrent tasks.
-///
-/// The read workload holds a connection for one statement and gives it back;
-/// the transaction workload holds one for the whole scope. So the two columns
-/// are the two shapes a pool sees, and only the second can exhaust it.
 pub fn pool(
     url: &str,
     sizes: &[usize],
@@ -781,10 +717,6 @@ pub struct Exhaustion {
 }
 
 /// What a pool smaller than the number of open scopes does.
-///
-/// ADR 0014 §3.2 makes this `E0437` and not a `Failed`, and not a hang: the
-/// program asked for a connection and the run said how many exist. This is the
-/// row that checks it is a sentence rather than a deadlock.
 pub fn exhaustion(url: &str, pool: usize, concurrency: u32, acquire_ms: u64) -> Result<Exhaustion> {
     let program = Program::parse()?;
     let fixture = Fixture::create(url, &program)?;
@@ -830,7 +762,7 @@ pub fn exhaustion(url: &str, pool: usize, concurrency: u32, acquire_ms: u64) -> 
 pub enum Store {
     /// `main` calls `run`, and the `db` atoms reach postgres.
     Postgres,
-    /// `main` calls `run_memory`, and they reach the twin. The W3 shape.
+    /// `main` calls `run_memory`, and they reach the twin.
     Twin,
 }
 
@@ -843,16 +775,7 @@ impl Store {
     }
 }
 
-/// `examples/desk.ply` as a project `ply run --host` can be pointed at, with its
-/// store rewritten.
-///
-/// The port and the connection budget are **not** rewritten any more: W5 made
-/// both configuration, so they arrive as `--set DESK_PORT=` and `--set
-/// DESK_CONNECTIONS=` beside the run, which is one fewer thing this harness has
-/// to keep matching the example's source. Which store a service uses is not
-/// configuration, so that one is still a rewrite — and it asserts it found what
-/// it replaced, because a silent miss would leave the harness measuring a
-/// program it guessed at.
+/// `examples/desk.ply` as a project `ply run --host` can be pointed at, with its store rewritten.
 fn project(dir: &Path, service: &str, store: Store) -> Result<()> {
     let source = if store == Store::Twin {
         let narrowed = replace(
@@ -872,15 +795,15 @@ fn project(dir: &Path, service: &str, store: Store) -> Result<()> {
     Ok(())
 }
 
-/// The `--set` arguments a served desk needs, now that its port, its budget and
-/// its credential are configuration rather than definitions.
+/// The `--set` arguments a served desk needs, now that its port, its budget and its credential are
+/// configuration rather than definitions.
 fn settings(port: u16, connections: u32) -> Vec<String> {
     vec![
         format!("DESK_PORT={port}"),
         format!("DESK_CONNECTIONS={connections}"),
-        // A benchmark's key is a fixture credential and is not a credential;
-        // what it is here for is that `--config-schema desk.config` declares the
-        // key `required`, so a run without one refuses to start.
+        // A benchmark's key is a fixture credential and is not a credential; what it is here for is
+        // that `--config-schema desk.config` declares the key `required`, so a run without one
+        // refuses to start.
         "DESK_API_KEY=bench-key".to_string(),
     ]
 }
@@ -896,13 +819,8 @@ fn replace(source: &str, from: &str, to: &str) -> Result<String> {
     Ok(source.replace(from, to))
 }
 
-/// Throughput and tail latency for one route at one concurrency, over the real
-/// binary and a real socket.
-///
-/// The routes are chosen so the delta is the database and nothing else:
-/// `/health` reaches no `db` atom at all and is W3's number re-taken on this
-/// machine, `/items` is one `select` behind the same framing, and `/orders/1`
-/// is one parameterised `select`.
+/// Throughput and tail latency for one route at one concurrency, over the real binary and a real
+/// socket.
 pub fn crud(
     repo: &Path,
     ply: &Path,
@@ -1081,9 +999,7 @@ pub fn render(m: &Measurements) -> String {
 mod tests {
     use super::*;
 
-    /// The program the whole module measures has to be a program. Checked with
-    /// the real front end, so a workload that stopped typechecking is a failing
-    /// test rather than a benchmark that silently measures nothing.
+    /// The program the whole module measures has to be a program.
     #[test]
     fn the_bench_program_checks() {
         let program = Program::parse().expect("the bench program checks");
@@ -1104,9 +1020,8 @@ mod tests {
         }
     }
 
-    /// The rows a `ply hosts` listing would print for the workloads, which is
-    /// the exit criterion W3 stated and W4 must not have widened: a read
-    /// workload's row names one table and one mode.
+    /// The rows a `ply hosts` listing would print for the workloads, which is the exit criterion W3
+    /// stated and W4 must not have widened: a read workload's row names one table and one mode.
     #[test]
     fn a_workload_publishes_the_table_it_names() {
         let program = Program::parse().unwrap();
@@ -1120,9 +1035,8 @@ mod tests {
         );
     }
 
-    /// The twin discharges every `db` atom, so a twin entry point's row is
-    /// empty — which is what makes a twin-backed test `det`, cached and
-    /// hermetic.
+    /// The twin discharges every `db` atom, so a twin entry point's row is empty — which is what
+    /// makes a twin-backed test `det`, cached and hermetic.
     #[test]
     fn a_twin_entry_point_reaches_nothing() {
         let program = Program::parse().unwrap();
@@ -1135,8 +1049,8 @@ mod tests {
         }
     }
 
-    /// The DDL comes from the program rather than from a copy of the schema in
-    /// this file, and it has to be the one table the workloads name.
+    /// The DDL comes from the program rather than from a copy of the schema in this file, and it
+    /// has to be the one table the workloads name.
     #[test]
     fn the_fixture_ddl_is_the_programs_own() {
         let program = Program::parse().unwrap();
@@ -1146,8 +1060,8 @@ mod tests {
         assert!(ddl[0].contains("numeric(10,4)"), "{}", ddl[0]);
     }
 
-    /// Every workload runs against the twin with no host at all, which is the
-    /// property that makes the `ply-twin` rung a rung rather than a stub.
+    /// Every workload runs against the twin with no host at all, which is the property that makes
+    /// the `ply-twin` rung a rung rather than a stub.
     #[test]
     fn every_workload_runs_against_the_twin() {
         let program = Program::parse().unwrap();

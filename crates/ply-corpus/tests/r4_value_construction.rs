@@ -1,77 +1,8 @@
 //! What a request allocates, attributed to the `Value` it is building.
-//!
-//! `w6_alloc_sites.rs` ranks a request's allocations by the *frame* that made
-//! them. That answers "which code allocates" and not "which value", and the two
-//! are different questions: `ply_eval::frame::dispatch` is one frame and three
-//! different things, and `ply_eval::interp::literal` is one frame that cannot
-//! allocate at all unless the literal is a `Str` or a `Bytes`
-//! (`crates/ply-eval/src/interp.rs:999` — `Int`, `Bool`, `Float`, `Decimal` and
-//! `Unit` are inline enum variants and return without touching the allocator).
-//!
-//! # The instrument names a layout, not a type
-//!
-//! A `GlobalAlloc` sees a [`Layout`] and a backtrace. Neither carries a Rust
-//! type: in a release build `Arc::new` is inlined into its caller, so no frame
-//! says `Arc<Vec<Value>>`. Attribution here is therefore
-//! **(deepest `ply_*` frame, allocation size)** matched against a rule table,
-//! and every rule in that table was verified by a controlled experiment in this
-//! file rather than read off the source:
-//!
-//! - [`a_warm_ply_call_takes_its_argument_vector_from_the_free_list`] adds one
-//!   1-argument call to a loop body and one 3-argument call to the same loop,
-//!   and watches for a 32-byte and a 96-byte allocation under `argv::take <
-//!   frame::dispatch`. It read `a_call_allocates_one_argument_vector_of_32_bytes_per_argument`
-//!   and watched exactly one of each *appear*; ADR 0019 §1's free list now
-//!   serves both, and its control — a 1-argument **builtin** call, whose buffer
-//!   `builtins::call` consumes by value — is what still licenses reading that
-//!   frame at a multiple of 32 as an argument vector.
-//! - [`a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation`]
-//!   does the same for a `String` and a `Bytes` literal, in the direction ADR
-//!   0019 §2 item 1 left them: the literal is evaluated every iteration and
-//!   reaches the allocator on none of them, with an allocation this change does
-//!   not touch held at 1.00 per iteration in a sibling loop, so that the zero
-//!   is a reading rather than a silence.
-//! - [`a_nullary_constructor_is_built_once_rather_than_on_every_mention`] and
-//!   [`a_constructor_of_arity_one_or_more_is_built_once_rather_than_per_mention`]
-//!   do the same for a constructor mention, in the direction the cache behind
-//!   `interp::ctor_value` left them: the mention is evaluated every iteration
-//!   and reaches the allocator on none of them.
-//! - [`the_shape_of_every_value_variant_is_measured`] records how many
-//!   allocations each variant costs and at what size, which is where the
-//!   sizes in the rule table come from.
-//!
-//! The table matches a rule anywhere in the three-frame chain rather than on
-//! the deepest frame alone, because which frame is deepest is a property of the
-//! build: in release `Value::str` is inlined into `interp::literal` and in debug
-//! it is a frame of its own beneath it. Both spellings must land in the same
-//! bucket or the same tree would be attributed two ways.
-//!
-//! Anything the table cannot place is printed as `unattributed` with its
-//! frames, and the test fails if that residue grows in absolute terms — see
-//! [`UNATTRIBUTED_CEILING_HEALTH`]. A
-//! classifier that silently stops recognizing the tree is worse than no
-//! classifier.
-//!
-//! # Two harnesses, two windows, and which to trust
-//!
-//! The same reconciliation `w6_alloc_sites.rs` documents applies here and for
-//! the same reason: `w3::Loaded::over_sim` builds one `Machine` per script, so
-//! a 20-request window charges every one-time cost to twenty requests. Every
-//! figure below is a **slope** fitted from a 20-request and a 200-request
-//! window, with the per-`Machine` intercept printed beside it. Read the slope
-//! for "what would another request cost"; read the intercept for "what does
-//! standing the service up cost".
-//!
-//! The `/health` SimNet path and the pure-call routing rung disagree on
-//! ranking, and they are both reported. The SimNet path is the one to trust for
-//! a served request, because it is the only one that pays for framing, the host
-//! boundary and the response encode. The routing rung is the one to trust for
-//! the interpreter proper, because it has no socket in it at all.
 
-// `Value::Record` and `Value::Closure` hold an `Arc` over a type that is not
-// `Send`: a `Value` is thread-confined by design (`value.rs`'s note on `RcK`),
-// and building one here has to use the same `Arc` the enum declares. Every
-// `ply-eval` test that mints a `Value` carries this line for the same reason.
+// `Value::Record` and `Value::Closure` hold an `Arc` over a type that is not `Send`: a `Value` is
+// thread-confined by design (`value.rs`'s note on `RcK`), and building one here has to use the same
+// `Arc` the enum declares.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_eval::{ARGUMENT_VECTOR_CLASSES as ARGV_CLASSES, Closure, ClosureKind, Value};
@@ -86,16 +17,13 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static INSIDE: Cell<bool> = const { Cell::new(false) };
     static SITES: RefCell<HashMap<Key, Count>> = RefCell::new(HashMap::new());
-    /// Code address -> the `ply_*` names at it. Written inside the allocator
-    /// under `INSIDE`, so what it allocates is not counted as the program's.
+    /// Code address -> the `ply_*` names at it.
     static NAMES: RefCell<HashMap<usize, Vec<String>>> = RefCell::new(HashMap::new());
     static TOTAL: Cell<usize> = const { Cell::new(0) };
     static BYTES: Cell<usize> = const { Cell::new(0) };
 }
 
-/// An allocation's size and the frames that asked for it. The size is half the
-/// identity: `frame::dispatch` at 32 bytes and `frame::dispatch` at 544 bytes
-/// are a one-argument call and a record's B-tree node.
+/// An allocation's size and the frames that asked for it.
 type Key = (usize, String);
 
 #[derive(Clone, Copy, Default)]
@@ -133,20 +61,7 @@ unsafe impl GlobalAlloc for Tracing {
 #[global_allocator]
 static ALLOCATOR: Tracing = Tracing;
 
-/// The nearest three `ply_*` frames. `alloc::` and `core::` frames are dropped:
-/// `RawVec::grow` names the allocator rather than the code that wanted the
-/// room, and in a release build the frame that would have named the type has
-/// been inlined away.
-///
-/// **The resolve is memoised per code address, and that is the whole of why
-/// this file is no longer the slowest target in the workspace.** It read
-/// `Backtrace::force_capture()` and then `format!("{bt}")`, which symbolicates
-/// every frame on the stack — and it did that on *every allocation*, for a
-/// stack whose depth is the interpreter's recursion depth. The set of
-/// addresses that allocate is small and fixed, so the same names were being
-/// resolved hundreds of thousands of times. Walking the stack is cheap;
-/// naming a frame is not, so the walk stays per-allocation and the naming
-/// moves behind [`NAMES`].
+/// The nearest three `ply_*` frames.
 fn frames() -> String {
     let mut out: Vec<String> = Vec::new();
     backtrace::trace(|frame| {
@@ -162,11 +77,6 @@ fn frames() -> String {
 }
 
 /// The `ply_*` names at one frame, or empty for a frame this file drops.
-///
-/// A `Vec` rather than an `Option` because one address can carry several
-/// inlined frames, which is what the `Display` this replaced printed as
-/// several lines — dropping all but the first would change the attribution
-/// rather than only its cost.
 fn named(frame: &backtrace::Frame) -> Vec<String> {
     let ip = frame.ip() as usize;
     if let Some(hit) = NAMES.with(|c| c.borrow().get(&ip).cloned()) {
@@ -218,8 +128,8 @@ fn capture<T>(requests: usize, f: impl FnOnce() -> T) -> Window {
     }
 }
 
-/// A pair of windows over one call, so a per-request slope can be separated
-/// from a per-`Machine` intercept.
+/// A pair of windows over one call, so a per-request slope can be separated from a per-`Machine`
+/// intercept.
 struct Fit {
     small: Window,
     large: Window,
@@ -272,27 +182,20 @@ impl Fit {
     }
 }
 
-// ------------------------------------------------------------- the rule table
-
-/// What a bucket says about the allocation: which `Value` it is part of, or
-/// that it is not part of one.
+/// What a bucket says about the allocation: which `Value` it is part of, or that it is not part of
+/// one.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum Kind {
     /// A `Value` variant's own heap payload.
     Payload,
-    /// A `Vec<Value>` that a `Value` is about to be built from, or that a call
-    /// passes its arguments in. Not a variant, but `size_of::<Value>()` wide
-    /// per element and so the thing a narrower `Value` would shrink.
+    /// A `Vec<Value>` that a `Value` is about to be built from, or that a call passes its arguments
+    /// in.
     Spine,
     /// Neither: control stack, lowering, interning, formatting, the host.
     Other,
 }
 
 /// `(bucket, kind, frame substring, size predicate)`, first match wins.
-///
-/// Every `Payload` and `Spine` rule is armed by a test in this file; the
-/// comment on each names it. The order matters where two rules could match the
-/// same allocation, and the comments say which.
 struct Rule {
     bucket: &'static str,
     kind: Kind,
@@ -317,16 +220,8 @@ fn value_vec(n: usize) -> bool {
 }
 
 const RULES: &[Rule] = &[
-    // `interp::literal` (crates/ply-eval/src/interp.rs) allocates for `Lit::Str`
-    // and `Lit::Bytes` and for nothing else. The two cannot be told apart here
-    // — `Arc<str>` and `Arc<[u8]>` have the same layout for the same length —
-    // so they share a bucket and the name says so.
-    //
-    // The rule is kept after ADR 0019 §2 item 1 took the machine off this path,
-    // because it is now a *guard*: it reads 0.0 per request on both routes, the
-    // tree-walker still calls `interp::literal` per evaluation, and a rule that
-    // was deleted could not report the hoist regressing. Armed by
-    // `a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation`.
+    // `interp::literal` (crates/ply-eval/src/interp.rs) allocates for `Lit::Str` and `Lit::Bytes`
+    // and for nothing else.
     Rule {
         bucket: "Value::Str|Bytes — literal, rebuilt per evaluation",
         kind: Kind::Payload,
@@ -346,14 +241,9 @@ const RULES: &[Rule] = &[
         frame: "ply_eval::value::Value::bytes",
         size: any,
     },
-    // `ctor_value` (interp.rs) used to build a fresh `Arc<Closure>` for every
-    // mention of a constructor of arity >= 1 and a fresh `Value::Ctor` for
-    // every mention of a nullary one; it now shares one value per constructor
-    // per thread, so both rows read 0.0 per request. They are kept because a
-    // rule that reads zero is what tells a re-broken cache from a rule that
-    // stopped matching, and the two tests named in the module header are the
-    // experiments that hold them to zero. `Value::ctor` is the deeper frame, so
-    // its rule has to come first or the closure rule would swallow it.
+    // `ctor_value` (interp.rs) used to build a fresh `Arc<Closure>` for every mention of a
+    // constructor of arity >= 1 and a fresh `Value::Ctor` for every mention of a nullary one; it
+    // now shares one value per constructor per thread, so both rows read 0.0 per request.
     Rule {
         bucket: "Value::Ctor — nullary, rebuilt per mention",
         kind: Kind::Payload,
@@ -373,29 +263,26 @@ const RULES: &[Rule] = &[
         frame: "ply_eval::value::Value::ctor",
         size: any,
     },
-    // `enter_closure`'s `ClosureKind::Ctor` arm (machine.rs) does
-    // `Arc::new(args)` inline, so `Machine::apply` is the deepest frame and 40
-    // is `ArcInner<Vec<Value>>`.
+    // `enter_closure`'s `ClosureKind::Ctor` arm (machine.rs) does `Arc::new(args)` inline, so
+    // `Machine::apply` is the deepest frame and 40 is `ArcInner<Vec<Value>>`.
     Rule {
         bucket: "Value::Ctor — applied constructor",
         kind: Kind::Payload,
         frame: "ply_eval::machine::Machine::apply",
         size: arc_header,
     },
-    // `Value::list` (value.rs:162) — the `Arc`; the `Vec` under it is Spine and
-    // was allocated by whoever filled it.
+    // `Value::list` (value.rs:162) — the `Arc`; the `Vec` under it is Spine and was allocated by
+    // whoever filled it.
     Rule {
         bucket: "Value::List",
         kind: Kind::Payload,
         frame: "ply_eval::value::Value::list",
         size: any,
     },
-    // `Frame::ListItem` and `Frame::RecordField` (frame.rs:259, :300) build the
-    // `Arc` inline, so the deepest frame is `frame::dispatch` and 40 bytes is
-    // `ArcInner<Vec<Value>>` or `ArcInner<BTreeMap<Symbol, Value>>` — the same
-    // size, and this instrument cannot separate them. Verified together by the
-    // list and record arms of
-    // `the_shape_of_every_value_variant_is_measured`.
+    // `Frame::ListItem` and `Frame::RecordField` (frame.rs:259, :300) build the `Arc` inline, so
+    // the deepest frame is `frame::dispatch` and 40 bytes is `ArcInner<Vec<Value>>` or
+    // `ArcInner<BTreeMap<Symbol, Value>>` — the same size, and this instrument cannot separate
+    // them.
     Rule {
         bucket: "Value::List|Record — Arc header built in a frame",
         kind: Kind::Payload,
@@ -403,8 +290,6 @@ const RULES: &[Rule] = &[
         size: arc_header,
     },
     // A record's B-tree, built in `Frame::RecordField` (frame.rs:258-259).
-    // Verified by `the_shape_of_every_value_variant_is_measured`: one 544-byte
-    // node up to eleven fields, plus a 40-byte `Arc`.
     Rule {
         bucket: "Value::Record — B-tree node",
         kind: Kind::Payload,
@@ -424,15 +309,9 @@ const RULES: &[Rule] = &[
         frame: "ply_eval::cont::Stack::capture",
         size: any,
     },
-    // `Frame::AppCallee`'s call to `argv::take` (frame.rs:111), `32 * arity`
-    // bytes — one per application that the free list could not serve, which
-    // since ADR 0019 §1 is not every application. `argv::take` is the deepest
-    // frame in release and `frame::dispatch` is its caller, so matching
-    // `ply_eval::frame` catches both spellings. Verified by
-    // `a_warm_ply_call_takes_its_argument_vector_from_the_free_list`. This rule
-    // must come after every `Payload` rule above that also lands in
-    // `frame::dispatch`, because 40 and 544 are not multiples of 32 but 32, 64,
-    // 96 and 128 are nothing else.
+    // `Frame::AppCallee`'s call to `argv::take` (frame.rs:111), `32 * arity` bytes — one per
+    // application that the free list could not serve, which since ADR 0019 §1 is not every
+    // application.
     Rule {
         bucket: "Vec<Value> — call arguments",
         kind: Kind::Spine,
@@ -458,8 +337,7 @@ const RULES: &[Rule] = &[
         frame: "ply_eval::builtins",
         size: value_vec,
     },
-    // Not a Value, and named so a reader can see how much of a request is not
-    // about values at all.
+    // Not a Value, and named so a reader can see how much of a request is not about values at all.
     Rule {
         bucket: "control stack — frame pool",
         kind: Kind::Other,
@@ -502,24 +380,8 @@ const RULES: &[Rule] = &[
         frame: "ply_host",
         size: any,
     },
-    // The same allocations as the two rules above, under the one spelling the
-    // three-frame window cannot reach past.
-    //
-    // `ply_eval::host::registration_names` (`host.rs:703`) asks
-    // `ply_std::is_reserved` whether a registered name is under the stdlib root,
-    // and that predicate builds a `String` per call — `name.starts_with(&format!
-    // ("{ROOT}."))`, `crates/ply-std/src/lib.rs:128`. In release it is inlined
-    // into `Machine::perform_host` and lands in the bucket above; in debug it is
-    // a frame of its own, and the two `ply_eval` frames beneath it symbolize to
-    // a bare crate name, so the window ends before `perform_host`. Counted
-    // directly in debug on `/health`: **22.0 per request**, which is the whole
-    // of the difference between a release residue of 54.9 and a debug residue
-    // of 74.9 against a ceiling of 60. Without this rule the same tree is
-    // attributed two ways by profile, which the module note says it may not be.
-    //
-    // Naming it is not pricing it: 22–23 allocations of 8 bytes a request is a
-    // real per-request cost with no lever and no threshold behind it. See
-    // `docs/adr/0019-value-representation.md` §6.
+    // The same allocations as the two rules above, under the one spelling the three-frame window
+    // cannot reach past.
     Rule {
         bucket: "host boundary — footprints, sockets, diagnostics",
         kind: Kind::Other,
@@ -560,28 +422,8 @@ fn classify(key: &Key) -> Option<(&'static str, Kind)> {
 }
 
 /// How many allocations per request the rule table is allowed to leave unnamed.
-///
-/// **This was a floor on a *share* and that was wrong.** The residue is real
-/// work the table deliberately does not name — string formatting inside
-/// `strict_binary`, the machine's own scratch — and it is a per-request
-/// *constant*, not a fraction. Measured across three builds of one tree
-/// differing only in which R4 lever was in, it was byte-identical every time:
-/// 54.9 on /health and 38.0 on the routing rung, while the request itself got
-/// 36.5% cheaper. The share therefore fell from 92.3% to 87.9% on the rung
-/// without one new unattributed allocation appearing, and the old
-/// `ATTRIBUTION_FLOOR: f64 = 0.90` failed with the message "a rule has stopped
-/// matching the tree" — which was the wrong half of its own dichotomy.
-///
-/// A share floor cannot survive a milestone whose purpose is removing
-/// classified allocations: every lever that lands pushes it down again. So the
-/// assertion is on the absolute count, which does not move when a lever lands,
-/// and the share is printed as a diagnostic rather than asserted. These bounds
-/// are the measured residues plus a small margin; tightening them as the table
-/// learns more rules is the intended direction.
 const UNATTRIBUTED_CEILING_HEALTH: f64 = 60.0;
 const UNATTRIBUTED_CEILING_ROUTING: f64 = 40.0;
-
-// ------------------------------------------------------------- the two routes
 
 /// The window this file's companion, `w6_alloc_sites.rs`, has always ranked at.
 const SMALL: usize = 20;
@@ -669,8 +511,7 @@ fn roll_up(fit: &Fit) -> (Vec<Row>, Vec<(Key, f64)>) {
     (rows, loose)
 }
 
-/// Answers `(share placed, allocations left unnamed)`, both per request. The
-/// share is a diagnostic; the residue is what the caller asserts on.
+/// Answers `(share placed, allocations left unnamed)`, both per request.
 fn report(name: &str, fit: &Fit) -> (f64, f64) {
     let (slope, byte_slope) = fit.total_slope();
     let (rows, loose) = roll_up(fit);
@@ -776,14 +617,9 @@ fn a_requests_allocations_are_attributed_to_the_values_they_build() {
             literal.1,
             100.0 * rebuilt / slope,
         );
-        // This read `assert!(literal.0 > 0.0)` and said that a zero here meant
-        // either that a literal had started being built once — "the change this
-        // file exists to detect" — or that the rule had stopped matching. It is
-        // the first: ADR 0019 §2 item 1 landed and `Machine::eval` clones the
-        // `Value` the lowered node carries. The assertion is inverted rather
-        // than deleted so that a regression is still a failure, and
-        // `a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation`
-        // is what separates the two readings a zero has.
+        // This read `assert!(literal.0 > 0.0)` and said that a zero here meant either that a
+        // literal had started being built once — "the change this file exists to detect" — or that
+        // the rule had stopped matching.
         assert_eq!(
             literal.0, 0.0,
             "{name} attributes {:.1} allocations per request to a literal: `NodeKind::Lit` \
@@ -820,10 +656,8 @@ fn a_requests_allocations_are_attributed_to_the_values_they_build() {
     }
 }
 
-// ------------------------------------------------- what arms the rules above
-
-/// A micro-program with one construction per loop body, so a difference against
-/// the empty loop is that construction and nothing else.
+/// A micro-program with one construction per loop body, so a difference against the empty loop is
+/// that construction and nothing else.
 const MICRO: &str = r#"
 type R4Colour = R4Red | R4Green | R4Blue
 type R4Boxed = R4Box(Int)
@@ -855,9 +689,7 @@ fn r4_applied(n: Int, acc: Int) -> Int =
   if n <= 0 { acc } else { r4_applied(n - 1, acc + r4_unbox(R4Box(1))) }
 "#;
 
-/// Iterations the micro-loops are fitted over. Larger than the request windows
-/// because one iteration is a handful of allocations and the frame pool needs
-/// room to stop growing.
+/// Iterations the micro-loops are fitted over.
 const MICRO_SMALL: usize = 100;
 const MICRO_LARGE: usize = 1000;
 
@@ -874,8 +706,8 @@ fn micro(loaded: &ply_corpus::w3::Loaded, name: &str) -> Fit {
     Fit { small, large }
 }
 
-/// One construction's cost: the loop with it, minus the same loop without it,
-/// per iteration, at the sizes where the difference lands.
+/// One construction's cost: the loop with it, minus the same loop without it, per iteration, at the
+/// sizes where the difference lands.
 fn added(base: &Fit, probe: &Fit) -> Vec<(usize, String, f64)> {
     let mut keys: Vec<Key> = base.keys();
     keys.extend(probe.keys());
@@ -897,32 +729,7 @@ fn micro_program() -> ply_corpus::w3::Loaded {
     ply_corpus::w3::Loaded::parse(MICRO).expect("the micro program must compile")
 }
 
-/// Whether an application takes its argument vector from the allocator. A call
-/// into Ply code does not; a call into a builtin still does.
-///
-/// This test read `a_call_allocates_one_argument_vector_of_32_bytes_per_argument`
-/// and asserted the opposite — exactly +1.00 allocation of `arity * 32` bytes
-/// per iteration under `ply_eval::frame::dispatch`, for a 1-argument and a
-/// 3-argument call alike — because that is what the tree did when the
-/// attribution behind ADR 0019 was taken. It was the arming experiment for the
-/// `Vec<Value> — call arguments` rule and the tripwire for ADR 0019 §1, and its
-/// failure message named this change as the reason it would fire. It fired. The
-/// experiment is unchanged; what it asserts is the other side of it.
-///
-/// `crate::argv`'s free list now hands `Frame::AppCallee` a buffer of the right
-/// capacity class and `Machine::enter_code` hands it back once
-/// `params.iter().zip(args)` has emptied it, so a warm call of arity 1 through
-/// 4 never reaches the allocator.
-///
-/// **A zero is only evidence if the instrument can still see an allocation on
-/// this path**, and the control here is more than a control — it is the finding.
-/// A *builtin* call of arity 1 still adds exactly +1.00 of 32 bytes under
-/// `ply_eval::argv::take`, because a builtin callee reaches
-/// `Machine::call_builtin` rather than `Machine::enter_code` and
-/// `ply_eval::builtins::call` takes its `Vec<Value>` **by value**: that buffer
-/// is freed, never given back, and the free list allocates a replacement. ADR
-/// 0019 §1 states that the 341.4 transient argument vectors "are freed by
-/// `enter_code`". They are not, and this line is where that shows.
+/// Whether an application takes its argument vector from the allocator.
 #[test]
 fn a_warm_ply_call_takes_its_argument_vector_from_the_free_list() {
     let loaded = micro_program();
@@ -947,10 +754,7 @@ fn a_warm_ply_call_takes_its_argument_vector_from_the_free_list() {
         }
     }
 
-    // The control, and the correction. `string_len("abcd")` is a 1-argument
-    // application of a *builtin*, and ADR 0019 §2 took the literal in it down to
-    // a refcount bump — so the only per-iteration allocation left in this loop
-    // is the argument vector the builtin's callee never gives back.
+    // The control, and the correction.
     let control = added(&base, &micro(&loaded, "r4_str"));
     println!("\nr4_str: adding one 1-argument builtin call to the loop body adds");
     for (size, site, per) in &control {
@@ -980,37 +784,11 @@ fn a_warm_ply_call_takes_its_argument_vector_from_the_free_list() {
 }
 
 /// The frame chain an argument vector is allocated under, in either profile.
-///
-/// `crate::argv::take` is the deepest frame in release and `Frame::dispatch` is
-/// its caller; a build that inlines `take` away leaves only the second. Matching
-/// either is what keeps one tree from being attributed two ways — the same
-/// reason [`is_ctor_mention`] exists.
 fn is_argument_vector(site: &str) -> bool {
     site.contains("ply_eval::argv") || site.contains("ply_eval::frame")
 }
 
-/// Whether evaluating a `Str` or a `Bytes` literal reaches the allocator. It
-/// does not.
-///
-/// This test read `a_literal_value_is_rebuilt_on_every_evaluation` and asserted
-/// the opposite — exactly +1.00 allocation of 24 bytes per iteration under
-/// `ply_eval::interp::literal`, for `r4_str` and for `r4_bytes` alike — because
-/// that is what the tree did when the attribution behind ADR 0019 was taken. It
-/// was the arming experiment for the `Value::Str|Bytes — literal, rebuilt per
-/// evaluation` rule and the tripwire for ADR 0019 §2 item 1, and its failure
-/// message named this change as the reason it would fire. It fired. The
-/// experiment is unchanged; what it asserts is the other side of it.
-///
-/// `NodeKind::Lit` now carries the [`Value`] the literal denotes, built once at
-/// lowering (`crates/ply-eval/src/code.rs`), and `Machine::eval` clones it — a
-/// refcount bump on the `Arc<str>` or `Arc<[u8]>`, which
-/// [`the_shape_of_every_value_variant_is_measured`] prices at 0 allocations.
-///
-/// **A zero is only evidence if the instrument can still see an allocation on
-/// this path**, so the control is inside this test rather than beside it: the
-/// same loop shape with `R4Box(1)` in it still shows +1.00 of a 40-byte
-/// `Arc<Vec<Value>>` under `Machine::apply`. Without that line a rule that had
-/// simply stopped matching would read the same as a lever that had landed.
+/// Whether evaluating a `Str` or a `Bytes` literal reaches the allocator.
 #[test]
 fn a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation() {
     let loaded = micro_program();
@@ -1034,9 +812,7 @@ fn a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation() {
         }
     }
 
-    // The control. `r4_applied` is the same loop with an allocation in it that
-    // this change does not touch, so +1.00 here is the instrument reporting
-    // that it can still see one.
+    // The control.
     let control = added(&base, &micro(&loaded, "r4_applied"));
     let hit = control
         .iter()
@@ -1055,9 +831,9 @@ fn a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation() {
          on it and it is measuring something else now"
     );
 
-    // The literals are still evaluated and still mean what they said: both
-    // loops sum `string_len("abcd")` / `bytes_len(b"abcd")`, so a shared value
-    // that had drifted to another literal would not answer 4 per iteration.
+    // The literals are still evaluated and still mean what they said: both loops sum
+    // `string_len("abcd")` / `bytes_len(b"abcd")`, so a shared value that had drifted to another
+    // literal would not answer 4 per iteration.
     for name in ["r4_str", "r4_bytes"] {
         let full = loaded.full(name).unwrap_or_else(|e| panic!("{name}: {e}"));
         let (_, answered) = loaded
@@ -1076,8 +852,8 @@ fn a_literal_value_is_built_once_at_lowering_rather_than_per_evaluation() {
     }
 }
 
-/// `interp::literal` cannot allocate for an `Int`, a `Bool` or a `Float`, so
-/// the premise that primitives are boxed is false in the tree as it stands.
+/// `interp::literal` cannot allocate for an `Int`, a `Bool` or a `Float`, so the premise that
+/// primitives are boxed is false in the tree as it stands.
 #[test]
 fn an_int_a_bool_and_a_float_are_inline_and_allocate_nothing() {
     let mut log: Vec<(&str, usize)> = Vec::new();
@@ -1114,21 +890,7 @@ fn an_int_a_bool_and_a_float_are_inline_and_allocate_nothing() {
     );
 }
 
-/// Whether a mention of a constructor reaches the allocator. It does not.
-///
-/// This test read `a_nullary_constructor_is_rebuilt_on_every_mention` and
-/// asserted the opposite — one 40-byte allocation per iteration under
-/// `Value::ctor < interp::ctor_value` — because that is what the tree did when
-/// the attribution behind ADR 0019 was taken. It was the arming experiment for
-/// the two `rebuilt per mention` rules and the tripwire for §2, and its failure
-/// message named this change as the reason it would fire. It fired. The
-/// experiment is unchanged; what it asserts is the other side of it.
-///
-/// A mention that allocates nothing is only evidence if the instrument can
-/// still see a per-iteration allocation on this path, and
-/// [`a_constructor_of_arity_one_or_more_is_built_once_rather_than_per_mention`]
-/// is that control: it holds a different allocation in the same loop to
-/// exactly 1.00 per iteration.
+/// Whether a mention of a constructor reaches the allocator.
 #[test]
 fn a_nullary_constructor_is_built_once_rather_than_on_every_mention() {
     let loaded = micro_program();
@@ -1148,9 +910,9 @@ fn a_nullary_constructor_is_built_once_rather_than_on_every_mention() {
         );
     }
 
-    // The mention is still evaluated and still means `R4Red`: `r4_rank` answers
-    // 1 for it and 2 or 3 for the other two arms, so a shared value that had
-    // drifted to another constructor would not sum to the iteration count.
+    // The mention is still evaluated and still means `R4Red`: `r4_rank` answers 1 for it and 2 or 3
+    // for the other two arms, so a shared value that had drifted to another constructor would not
+    // sum to the iteration count.
     let full = loaded.full("r4_nullary").expect("r4_nullary must resolve");
     let (_, answered) = loaded
         .pure_call(
@@ -1166,20 +928,8 @@ fn a_nullary_constructor_is_built_once_rather_than_on_every_mention() {
     );
 }
 
-/// The same for a constructor of arity >= 1, whose mention evaluates to an
-/// `Arc<Closure>` rather than to a `Value::Ctor`.
-///
-/// The `Value::Closure — constructor, rebuilt per mention` rule had no arming
-/// experiment when it was written and this is it, taken after the value it
-/// counted stopped being built: 24.0 per request on /health and 14.0 on the
-/// routing rung, and 0.00 per mention here.
-///
-/// It is also the positive control for the test above. Applying `R4Box` still
-/// costs one 40-byte `Arc<Vec<Value>>` for the arguments it keeps — a separate
-/// line in the profile (`Value::Ctor — applied constructor`, 31.0 per request)
-/// that ADR 0019 §2 does not touch and §4 refuses to trade away — so a loop
-/// that shows +1.00 of that and 0.00 under `ctor_value` is an instrument that
-/// can still see an allocation, reporting that this one is gone.
+/// The same for a constructor of arity >= 1, whose mention evaluates to an `Arc<Closure>` rather
+/// than to a `Value::Ctor`.
 #[test]
 fn a_constructor_of_arity_one_or_more_is_built_once_rather_than_per_mention() {
     let loaded = micro_program();
@@ -1190,10 +940,9 @@ fn a_constructor_of_arity_one_or_more_is_built_once_rather_than_per_mention() {
     for (size, site, per) in &rows {
         println!("   {per:>+6.2} per iteration  {size:>5}B  {site}");
     }
-    // Only `ctor_value` here, not [`is_ctor_mention`]'s second spelling: the
-    // applied constructor below builds its `Value::Ctor` inline in
-    // `enter_closure` rather than through `Value::ctor`, and matching that
-    // spelling would fail this test on its own control.
+    // Only `ctor_value` here, not [`is_ctor_mention`]'s second spelling: the applied constructor
+    // below builds its `Value::Ctor` inline in `enter_closure` rather than through `Value::ctor`,
+    // and matching that spelling would fail this test on its own control.
     if let Some((size, site, per)) = rows
         .iter()
         .find(|(_, site, _)| site.contains("ply_eval::interp::ctor_value"))
@@ -1222,18 +971,13 @@ fn a_constructor_of_arity_one_or_more_is_built_once_rather_than_per_mention() {
     );
 }
 
-/// Either spelling of the frame chain a rebuilt constructor mention allocates
-/// under. `Value::ctor` is inlined into `interp::ctor_value` in release and is
-/// a frame of its own in debug, and the closure case has no `Value::ctor` in it
-/// at all — so a test that matched one spelling would pass in one profile and
-/// on one arity.
+/// Either spelling of the frame chain a rebuilt constructor mention allocates under.
 fn is_ctor_mention(site: &str) -> bool {
     site.contains("ply_eval::interp::ctor_value") || site.contains("ply_eval::value::Value::ctor")
 }
 
-/// How many allocations each variant costs and at what size — where the rule
-/// table's sizes come from, and the answer to "`Ctor` is two allocations, what
-/// would `Arc<[Value]>` save".
+/// How many allocations each variant costs and at what size — where the rule table's sizes come
+/// from, and the answer to "`Ctor` is two allocations, what would `Arc<[Value]>` save".
 #[test]
 fn the_shape_of_every_value_variant_is_measured() {
     fn shape<T>(label: &str, f: impl FnOnce() -> T) -> (String, Vec<usize>) {
@@ -1256,14 +1000,13 @@ fn the_shape_of_every_value_variant_is_measured() {
     let list = shape("Value::list(4 elements)", || {
         Value::list((0..4).map(Value::Int).collect())
     });
-    // The names are interned outside the window: `Symbol::new` is an `Arc<str>`
-    // of its own and would be counted as the constructor's cost.
+    // The names are interned outside the window: `Symbol::new` is an `Arc<str>` of its own and
+    // would be counted as the constructor's cost.
     let some = Symbol::new("Some");
     let none = Symbol::new("None");
     let x = Symbol::new("x");
-    // Two halves, priced separately because they are made at different sites:
-    // the machine fills the argument `Vec` in `Frame::AppArgs` and `Value::ctor`
-    // only wraps it. A `Ctor` costs both.
+    // Two halves, priced separately because they are made at different sites: the machine fills the
+    // argument `Vec` in `Frame::AppArgs` and `Value::ctor` only wraps it.
     let spine = shape("the Vec<Value> a 1-argument call fills", || {
         let v: Vec<Value> = vec![Value::Int(1)];
         v
@@ -1311,8 +1054,7 @@ fn the_shape_of_every_value_variant_is_measured() {
         println!("  {label:<34} {bytes}");
     }
 
-    // `Ctor` is the only variant whose payload needs three words. Two rewrites
-    // of it, priced: one narrows the enum, the other widens it.
+    // `Ctor` is the only variant whose payload needs three words.
     #[allow(dead_code)]
     enum Boxed {
         Int(i64),
@@ -1413,48 +1155,11 @@ fn the_shape_of_every_value_variant_is_measured() {
     );
 }
 
-// ------------------------------- what the largest bucket is made of, and
-// ------------------------------- whether the two-window fit is entitled to
-// ------------------------------- call itself a slope
-
-/// A third window, so the slope can be checked against a second slope rather
-/// than assumed. Two points always fit a line.
+/// A third window, so the slope can be checked against a second slope rather than assumed.
 const THIRD: usize = 400;
 
-/// What is left of the argument-vector line once the free list has taken what
-/// it can, split by the reason each survivor survived.
-///
-/// This test read `the_argument_vector_is_the_largest_single_cost_and_its_buffers_are_small`
-/// and asserted that arity 1–4 was over 90% of the line, because that is the
-/// distribution a four-class free list was sized against and the attribution
-/// behind ADR 0019 §1 measured it at 93.8%. It fired when the free list landed,
-/// for the reason a design instrument fires when the design ships: the bucket no
-/// longer counts **argument vectors built**, it counts **argument vectors the
-/// free list could not serve**. The histogram is unchanged and still printed;
-/// what it is a histogram *of* has moved, and the assertions have moved with it.
-///
-/// Three populations survive, and the split is the point:
-///
-/// - **retained** — `enter_closure`'s `ClosureKind::Ctor` arm keeps the buffer
-///   as `Ctor.args`, so there is nothing to give back. Priced beside the
-///   histogram from the `Value::Ctor — applied constructor` line.
-/// - **wider than the list** — [`crate::argv`]'s four classes are arity 1
-///   through 4 and an application wider than that is left to the allocator by
-///   construction.
-/// - **never given back** — an arity-1..4 buffer that was freed and still did
-///   not reach `argv::give`. **This is the finding of ADR 0019 §1.** That
-///   document says the transient buffers "are freed by `enter_code`"; a builtin
-///   callee reaches `Machine::call_builtin` instead, and `builtins::call` takes
-///   its `Vec<Value>` by value, so the buffer is freed inside a function that
-///   cannot hand it back. `a_warm_ply_call_takes_its_argument_vector_from_the_free_list`
-///   is the controlled experiment that shows one such call allocating one
-///   buffer per iteration; this is how many of them a request makes.
-///
-/// The `Value`-wide slot count below is now a count of **allocations**, not of
-/// slots a request touches — the applications still happen, the buffers are just
-/// reused — so it understates what a narrower `Value` would move and ADR 0019
-/// §4's figure for that was taken before the free list existed. The line says so
-/// where it prints.
+/// What is left of the argument-vector line once the free list has taken what it can, split by the
+/// reason each survivor survived.
 #[test]
 fn the_argument_vectors_the_free_list_does_not_take_are_the_ones_no_callee_gives_back() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
@@ -1555,10 +1260,8 @@ fn the_argument_vectors_the_free_list_does_not_take_are_the_ones_no_callee_gives
          with it, or the service stopped making an application wider than {ARGV_CLASSES} \
          arguments"
     );
-    // A retained buffer is by construction one of the pooled classes' survivors:
-    // it was taken from the list and never came back. If the retained line is
-    // larger than the whole pooled-class residue the two classifiers disagree,
-    // and the split above is arithmetic over buckets that are not nested.
+    // A retained buffer is by construction one of the pooled classes' survivors: it was taken from
+    // the list and never came back.
     assert!(
         retained <= pooled + 0.05,
         "the `Value::Ctor — applied constructor` line is {retained:.1} per request but only \
@@ -1568,15 +1271,7 @@ fn the_argument_vectors_the_free_list_does_not_take_are_the_ones_no_callee_gives
     );
 }
 
-/// Every figure in this file is a slope through two points, and two points
-/// always fit a line. This takes a third window and checks the two slopes
-/// agree, so "911.5 per request" is a measurement rather than an arithmetic
-/// consequence of picking 20 and 200.
-///
-/// It exists because `w6-alloc`'s *byte* total is known to grow faster than the
-/// request count (`CONTRIBUTING.md` §"Things known to be broken" item 8) while
-/// its allocation count does not. If the allocation slope were superlinear too,
-/// every share in this file would be a share of the wrong denominator.
+/// Every figure in this file is a slope through two points, and two points always fit a line.
 #[test]
 fn the_per_request_slope_is_the_same_between_the_second_and_third_window() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");

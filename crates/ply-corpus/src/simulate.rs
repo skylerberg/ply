@@ -1,25 +1,4 @@
 //! The three numbers M7 spends and, before this module, never priced.
-//!
-//! [`crate::measure`] prices the machine ADR 0005 built; this prices the search
-//! ADR 0006 built on top of it:
-//!
-//! - **reduction** — interleavings the footprint-guided search runs against the
-//!   interleavings an unpruned enumeration runs, per test, at whatever conflict
-//!   density the corpus was generated at. This is the evidence that
-//!   resource-granular effects earned their complexity, and it is the one number
-//!   a milestone about partial-order reduction may not leave unmeasured.
-//! - **race power** — how many seeds it takes to reach a failing interleaving
-//!   under the search against under sampling. A ratio here is the practical form
-//!   of the reduction: a search that reaches a race in two interleavings where
-//!   sampling needs forty is a search worth running.
-//! - **throughput** — seeds per second. M7's premise is thousands of seeds per
-//!   change, and whether that is affordable is a wall-clock question that no
-//!   count of interleavings answers.
-//!
-//! Every measurement drives the real machine through the real scheduler, so a
-//! number here is a number `ply test` would also produce. The one thing this
-//! module does that the CLI cannot is choose the root set per trial, which is
-//! what makes a median over many trials possible at all.
 
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
@@ -30,12 +9,12 @@ use serde::Serialize;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// A test the search has something to say about: its footprint carries
-/// `sim.read`, so its outcome is a function of its definitions *and* a seed.
+/// A test the search has something to say about: its footprint carries `sim.read`, so its outcome
+/// is a function of its definitions *and* a seed.
 struct Seeded {
     key: String,
-    /// Where the machine finds it, which is not its index in `CheckOutput`: the
-    /// incremental front end reports tests from modules it never parsed.
+    /// Where the machine finds it, which is not its index in `CheckOutput`: the incremental front
+    /// end reports tests from modules it never parsed.
     module: Symbol,
     ordinal: usize,
 }
@@ -60,22 +39,18 @@ fn seeded_tests(front: &Front) -> Vec<Seeded> {
         .collect()
 }
 
-/// Whole-test replay at one seed, which is what `ply_test::InterpExecutor` does
-/// and this repeats rather than reuses: the runner drives a whole suite through
-/// a thread pool and a cache, and a measurement of the search must not be a
-/// measurement of those.
+/// Whole-test replay at one seed, which is what `ply_test::InterpExecutor` does and this repeats
+/// rather than reuses: the runner drives a whole suite through a thread pool and a cache, and a
+/// measurement of the search must not be a measurement of those.
 struct Driver<'a> {
     front: &'a Front,
     test: &'a Seeded,
     steps: u32,
-    /// Interleavings run. The search reports this too; keeping our own is what
-    /// lets a trial that ends in a failure still be counted.
+    /// Interleavings run.
     runs: u32,
     /// Hand the search a recording with no vector clocks on it, which is
-    /// [`ply_eval::sched::happens_before`]'s documented "no synchronization
-    /// known" case and therefore exactly the search as it behaved before clocks
-    /// existed. The third column of the reduction table, and the only honest way
-    /// to price a filter without checking out the tree that predates it.
+    /// [`ply_eval::sched::happens_before`]'s documented "no synchronization known" case and
+    /// therefore exactly the search as it behaved before clocks existed.
     blind: bool,
 }
 
@@ -121,27 +96,22 @@ impl Simulation for Driver<'_> {
     }
 }
 
-// ----------------------------------------------------------------- reduction
-
 #[derive(Clone, Debug, Serialize)]
 pub struct TestReduction {
     pub key: String,
     /// Interleavings the footprint-guided search ran.
     pub pruned: u32,
-    /// The same search with the recording's vector clocks withheld, so a pair
-    /// the join graph already ordered is queued as though it were a race. What
-    /// the search did before it read them.
+    /// The same search with the recording's vector clocks withheld, so a pair the join graph
+    /// already ordered is queued as though it were a race.
     pub unsynchronized: u32,
     pub unsynchronized_bounded: bool,
-    /// Interleavings the same search ran with the dependence relation forced to
-    /// `true`, which is exhaustive enumeration of every schedule respecting
-    /// per-task order and enabledness.
+    /// Interleavings the same search ran with the dependence relation forced to `true`, which is
+    /// exhaustive enumeration of every schedule respecting per-task order and enabledness.
     pub naive: u32,
-    /// The naive search spent its budget, so `naive` is a lower bound and the
-    /// ratio is one too.
+    /// The naive search spent its budget, so `naive` is a lower bound and the ratio is one too.
     pub naive_bounded: bool,
-    /// The pruned search spent its budget, so it proved nothing about the
-    /// interleavings it did not reach and the ratio understates both sides.
+    /// The pruned search spent its budget, so it proved nothing about the interleavings it did not
+    /// reach and the ratio understates both sides.
     pub pruned_bounded: bool,
     pub pruned_exhaustive: bool,
     pub reduction: f64,
@@ -150,11 +120,6 @@ pub struct TestReduction {
 }
 
 /// The reduction for every seeded test under `root`.
-///
-/// Both searches run against the same driver and the same budget, so the only
-/// difference between them is [`Dependence`] — which is the whole point of
-/// measuring it this way rather than against a second implementation that could
-/// disagree with the first for reasons nobody controls.
 pub fn reduction(root: &Path, budget: u32, steps: u32) -> Result<Vec<TestReduction>> {
     let front = front(root)?;
     let tests = seeded_tests(&front);
@@ -207,15 +172,12 @@ pub fn reduction(root: &Path, budget: u32, steps: u32) -> Result<Vec<TestReducti
         .collect()
 }
 
-// ---------------------------------------------------------------- race power
-
-/// One trial: a search started from one root, and what it cost to reach the
-/// failure — or that it did not reach one.
+/// One trial: a search started from one root, and what it cost to reach the failure — or that it
+/// did not reach one.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Trial {
     pub root: u64,
-    /// Interleavings run before the failure. `None` when the trial's budget was
-    /// spent without one, which is the case a median must not silently drop.
+    /// Interleavings run before the failure.
     pub interleavings: Option<u32>,
 }
 
@@ -233,19 +195,11 @@ pub struct RacePower {
     pub sampled_median: Option<f64>,
     pub sampled_worst: Option<u32>,
     pub sampled_misses: usize,
-    /// Sampled median over search median. `None` when either side never found
-    /// it, because a ratio against a miss is a ratio nobody observed.
+    /// Sampled median over search median.
     pub median_ratio: Option<f64>,
 }
 
 /// How many seeds each strategy needs to reach the failing interleaving.
-///
-/// A trial is a root. Under `dpor` the root seeds one search, which explores
-/// until it fails or empties its frontier; under sampling the root starts a run
-/// of independent single-interleaving seeds. Counting interleavings on both
-/// sides rather than seeds on one and interleavings on the other is what makes
-/// the ratio mean "runs of the program", which is the unit that costs wall
-/// clock.
 pub fn race_power(root: &Path, trials: u32, budget: u32, steps: u32) -> Result<Vec<RacePower>> {
     let front = front(root)?;
     let tests = seeded_tests(&front);
@@ -324,9 +278,7 @@ pub fn race_power(root: &Path, trials: u32, budget: u32, steps: u32) -> Result<V
     Ok(out)
 }
 
-/// Median, worst and misses. A trial that never found the failure is counted
-/// rather than dropped: a median over the trials that happened to succeed is the
-/// most flattering statistic available and the least honest one.
+/// Median, worst and misses.
 fn summarize(trials: &[Trial]) -> (Option<f64>, Option<u32>, usize) {
     let mut found: Vec<u32> = trials.iter().filter_map(|t| t.interleavings).collect();
     let misses = trials.len() - found.len();
@@ -343,8 +295,6 @@ fn summarize(trials: &[Trial]) -> (Option<f64>, Option<u32>, usize) {
     (Some(median), found.last().copied(), misses)
 }
 
-// ---------------------------------------------------------------- throughput
-
 #[derive(Clone, Debug, Serialize)]
 pub struct SeedRate {
     pub key: String,
@@ -353,21 +303,14 @@ pub struct SeedRate {
     pub interleavings: u32,
     pub millis: f64,
     pub seeds_per_second: f64,
-    /// Scheduling steps across the run, so a rate can be read against the size
-    /// of what it was scheduling rather than only against the program's.
+    /// Scheduling steps across the run, so a rate can be read against the size of what it was
+    /// scheduling rather than only against the program's.
     pub steps: u64,
-    /// The sample hit a failing interleaving and stopped, so fewer seeds ran
-    /// than were asked for. The rate still stands — it is the rate of the seeds
-    /// that ran — and the flag is what stops it being read as a full sample.
+    /// The sample hit a failing interleaving and stopped, so fewer seeds ran than were asked for.
     pub stopped_early: bool,
 }
 
 /// Seeds per second for every seeded test under `root`.
-///
-/// Whole-test replay means one seed is one entire test — including the setup
-/// that precedes the region — so this is the rate that decides whether "thousands
-/// of seeds per change" is affordable, and it is deliberately not the rate of the
-/// scheduler alone.
 pub fn seed_rate(root: &Path, budget: u32, steps: u32) -> Result<Vec<SeedRate>> {
     let front = front(root)?;
     let tests = seeded_tests(&front);
@@ -407,8 +350,6 @@ pub fn seed_rate(root: &Path, budget: u32, steps: u32) -> Result<Vec<SeedRate>> 
 fn millis(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
-
-// -------------------------------------------------------------------- render
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SimMeasurements {
@@ -489,8 +430,8 @@ pub fn render(m: &SimMeasurements) -> String {
     out
 }
 
-/// A statistic over trials that did not all find the failure is reported with
-/// the misses attached, never as a bare number.
+/// A statistic over trials that did not all find the failure is reported with the misses attached,
+/// never as a bare number.
 fn stat(value: Option<f64>, misses: usize) -> String {
     match (value, misses) {
         (None, _) => "never".to_string(),
@@ -499,8 +440,8 @@ fn stat(value: Option<f64>, misses: usize) -> String {
     }
 }
 
-/// A count whose search stopped at its budget is a lower bound and prints as
-/// one; a count nobody bounded prints bare.
+/// A count whose search stopped at its budget is a lower bound and prints as one; a count nobody
+/// bounded prints bare.
 fn bound(count: u32, bounded: bool) -> String {
     if bounded {
         format!(">={count}")
@@ -509,8 +450,8 @@ fn bound(count: u32, bounded: bool) -> String {
     }
 }
 
-/// A ratio over a bounded numerator is bounded too, and printing it bare is the
-/// one place this table could claim a number nobody observed.
+/// A ratio over a bounded numerator is bounded too, and printing it bare is the one place this
+/// table could claim a number nobody observed.
 fn ratio(reduction: f64, bounded: bool) -> String {
     if bounded {
         format!(">={reduction:.1}×")
@@ -569,8 +510,8 @@ mod tests {
         dir
     }
 
-    /// The claim, at the size a unit test can afford: pruning never runs more
-    /// interleavings than not pruning, and the search reaches its frontier.
+    /// The claim, at the size a unit test can afford: pruning never runs more interleavings than
+    /// not pruning, and the search reaches its frontier.
     #[test]
     fn pruning_never_costs_more_than_not_pruning() {
         let dir = corpus(0.0, 2);
@@ -588,9 +529,9 @@ mod tests {
         }
     }
 
-    /// Withholding the recording's clocks may only cost interleavings, never
-    /// save them: the filter refuses reorderings that are unreachable, so a
-    /// search that cannot see the ordering has strictly more to do.
+    /// Withholding the recording's clocks may only cost interleavings, never save them: the filter
+    /// refuses reorderings that are unreachable, so a search that cannot see the ordering has
+    /// strictly more to do.
     #[test]
     fn a_search_that_cannot_see_the_synchronization_never_runs_fewer() {
         let dir = corpus(0.0, 3);
@@ -605,8 +546,8 @@ mod tests {
         }
     }
 
-    /// A corpus with no failing test reports misses rather than a median over
-    /// nothing, and never a zero that reads as "found immediately".
+    /// A corpus with no failing test reports misses rather than a median over nothing, and never a
+    /// zero that reads as "found immediately".
     #[test]
     fn a_test_that_never_fails_reports_misses_and_no_ratio() {
         let dir = corpus(1.0, 2);
@@ -629,8 +570,8 @@ mod tests {
         }
     }
 
-    /// A statistic that dropped its misses would report the search as better
-    /// than it is, which is the one direction this module must not err in.
+    /// A statistic that dropped its misses would report the search as better than it is, which is
+    /// the one direction this module must not err in.
     #[test]
     fn a_summary_carries_its_misses() {
         let trials = [

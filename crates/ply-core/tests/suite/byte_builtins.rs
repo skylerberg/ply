@@ -1,11 +1,4 @@
 //! The byte builtins' type surface, at the source level.
-//!
-//! `ply-core`'s own unit test pins the printed schemes. This asks the two
-//! questions a pin cannot: that eight of the nine are **pure**, and that
-//! `bytes_position` — the one that calls back into user code — threads its
-//! predicate's row into the caller's footprint. A builtin that swallowed the
-//! row would let a definition reaching a socket publish an empty one, which is
-//! the failure ADR 0012 calls a green result over unexplored space.
 
 use ply_core::{CheckOutput, check_program, print_type};
 use ply_span::{Diagnostic, SourceId, Symbol};
@@ -77,9 +70,9 @@ fn the_byte_builtins_have_the_types_the_contract_states() {
     }
 }
 
-/// Eight of the nine perform nothing, so a parser written with them has an
-/// empty row — which is what lets `examples/hello.ply` keep its head parser out
-/// of the trusted computing base and still publish `{}`.
+/// Eight of the nine perform nothing, so a parser written with them has an empty row — which is
+/// what lets `examples/hello.ply` keep its head parser out of the trusted computing base and still
+/// publish `{}`.
 #[test]
 fn every_builtin_but_position_is_pure() {
     let out = ok(r#"
@@ -102,9 +95,7 @@ fn parse(head: Bytes) -> Int =
     assert_eq!(footprint(&out, "parse"), "{}");
 }
 
-/// `bytes_position` calls user code, so its row is the predicate's. A caller
-/// that hands it a predicate performing `net.write[conn]` publishes exactly
-/// that, and one that hands it a pure predicate publishes nothing.
+/// `bytes_position` calls user code, so its row is the predicate's.
 #[test]
 fn position_threads_its_predicates_row_and_nothing_more() {
     let out = ok(r#"
@@ -126,9 +117,8 @@ fn first_space(b: Bytes) -> Option<Int> =
     );
 }
 
-/// The declared row is checked as an upper bound like any other, so a
-/// definition that claims purity and hands `bytes_position` an effectful
-/// predicate is refused rather than believed.
+/// The declared row is checked as an upper bound like any other, so a definition that claims purity
+/// and hands `bytes_position` an effectful predicate is refused rather than believed.
 #[test]
 fn a_declared_empty_row_refuses_an_effectful_predicate() {
     let d = compile(

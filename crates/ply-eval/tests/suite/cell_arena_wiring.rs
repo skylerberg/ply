@@ -1,29 +1,4 @@
 //! A cell is a slot in the region that allocated it.
-//!
-//! ADR 0017 §1 makes `with_cell[r]` a region and the cell a value allocated in
-//! it. This file is the evidence that the arena is actually on the evaluation
-//! path — R1 built the allocator and connected nothing, and a benchmark rather
-//! than a report is what found that out — and that connecting it moved no
-//! program's meaning.
-//!
-//! What is asserted, in order:
-//!
-//! - the allocation goes through [`Arena`], counted by the arena's own `Stats`;
-//! - reads and writes cross region nesting in both directions, and the region's
-//!   lexical close hands the slots back — the reclamation event ADR 0017 §3
-//!   describes, which a region that never closed did not have. The values are
-//!   asserted from inside the program, where the cell is still live, rather than
-//!   from the arena after the run, where it is correctly gone;
-//! - a write made inside a resumption is visible after it, and resumption *n*
-//!   observes resumption *n−1*'s writes — ADR 0017 §3 as amended, which is ADR
-//!   0005 §3. The two-resumption example answers `30` with its trace cell at
-//!   `2`, and that integer is the one that distinguishes threading from the
-//!   retracted snapshot-at-capture reading;
-//! - a `Value::Cell` from a previous entry point reads *nothing* rather than
-//!   this run's cell, which is what the generation in a [`Slot`] buys and what
-//!   a `CellId` could not do;
-//! - the arena is reused across entry points, so a run that has been through
-//!   one region takes no chunk from the global allocator for the next.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Interp, Machine};
@@ -69,11 +44,8 @@ impl Compiled {
     }
 }
 
-/// Runs `name` on the machine and answers what the arena did: how many slots it
-/// bumped, the high-water mark, and what it still holds afterwards.
-///
-/// The program's own `assert_eq`s are what check the values, because they run
-/// where the cell is live. This is the cost side.
+/// Runs `name` on the machine and answers what the arena did: how many slots it bumped, the
+/// high-water mark, and what it still holds afterwards.
 fn arena_after(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
     let index = compiled.index_of(name);
     let mut machine = compiled.machine();
@@ -88,8 +60,8 @@ fn arena_after(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
     machine.cells().stats()
 }
 
-/// The same on the tree-walker, so a claim about the cell path is a claim about
-/// both engines wherever the tree-walker can express the program.
+/// The same on the tree-walker, so a claim about the cell path is a claim about both engines
+/// wherever the tree-walker can express the program.
 fn treewalk_arena_after(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
     let index = compiled.index_of(name);
     let mut interp = compiled.treewalk();
@@ -103,8 +75,6 @@ fn treewalk_arena_after(compiled: &Compiled, name: &str) -> ply_eval::arena::Sta
     );
     interp.cells().stats()
 }
-
-// ------------------------------------------------- 1. the allocation is a bump
 
 const NESTED: &str = r#"
 test "one region one cell" {
@@ -128,9 +98,7 @@ test "a sibling region does not see its neighbour's cell" {
 }
 "#;
 
-/// The claim R1 could not make: the allocation is the arena's, and the arena's
-/// own counter says so. The claim R1's wiring could not make either: the slot
-/// goes back at the region's lexical close.
+/// The claim R1 could not make: the allocation is the arena's, and the arena's own counter says so.
 #[test]
 fn a_with_cell_allocates_a_slot_in_the_arena_and_gives_it_back_at_the_close() {
     let compiled = Compiled::new(NESTED);
@@ -147,10 +115,8 @@ fn a_with_cell_allocates_a_slot_in_the_arena_and_gives_it_back_at_the_close() {
     );
 }
 
-/// The program asserts the values from inside, where the cells are live: the
-/// inner region writes the outer one's cell and reads its own back. What is
-/// asserted here is the shape of the arena the two regions leave — two bumps,
-/// both live at once, both handed back.
+/// The program asserts the values from inside, where the cells are live: the inner region writes
+/// the outer one's cell and reads its own back.
 #[test]
 fn reads_and_writes_cross_region_nesting_in_both_directions() {
     let compiled = Compiled::new(NESTED);
@@ -167,9 +133,9 @@ fn reads_and_writes_cross_region_nesting_in_both_directions() {
     }
 }
 
-/// Nesting is not the only shape: two regions in sequence are two bumps, and
-/// the second reuses the position the first gave back — one slot live at a time
-/// rather than two, which is the whole of what a close buys.
+/// Nesting is not the only shape: two regions in sequence are two bumps, and the second reuses the
+/// position the first gave back — one slot live at a time rather than two, which is the whole of
+/// what a close buys.
 #[test]
 fn two_regions_in_sequence_reuse_one_position() {
     let compiled = Compiled::new(NESTED);
@@ -185,8 +151,6 @@ fn two_regions_in_sequence_reuse_one_position() {
         );
     }
 }
-
-// ------------------------------------------- 2. resumptions, and the integer
 
 const RESUMED: &str = r#"
 effect amb {
@@ -242,9 +206,7 @@ test "the canonical state handler answers what was put" {
 }
 "#;
 
-/// A cell written by a handler clause before it resumes, read after the whole
-/// `handle` returned. Nothing on the cell path saves or restores, so the write
-/// is simply there.
+/// A cell written by a handler clause before it resumes, read after the whole `handle` returned.
 #[test]
 fn a_cell_written_inside_a_resumption_is_read_after_it() {
     let compiled = Compiled::new(RESUMED);
@@ -259,25 +221,22 @@ fn a_cell_written_inside_a_resumption_is_read_after_it() {
     );
 }
 
-/// ADR 0017 §3's two-resumption example, and the integer the whole section
-/// turns on: the trace cell reads **2**, because one cell serves both
-/// resumptions and `k(false)` observes what `k(true)` wrote. Snapshot-at-capture
-/// would answer `1`, and an arena that restored anything at a resumption would
-/// too — which is why this test is in the file that wires the arena up.
+/// ADR 0017 §3's two-resumption example, and the integer the whole section turns on: the trace cell
+/// reads **2**, because one cell serves both resumptions and `k(false)` observes what `k(true)`
+/// wrote.
 #[test]
 fn the_two_resumption_example_leaves_its_trace_cell_at_two() {
     let compiled = Compiled::new(RESUMED);
-    // `assert_eq(cell_get(c), 2)` is written in the program itself, and it runs
-    // inside the region where the cell is live. Reaching here at all is the
-    // assertion; the arena shape below is what it cost.
+    // `assert_eq(cell_get(c), 2)` is written in the program itself, and it runs inside the region
+    // where the cell is live.
     let stats = arena_after(&compiled, "two resumptions thread one cell");
     assert_eq!(stats.allocations, 1, "one cell served both resumptions");
     assert!(stats.pins_taken > 0);
 }
 
-/// The reason snapshot-at-capture cannot be taken, run rather than argued: the
-/// `put` clause writes the cell and *then* resumes, so restoring at the
-/// resumption would discard the write and `put(5); get()` would answer `0`.
+/// The reason snapshot-at-capture cannot be taken, run rather than argued: the `put` clause writes
+/// the cell and *then* resumes, so restoring at the resumption would discard the write and `put(5);
+/// get()` would answer `0`.
 #[test]
 fn the_canonical_state_handler_is_still_writable() {
     let compiled = Compiled::new(RESUMED);
@@ -288,15 +247,7 @@ fn the_canonical_state_handler_is_still_writable() {
     assert_eq!(stats.allocations, 1);
 }
 
-/// Nothing on the cell path takes a snapshot. `Arena::snapshot` and
-/// `Arena::restore` are a save-and-restore primitive the capture path must not
-/// use, and the arena's own counters are what say it did not.
-///
-/// Nothing in the evaluator calls either, so the counters stay at zero for a
-/// whole run: the entry-point reset rewinds the scope stack rather than saving
-/// it, so even that path takes no snapshot. An implementation that saved at the
-/// capture and restored at each resumption would show two of each here and would
-/// answer `1` for the trace cell.
+/// Nothing on the cell path takes a snapshot.
 #[test]
 fn no_capture_or_resumption_snapshots_the_arena() {
     let compiled = Compiled::new(RESUMED);
@@ -323,8 +274,6 @@ fn no_capture_or_resumption_snapshots_the_arena() {
         "nothing on a run's path restores, least of all a resumption"
     );
 }
-
-// ------------------------------------------------ 3. the generation discipline
 
 const ESCAPED: &str = r#"
 effect amb {
@@ -356,16 +305,8 @@ fn resume_it(saved: Saved) -> Int = {
 }
 "#;
 
-/// The one route ADR 0017 §2's brand does not close: a continuation parked in a
-/// cell, carried out of the run that made it, and resumed in the next one.
-///
-/// Under `CellId` this was undetectable in the general case — the audit that
-/// covered it had to say so out loud, because an id carries no lineage and the
-/// second run would have handed the same id to a different cell. Two things now
-/// stand in the way and either is a correct answer: the boundary check refuses
-/// the value on the way out, and behind it a `Slot` carries a generation the
-/// entry-point reset bumps, so the read is a report rather than a plausible
-/// number. What must not happen is an answer.
+/// The one route ADR 0017 §2's brand does not close: a continuation parked in a cell, carried out
+/// of the run that made it, and resumed in the next one.
 #[test]
 fn a_cell_carried_across_two_entry_points_is_named_rather_than_read() {
     let compiled = Compiled::new(ESCAPED);
@@ -384,16 +325,8 @@ fn a_cell_carried_across_two_entry_points_is_named_rather_than_read() {
     );
 }
 
-// ------------------------------------------------------- 4. what the arena buys
-
-/// The point of a bump arena, on the evaluator rather than in the allocator's
-/// own unit tests: an entry point that has run once costs the global allocator
-/// nothing for the cells of the next one.
-///
-/// `chunks_allocated` is the only field that counts a call to the global
-/// allocator, so it going flat is the claim. Under the persistent world every
-/// `with_cell` was a tree insertion and every `cell_set` a path copy, and
-/// neither ever went flat.
+/// The point of a bump arena, on the evaluator rather than in the allocator's own unit tests: an
+/// entry point that has run once costs the global allocator nothing for the cells of the next one.
 #[test]
 fn the_arena_takes_no_chunk_for_an_entry_point_it_has_already_sized() {
     let mut src = String::from("test \"warm\" {\n  with_cell[r](0) { c -> {\n");
@@ -424,11 +357,8 @@ fn the_arena_takes_no_chunk_for_an_entry_point_it_has_already_sized() {
     );
 }
 
-/// A `with_cell` in a loop is the shape ADR 0005 §2 charged one retained world
-/// entry per iteration for, and which R1's wiring still charged one arena slot
-/// per iteration for. Each region now closes at its own lexical end and no
-/// continuation outlives any of them, so the high-water mark is **one** however
-/// many iterations run.
+/// A `with_cell` in a loop is the shape ADR 0005 §2 charged one retained world entry per iteration
+/// for, and which R1's wiring still charged one arena slot per iteration for.
 #[test]
 fn a_region_in_a_loop_costs_one_slot_however_many_iterations_run() {
     let compiled = Compiled::new(

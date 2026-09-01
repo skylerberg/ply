@@ -1,5 +1,5 @@
-//! Content addressing: a definition's identity is its normalized structure, so
-//! a name is never part of it and renaming rebuilds nothing.
+//! Content addressing: a definition's identity is its normalized structure, so a name is never part
+//! of it and renaming rebuilds nothing.
 
 pub mod body;
 pub mod graph;
@@ -64,8 +64,8 @@ impl fmt::Display for DefHash {
     }
 }
 
-/// Hex rather than 32 numbers: the on-disk cache is meant to be readable by
-/// hand, and a hash has to work as a JSON object key.
+/// Hex rather than 32 numbers: the on-disk cache is meant to be readable by hand, and a hash has to
+/// work as a JSON object key.
 impl Serialize for DefHash {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         s.serialize_str(&self.to_hex())
@@ -80,45 +80,24 @@ impl<'de> Deserialize<'de> for DefHash {
     }
 }
 
-/// Every map is keyed by the program-wide name — `store.orders.place`, and
-/// `<module>.<label>` for a test. Those keys are namespace metadata: they change
-/// when a definition moves and the hashes they point at do not.
+/// Every map is keyed by the program-wide name — `store.orders.place`, and `<module>.<label>` for a
+/// test.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HashOutput {
     pub defs: IndexMap<Symbol, DefHash>,
-    /// `type` and `effect` declarations, which `defs` deliberately omits — only a
-    /// `fn` is a definition a test can be selected on. They are hashed all the
-    /// same, because a cached interface has to be keyed by one.
+    /// `type` and `effect` declarations, which `defs` deliberately omits — only a `fn` is a
+    /// definition a test can be selected on.
     pub decls: IndexMap<Symbol, DefHash>,
     pub tests: Vec<DefHash>,
-    /// Parallel to `CheckOutput::laws`. A law is an item with a body, so it is
-    /// hashed like a test: its binder types, guard and body normalized together
-    /// under their own discriminant.
+    /// Parallel to `CheckOutput::laws`.
     pub laws: Vec<DefHash>,
-    /// Definition program-wide name -> one hash per `requires` / `ensures`
-    /// clause, in source order.
-    ///
-    /// A spec is *erased* by normalization, so it appears in no entry of `defs`
-    /// and adding one re-runs no test. It gets its own key instead, through
-    /// [`spec_hash`], which covers the owner's hash — and therefore the owner's
-    /// whole closure.
+    /// Definition program-wide name -> one hash per `requires` / `ensures` clause, in source order.
     pub specs: IndexMap<Symbol, Vec<DefHash>>,
-    /// The same clauses as `specs`, identified as **sentences** rather than as
-    /// obligations: references by name, and no owner hash in the stream.
-    ///
-    /// `specs` is what an obligation is *discharged* under, so it covers the
-    /// owner and therefore moves whenever the implementation does — which is
-    /// what re-opens a proof when the code it is about is rewritten. That makes
-    /// it the wrong question for review, where "did the claim change?" must be
-    /// answerable independently of "did the implementation change?". Without
-    /// this, every implementation edit would also read as a spec edit and ADR
-    /// 0007 §9.2's *implementation changed · spec unchanged* row — the cheapest
-    /// review in the system — would be unreachable.
+    /// The same clauses as `specs`, identified as **sentences** rather than as obligations:
+    /// references by name, and no owner hash in the stream.
     pub spec_texts: IndexMap<Symbol, Vec<DefHash>>,
-    /// Parallel to `laws`, and a sentence identity for the same reason
-    /// [`HashOutput::spec_texts`] is one. A law's ordinary hash substitutes the
-    /// hash of every definition it names, so re-implementing any of them moves
-    /// it; the law as written has not changed.
+    /// Parallel to `laws`, and a sentence identity for the same reason [`HashOutput::spec_texts`]
+    /// is one.
     pub law_texts: Vec<DefHash>,
     /// Direct references, definition name -> names it mentions.
     pub deps: IndexMap<Symbol, Vec<Symbol>>,
@@ -126,21 +105,16 @@ pub struct HashOutput {
     pub closure: IndexMap<Symbol, BTreeSet<Symbol>>,
 }
 
-/// Domain tag, so a spec's key cannot collide with a definition's own hash,
-/// which is `blake3` over normalized bytes carrying no tag. The same device as
-/// the component/index composition below and as `ply_test::sim_key`.
+/// Domain tag, so a spec's key cannot collide with a definition's own hash, which is `blake3` over
+/// normalized bytes carrying no tag.
 const SPEC_DOMAIN: &[u8] = b"ply.spec.1";
 
-/// Domain tag for a claim's *sentence* identity, kept apart from [`SPEC_DOMAIN`]
-/// so that a review baseline can never be mistaken for an obligation key.
+/// Domain tag for a claim's *sentence* identity, kept apart from [`SPEC_DOMAIN`] so that a review
+/// baseline can never be mistaken for an obligation key.
 const SPEC_TEXT_DOMAIN: &[u8] = b"ply.spec.text.1";
 
 /// The identity of a claim as written, for [`HashOutput::spec_texts`] and
 /// [`HashOutput::law_texts`].
-///
-/// Deliberately *not* a function of the owner's hash or of any referent's hash:
-/// it moves when the sentence is rewritten and stays put when the definitions
-/// it mentions are re-implemented.
 fn spec_text_hash(kind: Option<SpecKind>, index: u32, normalized: &[u8]) -> DefHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SPEC_TEXT_DOMAIN);
@@ -151,15 +125,6 @@ fn spec_text_hash(kind: Option<SpecKind>, index: u32, normalized: &[u8]) -> DefH
 }
 
 /// The key an obligation attached to a definition is discharged under.
-///
-/// `normalized` is the ordinary body encoding of the clause: the owner's
-/// parameters and `result` as de Bruijn levels, a free reference contributing
-/// the referent's hash, names and spans erased.
-///
-/// `owner` is first and is not optional. A key that omitted it would leave a
-/// discharged `ensures` discharged after its definition was rewritten — a cached
-/// proof of something no longer true, which is the permissive-direction failure
-/// this milestone must not ship.
 pub fn spec_hash(owner: DefHash, kind: SpecKind, index: u32, normalized: &[u8]) -> DefHash {
     let mut hasher = blake3::Hasher::new();
     hasher.update(SPEC_DOMAIN);
@@ -170,10 +135,7 @@ pub fn spec_hash(owner: DefHash, kind: SpecKind, index: u32, normalized: &[u8]) 
     DefHash(*hasher.finalize().as_bytes())
 }
 
-/// Hashes every module of a program at once. A cross-module reference is
-/// normalized to the referent's hash exactly as a same-module one is, so nothing
-/// a module system introduces — its name, its imports, its `pub` markers — can
-/// reach a hash.
+/// Hashes every module of a program at once.
 pub fn hash_program(
     program: &Program,
     resolved: &Resolved,
@@ -182,8 +144,8 @@ pub fn hash_program(
     hash_program_ast(program, resolved)
 }
 
-/// [`hash_program`] without the type-check output, which normalization does not
-/// need: a hash is a function of resolved source structure alone.
+/// [`hash_program`] without the type-check output, which normalization does not need: a hash is a
+/// function of resolved source structure alone.
 pub fn hash_program_ast(
     program: &Program,
     resolved: &Resolved,
@@ -191,9 +153,7 @@ pub fn hash_program_ast(
     hash_index(ProgramIndex::of_program(program, resolved)?, None)
 }
 
-/// [`hash_program_ast`], keeping the normalized bytes it would otherwise throw
-/// away. They *are* the stored body — a definition's identity and its stored
-/// form are one byte stream — so collecting them costs a copy and nothing else.
+/// [`hash_program_ast`], keeping the normalized bytes it would otherwise throw away.
 pub fn hash_program_with_bodies(
     program: &Program,
     resolved: &Resolved,
@@ -207,10 +167,6 @@ pub fn hash_program_with_bodies(
 }
 
 /// One module with nothing imported: a snippet, an editor buffer, a test.
-///
-/// A module that declares an `import` is refused with `E0106` — the referent is
-/// not here to be hashed, and writing its name instead would silently alias two
-/// different definitions. Use [`hash_program`] for anything that imports.
 pub fn hash_module(
     module: &Module,
     _check: &ply_core::CheckOutput,
@@ -238,9 +194,9 @@ fn hash_index(
     let no_component = ComponentIndices::default();
     let no_effects = EffectIndex::default();
 
-    // What a definition references does not depend on what any of them hash to,
-    // so one pass with nothing known yields the reference graph, plus a sketch
-    // that orders a cycle's members without appealing to source position.
+    // What a definition references does not depend on what any of them hash to, so one pass with
+    // nothing known yields the reference graph, plus a sketch that orders a cycle's members without
+    // appealing to source position.
     let mut edges: Vec<Vec<NodeId>> = Vec::with_capacity(n);
     let mut sketches: Vec<Vec<u8>> = Vec::with_capacity(n);
     for node in &index.nodes {
@@ -259,8 +215,8 @@ fn hash_index(
         }
     }
 
-    // Components arrive dependency-first, so a component's own enumeration can
-    // splice in the ones it references.
+    // Components arrive dependency-first, so a component's own enumeration can splice in the ones
+    // it references.
     let mut orders: Vec<Vec<usize>> = Vec::with_capacity(components.len());
     for (ci, component) in components.iter().enumerate() {
         let mut members = component.clone();
@@ -325,11 +281,7 @@ fn hash_index(
         }
     }
 
-    // A law is an item with a body, hashed exactly as a test is. A spec clause
-    // is not: it is a claim *about* a definition, so it is keyed by
-    // `spec_hash`, whose first field is the owner's hash — which is what makes
-    // editing an implementation re-open its obligations while editing a claim
-    // moves no definition hash at all.
+    // A law is an item with a body, hashed exactly as a test is.
     let mut law_hashes = Vec::with_capacity(index.laws.len());
     let mut law_refs = Vec::with_capacity(index.laws.len());
     let mut law_texts = Vec::with_capacity(index.laws.len());
@@ -403,9 +355,9 @@ fn hash_index(
     ))
 }
 
-/// One item with a body, encoded the way a test is: a first pass with nothing
-/// known yields the references, which fix the effect enumeration, and a second
-/// pass writes the bytes against the finished hash table.
+/// One item with a body, encoded the way a test is: a first pass with nothing known yields the
+/// references, which fix the effect enumeration, and a second pass writes the bytes against the
+/// finished hash table.
 fn encode_item<'a>(
     index: &'a ProgramIndex<'a>,
     module: usize,
@@ -416,9 +368,7 @@ fn encode_item<'a>(
     encode_item_with(index, module, scc, hashes, false, encode)
 }
 
-/// [`encode_item`], with the choice of how a reference is written. `by_name`
-/// yields a *sentence* identity — see [`Normalizer::by_name`] — and is used only
-/// for the review baselines, never for a hash anything is selected or cached on.
+/// [`encode_item`], with the choice of how a reference is written.
 fn encode_item_with<'a>(
     index: &'a ProgramIndex<'a>,
     module: usize,
@@ -448,9 +398,7 @@ fn encode_item_with<'a>(
     nz.finish()
 }
 
-/// The component data an item's encoding reads, plus the empty tables a first
-/// pass runs against. Grouped so [`encode_item`] takes one borrow rather than
-/// six.
+/// The component data an item's encoding reads, plus the empty tables a first pass runs against.
 struct Components<'a> {
     component_of: &'a [usize],
     orders: &'a [Vec<usize>],
@@ -459,8 +407,8 @@ struct Components<'a> {
     no_effects: &'a EffectIndex,
 }
 
-/// What the item passes produced, so [`assemble`] takes one argument per idea
-/// rather than five positional vectors.
+/// What the item passes produced, so [`assemble`] takes one argument per idea rather than five
+/// positional vectors.
 struct Hashed {
     tests: Vec<DefHash>,
     test_refs: Vec<Vec<NodeId>>,
@@ -471,15 +419,8 @@ struct Hashed {
     spec_texts: IndexMap<Symbol, Vec<DefHash>>,
 }
 
-/// The effects one component can see, in an order derived only from what it
-/// references — never from a name, a module, or a source position.
-///
-/// A referent contributes its own enumeration before this component's own
-/// mentions are added, which is what anchors a slot to the *referent*. Without
-/// that anchor two definitions that handle different effects around the same
-/// callee would both write slot 0 and collapse onto one hash. A referent's
-/// enumeration is a function of its hash, so a slot means the same thing in
-/// every program where that hash appears.
+/// The effects one component can see, in an order derived only from what it references — never from
+/// a name, a module, or a source position.
 fn effect_order(
     index: &ProgramIndex<'_>,
     refs: &[NodeId],
@@ -518,13 +459,8 @@ fn slots(order: &[usize]) -> EffectIndex {
         .collect()
 }
 
-/// The hash each member of one strongly connected component gets, for a caller
-/// that has a hash table of its own to apply.
-///
-/// Exposed because `ply-test`'s renormalizer needs exactly this and had a copy of
-/// it: a duplicated hashing algorithm that drifts turns a bisection's `Edited`
-/// versus `Derived` question into a guess, and the drift is silent — the copy
-/// merely stops witnessing and the search widens.
+/// The hash each member of one strongly connected component gets, for a caller that has a hash
+/// table of its own to apply.
 pub fn component_hashes(
     index: &ProgramIndex<'_>,
     component: &[usize],
@@ -540,21 +476,14 @@ pub fn component_hashes(
 /// class, re-encode with each intra-component reference written as the
 /// referent's current class, and split until nothing splits further.
 ///
-/// Members that never split are the fixed point of that process, which for
-/// bodies whose references are positional means their unfoldings agree at every
-/// depth: `f(n) = g(n-1)` and `g(n) = f(n-1)` denote the same function and are
-/// interchangeable at every call site. They share an index, and so a hash —
-/// property 5 reaching inside a cycle, not a tie broken arbitrarily.
-///
-/// Two things make the bytes *usable* as well as canonical, and both are the same
-/// requirement said twice: **the label a reference mentions is the label its
-/// referent is filed under**. So the loop re-encodes once more after the partition
-/// settles, rather than shipping the round that produced the final split — a
-/// round that put every member in one class writes every reference as `class 0`,
-/// under which `f -> g, g -> h, h -> f` and `f -> h, h -> g, g -> f` are one
-/// definition set, which is both a collision and a cycle no decoder could rewire.
-/// And the payload is laid out **in class order** rather than sorted by bytes,
-/// so a member's index in it *is* its class with nothing to reconcile.
+/// **The loop re-encodes once more after the partition settles**, rather than
+/// shipping the round that produced the final split. The label a reference
+/// mentions has to be the label its referent is filed under, and the round that
+/// put every member in one class writes every reference as `class 0` — under
+/// which `f -> g, g -> h, h -> f` and `f -> h, h -> g, g -> f` are one definition
+/// set, which is both a collision and a cycle no decoder could rewire. The
+/// payload is laid out in class order for the same reason, so a member's index
+/// in it *is* its class.
 fn hash_component(
     index: &ProgramIndex<'_>,
     component: &[usize],
@@ -576,10 +505,7 @@ fn hash_component(
             .map(|(&v, e)| (v, distinct.binary_search(&e.as_slice()).unwrap_or(0) as u32))
             .collect()
     };
-    // Two labellings agree when they induce the same grouping. Comparing the
-    // *labels* instead would never terminate: relabelling a settled partition can
-    // permute its labels for ever, since each round ranks encodings that the
-    // previous round's labels changed.
+    // Two labellings agree when they induce the same grouping.
     let grouping = |classes: &ComponentIndices| -> Vec<Vec<usize>> {
         let mut groups: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
         for &v in component {
@@ -602,10 +528,9 @@ fn hash_component(
         }
     }
 
-    // One entry per class, in class order: members that share a class are
-    // interchangeable — the partition settled, so their encodings are equal —
-    // and storing one twice would leave the payload's indices and the members'
-    // classes disagreeing about how many there are.
+    // One entry per class, in class order: members that share a class are interchangeable — the
+    // partition settled, so their encodings are equal — and storing one twice would leave the
+    // payload's indices and the members' classes disagreeing about how many there are.
     let width = classes.values().copied().max().unwrap_or(0) as usize + 1;
     let mut by_class: Vec<&[u8]> = vec![&[]; width];
     for (&v, encoding) in component.iter().zip(&encodings) {
@@ -640,8 +565,8 @@ fn assemble(
         }
     }
 
-    // Components arrive dependency-first, so every closure a component needs has
-    // already been built by the time it is reached.
+    // Components arrive dependency-first, so every closure a component needs has already been built
+    // by the time it is reached.
     let mut component_closure: Vec<BTreeSet<Symbol>> = Vec::with_capacity(components.len());
     for (ci, component) in components.iter().enumerate() {
         let mut closure = BTreeSet::new();
@@ -710,10 +635,9 @@ fn assemble(
                 );
                 record(&mut out, name, deps, closure);
             }
-            // A law's references are what it is a claim *about*: `Laws::of`
-            // reads them to decide which definitions one law covers, which is
-            // why coverage is what a law names directly rather than what it can
-            // reach.
+            // A law's references are what it is a claim *about*: `Laws::of` reads them to decide
+            // which definitions one law covers, which is why coverage is what a law names directly
+            // rather than what it can reach.
             Entry::Law(l) => {
                 let name = index.laws[l].key.clone();
                 let (deps, closure) = reached(
@@ -730,8 +654,8 @@ fn assemble(
     out
 }
 
-/// What a nameless item — a test or a law — directly references, and everything
-/// its references can reach.
+/// What a nameless item — a test or a law — directly references, and everything its references can
+/// reach.
 fn reached(
     refs: &[NodeId],
     index: &ProgramIndex<'_>,
@@ -750,10 +674,8 @@ fn reached(
     (deps, closure)
 }
 
-/// Names collide across namespaces — a `type` and a `fn` may share one, as may
-/// two tests — so entries are merged rather than one silently replacing the
-/// other. A merged closure over-approximates the suspects, which is safe;
-/// dropping one would not be.
+/// Names collide across namespaces — a `type` and a `fn` may share one, as may two tests — so
+/// entries are merged rather than one silently replacing the other.
 fn record(out: &mut HashOutput, name: Symbol, deps: Vec<Symbol>, closure: BTreeSet<Symbol>) {
     match out.deps.get_mut(&name) {
         Some(existing) => {

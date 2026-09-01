@@ -1,23 +1,5 @@
-//! Adversarial audit of the one property the milestone cannot be wrong about:
-//! **no two region stacks opened from one fixture observe each other's
-//! writes.**
-//!
-//! Everything else in Ply degrades gracefully when it is wrong — a slower
-//! schedule, a wider suspect set. This one does not: two tests that can see each
-//! other's state produce a flake that survives the cache, and the cache makes it
-//! stick. So the attacks here are written to *succeed* if they can, and the
-//! assertions state what must remain true when they cannot.
-//!
-//! Three layers, because a defect can hide in any of them:
-//!
-//! 1. [`TaskRegions`] on its own — two stacks off one fixture, an entry point's
-//!    slots reclaimed under a slot somebody kept, and the index collision that
-//!    makes carrying a value between two stacks unsafe.
-//! 2. The machine on real source — a cell smuggled out of its region through
-//!    every carrier the language has, and a continuation resumed after the
-//!    region that made it returned.
-//! 3. The types — an argument from the definitions rather than from a run,
-//!    because a test can only sample the executions somebody thought of.
+//! Adversarial audit of the one property the milestone cannot be wrong about: **no two region
+//! stacks opened from one fixture observe each other's writes.**
 
 use ply_core::{CheckOutput, Footprint, check_program};
 use ply_eval::arena::Slot;
@@ -26,8 +8,6 @@ use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use std::marker::PhantomData;
-
-// ------------------------------------------------------------------ harness
 
 struct Compiled {
     program: Program,
@@ -81,8 +61,8 @@ impl Compiled {
         &self.check.tests[self.index_of(name)].footprint
     }
 
-    /// An isolation defect that only one engine has is still a defect, so
-    /// nothing here is believed until both engines say it.
+    /// An isolation defect that only one engine has is still a defect, so nothing here is believed
+    /// until both engines say it.
     fn run_both(&self, name: &str) -> Result<(), Diagnostic> {
         let index = self.index_of(name);
         let machine = self.machine().eval_test(index);
@@ -120,10 +100,8 @@ fn cell_of(fixture: &Fixture) -> Slot {
         .expect("the handle is a cell")
 }
 
-// ----------------------------------------- 1. the region stack on its own
-
-/// The headline property, stated over three stacks rather than two so that a
-/// defect that leaks in only one direction cannot hide behind symmetry.
+/// The headline property, stated over three stacks rather than two so that a defect that leaks in
+/// only one direction cannot hide behind symmetry.
 #[test]
 fn stacks_opened_from_one_fixture_never_read_each_others_value() {
     let fixture = one_cell();
@@ -133,8 +111,8 @@ fn stacks_opened_from_one_fixture_never_read_each_others_value() {
     for (i, stack) in stacks.iter_mut().enumerate() {
         assert!(stack.set(shared, Value::Int(i as i64 + 1)));
     }
-    // Interleaved a second time: a defect that needs the writes to alternate
-    // rather than run in a batch would survive the loop above.
+    // Interleaved a second time: a defect that needs the writes to alternate rather than run in a
+    // batch would survive the loop above.
     for i in (0..stacks.len()).rev() {
         assert!(stacks[i].set(shared, Value::Int(i as i64 + 10)));
         for (j, other) in stacks.iter().enumerate() {
@@ -154,11 +132,7 @@ fn stacks_opened_from_one_fixture_never_read_each_others_value() {
     );
 }
 
-/// The direction the forkable world made least obvious was a write to a shared
-/// ancestor. A region stack has no ancestor to write to — the fixture is a seed
-/// rather than a live parent — so the equivalent attack is to open a stack,
-/// mutate it deeply, and check that the seed the next open produces did not
-/// move. Twelve stacks, so a defect that needs depth has room to show.
+/// The direction the forkable world made least obvious was a write to a shared ancestor.
 #[test]
 fn no_amount_of_writing_to_an_open_stack_moves_what_the_fixture_seeds() {
     const DEPTH: usize = 12;
@@ -207,9 +181,9 @@ fn no_amount_of_writing_to_an_open_stack_moves_what_the_fixture_seeds() {
     }
 }
 
-/// An entry point's reset is the fork's replacement, and it has to mean both
-/// halves: the fixture comes back to what it was seeded as, and everything the
-/// entry point allocated on top of it is gone.
+/// An entry point's reset is the fork's replacement, and it has to mean both halves: the fixture
+/// comes back to what it was seeded as, and everything the entry point allocated on top of it is
+/// gone.
 #[test]
 fn a_reset_restores_the_seed_and_discards_what_the_entry_point_allocated() {
     let fixture = one_cell();
@@ -226,17 +200,9 @@ fn a_reset_restores_the_seed_and_discards_what_the_entry_point_allocated() {
     assert!(!regions.contains(scratch));
 }
 
-/// The hazard that makes every other test here necessary: two stacks opened
-/// from one fixture hand out the *same* slot for different cells, and reading a
-/// foreign slot succeeds quietly instead of failing. Nothing detects a value
-/// that crossed between two stacks — which is why nothing may carry one, and
-/// why the machine's isolation has to be structural rather than checked.
-///
-/// A slot is an index and a generation, and both stacks are fresh, so both
-/// generations are zero. The generation closes the *temporal* hole — a slot
-/// from a previous entry point, which
-/// `a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read`
-/// pins — and not this spatial one.
+/// The hazard that makes every other test here necessary: two stacks opened from one fixture hand
+/// out the *same* slot for different cells, and reading a foreign slot succeeds quietly instead of
+/// failing.
 #[test]
 fn a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner() {
     let fixture = Fixture::empty();
@@ -254,11 +220,8 @@ fn a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner() {
     assert_eq!(b.get(in_b).map(Value::render).unwrap(), "\"b's secret\"");
 }
 
-/// What a slot buys that a `CellId` did not: a slot whose region has been
-/// reclaimed reads `None` on every run rather than aliasing whatever was
-/// allocated in its place. That is the half of the hazard above that *is*
-/// closed, and it is closed by the generation rather than by a check anyone has
-/// to remember to write.
+/// What a slot buys that a `CellId` did not: a slot whose region has been reclaimed reads `None` on
+/// every run rather than aliasing whatever was allocated in its place.
 #[test]
 fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor() {
     let (mut regions, _) = Fixture::empty().open();
@@ -286,20 +249,7 @@ fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor()
     );
 }
 
-// ------------------------------------------- 2. the machine on real source
-
-/// The carriers that used to take a cell out of its region, and the one that
-/// still can.
-///
-/// A closure was the last one the region check did not inspect: it looked at the
-/// body's *type*, and a function type hid the cell in its effect row. ADR 0017
-/// §2 closed it, along with the record-of-closures, operation and store routes —
-/// `ply-core/tests/suite/region_escape_audit.rs` is where each is pinned as an error.
-/// What is left is a *continuation* parked in an enclosing region's cell: its
-/// row is erased where the variant field's function type is declared, so no type
-/// downstream of the constructor mentions the region. That is ADR 0005 required
-/// test 6, it is a success rather than an error, and it is the carrier this
-/// section now attacks with.
+/// The carriers that used to take a cell out of its region, and the one that still can.
 const ESCAPED: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 
@@ -335,9 +285,8 @@ test "two regions in one test are two cells" {
 }
 "#;
 
-/// Every carrier ADR 0017 §2 names is refused, including the closure route it
-/// lists first among the ways this could go wrong. Each of these ran before the
-/// brand looked at a function type's effect row.
+/// Every carrier ADR 0017 §2 names is refused, including the closure route it lists first among the
+/// ways this could go wrong.
 #[test]
 fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
     for (carrier, src) in [
@@ -374,12 +323,7 @@ fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
     }
 }
 
-/// The one carrier left, run. What it must not do is read anything but this
-/// run's own world.
-///
-/// The continuation half is machine-only: the tree-walker refuses a clause that
-/// binds a continuation (`E0504`, ADR 0005 required test 3), so `--engine both`
-/// has nothing to say about it and this is the oracle instead.
+/// The one carrier left, run.
 #[test]
 fn a_cell_carried_out_through_a_continuation_reads_this_runs_world() {
     let compiled = Compiled::new(ESCAPED);
@@ -393,17 +337,7 @@ fn a_cell_carried_out_through_a_continuation_reads_this_runs_world() {
         .expect("a second region is a second cell, not the first one again");
 }
 
-/// A nullary definition with an empty published row is a constant and the
-/// evaluators memoize it. `parked` is one — `with_cell` discharges its own
-/// atoms, so its footprint is `{}` — and its *value* is a key into the world
-/// that ran it. Remembering it hands the next test a cell its own world never
-/// allocated, which is the cross-test interference this whole file exists to
-/// rule out.
-///
-/// `E0505` catches it when the id is absent. It would not catch it when the
-/// next run has already allocated that id, which is the same undetectable half
-/// `a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read`
-/// records — so the memo has to refuse the value rather than rely on the check.
+/// A nullary definition with an empty published row is a constant and the evaluators memoize it.
 #[test]
 fn a_constant_whose_value_reaches_a_cell_is_not_remembered_across_tests() {
     let compiled = Compiled::new(ESCAPED);
@@ -415,8 +349,8 @@ fn a_constant_whose_value_reaches_a_cell_is_not_remembered_across_tests() {
             .unwrap_or_else(|d| panic!("run {run} must evaluate `parked` afresh: {d:#?}"));
     }
 
-    // The sanity half: a constant whose value reaches no cell is still memoized,
-    // so this refuses the value rather than the rule.
+    // The sanity half: a constant whose value reaches no cell is still memoized, so this refuses
+    // the value rather than the rule.
     let plain = Compiled::new(
         r#"
 fn table() -> List<Int> = [1, 2, 3]
@@ -430,11 +364,8 @@ test "a plain constant" { assert_eq(len(table()), 3) }
     machine.eval_test(index).expect("and again");
 }
 
-/// A `cell` atom reaching a published footprint is what the scheduler colours
-/// on, and with every escape route closed a *written row* is the only way one
-/// gets there. ADR 0005 §5 said a `cell` atom in a footprint needed a captured
-/// continuation; it now needs an annotation, because the continuation's row is
-/// erased where the variant field is declared.
+/// A `cell` atom reaching a published footprint is what the scheduler colours on, and with every
+/// escape route closed a *written row* is the only way one gets there.
 #[test]
 fn a_declared_cell_atom_is_what_reaches_a_tests_footprint() {
     let compiled = Compiled::new(
@@ -470,8 +401,8 @@ test "a read and a write" {
         vec!["cell.read[log]".to_string(), "cell.write[log]".to_string()]
     );
 
-    // And a region discharges its own label: the same atoms performed inside the
-    // region never reach the footprint at all.
+    // And a region discharges its own label: the same atoms performed inside the region never reach
+    // the footprint at all.
     let discharged = Compiled::new(
         r#"
 test "inside the region" {
@@ -482,11 +413,8 @@ test "inside the region" {
     assert_eq!(discharged.footprint("inside the region").atoms().count(), 0);
 }
 
-/// Two runs of one machine allocate at the *same* indices, because the entry
-/// point's reset hands the slots back. That is the collision of
-/// `a_foreign_slot_is_answered_by_the_reading_stack_and_never_by_its_owner`,
-/// reached through the front door — so the second run must start from the seed
-/// and not from whatever the first left behind.
+/// Two runs of one machine allocate at the *same* indices, because the entry point's reset hands
+/// the slots back.
 #[test]
 fn a_second_run_of_one_machine_reuses_the_indices_and_none_of_the_state() {
     let compiled = Compiled::new(ESCAPED);
@@ -501,8 +429,8 @@ fn a_second_run_of_one_machine_reuses_the_indices_and_none_of_the_state() {
         .iter()
         .map(|(slot, v)| (slot.index(), v.render()))
         .collect();
-    // Both regions reclaim index 0: the first hands it back at its close and
-    // the second bumps into the position it vacated.
+    // Both regions reclaim index 0: the first hands it back at its close and the second bumps into
+    // the position it vacated.
     assert_eq!(first, vec![(0, "3".into()), (0, "0".into())]);
 
     machine.eval_test(index).expect("the second run passes");
@@ -518,16 +446,9 @@ fn a_second_run_of_one_machine_reuses_the_indices_and_none_of_the_state() {
     );
 }
 
-/// A cell in a *constructor argument* used to be the one carrier the region
-/// check could not see: the variant's field type holds the `Cell`, so the
-/// region's result type was `Held` and mentioned no region.
-///
-/// ADR 0017 §2 closes it, and it is closed at the **declaration** rather than at
-/// the escape. A variant's field types are converted once for the whole program,
-/// so the region argument a written `Cell<Int>` gets is a single variable that
-/// no scheme quantifies — there is no later point at which the brand could be
-/// looked at, which is why the hole existed and why refusing the declaration is
-/// what closes it.
+/// A cell in a *constructor argument* used to be the one carrier the region check could not see:
+/// the variant's field type holds the `Cell`, so the region's result type was `Held` and mentioned
+/// no region.
 #[test]
 fn a_cell_in_a_constructor_argument_is_refused_where_the_field_is_declared() {
     let diags = Compiled::rejected(
@@ -548,9 +469,9 @@ test "a constructor carries the cell out of its region" {
     );
 }
 
-/// The boundary of that hole: the region variable in a declared `Cell<T>` field
-/// is fixed by the first region that fills it, so a second region using the same
-/// type is a mismatch rather than a silent alias between two regions' cells.
+/// The boundary of that hole: the region variable in a declared `Cell<T>` field is fixed by the
+/// first region that fills it, so a second region using the same type is a mismatch rather than a
+/// silent alias between two regions' cells.
 #[test]
 fn one_variant_cannot_hold_cells_from_two_regions_at_once() {
     let diags = Compiled::rejected(
@@ -572,8 +493,8 @@ test "two regions through one variant" {
     );
 }
 
-/// A cell in a list element or a record field *is* caught, because both keep the
-/// `Cell` type in the region's result type where `mentions_region` finds it.
+/// A cell in a list element or a record field *is* caught, because both keep the `Cell` type in the
+/// region's result type where `mentions_region` finds it.
 #[test]
 fn a_cell_in_a_list_or_a_record_field_is_refused_by_the_region_check() {
     for (carrier, src) in [
@@ -664,9 +585,8 @@ test "a continuation resumed after its region returned reads that region's cell"
 }
 "#;
 
-/// ADR 0005 §3.2's "resumes twice", with the second resumption's write landing
-/// on the first one's: one threaded world, not a snapshot per resumption. The
-/// first branch sees `1`, the second sees `2`, and `21 = 1 + 2 * 10`.
+/// ADR 0005 §3.2's "resumes twice", with the second resumption's write landing on the first one's:
+/// one threaded world, not a snapshot per resumption.
 #[test]
 fn two_resumptions_of_one_handler_write_one_cell_in_one_world() {
     let compiled = Compiled::new(RESUMED);
@@ -683,11 +603,9 @@ fn two_resumptions_of_one_handler_write_one_cell_in_one_world() {
     );
 }
 
-/// A `with_cell` *inside* a handled body runs once per resumption, and each run
-/// has to allocate its own cell: two resumptions sharing one region cell would
-/// be the two branches of a search seeing each other's scratch state. The tally
-/// discriminates — it is `1 + 1` when each branch starts from zero and `1 + 2`
-/// when the second inherits the first's.
+/// A `with_cell` *inside* a handled body runs once per resumption, and each run has to allocate its
+/// own cell: two resumptions sharing one region cell would be the two branches of a search seeing
+/// each other's scratch state.
 #[test]
 fn each_resumption_allocates_its_own_region_cell() {
     let compiled = Compiled::new(RESUMED);
@@ -709,11 +627,8 @@ fn each_resumption_allocates_its_own_region_cell() {
     );
 }
 
-/// A continuation parked in an enclosing region's cell and resumed after the
-/// region whose cell it reads has returned. Both regions are `shared`, so their
-/// slots outlive their lexical close and this is a success rather than a
-/// dangling read — and the value it answers with is this run's, never a
-/// neighbour's.
+/// A continuation parked in an enclosing region's cell and resumed after the region whose cell it
+/// reads has returned.
 #[test]
 fn a_continuation_resumed_after_its_region_returned_reads_this_runs_cell() {
     let compiled = Compiled::new(RESUMED);
@@ -748,22 +663,8 @@ fn a_continuation_resumed_after_its_region_returned_reads_this_runs_cell() {
     );
 }
 
-/// The one place a value *can* cross two entry points is the host API: `call`
-/// resets the region stack and then accepts arguments the caller built during an
-/// earlier run. Nothing in the tree does that, and this pins the refusal.
-///
-/// The carrier is a continuation parked in an enclosing region's cell, because
-/// that is the only one ADR 0017 §2's brand does not catch: the row is erased
-/// where the variant field's function type is declared.
-///
-/// Under the forkable world only half of this was detectable — had the second
-/// run already allocated `#0`, the resumed continuation would have read *that*
-/// cell and answered plausibly, because a `CellId` carried no lineage. Two
-/// things close the other half now, and the entry point's boundary check gets
-/// there first: it refuses the argument as `E0449` before the run starts. The
-/// backstop behind it is the slot's generation, which the reset bumps, and
-/// `a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor`
-/// is where that is stated on its own.
+/// The one place a value *can* cross two entry points is the host API: `call` resets the region
+/// stack and then accepts arguments the caller built during an earlier run.
 #[test]
 fn a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read() {
     let compiled = Compiled::new(ESCAPED);
@@ -779,10 +680,8 @@ fn a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read() {
     assert_eq!(smuggled.code, ply_span::codes::REGION_ESCAPE_AT_BOUNDARY);
 }
 
-/// The teeth behind every "they never observed each other" assertion elsewhere:
-/// tests that reset one stack all allocate their first cell at *the same index*.
-/// Isolation is therefore doing real work rather than being an accident of two
-/// tests happening to name different slots.
+/// The teeth behind every "they never observed each other" assertion elsewhere: tests that reset
+/// one stack all allocate their first cell at *the same index*.
 #[test]
 fn separate_tests_write_the_very_same_slot_index_in_their_own_entry_points() {
     let mut src = String::new();
@@ -811,9 +710,7 @@ fn separate_tests_write_the_very_same_slot_index_in_their_own_entry_points() {
     }
 }
 
-/// The fixture is what every entry point resets to. A test that writes must
-/// therefore leave it exactly as it found it, or the *next* test inherits the
-/// write — the interference this milestone exists to make impossible.
+/// The fixture is what every entry point resets to.
 #[test]
 fn a_seeded_fixture_survives_every_test_that_opens_it() {
     let compiled = Compiled::new(ESCAPED);
@@ -844,19 +741,7 @@ fn a_seeded_fixture_survives_every_test_that_opens_it() {
     );
 }
 
-// --------------------------------------------------- 3. the types themselves
-
-/// A test can only sample the executions somebody thought of. This is the
-/// argument from the definitions: a `Value` that could be shared across two
-/// worlds would need either interior mutability — a `RefCell`, a `Cell`, an
-/// atomic — or a way to reach one world from another thread. It has neither, and
-/// `Value: !Send` is what makes the second half unrepresentable rather than
-/// merely unwritten.
-///
-/// A `Value` holds `Rc` for its shared code and continuations, so a region
-/// stack that became `Send` would be a data race on a non-atomic refcount, not
-/// merely a scheduling surprise. If someone adds an `unsafe impl Send`, this
-/// fails.
+/// A test can only sample the executions somebody thought of.
 #[test]
 fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
     assert!(
@@ -876,11 +761,9 @@ fn a_region_stack_and_the_values_in_it_cannot_cross_a_thread() {
     assert!(is_send!(Engine));
 }
 
-/// Autoref specialization: the inherent method exists only when `T: Send`, and
-/// the trait method on `&Probe<T>` needs one more autoref step, so it is chosen
-/// exactly when the inherent one does not apply. It has to be a macro rather
-/// than a generic function, because resolution inside a generic body happens
-/// once, against a `T` that satisfies nothing.
+/// Autoref specialization: the inherent method exists only when `T: Send`, and the trait method on
+/// `&Probe<T>` needs one more autoref step, so it is chosen exactly when the inherent one does not
+/// apply.
 struct Probe<T>(PhantomData<T>);
 
 impl<T: Send> Probe<T> {

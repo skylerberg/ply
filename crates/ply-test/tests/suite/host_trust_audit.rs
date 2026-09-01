@@ -1,29 +1,5 @@
-//! What a lying host handler does to the **runner** — scheduling, the cache and
-//! the failure artifact.
-//!
-//! `ply-eval`'s `host_trust_audit.rs` establishes what a hostile handler can do
-//! to one machine. This file asks the question that decides whether that
-//! matters: which of `ply test`'s own guarantees are computed from the
-//! declaration a handler is trusted about.
-//!
-//! Three are, and they are the three W1 spends its trust on:
-//!
-//! - **grouping**, because the conflict graph is built from footprints;
-//! - **the cache**, because a green verdict is written unless the runtime says
-//!   the host was reached;
-//! - **the failure artifact**, because bisection re-runs a failing test.
-//!
-//! The cache holds, and so does the failure artifact: a host-backed failure is
-//! `Skipped::Host` rather than a culprit named with confidence for a verdict a
-//! socket decided, and a handler no longer picks the class its own failure is
-//! reported under.
-//!
-//! Grouping does not hold, and cannot. The conflict graph is drawn from the
-//! registration's mode and resource, both of which are unverifiable claims, and
-//! the remaining `documents_` test pins what that costs: two tests over a
-//! resource the handler writes, scheduled into one group, green and silent. ADR
-//! 0008 §2 now says so in as many words rather than leaving a reader to infer a
-//! backstop that is not there.
+//! What a lying host handler does to the **runner** — scheduling, the cache and the failure
+//! artifact.
 
 use ply_core::CheckOutput;
 use ply_core::ty::Resource;
@@ -41,8 +17,6 @@ use ply_test::{Hosting, Record, RunReport, Search, select};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-// ------------------------------------------------------------------- harness
 
 struct TempRoot(PathBuf);
 
@@ -94,9 +68,7 @@ impl Compiled {
     }
 }
 
-/// A handler with state of its own, so a run can be traced to *which* call
-/// moved it. Registered against a `read` operation everywhere below; the counter
-/// is the write nothing above the boundary can see.
+/// A handler with state of its own, so a run can be traced to *which* call moved it.
 struct Counting {
     calls: Arc<AtomicUsize>,
     answer: i64,
@@ -175,19 +147,7 @@ fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>
     run_with(compiled, store, binding, EngineChoice::Machine)
 }
 
-// -------------------------------------------------------------- the conflict graph
-
 /// Two tests, one resource, both declared `read`, and a handler that writes.
-///
-/// Readers-writers over footprints is what decides which tests may run beside
-/// which, and ADR 0008 §6 makes it the *only* isolation a host-backed test has —
-/// region isolation being inapplicable to a socket. So the conflict graph is the
-/// last line, and it is drawn entirely from a claim nothing verifies. Here both
-/// tests land in one group and are therefore free to run simultaneously against
-/// a resource that one of them is mutating.
-///
-/// The run is green, the schedule is what the language promises, and the promise
-/// is about a footprint that is false.
 const TWO_READERS: &str = r#"
 nondet effect db {
   read get[r](key: Int) -> Int
@@ -238,17 +198,8 @@ fn documents_two_tests_a_writing_handler_couples_are_scheduled_into_one_group() 
     );
 }
 
-// --------------------------------------------------------------------- the cache
-
-/// The one guarantee at this boundary that does hold under a hostile handler,
-/// and the reason a wrong answer never becomes a permanent one.
-///
-/// This is the `det` half of the claim, which is the half that matters: a
-/// `nondet` test is uncacheable anyway, so a run reaching a `Nondeterministic`
-/// handler is protected twice over. `Determinism::Deterministic` is what ADR
-/// 0011 §4 permits and §5 says is "still not cacheable" — so a `det`, otherwise
-/// perfectly cacheable test that reaches a lying handler must still write
-/// nothing, and it does, because the runtime rather than the prediction decides.
+/// The one guarantee at this boundary that does hold under a hostile handler, and the reason a
+/// wrong answer never becomes a permanent one.
 const DET_REACHES_HOST: &str = r#"
 effect disk {
   read peek[r](key: Int) -> Int
@@ -292,28 +243,16 @@ fn a_det_pass_over_a_lying_deterministic_handler_is_never_written_to_the_cache()
         );
     }
 
-    // The *result* cache is untouched, and one thing is not: a passing test
-    // records its closure as observed, which is what ends a definition's life as
-    // an M5 suspect. So a `--host` run does leave a mark on the store that a
-    // later hermetic run reads, and ADR 0011's "a run that reached the host is
-    // never written" is about the result cache alone.
+    // The *result* cache is untouched, and one thing is not: a passing test records its closure as
+    // observed, which is what ends a definition's life as an M5 suspect.
     assert!(
         store.definitions_len() > 0,
         "a host-backed run wrote nothing at all, so this note is out of date"
     );
 }
 
-/// A handler builds its own diagnostics, and `ply_test` classifies a failure by
-/// the code the diagnostic carries — so the code is not the handler's to choose.
-///
-/// `INTERNAL_ERROR` and the divergence codes mean "the evaluator failed rather
-/// than the program": the failure becomes `Status::Panicked`, bisection is
-/// skipped as `Skipped::Panicked`, and a consumer is told to file a bug against
-/// Ply. A handler returning one would have redirected the reader away from
-/// itself and suppressed the diagnosis that would have found it. The boundary
-/// rewrites it, so the failure lands where it belongs: an ordinary red test
-/// whose diagnostic names the handler, skipped by `Skipped::Host` because
-/// re-running it would call the handler again.
+/// A handler builds its own diagnostics, and `ply_test` classifies a failure by the code the
+/// diagnostic carries — so the code is not the handler's to choose.
 #[test]
 fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
     struct Impersonates;
@@ -382,17 +321,7 @@ fn a_handler_cannot_classify_its_own_failure_as_a_defect_in_ply() {
     );
 }
 
-/// And the same test, hermetic, fails rather than quietly passing over a double
-/// nobody wrote. The default really is the guarantee.
-///
-/// Which diagnostic it fails with depends on something ADR 0011 §5 treats as
-/// settled. A hermetic binding that carries the registry answers `E0424`, which
-/// says "pass `--host` or write a test double"; a binding that carries nothing
-/// answers `E0303`, which says "inference should have stopped this, file a bug".
-/// `ply test` always supplies the first, and `ply_test::Hosting::hermetic()` —
-/// the library's own default, and what `Hosting::default()` returns — supplies
-/// the second. Both shapes are pinned so that a consumer wiring the runner
-/// itself can see which one it is getting.
+/// And the same test, hermetic, fails rather than quietly passing over a double nobody wrote.
 #[test]
 fn the_same_det_test_is_refused_hermetically() {
     let compiled = Compiled::new(DET_REACHES_HOST);
@@ -431,10 +360,8 @@ fn the_same_det_test_is_refused_hermetically() {
     );
 }
 
-/// `--engine both` runs the tree-walker beside the machine, and the tree-walker
-/// cannot drive a host handler. That refusal has to be recognised as a refusal
-/// rather than compared as an answer, or every host-backed test would report an
-/// engine divergence about the boundary instead of about the program.
+/// `--engine both` runs the tree-walker beside the machine, and the tree-walker cannot drive a host
+/// handler.
 #[test]
 fn engine_both_over_a_host_handler_reports_no_divergence_and_calls_the_handler_once() {
     let compiled = Compiled::new(DET_REACHES_HOST);
@@ -472,21 +399,7 @@ fn engine_both_over_a_host_handler_reports_no_divergence_and_calls_the_handler_o
     assert_eq!(report.results[0].recorded, Some(Record::Host));
 }
 
-// ------------------------------------------------------- the footprint check
-
-/// A `handle` discharges an **atom**, and an atom names no operation. So a
-/// clause set covering `poke` and not `peek` takes `disk.read[log]` out of the
-/// row while leaving the `peek` below it to walk the whole stack and reach the
-/// binding.
-///
-/// The test's declared footprint is then empty: it is `det`, it is scheduled as
-/// region-isolated and trivially parallel, and what it actually does is a
-/// syscall. That is the failure mode ADR 0011 §7 arms E0427 against — the static
-/// picture and the dynamic one disagree — and it needs no dishonest handler at
-/// all, only a missing clause.
-///
-/// The check has to fire *before* the handler runs, or the diagnostic is a
-/// report of a packet that has already gone out.
+/// A `handle` discharges an **atom**, and an atom names no operation.
 const ATOM_DISCHARGED_OPERATION_ESCAPES: &str = r#"
 effect disk {
   read peek[r](key: Int) -> Int
@@ -558,10 +471,7 @@ fn an_operation_that_escapes_a_partial_clause_set_is_refused_before_the_handler_
     );
 }
 
-/// And the claim does not outlive the entry point that stated it. One `Machine`
-/// serves many tests per worker, so a row left standing from the previous test
-/// would judge this one — refusing an operation that is squarely inside its own
-/// footprint, or admitting one that is not.
+/// And the claim does not outlive the entry point that stated it.
 const TWO_TESTS_ONE_WORKER: &str = r#"
 effect disk {
   read peek[r](key: Int) -> Int
@@ -611,31 +521,11 @@ fn a_footprint_claim_is_restated_for_every_test_the_worker_runs() {
     );
 }
 
-// ------------------------------------------------------------ the failure artifact
-
-/// ADR 0011 §5: "Bisection and hybrids are skipped for a host-backed failure
-/// (`Skipped::Host`). M5 re-runs a failing test many times over mixed definition
-/// sets; doing that to a test that sends packets sends the packets that many
-/// times."
-///
-/// Two things had to be true and only one was. The packets were saved by an
-/// accident — `diagnose_failures` takes no `Hosting`, so every hybrid trial runs
-/// on a `Machine` with no binding at all — and that accident was one
-/// `set_host_binding` call away from becoming the blocker. Meanwhile the
-/// bisection still ran, against trials that failed at the boundary rather than
-/// where the real run failed, and returned a conclusive culprit for a verdict a
-/// socket decided.
-///
-/// Now the run is refused a search rather than given a wrong one, and the
-/// artifact keeps its static half: the suspects still come from hashes.
-///
-/// The three halves are asserted separately below, because each would be
-/// undone by a different change.
+/// ADR 0011 §5: "Bisection and hybrids are skipped for a host-backed failure (`Skipped::Host`).
 #[test]
 fn a_host_backed_failure_is_skipped_rather_than_attributed() {
-    // v1: the test never reaches the host, passes hermetically, and its pass is
-    // recorded — which is what gives the failure below a baseline to bisect
-    // against. Without one there is nothing to attribute and the gap is hidden.
+    // v1: the test never reaches the host, passes hermetically, and its pass is recorded — which is
+    // what gives the failure below a baseline to bisect against.
     let before = Compiled::new(
         r#"
 effect disk {
@@ -661,8 +551,8 @@ test "the regression" { assert_eq(ask(1), expected()) }
         "the baseline pass has to be recorded or there is nothing to bisect against"
     );
 
-    // v2: `ask` now reaches the host on the taken branch, and the answer the
-    // handler gives is not the one the assertion wants.
+    // v2: `ask` now reaches the host on the taken branch, and the answer the handler gives is not
+    // the one the assertion wants.
     let after = Compiled::new(
         r#"
 effect disk {
@@ -727,8 +617,8 @@ test "the regression" { assert_eq(ask(1), expected()) }
         "diagnosis reached the handler; M5 evaluates a failing test once per candidate set, \
          so this is the packet sent that many times"
     );
-    // The static half is still owed to the reader, and it needs no run: the
-    // suspects are the closure intersected with what changed.
+    // The static half is still owed to the reader, and it needs no run: the suspects are the
+    // closure intersected with what changed.
     assert!(
         report.failures[0]
             .attribution

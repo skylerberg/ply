@@ -1,10 +1,5 @@
-//! The properties in CONTRACTS.md, plus the collision cases a normalizer is
-//! most likely to get wrong.
-//!
-//! Hand-built ASTs cover the shapes that are fiddly to write in surface syntax;
-//! every span in them is `DUMMY`, which is safe because normalization erases
-//! spans. The parsed programs at the end re-prove the six properties against
-//! real source, where spans and formatting genuinely differ.
+//! The properties in CONTRACTS.md, plus the collision cases a normalizer is most likely to get
+//! wrong.
 
 use super::*;
 use ply_span::Span;
@@ -204,8 +199,7 @@ fn hash_of(items: Vec<Item>, name: &str) -> DefHash {
         .expect("definition should be hashed")
 }
 
-/// `a` calls `b` calls `c` calls `d`, with a test on top of `a`. The chain the
-/// rename properties are demonstrated against.
+/// `a` calls `b` calls `c` calls `d`, with a test on top of `a`.
 fn chain(a: &str, b: &str, c: &str, d: &str) -> Vec<Item> {
     vec![
         func(a, &["x"], callv(b, vec![add(var("x"), int(1))])),
@@ -218,8 +212,6 @@ fn chain(a: &str, b: &str, c: &str, d: &str) -> Vec<Item> {
         ),
     ]
 }
-
-// ---- property 1: renaming a top-level definition changes no hash ----
 
 #[test]
 fn renaming_a_transitively_called_definition_changes_no_hash() {
@@ -366,8 +358,6 @@ fn renaming_an_effect_changes_no_hash_of_its_performers() {
     );
 }
 
-// ---- property 2: renaming a local changes no hash ----
-
 #[test]
 fn renaming_parameters_and_let_bindings_changes_no_hash() {
     let program = |p: &str, q: &str, l: &str| {
@@ -466,11 +456,6 @@ fn renaming_a_cell_binder_changes_no_hash() {
     assert_eq!(hash_of(program("cell"), "f"), hash_of(program("c"), "f"));
 }
 
-/// ADR 0017 §1. A region is part of the definition it brands: adding one,
-/// removing one, or renaming it changes what the definition means, so each moves
-/// the hash. Omitting the brand from the encoding would let a program whose
-/// values are freed at one point share a cache entry with one whose values are
-/// freed at another.
 #[test]
 fn a_region_is_part_of_the_definition_it_brands() {
     let bare = hash_of(vec![func("f", &[], int(0))], "f");
@@ -491,8 +476,8 @@ fn a_region_is_part_of_the_definition_it_brands() {
     assert_ne!(region("r"), region("s"));
 }
 
-/// The region brands the values, not the names inside it: a local is a de Bruijn
-/// level under a region exactly as it is anywhere else.
+/// The region brands the values, not the names inside it: a local is a de Bruijn level under a
+/// region exactly as it is anywhere else.
 #[test]
 fn renaming_a_cell_binder_under_a_region_changes_no_hash() {
     let program = |binder: &str| {
@@ -541,8 +526,6 @@ fn a_let_binding_is_not_in_scope_in_its_own_right_hand_side() {
     );
     assert_eq!(inner, renamed);
 }
-
-// ---- property 3: reformatting and reordering change no hash ----
 
 #[test]
 fn wrapping_a_body_in_a_block_changes_no_hash() {
@@ -606,11 +589,9 @@ fn reordering_mutually_recursive_definitions_changes_no_hash() {
     );
 }
 
-/// `f(n) = g(n-1)` and `g(n) = f(n-1)` differ only in which of the two they
-/// call, which makes them the same definition twice over: either one can be
-/// substituted for the other anywhere without changing what the program
-/// computes. They share a hash, and reordering them is therefore free like any
-/// other reordering.
+/// `f(n) = g(n-1)` and `g(n) = f(n-1)` differ only in which of the two they call, which makes them
+/// the same definition twice over: either one can be substituted for the other anywhere without
+/// changing what the program computes.
 #[test]
 fn indistinguishable_cycle_members_share_one_hash() {
     let even = func(
@@ -639,8 +620,8 @@ fn indistinguishable_cycle_members_share_one_hash() {
     );
 }
 
-/// Refinement has to keep splitting past the first round: `a` and `c` are told
-/// apart only by what their callees' callees do, which no single pass sees.
+/// Refinement has to keep splitting past the first round: `a` and `c` are told apart only by what
+/// their callees' callees do, which no single pass sees.
 #[test]
 fn refinement_separates_members_that_differ_only_deeper_in_the_cycle() {
     let step = |name: &str, next: &str, extra: i64| {
@@ -712,11 +693,9 @@ fn reordering_the_atoms_of_an_effect_annotation_changes_no_hash() {
     assert_ne!(a, different);
 }
 
-/// Two atoms of *different* effects at the same mode and with no resource are
-/// the case the sort cannot separate on bytes alone: the pass that numbers the
-/// effect slots runs with no hash table, so both encode as `REF_SELF`. Written
-/// order deciding the numbering would make an `effect set`'s expansion and the
-/// same atoms typed by hand two different definitions.
+/// Two atoms of *different* effects at the same mode and with no resource are the case the sort
+/// cannot separate on bytes alone: the pass that numbers the effect slots runs with no hash table,
+/// so both encode as `REF_SELF`.
 const TWO_EFFECTS: &str = r#"
 effect x { write a() -> Unit }
 effect y { write b() -> Unit }
@@ -733,9 +712,9 @@ fn reordering_two_atoms_the_first_pass_cannot_tell_apart_changes_no_hash() {
     );
 }
 
-/// The same case, from the other side: an effect named only by an atom the
-/// dedup drops still has to reach the enumeration, or its reference is written
-/// as slot 0 — the slot of whichever effect the enumeration does begin with.
+/// The same case, from the other side: an effect named only by an atom the dedup drops still has to
+/// reach the enumeration, or its reference is written as slot 0 — the slot of whichever effect the
+/// enumeration does begin with.
 #[test]
 fn an_effect_named_only_by_a_deduplicated_atom_is_still_enumerated() {
     let one = parsed(TWO_EFFECTS);
@@ -758,8 +737,6 @@ fn an_effect_named_only_by_a_deduplicated_atom_is_still_enumerated() {
         "two declarations that differ are two effects"
     );
 }
-
-// ---- property 4: editing a body changes it and its dependents ----
 
 #[test]
 fn editing_a_body_changes_exactly_its_transitive_dependents() {
@@ -872,8 +849,6 @@ fn changing_one_member_of_a_cycle_changes_the_whole_component() {
     );
 }
 
-// ---- property 5: structurally identical definitions hash identically ----
-
 #[test]
 fn structurally_identical_definitions_share_a_hash() {
     let out = hashes(vec![
@@ -904,8 +879,6 @@ fn identical_definitions_hash_identically_across_modules() {
     );
     assert_eq!(alone, crowded);
 }
-
-// ---- property 6: swapping fields, arguments or arms changes the hash ----
 
 #[test]
 fn swapping_two_arguments_changes_the_hash() {
@@ -1051,8 +1024,8 @@ fn string_literals_cannot_be_confused_with_their_neighbours() {
     assert_ne!(a, b);
 }
 
-/// The two have different types and must not share a definition, which is the
-/// whole reason `LIT_BYTES` is a tag of its own rather than `LIT_STR` reused.
+/// The two have different types and must not share a definition, which is the whole reason
+/// `LIT_BYTES` is a tag of its own rather than `LIT_STR` reused.
 #[test]
 fn a_byte_literal_never_hashes_as_the_string_with_the_same_characters() {
     let s = hash_of(vec![func("f", &[], str_lit("ab"))], "f");
@@ -1085,8 +1058,8 @@ fn byte_literals_cannot_be_confused_with_their_neighbours() {
     assert_ne!(empty, nul);
 }
 
-/// A `b"..."` pattern is a `PatternKind::Lit` like any other, so this is really
-/// a check that the pattern path reaches the same tag the expression path does.
+/// A `b"..."` pattern is a `PatternKind::Lit` like any other, so this is really a check that the
+/// pattern path reaches the same tag the expression path does.
 #[test]
 fn a_byte_pattern_is_distinct_from_a_string_pattern() {
     let arms = |l: Lit| {
@@ -1246,9 +1219,7 @@ fn handler_clause_parameters_are_de_bruijn_bound() {
     assert_eq!(a, renamed);
 }
 
-/// ADR 0005, required tests 24 and 25. Omitting the binder from the hash makes
-/// a general clause and a tail-resumptive one — two different semantics — share
-/// one cache entry, which is the most expensive defect this system has.
+/// ADR 0005, required tests 24 and 25.
 #[test]
 fn binding_a_continuation_changes_the_hash_and_renaming_the_binder_does_not() {
     let with_binder = |binder: &str| {
@@ -1511,8 +1482,8 @@ fn deps_include_the_types_and_effects_a_definition_mentions() {
     assert!(!out.decls.contains_key(&Symbol::new("f")));
 }
 
-/// A declaration is content-addressed like anything else, so renaming a type
-/// moves nothing and changing its shape moves it.
+/// A declaration is content-addressed like anything else, so renaming a type moves nothing and
+/// changing its shape moves it.
 #[test]
 fn declaration_hashes_follow_structure_not_names() {
     let program = |name: &str, extra: Vec<VariantDef>| {
@@ -1614,8 +1585,6 @@ fn an_empty_module_hashes_to_nothing() {
     assert!(out.tests.is_empty());
     assert!(out.closure.is_empty());
 }
-
-// ---- the same properties, over real parsed source ----
 
 fn parsed(source: &str) -> HashOutput {
     let module = match ply_syntax::parse(ply_span::SourceId(0), source) {
@@ -1803,8 +1772,6 @@ test "reads are handled" {{
     assert_eq!(before.tests, after.tests);
 }
 
-// ---- effects are nominal, and `let` order is not always meaningful ----
-
 const LOOK_ALIKES: &str = "effect {a} {\n  write emit[r](v: Int) -> Int\n}\n\
                            effect {b} {\n  write emit[r](v: Int) -> Int\n}\n\
                            fn f(v: Int) -> Int / {{eff}.write[log]} = {eff}.emit[log](v)";
@@ -1818,16 +1785,8 @@ fn look_alikes(a: &str, b: &str, eff: &str) -> HashOutput {
     )
 }
 
-/// A definition that performs one of two byte-identical effects and one that
-/// performs the other differ by a consistent renaming of the two and by nothing
-/// else, so they are one definition. Nothing local can separate them — that is
-/// what "byte-identical declaration" means — and the alternatives all cost more
-/// than they buy: a rank over the program's names makes adding an unrelated
-/// module renumber existing hashes, and a rank over source position makes moving
-/// an item do the same.
-///
-/// It stays sound because the moment anything *pins* one of the two, that thing
-/// records which slot it meant; see [`a_handler_records_which_look_alike_it_discharges`].
+/// A definition that performs one of two byte-identical effects and one that performs the other
+/// differ by a consistent renaming of the two and by nothing else, so they are one definition.
 #[test]
 fn performing_either_of_two_identically_declared_effects_is_one_definition() {
     assert_eq!(
@@ -1836,9 +1795,7 @@ fn performing_either_of_two_identically_declared_effects_is_one_definition() {
     );
 }
 
-/// The separating context. `f` performs the first declared effect and `g` the
-/// second; a handler for one discharges exactly one of them, and which one it
-/// picked is part of its identity.
+/// The separating context.
 #[test]
 fn a_handler_records_which_look_alike_it_discharges() {
     let source = |handled: &str| {
@@ -1857,9 +1814,9 @@ fn a_handler_records_which_look_alike_it_discharges() {
     );
 }
 
-/// Renaming an effect is free even when the program holds a second one declared
-/// exactly like it, and free in either direction: the pair below is renamed so
-/// that the two swap places in every name ordering.
+/// Renaming an effect is free even when the program holds a second one declared exactly like it,
+/// and free in either direction: the pair below is renamed so that the two swap places in every
+/// name ordering.
 #[test]
 fn renaming_look_alike_effects_changes_no_hash() {
     let f = |a: &str, b: &str, eff: &str| look_alikes(a, b, eff).defs[&Symbol::new("f")];
@@ -1987,11 +1944,7 @@ test "double doubles" {
     assert_eq!(out, hash_ast(&parsed_module).unwrap());
 }
 
-/// A spec is a claim *about* a definition, so its key has to move when the
-/// definition does. A key that omitted the owner would leave a discharged
-/// `ensures` discharged after its body was rewritten — a cached proof of
-/// something no longer true, which is the permissive-direction failure M8 must
-/// not ship.
+/// A spec is a claim *about* a definition, so its key has to move when the definition does.
 #[test]
 fn a_spec_key_moves_when_its_definition_does() {
     let owner = DefHash([1; 32]);
@@ -2003,10 +1956,8 @@ fn a_spec_key_moves_when_its_definition_does() {
     );
 }
 
-/// The clause's own structure, its position among its siblings, and which kind
-/// of clause it is are all part of what is being claimed, so each separates two
-/// obligations. Reordering two `ensures` clauses therefore re-runs both, which
-/// is correct: the index is what names them.
+/// The clause's own structure, its position among its siblings, and which kind of clause it is are
+/// all part of what is being claimed, so each separates two obligations.
 #[test]
 fn a_spec_key_separates_the_clause_from_its_siblings() {
     let owner = DefHash([1; 32]);
@@ -2016,8 +1967,8 @@ fn a_spec_key_separates_the_clause_from_its_siblings() {
     assert_ne!(base, spec_hash(owner, SpecKind::Ensures, 0, b"other"));
 }
 
-/// Domain-tagged, so no clause can ever produce the hash of some definition's
-/// own normalized bytes and read a test's result as its own.
+/// Domain-tagged, so no clause can ever produce the hash of some definition's own normalized bytes
+/// and read a test's result as its own.
 #[test]
 fn a_spec_key_cannot_collide_with_a_definition_hash() {
     let owner = DefHash([1; 32]);
@@ -2028,11 +1979,8 @@ fn a_spec_key_cannot_collide_with_a_definition_hash() {
     );
 }
 
-/// A spec is a claim *about* a definition, not part of it, so the normalizer
-/// erases it exactly as it erases names, spans and `pub`. Writing one therefore
-/// changes no definition hash, moves no test hash, and rebuilds nothing — the
-/// same sentence as "renaming a function selects zero tests", and true for the
-/// same reason.
+/// A spec is a claim *about* a definition, not part of it, so the normalizer erases it exactly as
+/// it erases names, spans and `pub`.
 #[test]
 fn writing_a_spec_or_a_law_changes_no_definition_hash_and_no_test_hash() {
     const BARE: &str = r#"
@@ -2097,10 +2045,8 @@ test "the ledger settles" {
         assert_eq!(with_spec.decls, bare.decls);
         assert_eq!(with_spec.tests, bare.tests, "a test would be re-run");
 
-        // A law is an item of its own, so it brings its own reference entry —
-        // which is what `Laws::of` reads to decide the definitions it covers.
-        // What must not move is any entry that was already there: a law
-        // constrains what it names without becoming part of it.
+        // A law is an item of its own, so it brings its own reference entry — which is what
+        // `Laws::of` reads to decide the definitions it covers.
         for (name, deps) in &bare.deps {
             assert_eq!(with_spec.deps.get(name), Some(deps), "`{name}` moved");
             assert_eq!(with_spec.closure.get(name), bare.closure.get(name));
@@ -2120,9 +2066,8 @@ test "the ledger settles" {
     }
 }
 
-/// The claim gets its own hash, which covers the definition's — so editing an
-/// implementation re-opens its obligations, while editing the claim moves
-/// nothing at all. That asymmetry is exactly the asymmetry review has.
+/// The claim gets its own hash, which covers the definition's — so editing an implementation
+/// re-opens its obligations, while editing the claim moves nothing at all.
 #[test]
 fn an_obligation_key_covers_the_implementation_and_the_clause() {
     const SOURCE: &str = r#"
@@ -2136,9 +2081,7 @@ fn apply_debit(balance: Int, amount: Int) -> Int
     assert_eq!(clauses.len(), 2, "one key per clause, requires included");
     assert_ne!(clauses[0], clauses[1]);
 
-    // The implementation moved: every obligation on it re-opens. A key that
-    // omitted the owner's hash would leave a discharged `ensures` discharged
-    // after its definition was rewritten.
+    // The implementation moved: every obligation on it re-opens.
     let rewritten = parsed(&SOURCE.replace("balance - amount", "balance - (amount + 0)"));
     assert_ne!(
         rewritten.defs[&Symbol::new("apply_debit")],
@@ -2146,8 +2089,8 @@ fn apply_debit(balance: Int, amount: Int) -> Int
     );
     assert_ne!(rewritten.specs[&Symbol::new("apply_debit")], clauses);
 
-    // The claim moved and the implementation did not: the definition's hash is
-    // untouched, and only the clause that changed gets a new key.
+    // The claim moved and the implementation did not: the definition's hash is untouched, and only
+    // the clause that changed gets a new key.
     let restated = parsed(&SOURCE.replace("result <= balance", "result - balance <= 0"));
     assert_eq!(restated.defs, base.defs);
     assert_eq!(restated.specs[&Symbol::new("apply_debit")][0], clauses[0]);
@@ -2170,16 +2113,8 @@ fn apply_debit(balance: Int, amount: Int) -> Int
     );
 }
 
-/// The complement of the key above, and the whole of what `ply review` asks: a
-/// claim's *sentence* moves when the sentence is rewritten and stays put when
-/// the implementation under it is.
-///
-/// Both halves matter and they fail in opposite directions. If a sentence moved
-/// with its implementation, ADR 0007 §9.2's *implementation changed · spec
-/// unchanged* row — the cheapest review in the system — would be unreachable and
-/// every body edit would send a reviewer back to the diff. If it did not move
-/// when the claim was rewritten, a rewritten claim would report "spec unchanged"
-/// and the reviewer would never read it.
+/// The complement of the key above, and the whole of what `ply review` asks: a claim's *sentence*
+/// moves when the sentence is rewritten and stays put when the implementation under it is.
 #[test]
 fn a_claims_sentence_moves_with_the_claim_and_not_with_the_implementation() {
     const SOURCE: &str = r#"
@@ -2200,9 +2135,7 @@ law "a debit never raises the balance"
     assert_ne!(sentences[0], sentences[1]);
     assert_eq!(base.law_texts.len(), 1);
 
-    // The implementation moved. Every obligation *key* re-opens — that is the
-    // test above — and no sentence moves, because neither the clauses nor the
-    // law were rewritten.
+    // The implementation moved.
     let rewritten = parsed(&SOURCE.replace("balance - amount", "balance - (amount + 0)"));
     assert_ne!(rewritten.defs[&name], base.defs[&name]);
     assert_ne!(rewritten.specs[&name], base.specs[&name]);
@@ -2232,8 +2165,8 @@ law "a debit never raises the balance"
     assert_eq!(reformatted.law_texts, base.law_texts);
 }
 
-/// A law's identity is its binders, guard and body against the *hashes* of what
-/// it names — never their names, and never its own label.
+/// A law's identity is its binders, guard and body against the *hashes* of what it names — never
+/// their names, and never its own label.
 #[test]
 fn a_law_is_hashed_by_what_it_claims_rather_than_by_what_it_is_called() {
     const SOURCE: &str = r#"
@@ -2273,8 +2206,6 @@ law "a debit lowers a balance"
     assert_eq!(rebound.laws, base.laws, "a binder is a level, not a name");
 }
 
-// ---- `where derivable(D, a)` is part of the published signature ----
-
 fn constrained(param: &str, constraints: &[(Deriver, &str)]) -> Vec<Item> {
     vec![Item::Fn(Box::new(FnDef {
         vis: Visibility::Private,
@@ -2311,9 +2242,7 @@ fn param_of(name: &str, ty: TypeExpr) -> Param {
     }
 }
 
-/// Not a taste call. Gate 2 rechecks a definition only when its own hash moved,
-/// and a caller's hash moves only when a callee's does — so an erased constraint
-/// would leave a caller accepted against a signature that no longer admits it.
+/// Not a taste call.
 #[test]
 fn adding_a_constraint_changes_the_definition_hash() {
     let bare = hash_of(constrained("a", &[]), "f");
@@ -2360,8 +2289,8 @@ fn renaming_a_constrained_type_parameter_changes_no_hash() {
     assert_eq!(a, elem, "a type parameter is a level, not a name");
 }
 
-/// A constraint the signature does not bind is an error the checker reports, and
-/// a hash may not depend on a name the definition cannot reach.
+/// A constraint the signature does not bind is an error the checker reports, and a hash may not
+/// depend on a name the definition cannot reach.
 #[test]
 fn a_constraint_on_an_unbound_parameter_contributes_nothing() {
     let bare = hash_of(constrained("a", &[]), "f");
@@ -2369,9 +2298,7 @@ fn a_constraint_on_an_unbound_parameter_contributes_nothing() {
     assert_eq!(bare, dangling);
 }
 
-/// The decoder's half for a region. The brand is in the byte stream, so a body
-/// that lost it would decode into a definition with a different hash than the
-/// key it is filed under.
+/// The decoder's half for a region.
 #[test]
 fn a_region_survives_a_body_round_trip() {
     let items = vec![func(
@@ -2414,9 +2341,7 @@ fn a_region_survives_a_body_round_trip() {
     );
 }
 
-/// The decoder's half. A constraint is in the byte stream, so a body that lost
-/// one would decode into a definition with a different hash than the key it is
-/// filed under — which is the one thing a body may never do.
+/// The decoder's half.
 #[test]
 fn a_constraint_survives_a_body_round_trip() {
     let items = constrained("a", &[(Deriver::Ord, "a"), (Deriver::Json, "a")]);

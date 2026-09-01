@@ -17,10 +17,8 @@ use serde_json::{Value, json};
 /// The contextual keyword a general clause is written with.
 const RESUME: &str = "resume";
 
-/// What every line of the `--types` block is printed at: `IND` plus the two
-/// spaces that put a definition under its module heading. Passed to the
-/// renderer so that a wrapped row respects the terminal's right edge rather
-/// than its own.
+/// What every line of the `--types` block is printed at: `IND` plus the two spaces that put a
+/// definition under its module heading.
 const TYPES_INDENT: usize = IND.len() + 2;
 
 pub fn execute(args: &CheckArgs, style: Style) -> i32 {
@@ -49,8 +47,8 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
             emit_json(&report);
             return EXIT_COMPILE_ERROR;
         }
-        // After `front_end` is recorded, so that completing the parse cannot
-        // rewrite the report of what the gates decided.
+        // After `front_end` is recorded, so that completing the parse cannot rewrite the report of
+        // what the gates decided.
         if args.explain {
             if let Err(err) = complete_parse(args, &mut loaded, store.as_mut()) {
                 return report_load_error("check", &err, args.json, style);
@@ -82,8 +80,7 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
         print_explain(&loaded, style);
     }
     if args.types {
-        // Only now, so that `print_explain` above still reports the gates as
-        // they actually fired.
+        // Only now, so that `print_explain` above still reports the gates as they actually fired.
         if args.explain
             && let Err(err) = complete_parse(args, &mut loaded, store.as_mut())
         {
@@ -95,16 +92,6 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
 }
 
 /// Parses whatever gate 1 skipped.
-///
-/// `--explain`'s effect-set table and alias provenance are read from the AST, so
-/// a run that skipped a file would print less than a run that did not — and ADR
-/// 0013 §1.6 requires the reviewing command's bytes to be identical either way.
-/// The cheapest way to guarantee that is to make the output a function of the
-/// source rather than of what the cache held.
-///
-/// The store's own warnings are drained and dropped: this is a second read of
-/// files the first load already reported on, and a duplicate "the cache is
-/// unwritable" line tells the reader nothing new.
 fn complete_parse(
     args: &CheckArgs,
     loaded: &mut Loaded,
@@ -130,16 +117,8 @@ fn complete_parse(
     Ok(())
 }
 
-/// A program the chosen engine cannot express is not a program that checks,
-/// whatever inference said about it. Only `treewalk` refuses: under `both` such
-/// a program runs once, on the machine, so it is runnable.
-///
-/// The clauses live in the AST, and gate 1 may have skipped the file that holds
-/// one — so a scan of what this run happened to parse would make the exit code
-/// depend on what the cache held, over source that never changed. Any skipped
-/// file whose text mentions `resume` is parsed first. The binder has to be
-/// written in the file that writes the clause, so the pre-filter cannot miss
-/// one, and a project with no general clause pays a substring search per file.
+/// A program the chosen engine cannot express is not a program that checks, whatever inference said
+/// about it.
 fn refuse_machine_only(
     args: &CheckArgs,
     loaded: &mut Loaded,
@@ -174,8 +153,8 @@ fn refuse_machine_only(
     Ok(ply_eval::machine_only_clauses(&loaded.program))
 }
 
-/// A cache that cannot be opened is never a reason to refuse to typecheck: the
-/// front end degrades to the full path and says so.
+/// A cache that cannot be opened is never a reason to refuse to typecheck: the front end degrades
+/// to the full path and says so.
 fn check(
     args: &CheckArgs,
     warnings: &mut Vec<Diagnostic>,
@@ -230,20 +209,8 @@ fn print_explain(loaded: &Loaded, style: Style) {
     super::common::print_phases(&loaded.frontend.phases, style);
 }
 
-/// Grouped by module and printed with simple names: the module heading already
-/// carries the qualification, and repeating it on every line would bury the
-/// signatures the flag was asked for.
-///
-/// A definition's effect row is printed on its own wrapped line under the type
-/// rather than run onto the end of it. That is the whole of W3's exit criterion:
-/// a service has a hundred endpoints and each one's row is what says which
-/// resources it touches, so a row that scrolls off the right edge is a row
-/// nobody reads. A pure definition prints no row at all — the absence of a line
-/// says more than `{}` does.
-///
-/// `explain` adds the `effect set` table and, per definition, the alias its row
-/// was written with. The **expansion** is what the signature line prints, always
-/// and whatever the flag says: ADR 0013 §1.7's rule that the truth needs no flag.
+/// Grouped by module and printed with simple names: the module heading already carries the
+/// qualification, and repeating it on every line would bury the signatures the flag was asked for.
 fn print_types(loaded: &Loaded, explain: bool, style: Style) {
     for module in loaded.modules() {
         let defs = loaded.defs_of(module.name);
@@ -343,12 +310,8 @@ fn print_types(loaded: &Loaded, explain: bool, style: Style) {
     }
 }
 
-/// Adds under `--explain` what the AST knows and the check output does not: the
-/// `effect set` table per module and, per definition, the sets its row named.
-///
-/// Only under `--explain`, and only after [`complete_parse`], so that these
-/// fields are either absent or a function of the source — never a function of
-/// which files gate 1 skipped.
+/// Adds under `--explain` what the AST knows and the check output does not: the `effect set` table
+/// per module and, per definition, the sets its row named.
 fn attach_provenance(report: &mut Value, loaded: &Loaded) {
     if let Some(modules) = report["modules"].as_array_mut() {
         for entry in modules {
@@ -508,8 +471,8 @@ mod tests {
         (dir, loaded)
     }
 
-    /// The report also carries the prelude's own effects, so an effect is found
-    /// by the name the module gave it rather than by its position.
+    /// The report also carries the prelude's own effects, so an effect is found by the name the
+    /// module gave it rather than by its position.
     fn effect_named<'a>(report: &'a Value, name: &str) -> &'a Value {
         report["effects"]
             .as_array()
@@ -589,10 +552,7 @@ mod tests {
                 .ends_with("store/orders.ply")
         );
 
-        // Definitions follow the run's files and each file's source order. The
-        // check's own order is dependency-first, which would have put
-        // `store.orders.place` first — and would have put it somewhere else
-        // again on a run where gate 1 skipped that module.
+        // Definitions follow the run's files and each file's source order.
         let names: Vec<&str> = v["definitions"]
             .as_array()
             .unwrap()

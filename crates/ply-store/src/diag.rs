@@ -1,7 +1,5 @@
-//! `Diagnostic::code` is `&'static str`, which makes `Diagnostic` deserializable
-//! only from `&'static` input — not from a file read at runtime. These mirror
-//! types carry the code as an owned `String` on the wire and re-establish the
-//! `'static` lifetime by interning on the way back in.
+//! `Diagnostic::code` is `&'static str`, which makes `Diagnostic` deserializable only from
+//! `&'static` input — not from a file read at runtime.
 
 use ply_span::{Diagnostic, Label, Severity};
 use serde::{Deserialize, Serialize};
@@ -43,8 +41,8 @@ impl From<DiagnosticRepr> for Diagnostic {
     }
 }
 
-/// Interning bounds the leak by the number of distinct codes the process has
-/// ever read, rather than by the number of cache reads.
+/// Interning bounds the leak by the number of distinct codes the process has ever read, rather than
+/// by the number of cache reads.
 fn intern_code(code: &str) -> &'static str {
     static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let mut pool = POOL

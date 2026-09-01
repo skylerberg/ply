@@ -1,14 +1,5 @@
-//! Adversarial audit of ADR 0008 §7 / ADR 0011 §3 — a host handler's
-//! continuation may be resumed at most once.
-//!
-//! `host_boundary.rs` pins the shape the design describes. This file attacks it:
-//! every test here is a way to reach a second resumption *around* the rule
-//! rather than through it — through a cell, through another task, through a
-//! region that has ended, through an aliased binding, through a re-execution.
-//!
-//! The assertion in every case is a **count**, never a value. A boundary that
-//! sends the packet twice and returns the right number is precisely the defect
-//! this milestone exists to prevent, and no assertion on a result can see it.
+//! Adversarial audit of ADR 0008 §7 / ADR 0011 §3 — a host handler's continuation may be resumed at
+//! most once.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::host::{
@@ -21,8 +12,6 @@ use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-// ------------------------------------------------------------------- fixtures
 
 struct Compiled {
     program: Program,
@@ -50,8 +39,8 @@ impl Compiled {
     }
 }
 
-/// Answers the ordinal of its own call, so a replay is visible in the value as
-/// well as in the count.
+/// Answers the ordinal of its own call, so a replay is visible in the value as well as in the
+/// count.
 #[derive(Default)]
 struct Counter {
     calls: AtomicU64,
@@ -70,8 +59,7 @@ impl HostHandler for Counter {
     }
 }
 
-/// Never completes on the spot. Its token is what forces a task inside a
-/// production region to leave the enabled set.
+/// Never completes on the spot.
 struct Waits;
 
 impl HostHandler for Waits {
@@ -121,8 +109,7 @@ fn registry_of(entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> HostRegistry {
     registry
 }
 
-/// The three `task` registrations a production region needs in order to be
-/// openable at all.
+/// The three `task` registrations a production region needs in order to be openable at all.
 fn with_tasks(mut registry: HostRegistry, handler: Arc<dyn HostHandler>) -> HostRegistry {
     for name in ["spawn", "join", "yield"] {
         registry.register(op("task", name, Linearity::Repeatable), handler.clone());
@@ -130,8 +117,8 @@ fn with_tasks(mut registry: HostRegistry, handler: Arc<dyn HostHandler>) -> Host
     registry
 }
 
-/// Runs `source` with `net.send` bound at `linearity`, and answers what the run
-/// did and how many packets went out.
+/// Runs `source` with `net.send` bound at `linearity`, and answers what the run did and how many
+/// packets went out.
 struct Run {
     outcome: Result<(), Diagnostic>,
     sends: u64,
@@ -160,8 +147,8 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
         op("net", "send", linearity),
         counter.clone() as Arc<dyn HostHandler>,
     )]);
-    // Registered only where the fixture declares it: a registration for an
-    // operation the program does not have is `E0421` before anything runs.
+    // Registered only where the fixture declares it: a registration for an operation the program
+    // does not have is `E0421` before anything runs.
     if source.contains("accept[s]") {
         registry.register(op("net", "accept", linearity), Arc::new(Waits));
     }
@@ -183,11 +170,8 @@ fn run_with(source: &str, linearity: Linearity, tasks: bool, runtime: bool) -> R
     }
 }
 
-// --------------------------------------------------- laundering the same `k`
-
-/// The counter is shared across clones by `Rc`, so a second resumption cannot
-/// launder itself through an alias. If it could, every other test in this file
-/// would be defeated by one `let`.
+/// The counter is shared across clones by `Rc`, so a second resumption cannot launder itself
+/// through an alias.
 #[test]
 fn a_second_resumption_through_an_alias_is_still_the_second() {
     let run = run(
@@ -219,10 +203,8 @@ test/nondet "aliased" {
     assert_eq!(run.sends, 1, "the alias is the same continuation");
 }
 
-/// The rule is about one `perform` running twice because its control was
-/// reinstated, not about a program that performs twice. A retry loop is legal
-/// and must stay legal, or the boundary is unusable for the thing a network
-/// handler most needs to do.
+/// The rule is about one `perform` running twice because its control was reinstated, not about a
+/// program that performs twice.
 #[test]
 fn two_ordinary_performs_are_a_retry_and_are_allowed() {
     let run = run(
@@ -245,8 +227,6 @@ test/nondet "retries" {
 }
 
 /// Two performs of one operation capture two continuations, each resumed once.
-/// Refusing the second capture's first resumption would be a false positive on
-/// the most ordinary multi-shot program there is.
 #[test]
 fn a_fresh_capture_after_a_send_may_still_be_resumed_once() {
     let run = run(
@@ -279,14 +259,9 @@ test/nondet "twice over" {
     assert_eq!(run.sends, 2);
 }
 
-// ---------------------------------------------------- storing a continuation
-
-/// The hazard ADR 0011 §3 names, with the second resumption moved out of the
-/// clause entirely: the clause stores `k` in a cell, returns, and the *body*
-/// resumes it a second time long after the handler is gone.
-///
-/// Nothing about the rule depends on where a resumption is written, and this is
-/// the test that says so.
+/// The hazard ADR 0011 §3 names, with the second resumption moved out of the clause entirely: the
+/// clause stores `k` in a cell, returns, and the *body* resumes it a second time long after the
+/// handler is gone.
 #[test]
 fn a_continuation_stashed_in_a_cell_cannot_be_resumed_a_second_time() {
     let run = run(
@@ -322,12 +297,7 @@ test/nondet "stashed" {
     );
 }
 
-// ------------------------------------------------------------ across a region
-
-/// A continuation captured inside a production region and resumed from a
-/// *different* task. The two resumptions are separated by a scheduling
-/// decision, so nothing lexical connects them — the counter on the continuation
-/// is the only thing that can.
+/// A continuation captured inside a production region and resumed from a *different* task.
 #[test]
 fn a_continuation_resumed_from_another_task_is_still_counted() {
     let run = run(
@@ -370,12 +340,8 @@ test/nondet "resumed from a sibling" {
     );
 }
 
-/// A `simulate` region and a host operation in the same entry point, with the
-/// operation *outside* the region. E0425 covers only the inside, so this is the
-/// residue: whether the machine itself performs the operation once.
-///
-/// The machine does. What re-runs the whole entry point is the search, and that
-/// lives in `ply-test`; see `host_scheduler_audit.rs`.
+/// A `simulate` region and a host operation in the same entry point, with the operation *outside*
+/// the region.
 #[test]
 fn a_send_beside_a_simulate_region_is_performed_once_by_the_machine() {
     let run = run(
@@ -401,12 +367,8 @@ test/nondet "a region and a socket, side by side" {
     assert_eq!(run.sends, 1);
 }
 
-// ------------------------------------------------------------------- pending
-
-/// A task parked on a pending token has already spent its linearity: the
-/// operation happened, and only its answer is outstanding. A rule that charged
-/// at the wake instead would let a control captured over the *perform* be
-/// replayed while the first packet was still in flight.
+/// A task parked on a pending token has already spent its linearity: the operation happened, and
+/// only its answer is outstanding.
 #[test]
 fn a_pending_operation_is_charged_at_the_perform_and_closes_a_replay() {
     let run = run_with(
@@ -436,16 +398,8 @@ test/nondet "replay over a token" {
     run.refused(codes::HOST_CONTINUATION_RESUMED);
 }
 
-// ------------------------------------------------ the over-approximation
-
-/// The false positive ADR 0011 §3 accepts on purpose, pinned so it stays a
-/// decision rather than becoming a discovery.
-///
-/// The send happens in the *clause*, not inside the captured control, so
-/// replaying `k` would repeat nothing. The rule refuses anyway, because the
-/// precise version needs a per-resumption liveness scope on the control stack —
-/// in the one part of the system where a defect is silent and sends a packet
-/// twice. Widening this later is a real improvement; doing it by accident is not.
+/// The false positive ADR 0011 §3 accepts on purpose, pinned so it stays a decision rather than
+/// becoming a discovery.
 #[test]
 fn a_send_in_the_clause_refuses_a_replay_that_would_repeat_nothing() {
     let run = run(
@@ -481,10 +435,9 @@ test/nondet "the send is not inside the continuation" {
     assert_eq!(run.sends, 1);
 }
 
-/// A registry compiled in but not bound is the `ply test` default, and it must
-/// leave M6 exactly where it was: `host_ops` stays zero for the life of the
-/// entry point, so the refusal condition is unreachable and a three-shot handler
-/// still runs three times.
+/// A registry compiled in but not bound is the `ply test` default, and it must leave M6 exactly
+/// where it was: `host_ops` stays zero for the life of the entry point, so the refusal condition is
+/// unreachable and a three-shot handler still runs three times.
 #[test]
 fn a_present_but_unbound_registry_leaves_multi_shot_alone() {
     let compiled = compile(
@@ -517,18 +470,8 @@ test/nondet "three resumptions, nothing bound" {
     assert_eq!(counter.calls(), 0);
 }
 
-// ------------------------------------------------------------- M8's re-runs
-
-/// M8 runs a law's body once per generated case, so a law that could reach a
-/// socket would send one packet per case and report the result as a `property`
-/// tier over the whole domain.
-///
-/// It cannot, and the exclusion is in the front end rather than at the boundary:
-/// a spec expression is pure, so any host-backed row in a law or an `ensures` is
-/// `E0417` before `ply prove` ever builds a machine. Checked here because the
-/// two facts are only safe together — the purity rule is what makes the second
-/// line of defence (every `ply-prove` machine is hermetic) unnecessary rather
-/// than load-bearing.
+/// M8 runs a law's body once per generated case, so a law that could reach a socket would send one
+/// packet per case and report the result as a `property` tier over the whole domain.
 #[test]
 fn a_spec_can_never_reach_the_host_because_a_spec_can_never_perform() {
     for source in [
@@ -566,12 +509,8 @@ fn relay(n: Int) -> Int / {net.write[socket]}
     }
 }
 
-// ------------------------------------------------ the shape of the diagnostic
-
-/// E0426 is the one diagnostic in this milestone whose reader has to act on a
-/// *packet*, not on a program. It has to name the operation being protected, the
-/// handler that served it, and which resumption was refused, or the reader
-/// cannot tell a genuine replay from a false positive of the over-approximation.
+/// E0426 is the one diagnostic in this milestone whose reader has to act on a *packet*, not on a
+/// program.
 #[test]
 fn the_refusal_names_the_operation_the_handler_and_the_ordinal() {
     let run = run(
@@ -613,9 +552,8 @@ test/nondet "named" {
     );
 }
 
-/// A `Repeatable` claim is the one place a handler author can quietly re-open
-/// the boundary, so the flag has to be the *only* thing that changes between
-/// these two runs.
+/// A `Repeatable` claim is the one place a handler author can quietly re-open the boundary, so the
+/// flag has to be the *only* thing that changes between these two runs.
 #[test]
 fn repeatable_is_the_single_switch_between_refused_and_replayed() {
     const SOURCE: &str = r#"

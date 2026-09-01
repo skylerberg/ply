@@ -1,12 +1,4 @@
 //! ADR 0016 §3's spike, run.
-//!
-//!     ply-codegen-spike [--iterations N] [--repeats N] [--out spike.json]
-//!                       [--connections N] [--per-connection N] [--no-served]
-//!
-//! It prints the comparison, the entry cost both sides pay, what the compiled
-//! function is worth per request, what a whole request costs end to end, and
-//! the constructs the fragment refused. It is wired into no command and nothing
-//! in the workspace depends on it.
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::jit::{Jit, Opts};
@@ -29,8 +21,7 @@ const PARSE_HEAD: &str = "std.http.parse_head";
 const MAX_REQUEST_LINE: i64 = 8192;
 const MAX_HEADER_BYTES: i64 = 65536;
 
-/// What a browser sends: thirteen field lines, the length W1's sweep called
-/// browser-sized.
+/// What a browser sends: thirteen field lines, the length W1's sweep called browser-sized.
 const BROWSER_HEAD: &[u8] = b"GET /items HTTP/1.1\r\n\
 Host: localhost:8137\r\n\
 Connection: keep-alive\r\n\
@@ -59,9 +50,7 @@ fn large_head() -> Vec<u8> {
     head
 }
 
-/// Where every line of a head begins — where `field_lines` calls `read_line`
-/// from. Computed rather than guessed, so a per-request cost is over the calls a
-/// request actually makes.
+/// Where every line of a head begins — where `field_lines` calls `read_line` from.
 fn line_starts(head: &[u8]) -> Vec<usize> {
     let mut starts = vec![0usize];
     let mut i = 0;
@@ -133,11 +122,10 @@ struct Variant {
     interpreter_entry_micros: f64,
     spike_entry_micros: f64,
     inputs: Vec<InputResult>,
-    /// The minimum conservative ratio over the inputs, entry costs included on
-    /// both sides.
+    /// The minimum conservative ratio over the inputs, entry costs included on both sides.
     speedup: f64,
-    /// The same ratio with each side's entry cost subtracted: what the body is
-    /// worth when it is called from inside a request rather than entered.
+    /// The same ratio with each side's entry cost subtracted: what the body is worth when it is
+    /// called from inside a request rather than entered.
     body_speedup: f64,
     per_request: PerRequest,
     builtin_calls_per_call: f64,
@@ -151,9 +139,7 @@ struct PerRequest {
     spike_micros: f64,
 }
 
-/// How much of one module the fragment can even reach. A ceiling measured on
-/// one function says nothing about a backend's coverage, and coverage is half
-/// of what a backend would cost to keep.
+/// How much of one module the fragment can even reach.
 #[derive(Serialize)]
 struct Census {
     module: String,
@@ -172,8 +158,7 @@ struct Served {
 
 #[derive(Serialize)]
 struct Projection {
-    /// `read_line`'s share of one served request, from the two measurements
-    /// beside it.
+    /// `read_line`'s share of one served request, from the two measurements beside it.
     share_of_request: f64,
     share_of_parse_head: f64,
     kernel_speedup: f64,
@@ -183,9 +168,8 @@ struct Projection {
     ceiling: f64,
 }
 
-/// Exactly `ply_corpus::w6::Spike`'s shape, so the ladder run and the spike run
-/// can produce their halves of the W6 report independently and a field-by-field
-/// merge picks this up.
+/// Exactly `ply_corpus::w6::Spike`'s shape, so the ladder run and the spike run can produce their
+/// halves of the W6 report independently and a field-by-field merge picks this up.
 #[derive(Serialize)]
 struct SpikeHalf {
     function: String,
@@ -228,11 +212,7 @@ struct Args {
     iterations: u32,
     repeats: u32,
     out: Option<String>,
-    /// Where to write the *half* `ply-corpus w6` merges: `{"spike": ..}` and
-    /// nothing else. `--out` writes everything this run measured, including
-    /// fields a `w6::Report` has no room for, so a report assembled from it
-    /// would have to be trimmed by hand — and a file assembled by hand is a
-    /// file nobody can re-take.
+    /// Where to write the *half* `ply-corpus w6` merges: `{"spike": ..}` and nothing else.
     half: Option<String>,
     connections: u32,
     per_connection: u32,
@@ -265,8 +245,8 @@ fn parse_args() -> Result<Args> {
     Ok(a)
 }
 
-/// Agreement, on every input the spike will be timed on and on every refusal
-/// path a peer can choose, against the machine **and** the tree-walker.
+/// Agreement, on every input the spike will be timed on and on every refusal path a peer can
+/// choose, against the machine **and** the tree-walker.
 fn verify(harness: &mut Harness, large: &[u8]) -> Result<usize> {
     let mut inputs: Vec<Input> = Vec::new();
     for (label, head) in [
@@ -379,8 +359,8 @@ fn variant(
         })
         .fold(f64::INFINITY, f64::min);
 
-    // Every `read_line` call one request makes, at the offsets and budgets the
-    // parser passes, with each side's entry cost subtracted.
+    // Every `read_line` call one request makes, at the offsets and budgets the parser passes, with
+    // each side's entry cost subtracted.
     let starts = line_starts(head);
     let mut interpreter_total = 0.0;
     let mut spike_total = 0.0;
@@ -425,21 +405,7 @@ fn variant(
     })
 }
 
-/// How much of one module the fragment reaches, offering the module **as one
-/// unit**.
-///
-/// > **Corrected in R5.** This used to call `Jit::compile(loaded, &[name])` once
-/// > per function — each on its own — and count the ones that compiled. That was
-/// > the right question while a call to an uncompiled function became a
-/// > trampoline back into the machine. It is the wrong question now: a call to a
-/// > function outside the unit refuses the caller, so a function measured alone
-/// > is refused for *being alone*, and a census taken that way would report "a
-/// > call to `std.http.line_stops`" as a property of the fragment.
-/// >
-/// > Offering every function of the module together keeps the refusals about
-/// > constructs, which is what a coverage number is supposed to mean. It also
-/// > changes the number: a function whose only problem was a callee now counts
-/// > as accepted.
+/// How much of one module the fragment reaches, offering the module **as one unit**.
 fn census(loaded: &'static Loaded, module: &str) -> Census {
     let all = loaded.functions_in(module);
     let functions = all.len();
@@ -565,8 +531,8 @@ fn main() -> Result<()> {
         let out = std::env::temp_dir().join("ply-codegen-spike");
         let project = served::project(&root, &out)?;
         let server = served::Server::start(&binary, &project, 2 * a.connections + 8)?;
-        // A warm connection first: the first request a process answers pays for
-        // whatever it lowers on the way.
+        // A warm connection first: the first request a process answers pays for whatever it lowers
+        // on the way.
         served::drive(server.port, 1, 20)?;
         let short = served::drive(server.port, a.connections, a.per_connection)?;
         let long = served::drive_with(server.port, a.connections, a.per_connection, BROWSER_HEAD)?;

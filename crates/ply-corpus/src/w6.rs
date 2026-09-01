@@ -1,73 +1,24 @@
 //! Where a request's time goes now, and what would justify M9.
-//!
-//! W1 measured one endpoint and concluded that codegen was the *second* lever,
-//! because 5.41µs per byte of head was five O(n) folds and not a constant
-//! factor. W2 proved it by attacking the algorithm. W3, W4 and W5 then put
-//! framing, routing, TLS, a database and a sink on the same path, and nobody
-//! has stated what the whole of it costs. W6 states it, and decides M9 from the
-//! statement rather than from the assumption that carried M0–M8.
-//!
-//! Three things live here, and only the first is a measurement:
-//!
-//! 1. **The ladder** — [`Layer`], [`Point`], [`Ladder`]. W1's method extended to
-//!    the full W5 stack: every rung is a **pair of absolutes taken in the same
-//!    arena in the same run**, differing in exactly one substitution, so the
-//!    layer is their difference and no timer inside the machine has to be
-//!    trusted. A rung that cannot be expressed that way is not a rung.
-//! 2. **The decision** — [`Criteria`], [`decide`]. The thresholds are pinned
-//!    here, in code, with defaults that cannot be supplied from a measurement
-//!    file, so the verdict is computed from numbers rather than fitted to them.
-//!    ADR 0016 states each threshold and why it is where it is.
-//! 3. **The honest account** — [`Report`], [`Report::audit`]. A W6 report that
-//!    omits the accumulated table, what a reader gets today, or where this
-//!    language is not competitive is not a shorter report; it is a misleading
-//!    one, so the omission is an audit finding rather than a blank section.
-//!
-//! **The residue is printed, and its sign decides how it is charged.** The
-//! rungs will not sum to the served total — they are taken in two arenas and a
-//! served request pays for things no substitution isolates. [`Ladder`] reports
-//! `total − attributed` as [`Ladder::residue_micros`] and never folds it into a
-//! neighbouring layer. A **positive** residue is time no substitution
-//! separated: it is not credited to the interpreter, which makes the attributed
-//! share a lower bound. A **negative** residue is the opposite fact — the
-//! layers sum to more than the request they were read against, so the
-//! in-process arena over-counts against the served one — and crediting it to
-//! nobody would leave the numerator inflated in exactly the direction M9's case
-//! rests on. So it is charged back: [`Ladder::conservative_share`] is what
-//! [`decide`] reads, and it equals the attributed share whenever the residue is
-//! positive.
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// A measurement that can be divided by. Zero, negative, infinite and NaN are
-/// all measurement failures rather than very fast results, and every ratio here
-/// checks before dividing so a broken run reads as broken.
+/// A measurement that can be divided by.
 fn usable(micros: f64) -> bool {
     micros.is_finite() && micros > 0.0
 }
 
-// --------------------------------------------------------------- the ladder
-
-/// Where a rung is taken. The two are not interchangeable and a ladder that
-/// pretended they were would report a process boundary as a layer.
+/// Where a rung is taken.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Arena {
-    /// In this process, over `SimNet` or a real listener, with no CLI and no
-    /// child. What the parse, the route and the machine cost, without a
-    /// syscall's variance in the middle of them.
+    /// In this process, over `SimNet` or a real listener, with no CLI and no child.
     InProcess,
-    /// The real `ply` binary over loopback, driven by client threads. The only
-    /// place a flag substitution — `--tls`, `--db`, `--trace` — is available.
+    /// The real `ply` binary over loopback, driven by client threads.
     Served,
 }
 
 /// One layer of the W5 stack, and the substitution that isolates it.
-///
-/// The order is the order a request meets them, and it is the order a
-/// [`Ladder`] must present them in. Every variant names one thing; a layer that
-/// needed two substitutions to isolate would be two layers.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum Layer {
@@ -83,8 +34,7 @@ pub enum Layer {
 }
 
 impl Layer {
-    /// Every layer, in request order. `decide` requires all of them, because a
-    /// share taken over a partial stack is a share of the wrong denominator.
+    /// Every layer, in request order.
     pub const ORDER: [Layer; 9] = [
         Layer::Call,
         Layer::Endpoint,
@@ -133,8 +83,7 @@ impl Layer {
         }
     }
 
-    /// The one thing that changes between this rung's two measurements. If a
-    /// measurement cannot be taken this way it is not this rung.
+    /// The one thing that changes between this rung's two measurements.
     pub fn substitution(self) -> &'static str {
         match self {
             Layer::Call => "a function returning a constant, against not calling the machine",
@@ -162,13 +111,6 @@ impl Layer {
     }
 
     /// Whether a faster execution strategy could reach this layer.
-    ///
-    /// `Socket`, `Tls`, `Database` and `Tracing` are the host's: a syscall, a
-    /// cipher, a postgres server and a JSON writer are not what a codegen
-    /// backend compiles. `Tracing` is the **sink** and not the perform — there
-    /// is no configuration under which a trace operation is not performed (ADR
-    /// 0015 §1.4), so the Ply-side cost of a trace call is inside `Machine`,
-    /// where `--trace off` already pays it.
     pub fn is_interpreter(self) -> bool {
         matches!(
             self,
@@ -178,36 +120,16 @@ impl Layer {
 }
 
 /// One rung, as measured: two absolutes taken in one arena in one run.
-///
-/// Both numbers are required because a layer is a *difference*, and a
-/// difference between a number taken today and a number quoted from a milestone
-/// ago is a fact about two machines.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Point {
     pub layer: Layer,
     /// The route this rung's pair was taken on.
-    ///
-    /// A printed column rather than a fact about the harness: two rungs taken
-    /// on different routes have a difference that is not one layer, and the one
-    /// thing that makes that visible to a reader is seeing the route change.
-    /// The ladder is built around one route wherever it can be.
     pub taken_on: String,
-    /// The configuration **with** this layer, per request. The best of the
-    /// repeats, because the quantity of interest is the cost of the work and
-    /// everything a run adds to it is additive.
+    /// The configuration **with** this layer, per request.
     pub with_micros: f64,
-    /// The same configuration **without** it, same arena, same run. Zero is
-    /// legal only for [`Layer::Call`], whose "without" is not calling at all.
+    /// The same configuration **without** it, same arena, same run.
     pub without_micros: f64,
     /// The **worst** of the same repeats, when the rung was repeated.
-    ///
-    /// A best-of number on its own is a point with no width, and a layer is a
-    /// *difference* between two of them — so a rung whose layer is 1% of either
-    /// side carries both sides' noise and says nothing at the precision it is
-    /// printed to. With these, [`Rung::layer_low_micros`] and
-    /// [`Rung::layer_high_micros`] bound the layer and [`Ladder::share_low`]
-    /// bounds the share M9's case rests on. `None` means the rung was taken
-    /// once, which [`Report::audit`] reports rather than assumes away.
     #[serde(default)]
     pub with_worst_micros: Option<f64>,
     #[serde(default)]
@@ -217,15 +139,13 @@ pub struct Point {
 }
 
 impl Point {
-    /// The layer at its smallest: the fastest `with` against the slowest
-    /// `without`. Both bounds exist only when both sides were repeated.
+    /// The layer at its smallest: the fastest `with` against the slowest `without`.
     pub fn low_micros(&self) -> Option<f64> {
         Some(self.with_micros - self.without_worst_micros.unwrap_or(self.without_micros))
             .filter(|_| self.with_worst_micros.is_some() || self.without_worst_micros.is_some())
     }
 
-    /// The layer at its largest: the slowest `with` against the fastest
-    /// `without`.
+    /// The layer at its largest: the slowest `with` against the fastest `without`.
     pub fn high_micros(&self) -> Option<f64> {
         Some(self.with_worst_micros.unwrap_or(self.with_micros) - self.without_micros)
             .filter(|_| self.with_worst_micros.is_some() || self.without_worst_micros.is_some())
@@ -242,14 +162,10 @@ pub struct Rung {
     pub taken_on: String,
     pub with_micros: f64,
     pub without_micros: f64,
-    /// `with − without`. Negative is a real outcome and is reported as one: it
-    /// means the substitution did not isolate the layer, and [`decide`] refuses
-    /// on a ladder carrying a large one rather than reading a share off it.
+    /// `with − without`.
     pub layer_micros: f64,
-    /// The same difference at its smallest and largest over the repeats, when
-    /// the rung carries them. A rung whose band spans zero has not resolved its
-    /// own sign, and `Report::audit` says so — the alternative is printing two
-    /// decimals of a number the measurement did not produce.
+    /// The same difference at its smallest and largest over the repeats, when the rung carries
+    /// them.
     pub layer_low_micros: Option<f64>,
     pub layer_high_micros: Option<f64>,
     pub layer_share: f64,
@@ -266,17 +182,12 @@ impl Rung {
     }
 }
 
-/// What the floor and the total answered, so a multiple between them is
-/// readable rather than inferable.
-///
-/// A `total / floor` whose numerator serves one route over TLS against a
-/// database and whose denominator replays another route's response over
-/// plaintext is a ratio between two different jobs. The strings are printed
-/// beside the multiple and compared by [`Report::audit`].
+/// What the floor and the total answered, so a multiple between them is readable rather than
+/// inferable.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Denominators {
-    /// What the Rust floor answered, spelled out: the route, the response size
-    /// and everything it does *not* have under it.
+    /// What the Rust floor answered, spelled out: the route, the response size and everything it
+    /// does *not* have under it.
     pub floor_taken_on: String,
     /// What the measured total served.
     pub total_taken_on: String,
@@ -288,13 +199,11 @@ pub struct Denominators {
 pub struct Ladder {
     /// The same syscalls with no interpreter under them, per request.
     pub floor_micros: f64,
-    /// What the served stack actually delivered, end to end, per request. Not a
-    /// sum: it is measured, and the rungs are checked against it.
+    /// What the served stack actually delivered, end to end, per request.
     pub total_micros: f64,
     /// What the rungs account for.
     pub attributed_micros: f64,
-    /// `total − attributed`. Everything no substitution separated, printed
-    /// rather than folded into a neighbour.
+    /// `total − attributed`.
     pub residue_micros: f64,
     pub residue_share: f64,
     pub over_floor: f64,
@@ -303,36 +212,22 @@ pub struct Ladder {
     pub interpreter_micros: f64,
     pub interpreter_share: f64,
     /// The same with a **negative** residue charged back to it.
-    ///
-    /// A negative residue means the attributed layers sum to more than the
-    /// request they are read against, which can only be the in-process arena
-    /// over-counting against the served denominator — so the honest numerator
-    /// is the smaller one, and it is the one [`decide`] reads. When the residue
-    /// is positive this is exactly [`Ladder::interpreter_share`] and the share
-    /// is a lower bound, as §1.4 says.
     pub conservative_micros: f64,
     pub conservative_share: f64,
-    /// The conservative share at the two ends of the repeats it was read off:
-    /// the smallest numerator over the largest denominator, and the reverse.
-    /// `None` when no rung carried a second sample.
+    /// The conservative share at the two ends of the repeats it was read off: the smallest
+    /// numerator over the largest denominator, and the reverse.
     pub share_low: Option<f64>,
     pub share_high: Option<f64>,
-    /// Whether the interpreter rungs chain — each `without` is the rung below's
-    /// `with` — so that their sum is one absolute somebody measured rather than
-    /// five differences added up.
+    /// Whether the interpreter rungs chain — each `without` is the rung below's `with` — so that
+    /// their sum is one absolute somebody measured rather than five differences added up.
     pub telescopes: bool,
     /// The most negative layer as a share of the total, as a positive number.
-    /// A ladder above [`Criteria::max_negative_share`] did not separate.
     pub worst_negative_share: f64,
     pub rungs: Vec<Rung>,
 }
 
 impl Ladder {
     /// Assemble a ladder, refusing anything a share cannot honestly be read off.
-    ///
-    /// The refusals are loud on purpose: a duplicated layer double-counts, an
-    /// out-of-order one reads as a different stack, and a zero total makes every
-    /// share infinite. All three are silent in a table and fatal in a decision.
     pub fn assemble(floor_micros: f64, total_micros: f64, points: &[Point]) -> Result<Ladder> {
         Ladder::assemble_with(floor_micros, total_micros, points, &Denominators::default())
     }
@@ -418,9 +313,9 @@ impl Ladder {
         }
 
         let residue = total_micros - attributed;
-        // Only a negative residue moves the numerator: a positive one is time
-        // no substitution separated, and crediting it to the interpreter would
-        // be claiming an attribution the ladder did not earn.
+        // Only a negative residue moves the numerator: a positive one is time no substitution
+        // separated, and crediting it to the interpreter would be claiming an attribution the
+        // ladder did not earn.
         let seam = residue.min(0.0);
         let conservative = interpreter + seam;
 
@@ -432,10 +327,8 @@ impl Ladder {
             && interpreter_rungs
                 .first()
                 .is_some_and(|first| first.without_micros == 0.0);
-        // When the rungs chain, the interpreter total is the top rung's own
-        // absolute and its band is that rung's. When they do not, the only
-        // bound available is every layer at its widest, which compounds — and
-        // saying so is the point of the flag.
+        // When the rungs chain, the interpreter total is the top rung's own absolute and its band
+        // is that rung's.
         let top = points.iter().rfind(|p| p.layer.is_interpreter());
         let (share_low, share_high) = match top.filter(|_| telescopes) {
             Some(top) => match top.with_worst_micros {
@@ -471,8 +364,7 @@ impl Ladder {
         })
     }
 
-    /// Layers the ladder does not carry. A decision over a partial stack is a
-    /// share of the wrong denominator, so [`decide`] consults this first.
+    /// Layers the ladder does not carry.
     pub fn missing(&self) -> Vec<Layer> {
         Layer::ORDER
             .into_iter()
@@ -481,16 +373,7 @@ impl Ladder {
     }
 }
 
-// -------------------------------------------------------------- the engines
-
 /// The same request under one execution strategy and then another.
-///
-/// This is the cheapest empirical handle on how much of a request is dispatch
-/// rather than native work, and it needs nothing built: both engines exist and
-/// `--engine both` already polices their agreement. If swapping one whole
-/// interpreter for another whole interpreter barely moves a request, a third
-/// one will not either — and if it moves it a lot, the frame representation is
-/// a lever that costs a fraction of a codegen backend.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EnginePoint {
     /// `treewalk` or `machine`.
@@ -517,14 +400,7 @@ pub fn engine_spread(points: &[EnginePoint]) -> Option<(f64, String, String)> {
     ))
 }
 
-// ---------------------------------------------------------------- the spike
-
 /// One input the spike and the interpreter both answered.
-///
-/// Four times rather than two: a speedup read off two best-of numbers is a
-/// claim the noise has not been asked about. The conservative ratio compares
-/// the interpreter's **best** against the spike's **worst**, so a reported win
-/// is one that survived the worst sample of the thing being sold.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpikeInput {
     pub name: String,
@@ -532,13 +408,12 @@ pub struct SpikeInput {
     pub interpreter_worst_micros: f64,
     pub spike_best_micros: f64,
     pub spike_worst_micros: f64,
-    /// Whether the two produced equal values on this input, by `Value`'s own
-    /// ordering. A faster wrong answer is an `E0503`, not a speedup.
+    /// Whether the two produced equal values on this input, by `Value`'s own ordering.
     pub agreed: bool,
 }
 
 impl SpikeInput {
-    /// Interpreter best over spike worst. The number a decision may use.
+    /// Interpreter best over spike worst.
     pub fn conservative(&self) -> f64 {
         if !usable(self.spike_worst_micros) {
             return 0.0;
@@ -546,8 +421,7 @@ impl SpikeInput {
         self.interpreter_best_micros / self.spike_worst_micros
     }
 
-    /// Interpreter best over spike best. Reported beside the conservative one
-    /// so the width of the claim is visible, and never used to decide.
+    /// Interpreter best over spike best.
     pub fn optimistic(&self) -> f64 {
         if !usable(self.spike_best_micros) {
             return 0.0;
@@ -555,8 +429,7 @@ impl SpikeInput {
         self.interpreter_best_micros / self.spike_best_micros
     }
 
-    /// Whether the two samples separate at all. Overlapping bands mean the
-    /// measurement found no difference, whatever the midpoints say.
+    /// Whether the two samples separate at all.
     pub fn separated(&self) -> bool {
         self.spike_worst_micros < self.interpreter_best_micros
     }
@@ -567,27 +440,23 @@ impl SpikeInput {
 pub struct Spike {
     /// The function compiled, named so the choice is reviewable.
     pub function: String,
-    /// Why this one. ADR 0016 §3 fixes the selection rule; this is the rule's
-    /// output on this stack.
+    /// Why this one.
     pub chosen_because: String,
     /// Nodes in its lowered body, which is the size of what was compiled.
     pub nodes: usize,
-    /// What compiling it cost, once. A service compiles at first call, so this
-    /// is reported rather than amortized away.
+    /// What compiling it cost, once.
     pub compile_micros: f64,
     pub inputs: Vec<SpikeInput>,
 }
 
 #[derive(Clone, Debug, Serialize)]
 pub struct SpikeVerdict {
-    /// The **minimum** conservative ratio over every input. A speedup that
-    /// holds on one input and not another is that input's, so the weakest one
-    /// is the claim.
+    /// The **minimum** conservative ratio over every input.
     pub speedup: f64,
     /// The best optimistic ratio, for context only.
     pub optimistic: f64,
     pub evidence: bool,
-    /// Every rule that failed, named. Empty when the spike is evidence.
+    /// Every rule that failed, named.
     pub failures: Vec<String>,
 }
 
@@ -639,26 +508,15 @@ impl Spike {
     }
 }
 
-// --------------------------------------------------------- the alternatives
-
 /// One entry of ADR 0016 §4's table, **in code**.
-///
-/// C3 is "*every* alternative in §4 is priced", and a check written against
-/// whatever list a measurement file happened to carry is not that check: an
-/// empty array satisfies it vacuously, so deleting one field of the file would
-/// turn a deferral into an advance. The roster therefore lives here, beside the
-/// criteria and out of reach of the run being judged, and [`decide`] reads a
-/// file only for what each of these levers *measured*.
 pub struct Lever {
-    /// The key an [`Alternative`] carries in its `name` to answer for this
-    /// lever. Stable, because it is what a measurement file is matched on.
+    /// The key an [`Alternative`] carries in its `name` to answer for this lever.
     pub name: &'static str,
     /// What the change is, in the ADR's words.
     pub what: &'static str,
 }
 
-/// ADR 0016 §4's seven levers. C3 is decided against this array and nothing
-/// else.
+/// ADR 0016 §4's seven levers.
 pub const LEVERS: [Lever; 7] = [
     Lever {
         name: "more native builtins",
@@ -696,40 +554,25 @@ pub const LEVERS: [Lever; 7] = [
 ];
 
 /// A lever that is not a codegen backend, and what it measured.
-///
-/// W2's byte builtins beat W1's predicted codegen win by attacking the
-/// algorithm instead of the constant, so the existence of an **unpriced**
-/// alternative is itself a reason to keep deferring — which is why `priced` is
-/// a field rather than an omission.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Alternative {
-    /// The [`Lever`] this answers for. An alternative naming no lever in
-    /// [`LEVERS`] prices nothing C3 asks about.
+    /// The [`Lever`] this answers for.
     pub name: String,
     /// What the change is, concretely enough to be built.
     pub what: String,
     pub priced: bool,
-    /// End-to-end speedup on the same served workload the ladder's total came
-    /// from. `1.0` means "priced, and it bought nothing", which is a result.
-    /// Ignored when `priced` is false.
+    /// End-to-end speedup on the same served workload the ladder's total came from.
     pub end_to_end: f64,
     /// The two things the ratio is between, and where the numbers came from.
-    ///
-    /// `priced` is a boolean in a file and `end_to_end` is a number in a file;
-    /// either can be written by a hand rather than by a harness. This is what
-    /// makes the claim checkable by a reader, and a priced lever without it is
-    /// treated as unpriced — the same way a rung with one measurement is not a
-    /// rung.
     #[serde(default)]
     pub evidence: String,
-    /// What it would cost to keep, in one sentence. This is the column M9 loses
-    /// on even when its ratio is comparable.
+    /// What it would cost to keep, in one sentence.
     pub cost: String,
 }
 
 impl Alternative {
-    /// Whether this is a measurement C3 may read: priced, with a usable ratio,
-    /// and carrying what the ratio is between.
+    /// Whether this is a measurement C3 may read: priced, with a usable ratio, and carrying what
+    /// the ratio is between.
     pub fn is_priced(&self) -> bool {
         self.priced && usable(self.end_to_end) && !self.evidence.trim().is_empty()
     }
@@ -753,10 +596,6 @@ impl Alternative {
 }
 
 /// Every §4 lever this file does not price, as the sentence C3 fails on.
-///
-/// Two ways to fail and they are named apart, because the remedies differ: a
-/// lever with no entry at all was never looked at, and a lever with an entry
-/// that is not a measurement was looked at and not measured.
 pub fn c3_gaps(alternatives: &[Alternative]) -> Vec<String> {
     let mut gaps = Vec::new();
     for lever in &LEVERS {
@@ -789,40 +628,30 @@ pub fn c3_gaps(alternatives: &[Alternative]) -> Vec<String> {
     gaps
 }
 
-// ------------------------------------------------------------ the criteria
-
 /// The thresholds, pinned before the numbers exist.
-///
-/// Every one is stated and justified in ADR 0016 §2. There is deliberately no
-/// path from a measurement file to these values: [`Report`] carries no
-/// criteria, so a run cannot supply the bar it is about to clear.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Criteria {
-    /// Interpreter share at or above which M9's case can be made at all. At
-    /// exactly this share an *infinite* codegen speedup is worth 2.0x end to
-    /// end, and 2.0x is the least that buys a permanent second execution path.
+    /// Interpreter share at or above which M9's case can be made at all.
     pub min_share: f64,
-    /// Below this share, defer categorically and say why: the ceiling is
-    /// `1/(1−share)` however good the backend is.
+    /// Below this share, defer categorically and say why: the ceiling is `1/(1−share)` however good
+    /// the backend is.
     pub defer_share: f64,
     /// Speedup the spike must show on a real request-path function.
     pub min_spike: f64,
-    /// Below this, defer: a constant factor this small is inside the range a
-    /// cheaper lever has already delivered once.
+    /// Below this, defer: a constant factor this small is inside the range a cheaper lever has
+    /// already delivered once.
     pub defer_spike: f64,
     /// Projected end-to-end speedup, by Amdahl over the measured share.
     pub min_projection: f64,
-    /// Between [`Criteria::defer_share`] and [`Criteria::min_share`] the share
-    /// alone cannot carry M9, so the spike has to be this good instead.
+    /// Between [`Criteria::defer_share`] and [`Criteria::min_share`] the share alone cannot carry
+    /// M9, so the spike has to be this good instead.
     pub gray_spike: f64,
-    /// M9 must beat the best priced alternative by this factor, **on the gains
-    /// rather than the ratios**: a 1.5x and a 1.1x are a 50% and a 10%
-    /// improvement, and 1.5 against 2×1.1 compares nothing. M9 is a permanent
-    /// surface and an alternative is one change, so a near tie goes to the
-    /// alternative.
+    /// M9 must beat the best priced alternative by this factor, **on the gains rather than the
+    /// ratios**: a 1.5x and a 1.1x are a 50% and a 10% improvement, and 1.5 against 2×1.1 compares
+    /// nothing.
     pub alternative_margin: f64,
-    /// A ladder with a negative layer larger than this did not separate, and
-    /// nothing is decided from it.
+    /// A ladder with a negative layer larger than this did not separate, and nothing is decided
+    /// from it.
     pub max_negative_share: f64,
 }
 
@@ -842,20 +671,6 @@ impl Default for Criteria {
 }
 
 /// The one workload every share in this module is taken on.
-///
-/// A constant rather than a parameter because it is a property of the
-/// **instrument**: [`Ladder::missing`] refuses a ladder without all nine of
-/// `Layer::ORDER`'s rungs, so a compute kernel or a lexer over a file cannot be
-/// fed to `w6` at all — it answers [`Verdict::Undecided`] for them, correctly.
-///
-/// It is carried on [`Decision`] and printed beside the verdict because of what
-/// ADR 0026 §4.2 withdraws: this ladder's authority over **M9**, on three
-/// measured grounds — it refuses every workload but this one, its share moves
-/// with the network rather than with Ply, and its reopen sentence names a
-/// criterion only a regression can satisfy. The measurement is untouched and
-/// stays the best account this project has of where a served request's time
-/// goes. What changed is that "35% of a request" may no longer be read as "35%
-/// of Ply".
 pub const WORKLOAD: &str =
     "the served HTTP workload (examples/desk.ply over a socket, TLS and postgres)";
 
@@ -864,14 +679,12 @@ pub const WORKLOAD: &str =
 pub enum Verdict {
     /// Bring a code generator for this workload forward.
     Advance,
-    /// The grey band cleared: M9 is justified, and the report says on what
-    /// conditions, because the share alone did not carry it.
+    /// The grey band cleared: M9 is justified, and the report says on what conditions, because the
+    /// share alone did not carry it.
     Conditional,
     /// Keep deferring, with the number that would reopen it.
     Defer,
-    /// The measurement did not produce a decidable answer. Not the same as
-    /// `Defer`, and reported as itself: a missing rung and a small share call
-    /// for opposite responses.
+    /// The measurement did not produce a decidable answer.
     Undecided,
 }
 
@@ -889,17 +702,17 @@ impl Verdict {
 #[derive(Clone, Debug, Serialize)]
 pub struct Decision {
     pub verdict: Verdict,
-    /// What the share was taken on. See [`WORKLOAD`].
+    /// What the share was taken on.
     pub workload: &'static str,
-    /// [`Ladder::conservative_share`] — the share after a negative residue is
-    /// charged back — because that is the one a decision may read.
+    /// [`Ladder::conservative_share`] — the share after a negative residue is charged back —
+    /// because that is the one a decision may read.
     pub interpreter_share: f64,
     pub spike_speedup: f64,
     /// Amdahl over the measured share and the spike's ratio.
     pub projected: f64,
     pub best_alternative: Option<String>,
     pub best_alternative_end_to_end: f64,
-    /// Why, in the order the rules were applied. Always non-empty.
+    /// Why, in the order the rules were applied.
     pub reasons: Vec<String>,
     /// The number that would change the answer.
     pub reopens_at: String,
@@ -924,7 +737,7 @@ pub fn ceiling(share: f64) -> f64 {
     1.0 / (1.0 - share)
 }
 
-/// Apply the pinned criteria. Nothing here reads a verdict out of a file.
+/// Apply the pinned criteria.
 pub fn decide(
     ladder: &Ladder,
     spike: Option<&Spike>,
@@ -1021,10 +834,7 @@ pub fn decide(
         spike.function
     ));
 
-    // The sentence names only the conditions that are **not** met. Naming a met
-    // one as what would reopen M9 is how the first version of this document got
-    // its reopen sentence wrong (§11): it asked for a share and a spike that had
-    // both already cleared.
+    // The sentence names only the conditions that are **not** met.
     let mut wants: Vec<String> = Vec::new();
     if share < criteria.min_share {
         wants.push(format!(
@@ -1068,10 +878,9 @@ pub fn decide(
         criteria: *criteria,
     };
 
-    // C3's first clause, against the roster in [`LEVERS`] rather than against
-    // whatever list the file carried: a report that mentions no alternative at
-    // all has priced none of them, which is the strongest form of this failure
-    // and used to be the one that read as success.
+    // C3's first clause, against the roster in [`LEVERS`] rather than against whatever list the
+    // file carried: a report that mentions no alternative at all has priced none of them, which is
+    // the strongest form of this failure and used to be the one that read as success.
     let gaps = c3_gaps(alternatives);
     if !gaps.is_empty() {
         decision.reasons.push(format!(
@@ -1082,11 +891,8 @@ pub fn decide(
             if gaps.len() == 1 { "is" } else { "are" },
             gaps.join("; ")
         ));
-        // What C3 asks for, added to whatever else is unmet: the levers priced,
-        // and the best of them no better than half M9's projected gain. When
-        // the projection is at or below 1.00x there is no such number — nothing
-        // an alternative could measure would let M9 through — and the sentence
-        // says that rather than printing a bar of 1.00x.
+        // What C3 asks for, added to whatever else is unmet: the levers priced, and the best of
+        // them no better than half M9's projected gain.
         let priced = if e > 1.0 {
             format!(
                 "the {} unpriced lever(s) in ADR 0016 §4 are priced and the best of them measures \
@@ -1109,11 +915,8 @@ pub fn decide(
         return decision;
     }
 
-    // Every criterion left reads the share, so a share whose own repeats fall
-    // on both sides of a bar has not answered the criterion — it has answered
-    // whichever run was taken. That is not `Defer`: the remedy is more repeats,
-    // which is what `Undecided` means here. C3 is checked above it because C3
-    // reads no share at all (§2.5).
+    // Every criterion left reads the share, so a share whose own repeats fall on both sides of a
+    // bar has not answered the criterion — it has answered whichever run was taken.
     if let (Some(low), Some(high)) = (ladder.share_low, ladder.share_high) {
         for (bar, what) in [
             (criteria.min_share, "the share M9 needs"),
@@ -1215,8 +1018,6 @@ pub fn decide(
     decision
 }
 
-// ------------------------------------------------------- the honest account
-
 /// What a reader gets from this language today, on one workload.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Offering {
@@ -1228,9 +1029,7 @@ pub struct Offering {
     pub per_second: f64,
     pub p50_micros: f64,
     pub p99_micros: f64,
-    /// The same workload against the Rust floor on the same machine. `None`
-    /// where no floor was taken — printed as such rather than as a multiple the
-    /// report does not have.
+    /// The same workload against the Rust floor on the same machine.
     pub floor_per_second: Option<f64>,
 }
 
@@ -1242,9 +1041,6 @@ impl Offering {
 }
 
 /// Somewhere this language is genuinely not competitive, and why.
-///
-/// A required section. An honest ceiling stated plainly is more useful than a
-/// flattering one, and a report with no limits has not looked.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Limit {
     pub what: String,
@@ -1253,7 +1049,7 @@ pub struct Limit {
     pub evidence: Option<String>,
 }
 
-/// Where a number came from. Without this a table is a rumour.
+/// Where a number came from.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Provenance {
     pub machine: String,
@@ -1263,23 +1059,18 @@ pub struct Provenance {
     pub repeats: usize,
     pub request_head_bytes: usize,
     pub postgres: Option<String>,
-    /// What was not measured, and why. An empty vector is itself an audit
-    /// finding: every run leaves something out.
+    /// What was not measured, and why.
     pub not_measured: Vec<String>,
 }
 
 /// Everything W6 owes, as one value.
-///
-/// It carries measurements and nothing else — no verdict and no criteria — so
-/// the decision is recomputed by [`decide`] from pinned thresholds every time
-/// the report is rendered.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Report {
     pub provenance: Provenance,
     pub floor_micros: f64,
     pub total_micros: f64,
-    /// What the floor answered and what the total served, so the multiple
-    /// between them is readable rather than assumed to be like for like.
+    /// What the floor answered and what the total served, so the multiple between them is readable
+    /// rather than assumed to be like for like.
     #[serde(default)]
     pub denominators: Denominators,
     pub points: Vec<Point>,
@@ -1315,10 +1106,6 @@ impl Report {
     }
 
     /// What the report owes and does not have.
-    ///
-    /// W6 closes the web track, so the sections a reader needs are not
-    /// optional: a missing one is a finding printed above the tables, not a
-    /// shorter document.
     pub fn audit(&self) -> Vec<String> {
         let mut findings = Vec::new();
         match self.ladder() {
@@ -1445,8 +1232,6 @@ impl Report {
         findings
     }
 }
-
-// ------------------------------------------------------------------ render
 
 pub fn render(report: &Report) -> String {
     let mut s = String::new();
@@ -1739,16 +1524,16 @@ mod tests {
             taken_on: "/items".to_string(),
             with_micros: with,
             without_micros: without,
-            // A 1% spread on every rung, so a band exists to be reasoned about
-            // and no test depends on one having been taken once.
+            // A 1% spread on every rung, so a band exists to be reasoned about and no test depends
+            // on one having been taken once.
             with_worst_micros: Some(with * 1.01),
             without_worst_micros: Some(without * 1.01),
             requests: 1000,
         }
     }
 
-    /// One rung per layer, summing to 100µs of a 120µs request: 60µs of
-    /// interpreter (50%), 40µs of host, 20µs of residue.
+    /// One rung per layer, summing to 100µs of a 120µs request: 60µs of interpreter (50%), 40µs of
+    /// host, 20µs of residue.
     fn full_points() -> Vec<Point> {
         vec![
             point(Layer::Call, 5.0, 0.0),
@@ -1793,9 +1578,7 @@ mod tests {
         }
     }
 
-    /// Every §4 lever priced, with `best` the ratio of the best of them. C3's
-    /// first clause is about the roster rather than about a list, so a test
-    /// that wants to reach C1, C2 or C4 has to answer for all seven.
+    /// Every §4 lever priced, with `best` the ratio of the best of them.
     fn roster(best: f64) -> Vec<Alternative> {
         LEVERS
             .iter()
@@ -1832,8 +1615,8 @@ mod tests {
         );
     }
 
-    /// The residue is the whole point of the table: a ladder that attributed
-    /// everything would be hiding what it did not separate.
+    /// The residue is the whole point of the table: a ladder that attributed everything would be
+    /// hiding what it did not separate.
     #[test]
     fn a_ladder_reports_its_layers_its_residue_and_a_lower_bound_share() {
         let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
@@ -1884,9 +1667,7 @@ mod tests {
         assert!(err.contains("names no route"), "{err}");
     }
 
-    /// Two rungs on two routes have a difference that is not one layer. It is
-    /// sometimes the only measurement available — a `database` rung needs a
-    /// route with a database — so it is disclosed rather than refused.
+    /// Two rungs on two routes have a difference that is not one layer.
     #[test]
     fn a_route_change_between_two_rungs_is_an_audit_finding() {
         let mut points = full_points();
@@ -1910,8 +1691,8 @@ mod tests {
         assert!((ladder.worst_negative_share - 6.0 / 120.0).abs() < 1e-9);
     }
 
-    /// A layer whose repeats span zero has not measured its own sign, and two
-    /// decimals of it are two decimals of the machine it ran on.
+    /// A layer whose repeats span zero has not measured its own sign, and two decimals of it are
+    /// two decimals of the machine it ran on.
     #[test]
     fn a_layer_narrower_than_its_own_repeats_is_named_rather_than_printed() {
         let mut points = full_points();
@@ -1938,10 +1719,8 @@ mod tests {
         );
     }
 
-    /// A negative residue is the layers summing to more than the request they
-    /// were read against, which can only be the in-process arena over-counting.
-    /// It is charged to the interpreter rather than to nobody, so it can never
-    /// flatter the share M9's case rests on.
+    /// A negative residue is the layers summing to more than the request they were read against,
+    /// which can only be the in-process arena over-counting.
     #[test]
     fn a_negative_residue_is_charged_to_the_share_the_decision_reads() {
         let mut points = full_points();
@@ -1970,16 +1749,15 @@ mod tests {
             ladder.conservative_share
         );
 
-        // And the other direction: a positive residue is credited to nobody, so
-        // the share stays exactly what the rungs attributed.
+        // And the other direction: a positive residue is credited to nobody, so the share stays
+        // exactly what the rungs attributed.
         let positive = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
         assert!(positive.residue_micros > 0.0);
         assert!((positive.conservative_share - positive.interpreter_share).abs() < 1e-9);
     }
 
-    /// The share is one number read off one run, and M9's whole case is on
-    /// which side of 50% it falls. A band that falls on both sides has not
-    /// answered that, and answering it anyway is answering with a run.
+    /// The share is one number read off one run, and M9's whole case is on which side of 50% it
+    /// falls.
     #[test]
     fn a_share_whose_repeats_straddle_the_bar_decides_nothing() {
         let mut points = full_points();
@@ -2013,8 +1791,8 @@ mod tests {
         );
         assert!(decision.reopens_at.contains("repeat the ladder"));
 
-        // C3 is checked before it, because C3 reads no share: an unpriced lever
-        // defers whatever the band does.
+        // C3 is checked before it, because C3 reads no share: an unpriced lever defers whatever the
+        // band does.
         let deferred = decide(&straddling, Some(&spike(3.0)), &[], &Criteria::default());
         assert_eq!(deferred.verdict, Verdict::Defer);
     }
@@ -2029,8 +1807,8 @@ mod tests {
         assert!((ceiling(0.35) - 1.5384615).abs() < 1e-6);
     }
 
-    /// A speedup is the weakest input's, and a disagreement or an overlap is
-    /// not a slower speedup — it is no measurement at all.
+    /// A speedup is the weakest input's, and a disagreement or an overlap is not a slower speedup —
+    /// it is no measurement at all.
     #[test]
     fn a_spike_is_evidence_only_when_it_agreed_and_separated_on_enough_inputs() {
         let good = spike(4.0);
@@ -2082,17 +1860,6 @@ mod tests {
     }
 
     /// ADR 0026 §4.2, in code: the ladder answers about what it measured.
-    ///
-    /// Nothing about the thresholds moved and nothing about the arithmetic
-    /// moved; a run over the shipped files reads the same share, the same
-    /// projection and the same verdict it always did. What may not survive is
-    /// the *claim*: a nine-rung HTTP instrument that prints "keep deferring M9"
-    /// has answered a question about the language, and `Ladder::missing` refuses
-    /// every workload but this one — so it cannot have.
-    ///
-    /// Seen to fail: restoring `Verdict::label`'s "keep deferring M9" turns this
-    /// red on the first assertion, and dropping `Decision::workload` from the
-    /// rendered sentence turns it red on the second.
     #[test]
     fn a_verdict_names_the_workload_it_was_taken_on_and_never_names_a_milestone() {
         let full = report(full_points());
@@ -2145,8 +1912,8 @@ mod tests {
             "{:?}",
             decision.reasons
         );
-        // The share and the spike both clear their bars here, so what reopens
-        // M9 is the pricing and not either of them: 1 + (1.80 − 1)/2.
+        // The share and the spike both clear their bars here, so what reopens M9 is the pricing and
+        // not either of them: 1 + (1.80 − 1)/2.
         assert!(
             decision.reopens_at.contains("1.40x end to end"),
             "{}",
@@ -2185,9 +1952,7 @@ mod tests {
         );
     }
 
-    /// **C3 is checked against ADR 0016 §4, not against the file.** A report
-    /// that carries no alternatives at all has priced none of the seven, and
-    /// the roster is in code so that deleting the field cannot say otherwise.
+    /// **C3 is checked against ADR 0016 §4, not against the file.**
     #[test]
     fn a_report_that_prices_no_lever_at_all_defers_and_names_all_seven() {
         let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
@@ -2209,9 +1974,8 @@ mod tests {
         assert_eq!(c3_gaps(&[]).len(), LEVERS.len());
     }
 
-    /// The same hole through the values rather than through the field: a lever
-    /// may be claimed as priced, but a claim with nothing behind it is not a
-    /// measurement and does not answer C3.
+    /// The same hole through the values rather than through the field: a lever may be claimed as
+    /// priced, but a claim with nothing behind it is not a measurement and does not answer C3.
     #[test]
     fn a_lever_priced_without_evidence_is_not_priced() {
         let ladder = Ladder::assemble(4.0, 120.0, &full_points()).unwrap();
@@ -2380,8 +2144,8 @@ mod tests {
         }
     }
 
-    /// The audit is what makes the honest account a requirement rather than an
-    /// intention: a report missing a section says so above its own tables.
+    /// The audit is what makes the honest account a requirement rather than an intention: a report
+    /// missing a section says so above its own tables.
     #[test]
     fn the_audit_names_every_section_the_report_owes() {
         let complete = report(full_points());
@@ -2419,8 +2183,8 @@ mod tests {
         );
     }
 
-    /// A measurement file may not carry the bar it is about to clear, so the
-    /// rendered verdict is recomputed from `Criteria::default` every time.
+    /// A measurement file may not carry the bar it is about to clear, so the rendered verdict is
+    /// recomputed from `Criteria::default` every time.
     #[test]
     fn a_report_renders_its_tables_and_recomputes_its_verdict() {
         let out = render(&report(full_points()));
@@ -2446,8 +2210,8 @@ mod tests {
         assert!(rendered.spike.unwrap().evidence);
     }
 
-    /// A report round-trips as JSON: the two measuring agents produce the
-    /// halves separately and the decision is taken over the merged file.
+    /// A report round-trips as JSON: the two measuring agents produce the halves separately and the
+    /// decision is taken over the merged file.
     #[test]
     fn a_report_round_trips_through_json_without_carrying_a_verdict() {
         let original = report(full_points());
