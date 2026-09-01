@@ -747,8 +747,8 @@ is not the line most languages draw:
   has to be written.
 
 **Why the asymmetry.** A row is *derived* — it is a summary of what you called,
-it changes for good reasons, and 89% of the rows in the shipped tree are
-inferred. A type is *chosen*; it is a claim about what a definition means. Ply's
+and it changes for good reasons, so nearly every row in the shipped tree is left
+to inference. A type is *chosen*; it is a claim about what a definition means. Ply's
 premise is that what a human reviews is a specification (§11), and
 `ply review --changed`'s load-bearing row is *implementation changed, spec
 unchanged*. A signature inferred from the body it describes cannot hold still

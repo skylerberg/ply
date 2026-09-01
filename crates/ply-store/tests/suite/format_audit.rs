@@ -127,6 +127,8 @@ fn fingerprint() -> SourceFingerprint {
         defs: vec![DefEntry {
             name: Symbol::new("user.active_users"),
             hash: hash(1),
+            own: hash(2),
+            iface: hash(3),
             span: FileSpan { start: 10, end: 42 },
             kind: DefKind::Fn,
             members: vec![ply_store::Member {
@@ -910,6 +912,8 @@ fn the_edges_of_every_scalar_field_survive_a_round_trip() {
     fp.defs.push(DefEntry {
         name: Symbol::new(&long),
         hash: DefHash([0xff; 32]),
+        own: DefHash([0; 32]),
+        iface: DefHash([0xff; 32]),
         span: FileSpan {
             start: u32::MAX - 1,
             end: u32::MAX,

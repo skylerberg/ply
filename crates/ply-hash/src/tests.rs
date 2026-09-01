@@ -2372,3 +2372,232 @@ fn a_constraint_survives_a_body_round_trip() {
         "a decoded definition hashes back to its key"
     );
 }
+
+// ---- the gate keys: a definition's own form, and its interface ----
+
+const LEDGER_PAIR: &str = r#"
+fn apply_debit(balance: Int, amount: Int) -> Int = balance - amount
+
+fn settle(balance: Int, amount: Int) -> Int = apply_debit(balance, amount)
+"#;
+
+/// The whole of what early cutoff asks of [`HashOutput::own`], and it fails in
+/// opposite directions. If it moved with a callee's body it would recheck
+/// exactly what a `DefHash` already rechecks and buy nothing; if it stayed put
+/// when the definition's own text moved, a real edit would go unchecked.
+#[test]
+fn an_own_hash_moves_with_the_definitions_own_text_and_not_with_its_callees() {
+    let base = parsed(LEDGER_PAIR);
+    let settle = Symbol::new("settle");
+    let debit = Symbol::new("apply_debit");
+
+    assert_eq!(
+        base.own.keys().collect::<Vec<_>>(),
+        base.defs.keys().collect::<Vec<_>>(),
+        "every definition a gate can skip has a key to skip it by"
+    );
+    assert_ne!(
+        base.own[&settle], base.defs[&settle],
+        "a gate key is domain-tagged apart from the identity beside it"
+    );
+
+    // The callee was re-implemented. Its identity moves and so does its
+    // caller's, because a `DefHash` is transitive and stays that way.
+    let rebodied = parsed(&LEDGER_PAIR.replace("balance - amount", "balance - (amount + 0)"));
+    assert_ne!(rebodied.defs[&debit], base.defs[&debit]);
+    assert_ne!(rebodied.defs[&settle], base.defs[&settle]);
+    assert_ne!(rebodied.own[&debit], base.own[&debit]);
+    assert_eq!(
+        rebodied.own[&settle], base.own[&settle],
+        "the caller's own form did not change"
+    );
+
+    // The caller's own text changed and nothing else did.
+    let recalled = parsed(&LEDGER_PAIR.replace(
+        "apply_debit(balance, amount)",
+        "apply_debit(amount, balance)",
+    ));
+    assert_eq!(recalled.own[&debit], base.own[&debit]);
+    assert_ne!(recalled.own[&settle], base.own[&settle]);
+
+    // An own hash is still a normalized encoding: reformatting is not an edit.
+    let reformatted = parsed(&LEDGER_PAIR.replace("balance - amount", "balance   -   amount"));
+    assert_eq!(reformatted.own[&debit], base.own[&debit]);
+    assert_eq!(reformatted.own[&settle], base.own[&settle]);
+}
+
+/// The price of writing references by name, and why it is affordable: renaming a
+/// callee still moves no identity, so it still selects no test and rebuilds
+/// nothing. It costs the caller one recheck it did not need.
+#[test]
+fn renaming_a_callee_moves_its_callers_own_hash_and_no_identity() {
+    let base = parsed(LEDGER_PAIR);
+    let settle = Symbol::new("settle");
+
+    let renamed = parsed(&LEDGER_PAIR.replace("apply_debit", "debit"));
+    assert_eq!(
+        renamed.defs[&settle], base.defs[&settle],
+        "renaming rebuilds nothing"
+    );
+    assert_ne!(renamed.own[&settle], base.own[&settle]);
+}
+
+/// `fn f<..>(p0, p1) -> ret / e`, over whatever variable numbers a run's counter
+/// handed out and whatever order it collected the quantifiers in.
+fn poly(params: [u32; 2], ret: u32, e: u32, quantifiers: [u32; 2]) -> ply_core::Scheme {
+    use ply_core::{Row, RowVar, Scheme, TyVar, Type};
+    Scheme {
+        ty_vars: quantifiers.into_iter().map(TyVar).collect(),
+        row_vars: vec![RowVar(e)],
+        ty: Type::Fn {
+            params: params.into_iter().map(|p| Type::Var(TyVar(p))).collect(),
+            ret: Box::new(Type::Var(TyVar(ret))),
+            effects: Row::open(RowVar(e)),
+        },
+    }
+}
+
+/// A constraint names a quantifier by an index into `Scheme::ty_vars`, so a
+/// caller that reorders that list before passing it attributes the constraint to
+/// the wrong variable.
+#[test]
+fn a_constraint_follows_its_quantifier_rather_than_its_position() {
+    use ply_core::{DefConstraint, Footprint};
+    let empty = Footprint::empty();
+    let eq = |param| {
+        [DefConstraint {
+            deriver: Deriver::Eq,
+            param,
+        }]
+    };
+
+    // One definition, its quantifiers collected in the two orders a run might
+    // have collected them, the constraint naming `TyVar(9)` in both.
+    assert_eq!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(&poly([9, 3], 9, 5, [3, 9]), &empty, &eq(1)),
+    );
+    // Sorting `ty_vars` and keeping the index is what `canonicalize_scheme`
+    // would do to the pair, and it names the other variable.
+    assert_ne!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(&poly([9, 3], 9, 5, [3, 9]), &empty, &eq(0)),
+    );
+}
+
+/// `generalize` quantifies over whatever numbers the run's counter handed out,
+/// so the same definition reaches [`interface_hash`] under different numbers
+/// depending on what subset of the program was checked. Without canonicalization
+/// every interface would read as changed on every run and the cutoff would never
+/// fire once.
+#[test]
+fn an_interface_hash_survives_alpha_renaming_of_its_quantifiers() {
+    let empty = ply_core::Footprint::empty();
+    assert_eq!(
+        interface_hash(&poly([0, 1], 0, 0, [0, 1]), &empty, &[]),
+        interface_hash(&poly([41, 7], 41, 19, [41, 7]), &empty, &[]),
+    );
+    // Not vacuous: the numbering still tells the two parameters apart.
+    assert_ne!(
+        interface_hash(&poly([41, 7], 41, 19, [41, 7]), &empty, &[]),
+        interface_hash(&poly([41, 7], 7, 19, [41, 7]), &empty, &[]),
+    );
+}
+
+/// Effect rows are still inferred, so a body edit that adds a `perform` moves an
+/// interface even though no written signature changed. That is the half of a
+/// definition a caller can observe which early cutoff must keep propagating.
+#[test]
+fn an_interface_hash_separates_the_footprint_from_the_scheme() {
+    use ply_core::{EffectAtom, Footprint, Resource, Row, Scheme, Type};
+    let scheme = Scheme::mono(Type::Fn {
+        params: Vec::new(),
+        ret: Box::new(Type::int()),
+        effects: Row::empty(),
+    });
+    let atom = |mode| EffectAtom::new("db", Resource::Named(Symbol::new("orders")), mode);
+    let quiet = Footprint::empty();
+    let reads = Footprint::from_atoms([atom(Mode::Read)]);
+    let writes = Footprint::from_atoms([atom(Mode::Write)]);
+
+    assert_eq!(
+        interface_hash(&scheme, &reads, &[]),
+        interface_hash(&scheme, &reads, &[])
+    );
+    assert_ne!(
+        interface_hash(&scheme, &quiet, &[]),
+        interface_hash(&scheme, &reads, &[])
+    );
+    assert_ne!(
+        interface_hash(&scheme, &reads, &[]),
+        interface_hash(&scheme, &writes, &[])
+    );
+}
+
+/// A constraint names a quantifier by its position in a list whose order is an
+/// artefact of how a run collected it, so the key is written in the *variable*
+/// that position names rather than in the position.
+#[test]
+fn an_interface_hash_pins_which_quantifier_a_constraint_names() {
+    use ply_core::{DefConstraint, Footprint};
+    let empty = Footprint::empty();
+    let eq = |param| {
+        [DefConstraint {
+            deriver: Deriver::Eq,
+            param,
+        }]
+    };
+
+    assert_ne!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &[]),
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        "a constraint narrows the call sites a definition admits"
+    );
+    assert_ne!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(1)),
+        "which parameter is constrained is part of the interface"
+    );
+    assert_ne!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(
+            &poly([9, 3], 9, 5, [9, 3]),
+            &empty,
+            &[DefConstraint {
+                deriver: Deriver::Ord,
+                param: 0
+            }]
+        ),
+        "which deriver is demanded is part of the interface"
+    );
+    assert_eq!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(&poly([100, 50], 100, 2, [100, 50]), &empty, &eq(0)),
+    );
+    assert_eq!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(&poly([9, 3], 9, 5, [3, 9]), &empty, &eq(1)),
+        "the same variable constrained, listed the other way round"
+    );
+}
+
+/// A by-name encoding has no component index to write, so a cycle's members are
+/// encoded like any other definition — and must still be told apart. Their
+/// `DefHash`es may legitimately coincide, since refinement makes interchangeable
+/// members one definition; two gate keys collapsing onto one entry would instead
+/// lose a recheck.
+#[test]
+fn the_members_of_a_cycle_get_one_own_hash_each() {
+    let out = parsed(
+        r#"
+fn ping(n: Int) -> Int = pong(n - 1)
+
+fn pong(n: Int) -> Int = ping(n - 1)
+"#,
+    );
+    assert_eq!(
+        out.defs[&Symbol::new("ping")],
+        out.defs[&Symbol::new("pong")]
+    );
+    assert_ne!(out.own[&Symbol::new("ping")], out.own[&Symbol::new("pong")]);
+}

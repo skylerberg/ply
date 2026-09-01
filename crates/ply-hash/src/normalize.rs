@@ -13,7 +13,7 @@ fn qualifier(q: &QName) -> Option<&Symbol> {
 
 /// The parser's nesting limit does not bound this walk: a left-leaning operator chain is parsed
 /// iteratively at constant depth but is still an arbitrarily deep tree.
-fn grow<R>(f: impl FnOnce() -> R) -> R {
+pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)

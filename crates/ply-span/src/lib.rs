@@ -244,21 +244,7 @@ pub mod codes {
     /// A parameter filled neither positionally nor by name, carrying no default.
     pub const MISSING_ARGUMENT: &str = "E0125";
     /// A top-level `fn` that left a parameter type or its return type to be
-    /// inferred.
-    ///
-    /// A published signature is a claim a human makes, not a summary the
-    /// compiler derives: `ply review --changed`'s load-bearing row is
-    /// *implementation changed, spec unchanged*, and a signature that moves
-    /// with the body it describes cannot hold still for that row to mean
-    /// anything. So the type is written and inference checks it.
-    ///
-    /// Effect rows are the deliberate exception and are **not** covered by this
-    /// code: a row is derived from what a body calls rather than chosen, so it
-    /// stays inferred unless written, and a written one is checked as an upper
-    /// bound. See `docs/GUIDE.md` §5.9.
-    ///
-    /// The diagnostic names the type inference *would* have given, so the fix
-    /// is the text of the error.
+    /// inferred; the diagnostic names the type inference would have given.
     pub const MISSING_SIGNATURE: &str = "E0126";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
@@ -277,15 +263,6 @@ pub mod codes {
     pub const DECIMAL_DIVISION: &str = "E0209";
     /// An arithmetic or ordered-comparison operand whose numeric type nothing
     /// determines.
-    ///
-    /// Ply has three numeric types and no numeric tower, so `a + b` is one of
-    /// three different operations. This used to be settled by *defaulting* the
-    /// operand to `Int` before generalization — a tiebreak inside the compiler
-    /// that landed in a published signature. With signatures written
-    /// ([`MISSING_SIGNATURE`]) an operand a definition's own parameters do not
-    /// pin is a lambda binder or a `let` nothing constrains, and choosing for
-    /// the author there is a guess. The diagnostic asks for the annotation
-    /// rather than making it.
     pub const NUMERIC_UNDETERMINED: &str = "E0210";
     pub const UNBOUND_ROW_VAR: &str = "E0301";
     pub const EFFECT_NOT_PERMITTED: &str = "E0302";
