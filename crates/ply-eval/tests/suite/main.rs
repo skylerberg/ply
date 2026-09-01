@@ -38,6 +38,7 @@ mod resumption_snapshot_audit;
 mod secrets;
 mod simulated_handlers;
 mod simulation;
+mod slot_resolution;
 mod stdlib_accumulator_cost;
 mod transaction_scope_audit;
 mod use_after_free_audit;
