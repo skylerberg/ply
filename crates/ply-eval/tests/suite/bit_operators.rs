@@ -1,49 +1,7 @@
 //! The bit surface on real source, through parse, resolve, check and both engines.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::Machine;
-use ply_span::SourceId;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = match ply_syntax::parse_program(inputs) {
-        Ok(p) => p,
-        Err(d) => panic!("did not parse: {d:#?}"),
-    };
-    let resolved = match resolve(&mut program) {
-        Ok(r) => r,
-        Err(d) => panic!("did not resolve: {d:#?}"),
-    };
-    let check = match check_program(&program, &resolved) {
-        Ok(c) => c,
-        Err(d) => panic!("did not typecheck: {d:#?}"),
-    };
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
-
-fn run(source: &str) -> Compiled {
-    let c = compile(source);
-    assert!(!c.check.tests.is_empty(), "the source declares no test");
-    let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
-    for (i, t) in c.check.tests.iter().enumerate() {
-        if let Err(d) = machine.eval_test(i) {
-            panic!("`{}` failed: {d:#?}", t.name);
-        }
-    }
-    c
-}
 
 /// `name` raises, with the code a program-level failure carries.
 #[track_caller]
@@ -60,7 +18,8 @@ fn refused(c: &Compiled, name: &str) -> String {
 /// the pattern is what is being read.
 #[test]
 fn every_bit_operator_answers_the_two_s_complement_pattern() {
-    run(r#"
+    Compiled::ran(
+        r#"
 test "and, or and xor at small values" {
   assert_eq(12 & 10, 8);
   assert_eq(12 | 10, 14);
@@ -97,13 +56,15 @@ test "the operators are not their logical namesakes: both sides are evaluated" {
     assert_eq(cell_get(n), 1)
   } }
 }
-"#);
+"#,
+    );
 }
 
 /// The deliberate exception to checked arithmetic, and the only one.
 #[test]
 fn a_left_shift_discards_what_leaves_and_does_not_raise() {
-    run(r#"
+    Compiled::ran(
+        r#"
 fn min_int() -> Int = 0 - 9223372036854775807 - 1
 
 test "1 << 63 is the sign bit and raises nothing" {
@@ -130,14 +91,16 @@ test "a count of zero is a shift of nothing" {
   assert_eq(7 >> 0, 7);
   assert_eq((0 - 7) >>> 0, 0 - 7)
 }
-"#);
+"#,
+    );
 }
 
 /// Both shifts are in the language because `Int` is signed, and the pair only earns its keep if
 /// they differ.
 #[test]
 fn an_arithmetic_shift_and_a_logical_shift_differ_on_a_negative() {
-    run(r#"
+    Compiled::ran(
+        r#"
 test "arithmetic propagates the sign" {
   assert_eq(-8 >> 1, 0 - 4);
   assert_eq(-8 >> 3, 0 - 1);
@@ -159,13 +122,14 @@ test "they agree exactly where the sign bit is clear" {
   assert_eq(map(range(0, 20), |x| x >> 2), map(range(0, 20), |x| x >>> 2));
   assert(-4 >> 2 != -4 >>> 2)
 }
-"#);
+"#,
+    );
 }
 
 /// The count is refused rather than masked.
 #[test]
 fn a_shift_count_outside_the_word_raises_on_both_engines() {
-    let c = compile(
+    let c = Compiled::new(
         r#"
 fn at_minus_one() -> Int = 1 << -1
 fn at_sixty_four() -> Int = 1 << 64
@@ -203,7 +167,8 @@ test "the source checks" { assert(true) }
 /// `wrap_*` is what a program calls when the wrap is the point, and `+` stays the raising spelling.
 #[test]
 fn the_wrapping_builtins_answer_where_the_operators_raise() {
-    run(r#"
+    Compiled::ran(
+        r#"
 fn max_int() -> Int = 9223372036854775807
 fn min_int() -> Int = 0 - 9223372036854775807 - 1
 
@@ -233,10 +198,11 @@ test "wrapping agrees with masking below 32 bits" {
   assert_eq(wrap_add(4294967295, 1) & 4294967295, 0);
   assert_eq(wrap_mul(65537, 65537) & 4294967295, 131073)
 }
-"#);
+"#,
+    );
 
     // The same three expressions written with the operators, which raise.
-    let c = compile(
+    let c = Compiled::new(
         r#"
 fn add() -> Int = 9223372036854775807 + 1
 fn sub() -> Int = (0 - 9223372036854775807 - 1) - 1
@@ -254,7 +220,8 @@ test "the source checks" { assert(true) }
 /// A hash's mixing step, run on both engines, which is what the whole surface exists for.
 #[test]
 fn a_mixing_step_answers_the_same_number_on_both_engines() {
-    run(r#"
+    Compiled::ran(
+        r#"
 fn mask32() -> Int = 4294967295
 
 fn rotl32(x: Int, n: Int) -> Int =
@@ -279,16 +246,19 @@ test "rotation is a permutation of the low 32 bits" {
   assert_eq(rotl32(mask32(), 7), mask32());
   assert_eq(rotl32(1, 31), 2147483648)
 }
-"#);
+"#,
+    );
 }
 
 /// The names are not reserved, and a module that defines one gets its own — on both engines, which
 /// is where the two `lookup` orders could disagree.
 #[test]
 fn a_module_definition_shadows_a_wrapping_builtin() {
-    run(r#"
+    Compiled::ran(
+        r#"
 fn wrap_add(a: Int, b: Int) -> Int = 0
 
 test "the module's own definition wins" { assert_eq(wrap_add(1, 2), 0) }
-"#);
+"#,
+    );
 }

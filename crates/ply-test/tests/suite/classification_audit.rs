@@ -1,12 +1,11 @@
 //! What the defect/program-error split does with *every* code an evaluator can attach to a failure,
 //! and what each `Skipped` variant is actually applied to.
 
-use ply_core::CheckOutput;
+use crate::fixture::Compiled;
 use ply_eval::Plan;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, Severity, SourceId, Span, codes};
 use ply_store::Store;
-use ply_syntax::resolve::Resolved;
 use ply_test::{
     Baseline, Bisection, Executor, Gate, Mode, Options, RunReport, Skipped, Status, Verdict,
     precheck, run_with, select,
@@ -47,25 +46,6 @@ fn double(x: Int) -> Int = x * 2
 test "double doubles" { assert_eq(double(4), 8) }
 "#;
 
-struct Compiled {
-    check: CheckOutput,
-    hashes: HashOutput,
-}
-
-impl Compiled {
-    fn new(src: &str) -> Compiled {
-        let module = ply_syntax::parse(SourceId(0), src).expect("the fixture must parse");
-        let mut program = ply_syntax::ast::Program::single(module);
-        let resolved: Resolved = ply_syntax::resolve(&mut program)
-            .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        let hashes = ply_hash::hash_program(&program, &resolved, &check)
-            .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
-        Compiled { check, hashes }
-    }
-}
-
 /// Answers with whatever the case wants the evaluator to have said, so the classifier is measured
 /// against a code rather than against whichever program happens to produce it today.
 struct Answering {
@@ -92,7 +72,7 @@ impl Executor for Answering {
 fn report_for(executor: &Answering) -> RunReport {
     let root = TempRoot::new();
     let mut store = root.store();
-    let compiled = Compiled::new(CORPUS);
+    let compiled = Compiled::anonymous(CORPUS);
     let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
     run_with(
         &selection,

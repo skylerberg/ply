@@ -1,6 +1,8 @@
 //! Every integration test in this crate, as one binary: cargo links one per
 //! `.rs` directly under `tests/`, and the link dominates the build.
 
+mod fixture;
+
 mod bit_operators;
 mod blake3_differential;
 mod byte_builtins;

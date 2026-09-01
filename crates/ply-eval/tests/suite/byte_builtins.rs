@@ -1,53 +1,11 @@
 //! The byte builtins on real source, through parse, resolve, check and the evaluator.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::Machine;
-use ply_span::SourceId;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
-    let mut program = match ply_syntax::parse_program(inputs) {
-        Ok(p) => p,
-        Err(d) => panic!("did not parse: {d:#?}"),
-    };
-    let resolved = match resolve(&mut program) {
-        Ok(r) => r,
-        Err(d) => panic!("did not resolve: {d:#?}"),
-    };
-    let check = match check_program(&program, &resolved) {
-        Ok(c) => c,
-        Err(d) => panic!("did not typecheck: {d:#?}"),
-    };
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
-
-fn run_tests(source: &str) -> Compiled {
-    let c = compile(source);
-    assert!(!c.check.tests.is_empty(), "the source declares no test");
-    let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
-    for (i, t) in c.check.tests.iter().enumerate() {
-        if let Err(d) = machine.eval_test(i) {
-            panic!("`{}` failed under the machine: {d:#?}", t.name);
-        }
-    }
-    c
-}
 
 #[test]
 fn every_byte_builtin_behaves_as_the_contract_states() {
-    run_tests(
+    Compiled::ran(
         r#"
 fn head() -> Bytes = b"GET /orders?id=7 HTTP/1.1\r\nHost: x\r\n\r\nbody"
 
@@ -131,7 +89,7 @@ test "a position predicate may perform, and the search still exits early" {
 /// W1's folds answered.
 #[test]
 fn the_builtins_agree_with_the_folds_they_replaced() {
-    run_tests(
+    Compiled::ran(
         r#"
 fn fold_index_of(hay: Bytes, byte: Int, from: Int) -> Int =
   fold(range(from, bytes_len(hay)), -1, |found, i|
@@ -215,7 +173,7 @@ fn empty_separator() -> List<Bytes> = bytes_split(b"abc", b"")
 
 test "the source checks" { assert(true) }
 "#;
-    let c = compile(source);
+    let c = Compiled::new(source);
     for name in [
         "m.past_the_end",
         "m.negative_budget",

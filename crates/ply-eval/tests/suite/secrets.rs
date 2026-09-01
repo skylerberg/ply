@@ -5,46 +5,19 @@
 // `ply-eval`'s design and this is the same allow, for the same reason, that `ply-host` carries.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Machine, SECRET_REDACTED, Value, constant_time_eq, values_equal};
-use ply_span::{Diagnostic, SourceId, Symbol, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_eval::{SECRET_REDACTED, Value, constant_time_eq, values_equal};
+use ply_span::{Diagnostic, Symbol, codes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    let check = check_program(&program, &resolved).expect("the fixture typechecks");
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
-
-impl Compiled {
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-}
-
 /// Runs test 0 and answers its diagnostic, if any.
 fn run(source: &str) -> Result<(), Diagnostic> {
-    let compiled = compile(source);
+    let compiled = Compiled::named("t", source);
     let mut machine = compiled.machine();
     machine.eval_test(0)
 }
@@ -331,7 +304,7 @@ fn bound(compiled: &Compiled, handler: Arc<Counter>, secrets: bool) -> HostBindi
 /// The tripwire.
 #[test]
 fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let handler = Arc::new(Counter::default());
     let mut machine = compiled.machine();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
@@ -357,7 +330,7 @@ fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
 /// from — so the check is a walk rather than a top-level test.
 #[test]
 fn a_secret_nested_in_an_argument_is_found() {
-    let compiled = compile(SEND_NESTED);
+    let compiled = Compiled::named("t", SEND_NESTED);
     let handler = Arc::new(Counter::default());
     let mut machine = compiled.machine();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
@@ -371,7 +344,7 @@ fn a_secret_nested_in_an_argument_is_found() {
 /// does, and becomes a reviewed member of the trusted computing base.
 #[test]
 fn an_operation_that_declares_secrets_receives_one() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let handler = Arc::new(Counter::default());
     let mut machine = compiled.machine();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), true)));
@@ -386,7 +359,7 @@ fn an_operation_that_declares_secrets_receives_one() {
 /// An ordinary operation is untouched.
 #[test]
 fn an_argument_with_no_secret_reaches_the_handler_as_before() {
-    let compiled = compile(SEND_PLAIN);
+    let compiled = Compiled::named("t", SEND_PLAIN);
     let handler = Arc::new(Counter::default());
     let mut machine = compiled.machine();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
@@ -399,7 +372,7 @@ fn an_argument_with_no_secret_reaches_the_handler_as_before() {
 /// credentials moves the one line CI pins.
 #[test]
 fn the_secrets_column_moves_the_listing_digest() {
-    let compiled = compile(SEND);
+    let compiled = Compiled::named("t", SEND);
     let listing = |secrets| {
         let mut registry = HostRegistry::new();
         registry.register(op(secrets), Arc::new(Counter::default()));
@@ -425,12 +398,7 @@ test "launder" {
   }
 }
 "#;
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    let diagnostics = check_program(&program, &resolved)
-        .expect_err("a clause that laundered a `Secret` into a `String` is refused");
+    let diagnostics = Compiled::rejected_in("t", source);
     assert!(
         diagnostics.iter().any(|d| d.code == codes::TYPE_MISMATCH),
         "the refusal is a type mismatch at the clause: {diagnostics:#?}"
@@ -460,12 +428,7 @@ test "confuse" {
   }
 }
 "#;
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    let diagnostics = check_program(&program, &resolved)
-        .expect_err("a clause answering an `Int` for a `String` caller is refused");
+    let diagnostics = Compiled::rejected_in("t", source);
     assert!(
         diagnostics.iter().any(|d| d.code == codes::TYPE_MISMATCH),
         "{diagnostics:#?}"
