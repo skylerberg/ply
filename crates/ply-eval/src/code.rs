@@ -39,9 +39,11 @@ pub enum NodeKind {
         params: Rc<Vec<Symbol>>,
         body: Code,
         /// The body's free variables, which is all a closure over it has to keep — ADR 0034 §4.
+        /// `None` means "capture the whole scope", as [`Clause::free`] does, so that an omitted set
+        /// is the slow answer rather than a closure that captured nothing.
         /// Capturing the whole scope instead pins every other binding in it for the closure's life,
         /// which `costs.rs` records as its third blindness.
-        free: Rc<Vec<Symbol>>,
+        free: Option<Rc<Vec<Symbol>>>,
     },
     App {
         func: Code,
@@ -147,12 +149,23 @@ pub struct Clause {
     /// The continuation binder of a general clause.
     pub resume: Option<Symbol>,
     pub body: Code,
+    /// The body's free variables — what a clause needs from the scope its handler was installed in,
+    /// and nothing else. ADR 0034 §4.1: extending the whole prompt environment pins every binding in
+    /// it for the clause's life, and makes a flat slot index name the wrong thing.
+    ///
+    /// `None` means "do not narrow", which is what a hand-built `Clause` gets. An *empty* set means
+    /// the body reads nothing from the handler's scope, and narrowing to nothing is right. The
+    /// distinction matters because the two failure directions are not symmetric: keeping too much
+    /// costs a pinned binding, keeping too little is `cannot find` at the read.
+    pub free: Option<Rc<Vec<Symbol>>>,
     pub span: Span,
 }
 
 pub struct ReturnArm {
     pub binder: Symbol,
     pub body: Code,
+    /// As [`Clause::free`].
+    pub free: Option<Rc<Vec<Symbol>>>,
     pub span: Span,
 }
 
@@ -305,7 +318,7 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             let params: Vec<Symbol> = params.iter().map(|p| p.name.name.clone()).collect();
             let (body, free) = lower_barrier_free(&params, body, live);
             NodeKind::Lambda {
-                free: Rc::new(free),
+                free: Some(Rc::new(free)),
                 params: Rc::new(params),
                 body,
             }
@@ -757,7 +770,7 @@ fn lower_clause(c: &HandleClause, live: &mut Live) -> Clause {
     let resume = c.resume.as_ref().map(|r| r.name.clone());
     let mut bound = params.clone();
     bound.extend(resume.clone());
-    let body = lower_barrier(&bound, &c.body, live);
+    let (body, free) = lower_barrier_free(&bound, &c.body, live);
     Clause {
         effect: c.effect.clone(),
         op: c.op.name.clone(),
@@ -765,16 +778,18 @@ fn lower_clause(c: &HandleClause, live: &mut Live) -> Clause {
         params: Rc::new(params),
         resume,
         body,
+        free: Some(Rc::new(free)),
         span: c.span,
     }
 }
 
 fn lower_return(rc: &ReturnClause, live: &mut Live) -> Rc<ReturnArm> {
     let binder = rc.binder.name.clone();
-    let body = lower_barrier(std::slice::from_ref(&binder), &rc.body, live);
+    let (body, free) = lower_barrier_free(std::slice::from_ref(&binder), &rc.body, live);
     Rc::new(ReturnArm {
         binder,
         body,
+        free: Some(Rc::new(free)),
         span: rc.span,
     })
 }
