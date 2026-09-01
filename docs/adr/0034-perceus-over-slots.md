@@ -1,7 +1,7 @@
 # ADR 0034 — The append cliff is a calculus mismatch: Perceus over slots
 
-**Decisions 1, 2 and 3 are landed and their gates are green.** The machine
-runs on slot frames, a last use moves the value out of its slot, and
+**Every decision is landed and every gate is green.** The machine runs on
+slot frames, a last use moves the value out of its slot, and
 `position_invariance_g1` passes on all five pairs — the fifth included, through
 a field-granular move the flat record representation enabled. A record update
 whose base dies at the update writes into the base's record instead of building
@@ -11,9 +11,11 @@ levers the allocation census attributed, not through the slot frames themselves
 (`README.md` carries the figures, and `w6_report_allocations` holds them to the
 tree). The list is a radix trie whose newest leaf is held apart, so a copying
 append and a `[x, ..rest]` pattern are both bounded whatever the length, and
-the accumulator that used to quadruple per doubling now doubles. Decision 4 —
-the checked promise — remains sequenced behind its own gate; decision 5 was
-already done.
+the accumulator that used to quadruple per doubling now doubles. A `reuse fn`
+is the callee-side obligation Decision 4 asked for, refused with `E0127` when
+the cost checker cannot show every append in its body reuses, and the standard
+library's lexer, parser and encoder loops carry it. Decision 5 was already
+done. What remains of this record is the falsifiers below, which stay armed.
 
 Continues ADR 0024, whose findings it accepts entire and whose sequencing it
 re-orders.
@@ -426,6 +428,32 @@ about callers**: a function so marked fails to compile if it could allocate.
 caller, so the multi-shot counterexample does not reach it.** Opt-in and scoped
 to the standard library's hot paths.
 
+**Landed as `reuse fn`** — a contextual word before `fn`, after `pub` if any,
+so no name loses its meaning. The obligation is stated over the cost checker's
+verdicts, which is the instrument the tree already had: every `push` in the
+body must be one the checker shows reuses, **or an append onto the definition's
+own parameter at its last use**, which keeps the promise whatever the callers
+do — that is the callee-side reading made precise, and it is what lets the
+promise say nothing about callers. "Could allocate" is narrower here than the
+paragraph above wrote it: the promise is about appends, because appends are
+what the checker can see; a record literal or a constructor is not in it.
+
+**Where it is checked.** The promise is whole-program — a site fed by a call
+depends on whether the callee's return is fresh — so `ply check` parses every
+module when any declares a promise, and keeps the gates' own report so
+`--explain` still says what the run decided. For that to be possible the
+front-end cache's definition entry records the marker: gate 1 has to know a
+module it skips holds a promise without parsing it, which moved the cache
+format. `ply test` and `ply run` refuse a broken promise among the modules
+they parse. The incremental suite pins that a promise in a skipped module is
+still known and still refused.
+
+**What did not need building.** No mode, no change to unification, nothing in
+the signature or the content-addressed store beyond the entry flag:
+normalization erases the marker as it erases a spec, so a promise added or
+dropped moves no body hash and re-runs no test. The whole surface is one
+contextual word, one diagnostic and one bit in the cache.
+
 ## Decision 5 — a tail-resumptive clause is not a capture that outlives a region
 
 **Done.** Region inference called every region holding a tail-resumptive clause
@@ -584,7 +612,8 @@ need the representation and the representation's landing note above records
 what the copy counters turned out to need, which was one assertion rather than
 forty-four.
 
-Next: the checked promise, Decision 4.
+Also done since: the checked promise, as `reuse fn`. Nothing in this record's
+sequence remains; the standard library's marked loops are what stands guard.
 
 **The guide's statement of the positional rule is deleted** — §6.7 now states
 the ownership rule and the residue `--costs` reports: a copy means a genuine
@@ -611,8 +640,11 @@ longer needs stating.
    diverge between two — **which also removes the differential that would have
    caught a lowering change altering an answer.**
 6. **If the request path is bytes-bound rather than list-bound.** ADR 0024
-   counted the concatenation sites and two documented quadratics. **Not measured,
-   and it should be measured before the rewrite.**
+   counted the concatenation sites and two documented quadratics. **Measured at
+   the representation's landing, and it was list-bound**: the request path's
+   bytes roughly halved when `[x, ..rest]` stopped copying the tail, with no
+   concatenation site touched (`README.md` carries the figures). What remains
+   is the byte side, which "What this does not do" leaves alone on purpose.
 7. **If the size estimate is wrong by the margin this record's estimates usually
    are.**
 

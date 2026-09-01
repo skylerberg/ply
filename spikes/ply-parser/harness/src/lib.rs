@@ -558,6 +558,7 @@ impl<'a> Dumper<'a> {
         );
         self.rec(d.span, "fn");
         self.vis(d.vis);
+        self.opt(d.reuse.as_ref(), |s, span| s.rec(*span, "reu"));
         self.ident(&d.name);
         self.generics(&d.generics);
         self.list(&d.params, Self::param);
@@ -970,7 +971,7 @@ mod tests {
         let dump = reference_dump("fn f() = 1\n");
         assert_eq!(
             dump,
-            "#0;#1;0:10:fn;%priv;3:4:ident;@66;%gen;#0;#0;#0;?0;?0;#0;#0;9:10:elit;%int;@31;#0;"
+            "#0;#1;0:10:fn;%priv;?0;3:4:ident;@66;%gen;#0;#0;#0;?0;?0;#0;#0;9:10:elit;%int;@31;#0;"
         );
     }
 

@@ -497,6 +497,7 @@ impl Parser {
             )
         ) || self.at_law_start()
             || self.at_derive_start()
+            || self.at_reuse_start()
     }
 
     /// `law` is contextual: it opens an item only when a quoted label follows, so `fn law(..)` and
@@ -511,6 +512,11 @@ impl Parser {
     /// `derive` is contextual for the same reason `law` is.
     fn at_derive_start(&self) -> bool {
         self.at_ident_text("derive") && matches!(self.kind_at(1), TokenKind::Ident(_))
+    }
+
+    /// `reuse` is contextual too: it opens an item only when `fn` follows.
+    fn at_reuse_start(&self) -> bool {
+        self.at_ident_text("reuse") && matches!(self.kind_at(1), TokenKind::Kw(Kw::Fn))
     }
 
     fn recover_to_item(&mut self) {
@@ -574,8 +580,13 @@ impl Parser {
             Visibility::Private
         };
 
+        if self.at_reuse_start() {
+            let reuse = self.advance();
+            return self.fn_def(vis, Some(reuse)).map(|d| Item::Fn(Box::new(d)));
+        }
+
         match self.kind() {
-            TokenKind::Kw(Kw::Fn) => self.fn_def(vis).map(|d| Item::Fn(Box::new(d))),
+            TokenKind::Kw(Kw::Fn) => self.fn_def(vis, None).map(|d| Item::Fn(Box::new(d))),
             TokenKind::Kw(Kw::Type) => self.type_def(vis).map(|d| Item::Type(Box::new(d))),
             _ if self.at_effect_set_start() => {
                 if let Some(span) = pub_span {
@@ -774,7 +785,7 @@ impl Parser {
         })
     }
 
-    fn fn_def(&mut self, vis: Visibility) -> PResult<FnDef> {
+    fn fn_def(&mut self, vis: Visibility, reuse: Option<Span>) -> PResult<FnDef> {
         let start = self.advance();
         let name = self.expect_ident("a function name after `fn`")?;
         let generics = if self.at(&TokenKind::Lt) {
@@ -820,6 +831,7 @@ impl Parser {
             constraints,
             derived: None,
             spec,
+            reuse,
             body,
             span,
         })

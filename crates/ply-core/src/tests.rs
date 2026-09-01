@@ -272,6 +272,7 @@ fn func(name: &str, params: &[&str], body: Expr) -> FnBuilder {
             constraints: Vec::new(),
             derived: None,
             spec: Vec::new(),
+            reuse: None,
             body,
             span: any(),
         },

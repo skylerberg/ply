@@ -117,6 +117,10 @@ pub struct DefEntry {
     /// The names this definition mentions directly, in normalization order.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub deps: Vec<Symbol>,
+    /// A `reuse fn`: gate 1 has to know without a parse, because the promise is checked
+    /// whole-program and a module the gate skips can still hold one.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub reuse: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]

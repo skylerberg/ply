@@ -246,6 +246,9 @@ pub mod codes {
     /// A top-level `fn` that left a parameter type or its return type to be
     /// inferred; the diagnostic names the type inference would have given.
     pub const MISSING_SIGNATURE: &str = "E0126";
+    /// A `reuse fn` whose body has an append the cost checker cannot show reuses its list for a
+    /// reason inside the body — the callee-side promise ADR 0034 decision 4 specifies.
+    pub const REUSE_BROKEN: &str = "E0127";
     pub const TYPE_MISMATCH: &str = "E0201";
     pub const ARITY_MISMATCH: &str = "E0202";
     pub const OCCURS_CHECK: &str = "E0203";
@@ -584,6 +587,7 @@ mod tests {
             ("ARGUMENT_ORDER", codes::ARGUMENT_ORDER, "E0124"),
             ("MISSING_ARGUMENT", codes::MISSING_ARGUMENT, "E0125"),
             ("MISSING_SIGNATURE", codes::MISSING_SIGNATURE, "E0126"),
+            ("REUSE_BROKEN", codes::REUSE_BROKEN, "E0127"),
             ("TYPE_MISMATCH", codes::TYPE_MISMATCH, "E0201"),
             ("ARITY_MISMATCH", codes::ARITY_MISMATCH, "E0202"),
             ("OCCURS_CHECK", codes::OCCURS_CHECK, "E0203"),

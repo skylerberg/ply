@@ -30,6 +30,9 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         Ok(loaded) => loaded,
         Err(err) => return report_load_error("run", &err, args.json, style),
     };
+    if let Some(err) = super::test::broken_promises(&loaded) {
+        return report_load_error("run", &err, args.json, style);
+    }
 
     let entry = match entry_point(&loaded) {
         Ok(entry) => entry,

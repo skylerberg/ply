@@ -116,6 +116,9 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             Err(err) => return report_load_error("test", &err, args.json, style),
         }
     }
+    if let Some(err) = broken_promises(&loaded) {
+        return report_load_error("test", &err, args.json, style);
+    }
 
     // Before anything runs: a registration the program does not declare is the host author's bug,
     // and a run that started anyway would touch a resource nobody could name.
@@ -1715,6 +1718,19 @@ fn location_json(sources: &SourceMap, span: Span) -> Value {
 
 fn display_width(s: &str) -> usize {
     crate::style::strip_ansi(s).chars().count()
+}
+
+/// A `reuse fn` among the modules this run parsed whose promise the cost checker cannot show: the
+/// program does not get as far as running, as it would not under `ply check`.
+pub(crate) fn broken_promises(loaded: &Loaded) -> Option<crate::load::LoadError> {
+    if !loaded.promised {
+        return None;
+    }
+    let diagnostics = crate::costs::promises(&loaded.program, &loaded.resolved);
+    (!diagnostics.is_empty()).then(|| crate::load::LoadError {
+        sources: loaded.sources.clone(),
+        diagnostics,
+    })
 }
 
 #[cfg(test)]

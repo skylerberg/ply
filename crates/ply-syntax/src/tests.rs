@@ -1103,6 +1103,30 @@ fn derive_is_contextual_and_a_function_may_still_be_named_derive() {
 }
 
 #[test]
+fn a_reuse_fn_parses_before_and_after_pub_and_keeps_its_marker() {
+    assert_eq!(dump("reuse fn f(xs) = xs"), "(reuse fn f ((xs _)) xs)");
+    assert_eq!(
+        dump("pub reuse fn f(xs) = xs"),
+        "(pub reuse fn f ((xs _)) xs)"
+    );
+    let m = ok("reuse fn f(xs) = xs");
+    let Item::Fn(f) = &m.items[0] else {
+        panic!("expected a fn")
+    };
+    assert!(
+        f.reuse.is_some(),
+        "the marker's span is kept for the diagnostic"
+    );
+}
+
+#[test]
+fn reuse_is_contextual_and_stays_a_name_everywhere_else() {
+    assert_eq!(dump("fn reuse(x) = x"), "(fn reuse ((x _)) x)");
+    assert_eq!(dump("fn f(reuse) = reuse"), "(fn f ((reuse _)) reuse)");
+    ok("fn f(reuse: Int) -> Int = { let x = reuse; x }");
+}
+
+#[test]
 fn an_unknown_deriver_is_reported_with_the_whole_list() {
     let d = errs("derive toml for Order");
     assert_eq!(d[0].code, codes::UNKNOWN_DERIVER);
@@ -1174,7 +1198,8 @@ fn dump_item(i: &Item) -> String {
 fn dump_item_body(i: &Item) -> String {
     match i {
         Item::Fn(f) => {
-            let mut s = format!("(fn {}", f.name.name);
+            let reuse = if f.reuse.is_some() { "reuse " } else { "" };
+            let mut s = format!("({reuse}fn {}", f.name.name);
             if !f.generics.types.is_empty() || !f.generics.effects.is_empty() {
                 s.push_str(&format!(" {}", dump_generics(&f.generics)));
             }

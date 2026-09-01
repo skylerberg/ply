@@ -23,6 +23,10 @@ pub struct Loaded {
     pub hashes: HashOutput,
     pub complete: bool,
     pub frontend: FrontEnd,
+    /// Whether any module — parsed this run or restored from the cache — declares a `reuse fn`,
+    /// so a command knows whether the promise check has anything to check before it parses
+    /// everything the check needs.
+    pub promised: bool,
 }
 
 /// Carries the [`SourceMap`] even on failure: a parse error is useless without the text its spans
