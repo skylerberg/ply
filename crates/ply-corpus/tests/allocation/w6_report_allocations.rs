@@ -1,37 +1,7 @@
 //! The staleness guard that cannot be blamed on a machine.
 
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
+use crate::counting::charge;
 use std::path::{Path, PathBuf};
-
-thread_local! {
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static BYTES: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        let _ = BYTES.try_with(|c| c.set(c.get() + layout.size()));
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
-fn counted<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
-    ALLOCS.with(|c| c.set(0));
-    BYTES.with(|c| c.set(0));
-    let out = f();
-    (out, ALLOCS.with(Cell::get), BYTES.with(Cell::get))
-}
 
 fn repo() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -67,7 +37,7 @@ fn per_request() -> (f64, f64) {
 
     const N: usize = 200;
     let script: Vec<Vec<Vec<u8>>> = (0..N).map(|_| vec![request.clone()]).collect();
-    let (_, allocs, bytes) = counted(|| loaded.over_sim(script).expect("the service serves"));
+    let (_, allocs, bytes) = charge(|| loaded.over_sim(script).expect("the service serves"));
     (allocs as f64 / N as f64, bytes as f64 / N as f64)
 }
 

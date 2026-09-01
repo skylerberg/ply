@@ -1,39 +1,15 @@
 //! What a step costs the allocator, exactly.
 
+use crate::counting::charge;
 use ply_eval::cont::{Frame, Prompt, Segment};
 use ply_eval::{Env, Stack};
 use ply_span::Span;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::hint::black_box;
 use std::rc::Rc;
 
-thread_local! {
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static BYTES: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        let _ = BYTES.try_with(|c| c.set(c.get() + layout.size()));
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
 fn allocations_of<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    ALLOCS.with(|c| c.set(0));
-    let out = f();
-    (out, ALLOCS.with(Cell::get))
+    let (out, allocs, _) = charge(f);
+    (out, allocs)
 }
 
 fn call_frame() -> Frame {

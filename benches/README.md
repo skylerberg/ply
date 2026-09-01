@@ -57,7 +57,7 @@ makes on their own:
 | `Store::open` | against the cache the corpus has already filled |
 
 `--only-throughput` drops everything but the throughput table, which is what to
-point a profiler at. `crates/ply-corpus/tests/frame_cost.rs` counts the allocations a frame push
+point a profiler at. `crates/ply-corpus/tests/allocation/frame_cost.rs` counts the allocations a frame push
 and pop cost, which is the machine-independent half of the same question.
 
 ## What `sim` adds

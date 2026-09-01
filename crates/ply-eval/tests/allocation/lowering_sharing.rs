@@ -1,43 +1,16 @@
 //! One program, one lowering — however many machines run it.
 
+use crate::counting::charge;
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Machine, Value};
 use ply_span::{SourceId, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::rc::Rc;
 
-thread_local! {
-    static ARMED: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.try_with(Cell::get).unwrap_or(false) {
-            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
 fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
-    ALLOCS.with(|c| c.set(0));
-    ARMED.with(|c| c.set(true));
-    let out = f();
-    ARMED.with(|c| c.set(false));
-    (out, ALLOCS.with(Cell::get))
+    let (out, allocs, _) = charge(f);
+    (out, allocs)
 }
 
 struct Compiled {
