@@ -42,6 +42,18 @@ pub enum NodeKind {
     App {
         func: Code,
         args: Rc<Vec<Code>>,
+        /// Per argument, the bindings that argument is the **last reader** of —
+        /// ADR 0032 §11 S4's probe. Empty everywhere unless the probe is armed,
+        /// so the shipped lowering allocates one empty `Rc` per `App` and the
+        /// machine's `carry` takes exactly the branch it takes today.
+        ///
+        /// `dead[i]` is what [`crate::rc::carry_released`] removes from the
+        /// scope a pending `AppArgs` frame holds while arguments after `i` run.
+        /// It is sound for the same reason [`crate::rc::Own::Owned`] is: `Live`
+        /// is a backward pass over the whole activation, so a name it reports
+        /// here is read by nothing to the right of this argument — not by a
+        /// later argument, not by the callee application, not after the call.
+        dead: Rc<Vec<crate::rc::Dead>>,
     },
     If {
         cond: Code,
@@ -58,6 +70,10 @@ pub enum NodeKind {
     },
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
+        /// Per field, what that field's value is the last reader of — the same
+        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0032
+        /// §11 S4's probe covers. Empty unless the probe is armed.
+        dead: Rc<Vec<crate::rc::Dead>>,
     },
     Field {
         base: Code,
@@ -322,9 +338,9 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             }
         }
         ExprKind::App { func, args, .. } => {
-            let args = lower_all(args, live);
+            let (args, dead) = lower_args(args, live);
             let func = lower_in(func, live);
-            NodeKind::App { func, args }
+            NodeKind::App { func, args, dead }
         }
         ExprKind::If {
             cond,
@@ -377,13 +393,26 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             }
         }
         ExprKind::Record { fields } => {
+            let armed = crate::rc::probe_armed();
             let mut lowered: Vec<(Symbol, Code)> = Vec::with_capacity(fields.len());
+            let mut dead: Vec<crate::rc::Dead> = Vec::new();
             for (name, value) in fields.iter().rev() {
+                let before = if armed { live.snapshot() } else { Vec::new() };
                 lowered.push((name.name.clone(), lower_in(value, live)));
+                if armed {
+                    let fresh: Vec<Symbol> = live
+                        .snapshot()
+                        .into_iter()
+                        .filter(|n| !before.contains(n) && live.is_ownable(n))
+                        .collect();
+                    dead.push(Rc::from(fresh));
+                }
             }
             lowered.reverse();
+            dead.reverse();
             NodeKind::Record {
                 fields: Rc::new(lowered),
+                dead: Rc::new(dead),
             }
         }
         // Unreachable: the sugar is gone before any module reaches this crate, and lowering it as
@@ -484,6 +513,34 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
     }
     live.close(outer);
     code
+}
+
+/// [`lower_all`], also answering which bindings each argument is the last reader
+/// of — ADR 0032 §11 S4.
+///
+/// The walk is already in reverse evaluation order, which is what makes this a
+/// diff rather than a second pass: when argument `i` is walked, `live`'s set
+/// holds everything read to its right, so a name that appears *during* its walk
+/// and was not there before is one nothing to the right reads.
+fn lower_args(exprs: &[Expr], live: &mut Live) -> (Rc<Vec<Code>>, Rc<Vec<crate::rc::Dead>>) {
+    if !crate::rc::probe_armed() {
+        return (lower_all(exprs, live), Rc::new(Vec::new()));
+    }
+    let mut out: Vec<Code> = Vec::with_capacity(exprs.len());
+    let mut dead: Vec<crate::rc::Dead> = Vec::with_capacity(exprs.len());
+    for e in exprs.iter().rev() {
+        let before = live.snapshot();
+        out.push(lower_in(e, live));
+        let fresh: Vec<Symbol> = live
+            .snapshot()
+            .into_iter()
+            .filter(|n| !before.contains(n) && live.is_ownable(n))
+            .collect();
+        dead.push(Rc::from(fresh));
+    }
+    out.reverse();
+    dead.reverse();
+    (Rc::new(out), Rc::new(dead))
 }
 
 fn lower_all(exprs: &[Expr], live: &mut Live) -> Rc<Vec<Code>> {
@@ -821,7 +878,7 @@ mod tests {
     #[test]
     fn a_record_keeps_its_fields_in_source_order() {
         let e = record(vec![("b", int(2)), ("a", int(1))]);
-        let NodeKind::Record { fields } = &lower(&e).kind else {
+        let NodeKind::Record { fields, .. } = &lower(&e).kind else {
             panic!("expected a record");
         };
         let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();
