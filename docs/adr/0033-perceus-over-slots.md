@@ -171,7 +171,8 @@ calls with no annotation, which is why Koka needs no ownership in its surface
 types.
 
 **Measured, by §11's S4 probe rather than argued.** The probe is ADR 0025's P1 at
-the `App`-argument and `Record`-field carry sites, behind `PLY_ADR0033_PROBE=1`,
+the `App`-argument and `Record`-field carry sites, behind `PLY_ADR0033_PROBE=1`
+— which arms S3 as well, for the reason §11 gives —
 at `rc::carry_released`: the frame carries the scope *minus* what the
 sub-expression just started is the last reader of. Armed, **four of §10 G1's five
 pairs go to a gap of 0.000**, including ADR 0025 §Context row five — the case
@@ -399,7 +400,7 @@ and never referenced, leaving four shapes reported as five.
 G1 stays armed and red. What it has already done is separate a confirmed claim
 from an over-broad one before the region-track-sized rewrite was started.
 
-**G2 — the corpus, after §4.** Over each module's own test suite, by
+**G2 — the corpus, after §4. It has already fired once, on S3.** Over each module's own test suite, by
 `reference_counting_cost.rs`'s harness: `std.http` and `std.router` at or above
 0.90 in place, ADR 0025's own fallback bar adopted deliberately so the two ADRs
 are comparable; no module regresses; and **`w6_report_allocations` does not
@@ -421,13 +422,27 @@ the term. This supersedes ADR 0025's `Vector<T>` gate, for §5's reason.
 | **S0** | arm G1 | done — red on five shapes, non-vacuity shown by mutation |
 | **S1** | §8, the tail-resumptive refinement | done — sound, and worth zero regions |
 | **S2** | wire `ply check --costs` (ADR 0025 §2a, never built) | done |
-| **S3** | ADR 0025's P2 — a parameter may appear in a `Dead` set | done — G1's first pair to gap 0.000 |
+| **S3** | ADR 0025's P2 — a parameter may appear in a `Dead` set | **measured, gated, not landed** — it fails G2, see below |
 | **S4′** | §4's probe — P1 at the `App` and `Record` carry sites, behind `PLY_ADR0033_PROBE=1` | done — four of five pairs to 0.000; §4 has the narrowed claim |
 | **S6′** | §6's flat record representation, which the fifth pair needs | **next**, and ahead of S4 rather than behind it |
 | **S4** | §4, slot frames and flat closure conversion | gated on **G1**, then **G2** |
 | **S5** | §5, the chunked vector | gated on **G3** |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |
+
+**S3 fails G2, which is the second time a milestone of this shape has moved that number the wrong
+way.** Landed by default it takes `/health` from 773 allocations per request to 815.27, +5.2%, and
+bytes with it. The cause is the one ADR 0025 §What would make this wrong item 1 predicted for P1 and
+which applies to P2 for the same reason: `Env::release` rebuilds every link above the binding it
+releases, and a *parameter* is the deepest binding in its barrier's chain, so releasing one rebuilds
+the whole scope. The benefit is real and the corpus rates reproduce — but they are the standard
+library's test suites, and `/health` pays the release without pushing the lists that would repay it.
+
+So S3 sits behind `PLY_ADR0033_PROBE=1` with S4's probe, and the flag now arms both. The case
+analysis (§8.1), the adversarial cases and the G1 pair all stand; what does not stand is landing it
+by default. `Env::keep_only(live)` built up from empty is ADR 0025's suggested alternative primitive
+and is the thing to try before P2 is proposed again — or `Env::release` writing through a link it
+uniquely owns rather than rebuilding it, which it does not do today.
 
 `docs/GUIDE.md` §6.7 and its §19 gotcha are **deleted, not corrected**, when G1 is
 green. That is the test of whether the rule is gone: a rule that still needs
@@ -456,10 +471,11 @@ stating is still there.
    continuation still reaches — a wrong program, not a slow one, and the only item
    here that is not cost-only. `region_reclamation_audit` and
    `region_meaning_adversarial` are the guards.
-5. **If the tree-walker's divergence stops being acceptable.** `interp.rs` runs no
-   reference counting, so none of this reaches it and `--engine both` compares
-   answers rather than cost. This ADR widens that gap further than any milestone
-   before it.
+5. **If a second evaluator returns.** The tree-walker is deleted, so there is one engine and
+   nothing here can diverge between two. That also removes the differential check that would have
+   caught a lowering change altering an answer, which makes `differential_corpus`'s replacement
+   coverage the thing to watch when §4 lands.
+
 6. **If the request path is `Bytes`-bound rather than `List`-bound.** ADR 0025
    counted the `bytes_concat` sites and two documented quadratics. If that
    dominates, S4–S6 are the wrong milestone and `Value::Bytes` is the right one.
