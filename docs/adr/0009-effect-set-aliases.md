@@ -11,16 +11,9 @@ Amended by: `docs/adr/0013-w3-contract.md` §1.2 (a member is an atom, never a
 whole effect — the argument in full, including why a wildcard atom is not the
 alternative) and §1.3 (sets are module-local).
 
-> **Re-verified by the W6 documentation audit**, against the code rather than
-> against ADR 0013. Decisions 1, 5 and 6 all hold in
-> `crates/ply-syntax/src/effect_set.rs` and `parser.rs`: `Sets::unknown` emits
-> `E0114` with both notes decision 1 quotes verbatim and attaches them only when
-> the name is a declared *effect*; `Sets::lookup` emits `E0114` for a qualified
-> `other::Web`; the parser emits `E0114` for `pub effect set`; and
-> `Sets::find_cycles` emits `E0115` once per cycle, marking every set on it
-> `cyclic` so it contributes no atoms rather than looping. Decision 3 holds by
-> construction — `expand` splices atoms into the row and the set's name reaches
-> no later pass.
+`crates/ply-syntax/src/effect_set.rs` is the implementation; decision 3 holds by
+construction, because `expand` splices atoms into the row and the set's name
+reaches no later pass.
 
 ## Context
 
@@ -164,8 +157,8 @@ things bound it in practice, and neither existed when this ADR was written.
 Decision 1 means such a set has to enumerate every atom by hand, so it cannot be
 written once and then widen silently. And decision 4's `declared, not performed`
 line reports the gap per definition, so an over-broad alias is a countable
-finding rather than a judgement call — `examples/desk.ply` uses three sets and
-prints that line for exactly two of its 180 definitions.
+finding rather than a judgement call, and on the shipped example it fires for a
+handful of definitions out of hundreds.
 
 ## Not in this ADR
 

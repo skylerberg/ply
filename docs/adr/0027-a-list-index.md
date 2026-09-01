@@ -4,19 +4,14 @@
 things: a raising index, a `list_head`, a `list_last`, and — on a gate fixed
 before the measurement and missed by it — the `list_at_or` this record was
 drafted to add beside it.
-**Date:** 2026-08-30.
-**Corrects in place:** `docs/adr/0024-ownership-as-a-checked-property.md` §10;
-`docs/adr/0025-ownership-design.md` §Soundness; `docs/adr/0020-self-hosting-the-front-end.md`
-§4.4; `docs/adr/0022-the-call-ceiling.md` §0; `CONTRACTS.md`'s prelude
-enumeration and its builtin tables; `CONTRIBUTING.md`'s ADR count and its "where
-a change is likely to bite" table; `docs/GUIDE.md` §5.4, §6.7, §6.9, §13.2,
-§19.4 and §20.
-**Corrects itself in place, three times:** §2 argument 2 said a raising index
-would block `property`; this record then struck that and said it blocks `proved`
-instead; **the strike was wrong and is itself struck** — a raising index blocks
-`property` today, by raising during randomized execution rather than through
-`TOTAL_BUILTINS`, and it is the `proved` cost that is inert. §7 refuses the
-second builtin this record was drafted to add.
+**Corrects in place:** ADR 0024 §10, ADR 0025 §Soundness, ADR 0020 §4.4 and
+ADR 0022 §0, each of which reasoned from the absence of a list index; plus
+`CONTRACTS.md`'s prelude enumeration and builtin tables, `CONTRIBUTING.md`'s
+"where a change is likely to bite" table, and `docs/GUIDE.md`.
+**And it corrects itself:** §2's second argument against a *raising* index is
+that it would block `property` — **by raising during randomized execution, not
+through `TOTAL_BUILTINS`** — and **it is the `proved` cost that is inert**. §7
+refuses the second builtin this record was drafted to add.
 **Closes:** `spikes/ply-parser/GAPS.md` §1, ranked **first of fifteen** by the
 parser spike, and the three needs it files separately (an index, a `head`, a
 `last`). The spike itself is **not** ported here — see §8.
@@ -51,10 +46,10 @@ bite". The difference between tenth and first is not opinion: a lexer walks
 forward and a parser looks around.
 
 Four workarounds were counted in the shipped tree before this change, and each
-is a hand-written index under a different name: `crates/ply-std/ply/json.ply:800
-nth`, `crates/ply-std/ply/db.ply:604 nth`, `db.ply:610 last`, and the spike's own
+is a hand-written index under a different name: `crates/ply-std/ply/json.ply
+nth`, `crates/ply-std/ply/db.ply nth`, `db.ply last`, and the spike's own
 `tok_index`. Two more accessors in the same family are hand-written over `Bytes`
-for the same reason (`json.ply:167 at`, `db.ply:751 byte_at`).
+for the same reason (`json.ply at`, `db.ply byte_at`).
 
 ## §2 The surface, and why it is not `bytes_at`'s
 
@@ -78,13 +73,13 @@ answers an `Option`. Four arguments settle it, all from the tree rather than
 from taste.
 
 **1. No caller in the tree wants raising.** Every hand-written indexer already
-shipped is total. `json.ply:167 at` and `db.ply:751 byte_at` are both
+shipped is total. `json.ply at` and `db.ply byte_at` are both
 `if i < 0 || i >= bytes_len(src) { -1 } else { bytes_at(src, i) }` — the
 language's one raising index, wrapped in a total function at its heaviest use
 sites. The spike's `tok_index` goes further and *clamps*, so a peek past the end
 answers the last token. A raising `list_at` would have shipped a builtin whose
 first act at every use site is to be wrapped, and that wrapper is exactly the
-"three calls" `json.ply:1676` complains about.
+"three calls" `json.ply` complains about.
 
 **2. `TOTAL_BUILTINS` prices it — but by less than this ADR first claimed, and
 the correction is measured.** `crates/ply-prove/src/prove/lower.rs` explains why
@@ -198,7 +193,7 @@ removes the descent and the `Value::cmp` chain and keeps the allocation and the
 
 **The case that was made for a pair, kept because §7 refuted it rather than
 ignored it.** The tree has written both halves by hand and named the missing
-builtin. `crates/ply-std/ply/json.ply:1676`, in the shipped standard library:
+builtin. `crates/ply-std/ply/json.ply`, in the shipped standard library:
 
 > *"`at` is three calls where a `bytes_at_or(b, i, default)` builtin would be
 > one, and it is the most frequent thing the parser does. That is a constant
@@ -254,28 +249,22 @@ refuses the call before the row is looked up, for a reason that has nothing to d
 with `list_at`. **The compiled fragment and this feature do not meet on the
 workload that motivates the feature.**
 
-> **Withdrawn 2026-08-31: they meet, and on exactly that shape.** The bolded
-> sentence and the two before it are no longer true of this tree. `crossable`
-> grew `Bytes` (2026-08-30) and then the argument test stopped being a value
-> test at all: `compiled::Gate::ArgumentType` decides an argument from the
-> definition's **declared parameter type**, so a `List<Token>` parameter is
-> carried when `Token` is — which it is, being a record of `Int`s and a
-> constructor.
->
-> Measured on the ported front end (`spikes/ply-parser` parsing `examples/`,
-> `PLY_SEAM_CENSUS=1 ply test <dir> --no-cache -j 1 --filter probe.parse`), the
-> two definitions this ADR is named for are now among the most-admitted in the
-> whole corpus: **`spine.tok_index` 232,041 and `spine.tok_at` 231,729 admitted
-> calls**, both taking the `Ctx` record whose `toks` field is the `List<Token>`
-> this feature indexes. The seam's admitted share on that workload goes from
-> **12.205%** of body calls to **84.014%**.
->
-> What is unchanged is the sentence's *reason* one level down: `list_at` is a
-> builtin, `Gate::NotLoweredCode` still refuses it as a callee, and
-> `jit.rs::admissible_builtin` still admits it only through its `_ => Ok(())`
-> arm. The two features meet because the **caller** became admissible, not
-> because anything about `list_at` did. ADR 0030 §6's amendment carries the
-> before/after.
+**Withdrawn: they meet, and on exactly that shape.** `crossable` grew `Bytes`,
+and then the argument test **stopped being a value test at all**:
+`compiled::Gate::ArgumentType` decides an argument from the definition's
+**declared parameter type**, so a `List<Token>` parameter is carried when `Token`
+is — which it is, being a record of `Int`s and a constructor.
+
+Measured on the ported front end, **the two definitions this ADR is named for are
+now among the most-admitted in the whole corpus**, both taking the record whose
+field is the `List<Token>` this feature indexes, and the seam's admitted share on
+that workload rises by most of an order of magnitude.
+
+**What is unchanged is the reason one level down:** `list_at` is a builtin,
+`Gate::NotLoweredCode` still refuses it as a callee, and the code generator still
+admits it only through its catch-all arm. **The two features meet because the
+*caller* became admissible, not because anything about `list_at` did.** ADR 0030
+§6 carries the before and after.
 
 Where a definition *is* admitted and happens to contain a `list_at`,
 `crates/ply-codegen-spike/src/jit.rs::admissible_builtin` admits it through its
@@ -319,7 +308,7 @@ second hand-maintained table beside the prelude scheme, and ~~**nothing in the
 tree gates its value**~~ — **the hole is one-directional, and this record
 overstated it (corrected 2026-08-30 on review, which ran the other
 corruption).** `builtins::call` reads `b.arity()` on every call
-(`builtins.rs:558`; `region_kind.rs:1086` and `value.rs:169` read it too), so an
+(`builtins.rs`; `region_kind.rs` and `value.rs` read it too), so an
 arity *narrower* than the truth is caught loudly: giving `ListAt` `(1, 1)`
 reddens five of the six tests in `crates/ply-eval/tests/suite/list_builtins.rs`, at
 run time, under the tree-walker. What nothing gates is an arity that is too
@@ -462,7 +451,7 @@ verdict.
 number and is honoured against it. A peek in this evaluator is ~1.7 µs and is
 **almost entirely interpreter dispatch**; the `Some` allocation and the `match`
 that `_or` removes are 0.34 µs of that — real, and not a second name's worth.
-`json.ply:1676` asked for this to be *measured* before it was added; it was, and
+`json.ply` asked for this to be *measured* before it was added; it was, and
 the answer is no.
 
 ### The headline is a withdrawal, and it was registered as one in advance
@@ -499,7 +488,7 @@ standard library ships is not slow, it is asymptotically unusable.
   warns about, and it is filed as explicit follow-up rather than smuggled in
   here: `json::nth`, `db::nth`, `db::last` and the spike's `Map<Int, Token>` are
   the four call sites waiting.
-- **No `bytes_at_or`.** `json.ply:1676` asks for it and §7 has now answered the
+- **No `bytes_at_or`.** `json.ply` asks for it and §7 has now answered the
   question it asked — a defaulting form saves the `Some` and the `match`, which
   on a `List` is 0.34 µs of a 1.66 µs peek. That is a strong prior that
   `bytes_at_or` would not clear a 1.5× bar either, and it is a prior rather than

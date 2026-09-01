@@ -5,17 +5,11 @@ precision by ADR 0011, which wins where the two disagree because it was written
 after this one and against the code. §6 is **amended by ADR 0017**; see the note
 in §6.
 
-> **Corrected by the W6 documentation audit.** This line read "proposed" through
-> six shipped milestones, while ADR 0011 opened with "ADR 0008 settled *what*
-> the host boundary is" and ADRs 0013, 0014 and 0015 each built on it. Every
-> mechanism this document names is in the tree: `ply hosts` is
-> `Command::Hosts`, `--host` is a flag on four subcommands, `E0427` is
-> `HOST_FOOTPRINT_ESCAPE` and `E0428` is `HOST_BLOCKING_ANSWER` in
-> `ply_span::codes`, and `HostAnswer::{Value, Pending}` is
-> `crates/ply-eval/src/host.rs`. A status of "proposed" on a document that is
-> the trusted computing base's specification is exactly the shape of claim this
-> project's audits keep finding, in the harmless direction: it invites a reader
-> to skip it.
+**This status line read "proposed" through six shipped milestones**, while later
+ADRs opened by citing it as settled and built on it. Every mechanism named here
+is in the tree. **A status of "proposed" on a document that is the trusted
+computing base's specification is exactly the shape of claim this project's
+audits keep finding, in the harmless direction: it invites a reader to skip it.**
 
 ## Context
 

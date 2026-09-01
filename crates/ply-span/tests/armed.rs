@@ -13,16 +13,16 @@ const UNARMED_CODES: &[(&str, &str)] = &[
     (
         "DB_SCHEMA_MISMATCH",
         "E0435. Reserved for a schema verification that was specified and never \
-         built. NOT fixed and NOT blessed: the audit note at \
-         docs/adr/0014-w4-contract.md:1176-1186 says \"E0435 and E0438 are \
-         registered and reserved but never emitted\", and CONTRIBUTING.md \
+         built. NOT fixed and NOT blessed: docs/adr/0014-w4-contract.md s8 says \
+         \"E0435 and E0438 are registered and reserved but never emitted\", \
+         and CONTRIBUTING.md \
          s\"Do not state a guarantee you have not armed\" carries it as its \
          first live example. This row exists so the gap is asserted rather than \
          remembered; it is not a decision that the gap is acceptable.",
     ),
     (
         "DB_UNMODELLED_SIDE_EFFECT",
-        "E0438. Same reservation, and docs/adr/0014-w4-contract.md:1188 calls \
+        "E0438. Same reservation, and docs/adr/0014-w4-contract.md s8 calls \
          it \"the more serious of the two absences\". NOT fixed. Both codes are \
          in crates/ply-eval/src/host.rs's RESERVED_CODES, so a handler cannot \
          answer with either — a real, armed restriction (is_reserved_code), and \

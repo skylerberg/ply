@@ -1,21 +1,14 @@
-# 2. The incremental front end
+# ADR 0002 — The incremental front end
 
 Status: accepted — **implemented**. Its *storage* is superseded by ADR 0003 —
 the gates, the witness and the invalidation table below stand unchanged; "one
 file written atomically" does not.
 
-> **Corrected by the W6 documentation audit.** This line read "interface landed,
-> implementation outstanding", and the "Not done here" section below still
-> listed the gates, `--explain`, `--no-incremental` and the equivalence test as
-> unimplemented. All four have shipped and were verified against the tree, not
-> against another document: both gates are `crates/ply-cli/src/driver.rs`
-> (its module doc states them in this ADR's own terms), `--no-incremental` is
-> `crates/ply-cli/src/cli.rs` on four subcommands and `Refusal::NotIncremental`
-> in the driver, and the equivalence test is
-> `crates/ply-cli/tests/suite/incremental.rs`, which compares `DefHash`, `Scheme` and
-> `Footprint` by equality rather than alpha-equivalence and asserts that gate 1
-> actually fired before it credits an agreement. The one item below that is
-> still outstanding is name-erased schemes, and it is still deferred by choice.
+Both gates are `crates/ply-cli/src/driver.rs`, whose module doc states them in
+this ADR's own terms; `--no-incremental` is a flag on four subcommands; and the
+equivalence test is `crates/ply-cli/tests/suite/incremental.rs`, **which compares
+`DefHash`, `Scheme` and `Footprint` by equality rather than alpha-equivalence
+and asserts that gate 1 actually fired before it credits an agreement.**
 
 ## Context
 
@@ -25,10 +18,10 @@ outcomes* only. Every `ply test` invocation re-reads every file, re-parses it,
 re-checks the whole module and re-hashes every definition, because
 `check_module` and `hash_module` both take an entire module by construction.
 
-At 41 definitions this is invisible. At 10,000 it becomes the new floor: the
-result cache would be perfect, selection would be exact, and the loop would
-still be slow — which is precisely the failure this language exists to prevent.
-A perfect cache behind a linear front end is a linear system.
+At a few dozen definitions this is invisible. At ten thousand it becomes the new
+floor: the result cache would be perfect, selection would be exact, **and the
+loop would still be slow — which is precisely the failure this language exists
+to prevent. A perfect cache behind a linear front end is a linear system.**
 
 ## Decision
 
@@ -227,14 +220,9 @@ way round.
 
 ## Not done here
 
-~~This ADR lands the interface only: the `ply-store` API, its persistence, and
-the contract. The gates themselves, the `--explain` output, the
-`--no-incremental` flag and the equivalence test are not implemented.~~
-
-**As written when this ADR landed, and no longer true.** All four shipped; see
-the status line for where each one is. What follows is what is still deferred.
-
-Deferred by choice:
+The gates, the `--explain` output, the `--no-incremental` flag and the
+equivalence test were all deferred when this ADR landed and have all shipped.
+What is still deferred, by choice:
 
 - **Name-erased schemes.** The principled fix for the witness mechanism, and the
   thing that would make a rename genuinely free rather than merely cheap.

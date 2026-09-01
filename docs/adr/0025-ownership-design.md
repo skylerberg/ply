@@ -26,10 +26,10 @@ Implements the decision recorded as ADR 0024. Amends ADR 0017 §4 and
 
 ### The defect, measured on the shipped standard library
 
-`Value::List` is `Arc<Vec<Value>>` — `crates/ply-eval/src/value.rs:22`, whose own
+`Value::List` is `Arc<Vec<Value>>` — `crates/ply-eval/src/value.rs`, whose own
 comment calls it *"whole-list sharing rather than structural sharing: `push`
 copies, which is fine at v0 sizes and costs no persistent-vector dependency."*
-`builtins.rs:457` asks `Arc::get_mut`; when it answers `None` the whole vector is
+`builtins.rs` asks `Arc::get_mut`; when it answers `None` the whole vector is
 copied. So an append is O(1) when the caller is the sole owner and O(n) when
 anything else holds a reference, and which one a program gets is not visible in
 its source.
@@ -50,7 +50,7 @@ this tree; the probe is described in §Provenance):
 The two modules on the request path are the two that reuse nothing. ADR 0020 §4
 priced the same defect end to end on the shipped `json::encode_string` —
 0.03 / 0.07 / 0.22 / 0.79 s for k = 1,000 / 2,000 / 4,000 / 8,000 escapes,
-ratios approaching 4× per doubling — and `README.md:343` records `std.trace`'s
+ratios approaching 4× per doubling — and `README.md` records `std.trace`'s
 sink as O(N²) for the same reason. This is not a hypothetical.
 
 ### Where the copies actually are
@@ -60,18 +60,18 @@ This is the measurement the design turns on and no proposal had it:
 
 | copies | site | shape |
 | ---: | --- | --- |
-| 4,100 | `http.ply:1400` `body_more` | `let taken = push(out, step.out);` and more statements — `out` is a **parameter** |
-| 2,062 | `http.ply:1337` `absorb` | growing field **first** in a record literal |
-| 34 | `http.ply:1149` | argument position |
-| 32 | `router.ply:492` `numbered` | growing field first |
-| 21 | `http.ply:700` | argument position |
-| 20 | `lexer.ply:114,119` `emit`/`err` | projection out of a record parameter still held |
-| 13 | `json.ply:598` `escape_runs` | `push(push(acc, x), y)` |
+| 4,100 | `http.ply` `body_more` | `let taken = push(out, step.out);` and more statements — `out` is a **parameter** |
+| 2,062 | `http.ply` `absorb` | growing field **first** in a record literal |
+| 34 | `http.ply` | argument position |
+| 32 | `router.ply` `numbered` | growing field first |
+| 21 | `http.ply` | argument position |
+| 20 | `lexer.ply` `emit`/`err` | projection out of a record parameter still held |
+| 13 | `json.ply` `escape_runs` | `push(push(acc, x), y)` |
 
 Two causes, and neither is the one the language would be changed for:
 
 1. **A parameter is never released from a block continuation's scope.**
-   `code.rs:634` seeds `cumulative` with an empty vector and grows it only from
+   `code.rs` seeds `cumulative` with an empty vector and grows it only from
    `stmt_binders(stmts[i])`, so no function parameter can ever appear in a `Dead`
    set. An accumulator threaded as a `let` binding is reused; the identical
    accumulator threaded as a parameter is not. Measured directly:
@@ -80,8 +80,8 @@ Two causes, and neither is the one the language would be changed for:
 
 2. **`rc::carry` is all-or-nothing.** It is
    `carry(env, remaining: bool) -> if remaining { env.clone() } else { Env::empty() }`
-   (`rc.rs:98`), called at exactly eight sites — `frame.rs:107,142,263,301`,
-   `machine.rs:1035,1092,1122`, `handler.rs:208` — each passing a boolean of the
+   (`rc.rs`), called at exactly eight sites — `frame.rs`,
+   `machine.rs`, `handler.rs` — each passing a boolean of the
    form `next + 1 < args.len()`. A frame with *any* sub-expression left carries
    the *whole* scope, so every binding in it sits at two owners for the whole of
    that sub-expression, even when the sub-expression is a literal that reads
@@ -103,16 +103,16 @@ enclosing node on the path from the `push` up**. Measured, n = 200:
 | `fold(range(0, 200), [], \|acc, x\| push(acc, x))` | 200 / 200 |
 
 Row five is the finding. The growing field is last in its record literal — the
-rule as written down in `lexer.ply:96-104`, in `GAPS.md` §1 and in ADR 0020 §4 —
+rule as written down in `lexer.ply`, in `GAPS.md` §1 and in ADR 0020 §4 —
 and the program is still quadratic, because the record is not last in the
 *call*. An author who learns the documented rule and applies it correctly still
 gets the quadratic. Two careful authors have already written a version of this
 rule down and both were corrected; this is the third correction, and it is the
 argument that no rule of this kind should have to be learned at all.
 
-> **A smaller correction, in passing.** `lexer.ply:99-100` attributes the rule to
-> `ply_eval::rc::carry`, *"called from `machine.rs:1064` and `frame.rs:263`"*.
-> `frame.rs:263` is a `carry` site. `machine.rs:1064` is a closing brace; the
+> **A smaller correction, in passing.** `lexer.ply` attributes the rule to
+> `ply_eval::rc::carry`, *"called from `machine.rs` and `frame.rs`"*.
+> `frame.rs` is a `carry` site. `machine.rs` is a closing brace; the
 > three sites in that file are `1035`, `1092` and `1122`. The comment is right
 > about the mechanism and stale about one of its two citations, which is worth a
 > one-line fix when P1 rewrites that mechanism anyway.
@@ -209,7 +209,7 @@ green result over unexplored space, inside the mechanism meant to cure it.
 
 ### 1.2 The mode cannot be cached under a `DefHash`, and a mode that is re-derived per program is not a signature
 
-`region_kind.rs:96-115` settles this against itself, for the analysis that asks
+`region_kind.rs` settles this against itself, for the analysis that asks
 the closest available question:
 
 > A cache keyed by the region's definition hash would therefore answer `unique`
@@ -263,14 +263,14 @@ and whether the lowering marked its list argument `Owned`:
 
 ```
 std.json.escape_runs
-  json.ply:593  push(acc, ..)                     reused
-  json.ply:598  push(push(acc, ..), ..)  inner    COPIES — acc is carried for the
+  json.ply:LL  push(acc, ..)                      reused
+  json.ply:LL  push(push(acc, ..), ..)  inner     COPIES — acc is carried for the
                                                   trailing argument
 ```
 
 The legibility mechanism is grafted from the **regions** proposal, which took it
-from `Cell[users]<Int>`: `infer.rs:1573-1578` gives a written `Cell<T>` a fresh
-region variable nobody typed and `print.rs:138` fills the brand back into the
+from `Cell[users]<Int>`: `infer.rs` gives a written `Cell<T>` a fresh
+region variable nobody typed and `print.rs` fills the brand back into the
 printed signature, so a property is inferred and *shown* without being *asked
 for*. The **param-marks** proposal supplied the correction that matters: what
 belongs in that slot is a **count**, not a type, because the honest form of this
@@ -297,7 +297,7 @@ by making `Live` refuse to mark them (§Decision 4) — not exempted.
 **2c. `copy(x)`.** One new builtin, `<a>(a) -> a`, semantically the identity:
 `copy(x) == x` for every `x`, and no test, no `law`, no spec and no
 `--engine both` divergence check can tell a program with one from the same
-program without it. It is `builtins.rs:454`'s existing copying branch promoted
+program without it. It is `builtins.rs`'s existing copying branch promoted
 from a silent fallback to a written word. Grafted from **Sole**, whose judges
 were right that identity-ness is the property that makes an escape hatch safe for
 code a model writes at speed: every diagnostic has a mechanical fix that provably
@@ -316,9 +316,9 @@ measured win is.
 
 ### P2 — a parameter may appear in a `Dead` set. **Built and measured.**
 
-`code.rs:634` seeds `cumulative` from statement binders only. Seed it instead
+`code.rs` seeds `cumulative` from statement binders only. Seed it instead
 from the enclosing barrier's bindings, which `rc::Live` already tracks in
-`ownable` (`rc.rs:334`, *"one frame per barrier … holding every name bound
+`ownable` (`rc.rs`, *"one frame per barrier … holding every name bound
 anywhere inside it"*), so the statement that is a parameter's last reader names
 it in its `dead` set and the block's continuation carries a scope without it.
 
@@ -360,14 +360,14 @@ built and this is not.
 Its ceiling is measured rather than argued: the same programs, reordered so the
 `push` already sits in last position at every enclosing node, are **200 of 200 in
 place** (§Context, rows 1, 3 and 6). P1 is what makes that hold without the
-reordering. It is the fix for `json.ply:598` `escape_runs`, for the argument-position
-sites at `http.ply:700,1149`, and for the nested `emit(err(s, ..), ..)` shape in
+reordering. It is the fix for `json.ply` `escape_runs`, for the argument-position
+sites at `http.ply`, and for the nested `emit(err(s, ..), ..)` shape in
 the lexer that the current boolean cannot express — "release `s`, keep `so_far`"
 is not a value a `bool` has.
 
 **Two conditions, both from judges who checked the mechanism against `env.rs`.**
 `Env::release` clones the value of every binding *above* the deepest released one
-into a fresh chain and shares the tail below it (`env.rs:189`), so a release at
+into a fresh chain and shares the tail below it (`env.rs`), so a release at
 every sub-expression replaces an `Rc` bump on the machine's hottest path with an
 O(scope-depth) operation, **and can newly refuse a `take_unique` that succeeds
 today** by introducing a shared link. `frame::dispatch < Machine::step <
@@ -381,16 +381,16 @@ primitive if `release` measures badly, and the **param-marks** implementation
 judge is owed the observation that it is probably the right one.
 
 Scope note the proposals understated: `Dead` lives only on `Stmt`
-(`code.rs:138,142`). `App`, `Record`, `List` and `Perform` carry no per-argument
+(`code.rs`). `App`, `Record`, `List` and `Perform` carry no per-argument
 dead sets, so P1 is a `Code` IR change plus lowering, not an edit to eight call
 sites.
 
 ### P3 — a projection may move a field out of a record that is dying
 
-`emit` and `err` (`lexer.ply:111-119`) write the growing field **last**, exactly
+`emit` and `err` (`lexer.ply`) write the growing field **last**, exactly
 as the documented rule asks, and still copy 20 times. The record parameter `s` is
 read for `s.diags` and then for `s.toks`, and `Frame::FieldAccess`
-(`frame.rs:281`) answers `v.clone()` unconditionally — it never moves the field
+(`frame.rs`) answers `v.clone()` unconditionally — it never moves the field
 out even when this frame is the record's only owner. `absorb` is the same defect
 with the fields in the other order, and it is 2,062 copies.
 
@@ -453,7 +453,7 @@ with a later read in the same body, or a name free in a closure. It names the
 reordering, `cell_update`/`map_update`, or `copy` — in that order.
 
 It is a warning and not an error because the measured false-positive rate of any
-analysis of this shape is not zero and the direction is wrong: `json.ply:1565`'s
+analysis of this shape is not zero and the direction is wrong: `json.ply`'s
 `collect_prices` captures its accumulator in a lambda, which `Live::close` must
 call unownable forever, and it is **100% in place at runtime**. A hard error there
 forces `push(copy(acc), p)` and makes a linear loop quadratic — which the
@@ -497,7 +497,7 @@ place. Anyone budgeting from this table should budget from row four.
 (`cell_set(c, push(cell_get(c), x))` → `cell_update`), all mechanical, all
 optional in the sense that the old form keeps compiling, and all in test doubles
 and example programs where N is small — but the shape is the one a production
-handler would use, and `README.md:343` already records `std.trace`'s sink as
+handler would use, and `README.md` already records `std.trace`'s sink as
 quadratic for exactly it.
 
 **And the number nobody should take from this document**: `Value::Bytes` is
@@ -687,33 +687,26 @@ to claim this result.**
 | (d)/(a) < 6 | **7.56, stable** | **fail** |
 | index ratio < 5 | **7.07 at n = 64,000** | **fail** |
 
-~~The index criterion was also **ill-posed, and I found that out after
-measuring**: there is no list index builtin. `Builtin` is `Len, Push, Map,
-Filter, Fold, Range` for lists, and every `Value::List` access in the evaluator
-is `.iter()`, `.len()`, `.is_empty()` or `Arc::get_mut` — checked by grep across
-`crates/ply-eval/src/*.rs`. **No Ply program can pay the index cost**, so the
-O(1) index that `Arc<Vec<Value>>` buys is unreachable from the language. That
-makes the criterion meaningless rather than met; it is recorded as a miss and not
-quietly dropped, because a criterion rewritten after seeing the number is not a
-criterion.~~
+**The index criterion was ill-posed when it was written, and that was found out
+after measuring: there was no list index builtin at all.** No Ply program could
+pay the index cost, so the O(1) index that `Arc<Vec<Value>>` buys was unreachable
+from the language. **That made the criterion meaningless rather than met, and it
+is recorded as a miss rather than quietly dropped, because a criterion rewritten
+after seeing the number is not a criterion.**
 
-> **Corrected in place (list index, 2026-08-30).** Every sentence above was true
-> when it was written and the miss it records stands — the criterion **was**
-> ill-posed at the time, and it is still recorded as a miss. What is no longer
-> true is the reason. `docs/adr/0027-a-list-index.md` adds `list_at`, so a Ply
-> program **can** now pay the index cost, the O(1) index that `Arc<Vec<Value>>`
-> buys is reachable from the language, and the criterion is well-posed for the
-> next taking. One caution for whoever takes it: ADR 0027 §7 measures a peek at
-> ~1.7 µs and finds it is **almost all interpreter dispatch** — a `map_get` peek
-> and a `list_at` peek cost the same to within 2% — so the index arm will price
-> a small term unless the backend has landed.
->
-> That gives this ADR's own `Vector<T>` gate below a term it did not have when
-> the gate was fixed. A chunked structurally-shared vector would make `list_at`
-> O(log₃₂ n) where it is O(1) today, and there is now a builtin for that to be a
-> cost *of*. The gate's wording is unchanged — a bar moved after a measurement
-> is not a bar — but anyone re-taking it should price the index arm rather than
-> record it as meaningless a second time.
+**The miss stands and its reason no longer holds.** ADR 0027 adds `list_at`, so
+the index cost is now payable and **the criterion is well-posed for the next
+taking.** One caution for whoever takes it: ADR 0027 §7 measures a peek and finds
+it is **almost all interpreter dispatch** — a `map_get` peek and a `list_at` peek
+cost the same to within a couple of percent — **so the index arm will price a
+small term unless the backend has landed.**
+
+That gives this ADR's own `Vector<T>` gate below a term it did not have when the
+gate was fixed: a chunked structurally-shared vector would make `list_at`
+O(log₃₂ n) where it is O(1) today, **and there is now a builtin for that to be a
+cost *of*.** The gate's wording is unchanged — **a bar moved after a measurement
+is not a bar** — but anyone re-taking it should price the index arm rather than
+**record it as meaningless a second time.**
 
 So: **the representation change is not taken now.** It is the fallback, it is
 now priced, and the gate is fixed here, before the measurement, so a number
@@ -752,7 +745,7 @@ predecessors are judged on.
    `Live::close`'s and eight adversarial programs are consistent with it, but the
    case analysis is not written and `lower_block`'s filter does not consult
    `barrier_binders`. The failure mode is `Slot::Released` →
-   `INTERNAL_ERROR` on a legal program (raised at `machine.rs:2322`, built by
+   `INTERNAL_ERROR` on a legal program (raised at `machine.rs`, built by
    `err_released` at `:2590`, whose note reads *"reaching this is a defect in
    Ply, not in the program"*) — loud, not silent,
    which is the right direction, but it is a new way to reach a diagnostic whose
