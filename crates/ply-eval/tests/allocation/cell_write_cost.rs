@@ -2,45 +2,15 @@
 //! a persistent map — so "the forkable world and the zero-cost path are mutually exclusive" stays a
 //! number rather than a slogan.
 
+use crate::counting::charge;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, TaskRegions, Value};
 use rpds::RedBlackTreeMap;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
-
-thread_local! {
-    static ARMED: Cell<bool> = const { Cell::new(false) };
-    static COUNT: Cell<usize> = const { Cell::new(0) };
-    static BYTES: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.try_with(Cell::get).unwrap_or(false) {
-            let _ = COUNT.try_with(|c| c.set(c.get() + 1));
-            let _ = BYTES.try_with(|b| b.set(b.get() + layout.size()));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
 
 /// Allocations and bytes charged while `f` runs.
 fn charged<T>(f: impl FnOnce() -> T) -> (usize, usize, T) {
-    COUNT.with(|c| c.set(0));
-    BYTES.with(|b| b.set(0));
-    ARMED.with(|a| a.set(true));
-    let out = f();
-    ARMED.with(|a| a.set(false));
-    (COUNT.with(Cell::get), BYTES.with(Cell::get), out)
+    let (out, allocs, bytes) = charge(f);
+    (allocs, bytes, out)
 }
 
 fn filled(n: usize) -> (TaskRegions, Vec<Slot>) {

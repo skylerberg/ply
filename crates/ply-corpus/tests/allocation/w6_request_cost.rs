@@ -1,38 +1,8 @@
 //! What one request allocates, exactly, layer by layer.
 
+use crate::counting::charge;
 use ply_eval::Value;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::path::{Path, PathBuf};
-
-thread_local! {
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static BYTES: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-        let _ = BYTES.try_with(|c| c.set(c.get() + layout.size()));
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
-
-fn counted<T>(f: impl FnOnce() -> T) -> (T, usize, usize) {
-    ALLOCS.with(|c| c.set(0));
-    BYTES.with(|c| c.set(0));
-    let out = f();
-    (out, ALLOCS.with(Cell::get), BYTES.with(Cell::get))
-}
 
 /// The repository root this test reads `examples/desk.ply` from.
 fn repo() -> PathBuf {
@@ -64,7 +34,7 @@ fn a_request_allocates_where_the_ladder_says_its_time_goes() {
         loaded
             .pure_call(&bench, vec![Value::Int(mode), Value::Int(8)], 1)
             .expect("the driver runs");
-        let (_, allocs, bytes) = counted(|| {
+        let (_, allocs, bytes) = charge(|| {
             loaded
                 .pure_call(&bench, vec![Value::Int(mode), Value::Int(N as i64)], 1)
                 .expect("the driver runs")
@@ -76,7 +46,7 @@ fn a_request_allocates_where_the_ladder_says_its_time_goes() {
     loaded
         .over_sim(vec![vec![request.clone()]])
         .expect("the service serves one connection");
-    let (_, allocs, bytes) = counted(|| loaded.over_sim(script).expect("the service serves"));
+    let (_, allocs, bytes) = charge(|| loaded.over_sim(script).expect("the service serves"));
     rows.push((
         "whole request over SimNet",
         allocs as f64 / N as f64,
@@ -128,7 +98,7 @@ fn the_in_memory_store_is_priced_apart_from_the_endpoint() {
         loaded
             .pure_call(&items, vec![Value::Int(mode), Value::Int(4)], 1)
             .expect("the driver runs");
-        let (_, allocs, _) = counted(|| {
+        let (_, allocs, _) = charge(|| {
             loaded
                 .pure_call(&items, vec![Value::Int(mode), Value::Int(N as i64)], 1)
                 .expect("the driver runs")
@@ -157,7 +127,7 @@ fn entering_the_machine_allocates_a_bounded_amount() {
         .pure_call(&constant, Vec::new(), 8)
         .expect("the driver runs");
     const N: u32 = 1_000;
-    let (_, allocs, _) = counted(|| {
+    let (_, allocs, _) = charge(|| {
         loaded
             .pure_call(&constant, Vec::new(), N)
             .expect("the driver runs")

@@ -1,46 +1,16 @@
 //! What the region allocator costs, counted rather than asserted.
 
+use crate::counting::charge;
 use ply_eval::Value;
 use ply_eval::arena::{Arena, RegionKind};
 use ply_span::Span;
 use rpds::RedBlackTreeMap;
-use std::alloc::{GlobalAlloc, Layout, System};
-use std::cell::Cell;
 use std::time::Instant;
-
-thread_local! {
-    static ARMED: Cell<bool> = const { Cell::new(false) };
-    static ALLOCS: Cell<usize> = const { Cell::new(0) };
-    static BYTES: Cell<usize> = const { Cell::new(0) };
-}
-
-struct Counting;
-
-unsafe impl GlobalAlloc for Counting {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        if ARMED.try_with(Cell::get).unwrap_or(false) {
-            let _ = ALLOCS.try_with(|c| c.set(c.get() + 1));
-            let _ = BYTES.try_with(|c| c.set(c.get() + layout.size()));
-        }
-        unsafe { System.alloc(layout) }
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        unsafe { System.dealloc(ptr, layout) }
-    }
-}
-
-#[global_allocator]
-static ALLOCATOR: Counting = Counting;
 
 /// Allocations and bytes `f` took from the global allocator.
 fn counted<R>(f: impl FnOnce() -> R) -> (usize, usize, R) {
-    ALLOCS.with(|c| c.set(0));
-    BYTES.with(|c| c.set(0));
-    ARMED.with(|c| c.set(true));
-    let out = f();
-    ARMED.with(|c| c.set(false));
-    (ALLOCS.with(Cell::get), BYTES.with(Cell::get), out)
+    let (out, allocs, bytes) = charge(f);
+    (allocs, bytes, out)
 }
 
 /// One region's worth of work: open, fill, close.
