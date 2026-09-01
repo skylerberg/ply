@@ -12,8 +12,8 @@ use std::sync::{Arc, OnceLock};
 pub enum Cause {
     /// A handler clause with a `resume` binder, which may resume any number of times.
     Clause { effect: Symbol, op: Symbol },
-    /// A tail-resumptive clause, which resumes exactly once — and still captures, so its
-    /// continuation can still outlive the region.
+    /// A tail-resumptive clause, whose continuation reaches no binder and is spliced above the
+    /// region's close, so it is not on its own a reason to be `shared` — ADR 0033 §8.
     TailClause { effect: Symbol, op: Symbol },
     /// A `perform` no `handle` inside the region answers.
     Escapes { effect: Symbol, op: Symbol },
@@ -36,8 +36,8 @@ impl Cause {
                 format!("`{effect}.{op}` binds its continuation with `resume`")
             }
             Cause::TailClause { effect, op } => format!(
-                "`{effect}.{op}` is tail-resumptive, which still captures: `op(x) -> e` is \
-                 `op(x) resume k -> k(e)`"
+                "`{effect}.{op}` is tail-resumptive: its continuation is spliced by the `Resume` \
+                 frame pushed for it and reaches no binder, so it cannot outlive this region"
             ),
             Cause::Escapes { effect, op } => format!(
                 "`{effect}.{op}` is answered outside this region, so the capture crosses its \
@@ -175,18 +175,30 @@ struct Scan {
     direct: Option<CaptureSite>,
     /// The first place the body reaches code this analysis cannot name.
     indirect: Option<CaptureSite>,
+    /// The first tail-resumptive clause, which is not a capture that outlives a region.
+    ///
+    /// Its own slot rather than a filter at [`Analysis::settle`]: `direct` keeps only the first
+    /// cause in source order and a clause is recorded before its own body is walked, so a
+    /// `TailClause` in `direct` would hide the `Escapes` that body contributes.
+    tail: Option<CaptureSite>,
     /// Definitions named in the body, in source order.
     refs: Vec<Symbol>,
 }
 
 impl Scan {
     fn direct_at(&mut self, span: Span, cause: Cause) {
-        if self.direct.is_none() {
-            self.direct = Some(CaptureSite {
-                span,
-                cause,
-                through: Vec::new(),
-            });
+        let site = CaptureSite {
+            span,
+            cause,
+            through: Vec::new(),
+        };
+        let slot = if matches!(site.cause, Cause::TailClause { .. }) {
+            &mut self.tail
+        } else {
+            &mut self.direct
+        };
+        if slot.is_none() {
+            *slot = Some(site);
         }
     }
 
@@ -206,6 +218,9 @@ impl Scan {
         }
         if self.indirect.is_none() {
             self.indirect = other.indirect;
+        }
+        if self.tail.is_none() {
+            self.tail = other.tail;
         }
         self.refs.extend(other.refs);
     }

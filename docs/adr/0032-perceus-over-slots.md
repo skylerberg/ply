@@ -345,7 +345,33 @@ related question of whether a tail-resumptive clause claims a pin:
 > `Rc`, and **tail-resumptive is what essentially every handler in the standard
 > library is.**
 
-**These two are in tension and the tension is worth 113 regions.** Stated as a
+> **Corrected (2026-08-31) by taking the refinement instead of estimating it,
+> before this ADR was acted on further.** The sentence below read:
+>
+> > **These two are in tension and the tension is worth 113 regions.**
+>
+> The tension is real, the case analysis closes, the refinement is implemented,
+> and it is worth **0 regions**. Every one of the 113 has another, independent
+> reason to be `shared` — 3 a clause binding `resume`, 75 a `perform` answered
+> outside the region, 15 a `simulate`, 20 an unknown callee. The 113 figure is a
+> tally over the **first** cause in source order, which is all `Scan::direct_at`
+> keeps, and `the_split_over_the_repositorys_own_examples` carries a comment
+> saying exactly that — *"a row is an upper bound on what relaxing that one rule
+> would move"* — which both `region_kind.rs`'s header and this section read as a
+> lower bound.
+>
+> **This is §12 item 4 firing in the cheap direction and it is why S1 was
+> sequenced first.** What the refinement buys is not memory: it is that the
+> causes this analysis reports are the load-bearing ones, and that a
+> `TailClause` in the `direct` slot can no longer *hide* the `Escapes` its own
+> clause body contributes. The claim that ADR 0017 §3's "common case" fails on
+> this corpus survives; its reason is now known to be the 75 escaping performs.
+>
+> The estimate was mine and the measurement contradicts it. Recorded here rather
+> than quietly dropped, because a §2-style survey argument and a mechanism
+> argument both pointed at this item and neither was a number.
+
+**These two are in tension.** Stated as a
 tension rather than as a defect, because they answer different questions —
 `handler.rs` reasons about the runtime frame layout at one capture, `region_kind`
 must answer statically for a whole program — and because `handler.rs` carries its
@@ -361,7 +387,8 @@ something to refine, and
 number it would move.
 
 This item is **independent of §4 through §7**, is a day's work, and is sequenced
-first among the fixes for that reason.
+first among the fixes for that reason — which is what let its estimate be
+refuted before anything expensive was built on it.
 
 ---
 
@@ -553,7 +580,7 @@ Each item is landable alone and each is gated on the one above only where said.
 | | item | gate | size |
 | --- | --- | --- | --- |
 | **S0** | Arm G1: the criteria in code, the paired corpus, the test shown red, the corpus itself held | — | small, **done**: `crates/ply-eval/tests/position_invariance_g1.rs`, §10 |
-| **S1** | §8, the tail-resumptive refinement in `region_kind` | `the_split_over_the_repositorys_own_examples` moves and is re-pinned | small |
+| **S1** | §8, the tail-resumptive refinement in `region_kind` | ~~the split moves~~ — **done, and it moved 0 of 113; see §8's correction** | small |
 | **S2** | Wire `ply check --costs` (ADR 0025 §2a, never built; `costs.rs` exists and is unreachable from the CLI) | §17 of the guide, `cli.rs` | small |
 | **S3** | ADR 0025's P2 — a parameter may appear in a `Dead` set | its own landing condition: the case analysis ADR 0025 §What would make this wrong item 2 requires | small, **already measured**: http 0.2% → 65.7%, router 0.5% → 65.3% |
 | **S4** | §4, slot frames and flat closure conversion | **G1**, then **G2** | large |

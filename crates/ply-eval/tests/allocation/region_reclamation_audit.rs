@@ -344,6 +344,9 @@ fn runs_held_inside_a_region_are_absorbed_into_it_when_it_closes() {
 
 /// The interaction ADR 0017's Consequences call the hardest to see: `unique` inferred where a
 /// capture is reachable frees memory a continuation still holds.
+///
+/// A tail-resumptive clause is deliberately not among the shapes — ADR 0033 §8 — and its
+/// demonstration is `region_meaning_adversarial::a_tail_resumptive_clause_writing_its_own_region_still_threads`.
 #[test]
 fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
     const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";
@@ -353,12 +356,6 @@ fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
             "fn go() -> Int = with_cell[r](0) { c ->
                handle { if amb.flip[coin]() { 1 } else { 2 } }
                with { amb.flip[coin]() resume k -> k(true) + k(false), return x -> x } }",
-        ),
-        (
-            "a tail-resumptive clause, which captures just the same",
-            "fn go() -> Int = with_cell[r](0) { c ->
-               handle { if amb.flip[coin]() { 1 } else { 2 } }
-               with { amb.flip[coin]() -> true, return x -> x } }",
         ),
         (
             "a handle lexically enclosing the region, which answers across it",
