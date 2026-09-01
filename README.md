@@ -441,8 +441,10 @@ a machine that was busy compiling something else. On a quiet machine it passes.
 
 Read [DESIGN.md](DESIGN.md) for the language and the reasoning,
 [ROADMAP.md](ROADMAP.md) for what is built and what each milestone decided,
-[docs/adr/](docs/adr/) for the decisions with their arguments, and
-[CONTRACTS.md](CONTRACTS.md) for the internal crate APIs.
+[docs/adr/](docs/adr/) for the decisions with their arguments,
+[CONTRACTS.md](CONTRACTS.md) for the internal crate APIs, and
+[docs/BOOTSTRAP-PATH.md](docs/BOOTSTRAP-PATH.md) for what still stands between
+Ply and a compiler written in Ply, in the order to take it.
 
 Native codegen is the one planned milestone that has not landed, and it is
 deferred on measurement rather than on effort — see
