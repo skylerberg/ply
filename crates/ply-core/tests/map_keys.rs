@@ -50,28 +50,49 @@ fn sig(out: &CheckOutput, name: &str) -> String {
 /// only by whichever downstream test happened to use it.
 #[test]
 fn the_map_builtins_have_the_types_the_contract_states() {
+    // The middle column is the probe's own generic list: the type and row
+    // variables the contract's type mentions have to be *bound* now that the
+    // return type is written down, and `<| e>` is the row namespace.
     let expected = [
-        ("map_new", "() -> Map<a, b>"),
-        ("map_insert", "(Map<a, b>, a, b) -> Map<a, b>"),
-        ("map_get", "(Map<a, b>, a) -> Option<b>"),
-        ("map_contains", "(Map<a, b>, a) -> Bool"),
-        ("map_remove", "(Map<a, b>, a) -> Map<a, b>"),
-        ("map_len", "(Map<a, b>) -> Int"),
-        ("map_keys", "(Map<a, b>) -> List<a>"),
-        ("map_values", "(Map<a, b>) -> List<b>"),
-        ("map_entries", "(Map<a, b>) -> List<{key: a, value: b}>"),
-        ("map_of_entries", "(List<{key: a, value: b}>) -> Map<a, b>"),
-        ("map_merge", "(Map<a, b>, Map<a, b>) -> Map<a, b>"),
-        ("map_fold", "(Map<a, b>, c, (c, a, b) -> c / e) -> c / e"),
+        ("map_new", "<a, b>", "() -> Map<a, b>"),
+        ("map_insert", "<a, b>", "(Map<a, b>, a, b) -> Map<a, b>"),
+        ("map_get", "<a, b>", "(Map<a, b>, a) -> Option<b>"),
+        ("map_contains", "<a, b>", "(Map<a, b>, a) -> Bool"),
+        ("map_remove", "<a, b>", "(Map<a, b>, a) -> Map<a, b>"),
+        ("map_len", "<a, b>", "(Map<a, b>) -> Int"),
+        ("map_keys", "<a, b>", "(Map<a, b>) -> List<a>"),
+        ("map_values", "<a, b>", "(Map<a, b>) -> List<b>"),
+        (
+            "map_entries",
+            "<a, b>",
+            "(Map<a, b>) -> List<{key: a, value: b}>",
+        ),
+        (
+            "map_of_entries",
+            "<a, b>",
+            "(List<{key: a, value: b}>) -> Map<a, b>",
+        ),
+        ("map_merge", "<a, b>", "(Map<a, b>, Map<a, b>) -> Map<a, b>"),
+        (
+            "map_fold",
+            "<a, b, c | e>",
+            "(Map<a, b>, c, (c, a, b) -> c / e) -> c / e",
+        ),
     ];
-    // `fn probe_f() = f` returns the builtin itself, so the printed signature of
-    // the probe carries the builtin's whole type.
+    // `fn probe_f() -> T = f` returns the builtin itself under a *written*
+    // return type (`MISSING_SIGNATURE`), so the printed signature of the probe
+    // still carries the builtin's whole type — but the builtin must now
+    // *unify* with the contract's type rather than merely print as it, which is
+    // strictly stronger. `where derivable(ord, a)` is the clause a written
+    // `Map<a, _>` owes; a probe cannot name a key type it has not ordered.
     let source: String = expected
         .iter()
-        .map(|(name, _)| format!("fn probe_{name}() = {name}\n"))
+        .map(|(name, generics, ty)| {
+            format!("fn probe_{name}{generics}() -> {ty} where derivable(ord, a) = {name}\n")
+        })
         .collect();
     let out = ok(&source);
-    for (name, ty) in expected {
+    for (name, _, ty) in expected {
         assert_eq!(
             sig(&out, &format!("probe_{name}")),
             format!("() -> {ty}"),
@@ -98,10 +119,14 @@ fn a_float_key_is_refused_where_it_is_written() {
 /// The same refusal where nothing wrote `Map<Float, _>` down: the key is a
 /// variable when the call is walked, and only unification pins it. This is why
 /// the check is deferred rather than made at `conv_type`.
+///
+/// `MISSING_SIGNATURE` means the fixture must write *a* return type, so the map
+/// is measured and the signature says `Int`: the key stays a variable that only
+/// the `1.5` argument pins, which is the whole point of the test.
 #[test]
 fn an_inferred_float_key_is_refused_too() {
     let d = only_code(
-        "fn m() = map_insert(map_new(), 1.5, \"a\")\n",
+        "fn m() -> Int = map_len(map_insert(map_new(), 1.5, \"a\"))\n",
         codes::NOT_DERIVABLE,
     );
     assert!(d.message.contains("Float"), "{}", d.message);

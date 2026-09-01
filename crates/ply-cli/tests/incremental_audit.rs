@@ -539,7 +539,17 @@ fn renaming_a_type_two_modules_away_agrees() {
         "b.ply",
         "import a\npub fn get() -> a::T = a::mk()\n",
     );
-    write(dir.path(), "c.ply", "import b\npub fn top() = b::get()\n");
+    // `top` depends on `b::get` without *republishing* its type. Since
+    // `MISSING_SIGNATURE` a written return type here would name `a::T`, and the
+    // rename below would then have to touch `c.ply` too — which is the one
+    // thing this test exists to show is unnecessary. That is a real cost of
+    // written signatures and it is stated rather than hidden: a module that
+    // passes a value through now names its type, unless it consumes it.
+    write(
+        dir.path(),
+        "c.ply",
+        "import b\npub fn top() -> Bool = { b::get(); true }\n",
+    );
     agree(dir.path(), "cold");
 
     write(

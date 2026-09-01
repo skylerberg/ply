@@ -76,20 +76,16 @@ fn arithmetic_works_at_each_of_the_three_numeric_types() {
 
 /// The operand type is often unknown at the node and known three tokens later,
 /// which is why the decision is deferred rather than taken on sight.
+///
+/// The binder that learns it is a **lambda's**: a top-level parameter is
+/// written since `MISSING_SIGNATURE`, so the deferral has nowhere to show
+/// itself in a signature. The mechanism is unchanged — both sides are unified
+/// on sight and the numeric type is settled once the component is solved.
 #[test]
 fn the_operand_type_is_learned_from_either_side() {
-    assert_eq!(
-        scheme("pub fn f(a) -> Float = a + 1.0", "m.f"),
-        "(Float) -> Float"
-    );
-    assert_eq!(
-        scheme("pub fn f(a) -> Decimal = 1m + a", "m.f"),
-        "(Decimal) -> Decimal"
-    );
-    assert_eq!(
-        scheme("pub fn f(a) -> Bool = a < 1.5", "m.f"),
-        "(Float) -> Bool"
-    );
+    ok("pub fn f() -> Float = { let g = |a| a + 1.0; 0.0 }");
+    ok("pub fn f() -> Decimal = { let g = |a| 1m + a; 0m }");
+    ok("pub fn f() -> Int = { let g = |a| a < 1.5; 0 }");
 }
 
 /// A caller inside the same recursive component can be what pins a callee's
@@ -99,7 +95,7 @@ fn the_operand_type_is_learned_from_either_side() {
 fn a_recursive_component_settles_after_every_member() {
     assert_eq!(
         scheme(
-            "pub fn total(xs: List<Decimal>, acc) -> Decimal =\n\
+            "pub fn total(xs: List<Decimal>, acc: Decimal) -> Decimal =\n\
              \x20 match xs { [] -> acc, [x, ..rest] -> total(rest, acc + x) }",
             "m.total"
         ),
@@ -107,16 +103,69 @@ fn a_recursive_component_settles_after_every_member() {
     );
 }
 
-/// An operand type nothing pinned defaults to `Int`, **before** generalization.
-/// Leaving it open would publish `add` as `<t>(t, t) -> t`, a signature whose
-/// body works at three types and whose declaration claims every one.
+/// An operand type nothing pins is `NUMERIC_UNDETERMINED`, not a default.
+///
+/// This used to default to `Int` before generalization, on the argument that
+/// leaving it open would publish `add` as `<t>(t, t) -> t` — a signature whose
+/// body works at three types and whose declaration claims every one. That
+/// argument was answered by writing the signature instead: with
+/// `MISSING_SIGNATURE` in force there is no unpinned *parameter* to default, and
+/// what is left is a lambda binder or a `let`, where choosing `Int` for the
+/// author is a guess that no annotation asked for.
 #[test]
-fn an_unconstrained_operand_defaults_to_int_rather_than_generalizing() {
+fn an_unconstrained_operand_is_e0210_rather_than_defaulting_to_int() {
     assert_eq!(
-        scheme("pub fn add(a, b) = a + b", "m.add"),
+        code("pub fn f() -> Int = { let g = |a, b| a + b; 0 }"),
+        codes::NUMERIC_UNDETERMINED
+    );
+    assert_eq!(
+        code("pub fn f() -> Int = { let g = |a| -a; 0 }"),
+        codes::NUMERIC_UNDETERMINED
+    );
+    // Pinned by a literal on the other side, so it never reaches the arm above.
+    ok("pub fn f() -> Int = { let g = |a| 0 - a; 0 }");
+}
+
+/// A top-level `fn` publishes what a human wrote, so an omitted parameter type
+/// or return type is `MISSING_SIGNATURE` — and the diagnostic names the type
+/// inference would have given, which is what makes the fix mechanical.
+#[test]
+fn an_omitted_signature_is_e0126_and_the_message_carries_the_fix() {
+    let diags = errors("pub fn shout(m: String) = string_upper(m)");
+    assert_eq!(diags[0].code, codes::MISSING_SIGNATURE);
+    assert!(
+        diags[0]
+            .labels
+            .iter()
+            .any(|l| l.message.contains("-> String")),
+        "the diagnostic has to carry the annotation to write: {:?}",
+        diags[0].labels
+    );
+    assert_eq!(
+        code("pub fn f(xs: List<Int>, n) -> Int = n"),
+        codes::MISSING_SIGNATURE
+    );
+}
+
+/// An effect row is the deliberate exception: derived from what the body calls
+/// rather than chosen, so it stays inferred with every type written.
+#[test]
+fn an_omitted_effect_row_is_still_inferred() {
+    assert_eq!(
+        scheme("pub fn f(a: Int, b: Int) -> Int = a + b", "m.f"),
         "(Int, Int) -> Int"
     );
-    assert_eq!(scheme("pub fn neg(a) = 0 - a", "m.neg"), "(Int) -> Int");
+}
+
+/// Only a top-level `fn` publishes a signature, so only a top-level `fn` has to
+/// write one. A handler clause binds its operation's declared parameter types
+/// and a lambda binds from context; neither is a published claim.
+#[test]
+fn a_handler_clause_binder_and_a_lambda_binder_still_infer() {
+    ok("effect log { write emit(m: String) -> Unit }\n\
+        pub fn shout(m: String) -> Unit = log.emit(m)\n\
+        pub fn run() -> Unit = handle shout(\"hi\") with { log.emit(x) -> () }");
+    ok("pub fn f(xs: List<Int>) -> List<Int> = map(xs, |n| n + 1)");
 }
 
 /// The one place W2 refuses what every other language allows.
@@ -290,8 +339,11 @@ fn the_decimal_builtins_have_the_signatures_the_contract_names() {
         ("decimal_to_string", "(Decimal) -> String"),
     ] {
         // Checking through a definition that names it is what proves the builtin
-        // is reachable *and* has the type, in one step.
-        let source = format!("pub fn f() -> Int = 1\npub fn g() = {name}");
+        // is reachable *and* has the type, in one step. The return type is
+        // *written* (`MISSING_SIGNATURE`), which makes this stronger than it was
+        // when it was read off inference: the builtin must now unify with the
+        // contract's type rather than merely print as it.
+        let source = format!("pub fn f() -> Int = 1\npub fn g() -> {want} = {name}");
         let printed = scheme(&source, "m.g");
         assert_eq!(printed, format!("() -> {want}"), "`{name}`");
     }
