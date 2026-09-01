@@ -4,7 +4,7 @@ use crate::entry::{SpikeBodies, enterable};
 use crate::jit::{Compiled, Jit, Opts};
 use crate::program::Loaded;
 use anyhow::Result;
-use ply_eval::{DEFAULT_MAX_CALLS, Interp, Machine, Value, values_equal};
+use ply_eval::{DEFAULT_MAX_CALLS, Machine, Value, values_equal};
 use ply_span::{Diagnostic, Span};
 use serde::Serialize;
 use std::rc::Rc;
@@ -106,7 +106,7 @@ impl Harness {
     }
 
     /// The same, keeping the diagnostic rather than its message — what a comparison against the
-    /// tree-walker needs.
+    /// compiled answer needs.
     pub fn interpret_outcome(&mut self, name: &str, args: &[Value]) -> Result<Value, Diagnostic> {
         self.machine.call(name, args.to_vec(), Span::DUMMY)
     }
@@ -214,21 +214,6 @@ pub fn compare(
         });
     }
     Ok(Measured { results })
-}
-
-/// Agreement with the tree-walker as well, so the comparison is against an evaluator that `--engine
-/// both` already polices (ADR 0016 §7 test 14).
-pub fn agrees_with_treewalk(harness: &mut Harness, function: &str, input: &Input) -> Result<bool> {
-    let mut interp = Interp::new(
-        &harness.loaded.ast,
-        &harness.loaded.resolved,
-        &harness.loaded.check,
-    );
-    let expected = interp
-        .call(function, input.args.clone(), Span::DUMMY)
-        .map_err(|d| anyhow::anyhow!("the tree-walker raised: {}", d.message))?;
-    let actual = harness.compiled_call(function, &input.args)?;
-    Ok(values_equal(&expected, &actual, Span::DUMMY).unwrap_or(false))
 }
 
 /// The minimum conservative ratio — interpreter best over spike worst — across every input, which

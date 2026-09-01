@@ -1,16 +1,11 @@
 //! What a step costs the allocator, exactly.
 
-use ply_corpus::build::generate;
-use ply_corpus::pipeline::front;
-use ply_corpus::spec::CorpusSpec;
-use ply_corpus::write::write;
 use ply_eval::cont::{Frame, Prompt, Segment};
-use ply_eval::{Engine, Env, Evaluator, Interp, Machine, Stack};
+use ply_eval::{Env, Stack};
 use ply_span::Span;
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::hint::black_box;
-use std::path::Path;
 use std::rc::Rc;
 
 thread_local! {
@@ -145,68 +140,5 @@ fn pushing_a_frame_costs_no_more_than_opening_a_prompt() {
     assert!(
         frames <= prompts,
         "pushing a frame allocated {frames} against {prompts} for opening a prompt, so the frequent operation is again the dearer one"
-    );
-}
-
-fn corpus(root: &Path) {
-    let spec = CorpusSpec {
-        seed: 9,
-        modules: 6,
-        defs_per_module: 8,
-        tests: 24,
-        depth: 3,
-        ..CorpusSpec::default()
-    };
-    write(root, &spec, &generate(&spec)).expect("the corpus must be writable");
-}
-
-/// The same programs, on both engines, counted rather than timed.
-#[test]
-fn the_machine_allocates_more_per_test_than_the_tree_walker() {
-    let dir = tempfile::tempdir().expect("a temporary directory");
-    let root = dir.path().join("corpus");
-    corpus(&root);
-    let front = front(&root).expect("the corpus must compile");
-
-    let mut counts = Vec::new();
-    for engine in [Engine::Treewalk, Engine::Machine] {
-        let mut worker: Box<dyn Evaluator> = match engine {
-            Engine::Treewalk => {
-                Box::new(Interp::new(&front.program, &front.resolved, &front.check))
-            }
-            Engine::Machine => {
-                Box::new(Machine::new(&front.program, &front.resolved, &front.check))
-            }
-        };
-        // A first pass so lazily-built state is not charged to the count.
-        for index in 0..worker.test_count() {
-            worker.eval_test(index).expect("the corpus passes");
-        }
-        let (_, allocs) = allocations_of(|| {
-            for index in 0..worker.test_count() {
-                worker.eval_test(index).expect("the corpus passes");
-            }
-        });
-        counts.push((engine, allocs, worker.test_count()));
-    }
-
-    for (engine, allocs, tests) in &counts {
-        println!(
-            "{}: {} allocations over {} tests ({:.0} per test)",
-            engine.as_str(),
-            allocs,
-            tests,
-            *allocs as f64 / *tests as f64
-        );
-    }
-
-    let tree = counts[0].1;
-    let machine = counts[1].1;
-    assert!(tree > 0 && machine > 0);
-    // A ceiling rather than an equality: this documents the gap the profile found and fails if it
-    // widens, without pretending the current ratio is a target.
-    assert!(
-        machine < tree * 4,
-        "the machine allocated {machine} against the tree-walker's {tree}, which is worse than the gap this test was written over"
     );
 }

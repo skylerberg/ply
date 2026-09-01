@@ -1,7 +1,7 @@
-//! The regions a *program* opens, on the evaluation path of both engines.
+//! The regions a *program* opens, on the evaluation path.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::{Interp, Machine, RegionKind, Value};
+use ply_eval::{Machine, RegionKind, Value};
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -53,26 +53,7 @@ fn machine_stats(compiled: &Compiled, name: &str) -> ply_eval::arena::Stats {
     machine.cells().stats()
 }
 
-/// `None` where the tree-walker declines the program — a clause that binds a continuation is
-/// `E0504`, which is ADR 0005 required test 3 and not something this file may work around.
-fn treewalk_stats(compiled: &Compiled, name: &str) -> Option<ply_eval::arena::Stats> {
-    let index = compiled.index_of(name);
-    let mut treewalk = Interp::new(&compiled.program, &compiled.resolved, &compiled.check);
-    match treewalk.eval_test(index) {
-        Ok(()) => Some(treewalk.cells().stats()),
-        Err(d) if ply_eval::is_machine_only(&d) => None,
-        Err(d) => panic!("{name:?} must run on the tree-walker: {d:#?}"),
-    }
-}
-
-/// Both engines' figures, the tree-walker's omitted where it declined.
-fn stats(compiled: &Compiled, name: &str) -> Vec<(&'static str, ply_eval::arena::Stats)> {
-    let mut out = vec![("machine", machine_stats(compiled, name))];
-    if let Some(stats) = treewalk_stats(compiled, name) {
-        out.push(("treewalk", stats));
-    }
-    out
-}
+// -------------------------------------------- 1. the analysis is consulted
 
 const PURE: &str = r#"
 fn scratch(n: Int) -> Int = with_cell[r](n) { c -> { cell_set(c, cell_get(c) + 1); cell_get(c) } }
@@ -95,50 +76,22 @@ fn a_with_cell_opens_the_scope_the_inference_decided_for_its_span() {
         "nothing in this program captures a continuation"
     );
 
-    let engines = stats(&compiled, "a region with no capture anywhere near it");
-    assert_eq!(
-        engines.len(),
-        2,
-        "both engines run a program with no capture"
-    );
-    for (engine, stats) in engines {
-        assert_eq!(
-            stats.allocations, 1,
-            "{engine}: the cell is a bump in the arena"
-        );
+    {
+        let stats = machine_stats(&compiled, "a region with no capture anywhere near it");
+        assert_eq!(stats.allocations, 1, "the cell is a bump in the arena");
         assert_eq!(
             stats.regions_opened,
             SCAFFOLD_REGIONS + 1,
-            "{engine}: the `with_cell` opened a scope of its own"
+            "the `with_cell` opened a scope of its own"
         );
         assert_eq!(
             stats.pins_taken, 0,
-            "{engine}: nothing captured, so nothing was pinned"
+            "nothing captured, so nothing was pinned"
         );
     }
 }
 
-/// The engines must agree about the region structure, not merely about the answer: two engines that
-/// opened different scopes would reclaim at different points, and `--engine both` compares what
-/// each reclaimed.
-#[test]
-fn both_engines_open_the_same_regions_for_the_same_program() {
-    for source in [PURE, LOOPED, CAPTURED, PARKED, NESTED_REGION] {
-        let compiled = Compiled::new(source);
-        for index in 0..compiled.check.tests.len() {
-            let name = compiled.check.tests[index].name.clone();
-            let machine = machine_stats(&compiled, &name);
-            let Some(treewalk) = treewalk_stats(&compiled, &name) else {
-                continue;
-            };
-            assert_eq!(
-                (machine.regions_opened, machine.allocations),
-                (treewalk.regions_opened, treewalk.allocations),
-                "{name:?}: the two engines opened different regions"
-            );
-        }
-    }
-}
+// ------------------------------------------------ 2. the close is the point
 
 const LOOPED: &str = r#"
 fn once(n: Int) -> Int = with_cell[r](n) { c -> cell_get(c) }
@@ -153,17 +106,13 @@ test "a region per iteration" { assert_eq(upto(99), 4950) }
 #[test]
 fn a_region_in_a_loop_costs_one_slot_rather_than_one_per_iteration() {
     let compiled = Compiled::new(LOOPED);
-    for (engine, stats) in stats(&compiled, "a region per iteration") {
-        assert_eq!(stats.allocations, 100, "{engine}");
-        assert_eq!(
-            stats.peak_live, 1,
-            "{engine}: each region closed before the next opened"
-        );
-        assert_eq!(
-            stats.closes_deferred, 0,
-            "{engine}: no capture, no deferral"
-        );
-    }
+    let stats = machine_stats(&compiled, "a region per iteration");
+    assert_eq!(stats.allocations, 100);
+    assert_eq!(
+        stats.peak_live, 1,
+        "each region closed before the next opened"
+    );
+    assert_eq!(stats.closes_deferred, 0, "no capture, no deferral");
 }
 
 const CAPTURED: &str = r#"
@@ -248,7 +197,7 @@ fn doubled(n: Int) -> Int = with_region[r] {
 test "a with_region around a cell of its own brand" { assert_eq(doubled(21), 42) }
 "#;
 
-/// `with_region` lowered to its body until now, on both engines, so nothing at run time
+/// `with_region` lowered to its body until now, so nothing at run time
 /// distinguished it from the code inside it.
 #[test]
 fn a_with_region_opens_one_region_and_the_cell_inside_it_opens_none() {
@@ -260,20 +209,17 @@ fn a_with_region_opens_one_region_and_the_cell_inside_it_opens_none() {
         "the `with_cell[r]` shares the brand, so there is one region and not two"
     );
 
-    let engines = stats(&compiled, "a with_region around a cell of its own brand");
-    assert_eq!(engines.len(), 2, "neither engine declines this program");
-    for (engine, stats) in engines {
-        assert_eq!(
-            stats.regions_opened,
-            SCAFFOLD_REGIONS + 1,
-            "{engine}: one region for `with_region` and none for the cell inside it"
-        );
-        assert_eq!(stats.allocations, 1, "{engine}");
-        assert_eq!(
-            stats.peak_live, 1,
-            "{engine}: and the cell went back at the region's close"
-        );
-    }
+    let stats = machine_stats(&compiled, "a with_region around a cell of its own brand");
+    assert_eq!(
+        stats.regions_opened,
+        SCAFFOLD_REGIONS + 1,
+        "one region for `with_region` and none for the cell inside it"
+    );
+    assert_eq!(stats.allocations, 1);
+    assert_eq!(
+        stats.peak_live, 1,
+        "and the cell went back at the region's close"
+    );
 }
 
 const NO_REGION: &str = r#"

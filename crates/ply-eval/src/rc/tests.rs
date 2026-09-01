@@ -493,8 +493,6 @@ fn a_shadowed_outer_binding_is_neither_reused_nor_released() {
 /// break a liveness analysis.
 mod generated {
     use super::*;
-    use crate::Interp;
-    use crate::differential::compare_answers;
     use ply_syntax::ast::Stmt as AstStmt;
 
     const POOL: [&str; 3] = ["a", "b", "c"];
@@ -669,18 +667,14 @@ mod generated {
         }
     }
 
-    /// Every generated program answers the same thing on both engines, and none of them reaches the
-    /// released-binding path.
+    /// No generated program reaches the released-binding path.
     #[test]
-    fn the_reference_counted_engine_answers_what_the_uncounted_one_does() {
+    fn no_generated_program_releases_a_binding_something_still_reads() {
         let (program, resolved) = standalone(Vec::new());
         for seed in 0..4_000u64 {
             let e = Gen::new(seed).ints(4);
-            let mut treewalk = Interp::for_program(&program, &resolved);
             let mut machine = Machine::for_program(&program, &resolved);
-            let left = treewalk.eval_expr_for_test(&e);
-            let right = machine.eval_expr_for_test(&e);
-            if let Err(d) = &right {
+            if let Err(d) = machine.eval_expr_for_test(&e) {
                 assert_ne!(
                     d.code,
                     codes::INTERNAL_ERROR,
@@ -688,19 +682,10 @@ mod generated {
                     d.message
                 );
             }
-            if let Some(divergence) = compare_answers(
-                &treewalk,
-                &machine,
-                &format!("generated program {seed}"),
-                &left,
-                &right,
-            ) {
-                panic!("seed {seed} diverged — {divergence}");
-            }
         }
     }
 
-    /// The same corpus under a handler that resumes twice, which the tree-walker refuses and so
+    /// The same corpus under a handler that resumes twice, whose oracle is arithmetic and so
     /// cannot audit.
     #[test]
     fn each_resumption_answers_as_though_it_were_the_only_one() {

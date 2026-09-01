@@ -1,8 +1,7 @@
 //! Adversarial probes for the one property ADR 0017 may not break.
 
 use ply_core::check_program;
-use ply_eval::differential::compare_tests;
-use ply_eval::{Fixture, Interp, Machine, Plan, Seed, explore};
+use ply_eval::{Machine, Plan, Seed, explore};
 use ply_span::{SourceId, SourceMap};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -19,15 +18,9 @@ fn load(src: &str) -> (Program, Resolved) {
     (program, resolved)
 }
 
-/// Runs every test on both engines and requires all of them to pass.
+/// Runs every test in a probe and requires all of them to pass.
 #[track_caller]
 fn holds(src: &str) {
-    let (program, resolved) = load(src);
-    let mut treewalk = Interp::for_program(&program, &resolved);
-    let mut machine = Machine::for_program(&program, &resolved);
-    let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
-    assert!(report.is_clean(), "{report}\n--- program ---\n{src}");
-
     let (program, resolved) = load(src);
     let mut machine = Machine::for_program(&program, &resolved);
     let count = machine.test_count();

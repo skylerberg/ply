@@ -1,7 +1,6 @@
-//! Whether the standard library's own accumulators copy, counted rather than timed — **and on which
-//! of the two engines they do not**.
+//! Whether the standard library's own accumulators copy, counted rather than timed.
 
-use ply_eval::{Interp, Machine, TaskRegions, rc};
+use ply_eval::{Machine, TaskRegions, rc};
 use ply_span::{SourceMap, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -112,42 +111,25 @@ struct Counted {
     copies: u64,
 }
 
-/// One accumulator site: what to call it, how to drive it at a size, and the sizes to drive it at.
-type Site = (&'static str, fn(usize, Engine) -> Counted, &'static [usize]);
-
-/// Which evaluator the counters are taken on.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Engine {
-    Machine,
-    Treewalk,
-}
-
 /// Counters are per thread and cumulative, so this takes them either side of the one test rather
 /// than resetting them — a reset would discard whatever a neighbouring test on this thread had
 /// counted.
-fn count(program: &Program, resolved: &Resolved, engine: Engine) -> Counted {
+fn count(program: &Program, resolved: &Resolved) -> Counted {
     // By module and ordinal, never by index into the whole program: `std.json` ships 37 tests of
     // its own, so `eval_test(0)` counts one of those and `test_count()` is 38.
     let probe = Symbol::from("probe");
     let before = rc::stats();
-    let outcome = match engine {
-        Engine::Machine => {
-            let mut machine = Machine::for_program(program, resolved).with_max_calls(200_000);
-            machine.set_regions(TaskRegions::new());
-            machine.eval_test_in(&probe, 0)
-        }
-        Engine::Treewalk => {
-            let mut interp = Interp::for_program(program, resolved).with_max_calls(200_000);
-            interp.set_regions(TaskRegions::new());
-            interp.eval_test_in(&probe, 0)
-        }
+    let outcome = {
+        let mut machine = Machine::for_program(program, resolved).with_max_calls(200_000);
+        machine.set_regions(TaskRegions::new());
+        machine.eval_test_in(&probe, 0)
     };
     let after = rc::stats();
 
     // The signature failure here is a green count over a program that never ran: a probe that fails
     // to run performs no pushes and would sail past a `copies <= 8` bound.
     outcome.unwrap_or_else(|d| {
-        panic!("the probe did not run on {engine:?}, so its counters measure nothing: {d:#?}")
+        panic!("the probe did not run, so its counters measure nothing: {d:#?}")
     });
 
     Counted {
@@ -157,19 +139,19 @@ fn count(program: &Program, resolved: &Resolved, engine: Engine) -> Counted {
     }
 }
 
-fn encode_on(k: usize, byte: &str, encoded_width: usize, engine: Engine) -> Counted {
+fn encode_on(k: usize, byte: &str, encoded_width: usize) -> Counted {
     let (program, resolved) = load(&json_probe(k, byte, encoded_width), &["std.json"]);
-    count(&program, &resolved, engine)
+    count(&program, &resolved)
 }
 
-fn route_on(n: usize, engine: Engine) -> Counted {
+fn route_on(n: usize) -> Counted {
     let (program, resolved) = load(&router_probe(n), &["std.http", "std.router"]);
-    count(&program, &resolved, engine)
+    count(&program, &resolved)
 }
 
-fn trace_on(n: usize, engine: Engine) -> Counted {
+fn trace_on(n: usize) -> Counted {
     let (program, resolved) = load(&trace_probe(n), &["std.trace"]);
-    count(&program, &resolved, engine)
+    count(&program, &resolved)
 }
 
 /// Every escape in the subject, so `k` is the number of escapes.
@@ -192,7 +174,7 @@ fn encoding_a_string_of_escapes_copies_the_accumulator_a_constant_number_of_time
     println!("{:>8} {:>10} {:>10}", "k", "updates", "copies");
     let mut failures = Vec::new();
     for k in SIZES {
-        let counted = encode_on(k, ESCAPE, 2, Engine::Machine);
+        let counted = encode_on(k, ESCAPE, 2);
         println!("{:>8} {:>10} {:>10}", k, counted.updates, counted.copies);
 
         // Proves the encode reached the accumulator loop rather than answering early: one push per
@@ -209,7 +191,7 @@ fn encoding_a_string_of_escapes_copies_the_accumulator_a_constant_number_of_time
     // The module's headline property, which the fix had to leave alone: "a string with no escapes
     // costs one pass and one copy" (`json.ply`, above `escape_runs`).
     for k in [1_000usize, 32_000] {
-        let clean = encode_on(k, "a", 1, Engine::Machine);
+        let clean = encode_on(k, "a", 1);
         println!(
             "{:>8} {:>10} {:>10}  (no escapes)",
             k, clean.updates, clean.copies
@@ -240,14 +222,11 @@ fn the_route_table_and_the_trace_sink_do_not_copy_their_accumulators_either() {
     println!("{:>8} {:>10} {:>10}  site", "n", "updates", "copies");
     let mut failures = Vec::new();
     for (site, run) in [
-        (
-            "std.router `numbered`",
-            route_on as fn(usize, Engine) -> Counted,
-        ),
+        ("std.router `numbered`", route_on as fn(usize) -> Counted),
         ("std.trace `append`", trace_on),
     ] {
         for n in TABLE_SIZES {
-            let counted = run(n, Engine::Machine);
+            let counted = run(n);
             println!(
                 "{:>8} {:>10} {:>10}  {site}",
                 n, counted.updates, counted.copies
@@ -274,53 +253,5 @@ fn the_route_table_and_the_trace_sink_do_not_copy_their_accumulators_either() {
          `numbered` is on every `conflicts`/`well_formed` assertion a service makes about its \
          table; `append` is on the path of every record a served request traces.",
         failures.join(", "),
-    );
-}
-
-/// **The three fixes hold on the machine engine and on that engine only, and this is what says
-/// so.**
-#[test]
-fn all_three_fixes_are_the_machine_engines_only() {
-    println!(
-        "{:>22} {:>8} {:>10} {:>10}",
-        "site", "n", "updates", "copies"
-    );
-    let mut reusing = Vec::new();
-    let sites: [Site; 3] = [
-        (
-            "std.json `escape_runs`",
-            |k, e| encode_on(k, ESCAPE, 2, e),
-            &[1_000, 2_000, 4_000, 8_000],
-        ),
-        ("std.router `numbered`", route_on, &TABLE_SIZES),
-        ("std.trace `append`", trace_on, &TABLE_SIZES),
-    ];
-    for (site, run, sizes) in sites {
-        for &n in sizes {
-            let counted = run(n, Engine::Treewalk);
-            println!(
-                "{:>22} {:>8} {:>10} {:>10}",
-                site, n, counted.updates, counted.copies
-            );
-            assert!(
-                counted.updates >= n as u64,
-                "{site} at n = {n} performed only {} pushes on the tree-walker, so this is \
-                 measuring something else",
-                counted.updates
-            );
-            if counted.copies + SLACK < n as u64 {
-                reusing.push(format!("{site} at n = {n}: {} copies", counted.copies));
-            }
-        }
-    }
-    assert!(
-        reusing.is_empty(),
-        "the tree-walker reused an accumulator it has never reused — {} — which is a real \
-         improvement and makes six documents wrong. Correct each, in place and quoting the \
-         withdrawn text: this file's module comment; `json.ply` above `escape_runs`; \
-         `trace.ply` above `append`; `router.ply` above `numbered`; ADR 0020 §7 item 3; and \
-         `spikes/ply-lexer/GAPS.md` §1 — every one of which states that the linear shape is \
-         the machine engine's alone.",
-        reusing.join(", "),
     );
 }

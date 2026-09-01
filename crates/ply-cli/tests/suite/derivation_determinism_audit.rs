@@ -221,7 +221,7 @@ fn renaming_the_type_re_runs_no_test_and_renaming_a_variant_re_runs_its_own() {
 }
 
 /// A derived encoding containing a `Map` must be a function of the map's contents and not of the
-/// history that built it — in one process, across processes, and under both engines.
+/// history that built it — in one process and across processes.
 #[test]
 fn a_map_in_a_derived_encoding_is_byte_identical_however_it_was_built() {
     let dir = project(&[(
@@ -263,12 +263,8 @@ test "one map, one document" {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("selected 0 of 1 (1 cached)"), "{text}");
 
-    let (code, text) = run(dir.path(), &["test", "--engine", "both", "--no-cache"]);
+    let (code, text) = run(dir.path(), &["test", "--no-cache"]);
     assert_eq!(code, 0, "{text}");
-    assert!(
-        !text.contains("E0503"),
-        "the two engines disagreed about a derived encoding of a map:\n{text}"
-    );
 }
 
 /// The same claim over the key type it was **false** for until 2026-08-21.
@@ -303,11 +299,11 @@ test "one catalogue, one document" {
     assert_eq!(code, 0, "{text}");
     assert!(text.contains("0 failed, 1 passed"), "{text}");
 
-    let (code, text) = run(dir.path(), &["test", "--engine", "both", "--no-cache"]);
+    let (code, text) = run(dir.path(), &["test", "--no-cache"]);
     assert_eq!(code, 0, "{text}");
     assert!(
         !text.contains("E0503"),
-        "the two engines disagreed about a `Decimal`-keyed map:\n{text}"
+        "a `Decimal`-keyed map did not survive the cache:\n{text}"
     );
 }
 

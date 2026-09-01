@@ -581,7 +581,7 @@ intended shape is recorded and deleting the code deletes the design.
 **ARM the cheap half (`observed`) now; DELETE `entered`/`stack`/`reproduced` and
 the `--trace` flag; write down the one open question.**
 
-*One-line reason:* `observed` is already computed by both engines and thrown away
+*One-line reason:* `observed` is already computed by the evaluator and thrown away
 — two or three files of wiring buys back three of ADR 0004's nine dead rows — while
 `entered`/`stack` needs a push and a pop per call in **two** engines to deliver a
 field that has never existed, which is a milestone, not a fix.

@@ -2,7 +2,7 @@
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::region_kind::Kinds;
-use ply_eval::{Interp, Machine, RegionKind};
+use ply_eval::{Machine, RegionKind};
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -30,10 +30,6 @@ impl Compiled {
 
     fn machine(&self) -> Machine<'_> {
         Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn interp(&self) -> Interp<'_> {
-        Interp::new(&self.program, &self.resolved, &self.check)
     }
 
     fn index_of(&self, name: &str) -> usize {
@@ -85,15 +81,6 @@ fn an_engine_handed_an_analysis_does_not_infer_one_of_its_own() {
         std::ptr::eq(filled, second.region_kinds()),
         "the second machine holds a different `Regions`, so it inferred its own"
     );
-
-    // The tree-walker takes the machine's, which is what keeps `--engine both` comparing two
-    // engines over one region structure rather than over two.
-    let mut treewalk = compiled.interp();
-    treewalk.share_region_kinds(first.shared_region_kinds());
-    assert!(
-        std::ptr::eq(filled, treewalk.region_kinds()),
-        "the tree-walker inferred its own"
-    );
 }
 
 /// An engine handed nothing infers its own, and every engine in this repository that is handed
@@ -106,7 +93,7 @@ fn an_engine_handed_nothing_still_answers() {
     assert_eq!(alone.region_kinds().shared(), 1);
 }
 
-/// Region by region, on both engines: a shared analysis decides what a private one decides.
+/// Region by region: a shared analysis decides what a private one decides.
 #[test]
 fn a_shared_analysis_answers_what_a_private_one_answers() {
     let compiled = Compiled::new(BOTH_KINDS);
@@ -116,8 +103,6 @@ fn a_shared_analysis_answers_what_a_private_one_answers() {
 
     let mut machine = compiled.machine();
     machine.share_region_kinds(Kinds::clone(&shared));
-    let mut treewalk = compiled.interp();
-    treewalk.share_region_kinds(Kinds::clone(&shared));
 
     assert!(
         private.iter().any(|r| r.kind == RegionKind::Unique)
@@ -130,12 +115,6 @@ fn a_shared_analysis_answers_what_a_private_one_answers() {
             machine.region_kind(region.span),
             Some(region.kind),
             "the machine's shared analysis disagrees about `{}`",
-            region.brand
-        );
-        assert_eq!(
-            treewalk.region_kinds().at(region.span).map(|r| r.kind),
-            Some(region.kind),
-            "the tree-walker's shared analysis disagrees about `{}`",
             region.brand
         );
     }

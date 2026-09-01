@@ -4,7 +4,7 @@ use ply_codegen_spike::entry::{admissible, enterable, refusals_over, scalar_sign
 use ply_codegen_spike::jit::Opts;
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
-use ply_eval::{Interp, Value, compare_answers, values_equal};
+use ply_eval::{Value, compare_answers, values_equal};
 use ply_span::Span;
 use std::path::PathBuf;
 
@@ -197,14 +197,6 @@ fn a_search_the_interpreter_drives_answers_the_same_with_a_backend_attached() {
             )
             .map(|d| d.to_string())
         );
-
-        let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
-        let walked = interp.call("mcts.plan", args, Span::DUMMY);
-        assert!(
-            compare_answers(&interp, &harness.machine, "mcts.plan", &walked, &plain).is_none(),
-            "case {case}: the tree-walker and the machine disagree, which is not about the \
-             backend at all"
-        );
     }
     let (entries, _) = harness.hybrid_counts();
     assert!(
@@ -395,7 +387,7 @@ fn a_runaway_recursion_is_the_machines_diagnostic_and_not_a_crash() {
     for (which, said) in ["machine", "hybrid"].iter().zip(&says) {
         assert!(
             said.contains("recursion limit of 10000 nested calls exceeded"),
-            "the {which} side answered `{said}` rather than the bound both engines owe"
+            "the {which} side answered `{said}` rather than the bound it owes"
         );
     }
 }

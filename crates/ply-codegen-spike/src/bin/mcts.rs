@@ -6,7 +6,7 @@ use ply_codegen_spike::jit::{Opts, node_count};
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
 use ply_codegen_spike::wrong::Mutant;
-use ply_eval::{Interp, Value, compare_answers, lower};
+use ply_eval::{Value, compare_answers, lower};
 use ply_span::Span;
 use serde::Serialize;
 use std::collections::BTreeMap;
@@ -559,14 +559,8 @@ fn verify(
                 bad.push(format!("{name} case {case}: with a backend attached, {d}"));
             }
 
-            let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
-            let walked = interp.call(&name, args.clone(), Span::DUMMY);
-            if let Some(d) = compare_answers(&interp, &harness.machine, &name, &walked, &expected) {
-                bad.push(format!("{name} case {case}: the tree-walker {d}"));
-            }
-
-            // And the fragment on its own, which is the only place its answers are visible at all:
-            // a decline is invisible through the machine by design.
+            // And the fragment on its own, which is the only place its answers are visible at
+            // all: a decline is invisible through the machine by design.
             if !compiled {
                 continue;
             }
@@ -617,12 +611,6 @@ fn verify(
                 "mcts.plan case {case} (state {state}, seed {s}, {n} iterations): {d}"
             ));
         }
-        let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
-        let walked = interp.call("mcts.plan", args, Span::DUMMY);
-        if let Some(d) = compare_answers(&interp, &harness.machine, "mcts.plan", &walked, &expected)
-        {
-            bad.push(format!("mcts.plan case {case}: the tree-walker {d}"));
-        }
     }
 
     let (entries, _) = harness.hybrid_counts();
@@ -653,7 +641,7 @@ fn entries_for(harness: &Harness, name: &str) -> u64 {
 }
 
 /// Two deep recursions, both compared field by field rather than described.
-fn deep_recursion(loaded: &'static Loaded, harness: &mut Harness) -> Vec<String> {
+fn deep_recursion(harness: &mut Harness) -> Vec<String> {
     let mut bad = Vec::new();
     let deep: [(&str, Vec<Value>); 2] = [
         (
@@ -676,13 +664,6 @@ fn deep_recursion(loaded: &'static Loaded, harness: &mut Harness) -> Vec<String>
             compare_answers(&harness.machine, &harness.hybrid, name, &expected, &hybrid)
         {
             bad.push(format!("{name} at the nested-call bound: {d}"));
-        }
-        let mut interp = Interp::new(&loaded.ast, &loaded.resolved, &loaded.check);
-        let walked = interp.call(name, args.clone(), Span::DUMMY);
-        if let Some(d) = compare_answers(&interp, &harness.machine, name, &walked, &expected) {
-            bad.push(format!(
-                "{name} at the nested-call bound: the tree-walker {d}"
-            ));
         }
     }
     bad
@@ -1275,13 +1256,11 @@ fn main() -> Result<()> {
         }
     };
     let mut agreement = verify(loaded, &mut harness, 0x9E3779B97F4A7C15, 64)?;
-    agreement
-        .disagreements
-        .extend(deep_recursion(loaded, &mut harness));
+    agreement.disagreements.extend(deep_recursion(&mut harness));
     println!(
         "\n== agreement, before anything is timed ==\n   \
          {} functions ({} of them compiled) × generated inputs = {} cases, plus {} whole-kernel \
-         searches\n   and 2 deep recursions, against the machine and the tree-walker",
+         searches\n   and 2 deep recursions, against the machine",
         agreement.functions,
         agreement.compiled_functions,
         agreement.cases,
@@ -1510,7 +1489,7 @@ fn main() -> Result<()> {
             let Some(kinds) = scalar_params(loaded, &name) else {
                 continue;
             };
-            // Sets both engines answer and on which the hybrid enters something.
+            // Sets the machine answers and on which the hybrid enters something.
             let mut sets: Vec<Vec<Value>> = Vec::new();
             for Case { args, scalar } in cases_for(&mut rng, &name, &kinds, 12, &shapes) {
                 if sets.len() >= 8 {

@@ -23,7 +23,6 @@ use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
-    let engine: ply_eval::EngineChoice = args.engine.into();
     // Before the store is opened, because a misspelled `--backend` must not leave a cache directory
     // behind for a run that is about to refuse.
     let backend = match backend_spec(args) {
@@ -197,7 +196,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let mut run = || {
         let mut executor =
             ply_test::InterpExecutor::new(&loaded.program, &loaded.resolved, &loaded.check)
-                .with_engine(engine)
+                .with_backend_audit(args.audit_backend)
                 .with_search(simulation.clone())
                 .with_hosts(hosting(&hosts, &runtime));
         if let (Some(provider), Some(spec)) = (provider, backend.clone()) {
@@ -374,7 +373,7 @@ fn backend_escapes(report: &RunReport) -> Vec<Diagnostic> {
                     r.name
                 ),
             )
-            .note("a backend is a third execution strategy; a cached `Pass` is a claim about the authoritative engine")
+            .note("a backend is a second execution strategy; a cached `Pass` is a claim about the evaluator's own answer")
             .note("run `ply cache clear`: an entry written here would be believed by a later run with no backend")
             .note("this is Ply's fault — the runner and the backend disagree about what this run may record")
         })
@@ -467,9 +466,7 @@ fn cache_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> Vec<
 /// A stored `Pass` is a claim about what the authoritative engine did, so a run on any other engine
 /// may neither believe one nor leave one behind.
 fn cache_bypassed(args: &TestArgs) -> bool {
-    args.no_cache
-        || args.backend.is_some()
-        || ply_eval::EngineChoice::from(args.engine).bypasses_cache()
+    args.no_cache || args.backend.is_some()
 }
 
 /// What `--backend` asked for, or the diagnostic that refuses it.
@@ -477,14 +474,6 @@ fn backend_spec(args: &TestArgs) -> Result<Option<ply_eval::BackendSpec>, Diagno
     let Some(spec) = &args.backend else {
         return Ok(None);
     };
-    if args.engine == crate::cli::EngineArg::Treewalk {
-        return Err(Diagnostic::error(
-            codes::BACKEND_UNAVAILABLE,
-            "`--backend` needs an engine that can enter compiled code",
-        )
-        .note("the tree-walker has no compiled path, so a backend attached to it would be inert")
-        .note("use `--engine machine` (the default) or `--engine both`"));
-    }
     ply_eval::backend::parse(spec).map(Some).map_err(|message| {
         Diagnostic::error(codes::BACKEND_UNAVAILABLE, message).note(
             "a wrong backend is a self-test: it exists so that a green run with a backend \
@@ -821,7 +810,7 @@ fn print_human(
     if let Some(line) = report.simulation.line() {
         println!("{IND}{}", style.bold(&line));
     }
-    // `--engine both` is the differential oracle, and a green run under it reads as "two engines
+    // `--audit-backend` is the differential oracle, and a green run under it reads as "the backend
     // agreed about every test".
     if let Some(audit) = &report.audit
         && let Some(line) = audit.line()
@@ -830,7 +819,7 @@ fn print_human(
         if audit.unaudited > 0 {
             println!(
                 "{IND}{}",
-                style.dim("the other engine refused those; no disagreement was possible")
+                style.dim("those ran once, so no disagreement was possible")
             );
         }
     }
@@ -876,11 +865,9 @@ fn print_human(
     }
     if cache_bypassed(args) {
         let why = if args.no_cache {
-            "--no-cache".to_string()
-        } else if args.backend.is_some() {
-            "--backend".to_string()
+            "--no-cache"
         } else {
-            format!("--engine {}", args.engine.as_str())
+            "--backend"
         };
         println!(
             "{IND}{}",
@@ -1261,10 +1248,10 @@ fn print_explain(
         } else {
             format!(" {shared}")
         };
-        // A test whose row carries `sim.read` reaches a `simulate` region, and the tree-walker
+        // A test whose row carries `sim.read` reaches a `simulate` region, so it is searched
         // cannot run one.
         let engine = if ply_test::is_seeded(&test.footprint) {
-            " · machine-only"
+            " · searched"
         } else {
             ""
         };
@@ -1517,7 +1504,7 @@ fn report_json(
                 // explored count of zero from a test that never simulated anything.
                 "simulation": r.simulation.as_ref().map(ply_test::report::exploration_json),
                 "cached": r.recorded.as_ref().map(|record| record.is_written()),
-                // Absent outside `--engine both`, where there is no oracle whose coverage this
+                // Absent outside `--audit-backend`, where there is no oracle whose coverage this
                 // could describe.
                 "audited": r.audited,
             })
@@ -1560,7 +1547,7 @@ fn report_json(
             "bisect": args.bisect.as_str(),
             "bisect_budget": args.bisect_budget,
             "trace": args.trace.as_str(),
-            "engine": args.engine.as_str(),
+            "audit_backend": args.audit_backend,
             // The whole plan, because every field of it is in a seeded test's cache key and a
             // consumer comparing two runs needs to see which one searched more.
             "sim": {
@@ -1796,7 +1783,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             &loaded.check,
             &loaded.hashes().unwrap(),
             store,
-            ply_eval::EngineChoice::Both,
+            false,
             ply_test::Search::of(selection),
             ply_test::Hosting::hermetic(),
         )
@@ -1865,7 +1852,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             db: crate::db::DbOptions::default(),
             config: crate::config::ConfigOptions::default(),
             std: false,
-            engine: crate::cli::EngineArg::default(),
+            audit_backend: false,
             simulation: crate::cli::SimOptions {
                 seed: None,
                 sim: crate::cli::SimArg::default(),

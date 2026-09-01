@@ -25,7 +25,7 @@ pub mod write;
 pub use spec::CorpusSpec;
 
 use anyhow::{Result, bail};
-use ply_eval::{EngineChoice, Plan};
+use ply_eval::Plan;
 use ply_store::Store;
 use std::path::Path;
 
@@ -56,7 +56,7 @@ pub fn verify(root: &Path) -> Result<Verified> {
         &front.check,
         &front.hashes,
         &mut store,
-        EngineChoice::Both,
+        false,
         ply_test::Search::of(&selection),
         ply_test::Hosting::hermetic(),
     );

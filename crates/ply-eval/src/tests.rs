@@ -1,26 +1,12 @@
 use crate::build::*;
-use crate::differential::compare_answers;
-use crate::{Interp, Machine, Value};
+use crate::{Machine, Value};
 use ply_span::{Diagnostic, codes};
 use ply_syntax::ast::{BinOp, Expr, Item, Mode, UnOp};
 
-/// Runs both engines, so that every test below is a differential test.
+/// Evaluates an expression in a program of its own.
 fn eval_in(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(items);
-    let mut treewalk = Interp::for_program(&program, &resolved);
-    let mut machine = Machine::for_program(&program, &resolved);
-    let left = treewalk.eval_expr_for_test(&e);
-    let right = machine.eval_expr_for_test(&e);
-    if let Some(d) = compare_answers(
-        &treewalk,
-        &machine,
-        "the expression under test",
-        &left,
-        &right,
-    ) {
-        panic!("treewalk and machine disagree — {d}");
-    }
-    left
+    Machine::for_program(&program, &resolved).eval_expr_for_test(&e)
 }
 
 fn eval(e: Expr) -> Result<Value, Diagnostic> {
@@ -29,7 +15,7 @@ fn eval(e: Expr) -> Result<Value, Diagnostic> {
 
 fn eval_depth(items: Vec<Item>, e: Expr, depth: usize) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(items);
-    Interp::for_program(&program, &resolved)
+    Machine::for_program(&program, &resolved)
         .with_max_calls(depth)
         .eval_expr_for_test(&e)
 }
@@ -308,40 +294,6 @@ fn unbounded_recursion_becomes_a_diagnostic_not_a_stack_overflow() {
     };
     assert_eq!(d.code, codes::RUNTIME_ERROR);
     assert!(d.message.contains("recursion limit"), "{}", d.message);
-}
-
-/// The depth limit is only a real bound if the native stack underneath it never runs out first, on
-/// a stack far smaller than a worker's default.
-#[test]
-fn recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack() {
-    let handle = std::thread::Builder::new()
-        .stack_size(1024 * 1024)
-        .spawn(|| {
-            let items = vec![fn_def(
-                "down",
-                &["n"],
-                if_(
-                    bin(BinOp::Le, var("n"), int(0)),
-                    int(0),
-                    bin(
-                        BinOp::Add,
-                        int(0),
-                        callv("down", vec![bin(BinOp::Sub, var("n"), int(1))]),
-                    ),
-                ),
-            )];
-            let depth = crate::DEFAULT_MAX_CALLS as i64;
-            matches!(
-                eval_in(items, callv("down", vec![int(depth - 1)])),
-                Ok(Value::Int(0))
-            )
-        })
-        .expect("failed to spawn");
-    assert!(
-        handle
-            .join()
-            .expect("the interpreter overflowed the thread stack")
-    );
 }
 
 /// Runs `f` on a stack half a worker's default, where an unbounded host recursion aborts the whole
@@ -630,7 +582,7 @@ fn a_refutable_let_that_fails_is_a_diagnostic() {
 }
 
 #[test]
-fn the_tree_walker_refuses_a_clause_that_binds_a_continuation() {
+fn a_clause_that_binds_a_continuation_resumes_the_perform_site() {
     let items = vec![state_effect()];
     let e = handle(
         block(
@@ -649,22 +601,13 @@ fn the_tree_walker_refuses_a_clause_that_binds_a_continuation() {
     let e = with_cell("log", int(0), "c", e);
 
     let (program, resolved) = standalone(items);
-    let mut treewalk = Interp::for_program(&program, &resolved);
-    let d = treewalk
-        .eval_expr_for_test(&e)
-        .expect_err("the tree-walker cannot run a general clause");
-    assert_eq!(d.code, codes::MACHINE_ONLY_CLAUSE);
-    assert!(d.message.contains("`state.get`"), "{}", d.message);
-    assert!(crate::is_machine_only(&d));
-    let untouched = treewalk.cells().slots().all(|(_, v)| v.render() == "0");
-    assert!(
-        untouched,
-        "the refusal lands before the handled body runs, the cells were {:?}",
-        treewalk.regions()
-    );
-
     let mut machine = Machine::for_program(&program, &resolved);
     assert_eq!(machine.eval_expr_for_test(&e).unwrap().render(), "1");
+    assert!(
+        machine.cells().slots().any(|(_, v)| v.render() == "7"),
+        "the handled body never ran, the cells were {:?}",
+        machine.regions()
+    );
 }
 
 #[test]
@@ -1544,8 +1487,6 @@ fn a_bytes_pattern_matches_exactly_and_never_a_string() {
     );
 }
 
-/// Both engines run every test in this file, so this is really a claim about the machine and the
-/// tree-walker agreeing on a value neither had before.
 #[test]
 fn a_large_bytes_value_renders_truncated_rather_than_in_full() {
     let big: Vec<u8> = (0..=255u8).collect();
@@ -1769,13 +1710,13 @@ fn eval_test_runs_the_indexed_test_and_reports_a_failure() {
         ),
     ]);
     let (program, resolved) = standalone_module(m);
-    let mut interp = Interp::for_program(&program, &resolved);
-    assert_eq!(interp.test_count(), 2);
-    assert_eq!(interp.test_name(1), Some("fails"));
-    assert!(interp.eval_test(0).is_ok());
-    let d = interp.eval_test(1).unwrap_err();
+    let mut machine = Machine::for_program(&program, &resolved);
+    assert_eq!(machine.test_count(), 2);
+    assert_eq!(machine.test_name(1), Some("fails"));
+    assert!(machine.eval_test(0).is_ok());
+    let d = machine.eval_test(1).unwrap_err();
     assert_eq!(d.code, codes::ASSERTION_FAILED);
-    assert!(interp.eval_test(2).is_err());
+    assert!(machine.eval_test(2).is_err());
 }
 
 #[test]
@@ -1794,10 +1735,10 @@ fn a_failed_test_does_not_poison_the_next_one() {
         perform("state", "get", None, vec![]),
     ));
     let (program, resolved) = standalone(all);
-    let mut interp = Interp::for_program(&program, &resolved);
-    assert_eq!(interp.eval_test(0).unwrap_err().code, codes::RUNTIME_ERROR);
+    let mut machine = Machine::for_program(&program, &resolved);
+    assert_eq!(machine.eval_test(0).unwrap_err().code, codes::RUNTIME_ERROR);
     assert_eq!(
-        interp.eval_test(1).unwrap_err().code,
+        machine.eval_test(1).unwrap_err().code,
         codes::UNHANDLED_EFFECT
     );
 }
@@ -1808,12 +1749,15 @@ fn a_failed_test_does_not_poison_the_next_one() {
 fn call_invokes_a_definition_by_its_program_wide_name() {
     let (program, resolved) =
         standalone(vec![fn_def("main", &[], bin(BinOp::Add, int(1), int(2)))]);
-    let mut interp = Interp::for_program(&program, &resolved);
-    assert_eq!(interp.call("main", Vec::new(), sp()).unwrap().render(), "3");
+    let mut machine = Machine::for_program(&program, &resolved);
+    assert_eq!(
+        machine.call("main", Vec::new(), sp()).unwrap().render(),
+        "3"
+    );
 
     let (empty, resolved) = standalone(Vec::new());
-    let mut interp = Interp::for_program(&empty, &resolved);
-    let d = interp.call("main", Vec::new(), sp()).unwrap_err();
+    let mut machine = Machine::for_program(&empty, &resolved);
+    let d = machine.call("main", Vec::new(), sp()).unwrap_err();
     assert_eq!(d.code, codes::UNKNOWN_NAME);
 }
 
@@ -1831,24 +1775,4 @@ fn values_render_readably_for_a_report_reader() {
         .unwrap()
         .render();
     assert!(long.ends_with("… 8 more]"), "{long}");
-}
-
-/// The default engine is the authoritative one, and only the authoritative one may read or write a
-/// cached `Pass`.
-#[test]
-fn the_default_engine_is_the_one_whose_results_may_be_cached() {
-    use crate::{Engine, EngineChoice};
-
-    assert_eq!(EngineChoice::default().primary(), Engine::default());
-    assert!(!EngineChoice::default().bypasses_cache());
-    assert_eq!(Engine::default(), Engine::Machine);
-
-    // An explicit choice is reported as itself, never as whatever the default happens to be — the
-    // bug the flip exposed.
-    assert_eq!(EngineChoice::Treewalk.primary(), Engine::Treewalk);
-    assert_eq!(EngineChoice::Machine.primary(), Engine::Machine);
-
-    assert!(EngineChoice::Treewalk.bypasses_cache());
-    assert!(EngineChoice::Both.bypasses_cache());
-    assert_eq!(EngineChoice::Both.auditor(), Some(Engine::Treewalk));
 }

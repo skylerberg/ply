@@ -6,7 +6,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{EngineChoice, Plan, Value};
+use ply_eval::{Plan, Value};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::Store;
@@ -131,7 +131,7 @@ fn run(
         &compiled.check,
         &compiled.hashes,
         store,
-        EngineChoice::Machine,
+        false,
         Search::default(),
         hosting,
     )

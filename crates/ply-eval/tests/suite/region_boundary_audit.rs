@@ -10,7 +10,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Arena, Engine, Interp, Machine, RegionKind, TaskRegions, Value};
+use ply_eval::{Arena, Machine, RegionKind, TaskRegions, Value};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -48,10 +48,6 @@ impl Compiled {
 
     fn machine(&self) -> Machine<'_> {
         Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn interp(&self) -> Interp<'_> {
-        Interp::new(&self.program, &self.resolved, &self.check)
     }
 
     fn index_of(&self, name: &str) -> usize {
@@ -151,13 +147,6 @@ fn the_documented_open_route_still_behaves_as_adr_0017_section_2_says() {
         .machine()
         .eval_test(index)
         .unwrap_or_else(|d| panic!("the open route must still run on the machine: {d:#?}"));
-
-    // The tree-walker refuses every clause that binds a continuation (`E0504`, ADR 0005 required
-    // test 3), so its answer here is that refusal and not a different reading of the program.
-    let treewalk = compiled.interp().eval_test(index).expect_err("E0504");
-    assert_eq!(treewalk.code, codes::MACHINE_ONLY_CLAUSE);
-    assert!(ply_eval::is_machine_only(&treewalk));
-    let _ = Engine::Machine;
 }
 
 /// And the value it carries is found by the walk the boundaries use.
@@ -240,27 +229,6 @@ fn a_cell_from_another_arena_is_refused_at_the_entry_point() {
 
     assert_eq!(d.code, codes::REGION_ESCAPE_AT_BOUNDARY);
     assert!(d.message.contains("`Cell`"), "{}", d.message);
-}
-
-/// Both engines, at the same point and with the same message, or `--engine both` reports the
-/// refusal itself as a divergence.
-#[test]
-fn both_engines_refuse_an_entry_point_argument_identically() {
-    let compiled = Compiled::new(PARKED);
-    let (_arena, cell) = live_cell();
-
-    let machine = compiled
-        .machine()
-        .call("m.identity", vec![cell.clone()], Span::DUMMY)
-        .expect_err("the machine refuses");
-    let treewalk = compiled
-        .interp()
-        .call("m.identity", vec![cell], Span::DUMMY)
-        .expect_err("the tree-walker refuses");
-
-    assert_eq!(machine.code, treewalk.code);
-    assert_eq!(machine.message, treewalk.message);
-    assert_eq!(machine.notes, treewalk.notes);
 }
 
 /// Data crosses.
@@ -534,15 +502,6 @@ fn a_constant_whose_value_reaches_a_region_is_not_remembered_across_runs() {
         machine
             .eval_test(0)
             .unwrap_or_else(|d| panic!("run {run} must read this run's own cell: {d:#?}"));
-    }
-
-    // And the same on the other engine, or the two disagree about a resource bound and `--engine
-    // both` reports it as `E0503`.
-    let mut interp = compiled.interp();
-    for run in 0..3 {
-        interp
-            .eval_test(0)
-            .unwrap_or_else(|d| panic!("tree-walker run {run}: {d:#?}"));
     }
 }
 

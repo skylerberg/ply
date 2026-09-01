@@ -147,16 +147,16 @@ POSTGRES_SHARD=postgres
 # offer count of zero that is its whole point. The eighth does not move, for a
 # structural reason: the spike's backend is native code on a fixed stack, so
 # ignoring the budget entirely CRASHES and run_guarded reports it from outside;
-# Reference is a tree-walker whose frames grow on the heap, so the same
-# corruption HANGS -- measured at no output and no exit in 45 seconds against
+# Reference evaluates on a nested machine whose frames grow on the heap, so the
+# same corruption HANGS -- measured at no output and no exit in 45 seconds against
 # 0.03s for the run that reports. Nothing in the workspace can report a run that
 # never comes back, so the spike is still the only place that demonstration
 # lives.
 # **The condition is MET as of 2026-08-31 and the entry is still here.** The
 # note below read, until then: "seven of eight is where 2026-08-28 left it --
 # the unbounded exceeds-budget runaway crashes under the spike's native frames
-# and only hangs under a tree-walker, and a run that never comes back cannot be
-# reported from inside it". The workspace now has a backend with native frames:
+# and only hangs under an interpreting backend, and a run that never comes back
+# cannot be reported from inside it". The workspace now has a backend with native frames:
 # `ply test --backend cranelift:wrong:exceeds-budget` over a recursion with no
 # base case aborts, exit 134, in 0.02s, and `ply-cli/tests/suite/backend.rs` has
 # always run `ply` as a child so the reporter was never the problem. Eight of

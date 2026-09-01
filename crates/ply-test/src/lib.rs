@@ -19,8 +19,7 @@ use ply_core::{CheckOutput, Footprint};
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{
-    Arena, Engine, EngineChoice, Exploration, Interp, Lowering, Machine, Plan, Race, Seed,
-    TaskRegions, Value, compare_outcomes,
+    Arena, Exploration, Lowering, Machine, Plan, Race, Seed, TaskRegions, Value, compare_outcomes,
 };
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol, codes};
@@ -176,7 +175,7 @@ pub struct TestResult {
     /// Absent when nothing was written: a spent budget proved nothing, and a seeded test whose
     /// search went unobserved is a run nobody watched.
     pub recorded: Option<Record>,
-    /// Whether the differential oracle actually compared two engines on this test.
+    /// Whether the backend oracle actually compared a pair on this test.
     pub audited: Option<bool>,
     /// What this test asked of a compiled backend, and the fact ADR 0026 §4.6's stage two reads: a
     /// written `Pass` beside a non-zero `entries` is a run that cached a third execution strategy's
@@ -366,10 +365,10 @@ pub struct RunReport {
     pub audit: Option<AuditSummary>,
 }
 
-/// What `--engine both` compared, and what it could not.
+/// What `--audit-backend` compared, and what it could not.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AuditSummary {
-    /// Tests both engines ran and whose outcomes were compared.
+    /// Tests the pair ran and whose outcomes were compared.
     pub compared: usize,
     /// Tests one engine could not run, and which the oracle therefore says nothing about.
     pub unaudited: usize,
@@ -387,7 +386,7 @@ impl AuditSummary {
         }
         let mut line = format!("audited {} of {}", self.compared, self.total());
         if self.unaudited > 0 {
-            line.push_str(&format!(" · {} ran on one engine only", self.unaudited));
+            line.push_str(&format!(" · {} ran unpaired", self.unaudited));
         }
         Some(line)
     }
@@ -418,7 +417,7 @@ pub trait Executor: Sync {
         None
     }
 
-    /// Whether the last [`Executor::execute`] compared two engines.
+    /// Whether the last [`Executor::execute`] compared a pair.
     fn audited(&self, _worker: &Self::Worker) -> Option<bool> {
         None
     }
@@ -504,7 +503,8 @@ pub struct InterpExecutor<'a> {
     addresses: Vec<(Symbol, usize)>,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
-    engine: EngineChoice,
+    /// Whether to run the plain machine beside the backed one and compare.
+    audit_backend: bool,
     /// The backend this run installs, and which of the eight corruptions it is wearing.
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
     search: Search,
@@ -514,9 +514,8 @@ pub struct InterpExecutor<'a> {
 
 /// One test's evaluator.
 pub enum Engines<'a> {
-    Treewalk(Box<Interp<'a>>),
-    Machine(Box<Machine<'a>>),
-    Both(Box<Interp<'a>>, Box<Machine<'a>>, Option<Box<Machine<'a>>>),
+    One(Box<Machine<'a>>),
+    Audited(Box<Machine<'a>>, Box<Machine<'a>>),
 }
 
 /// One pool thread's evaluators, plus what its last test searched.
@@ -527,7 +526,7 @@ pub struct Worker<'a> {
     host: Option<ply_eval::host::HostUse>,
     /// The region this worker's tests run in, built once and mutated in place.
     region: GroupRegion,
-    /// Whether the last test was actually compared on two engines.
+    /// Whether the last test was actually compared as a pair.
     audited: Option<bool>,
     /// This worker's backend, built once and installed on every machine it builds — including the
     /// machines a search rebuilds per interleaving, which would otherwise each construct their own
@@ -562,8 +561,8 @@ impl<'a> Worker<'a> {
     /// The machine carrying this run's backend, if one is installed.
     fn backed(&self) -> Option<&Machine<'a>> {
         match (&self.engines, self.backend.is_some()) {
-            (Engines::Machine(m), true) => Some(m.as_ref()),
-            (Engines::Both(_, _, Some(b)), _) => Some(b.as_ref()),
+            (Engines::One(m), true) => Some(m.as_ref()),
+            (Engines::Audited(_, b), _) => Some(b.as_ref()),
             _ => None,
         }
     }
@@ -584,27 +583,21 @@ impl<'a> Worker<'a> {
     /// What this worker's machine has already lowered, for the machines a search builds per
     /// interleaving.
     fn lowering(&self) -> Option<Rc<Lowering<'a>>> {
-        match &self.engines {
-            Engines::Machine(m) | Engines::Both(_, m, _) => Some(m.share_lowering()),
-            Engines::Treewalk(_) => None,
-        }
+        let (Engines::One(m) | Engines::Audited(m, _)) = &self.engines;
+        Some(m.share_lowering())
     }
 
-    /// Hands each engine a stack seeded from the group's region, one each, so that two engines
-    /// under `--engine both` cannot write through to one another.
+    /// Hands each machine a stack seeded from the group's region, one each, so that the two under
+    /// `--audit-backend` cannot write through to one another.
     fn open_region(&mut self) {
         if self.region.is_empty() {
             return;
         }
         match &mut self.engines {
-            Engines::Treewalk(i) => i.set_regions(self.region.open().0),
-            Engines::Machine(m) => m.set_regions(self.region.open().0),
-            Engines::Both(i, m, backed) => {
-                i.set_regions(self.region.open().0);
+            Engines::One(m) => m.set_regions(self.region.open().0),
+            Engines::Audited(m, backed) => {
                 m.set_regions(self.region.open().0);
-                if let Some(b) = backed {
-                    b.set_regions(self.region.open().0);
-                }
+                backed.set_regions(self.region.open().0);
             }
         }
     }
@@ -615,26 +608,19 @@ impl<'a> Worker<'a> {
         if self.region.is_empty() {
             return;
         }
-        let after = match &self.engines {
-            Engines::Treewalk(i) => i.cells(),
-            Engines::Machine(m) | Engines::Both(_, m, _) => m.cells(),
-        };
-        self.region.close(after);
+        let (Engines::One(m) | Engines::Audited(m, _)) = &self.engines;
+        self.region.close(m.cells());
     }
 
-    /// The cells of the engine whose verdict is reported.
+    /// The cells of the machine whose verdict is reported.
     pub fn cells_mut(&mut self) -> &mut Arena {
-        match &mut self.engines {
-            Engines::Treewalk(i) | Engines::Both(i, _, _) => i.cells_mut(),
-            Engines::Machine(m) => m.cells_mut(),
-        }
+        let (Engines::One(m) | Engines::Audited(m, _)) = &mut self.engines;
+        m.cells_mut()
     }
 
     pub fn cells(&self) -> &Arena {
-        match &self.engines {
-            Engines::Treewalk(i) | Engines::Both(i, _, _) => i.cells(),
-            Engines::Machine(m) => m.cells(),
-        }
+        let (Engines::One(m) | Engines::Audited(m, _)) = &self.engines;
+        m.cells()
     }
 }
 
@@ -663,7 +649,7 @@ impl<'a> InterpExecutor<'a> {
             addresses,
             fixture: None,
             hosts: Hosting::hermetic(),
-            engine: EngineChoice::default(),
+            audit_backend: false,
             backend: None,
             search: Search::default(),
             region_kinds: ply_eval::region_kind::Kinds::default(),
@@ -676,8 +662,8 @@ impl<'a> InterpExecutor<'a> {
         self
     }
 
-    pub fn with_engine(mut self, engine: EngineChoice) -> Self {
-        self.engine = engine;
+    pub fn with_backend_audit(mut self, audit: bool) -> Self {
+        self.audit_backend = audit;
         self
     }
 
@@ -709,15 +695,6 @@ impl<'a> InterpExecutor<'a> {
             Some(build) => GroupRegion::build(build),
             None => GroupRegion::empty(),
         }
-    }
-
-    fn interp(&self) -> Box<Interp<'a>> {
-        let mut interp = Interp::new(self.program, self.resolved, self.check);
-        interp.share_region_kinds(self.shared_region_kinds());
-        if let Some(binding) = &self.hosts.binding {
-            interp.set_host_binding(Arc::clone(binding));
-        }
-        Box::new(interp)
     }
 
     /// The run's one answer about this program's regions.
@@ -778,12 +755,10 @@ impl<'a> InterpExecutor<'a> {
     /// Whether this test's outcome is a function of a seed as well as of its definitions, and
     /// therefore something to search rather than to run.
     fn searches(&self, index: usize) -> bool {
-        self.engine.primary() == Engine::Machine
-            && self
-                .check
-                .tests
-                .get(index)
-                .is_some_and(|t| is_seeded(&t.footprint))
+        self.check
+            .tests
+            .get(index)
+            .is_some_and(|t| is_seeded(&t.footprint))
     }
 
     /// The whole test, once per interleaving, each opening the group's region as the test found it.
@@ -867,18 +842,11 @@ impl<'a> Executor for InterpExecutor<'a> {
     fn worker(&self) -> Worker<'a> {
         let backend = self.backend();
         let mut worker = Worker::in_region(
-            match self.engine {
-                EngineChoice::Treewalk => Engines::Treewalk(self.interp()),
-                EngineChoice::Machine => {
-                    Engines::Machine(self.machine_lowering(None, backend.clone()))
+            match (self.audit_backend, backend.clone()) {
+                (true, Some(b)) => {
+                    Engines::Audited(self.machine(), self.machine_lowering(None, Some(b)))
                 }
-                EngineChoice::Both => Engines::Both(
-                    self.interp(),
-                    self.machine(),
-                    backend
-                        .clone()
-                        .map(|b| self.machine_lowering(None, Some(b))),
-                ),
+                (_, b) => Engines::One(self.machine_lowering(None, b)),
             },
             self.build_region(),
         );
@@ -905,30 +873,24 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.backend_use
     }
 
-    /// Only the machine has a runtime to close anything on: the tree-walker refuses a bound host
-    /// operation rather than driving one, so there is never a scope of its to hear about.
     fn teardown(&self, worker: &mut Worker<'a>) -> Vec<Diagnostic> {
-        // A cycle among escaped values is never collected (ADR 0017 §4), so the run that built one
-        // is the only place it can be reported at all.
         let mut out = ply_eval::rc::take_cycles();
-        out.extend(match &mut worker.engines {
-            Engines::Machine(m) | Engines::Both(_, m, _) => m.take_teardown_warnings(),
-            Engines::Treewalk(_) => Vec::new(),
-        });
+        let (Engines::One(m) | Engines::Audited(m, _)) = &mut worker.engines;
+        out.extend(m.take_teardown_warnings());
         out
     }
 
     fn execute(&self, worker: &mut Worker<'a>, index: usize) -> Result<(), Diagnostic> {
         worker.exploration = None;
         worker.host = None;
-        let auditing = matches!(worker.engines, Engines::Both(_, _, _));
+        let auditing = matches!(worker.engines, Engines::Audited(_, _));
         worker.audited = None;
         // Cumulative over the machine's life, so this test's own is the difference.
         let before = worker.backed().map(Machine::compiled_counts);
         worker.backend_use = None;
         if self.searches(index) {
             // A searched test is re-run per interleaving on a machine built for the schedule, so
-            // the tree-walker never sees it and there is no second answer to compare against.
+            // the pair never runs and there is no second answer to compare against.
             worker.audited = auditing.then_some(false);
             let (outcome, exploration, host, searched) = self.search(worker, index);
             worker.exploration = exploration;
@@ -948,12 +910,11 @@ impl<'a> Executor for InterpExecutor<'a> {
             }),
             _ => None,
         };
-        // Only the machine can reach a host handler: the tree-walker refuses one as machine-only
-        // rather than driving it, so under `--engine both` there is one answer here and never two
-        // to reconcile.
-        worker.host = match &worker.engines {
-            Engines::Machine(m) | Engines::Both(_, m, _) => m.host_use().cloned(),
-            Engines::Treewalk(_) => None,
+        // The machine whose verdict is reported, never the backed one: a backend reaches no host
+        // handler, so the two cannot disagree here.
+        worker.host = {
+            let (Engines::One(m) | Engines::Audited(m, _)) = &worker.engines;
+            m.host_use().cloned()
         };
         // A failing test closes its region like a passing one: what it allocated is still gone, and
         // the next test in the group must not inherit it because this one was red.
@@ -963,37 +924,30 @@ impl<'a> Executor for InterpExecutor<'a> {
 }
 
 impl<'a> InterpExecutor<'a> {
-    /// The verdict, and whether two engines produced it.
+    /// The verdict, and whether a pair produced it.
     fn execute_directly(
         &self,
         worker: &mut Worker<'a>,
         index: usize,
     ) -> (Result<(), Diagnostic>, bool) {
         match &mut worker.engines {
-            Engines::Treewalk(i) => (self.run_one(i.as_mut(), index), false),
-            Engines::Machine(m) => {
+            Engines::One(m) => {
                 self.arm_footprint_check(m.as_mut(), index);
                 (self.run_one(m.as_mut(), index), false)
             }
-            Engines::Both(i, m, backed) => {
+            Engines::Audited(m, backed) => {
                 self.arm_footprint_check(m.as_mut(), index);
-                if let Some(b) = backed.as_mut() {
-                    self.arm_footprint_check(b.as_mut(), index);
+                self.arm_footprint_check(backed.as_mut(), index);
+                // Both are stepped even when the first has already failed: a backed machine that
+                // skipped a test has a different constant memo and a different stale answer from
+                // here on.
+                let plain = self.run_one(m.as_mut(), index);
+                // A host handler is not a function, so a test that reached the boundary is run
+                // once and counted unaudited rather than having its handler called twice.
+                if m.host_use().is_some() {
+                    return (plain, false);
                 }
-                // Both are stepped even when the first has already failed: an engine that skipped a
-                // test is at a different point in the corpus, and every later comparison becomes
-                // meaningless.
-                let left = self.run_one(i.as_mut(), index);
-                let right = self.run_one(m.as_mut(), index);
-                // And the third, for the same reason: a backed machine that skipped a test has a
-                // different constant memo and a different stale answer from here on.
-                let third = backed.as_mut().map(|b| self.run_one(b.as_mut(), index));
-                // Comparing a refusal against an answer reports a divergence between an engine that
-                // declined to start and one that did the work, which is not a disagreement about
-                // what the program means.
-                if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
-                    return (right, false);
-                }
+                let with_backend = self.run_one(backed.as_mut(), index);
                 let subject = self
                     .check
                     .tests
@@ -1005,34 +959,21 @@ impl<'a> InterpExecutor<'a> {
                     .tests
                     .get(index)
                     .map_or(ply_span::Span::DUMMY, |t| t.span);
-                let engines =
-                    compare_outcomes(i.as_ref(), m.as_ref(), &subject, Some(index), &left, &right)
-                        .map(|d| d.to_diagnostic(Engine::Treewalk, Engine::Machine, span));
-                // The backend's own pair, against the plain machine rather than against the
-                // tree-walker, so that a divergence reported here is the backend's and nothing
-                // else's.
-                let backend = match (&third, backed.as_ref()) {
-                    (Some(third), Some(b)) => compare_outcomes(
-                        m.as_ref(),
-                        b.as_ref(),
-                        &subject,
-                        Some(index),
-                        &right,
-                        third,
-                    )
-                    .map(|d| d.to_backend_diagnostic(span)),
-                    _ => None,
-                };
-                let verdict = match (engines, backend) {
-                    // The engines first: a backend cannot be blamed for a disagreement between the
-                    // two evaluators that offered it the call.
-                    (Some(d), _) | (None, Some(d)) => Err(d),
-                    // The authoritative engine's answer, so that which engine a run reports never
-                    // depends on whether auditing was on.
-                    (None, None) => match EngineChoice::Both.primary() {
-                        Engine::Machine => right,
-                        Engine::Treewalk => left,
-                    },
+                // Taken whatever the plain machine said: comparing only where the plain run
+                // passed would make a backend that turns a red test *green* the one thing this
+                // cannot see.
+                let verdict = match compare_outcomes(
+                    m.as_ref(),
+                    backed.as_ref(),
+                    &subject,
+                    Some(index),
+                    &plain,
+                    &with_backend,
+                ) {
+                    Some(d) => Err(d.to_backend_diagnostic(span)),
+                    // The plain machine's answer, so that what a run reports never depends on
+                    // whether auditing was switched on.
+                    None => plain,
                 };
                 (verdict, true)
             }
@@ -1298,12 +1239,12 @@ pub fn run(
     check: &CheckOutput,
     hashes: &HashOutput,
     store: &mut Store,
-    engine: EngineChoice,
+    audit_backend: bool,
     search: Search,
     hosts: Hosting<'_>,
 ) -> RunReport {
     let executor = InterpExecutor::new(program, resolved, check)
-        .with_engine(engine)
+        .with_backend_audit(audit_backend)
         .with_search(search)
         .with_hosts(hosts);
     run_with(selection, check, hashes, store, &executor)
@@ -1567,7 +1508,7 @@ struct Executed {
     host: Option<ply_eval::host::HostUse>,
     /// What the host runtime reported while closing the entry point.
     teardown: Vec<Diagnostic>,
-    /// Whether two engines produced this verdict.
+    /// Whether a pair produced this verdict.
     audited: Option<bool>,
     /// What this test asked of a compiled backend.
     backend: Option<BackendUse>,

@@ -626,7 +626,7 @@ fn reconstructed_tests_evaluate() {
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should check");
-    let mut interp = ply_eval::Interp::new(&rebuilt.program, &resolved, &check);
+    let mut interp = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
 
     assert_eq!(interp.test_count(), 2);
     for index in 0..interp.test_count() {
@@ -913,7 +913,7 @@ fn two_tests_that_number_one_effect_differently_both_reconstruct() {
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
-    let mut interp = ply_eval::Interp::new(&rebuilt.program, &resolved, &check);
+    let mut interp = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
     assert_eq!(interp.test_count(), 2);
     for index in 0..interp.test_count() {
         interp
