@@ -1,20 +1,10 @@
-# 6. Deterministic simulation
+# ADR 0006 — Deterministic simulation
 
-Status: accepted — **implemented**
-Date: 2026-08-13
-
-> **Corrected by the W6 documentation audit.** This line read "the seed, the
-> plan and the dependence relation landed; everything that runs is outstanding".
-> Everything that runs has since landed, verified against the tree: the
-> deterministic scheduler is `crates/ply-eval/src/sched.rs`, the DPOR search in
-> the backtrack-set formulation is `crates/ply-eval/src/explore.rs` — which sets
-> `exhaustive` from the search rather than asserting it — and `--simulation` is
-> a real option group on `ply test`, `ply prove` and `ply review`
-> (`crates/ply-cli/src/cli.rs`). `Isolation` and the ambient-atom rule are
-> `crates/ply-test/src/schedule.rs`.
->
-> Two entries in "Not in M7" have also stopped being true; each is marked there
-> rather than here.
+Status: accepted — **implemented**. The deterministic scheduler is
+`ply_eval::sched` and the DPOR search, in the backtrack-set formulation, is
+`ply_eval::explore` — **which sets `exhaustive` from the search rather than
+asserting it.** Two entries in "Not in M7" have stopped being true and are marked
+there.
 Builds on: `0005-control-stack-and-world.md`, whose threaded world and explicit
 control stack are the two things this milestone is impossible without.
 

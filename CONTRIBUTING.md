@@ -176,13 +176,12 @@ the timing suites need a job of their own.
    as an English sentence. See §Style.
 3. If you changed a *guarantee*, you found and updated the document that states
    it. `grep -rn` the guarantee's words across `README.md`, `DESIGN.md`,
-   `ROADMAP.md`, `CONTRACTS.md` and `docs/adr/`. Roughly 24,500 lines of prose
-   and **one sentence** of it is read by a test — `README.md`'s request-path
-   allocation count, by
-   `w6_report_allocations::the_readme_still_describes_this_request_path`, added
-   after that sentence went stale twice. For the other 24,500 lines you are the
-   only check. (Re-take the figure rather than quoting it;
-   `docs/ONBOARDING.md` §7 gives the command.)
+   `ROADMAP.md`, `CONTRACTS.md` and `docs/adr/`. **One sentence of that whole
+   prose surface is read by a test** — `README.md`'s request-path allocation
+   count, by `w6_report_allocations::the_readme_still_describes_this_request_path`,
+   added after that sentence went stale twice. **For everything else you are the
+   only check.** (Re-take the figure rather than quoting it; `docs/ONBOARDING.md`
+   §7 gives the command.)
 4. If you changed something the shipped measurement files describe, re-take
    them. The command is in `docs/adr/0016-w6-performance.md` §"Provenance"; the
    three tests that will fail otherwise are
@@ -543,8 +542,8 @@ comments record why each of the three non-obvious ones (`rustls`,
 
 ### An ADR
 
-`docs/adr/` is **twenty-nine** files, `00NN-slug.md`, with **no index** — the
-numbers are the ordering. Pick the next free one — and **nothing you have to
+`docs/adr/` is `00NN-slug.md` files with **no index** — the numbers are the
+ordering. Pick the next free one — and **nothing you have to
 remember decides this any more**: `ply-span:armed:no_two_adrs_share_a_number`
 fails when two files share a number, so the check catches you rather than a
 reader finding an ambiguous `ADR NNNN` citation months later.
@@ -557,12 +556,23 @@ reader finding an ambiguous `ADR NNNN` citation months later.
 > repository can follow. `no_two_adrs_share_a_number` in
 > `crates/ply-span/tests/armed.rs` is what catches the collision now.
 
-ADR 0005 is superseded in part by
-ADR 0017, and it is the model for how to record that: 0005's *title* does not say
-so, but its header does — lines 3–9 carry `Status: accepted — … §2's persistent
-forkable world is **superseded by ADR 0017**` and `Superseded in part by:
-docs/adr/0017-regions.md (§2 only)`, and §2 itself opens with a
-`> **Superseded by ADR 0017.**` block at line 289. Do that in both files.
+ADR 0005 is superseded in part by ADR 0017, and it is the model for how to record
+that: 0005's *title* does not say so, but its header carries
+`Status: accepted — … §2's persistent forkable world is **superseded by ADR
+0017**` and `Superseded in part by: docs/adr/0017-regions.md (§2 only)`, and §2
+itself opens with a `> **Superseded by ADR 0017.**` block. Do that in both files.
+
+**Amend an ADR in place; do not append a note saying what it used to say.** This
+directory ran the opposite convention and §"Correct in place" is the general
+rule; the ADR-specific half is that an amendment belongs in the sentence it
+amends, because a reader who reaches the sentence has already believed it. What
+stays beside a claim is the small class §"Writing a claim down" names — a
+rejected alternative with its reason, a trap, a wrong-instrument correction.
+
+**An ADR's section numbers are an API.** They are cited by number from every
+other document and from source comments, so **renumbering or deleting a section
+breaks citations silently.** Trim a section's body to a line if it is spent;
+leave its heading where it is.
 
 An ADR here is expected to state the criteria *before* the measurement, in code
 where possible. `ply_corpus::w6::Criteria::default()` is the model: eight

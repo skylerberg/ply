@@ -4,18 +4,15 @@ Status: accepted — **implemented**, and **amended by W2 in two places**: `std`
 is a reserved first path segment (ADR 0012 §1), and a small set of builtin names
 is reserved against the shadowing rule below (ADR 0012 §A5). Both are marked
 inline where they apply.
-Date: 2026-07-25
 Supersedes: the loader behaviour where `ply test <dir>` concatenated every
 `*.ply` file under the directory into one module.
 Amended by: `docs/adr/0012-w2-contract.md` §1 and §A5.
 
-> **Added by the W6 documentation audit.** This ADR's "Resolution order" and
-> "One file, one module" are the two rules the rest of the language is written
-> against, and W2 cut a hole in each without either being recorded here. The
-> `compare_values` amendment in particular exists because the unrestricted rule
-> below produced a real defect — a module defining `fn compare` supplied the
-> order of every dictionary derived in it — so the exception is load-bearing
-> rather than cosmetic.
+**"Resolution order" and "One file, one module" are the two rules the rest of the
+language is written against, and W2 cut a hole in each.** Both amendments are
+marked inline. The `compare_values` one is load-bearing rather than cosmetic:
+**the unrestricted rule below produced a real defect — a module defining
+`fn compare` supplied the order of every dictionary derived in it.**
 
 ## Context
 
@@ -51,8 +48,8 @@ single named file.
 > file whose path would derive a module name of `std` or `std.*` is
 > `E0113 RESERVED_MODULE_NAME` (`ply_span::codes::RESERVED_MODULE_NAME`),
 > reported against the file. `import std.json` names a module whose source ships
-> with the compiler — `crates/ply-std/ply/*.ply`, eight modules as of W5 — and
-> which therefore has no project root at all. This is the one exception to "a
+> with the compiler — `crates/ply-std/ply/*.ply` — and which therefore has no
+> project root at all. This is the one exception to "a
 > module name is derived from a path under the root"; reserving the segment is
 > what makes it an exception rather than a precedence order.
 

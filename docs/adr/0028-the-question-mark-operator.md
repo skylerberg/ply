@@ -17,7 +17,7 @@ exactly.
 recursive-descent parser hits, and it is careful to say that the *writing* cost
 is not the problem:
 
-> `parser.rs:11`'s `Bail` is a zero-field struct, so `PResult<T> = Result<T,
+> `parser.rs`'s `Bail` is a zero-field struct, so `PResult<T> = Result<T,
 > Bail>` is isomorphic to `Option<T>` … A `bail: Bool` in the threaded state is
 > therefore the *same type*, not an approximation — and the guard goes on the
 > **callee** instead of the call site, which is strictly better than the shape
@@ -327,7 +327,7 @@ the site was reverted to its `match`.
 
 > **The design phase's `RESULTS.md` recorded, as an auxiliary check, "Of the 129
 > S1 sites, 0 sit under a lambda."** That is **wrong**, and wrong in the
-> reassuring direction: it is 1 of 129, and the one is `examples/desk.ply:626`.
+> reassuring direction: it is 1 of 129, and the one is `examples/desk.ply`.
 > The `db.ply` half of the claim — 0 of 119 — holds, and `db.ply` is still the
 > demonstration. The lambda restriction now has a measured cost of exactly one
 > shipped site, which is a better number than "zero" because it is true.

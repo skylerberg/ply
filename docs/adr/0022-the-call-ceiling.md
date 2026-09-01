@@ -92,13 +92,13 @@ Type, pinned at `crates/ply-core/tests/suite/iterate_builtin.rs`:
 
 ### §1.1 It rides the protocol `fold` already rides
 
-`iterate` is not a new mechanism. `crates/ply-eval/src/builtins.rs:549`
+`iterate` is not a new mechanism. `crates/ply-eval/src/builtins.rs`
 answers a `Step::Apply` carrying a `Frame::IterateStep`
-(`crates/ply-eval/src/cont.rs:270`), exactly as `next_fold` answers one
+(`crates/ply-eval/src/cont.rs`), exactly as `next_fold` answers one
 carrying a `Frame::FoldStep`. The machine pushes that frame and pops it again
-each round (`machine.rs:2128 run_builtin_step`, dispatched at
+each round (`machine.rs run_builtin_step`, dispatched at
 `frame.rs`'s builtin-step arm); the tree-walker keeps the round on its host
-stack in a `loop` (`builtins.rs:1641 Interp::call_builtin`). **Neither nests.**
+stack in a `loop` (`builtins.rs Interp::call_builtin`). **Neither nests.**
 One definition, two engines, which is the property `crate::differential` exists
 to protect.
 
@@ -106,11 +106,11 @@ to protect.
 
 ### §1.2 The budget is the second argument, and that is not a style choice
 
-`crates/ply-eval/src/region_kind.rs:807 walk_callback` reads a higher-order
+`crates/ply-eval/src/region_kind.rs walk_callback` reads a higher-order
 builtin's function out of `args.last()`. Two tests assert that every
 higher-order builtin has it last —
-`region_kind.rs:1059 the_callback_builtins_are_the_six_this_module_knows` and
-`builtins.rs:2816 exactly_the_callback_builtins_are_higher_order`. A
+`region_kind.rs the_callback_builtins_are_the_six_this_module_knows` and
+`builtins.rs exactly_the_callback_builtins_are_higher_order`. A
 callback in the middle would be read as data and the `Int` read as the
 callback, and region-kind inference would record `Cause::Indirect` **silently**.
 So `iterate(seed, budget, step)`, matching `fold(xs, init, f)` and
@@ -154,19 +154,19 @@ in both takes (0.04→0.01, 0.06→0.03 — a cold first run each time), so its 
 is UNMEASURED; its windows are above and the conclusion does not rest on it.
 
 **The load-independent half of the claim is a test, not a stopwatch**:
-`equivalence_audit.rs:2260 an_iterate_whose_step_never_stops_is_a_diagnostic_on_both_engines`
+`equivalence_audit.rs an_iterate_whose_step_never_stops_is_a_diagnostic_on_both_engines`
 asserts that both engines produce the diagnostic, and that it does **not**
 contain the string "recursion limit". An exhausted budget is
-`crates/ply-eval/src/limit.rs:176 err_iterate_budget`; a budget below one is
-`limit.rs:189 err_iterate_budget_not_a_count`, refused before the first round
+`crates/ply-eval/src/limit.rs err_iterate_budget`; a budget below one is
+`limit.rs err_iterate_budget_not_a_count`, refused before the first round
 because zero steps is a bound nobody writes on purpose. Neither says
 **"recursion limit"**, deliberately: nothing nested, and things classify on that
 string. `limit.rs`'s own correction block names four
-(`ply-cli/tests/suite/failure_classification_audit.rs`, `ply-test/tests/suite/hybrid.rs`,
+(`ply-cli/tests/failure_classification_audit.rs`, `ply-test/tests/hybrid.rs`,
 `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`) — that list is quoted from
 there and was not independently re-derived here; what *is* checked is that the
 new diagnostics do not contain the phrase, asserted at
-`equivalence_audit.rs:2260` and at
+`equivalence_audit.rs` and at
 `builtins.rs::an_iterate_that_never_stops_exhausts_its_budget_and_says_so`.
 
 And the argument is the whole link to §5: **a number in the source is a number
@@ -179,9 +179,9 @@ A new prelude type name. `Iter` joins `builtin_types()`, so a project's own
 `type Iter` is now `E0105`
 (`crates/ply-core/tests/suite/iterate_builtin.rs::a_project_may_not_declare_its_own_iter`).
 `grep -rnw Iter` over the tree found the name free outside prose. `Step` and
-`Loop` were **not** available: `crates/ply-std/ply/json.ply:116` and
-`examples/twin_divergence_audit.ply:60` declare `type Step`, and
-`crates/ply-eval/tests/suite/reference_cycles.rs:61` declares `type Loop` — naming
+`Loop` were **not** available: `crates/ply-std/ply/json.ply` and
+`examples/twin_divergence_audit.ply` declare `type Step`, and
+`crates/ply-eval/tests/suite/reference_cycles.rs` declares `type Loop` — naming
 the ADT `Step` would have broken a shipped `std` module.
 
 Constructor names are a separate namespace and are **not** globally reserved, so
@@ -236,7 +236,7 @@ front end now reads differently.
 
 **`PROVER_VERSION` is deliberately not bumped**, and that is a decision rather
 than an omission. Adding to `prelude::ADTS` does reach the prover —
-`ply-prove/src/prove/context.rs:239 drop_incomplete` (the table is read at `:245`) reads the table to know a
+`ply-prove/src/prove/context.rs drop_incomplete` (the table is read at `:245`) reads the table to know a
 prelude ADT's declaration is complete, so the case split will now split on an
 `Iter`. But no *existing* obligation can change: splitting on `Iter` requires
 source that mentions it, and any program that previously declared its own
@@ -244,10 +244,10 @@ source that mentions it, and any program that previously declared its own
 are unreachable rather than wrong. Nothing else in `ply-prove` reads the new
 entry.
 
-The compiled fragment **refuses** it: `crates/ply-codegen-spike/src/jit.rs:537
+The compiled fragment **refuses** it: `crates/ply-codegen-spike/src/jit.rs
 admissible_builtin` returns `Err` for any `b.higher_order()`, which `iterate`
 is. That is expected and is not a regression — `fold` is refused by the same
-line. (ADR 0020 cites this function as `jit.rs:508`; it is at `:537`, corrected
+line. (ADR 0020 cites this function as `jit.rs`; it is at `:537`, corrected
 there in place.)
 
 ---
@@ -291,7 +291,7 @@ ADR 0020's "at perhaps 15 precedence levels that is ~255 frames" overstates it
 by more than half.
 
 And the strongest fact, which neither ADR had: **the reference parser bounds
-grammar nesting itself.** `const MAX_DEPTH: u32 = 128` (`parser.rs:23`),
+grammar nesting itself.** `const MAX_DEPTH: u32 = 128` (`parser.rs`),
 enforced by `deeper()` (`:244`) at exactly three sites — `ty_inner` (`:1035`),
 `unary_expr` (`:1244`) and `pattern` (`:1846`). Against ADR 0020's own measured
 corpus maximum of **17**, and a call ceiling of 10,000, grammar nesting in this
@@ -422,11 +422,10 @@ that a ranking taken at one window is not a cost.
 residual from its fitted line within **1.5%** of that point's measured value.
 The worst is 0.52%.
 
-> **Withdrawn readings.** This ADR was handed 369 / 3,160 and 3,140 / 11,764
-> bytes for the same four cells. Three of the four are within 2% of what I
-> measured; the machine's one-operand cell is 369 against my **339**, 8.8%
-> apart. Mine are what this ADR carries, per the pre-registered rule that a
-> handed figure is not a target.
+**This ADR was handed figures for the same four cells and re-took them rather
+than carrying them.** Three of the four agree within a couple of percent and one
+does not. **The measured ones are what this ADR carries, per the pre-registered
+rule that a handed figure is not a target.**
 
 The shape is what matters, not the constants: raising `DEFAULT_MAX_CALLS` from
 10,000 to 100,000 costs, at the worst cell, 90,000 × 11,792 B ≈ **1.06 GB** of
@@ -462,15 +461,12 @@ that is what decides this: by the pre-registered formula the medians give
 **labelled UNMEASURED** and is not carried as a claim by this ADR. Raw windows
 are above so it can be re-taken on an idle machine.
 
-> **The withdrawn reading, recorded rather than quoted.** This ADR was handed
-> "~0.44 µs per wasted iteration, 76% of a real step, from a 500,000-iteration
-> fold at 0.29 s all-real against 0.22 s mostly-no-op". My own runs are 0.93 s
-> and 0.48 s and give 0.951 µs and 51.1%. The two are **not comparable**: the
-> brief named no step function, and mine allocates a two-field record per real
-> step, so the disagreement is at least partly a difference of program and not
-> of machine. Neither figure is quotable from this session. What is not in doubt
-> — because it needs no stopwatch — is the *count*: 87% of desk.ply's lexer loop
-> is no-ops, which is a fact about the program.
+**A handed reading for the same quantity disagrees, and neither figure is
+quotable from this session.** The brief named no step function and the
+reproduction here allocates a record per real step, **so the disagreement is at
+least partly a difference of program and not of machine.** What is not in doubt —
+**because it needs no stopwatch** — is the *count*: the overwhelming majority of
+the lexer loop's iterations are no-ops, **which is a fact about the program.**
 
 **Nothing in this ADR is refused or accepted on M4.** It priced a motivation
 that §3's depth-1 measurements and §7's `recursion limit of 10000 nested calls
@@ -506,7 +502,7 @@ That asymmetry decides it:
 
 A flag that is safe in one direction and silently wrong in the other is not a
 flag. Making it safe means keying results on it, and the precedent for what that
-costs is in the tree already: `crates/ply-prove/src/key.rs:19 prove_key` hashes
+costs is in the tree already: `crates/ply-prove/src/key.rs prove_key` hashes
 `PLAN_DOMAIN`, the `DefHash` and the plan's digest together, so a discharge
 earned under one plan is never read by a run under another —
 `result_key` (`:33`) then writes a sampled tier under the *plan* key and only a
@@ -554,10 +550,10 @@ needs no engine deleted:
 | what a call costs | zero on the machine, one on the tree-walker | one on both, and the loop is not a call |
 | what bounds a runaway | nothing | the budget, an argument |
 | how the engines count | differently — that was the defect | identically: one `Frame::IterateStep`, pushed and popped |
-| how it is checked | it was not | `equivalence_audit.rs:2194`, `:2234`, `:2260`, `:2295` |
+| how it is checked | it was not | `equivalence_audit.rs`, `:2234`, `:2260`, `:2295` |
 
 The difference is asserted rather than claimed.
-`equivalence_audit.rs:2194 an_iterate_of_five_hundred_thousand_steps_is_depth_one_on_both_engines`
+`equivalence_audit.rs an_iterate_of_five_hundred_thousand_steps_is_depth_one_on_both_engines`
 runs a **500,000-step** loop under `with_max_calls(8)` on both engines — 50×
 `DEFAULT_MAX_CALLS` above, three orders of magnitude below — and passes. Its
 arming leg is what makes that non-vacuous: the **same loop** written as the tail
@@ -580,7 +576,7 @@ then restored to byte-identical digests and the pair re-run green.
 
 ## §7 What this changes in `std`
 
-`crates/ply-std/ply/http.ply:1584 stream_chunks` and `:1613 stream_raw` are now
+`crates/ply-std/ply/http.ply stream_chunks` and `:1613 stream_raw` are now
 `iterate` drivers. `max_stream_chunks` (`:102`) is a policy number.
 
 M7, and it is the one clause of the exit criterion with two halves that are both
@@ -596,7 +592,7 @@ required. `respond_chunked` with `max_stream_chunks: 50000` — five times
 
 Without the first row the second is a claim about a bound nothing reached, and
 the user-visible motivation in §0 would be false. It is now
-`crates/ply-cli/tests/suite/w3_http_audit.rs:689`.
+`crates/ply-cli/tests/suite/w3_http_audit.rs`.
 
 **The terminating-chunk guarantee survives, and it is why the budget is spent
 inside the step.** `w3_http_audit.rs::a_streamed_response_always_ends_with_its_terminating_chunk`
@@ -623,7 +619,7 @@ that silence does not imply the file is finished.
 ## §8 What would make this ADR wrong
 
 - **If `iterate`'s depth turns out not to be 1 on some engine or backend.** The
-  depth claim is asserted at two tests — `equivalence_audit.rs:2194` for the
+  depth claim is asserted at two tests — `equivalence_audit.rs` for the
   call count on both engines, `:2234` for the machine's frame count — and both
   were seen to fail under a driver that nests. A third execution strategy would
   have to be checked against them rather than assumed into them; the compiled

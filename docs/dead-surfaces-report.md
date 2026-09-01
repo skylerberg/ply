@@ -374,7 +374,7 @@ constant.** The ranking that ships is: culprits first, then everything else by
 
 ### 1.2 What the decision record promised, and what a reader believes today
 
-**ADR 0004 §5 "The causal slice"** (`docs/adr/0004-machine-shaped-failure.md:272`)
+**ADR 0004 §5 "The causal slice"** (`docs/adr/0004-machine-shaped-failure.md` §5)
 specifies `stack`, `entered` and `observed`, and closes: *"`ply-eval` gains the
 recorder; the hook is `Interp::apply` for named closures and the perform site for
 atoms."*
@@ -548,10 +548,10 @@ house convention):
 
 | document | what needs withdrawing |
 | --- | --- |
-| `docs/adr/0004-machine-shaped-failure.md:272-307` | all of §5 |
-| `docs/adr/0004-machine-shaped-failure.md:333-395` | the example object's `causal_slice`, `suspects[].ran` and `suspects[].depth` |
-| `docs/adr/0004-machine-shaped-failure.md:412-419` | six rows of the §7 table, and the `observed` half of a seventh |
-| `docs/adr/0004-machine-shaped-failure.md:309-323` | §6's "innermost first" ranking, which becomes unimplementable |
+| `docs/adr/0004-machine-shaped-failure.md` §5 | all of it |
+| `docs/adr/0004-machine-shaped-failure.md` §7 | the example object's `causal_slice`, `suspects[].ran` and `suspects[].depth` |
+| `docs/adr/0004-machine-shaped-failure.md` §7 | six rows of its field table, and the `observed` half of a seventh |
+| `docs/adr/0004-machine-shaped-failure.md` §6 | its "innermost first" ranking, which becomes unimplementable |
 | `CONTRACTS.md:1170` | `Attribution::slice` |
 | `CONTRACTS.md:1315-1335` | *"Causal slice — **landed** in `ply-test::slice`"* and the type listing |
 | `CONTRACTS.md:1382` | *"`ply-eval` gains the tracer — hooked at `Interp::apply`"* |
@@ -1627,7 +1627,7 @@ the next change does not have to rediscover them.
    production outside `slice.rs`'s own `Default` impl.
 
 4. **ADR 0004's correction says "four rows"**, §1.2:
-   `docs/adr/0004-machine-shaped-failure.md:424`. Nine of the 20 rows describe a
+   `docs/adr/0004-machine-shaped-failure.md` §7. Nine of the rows describe a
    field that is null in every report the binary writes.
 
 5. **`CONTRIBUTING.md`'s closing summary of item 12 contradicts item 12's own

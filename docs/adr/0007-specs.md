@@ -1,20 +1,10 @@
-# 7. Specs
+# ADR 0007 — Specs
 
-Status: accepted — **implemented**
-Date: 2026-08-13
-
-> **Corrected by the W6 documentation audit.** This line read "the decision
-> types, the AST and the diagnostics landed; everything that decides an
-> obligation is outstanding". Everything that decides one has since landed,
-> verified against the tree rather than against a later ADR: the prover is
-> `crates/ply-prove/src/prove/` (`lower.rs`, `egraph.rs`, `solve.rs`,
-> `arith.rs`, `term.rs`), the property engine is
-> `crates/ply-prove/src/property.rs`, the shrinker is
-> `crates/ply-prove/src/shrink.rs`, and `ply prove` is a real subcommand
-> (`Command::Prove` → `commands::prove::execute`). W2 then amended the prover's
-> `Float` rule — see ADR 0012 §A3 and §A6, which moved `PROVER_VERSION` to
-> `0.4.0` because an obligation over a hidden `Float` is now refused where it
-> was previously certified.
+Status: accepted — **implemented**. The prover is `crates/ply-prove/src/prove/`,
+the property engine and the shrinker beside it, and `ply prove` is a real
+subcommand. **W2 then amended the prover's `Float` rule** — ADR 0012 §A3 and §A6
+— **which moved `PROVER_VERSION` because an obligation over a hidden `Float` is
+now refused where it was previously certified.**
 Builds on: `0002-incremental-frontend.md` and `0003-cache-storage.md`, whose
 content-addressed front end is what makes an obligation discharge once ever;
 `0006-deterministic-simulation.md`, whose `exhaustive: true` is the only place a
@@ -1437,7 +1427,7 @@ The tier contract:
     survives 1,000 sampled cases across 8 roots. A refutation **and a raise** are
     each classified as a defect in Ply.
     *Enforced by `every_proof_a_generated_corpus_produces_survives_a_wide_sample`
-    (`crates/ply-corpus/tests/suite/tier_audit.rs:26`), verified in the 2026-08-17
+    (`crates/ply-corpus/tests/suite/tier_audit.rs`), verified in the 2026-08-17
     docs pass. It sweeps seeds 1..=6, re-samples at `cases: 1_000` over
     `roots: 0..8`, and `disagreement` treats both `Discharge::Refuted` and
     `Gap::Raised` as defects, which is the `i64`-versus-ℤ shape §5.1(a)
