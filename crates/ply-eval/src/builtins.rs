@@ -453,7 +453,7 @@ impl fmt::Debug for Step {
 fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
-    let copied = match &mut xs {
+    let (out, copied) = match &mut xs {
         Value::List(list) => match std::sync::Arc::get_mut(list) {
             Some(items) => {
                 items.push(x);
@@ -461,16 +461,17 @@ fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
                 return Ok(Step::Done(xs));
             }
             None => {
-                let mut out = Vec::with_capacity(list.len() + 1);
+                let copied = list.len();
+                let mut out = Vec::with_capacity(copied + 1);
                 out.extend(list.iter().cloned());
                 out.push(x);
-                out
+                (out, copied)
             }
         },
         other => return Err(type_error(span, "`push`", "List", other)),
     };
-    crate::rc::note_update(false, span);
-    Ok(Step::Done(Value::list(copied)))
+    crate::rc::note_update_of(false, copied, span);
+    Ok(Step::Done(Value::list(out)))
 }
 
 /// `cells` is the run's live arena, threaded rather than snapshotted: `cell_get` must observe every

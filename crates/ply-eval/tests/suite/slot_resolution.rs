@@ -385,3 +385,48 @@ fn the_corpus_carries_far_more_often_than_it_captures() {
          is much the more common of the two, and on this corpus it is not"
     );
 }
+
+/// The append counter measures what was copied, not only whether anything was — ADR 0034 §5.
+///
+/// `updates_in_place` answers "did this append copy the whole list", which is the right question
+/// only while a copy is all-or-nothing. A chunked representation copies a path instead of an array,
+/// so the boolean would read `false` for an O(log n) append and the rate would look uniformly bad
+/// while the program got faster. This pins the volume, which is the question that survives.
+#[test]
+fn a_copying_append_reports_how_much_it_copied() {
+    use ply_eval::{Machine, rc};
+    use ply_syntax::resolve::resolve as resolve_names;
+
+    // `grow` appends in argument position 0 of 2, so every append copies the whole list: the copies
+    // are 0 + 1 + .. + (n-1) elements for n appends.
+    let src = "\
+fn grow(xs: List<Int>, n: Int) -> List<Int> =
+  if n == 0 { xs } else { grow(push(xs, n), n - 1) }
+test \"grown\" { assert_eq(len(grow([], 20)), 20) }
+";
+    let mut map = SourceMap::new();
+    let id: SourceId = map.add("volume.ply", src.to_string());
+    let mut program =
+        parse_program([(id, ModuleName::from_dotted("volume"), src)]).expect("the probe parses");
+    let resolved = resolve_names(&mut program).expect("the probe resolves");
+
+    let before = rc::stats();
+    let mut machine = Machine::for_program(&program, &resolved);
+    for i in 0..machine.test_count() {
+        machine.eval_test(i).expect("the probe passes");
+    }
+    let after = rc::stats();
+
+    let updates = after.updates - before.updates;
+    let in_place = after.updates_in_place - before.updates_in_place;
+    let copied = after.elements_copied - before.elements_copied;
+    assert_eq!(
+        (updates, in_place),
+        (20, 0),
+        "twenty appends, none of them in place"
+    );
+    assert_eq!(
+        copied, 190,
+        "0 + 1 + .. + 19 elements copied, which the boolean cannot say and the volume can"
+    );
+}

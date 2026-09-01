@@ -390,6 +390,16 @@ neither of which moves the bar it failed:**
    property of the language: **no core operation may have a cost ratio that grows
    with n on a property the source does not show.**
 
+**The instrument S5 needs is now in the tree.** `rc::Stats::updates_in_place` answers "did this
+append copy the whole list", which is the right question only while a copy is all-or-nothing: a
+chunked append that cannot rewrite copies a path, so the boolean would read `false` for something
+costing O(log n) and the rate would look uniformly bad while the program got faster. Seven armed
+assertions read that boolean, and S5 would have made every one of them vacuous.
+`rc::Stats::elements_copied` counts what was actually copied, which is the question that survives
+the representation — 190 elements for twenty whole-list appends, pinned in
+`slot_resolution::a_copying_append_reports_how_much_it_copied`. Under `imbl` the same program
+reports a number that shrinks rather than a boolean that stops meaning anything.
+
 The index cost is real and is now measurable via `list_at`. ADR 0027 §7 warns that
 a peek is almost all interpreter dispatch, so it must be priced through the
 backend or not at all; G3 says so rather than waiving it.
@@ -629,6 +639,7 @@ small lists, and G2 is measured there. That number needs the change to exist, so
 | **S4b** | slot resolution at lowering, verified against the names | done — no runtime change; the assignment the rewrite switches to is wrong-checked first |
 | **S4c** | clause and `return` bodies copy in their free variables rather than extending the prompt scope | done, behind the probe — removes §4.1's addressing obstacle |
 | **S4** | §4, slot frames — the machine reads by index | gated on **G1**, then **G2** |
+| **S5a** | the append counter measures volume, not a boolean | done — the instrument S5 would otherwise make vacuous |
 | **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |

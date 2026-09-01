@@ -129,6 +129,7 @@ fn delta(before: rc::Stats, after: rc::Stats) -> rc::Stats {
         takes_moved: after.takes_moved - before.takes_moved,
         updates: after.updates - before.updates,
         updates_in_place: after.updates_in_place - before.updates_in_place,
+        elements_copied: after.elements_copied - before.elements_copied,
         cycles: after.cycles - before.cycles,
     }
 }
