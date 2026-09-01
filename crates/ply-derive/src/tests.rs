@@ -13,8 +13,8 @@ fn parse(source: &str) -> Module {
     }
 }
 
-/// The generated source, having also checked that expansion itself is clean and
-/// that what it produced went into `items`.
+/// The generated source, having also checked that expansion itself is clean and that what it
+/// produced went into `items`.
 fn generated(source: &str) -> Vec<String> {
     let mut module = parse(source);
     let before = module.items.len();
@@ -40,8 +40,6 @@ fn errors(source: &str) -> Vec<Diagnostic> {
 
 const JSON: &str = "import std.json\n";
 
-// ---------------------------------------------------------------- naming
-
 #[test]
 fn snake_case_follows_the_rule_including_acronyms() {
     assert_eq!(snake_case("Order"), "order");
@@ -55,8 +53,6 @@ fn snake_case_follows_the_rule_including_acronyms() {
         "order_line_json"
     );
 }
-
-// ---------------------------------------------------------------- shape
 
 #[test]
 fn a_record_encodes_its_fields_in_declaration_order() {
@@ -160,8 +156,6 @@ fn a_binder_cannot_shadow_a_dictionary_parameter_named_like_one() {
     assert!(!g.contains("|dv:"), "{g}");
 }
 
-// ---------------------------------------------------------------- determinism
-
 #[test]
 fn the_same_type_generates_byte_identical_source_every_time() {
     let source = format!(
@@ -187,10 +181,7 @@ fn generation_does_not_depend_on_the_order_unrelated_items_were_written_in() {
     assert_eq!(a, b);
 }
 
-/// The golden pin. It exists to fail: when it does, the deriver's output moved,
-/// and gate 1 keys on raw file content — so a build that emits different code
-/// for the same file would reuse a stale generated definition unless
-/// `FRONTEND_VERSION` moves with it.
+/// The golden pin.
 #[test]
 fn the_generated_form_is_pinned() {
     let source = format!(
@@ -212,8 +203,6 @@ fn status_json() -> json::JsonCodec<Status> = {encode: |dv: Status| match dv {Pl
          whose generated definition changed would be skipped and the stale one reused."
     );
 }
-
-// ---------------------------------------------------------------- spans
 
 #[test]
 fn every_span_in_a_generated_definition_is_the_derive_items() {
@@ -295,8 +284,6 @@ fn collect_spans(e: &ply_syntax::ast::Expr, out: &mut Vec<Span>) {
     }
 }
 
-// ---------------------------------------------------------------- refusals
-
 #[test]
 fn a_function_field_is_refused_naming_the_field() {
     let d = errors(&format!(
@@ -360,11 +347,8 @@ fn a_module_without_the_deriver_s_runtime_module_is_told_to_import_it() {
     assert!(d[0].notes.iter().any(|n| n.contains("import std.json")));
 }
 
-/// A selective import binds no module name, so expansion adds one and the
-/// generated body writes through it. A bare name would be resolved in the
-/// *deriving* module, and a module that declared `int_json` would then supply
-/// the leaf codec its own derivation composed with — one type, two encodings,
-/// no diagnostic.
+/// A selective import binds no module name, so expansion adds one and the generated body writes
+/// through it.
 #[test]
 fn a_selective_import_of_std_json_still_writes_a_module_binder() {
     let source = "import std.json (JsonCodec, Json, object, field, int_json)\n\
@@ -383,8 +367,8 @@ fn a_selective_import_of_std_json_still_writes_a_module_binder() {
     );
 }
 
-/// The binder expansion adds cannot collide with one the file already bound,
-/// and which name it picks is a function of the file's own imports.
+/// The binder expansion adds cannot collide with one the file already bound, and which name it
+/// picks is a function of the file's own imports.
 #[test]
 fn a_synthesized_binder_steps_around_the_names_the_file_already_binds() {
     let g = one(

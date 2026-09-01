@@ -1,8 +1,4 @@
 //! Adversarial audit of content addressing.
-//!
-//! Every test here is written at the source level, because that is the surface a
-//! user edits. A failure in the "false negative" section means the cache can
-//! return a stale pass for changed code.
 
 use ply_hash::{DefHash, HashOutput, hash_ast};
 use ply_span::{SourceId, Symbol};
@@ -356,13 +352,8 @@ fn a_match_binder_that_captures_a_parameter_changes_the_hash() {
     );
 }
 
-/// `db` and `audit` declare the same operations, so performing one and
-/// performing the other differ by a consistent renaming and by nothing a hash
-/// may see. What must stay distinguishable is a definition that *chooses*
-/// between them while both are in view: `f` performs the first, `g` the second,
-/// and the handler discharges exactly one. Two identical handler clauses that
-/// catch different atoms would otherwise share a hash while leaving different
-/// residual footprints.
+/// `db` and `audit` declare the same operations, so performing one and performing the other differ
+/// by a consistent renaming and by nothing a hash may see.
 #[test]
 fn a_definition_that_chooses_between_look_alike_effects_is_distinguishable() {
     let source = |handled: &str| {
@@ -383,10 +374,8 @@ fn a_definition_that_chooses_between_look_alike_effects_is_distinguishable() {
     );
 }
 
-/// Aliases are expanded by the checker, so `Meters` and `Feet` below are both
-/// literally `Int` and swapping one for the other is genuinely a no-op. This is
-/// the one place where erasing a declaration's name is safe, and it is safe only
-/// because the entity is structural — contrast the effect case above.
+/// Aliases are expanded by the checker, so `Meters` and `Feet` below are both literally `Int` and
+/// swapping one for the other is genuinely a no-op.
 #[test]
 fn swapping_two_transparent_type_aliases_is_free() {
     let source = |ty: &str| {
@@ -720,9 +709,7 @@ fn every_definition_in_a_realistic_module_gets_a_distinct_hash_unless_identical(
     );
 }
 
-/// Normalization walks the expression tree recursively. The parser's own limit
-/// does not bound that walk: a left-leaning operator chain is parsed iteratively
-/// at constant depth, so an arbitrarily deep tree reaches the normalizer.
+/// Normalization walks the expression tree recursively.
 #[test]
 fn a_long_operator_chain_does_not_overflow_the_stack() {
     let chain = std::iter::repeat_n("a", 20_000)
@@ -733,10 +720,7 @@ fn a_long_operator_chain_does_not_overflow_the_stack() {
     let out = hash_ast(&module).expect("a long chain hashes");
     assert!(out.defs.contains_key(&Symbol::new("f")));
 
-    // `Expr`'s derived `Drop` recurses through every `Box` and overflows on a
-    // tree this deep. That is the AST's own defect and it cannot be fixed from
-    // here, so the tree is leaked rather than allowed to abort this binary and
-    // hide the result above.
+    // `Expr`'s derived `Drop` recurses through every `Box` and overflows on a tree this deep.
     std::mem::forget(module);
 }
 
@@ -748,10 +732,9 @@ fn next(state: &mut u64) -> u64 {
     *state
 }
 
-/// Definitions are hashed in the order Tarjan emits components, and a reference
-/// is written as the referent's hash, so a component emitted before one it
-/// depends on would silently fall back to an opaque self-marker and collapse
-/// distinct references onto the same bytes.
+/// Definitions are hashed in the order Tarjan emits components, and a reference is written as the
+/// referent's hash, so a component emitted before one it depends on would silently fall back to an
+/// opaque self-marker and collapse distinct references onto the same bytes.
 #[test]
 fn randomized_acyclic_modules_hash_independently_of_item_order() {
     let mut seed = 0x5eed_1234_u64;
@@ -837,15 +820,8 @@ fn randomized_graphs_are_emitted_in_reverse_topological_order() {
 
 // --- `law/host` -------------------------------------------------------------
 
-/// ADR 0014 §6.1: `law/host` is part of the law's own hash, written after
-/// `tag::LAW` exactly as `TestDef::nondet` is written after `tag::TEST`.
-///
-/// A law that changes from `law` to `law/host` is a **different claim** — the
-/// first says nothing outside the program decides it — so it must re-discharge
-/// rather than reuse a certificate about a claim it no longer makes.
-///
-/// The second half is what bounds the blast radius of the `BODY_ENCODING` bump:
-/// no definition's hash moves for a law's sake.
+/// ADR 0014 §6.1: `law/host` is part of the law's own hash, written after `tag::LAW` exactly as
+/// `TestDef::nondet` is written after `tag::TEST`.
 #[test]
 fn declaring_a_law_host_changes_the_law_and_no_definition() {
     const PLAIN: &str = "\
@@ -880,20 +856,9 @@ law/host \"f grows\"
     );
 }
 
-// Record update. The whole feature is one claim about hashing, so the test for
-// it lives here rather than beside the parser.
+// Record update.
 
-/// **The record-update invariant.** `{..s, a: 1}` is not a new kind of
-/// expression; it is a way of writing one that already existed. If the two
-/// spellings hashed differently, adopting the sugar would move every definition
-/// that adopted it *and* split one value into two cache entries — two
-/// definitions computing the same thing, each re-running its own tests.
-///
-/// The expansion is pinned, not merely "some expansion": copies first, sorted by
-/// field name, then the written fields in the order written. The `assert_ne!` is
-/// what stops this test from passing vacuously under a hash that ignored field
-/// order — `swapping_two_record_fields_changes_the_hash` is the invariant it
-/// leans on, and a different order is genuinely a different definition.
+/// **The record-update invariant.**
 #[test]
 fn record_update_hashes_as_its_expansion() {
     const SIG: &str = "fn f(s: {a: Int, b: Int, c: Int}) -> {a: Int, b: Int, c: Int} = ";
@@ -914,14 +879,9 @@ fn record_update_hashes_as_its_expansion() {
          proves nothing about which expansion was emitted"
     );
 
-    // Names of *differing length*, because `a`/`b`/`c` cannot tell
-    // lexicographic order apart from any comparator that ties-breaks on length
-    // first — and a longhand a reader writes from ADR 0023 §Decision 2 has to
-    // match the emitted order for real field names, not just short ones.
-    //
-    // Both directions. `aa`/`z` sorts the longer name first, so it catches a
-    // shortest-first comparator and *not* a longest-first one, which emits the
-    // same order sorting by name does. `a`/`zz` is the mirror.
+    // Names of *differing length*, because `a`/`b`/`c` cannot tell lexicographic order apart from
+    // any comparator that ties-breaks on length first — and a longhand a reader writes from ADR
+    // 0023 §Decision 2 has to match the emitted order for real field names, not just short ones.
     const WIDE: &str = "type R = {aa: Int, z: Int, k: Int}\nfn f(s: R) -> R = ";
     unchanged(
         "record update with field names of differing length",
@@ -938,10 +898,9 @@ fn record_update_hashes_as_its_expansion() {
     );
 }
 
-/// The copies are sorted by field name rather than emitted in the type's
-/// declaration order, so that `reordering_the_fields_of_a_record_type_is_free`
-/// keeps holding for a definition written with the sugar. Declaration-order
-/// expansion would make `type` field order load-bearing for every update.
+/// The copies are sorted by field name rather than emitted in the type's declaration order, so that
+/// `reordering_the_fields_of_a_record_type_is_free` keeps holding for a definition written with the
+/// sugar.
 #[test]
 fn reordering_the_updated_type_is_still_free() {
     unchanged(
@@ -952,11 +911,8 @@ fn reordering_the_updated_type_is_still_free() {
     );
 }
 
-/// The shape is found by following this module's alias chain, and what comes out
-/// is the same expansion the reader would have written. The signature is held
-/// fixed so that only the body differs: a *type reference* is a reference and
-/// hashes as one, so `-> S` and `-> {a: Int, b: Int}` are legitimately different
-/// definitions and would mask what this test is about.
+/// The shape is found by following this module's alias chain, and what comes out is the same
+/// expansion the reader would have written.
 #[test]
 fn updating_through_a_type_alias_hashes_as_its_expansion() {
     const DECLS: &str = "type R = {a: Int, b: Int}\ntype S = R\n";
@@ -968,18 +924,7 @@ fn updating_through_a_type_alias_hashes_as_its_expansion() {
     );
 }
 
-/// A projected base is copied as written, once per field, exactly as the
-/// longhand copies it. This is the `chunk_trailers` shape.
-///
-/// `pp`/`q` rather than `p`/`q`: the copies have to be two names whose
-/// lexicographic order and whose length order **disagree**, or this test passes
-/// under either comparator and pins nothing about which one ran. `Limits`, the
-/// record this shape exists for, has thirteen field names of eight different
-/// lengths.
-///
-/// And then `p`/`qq` as well, because one pair only disagrees with length in one
-/// direction: `pp` before `q` is what sorting by name *and* sorting longest-first
-/// both emit, so that pair alone leaves a longest-first comparator green.
+/// A projected base is copied as written, once per field, exactly as the longhand copies it.
 #[test]
 fn a_projected_base_hashes_as_its_expansion() {
     const DECLS: &str = "type L = {pp: Int, q: Int, r: Int}\ntype W = {lim: L, tag: Int}\n";
@@ -998,9 +943,7 @@ fn a_projected_base_hashes_as_its_expansion() {
     );
 }
 
-/// Changing which field an update replaces is a real change and must move the
-/// hash. Without this the invariance tests above could be satisfied by a hash
-/// that ignored the update entirely.
+/// Changing which field an update replaces is a real change and must move the hash.
 #[test]
 fn changing_the_updated_field_changes_the_hash() {
     changed(
@@ -1011,31 +954,9 @@ fn changing_the_updated_field_changes_the_hash() {
     );
 }
 
-// The `?` operator. Same shape of claim as record update, and for the same
-// reason, so its test lives here too.
+// The `?` operator.
 
-/// **The `?` invariant.** `e?` is not a new kind of expression; it is a way of
-/// writing the `match` the corpus hand-writes 129 times. If the two spellings
-/// hashed differently, converting a site would move its `DefHash` and every
-/// dependent's, split one value into two cache entries, and turn "the module's
-/// behaviour is unchanged" from something shown into something asserted.
-///
-/// **The arm order is what this pins, and it is measured rather than chosen.**
-/// `normalize.rs` writes match arms in source order, so an expansion emitting
-/// `Ok` first would be a *different* definition — and the corpus writes the
-/// failure arm first 129 times to 3 for `Result`, 11 to 6 for `Option`. The
-/// longhand in each pair below is written failure-first for that reason; the
-/// `assert_ne!` against the reversed longhand is what stops the pair passing
-/// vacuously under a hash that ignored arm order.
-///
-/// ADR 0023's mixed-length field names have **no analogue here** and are
-/// deliberately not imitated: they exist because record-update copies are
-/// *sorted*, and a single-letter suite cannot tell sorting by name from sorting
-/// by length. Match arms are not sorted, so what has to be shown instead is that
-/// the order is the corpus's and that reversing it is visible. Binder *names*
-/// are erased by de Bruijn levelling, which is why the sugar's synthesized `?0`
-/// can equal a longhand's `x` at all — and the longhands below use ordinary
-/// names, so a levelling that leaked a name would fail every one of them.
+/// **The `?` invariant.**
 #[test]
 fn try_hashes_as_its_longhand() {
     const DECLS: &str = "type E = {msg: Int}\nfn g(n: Int) -> Result<Int, E> = Ok(n)\n";
@@ -1052,11 +973,8 @@ fn try_hashes_as_its_longhand() {
          proves nothing about which order was emitted"
     );
 
-    // The `let`-bound shape, which is what every corpus conversion is: the
-    // `let`'s own pattern becomes the success arm's binder and the `let` is gone.
-    // The general rule would emit `Ok(t) -> { let a = t; ... }`, a different
-    // definition — `a_let_bound_try_puts_its_own_pattern_on_the_success_arm` in
-    // `ply-syntax` pins the tree, and this pins that the tree is the longhand's.
+    // The `let`-bound shape, which is what every corpus conversion is: the `let`'s own pattern
+    // becomes the success arm's binder and the `let` is gone.
     let bound = format!("{DECLS}{SIG}{{ let a = g(n)?; let b = g(a)?; Ok(a + b) }}");
     let bound_long = format!(
         "{DECLS}{SIG}match g(n) {{\n\
@@ -1066,8 +984,8 @@ fn try_hashes_as_its_longhand() {
     );
     unchanged("two `?`s in a run", &bound, &bound_long, "f");
 
-    // `db.ply:1000`, verbatim in shape: the continuation is a tail call and the
-    // expansion leaves it in tail position.
+    // `db.ply:1000`, verbatim in shape: the continuation is a tail call and the expansion leaves it
+    // in tail position.
     let tail = format!("{DECLS}{SIG}g(g(n)?)");
     let tail_long = format!("{DECLS}{SIG}match g(n) {{ Err(er) -> Err(er), Ok(c) -> g(c) }}");
     unchanged("`?` in a tail-call argument", &tail, &tail_long, "f");
@@ -1089,8 +1007,8 @@ fn try_hashes_as_its_longhand() {
     );
 }
 
-/// Without this the invariance above could be satisfied by a hash that ignored
-/// what the `?` was applied to.
+/// Without this the invariance above could be satisfied by a hash that ignored what the `?` was
+/// applied to.
 #[test]
 fn changing_what_a_try_unwraps_changes_the_hash() {
     const DECLS: &str = "type E = {msg: Int}\n\
@@ -1104,11 +1022,8 @@ fn changing_what_a_try_unwraps_changes_the_hash() {
     );
 }
 
-/// `is_pure` moved out of `normalize.rs` into `ply_syntax::ast` so that `?`
-/// expansion and `commutable_run` ask one implementation whether an expression
-/// may be reordered. This is the invariant that says the move was free: a run of
-/// pure `let`s is still written in its sorted order, so which one the author
-/// typed first is still not part of the definition's identity.
+/// `is_pure` moved out of `normalize.rs` into `ply_syntax::ast` so that `?` expansion and
+/// `commutable_run` ask one implementation whether an expression may be reordered.
 #[test]
 fn a_run_of_pure_lets_still_commutes_after_the_predicate_moved() {
     unchanged(

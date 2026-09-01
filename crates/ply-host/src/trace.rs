@@ -1,58 +1,4 @@
 //! The `trace` effect and the sinks that serve it.
-//!
-//! [`DECLARATION`] is the Ply source this registers against — the module
-//! `std.trace`, which ships with the compiler — and `HostRegistry::bind` is what
-//! checks the two still agree: an operation renamed on either side is `E0421`
-//! before anything runs.
-//!
-//! Four properties of the registration are what `ply hosts` prints, and each is
-//! one line of [`Op::declaration`]:
-//!
-//! - **The resource is a channel, and the call site writes it.** `trace.write[c]`
-//!   per channel, never one singleton `trace.write`. A singleton would put every
-//!   test that records anything into one concurrency group, and it would make a
-//!   row say "records" and nothing more.
-//! - **Nondeterministic.** A production sink stamps a wall-clock timestamp and
-//!   mints a span id, and neither is a function of the program's state. So a
-//!   `det` test that reaches an unhandled `trace` operation is `E0412` at compile
-//!   time, whether or not `--host` was passed, and the only way to make such a
-//!   test compile is to install a collecting handler.
-//! - **At most once.** Replaying a continuation across an event writes the event
-//!   twice, and a duplicated span in a log is a wrong answer about what happened
-//!   rather than a missing one.
-//! - **Not blocking.** A record is formatted and written inline; nothing here
-//!   waits on a peer, so nothing answers `Pending`.
-//!
-//! ## What a span costs when nothing is collecting
-//!
-//! There is no configuration under which a trace operation is not performed — a
-//! row cannot be conditional on a flag — so `--trace off` binds
-//! [`sink::Discard`], a real, listed member of the trusted computing base whose
-//! clause answers `Unit`. What that costs is exactly:
-//!
-//! 1. the `Fields` map the call site built, which is the program's;
-//! 2. one perform: a failed `Stack::find_handler` walk, a binding resolution, and
-//!    the `call` below;
-//! 3. nothing else.
-//!
-//! "Nothing else" is designed rather than observed, and it is one `if` per
-//! operation: [`Sink::wants`] is consulted **before** a name is decoded, a field
-//! list is built or a clock is read. `crates/ply-host/tests/trace_cost.rs` is
-//! the counting harness that asserts it — zero handler-side allocations, zero
-//! clock reads, zero formatted strings for a discarded event — and it is a
-//! counting harness rather than a stopwatch because a stopwatch cannot say
-//! *what* was paid for.
-//!
-//! Level filtering is the sink's for the same reason, and it therefore saves
-//! (1) nothing and (3) everything: `--trace-level warn` does not make a `Debug`
-//! event free, it makes it cost one perform and one map. Saying otherwise would
-//! be the misleading claim, because the only way to make it free is a row that
-//! lies.
-//!
-//! Spans are the one thing kept whatever the sink. [`spans::Spans`] pushes and
-//! pops under `discard` exactly as it does under `json`, because `E0445` is a
-//! statement about the *program* and a program whose verdict changed with
-//! `--trace off` would be a program nobody could debug.
 
 pub mod sink;
 pub mod spans;
@@ -74,23 +20,17 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-/// The Ply declaration the registrations below are checked against: the source
-/// of the module `std.trace`, which ships with the compiler.
+/// The Ply declaration the registrations below are checked against: the source of the module
+/// `std.trace`, which ships with the compiler.
 pub const DECLARATION: &str = ply_std::TRACE;
 
 /// The module the declaration ships as, which is what qualifies [`EFFECT`].
 pub const MODULE: &str = "std.trace";
 
-/// The program-wide effect name. Effect names are qualified, so the `trace`
-/// declared by `std.trace` is `std.trace.trace`, and a program that declares its
-/// own `trace` instead is `E0421` rather than silently acquiring a real sink.
+/// The program-wide effect name.
 pub const EFFECT: &str = "std.trace.trace";
 
 /// How much of a record a sink admits.
-///
-/// Ordered `Debug < Info < Warn < Error`, which is what `--trace-level` filters
-/// against. A span and a metric are `Info`: they are the shape of a thing that
-/// happened rather than a thing that went wrong.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub enum Level {
     Debug,
@@ -172,25 +112,18 @@ impl Op {
         }
     }
 
-    /// The registration. Everything a reviewer reads in `ply hosts` is decided
-    /// here; the only column an implementation gets a say in is the path, which
-    /// must name the sink that actually serves the run rather than the effect.
+    /// The registration.
     fn declaration(self, path: &'static str) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
-            // Whichever channels the program uses. `bind` expands this against
-            // the program's own atoms and `ply hosts` prints one row per
-            // expansion, so a sink that serves every channel still has to list
-            // the channels it got — the difference between "this handler claims
-            // everything" and "this handler claims these four channels".
+            // Whichever channels the program uses.
             resource: HostResource::Any,
             determinism: Determinism::Nondeterministic,
             linearity: Linearity::AtMostOnce,
             blocking: false,
-            // A `Field` has no constructor over a `Secret`, so nothing of that
-            // type can reach a record. The column is the boundary's own account
-            // of itself and this row's answer is no.
+            // A `Field` has no constructor over a `Secret`, so nothing of that type can reach a
+            // record.
             secrets: false,
             path,
         }
@@ -207,13 +140,6 @@ pub struct Counts {
 }
 
 /// The sink, the clock, and every span every entry point has open.
-///
-/// One per run, shared by `Arc`. The span table is what makes this stateful and
-/// therefore what makes it a member of §7's accounting: the atom is
-/// `trace.write[c]`, a **write** per channel, so two tests recording on one
-/// channel conflict and are serialised by the existing conflict graph, and a
-/// test that installs the `std.trace` twin discharges the atom entirely and is
-/// coupled to nothing.
 pub struct Trace {
     sink: Arc<dyn Sink>,
     clock: Arc<dyn Clock>,
@@ -233,9 +159,9 @@ impl Trace {
         Trace::with_clock(sink, Arc::new(HostClock))
     }
 
-    /// The same, over a clock a test supplies — which is how the counting
-    /// harness asserts that a discarded event reads the clock zero times, and
-    /// how a golden test over a JSON line gets a stamp that does not move.
+    /// The same, over a clock a test supplies — which is how the counting harness asserts that a
+    /// discarded event reads the clock zero times, and how a golden test over a JSON line gets a
+    /// stamp that does not move.
     pub fn with_clock(sink: Arc<dyn Sink>, clock: Arc<dyn Clock>) -> Trace {
         Trace {
             sink,
@@ -246,10 +172,8 @@ impl Trace {
         }
     }
 
-    /// The sink's reviewable identity and where it writes, for the
-    /// `observability` block of `ply hosts` and for the digest that block is in.
-    /// Read from the sink rather than from the flag that chose it, so the
-    /// listing and the handler column cannot disagree.
+    /// The sink's reviewable identity and where it writes, for the `observability` block of `ply
+    /// hosts` and for the digest that block is in.
     pub fn sink_path(&self) -> &'static str {
         self.sink.path()
     }
@@ -258,8 +182,7 @@ impl Trace {
         self.sink.destination()
     }
 
-    /// What the shutdown banner prints. Every number is one the run already
-    /// held; nothing here is computed for the banner.
+    /// What the shutdown banner prints.
     pub fn counts(&self) -> Counts {
         let spans = lock(&self.spans);
         Counts {
@@ -270,20 +193,12 @@ impl Trace {
         }
     }
 
-    /// How many spans are open across every entry point. For the "0 spans open"
-    /// line a stopping service prints, and for a test that asserts a teardown
-    /// left nothing behind.
+    /// How many spans are open across every entry point.
     pub fn open_spans(&self) -> usize {
         lock(&self.spans).total_open()
     }
 
-    /// Closes every span this machine still has open, `Abandoned`, innermost
-    /// first per task.
-    ///
-    /// Called from `HostRuntime::end_entry_point` on **every** exit path — a
-    /// value, a diagnostic, or a spent budget — which is the whole of its value:
-    /// three of the four ways a computation leaves a span never run another line
-    /// of it.
+    /// Closes every span this machine still has open, `Abandoned`, innermost first per task.
     pub fn end_entry_point(&self, machine: MachineId) -> Option<Diagnostic> {
         let closings = lock(&self.spans).end_entry_point(machine);
         if closings.is_empty() {
@@ -295,9 +210,7 @@ impl Trace {
         Some(spans::warn_abandoned(&closings))
     }
 
-    /// Flushes the sink. Runs after `end_entry_point` and **before** the
-    /// connection pool closes, so a trace naming a rolled-back transaction is
-    /// written before the connection that rolled it back is gone.
+    /// Flushes the sink.
     pub fn flush(&self) {
         self.sink.flush();
         self.flushed.fetch_add(1, Ordering::Relaxed);
@@ -334,10 +247,6 @@ pub fn register(registry: &mut HostRegistry, trace: Arc<Trace>) {
 }
 
 /// One operation's handler, outside a registry.
-///
-/// For the cost harness, which has to call the same handler a bound run calls
-/// and must not be measuring a registry lookup a bound run does once. A second
-/// handler written for the benchmark would be a benchmark of something else.
 pub fn handler(op: Op, trace: Arc<Trace>) -> Arc<dyn HostHandler> {
     Arc::new(Operation { op, trace })
 }
@@ -360,19 +269,18 @@ impl HostHandler for Operation {
         if req.args.len() != self.op.arity() {
             return Err(arity(self.op, req.args.len(), span));
         }
-        // The resolved atom's resource, never one the handler re-derives: the
-        // registry already decided which channel this perform named.
+        // The resolved atom's resource, never one the handler re-derives: the registry already
+        // decided which channel this perform named.
         let channel = &req.atom.resource;
         let owner: Owner = (req.machine, req.task);
         match self.op {
-            // Two operations keep state whatever the sink does, because `E0445`
-            // is a statement about the program and a program whose verdict moved
-            // with `--trace off` would be a program nobody could debug.
+            // Two operations keep state whatever the sink does, because `E0445` is a statement
+            // about the program and a program whose verdict moved with `--trace off` would be a
+            // program nobody could debug.
             Op::Enter => self.enter(req, channel, owner),
             Op::Exit => self.exit(req, channel, owner, span),
-            // The other four have nothing to keep, so a sink that wants nothing
-            // is answered before a name is decoded, a field is built or a clock
-            // is read.
+            // The other four have nothing to keep, so a sink that wants nothing is answered before
+            // a name is decoded, a field is built or a clock is read.
             Op::Event => {
                 let level = value::level(&req.args[0], span)?;
                 self.simple(req, channel, owner, level, 1)
@@ -384,10 +292,6 @@ impl HostHandler for Operation {
 
 impl Operation {
     /// `event`, `count`, `gauge` and `time`: one record, no state.
-    ///
-    /// All four take their `Fields` last and their amount, if they have one, in
-    /// the middle; `name_at` is the one position that moves, because an `event`
-    /// carries a leading `level` and a metric does not.
     fn simple(
         &self,
         req: &HostRequest<'_>,
@@ -434,9 +338,9 @@ impl Operation {
     ) -> Result<HostAnswer, Diagnostic> {
         let span = req.span;
         let wanted = self.trace.sink.wants(Level::Info);
-        // The `Arc<str>` the argument already holds, so keeping the name costs
-        // no allocation even when nothing is collecting — which is what lets
-        // `W0609` name the innermost span under `--trace off`.
+        // The `Arc<str>` the argument already holds, so keeping the name costs no allocation even
+        // when nothing is collecting — which is what lets `W0609` name the innermost span under
+        // `--trace off`.
         let name = match &req.args[0] {
             ply_eval::Value::Str(s) => Arc::clone(s),
             other => return Err(value_error(span, "a span's name", other)),
@@ -485,24 +389,16 @@ impl Operation {
     }
 
     /// The span an event or a metric was recorded in, and that span's parent.
-    /// `(0, 0)` outside any span.
     fn enclosing(&self, owner: Owner) -> (i64, i64) {
         lock(&self.trace.spans).innermost(owner)
     }
 }
 
 /// The two field names of a `Span`, interned once.
-///
-/// A `Symbol` is an `Arc<str>`, so minting one per `enter` and one per `exit`
-/// would be three allocations per span for two constants — which is a third of
-/// what a disabled span costs, spent on strings that never change.
 pub(crate) static ID: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("id"));
 static CHANNEL: std::sync::LazyLock<Symbol> = std::sync::LazyLock::new(|| Symbol::new("channel"));
 
 /// `{ id: Int, channel: String }`, as `trace.enter` answers it.
-///
-/// Two scalars in a record, which is the whole of what a call site allocates for
-/// a span. The record is the sink's, and a discarding sink builds none.
 fn span_value(id: i64, channel: &Resource) -> ply_eval::Value {
     let mut fields = BTreeMap::new();
     fields.insert(ID.clone(), ply_eval::Value::Int(id));
@@ -510,9 +406,8 @@ fn span_value(id: i64, channel: &Resource) -> ply_eval::Value {
     ply_eval::Value::Record(Arc::new(fields))
 }
 
-/// A poisoned lock here holds a span table whose invariant is "innermost last",
-/// which a thread that panicked mid-push cannot have broken: the push is one
-/// `Vec::push`.
+/// A poisoned lock here holds a span table whose invariant is "innermost last", which a thread that
+/// panicked mid-push cannot have broken: the push is one `Vec::push`.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }

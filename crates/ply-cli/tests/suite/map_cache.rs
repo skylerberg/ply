@@ -1,18 +1,12 @@
-//! A `Map` through the result cache, which is where a non-canonical iteration
-//! order would do its quietest damage.
-//!
-//! The failure being ruled out is specific: if a map's identity depended on how
-//! it was built, a passing test would be written to the cache under one
-//! insertion order and re-run **red** under another — a red result over correct
-//! code, produced by nothing the user changed.
+//! A `Map` through the result cache, which is where a non-canonical iteration order would do its
+//! quietest damage.
 
 use assert_cmd::Command;
 use std::path::Path;
 use tempfile::TempDir;
 
-/// The orders are data rather than source, so the two runs below are the *same*
-/// definitions — which is what makes the second one a cache read rather than a
-/// second first run.
+/// The orders are data rather than source, so the two runs below are the *same* definitions — which
+/// is what makes the second one a cache read rather than a second first run.
 const SOURCE: &str = "\
 fn build(ks: List<Int>) -> Map<Int, Int> =
   fold(ks, map_new(), |m, k| map_insert(m, k, k * 10))
@@ -64,9 +58,7 @@ fn a_test_over_maps_built_in_different_orders_passes_and_then_caches() {
     );
 }
 
-/// Both engines, over the same program, with the cache bypassed. `--engine both`
-/// reporting `E0503` on a correct program is the fourth thing a hash-ordered map
-/// would break, and it is the one that would be blamed on the machine.
+/// Both engines, over the same program, with the cache bypassed.
 #[test]
 fn both_engines_agree_about_a_map() {
     let dir = project(SOURCE);

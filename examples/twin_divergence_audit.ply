@@ -1,29 +1,9 @@
-// An adversarial audit of ADR 0014 §5's central claim: that `std.db`'s
-// in-memory twin and postgres agree.
-//
-// The right-hand side of every assertion here is what PostgreSQL 18.3 answered
-// for the same statement text against the same schema, under
-// `LC_COLLATE=C LC_CTYPE=C ENCODING=UTF8` — the collation §5.3 pins — recorded
-// by hand and written into the test. The left-hand side is the twin, run here,
-// hermetically, under `ply test`.
-//
-// **Eight of these were recorded disagreements and are now agreements.** Each
-// doc comment still says what the twin used to answer and why the difference was
-// silent, because a fix whose shape nobody can find is a fix that comes back.
-// The three that remain are the ones no twin can close — an order SQL does not
-// promise, and a refusal the twin makes as a value where the driver makes it as
-// a diagnostic — and each says what closes it instead.
-//
-// Each test names, in this order: what postgres does, what the twin does, and
-// whether the agreement law as ADR 0014 §6.2 specifies it could reach the case.
+// An adversarial audit of ADR 0014 §5's central claim: that `std.db`'s in-memory twin and postgres
+// agree.
 import std.db
 import std.db (db)
 
 // --- The fixture ------------------------------------------------------------
-//
-// `examples/agreement.ply`'s two tables, copied rather than imported: a test
-// run over one file has to resolve, and the divergences below are about the
-// twin rather than about that file.
 
 pub fn fixture() -> db::Schema = {tables: [part(), bin()]}
 
@@ -68,8 +48,7 @@ fn replay(steps: List<Step>) -> List<db::Answer> =
     {db: r.db, out: push(acc.out, r.out)}
   }).out
 
-// The answer to the last statement of a sequence, which is what most tests
-// below assert on.
+// The answer to the last statement of a sequence, which is what most tests below assert on.
 fn last_answer(steps: List<Step>) -> db::Answer = last_of(replay(steps))
 
 fn last_of(xs: List<db::Answer>) -> db::Answer =
@@ -85,9 +64,7 @@ fn insert_part(sku: String, n: db::Param) -> Step =
   {sql: "insert into part (sku, price, tag, n) values ($1, $2, $3, $4)",
    ps: [db::PText(sku), db::PNumeric(1m), db::PNull, n]}
 
-// The SQLSTATE, or the shape when there was no failure. Comparing shapes is
-// what makes "postgres answered rows and the twin answered a failure" readable
-// as one line.
+// The SQLSTATE, or the shape when there was no failure.
 fn shape(a: db::Answer) -> String =
   match a {
     db::Failed(e) -> "Failed " ++ e.code,
@@ -102,39 +79,17 @@ fn skus(a: db::Answer) -> List<String> =
     _ -> [],
   }
 
-// --- 1. `ORDER BY` does not determine an order when the key has ties ---------
-//
-// ADR 0014 §6.2 justifies comparing result sets positionally with "an unordered
-// `SELECT` is `ORDER BY` on the primary key by construction of `render`". That
-// sentence is not true of the code: `render` orders by `SelectOp::order_by`,
-// and `well_formed` requires only that it name *a* column of the table. `n` and
-// `tag` are nullable and carry no unique constraint, so a generated `Select` can
-// order by a key with ties — and a key with ties fixes nothing.
-//
-// postgres  twelve rows a..l, every `n` equal to 1, `order by n limit 3` →
-//           `b, c, a`. The bounded sort is a top-N heapsort and its output order
-//           among equal keys is neither the heap order nor stable.
-// twin      `a, b, c`. Rows are kept in insertion order and `insert_sorted`
-//           is stable, so ties come back in the order they were written.
-// the law   **used to reach this and would have been refuted by it**, on a
-//           sequence of twelve `Insert`s and one `Select` that `well_formed`
-//           admitted in full. Neither answer is wrong, so the law would have
-//           failed for a reason nobody could fix — which is worse than a gap,
-//           because a claim that fails unfixably is a claim everybody learns to
-//           skip. What closes it is not a change to either side: `render` now
-//           appends the table's primary key to every generated `ORDER BY`, and
-//           `well_formed` admits only a table that has one, so no generated
-//           order has a tie for the two sides to disagree inside.
+// --- 1.
 test "an ORDER BY over a column with ties returns an order SQL does not promise" {
   let twelve = fold(range(0, 12), [], |acc: List<Step>, i: Int|
     push(acc, insert_part(letter(i), db::PInt(1))));
   let answer = last_answer(push(twelve, q("select sku from part order by n limit 3")));
   assert_eq(skus(answer), ["a", "b", "c"]);
-  // PostgreSQL 18.3, the same twelve inserts and the same statement:
+  // PostgreSQL 18.3, the same twelve inserts and the same statement.
   assert(skus(answer) != ["b", "c", "a"]);
 
-  // The same twelve rows under the order `render` generates, which is what the
-  // law compares: the tie is broken by the primary key and the two agree.
+  // The same twelve rows under the order `render` generates, which is what the law compares: the
+  // tie is broken by the primary key and the two agree.
   let keyed = last_answer(push(twelve, q("select sku from part order by n, sku limit 3")));
   assert_eq(skus(keyed), ["a", "b", "c"])
 }
@@ -143,16 +98,7 @@ test "an ORDER BY over a column with ties returns an order SQL does not promise"
 fn letter(i: Int) -> String =
   string_slice("abcdefghijkl", i, i + 1)
 
-// The same disagreement without a bounded sort, which rules out "it is only the
-// top-N heapsort".
-//
-// postgres  three rows a, b, c with `n = 5`; `update part set n = 5 where
-//           sku = 'a'`; `select sku from part order by n limit 10` → `b, c, a`.
-//           An updated row is a new tuple at the end of the heap.
-// twin      `a, b, c`. An `UPDATE` leaves a row where it was.
-// the law   reached this — `Insert` x3, `Update`, `Select`, all well-formed —
-//           and no longer does, for the same reason: the generated order ends
-//           with the primary key.
+// The same disagreement without a bounded sort, which rules out "it is only the top-N heapsort".
 test "an UPDATE moves a row in postgres and leaves it in place in the twin" {
   let ops = [
     insert_part("a", db::PInt(5)),
@@ -168,45 +114,20 @@ test "an UPDATE moves a row in postgres and leaves it in place in the twin" {
   assert_eq(skus(keyed), ["a", "b", "c"])
 }
 
-// --- 2. A `WHERE` is checked per row, so an empty table hides every error -----
-//
-// The twin evaluates a predicate once per stored row. Postgres resolves names
-// and operators when it plans, before it looks at a row. So every static error
-// postgres raises is invisible in the twin whenever the predicate is never
-// evaluated — which is every query against an empty table.
-//
-// postgres  `42703 column "nosuch" does not exist`, on an empty table.
-// twin      `Rows([])` — until `plan_filter`, which resolves the names before a
-//           row is examined, exactly where postgres does.
-// the law   cannot reach it. `SelectOp` carries no `WHERE` at all, and
-//           `well_formed` requires an `Update`'s and a `Delete`'s `where_col` to
-//           be a column the fixture has. The generator is too gentle to see it,
-//           which is why this test exists beside the law rather than inside it.
+// --- 2.
 test "a WHERE naming a column that does not exist is refused on an empty table" {
   assert_eq(shape(last_answer([q("select sku from part where nosuch = 1")])), "Failed 42703");
   assert_eq(shape(last_answer([{sql: "delete from part where nosuch = $1",
                                 ps: [db::PInt(1)]}])), "Failed 42703");
   assert_eq(shape(last_answer([{sql: "update part set n = $1 where nosuch = $2",
                                 ps: [db::PInt(1), db::PInt(1)]}])), "Failed 42703");
-  // And a result column the table does not have, which used to be decided in
-  // `project_row` and therefore never on an empty table.
+  // And a result column the table does not have, which used to be decided in `project_row` and
+  // therefore never on an empty table.
   assert_eq(shape(last_answer([q("select nosuch from part")])), "Failed 42703")
 }
 
-// The same hole without an empty table, which is the sharper case because a
-// reader who has read the one above will assume a row is enough to close it.
-//
-// `datum_cmp` tests for `CNull` **before** it tests the operand types, so a
-// comparison against a `NULL` column answers "unknown" rather than refusing the
-// operator. Postgres has already refused it at plan time, whatever the data is.
-//
-// postgres  `22P02 invalid input syntax for type bigint: "abc"` — with rows
-//           present and with the table empty alike.
-// twin      `Rows([])` while `n` was `NULL`; `42883` once `n` held a value.
-//           Two wrong answers in two different ways, and the first one silent.
-//           `plan_operands` now resolves the literal against the column's type
-//           where postgres does, so both are `22P02` and no row decides it.
-// the law   cannot reach it: no generated `Select` carries a `WHERE`.
+// The same hole without an empty table, which is the sharper case because a reader who has read the
+// one above will assume a row is enough to close it.
 test "a literal that will not parse at the column's type is refused when the statement is planned" {
   let with_null = last_answer([
     insert_part("a", db::PNull),
@@ -221,31 +142,15 @@ test "a literal that will not parse at the column's type is refused when the sta
   assert_eq(shape(with_value), "Failed 22P02");
   assert_eq(shape(empty), "Failed 22P02");
 
-  // The literal that *does* parse is coerced rather than refused, which is the
-  // other half of the same resolution.
+  // The literal that *does* parse is coerced rather than refused, which is the other half of the
+  // same resolution.
   assert_eq(shape(last_answer([
               insert_part("a", db::PInt(3)),
               q("select sku from part where n = '3'"),
             ])), "Rows 1")
 }
 
-// --- 3. The twin has no assignment casts -------------------------------------
-//
-// This is the largest disagreement in the catalogue, because it turns an
-// ordinary statement into a `Failed` value the program will branch on.
-//
-// postgres  `insert into part (sku, price, n) values ('x', 1, 2.6)` inserts one
-//           row with `n = 3`. A `numeric` is assignment-cast to `bigint`,
-//           rounding half away from zero (2.5 → 3, 3.5 → 4). The same holds for
-//           a **typed `numeric` parameter**, which is what the driver sends for
-//           a `PNumeric`, so this is reachable through the driver and not only
-//           through literal text.
-// twin      `42804 column "n" is of type bigint but expression is of type
-//           numeric`, because `coerce_value`'s `TInt` arm accepted `CInt` and
-//           nothing else. It now performs the assignment cast postgres performs.
-// the law   cannot reach it. `render` never puts a literal in a statement, and
-//           `well_formed`'s `param_fits` refuses a `PNumeric` for a `TInt`
-//           column — the guard excludes exactly the case that diverged.
+// --- 3.
 test "a numeric is assignment-cast into a bigint column, rounding half away from zero" {
   assert_eq(shape(last_answer([q("insert into part (sku, price, n) values ('x', 1, 2.6)")])),
             "Count 1");
@@ -268,17 +173,8 @@ fn ns(a: db::Answer) -> List<Int> =
     _ -> [],
   }
 
-// A string literal in statement text is `unknown`-typed, and postgres coerces it
-// to whatever the column is. `wrong_type`'s own comment says so — and then the
-// twin refuses the coercion that succeeds as well as the one that fails.
-//
-// postgres  `insert into part (sku, price, n) values ('y', '1', '2')` inserts
-//           one row with `price = 1.0000` and `n = 2`.
-// twin      `22P02 invalid input syntax for type numeric` — for the good ones as
-//           well as the bad, because `coerce_value` never attempted the
-//           coercion at all. It attempts it now, and `22P02` is what a text the
-//           column's type cannot read still answers.
-// the law   cannot reach it; `render` emits only parameters.
+// A string literal in statement text is `unknown`-typed, and postgres coerces it to whatever the
+// column is.
 test "a string literal is coerced to the column's type, and only a bad one is 22P02" {
   assert_eq(shape(last_answer([q("insert into part (sku, price, n) values ('y', '1', '2')")])),
             "Count 1");
@@ -286,24 +182,19 @@ test "a string literal is coerced to the column's type, and only a bad one is 22
               insert_part("z", db::PInt(2)),
               q("update part set n = '9' where sku = 'z'"),
             ])), "Count 1");
-  // A text the target type cannot read is still `22P02`, and `'2.6'::bigint` is
-  // one of them: text is read at the target type and `bigint` has no fraction.
+  // A text the target type cannot read is still `22P02`, and `'2.6'::bigint` is one of them: text
+  // is read at the target type and `bigint` has no fraction.
   assert_eq(shape(last_answer([q("insert into part (sku, price) values ('y', 'abc')")])),
             "Failed 22P02");
   assert_eq(shape(last_answer([q("insert into part (sku, price, n) values ('y', 1, '2.6')")])),
             "Failed 22P02");
-  // A **parameter** is not `unknown`: it crosses the wire with a type, so the
-  // wrong one is `42804` and never a coercion.
+  // A **parameter** is not `unknown`: it crosses the wire with a type, so the wrong one is `42804`
+  // and never a coercion.
   assert_eq(shape(last_answer([{sql: "insert into part (sku, price, n) values ($1, 1, $2)",
                                 ps: [db::PText("y"), db::PText("2")]}])), "Failed 42804")
 }
 
 // The column-to-column form, which a real `UPDATE` writes constantly.
-//
-// postgres  `update part set n = price` updates every row, rounding the
-//           `numeric` into the `bigint`.
-// twin      `42804`, which was a hole in one arm of `coerce_value` rather than
-//           a stated policy: the reverse direction already worked.
 test "an UPDATE assigns one column to another of a different type in both directions" {
   assert_eq(shape(last_answer([
               insert_part("a", db::PInt(2)),
@@ -315,28 +206,7 @@ test "an UPDATE assigns one column to another of a different type in both direct
             ])), "Count 1")
 }
 
-// --- 4. Statement text postgres accepts and the twin refuses -----------------
-//
-// ADR 0014 §5.3 enumerates what the twin does not model — joins, subqueries,
-// `GROUP BY`, aggregates other than `count(*)`, and so on. None of these three
-// is on that list, and each is ordinary SQL rather than a construct:
-//
-//   a comment, a result-column alias, and an ordinal `ORDER BY`.
-//
-// postgres  all four succeed.
-// twin      `0A000`, with the token named.
-// the law   cannot reach any of them; `render` writes five fixed shapes.
-//
-// The alias was the one that cost something. `E0433`'s own note tells a program
-// to write `select a.id as a_id, b.id as b_id` when a statement returns two
-// columns of one name — and that statement was a `0A000` in the twin, so the
-// driver's remedy was a statement the twin could not run. The driver's scanner
-// refused it too, at `CLAUSE_WORDS`.
-//
-// The ordinal is the one that stays refused, and it is now **named in §5.3**
-// rather than being an unlisted surprise: resolving `order by 1` needs the
-// select list and the table's column order together, which is a second name
-// resolution for a form nothing generates.
+// --- 4.
 test "a comment and an alias are ordinary SQL; an ordinal ORDER BY is a named refusal" {
   assert_eq(shape(last_answer([q("select sku from part -- trailing comment")])), "Rows 0");
   assert_eq(shape(last_answer([q("select /* leading */ sku from part")])), "Rows 0");
@@ -344,27 +214,8 @@ test "a comment and an alias are ordinary SQL; an ordinal ORDER BY is a named re
   assert_eq(shape(last_answer([q("select sku from part order by 1")])), "Failed 0A000")
 }
 
-// A `Row` is a `Map<String, Datum>`, so two result columns of one name have one
-// canonical form and the second would silently win. The twin refuses, which is
-// right — but note *how* the two halves refuse, because they do not match:
-//
-// postgres  `select sku, sku from part` returns two columns.
-// twin      `Failed(0A000)`, a value the program matches on.
-// driver    `E0433 DB_PREPARE_FAILED`, a **diagnostic** that stops the run.
-//
-// A program that handles the twin's `Failed` still dies under postgres, and no
-// law comparing two `List<Answer>` can express the difference, because one side
-// never produces an `Answer` at all.
-//
-// The twin's refusal used to be per row — projection runs once per surviving
-// row, so an **empty** table answered `Rows([])` and the duplicate was never
-// seen. It is now decided in `check_projection`, before a row is examined, which
-// is where the driver decides it: from the result description, at prepare.
-//
-// What does **not** close is the shape of the refusal. A diagnostic stops the
-// run and an `Answer` does not, and no law comparing two `List<Answer>` can
-// express the difference because one side never produces an `Answer` at all.
-// This is the residual, and it is stated rather than left to be discovered.
+// A `Row` is a `Map<String, Datum>`, so two result columns of one name have one canonical form and
+// the second would silently win.
 test "a duplicate result column is refused before a row, as a value in the twin and a diagnostic in the driver" {
   assert_eq(shape(last_answer([q("select sku, sku from part")])), "Failed 0A000");
   assert_eq(shape(last_answer([
@@ -375,65 +226,34 @@ test "a duplicate result column is refused before a row, as a value in the twin 
   assert_eq(shape(last_answer([q("select sku as x, tag as x from part")])), "Failed 0A000")
 }
 
-// --- 5. Scope operations the twin and the driver disagree about --------------
-//
-// These two are not twin-versus-postgres; they are **twin-versus-driver**, which
-// is the same claim ADR 0008 §5 makes ("a real handler and an in-memory twin
-// satisfy the same declared signature") one level lower, and they are hidden
-// from the law by its own guard.
-//
-// `commit` or `abort` with nothing open:
-//   driver    `Failed(25P01)` — `ScopeTable::close` refuses locally and sends
-//             nothing.
-//   twin      `Count(0)` — `commit_step` on an empty stack answered success.
-//             It answers `25P01` now.
-//   postgres  a `WARNING` and a successful command, which was the twin's answer.
-//   the law   `well_formed`'s `balanced` rejects every unbalanced sequence, so
-//             the one place the two halves of W4 answered differently about a
-//             transaction was excluded from the claim by construction.
-//
-// The driver's answer is the one both keep, and that is a **deliberate
-// divergence from the server** rather than an accident: `transaction` reads only
-// `Failed` on the commit, and the `WARNING` postgres emits is not a value a Ply
-// program can read — so matching the server here would mean telling a caller its
-// writes are durable when nothing was ever opened to hold them.
+// --- 5.
 test "a commit with no transaction open is 25P01 in both halves" {
   let d = db::open(fixture());
   assert_eq(shape(db::commit_step(d).out), "Failed 25P01");
   assert_eq(shape(db::abort_step(d).out), "Failed 25P01");
-  // And it poisons nothing: there is no transaction for it to abort, so the
-  // next statement is an ordinary one rather than `25P02`.
+  // And it poisons nothing: there is no transaction for it to abort, so the next statement is an
+  // ordinary one rather than `25P02`.
   assert_eq(shape(db::step(db::commit_step(d).db,
                            db::stmt("insert into part (sku, price) values ($1, $2)"),
                            [db::PText("a"), db::PNumeric(1m)]).out), "Count 1")
 }
 
-// A nested `begin` that widens the access mode:
-//   driver    `Failed(25001)` — `ScopeTable::begin` refuses a `ReadWrite` nested
-//             inside a `ReadOnly`, because a savepoint cannot widen what the
-//             transaction may do.
-//   twin      accepted. `begin_step` compares the isolation level and never
-//             looks at `access` at all.
-//   the law   cannot reach it: `Op::Begin` carries an `Isolation` and no
-//             `Access`, and both `replay_memory` and `replay_live` hard-code
-//             `db::ReadWrite`. So this test is the only thing that checks it.
+// A nested `begin` that widens the access mode: driver `Failed(25001)` — `ScopeTable::begin`
+// refuses a `ReadWrite` nested inside a `ReadOnly`, because a savepoint cannot widen what the
+// transaction may do. twin accepted.
 test "a nested begin that widens the access mode is 25001 in both halves" {
   let d = db::open(fixture());
   let outer = db::begin_step(d, db::ReadCommitted, db::ReadOnly);
   let inner = db::begin_step(outer.db, db::ReadCommitted, db::ReadWrite);
   assert_eq(shape(outer.out), "Count 0");
   assert_eq(shape(inner.out), "Failed 25001");
-  // A narrowing is still accepted, and is documentation rather than
-  // enforcement: postgres has no read-only savepoint.
+  // A narrowing is still accepted, and is documentation rather than enforcement: postgres has no
+  // read-only savepoint.
   assert_eq(shape(db::begin_step(db::begin_step(d, db::ReadCommitted, db::ReadWrite).db,
                                  db::ReadCommitted, db::ReadOnly).out), "Count 0")
 }
 
 // --- What agrees ------------------------------------------------------------
-//
-// Recorded for the same reason the disagreements are: a catalogue that listed
-// only failures would say nothing about how much of the twin was checked. Every
-// assertion below was run against PostgreSQL 18.3 and matched exactly.
 test "the areas the audit could not break agree with postgres exactly" {
   // three-valued logic in `WHERE`, including `IN` and `NOT IN` over a NULL
   let ops = [
@@ -463,8 +283,8 @@ test "the areas the audit could not break agree with postgres exactly" {
   assert_eq(map(drop_first(nulls, 3), |a: db::Answer| skus(a)),
             [["a", "c", "b"], ["b", "c", "a"], ["b", "a", "c"], ["c", "a", "b"]]);
 
-  // `numeric` rescaled to the column's scale, rounding half away from zero, and
-  // the overflow that a rounding produces
+  // `numeric` rescaled to the column's scale, rounding half away from zero, and the overflow that a
+  // rounding produces.
   let money = replay([
     q("insert into part (sku, price) values ('a', 1.00005)"),
     q("insert into part (sku, price) values ('b', 1.00004)"),
@@ -474,8 +294,7 @@ test "the areas the audit could not break agree with postgres exactly" {
   assert_eq(map(money, |a: db::Answer| shape(a)),
             ["Count 1", "Count 1", "Failed 22003", "Rows 2"]);
 
-  // a unique key with a NULL in it never collides, and a `CHECK` passes on
-  // unknown
+  // a unique key with a NULL in it never collides, and a `CHECK` passes on unknown.
   assert_eq(shape(last_answer([
               insert_part("a", db::PNull),
               insert_part("b", db::PNull),

@@ -1,16 +1,4 @@
 //! The one test in this tree that opens a real socket.
-//!
-//! Everything else about W1 can be asserted in memory, and most of it should
-//! be. This cannot: the claim is that a Ply program reached the host through
-//! the effect system and came back with the right bytes, and the only witness
-//! to that is a TCP connection made by something that is not Ply.
-//!
-//! Three things are checked together on purpose, because each one is only
-//! meaningful beside the others: the request round trips under `--host`; a
-//! malformed request is answered 400 rather than crashing the server; and the
-//! *same source*, unchanged, is hermetic under `ply test` and refused with
-//! `E0424` under `ply run` without the flag. A green round trip that also
-//! passed hermetically would mean the binding did nothing.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -18,8 +6,7 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-/// How long the server has to typecheck the program and bind. Generous: a cold
-/// front-end cache in CI is slower than anything a laptop shows.
+/// How long the server has to typecheck the program and bind.
 const STARTUP: Duration = Duration::from_secs(30);
 
 fn repo(rel: &str) -> PathBuf {
@@ -29,22 +16,12 @@ fn repo(rel: &str) -> PathBuf {
 }
 
 /// A port nothing is listening on.
-///
-/// Bind, read the number, drop. The window between the drop and the server's
-/// own bind is a race with every other process on the machine; it is also the
-/// only option, because `ply run` takes no program arguments, so the port has
-/// to be in the source before the process starts.
 fn reserve_port() -> u16 {
     let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port");
     listener.local_addr().expect("a bound address").port()
 }
 
 /// The example, verbatim, with the two numbers a test needs to choose.
-///
-/// The substitution asserts it found what it was replacing. A silent miss
-/// would leave the server listening on 8080 and answering somebody else's
-/// test, which is exactly the sort of green-over-unexplored-space this
-/// milestone exists to refuse.
 fn project(port: u16, connections: u32) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
     let hello = std::fs::read_to_string(repo("examples/hello.ply")).expect("examples/hello.ply");
@@ -79,8 +56,7 @@ fn ply(dir: &std::path::Path) -> Command {
     cmd
 }
 
-/// Kills the server whatever the test does, including panicking out of an
-/// assertion. A leaked `ply run` holds a port for the rest of the suite.
+/// Kills the server whatever the test does, including panicking out of an assertion.
 struct Server {
     child: Option<Child>,
     addr: SocketAddr,
@@ -104,9 +80,6 @@ impl Server {
         self.child.as_mut().expect("the server has not been reaped")
     }
 
-    /// Connects once the server is listening. A child that exited first is
-    /// reported with what it printed — a compile error there is far more
-    /// useful than "connection refused" thirty seconds later.
     fn connect(&mut self) -> TcpStream {
         let deadline = Instant::now() + STARTUP;
         loop {
@@ -124,9 +97,8 @@ impl Server {
         }
     }
 
-    /// The server was asked for a fixed number of connections and has been
-    /// given them, so it must return on its own. One that has to be killed has
-    /// not demonstrated that the host operation returned into the program.
+    /// The server was asked for a fixed number of connections and has been given them, so it must
+    /// return on its own.
     fn finish(mut self) {
         let deadline = Instant::now() + STARTUP;
         loop {
@@ -168,9 +140,7 @@ impl Drop for Server {
     }
 }
 
-/// Writes a request and reads until the server closes. The endpoint answers
-/// `Connection: close` and closes, so end-of-stream is the end of the response
-/// and there is no framing to get wrong on this side.
+/// Writes a request and reads until the server closes.
 fn exchange(mut stream: TcpStream, request: &[u8]) -> String {
     stream
         .set_read_timeout(Some(Duration::from_secs(10)))
@@ -218,9 +188,9 @@ fn a_request_over_a_real_socket_is_answered_by_a_ply_program() {
     server.finish();
 }
 
-/// A peer sending nonsense is the case a host boundary makes dangerous: the
-/// bytes come from outside, and the response to them must be a 400 rather than
-/// a panic that takes the listener with it.
+/// A peer sending nonsense is the case a host boundary makes dangerous: the bytes come from
+/// outside, and the response to them must be a 400 rather than a panic that takes the listener with
+/// it.
 #[test]
 fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
     let port = reserve_port();
@@ -237,8 +207,7 @@ fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
         "got:\n{response}"
     );
 
-    // The listener is still there, which is the half of the claim a single
-    // request cannot make.
+    // The listener is still there, which is the half of the claim a single request cannot make.
     let second = exchange(
         server.connect(),
         b"GET / HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n",
@@ -248,9 +217,6 @@ fn a_malformed_request_is_answered_400_and_the_server_survives_it() {
     server.finish();
 }
 
-/// A request that arrives in pieces. `read_head` is the only reason this is
-/// not the packet-boundary bug every hand-rolled HTTP server ships with, and
-/// a loopback connection will not produce the split on its own.
 #[test]
 fn a_request_split_across_writes_is_read_to_its_terminator() {
     let port = reserve_port();
@@ -285,9 +251,8 @@ fn a_request_split_across_writes_is_read_to_its_terminator() {
 
 // --- The same source, hermetically ------------------------------------------
 
-/// The point of the boundary: the program that just answered a socket is also
-/// the program `ply test` runs with nothing bound, and there it touches
-/// nothing at all.
+/// The point of the boundary: the program that just answered a socket is also the program `ply
+/// test` runs with nothing bound, and there it touches nothing at all.
 #[test]
 fn the_same_program_is_hermetic_under_ply_test() {
     let dir = project(reserve_port(), 1);
@@ -307,9 +272,8 @@ fn the_same_program_is_hermetic_under_ply_test() {
     );
 }
 
-/// Without `--host` the run is hermetic, and reaching the boundary there is
-/// `E0424` rather than a socket. This is the assertion that makes the round
-/// trip above mean something: the binding is what changed, not the source.
+/// Without `--host` the run is hermetic, and reaching the boundary there is `E0424` rather than a
+/// socket.
 #[test]
 fn without_the_flag_the_program_never_reaches_the_socket() {
     let port = reserve_port();
@@ -336,13 +300,7 @@ fn without_the_flag_the_program_never_reaches_the_socket() {
 
 // --- `ply test` and the binding ----------------------------------------------
 
-/// A test that reaches a socket, and the same project's whole cache lifecycle
-/// around it.
-///
-/// The source **imports** the declaration rather than copying it, which is what
-/// W2 made possible: a copy is a signature that can drift, and a drifted one is
-/// `E0421` at bind time, which would leave this test asserting about a program
-/// that never bound rather than about one that ran.
+/// A test that reaches a socket, and the same project's whole cache lifecycle around it.
 fn reaching_test(port: u16) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
     std::fs::write(
@@ -371,14 +329,8 @@ fn output(out: &Output) -> String {
     )
 }
 
-/// `ply test` binds the registry **without** binding it: nothing is reachable,
-/// and the refusal still names the handler that `--host` would have used.
-///
-/// The distinction is the whole of ADR 0011 §5. `E0303` means inference should
-/// have prevented the perform and did not — file a bug — and `E0424` means
-/// inference was right and the run was configured hermetically — pass the flag
-/// or write a test double. A consumer that cannot tell them apart does the
-/// wrong one, and a runner that never bound the registry can only say `E0303`.
+/// `ply test` binds the registry **without** binding it: nothing is reachable, and the refusal
+/// still names the handler that `--host` would have used.
 #[test]
 fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() {
     let dir = reaching_test(reserve_port());
@@ -388,8 +340,8 @@ fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() 
         .expect("`ply test` runs");
     let text = output(&out);
     assert_ne!(out.status.code(), Some(0), "got:\n{text}");
-    // The failure block prints the diagnostic's message rather than its code,
-    // and E0424's message is the one sentence E0303 cannot produce.
+    // The failure block prints the diagnostic's message rather than its code, and E0424's message
+    // is the one sentence E0303 cannot produce.
     assert!(
         text.contains("reached the host boundary in a hermetic run"),
         "got:\n{text}"
@@ -399,11 +351,6 @@ fn a_hermetic_test_that_reaches_the_boundary_names_the_handler_it_did_not_use() 
 }
 
 /// `--host` is not reporting: the test opens a real listener and goes green.
-///
-/// And the pass is never written, in either direction — the hermetic run after
-/// it fails again. A cached pass earned over a socket is believed by every
-/// later hermetic run and nothing about that run looks wrong, which is the
-/// longest-lived failure this boundary can produce.
 #[test]
 fn a_host_backed_pass_is_never_cached_and_never_satisfies_a_hermetic_run() {
     let dir = reaching_test(reserve_port());
@@ -443,10 +390,6 @@ fn a_host_backed_pass_is_never_cached_and_never_satisfies_a_hermetic_run() {
 }
 
 /// The production scheduler, reached the only way a program can reach it.
-///
-/// `task.*` is answered by opening a region rather than by a handler — a task is
-/// a suspended machine state and a handler sees only values — so a defect here
-/// is `E0505` from `ply_host::sched`, not a wrong number.
 #[test]
 fn task_spawn_under_the_flag_runs_on_the_production_scheduler() {
     let dir = tempfile::tempdir().expect("a temp dir");
@@ -468,8 +411,8 @@ fn task_spawn_under_the_flag_runs_on_the_production_scheduler() {
     assert_eq!(out.status.code(), Some(0), "got:\n{text}");
     assert!(text.contains('3'), "got:\n{text}");
 
-    // Lock 3: hermetically the same program reaches the boundary and is told
-    // both remedies, rather than getting real threads by accident.
+    // Lock 3: hermetically the same program reaches the boundary and is told both remedies, rather
+    // than getting real threads by accident.
     let out = ply(dir.path()).arg("run").output().expect("`ply run` runs");
     let text = output(&out);
     assert_ne!(out.status.code(), Some(0), "got:\n{text}");

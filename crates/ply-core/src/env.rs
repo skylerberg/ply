@@ -7,8 +7,7 @@ use std::collections::BTreeSet;
 #[derive(Clone, Debug, Default)]
 struct Scope {
     schemes: FxHashMap<Symbol, Scheme>,
-    /// Names whose scheme has not yet been shown to contribute no free variable
-    /// to [`generalize`]. See [`TypeEnv::free_vars`].
+    /// Names whose scheme has not yet been shown to contribute no free variable to [`generalize`].
     open: FxHashSet<Symbol>,
 }
 
@@ -60,9 +59,8 @@ impl TypeEnv {
         self.scopes.iter().rev().find_map(|s| s.schemes.get(name))
     }
 
-    /// `Some(0)` means the name resolves to a global; anything deeper means a
-    /// user binding shadows it, which is how the builtin call forms know to
-    /// stand aside.
+    /// `Some(0)` means the name resolves to a global; anything deeper means a user binding shadows
+    /// it, which is how the builtin call forms know to stand aside.
     pub fn depth_of(&self, name: &Symbol) -> Option<usize> {
         self.scopes
             .iter()
@@ -77,25 +75,12 @@ impl TypeEnv {
     }
 
     /// The bindings the definition being checked introduced, globals excluded.
-    ///
-    /// A global is bound from a scheme that was generalized first, so its
-    /// variables are quantified and a later unification reaches a fresh copy
-    /// rather than the scheme — which is why the region escape check can ask
-    /// about locals alone and still see every binding a region could store into.
     pub fn locals(&self) -> impl Iterator<Item = (&Symbol, &Scheme)> {
         self.scopes.iter().skip(1).flat_map(|s| s.schemes.iter())
     }
 
-    /// The type and row variables still unsolved anywhere in scope — the ones
-    /// [`generalize`] may not quantify.
-    ///
-    /// A scheme that contributes nothing is dropped from the scan for good.
-    /// That is sound because contributing nothing is *monotone*: a substitution
-    /// only ever gains bindings, and a binding is never replaced, so a scheme
-    /// whose every variable is either quantified or already solved can never
-    /// acquire a free one. Rebinding a name puts it back under scrutiny.
-    /// Scanning them all instead is quadratic in the size of the program,
-    /// because the global scope holds every definition already checked.
+    /// The type and row variables still unsolved anywhere in scope — the ones [`generalize`] may
+    /// not quantify.
     fn free_vars(&mut self, subst: &Subst) -> (BTreeSet<TyVar>, BTreeSet<RowVar>) {
         let (mut env_tys, mut env_rows) = (BTreeSet::new(), BTreeSet::new());
         for scope in &mut self.scopes {
@@ -128,13 +113,7 @@ pub fn instantiate(scheme: &Scheme, fresh: &mut Fresh) -> Type {
     instantiate_with(scheme, fresh).0
 }
 
-/// [`instantiate`], and what each quantified type variable became, in the
-/// scheme's own order.
-///
-/// A `where derivable(D, a)` names its parameter by that position, because a
-/// name is exactly what a published interface may not depend on. A call site
-/// checking the constraint needs the argument the instantiation handed it, and
-/// this is the only place that knows.
+/// [`instantiate`], and what each quantified type variable became, in the scheme's own order.
 pub fn instantiate_with(scheme: &Scheme, fresh: &mut Fresh) -> (Type, Vec<Type>) {
     if scheme.ty_vars.is_empty() && scheme.row_vars.is_empty() {
         return (scheme.ty.clone(), Vec::new());
@@ -154,8 +133,8 @@ pub fn instantiate_with(scheme: &Scheme, fresh: &mut Fresh) -> (Type, Vec<Type>)
     (rename(&scheme.ty, &tys, &rows), args)
 }
 
-/// [`instantiate`] onto variables the caller chose rather than fresh ones, so
-/// that the result can be quantified again over exactly those.
+/// [`instantiate`] onto variables the caller chose rather than fresh ones, so that the result can
+/// be quantified again over exactly those.
 pub fn rename_scheme(scheme: &Scheme, ty_vars: &[TyVar], row_vars: &[RowVar]) -> Type {
     let tys: FxHashMap<TyVar, Type> = scheme
         .ty_vars

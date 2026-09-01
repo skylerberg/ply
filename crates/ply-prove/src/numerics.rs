@@ -1,10 +1,4 @@
 //! Drawing and shrinking `Float` and `Decimal`.
-//!
-//! A `property` discharge is a claim about the values that were run, so a
-//! generator that never produced a `NaN` would make `property` a lie about
-//! `Float` — the type's defining value would be the one value never sampled.
-//! Leaving either type ungeneratable would be worse: a law over it would be
-//! `E0418` and could not be written at all.
 
 use crate::property::{EDGE_CASES, GenStream, TypeWorld, generatable, generate};
 use crate::shrink::{candidates, minimal, size};
@@ -48,8 +42,8 @@ fn decimals(cases: u32) -> Vec<Decimal> {
         .collect()
 }
 
-/// The same guarantee `Bytes` earned in W1: a new primitive that could not be
-/// quantified over would regress M8 on contact.
+/// The same guarantee `Bytes` earned in W1: a new primitive that could not be quantified over would
+/// regress M8 on contact.
 #[test]
 fn both_numeric_types_are_generatable() {
     let world = world();
@@ -58,12 +52,8 @@ fn both_numeric_types_are_generatable() {
     assert!(generatable(&Type::list(Type::float()), &world).is_ok());
 }
 
-/// The edge cases are drawn **first and every time**, which is what turns "a
-/// generator that samples NaN" into a guarantee rather than a probability.
-///
-/// `NaN` is first because it is the value every restriction on the type follows
-/// from: `forall (x: Float) { x == x }` is false, and a run that had to be lucky
-/// to find that out would make `property` a lie about `Float`.
+/// The edge cases are drawn **first and every time**, which is what turns "a generator that samples
+/// NaN" into a guarantee rather than a probability.
 #[test]
 fn the_first_float_cases_are_the_specials() {
     let drawn = floats(EDGE_CASES);
@@ -78,9 +68,9 @@ fn the_first_float_cases_are_the_specials() {
     );
 }
 
-/// The rest of the edge — the infinities and the ends of the range — arrives
-/// through the biased sampler rather than the first five slots, because there
-/// are more specials than there are edge cases.
+/// The rest of the edge — the infinities and the ends of the range — arrives through the biased
+/// sampler rather than the first five slots, because there are more specials than there are edge
+/// cases.
 #[test]
 fn an_ordinary_run_reaches_the_infinities_and_the_ends_of_the_range() {
     let drawn = floats(200);
@@ -92,8 +82,8 @@ fn an_ordinary_run_reaches_the_infinities_and_the_ends_of_the_range() {
     assert!(drawn.contains(&f64::MAX), "no MAX: {drawn:?}");
 }
 
-/// A `Float` law is checked over values a program can actually meet, so the
-/// draw has to reach ordinary magnitudes as well as the ends of the range.
+/// A `Float` law is checked over values a program can actually meet, so the draw has to reach
+/// ordinary magnitudes as well as the ends of the range.
 #[test]
 fn the_float_draw_reaches_ordinary_finite_values() {
     let drawn = floats(200);
@@ -109,9 +99,9 @@ fn the_float_draw_reaches_ordinary_finite_values() {
     );
 }
 
-/// Money is written at two places and a rate at four, so the interesting scales
-/// are small — and `MIN`/`MAX` are where an exact addition overflows, which is
-/// the failure `Decimal` reports rather than hides.
+/// Money is written at two places and a rate at four, so the interesting scales are small — and
+/// `MIN`/`MAX` are where an exact addition overflows, which is the failure `Decimal` reports rather
+/// than hides.
 #[test]
 fn the_decimal_draw_covers_small_scales_and_the_ends_of_the_range() {
     let drawn = decimals(200);
@@ -130,8 +120,8 @@ fn the_decimal_draw_covers_small_scales_and_the_ends_of_the_range() {
     );
 }
 
-/// Deterministic, so a reported `(root, case)` names a tuple somebody can draw
-/// again without re-running anything.
+/// Deterministic, so a reported `(root, case)` names a tuple somebody can draw again without
+/// re-running anything.
 #[test]
 fn a_numeric_draw_is_a_function_of_its_root_and_case() {
     let first = floats(40);
@@ -143,8 +133,7 @@ fn a_numeric_draw_is_a_function_of_its_root_and_case() {
     assert_eq!(decimals(40), decimals(40));
 }
 
-/// `0.0` and not `-0.0`: the two are different values and the positive one is
-/// the floor. `0m` at scale 0, for the same reason.
+/// `0.0` and not `-0.0`: the two are different values and the positive one is the floor.
 #[test]
 fn the_floor_of_each_numeric_type_is_its_smallest_value() {
     let world = world();
@@ -156,8 +145,8 @@ fn the_floor_of_each_numeric_type_is_its_smallest_value() {
     );
 }
 
-/// Every candidate is a strict descent by [`size`], which is what makes the
-/// walk terminate whatever the budget is.
+/// Every candidate is a strict descent by [`size`], which is what makes the walk terminate whatever
+/// the budget is.
 #[test]
 fn every_numeric_candidate_is_strictly_smaller() {
     let world = world();
@@ -188,8 +177,8 @@ fn every_numeric_candidate_is_strictly_smaller() {
     }
 }
 
-/// Greedy descent has to actually arrive: a witness that never reaches `0.0`
-/// costs a reader the shortest counterexample there is.
+/// Greedy descent has to actually arrive: a witness that never reaches `0.0` costs a reader the
+/// shortest counterexample there is.
 #[test]
 fn a_float_shrinks_all_the_way_to_zero() {
     let world = world();
@@ -206,8 +195,7 @@ fn a_float_shrinks_all_the_way_to_zero() {
     assert!(matches!(current, Value::Float(f) if f == 0.0 && f.is_sign_positive()));
 }
 
-/// Toward `0m` *and* toward scale 0, so a witness reads `1.5m` rather than
-/// `1.500000m`.
+/// Toward `0m` *and* toward scale 0, so a witness reads `1.5m` rather than `1.500000m`.
 #[test]
 fn a_decimal_sheds_its_trailing_zeros_before_its_digits() {
     let world = world();

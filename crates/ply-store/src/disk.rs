@@ -24,45 +24,24 @@ const REVIEWS_STEM: &str = "reviews";
 pub(crate) const STDLIB_FILE: &str = "stdlib";
 const STDLIB_STEM: &str = "stdlib";
 
-/// Both new files are read on their first question rather than at
-/// `Store::open`, so neither is in the way of the open budget, and both are
-/// pretty-printed JSON for the reason the result cache is: `cat`ting one to find
-/// out why an obligation did not re-run is worth more than its parse cost.
+/// Both new files are read on their first question rather than at `Store::open`, so neither is in
+/// the way of the open budget, and both are pretty-printed JSON for the reason the result cache is:
+/// `cat`ting one to find out why an obligation did not re-run is worth more than its parse cost.
 const OBLIGATIONS_FORMAT: u32 = 1;
 const REVIEWS_FORMAT: u32 = 1;
 
-/// A review baseline is a decision a person made about a set of hashes. It
-/// survives every version constant in this crate deliberately: a new prover, a
-/// new runtime and a new front end all leave "this is what I accepted"
-/// standing, and a change that *does* move a `DefHash` shows up as a changed
-/// definition — which is a re-read, never a false unchanged.
-///
-/// `2` because `ReviewRecord::specs` changed meaning: it holds each claim's
-/// *sentence* rather than its obligation key, so that re-implementing a
-/// definition no longer reads as rewriting the claims about it. A baseline
-/// written under `1` is discarded rather than compared, which reports its
-/// definitions as unreviewed — one re-accept — where reading it would have
-/// reported every definition's spec as changed.
+/// A review baseline is a decision a person made about a set of hashes.
 const REVIEWS_VERSION: &str = "2";
 
-/// Independent of [`RUNTIME_VERSION`]: the layout can change without
-/// invalidating results, and results can be invalidated without the layout
-/// changing.
-///
-/// Format 1 carried the pass records inline. They are the largest thing the
-/// result cache holds — at ten thousand definitions they were seven of its nine
-/// megabytes — and only a *failing* test ever reads one, so parsing them at
-/// `Store::open` charged every green run for a file it was not going to look at.
-/// Format 2 keeps them in [`PASSES_FILE`], read on the first question. A format
-/// 1 file is still read, its records are carried over, and the first flush
-/// rewrites both files; nothing is lost and no test re-runs.
+/// Independent of [`RUNTIME_VERSION`]: the layout can change without invalidating results, and
+/// results can be invalidated without the layout changing.
 const FORMAT: u32 = 2;
 const FORMAT_INLINE_PASSES: u32 = 1;
 
 const TEMP_SUFFIX: &str = ".tmp";
 
-/// A temp file younger than this may belong to a concurrent writer that has not
-/// reached its rename yet; deleting it would make that writer fail.
+/// A temp file younger than this may belong to a concurrent writer that has not reached its rename
+/// yet; deleting it would make that writer fail.
 const STALE_TEMP_AGE: Duration = Duration::from_secs(60);
 
 pub(crate) type Entries = BTreeMap<DefHash, Outcome>;
@@ -71,10 +50,7 @@ pub(crate) type Passes = BTreeMap<Symbol, PassRecord>;
 pub(crate) type Obligations = BTreeMap<DefHash, CachedObligation>;
 pub(crate) type Reviews = BTreeMap<Symbol, ReviewRecord>;
 
-/// `definitions` records which definitions a run has already seen. No test
-/// outcome can stand in for it: a green test vouches for the definitions in
-/// *its* closure, which says nothing about whether they are the ones that
-/// changed under a red one.
+/// `definitions` records which definitions a run has already seen.
 #[derive(Default)]
 pub(crate) struct Cache {
     pub(crate) results: Entries,
@@ -117,8 +93,8 @@ struct PassesFileRef<'a> {
     passes: PassesRepr,
 }
 
-/// `Symbol` has no `serde` impl and should not grow one for this: a test key is
-/// a string on disk and nothing else reads it back as a name.
+/// `Symbol` has no `serde` impl and should not grow one for this: a test key is a string on disk
+/// and nothing else reads it back as a name.
 type PassesRepr = BTreeMap<String, PassRecord>;
 
 pub(crate) enum LoadError {
@@ -160,10 +136,9 @@ impl LoadError {
         d.note("continuing with an empty cache; every test will re-run and the cache is rewritten")
     }
 
-    /// Separate from [`LoadError::into_diagnostic`] because losing the pass
-    /// records costs an attribution rather than a result: nothing re-runs, and a
-    /// reader told otherwise would go looking for a cache miss that never
-    /// happened.
+    /// Separate from [`LoadError::into_diagnostic`] because losing the pass records costs an
+    /// attribution rather than a result: nothing re-runs, and a reader told otherwise would go
+    /// looking for a cache miss that never happened.
     pub(crate) fn into_passes_diagnostic(self, path: &Path) -> Diagnostic {
         let display = path.display();
         let d = match self {
@@ -199,8 +174,8 @@ impl LoadError {
         )
     }
 
-    /// Losing the obligation cache costs a re-discharge and never a wrong label:
-    /// every obligation is attempted again from nothing.
+    /// Losing the obligation cache costs a re-discharge and never a wrong label: every obligation
+    /// is attempted again from nothing.
     pub(crate) fn into_obligations_diagnostic(self, path: &Path) -> Diagnostic {
         let display = path.display();
         let d = match self {
@@ -234,8 +209,8 @@ impl LoadError {
         d.note("every obligation is discharged again; no test re-runs")
     }
 
-    /// Losing a review baseline reports every definition as unreviewed, which is
-    /// a re-read rather than a wrong answer — and is the direction to fail in.
+    /// Losing a review baseline reports every definition as unreviewed, which is a re-read rather
+    /// than a wrong answer — and is the direction to fail in.
     pub(crate) fn into_reviews_diagnostic(self, path: &Path) -> Diagnostic {
         let display = path.display();
         let d = match self {
@@ -304,13 +279,6 @@ pub(crate) fn save(dir: &Path, path: &Path, cache: &Cache) -> anyhow::Result<()>
 }
 
 /// The stdlib digest this cache was last written under, as one line of text.
-///
-/// Its own file, and deliberately not a field of the result cache: it must
-/// survive a `RUNTIME_VERSION` bump, which discards that file whole. A compiler
-/// upgrade is exactly when both change, and losing the digest there would drop
-/// `W0605` at the only moment it has anything to say. Nothing keys on it — a
-/// digest in a cache key would invalidate a project on an edit to a `std` module
-/// it never imports.
 pub(crate) fn load_stdlib(path: &Path) -> Option<String> {
     let text = fs::read_to_string(path).ok()?;
     let line = text.trim();
@@ -364,9 +332,8 @@ fn intern(repr: PassesRepr) -> Passes {
         .collect()
 }
 
-/// The shape both files added in M8 share: a format, the version whose entries
-/// these are, and the entries. One shape rather than two so that a third cannot
-/// arrive with a different idea of where the version goes.
+/// The shape both files added in M8 share: a format, the version whose entries these are, and the
+/// entries.
 #[derive(Deserialize)]
 struct VersionedFile<T> {
     format: u32,
@@ -486,8 +453,8 @@ pub(crate) fn write_atomic(
             .context(format!("could not replace the {what} `{}`", path.display())));
     }
 
-    // Without this the rename can be lost by a crash even though the data was
-    // synced; the cache would then silently revert to its previous contents.
+    // Without this the rename can be lost by a crash even though the data was synced; the cache
+    // would then silently revert to its previous contents.
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
     }
@@ -547,17 +514,12 @@ const LOCK_FILE: &str = "lock";
 const LOCK_WAIT: Duration = Duration::from_secs(2);
 const LOCK_POLL: Duration = Duration::from_millis(2);
 
-/// Far longer than a write takes, so only a lock left by a killed process is
-/// ever broken.
+/// Far longer than a write takes, so only a lock left by a killed process is ever broken.
 const LOCK_STALE_AGE: Duration = Duration::from_secs(30);
 
-/// Serializes the read-merge-write in `Store::flush` across processes, which
-/// rename alone cannot do: two writers can otherwise read the same cache and the
-/// second rename drops the first one's entries.
-///
-/// Waiting is bounded and giving up is not an error — a caller that proceeds
-/// unlocked risks losing a concurrent writer's entries, which costs a re-run,
-/// but still cannot produce a torn file.
+/// Serializes the read-merge-write in `Store::flush` across processes, which rename alone cannot
+/// do: two writers can otherwise read the same cache and the second rename drops the first one's
+/// entries.
 pub(crate) struct Lock {
     path: PathBuf,
     pub(crate) held: bool,

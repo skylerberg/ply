@@ -9,33 +9,23 @@ use std::collections::BTreeSet;
 
 pub trait Classify {
     /// `key`'s current body re-normalized against the baseline hash table.
-    /// Equality with the baseline hash is what proves nobody edited it, so
-    /// `None` — "cannot say" — must be read as *edited*: a false `Derived` drops
-    /// a real candidate and yields a confidently wrong culprit.
     fn renormalized(&mut self, key: &DefKey) -> Option<DefHash>;
 
-    /// The same for the test's own body. `None` withholds `TestChanged` rather
-    /// than accusing a test nobody touched.
+    /// The same for the test's own body.
     fn renormalized_test(&mut self, key: &Symbol) -> Option<DefHash>;
 
-    /// Whether the published interface — canonical scheme and footprint — is the
-    /// same on both sides, which is exactly the condition under which a hybrid
-    /// that swaps this definition alone still typechecks. `None` is read as *not*
-    /// independent, which costs a larger cluster and never a wrong flip.
+    /// Whether the published interface — canonical scheme and footprint — is the same on both
+    /// sides, which is exactly the condition under which a hybrid that swaps this definition alone
+    /// still typechecks.
     fn interface_stable(&mut self, key: &DefKey, before: DefHash) -> Option<bool>;
 
-    /// The strongly connected component `key` belongs to, when it has more than
-    /// one member. Those members share a component hash and one stored body, so
-    /// no hybrid can flip one of them alone and the search must never be offered
-    /// the choice.
+    /// The strongly connected component `key` belongs to, when it has more than one member.
     fn component(&mut self, _key: &DefKey) -> Vec<DefKey> {
         Vec::new()
     }
 
-    /// Every hash the *whole current program* re-normalizes to against the
-    /// baseline table — the identities the current definitions would have had
-    /// back then. A definition whose baseline hash is in here still exists; it
-    /// was renamed, not removed.
+    /// Every hash the *whole current program* re-normalizes to against the baseline table — the
+    /// identities the current definitions would have had back then.
     fn baseline_image(&mut self) -> BTreeSet<DefHash> {
         BTreeSet::new()
     }
@@ -43,8 +33,7 @@ pub trait Classify {
 
 pub struct StoreClassify<'a> {
     renormalizer: &'a Renormalizer<'a>,
-    /// The baseline era's hash for every node, resolved once. Building it walks
-    /// the program, and a classifier is asked about every changed definition.
+    /// The baseline era's hash for every node, resolved once.
     table: EraTable,
     store: &'a Store,
     check: &'a CheckOutput,
@@ -79,9 +68,7 @@ impl Classify for StoreClassify<'_> {
         self.renormalizer.rehash_test(key, &self.table)
     }
 
-    /// Only a `fn` is compared. A `type` or `effect` whose hash moved has by
-    /// definition changed something every mention of it can see, so treating it
-    /// as interface-breaking is not a concession — it is the answer.
+    /// Only a `fn` is compared.
     fn interface_stable(&mut self, key: &DefKey, before: DefHash) -> Option<bool> {
         if key.ns == Ns::Decl {
             return Some(false);
@@ -103,9 +90,7 @@ impl Classify for StoreClassify<'_> {
     }
 }
 
-/// A classifier with no evidence: everything is `Edited`, nothing is
-/// independent. What a run gets when the front-end cache has been pruned, and
-/// the shape every degraded answer has to take — wider, never wrong.
+/// A classifier with no evidence: everything is `Edited`, nothing is independent.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Unknown;
 

@@ -1,11 +1,4 @@
 //! `ply prove` and `ply review` through the real binary.
-//!
-//! Mostly over a program with no specifications, because that is the state every
-//! project starts in and the one the output has to be most careful about: a tool
-//! that reports its successes by default and its blind spots on request is a
-//! tool that misleads its user by default. [`SPECIFIED`] is the other half —
-//! determinism and the cache have nothing to disagree about until there are
-//! obligations to disagree over.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -42,9 +35,7 @@ fn json_of(output: &std::process::Output) -> Value {
         .unwrap_or_else(|e| panic!("stdout was not one JSON object: {e}\n---\n{text}\n---"))
 }
 
-/// The line that is never behind a flag, on the command that has the least to
-/// report. Three definitions and no claims about any of them is exactly the
-/// project a green tick would mislead.
+/// The line that is never behind a flag, on the command that has the least to report.
 #[test]
 fn prove_leads_with_the_review_surface() {
     let dir = project(UNSPECIFIED);
@@ -80,8 +71,6 @@ fn prove_json_is_one_object_carrying_the_coverage_block() {
     assert!(v["obligations"].as_array().unwrap().is_empty());
 }
 
-/// Two runs of one project produce one artifact. The obligation order is a
-/// property of the program, so the worker count cannot reach it.
 #[test]
 fn prove_json_is_byte_identical_across_runs_and_job_counts() {
     let dir = project(UNSPECIFIED);
@@ -106,9 +95,8 @@ fn prove_json_is_byte_identical_across_runs_and_job_counts() {
     assert_eq!(one, many);
 }
 
-/// `ply prove` must not mark definitions as seen: a definition an obligation
-/// exercised has not been vindicated as a *test* subject, and recording it would
-/// empty the next `ply test`'s suspect set.
+/// `ply prove` must not mark definitions as seen: a definition an obligation exercised has not been
+/// vindicated as a *test* subject, and recording it would empty the next `ply test`'s suspect set.
 #[test]
 fn proving_does_not_touch_what_the_next_test_run_suspects() {
     let dir = project(UNSPECIFIED);
@@ -130,8 +118,8 @@ fn proving_does_not_touch_what_the_next_test_run_suspects() {
     assert_eq!(json_of(&after)["definitions_seen"], before);
 }
 
-/// One of each outcome, so the determinism and cache checks below run against a
-/// report that has something to disagree about.
+/// One of each outcome, so the determinism and cache checks below run against a report that has
+/// something to disagree about.
 const SPECIFIED: &str = "\
 fn one(x: Int) -> Int
   ensures result >= 0
@@ -154,16 +142,15 @@ law \"a batch never holds more than three entries\"
 
 fn artifact(output: &std::process::Output) -> Value {
     let mut v = json_of(output);
-    // The clock, and where each answer came from, are the two things that
-    // legitimately differ between a warm run and a cold one.
+    // The clock, and where each answer came from, are the two things that legitimately differ
+    // between a warm run and a cold one.
     v["duration_ms"] = Value::Null;
     v["cached"] = Value::Null;
     v
 }
 
-/// The determinism check above runs over a program with no obligations, which
-/// cannot catch an order that depends on the worker pool. This one has four,
-/// including a shrunk counterexample.
+/// The determinism check above runs over a program with no obligations, which cannot catch an order
+/// that depends on the worker pool.
 #[test]
 fn prove_json_agrees_across_job_counts_over_real_obligations() {
     let dir = project(SPECIFIED);
@@ -184,9 +171,7 @@ fn prove_json_agrees_across_job_counts_over_real_obligations() {
     assert_eq!(one, many);
 }
 
-/// The whole risk of an obligation cache is that a read says something the work
-/// would not have. A cached run and a run that discharges everything again have
-/// to produce the same artifact, tier for tier and certificate for certificate.
+/// The whole risk of an obligation cache is that a read says something the work would not have.
 #[test]
 fn a_cached_run_reports_exactly_what_a_fresh_one_does() {
     let dir = project(SPECIFIED);
@@ -243,10 +228,8 @@ fn accepting_a_review_makes_the_next_one_quiet() {
     );
 }
 
-/// The row where review still costs what it costs today — and the wording that
-/// must not overstate it. Changing an unspecified body changed the program;
-/// nothing here can tell whether it changed the behaviour, and the summary says
-/// so in the same breath as it says nothing specified moved.
+/// The row where review still costs what it costs today — and the wording that must not overstate
+/// it.
 #[test]
 fn an_unspecified_change_is_reported_as_invisible_rather_than_as_nothing() {
     let dir = project(UNSPECIFIED);
@@ -323,8 +306,6 @@ fn review_json_names_what_moved_and_what_the_claim_covers() {
     );
 }
 
-/// Renaming a definition loses its baseline. It shows up as newly unreviewed,
-/// which costs one re-read and never a false "unchanged".
 #[test]
 fn renaming_a_definition_loses_its_baseline_rather_than_its_history() {
     let dir = project(UNSPECIFIED);
@@ -349,11 +330,8 @@ fn renaming_a_definition_loses_its_baseline_rather_than_its_history() {
     assert_eq!(changed[0]["implementation"], "never reviewed");
 }
 
-/// The row `ply review` must never overstate: a definition whose only claim the
-/// machine could not attempt. The obligation is a gap, not evidence, so the
-/// definition stays on the uncovered list, the run does not report it as a
-/// specification that held, and the summary does not say no specified behaviour
-/// changed.
+/// The row `ply review` must never overstate: a definition whose only claim the machine could not
+/// attempt.
 #[test]
 fn a_change_under_an_undischargeable_obligation_is_never_reported_as_checked() {
     const EFFECTFUL: &str = "\
@@ -405,10 +383,8 @@ fn stored(k: Int) -> Int / {db.read[rows]}
     );
     assert_eq!(v["broken"], 1);
     assert_eq!(v["undischarged"], 1);
-    // The number the headline discloses the blind spot with, and the sentence an
-    // agent consuming this artifact would act on. An obligation nothing
-    // discharged puts the definition on the side of the ledger where review
-    // still costs what it costs today.
+    // The number the headline discloses the blind spot with, and the sentence an agent consuming
+    // this artifact would act on.
     assert_eq!(v["specified_changed"], 0);
     assert_eq!(v["unspecified_changed"], 1);
     assert_eq!(v["changed"][0]["specified"], false);
@@ -425,15 +401,8 @@ fn stored(k: Int) -> Int / {db.read[rows]}
     assert_eq!(v["changed"][0]["obligations"][0]["tier"], Value::Null);
 }
 
-/// A guard the generator cannot hit is a gap in the **search**, not a defect in
-/// the spec, and the two must not print the same thing.
-///
-/// `x > 1000000 && x < 1000010` admits nine integers. Reporting `E0420 the guard
-/// admits no value` for it states something false about the program and exits 1
-/// on a correct specification, which is criterion 4's machinery misfiring in the
-/// opposite direction: a false red rather than a false green. So the run exits
-/// 0, reports `W0604`, names the value the guard does admit, and leaves the
-/// definition uncovered — which is the honest reading of "nothing was checked".
+/// A guard the generator cannot hit is a gap in the **search**, not a defect in the spec, and the
+/// two must not print the same thing.
 #[test]
 fn a_guard_the_search_missed_is_a_gap_and_not_a_vacuity() {
     const SOURCE: &str = "\
@@ -474,10 +443,8 @@ law \"a narrow window\" forall (xs: List<Int>, x: Int)
     assert_eq!(v["coverage"]["covered"], 0);
 }
 
-/// The boundary, end to end: a postcondition valid over ℤ and unevaluable at
-/// `i64::MAX` is not proved, and the same claim over a domain its arithmetic
-/// fits in is. ADR 0007 §5.1(a) disclosed the first as a live unsoundness and
-/// named a mitigation that could not fire.
+/// The boundary, end to end: a postcondition valid over ℤ and unevaluable at `i64::MAX` is not
+/// proved, and the same claim over a domain its arithmetic fits in is.
 #[test]
 fn a_postcondition_that_raises_at_the_boundary_is_not_proved() {
     const SOURCE: &str = "\
@@ -516,14 +483,8 @@ fn bounded(x: Int) -> Int
     );
 }
 
-/// ADR 0014 §6.1: under a hermetic run — which is `ply prove`'s default — a
-/// `law/host` is reported `W0604 unattempted` with the reason, never green.
-///
-/// This is the shape of the failure the whole command exists to prevent, applied
-/// to itself: a law about a database that never ran a database, reported as
-/// passing, is a green result over unexplored space. The run still exits 0 —
-/// a gap is not a failure — and the definition stays uncovered, which is the
-/// honest reading of "nothing was checked".
+/// ADR 0014 §6.1: under a hermetic run — which is `ply prove`'s default — a `law/host` is reported
+/// `W0604 unattempted` with the reason, never green.
 #[test]
 fn a_law_host_is_unattempted_under_a_hermetic_run_and_never_green() {
     const SOURCE: &str = "\
@@ -557,8 +518,8 @@ law \"an ordinary claim\" forall (k: Int) { k == k }
         text.contains("1 unattempted"),
         "the count has to carry it: {text}"
     );
-    // And the law beside it is discharged as usual, so this is a claim about the
-    // one law rather than about the run.
+    // And the law beside it is discharged as usual, so this is a claim about the one law rather
+    // than about the run.
     assert!(text.contains("an ordinary claim"), "{text}");
 
     let v = json_of(
@@ -568,10 +529,9 @@ law \"an ordinary claim\" forall (k: Int) { k == k }
             .unwrap(),
     );
     assert_eq!(v["summary"]["unattempted"], 1);
-    // A `law/host` can never be `proved`: the static tier and the finite
-    // enumeration are both skipped, because either would be a claim about every
-    // value and the world is not a function of the arguments. The law beside it
-    // is proved, which is what makes this a claim about the one law.
+    // A `law/host` can never be `proved`: the static tier and the finite enumeration are both
+    // skipped, because either would be a claim about every value and the world is not a function of
+    // the arguments.
     let hosted = v["obligations"]
         .as_array()
         .unwrap()

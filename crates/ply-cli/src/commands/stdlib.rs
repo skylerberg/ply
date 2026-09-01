@@ -1,13 +1,4 @@
 //! `ply std` — the modules that ship with the compiler.
-//!
-//! The sibling of `ply hosts`, and for the same reason: a thing compiled into
-//! the binary that a program's meaning depends on should be enumerable in one
-//! command rather than inferred from a directory nobody can see. It needs no
-//! project, because nothing on disk decides what it prints.
-//!
-//! `--digest` is what a CI check pins. The digest keys no cache — a digest in a
-//! cache key would invalidate a project on an edit to a `std` module it never
-//! imports — so it is a claim about this binary and never about a run.
 
 use super::common::{IND, diagnostics_json, emit_json, plural, print_diagnostics};
 use crate::cli::StdArgs;
@@ -17,11 +8,9 @@ use ply_span::{Diagnostic, SourceId, SourceMap, Span, codes};
 use ply_syntax::ast::{Item, ModuleName};
 use serde_json::{Value, json};
 
-/// The `--json` object's shape. Independent of every other command's, because a
-/// consumer pinning a stdlib is not the consumer reading a run.
+/// The `--json` object's shape.
 pub const SCHEMA_VERSION: u32 = 1;
 
-/// One row per shipped module.
 pub struct Row {
     name: String,
     definitions: usize,
@@ -95,8 +84,8 @@ fn report(diagnostics: &[Diagnostic], json: bool, style: Style) -> i32 {
     EXIT_COMPILE_ERROR
 }
 
-/// Counting definitions needs a parse, and a shipped module that does not parse
-/// is Ply's fault: the user cannot have caused it and cannot fix it.
+/// Counting definitions needs a parse, and a shipped module that does not parse is Ply's fault: the
+/// user cannot have caused it and cannot fix it.
 fn rows() -> Result<Vec<Row>, Vec<Diagnostic>> {
     let mut out = Vec::new();
     let mut diagnostics = Vec::new();
@@ -216,15 +205,13 @@ mod tests {
         assert_eq!(args.show, None);
     }
 
-    /// `--digest` is the one-line form a CI check pins, so it may not also carry
-    /// a table for a machine.
+    /// `--digest` is the one-line form a CI check pins, so it may not also carry a table for a
+    /// machine.
     #[test]
     fn digest_and_json_cannot_both_be_asked_for() {
         assert!(Cli::try_parse_from(["ply", "std", "--digest", "--json"]).is_err());
     }
 
-    /// The listing names every shipped module, counts its definitions, and ends
-    /// with the digest — which is the artifact a review diffs.
     #[test]
     fn the_listing_names_every_shipped_module_and_ends_with_the_digest() {
         let rows = rows().expect("every shipped module parses");
@@ -240,8 +227,8 @@ mod tests {
         assert!(rows.iter().all(|r| r.definitions > 0), "a module is empty");
     }
 
-    /// Two runs of one binary have to agree byte for byte, or pinning the
-    /// digest in CI pins nothing.
+    /// Two runs of one binary have to agree byte for byte, or pinning the digest in CI pins
+    /// nothing.
     #[test]
     fn the_listing_is_stable_across_runs() {
         let once = lines(&rows().unwrap());

@@ -1,16 +1,4 @@
-//! `ply review --changed` — the artifact this milestone exists to produce.
-//!
-//! Per changed definition: whether the implementation changed, whether the
-//! specification changed, and whether the obligations still hold. The row that
-//! matters is *implementation changed, spec unchanged*, where the review is
-//! reading the obligations rather than the diff.
-//!
-//! The one sentence this command must not get wrong is its summary. **"No
-//! specified behaviour changed" is true; "nothing changed" is false**, because a
-//! behaviour nobody specified can change without anything here noticing — by
-//! construction, not by omission. So the count of changed definitions carrying
-//! no obligation is in the same sentence as the claim, and the coverage line is
-//! above both.
+//! `ply review --changed`.
 
 use super::common::{
     IND, diagnostic_json, diagnostics_json, emit_json, millis, once_each, plural,
@@ -99,8 +87,8 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
         &loaded.check,
         loaded.complete,
         collected.obligations.len(),
-        // `ply review` reports what moved; it binds nothing, so a `law/host` is
-        // a gap here exactly as it is under a hermetic `ply prove`.
+        // `ply review` reports what moved; it binds nothing, so a `law/host` is a gap here exactly
+        // as it is under a hermetic `ply prove`.
         None,
     );
     warnings.extend(engine_warning);
@@ -178,15 +166,8 @@ fn report_accept(
     code
 }
 
-/// What a reviewer should do with this definition, from the four rows of ADR
-/// 0007 §9.2's table that are worth printing.
-///
-/// Every row that tells a reviewer to stop reading the diff is derived from
-/// *"the claim is fixed and still holds"*. A definition whose obligations were
-/// never discharged has neither half of that, so it falls to the row where
-/// review costs what it costs today — and says which of the two reasons it is
-/// there for, because "no spec" and "a spec nothing could check" want different
-/// things from the reader.
+/// What a reviewer should do with this definition, from the four rows of ADR 0007 §9.2's table that
+/// are worth printing.
 fn advice(entry: &Reviewed) -> &'static str {
     if !entry.specified() {
         return if entry.claimed() {
@@ -302,8 +283,8 @@ fn report_json(
         "coverage": coverage_json(&review.coverage),
         "plan": plan_json(&report.plan),
         "duration_ms": millis(review.duration),
-        // Not `changed`: a definition nobody specified can change without
-        // anything here noticing, so the artifact says what the claim is about.
+        // Not `changed`: a definition nobody specified can change without anything here noticing,
+        // so the artifact says what the claim is about.
         "headline": review.headline(),
         "specified_changed": review.specified(),
         "unspecified_changed": review.unspecified(),

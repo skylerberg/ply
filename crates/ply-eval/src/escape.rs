@@ -1,123 +1,4 @@
 //! Escape enforcement at the boundaries the brand cannot see.
-//!
-//! ADR 0017 §2 makes escape a type error, and it is one: `brand_in` runs over
-//! the **resolved** type, a function type's effect row included, so a closure
-//! that captured a branded value is caught wherever a type still mentions the
-//! brand. This module is about the places where no type does.
-//!
-//! Before regions, an escape here was harmless: the forkable world was monotone,
-//! a `CellId` never dangled, and the worst outcome was a read of a cell some
-//! other run allocated. Once a region's memory is genuinely reclaimed the same
-//! escape is a read of a slot that has been handed to something else, so each of
-//! these boundaries needs an answer, and the answer has to be one of three
-//! things rather than silence.
-//!
-//! # The boundaries, and what each one's answer is
-//!
-//! **Closed here, by a runtime check.**
-//!
-//! - *A host handler*, which outlives every region (ADR 0008). Checked on the
-//!   arguments, by [`Boundary::HostArgument`].
-//! - *A value a host handler or runtime answers with*, which is the same
-//!   boundary crossed the other way and the only route by which a handle the
-//!   program never made can enter it. Checked by [`Boundary::HostAnswer`] on the
-//!   inline and `block_on` routes and by [`Boundary::HostToken`] where the
-//!   scheduler resolves a token a parked task is waiting on.
-//! - *A value handed to an entry point from outside the program.* Checked by
-//!   [`Boundary::EntryPoint`], and this one got sharper rather than softer under
-//!   regions. `world_isolation_audit.rs` recorded the route as half-closed: a
-//!   `CellId` the new world did not hold was named, and one it happened to hold
-//!   was read. [`TaskRegions::reset`](crate::TaskRegions::reset) restores the
-//!   fixture's values **and their generations**, deliberately and correctly, so
-//!   a [`Slot`](crate::arena::Slot) carried out of one entry point *resolves* in
-//!   the next one and reads the fixture. The half that used to be caught is no
-//!   longer caught by anything downstream, and this check is what stands there.
-//!
-//! **Closed elsewhere, and tested from here.**
-//!
-//! - *A trace span attribute or a log line* (W5). `std.trace` is served by a
-//!   host handler, so a value reaching a span attribute crosses
-//!   [`Boundary::HostArgument`] and nothing further is needed. What a sink then
-//!   writes is text: `Value::write` renders a handle as an opaque `<cell @3.0>`
-//!   and never dereferences one.
-//! - *A cached result.* `memo.rs` refuses to remember a value that is not
-//!   independent of the run that produced it, and a `Cell`, a `Task` and a
-//!   `Continuation` are each disqualifying there.
-//! - *The content-addressed store and a failure artifact.* `ply-store` does not
-//!   depend on `ply-eval` and holds no `Value`: an outcome is a `String` and a
-//!   `Diagnostic`. The route is a rendered handle, which is opaque.
-//! - *An M8 counterexample or a shrunk witness.* `E0418` refuses a `forall`
-//!   binder whose type is not one the generator can inhabit, and `ungeneratable`
-//!   walks a user type's declared fields — so a record or a variant holding a
-//!   `Cell` is refused where the law is written.
-//! - *A bisection hybrid* (M5). What crosses between two executions of a mixture
-//!   is `ply_test::hybrid::Signature` — a code and a message — and never a
-//!   `Value`.
-//! - *A value crossing into a task.* ADR 0017 §2 excludes `task.spawn` from a
-//!   bare `with_cell`'s escape rule on purpose, because a cell reaching a task
-//!   is how tasks share memory, and §3 makes that safe rather than tolerated: a
-//!   `task` operation anywhere in a region infers [`RegionKind::Shared`](crate::RegionKind)
-//!   ([`Cause::Task`], [`Cause::Simulate`]), and a `shared` region's slots
-//!   outlive its close. A runtime refusal here would refuse the landed shape.
-//!   For `with_region` the stricter rule is static, and is `E0446`.
-//!
-//! **Open, and named.**
-//!
-//! - *A continuation parked in an enclosing region's cell*, where the brand is
-//!   erased at a nominal constructor's field type. ADR 0017 §2 records this as
-//!   the one route that stays open and it stays open: closing it needs the brand
-//!   to survive a nominal declaration. What this module does about it is make
-//!   its *consequences* checkable — the continuation cannot then leave through
-//!   an entry point or a host operation, and a slot it reads after its region
-//!   closed is a diagnostic rather than a wrong value.
-//! - *A simulation record replayed from a seed* (M7). A `Trail` records
-//!   `Access::Cell { id }` and compares ids across interleavings to decide
-//!   dependence. Under the monotone world an id was never reused, so the
-//!   comparison was exact. Under an arena a slot index **is** reused after a
-//!   region closes, and the comparison stays exact only if what is recorded
-//!   carries the generation — a whole [`Slot`](crate::arena::Slot) rather than
-//!   its index. That is a requirement on the wiring rather than something this
-//!   module can enforce, and it is written down here so it is not discovered
-//!   later as a reduction that reports more than it explored.
-//!
-//! # What the walk is, and what it deliberately over-approximates
-//!
-//! [`carries`] finds the first region-bound handle a value can reach: a `Cell`
-//! or a `Task`, which are keys into a region's store and into a scheduler that
-//! dies with its region, and a `Continuation`, which reaches every region open
-//! where it was captured. It descends through every data constructor, a
-//! `Secret`'s payload included — a credential is not a laundering wrapper — and
-//! through a closure's captured environment.
-//!
-//! The environment walk is the over-approximation, and it is deliberate: an
-//! [`Env`](crate::Env) is the closure's whole defining scope rather than its
-//! free set, so a closure built beside a cell carries that cell in its chain
-//! whether or not its body can reach it. Nothing in the shipped trusted
-//! computing base declares an operation with a function parameter, so no
-//! program's meaning moves for it today.
-//!
-//! It is a backstop rather than the primary defence, and it is worth being exact
-//! about which: the shape it looks like it is for — `Wrap(|| cell_get(c))`,
-//! smuggling a cell through the same constructor erasure §2's open route uses —
-//! does not compile. A field type is declared once for the whole program, so
-//! `Wrap`'s is `() -> Int` with an empty row and the closure's `{cell.read[log]}`
-//! has nothing to unify with at the constructor's *application*: `E0302`, before
-//! any region check runs. §2's route is open specifically for a **continuation**,
-//! because `ρ_κ` is a variable the `handle` solves. So the walk defends no route
-//! that is reachable today, and it is kept because six of this project's found
-//! defects were routes nobody had enumerated.
-//! `the_constructor_erasure_does_not_also_launder_a_cell_inside_a_closure` in
-//! `region_boundary_audit.rs` is where that is pinned, so a change that made the
-//! shape compile would be caught rather than quietly widening the boundary.
-//!
-//! The walk terminates without a depth bound because a `Value` graph is acyclic:
-//! a `Cell` is a slot and not a pointer, so the only cycle a program can build
-//! goes through the arena, and the walk stops at the `Cell` rather than
-//! following it. `grow` is what keeps a deep value from overflowing the host
-//! stack, exactly as it does for the credential walk beside it.
-//!
-//! [`Cause::Task`]: crate::region_kind::Cause::Task
-//! [`Cause::Simulate`]: crate::region_kind::Cause::Simulate
 
 use crate::limit::grow;
 use crate::value::{ClosureKind, Value};
@@ -131,8 +12,7 @@ pub enum Handle {
     Cell,
     /// A key into a scheduler, which dies with its region.
     Task,
-    /// A captured continuation, which reaches every region that was open where
-    /// it was captured.
+    /// A captured continuation, which reaches every region that was open where it was captured.
     Continuation,
 }
 
@@ -168,14 +48,13 @@ impl Handle {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Escapee {
     pub handle: Handle,
-    /// Outermost first, e.g. `["item 2", "`Just`'s argument 1"]`. Empty when the
-    /// value *is* the handle.
+    /// Outermost first, e.g. `["item 2", "`Just`'s argument 1"]`.
     pub route: Vec<String>,
 }
 
 impl Escapee {
-    /// `, reached through item 2 → `Just`'s argument 1`, or the empty string
-    /// when the value is the handle itself.
+    /// `, reached through item 2 → `Just`'s argument 1`, or the empty string when the value is the
+    /// handle itself.
     fn reached(&self) -> String {
         if self.route.is_empty() {
             return String::new();
@@ -185,14 +64,9 @@ impl Escapee {
 }
 
 /// Which boundary a value was about to cross.
-///
-/// Borrowed rather than owned so that constructing one costs nothing: it is
-/// built per host answer and per entry point, and a `String` there would put an
-/// allocation on the request path this milestone exists to take them off.
 #[derive(Clone, Copy, Debug)]
 pub enum Boundary<'a> {
-    /// An argument to a host operation. Positions are 0-based; the diagnostic
-    /// prints them 1-based, as `E0439` does.
+    /// An argument to a host operation.
     HostArgument {
         operation: &'a str,
         path: &'static str,
@@ -204,9 +78,7 @@ pub enum Boundary<'a> {
         operation: &'a str,
         path: &'static str,
     },
-    /// The value a host runtime resolved a parked token to. A separate variant
-    /// because the scheduler knows the token and not the registration: the task
-    /// parked, and which handler minted the token is no longer on the path.
+    /// The value a host runtime resolved a parked token to.
     HostToken { label: &'static str, token: u64 },
     /// An argument handed to an entry point from outside the program.
     EntryPoint { name: &'a str },
@@ -244,8 +116,7 @@ impl Boundary<'_> {
         }
     }
 
-    /// What outlives the region, said once per boundary. This is the sentence
-    /// the reader needs and the one a generic message would not have.
+    /// What outlives the region, said once per boundary.
     fn outlives(&self) -> Cow<'static, str> {
         match self {
             Boundary::HostArgument { path, .. } => Cow::Owned(format!(
@@ -286,10 +157,6 @@ impl Boundary<'_> {
 }
 
 /// The first region-bound handle `value` can reach, with the route to it.
-///
-/// Structural order — a list by index, a map by ascending key, a record by field
-/// name — so two engines walking the same value name the same handle and print
-/// the same diagnostic.
 pub fn carries(value: &Value) -> Option<Escapee> {
     let mut route = Vec::new();
     let handle = find(value, &mut route)?;
@@ -298,10 +165,6 @@ pub fn carries(value: &Value) -> Option<Escapee> {
 }
 
 /// Refuses `value` at `boundary`, or lets it through.
-///
-/// The handle's *kind* and its route are named and its contents are not, which
-/// is `E0439`'s discipline and holds here for the same reason: the route is
-/// enough to find the value in the source, and the value may be a credential.
 pub fn check(boundary: &Boundary<'_>, value: &Value, span: Span) -> Result<(), Diagnostic> {
     match carries(value) {
         None => Ok(()),
@@ -309,8 +172,7 @@ pub fn check(boundary: &Boundary<'_>, value: &Value, span: Span) -> Result<(), D
     }
 }
 
-/// [`check`] over a run of arguments, naming the position of the first that
-/// carries a handle.
+/// [`check`] over a run of arguments, naming the position of the first that carries a handle.
 pub fn check_arguments(
     operation: &str,
     path: &'static str,
@@ -347,8 +209,8 @@ fn refuse(boundary: &Boundary<'_>, escapee: &Escapee, span: Span) -> Diagnostic 
     .note(boundary.remedy())
 }
 
-/// Innermost-first: each frame pushes its own segment as the `Some` unwinds, so
-/// nothing is allocated for a value that carries no handle.
+/// Innermost-first: each frame pushes its own segment as the `Some` unwinds, so nothing is
+/// allocated for a value that carries no handle.
 fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
     match value {
         Value::Cell(_) => Some(Handle::Cell),
@@ -400,9 +262,6 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
         }),
 
         // Descended into, because a credential is not a place to hide a handle.
-        // The route stops here rather than naming what is inside: everything
-        // below a `Secret` is redacted, and a field name is part of the value's
-        // shape.
         Value::Secret(inner) => grow(|| {
             let handle = find(inner, route)?;
             route.clear();
@@ -435,9 +294,9 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    /// A real slot from a real region, because [`Slot`](crate::arena::Slot)
-    /// carries a generation and has no constructor outside the allocator — which
-    /// is the property that makes a stale one readable as stale.
+    /// A real slot from a real region, because [`Slot`](crate::arena::Slot) carries a generation
+    /// and has no constructor outside the allocator — which is the property that makes a stale one
+    /// readable as stale.
     fn cell() -> Value {
         let mut arena = Arena::new();
         arena.open(RegionKind::Shared, Span::DUMMY);
@@ -462,8 +321,8 @@ mod tests {
         assert_eq!(carries(&value), None);
     }
 
-    /// The erasure route ADR 0017 §2 leaves open, seen from the boundary: the
-    /// constructor's field type mentions no brand, so only the value says so.
+    /// The erasure route ADR 0017 §2 leaves open, seen from the boundary: the constructor's field
+    /// type mentions no brand, so only the value says so.
     #[test]
     fn a_handle_inside_a_constructor_is_found_and_the_route_names_it() {
         let value = Value::Ctor {
@@ -496,9 +355,8 @@ mod tests {
         );
     }
 
-    /// A `Secret` is walked, because a wrapper nothing descends into is a
-    /// wrapper a handle hides behind — and the route stops at it, because what
-    /// is inside one is redacted everywhere else.
+    /// A `Secret` is walked, because a wrapper nothing descends into is a wrapper a handle hides
+    /// behind — and the route stops at it, because what is inside one is redacted everywhere else.
     #[test]
     fn a_secret_is_not_a_place_to_hide_a_handle_and_its_shape_stays_redacted() {
         let value = Value::Secret(Arc::new(Value::Ctor {
@@ -531,9 +389,9 @@ mod tests {
         assert_eq!(carries(&value), None);
     }
 
-    /// The backstop the module doc describes, exercised where it can be: no
-    /// source program builds this closure today (`E0302` refuses the shape at
-    /// the constructor), so the environment is assembled directly.
+    /// The backstop the module doc describes, exercised where it can be: no source program builds
+    /// this closure today (`E0302` refuses the shape at the constructor), so the environment is
+    /// assembled directly.
     #[test]
     fn a_closure_whose_scope_reaches_a_handle_is_found_and_the_binding_named() {
         use crate::env::Env;

@@ -1,28 +1,4 @@
 //! What decides whether a host-backed test runs at all.
-//!
-//! ADR 0011 §5 makes one claim about selection under `--host`:
-//!
-//! > the tests that can reach the host are exactly those whose footprint
-//! > intersects the binding's. Those get `Reason::Host`: they always run and are
-//! > never written to the cache, in either direction.
-//!
-//! Two halves. The **write** half is implemented and is implemented well: the
-//! runtime is authoritative, a run that reached a host handler records
-//! `Record::Host` and nothing is stored, and `ply test` audits every written
-//! result against the binding afterwards. The tests here pin that.
-//!
-//! The **read** half is not implemented. [`select`] takes no binding — it is
-//! `select(check, hashes, store, plan)` — so no test is ever selected *because*
-//! it can reach the host. A host-reaching test runs today only because `Reason::
-//! Nondet` covers it, and it covers it only because every handler in W1's
-//! trusted computing base is registered `Determinism::Nondeterministic`.
-//!
-//! ADR 0011 §4 explicitly permits a `Determinism::Deterministic` registration
-//! and §5 says such a handler is "still not cacheable". The last test here shows
-//! that it is: a hermetic pass by a test whose footprint reaches the binding is
-//! read back under `--host`, and the test is skipped without the host being
-//! consulted. It is named `documents_` because it pins present behaviour so a
-//! fix shows up as a diff — it is not an endorsement.
 
 use ply_core::CheckOutput;
 use ply_core::ty::Resource;
@@ -40,8 +16,6 @@ use ply_test::{Hosting, Reason, Search, select};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-// ------------------------------------------------------------------ harness
 
 struct TempRoot(PathBuf);
 
@@ -104,9 +78,6 @@ impl Compiled {
 }
 
 /// A handler that answers a constant and counts how often it was asked.
-///
-/// The count is the point: "the host was consulted" is a claim a passing test
-/// cannot make on its own, because the fixtures below pass either way.
 struct Counting {
     calls: Arc<AtomicUsize>,
 }
@@ -177,8 +148,6 @@ fn reason(compiled: &Compiled, store: &Store, name: &str) -> Reason {
     selection.reasons[index]
 }
 
-// --------------------------------------------------- the write half, which holds
-
 /// A `nondet` effect, which is every effect W1's trusted computing base serves.
 const NONDET: &str = r#"
 nondet effect wire {
@@ -190,8 +159,8 @@ fn ask(k: Int) -> Int / {wire.read[log]} = wire.peek[log](k)
 test/nondet "reaches the host" { assert_eq(ask(1), 99) }
 "#;
 
-/// The claim ADR 0008 §3 and ADR 0011 §5 are built on, end to end: a run that
-/// reached a real handler writes nothing, so the next run cannot believe it.
+/// The claim ADR 0008 §3 and ADR 0011 §5 are built on, end to end: a run that reached a real
+/// handler writes nothing, so the next run cannot believe it.
 #[test]
 fn a_pass_earned_over_a_host_handler_is_never_written_to_the_cache() {
     let compiled = Compiled::new(NONDET);
@@ -222,8 +191,8 @@ fn a_pass_earned_over_a_host_handler_is_never_written_to_the_cache() {
     );
 }
 
-/// And the flag really is what changed: with nothing bound the same test cannot
-/// reach the handler at all.
+/// And the flag really is what changed: with nothing bound the same test cannot reach the handler
+/// at all.
 #[test]
 fn the_same_test_reaches_nothing_when_nothing_is_bound() {
     let compiled = Compiled::new(NONDET);
@@ -237,15 +206,8 @@ fn the_same_test_reaches_nothing_when_nothing_is_bound() {
     assert_eq!(calls.load(Ordering::Relaxed), 0);
 }
 
-// ------------------------------------------- the read half, which does not hold
-
-/// A **deterministic** effect, which ADR 0011 §4 permits a host handler to serve
-/// and which nothing in W1's trusted computing base currently does.
-///
-/// The test's footprint carries `disk.read[log]` — inference cannot know the
-/// branch is never taken — so it is exactly the "footprint intersects the
-/// binding" case §5 is about. It is `det`, because `disk` is not `nondet`, so it
-/// is cacheable.
+/// A **deterministic** effect, which ADR 0011 §4 permits a host handler to serve and which nothing
+/// in W1's trusted computing base currently does.
 const DETERMINISTIC: &str = r#"
 effect disk {
   read peek[r](k: Int) -> Int
@@ -274,23 +236,7 @@ fn a_deterministic_registration_binds_and_the_test_footprint_reaches_it() {
     );
 }
 
-/// **The gap.** A hermetic pass is read back under `--host`, so the test is
-/// skipped and the host is never consulted.
-///
-/// ADR 0011 §5 requires the opposite: such a test "always runs and is never
-/// written to the cache, in either direction". Selection cannot implement that
-/// because it is never given the binding — `select(check, hashes, store, plan)`
-/// has no parameter for one — so the only thing making host-backed tests re-run
-/// today is `Reason::Nondet`, which is a property of the *program's*
-/// declaration rather than of the binding.
-///
-/// Why it matters, in the shape this project's defects always take: the run is
-/// green, the count of cached tests looks right, and the resource the test
-/// exists to exercise was never touched. Nothing anywhere says so.
-///
-/// This is unreachable through the shipped `ply` binary, because every
-/// registration in `ply_host::registry` is `Nondeterministic`. It becomes
-/// reachable the moment one is not.
+/// **The gap.**
 #[test]
 fn documents_a_host_reaching_test_is_skipped_when_its_hermetic_pass_was_cached() {
     let compiled = Compiled::new(DETERMINISTIC);
@@ -299,8 +245,7 @@ fn documents_a_host_reaching_test_is_skipped_when_its_hermetic_pass_was_cached()
     let mut store = root.store();
     let calls = Arc::new(AtomicUsize::new(0));
 
-    // A hermetic run. The branch that would perform `disk.peek` is not taken, so
-    // the test passes and its pass is cached — correctly, hermetically.
+    // A hermetic run.
     let report = run(&compiled, &mut store, None);
     assert_eq!(report.failed, 0, "{:?}", report.failures);
     assert_eq!(report.passed, 1);

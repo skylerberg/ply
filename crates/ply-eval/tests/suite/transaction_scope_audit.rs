@@ -1,21 +1,5 @@
-//! A transaction is a handler, so its two hazards are the machine's rather than
-//! a driver's, and both are audited here.
-//!
-//! **A rollback is zero resumptions.** ADR 0008 §7 caps a host handler's
-//! continuation at one resumption because resuming twice performs the I/O twice.
-//! A `db.rollback` clause resumes *zero* times, which is inside that cap rather
-//! than an exception to it — so a rollback needs no exemption, no new predicate
-//! and no change to `Continuation::admit`. That claim is worth nothing unless
-//! something checks it against a run where the counter is actually armed, which
-//! is what the first half of this file does: every fixture performs a real,
-//! `AtMostOnce`, bound host operation before it rolls back, and the second half
-//! shows the same shape being refused when the clause resumes twice.
-//!
-//! **An entry point can end with a scope open.** A body that raises propagates
-//! past the `handle` that would have committed or aborted, so the machine has to
-//! tell the runtime that the entry point is over on *every* exit path — a value,
-//! a diagnostic, or a spent budget — and the second half of this file counts
-//! those.
+//! A transaction is a handler, so its two hazards are the machine's rather than a driver's, and
+//! both are audited here.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::host::{
@@ -28,8 +12,6 @@ use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-// ------------------------------------------------------------------- fixtures
 
 struct Compiled {
     program: Program,
@@ -51,10 +33,7 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-/// The `db` effect and the `transaction` scope, in the shape `std.db` ships
-/// them. Written out here rather than imported because these tests compile one
-/// module with no loader, and what is under test is the shape rather than the
-/// text.
+/// The `db` effect and the `transaction` scope, in the shape `std.db` ships them.
 const DB: &str = r#"
 nondet effect db {
   write execute[t](row: Int) -> Int
@@ -78,10 +57,7 @@ fn transaction<a | e>(body: () -> a / e) -> Result<a, String> / {db.write | e} =
   }
 "#;
 
-/// What the run performed, in order. Every operation goes through one handler,
-/// because the assertion that matters is a *sequence* — a rollback that also
-/// committed, or a statement that ran after the discard, is invisible to any
-/// assertion on the value.
+/// What the run performed, in order.
 #[derive(Default)]
 struct Journal {
     lines: Mutex<Vec<String>>,
@@ -112,8 +88,8 @@ impl HostHandler for Journal {
     }
 }
 
-/// Records the task each operation was performed by, which is the identity a
-/// driver keys an open scope on.
+/// Records the task each operation was performed by, which is the identity a driver keys an open
+/// scope on.
 #[derive(Default)]
 struct Performers {
     seen: Mutex<Vec<(String, Option<TaskId>)>>,
@@ -135,8 +111,8 @@ fn op(effect: &str, name: &str, resource: HostResource) -> HostOp {
         op: Symbol::new(name),
         resource,
         determinism: Determinism::Nondeterministic,
-        // The whole point: every one of these is a real write, so the linearity
-        // counter is armed for the rollback tests rather than dormant.
+        // The whole point: every one of these is a real write, so the linearity counter is armed
+        // for the rollback tests rather than dormant.
         linearity: Linearity::AtMostOnce,
         blocking: false,
         secrets: false,
@@ -200,9 +176,9 @@ impl HostRuntime for Bookkeeper {
     }
 
     fn end_entry_point(&self, machine: MachineId) -> Result<(), Diagnostic> {
-        // Recorded, because the identity a handler keys scoped state on is half
-        // the point of the hook: a teardown that could not tell two entry points
-        // apart would roll back the wrong one's transaction.
+        // Recorded, because the identity a handler keys scoped state on is half the point of the
+        // hook: a teardown that could not tell two entry points apart would roll back the wrong
+        // one's transaction.
         *self.machines.lock().expect("no panic holds this") = Some(machine);
         self.ends.fetch_add(1, Ordering::SeqCst);
         match self.fails {
@@ -256,10 +232,8 @@ fn run_with(body: &str, tasks: bool) -> Run {
     Run { outcome, journal }
 }
 
-// ------------------------------------------------ a rollback is zero resumes
-
-/// The claim, against a run where the counter is armed: the statement after the
-/// rollback never executes, the commit never executes, and nothing is refused.
+/// The claim, against a run where the counter is armed: the statement after the rollback never
+/// executes, the commit never executes, and nothing is refused.
 #[test]
 fn a_rollback_discards_the_continuation_and_trips_no_linearity_rule() {
     let run = run(r#"
@@ -281,9 +255,8 @@ test/nondet "rollback" {
     );
 }
 
-/// The same discard from two calls deep, which is the shape a program actually
-/// writes: the rollback is not a lexical `return` and the site that performs it
-/// cannot see the `handle` that answers it.
+/// The same discard from two calls deep, which is the shape a program actually writes: the rollback
+/// is not a lexical `return` and the site that performs it cannot see the `handle` that answers it.
 #[test]
 fn a_rollback_two_calls_deep_discards_its_callers() {
     let run = run(r#"
@@ -304,9 +277,7 @@ test/nondet "deep" {
     assert_eq!(run.journal.lines(), ["begin", "execute[items]", "abort"]);
 }
 
-/// A nested transaction is a second `handle`, and the innermost one answers. The
-/// outer body carries on and commits, which is what makes a savepoint the right
-/// thing for the driver to issue underneath.
+/// A nested transaction is a second `handle`, and the innermost one answers.
 #[test]
 fn an_inner_rollback_is_answered_by_the_inner_scope() {
     let run = run(r#"
@@ -340,10 +311,8 @@ test/nondet "nested" {
     );
 }
 
-/// The contrast, and the reason the tests above prove anything: in the same
-/// program shape, with the same bound handlers, a clause that resumes **twice**
-/// after a host operation is refused. So "no `E0426`" above is the rule being
-/// satisfied rather than the rule being absent.
+/// The contrast, and the reason the tests above prove anything: in the same program shape, with the
+/// same bound handlers, a clause that resumes **twice** after a host operation is refused.
 #[test]
 fn resuming_twice_over_the_same_boundary_is_still_refused() {
     let run = run(r#"
@@ -369,9 +338,8 @@ test/nondet "twice" {
     );
 }
 
-/// `db.begin` is `AtMostOnce`, so a continuation captured *before* a transaction
-/// opened cannot be resumed a second time. That is right rather than incidental:
-/// the replay would issue a second `BEGIN` on a connection already inside one.
+/// `db.begin` is `AtMostOnce`, so a continuation captured *before* a transaction opened cannot be
+/// resumed a second time.
 #[test]
 fn a_continuation_captured_before_begin_cannot_be_replayed_over_it() {
     let run = run(r#"
@@ -392,11 +360,9 @@ test/nondet "replayed" {
     assert_eq!(run.journal.count("begin"), 1);
 }
 
-// --------------------------------------------------- who performed, and when
-
-/// Outside a scheduler region the identity is `None`, and that is one identity
-/// rather than an absence of one: the entry point is a single thread of control
-/// and a scope it opened belongs to it.
+/// Outside a scheduler region the identity is `None`, and that is one identity rather than an
+/// absence of one: the entry point is a single thread of control and a scope it opened belongs to
+/// it.
 #[test]
 fn an_operation_outside_a_region_carries_the_entry_point_as_its_performer() {
     let source = format!(
@@ -424,8 +390,8 @@ test/nondet "alone" {
     );
 }
 
-/// Inside one, it is the task that ran the statement — which is what lets a
-/// driver refuse a `commit` performed by a task that does not own the scope.
+/// Inside one, it is the task that ran the statement — which is what lets a driver refuse a
+/// `commit` performed by a task that does not own the scope.
 #[test]
 fn an_operation_inside_a_region_carries_the_task_that_performed_it() {
     let source = format!(
@@ -458,8 +424,6 @@ test/nondet "spawned" {
     );
 }
 
-// ------------------------------------------------------ every exit path ends
-
 fn ends_after(body: &str, budget: Option<usize>) -> (Arc<Bookkeeper>, Result<(), Diagnostic>) {
     let source = format!("{DB}{body}");
     let compiled = compile(&source);
@@ -478,9 +442,8 @@ fn ends_after(body: &str, budget: Option<usize>) -> (Arc<Bookkeeper>, Result<(),
     (bookkeeper, outcome)
 }
 
-/// `Rc<dyn HostRuntime>` is what the machine takes and `Arc` is what a test
-/// keeps a handle through, so the two are bridged rather than the counter being
-/// made thread-local.
+/// `Rc<dyn HostRuntime>` is what the machine takes and `Arc` is what a test keeps a handle through,
+/// so the two are bridged rather than the counter being made thread-local.
 struct BookkeeperHandle(Arc<Bookkeeper>);
 
 impl HostRuntime for BookkeeperHandle {
@@ -501,15 +464,8 @@ impl HostRuntime for BookkeeperHandle {
     }
 }
 
-/// The identity the hook carries, which is what stops one entry point's
-/// teardown from ending another's transaction.
-///
-/// `Host` holds one driver and every worker gets a `Facilities` over it, so
-/// nothing on the host side can tell two entry points apart on its own. The task
-/// cannot either: `Machine::performing_task` is `None` outside a production
-/// region, which every `ply test` entry point is. The machine's own identity is
-/// the only thing that distinguishes them, so it is carried across the boundary
-/// and it is unique per machine.
+/// The identity the hook carries, which is what stops one entry point's teardown from ending
+/// another's transaction.
 #[test]
 fn a_teardown_names_the_machine_whose_entry_point_ended() {
     let (first, _) = ends_after(
@@ -553,9 +509,7 @@ test/nondet "value" {
     assert_eq!(book.ends(), 1);
 }
 
-/// The path that needs the hook. The body raises inside the transaction, so the
-/// raise propagates past the `handle`, nothing committed, and the scope is still
-/// open — which the runtime is told about exactly once.
+/// The path that needs the hook.
 #[test]
 fn an_entry_point_that_raised_inside_a_transaction_still_ends() {
     let (book, outcome) = ends_after(
@@ -580,8 +534,8 @@ test/nondet "raised" {
     );
 }
 
-/// And the budget path, which is neither a value nor a diagnostic the program
-/// wrote: a run that spent its call budget has left whatever it was holding.
+/// And the budget path, which is neither a value nor a diagnostic the program wrote: a run that
+/// spent its call budget has left whatever it was holding.
 #[test]
 fn an_entry_point_that_spent_its_budget_still_ends() {
     let (book, outcome) = ends_after(
@@ -602,11 +556,9 @@ test/nondet "budget" {
     assert_eq!(book.ends(), 1);
 }
 
-/// A failure while closing is the *run's* fault and not the program's: the
-/// program asked for nothing and did nothing wrong, and attributing a discarded
-/// connection to whichever test was running would send a reader looking for a
-/// defect in their own program. It is collected as a warning and the verdict
-/// stands.
+/// A failure while closing is the *run's* fault and not the program's: the program asked for
+/// nothing and did nothing wrong, and attributing a discarded connection to whichever test was
+/// running would send a reader looking for a defect in their own program.
 #[test]
 fn a_teardown_failure_is_a_warning_and_not_the_entry_points_verdict() {
     let source = format!(

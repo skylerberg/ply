@@ -1,154 +1,16 @@
-// The parts desk: a multi-route HTTP service, over postgres, whose types are its
-// documentation — and which can be started, watched, and stopped without losing
-// a request.
-//
-//     $ ply check --types examples/desk.ply     # the map below
-//     $ ply test examples/desk.ply              # 68 hermetic tests, no database
-//     $ ply prove examples/desk.ply             # seven laws, two of them proved
-//     $ examples/serve.sh --memory              # the service, with no database
-//     $ examples/same-tests.sh                  # W4's exit criterion, checked
-//
-// --- Running it, and stopping it ------------------------------------------------
-//
-// The whole of the operator's loop, in five commands. Read them top to bottom:
-// this is the sequence the file is written to make obvious.
-//
-//     $ export DESK_API_KEY=correct-horse-battery-staple
-//     $ ply run examples/desk.ply --host \
-//         --db postgres://desk@localhost/desk --db-schema desk.schema \
-//         --config-schema desk.config --set DESK_PORT=8137 \
-//         --trace json --trace-level info --drain-ms 30000
-//
-//     binding host · 36 operations · b3:66c6fe2369eb
-//     config      3 keys · 1 environment · 2 --set · 1 secret (values not shown)
-//     shutdown    signals INT TERM · lead 0ms · drain 30000ms · second signal exits 130/143
-//
-//     $ curl -sS localhost:8137/health     # is the process up          → 200, always
-//     $ curl -sS localhost:8137/ready      # should it get traffic      → 200 or 503
-//     $ curl -sS localhost:8137/orders -H "x-api-key: $DESK_API_KEY" \
-//         -d '{"customer":"ada","lines":[{"sku":"bolt","qty":4}]}'
-//     $ kill -TERM $(pgrep -f 'ply run')   # or ^C
-//
-//     stopping    signal TERM · lead 0ms · drain 30000ms · 1 connection in flight
-//     drained     4ms since the signal
-//     teardown    0 transactions rolled back, none committed · sink flushed
-//
-// Between the signal and the exit: `/ready` starts answering 503 while `/health`
-// still answers 200, the listener stops accepting, the connection in flight
-// finishes its request, every open transaction is rolled back, every open span
-// is closed `Abandoned`, the sink is flushed and the pool is closed — in that
-// order, which is ADR 0015 §4.4 and is pinned because three of those four steps
-// are ordering-sensitive and a wrong order loses data rather than tidiness.
-//
-// The trace lines go to **stderr**, one JSON object per line, while every `ply`
-// command's `--json` owns stdout — so a run can be piped into `jq` and watched
-// at the same time. `examples/serve.sh --memory` writes none of them, and that
-// is not a bug: the twin discharges every `trace` atom in Ply, so nothing
-// reaches the sink. A twin that wrote to the sink would not be a twin.
-//
-// **Not one line of the accept loop changed to make that work.** `serve` exits
-// when `net.accept` answers `0`, and stopping the listener is what makes it
-// answer `0`. That is ADR 0013's decision paying for itself a milestone later,
-// and `a signal drains the accept loop with no source change` below is the test
-// that says so.
-//
-// --- What the types say ----------------------------------------------------------
-//
-// W3's exit criterion is that an endpoint's declared signature says which
-// resources it touches; W4's is that the same endpoints run unchanged against a
-// real database and against an in-memory twin; W5's is that the same signature
-// now also says **which channels an endpoint records on** and **which of them
-// reads a credential**. That is what this file is for. Here is
-// `ply check --types`, with the rows exactly as it prints them and two record
-// types abbreviated: Ply's records are structural, so the real output writes
-// `{body: Bytes, headers: Map<String, List<String>>, status: Int}` wherever this
-// says `Response` and `{endpoint: Endpoint, method: Method, path:
-// List<Segment>}` wherever it says `Route<Endpoint>`. Nothing else is elided:
-//
-//   table         : () -> List<Route<Endpoint>>
-//   route_of      : (Method, String) -> Matched<Endpoint>
-//   health        : () -> Response
-//   docs          : (Map<String, String>) -> Response
-//   ready         : () -> Response / {std.db.db.read[items],
-//                                     std.signal.signal.read}
-//   list_items    : () -> Response / {std.db.db.read[items]}
-//   featured      : () -> Response / {std.db.db.read[items]}
-//   get_item      : (Map<String, String>) -> Response / {std.db.db.read[items]}
-//   list_orders   : () -> Response / {std.db.db.read[orders]}
-//   get_order     : (Map<String, String>) -> Response / {std.db.db.read[orders]}
-//   receipt       : (Map<String, String>) -> Reply / {std.db.db.read[items],
-//                                                     std.db.db.read[orders]}
-//   place_order   : (Bytes) -> Response / {std.db.db.read[items],
-//                                          std.db.db.write[items],
-//                                          std.db.db.read[orders],
-//                                          std.db.db.write[orders],
-//                                          std.db.db.write,
-//                                          std.trace.trace.write[items],
-//                                          std.trace.trace.write[orders]}
-//   cancel_order  : (Map<String, String>) -> Response / {std.db.db.read[items],
-//                                          std.db.db.write[items],
-//                                          std.db.db.read[orders],
-//                                          std.db.db.write[orders],
-//                                          std.db.db.write,
-//                                          std.trace.trace.write[items],
-//                                          std.trace.trace.write[orders]}
-//   dispatch      : (Endpoint, Request, Map<String, String>) -> Reply
-//                                       / {std.config.config.read[credentials],
-//                                          std.db.db.read[items],
-//                                          std.db.db.write[items],
-//                                          std.db.db.read[orders],
-//                                          std.db.db.write[orders],
-//                                          std.db.db.write,
-//                                          std.signal.signal.read,
-//                                          std.trace.trace.write[http],
-//                                          std.trace.trace.write[items],
-//                                          std.trace.trace.write[orders]}
-//
-// Read it as a map of the API to what the API does to which table and records on
-// which channel. `GET /items` cannot write anything, cannot see the order book
-// and records nothing; `GET /orders/{id}` cannot see the shelf; `health` and
-// `docs` reach no database at all, which is exactly why `health` cannot be made
-// to fail by a database outage and `ready` can; and `table` and `route_of` are
-// pure, so the part of a web framework that is hardest to test is here a
-// function over a value. None of those sentences is a comment that can go stale
-// — each is inferred from the body and checked against the annotation, and
-// deleting an annotation changes nothing but who is checked against whom.
-//
-// The two rows worth reading twice are `health` and `ready`. One is empty and
-// one names a table and the stop flag, and the difference between them *is* the
-// difference between liveness and readiness: a readiness route whose row is `{}`
-// is a readiness route that checks nothing, and `ply check --types` says so
-// without anybody having to read its body.
-//
-// The bare `std.db.db.write` on the two writers is the transaction: `begin`,
-// `commit`, `abort` and `rollback` name no table, so their atom is the singleton
-// named for the effect, and carrying it is what says "this endpoint opens a
-// transaction" in the type. The five read-only rows do not carry it, which is
-// what says the reads never do.
-//
-// Two endpoints need the same seven atoms, so those two are written `/ {Desk}` —
-// an `effect set`, which is an abbreviation for a row and never a widening of
-// one. Every other endpoint writes its atoms out, because at an endpoint the
-// difference between `read[items]` and `write[orders]` is the documentation and
-// an abbreviation would be hiding it. `ply check --types` prints the expansion
-// either way, with no flag: the alias name is nowhere in this output, and
-// `--explain` is what adds it back as provenance.
+// The parts desk: a multi-route HTTP service, over postgres, whose types are its documentation —
+// and which can be started, watched, and stopped without losing a request.
 
 import std.net (net, send_all)
-// Twice, and both are needed: the selective import binds the effect name, so
-// that a row can say `db.read[items]` and a perform can say `db.query[items]`,
-// and the plain import binds the module, so that a type can say `db::Answer`
-// and a call can say `db::transaction`. A selective import binds no module name
-// and a module import brings no effect into scope.
+// Twice, and both are needed: the selective import binds the effect name, so that a row can say
+// `db.read[items]` and a perform can say `db.query[items]`, and the plain import binds the module,
+// so that a type can say `db::Answer` and a call can say `db::transaction`.
 import std.db
 import std.db (db)
 import std.json
 import std.http
 import std.router
-// The three W5 effects, each twice for the reason above. A row says
-// `trace.write[orders]` and a perform says `trace.event[orders]`, so the effect
-// name has to be in scope; a value says `trace::Info` and a twin call says
-// `trace::sink()`, so the module name has to be too.
+// The three W5 effects, each twice for the reason above.
 import std.trace
 import std.trace (trace)
 import std.config
@@ -157,85 +19,22 @@ import std.signal
 import std.signal (signal)
 
 // --- The store ----------------------------------------------------------------
-//
-// It is postgres. `std.db`'s resource label is a table name, so `items` and
-// `orders` are the same two resources W3's `effect store` had and the rows above
-// still say which tables an endpoint touches — which is the one property this
-// whole file exists to show, and the one that had to survive the swap.
-//
-// What did **not** survive, said plainly because a milestone that smoothed it
-// over would be lying about its own exit criterion: W3's comment on `run`
-// claimed that swapping its clauses for a Postgres handler would change that one
-// function and no other. That was false, and it was false for a reason worth
-// knowing. `store.all[items]()` handed back the whole table and `store.save`
-// took the whole table back; a database is not a variable, and an interface that
-// pretends it is has already thrown away the only things a database is for — a
-// statement, a transaction, a constraint. So every endpoint's *body* moved from
-// `store.all[items]()` to a statement, and every endpoint's *row* moved from
-// `desk.store.read[items]` to `std.db.db.read[items]`.
-//
-// What is true, and is the claim worth making, is one step weaker and one step
-// more useful: the **resources did not move**, so every row still names the same
-// tables, `ply check --types` still reads as a map of the API to what it touches,
-// and swapping the *twin* for postgres — `run_memory` for `run` — changes
-// nothing but which handler is installed. That last swap is W4's exit criterion,
-// and it is one function.
 
-// The desk used to declare `effect log { write note(line: String) -> Unit }`, a
-// singleton atom for the one audit trail it had. It is gone, and what replaced
-// it is the reason W5 exists: an audit trail is one channel, and a channel is a
-// resource. `trace.write[orders]` and `trace.write[items]` are two atoms where
-// `log.write` was one, so `ply check --types` now answers *which subsystem an
-// endpoint records on* out of the type — and, because two writes to different
-// resources do not conflict, two tests that record on different channels still
-// run side by side. Under `log.write` every test that recorded anything was in
-// one concurrency group.
-//
-// Every atom a request can reach in the database and nothing else, so `run` can
-// say what it hands to the host and `run_memory` can say what its twin
-// discharges. `db.write` with no resource is the transaction control —
-// `begin`, `commit`, `abort` and `rollback` take no table, so their atom is the
-// singleton named for the effect. That is a real scheduling cost stated rather
-// than discovered: every definition that opens a transaction carries it, so any
-// two that do conflict even when their tables are disjoint. The read-only
-// endpoints open none and keep their concurrency, which is where most of a
-// service's parallelism is.
+// The desk used to declare `effect log { write note(line: String) -> Unit }`, a singleton atom for
+// the one audit trail it had.
 effect set Store = {
   db.read[items], db.write[items],
   db.read[orders], db.write[orders],
   db.write,
 }
 
-// Placing an order and cancelling one both read the shelf, write the shelf,
-// read the order book, write the order book, open a transaction, record on the
-// order book's channel and record on the shelf's. They perform this set exactly
-// — not a subset — which is what earns the abbreviation. An alias wider than the
-// body that carries it is legal and costs two things (ADR 0013 §1.6): it widens
-// the conflict graph, so tests that could have run side by side are serialised,
-// and it weakens every frame condition, since the footprint is what an `ensures`
-// promises nothing outside of. `ply check --types --explain` is where that
-// claim is checked rather than asserted: it prints a `declared, not performed`
-// line for any definition whose annotation is wider than its body, and it prints
-// one for exactly two definitions in this file — `recorded` and `restocked`,
-// each of which carries the alias its callers share and reads only one of the
-// two tables. `place_order` and `cancel_order`, which is what the alias is for,
-// print none. The cost is the one named above and it is paid knowingly: the
-// alternative is two more aliases for two functions, which would make the
-// abbreviation harder to read than the expansion.
+// Placing an order and cancelling one both read the shelf, write the shelf, read the order book,
+// write the order book, open a transaction, record on the order book's channel and record on the
+// shelf's.
 effect set Desk = { Store, trace.write[orders], trace.write[items] }
 
-// What the *serving* layer performs, which is strictly more: the request span on
-// the `http` channel, the credential the API-key check reads, and the stop flag
-// the readiness route consults. It is a second alias rather than a wider `Desk`
-// for exactly the reason above — folding these three into `Desk` would make the
-// alias wider than `place_order`'s body, and the `declared, not performed` line
-// this file has never printed would appear.
-//
-// Everything from `dispatch` outwards carries it, and nothing below an endpoint
-// does. That split is the readable statement of ADR 0015 §3.6: the configured
-// part of a service and the specified part are distinguishable in the types, and
-// a `det` test that handles no `config` at all is a proof that what it covered
-// was the second kind.
+// What the *serving* layer performs, which is strictly more: the request span on the `http`
+// channel, the credential the API-key check reads, and the stop flag the readiness route consults.
 effect set Serving = { Desk, trace.write[http], config.read[credentials], signal.read }
 
 // --- What the desk sells --------------------------------------------------------
@@ -254,32 +53,18 @@ pub type Order = {
   state: State,
 }
 
-// What a client posts to `/orders`. Deliberately not `Order`: the id, the total
-// and the state are the desk's to decide, and a request body that could carry
-// them is a request body that can lie about them.
+// What a client posts to `/orders`.
 pub type Placement = { customer: String, lines: List<Line> }
 
-// One shape for every refusal, so a client parses one document whatever went
-// wrong. `error` is the stable tag a program branches on; `detail` is the
-// sentence a person reads.
+// One shape for every refusal, so a client parses one document whatever went wrong.
 pub type Problem = { error: String, detail: String }
 
 pub type Health = { service: String, routes: Int }
 
-// What a readiness probe answers, and it is deliberately not `Health`. Liveness
-// is "the process is up"; readiness is "this instance should receive traffic",
-// and the two conditions that decide it are both in here so that an operator
-// reading a 503 knows which one fired.
+// What a readiness probe answers, and it is deliberately not `Health`.
 pub type Readiness = { service: String, store: String, stopping: Bool }
 
-// The whole wire format, and nobody wrote it. A field added to `Line` is a field
-// in the codec, in the receipt and in the tests that reach it, in one edit.
-//
-// There is no `derive json for` anything holding a `Secret`, and there could not
-// be: `derivable(json, Secret<a>)` is false, so a record with a credential field
-// is `E0206` naming the field rather than a codec that writes it out. That is
-// the headline of W5 stated as an absence — the safe thing here is what is *not*
-// written, and it is not written because it cannot be.
+// The whole wire format, and nobody wrote it.
 derive json for Item
 derive json for Line
 derive json for State
@@ -289,29 +74,7 @@ derive json for Problem
 derive json for Health
 derive json for Readiness
 
-// The storage format. `Item` is four scalar columns; `Order` is three scalars
-// plus two a flat row cannot hold — `lines` is a `List<Line>` and `state` is a
-// sum — so both become `jsonb` columns encoded through the json codec above.
-//
-// That is W4 having no opinion about normalization, and it is worth noticing
-// rather than glossing: a desk that wanted `order_lines` as its own table writes
-// two codecs and two statements, and nothing here will write a join for it.
-//
-// **These two functions are written out because `derive row` does not exist
-// yet.** ADR 0014 §4.4 specifies it — `derive row for Item` generates exactly
-// `fn item_row() -> RowCodec<Item>`, by the field names, in field order, with
-// `Option<leaf>` nullable, `List<leaf>` an array and anything else that is
-// `derivable(json, ·)` a `jsonb` column — and when it lands the swap is: delete
-// `RowError`, `RowCodec`, the four cell readers and the two codecs below, put
-// `derive row for Item` and `derive row for Order` here, and change
-// `RowCodec<a>` to `RowCodec<a>` in the four signatures that name it.
-// Nothing else in this file refers to how a codec was made.
-//
-// `columns` is in the record because the driver checks a statement's result
-// description against it at prepare time: a column this file stopped selecting
-// is `E0433` before the first row arrives rather than a decode failure per row
-// afterwards. `params` writes them in the same order, which is what makes
-// `item_insert` below a four-parameter statement nobody has to keep in step.
+// The storage format.
 pub type RowError = { column: String, expected: String, found: String }
 
 pub type RowCodec<a> = {
@@ -348,8 +111,8 @@ fn numeric_at(r: db::Row, k: String) -> Result<Decimal, RowError> =
     _ -> Err(wrong(k, "numeric")),
   }
 
-// A `jsonb` column read back through the type's own json codec, which is what
-// makes the wire format and the storage format one text rather than two.
+// A `jsonb` column read back through the type's own json codec, which is what makes the wire format
+// and the storage format one text rather than two.
 fn json_at<a>(r: db::Row, k: String, c: json::JsonCodec<a>) -> Result<a, RowError> =
   match map_get(r, k) {
     Some(db::CJson(j)) ->
@@ -387,26 +150,6 @@ fn order_row() -> RowCodec<Order> = {
 }
 
 // --- The schema, which is a value ------------------------------------------------
-//
-// W4 ships no migration tool — no versions, no up and down, no diffing a live
-// database into a change script. What it ships is this: the schema is an
-// ordinary value, so the three places it has to exist cannot disagree.
-//
-//   1. the twin      `db::open(schema())`, and nothing touches a disk
-//   2. a fixture     `db::create_schema(schema())` is the `CREATE TABLE` text
-//   3. production    it is already there, and `--db-schema desk.schema` reads
-//                    `information_schema` at bind time and reports `E0435` for
-//                    every difference before a request is served
-//
-// The third is most of what a migration tool is actually bought for. A column
-// this file renamed and `examples/desk.sql` did not is a start-up refusal naming
-// the column, rather than a 500 on whichever route touched it first.
-//
-// `on_hand >= 0` is the desk's most important line. It is the mechanical
-// backstop under the drawdown below: even if the reservation were wrong, the one
-// component in the stack that cannot be fooled by an annotation refuses to let
-// the shelf go negative, and refuses it as a value the program reads (`23514`)
-// rather than as a crash.
 pub fn schema() -> db::Schema = {
   tables: [
     {
@@ -440,35 +183,6 @@ pub fn schema() -> db::Schema = {
 }
 
 // --- The configuration, which is also a value -----------------------------------------
-//
-// The same trick as the schema above, applied to the second thing a service
-// cannot start without. `config()` is an ordinary nullary pure function
-// returning an ordinary record, and `--config-schema desk.config` is what makes
-// the run resolve every key below against `--set`, the `--config` files and the
-// process environment **at bind time**. A required key nothing supplies is
-// `E0441` before a socket is opened — not a `None` on whichever request first
-// needed it, and not a 500 at three in the morning.
-//
-//     $ ply run examples/desk.ply --host --config-schema desk.config
-//     error[E0441]: the configuration schema requires `DESK_API_KEY` and
-//                   nothing supplies it
-//
-// **Three keys, and the fourth thing a deployment configures is not here.** The
-// database is `--db postgres://…` and `PLY_DB_PASSWORD`, configured beside the
-// run rather than through this effect, and that is a rule rather than an
-// oversight: configuration may supply a *value* and may never cause a *binding*
-// (ADR 0011, ADR 0015 §3.3). A key in this list can change what the desk answers
-// with; it can never make the desk open something it was not told to open, and a
-// reviewer reads `--host --db …` in the command or the run reached no database
-// at all. The same sentence covers the TLS credential: `--tls desk=cert,key`
-// names material the program never sees.
-//
-// The line between what may be configured and what may not is worth stating,
-// because getting it wrong is how a service acquires behaviour no test covers.
-// The port and the credential may: they are the identity of the peers this
-// deployment talks to. `limits()` may not, and does not — it is a definition, so
-// two runs of this program cannot differ in what they refuse, and every test
-// below quantifies over the same bounds production runs under.
 pub fn port_key() -> String = "DESK_PORT"
 
 pub fn connections_key() -> String = "DESK_CONNECTIONS"
@@ -477,29 +191,16 @@ pub fn api_key() -> String = "DESK_API_KEY"
 
 pub fn config() -> config::ConfigSpec =
   config::spec([
-    // A default, so a developer runs `ply run --host --config-schema desk.config`
-    // and gets a desk on 8137 without a word of configuration.
+    // A default, so a developer runs `ply run --host --config-schema desk.config` and gets a desk
+    // on 8137 without a word of configuration.
     config::with_default(port_key(), config::SInt, "8137"),
     config::with_default(connections_key(), config::SInt, "64"),
-    // `SSecret` is the whole of §2's containment for a configured value, and it
-    // does two things at once. `config.get` will not answer this key at all —
-    // it is `None` however it is set — so there is no call site at which the
-    // credential exists as a `String`; and `config.secret` answers a
-    // `Secret<String>`, which has no path to a trace field, a JSON document, a
-    // SQL parameter, a response body, a panic payload or a diagnostic message.
-    // Required, because a desk that accepted every order because its key was
-    // unset is the failure this line exists to prevent.
+    // `SSecret` is the whole of §2's containment for a configured value, and it does two things at
+    // once.
     config::required(api_key(), config::SSecret),
   ])
 
 // The port a run was told to listen on, or the refusal to start.
-//
-// `Option` rather than a raise, because a missing key is a value the program
-// matches on — and the interesting half is that with `--config-schema` this
-// branch is unreachable in production: the run refused before `main` was
-// entered. It is written anyway, because a run *without* the schema flag reaches
-// it, and "the operator forgot the flag" is not a reason to serve on a port
-// nobody chose.
 pub fn port_of(configured: Option<String>) -> Result<Int, String> =
   match configured {
     None -> Err(port_key() ++ " is unset; pass `--config-schema desk.config` so the run "
@@ -516,8 +217,7 @@ pub fn port_of(configured: Option<String>) -> Result<Int, String> =
       },
   }
 
-// The same shape for the connection budget. A desk told to serve zero
-// connections would start, listen, accept nothing and look healthy.
+// The same shape for the connection budget.
 pub fn connections_of(configured: Option<String>) -> Result<Int, String> =
   match configured {
     None -> Ok(64),
@@ -529,34 +229,12 @@ pub fn connections_of(configured: Option<String>) -> Result<Int, String> =
   }
 
 // --- The statements ---------------------------------------------------------------
-//
-// One `Stmt` per shape, named, so that the prepared-statement cache has a fixed
-// set of texts to key on and a reader can see the whole of what this service
-// asks a database for in one screen.
-//
-// **A value never becomes syntax.** Every parameter below crosses the wire in a
-// `Bind` message, typed; nothing here interpolates, formats, escapes or quotes a
-// value into SQL, and a program could not: no such function exists to call. A
-// `sku` of `'; drop table items; --` is stored as that string, and the same
-// bytes written into `Stmt::sql` would be `E0432` — one statement per `Stmt` is
-// checked, so the payload class that turns an injected fragment into a `DROP`
-// has nowhere to land.
-//
-// The column lists are written out rather than `select *`, because `derive row`
-// hands the driver a codec with a column list and the two are checked against
-// each other at prepare time: a column this file stopped selecting is `E0433`
-// before the first row arrives rather than a decode failure per row after it.
 
 fn items_all() -> db::Stmt =
   db::stmt("select sku, name, price, on_hand from items order by sku")
 
-// The readiness probe, and the cheapest statement in the file: one aggregate
-// over one table, no rows on the wire, no parameters to bind.
-//
-// Named because it is the mistake — a readiness route that runs a real query on
-// every poll is a load generator with a two-second period. The poll interval is
-// the operator's; what this file owes is that the check is one statement on a
-// pooled connection and that its cost is visible in `ready`'s row.
+// The readiness probe, and the cheapest statement in the file: one aggregate over one table, no
+// rows on the wire, no parameters to bind.
 fn store_reachable() -> db::Stmt = db::stmt("select count(*) from items")
 
 fn items_in_stock() -> db::Stmt =
@@ -568,12 +246,7 @@ fn item_by_sku() -> db::Stmt =
 fn item_insert() -> db::Stmt =
   db::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
 
-// The reservation, and the only interesting statement in the file. `on_hand =
-// $3` is the value this transaction read; the update takes effect only if the
-// row still holds it. A concurrent order that moved the shelf makes this affect
-// zero rows, and zero rows is what the caller turns into a rollback — which is
-// the difference between a desk that oversells under load and one that refuses
-// and says so.
+// The reservation, and the only interesting statement in the file.
 fn item_reserve() -> db::Stmt =
   db::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
 
@@ -583,38 +256,17 @@ fn orders_all() -> db::Stmt =
 fn order_by_id() -> db::Stmt =
   db::stmt("select id, customer, lines, total, state from orders where id = $1")
 
-// The id is the database's. `derive row`'s `params` writes every column
-// including that one, so this insert writes its four by hand and reads the whole
-// row back through the derived codec — which is where `id` comes from and the
-// only place it could honestly come from.
+// The id is the database's.
 fn order_insert() -> db::Stmt =
   db::stmt("insert into orders (customer, lines, total, state) values ($1, $2, $3, $4)"
     ++ " returning id, customer, lines, total, state")
 
-// No compare-and-set on `state`, and the reason is worth writing down because it
-// is a design decision the twin forced rather than a shortcut.
-//
-// `state` is a `jsonb` column — `derive row` cannot flatten a sum, so that is
-// what it becomes — and the twin **refuses to compare `jsonb`**: `0A000`, named,
-// rather than a guess. Postgres would have compared it happily, so a
-// `where .. and state = $3` here would be a statement the tests could not
-// execute, and a write path that only runs in production is the drift this whole
-// milestone is about measuring.
-//
-// So the guarantee is asked of the database instead, at `Serializable` (see
-// `cancel_order`): two cancels of one order cannot both see it open, and the
-// loser is `40001`, which `db::is_retryable` names as the server telling the
-// program to try again.
+// No compare-and-set on `state`, and the reason is worth writing down because it is a design
+// decision the twin forced rather than a shortcut.
 fn order_cancel() -> db::Stmt =
   db::stmt("update orders set state = $1 where id = $2")
 
 // --- Reading a result set ----------------------------------------------------------
-//
-// Three answers and three of them are handled, every time. `Failed` carries a
-// SQLSTATE, which is a value: a unique violation, a check violation and a
-// database that went away are all things this service answers a client about,
-// and a language that turned a constraint into a compiler-shaped failure would
-// have made the constraint unusable as a concurrency control.
 
 fn rows_of<a>(ans: db::Answer, c: RowCodec<a>) -> Result<List<a>, http::Response> =
   match ans {
@@ -637,10 +289,7 @@ fn decoded<a>(rows: List<db::Row>, c: RowCodec<a>) -> Result<List<a>, http::Resp
 
 fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
 
-// A SQLSTATE the desk has no answer for. `23505` and `23514` are answered by the
-// endpoints that can provoke them; anything else is the database saying it could
-// not do the work, which is a 503 and not a 500 — the request was well formed
-// and asking again may work.
+// A SQLSTATE the desk has no answer for.
 fn unavailable(e: db::DbError) -> http::Response =
   problem(503, "the store is unavailable", e.code)
 
@@ -655,9 +304,8 @@ fn order_row_of(id: Int) -> Result<Option<Order>, http::Response> / {db.read[ord
   Ok(head_of(os))
 }
 
-// `lines` and `state` are `jsonb`, so a parameter for either is a `Json` value
-// built by the codec this file already derived. There is one encoding of a
-// `Line` in this program and it is the one on the wire.
+// `lines` and `state` are `jsonb`, so a parameter for either is a `Json` value built by the codec
+// this file already derived.
 fn lines_param(lines: List<Line>) -> db::Param = {
   let c = json::list_json(line_json());
   db::PJson((c.encode)(lines))
@@ -680,9 +328,7 @@ pub fn price_of(shelf: List<Item>, sku: String) -> Decimal =
     None -> 0m,
   }
 
-// `Decimal`, because money is exact and not binary. `*` is exact whenever the
-// result fits, `+` is exact or it raises, and `/` is not written here and could
-// not be — it is `E0209` without a rounding mode nobody has chosen.
+// `Decimal`, because money is exact and not binary.
 pub fn total_of(shelf: List<Item>, lines: List<Line>) -> Decimal =
   fold(lines, 0m, |acc: Decimal, l: Line|
     acc + decimal_of_int(l.qty) * price_of(shelf, l.sku))
@@ -690,16 +336,12 @@ pub fn total_of(shelf: List<Item>, lines: List<Line>) -> Decimal =
 pub fn unknown_skus(shelf: List<Item>, lines: List<Line>) -> List<String> =
   map(filter(lines, |l: Line| item_named(shelf, l.sku) == None), |l: Line| l.sku)
 
-// Summed per sku rather than checked per line, and walked over the shelf rather
-// than over the order, so a sku named twice is one draw on the shelf and is
-// reported once. Checking the lines apart is how a desk sells the same three
-// widgets twice inside one order — the drawdown below sums them either way.
+// Summed per sku rather than checked per line, and walked over the shelf rather than over the
+// order, so a sku named twice is one draw on the shelf and is reported once.
 pub fn short_skus(shelf: List<Item>, lines: List<Line>) -> List<String> =
   map(filter(shelf, |i: Item| i.on_hand < taken(lines, i.sku)), |i: Item| i.sku)
 
-// A quantity that is not positive is refused rather than clamped. A line of
-// `-5` would raise the shelf and lower the total, which is a discount a client
-// wrote for itself.
+// A quantity that is not positive is refused rather than clamped.
 pub fn bad_qty(lines: List<Line>) -> Bool =
   fold(lines, false, |seen: Bool, l: Line| seen || l.qty <= 0)
 
@@ -718,11 +360,7 @@ pub fn draw_down(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(she
 
 pub fn put_back(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(shelf, lines, -1)
 
-// There is no `next_id` here any more, and its absence is the point. W3 computed
-// the next order number by folding over the book, which is a check-then-act
-// between two requests and would have handed two customers one id. A sequence is
-// the database's answer to that and it is not a thing a program can get wrong,
-// so the id comes back out of the `INSERT` rather than going into it.
+// There is no `next_id` here any more, and its absence is the point.
 pub fn order_by(orders: List<Order>, id: Int) -> Option<Order> =
   fold(orders, None, |found: Option<Order>, o: Order|
     if o.id == id { Some(o) } else { found })
@@ -731,14 +369,6 @@ pub fn cancelled(o: Order) -> Order =
   {id: o.id, customer: o.customer, lines: o.lines, total: o.total, state: Cancelled}
 
 // --- The route table, which is data ---------------------------------------------
-//
-// Not a macro, not a registry, not a list of closures. `List` is homogeneous and
-// a function type carries its row, so a table of handlers would force every
-// endpoint to declare byte-identically the same row — the union of the whole
-// service — which is exactly the per-endpoint legibility this file exists to
-// show. With a tag, `dispatch` writes the `match`, and that `match` is
-// exhaustiveness-checked: a route in the table with no handler is `E0205` rather
-// than a 500 at three in the morning.
 
 pub type Endpoint =
   | Health
@@ -759,16 +389,8 @@ fn route(method: http::Method, pattern: String, e: Endpoint) -> router::Route<En
 fn get(pattern: String, e: Endpoint) -> router::Route<Endpoint> =
   route(http::Get, pattern, e)
 
-// `/items/featured` and `/items/{sku}` both match `/items/featured`, and the
-// literal wins — decided segment by segment, left to right, by the matcher and
-// not by the order of this list. `conflicts` reports any pair the matcher would
-// have had to break by position instead, and a law below says there are none.
-//
-// `{id:Int}` is a typed binder: the route does not match unless the segment
-// parses, and `router::int_param` reads it back with the same three functions
-// the match used, so "it matched" and "it reads back" cannot drift. A request
-// for `/orders/seven` therefore reaches no route at all and is a 404, rather
-// than reaching `get_order` and being turned into a 400 there.
+// `/items/featured` and `/items/{sku}` both match `/items/featured`, and the literal wins — decided
+// segment by segment, left to right, by the matcher and not by the order of this list.
 pub fn table() -> List<router::Route<Endpoint>> = [
   get("/health", Health),
   get("/ready", Ready),
@@ -783,8 +405,7 @@ pub fn table() -> List<router::Route<Endpoint>> = [
   get("/orders/{id:Int}/receipt", Receipt),
 ]
 
-// Pure, and that is the first thing `ply check --types` prints about this
-// service.
+// Pure, and that is the first thing `ply check --types` prints about this service.
 pub fn route_of(method: http::Method, path: String) -> router::Matched<Endpoint> =
   router::route(table(), method, path)
 
@@ -793,13 +414,7 @@ pub fn route_of(method: http::Method, path: String) -> router::Matched<Endpoint>
 fn field(name: String, value: String) -> {key: String, value: List<String>} =
   {key: name, value: [value]}
 
-// One entry of a `Fields` map. `std.trace` ships no function that performs —
-// the channel label is syntax, so a helper that recorded on the caller's channel
-// is not expressible — but the *values* are ordinary data, so these two are
-// ordinary functions and every perform below reads as one line.
-//
-// There is no `secret_field`, and there could not be: `Field` has no case over
-// `Secret<a>`, so a credential in a trace field is `E0201` at the call site.
+// One entry of a `Fields` map.
 fn text_field(name: String, value: String) -> {key: String, value: trace::Field} =
   {key: name, value: trace::FText(value)}
 
@@ -809,9 +424,7 @@ fn int_field(name: String, value: Int) -> {key: String, value: trace::Field} =
 fn json_headers() -> http::Headers =
   map_of_entries([field("content-type", "application/json")])
 
-// The dictionary is an argument. ADR 0010's elaborated form of a typeclass
-// constraint: a codec is a record of two functions, so a framework signature
-// takes the one the caller derived rather than resolving anything.
+// The dictionary is an argument.
 fn json_body<a>(status: Int, x: a, codec: json::JsonCodec<a>) -> http::Response =
   {status: status, headers: json_headers(), body: json::encode_bytes(x, codec)}
 
@@ -828,45 +441,12 @@ fn join(xs: List<String>) -> String =
   fold(xs, "", |acc: String, x: String| if acc == "" { x } else { acc ++ ", " ++ x })
 
 // --- The endpoints ---------------------------------------------------------------
-//
-// Each one writes its own row. That is the point of the table holding tags: the
-// rows below differ, and a reader can see which.
 
 // --- Liveness and readiness, which are two different questions --------------------
-//
-// The distinction an operator most often gets wrong, made by the rows rather
-// than by a comment.
-//
-//   health : () -> Response
-//   ready  : () -> Response / {signal.read, db.read[items]}
-//
-// **Liveness** is "the process is up and its scheduler is not wedged". Its row
-// is empty, and that emptiness is a *proof*: `health` reaches no database, so it
-// cannot be made to fail by a database outage, and a supervisor that restarts on
-// a failed liveness probe will not restart this desk because postgres went away.
-// A `/health` that queried a database is how an outage in one dependency becomes
-// a restart loop across a fleet.
-//
-// **Readiness** is "this instance should receive traffic", and it is two
-// conditions: nobody has asked this process to stop, and the store it needs is
-// actually reachable. Both are in the row, so `ply check --types` answers "what
-// does readiness verify" without anybody reading the body — and a readiness
-// route whose row was `{}` would be a readiness route that checked nothing,
-// which is the failure this shape makes visible.
-//
-// Pure. It reports how many routes the table holds, so a service that has grown
-// a route says so without anybody editing this function.
 pub fn health() -> http::Response =
   json_body(200, {service: "parts desk", routes: len(table())}, health_json())
 
 // 503 while draining, 503 while the store is unreachable, 200 otherwise.
-//
-// The stop flag is read *first*, and the order matters: during a drain this
-// instance should be removed from the load balancer whether or not its database
-// is well, and asking the database first would spend a connection to answer a
-// question already decided. `--drain-lead-ms` is what buys the time for this
-// answer to be believed — accept keeps running for that long after the signal,
-// so a poller sees the 503 before the listener closes.
 pub fn ready() -> http::Response / {signal.read, db.read[items]} =
   if signal.stopping() {
     unready("draining", true)
@@ -874,9 +454,8 @@ pub fn ready() -> http::Response / {signal.read, db.read[items]} =
     match db.query[items](store_reachable(), []) {
       db::Rows(_) -> json_body(200,
         {service: "parts desk", store: "reachable", stopping: false}, readiness_json()),
-      // The SQLSTATE is the detail rather than the error, exactly as
-      // `unavailable` does it: a client's action is the same whichever code the
-      // server sent, and an operator's is not.
+      // The SQLSTATE is the detail rather than the error, exactly as `unavailable` does it: a
+      // client's action is the same whichever code the server sent, and an operator's is not.
       db::Failed(e) -> unready(e.code, false),
       db::Count(_) -> unready("unreadable answer", false),
     }
@@ -885,9 +464,7 @@ pub fn ready() -> http::Response / {signal.read, db.read[items]} =
 fn unready(store: String, stopping: Bool) -> http::Response =
   json_body(503, {service: "parts desk", store: store, stopping: stopping}, readiness_json())
 
-// Also pure: the pages are definitions, not rows, so serving one touches
-// nothing. This is the `Rest` route, and its capture is every remaining segment
-// joined by `/` — which is why `docs/a/b` finds `a/b` and not `a`.
+// Also pure: the pages are definitions, not rows, so serving one touches nothing.
 fn pages() -> Map<String, String> =
   map_of_entries([
     {key: "index", value: "GET /items, GET /orders, POST /orders, DELETE /orders/{id}"},
@@ -911,13 +488,7 @@ pub fn list_items() -> http::Response / {db.read[items]} =
     Ok(rows) -> json_body(200, rows, json::list_json(item_json())),
   }
 
-// Everything the shelf is short of. A second read-only endpoint over the same
-// resource, which is what makes it and `list_items` runnable side by side: two
-// reads of one resource do not conflict.
-//
-// The filter is the database's rather than this function's, which is the one
-// place a `WHERE` earns its keep here: a shelf of ten thousand parts sends the
-// rows that matched rather than the rows that exist.
+// Everything the shelf is short of.
 pub fn featured() -> http::Response / {db.read[items]} =
   match rows_of(db.query[items](items_in_stock(), [db::PInt(0)]), item_row()) {
     Err(r) -> r,
@@ -958,9 +529,8 @@ pub fn get_order(params: Map<String, String>) -> http::Response / {db.read[order
       },
   }
 
-// `Some` for every route whose pattern declared `{id:Int}`, because nothing else
-// could have matched. The `None` branch is the one a route with a plain `{id}`
-// would reach, and it is written rather than assumed away.
+// `Some` for every route whose pattern declared `{id:Int}`, because nothing else could have
+// matched.
 fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response> =
   match router::int_param(params, "id") {
     Some(id) -> Ok(id),
@@ -968,26 +538,6 @@ fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response> =
   }
 
 // --- The two that are transactions --------------------------------------------------
-//
-// Placing an order writes two tables and must write both or neither: an order
-// row whose stock was never drawn is a promise the shelf cannot keep, and a
-// drawdown with no order is stock nobody can collect. So the body runs inside
-// `db::transaction`, and the interesting half is what happens when it must not
-// finish.
-//
-// **A rollback is the absence of a resumption.** `db.rollback` is performed
-// three calls deep, inside the walk over the skus the order draws on; its clause in
-// `db::transaction` does not resume, so the value of that clause is the value of
-// the whole `handle` and everything the body had left to do — the rest of the
-// reservation, the log line, the 201 it was about to build — is the continuation
-// and the continuation is dropped. Nothing unwinds. No frame runs an epilogue.
-// The order row that was already inserted goes away because `ROLLBACK` is what
-// the clause does before it answers, not because anything undid it in Ply.
-//
-// One thing does survive, and it is postgres's behaviour rather than a leak:
-// the id the discarded insert consumed is gone. A sequence does not roll back,
-// in postgres or in the twin, and a desk whose order numbers skip after a
-// refusal is telling the truth about that.
 
 pub fn place_order(body: Bytes) -> http::Response / {Desk} =
   match json::decode_bytes(body, placement_json()) {
@@ -995,8 +545,8 @@ pub fn place_order(body: Bytes) -> http::Response / {Desk} =
     Ok(p) -> placed(p),
   }
 
-// The two refusals that need no database are answered before one is opened, so
-// a malformed order costs no connection and no `BEGIN`.
+// The two refusals that need no database are answered before one is opened, so a malformed order
+// costs no connection and no `BEGIN`.
 fn placed(p: Placement) -> http::Response / {Desk} =
   if len(p.lines) == 0 {
     problem(422, "empty order", "an order needs at least one line")
@@ -1007,19 +557,8 @@ fn placed(p: Placement) -> http::Response / {Desk} =
             "out of stock")
   }
 
-// The span that shows where a placement's time went, and the one place in this
-// file where a span is *not* closed by the program.
-//
-// `reserving` runs inside `db::transaction`. If `reserved` cannot hold a sku it
-// performs `db.rollback`, whose clause does not resume — so `trace.exit[orders]`
-// below is in the continuation and the continuation is dropped. The span stays
-// open, and `dispatch`'s `trace.exit[http]` closes it, and every span the task
-// opened above it, as `Abandoned`.
-//
-// That is not a leak and not a warning: it is the useful signal. A record marked
-// `Abandoned` and named `reserving` says the request died while reserving stock,
-// which is exactly what an operator reading a 409 storm needs to know, and no
-// line of this program had to remember to write it.
+// The span that shows where a placement's time went, and the one place in this file where a span is
+// *not* closed by the program.
 fn placing(p: Placement) -> http::Response / {Desk} = {
   let span = trace.enter[orders]("reserving", map_of_entries([
     text_field("customer", p.customer),
@@ -1048,18 +587,9 @@ fn recorded(p: Placement, stock: List<Item>, total: Decimal) -> http::Response /
       match head_of(rows) {
         None -> problem(500, "unreadable answer", "an insert returned no row"),
         Some(o) -> {
-          // The order exists in the transaction's view from here on. Every
-          // statement below can still discard it.
+          // The order exists in the transaction's view from here on.
           move_stock(stock, p.lines, 1);
-          // Two records rather than one, and they answer different questions. The
-          // event is what a person reads when they are looking at one order; the
-          // counter is what a dashboard sums over ten thousand. Both are appends
-          // to one sink — which is why metrics are operations on `trace` and not
-          // a second effect with its own handler clause set.
-          //
-          // Neither of them runs if the reservation below rolls back, because
-          // both are in the continuation the rollback discards. `an order the
-          // shelf cannot cover writes nothing and records nothing` is the test.
+          // Two records rather than one, and they answer different questions.
           trace.event[orders](trace::Info, "placed", map_of_entries([
             int_field("order", o.id),
             text_field("customer", p.customer),
@@ -1072,24 +602,15 @@ fn recorded(p: Placement, stock: List<Item>, total: Decimal) -> http::Response /
       },
   }
 
-// One `UPDATE` per sku the order draws on, walked over the shelf rather than
-// over the order, so a sku named on two lines is one reservation of their sum —
-// which is how a desk avoids selling the same three widgets twice inside one
-// order. `sign` is `1` to draw the shelf down and `-1` to put it back, which is
-// exactly `moved`'s parameter: the statement and the pure function this file
-// tests move the shelf by one arithmetic, written once.
+// One `UPDATE` per sku the order draws on, walked over the shelf rather than over the order, so a
+// sku named on two lines is one reservation of their sum — which is how a desk avoids selling the
+// same three widgets twice inside one order.
 fn move_stock(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
   / {db.write[items], db.write, trace.write[items]} = {
   let drawn = filter(stock, |i: Item| taken(lines, i.sku) > 0);
   moving(drawn, lines, sign);
-  // After the reservations and not before, so the record is a claim that the
-  // shelf moved rather than that something tried to move it. A `db.rollback`
-  // inside `moving` discards the continuation, and this line is in it.
-  //
-  // The shelf's own channel, so that "what moved the stock" is a filter on
-  // `items` and does not have to be picked out of the order book's records. One
-  // event per call rather than per sku: an order of forty lines is one movement
-  // of the shelf, and forty records would say the same thing forty times.
+  // After the reservations and not before, so the record is a claim that the shelf moved rather
+  // than that something tried to move it.
   trace.event[items](trace::Info, "shelf moved", map_of_entries([
     int_field("skus", len(drawn)),
     int_field("sign", sign),
@@ -1107,16 +628,6 @@ fn moving(stock: List<Item>, lines: List<Line>, sign: Int) -> Unit
   }
 
 // Three answers, and each one is a different thing to have happened.
-//
-//   `Count(1)`   the row still held what this transaction read; it is reserved
-//   `Count(0)`   somebody else moved it between the read and the write
-//   `Failed`     the shelf would have gone negative and `23514` refused it
-//
-// The last two are one answer to a client — the desk could not reserve this sku
-// — and they are deliberately not distinguished in the response. A stale
-// reservation and an empty shelf are both "ask again"; telling them apart would
-// leak the desk's concurrency control into its wire format, and the client's
-// action is the same either way.
 fn reserved(i: Item, to: Int) -> Unit / {db.write[items], db.write} =
   match db.execute[items](item_reserve(),
                           [db::PInt(to), db::PText(i.sku), db::PInt(i.on_hand)]) {
@@ -1125,13 +636,7 @@ fn reserved(i: Item, to: Int) -> Unit / {db.write[items], db.write} =
     _ -> db.rollback(i.sku),
   }
 
-// What `db::transaction` hands back, turned into a response. `Ok` carries
-// whatever the body computed. `Err` is a scope that ended some other way: with
-// an `error` it is the database refusing to open or to commit, and without one
-// it is this program's own `db.rollback`, whose `reason` is the sku it could not
-// move. A `Rollback` carries a `String` and nothing more, so a program that
-// wants a structured reason encodes one — the desk needs a sku and an `error`
-// name chosen by the caller, and that is the whole of its encoding.
+// What `db::transaction` hands back, turned into a response.
 fn settled(out: Result<http::Response, db::Rollback>, error: String) -> http::Response =
   match out {
     Ok(r) -> r,
@@ -1142,13 +647,7 @@ fn settled(out: Result<http::Response, db::Rollback>, error: String) -> http::Re
       },
   }
 
-// `Serializable`, and it is the only endpoint that asks for it. Cancelling reads
-// an order, decides on what it read, and writes two tables on the strength of
-// that decision — so under `ReadCommitted` two cancels of one order could both
-// read it open and both put the lines back, and the shelf would gain them twice.
-// The placement path defends itself with a compare-and-set it can write; this
-// one cannot (see `order_cancel`), so it asks the server, and the loser of the
-// race is `40001` rather than a second restock.
+// `Serializable`, and it is the only endpoint that asks for it.
 pub fn cancel_order(params: Map<String, String>) -> http::Response / {Desk} =
   match order_wanted(params) {
     Err(r) -> r,
@@ -1170,10 +669,9 @@ fn cancelling(id: Int) -> http::Response / {Desk} =
       },
   }
 
-// A `DELETE` that raced another one and lost affects no row here, because the
-// order it read is gone from under it; that answers 409 without a rollback —
-// nothing had been written, so there is nothing to discard and committing an
-// empty transaction is the honest end of it.
+// A `DELETE` that raced another one and lost affects no row here, because the order it read is gone
+// from under it; that answers 409 without a rollback — nothing had been written, so there is
+// nothing to discard and committing an empty transaction is the honest end of it.
 fn cancelled_now(o: Order) -> http::Response / {Desk} =
   match db.execute[orders](order_cancel(), [state_param(Cancelled), db::PInt(o.id)]) {
     db::Count(n) ->
@@ -1201,17 +699,6 @@ fn restocked(o: Order) -> http::Response / {Desk} =
   }
 
 // --- The streamed receipt ---------------------------------------------------------
-//
-// A body written as it is produced rather than built and then written. It needs
-// no language feature: `http::respond_chunked` takes a seed and a producer, the
-// producer is an ordinary function with its own row, and this one's row is `{}`
-// — so the streaming route publishes the two reads that found the order and
-// `net.write[conn]`, and nothing else.
-//
-// The cursor renders one line per pull rather than holding a rendered body, so a
-// receipt of ten thousand lines holds one line at a time and each pull costs the
-// shelf lookup rather than the receipt. That is the difference between streaming
-// and a list of chunks wearing streaming's clothes.
 
 pub type Phase = Opening | Lines | Done
 
@@ -1257,9 +744,7 @@ pub fn next_chunk(c: Cursor) -> Option<{chunk: Bytes, next: Cursor}> =
     Done -> None,
   }
 
-// What a buffered path would have sent. The law at the foot of the file says the
-// two agree for every order, which is the claim a streaming encoder has to earn
-// and almost never states.
+// What a buffered path would have sent.
 pub fn drained(c: Cursor) -> Bytes = bytes_concat_all(chunks_of(c, []))
 
 fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
@@ -1270,9 +755,7 @@ fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
 
 // --- Dispatch ---------------------------------------------------------------------
 
-// A buffered answer, or a head and a cursor the connection pulls. The two cases
-// are what lets one route stream while ten do not, without the ten having to
-// know a connection exists.
+// A buffered answer, or a head and a cursor the connection pulls.
 pub type Reply =
   | Buffered(http::Response)
   | Stream({ head: http::Response, cursor: Cursor })
@@ -1292,11 +775,10 @@ pub fn receipt(params: Map<String, String>) -> Reply
       },
   }
 
-// The shelf is read before the head is written, because a cursor pulls prices
-// out of a list rather than out of the database: a receipt of ten thousand lines
-// costs one query and holds one line at a time, and a chunk producer that
-// queried per line would put the database inside `next_chunk`'s row and inside
-// the connection's write loop.
+// The shelf is read before the head is written, because a cursor pulls prices out of a list rather
+// than out of the database: a receipt of ten thousand lines costs one query and holds one line at a
+// time, and a chunk producer that queried per line would put the database inside `next_chunk`'s row
+// and inside the connection's write loop.
 fn streamed(o: Order) -> Reply / {db.read[items]} =
   match shelf() {
     Err(r) -> Buffered(r),
@@ -1304,28 +786,6 @@ fn streamed(o: Order) -> Reply / {db.read[items]} =
   }
 
 // --- The request span, and the credential ----------------------------------------
-//
-// One span per request, on the `http` channel, and it is opened here rather than
-// in the connection loop for one reason: this is the innermost place that knows
-// *which route* was matched, and a span named `dispatch` with no endpoint field
-// is a span that tells an operator nothing they could not have got from a
-// counter.
-//
-// **The program does not maintain the stack.** `enter` pushes and `exit` pops,
-// per performing task, in the handler — which is not a convenience but the only
-// correct answer, because three of the four ways a Ply computation leaves a span
-// never run another line of it. The interesting one is right underneath: a
-// `db.rollback` inside `place_order` discards the continuation, so the span
-// `placing` opened is never closed by the program, and the `exit` below closes
-// it — and every span the task opened above it — as `Abandoned`. A record marked
-// `Abandoned` is the useful signal about what a dying request was doing, and
-// `an order the shelf cannot cover writes nothing and says which sku` is the
-// test that pins it — it asserts the two outcomes in order, `Abandoned` then
-// `Failed("409")`.
-//
-// The span's `micros` is the sink's, stamped from the host clock at `exit`, so
-// no call site reads a clock and `clock.read` is in nobody's row. That is what
-// keeps a trace call from dragging time into fifty endpoints' signatures.
 pub fn dispatch(e: Endpoint, req: http::Request, params: Map<String, String>) -> Reply
   / {Serving} = {
   let span = trace.enter[http]("dispatch", map_of_entries([
@@ -1338,9 +798,7 @@ pub fn dispatch(e: Endpoint, req: http::Request, params: Map<String, String>) ->
   reply
 }
 
-// What the span records as its outcome. A 4xx or 5xx is a `Failed` carrying the
-// status, so "which requests went wrong" is a filter over the records rather
-// than a text search over rendered lines.
+// What the span records as its outcome.
 fn outcome_of(r: Reply) -> trace::Outcome =
   match r {
     Buffered(response) ->
@@ -1349,31 +807,12 @@ fn outcome_of(r: Reply) -> trace::Outcome =
       } else {
         trace::Failed(int_to_string(response.status))
       },
-    // A streamed body is written after this span closes, so the only thing the
-    // handler decided is that it had an order to stream.
+    // A streamed body is written after this span closes, so the only thing the handler decided is
+    // that it had an order to stream.
     Stream(_) -> trace::Ok,
   }
 
-// The API-key check, and the only place in this repository a `Secret<a>` is used
-// end to end.
-//
-// Three properties, none of which is a review rule:
-//
-//   1. the credential arrives as a `Secret<String>` and there is no function
-//      that turns one back into a `String`, so it cannot reach the trace field
-//      three lines below, the JSON body, a SQL parameter or a panic payload —
-//      each of those is a type error at the call site rather than something a
-//      reviewer has to notice;
-//   2. `secret_verify` compares in constant time over the bytes it compares, so
-//      a wrong key does not leak its correct prefix through timing;
-//   3. the refusal records the *fact* on the `http` channel and never the
-//      value, and it could not record the value even if this line tried to.
-//
-// A desk that had no key configured refuses `POST /orders` outright rather than
-// accepting every order, because "the credential was unset" and "the credential
-// matched" must never be the same branch. With `--config-schema desk.config`
-// that state is unreachable — the run refused at start-up — and this is the
-// answer for a run that did not pass the flag.
+// The API-key check, and the only place in this repository a `Secret<a>` is used end to end.
 fn guarded(e: Endpoint, req: http::Request, params: Map<String, String>) -> Reply
   / {Serving} =
   match e {
@@ -1397,8 +836,7 @@ fn presented(req: http::Request) -> String =
     _ -> "",
   }
 
-// `None` is a refusal and not a pass. The one line that would turn this whole
-// section into decoration is `None -> true`.
+// `None` is a refusal and not a pass.
 fn authorized(configured: Option<Secret<String>>, offered: String) -> Bool =
   match configured {
     None -> false,
@@ -1420,12 +858,8 @@ fn endpoint_name(e: Endpoint) -> String =
     Receipt -> "receipt",
   }
 
-// Exhaustive by construction: add a variant to `Endpoint` without a route and
-// the table is one line short; add one without an arm here and it is `E0205`.
-// Annotated `{Desk, signal.read}` and not `{Serving}`, because it performs
-// neither the request span nor the credential read — those belong to `dispatch`
-// and `guarded`, one layer out each. Writing the two atoms out costs a line and
-// keeps the annotation a fact rather than an upper bound nobody reaches.
+// Exhaustive by construction: add a variant to `Endpoint` without a route and the table is one line
+// short; add one without an arm here and it is `E0205`.
 fn dispatched(e: Endpoint, req: http::Request, params: Map<String, String>) -> Reply
   / {Desk, signal.read} =
   match e {
@@ -1444,9 +878,7 @@ fn dispatched(e: Endpoint, req: http::Request, params: Map<String, String>) -> R
 
 pub fn answer(req: http::Request) -> Reply / {Serving} =
   if req.target == "*" {
-    // `OPTIONS *` asks about the server rather than about a path, so it is not
-    // routed. The methods are read off the table by `declared_methods`, which is
-    // what stops this answer falling behind the routes.
+    // `OPTIONS *` asks about the server rather than about a path, so it is not routed.
     Buffered(server_options())
   } else {
     match route_of(routed_method(req.method), req.path) {
@@ -1456,10 +888,8 @@ pub fn answer(req: http::Request) -> Reply / {Serving} =
     }
   }
 
-// A `HEAD` is a `GET` whose response carries no body, and `http::encode` is what
-// drops it — computing the `Content-Length` the same request would have produced
-// under `GET`. Routing it as a `GET` is what makes that true of every route
-// rather than of the ones somebody remembered to add a second table entry for.
+// A `HEAD` is a `GET` whose response carries no body, and `http::encode` is what drops it —
+// computing the `Content-Length` the same request would have produced under `GET`.
 fn routed_method(m: http::Method) -> http::Method =
   match m {
     http::Head -> http::Get,
@@ -1475,9 +905,9 @@ fn server_options() -> http::Response = {
   body: b"",
 }
 
-// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and the methods come from the
-// matcher rather than from a list written here — sorted and deduplicated by
-// `route`, so the field cannot disagree with the table it was derived from.
+// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and the methods come from the matcher rather than
+// from a list written here — sorted and deduplicated by `route`, so the field cannot disagree with
+// the table it was derived from.
 fn method_not_allowed(ms: List<http::Method>) -> http::Response = {
   status: 405,
   headers: map_of_entries([
@@ -1490,8 +920,8 @@ fn method_not_allowed(ms: List<http::Method>) -> http::Response = {
     problem_json()),
 }
 
-// Every route, buffered — the shape a test drives and the shape `http::serve`
-// would take as its `app`.
+// Every route, buffered — the shape a test drives and the shape `http::serve` would take as its
+// `app`.
 pub fn app(req: http::Request) -> http::Response / {Serving} = collapse(answer(req))
 
 pub fn collapse(r: Reply) -> http::Response =
@@ -1501,42 +931,23 @@ pub fn collapse(r: Reply) -> http::Response =
   }
 
 // --- The connection ------------------------------------------------------------------
-//
-// `http::serve` serves nine of these ten routes as written, because its `app`
-// is `(Request) -> Response`. A streamed body is written as it is produced, so
-// the receipt route needs the connection — and ADR 0013 §2.4 is explicit that a
-// program wanting that writes its own loop. This is that loop, and nothing in it
-// re-implements HTTP: `read_head` accumulates, `parse_head` frames, `read_body`
-// decodes, `encode` writes a buffered response and `respond_chunked` writes a
-// streamed one. Two framing parsers that disagree is the failure §2 of the ADR
-// exists to prevent, and a service is not exempt from it.
 
-// The bounds this service runs under, written down. A record rather than a
-// global, an environment variable or a flag, so two runs of this program cannot
-// differ in what they refuse, and a test can quantify over them.
+// The bounds this service runs under, written down.
 pub fn limits() -> http::Limits = {
   max_request_line: 8192,
   max_header_bytes: 16384,
   max_header_count: 64,
-  // A `Placement` is small. A megabyte would be a megabyte a peer can make the
-  // desk hold by sending one field.
+  // A `Placement` is small.
   max_body: 65536,
   max_chunk_size: 65536,
   max_chunk_line: 4096,
   max_trailer_bytes: 4096,
   max_keep_alive: 100,
   // The receipt route streams a handful of chunks and this is far above it.
-  //
-  // > **Corrected (2026-08-27, ADR 0022).** This also read *"and far below the
-  // > evaluator's nested-call bound, which `stream_chunks` spends one of per
-  // > chunk"*. `stream_chunks` spends none of them: it drives its loop with
-  // > `iterate`, which is depth 1 however long it runs. The number is a policy
-  // > about receipts now, and nothing here is shaped by the ceiling.
   max_stream_chunks: 1024,
-  // Equal on purpose: this loop passes one `Limits` to `read_head` for both the
-  // first read of a connection and the first read of a reused one, so the two
-  // bounds are the same number rather than two numbers that look the same.
-  // `std.http`'s own loop swaps the field instead, and can.
+  // Equal on purpose: this loop passes one `Limits` to `read_head` for both the first read of a
+  // connection and the first read of a reused one, so the two bounds are the same number rather
+  // than two numbers that look the same.
   header_timeout_ms: 5000,
   idle_timeout_ms: 5000,
   body_timeout_ms: 15000,
@@ -1544,9 +955,8 @@ pub fn limits() -> http::Limits = {
 }
 
 pub fn serve_connection(c: Int, l: http::Limits) -> Unit / {Serving, net.write[conn]} = {
-  // A limit that is zero or negative is a configuration nobody meant, and it is
-  // refused here rather than turning into a service that answers 413 to
-  // everything.
+  // A limit that is zero or negative is a configuration nobody meant, and it is refused here rather
+  // than turning into a service that answers 413 to everything.
   http::check_limits(l);
   turn(c, l, b"", l.max_keep_alive, false);
   net.close[conn](c)
@@ -1560,10 +970,8 @@ fn turn(c: Int, l: http::Limits, carried: Bytes, left: Int, reused: Bool) -> Uni
     match http::read_head(c, carried, l, reused) {
       // The peer went away. There is nothing to answer and nothing to say.
       http::HeadClosed(_) -> (),
-      // An idle keep-alive connection is closed with no response: no request had
-      // started, so there is no request to answer. `read_head` decides it,
-      // because a head that *had* begun and then stalled is a 408 and deciding
-      // it here could not tell the two apart.
+      // An idle keep-alive connection is closed with no response: no request had started, so there
+      // is no request to answer.
       http::HeadIdle -> (),
       http::HeadTimedOut ->
         write_out(c, l, http::Get, http::Http11, false,
@@ -1575,9 +983,8 @@ fn turn(c: Int, l: http::Limits, carried: Bytes, left: Int, reused: Bool) -> Uni
 fn heard(c: Int, l: http::Limits, buf: Bytes, complete: Bool, left: Int) -> Unit
   / {Serving, net.write[conn]} =
   match http::parse_head(buf, l) {
-    // The head stopped mid-way with nothing more coming, or it ran past the
-    // bound without a terminator. Neither framed a message, and the two are
-    // different answers to the peer.
+    // The head stopped mid-way with nothing more coming, or it ran past the bound without a
+    // terminator.
     http::Incomplete ->
       if complete {
         write_out(c, l, http::Get, http::Http11, false,
@@ -1586,9 +993,8 @@ fn heard(c: Int, l: http::Limits, buf: Bytes, complete: Bool, left: Int) -> Unit
         write_out(c, l, http::Get, http::Http11, false,
           http::text_response(431, "the request head never ended within the bound\n"))
       },
-    // Every framing refusal closes the connection: what a refusal did not
-    // establish is exactly where the next message begins, so there is nothing
-    // to resynchronise to. That is why this branch never loops.
+    // Every framing refusal closes the connection: what a refusal did not establish is exactly
+    // where the next message begins, so there is nothing to resynchronise to.
     http::Refused(why) -> write_out(c, l, http::Get, http::Http11, false,
       http::refusal_response(why)),
     http::Parsed(h) -> continued(c, l, h, buf, left),
@@ -1596,8 +1002,8 @@ fn heard(c: Int, l: http::Limits, buf: Bytes, complete: Bool, left: Int) -> Unit
 
 fn continued(c: Int, l: http::Limits, h: http::Head, buf: Bytes, left: Int) -> Unit
   / {Serving, net.write[conn]} = {
-  // A client that waits for a `100` it never gets is a hang, and a hang is the
-  // failure shape with nothing to read.
+  // A client that waits for a `100` it never gets is a hang, and a hang is the failure shape with
+  // nothing to read.
   let told = if h.expects_continue {
     send_all(c, http::continue_response(), l.write_timeout_ms)
   } else {
@@ -1606,9 +1012,7 @@ fn continued(c: Int, l: http::Limits, h: http::Head, buf: Bytes, left: Int) -> U
   if !told {
     ()
   } else {
-    // The body is read whatever the route does with it. An unread body is the
-    // next message's bytes as far as the connection is concerned, and framing
-    // the next request out of one is a smuggle the server performs on itself.
+    // The body is read whatever the route does with it.
     with_body(c, l, h, http::read_body(c, h.framing,
       bytes_slice(buf, h.consumed, bytes_len(buf)), l), left)
   }
@@ -1633,26 +1037,22 @@ fn answered(c: Int, l: http::Limits, h: http::Head,
   let wrote = match streamable(h.request.method, reply) {
     Buffered(r) -> send_all(c, http::encode(h.request.method, h.request.version, keep, r),
       l.write_timeout_ms),
-    // The one route that writes as it produces. `next_chunk`'s row is `{}`, so
-    // this call publishes `net.write[conn]` and nothing more than the reads that
-    // found the order.
+    // The one route that writes as it produces.
     Stream(s) -> http::respond_chunked(c, h.request.version, s.head, keep, l, s.cursor,
       next_chunk),
   };
   if wrote && keep {
-    // Pipelined requests are answered in order by construction: one connection,
-    // one task, and the leftover buffer carried into the next turn.
+    // Pipelined requests are answered in order by construction: one connection, one task, and the
+    // leftover buffer carried into the next turn.
     turn(c, l, got.rest, left - 1, true)
   } else {
     ()
   }
 }
 
-// A `HEAD` response carries no body, so there is nothing to stream: the cursor
-// is drained here and `http::encode` writes the `Content-Length` a `GET` would
-// have produced and no bytes after the head. Writing chunks to a `HEAD` is the
-// framing bug on the response side of the same coin as reading a body nobody
-// asked for.
+// A `HEAD` response carries no body, so there is nothing to stream: the cursor is drained here and
+// `http::encode` writes the `Content-Length` a `GET` would have produced and no bytes after the
+// head.
 fn streamable(m: http::Method, r: Reply) -> Reply =
   match m {
     http::Head -> Buffered(collapse(r)),
@@ -1660,10 +1060,6 @@ fn streamable(m: http::Method, r: Reply) -> Reply =
   }
 
 // The head's request with the body and the trailers it was framed with.
-// Trailers stay in their own field: a trailer named `content-length`,
-// `transfer-encoding`, `host` or `authorization` changes nothing about framing,
-// routing or authorization, and merging them is a documented smuggling and
-// privilege-escalation route.
 fn whole(h: http::Head, body: Bytes, trailers: http::Headers) -> http::Request = {
   method: h.request.method,
   target: h.request.target,
@@ -1704,17 +1100,7 @@ pub fn listen_and_serve(port: Int, count: Int) -> Int
   served
 }
 
-// The same service over TLS. Not one line above changes: TLS is the same `net`
-// effect over the same resource, because a row claims which resources a
-// computation touches and whether two computations contend — and an encrypted
-// connection and a plaintext one are the same resource contending the same way.
-// What says a listener is encrypted is this call and `ply hosts`, which prints
-// `net.listen_tls` on its own line with its own handler path.
-//
-// `credential` is a name. The certificate and the key are configured beside the
-// run — `ply run --host --tls desk=certs/desk.pem,certs/desk.key` — because
-// certificate bytes in the program would put a private key into a definition's
-// hash and into a store designed never to forget.
+// The same service over TLS.
 pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int
   / {Serving, net.write[conn], net.write[listener]} {
   let listener = net.listen_tls[listener](port, credential);
@@ -1724,34 +1110,6 @@ pub fn listen_and_serve_tls(port: Int, credential: String, count: Int) -> Int
 }
 
 // --- The desk, stocked and running ----------------------------------------------------
-//
-// Three entry points, and the difference between them is the whole of W4's exit
-// criterion, now carrying W5's too. `run` hands the `db`, `trace`, `config` and
-// `signal` atoms to the host: nothing discharges them, so they are in its
-// published row, `ply hosts --host` prints a line per operation, and
-// `ply_host::db`, `::trace`, `::config` and `::signal` answer them.
-// `run_memory` installs the twins — a `MemDb`, a `Sink` and a `Stop`, over three
-// region-scoped cells — and publishes two `net` atoms and nothing else, which is
-// what makes a test that drives it `det`, cacheable and hermetic.
-//
-// Every definition above this line is identical between the two. That is the
-// claim, and it is checkable rather than asserted: the handler is the only thing
-// that moves, and `ply check --types` prints the same row for every endpoint
-// under either.
-//
-//     $ examples/serve.sh --memory              # no database at all
-//     $ examples/serve.sh --db postgres://localhost/desk
-//     $ curl -sS localhost:8137/items
-//     $ curl -sS localhost:8137/ready
-//     $ curl -sS localhost:8137/orders -H "x-api-key: $DESK_API_KEY" \
-//         -d '{"customer":"ada","lines":[{"sku":"bolt","qty":4}]}'
-//     $ curl -sS --raw localhost:8137/orders/1/receipt
-//
-// `main` runs the postgres one, because a service whose entry point was its test
-// double is a service nobody can start. `examples/desk.sql` is the schema it
-// expects and `--db-schema desk.schema` is what checks that claim before the
-// first request: this file is the authority and the database is verified against
-// it at bind time.
 pub fn run(port: Int, count: Int) -> Int
   / {Serving, net.write[conn], net.write[listener]} =
   listen_and_serve(port, count)
@@ -1761,63 +1119,19 @@ pub fn run_tls(port: Int, credential: String, count: Int) -> Int
   / {Serving, net.write[conn], net.write[listener]} =
   listen_and_serve_tls(port, credential, count)
 
-// The same desk, over a database that is a value, a sink that is a value and a
-// stop flag that is a value. The twins are sets of pure functions over a
-// `MemDb`, a `Sink` and a `Stop`, so the whole of the mutable state is three
-// region-scoped cells and the closures below are what put it there: take the
-// value out, step it, put it back, answer.
-//
-// They are closures rather than functions because a cell cannot leave its
-// region — `cell_get` and `cell_set` must name the `with_cell` binder lexically
-// or it is `E0304`, so a `run(c, s, ps)` taking the cell as an argument is not
-// expressible in Ply. A closure over the binder is, and it is what keeps the
-// eighteen clauses below one line each.
-//
-// The boilerplate is proportional to tables times operations and it is real. It
-// is also the point: a clause names one concrete `(operation, resource)` pair,
-// so this list *is* the capability grant, and a route that reached a table the
-// desk does not have — or recorded on a channel this desk does not have — would
-// have no clause to be answered by.
-//
-// **Where the cells go is the W4 lesson repeated.** They are opened *inside*
-// this function, so every call gets its own store, its own sink and its own stop
-// flag. Hoisting them to a definition shared across calls would be one sink two
-// tests assert on — which is exactly how W4's pooled connection coupled two
-// tests the footprint graph believed were disjoint, in a new costume.
-//
-// `db.rollback` is in the list and never fires. `db::transaction` handles it,
-// and the driver never binds it; a clause here is what catches a `db.rollback`
-// performed outside any transaction, which would otherwise be an unhandled
-// operation at run time. It cannot be a compile error: `rollback`, `begin`,
-// `commit` and `abort` are one atom, so the type system sees this handler
-// discharge `db.write` and has nothing left to say about which of the four
-// operations have clauses. `signal.stopping` is the same sentence in a second
-// place: `stopping` and `deadline_ms` are one atom, so one clause grants both
-// and this desk performs only the first.
+// The same desk, over a database that is a value, a sink that is a value and a stop flag that is a
+// value.
 pub fn run_memory(port: Int, api: Option<Secret<String>>, count: Int) -> Int
   / {net.write[conn], net.write[listener]} =
   memory_serving(port, "", api, count)
 
-// The twin over TLS, which is the same sentence `run_tls` is: the credential
-// decides the handshake and nothing else, and the clauses below are written
-// once rather than once per transport.
+// The twin over TLS, which is the same sentence `run_tls` is: the credential decides the handshake
+// and nothing else, and the clauses below are written once rather than once per transport.
 pub fn run_memory_tls(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int
   / {net.write[conn], net.write[listener]} =
   memory_serving(port, tls, api, count)
 
-// The API key the *tests* drive the twin with. A source literal, which ADR 0015
-// §2.5 (1) names as the largest hole in `Secret`'s containment — a literal
-// normalizes into a definition's bytes and lands in a store designed never to
-// forget. It is harmless *here* and nowhere else: a fixture credential is not a
-// credential, and the production one comes from `config.secret`, which is in no
-// definition and therefore in no hash.
-//
-// `run_memory` does **not** use it. The twin takes its credential as an
-// argument, so a desk served over the in-memory store authenticates against
-// whatever the deployment configured rather than against a value compiled into
-// it — which is ADR 0015 §3.6's "configuration is read at start-up and is a
-// value thereafter", and is what keeps the twin's row two `net` atoms while its
-// behaviour still depends on the run.
+// The API key the *tests* drive the twin with.
 pub fn twin_key() -> String = "twin-key-not-a-credential"
 
 fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: Int) -> Int
@@ -1845,10 +1159,7 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
       cell_set(c, o.db);
       o.out
     };
-    // Four lines that are the whole of "a log is an effect". A production run
-    // binds `ply_host::trace::json` here and writes a line to stderr; this one
-    // appends to a value. Neither knows about the other, and the signature they
-    // both satisfy is one text in `std.trace`.
+    // Four lines that are the whole of "a log is an effect".
     let noted = |channel: String, level: trace::Level, name: String, fs: trace::Fields| {
       cell_set(t, trace::event_step(cell_get(t), channel, level, name, fs))
     };
@@ -1860,10 +1171,8 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
     let exited = |span: trace::Span, outcome: trace::Outcome| {
       let o = trace::exit_step(cell_get(t), span, outcome);
       cell_set(t, o.sink);
-      // `exit_step` answers `ok: false` where the bound driver raises `E0445`,
-      // because a twin is a value and a value does not raise. What to do about
-      // it is the program's, and this program treats an unbalanced exit as the
-      // defect it is rather than swallowing it.
+      // `exit_step` answers `ok: false` where the bound driver raises `E0445`, because a twin is a
+      // value and a value does not raise.
       if o.ok { () } else { panic("trace.exit named a span that is not open") }
     };
     handle {
@@ -1893,8 +1202,6 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
         cell_set(t, trace::count_step(cell_get(t), "orders", name, delta, fs)),
       trace.event[items](level, name, fs) -> noted("items", level, name, fs),
       // Answered from the argument, and only for the key this desk declares.
-      // A clause that answered every key would be a desk that accepted its API
-      // key under any name a caller asked for.
       config.secret[credentials](key) -> if key == api_key() { api } else { None },
       signal.stopping() -> signal::stopping_step(cell_get(s)),
     }
@@ -1903,32 +1210,6 @@ fn memory_serving(port: Int, tls: String, api: Option<Secret<String>>, count: In
   } }
 
 // The entry point, which is the postgres one.
-//
-//     $ ply run examples/desk.ply --host \
-//         --db postgres://localhost/desk --db-schema desk.schema \
-//         --config-schema desk.config --trace json
-//
-// **Configuration is read here and is a value thereafter.** Two `config`
-// performs, both at start-up, and then a handler that answers every read below
-// out of what they produced — so no definition under `run` consults the
-// environment, `config.read[credentials]` in an endpoint's row means "this
-// endpoint checks a credential" rather than "this endpoint reads the
-// environment", and there is no live reload to make two requests in one run
-// disagree. ADR 0015 §3.6, written out.
-//
-// The port is not passed to `run` as a definition any more, and that is the one
-// behavioural change at this level: `port()` used to be `8137` and is now
-// whatever the deployment says. `limits()` did not move and will not — a bound
-// this program's tests quantify over must not differ per environment.
-//
-// A refusal to start is a `panic` and not a 500 on the first request. With
-// `--config-schema desk.config` the run has already refused before reaching this
-// line, with `E0441` naming the key and the four places it looked; this is what
-// a run that did not pass the flag gets, and it says which flag to pass.
-// The row is written as one line on purpose. `examples/serve.sh` swaps this
-// desk's store for the twin by rewriting exactly two lines of a copy — this one
-// and the call below — and a rewrite that has to match three wrapped lines is a
-// rewrite that silently stops matching the first time somebody reflows them.
 fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {
   let key = config.secret[credentials](api_key());
   let port = configured(port_of(config.get[server](port_key())));
@@ -1936,10 +1217,7 @@ fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[lis
   handle {
     run(port, count)
   } with {
-    // Answered from the value read above, once. Every `config.secret` below
-    // this line — there is one, in `guarded` — is a lookup rather than a read of
-    // the world, which is what makes it honest to say the environment was read
-    // at start-up.
+    // Answered from the value read above, once.
     config.secret[credentials](k) -> key,
   }
 }
@@ -1964,17 +1242,6 @@ pub fn seed_orders() -> List<Order> = [
 ]
 
 // A database with those rows in it, as a value.
-//
-// The seeds go in through the same statements the service uses, so the fixture
-// is not a second description of the schema: `item_row().params` is the derived
-// codec writing its four columns in its own order, and the orders are inserted
-// without their ids so the sequence hands out 1 and 2 and the next order placed
-// is 3. A fixture that wrote the ids and left the sequence at zero would make
-// the first placement collide with `ada`'s order, which is the kind of thing a
-// hand-built double never notices and a real database says immediately.
-//
-// `examples/desk.sql` seeds a real database with the same rows the same way, and
-// `--db-schema desk.schema` is what checks the two agree about the columns.
 pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb =
   fold(orders, fold(shelf, db::open(schema()), |d: db::MemDb, i: Item|
          stepped(d, item_insert(), item_row().params(i))),
@@ -1983,9 +1250,7 @@ pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb =
            [db::PText(o.customer), lines_param(o.lines), db::PNumeric(o.total),
             state_param(o.state)]))
 
-// A step whose answer must be a success. A seed the twin refused would otherwise
-// leave an empty table and a test asserting about nothing, which is the failure
-// shape this project exists to make impossible — so it is loud here instead.
+// A step whose answer must be a success.
 fn stepped(d: db::MemDb, s: db::Stmt, ps: List<db::Param>) -> db::MemDb = {
   let out = db::step(d, s, ps);
   match out.out {
@@ -1994,9 +1259,9 @@ fn stepped(d: db::MemDb, s: db::Stmt, ps: List<db::Param>) -> db::MemDb = {
   }
 }
 
-// What the twin holds, read back through the same statements an endpoint uses,
-// so an assertion about the store is an assertion about what a request would
-// see rather than about the twin's internals.
+// What the twin holds, read back through the same statements an endpoint uses, so an assertion
+// about the store is an assertion about what a request would see rather than about the twin's
+// internals.
 pub fn shelf_of(d: db::MemDb) -> List<Item> = read_out(d, items_all(), item_row())
 
 pub fn book_of(d: db::MemDb) -> List<Order> = read_out(d, orders_all(), order_row())
@@ -2038,9 +1303,7 @@ test "a line naming nothing on the shelf, and one the shelf cannot cover, are na
   assert_eq(short_skus(seed_shelf(), [{sku: "widget", qty: 3}]), [])
 }
 
-// Two lines for one sku are one draw on the shelf. Checked per line, three
-// widgets would cover two orders of two, and the drawdown would leave the shelf
-// holding minus one.
+// Two lines for one sku are one draw on the shelf.
 test "two lines naming one sku are checked as one draw on the shelf" {
   let doubled = [{sku: "widget", qty: 2}, {sku: "widget", qty: 2}];
   assert_eq(short_skus(seed_shelf(), doubled), ["widget"]);
@@ -2055,9 +1318,8 @@ test "a quantity that is not positive is refused rather than clamped" {
   assert(!bad_qty([]))
 }
 
-// A typed binder is the difference between a route that matches and one that
-// does not, so these are claims about the table's shape rather than about a
-// parser this file owns.
+// A typed binder is the difference between a route that matches and one that does not, so these are
+// claims about the table's shape rather than about a parser this file owns.
 test "an order id is a segment that parses as an Int, and nothing else routes" {
   assert_eq(route_of(http::Get, "/orders/7"),
     router::Found({endpoint: GetOrder, params: map_of_entries([{key: "id", value: "7"}])}));
@@ -2088,10 +1350,8 @@ test "a path no route matches is NotFound, and one under another method names th
   assert_eq(route_of(http::Post, "/orders/1"), router::MethodNotAllowed([http::Delete, http::Get]))
 }
 
-// A trailing empty segment is kept rather than normalized away, so `/orders/` is
-// a two-segment path whose second segment is empty and matches neither route.
-// Two answers to "which path is this" is how a route and an authorization check
-// come to disagree.
+// A trailing empty segment is kept rather than normalized away, so `/orders/` is a two-segment path
+// whose second segment is empty and matches neither route.
 test "/orders and /orders/ are different paths" {
   assert_eq(route_of(http::Get, "/orders"),
     router::Found({endpoint: ListOrders, params: map_new()}));
@@ -2099,9 +1359,8 @@ test "/orders and /orders/ are different paths" {
   assert_eq(router::normalize_path("/orders/"), "/orders")
 }
 
-// Percent-decoding happens per segment, after splitting, so `%2F` decodes to a
-// `/` inside one segment and can never introduce a boundary. This is the
-// path-traversal rule and it is worth its own test.
+// Percent-decoding happens per segment, after splitting, so `%2F` decodes to a `/` inside one
+// segment and can never introduce a boundary.
 test "a percent-encoded slash stays inside the segment it was written in" {
   assert_eq(route_of(http::Get, "/items/a%2Fb"),
     router::Found({endpoint: GetItem, params: map_of_entries([{key: "sku", value: "a/b"}])}))
@@ -2115,54 +1374,17 @@ test "a Rest segment captures every remaining segment, joined" {
 }
 
 // --- Tests: every route, hermetically -----------------------------------------------
-//
-// Every test below runs against the twin — `std.db`'s memory engine, which is
-// pure Ply over a `MemDb` value — and every one of them is `det`, cached and
-// hermetic. No port, no fixture directory, no `--host`, no teardown, and no
-// second implementation of the desk: the endpoints under test are the ones
-// `main` serves, and the statements they issue are executed rather than
-// intercepted, by a scanner that refuses what it does not model instead of
-// guessing at it.
-//
-// One thing changed shape when the store became a database, and it is worth
-// stating rather than discovering. W3's `effect store` was not `nondet`, so a
-// test could grant `store.all[items]` alone and let the four atoms it did not
-// grant sit unused in the row. `db` **is** `nondet`, so an ungranted `db` atom
-// in a `det` test's footprint is `E0412` at compile time — which means a test
-// that drives `app`, whose row is the whole desk, has to discharge the whole
-// desk. `against` below is that grant, written once.
-//
-// What was lost is a test that hands one route a subset of the store. What was
-// bought is that the subset is now *checked*: `list_items_reaches_one_table`
-// below grants `db.query[items]` and nothing else, and if `list_items` ever
-// reached the order book that test would stop compiling rather than start
-// failing.
 
 pub type Ran<a> = {
   out: a,
   shelf: List<Item>,
   book: List<Order>,
-  // Every record the request produced, in `seq` order, with every span the
-  // program left open closed `Abandoned` by `drain`. This is what makes "what
-  // this endpoint records" a checked claim rather than a hope.
+  // Every record the request produced, in `seq` order, with every span the program left open closed
+  // `Abandoned` by `drain`.
   records: List<trace::Record>,
 }
 
-// The whole service's world, installed as values. This is `run_memory`'s clause
-// set with the records kept instead of dropped, and it is the only place in the
-// tests that names a `db` or a `trace` operation: a test says what it drives and
-// what it expects, and the handlers are one text rather than one per test.
-//
-// **The cells are opened per call.** `against` is a function, so every test that
-// calls it gets its own store and its own sink; two tests asserting on records
-// are coupled to nothing. Hoisting these two `with_cell`s out to wrap the suite
-// would be one sink shared by sixty-odd tests, which is exactly W4's pooled
-// connection in a new costume — the defect ADR 0015 §7 names, and the reason
-// this comment is here rather than in a design document.
-//
-// `signal` is the one thing it does not handle, and the caller does. A stop that
-// arrives half way through a run is the only interesting thing about a stop, so
-// the test that owns the cell writes the clause.
+// The whole service's world, installed as values.
 fn against<a | e>(d: db::MemDb, values: config::Values,
                   body: () -> a / {Serving | e}) -> Ran<a> / {signal.read | e} =
   with_cell[store](d) { c -> {
@@ -2223,28 +1445,20 @@ fn against<a | e>(d: db::MemDb, values: config::Values,
         cell_set(t, trace::count_step(cell_get(t), "orders", name, delta, fs)),
       trace.event[items](level, name, fs) -> noted("items", level, name, fs),
       config.secret[credentials](key) -> config::secret_step(values, key),
-      // And **not** `signal`, which the caller handles. A stop that arrives half
-      // way through a run is the only interesting thing about a stop, and a
-      // clause here would answer out of a value fixed before the body started.
-      // The caller owns the cell, so the caller writes the clause — which is
-      // also why `against`'s row carries `signal.read` for it to discharge.
+      // And **not** `signal`, which the caller handles.
     };
     {
       out: out,
       shelf: shelf_of(cell_get(c)),
       book: book_of(cell_get(c)),
-      // `drain` closes every span the program left open as `Abandoned`, so a
-      // hermetic test observes the same records a bound run would write. A twin
-      // that left them open would be a twin whose divergence from production is
-      // precisely in the failure path.
+      // `drain` closes every span the program left open as `Abandoned`, so a hermetic test observes
+      // the same records a bound run would write.
       records: trace::drain(cell_get(t)),
     }
   } }
   } }
 
-// The desk as `examples/desk.sql` seeds it, with a key configured and nobody
-// asking it to stop. Every test that does not care about configuration or
-// shutdown uses this and reads as it did before W5.
+// The desk as `examples/desk.sql` seeds it, with a key configured and nobody asking it to stop.
 fn under<a | e>(d: db::MemDb, body: () -> a / {Serving | e}) -> Ran<a> / e =
   handle {
     against(d, config::one_secret(api_key(), twin_key()), body)
@@ -2258,9 +1472,7 @@ fn stock() -> db::MemDb = stocked(seed_shelf(), seed_orders())
 fn served_by(m: http::Method, path: String, body: Bytes) -> Ran<http::Response> =
   under(stock(), || app(request(m, path, body)))
 
-// A placement, with the key. Every test that posts an order goes through here,
-// so "the key is checked" is one edit away from being visible in sixty tests
-// rather than something each of them restates.
+// A placement, with the key.
 fn posted(body: String) -> Ran<http::Response> =
   under(stock(), || app(authorized_request(http::Post, "/orders", bytes_of_string(body))))
 
@@ -2276,8 +1488,7 @@ fn request(m: http::Method, path: String, body: Bytes) -> http::Request = {
   body: body,
 }
 
-// A request carrying the key the twin is configured with. `POST /orders` is the
-// one route that needs it, and every test that posts an order uses this.
+// A request carrying the key the twin is configured with.
 fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Request = {
   method: m,
   target: path,
@@ -2290,9 +1501,7 @@ fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Reque
   body: body,
 }
 
-// The names of the records a run produced, in order. Most assertions want this
-// rather than the whole record, because what a reader checks is *what was
-// recorded and in what order*.
+// The names of the records a run produced, in order.
 fn recorded_names(rs: List<trace::Record>) -> List<String> =
   map(rs, |r: trace::Record| r.name)
 
@@ -2320,12 +1529,8 @@ test "GET /docs serves a page, and names the pages when there is none" {
   assert_eq(served_by(http::Get, "/docs/nothing", b"").out.status, 404)
 }
 
-// A handler is a capability grant, and this is the one place the grant is a
-// subset: `list_items` is called rather than routed, so its row is one atom and
-// one clause discharges it. `db` is `nondet`, so this test compiles only while
-// that stays true — a `list_items` that reached the order book would leave
-// `db.read[orders]` in a `det` test's footprint, which is `E0412` before
-// anything runs.
+// A handler is a capability grant, and this is the one place the grant is a subset: `list_items` is
+// called rather than routed, so its row is one atom and one clause discharges it.
 test "list_items reaches one table, and the type is what says so" {
   with_cell[store](stock()) { c -> {
     handle {
@@ -2348,12 +1553,9 @@ test "GET /items reads the shelf and answers it in sku order" {
   assert_eq(json::decode_bytes(r.out.body, json::list_json(item_json())), Ok(seed_shelf()))
 }
 
-// The literal route, which shares a resource with `/items/{sku}` and a
-// footprint with it too: two reads of one resource do not conflict, so the two
-// tests below are placed in the same concurrency group and run side by side.
-//
-// The `WHERE` is the database's, so this asserts what the statement selected
-// rather than what a `filter` in Ply would have.
+// The literal route, which shares a resource with `/items/{sku}` and a footprint with it too: two
+// reads of one resource do not conflict, so the two tests below are placed in the same concurrency
+// group and run side by side.
 test "GET /items/featured is the shelf minus what is out of stock" {
   let flange = {sku: "flange", name: "flange", price: 1.00m, on_hand: 0};
   let r = under(stocked(push(seed_shelf(), flange), []),
@@ -2370,9 +1572,7 @@ test "GET /items/{sku} answers the item, and 404s the one nobody stocks" {
     Ok({error: "no such item", detail: "sprocket"}))
 }
 
-// A `sku` that would end a string literal if a value ever became syntax. It is a
-// parameter, so it is a `Bind` message and not part of the statement: the row
-// comes back not found and the tables are all still there.
+// A `sku` that would end a string literal if a value ever became syntax.
 test "a sku that looks like an injection is a value and nothing else" {
   let r = served_by(http::Get, "/items/'; drop table items; --", b"");
   assert_eq(r.out.status, 404);
@@ -2388,18 +1588,17 @@ test "GET /orders reads the order book and answers it in id order" {
 test "GET /orders/{id:Int} answers one order, and an unparseable id routes nowhere" {
   assert_eq(served_by(http::Get, "/orders/1", b"").out.status, 200);
   assert_eq(served_by(http::Get, "/orders/99", b"").out.status, 404);
-  // Not a 400 from inside the endpoint: `seven` never parses, so no route
-  // matches and the answer comes from the table rather than from a check the
-  // handler had to remember to write.
+  // Not a 400 from inside the endpoint: `seven` never parses, so no route matches and the answer
+  // comes from the table rather than from a check the handler had to remember to write.
   let unrouted = served_by(http::Get, "/orders/seven", b"");
   assert_eq(unrouted.out.status, 404);
   assert_eq(json::decode_bytes(unrouted.out.body, problem_json()),
     Ok({error: "no such route", detail: "/orders/seven"}))
 }
 
-// The id is 3 because the sequence handed out 1 and 2 to the seeds, which is the
-// fixture going in through the same insert a request does rather than through a
-// side door that would have left the sequence at zero.
+// The id is 3 because the sequence handed out 1 and 2 to the seeds, which is the fixture going in
+// through the same insert a request does rather than through a side door that would have left the
+// sequence at zero.
 test "POST /orders prices the lines, draws the shelf down and records a line" {
   let r = posted("{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"widget\",\"qty\":2}]}");
   assert_eq(r.out.status, 201);
@@ -2409,26 +1608,20 @@ test "POST /orders prices the lines, draws the shelf down and records a line" {
   assert_eq(item_named(r.shelf, "widget"),
     Some({sku: "widget", name: "left-handed widget", price: 12.50m, on_hand: 1}));
   assert_eq(len(r.book), 3);
-  // What the request recorded, in order and on the right channels: the request
-  // span opened, the shelf moved, the order was placed, the counter went up, and
-  // the span closed `Ok`. Six records is a checked claim about this endpoint's
-  // observability — not a hope that somebody remembered to log something.
+  // What the request recorded, in order and on the right channels: the request span opened, the
+  // shelf moved, the order was placed, the counter went up, and the span closed `Ok`.
   assert_eq(recorded_names(r.records),
     ["dispatch", "reserving", "shelf moved", "placed", "orders placed",
      "reserving", "dispatch"]);
   assert_eq(len(trace::on_channel(r.records, "items")), 1);
   assert_eq(len(trace::on_channel(r.records, "http")), 2);
   assert_eq(trace::counter_total(r.records, "orders placed"), 1);
-  // Both spans closed, both `Ok`, innermost first — which is the nesting an
-  // operator reads as "the request spent its time reserving".
+  // Both spans closed, both `Ok`, innermost first — which is the nesting an operator reads as "the
+  // request spent its time reserving".
   assert_eq(outcomes_of(r.records), [trace::Ok, trace::Ok])
 }
 
-// The rollback, driven by a route rather than by a unit test. The order row was
-// inserted before the reservation was refused, and what makes it absent from the
-// book afterwards is that `db.rollback`'s clause never resumed: the `RETURNING`
-// happened, the `UPDATE` was refused by `on_hand >= 0`, and everything the body
-// had left to do — including the 201 — was the continuation and was dropped.
+// The rollback, driven by a route rather than by a unit test.
 test "an order the shelf cannot cover writes nothing and says which sku" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":9}]}");
   assert_eq(r.out.status, 409);
@@ -2436,27 +1629,17 @@ test "an order the shelf cannot cover writes nothing and says which sku" {
     Ok({error: "out of stock", detail: "widget"}));
   assert_eq(r.shelf, seed_shelf());
   assert_eq(r.book, seed_orders());
-  // Nothing was placed, so nothing was recorded about a placement: both the
-  // event and the counter are in the continuation the rollback discarded, and so
-  // is the `shelf moved` record — which is why it says the shelf moved rather
-  // than that something tried to.
+  // Nothing was placed, so nothing was recorded about a placement: both the event and the counter
+  // are in the continuation the rollback discarded, and so is the `shelf moved` record — which is
+  // why it says the shelf moved rather than that something tried to.
   assert_eq(recorded_names(r.records),
     ["dispatch", "reserving", "reserving", "dispatch"]);
-  // The span the rollback discarded is closed `Abandoned` by the enclosing
-  // `exit`, and the request span closes `Failed` carrying the status. Between
-  // them they say "this request died while reserving, and the client got a 409"
-  // — which is the whole of what a trace is for, and no line of this program had
-  // to remember to write it.
+  // The span the rollback discarded is closed `Abandoned` by the enclosing `exit`, and the request
+  // span closes `Failed` carrying the status.
   assert_eq(outcomes_of(r.records), [trace::Abandoned, trace::Failed("409")])
 }
 
-// The one thing a rollback does not undo, pinned so that nobody has to discover
-// it. A sequence is not transactional — in postgres or in the twin, which
-// reproduces the surprising behaviour deliberately — so the number the refused
-// order was given is gone and the next order placed is 4 rather than 3. A desk
-// whose order numbers skip after a refusal is telling the truth about that, and
-// a test that asserted `id == 3` here would be a test that only passes once
-// against a real database.
+// The one thing a rollback does not undo, pinned so that nobody has to discover it.
 test "a rolled-back placement consumes the order number it was given" {
   let r = under(stock(), || {
     assert_eq(app(authorized_request(http::Post, "/orders",
@@ -2472,8 +1655,8 @@ test "a rolled-back placement consumes the order number it was given" {
   assert_eq(len(r.book), 3)
 }
 
-// The same refusal when the quantity is spread over two lines, which is the
-// version a per-line check would have sold.
+// The same refusal when the quantity is spread over two lines, which is the version a per-line
+// check would have sold.
 test "two lines for one sku are one reservation, and are refused as one" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":2},"
     ++ "{\"sku\":\"widget\",\"qty\":2}]}");
@@ -2496,8 +1679,8 @@ test "a body that does not fit the type is refused by field and reason" {
   assert_eq(json::decode_bytes(r.out.body, problem_json()),
     Ok({error: "malformed body",
         detail: "$.lines[0].qty: expected a number, found a string"}));
-  // A body that never parsed opened no transaction, so there is nothing to
-  // roll back and nothing was.
+  // A body that never parsed opened no transaction, so there is nothing to roll back and nothing
+  // was.
   assert_eq(r.book, seed_orders())
 }
 
@@ -2517,8 +1700,8 @@ test "DELETE /orders/{id} puts the lines back and cancels once" {
   });
   assert_eq(item_named(r.shelf, "bolt"),
     Some({sku: "bolt", name: "hex bolt", price: 0.40m, on_hand: 510}));
-  // Three requests, three spans, and exactly one cancellation recorded — the two
-  // that were refused are `Failed` spans with nothing under them.
+  // Three requests, three spans, and exactly one cancellation recorded — the two that were refused
+  // are `Failed` spans with nothing under them.
   assert_eq(trace::named(r.records, "cancelled") != [], true);
   assert_eq(len(trace::named(r.records, "cancelled")), 1);
   assert_eq(outcomes_of(r.records),
@@ -2534,15 +1717,10 @@ test "a route nobody serves is 404 and a method nobody serves is 405 with Allow"
 }
 
 // --- Tests: liveness, readiness, and the difference -----------------------------------
-//
-// Four tests for two routes, because the whole value of the pair is in the cases
-// where they disagree.
 
 test "GET /health is 200 with no store, no clock and no stop flag in reach" {
-  // Called rather than routed, and handled by nothing at all — which is only
-  // possible because `health`'s row is empty. A `/health` that queried a
-  // database could not be written as this test is written, and that is the
-  // check: an outage cannot make liveness fail because liveness cannot see one.
+  // Called rather than routed, and handled by nothing at all — which is only possible because
+  // `health`'s row is empty.
   let r = health();
   assert_eq(r.status, 200);
   assert_eq(json::decode_bytes(r.body, health_json()),
@@ -2559,24 +1737,18 @@ test "GET /ready is 200 when the store answers and nobody has asked it to stop" 
   assert_eq(r.book, seed_orders())
 }
 
-// The case an operator most needs and most services get wrong: the database is
-// gone, and the two probes must answer differently.
+// The case an operator most needs and most services get wrong: the database is gone, and the two
+// probes must answer differently.
 test "GET /ready is 503 when the store is unreachable and /health is still 200" {
   handle {
     let r = ready();
     assert_eq(r.status, 503);
     assert_eq(json::decode_bytes(r.body, readiness_json()),
       Ok({service: "parts desk", store: "57P01", stopping: false}));
-    // The same process, the same moment, the same outage. A supervisor watching
-    // `/health` does not restart this desk; a load balancer watching `/ready`
-    // stops sending it traffic. That is the entire distinction, and it is a
-    // consequence of the two rows rather than of a convention.
+    // The same process, the same moment, the same outage.
     assert_eq(health().status, 200)
   } with {
-    // Two clauses, because `ready`'s row is two atoms. A readiness route that
-    // checked nothing would need none, and this test would not compile against
-    // it — which is how "readiness actually verifies the store" is checked
-    // rather than asserted.
+    // Two clauses, because `ready`'s row is two atoms.
     db.query[items](q, ps) ->
       db::Failed({code: "57P01", constraint: "", detail: "terminating connection"}),
     signal.stopping() -> false,
@@ -2592,18 +1764,14 @@ test "a draining desk answers 503 before it stops accepting, and asks no databas
     assert_eq(health().status, 200)
   } with {
     signal.stopping() -> true,
-    // The stop flag is read first, so a draining instance answers without
-    // spending a connection. This clause is what makes that an assertion rather
-    // than a claim: reaching the database here is a failed test.
+    // The stop flag is read first, so a draining instance answers without spending a connection.
     db.query[items](q, ps) -> panic("a draining desk must not ask the database"),
   }
 }
 
 // --- Tests: the credential, which the type system keeps out of everything -------------
 
-// The unit that says a missing key is a refusal. The one line that would turn
-// the whole API-key check into decoration is `None -> true`, and this is what
-// stands in front of it.
+// The unit that says a missing key is a refusal.
 test "an unset credential refuses, an empty one refuses, and a wrong one refuses" {
   assert(!authorized(None, "anything"));
   assert(!authorized(Some(secret_of_string("")), ""));
@@ -2627,10 +1795,8 @@ test "POST /orders takes the configured key and refuses every other request" {
   }));
   assert_eq(guessed.out.status, 401);
   assert_eq(guessed.book, seed_orders());
-  // The refusal is recorded as a fact — that a key was presented and did not
-  // match — and never as a value. It could not be recorded as a value: `Field`
-  // has no case over `Secret<a>`, so `text_field("key", the_secret)` is `E0201`
-  // at the call site rather than something a reviewer has to catch.
+  // The refusal is recorded as a fact — that a key was presented and did not match — and never as a
+  // value.
   assert_eq(recorded_names(guessed.records),
     ["dispatch", "api key refused", "dispatch"]);
   assert_eq(outcomes_of(guessed.records), [trace::Failed("401")]);
@@ -2640,10 +1806,7 @@ test "POST /orders takes the configured key and refuses every other request" {
   assert_eq(bare.book, seed_orders())
 }
 
-// The failure mode that matters more than a wrong key: no key at all. A desk
-// whose credential was never configured must refuse rather than wave everything
-// through, because "unset" and "matched" arriving at the same branch is how an
-// API becomes public by deployment accident.
+// The failure mode that matters more than a wrong key: no key at all.
 test "a desk with no credential configured refuses POST /orders rather than accepting it" {
   let r = handle {
     against(stock(), config::no_values(),
@@ -2657,9 +1820,7 @@ test "a desk with no credential configured refuses POST /orders rather than acce
   assert_eq(r.shelf, seed_shelf())
 }
 
-// The credential's bytes, hunted for in everything a request produced. Every one
-// of these is a route ADR 0015 §2.3 closes with a type rather than with a rule,
-// so this test can only ever fail if one of those types weakened.
+// The credential's bytes, hunted for in everything a request produced.
 test "the configured credential appears in no response, no field and no record" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":1}]}");
   assert_eq(r.out.status, 201);
@@ -2669,9 +1830,7 @@ test "the configured credential appears in no response, no field and no record" 
   assert_eq(bytes_index_of(bytes_of_string(rendered_fields(r.records)), key), None)
 }
 
-// Every field of every record, rendered. A `Secret` cannot be in one — `Field`
-// has no case for it — so this walks what *is* there and the test above asserts
-// the credential is not among it.
+// Every field of every record, rendered.
 fn rendered_fields(rs: List<trace::Record>) -> String =
   fold(rs, "", |acc: String, r: trace::Record|
     fold(map_keys(r.fields), acc, |inner: String, k: String|
@@ -2691,14 +1850,11 @@ fn shown_field(f: Option<trace::Field>) -> String =
 test "the schema declares the key the desk cannot start without, and defaults the rest" {
   let keys = config().keys;
   assert_eq(len(keys), 3);
-  // The credential is `SSecret` and required. `SSecret` is what makes
-  // `config.get` answer `None` for it however it is set, so there is no call
-  // site at which it exists as a `String`; `required` is what makes a run
-  // without it `E0441` at start-up rather than a 401 on every order.
+  // The credential is `SSecret` and required.
   assert_eq(key_named(keys, api_key()),
     Some({name: "DESK_API_KEY", shape: config::SSecret, required: true, default: None}));
-  // The port has a default, so `ply run --host --config-schema desk.config`
-  // starts a desk with no configuration written anywhere.
+  // The port has a default, so `ply run --host --config-schema desk.config` starts a desk with no
+  // configuration written anywhere.
   assert_eq(key_named(keys, port_key()),
     Some({name: "DESK_PORT", shape: config::SInt, required: false, default: Some("8137")}))
 }
@@ -2707,8 +1863,8 @@ fn key_named(keys: List<config::Key>, name: String) -> Option<config::Key> =
   fold(keys, None, |found: Option<config::Key>, k: config::Key|
     if k.name == name { Some(k) } else { found })
 
-// What a run that forgot `--config-schema` gets: a refusal that names the flag,
-// rather than a desk listening on a port nobody chose.
+// What a run that forgot `--config-schema` gets: a refusal that names the flag, rather than a desk
+// listening on a port nobody chose.
 test "a desk told nothing about its port refuses to start and says which flag to pass" {
   match port_of(None) {
     Ok(port) -> panic("an unset port must not resolve to " ++ int_to_string(port)),
@@ -2722,8 +1878,8 @@ test "a desk told nothing about its port refuses to start and says which flag to
     Ok(_) -> panic("`eight` is not a port"),
     Err(why) -> assert(mentions(why, b"eight")),
   };
-  // A port outside 1..65535 is a configuration nobody meant, and it is refused
-  // here rather than turning into a listener that never binds.
+  // A port outside 1..65535 is a configuration nobody meant, and it is refused here rather than
+  // turning into a listener that never binds.
   assert(port_of(Some("0")) != Ok(0));
   assert(port_of(Some("70000")) != Ok(70000))
 }
@@ -2742,16 +1898,8 @@ fn mentions(text: String, needle: Bytes) -> Bool =
 
 // --- Tests: the drain ------------------------------------------------------------------
 
-// ADR 0015 §4.3's exit criterion, and it is a claim about what is *absent*: not
-// one line of `serve`, `serve_connection` or the framing changed to make a
-// signal drain this desk. `serve` already stopped when `accept` answered `0`,
-// and stopping the listener is what makes it answer `0`.
-//
-// The signal arrives while a request is in flight — the flag is set from the
-// `net.close[conn]` clause, which is the moment the first connection finishes —
-// and what the test asserts is the three things a deployment cares about: the
-// request that was running completed, no further connection was accepted, and
-// the listener was closed.
+// ADR 0015 §4.3's exit criterion, and it is a claim about what is *absent*: not one line of
+// `serve`, `serve_connection` or the framing changed to make a signal drain this desk.
 test "a signal drains the accept loop with no source change" {
   with_cell[stop](signal::running()) { s -> {
   with_cell[inbox]([get_line("/health")]) { queue -> {
@@ -2764,8 +1912,8 @@ test "a signal drains the accept loop with no source change" {
         run(8137, 8)
       } with {
         net.listen[listener](port) -> 1,
-        // Phase 2 of the shutdown sequence, as this desk sees it: the listening
-        // socket is closed, so `accept` answers `0`.
+        // Phase 2 of the shutdown sequence, as this desk sees it: the listening socket is closed,
+        // so `accept` answers `0`.
         net.accept[listener](l) -> if signal::stopping_step(cell_get(s)) { 0 } else { 7 },
         net.close[listener](l) -> cell_set(shut, cell_get(shut) + 1),
         net.recv[conn](c, max, timeout_ms) -> {
@@ -2777,9 +1925,7 @@ test "a signal drains the accept loop with no source change" {
           cell_set(sent, push(cell_get(sent), payload));
           Some(bytes_len(payload))
         },
-        // The signal, arriving. A real handler sets an atomic flag and does
-        // nothing else, which is the only thing a signal handler is allowed to
-        // do; this one sets a cell, which is the same fact as a value.
+        // The signal, arriving.
         net.close[conn](c) -> cell_set(s, signal::draining(30000)),
       }
     })
@@ -2787,17 +1933,15 @@ test "a signal drains the accept loop with no source change" {
       // The clause that reads the flag, written by the test that owns the cell.
       signal.stopping() -> signal::stopping_step(cell_get(s)),
     };
-    // One connection served, completely: the request in flight was answered
-    // rather than cut off.
+    // One connection served, completely: the request in flight was answered rather than cut off.
     assert_eq(r.out, 1);
     let wrote = bytes_concat_all(cell_get(sent));
     assert_eq(status_of(wrote), 200);
     assert(bytes_index_of(wrote, b"\"service\":\"parts desk\"") != None);
-    // And the listener was closed on the way out, which is what `serve`
-    // returning means.
+    // And the listener was closed on the way out, which is what `serve` returning means.
     assert_eq(cell_get(shut), 1);
-    // The drain left nothing open: every span the run produced is closed, so a
-    // reader of the records sees a complete request rather than a dangling one.
+    // The drain left nothing open: every span the run produced is closed, so a reader of the
+    // records sees a complete request rather than a dangling one.
     assert_eq(outcomes_of(r.records), [trace::Ok])
   } }
   } }
@@ -2805,9 +1949,9 @@ test "a signal drains the accept loop with no source change" {
   } }
 }
 
-// The other half of the drain, from the client's side: while a stop is pending
-// but the listener is still accepting — the `--drain-lead-ms` window — the desk
-// answers `/ready` with 503 and keeps answering everything else.
+// The other half of the drain, from the client's side: while a stop is pending but the listener is
+// still accepting — the `--drain-lead-ms` window — the desk answers `/ready` with 503 and keeps
+// answering everything else.
 test "during the drain lead a desk is unready and still serving" {
   let r = handle {
     against(stock(), config::one_secret(api_key(), twin_key()), || {
@@ -2820,9 +1964,7 @@ test "during the drain lead a desk is unready and still serving" {
   };
   // A load balancer polling `/ready` removes this instance…
   assert_eq(r.out.ready, 503);
-  // …while the requests already in flight are still answered properly. Shedding
-  // them would be the wrong answer: they arrived before the stop and there is
-  // time to finish them.
+  // …while the requests already in flight are still answered properly.
   assert_eq(r.out.items, 200)
 }
 
@@ -2838,9 +1980,7 @@ test "a receipt is produced one line at a time and ends" {
   assert_eq(len(chunks_of(c, [])), 3)
 }
 
-// Two clauses, and they are the two atoms `receipt`'s row names. A receipt that
-// wrote anything would have no clause to be answered by, and — because `db` is
-// `nondet` — would not have compiled into this `det` test in the first place.
+// Two clauses, and they are the two atoms `receipt`'s row names.
 test "GET /orders/{id}/receipt streams, and a missing order does not" {
   with_cell[store](stock()) { c -> {
     handle {
@@ -2871,21 +2011,6 @@ test "GET /orders/{id}/receipt streams, and a missing order does not" {
 }
 
 // --- The whole service, over a simulated socket ---------------------------------------
-//
-// One function, and every test below it is a `det`, cacheable, hermetic test
-// over raw request bytes. `exchange` opens five region-scoped cells and hands
-// `serve_connection` a socket that is a list of chunks and a store that is a
-// `MemDb` in a cell — and because every atom the service can perform is
-// discharged here, `exchange`'s own row is empty. That is what makes the
-// service's framing behaviour testable with no port, no database, no fixture
-// directory and no teardown.
-//
-// Dropping a whole atom is not a way to make these tests flaky: `net` is
-// `nondet`, so a `det` test that left `net.write[conn]` in its footprint is
-// `E0412` at compile time. Dropping one *operation* of a handled atom — the
-// `net.send` clause while keeping `net.recv` — is a run-time unhandled-effect
-// error instead, because a handler discharges an atom and those two are one
-// atom. That seam is real and this comment is where it is written down.
 
 type Exchange = { wrote: Bytes, sent: Int, closes: Int, shelf: List<Item>, book: List<Order> }
 
@@ -2915,11 +2040,9 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
     });
     {
       wrote: bytes_concat_all(cell_get(sent)),
-      // How many *responses* were written, counted as the writes that begin with
-      // a status line: `send_all` writes a buffered response in one, and
-      // `respond_chunked` writes a head and then chunks that begin with a hex
-      // size. Searching the joined bytes for a status line would count the one
-      // inside a refusal that quotes the version it refused.
+      // How many *responses* were written, counted as the writes that begin with a status line:
+      // `send_all` writes a buffered response in one, and `respond_chunked` writes a head and then
+      // chunks that begin with a hex size.
       sent: len(filter(cell_get(sent), |p: Bytes| bytes_starts_with(p, b"HTTP/1.1 "))),
       closes: cell_get(closes),
       shelf: ran.shelf,
@@ -2956,9 +2079,8 @@ test "a request over the simulated socket is answered and the connection closed"
   assert_eq(e.sent, 1)
 }
 
-// Pipelining is answered in order by construction: one connection, one task, and
-// the leftover buffer carried into the next turn. The bug this catches is a
-// server that frames the second request out of the first one's unread body.
+// Pipelining is answered in order by construction: one connection, one task, and the leftover
+// buffer carried into the next turn.
 test "two pipelined requests are answered in order on one connection" {
   let e = served(bytes_concat(get_line("/health"), get_line("/items")));
   assert_eq(e.sent, 2);
@@ -2967,9 +2089,7 @@ test "two pipelined requests are answered in order on one connection" {
   assert(bytes_index_of(e.wrote, b"\"sku\":\"gasket\"") != None)
 }
 
-// A head split across three reads, one of the cuts falling inside the
-// terminator. This is the case a single `recv` passes and a real network fails,
-// and the carried three bytes in `Reading` are what make it pass here.
+// A head split across three reads, one of the cuts falling inside the terminator.
 test "a head whose terminator is split across two reads is still found" {
   let whole = get_line("/health");
   let cut = bytes_len(whole) - 2;
@@ -2992,29 +2112,27 @@ test "a posted order travels the whole connection and moves the store" {
   assert_eq(len(e.book), 3)
 }
 
-// The streamed route over the socket: the response is chunked, and the bytes
-// between the chunk sizes are exactly what the buffered path would have sent.
+// The streamed route over the socket: the response is chunked, and the bytes between the chunk
+// sizes are exactly what the buffered path would have sent.
 test "a receipt is written as chunks and ends with the terminating chunk" {
   let e = served(get_line("/orders/1/receipt"));
   assert_eq(status_of(e.wrote), 200);
   assert(bytes_index_of(e.wrote, b"Transfer-Encoding: chunked\r\n") != None);
   assert(bytes_index_of(e.wrote, b"Content-Length") == None);
   assert(bytes_ends_with(e.wrote, b"0\r\n\r\n"));
-  // The chunk sizes are the only thing between the streamed bytes and the
-  // buffered ones, which is what the law at the foot of the file says.
+  // The chunk sizes are the only thing between the streamed bytes and the buffered ones, which is
+  // what the law at the foot of the file says.
   assert(bytes_index_of(e.wrote, b"receipt for order 1\ncustomer: ada\n") != None);
   assert(bytes_index_of(e.wrote, b"total: 4.00\n") != None)
 }
 
-// A HEAD is routed as the GET it mirrors, and `encode` is what drops the body:
-// the `Content-Length` is the one a GET would have produced, and not a byte of
-// body follows the head. The streamed route is drained rather than chunked,
-// because writing chunks to a HEAD is a framing bug on the response side.
+// A HEAD is routed as the GET it mirrors, and `encode` is what drops the body: the `Content-Length`
+// is the one a GET would have produced, and not a byte of body follows the head.
 test "HEAD is answered like GET with the length it would have had and no body" {
   let head = served(bytes_of_string("HEAD /items HTTP/1.1\r\nHost: d\r\n\r\n"));
   let get = served(get_line("/items"));
-  // Byte for byte the GET's head — the same status, the same fields and the
-  // same `Content-Length` — and then nothing at all.
+  // Byte for byte the GET's head — the same status, the same fields and the same `Content-Length` —
+  // and then nothing at all.
   assert_eq(head.wrote, bytes_slice(get.wrote, 0, head_end(get.wrote)));
   assert_eq(status_of(head.wrote), 200);
   assert(bytes_index_of(head.wrote, bytes_of_string("Content-Length: "
@@ -3026,9 +2144,9 @@ test "HEAD is answered like GET with the length it would have had and no body" {
   assert(bytes_ends_with(receipt.wrote, b"\r\n\r\n"))
 }
 
-// `OPTIONS *` asks about the server rather than about a path, so it is not
-// routed at all — and its `Allow` is read off the table, so a route added below
-// changes this answer without anybody editing it.
+// `OPTIONS *` asks about the server rather than about a path, so it is not routed at all — and its
+// `Allow` is read off the table, so a route added below changes this answer without anybody editing
+// it.
 test "OPTIONS * answers the methods the table declares anywhere" {
   let e = served(b"OPTIONS * HTTP/1.1\r\nHost: d\r\n\r\n");
   assert_eq(status_of(e.wrote), 204);
@@ -3042,17 +2160,6 @@ test "a peer that opens a connection and says nothing is closed without a respon
 }
 
 // --- The same service over TLS ----------------------------------------------------
-//
-// Not one line of the service changes. TLS is the same `net` effect over the
-// same resource, so what differs is which listener was opened — which is the
-// whole of ADR 0013 §6.1, checked rather than asserted: the response bytes are
-// compared against the plaintext path's.
-//
-// `run` and `run_tls` are the entry points `main` and `examples/serve.sh` use,
-// and they hand the `db` atoms to the host rather than discharging them — so
-// this harness installs the twin *around* them with `against` and grants sockets
-// itself. What is under test is therefore the deployed program and not a second
-// spelling of it.
 
 fn over_socket(inbox: List<Bytes>, tls: Bool) -> {wrote: Bytes, sent: Int} =
   with_cell[inbox](inbox) { queue -> {
@@ -3101,10 +2208,6 @@ test "a listener serves exactly the connections it was asked for" {
 }
 
 // The twin entry point, driven end to end with nothing granted but sockets.
-// Its row is two `net` atoms because the nine `db` clauses inside it discharge
-// every atom the desk can perform — which is the whole of what "the same tests
-// against the in-memory handler" means, stated as a type rather than as a
-// promise.
 test "run_memory serves the desk with no database bound and no host at all" {
   with_cell[inbox]([bytes_concat(get_line("/items"), get_line("/orders"))]) { queue -> {
   with_cell[outbox]([]) { sent -> {
@@ -3134,19 +2237,10 @@ test "run_memory serves the desk with no database bound and no host at all" {
 }
 
 // --- One case per protocol refusal ---------------------------------------------------
-//
-// Every framing rule W3 refuses, driven end to end through this service rather
-// than through the parser alone: the status the peer is given, and the close.
-// `std.http` owns the rules; these are the regression coverage that the service
-// *answers* them — a parser that refuses and a server that then reads the next
-// request out of the refused message is still a smuggle.
 
-// The status the peer was given — and, for every case below rather than for the
-// ones a test author remembered, three properties that make a refusal a refusal:
-// exactly one response was written, the connection was closed, and neither the
-// shelf nor the order book moved. A connection reused after a refusal is a
-// connection two implementations disagree about the framing of, which is the
-// whole of the smuggling class.
+// The status the peer was given — and, for every case below rather than for the ones a test author
+// remembered, three properties that make a refusal a refusal: exactly one response was written, the
+// connection was closed, and neither the shelf nor the order book moved.
 fn refused(raw: Bytes) -> Int = {
   let e = served(raw);
   assert_eq(e.sent, 1);
@@ -3217,16 +2311,15 @@ test "a chunk size that is empty, not hex, or unterminated is refused" {
     b"5\r\nhelloXX0\r\n\r\n")), 400)
 }
 
-// A trailer named `content-length` changes no framing decision and a trailer
-// named `authorization` never appears among the headers. Merging them is a
-// documented smuggling and privilege-escalation route.
+// A trailer named `content-length` changes no framing decision and a trailer named `authorization`
+// never appears among the headers.
 test "trailers arrive in their own field and are never merged into the headers" {
   let e = served(bytes_concat(
     bytes_of_string("POST /orders HTTP/1.1\r\nHost: d\r\nx-api-key: " ++ twin_key()
       ++ "\r\nTransfer-Encoding: chunked\r\n\r\n"),
     b"2\r\n{}\r\n0\r\nContent-Length: 0\r\nAuthorization: root\r\n\r\n"));
-  // The body was framed by the chunks and not by the trailer, so the desk saw
-  // `{}` and refused it as a `Placement` rather than as a framing error.
+  // The body was framed by the chunks and not by the trailer, so the desk saw `{}` and refused it
+  // as a `Placement` rather than as a framing error.
   assert_eq(status_of(e.wrote), 400);
   assert_eq(e.closes, 1)
 }
@@ -3252,18 +2345,15 @@ fn fill_to(so_far: Bytes, n: Int) -> Bytes =
 
 // --- Laws the route table being data makes possible -------------------------------------
 
-// A route the matcher cannot reach is a line of documentation for something the
-// service does not do. The sample path is built from the pattern itself — a
-// captured segment becomes `:name`, and no literal in the table begins with a
-// colon — so this quantifies over every tag rather than over the paths a test
-// author remembered to write.
+// A route the matcher cannot reach is a line of documentation for something the service does not
+// do.
 fn sample_segment(s: router::Segment) -> String =
   match s {
     router::Literal(text) -> text,
     router::Param(name) -> ":" ++ name,
     router::Rest(name) -> ":" ++ name,
-    // A typed binder only matches a segment that parses, so the sample has to
-    // parse; no literal in the table is one of these three words.
+    // A typed binder only matches a segment that parses, so the sample has to parse; no literal in
+    // the table is one of these three words.
     router::Typed(binding) -> sample_of_kind(binding.kind),
   }
 
@@ -3304,8 +2394,6 @@ law "every endpoint the desk can dispatch is reachable through the table"
   }
 
 // The property a framework enforces with a macro is here a value a law asserts.
-// A tie is broken by position in the list, which is a defect rather than a
-// feature, and `conflicts` is what names it.
 law "no two routes overlap ambiguously, and every pattern is well formed" {
   conflicts_and_defects() == 0
 }
@@ -3313,9 +2401,8 @@ law "no two routes overlap ambiguously, and every pattern is well formed" {
 pub fn conflicts_and_defects() -> Int =
   len(router::conflicts(table())) + len(router::well_formed(table()))
 
-// The claim a streaming encoder has to earn and almost never states: the bytes
-// pulled out of the cursor are the bytes a buffered body would have held. It is
-// quantified over the order, so a line count the tests never tried is covered.
+// The claim a streaming encoder has to earn and almost never states: the bytes pulled out of the
+// cursor are the bytes a buffered body would have held.
 law "a streamed receipt is byte-for-byte what a buffered one would have been"
   forall (o: Order) {
     drained(cursor_for(o, seed_shelf())) == buffered_receipt(o)
@@ -3326,29 +2413,15 @@ pub fn buffered_receipt(o: Order) -> Bytes =
     bytes_concat_all(map(o.lines, |l: Line| item_line(seed_shelf(), l)))),
     closing_line(o)))
 
-// Drawing a shelf down and putting the same lines back is the identity, which is
-// what makes a cancellation safe to answer twice — the second one is refused by
-// `state`, and this says the first one moved exactly what it should have.
+// Drawing a shelf down and putting the same lines back is the identity, which is what makes a
+// cancellation safe to answer twice — the second one is refused by `state`, and this says the first
+// one moved exactly what it should have.
 law "a drawdown is undone exactly by putting the same lines back"
   forall (lines: List<Line>) {
     put_back(draw_down(seed_shelf(), lines), lines) == seed_shelf()
   }
 
 // --- Laws the store being a value makes possible ----------------------------------------
-//
-// A store that is a database is a store no law can quantify over: a claim about
-// what a request left behind would need a database per case, and a hundred cases
-// would be a hundred round trips against shared state that the next case can
-// see. A store that is a **value** is different in kind — `stocked` builds one,
-// `against` runs a request over it and hands back what the request could then
-// read, and the whole of it is pure. So the two sentences a service most wants
-// to be true of a write path are quantified rather than sampled.
-//
-// These are `law` and not `law/host`: their bodies discharge every `db` atom
-// through the twin, so their row is empty and `ply prove` can attempt them at
-// whatever tier they earn. What they say about **postgres** is exactly as strong
-// as the agreement between the twin and the driver — which is what the agreement
-// law is for, and is why that law is a deliverable rather than a demonstration.
 
 pub type Pick = Bolt | Gasket | Widget
 
@@ -3359,25 +2432,22 @@ pub type Want = { pick: Pick, amount: Amount }
 fn sku_of(p: Pick) -> String =
   match p { Bolt -> "bolt", Gasket -> "gasket", Widget -> "widget" }
 
-// `Crate` is 40, which the gasket shelf cannot cover and the bolt shelf can, so
-// a generated order lands on both sides of the refusal rather than on one.
+// `Crate` is 40, which the gasket shelf cannot cover and the bolt shelf can, so a generated order
+// lands on both sides of the refusal rather than on one.
 fn qty_of(a: Amount) -> Int =
   match a { One -> 1, Couple -> 2, Handful -> 5, Crate -> 40 }
 
 pub fn lines_of(ws: List<Want>) -> List<Line> =
   map(ws, |w: Want| {sku: sku_of(w.pick), qty: qty_of(w.amount)})
 
-// Through the whole route — the key check, the decode and the span — so the law
-// covers what a client actually reaches rather than starting after it.
+// Through the whole route — the key check, the decode and the span — so the law covers what a
+// client actually reaches rather than starting after it.
 pub fn placed_over(ws: List<Want>) -> Ran<http::Response> =
   under(stocked(seed_shelf(), []),
     || app(authorized_request(http::Post, "/orders",
              json::encode_bytes({customer: "ada", lines: lines_of(ws)}, placement_json()))))
 
-// The claim a rollback is for. The `INSERT` ran, the `RETURNING` came back and
-// the order existed inside the transaction; what makes it absent afterwards is
-// that the reservation was refused and the continuation — the rest of the
-// placement, the log line, the 201 — was discarded rather than undone.
+// The claim a rollback is for.
 pub fn refused_without_trace(ws: List<Want>) -> Bool = {
   let r = placed_over(ws);
   r.out.status == 409 && r.shelf == seed_shelf() && r.book == []
@@ -3391,9 +2461,9 @@ law "a placement the shelf cannot cover leaves no row behind"
     refused_without_trace(ws)
   }
 
-// And the other half, without which the first is satisfied by a desk that
-// refuses everything: what a placement that succeeds does to the shelf is
-// exactly `draw_down`, the pure function the tests above check on its own.
+// And the other half, without which the first is satisfied by a desk that refuses everything: what
+// a placement that succeeds does to the shelf is exactly `draw_down`, the pure function the tests
+// above check on its own.
 pub fn committed_as_specified(ws: List<Want>) -> Bool = {
   let r = placed_over(ws);
   r.out.status == 201
@@ -3407,9 +2477,7 @@ law "a placement the shelf can cover moves the shelf by exactly the drawdown"
     committed_as_specified(ws)
   }
 
-// The statement and the predicate it replaced, over every id. `where id = $1` is
-// text this file cannot typecheck and `order_by` is a fold this file can; the
-// law is what says they are the same question.
+// The statement and the predicate it replaced, over every id.
 pub fn one_order_agrees(id: Int) -> Bool = {
   let r = under(stock(), || app(request(http::Get, "/orders/" ++ int_to_string(id), b"")));
   match order_by(seed_orders(), id) {

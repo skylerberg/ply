@@ -1,16 +1,5 @@
-//! The comparison this spike exists for: for every `.ply` file in the tree, the
-//! Ply lexer's token stream against `crates/ply-syntax`'s.
-//!
-//! It shells out to the shipping `ply` binary rather than driving `ply-eval` in
-//! process, because the shipping binary is what a user would run and because
-//! the 10,000-nested-call bound this lexer is shaped around is the one the CLI
-//! installs. Driving the evaluator directly would let the harness choose a
-//! bound no user can choose.
-//!
-//! Nothing here skips. If the `ply` binary is missing the tests fail and say
-//! how to build it; `CONTRIBUTING.md` §"The suite proves less than it looks
-//! like it proves" is about four gates that skip silently and this is not going
-//! to be a fifth.
+//! The comparison this spike exists for: for every `.ply` file in the tree, the Ply lexer's token
+//! stream against `crates/ply-syntax`'s.
 
 use ply_lexer_spike_harness::{byte_literal, floats_to_bits, records, reference_dump};
 use std::path::{Path, PathBuf};
@@ -24,8 +13,8 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// The shipping binary, release first because `examples/desk.ply` is 160
-/// kilobytes and the debug interpreter is about eight times slower on it.
+/// The shipping binary, release first because `examples/desk.ply` is 160 kilobytes and the debug
+/// interpreter is about eight times slower on it.
 fn ply_binary() -> PathBuf {
     if let Ok(explicit) = std::env::var("PLY_BIN") {
         let path = PathBuf::from(explicit);
@@ -58,13 +47,9 @@ fn spike_dir() -> PathBuf {
 }
 
 /// Run the Ply lexer over `bytes` and return its dump.
-///
-/// The source arrives as a `b"..."` literal because there is no other way in:
-/// Ply has no file-reading host handler, so a program either holds its input as
-/// a literal or never sees it.
 fn ply_dump(bytes: &[u8], label: &str) -> String {
-    // A counter as well as the label: two tests may lex the same fixture, and
-    // `cargo test` runs them on different threads at the same time.
+    // A counter as well as the label: two tests may lex the same fixture, and `cargo test` runs
+    // them on different threads at the same time.
     static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let dir = std::env::temp_dir().join(format!(
         "ply-lexer-spike-{}-{}-{}",
@@ -107,19 +92,6 @@ fn ply_dump(bytes: &[u8], label: &str) -> String {
 }
 
 /// The `value` field of `ply run --json`, unwrapped.
-///
-/// Two layers of quoting, and both are load-bearing. `ply run` puts
-/// `Value::to_string()` in that field, and a `Value::Str` *renders* with its
-/// own quotes and its own escaping (`ply_eval::value::escape`), so the JSON
-/// string holds `"<dump>"` and serde escapes those two quotes again. What
-/// arrives is therefore `\"<dump>\"` between the JSON quotes.
-///
-/// The dump is printable ASCII with no `"` and no `\` by construction — the
-/// harness's own `the_dump_is_printable_ascii_with_no_quote_and_no_backslash`
-/// asserts that of the reference side — so between those two markers the dump
-/// is verbatim and no unescaper is needed. If either assumption ever breaks
-/// this fails loudly rather than quietly comparing an unescaper against a
-/// lexer.
 fn extract_value(stdout: &str, dir: &Path) -> String {
     let needle = "\n  \"value\": \"";
     let occurrences = stdout.matches(needle).count();
@@ -190,8 +162,8 @@ fn check_agreement(path: &Path) {
             path.display()
         );
     }
-    // Printed under `--nocapture` so that a file the loop silently skipped is
-    // visible: a comparison over an empty corpus passes.
+    // Printed under `--nocapture` so that a file the loop silently skipped is visible: a comparison
+    // over an empty corpus passes.
     println!(
         "  agreed {:>52}  {:>7} bytes  {:>6} records  {:>7.2}s",
         path.display()
@@ -238,27 +210,9 @@ fn the_ply_lexer_agrees_with_the_rust_one_on_the_shipped_standard_library() {
     }
 }
 
-/// Nothing in the corpus above reaches a malformed literal, an out-of-range
-/// number, or an unterminated string, so agreeing on it says nothing at all
-/// about the error paths, which are half of what `lexer.rs` does. These ten
-/// files are the only thing in the spike that exercises them: **all 25
-/// diagnostics in the whole comparison come from five of these ten fixtures**,
-/// and the 767,638 bytes of real source raise none.
-///
-/// > **Corrected (verification pass, 2026-08-24).** This doc opened: *"The
-/// > corpus above is every `.ply` file in the tree and **all of it is ASCII** —
-/// > checked, and the reason this test exists."* Both halves are false, and the
-/// > second is refuted by
-/// > `every_non_ascii_byte_in_the_corpus_is_somewhere_both_lexers_agree`
-/// > forty lines below, which asserts **1,543** non-ASCII bytes and carries two
-/// > correction blocks of its own saying so. The corpus is **33** files; the
-/// > tree holds **109** `.ply` files outside `spikes/`, so **86** files and
-/// > **95,419** bytes are not compared — among them
-/// > `tests/fixtures/unterminated_string.ply`, the one file outside this spike
-/// > that raises a lexer diagnostic. (Compared by hand during the verification
-/// > pass: the two lexers agree on it exactly, `E0002` included.) A stale
-/// > sentence sitting above a test whose own body refutes it is this
-/// > repository's signature defect in miniature.
+/// Nothing in the corpus above reaches a malformed literal, an out-of-range number, or an
+/// unterminated string, so agreeing on it says nothing at all about the error paths, which are half
+/// of what `lexer.rs` does.
 #[test]
 fn the_ply_lexer_agrees_with_the_rust_one_on_the_hand_written_edge_cases() {
     for path in ply_files(&spike_dir().join("fixtures")) {
@@ -266,32 +220,8 @@ fn the_ply_lexer_agrees_with_the_rust_one_on_the_hand_written_edge_cases() {
     }
 }
 
-/// Where the corpus's non-ASCII bytes are, which is the whole reason the four
-/// tests above can agree at all.
-///
-/// > **Corrected.** This test used to assert that every file it reads is
-/// > ASCII, on the strength of a `grep -c $'[\x80-\xff]'` that reported `0`
-/// > for every file and was simply not working. There are **1,543** non-ASCII
-/// > bytes in the corpus — em dashes and section signs in prose comments. The
-/// > agreement is real; the reason for it was not what the first version of
-/// > this test said.
-///
-/// > **Corrected again, by running it.** The replacement asserted that every
-/// > non-ASCII byte falls *outside every token span*. It does not:
-/// > `examples/hello.ply` holds three accented characters inside a string
-/// > literal at offset 17,656. Two claims about this corpus in a row, both
-/// > written from a tool that was not doing what it looked like it was doing,
-/// > both refuted by the check that was supposed to confirm them.
-///
-/// What is actually true: every non-ASCII byte in the corpus is either trivia
-/// or inside a `Str` literal, and those are exactly the two positions where the
-/// two lexers agree — trivia is skipped by both, and a string's bytes are
-/// copied through by both, which
-/// `a_non_ascii_character_inside_a_string_is_not_a_divergence` pins. Not one of
-/// them sits at a token's **first** byte, which is the only place the two
-/// disagree. So this corpus does not exercise the divergence, and
-/// `the_two_lexers_differ_on_a_unicode_identifier` and its two neighbours are
-/// what cover it.
+/// Where the corpus's non-ASCII bytes are, which is the whole reason the four tests above can agree
+/// at all.
 #[test]
 fn every_non_ascii_byte_in_the_corpus_is_somewhere_both_lexers_agree() {
     let mut non_ascii = 0usize;
@@ -325,8 +255,8 @@ fn every_non_ascii_byte_in_the_corpus_is_somewhere_both_lexers_agree() {
         }
     }
     assert!(files >= 20, "only {files} files were checked");
-    // Pinned so that a corpus that lost its prose — or gained a file this loop
-    // silently skipped — is visible rather than quietly narrowing the claim.
+    // Pinned so that a corpus that lost its prose — or gained a file this loop silently skipped —
+    // is visible rather than quietly narrowing the claim.
     assert_eq!(
         (non_ascii, in_string),
         (1543, 45),
@@ -345,12 +275,6 @@ fn corpus_dirs() -> Vec<PathBuf> {
 }
 
 // --- Where the two lexers disagree on purpose --------------------------------
-//
-// Three shapes, all at the first byte of a token, all because `lexer.rs` asks
-// `char::is_alphabetic` and `char::is_whitespace` there and Ply has no
-// character type and no Unicode table to ask. Asserted as exact dumps rather
-// than described, so that a change to either lexer that closes or widens a
-// divergence fails here instead of being discovered by a user.
 
 fn both_dumps(text: &str, label: &str) -> (String, String) {
     let bytes = text.as_bytes();
@@ -360,8 +284,8 @@ fn both_dumps(text: &str, label: &str) -> (String, String) {
     )
 }
 
-/// The one divergence that changes the **token stream** rather than only a
-/// diagnostic: `lexer.rs` accepts any `char::is_alphabetic` as an identifier.
+/// The one divergence that changes the **token stream** rather than only a diagnostic: `lexer.rs`
+/// accepts any `char::is_alphabetic` as an identifier.
 #[test]
 fn the_two_lexers_differ_on_a_unicode_identifier() {
     let (rust, ply) = both_dumps("let \u{e9} = 1\n", "div-ident");
@@ -369,9 +293,7 @@ fn the_two_lexers_differ_on_a_unicode_identifier() {
     assert_eq!(ply, "0:3:k:let;7:8:p:eq;9:10:n:1;11:11:e;4:6:!:X0001;");
 }
 
-/// `char::is_whitespace` accepts sixteen characters outside ASCII. This one is
-/// worse than it looks: the Rust lexer skips a non-breaking space silently, so
-/// the source that produced it is *accepted*, and the Ply lexer refuses it.
+/// `char::is_whitespace` accepts sixteen characters outside ASCII.
 #[test]
 fn the_two_lexers_differ_on_a_unicode_space() {
     let (rust, ply) = both_dumps("a\u{a0}b\n", "div-space");
@@ -379,9 +301,7 @@ fn the_two_lexers_differ_on_a_unicode_space() {
     assert_eq!(ply, "0:1:i:a;3:4:i:b;5:5:e;1:3:!:X0001;");
 }
 
-/// The mildest of the three: both refuse, at the same span, with no token. Only
-/// the diagnostic code differs, because the Ply lexer cannot tell this case
-/// from the identifier case and says so with a code of its own.
+/// The mildest of the three: both refuse, at the same span, with no token.
 #[test]
 fn the_two_lexers_differ_only_in_the_code_on_a_unicode_symbol() {
     for (text, label) in [
@@ -399,8 +319,7 @@ fn the_two_lexers_differ_only_in_the_code_on_a_unicode_symbol() {
     }
 }
 
-// The four shapes that look like they should diverge and do not. Each was
-// written down as a divergence first and refuted by running it.
+// The four shapes that look like they should diverge and do not.
 
 #[test]
 fn a_backslash_before_a_non_ascii_character_is_not_a_divergence() {
@@ -431,17 +350,8 @@ fn a_non_ascii_character_inside_a_comment_is_not_a_divergence() {
 }
 
 // --- Whether the comparison can fail ----------------------------------------
-//
-// Everything above is a green result, and a green result over a comparison that
-// cannot go red is the defect this repository names first. These five mutate a
-// dump that really did come out of the Ply lexer, in the five ways a
-// same-shaped-but-wrong lexer would differ, and assert the comparator says so.
-// Four of them are the hazards a survey of `std.json`'s parser flagged as the
-// ways a token-stream comparison is usually blind: kind, payload, span, a
-// dropped token, and a dropped diagnostic.
 
-/// A fixture that has all five things to break: tokens, a payload, spans, and
-/// diagnostics.
+/// A fixture that has all five things to break: tokens, a payload, spans, and diagnostics.
 fn a_mutable_dump() -> (String, String) {
     let path = spike_dir().join("fixtures").join("bytes.ply");
     let bytes = std::fs::read(&path).expect("the fixture");
@@ -471,8 +381,8 @@ fn the_comparison_notices_a_token_whose_payload_is_wrong() {
     assert!(first_difference(&reference, &mutated).is_some());
 }
 
-/// The hazard worth naming: a lexer with every kind and payload right and every
-/// offset wrong would agree with a span-blind comparator perfectly.
+/// The hazard worth naming: a lexer with every kind and payload right and every offset wrong would
+/// agree with a span-blind comparator perfectly.
 #[test]
 fn the_comparison_notices_a_token_whose_span_is_wrong() {
     let (reference, actual) = a_mutable_dump();
@@ -493,9 +403,8 @@ fn the_comparison_notices_a_token_that_is_missing_from_the_end() {
     assert!(first_difference(&reference, &mutated).is_some());
 }
 
-/// `lex` never fails — it answers with diagnostics *beside* the tokens — so a
-/// comparison of tokens alone passes a lexer that silently accepts malformed
-/// input.
+/// `lex` never fails — it answers with diagnostics *beside* the tokens — so a comparison of tokens
+/// alone passes a lexer that silently accepts malformed input.
 #[test]
 fn the_comparison_notices_a_diagnostic_that_was_not_raised() {
     let (reference, actual) = a_mutable_dump();
@@ -504,13 +413,12 @@ fn the_comparison_notices_a_diagnostic_that_was_not_raised() {
     assert!(first_difference(&reference, &mutated).is_some());
 }
 
-/// And the whole apparatus, end to end: if the Ply lexer itself is wrong, the
-/// agreement tests go red rather than the harness quietly agreeing with itself.
+/// And the whole apparatus, end to end: if the Ply lexer itself is wrong, the agreement tests go
+/// red rather than the harness quietly agreeing with itself.
 #[test]
 fn a_broken_ply_lexer_makes_the_agreement_tests_fail() {
     let source = std::fs::read_to_string(spike_dir().join("lexer.ply")).expect("the lexer");
-    // `++` is `plusplus`; a lexer that forgot maximal munch would call it two
-    // `plus` tokens. One character, in one string literal, in `punct`.
+    // `++` is `plusplus`; a lexer that forgot maximal munch would call it two `plus` tokens.
     let broken = source.replacen("b\"plusplus\", b\"plus\"", "b\"plus\", b\"plus\"", 1);
     assert_ne!(broken, source, "the mutation did not apply to lexer.ply");
 

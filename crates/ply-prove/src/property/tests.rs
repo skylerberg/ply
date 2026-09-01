@@ -6,9 +6,8 @@ use ply_span::SourceId;
 use ply_syntax::ast::{Mode, Program};
 use ply_syntax::resolve::Resolved;
 
-/// A compiled fixture, so the generator is exercised against the type
-/// information the checker really produces rather than against a hand-built
-/// approximation of it.
+/// A compiled fixture, so the generator is exercised against the type information the checker
+/// really produces rather than against a hand-built approximation of it.
 pub(crate) struct Fixture {
     program: Program,
     resolved: Resolved,
@@ -62,8 +61,8 @@ fn draw(ty: &Type, world: &TypeWorld, cases: u32) -> Vec<Value> {
         .collect()
 }
 
-/// Answers from two closures, and records every tuple it was asked about so a
-/// test can assert on the *order* of the questions as well as the answers.
+/// Answers from two closures, and records every tuple it was asked about so a test can assert on
+/// the *order* of the questions as well as the answers.
 pub(crate) struct Fn2<G, B> {
     pub guard: G,
     pub body: B,
@@ -119,8 +118,6 @@ fn apply_str(f: (String) -> Bool, x: String) -> Bool = f(x)
 /// A type and what a value of it must look like.
 type Shaped = fn(&Value) -> bool;
 
-// ---------------------------------------------------------------- generation
-
 #[test]
 fn every_ply_type_generates() {
     let fixture = Fixture::compile(ADTS);
@@ -156,8 +153,8 @@ fn every_ply_type_generates() {
             },
             |v| matches!(v, Value::Closure(_)),
         ),
-        // A type variable is monomorphised to `Int`, which is what
-        // `CaseReport::instantiations` reports.
+        // A type variable is monomorphised to `Int`, which is what `CaseReport::instantiations`
+        // reports.
         (Type::Var(TyVar(0)), |v| matches!(v, Value::Int(_))),
     ];
     for (ty, shaped) in cases {
@@ -203,9 +200,8 @@ fn an_adt_draws_every_constructor() {
     assert_eq!(seen.len(), 3, "every variant of `Color` should be drawn");
 }
 
-/// The disclosed unsoundness in ADR 0007 §5.1(a) is that the prover reasons over
-/// ℤ while `Int` is an `i64`. The sampled tier is the mitigation, and a
-/// mitigation that fires "with fixed probability" is one that misses.
+/// The disclosed unsoundness in ADR 0007 §5.1(a) is that the prover reasons over ℤ while `Int` is
+/// an `i64`.
 #[test]
 fn the_integer_boundary_is_drawn_on_every_run() {
     let world = TypeWorld::default();
@@ -215,9 +211,9 @@ fn the_integer_boundary_is_drawn_on_every_run() {
     }
 }
 
-/// `Bytes` draws over the whole byte range and over the whole length range,
-/// unlike `String`'s alphabet: a generator that never produces `0x00` or `0xff`
-/// checks a law only over the cases that never break.
+/// `Bytes` draws over the whole byte range and over the whole length range, unlike `String`'s
+/// alphabet: a generator that never produces `0x00` or `0xff` checks a law only over the cases that
+/// never break.
 #[test]
 fn bytes_generation_reaches_every_byte_and_the_empty_value() {
     let world = TypeWorld::default();
@@ -317,8 +313,6 @@ fn the_types_a_binder_may_not_have_are_named() {
     );
 }
 
-// ------------------------------------------------------------ reproducibility
-
 #[test]
 fn a_root_replays_exactly() {
     let fixture = Fixture::compile(ADTS);
@@ -343,9 +337,8 @@ fn another_root_draws_another_run() {
     assert_ne!(rendered(&a), rendered(&b));
 }
 
-/// Without the obligation in the stream's key, adding a law would shift every
-/// later law's cases, so an unrelated edit would change which counterexample a
-/// failing obligation reports.
+/// Without the obligation in the stream's key, adding a law would shift every later law's cases, so
+/// an unrelated edit would change which counterexample a failing obligation reports.
 #[test]
 fn the_obligation_keys_the_stream() {
     let world = TypeWorld::default();
@@ -379,11 +372,9 @@ pub(crate) fn rendered(cases: &[Vec<Value>]) -> Vec<Vec<String>> {
         .collect()
 }
 
-// ------------------------------------------------------------ function values
-
-/// Every member of the family has to be a function the evaluator can actually
-/// apply — twice, to the same answer — or a counterexample naming one is a
-/// counterexample naming something that does not exist.
+/// Every member of the family has to be a function the evaluator can actually apply — twice, to the
+/// same answer — or a counterexample naming one is a counterexample naming something that does not
+/// exist.
 #[test]
 fn a_generated_function_is_total_pure_and_deterministic() {
     let fixture = Fixture::compile(ADTS);
@@ -448,8 +439,6 @@ fn a_generated_function_prints_what_it_does() {
     }
 }
 
-// ---------------------------------------------------------------- the run
-
 fn plan(cases: u32) -> ProvePlan {
     ProvePlan {
         cases,
@@ -476,9 +465,8 @@ where
     )
 }
 
-/// The case the milestone exists to not get wrong: a guard nothing satisfies
-/// makes `guard ⟹ body` valid, and a system that called that a pass would
-/// reward a typo with a green tick.
+/// The case the milestone exists to not get wrong: a guard nothing satisfies makes `guard ⟹ body`
+/// valid, and a system that called that a pass would reward a typo with a green tick.
 #[test]
 fn a_guard_that_admits_nothing_is_reported_rather_than_passed() {
     let world = TypeWorld::default();
@@ -493,8 +481,7 @@ fn a_guard_that_admits_nothing_is_reported_rather_than_passed() {
     }
 }
 
-/// `example` is not a thing a user asks for. It is what the system reports when
-/// the guard was tight enough that a coverage claim would be a lie.
+/// `example` is not a thing a user asks for.
 #[test]
 fn a_tight_guard_reports_example_and_a_loose_one_property() {
     let world = TypeWorld::default();
@@ -526,8 +513,8 @@ fn a_tight_guard_reports_example_and_a_loose_one_property() {
     assert_eq!(loose.tier(), Some(Tier::Property));
 }
 
-/// A body evaluated at a tuple the guard rejects is a claim about a value the
-/// obligation never spoke about.
+/// A body evaluated at a tuple the guard rejects is a claim about a value the obligation never
+/// spoke about.
 #[test]
 fn the_guard_decides_before_the_body_is_ever_evaluated() {
     let world = TypeWorld::default();
@@ -592,8 +579,8 @@ fn a_binder_the_generator_cannot_inhabit_is_a_gap_rather_than_a_verdict() {
     }
 }
 
-/// A spec that raises is not false, so it is neither a refutation nor a hold —
-/// and the raising input is still worth minimizing.
+/// A spec that raises is not false, so it is neither a refutation nor a hold — and the raising
+/// input is still worth minimizing.
 #[test]
 fn a_raising_case_is_a_gap_with_a_shrunk_input() {
     let world = TypeWorld::default();
@@ -629,8 +616,8 @@ fn a_raising_case_is_a_gap_with_a_shrunk_input() {
     }
 }
 
-/// The property tier cannot generate a value of an unknown type, so `property`
-/// on a polymorphic law is a claim about `Int` and has to say so.
+/// The property tier cannot generate a value of an unknown type, so `property` on a polymorphic law
+/// is a claim about `Int` and has to say so.
 #[test]
 fn a_polymorphic_binder_is_monomorphised_and_recorded() {
     let world = TypeWorld::default();

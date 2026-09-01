@@ -25,23 +25,20 @@ pub(crate) type OpTable = FxHashMap<(Symbol, Symbol), (bool, Mode)>;
 
 struct HandlerFrame {
     clauses: Arc<Vec<HandleClause>>,
-    /// Each clause's effect under its program-wide name, resolved where the
-    /// `handle` was written: a perform reached from another module spells the
-    /// same effect differently, and the two only meet once both are qualified.
+    /// Each clause's effect under its program-wide name, resolved where the `handle` was written: a
+    /// perform reached from another module spells the same effect differently, and the two only
+    /// meet once both are qualified.
     effects: Arc<Vec<Symbol>>,
     env: Env,
-    /// The module the clause bodies were written in, which is not the one the
-    /// perform that triggers them is reached from.
+    /// The module the clause bodies were written in, which is not the one the perform that triggers
+    /// them is reached from.
     module: usize,
-    /// The calls pending when this handler was installed. A clause body runs on
-    /// the stack *below* its own handler, so those are the calls pending while
-    /// it runs — which is what the machine's `capture` does to its own stack,
-    /// and the two engines have to charge one program the same way.
+    /// The calls pending when this handler was installed.
     calls: usize,
 }
 
-/// Ordered exactly as [`CheckOutput::tests`] is — load order, then source order
-/// — because the index into the two is the same index.
+/// Ordered exactly as [`CheckOutput::tests`] is — load order, then source order — because the index
+/// into the two is the same index.
 struct TestSlot<'a> {
     module: usize,
     def: &'a TestDef,
@@ -53,38 +50,27 @@ pub struct Interp<'a> {
     check: Option<&'a CheckOutput>,
     /// Keyed by program-wide name, so two modules may declare one simple name.
     globals: FxHashMap<Symbol, Value>,
-    /// What a nullary pure definition evaluated to. The machine keeps the same
-    /// memo under the same rule, because a constant one engine remembers and
-    /// the other recomputes is two engines with two recursion budgets.
+    /// What a nullary pure definition evaluated to.
     memo: Memo,
     ctors: FxHashMap<Symbol, usize>,
     ops: OpTable,
     tests: Vec<TestSlot<'a>>,
     handlers: Vec<HandlerFrame>,
-    /// Where every cell this engine allocates lives, and the fixture every
-    /// entry point resets to — so one seeded fixture serves every test in a run
-    /// without any of them observing another's writes. ADR 0017 §1 and §5.
+    /// Where every cell this engine allocates lives, and the fixture every entry point resets to —
+    /// so one seeded fixture serves every test in a run without any of them observing another's
+    /// writes.
     regions: TaskRegions,
-    /// Which of ADR 0017 §3's two kinds each region in this program is. Lazy,
-    /// and scoped to the program rather than to this evaluator, for the reasons
-    /// the machine's copy is — [`crate::Machine::share_region_kinds`].
+    /// Which of ADR 0017 §3's two kinds each region in this program is.
     region_kinds: crate::region_kind::Kinds,
     /// What this entry point performed, which is not what its row said it could.
     trace: Trace,
-    /// The module a bare name is resolved in: the one that wrote the expression
-    /// being evaluated, not the one that called it.
+    /// The module a bare name is resolved in: the one that wrote the expression being evaluated,
+    /// not the one that called it.
     module: usize,
-    /// The pending calls, innermost last, by name. Its length is the depth the
-    /// budget bounds, so the two are one field rather than two that can drift.
+    /// The pending calls, innermost last, by name.
     calls: Vec<Option<Symbol>>,
     max_calls: usize,
     /// What the run's host boundary is, held only in order to *refuse* at it.
-    ///
-    /// The tree-walker serves no host operation: a `Pending` answer needs a
-    /// reactor it has no way to poll. It carries the binding so that reaching
-    /// the boundary is the same diagnostic on both engines — `E0424` when
-    /// nothing is bound, and a machine-only refusal when something is — rather
-    /// than an `E0303` that tells the reader to file a bug.
     binding: Option<Arc<HostBinding>>,
 }
 
@@ -93,16 +79,16 @@ impl<'a> Interp<'a> {
         Self::build(program, resolved, Some(check))
     }
 
-    /// Everything the evaluator needs is derivable from the resolved AST alone,
-    /// so evaluation can be exercised without a type-check pass.
+    /// Everything the evaluator needs is derivable from the resolved AST alone, so evaluation can
+    /// be exercised without a type-check pass.
     pub fn for_program(program: &'a Program, resolved: &'a Resolved) -> Self {
         Self::build(program, resolved, None)
     }
 
     fn build(program: &'a Program, resolved: &'a Resolved, check: Option<&'a CheckOutput>) -> Self {
         let mut globals = FxHashMap::default();
-        // The prelude's first, so a module declaring its own `Some` overwrites
-        // it — the resolution order every other prelude name follows.
+        // The prelude's first, so a module declaring its own `Some` overwrites it — the resolution
+        // order every other prelude name follows.
         let mut ctors: FxHashMap<Symbol, usize> =
             ply_core::prelude::ctor_arities().into_iter().collect();
         let mut ops = FxHashMap::default();
@@ -141,11 +127,8 @@ impl<'a> Interp<'a> {
                         }
                     }
                     Item::Test(t) => tests.push(TestSlot { module: m, def: t }),
-                    // A law is not a global and not a test: `ply-prove`
-                    // evaluates its body through `eval_expr_for_test`, with
-                    // its binders bound to generated values. A `derive` is not
-                    // one either — expansion has already appended the globals
-                    // it stands for.
+                    // A law is not a global and not a test: `ply-prove` evaluates its body through
+                    // `eval_expr_for_test`, with its binders bound to generated values.
                     Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
                 }
             }
@@ -171,7 +154,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The run's host boundary. See [`Interp::binding`].
+    /// The run's host boundary.
     pub fn set_host_binding(&mut self, binding: Arc<HostBinding>) {
         self.binding = Some(binding);
     }
@@ -182,13 +165,6 @@ impl<'a> Interp<'a> {
     }
 
     /// The same bound, moved on an evaluator that already exists.
-    ///
-    /// [`Interp::call`] resets the call stack, so this is only ever read from an
-    /// empty one and a bound lowered under a live stack is not a case this can
-    /// reach. `crate::backend::Reference` is what needs it: a backend is handed
-    /// the machine's *remaining* nested calls per call, and re-building an
-    /// evaluator per entry to carry that number would make the seam's own
-    /// budget the most expensive thing about it.
     pub fn set_max_calls(&mut self, max_calls: usize) {
         self.max_calls = max_calls.max(1);
     }
@@ -214,8 +190,7 @@ impl<'a> Interp<'a> {
         &self.regions
     }
 
-    /// Every subsequent entry point resets to this stack's fixture rather than
-    /// to an empty one. A fixture built once is handed to every test this way.
+    /// Every subsequent entry point resets to this stack's fixture rather than to an empty one.
     pub fn set_regions(&mut self, regions: TaskRegions) {
         self.regions = regions;
     }
@@ -254,12 +229,6 @@ impl<'a> Interp<'a> {
     }
 
     /// Runs the `ordinal`-th test declared by `module`.
-    ///
-    /// A position in this program is not a position in a [`CheckOutput`]: the
-    /// incremental front end reports every module's tests while parsing only
-    /// some of them, so the two lists agree on order but not on length. Naming
-    /// the module is what survives that. Two tests in one module may share a
-    /// label, so the ordinal — not the label — is the second half of the key.
     pub fn eval_test_in(&mut self, module: &Symbol, ordinal: usize) -> Result<(), Diagnostic> {
         let program = self.program;
         let found = self
@@ -290,18 +259,15 @@ impl<'a> Interp<'a> {
         outcome
     }
 
-    /// Closes every region the run left open. A diagnostic propagating out of a
-    /// region body unwinds past this evaluator's own close on the machine, so
-    /// both engines end an entry point with the same arena — which is what
-    /// `--engine both` compares.
+    /// Closes every region the run left open.
     fn end_entry_point(&mut self) {
         self.regions.close_program_regions();
     }
 
     /// `name` is the program-wide name — `app.main`, not `main`.
     pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
-        // Both engines, at the same point and with the same message, or
-        // `--engine both` reports the refusal as a divergence. See `escape`.
+        // Both engines, at the same point and with the same message, or `--engine both` reports the
+        // refusal as a divergence.
         let boundary = crate::escape::Boundary::EntryPoint { name };
         for arg in &args {
             crate::escape::check(&boundary, arg, span)?;
@@ -309,37 +275,8 @@ impl<'a> Interp<'a> {
         self.call_within(name, args, span)
     }
 
-    /// The same call **without** the entry-point boundary check, for a caller
-    /// that is not an entry point.
-    ///
-    /// The one such caller is `crate::backend::Reference`, which is handed a
-    /// call the machine is in the middle of and answers it on this evaluator.
-    /// `escape::check` asks "does this argument carry a [`Value::Cell`],
-    /// [`Value::Task`] or [`Value::Continuation`]", and
-    /// `compiled::admit` has already answered it: every argument that reaches a
-    /// backend is either childless — an `i64`, a `bool`, an `Arc<[u8]>` — or of
-    /// a declared type `compiled::CarriedTypes` cleared of reaching any of those
-    /// three at any depth. Asking again is not a second opinion; it is the same
-    /// question asked of the value instead of the type, which is precisely the
-    /// **O(value) walk per call** ADR 0030 and `crate::census` measured as
-    /// unaffordable on a real front end and which the type gate exists to avoid.
-    ///
-    /// Measured rather than reasoned, on the ADR 0030 workload
-    /// (`spikes/ply-parser` parsing `examples/`, 13 files, 333,851 bytes,
-    /// `ply test <dir> --no-cache -j 1 --filter probe.parse --backend
-    /// reference`): with the widened argument gate and this check on every
-    /// entry, **14.94 s**; without it, the figure recorded in
-    /// `crate::backend::Reference`'s header. Nothing else differs between the
-    /// two runs and both report the same entry count.
-    ///
-    /// It is **not** a check being dropped for speed. The boundary this refuses
-    /// at is `Boundary::EntryPoint`, and a compiled entry is not one: the
-    /// interpreter's own inner calls — `apply` on a closure inside a body — do
-    /// not run it either, and routing a backend's entry through the entry-point
-    /// spelling also reset a `Trace` and closed program regions that belonged to
-    /// the surrounding run. What keeps a handle out of a backend is
-    /// `compiled::admit`, and `a_cell_touching_caller_agrees_slot_for_slot_with_an_entered_callee`
-    /// is where that is asserted end to end.
+    /// The same call **without** the entry-point boundary check, for a caller that is not an entry
+    /// point.
     pub(crate) fn call_within(
         &mut self,
         name: &str,
@@ -358,8 +295,8 @@ impl<'a> Interp<'a> {
         outcome
     }
 
-    /// A previous failure can leave frames installed; nothing survives from one
-    /// entry point to the next.
+    /// A previous failure can leave frames installed; nothing survives from one entry point to the
+    /// next.
     fn reset(&mut self) {
         self.handlers.clear();
         self.calls.clear();
@@ -369,10 +306,6 @@ impl<'a> Interp<'a> {
     }
 
     /// Resolution already decided what this denotes; nothing here re-derives it.
-    ///
-    /// A bare name goes straight to the module's scope rather than through
-    /// [`Resolved::lookup`], because a miss there is the ordinary prelude case
-    /// and building a diagnostic for every `len(..)` would not be free.
     fn global(&self, ns: Namespace, q: &QName) -> Option<Symbol> {
         if q.is_bare() {
             return self
@@ -388,10 +321,8 @@ impl<'a> Interp<'a> {
             .map(|b| b.qualified.clone())
     }
 
-    /// The program-wide name a constructor reference denotes, falling back to
-    /// the prelude's — which no module declares, so nothing qualifies it. A
-    /// module that declares its own `Some` shadows the prelude's, exactly as one
-    /// declaring its own `len` does.
+    /// The program-wide name a constructor reference denotes, falling back to the prelude's — which
+    /// no module declares, so nothing qualifies it.
     fn ctor_name(&self, q: &QName) -> Option<Symbol> {
         match self.global(Namespace::Value, q) {
             Some(name) => Some(name),
@@ -418,14 +349,8 @@ impl<'a> Interp<'a> {
         limit::err_recursion_limit(span, NESTED_CALLS, self.max_calls, &innermost)
     }
 
-    /// Every arm that needs more than a handful of locals is out of line: an
-    /// unoptimized frame is sized for the union of all arms, and this function
-    /// sits on the recursion path.
-    /// Grows once per node, not once per Ply call: the call bound does not reach
-    /// this recursion at all, because an expression can nest arbitrarily deep
-    /// while calling nothing. The machine spends a heap frame where this spends
-    /// a native one, so this is what keeps the two engines agreeing on a program
-    /// the front end already accepted.
+    /// Every arm that needs more than a handful of locals is out of line: an unoptimized frame is
+    /// sized for the union of all arms, and this function sits on the recursion path.
     fn eval(&mut self, e: &Expr, env: &Env) -> Result<Value, Diagnostic> {
         grow(|| self.eval_node(e, env))
     }
@@ -453,17 +378,15 @@ impl<'a> Interp<'a> {
             ExprKind::Match { scrutinee, arms } => self.eval_match(scrutinee, arms, env),
             ExprKind::Block { stmts, tail } => self.eval_block(stmts, tail.as_deref(), env),
             ExprKind::Record { fields } => self.eval_record(fields, env),
-            // Both engines evaluate a record update through the ordinary record
-            // path, because expansion makes it the same tree. There is no second
-            // implementation here to disagree with the machine's.
+            // Both engines evaluate a record update through the ordinary record path, because
+            // expansion makes it the same tree.
             ExprKind::RecordUpdate { .. } => unreachable!(
                 "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_record_update_survives_parse_module_anywhere_in_the_tree`"
             ),
-            // Unreachable for the same reason: the tree-walker and the machine
-            // both evaluate the `match` `?` became, so there is no second
-            // implementation of an early exit here to disagree with the other
-            // engine's.
+            // Unreachable for the same reason: the tree-walker and the machine both evaluate the
+            // `match` `?` became, so there is no second implementation of an early exit here to
+            // disagree with the other engine's.
             ExprKind::Try { .. } => unreachable!(
                 "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
                  `no_try_survives_parse_module_anywhere_in_the_tree`"
@@ -485,9 +408,8 @@ impl<'a> Interp<'a> {
                 init, binder, body, ..
             } => self.eval_with_cell(init, binder, body, env, e.span),
             ExprKind::WithRegion { body, .. } => self.in_region(e.span, |me| me.eval(body, env)),
-            // Refused before the body runs, for the reason a general clause is:
-            // running one unnamed interleaving would be a plausible wrong answer
-            // and the result cache would keep it.
+            // Refused before the body runs, for the reason a general clause is: running one unnamed
+            // interleaving would be a plausible wrong answer and the result cache would keep it.
             ExprKind::Simulate { .. } => Err(crate::differential::machine_only_region(e.span)),
         }
     }
@@ -501,8 +423,8 @@ impl<'a> Interp<'a> {
         span: Span,
     ) -> Result<Value, Diagnostic> {
         let v = self.eval(operand, env)?;
-        // One implementation for both engines, so `--engine both` cannot report
-        // a divergence that is the two of them disagreeing about a `-0.0`.
+        // One implementation for both engines, so `--engine both` cannot report a divergence that
+        // is the two of them disagreeing about a `-0.0`.
         crate::machine::apply_unary(op, &v, operand.span, span)
     }
 
@@ -632,9 +554,7 @@ impl<'a> Interp<'a> {
         )
     }
 
-    /// An effect no module declares keeps the name as written. Inference has
-    /// already rejected that, and falling back this way keeps a perform and the
-    /// clause meant to handle it agreeing rather than mysteriously not.
+    /// An effect no module declares keeps the name as written.
     fn effect_name(&self, effect: &QName) -> Symbol {
         self.global(Namespace::Effect, effect)
             .unwrap_or_else(|| effect.symbol().clone())
@@ -648,9 +568,9 @@ impl<'a> Interp<'a> {
         return_clause: Option<&ReturnClause>,
         env: &Env,
     ) -> Result<Value, Diagnostic> {
-        // Refused before the body runs, not when the clause is reached: a
-        // program that ran halfway and then failed has already written to the
-        // world, and the refusal is about what this engine can express at all.
+        // Refused before the body runs, not when the clause is reached: a program that ran halfway
+        // and then failed has already written to the world, and the refusal is about what this
+        // engine can express at all.
         if let Some(c) = clauses.iter().find(|c| c.resume.is_some()) {
             return Err(crate::differential::machine_only_clause(
                 c.span,
@@ -683,10 +603,8 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// The kind of the region opened at `span`, and `None` when that span opens
-    /// no region of its own. The machine answers this from the same analysis
-    /// over the same program, which is what keeps `--engine both` from seeing
-    /// two different region structures.
+    /// The kind of the region opened at `span`, and `None` when that span opens no region of its
+    /// own.
     fn region_kind(&self, span: Span) -> Option<RegionKind> {
         self.region_kinds().at(span).map(|region| region.kind)
     }
@@ -702,20 +620,15 @@ impl<'a> Interp<'a> {
         crate::region_kind::Kinds::clone(&self.region_kinds)
     }
 
-    /// See [`crate::Machine::share_region_kinds`], whose contract this shares:
-    /// `kinds` must be an answer about the same program.
+    /// See [`crate::Machine::share_region_kinds`], whose contract this shares: `kinds` must be an
+    /// answer about the same program.
     pub fn share_region_kinds(&mut self, kinds: crate::region_kind::Kinds) {
         self.region_kinds = kinds;
     }
 
-    /// Opens the region, runs `body` in it and closes it — on the error path
-    /// too, because a diagnostic propagating out of a region body is that
-    /// region's lexical end just as much as a value is.
-    ///
-    /// The close is where the two kinds differ, and it is the arena that decides
-    /// rather than the kind: a continuation captured across the region and still
-    /// live holds a pin, and the close retains its slots instead of handing them
-    /// back.
+    /// Opens the region, runs `body` in it and closes it — on the error path too, because a
+    /// diagnostic propagating out of a region body is that region's lexical end just as much as a
+    /// value is.
     fn in_region(
         &mut self,
         span: Span,
@@ -749,13 +662,12 @@ impl<'a> Interp<'a> {
         })
     }
 
-    /// Locals, then the module's own items and its selective imports, then the
-    /// prelude — the resolution order the whole language is specified in.
+    /// Locals, then the module's own items and its selective imports, then the prelude — the
+    /// resolution order the whole language is specified in.
     fn lookup(&self, q: &QName, env: &Env) -> Result<Value, Diagnostic> {
-        // The tree-walker never releases a binding — it runs no reference
-        // counting — so a released slot here would be one the machine put in a
-        // scope this engine then read, which cannot happen and is reported
-        // rather than silently resolved to something else.
+        // The tree-walker never releases a binding — it runs no reference counting — so a released
+        // slot here would be one the machine put in a scope this engine then read, which cannot
+        // happen and is reported rather than silently resolved to something else.
         if q.is_bare()
             && let Some(slot) = env.lookup(q.symbol())
         {
@@ -824,8 +736,8 @@ impl<'a> Interp<'a> {
                     scope = scope.bind(p.clone(), v);
                 }
                 let body = body.clone();
-                // The body's bare names mean what they meant where it was
-                // written, which is not where it is being called from.
+                // The body's bare names mean what they meant where it was written, which is not
+                // where it is being called from.
                 let caller = std::mem::replace(&mut self.module, *module);
                 let entered = self.enter(closure.name.as_ref(), span);
                 let result = match entered {
@@ -842,8 +754,8 @@ impl<'a> Interp<'a> {
                 }
                 result
             }
-            // Only a caller mixing the two engines' values reaches this, and
-            // answering with the wrong function would be worse than refusing.
+            // Only a caller mixing the two engines' values reaches this, and answering with the
+            // wrong function would be worse than refusing.
             ClosureKind::Code { .. } => Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!("{} was compiled for the machine engine", closure.describe()),
@@ -866,10 +778,7 @@ impl<'a> Interp<'a> {
         }
     }
 
-    /// Walks the handler stack inward-out. The clause body runs with the stack
-    /// truncated to what was installed *below* the matching handler, so a
-    /// handler that performs the operation it handles reaches the next handler
-    /// out instead of catching itself forever.
+    /// Walks the handler stack inward-out.
     fn perform(
         &mut self,
         effect: &Symbol,
@@ -910,10 +819,10 @@ impl<'a> Interp<'a> {
             let installed_at = self.handlers[i].calls;
             let outer = self.handlers.split_off(i);
             let performer = std::mem::replace(&mut self.module, handler_module);
-            // The clause runs below its own handler, so the calls the body made
-            // since the handler was installed are not pending while it runs —
-            // they are held aside exactly as the machine's `capture` holds them,
-            // and put back when the value returns to the perform site.
+            // The clause runs below its own handler, so the calls the body made since the handler
+            // was installed are not pending while it runs — they are held aside exactly as the
+            // machine's `capture` holds them, and put back when the value returns to the perform
+            // site.
             let pending = self.calls.split_off(installed_at);
             let result = grow(|| self.eval(&clause.body, &scope));
             self.calls.truncate(installed_at);
@@ -972,8 +881,8 @@ impl<'a> Interp<'a> {
         Ok(match &pat.kind {
             PatternKind::Wildcard => true,
             PatternKind::Var(id) => {
-                // A nullary constructor written bare is indistinguishable from a
-                // binder in the AST, so the constructor table decides.
+                // A nullary constructor written bare is indistinguishable from a binder in the AST,
+                // so the constructor table decides.
                 let declared = self.ctor_name(&QName::bare(id.clone()));
                 match declared.as_ref().and_then(|name| self.ctors.get(name)) {
                     Some(0) => {
@@ -1051,8 +960,7 @@ impl<'a> Interp<'a> {
     }
 }
 
-/// What the two engines share so that a mis-declared operation reads the same
-/// whichever one ran it.
+/// What the two engines share so that a mis-declared operation reads the same whichever one ran it.
 pub(crate) fn op_decl(ops: &OpTable, effect: &Symbol, op: &Symbol) -> OpDecl {
     match ops.get(&(effect.clone(), op.clone())) {
         Some(&(resource_param, mode)) => OpDecl::Declared {
@@ -1077,21 +985,12 @@ pub(crate) fn literal(lit: &Lit) -> Value {
 }
 
 /// A `Decimal` literal's value.
-///
-/// Total because both producers of a `Lit::Decimal` already enforce the type's
-/// range — the lexer refuses a mantissa past 96 bits or a scale past 28, and the
-/// body decoder refuses the same bytes — so the fallback is a shape no stream
-/// this evaluator is handed can carry.
 pub(crate) fn decimal_lit(mantissa: i128, scale: u32) -> Decimal {
     Decimal::try_from_i128_with_scale(mantissa, scale).unwrap_or(Decimal::ZERO)
 }
 
-/// A literal pattern against a value, shared by both engines so a `--engine
-/// both` divergence cannot be the two of them disagreeing about a NaN.
-///
-/// `Float` matches by IEEE `==`, so a `NaN` pattern matches nothing at all —
-/// including a NaN scrutinee. A pattern that answered otherwise would be a
-/// second equality on the type, and nobody wrote that one down.
+/// A literal pattern against a value, shared by both engines so a `--engine both` divergence cannot
+/// be the two of them disagreeing about a NaN.
 pub(crate) fn lit_matches(lit: &Lit, value: &Value) -> bool {
     match (lit, value) {
         (Lit::Int(a), Value::Int(b)) => a == b,
@@ -1122,41 +1021,18 @@ fn eval_lambda(params: &[Param], body: &Expr, env: &Env, module: usize) -> Value
 }
 
 /// Constructor values kept per thread.
-///
-/// Bounded for [`crate::pool`]'s reason and stated here so the cost is a number:
-/// a thread that has run a program with more constructors than this keeps the
-/// first [`CTOR_CACHE_KEEP`] it met and builds the rest per mention, which is
-/// what it did before this cache existed. Past the bound the cost degrades to
-/// the old one rather than to a cliff, which is why nothing is evicted.
 const CTOR_CACHE_KEEP: usize = 4096;
 
 thread_local! {
-    /// Keyed by the constructor's program-wide name, holding the arity the
-    /// value was built at: two programs run on one thread can spell one name
-    /// with two arities, and the second must not read the first's value. See
-    /// [`ctor_value`].
+    /// Keyed by the constructor's program-wide name, holding the arity the value was built at: two
+    /// programs run on one thread can spell one name with two arities, and the second must not read
+    /// the first's value.
     static CTOR_VALUES: RefCell<FxHashMap<Symbol, (usize, Value)>> =
         RefCell::new(FxHashMap::default());
 }
 
-/// The value a mention of a constructor evaluates to: one per constructor per
-/// thread, built on first mention.
-///
-/// A mention is a compile-time constant — the value is a function of the name
-/// and the arity and of nothing else — and rebuilding it per mention cost 21.0
-/// nullary `Value::Ctor`s and 24.0 `Arc<Closure>`s per `/health` request,
-/// measured by `cargo test -p ply-corpus --release --test r4_value_construction
-/// -- --nocapture`. [`Value::builtin`] has shared a builtin's closure since W6
-/// for the same reason and its note carries the argument that sharing one is
-/// invisible: a `Closure` is immutable and [`Value::cmp`] answers `Equal` for
-/// any two of them, so there is no identity to observe. The nullary case adds
-/// one clause to that argument — a shared `Ctor` is immutable because its
-/// `args` are empty, so it holds no [`Value::Cell`] past the region that would
-/// reclaim one, and it can never be a [`Value::Secret`], which is built by no
-/// path that reaches here.
-///
-/// [`Value::builtin`]: crate::value::Value::builtin
-/// [`Value::cmp`]: crate::value::Value
+/// The value a mention of a constructor evaluates to: one per constructor per thread, built on
+/// first mention.
 pub(crate) fn ctor_value(name: &Symbol, arity: usize) -> Value {
     let fresh = || {
         if arity == 0 {
@@ -1171,10 +1047,8 @@ pub(crate) fn ctor_value(name: &Symbol, arity: usize) -> Value {
             }))
         }
     };
-    // `try_with`, because a `Value` dropped during thread-local teardown can
-    // reach here after the cache is gone, and building a fresh one is the right
-    // answer there rather than an abort. [`Value::builtin`] takes it for the
-    // same reason.
+    // `try_with`, because a `Value` dropped during thread-local teardown can reach here after the
+    // cache is gone, and building a fresh one is the right answer there rather than an abort.
     CTOR_VALUES
         .try_with(|cache| {
             let mut cache = cache.borrow_mut();
@@ -1197,8 +1071,8 @@ pub(crate) fn ctor_value(name: &Symbol, arity: usize) -> Value {
         .unwrap_or_else(|_| fresh())
 }
 
-/// A clause without a resource label handles every resource of its operation;
-/// an operation declared without `[r]` has exactly one anyway.
+/// A clause without a resource label handles every resource of its operation; an operation declared
+/// without `[r]` has exactly one anyway.
 fn clause_matches(
     c: &HandleClause,
     clause_effect: &Symbol,
@@ -1232,10 +1106,8 @@ pub(crate) fn strict_binary(
             let b = r.as_str(rspan, "`++`")?;
             Ok(Value::str(format!("{a}{b}")))
         }
-        // `Float` answers by IEEE, where `NaN < x` and `NaN >= x` are both
-        // false — so a comparison is not the negation of its converse. That is
-        // what the type says, and smoothing it over here would make the operator
-        // disagree with `==` on the same two values.
+        // `Float` answers by IEEE, where `NaN < x` and `NaN >= x` are both false — so a comparison
+        // is not the negation of its converse.
         BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
             if let (Value::Float(a), Value::Float(b)) = (l, r) {
                 return Ok(Value::Bool(match op {
@@ -1300,11 +1172,7 @@ pub(crate) fn strict_binary(
     }
 }
 
-/// IEEE-754, unmodified. There is no overflow error and no zero-divisor error:
-/// `1.0 / 0.0` is `Infinity` and `0.0 / 0.0` is `NaN`, and those are values the
-/// standard defines rather than failures. Refusing them would make `Float` a
-/// worse `Decimal` instead of a different type — and the cost is stated in the
-/// type, which is why nothing about a `Float` may be `proved`.
+/// IEEE-754, unmodified.
 fn float_arithmetic(op: BinOp, a: f64, b: f64, span: Span) -> Result<Value, Diagnostic> {
     Ok(Value::Float(match op {
         BinOp::Add => a + b,
@@ -1322,13 +1190,7 @@ fn float_arithmetic(op: BinOp, a: f64, b: f64, span: Span) -> Result<Value, Diag
     }))
 }
 
-/// Exact, or a diagnostic. Never a silent wrap and never a silent rounding: a
-/// total that quietly lost a cent is the failure this type exists to prevent.
-///
-/// `/` never arrives — inference refuses it with `E0209`, because the exact
-/// quotient of two decimals is not in general a decimal and an operator would
-/// have to round. `%` does, and is exact: the *remainder* of a decimal division
-/// is a decimal even when the quotient is not.
+/// Exact, or a diagnostic.
 fn decimal_arithmetic(
     op: BinOp,
     a: Decimal,
@@ -1339,9 +1201,7 @@ fn decimal_arithmetic(
     let (result, what) = match op {
         BinOp::Add => (a.checked_add(b), "addition"),
         BinOp::Sub => (a.checked_sub(b), "subtraction"),
-        // Exact while the result's scale fits, and half-to-even at scale 28
-        // otherwise. `checked_mul` is what applies that rule; a mantissa that
-        // leaves 96 bits is `None` and is reported rather than rounded.
+        // Exact while the result's scale fits, and half-to-even at scale 28 otherwise.
         BinOp::Mul => (a.checked_mul(b), "multiplication"),
         BinOp::Rem => {
             if b.is_zero() {
@@ -1492,8 +1352,8 @@ fn plural(n: usize) -> &'static str {
 mod tests {
     use super::*;
 
-    /// A name no other test in this module uses, because the cache is
-    /// thread-local and a test binary may run two tests on one thread.
+    /// A name no other test in this module uses, because the cache is thread-local and a test
+    /// binary may run two tests on one thread.
     fn name(s: &str) -> Symbol {
         Symbol::new(format!("interp::tests::{s}"))
     }
@@ -1512,8 +1372,8 @@ mod tests {
         }
     }
 
-    /// "Built once" as identity rather than as an allocation count: an equal
-    /// value would mean it was rebuilt.
+    /// "Built once" as identity rather than as an allocation count: an equal value would mean it
+    /// was rebuilt.
     #[test]
     fn a_nullary_constructors_value_is_built_once_per_thread() {
         let n = name("Red");
@@ -1538,9 +1398,9 @@ mod tests {
         assert_eq!(first.arity(), 1);
     }
 
-    /// The hazard a cache keyed by name has and a fresh build does not: two
-    /// programs run on one thread can spell one constructor with two arities,
-    /// and the second must not be handed the first's value.
+    /// The hazard a cache keyed by name has and a fresh build does not: two programs run on one
+    /// thread can spell one constructor with two arities, and the second must not be handed the
+    /// first's value.
     #[test]
     fn a_name_met_at_another_arity_is_not_answered_from_the_cache() {
         let n = name("Same");
@@ -1563,9 +1423,9 @@ mod tests {
             values_equal(&shared, &fresh, Span::DUMMY).expect("two `Ctor`s compare"),
             "the shared value is not the value a mention used to build"
         );
-        // A closure has no equality a program can ask for, so this is the
-        // statement [`Value::builtin`]'s note rests on instead: the ordering
-        // that decides a `Map`'s key order cannot separate two of them.
+        // A closure has no equality a program can ask for, so this is the statement
+        // [`Value::builtin`]'s note rests on instead: the ordering that decides a `Map`'s key order
+        // cannot separate two of them.
         let f = ctor_value(&name("Pair"), 2);
         let g = Value::Closure(Arc::new(Closure {
             name: Some(name("Pair")),
@@ -1577,12 +1437,7 @@ mod tests {
         assert_eq!(f.cmp(&g), std::cmp::Ordering::Equal);
     }
 
-    /// ADR 0019 §0.1 at this seam. A cached value has the program's lifetime, so
-    /// what it may hold is the whole question: a nullary constructor's `args`
-    /// are empty, so it can hold no [`Value::Cell`] past the region that would
-    /// reclaim one and no [`Value::Secret`] past the call that made it — and
-    /// `ctor_value` is reached only from a name resolution, which has no
-    /// argument to put in one.
+    /// ADR 0019 §0.1 at this seam.
     #[test]
     fn a_cached_constructor_value_holds_nothing() {
         let held = ctor_value(&name("Empty"), 0);
@@ -1601,34 +1456,13 @@ mod tests {
         }
     }
 
-    /// What the cache trades: a `malloc`/`free` pair for a hash of the name and
-    /// a refcount bump. Unmeasured until this ran, and ADR 0019's
-    /// `max_time_regression` is what it feeds.
-    ///
-    /// Both arms are timed in one window inside one process, alternating, and
-    /// the fastest of each is reported — `benches/README.md` §"Every ratio is
-    /// taken inside one window" is the reason, and on a machine whose load
-    /// moves between 3 and 47 it is the only way this resolves at all. The
-    /// second arm is `ctor_value`'s body from before ADR 0019 §2, spelled out
-    /// rather than called, because that function no longer exists.
-    ///
-    /// **What it measures is a mention in a hot loop, where the allocator's
-    /// free list is warm and a `malloc`/`free` pair is at its cheapest.** The
-    /// nullary case comes out near even on that footing; the arity>=1 case does
-    /// not, because rebuilding a constructor closure allocates 80 bytes rather
-    /// than 40. Neither is the request path, where 45.0 fewer allocations is
-    /// what the change is for — `r4_value_construction` is that instrument.
-    ///
-    /// The bar here is deliberately loose: this is a wall clock on a shared
-    /// machine, it decides nothing, and a green suite should not depend on one.
-    /// It fails only if a lookup is *dearer than the allocation it replaced*
-    /// by more than half, which would mean the trade is the wrong way round.
+    /// What the cache trades: a `malloc`/`free` pair for a hash of the name and a refcount bump.
     #[test]
     #[ignore = "timing; run with `cargo test -p ply-eval --release --lib interp::tests::a_cached_mention_against_the_allocation_it_replaces -- --ignored --nocapture`"]
     fn a_cached_mention_against_the_allocation_it_replaces() {
         const MENTIONS: usize = 200_000;
-        // A real constructor's program-wide name rather than this module's
-        // prefixed one: the cache hashes the name, so its length is a cost.
+        // A real constructor's program-wide name rather than this module's prefixed one: the cache
+        // hashes the name, so its length is a cost.
         let n = Symbol::new("m.Red");
         let b = Symbol::new("m.Box");
         let per = |s: f64| 1e9 * s / MENTIONS as f64;
@@ -1689,9 +1523,8 @@ mod tests {
         }
     }
 
-    /// What the cache can hold, so its memory cost is a number rather than a
-    /// hope, and what a program past the bound gets — which is what it got
-    /// before the cache existed.
+    /// What the cache can hold, so its memory cost is a number rather than a hope, and what a
+    /// program past the bound gets — which is what it got before the cache existed.
     #[test]
     fn past_the_bound_a_mention_is_built_as_it_was_before() {
         let entry = size_of::<Symbol>() + size_of::<usize>() + size_of::<Value>();

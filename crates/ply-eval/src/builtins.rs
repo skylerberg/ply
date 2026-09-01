@@ -1,17 +1,4 @@
 //! The prelude, in one definition per builtin that both engines run.
-//!
-//! `map`, `filter` and `fold` call back into user code. On an explicit control
-//! stack they cannot recurse into the host: a continuation captured inside the
-//! function passed to `map` would be captured across a native frame that cannot
-//! be re-entered, and the second resumption would have nowhere to return to. So
-//! they are expressed as a step protocol — [`call`] starts one, [`advance`]
-//! resumes it — where every suspension point is a [`Frame`] the machine can
-//! push, capture and splice like any other.
-//!
-//! The tree-walker drives the same protocol with a host loop. That is
-//! deliberate: two engines that disagree about what `map` means is exactly the
-//! defect `crate::differential` exists to catch, and sharing the definition
-//! means the audit is comparing the machinery rather than two transcriptions.
 
 use crate::arena::{Arena, Slot};
 use crate::cont::Frame;
@@ -36,28 +23,11 @@ pub enum Builtin {
     Len,
     Push,
     /// The list index, and the whole of it.
-    ///
-    /// A negative index and one at or past the end are both `None`: absent,
-    /// never the nearest element and never counted from the end. `bytes_at`
-    /// raises instead, and the two conventions are deliberate rather than
-    /// accidental — see `docs/adr/0027-a-list-index.md`.
-    ///
-    /// A `list_at_or(xs, i, default)` was designed beside this and **refused on
-    /// its own registered gate**: it had to be 1.5× faster per peek and it
-    /// measured 1.26×, because a peek in this interpreter is ~1.7 µs of
-    /// dispatch and the `Some` it saves is a fifth of that. ADR 0027 §7.
     ListAt,
     Map,
     Filter,
     Fold,
     /// The one loop that can stop before its bound.
-    ///
-    /// `fold` visits every element, so a search or a parse expressed over one
-    /// runs to a conservative bound and no-ops after its real work is done.
-    /// This answers `Stop(r)` the step it is finished and costs the loop
-    /// nothing further, and it takes the bound as an argument so that a step
-    /// which never stops is a diagnostic naming a number the program wrote
-    /// rather than a hang.
     Iterate,
     Range,
     IntToString,
@@ -67,10 +37,6 @@ pub enum Builtin {
     BytesSlice,
     BytesConcat,
     /// One allocation over the whole list.
-    ///
-    /// A read loop that folds `bytes_concat` across N answers copies the
-    /// accumulated prefix N times, which is O(total²) — quadratic in the size of
-    /// a request an unauthenticated peer chooses. This copies each byte once.
     BytesConcatAll,
     BytesOfString,
     BytesIsUtf8,
@@ -116,23 +82,12 @@ pub enum Builtin {
     DecimalOfString,
     DecimalToString,
     Compare,
-    /// The same order as [`Builtin::Compare`], under a name a module may not
-    /// declare.
-    ///
-    /// `derive ord for T` generates a dictionary whose `compare` field is this
-    /// call. A bare `compare` would be an ordinary name, and ADR 0001 says a
-    /// module's own items shadow the prelude — so a module that happened to
-    /// declare `fn compare` would supply the order of every dictionary derived
-    /// in it, while `derivable(ord, T)` still called the type ordered. That is
-    /// the second order ADR 0012 §2 rests on not existing.
+    /// The same order as [`Builtin::Compare`], under a name a module may not declare.
     CompareValues,
     CellGet,
     CellSet,
     Panic,
-    /// The only introduction of a [`Value::Secret`]. There is no elimination:
-    /// the three below answer a `Bool` or a `Secret`, never the payload's type,
-    /// so no plaintext leaves except by a host operation declaring it may
-    /// receive one.
+    /// The only introduction of a [`Value::Secret`].
     SecretOfString,
     SecretVerify,
     SecretIsEmpty,
@@ -289,14 +244,7 @@ impl Builtin {
     /// Inclusive `(min, max)` argument counts.
     pub fn arity(self) -> (usize, usize) {
         match self {
-            // Every builtin is exactly applied. `assert` and `range` were the
-            // only two that were not: `assert` took an optional message the
-            // checker's signature had no room for, and `range` an optional
-            // lower bound, so both second arms were unreachable from source
-            // for as long as they existed. `assert`'s message is now a
-            // defaulted parameter (`ply_syntax::defaults`) and `range`'s lower
-            // bound is written out, which is shorter than the `range(hi: n)` a
-            // leading default would have forced.
+            // Every builtin is exactly applied.
             Builtin::MapNew => (0, 0),
             // Ply has no top-level constants, so the empty map is a call.
             Builtin::Len
@@ -367,8 +315,8 @@ impl Builtin {
         }
     }
 
-    /// Calls user code, so [`call`] may answer [`Step::Apply`] rather than a
-    /// value and the caller must be able to suspend.
+    /// Calls user code, so [`call`] may answer [`Step::Apply`] rather than a value and the caller
+    /// must be able to suspend.
     pub fn higher_order(self) -> bool {
         matches!(
             self,
@@ -458,9 +406,7 @@ impl Builtin {
 /// What a builtin needs before it can produce a value.
 pub enum Step {
     Done(Value),
-    /// Apply `callee` to `args`, then hand the answer to [`advance`] along with
-    /// `frame`. The machine pushes `frame` and enters the application; the
-    /// tree-walker keeps the application on the host stack.
+    /// Apply `callee` to `args`, then hand the answer to [`advance`] along with `frame`.
     Apply {
         callee: Value,
         args: Vec<Value>,
@@ -479,58 +425,8 @@ impl fmt::Debug for Step {
     }
 }
 
-/// `push`, with the reuse that is the point of reference counting — and with the
-/// defect that reuse arrives attached to.
-///
-/// A list the caller is the last owner of grows in place; one anybody else can
-/// still see is copied. The two answer the same value, which is what
-/// [`Arc::get_mut`] checks, and they do not cost the same: the copying branch is
-/// O(the list's current length), so a program that takes it once per element is
-/// quadratic in the list it is building.
-///
-/// **Which branch runs is decided by position, and not by anything at this call
-/// site.** A pending frame keeps a live clone of the caller's scope for as long
-/// as any sub-expression of its enclosing node is still to come — that is
-/// `rc::carry` (`crates/ply-eval/src/rc.rs`), which asks only *is another
-/// sub-expression left*, never *does it read this list*. So `push(xs, x)`
-/// written anywhere but the last sub-expression of its enclosing node finds
-/// `xs` at two owners and copies — and the trailing sub-expression that costs
-/// the copy may be a literal constant. The rule composes across call
-/// boundaries: a correctly written callee is made quadratic by its caller.
-/// `spikes/ply-lexer/GAPS.md` §1 states the rule and
-/// `docs/adr/0020-self-hosting-the-front-end.md` §5.2 measures the composition.
-///
-/// **Last position is necessary and not sufficient, and on the tree-walker it
-/// buys nothing at all.** Anything else that already holds the list keeps it at
-/// two owners however the call is placed: `{a: s.a, b: push(s.a, i)}` grows in
-/// the *last* field and is 0 of 200 updates in place, because the field before
-/// it put a second owner into the record being built — ADR 0024 §2 (branch
-/// `adr/ownership`) tables that shape and two more like it. And every case
-/// above is the machine's: the tree-walker runs no reference counting —
-/// `Interp::lookup` answers each `Var` with `v.clone()`, and `interp.rs` has no
-/// `rc::carry` call site and no `Env::take_unique` — so under
-/// `--engine treewalk` this function takes the copying branch whatever position
-/// the call is written in.
-///
-/// > **Corrected (mechanism sweep, 2026-08-28).** This read: *"The two answer
-/// > the same value — that is what [`Arc::get_mut`] checks and **why the choice
-/// > is invisible** — and they do not cost the same: appending in a fold copies
-/// > the whole accumulator per element without this, which is quadratic in the
-/// > list being built."* Every clause of that is true and the sentence they make
-/// > together is wrong, because it files the invisibility as the explanation of
-/// > a virtue. Invisibility here is a **defect of this function**: an author has
-/// > no way to see at the call which branch will run, and the difference between
-/// > them is asymptotic. This doc comment is the licence the quadratic JSON
-/// > serializer shipped under — `escape_runs` in `crates/ply-std/ply/json.ply`
-/// > nests its accumulating `push` as argument 0 of 2 of an outer `push`, so it
-/// > copies once per escape in a string a client chooses (measured on the
-/// > shipped module in ADR 0020 §4.1). The remedy the old wording invites — avoid `push` — does
-/// > not exist: `push` is the language's only list primitive and
-/// > `crates/ply-std/ply/trace.ply`'s own `cons` is written out of it. The
-/// > remedy that does exist is positional, and nothing in the type system, the
-/// > syntax or a diagnostic says so at the point an author needs it.
-///
-/// [`Arc::get_mut`]: std::sync::Arc::get_mut
+/// `push`, with the reuse that is the point of reference counting — and with the defect that reuse
+/// arrives attached to.
 fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     let x = args.pop().expect("arity checked");
     let mut xs = args.pop().expect("arity checked");
@@ -554,9 +450,8 @@ fn push(mut args: Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     Ok(Step::Done(Value::list(copied)))
 }
 
-/// `cells` is the run's live arena, threaded rather than snapshotted:
-/// `cell_get` must observe every write made before this call, including one a
-/// handler clause made before resuming.
+/// `cells` is the run's live arena, threaded rather than snapshotted: `cell_get` must observe every
+/// write made before this call, including one a handler clause made before resuming.
 pub fn call(
     b: Builtin,
     args: Vec<Value>,
@@ -788,9 +683,8 @@ pub fn call(
             Ok(Step::Done(Value::str(String::from_utf8_lossy(b))))
         }
 
-        // `len` is `(List<a>) -> Int`, so a String needs its own name until W2
-        // settles type-directed dispatch. Characters rather than bytes: it is
-        // the number that pairs with `string_slice`.
+        // `len` is `(List<a>) -> Int`, so a String needs its own name until W2 settles
+        // type-directed dispatch.
         Builtin::StringLen => Ok(Step::Done(Value::Int(
             args[0].as_str(span, "`string_len`")?.chars().count() as i64,
         ))),
@@ -827,11 +721,7 @@ pub fn call(
             )))
         }
 
-        // These three read `std`'s Unicode tables, so their answers move if
-        // those tables do. A toolchain upgrade is therefore a
-        // `RUNTIME_VERSION` bump — a cached `Pass` is a claim about what the
-        // evaluator did, and this is the first thing in the language whose
-        // behaviour is not settled by this repository alone.
+        // These three read `std`'s Unicode tables, so their answers move if those tables do.
         Builtin::StringTrim => Ok(Step::Done(Value::str(
             args[0].as_str(span, "`string_trim`")?.trim(),
         ))),
@@ -880,16 +770,10 @@ pub fn call(
             }
         }
 
-        // The order `Map` iterates in, so a derived `OrdDict` and a map's own
-        // key order are one order rather than two that can drift. `Float` is
-        // refused by `derivable(ord, ·)` at the signature, which is what keeps
-        // `total_cmp` out of reach of a program that could observe it
-        // disagreeing with `==`.
+        // The order `Map` iterates in, so a derived `OrdDict` and a map's own key order are one
+        // order rather than two that can drift.
         Builtin::Compare | Builtin::CompareValues => {
-            // The runtime backstop ADR 0015 §2.2 asks for. `derivable(ord, ·)`
-            // already refuses a `Secret` at both walks, so a well-typed program
-            // cannot arrive here; this is what a defect in either walk meets
-            // instead of an ordering oracle over a credential.
+            // The runtime backstop ADR 0015 §2.2 asks for.
             crate::value::secret_has_no_order(&args[0], b.name(), span)?;
             crate::value::secret_has_no_order(&args[1], b.name(), span)?;
             Ok(Step::Done(Value::ctor(
@@ -902,11 +786,8 @@ pub fn call(
             )))
         }
 
-        // Every one of these reaches a key through `map::key`, which is the one
-        // gate `Value::cmp` is behind. The check is not repeated here, because a
-        // backstop written once per call site is a backstop a seventh map
-        // builder forgets — which is exactly how `map_of_entries` and
-        // `map_merge` came to be an ordering oracle over a credential.
+        // Every one of these reaches a key through `map::key`, which is the one gate `Value::cmp`
+        // is behind.
         Builtin::MapNew => Ok(Step::Done(map::new())),
         Builtin::MapInsert => {
             let mut args = args;
@@ -948,9 +829,8 @@ pub fn call(
 
         Builtin::CellSet => {
             let slot = args[0].as_cell(span, "`cell_set`")?;
-            // Reported rather than refused: refusing would change what a legal
-            // program means, and ADR 0017 §4 accepts the leak and asks only that
-            // it be said out loud.
+            // Reported rather than refused: refusing would change what a legal program means, and
+            // ADR 0017 §4 accepts the leak and asks only that it be said out loud.
             crate::rc::cell_cycle(slot, &args[1], span);
             let mut args = args;
             if cells.set(slot, args.remove(1)) {
@@ -960,8 +840,8 @@ pub fn call(
             }
         }
 
-        // `/` on `Decimal` is `E0209` precisely so that a division names its
-        // scale and its rounding mode here instead.
+        // `/` on `Decimal` is `E0209` precisely so that a division names its scale and its rounding
+        // mode here instead.
         Builtin::DecimalDiv => {
             let a = args[0].as_decimal(span, "`decimal_div`")?;
             let b = args[1].as_decimal(span, "`decimal_div`")?;
@@ -1000,8 +880,8 @@ pub fn call(
             )))
         }
 
-        // Lossy and total, which is the honest pair: every `Decimal` has a
-        // nearest `f64`, and saying so beats an `Option` nobody can act on.
+        // Lossy and total, which is the honest pair: every `Decimal` has a nearest `f64`, and
+        // saying so beats an `Option` nobody can act on.
         Builtin::FloatOfDecimal => {
             let d = args[0].as_decimal(span, "`float_of_decimal`")?;
             Ok(Step::Done(Value::Float(float_of_decimal(d))))
@@ -1017,8 +897,8 @@ pub fn call(
             Ok(Step::Done(option(parse_decimal(s).map(Value::Decimal))))
         }
 
-        // Round-trips `decimal_of_string` exactly, scale included: `1.50m`
-        // renders `1.50`, because the trailing zero is what the value carries.
+        // Round-trips `decimal_of_string` exactly, scale included: `1.50m` renders `1.50`, because
+        // the trailing zero is what the value carries.
         Builtin::DecimalToString => {
             let d = args[0].as_decimal(span, "`decimal_to_string`")?;
             Ok(Step::Done(Value::str(d.to_string())))
@@ -1035,17 +915,15 @@ pub fn call(
             )
         }
 
-        // Does not consume its argument: Ply is a value language, so the
-        // plaintext is still in scope and can still be traced or returned.
-        // Containment starts here, and ADR 0015 §2.5 (2) says so out loud.
+        // Does not consume its argument: Ply is a value language, so the plaintext is still in
+        // scope and can still be traced or returned.
         Builtin::SecretOfString => {
             args[0].as_str(span, "`secret_of_string`")?;
             Ok(Step::Done(Value::secret(args[0].clone())))
         }
 
-        // One bit per call, constant time over the compared bytes, and not rate
-        // limited — a loop over candidates recovers the value, which is the
-        // program's to prevent (§2.5 (3)).
+        // One bit per call, constant time over the compared bytes, and not rate limited — a loop
+        // over candidates recovers the value, which is the program's to prevent (§2.5 (3)).
         Builtin::SecretVerify => {
             let Value::Secret(held) = &args[0] else {
                 return Err(type_error(span, "`secret_verify`", "Secret", &args[0]));
@@ -1058,8 +936,7 @@ pub fn call(
             ))))
         }
 
-        // Presence, never the value. An operator must be able to tell a missing
-        // credential from a wrong one, and that is metadata.
+        // Presence, never the value.
         Builtin::SecretIsEmpty => {
             let Value::Secret(held) = &args[0] else {
                 return Err(type_error(span, "`secret_is_empty`", "Secret", &args[0]));
@@ -1067,10 +944,9 @@ pub fn call(
             Ok(Step::Done(Value::Bool(match &**held {
                 Value::Str(s) => s.is_empty(),
                 Value::Bytes(b) => b.is_empty(),
-                // `secret_of_string` is the only introduction, so nothing else
-                // is constructible; a payload that is not a sequence has no
-                // emptiness, and answering `false` reports "a credential is
-                // present" rather than inventing one.
+                // `secret_of_string` is the only introduction, so nothing else is constructible; a
+                // payload that is not a sequence has no emptiness, and answering `false` reports "a
+                // credential is present" rather than inventing one.
                 _ => false,
             })))
         }
@@ -1078,17 +954,6 @@ pub fn call(
 }
 
 /// Where a list index becomes a position.
-///
-/// A negative index is **absent**, not counted from the end: `usize::try_from`
-/// refuses it before `get` is reached. Counting from the end reads well until an
-/// arithmetic slip turns an intended index negative, at which point the program
-/// gets an element rather than the `None` that would have named the mistake.
-///
-/// `i as usize` would answer the same thing for every input — `-1` becomes
-/// `2^64 - 1`, which `get` refuses on any list that fits in memory — and that
-/// mutant is recorded as equivalent in `crates/ply-eval/tests/suite/list_builtins.rs`
-/// rather than as a hole, because a test written to kill it would be a test of
-/// this line's spelling.
 fn at(xs: &[Value], i: i64) -> Option<&Value> {
     usize::try_from(i).ok().and_then(|i| xs.get(i))
 }
@@ -1102,10 +967,6 @@ fn option(v: Option<Value>) -> Value {
 }
 
 /// A `Rounding` argument as `rust_decimal`'s strategy.
-///
-/// The six are the prelude's constructors, and an argument that is not one of
-/// them is a runtime error rather than a default: silently choosing a rounding
-/// is exactly what refusing `/` was for.
 fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagnostic> {
     let name = match v {
         Value::Ctor { name, args } if args.is_empty() => name.as_str(),
@@ -1127,8 +988,8 @@ fn rounding(v: &Value, span: Span, what: &str) -> Result<RoundingStrategy, Diagn
     }
 }
 
-/// A scale argument, refused outside `0..=28` rather than clamped: a scale the
-/// caller asked for and did not get is a rounding they did not write down.
+/// A scale argument, refused outside `0..=28` rather than clamped: a scale the caller asked for and
+/// did not get is a rounding they did not write down.
 fn decimal_scale(v: &Value, span: Span, what: &str) -> Result<u32, Diagnostic> {
     let scale = int_arg(v, span, what)?;
     u32::try_from(scale)
@@ -1152,14 +1013,8 @@ fn decimal_overflow(span: Span, what: &str) -> Diagnostic {
     .note("`Decimal` is exact and bounded; it will not round to make room")
 }
 
-/// The **shortest decimal that round-trips the float**, and `None` for NaN, an
-/// infinity, and anything outside `Decimal`'s range.
-///
-/// Shortest is the only defensible choice: any other is an arbitrary number of
-/// digits of a binary approximation, and `0.1` would decode as
-/// `0.1000000000000000055511151231257827` — technically the value, and not what
-/// anybody wrote. Rust's own `f64` formatting already produces exactly that
-/// shortest form, so this is a format and a parse rather than an algorithm.
+/// The **shortest decimal that round-trips the float**, and `None` for NaN, an infinity, and
+/// anything outside `Decimal`'s range.
 fn decimal_of_float(f: f64) -> Option<Decimal> {
     if !f.is_finite() {
         return None;
@@ -1167,32 +1022,16 @@ fn decimal_of_float(f: f64) -> Option<Decimal> {
     parse_decimal(&format!("{f}"))
 }
 
-/// The **nearest** `f64` to a decimal, which is what makes
-/// `float_of_decimal(decimal_of_float(f)) == f` for every `f` that has a
-/// `Decimal` at all.
-///
-/// Through the decimal's own digits rather than through `Decimal::to_f64`,
-/// which divides a mantissa by a power of ten in binary and is therefore off by
-/// an ulp or two for a value with a long scale — enough that a `Float` field's
-/// derived JSON codec silently changed the value it round-tripped. Rust's
-/// `f64` parser is correctly rounded, and `Decimal::to_string` is exact, so the
-/// pair is.
+/// The **nearest** `f64` to a decimal, which is what makes `float_of_decimal(decimal_of_float(f))
+/// == f` for every `f` that has a `Decimal` at all.
 fn float_of_decimal(d: Decimal) -> f64 {
     d.to_string()
         .parse::<f64>()
         .unwrap_or_else(|_| d.to_f64().unwrap_or(f64::NAN))
 }
 
-/// The one decimal grammar, for `decimal_of_string` and for the shortest
-/// round-tripping form of a `Float` alike.
-///
-/// The two parsers are disjoint rather than layered: `from_str_exact` preserves
-/// the scale the text was written with, which is what makes `1.50` a different
-/// value from `1.5`, and it refuses an exponent; `from_scientific` requires one.
-/// Dispatching on `e` therefore never costs the trailing zero of a plain
-/// literal, and `1e3` — which JSON's grammar admits and which is well inside
-/// `Decimal`'s range — parses instead of being reported as out of range.
-/// Anything needing a scale past 28 or a mantissa past 96 bits is still `None`.
+/// The one decimal grammar, for `decimal_of_string` and for the shortest round-tripping form of a
+/// `Float` alike.
 fn parse_decimal(text: &str) -> Option<Decimal> {
     if text.contains(['e', 'E']) {
         Decimal::from_scientific(text).ok()
@@ -1201,12 +1040,8 @@ fn parse_decimal(text: &str) -> Option<Decimal> {
     }
 }
 
-/// Resumes a higher-order builtin: `answer` is what the user code the frame was
-/// waiting on returned.
-///
-/// The frame is consumed by value but it is `Clone`, so a machine that captured
-/// it inside a continuation may advance the same suspension point more than
-/// once — each resumption continuing its own copy of the list being built.
+/// Resumes a higher-order builtin: `answer` is what the user code the frame was waiting on
+/// returned.
 pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
     Ok(match frame {
         Frame::MapStep {
@@ -1266,8 +1101,8 @@ pub fn advance(frame: Frame, answer: Value) -> Result<Step, Diagnostic> {
             span,
         } => {
             if answer.as_bool(span, "the predicate given to `bytes_position`")? {
-                // `next` is one past the byte the predicate was asked about,
-                // and the answer is that byte's index rather than the byte.
+                // `next` is one past the byte the predicate was asked about, and the answer is that
+                // byte's index rather than the byte.
                 Step::Done(position(Some(next - 1)))
             } else {
                 next_position(f, bytes, next, span)
@@ -1328,13 +1163,8 @@ fn next_fold(f: Value, items: Vector<Value>, next: usize, acc: Value, span: Span
     }
 }
 
-/// `iterate`'s step, which is `next_fold`'s shape with the list replaced by a
-/// countdown and the end replaced by an answer the step itself gives.
-///
-/// It returns a `Result` where the others return a `Step`, because running out
-/// of budget is the one way this loop can end without a value: `Stop` is the
-/// only source of an `r`, so there is nothing to answer with and a diagnostic
-/// is the honest outcome.
+/// `iterate`'s step, which is `next_fold`'s shape with the list replaced by a countdown and the end
+/// replaced by an answer the step itself gives.
 fn next_iterate(
     f: Value,
     seed: Value,
@@ -1358,22 +1188,15 @@ fn next_iterate(
 }
 
 /// What the step answered, with its payload.
-///
-/// The payload is cloned rather than moved out because [`Value`] is `Drop` and
-/// cannot be destructured by value. It costs a refcount bump that is gone
-/// before the seed is read: both engines drop `answer` inside [`advance`], so
-/// the value handed to the next round is again singly owned by the time the
-/// step runs on it.
 enum IterAnswer {
     Continued(Value),
     Stopped(Value),
 }
 use IterAnswer::{Continued, Stopped};
 
-/// Anything but the prelude's two constructors is a type error rather than a
-/// silent stop: inference admits only `Iter<s, r>` here, so reaching this with
-/// another shape means a host handler or a `Value` built in Rust answered
-/// something the checker never saw.
+/// Anything but the prelude's two constructors is a type error rather than a silent stop: inference
+/// admits only `Iter<s, r>` here, so reaching this with another shape means a host handler or a
+/// `Value` built in Rust answered something the checker never saw.
 fn iterate_answer(answer: &Value, span: Span) -> Result<IterAnswer, Diagnostic> {
     if let Value::Ctor { name, args } = answer
         && args.len() == 1
@@ -1408,9 +1231,7 @@ fn next_position(f: Value, bytes: std::sync::Arc<[u8]>, next: usize, span: Span)
     }
 }
 
-/// `Option<Int>`, the answer shape of every builtin that searches. `Some` and
-/// `None` are the prelude's constructors, so these names are program-wide and
-/// need no module.
+/// `Option<Int>`, the answer shape of every builtin that searches.
 fn position(at: Option<usize>) -> Value {
     match at {
         Some(i) => Value::ctor("Some", vec![Value::Int(i as i64)]),
@@ -1418,9 +1239,8 @@ fn position(at: Option<usize>) -> Value {
     }
 }
 
-/// An empty needle occurs at `from`, which is what `str::find` answers and what
-/// makes `bytes_index_of(b, b"")` `Some(0)` rather than a special case every
-/// caller has to write.
+/// An empty needle occurs at `from`, which is what `str::find` answers and what makes
+/// `bytes_index_of(b, b"")` `Some(0)` rather than a special case every caller has to write.
 fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     if needle.is_empty() {
         return Some(from);
@@ -1428,9 +1248,8 @@ fn find(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
     memchr::memmem::find(&hay[from..], needle).map(|at| from + at)
 }
 
-/// A 256-bit membership test built once per call, in time proportional to the
-/// set rather than to the buffer. This is the whole reason `bytes_scan` takes
-/// its byte class as a `Bytes` and still costs nothing per byte.
+/// A 256-bit membership test built once per call, in time proportional to the set rather than to
+/// the buffer.
 struct ByteSet([u64; 4]);
 
 impl ByteSet {
@@ -1447,20 +1266,13 @@ impl ByteSet {
     }
 }
 
-/// The bytes a bounded scan is allowed to look at: `max` of them at most, and
-/// never past the end. Returning the window rather than a pair of indices is
-/// what makes the budget structural — a scan cannot examine a byte it was not
-/// handed.
+/// The bytes a bounded scan is allowed to look at: `max` of them at most, and never past the end.
 fn scan_window(hay: &[u8], from: usize, max: usize) -> &[u8] {
     &hay[from..hay.len().min(from.saturating_add(max))]
 }
 
-/// The typed-argument readers the byte and decimal builtins use, quoting the
-/// operation's name only when the argument is the wrong type.
-///
-/// `v.as_int(span, &format!("`{what}`"))` builds that `String` on the success
-/// path, which is every call: W6 counted 540 such allocations per request, all
-/// of them for a message no request produced.
+/// The typed-argument readers the byte and decimal builtins use, quoting the operation's name only
+/// when the argument is the wrong type.
 fn int_arg(v: &Value, span: Span, what: &str) -> Result<i64, Diagnostic> {
     match v {
         Value::Int(i) => Ok(*i),
@@ -1489,10 +1301,7 @@ fn bytes_arg<'a>(
     }
 }
 
-/// Both bounded scans. `want` is whether it stops on a member of the set or on
-/// a non-member; the answer is the index it stopped at, or the end of the
-/// window when it did not, so a caller tells "the class ended" from "the budget
-/// ran out" by comparing against `from + max`.
+/// Both bounded scans.
 fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagnostic> {
     let what = if want {
         "bytes_scan_until"
@@ -1504,11 +1313,11 @@ fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagn
     let max = budget(&args[3], span, what)?;
     let window = scan_window(hay, from, max);
 
-    // `memchr` is SIMD and a bitmap loop is not, so a small set — which is
-    // every header delimiter a parser cares about — takes the fast path.
+    // `memchr` is SIMD and a bitmap loop is not, so a small set — which is every header delimiter a
+    // parser cares about — takes the fast path.
     let found = match (want, members.as_ref()) {
-        // An empty class is never entered, so `bytes_scan_until` runs out the
-        // window and `bytes_scan` — which stops off the class — stops at once.
+        // An empty class is never entered, so `bytes_scan_until` runs out the window and
+        // `bytes_scan` — which stops off the class — stops at once.
         (true, []) => None,
         (true, [a]) => memchr::memchr(*a, window),
         (true, [a, b]) => memchr::memchr2(*a, *b, window),
@@ -1524,9 +1333,7 @@ fn scan(args: &[Value], hay: &[u8], span: Span, want: bool) -> Result<i64, Diagn
     })
 }
 
-/// A position a search may start at. `len` itself is admissible — an empty
-/// window is a real answer — and anything else is refused rather than clamped,
-/// for the reason [`range_args`] gives.
+/// A position a search may start at.
 fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diagnostic> {
     let from = int_arg(v, span, what)?;
     match usize::try_from(from) {
@@ -1542,9 +1349,7 @@ fn start_at(v: &Value, len: usize, span: Span, what: &str) -> Result<usize, Diag
     }
 }
 
-/// The bound that stops a 20-megabyte header line from being a denial of
-/// service. Negative is refused rather than treated as zero: a caller that
-/// computed a negative budget has a bug, and answering `from` for it hides it.
+/// The bound that stops a 20-megabyte header line from being a denial of service.
 fn budget(v: &Value, span: Span, what: &str) -> Result<usize, Diagnostic> {
     let max = int_arg(v, span, what)?;
     usize::try_from(max).map_err(|_| {
@@ -1569,13 +1374,7 @@ fn one_byte(v: &Value, span: Span, what: &str) -> Result<u8, Diagnostic> {
     })
 }
 
-/// The half-open `[start, end)` of a slicing builtin, refused rather than
-/// clamped.
-///
-/// Clamping is what turns an off-by-one into a shorter answer that every later
-/// assertion agrees with, which is the silent-wrong-answer shape this project
-/// exists to refuse. `len` and `unit` are whatever the builtin indexes in:
-/// bytes for `bytes_slice`, characters for `string_slice`.
+/// The half-open `[start, end)` of a slicing builtin, refused rather than clamped.
 fn range_args(
     start: &Value,
     end: &Value,
@@ -1599,9 +1398,7 @@ fn range_args(
     Ok((start as usize, end as usize))
 }
 
-/// The byte offset of the `n`-th character boundary. `n` has already been
-/// checked against the character count, so the fallback is unreachable for a
-/// caller that went through [`range_args`].
+/// The byte offset of the `n`-th character boundary.
 fn char_offset(s: &str, n: usize) -> usize {
     s.char_indices()
         .map(|(i, _)| i)
@@ -1610,9 +1407,9 @@ fn char_offset(s: &str, n: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-/// The offset is the first byte the decoder could not use, which is the number
-/// an author needs to find the truncation — a `Bytes` cut mid-character by
-/// `bytes_slice` reports the position of the character it cut.
+/// The offset is the first byte the decoder could not use, which is the number an author needs to
+/// find the truncation — a `Bytes` cut mid-character by `bytes_slice` reports the position of the
+/// character it cut.
 fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
     let at = e.valid_up_to();
     let what = match e.error_len() {
@@ -1643,10 +1440,8 @@ fn out_of_range(span: Span, what: &str, index: i64, len: usize) -> Diagnostic {
     ))
 }
 
-/// The `ASSERTION_FAILED` an agent reads to decide what to fix: both values in
-/// full, plus the path to the first place they differ.
-///
-/// Argument order follows `assert_eq(actual, expected)`.
+/// The `ASSERTION_FAILED` an agent reads to decide what to fix: both values in full, plus the path
+/// to the first place they differ.
 pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagnostic {
     let mut diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
@@ -1668,12 +1463,8 @@ pub fn assertion_failure(actual: &Value, expected: &Value, span: Span) -> Diagno
     diag
 }
 
-/// The `ASSERTION_FAILED` for a failing `assert`, whose second argument is the
-/// message the author wanted the reader to see.
-///
-/// `None` is what a call that wrote no message passes: the parameter is
-/// `Option<String>` defaulted to `None`, spliced in at the call site, so this
-/// sees an argument either way rather than an absent one.
+/// The `ASSERTION_FAILED` for a failing `assert`, whose second argument is the message the author
+/// wanted the reader to see.
 pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     let mut diag = Diagnostic::error(
         codes::ASSERTION_FAILED,
@@ -1683,8 +1474,8 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     let carried = match message {
         Value::Ctor { name, args, .. } if name.as_str() == "Some" => args.first(),
         Value::Ctor { .. } => None,
-        // A message that is not an `Option` at all can only come from a call
-        // this evaluator was handed without a check in front of it.
+        // A message that is not an `Option` at all can only come from a call this evaluator was
+        // handed without a check in front of it.
         other => Some(other),
     };
     if let Some(message) = carried {
@@ -1696,10 +1487,7 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
     diag
 }
 
-/// A cell whose region has closed. Reachable only by carrying a value out of
-/// the run that made it, which no source program can express; the generation in
-/// the slot is what turns it into this report rather than a read of whatever
-/// now lives at that position.
+/// A cell whose region has closed.
 #[cold]
 fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     Diagnostic::error(
@@ -1710,15 +1498,7 @@ fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     .note("please report this: a cell value escaped the region that allocated it")
 }
 
-/// Only the higher-order builtins suspend, so only their frames reach here. An
-/// engine that routes another one in has a dispatch bug, and saying so beats
-/// folding an unrelated frame into a list.
-///
-/// > **Corrected (2026-08-27): this read *"Only the **three** higher-order
-/// > builtins suspend"*.** There were five when `map_fold` and
-/// > `bytes_position` joined and there are six now that `iterate` has;
-/// > `exactly_the_callback_builtins_are_higher_order` is what counts them, so
-/// > the number is written down once, there.
+/// Only the higher-order builtins suspend, so only their frames reach here.
 #[cold]
 fn not_a_builtin_step() -> Diagnostic {
     Diagnostic::error(
@@ -1729,10 +1509,7 @@ fn not_a_builtin_step() -> Diagnostic {
 }
 
 impl Interp<'_> {
-    /// The tree-walker's driver for the step protocol. It calls back into user
-    /// code on the host stack, which is precisely why it can never run a
-    /// continuation captured inside `map`; the machine pushes the same frames
-    /// onto the heap instead and can.
+    /// The tree-walker's driver for the step protocol.
     pub(crate) fn call_builtin(
         &mut self,
         b: Builtin,
@@ -1815,8 +1592,8 @@ mod tests {
         format!("Some({i})")
     }
 
-    /// `Some(i)` as `i` and `None` as `-1`, which is the shape W1's folds
-    /// answered in and therefore the shape a comparison against them needs.
+    /// `Some(i)` as `i` and `None` as `-1`, which is the shape W1's folds answered in and therefore
+    /// the shape a comparison against them needs.
     fn at(v: &Value) -> i64 {
         match v {
             Value::Ctor { args, .. } if !args.is_empty() => {
@@ -1826,8 +1603,8 @@ mod tests {
         }
     }
 
-    /// Deterministic and dependency-free, so a failing case is a seed a reader
-    /// can reproduce rather than a number that moves between runs.
+    /// Deterministic and dependency-free, so a failing case is a seed a reader can reproduce rather
+    /// than a number that moves between runs.
     struct Xorshift(u64);
 
     impl Xorshift {
@@ -1842,8 +1619,6 @@ mod tests {
             (self.next() % bound as u64) as usize
         }
     }
-
-    // ------------------------------------------------------------ the searches
 
     #[test]
     fn index_of_covers_empty_absent_at_the_start_at_the_end_and_overlapping() {
@@ -1885,8 +1660,7 @@ mod tests {
             some(3)
         );
 
-        // Overlapping occurrences: `aa` sits at 0, 1, 4 and 5, and the first is
-        // the answer.
+        // Overlapping occurrences: `aa` sits at 0, 1, 4 and 5, and the first is the answer.
         assert_eq!(
             found(Builtin::BytesIndexOf, vec![hay.clone(), bytes(b"aa")]),
             some(0)
@@ -1907,9 +1681,8 @@ mod tests {
         );
     }
 
-    /// The index a `_from` search answers is absolute, so it feeds straight
-    /// back into `bytes_slice`. A relative one would be an off-by-`from` in
-    /// every caller that resumed a scan.
+    /// The index a `_from` search answers is absolute, so it feeds straight back into
+    /// `bytes_slice`.
     #[test]
     fn index_of_from_answers_an_absolute_index_and_admits_the_end() {
         let hay = bytes(b"GET / HTTP/1.1");
@@ -1997,8 +1770,7 @@ mod tests {
         }
     }
 
-    /// Required test 36. A naive search is obviously correct and obviously
-    /// slow, which is exactly what a SIMD one should be checked against.
+    /// Required test 36.
     #[test]
     fn index_of_agrees_with_a_naive_search_over_ten_thousand_pairs() {
         fn naive(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
@@ -2050,8 +1822,6 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------- prefix and suffix
-
     #[test]
     fn starts_with_and_ends_with_agree_with_the_empty_and_whole_cases() {
         let b = bytes(b"HTTP/1.1");
@@ -2094,8 +1864,6 @@ mod tests {
         );
     }
 
-    // ------------------------------------------------------------------ splits
-
     #[test]
     fn split_keeps_the_empty_pieces_a_join_needs_to_round_trip() {
         let split =
@@ -2111,18 +1879,14 @@ mod tests {
             split(b"a\r\n\r\nb", b"\r\n").unwrap().render(),
             "[b\"a\", b\"\", b\"b\"]"
         );
-        // Non-overlapping, left to right: the second `aa` starts after the
-        // first one's last byte.
+        // Non-overlapping, left to right: the second `aa` starts after the first one's last byte.
         assert_eq!(
             split(b"aaaa", b"aa").unwrap().render(),
             "[b\"\", b\"\", b\"\"]"
         );
     }
 
-    /// ADR 0013 §4's builtin. The claim is the allocation count, and what is
-    /// asserted here is the observable half of it: the answer is the
-    /// concatenation, the empty list is `b""`, and a list holding anything but
-    /// `Bytes` is refused rather than skipped.
+    /// ADR 0013 §4's builtin.
     #[test]
     fn concat_all_joins_every_piece_in_order() {
         let empty = done(Builtin::BytesConcatAll, vec![Value::list(vec![])]).unwrap();
@@ -2198,8 +1962,6 @@ mod tests {
         assert!(d.message.contains("empty"), "{}", d.message);
     }
 
-    // ------------------------------------------------------------ the scans
-
     fn scan(b: Builtin, hay: &[u8], from: i64, set: &[u8], max: i64) -> Result<i64, Diagnostic> {
         Ok(done(
             b,
@@ -2239,8 +2001,8 @@ mod tests {
             "`=` is not a digit, so the scan stops where it started"
         );
 
-        // The whole point of `bytes_scan` over a fold: the answer for a run
-        // that reaches the end is the end, not a sentinel.
+        // The whole point of `bytes_scan` over a fold: the answer for a run that reaches the end is
+        // the end, not a sentinel.
         assert_eq!(
             scan(Builtin::BytesScanUntil, head, 0, b"z", big).unwrap(),
             big
@@ -2255,8 +2017,8 @@ mod tests {
         assert_eq!(scan(Builtin::BytesScan, head, big, b"a", big).unwrap(), big);
     }
 
-    /// Every set size takes a different path — `memchr`, `memchr2`, `memchr3`,
-    /// then the bitmap — so the four have to agree with each other.
+    /// Every set size takes a different path — `memchr`, `memchr2`, `memchr3`, then the bitmap — so
+    /// the four have to agree with each other.
     #[test]
     fn every_set_size_takes_its_own_path_and_they_all_agree() {
         fn naive(hay: &[u8], from: usize, set: &[u8], max: usize, want: bool) -> i64 {
@@ -2294,9 +2056,7 @@ mod tests {
         }
     }
 
-    /// Required test 37. The bound is structural rather than timed: the scan is
-    /// handed the window and cannot look outside it, so a marker placed one
-    /// byte past the budget is invisible however the search is implemented.
+    /// Required test 37.
     #[test]
     fn a_scan_examines_at_most_max_bytes() {
         for max in 0..40usize {
@@ -2333,8 +2093,6 @@ mod tests {
         assert_eq!(d.code, codes::RUNTIME_ERROR);
         assert!(d.message.contains("negative budget"), "{}", d.message);
     }
-
-    // --------------------------------------------------------- the escape hatch
 
     #[test]
     fn position_finds_the_first_byte_its_predicate_accepts() {
@@ -2375,8 +2133,7 @@ mod tests {
         );
     }
 
-    /// Required test 38. The whole reason this builtin exists beside the fold
-    /// it replaces: it stops.
+    /// Required test 38.
     #[test]
     fn position_calls_its_predicate_once_for_a_match_at_the_start_of_a_megabyte() {
         let mut calls = 0;
@@ -2405,9 +2162,8 @@ mod tests {
         assert!(d.message.contains("Bool"), "{}", d.message);
     }
 
-    /// The property every builtin frame owes: a suspension point captured
-    /// inside it can be advanced more than once, and each resumption is its own
-    /// search.
+    /// The property every builtin frame owes: a suspension point captured inside it can be advanced
+    /// more than once, and each resumption is its own search.
     #[test]
     fn one_suspension_point_inside_position_can_be_resumed_twice() {
         let mut cells = TaskRegions::new();
@@ -2438,16 +2194,12 @@ mod tests {
         );
     }
 
-    // ---------------------------------------------------- against what they replace
-
-    /// The fold-based `index_of` from W1's `examples/hello.ply`, verbatim in
-    /// Rust. The new builtins have to answer what it answered — the point of
-    /// the milestone is that they answer it in one pass instead of `n`.
+    /// The fold-based `index_of` from W1's `examples/hello.ply`, verbatim in Rust.
     #[test]
     fn the_scans_agree_with_the_folds_they_replace() {
         fn fold_index_of(hay: &[u8], byte: u8, from: usize) -> i64 {
-            // The fold's shape, kept: it visits every remaining byte even after
-            // it has the answer, which is the cost the builtins removed.
+            // The fold's shape, kept: it visits every remaining byte even after it has the answer,
+            // which is the cost the builtins removed.
             let mut found: i64 = -1;
             for (i, &b) in hay.iter().enumerate().skip(from) {
                 if found < 0 && b == byte {
@@ -2491,8 +2243,8 @@ mod tests {
                 "case {case}: {head:?}"
             );
 
-            // The same question through the bounded scan, whose "absent" is the
-            // end of the window rather than a sentinel.
+            // The same question through the bounded scan, whose "absent" is the end of the window
+            // rather than a sentinel.
             let stopped = scan(Builtin::BytesScanUntil, &head, 0, &[byte], len).unwrap();
             assert_eq!(
                 if stopped == len { -1 } else { stopped },
@@ -2522,11 +2274,8 @@ mod tests {
         }
     }
 
-    /// These are byte builtins and index in bytes, which is the whole reason a
-    /// request target is `Bytes`: a peer may send what is not UTF-8 at all. The
-    /// `String` pair indexes in characters, and the two answers differ on the
-    /// same text — so this pins the distinction rather than leaving a caller to
-    /// discover it on the first non-ASCII request.
+    /// These are byte builtins and index in bytes, which is the whole reason a request target is
+    /// `Bytes`: a peer may send what is not UTF-8 at all.
     #[test]
     fn the_byte_searches_index_in_bytes_where_the_string_ones_index_in_characters() {
         let text = "héllo=wörld";
@@ -2545,8 +2294,8 @@ mod tests {
             "5"
         );
 
-        // A byte search may stop in the middle of a character, and the piece it
-        // cuts is refused by `string_of_bytes` rather than silently replaced.
+        // A byte search may stop in the middle of a character, and the piece it cuts is refused by
+        // `string_of_bytes` rather than silently replaced.
         let cut = done(
             Builtin::BytesSlice,
             vec![bytes(text.as_bytes()), Value::Int(0), Value::Int(2)],
@@ -2563,8 +2312,8 @@ mod tests {
             codes::RUNTIME_ERROR
         );
 
-        // A multi-byte needle is matched whole, so a search never reports a
-        // position that splits one.
+        // A multi-byte needle is matched whole, so a search never reports a position that splits
+        // one.
         assert_eq!(
             found(
                 Builtin::BytesIndexOf,
@@ -2634,9 +2383,8 @@ mod tests {
         assert_eq!(out.render(), "123");
     }
 
-    /// The property the frames exist for: a suspension point inside `map` can
-    /// be advanced twice and each resumption completes its own list. Host
-    /// recursion cannot do this, which is why `map` is a frame.
+    /// The property the frames exist for: a suspension point inside `map` can be advanced twice and
+    /// each resumption completes its own list.
     #[test]
     fn one_suspension_point_inside_map_can_be_resumed_twice() {
         let mut cells = TaskRegions::new();
@@ -2664,9 +2412,8 @@ mod tests {
         assert_eq!(b.render(), "[9, 1, 1]");
     }
 
-    /// `iterate` through the protocol an engine drives, with the step answered
-    /// by hand: the seed is threaded, `Stop` ends it, and the value `Stop`
-    /// carries is the answer rather than the seed.
+    /// `iterate` through the protocol an engine drives, with the step answered by hand: the seed is
+    /// threaded, `Stop` ends it, and the value `Stop` carries is the answer rather than the seed.
     #[test]
     fn an_iterate_threads_its_seed_and_answers_what_stop_carries() {
         let stop_at = |n: i64| {
@@ -2689,8 +2436,7 @@ mod tests {
         .unwrap();
         assert_eq!(out.render(), "\"done at 7\"");
 
-        // Stopping on the very first step costs one round, not none: the step
-        // has to run to say so.
+        // Stopping on the very first step costs one round, not none: the step has to run to say so.
         let out = drive(
             Builtin::Iterate,
             vec![Value::Int(9), Value::Int(1), f()],
@@ -2700,10 +2446,9 @@ mod tests {
         assert_eq!(out.render(), "\"done at 9\"");
     }
 
-    /// The reason the loop is a `Frame` and not host recursion: a continuation
-    /// captured inside the step can be resumed more than once, and each
-    /// resumption has to continue **its own** copy of the countdown. A shared
-    /// counter would let the second resumption inherit what the first spent.
+    /// The reason the loop is a `Frame` and not host recursion: a continuation captured inside the
+    /// step can be resumed more than once, and each resumption has to continue **its own** copy of
+    /// the countdown.
     #[test]
     fn one_suspension_point_inside_iterate_can_be_resumed_twice() {
         let mut cells = TaskRegions::new();
@@ -2718,9 +2463,7 @@ mod tests {
             panic!("iterate suspends on its first round");
         };
 
-        // Each leg runs the loop out from the same captured point. Both get the
-        // full remaining budget, so both reach the same round and stop; a shared
-        // countdown would make the second leg raise instead.
+        // Each leg runs the loop out from the same captured point.
         let run = |mut step: Step, stop_after: i64| {
             let mut seen = 0;
             loop {
@@ -2759,9 +2502,8 @@ mod tests {
             "the second resumption inherited a spent budget"
         );
 
-        // And the budget above is exactly tight, which is what makes the pair
-        // above non-vacuous: one leg spends all four rounds, so two legs sharing
-        // a countdown could not both finish. At three, one leg already raises.
+        // And the budget above is exactly tight, which is what makes the pair above non-vacuous:
+        // one leg spends all four rounds, so two legs sharing a countdown could not both finish.
         let mut cells = TaskRegions::new();
         let tight = call(
             Builtin::Iterate,
@@ -2781,8 +2523,8 @@ mod tests {
         assert!(d.message.contains("budget of 3 steps"), "{}", d.message);
     }
 
-    /// The budget is spent per round and exhausting it is a diagnostic, because
-    /// `Stop` is the only source of an answer and there is none to give.
+    /// The budget is spent per round and exhausting it is a diagnostic, because `Stop` is the only
+    /// source of an answer and there is none to give.
     #[test]
     fn an_iterate_that_never_stops_exhausts_its_budget_and_says_so() {
         let d = drive(
@@ -2798,8 +2540,7 @@ mod tests {
         .unwrap_err();
         assert_eq!(d.code, codes::RUNTIME_ERROR);
         assert!(d.message.contains("budget of 12 steps"), "{}", d.message);
-        // Nothing nested, so nothing here may say it did. Four consumers
-        // classify on this string; see `limit::err_recursion_limit`.
+        // Nothing nested, so nothing here may say it did.
         assert!(!d.message.contains("recursion limit"), "{}", d.message);
     }
 
@@ -2821,9 +2562,9 @@ mod tests {
         }
     }
 
-    /// Inference admits only `Iter<s, r>` in this position, so anything else
-    /// arriving here came from a host handler or a `Value` built in Rust — and
-    /// treating it as a silent stop would answer a value nobody asked for.
+    /// Inference admits only `Iter<s, r>` in this position, so anything else arriving here came
+    /// from a host handler or a `Value` built in Rust — and treating it as a silent stop would
+    /// answer a value nobody asked for.
     #[test]
     fn an_iterate_step_answering_neither_continue_nor_stop_is_a_runtime_error() {
         let d = drive(
@@ -2881,9 +2622,8 @@ mod tests {
         assert_eq!(v.render(), "2");
     }
 
-    /// The generation is what makes this a report rather than a read of the cell
-    /// now living at that position: the stale slot and the live one share an
-    /// index and differ in generation.
+    /// The generation is what makes this a report rather than a read of the cell now living at that
+    /// position: the stale slot and the live one share an index and differ in generation.
     #[test]
     fn a_cell_from_another_region_stack_is_named_rather_than_silently_read() {
         let mut other = TaskRegions::new();
@@ -2937,21 +2677,6 @@ mod tests {
     }
 
     /// **The test this repository went its whole history without.**
-    ///
-    /// A builtin is described in three places, in three crates that cannot see
-    /// each other: its argument count here, its type in `ply_core::infer`'s
-    /// prelude, and its defaults in `ply_syntax::defaults`. Nothing checked
-    /// that the three agreed, and for `assert` and `range` they did not — this
-    /// file said `(1, 2)` and the checker said one parameter and two. The
-    /// second arm of each was therefore unreachable from any program the
-    /// checker would accept, and stayed that way from the first commit until
-    /// ADR 0029. It was found by a reader who nearly documented the evaluator's
-    /// behaviour as the language's.
-    ///
-    /// This is the check that makes the next such drift a red test rather than
-    /// a wrong sentence in a manual. It is deliberately an *equality*: after
-    /// ADR 0029 no builtin has a variable arity, and one that acquires one has
-    /// to come here and say why.
     #[test]
     fn every_builtin_agrees_on_its_arity_everywhere() {
         for b in Builtin::all() {
@@ -2965,8 +2690,8 @@ mod tests {
                 b.name()
             );
 
-            // A builtin the prelude does not type cannot be called at all, so
-            // the two tables have to cover the same set.
+            // A builtin the prelude does not type cannot be called at all, so the two tables have
+            // to cover the same set.
             let typed = ply_core::prelude_arity(b.name()).unwrap_or_else(|| {
                 panic!(
                     "`{}` is a builtin with no scheme in the prelude: no program can call it",
@@ -2997,25 +2722,8 @@ mod tests {
         }
     }
 
-    /// What [`Builtin::all`] lists, pinned — because until this was written,
-    /// **nothing checked that it was complete**.
-    ///
-    /// Every other table is checked by iterating `all()`:
-    /// [`every_builtin_is_reachable_by_the_name_it_reports`],
-    /// [`exactly_the_callback_builtins_are_higher_order`],
-    /// `tests::every_builtin_checks_its_argument_count` and
-    /// `region_kind::tests::the_callback_builtins_are_the_six_this_module_knows`
-    /// all start from it. So a variant *missing* from `all()` is invisible to
-    /// all four at once: it is never named, so it is never checked, and the
-    /// suite stays green over a builtin nothing has looked at. Deleting
-    /// `Builtin::ListAt` from `all()` was run against the reachability test on
-    /// the assumption that it would go red; it stayed green, which is what this
-    /// test exists to stop being true.
-    ///
-    /// It is the same shape as
-    /// [`exactly_the_callback_builtins_are_higher_order`] and carries the same
-    /// obligation: adding a builtin means adding its name here, and that is the
-    /// point rather than the cost.
+    /// What [`Builtin::all`] lists, pinned — because until this was written, **nothing checked that
+    /// it was complete**.
     #[test]
     fn builtin_all_is_complete_and_lists_each_name_once() {
         let mut names: Vec<&str> = Builtin::all().iter().map(|b| b.name()).collect();
@@ -3109,10 +2817,9 @@ mod tests {
         effect_def("state", &[("get", Mode::Read, false)])
     }
 
-    /// The suspension points are where a builtin is most likely to be handed a
-    /// stale arena, so the handler both writes a cell and decides the answer
-    /// from it: a builtin that carried its own copy would keep the count at 1
-    /// and keep the wrong elements.
+    /// The suspension points are where a builtin is most likely to be handed a stale arena, so the
+    /// handler both writes a cell and decides the answer from it: a builtin that carried its own
+    /// copy would keep the count at 1 and keep the wrong elements.
     #[test]
     fn a_predicate_that_performs_sees_every_write_the_handler_made_before_it() {
         let bump = block(
@@ -3178,8 +2885,8 @@ mod tests {
         assert_eq!(run(vec![state()], e).unwrap().render(), "306");
     }
 
-    /// The handler is inside the callback, so it is installed and torn down once
-    /// per element rather than once for the whole `map`.
+    /// The handler is inside the callback, so it is installed and torn down once per element rather
+    /// than once for the whole `map`.
     #[test]
     fn a_handler_installed_inside_a_map_callback_does_not_leak_to_the_next_element() {
         let inner = handle(

@@ -1,23 +1,4 @@
 //! What the region allocator costs, counted rather than asserted.
-//!
-//! ADR 0017 exists to move a number, so its allocator has to be priced the way
-//! W6 priced everything else: by counting, in its own binary, with a
-//! `#[global_allocator]` that a machine's load cannot argue with.
-//!
-//! Two claims are priced here and nothing else:
-//!
-//! 1. **A `unique` region is a bump pointer.** Allocating in a region and
-//!    closing it costs the global allocator *nothing* once the arena has been
-//!    through a region of that size — no allocation per value, no free per
-//!    value, no free at the close.
-//! 2. **A `shared` region pays at the capture.** A snapshot is linear in the
-//!    region's live slots and constant in everything else, and the constant is
-//!    one allocation per snapshot rather than one per slot.
-//!
-//! Its own integration test rather than a unit test because a
-//! `#[global_allocator]` is a whole-binary decision, and a counter on every
-//! allocation in `ply-eval`'s unit tests would perturb every other number the
-//! crate takes.
 
 use ply_eval::Value;
 use ply_eval::arena::{Arena, RegionKind};
@@ -71,8 +52,6 @@ fn cycle(arena: &mut Arena, kind: RegionKind, size: usize) {
     arena.close(r);
 }
 
-/// Claim 1, as a number: a warm arena serves a region of a size it has seen
-/// before without touching the allocator at all.
 #[test]
 fn a_warm_unique_region_costs_the_allocator_nothing() {
     for size in [1usize, 16, 256, 1_000, 10_000] {
@@ -96,9 +75,7 @@ fn a_warm_unique_region_costs_the_allocator_nothing() {
     }
 }
 
-/// The cold pass is bounded and stated: one chunk per 256 slots, and nothing
-/// per value. A regression that put a `Vec` growth back on the path would show
-/// as a count that is not `ceil(size / 256)`.
+/// The cold pass is bounded and stated: one chunk per 256 slots, and nothing per value.
 #[test]
 fn a_cold_region_costs_one_chunk_per_two_hundred_and_fifty_six_slots() {
     for size in [1usize, 256, 257, 1_000, 10_000] {
@@ -113,8 +90,8 @@ fn a_cold_region_costs_one_chunk_per_two_hundred_and_fifty_six_slots() {
     }
 }
 
-/// Nesting is free too: an inner region is a mark on the same bump pointer, not
-/// an arena of its own.
+/// Nesting is free too: an inner region is a mark on the same bump pointer, not an arena of its
+/// own.
 #[test]
 fn nesting_costs_the_allocator_nothing_once_warm() {
     let mut arena = Arena::new();
@@ -140,17 +117,8 @@ fn nesting_costs_the_allocator_nothing_once_warm() {
     assert_eq!((allocations, bytes), (0, 0));
 }
 
-/// Claim 2, as a number: a snapshot is one allocation for the values, one for
-/// the generations and one for the scope stack it has to put back, whatever the
-/// region holds.
-///
-/// The third is not overhead that could be trimmed away. A restore that put the
-/// values back without the scopes would resurrect a region closed since the
-/// capture with nothing left to free it, and strand a region opened since it
-/// with a mark above the bump pointer — `arena::tests` pins both. It is
-/// proportional to the *nesting depth* at the capture and to nothing else,
-/// which is why the byte overhead below is the same at one slot and at ten
-/// thousand.
+/// Claim 2, as a number: a snapshot is one allocation for the values, one for the generations and
+/// one for the scope stack it has to put back, whatever the region holds.
 #[test]
 fn a_snapshot_costs_three_allocations_and_is_linear_in_bytes() {
     let mut widths = Vec::new();
@@ -176,8 +144,8 @@ fn a_snapshot_costs_three_allocations_and_is_linear_in_bytes() {
         arena.close(r);
     }
 
-    // Bytes per slot is the `Value` plus its generation, and the remainder — the
-    // one scope that was open — does not drift with the region's size.
+    // Bytes per slot is the `Value` plus its generation, and the remainder — the one scope that was
+    // open — does not drift with the region's size.
     let per_slot = std::mem::size_of::<Value>() + std::mem::size_of::<u32>();
     let overhead = widths[0].1;
     assert!(overhead > 0, "one open scope was recorded");
@@ -190,8 +158,8 @@ fn a_snapshot_costs_three_allocations_and_is_linear_in_bytes() {
     }
 }
 
-/// Restoring is the same shape as snapshotting: no allocation at all, because
-/// the arena writes back into chunks it already owns.
+/// Restoring is the same shape as snapshotting: no allocation at all, because the arena writes back
+/// into chunks it already owns.
 #[test]
 fn restoring_a_snapshot_costs_the_allocator_nothing() {
     let mut arena = Arena::new();
@@ -211,13 +179,7 @@ fn restoring_a_snapshot_costs_the_allocator_nothing() {
     arena.close(r);
 }
 
-/// The measurement ADR 0017 asks for: what a capture costs as a function of the
-/// region it crosses.
-///
-/// Printed rather than only asserted, because the shape is the finding and a
-/// number nobody can read is not a measurement. The assertion is the shape — a
-/// hundredfold region within a small constant of a hundredfold cost — rather
-/// than a wall-clock threshold, which would be this machine's.
+/// The measurement ADR 0017 asks for: what a capture costs as a function of the region it crosses.
 #[test]
 fn snapshot_cost_as_a_function_of_region_size() {
     const REPEATS: usize = 200;
@@ -230,8 +192,7 @@ fn snapshot_cost_as_a_function_of_region_size() {
         for i in 0..size {
             arena.alloc(Value::Int(i as i64));
         }
-        // Warm the allocator, so the first snapshot's `Vec` growth is not the
-        // measurement.
+        // Warm the allocator, so the first snapshot's `Vec` growth is not the measurement.
         drop(arena.snapshot(r));
 
         let mut best = f64::MAX;
@@ -248,10 +209,8 @@ fn snapshot_cost_as_a_function_of_region_size() {
         arena.close(r);
     }
 
-    // Ten times the slots for at most twenty times the cost, at every step
-    // where the constant is not the whole measurement. Twenty rather than ten
-    // because the smallest rows are dominated by the two allocations a snapshot
-    // makes, which do not scale with anything.
+    // Ten times the slots for at most twenty times the cost, at every step where the constant is
+    // not the whole measurement.
     for pair in rows.windows(2) {
         let (small, big) = (&pair[0], &pair[1]);
         if small.0 < 100 {
@@ -270,21 +229,12 @@ fn snapshot_cost_as_a_function_of_region_size() {
 }
 
 /// What the allocator is worth on the workload it replaced.
-///
-/// The arena **is** the machine's cell store now, so this is a result rather
-/// than the projection it was written as. The denominator is the data structure
-/// the store used to be — a persistent map keyed by a dense integer, which is
-/// what `World` was — kept here so the comparison survives the type's removal.
-///
-/// Printed as well as asserted. The assertion is only the direction, because a
-/// ratio is this machine's and a reader deciding what the store is worth needs
-/// the numbers rather than the verdict.
 #[test]
 fn a_region_against_the_persistent_map_it_replaced() {
     const CELLS: usize = 10_000;
 
-    // The handle vectors are reserved before either side is armed, so what is
-    // counted is the store's own cost and not the test's bookkeeping.
+    // The handle vectors are reserved before either side is armed, so what is counted is the
+    // store's own cost and not the test's bookkeeping.
     let mut map: RedBlackTreeMap<u32, Value> = RedBlackTreeMap::new();
     let mut ids = Vec::with_capacity(CELLS);
     let (world_build, world_bytes, ()) = counted(|| {
@@ -300,8 +250,8 @@ fn a_region_against_the_persistent_map_it_replaced() {
     });
 
     let mut arena = Arena::new();
-    // Warm, because the claim is about a steady state: a service opens a region
-    // per request and a test opens one per test.
+    // Warm, because the claim is about a steady state: a service opens a region per request and a
+    // test opens one per test.
     cycle(&mut arena, RegionKind::Unique, CELLS);
 
     let mut slots = Vec::with_capacity(CELLS);
@@ -343,8 +293,8 @@ fn a_region_against_the_persistent_map_it_replaced() {
     );
 }
 
-/// A `unique` region never pays the snapshot, which is the whole of "and it is
-/// free": the same workload under the two kinds differs by exactly the copies.
+/// A `unique` region never pays the snapshot, which is the whole of "and it is free": the same
+/// workload under the two kinds differs by exactly the copies.
 #[test]
 fn the_two_kinds_differ_by_exactly_the_snapshots() {
     const SIZE: usize = 4_000;
@@ -390,22 +340,7 @@ fn the_two_kinds_differ_by_exactly_the_snapshots() {
     assert_eq!(shared.stats().slots_copied, SIZE as u64);
 }
 
-// ------------------------------------------- 3. what a close itself costs
-
-/// The reclamation event R2 put on the evaluation path, timed against the two
-/// answers it can give.
-///
-/// Only the close is inside the clock: the region is opened and filled outside
-/// it, so the figure is the reclamation and not the bumps that preceded it.
-///
-/// - **freed** — no pin covers it, so the close truncates. This is what a
-///   `unique` region always does and what a `shared` region does whenever no
-///   continuation outlived it, which on `examples/` is every time.
-/// - **deferred** — a live pin covers it, so the slots are held as a run
-///   instead. The cost of `shared` when it is really shared.
-///
-/// Printed rather than bounded: a nanosecond figure moves with the machine, and
-/// what is asserted is only that a deferred run does eventually go back.
+/// The reclamation event R2 put on the evaluation path, timed against the two answers it can give.
 #[test]
 fn a_close_is_priced_against_what_it_can_answer() {
     const SIZE: usize = 1_000;
@@ -437,17 +372,17 @@ fn a_close_is_priced_against_what_it_can_answer() {
         let started = Instant::now();
         arena.close(r);
         deferring += started.elapsed();
-        // Outside the clock: what the deferral costs is the close, and the run
-        // it left goes back at the next one.
+        // Outside the clock: what the deferral costs is the close, and the run it left goes back at
+        // the next one.
         drop(pin);
     }
     arena.collect();
 
     let free = freeing.as_secs_f64() * 1e9 / ROUNDS as f64;
     let defer = deferring.as_secs_f64() * 1e9 / ROUNDS as f64;
-    // A deferral is cheaper *at the close* than a free, and that is not a
-    // saving: it records a run and postpones the truncation, which the next
-    // close after the continuation dies then pays in full.
+    // A deferral is cheaper *at the close* than a free, and that is not a saving: it records a run
+    // and postpones the truncation, which the next close after the continuation dies then pays in
+    // full.
     println!(
         "  closing a region of {SIZE} slots: freed {free:.0} ns ({:.2} ns/slot); \
          deferred to a live continuation {defer:.0} ns, which is the run being recorded \

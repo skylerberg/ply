@@ -1,20 +1,12 @@
-//! ADR 0015 §2 at the type level: every route a credential could take out of a
-//! program, and the diagnostic that closes it.
-//!
-//! Read as a checklist rather than as a suite. §2.1 states a claim that can be
-//! falsified — "no value of type `Secret<a>` can reach a trace field, a JSON
-//! document, a SQL parameter, an HTTP response, a diagnostic message, an
-//! assertion diff, a panic payload, a `--json` object, a definition hash, the
-//! front-end store or the result cache" — and each test below is one attempt to
-//! falsify it. A route that stops being closed fails here by name.
+//! ADR 0015 §2 at the type level: every route a credential could take out of a program, and the
+//! diagnostic that closes it.
 
 use ply_core::{CheckOutput, check_program, print_type};
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
 use ply_syntax::ast::ModuleName;
 use ply_syntax::resolve::resolve;
 
-/// The signatures a generated `json` dictionary references. The same stub
-/// `derivation.rs` carries, trimmed to what a `Secret` test reaches.
+/// The signatures a generated `json` dictionary references.
 const JSON: &str = r#"
 pub type Json = Null | Bool(Bool) | Number(Decimal) | Str(String)
               | Array(List<Json>) | Object(Map<String, Json>)
@@ -83,8 +75,8 @@ fn errors(source: &str) -> Vec<Diagnostic> {
     }
 }
 
-/// The first diagnostic carrying `code`, and a readable failure when there is
-/// none — a route that opened usually opens by producing *no* diagnostic at all.
+/// The first diagnostic carrying `code`, and a readable failure when there is none — a route that
+/// opened usually opens by producing *no* diagnostic at all.
 fn code(source: &str, code: &str) -> Diagnostic {
     let diags = errors(source);
     match diags.iter().find(|d| d.code == code) {
@@ -115,8 +107,8 @@ fn blank(s: Secret<String>) -> Bool = secret_is_empty(s)");
     assert_eq!(sig(&out, "blank"), "(Secret<String>) -> Bool");
 }
 
-/// The operations a program is *supposed* to be able to do with a credential:
-/// hold it in a record, pass it, compare two of them, and answer a `Bool`.
+/// The operations a program is *supposed* to be able to do with a credential: hold it in a record,
+/// pass it, compare two of them, and answer a `Bool`.
 #[test]
 fn a_secret_survives_the_operations_that_are_meant_to_work() {
     ok(r#"type Login = {user: String, password: Secret<String>}
@@ -139,16 +131,16 @@ fn keyed(m: Map<String, Secret<String>>, k: String) -> Option<Secret<String>> =
   map_get(m, k)"#);
 }
 
-/// A `Secret` is a value in every ordinary sense: it goes in an `Option`, a
-/// `List`, a record and a map *value*, and it comes back out.
+/// A `Secret` is a value in every ordinary sense: it goes in an `Option`, a `List`, a record and a
+/// map *value*, and it comes back out.
 #[test]
 fn derive_eq_accepts_a_secret_field() {
     ok("type Login = {user: String, password: Secret<String>}
 derive eq for Login");
 }
 
-/// §2.5 (7): presence is deliberately observable, so a start-up can tell a
-/// missing credential from a wrong one. That is metadata, never the value.
+/// §2.5 (7): presence is deliberately observable, so a start-up can tell a missing credential from
+/// a wrong one.
 #[test]
 fn presence_is_observable_and_answers_a_bool() {
     let out = ok("fn present(s: Secret<String>) -> Bool = !secret_is_empty(s)");
@@ -163,8 +155,6 @@ fn secret_is_a_builtin_type_no_module_may_claim() {
     assert!(says(&d, "builtin type"), "{d:#?}");
 }
 
-/// The single most important line of §2.2. A `Value::Ctor` would be matchable
-/// and `match s { Secret(plain) -> plain }` would be a one-line escape.
 #[test]
 fn there_is_no_pattern_that_binds_the_payload() {
     let d = code(
@@ -172,9 +162,8 @@ fn there_is_no_pattern_that_binds_the_payload() {
         codes::UNKNOWN_NAME,
     );
     assert!(d.message.contains("unknown constructor `Secret`"), "{d:#?}");
-    // The general "constructors come from a `type` declaration" note would send
-    // the reader looking for a declaration that cannot exist, so the absence is
-    // named as the mechanism it is.
+    // The general "constructors come from a `type` declaration" note would send the reader looking
+    // for a declaration that cannot exist, so the absence is named as the mechanism it is.
     assert!(says(&d, "declares none"), "{d:#?}");
     assert!(says(&d, "secret_verify"), "{d:#?}");
 }
@@ -201,9 +190,7 @@ fn a_secret_takes_exactly_one_type_argument() {
 
 // --- route by route ---------------------------------------------------------
 
-/// `++` is `String`-only, so the concatenation route is a type error rather
-/// than a review item. This is the route that puts a credential in a log line
-/// in every other language.
+/// `++` is `String`-only, so the concatenation route is a type error rather than a review item.
 #[test]
 fn concatenation_with_a_string_is_refused() {
     code(
@@ -225,8 +212,7 @@ fn a_secret_is_not_a_string_anywhere_a_string_is_wanted() {
     }
 }
 
-/// The panic payload. `panic` takes a `String`, and a `Secret` reaches neither
-/// it nor the `++` that would build its argument.
+/// The panic payload.
 #[test]
 fn a_panic_payload_cannot_carry_one() {
     code(
@@ -239,8 +225,8 @@ fn a_panic_payload_cannot_carry_one() {
     );
 }
 
-/// A derived JSON document is the route the milestone's headline is about, and
-/// the refusal names the field rather than the type.
+/// A derived JSON document is the route the milestone's headline is about, and the refusal names
+/// the field rather than the type.
 #[test]
 fn derive_json_refuses_a_secret_field_and_names_it() {
     let d = code(
@@ -273,8 +259,8 @@ derive json for Bag",
     }
 }
 
-/// The alias case is what `ply_core`'s walk over the *solved* type exists for:
-/// the syntactic walk in `ply_derive` sees only `Password`.
+/// The alias case is what `ply_core`'s walk over the *solved* type exists for: the syntactic walk
+/// in `ply_derive` sees only `Password`.
 #[test]
 fn derive_json_refuses_a_secret_behind_an_alias() {
     code(
@@ -286,9 +272,8 @@ derive json for Login",
     );
 }
 
-/// Equality leaks one bit per call; an ordering leaks a bit of *position* per
-/// call and recovers the whole value in calls proportional to its length. That
-/// line — not taste — is the whole of why these two derivers differ.
+/// Equality leaks one bit per call; an ordering leaks a bit of *position* per call and recovers the
+/// whole value in calls proportional to its length.
 #[test]
 fn derive_ord_refuses_what_derive_eq_accepts() {
     let d = code(
@@ -300,8 +285,8 @@ derive ord for Login",
     assert!(says(&d, "secret_verify"), "{d:#?}");
 }
 
-/// A secret as a map key would be an ordering oracle with a data structure
-/// attached, and a `Map` key needs `derivable(ord, k)`.
+/// A secret as a map key would be an ordering oracle with a data structure attached, and a `Map`
+/// key needs `derivable(ord, k)`.
 #[test]
 fn a_secret_is_not_a_map_key() {
     let d = code(
@@ -323,8 +308,8 @@ fn index(m: Map<Pair, Int>) -> Int = map_len(m)",
     }
 }
 
-/// `compare` and `compare_values` both carry `where derivable(ord, ·)`, so the
-/// ordering oracle is refused at the call and not only at a derivation.
+/// `compare` and `compare_values` both carry `where derivable(ord, ·)`, so the ordering oracle is
+/// refused at the call and not only at a derivation.
 #[test]
 fn compare_refuses_a_secret_at_the_call_site() {
     code(
@@ -333,8 +318,8 @@ fn compare_refuses_a_secret_at_the_call_site() {
     );
 }
 
-/// A generator that minted credentials and a shrinker that printed
-/// counterexamples is a leak by construction, and the code for both exists.
+/// A generator that minted credentials and a shrinker that printed counterexamples is a leak by
+/// construction, and the code for both exists.
 #[test]
 fn a_law_cannot_quantify_over_a_secret() {
     let d = code(
@@ -353,8 +338,7 @@ law "nothing" forall (l: Login) { secret_is_empty(l.password) == secret_is_empty
     );
 }
 
-/// `secret_of_string` is the only introduction, and it takes a `String`. There
-/// is no route from `Bytes`, from an `Int`, or from another `Secret`.
+/// `secret_of_string` is the only introduction, and it takes a `String`.
 #[test]
 fn the_only_introduction_takes_a_string() {
     code(
@@ -367,9 +351,7 @@ fn the_only_introduction_takes_a_string() {
     );
 }
 
-/// There is no `secret_expose`, no `secret_len`, no `secret_map` and no
-/// `secret_slice`. Each would have to see the plaintext, and a function that
-/// sees it can return it.
+/// There is no `secret_expose`, no `secret_len`, no `secret_map` and no `secret_slice`.
 #[test]
 fn the_eliminations_that_do_not_exist_do_not_resolve() {
     for name in [
@@ -391,10 +373,8 @@ fn the_eliminations_that_do_not_exist_do_not_resolve() {
     }
 }
 
-/// The `trace.event[c](.., fields)` route, written without depending on
-/// `std.trace`'s own text: a sum type with no `Secret` variant cannot be handed
-/// one, whatever its variants are called. This is why `Field` needs no rule of
-/// its own — it is closed by having no constructor over `Secret<a>`.
+/// The `trace.event[c](.., fields)` route, written without depending on `std.trace`'s own text: a
+/// sum type with no `Secret` variant cannot be handed one, whatever its variants are called.
 #[test]
 fn a_sum_type_with_no_secret_variant_cannot_hold_one() {
     code(
@@ -404,8 +384,8 @@ fn record(s: Secret<String>) -> Field = FText(s)"#,
     );
 }
 
-/// The SQL parameter route, same shape: `Param` has no `PSecret`, so a
-/// credential cannot be bound into a statement.
+/// The SQL parameter route, same shape: `Param` has no `PSecret`, so a credential cannot be bound
+/// into a statement.
 #[test]
 fn a_parameter_type_with_no_secret_case_cannot_hold_one() {
     code(
@@ -415,10 +395,8 @@ fn bind(s: Secret<String>) -> Param = PText(s)"#,
     );
 }
 
-/// The one way a program observes a credential: a handler clause is handed the
-/// whole `Secret` and answers something derived from it. The clause is where
-/// review happens, and the type is what forces it to be a clause rather than a
-/// string interpolation anywhere in the program.
+/// The one way a program observes a credential: a handler clause is handed the whole `Secret` and
+/// answers something derived from it.
 #[test]
 fn a_redacting_handler_clause_is_how_a_secret_is_observed() {
     ok(r#"effect vault {
@@ -438,8 +416,6 @@ test "the clause sees the credential and answers a Bool" {
 }
 
 /// `secret_verify` answers a `Bool` and `secret_is_empty` answers a `Bool`.
-/// Neither has the payload's type anywhere in its return, which is what makes
-/// "no `String` in any return type" a checkable claim rather than a convention.
 #[test]
 fn no_builtin_over_a_secret_returns_its_payload() {
     code(

@@ -1,14 +1,4 @@
-//! The equivalence property, which is the whole safety argument for the
-//! incremental front end.
-//!
-//! For every corpus and after every kind of edit, the incremental path must
-//! produce **byte-identical** `DefHash`es, `Scheme`s and `Footprint`s to a
-//! from-scratch check. Comparison is by equality and never by alpha-equivalence:
-//! weakening it would hide exactly the defect these tests exist to catch.
-//!
-//! A cold cache never exercises an invalidation, and every interesting failure
-//! *is* an invalidation, so each case runs a mutation against a warm store
-//! rather than only the clean case.
+//! The equivalence property, which is the whole safety argument for the incremental front end.
 
 use ply_cli::driver;
 use ply_cli::load::Loaded;
@@ -17,9 +7,9 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// `{:?}` rather than a printed signature: `print_scheme` renames variables per
-/// item, which would paper over exactly the numbering divergence that made
-/// canonicalization necessary in the first place.
+/// `{:?}` rather than a printed signature: `print_scheme` renames variables per item, which would
+/// paper over exactly the numbering divergence that made canonicalization necessary in the first
+/// place.
 fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
     let mut out = BTreeMap::new();
     for (name, hash) in &loaded.hashes.defs {
@@ -64,10 +54,9 @@ fn snapshot(loaded: &Loaded) -> BTreeMap<String, String> {
     out
 }
 
-/// The incremental run goes first so it sees the store as an edit-test loop
-/// would, and its result is returned so a caller can assert that a gate
-/// actually fired — an equivalence that holds because nothing was skipped
-/// proves nothing.
+/// The incremental run goes first so it sees the store as an edit-test loop would, and its result
+/// is returned so a caller can assert that a gate actually fired — an equivalence that holds
+/// because nothing was skipped proves nothing.
 #[track_caller]
 fn agree(dir: &Path, what: &str) -> Loaded {
     let mut store = Store::open(dir).expect("the cache directory must be creatable");
@@ -254,9 +243,9 @@ fn renaming_a_definition_agrees() {
     agree(dir.path(), "rename a function");
 }
 
-/// The case the resolution witness exists for: a `type` rename changes no hash
-/// at all, so nothing but the witness can tell the front end that every scheme
-/// mentioning it is now written in a different name.
+/// The case the resolution witness exists for: a `type` rename changes no hash at all, so nothing
+/// but the witness can tell the front end that every scheme mentioning it is now written in a
+/// different name.
 #[test]
 fn renaming_a_type_agrees() {
     let dir = corpus();
@@ -313,8 +302,8 @@ fn adding_a_file_agrees() {
     agree(dir.path(), "file added");
 }
 
-/// The case a content-only gate would get wrong: the *referencing* file did not
-/// change, so nothing about its bytes says its dependency is gone.
+/// The case a content-only gate would get wrong: the *referencing* file did not change, so nothing
+/// about its bytes says its dependency is gone.
 #[test]
 fn deleting_a_file_is_reported_rather_than_skipped_past() {
     let dir = corpus();
@@ -367,8 +356,8 @@ fn adding_and_removing_an_import_agrees() {
     agree(dir.path(), "import removed");
 }
 
-/// Gate 1 is conservative about formatting and gate 2 is exact, so a reformat
-/// must cost a parse and no inference at all.
+/// Gate 1 is conservative about formatting and gate 2 is exact, so a reformat must cost a parse and
+/// no inference at all.
 #[test]
 fn reformatting_costs_a_parse_and_no_recheck() {
     let dir = corpus();
@@ -417,8 +406,8 @@ fn a_dependencys_change_reaches_its_dependents() {
     );
 }
 
-/// `--no-incremental` must neither read nor write the front-end cache, so a run
-/// under it can never be the reason a later run skips something.
+/// `--no-incremental` must neither read nor write the front-end cache, so a run under it can never
+/// be the reason a later run skips something.
 #[test]
 fn the_full_path_writes_no_front_end_cache() {
     let dir = corpus();
@@ -467,9 +456,8 @@ fn a_definition_removed_outright_agrees() {
     agree(dir.path(), "definition removed");
 }
 
-/// Every mutation in sequence against one store, which is what an editing
-/// session actually looks like: each step's fingerprints are whatever the step
-/// before it left behind.
+/// Every mutation in sequence against one store, which is what an editing session actually looks
+/// like: each step's fingerprints are whatever the step before it left behind.
 #[test]
 fn a_whole_editing_session_agrees_at_every_step() {
     let dir = corpus();
@@ -507,14 +495,8 @@ fn a_whole_editing_session_agrees_at_every_step() {
     agree(dir.path(), "step 7: rename an effect");
 }
 
-/// Two structurally identical definitions in different modules share a
-/// `DefHash` while their schemes name different types. Both must be cached: the
-/// store holds one interface per `(hash, name)`, so neither evicts the other.
-///
-/// Getting this wrong is silent. Every hash and scheme stays right — the loser
-/// is simply rechecked, forever, on every run. Duplicate definitions are common
-/// enough at scale that the effect is not marginal, so the assertion here is
-/// that both files skip rather than that they merely agree.
+/// Two structurally identical definitions in different modules share a `DefHash` while their
+/// schemes name different types.
 #[test]
 fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
     let dir = tempfile::tempdir().unwrap();
@@ -556,11 +538,8 @@ fn two_definitions_that_share_a_hash_each_keep_their_own_interface() {
     }
 }
 
-/// Two byte-identical effect declarations are two capabilities, and `x.look`
-/// and `y.look` are still one definition: they differ only by which of the two
-/// they name, which no context can observe. What must stay distinct is a
-/// definition that reaches both and commits to one — `w.pick` here — and both
-/// front ends have to agree about all of it.
+/// Two byte-identical effect declarations are two capabilities, and `x.look` and `y.look` are still
+/// one definition: they differ only by which of the two they name, which no context can observe.
 #[test]
 fn identically_declared_effects_in_two_modules_agree() {
     let dir = tempfile::tempdir().unwrap();
@@ -599,9 +578,8 @@ fn identically_declared_effects_in_two_modules_agree() {
     agree(dir.path(), "an unrelated edit");
 }
 
-/// A `type` alias has no constructors, so nothing about it survives in a cached
-/// declaration beyond its arity. A module that declares one may still be
-/// skipped, because a skipped module is never one a checked module imports.
+/// A `type` alias has no constructors, so nothing about it survives in a cached declaration beyond
+/// its arity.
 #[test]
 fn a_module_declaring_a_type_alias_can_still_be_skipped() {
     let dir = tempfile::tempdir().unwrap();
@@ -638,9 +616,9 @@ fn a_module_declaring_a_type_alias_can_still_be_skipped() {
     );
 }
 
-/// A test's footprint is written in effect names that its hash erases, and a
-/// `CachedTest` carries no witness, so a test whose hash the fingerprint does
-/// not already hold has to be checked rather than restored.
+/// A test's footprint is written in effect names that its hash erases, and a `CachedTest` carries
+/// no witness, so a test whose hash the fingerprint does not already hold has to be checked rather
+/// than restored.
 #[test]
 fn a_file_whose_tests_changed_is_checked_rather_than_restored() {
     let dir = tempfile::tempdir().unwrap();
@@ -663,9 +641,8 @@ fn a_file_whose_tests_changed_is_checked_rather_than_restored() {
     assert!(m.rechecked, "a file with a new test must be checked");
 }
 
-/// A test's footprint is a function of its body, so a test added with a body the
-/// file already holds is a test whose footprint the file already holds. Adding
-/// one costs a parse and no inference.
+/// A test's footprint is a function of its body, so a test added with a body the file already holds
+/// is a test whose footprint the file already holds.
 #[test]
 fn a_test_added_with_a_body_already_present_costs_no_recheck() {
     let dir = tempfile::tempdir().unwrap();
@@ -688,8 +665,8 @@ fn a_test_added_with_a_body_already_present_costs_no_recheck() {
     assert!(!m.rechecked, "the added test's body was already checked");
 }
 
-/// The mutations again on real code, which exercises handlers, regions,
-/// `nondet` effects and cross-module types that the synthetic corpus does not.
+/// The mutations again on real code, which exercises handlers, regions, `nondet` effects and
+/// cross-module types that the synthetic corpus does not.
 #[test]
 fn the_example_corpus_agrees_across_a_session() {
     let dir = examples();
@@ -721,17 +698,13 @@ fn the_example_corpus_agrees_across_a_session() {
     agree(dir.path(), "step 4: add a definition");
 }
 
-/// A long shuffle through states that all compile, because the failures worth
-/// finding are the ones nobody thought to write a case for: an invalidation is
-/// wrong only in some *sequence* of edits, and a hand-written case only ever
-/// exercises the sequence its author imagined.
-///
-/// Seeded rather than random: a divergence has to be reproducible from the
-/// failure message alone.
+/// A long shuffle through states that all compile, because the failures worth finding are the ones
+/// nobody thought to write a case for: an invalidation is wrong only in some *sequence* of edits,
+/// and a hand-written case only ever exercises the sequence its author imagined.
 #[test]
 fn a_long_shuffle_of_compiling_states_agrees_at_every_step() {
-    // Each file's variants differ in a way the gates must notice: a body, a
-    // signature, a name, a declaration's shape, an import.
+    // Each file's variants differ in a way the gates must notice: a body, a signature, a name, a
+    // declaration's shape, an import.
     let variants: [(&str, [&str; 3]); 3] = [
         (
             "leaf.ply",
@@ -782,8 +755,8 @@ fn a_long_shuffle_of_compiling_states_agrees_at_every_step() {
     }
 }
 
-/// `str::replace` is not `const`, and the variants above want to be written as
-/// edits of the corpus rather than as three copies that can drift apart.
+/// `str::replace` is not `const`, and the variants above want to be written as edits of the corpus
+/// rather than as three copies that can drift apart.
 fn const_str_replace(text: &str, from: &str, to: &str) -> String {
     assert!(text.contains(from), "`{from}` is not in the fixture");
     text.replace(from, to)
@@ -810,18 +783,8 @@ test "the default crosses the module boundary" {
 }
 "#;
 
-/// **The stale-expansion hazard ADR 0023 refused record update over, checked
-/// where defaults do cross the boundary.**
-///
-/// `wall.ply`'s bytes never change. Its call to `paint` was expanded against a
-/// default written in `palette.ply`, so if gate 1 let it skip, the tree would
-/// hold an expansion of a default that no longer exists — and unlike a stale
-/// name, that is a wrong *value*, silently.
-///
-/// What makes it safe is that a default is part of the callee's `DefHash`, so
-/// the exports digest of the module declaring it moves and the importer is
-/// refused. Both halves are asserted: the importer is re-parsed, and the
-/// incremental snapshot is byte-identical to a from-scratch check.
+/// **The stale-expansion hazard ADR 0023 refused record update over, checked where defaults do
+/// cross the boundary.**
 #[test]
 fn editing_a_cross_module_default_agrees_and_refuses_the_importer() {
     let dir = tempfile::tempdir().unwrap();
@@ -831,8 +794,7 @@ fn editing_a_cross_module_default_agrees_and_refuses_the_importer() {
     let cold = agree(dir.path(), "cold");
     let before = cold.hashes.defs[&ply_span::Symbol::new("wall.wall")];
 
-    // Only the default moves. Every other byte of both files is untouched, and
-    // `wall.ply` is not touched at all.
+    // Only the default moves.
     edit(
         dir.path(),
         "palette.ply",
@@ -854,9 +816,8 @@ fn editing_a_cross_module_default_agrees_and_refuses_the_importer() {
     );
 }
 
-/// The identity the whole design rests on, at the level a user sees: three
-/// spellings of one call are one definition with one hash, so adopting a
-/// default or a name re-runs nothing.
+/// The identity the whole design rests on, at the level a user sees: three spellings of one call
+/// are one definition with one hash, so adopting a default or a name re-runs nothing.
 #[test]
 fn the_three_spellings_of_one_call_are_one_definition() {
     let dir = tempfile::tempdir().unwrap();

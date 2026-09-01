@@ -1,29 +1,4 @@
-// The database effect. `import std.db` and the operations below are the ones
-// `ply_host::db` registers against.
-//
-// This module is the declaration and the transaction scope, and nothing else:
-// the signature the driver binds to and the signature the program performs are
-// one text that cannot drift. An operation renamed on either side is E0421 at
-// bind time, naming the operation that moved.
-//
-// **The resource label is a table.** That is the whole reason to put a database
-// behind an effect: an endpoint's declared signature names the tables it
-// touches, and a driver answering `db.write[db]` for every statement has thrown
-// that away and kept the ceremony. `db.query[items]` performs `(db, items,
-// Read)`; `db.execute[items]` and `db.returning[items]` perform `(db, items,
-// Write)`.
-//
-// `nondet` is load-bearing and it is the same sentence `std.net` carries: a
-// database's contents are not a function of the program's state, so a `det`
-// test reaching an unhandled `db` operation is E0412 at compile time whether or
-// not `--host` was passed.
-//
-// **A SQLSTATE is a value, never a diagnostic.** A unique violation, a
-// foreign-key violation, a serialization failure, a connection that died
-// mid-statement — all of them are `Failed(e)` the program matches on. A server
-// that dies because a row already existed is not a server, and a language that
-// turned every constraint into a compiler-shaped failure would make the
-// constraint unusable as a concurrency control.
+// The database effect.
 
 import std.json
 
@@ -32,20 +7,14 @@ pub nondet effect db {
   write execute[t](s: Stmt, ps: List<Param>)    -> Answer
   write returning[t](s: Stmt, ps: List<Param>)  -> Answer
 
-  // The transaction control operations take no resource, so their atom is the
-  // singleton `db.write`. That is a real scheduling cost, stated rather than
-  // discovered: every definition that opens a transaction carries `db.write`,
-  // so any two tests that open one conflict and are serialised even when their
-  // tables are disjoint. It is also true — they contend for the same pool.
-  // Read-only endpoints do not open transactions and keep their concurrency.
+  // The transaction control operations take no resource, so their atom is the singleton `db.write`.
   write begin(level: Isolation, access: Access) -> Answer
   write commit()                                -> Answer
   write abort()                                 -> Answer
 
-  // Performed anywhere inside a `transaction` body, arbitrarily deep, and
-  // handled by `transaction` rather than by the host: it never reaches a
-  // binding, and if `ply hosts` ever prints a row for it something has bound it
-  // and that is a defect.
+  // Performed anywhere inside a `transaction` body, arbitrarily deep, and handled by `transaction`
+  // rather than by the host: it never reaches a binding, and if `ply hosts` ever prints a row for
+  // it something has bound it and that is a defect.
   write rollback(reason: String)                -> Unit
 }
 
@@ -63,26 +32,17 @@ pub type Param =
   | PFloat(Float) | PNumeric(Decimal) | PJson(json::Json)
   | PArray(List<Param>)
 
-// One value out of one column. Spelled `Datum` rather than the contract's
-// `Cell`, which is the builtin type constructor a region-scoped cell has and
-// which no program may redefine (E0105); the constructors keep the contract's
-// names, so `CText` still reads as the cell that holds text.
+// One value out of one column.
 pub type Datum =
   | CNull
   | CInt(Int) | CBool(Bool) | CText(String) | CBytes(Bytes)
   | CFloat(Float) | CNumeric(Decimal) | CJson(json::Json)
   | CArray(List<Datum>)
 
-// Column name to value. A `Map`, so a row has one canonical form, two rows
-// built in different column orders are equal, and a golden test over a result
-// set is stable.
+// Column name to value.
 pub type Row = Map<String, Datum>
 
-// The SQLSTATE the server returned and the object it named. **The message is
-// not here.** It is postgres's prose, it moves between server versions and
-// locales, and a twin that had to reproduce it would be reproducing English
-// rather than behaviour. `detail` carries it for a person and nothing compares
-// it.
+// The SQLSTATE the server returned and the object it named.
 pub type DbError = {
   code: String,
   constraint: String,
@@ -95,41 +55,11 @@ pub type Answer =
   | Failed(DbError)
 
 // --- Transactions -----------------------------------------------------------
-//
-// A transaction is a **scope**, and the only thing that must be scoped in Ply
-// is the abort. Note what does not appear below: a clause per table. A Ply
-// handler clause names a concrete `(operation, resource)` pair, so a
-// transaction that intercepted the data operations would need one clause per
-// table per operation and could not be a library function at all. It does not
-// need to — the data operations pass straight through to whatever handler is
-// below, and the driver routes them onto the open scope's connection because
-// the scope is host-side state.
 
 pub type Rollback = { reason: String, error: Option<DbError> }
 
-// `db.rollback` is performed anywhere inside the body, arbitrarily deep, and
-// its clause **does not resume**. The value of the clause is the value of the
-// whole `handle`, so everything the body had left to do — the rest of the
-// function, its callers up to here, the statements it was about to issue — is
-// the continuation, and the continuation is dropped on the floor. Nothing
-// unwinds, nothing is caught, no frame runs an epilogue.
-//
-// The continuation is bound and never called, and that is the point rather than
-// an oversight: `k` names the work being discarded. A rollback is `resumes = 0`,
-// which satisfies the host boundary's `resumes <= 1` trivially — so it needs no
-// exemption from the linearity rule and no change to the check, which is the
-// strongest evidence available that the restriction was the right one.
-//
-// Three of the four exits are here; the fourth is not, and cannot be. A body
-// that **raises** — an assertion, a spent step budget — propagates past this
-// `handle` unchanged with the scope still open, and the driver rolls it back
-// when the entry point ends.
-//
-// The body's row is `e` and not `{db.write | e}` as the contract writes it,
-// because a row unifies rather than subsumes: the second spelling would demand
-// that every body perform a transaction-control operation of its own, and a
-// body that only inserts would not typecheck against it. `{db.write | e}` is
-// what this function *carries*, which is the claim that matters at a call site.
+// `db.rollback` is performed anywhere inside the body, arbitrarily deep, and its clause **does not
+// resume**.
 pub fn transaction<a | e>(level: Isolation, access: Access, body: () -> a / e)
   -> Result<a, Rollback> / {db.write | e} =
   handle {
@@ -150,20 +80,7 @@ pub fn transaction<a | e>(level: Isolation, access: Access, body: () -> a / e)
     },
   }
 
-// A transaction that always rolls back, whatever the body did. The body's value
-// comes out; its writes do not.
-//
-// What it does **not** isolate, stated where it is defined rather than
-// discovered on the second run: DDL; a sequence's advance, which postgres does
-// not roll back, so two sandboxed tests see different ids and a test asserting
-// `id == 1` is wrong on its second run; anything a *different* connection does;
-// and a nesting deeper than the driver's savepoint bound.
-//
-// A `begin` that failed is an assertion rather than a value, and that is the
-// one place this function is louder than `transaction`. Its result type is the
-// body's, so there is nothing to report a failure in — and a sandbox that
-// silently ran the body outside a transaction would write to the live database
-// and hand back a value indistinguishable from the sandboxed one.
+// A transaction that always rolls back, whatever the body did.
 pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.write | e} = {
   assert(opened(db.begin(ReadCommitted, ReadWrite)));
   let value = body();
@@ -173,31 +90,15 @@ pub fn sandbox<a | e>(body: () -> a / e) -> a / {db.write | e} = {
 
 fn opened(a: Answer) -> Bool = match a { Failed(_) -> false, _ -> true }
 
-// A serialization failure and a deadlock are the two the server is telling the
-// program to try again. W4 never retries on the program's behalf: retrying means
-// re-running the body, and only the program knows whether the body sent an
-// email, charged a card or wrote a file between two statements. So the decision
-// is one `if` at a site that can see what it is repeating, and the retry is a
-// fresh call to `transaction` rather than a second resumption.
+// A serialization failure and a deadlock are the two the server is telling the program to try
+// again.
 pub fn is_retryable(e: DbError) -> Bool = e.code == "40001" || e.code == "40P01"
 
 
 // --- Tests ------------------------------------------------------------------
-//
-// A shipped module's tests are the compiler's, not a project's: `ply test` in a
-// project that imports this module does not select them and writes nothing
-// about them to that project's cache. `ply test --std` selects them, and the
-// compiler's own suite runs them.
-//
-// Every test here is `det`, hermetic and cached, because the handler each one
-// installs discharges every `db` atom it reaches. The handlers are journals
-// rather than databases — what is under test is the control flow of a scope,
-// and a journal is what makes "the statements after the rollback never ran" an
-// assertion about a list rather than a query against something.
 
-// A rollback raised two calls deep, which is the shape a real program writes:
-// the discard is not a lexical `return` and the site that raises it cannot see
-// the `handle` that answers it.
+// A rollback raised two calls deep, which is the shape a real program writes: the discard is not a
+// lexical `return` and the site that raises it cannot see the `handle` that answers it.
 fn charge(stock: Bool) -> Int / {db.write, db.write[items]} = {
   db.execute[items](stmt("insert one"), []);
   reserve(stock);
@@ -223,9 +124,9 @@ test "a rollback discards the continuation the body had left" {
         7
       });
       assert_eq(out, Err({reason: "out of stock", error: None}));
-      // `insert two` is absent because it was never reached, and `commit` is
-      // absent for the same reason: the `match` that would have committed is
-      // part of the continuation the clause discarded.
+      // `insert two` is absent because it was never reached, and `commit` is absent for the same
+      // reason: the `match` that would have committed is part of the continuation the clause
+      // discarded.
       assert_eq(cell_get(j), ["begin", "insert one", "abort"])
     } with {
       db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
@@ -254,9 +155,9 @@ test "a body that returns commits, and its value comes out" {
   }
 }
 
-// A `begin` that failed never ran the body, which is the difference between a
-// transaction that could not start and one that started and was abandoned: the
-// second leaves a scope for the driver to close and the first leaves nothing.
+// A `begin` that failed never ran the body, which is the difference between a transaction that
+// could not start and one that started and was abandoned: the second leaves a scope for the driver
+// to close and the first leaves nothing.
 test "a begin that fails runs no body and issues no abort" {
   with_cell[journal]([]) { j ->
     handle {
@@ -280,9 +181,8 @@ test "a begin that fails runs no body and issues no abort" {
   }
 }
 
-// A commit that fails — a deferred constraint, a serialization failure at the
-// commit — is an `Err` carrying the SQLSTATE rather than a diagnostic, and the
-// scope is over either way.
+// A commit that fails — a deferred constraint, a serialization failure at the commit — is an `Err`
+// carrying the SQLSTATE rather than a diagnostic, and the scope is over either way.
 test "a commit that fails is an Err carrying the SQLSTATE" {
   with_cell[journal]([]) { j ->
     handle {
@@ -341,10 +241,9 @@ test "the same body without the rollback runs to its end and commits" {
   }
 }
 
-// Nesting is a savepoint, and what makes it expressible in Ply at all is that
-// the inner `transaction`'s `handle` is the innermost one: an inner rollback is
-// answered by the inner scope and the outer body carries on. The savepoint
-// itself is the driver's; this is the half that is the language's.
+// Nesting is a savepoint, and what makes it expressible in Ply at all is that the inner
+// `transaction`'s `handle` is the innermost one: an inner rollback is answered by the inner scope
+// and the outer body carries on.
 test "an inner rollback leaves the outer transaction running" {
   with_cell[journal]([]) { j ->
     handle {
@@ -371,8 +270,8 @@ test "an inner rollback leaves the outer transaction running" {
   }
 }
 
-// The outer rollback is the other direction: an inner scope that committed is
-// discarded with everything else, because a released savepoint is not a commit.
+// The outer rollback is the other direction: an inner scope that committed is discarded with
+// everything else, because a released savepoint is not a commit.
 test "an outer rollback discards a committed inner scope" {
   with_cell[journal]([]) { j ->
     handle {
@@ -412,9 +311,9 @@ test "sandbox runs the body, hands back its value and aborts" {
   }
 }
 
-// A rollback inside a sandbox is answered by the sandbox's caller, not by the
-// sandbox: `sandbox` installs no `handle`, because its result type is the
-// body's and there is no `Err` for it to produce.
+// A rollback inside a sandbox is answered by the sandbox's caller, not by the sandbox: `sandbox`
+// installs no `handle`, because its result type is the body's and there is no `Err` for it to
+// produce.
 test "a sandbox nested in a transaction keeps the transaction's rollback" {
   with_cell[journal]([]) { j ->
     handle {
@@ -424,9 +323,8 @@ test "a sandbox nested in a transaction keeps the transaction's rollback" {
         2
       }));
       assert_eq(out, Err({reason: "give up", error: None}));
-      // The sandbox's own abort is part of the discarded continuation, so the
-      // scope it opened is closed by the transaction's abort and by the
-      // driver's teardown rather than by the sandbox.
+      // The sandbox's own abort is part of the discarded continuation, so the scope it opened is
+      // closed by the transaction's abort and by the driver's teardown rather than by the sandbox.
       assert_eq(cell_get(j), ["begin", "begin", "insert one", "abort"])
     } with {
       db.begin(level, access) -> { cell_set(j, push(cell_get(j), "begin")); Count(0) },
@@ -445,11 +343,6 @@ test "is_retryable names the two the server is telling the program to try again"
 }
 
 // --- A schema is a value --------------------------------------------------------
-//
-// A migration *tool* is out of scope — no versions, no up and down, no ordering
-// across deploys, no diffing a live database into a change script. A schema
-// value is the part that is needed: the twin has to be built from something and
-// a fixture has to exist.
 
 pub type ColumnType = TInt | TBool | TText | TBytes | TFloat | TNumeric(Int, Int) | TJson
                     | TArray(ColumnType)
@@ -473,9 +366,8 @@ pub type Table = {
 
 pub type Schema = { tables: List<Table> }
 
-// A savepoint stack deeper than this is a program that recursed, and the
-// program is what must stop, so exceeding it is `Failed` with `54000` rather
-// than a diagnostic.
+// A savepoint stack deeper than this is a program that recursed, and the program is what must stop,
+// so exceeding it is `Failed` with `54000` rather than a diagnostic.
 pub fn max_savepoints() -> Int = 16
 
 pub fn db_error(code: String, constraint: String, detail: String) -> DbError =
@@ -488,11 +380,6 @@ pub fn column_default(name: String, ty: ColumnType, nullable: Bool, d: Default) 
   { name: name, ty: ty, nullable: nullable, default: d }
 
 // --- The DDL a schema renders to ------------------------------------------------
-//
-// This is the one DDL the driver's scanner accepts, and it accepts it only from
-// the harness that creates a fixture. A `CREATE TABLE` handed to `db.execute`
-// is `E0432` like any other unrecognised statement, because DDL inside a
-// request handler is not a thing W4 has an opinion about how to schedule.
 
 pub fn create_schema(s: Schema) -> List<Stmt> =
   fold(s.tables, sequence_statements(s), |acc: List<Stmt>, t: Table|
@@ -559,10 +446,8 @@ fn type_sql(t: ColumnType) -> String =
     TArray(inner) -> type_sql(inner) ++ "[]",
   }
 
-// Only in the `DEFAULT` clause of a `CREATE TABLE`, which is DDL a harness
-// writes and never a value a request supplied. Nothing else in this module
-// turns a value into syntax, and a default this cannot render is refused rather
-// than approximated.
+// Only in the `DEFAULT` clause of a `CREATE TABLE`, which is DDL a harness writes and never a value
+// a request supplied.
 fn literal_sql(p: Param) -> String =
   match p {
     PNull -> "null",
@@ -588,12 +473,6 @@ fn join_with(pieces: List<String>, sep: String) -> String =
     else { {started: true, out: p} }).out
 
 // --- Lists, which the language gives one primitive for ---------------------------
-//
-// `push` appends; there is no concatenation, no prepend and no index. These
-// four are what the rest of this module builds out of, and they are quadratic
-// rather than linear. A statement's token list, a table's column list and a
-// result set are all small, so the bound that matters is the evaluator's call
-// budget rather than this.
 
 fn concat_lists<a>(xs: List<a>, ys: List<a>) -> List<a> =
   fold(ys, xs, |acc: List<a>, y: a| push(acc, y))
@@ -625,61 +504,10 @@ fn has_string(xs: List<String>, s: String) -> Bool =
   fold(xs, false, |acc: Bool, x: String| acc || x == s)
 
 // --- The in-memory twin ---------------------------------------------------------
-//
-// A set of **pure functions over a `MemDb` value**, with no effects at all.
-// Rows are `Map<String, Datum>` and answers are `Answer`, so the twin and the
-// driver produce values of one type by construction — ADR 0008 §5's "the same
-// declared signature", made structural rather than promised.
-//
-// It executes the same `Stmt` text the driver does, through its own scanner,
-// which is the point: the scanner is where the divergences live, and a twin
-// that took a structured operation instead would never test it.
-//
-// **What it does not model, it refuses.** Anything outside the list below makes
-// `step` answer `Failed({code: "0A000", ..})` — `feature_not_supported`, the
-// SQLSTATE postgres itself uses — with the construct in `detail`. It never
-// guesses and never answers as though it executed. The named gaps, so that
-// nobody has to discover them:
-//
-//   - Joins, subqueries, `GROUP BY`, `HAVING`, window functions, CTEs, set
-//     operations, and every aggregate but `count(*)`. A `WHERE` is not a query
-//     planner and W4 does not ship one.
-//   - Views, triggers, rules, `ON CONFLICT`, generated columns, partial and
-//     expression indexes, and arithmetic anywhere in an expression.
-//   - **Isolation.** The twin is serial: one connection, one scope stack, no
-//     concurrency. It cannot exhibit a phantom read, a lost update, a
-//     serialization failure or a deadlock, so `RepeatableRead` and
-//     `Serializable` are accepted and behave as a serial execution. This is the
-//     largest thing it does not model and the one a reader is most likely to
-//     assume it does.
-//   - **Collation.** Text orders by `Value` order, which is byte order, which
-//     is `C`. Under any other database collation an `ORDER BY` over text
-//     disagrees, which is the divergence the agreement law's collation
-//     injection exists to demonstrate.
-//   - **Physical row order, and ties inside an `ORDER BY`.** Rows are kept in
-//     insertion order and an `UPDATE` leaves a row where it was; postgres writes
-//     a new tuple at the end of the heap. An `ORDER BY` over a key with ties does
-//     not close that, and this was believed to: postgres's bounded sort is a
-//     top-N heapsort whose output among equal keys is neither the heap order nor
-//     stable, so twelve rows sharing one `n` come back `b, c, a` there and
-//     `a, b, c` here. **SQL promises nothing about ties**, so neither answer is
-//     wrong and no twin can be made to agree. What closes it is ordering by a
-//     key that has none: `examples/agreement.ply`'s `render` appends the primary
-//     key to every generated `ORDER BY`, and `well_formed` admits nothing else.
-//   - **An ordinal `ORDER BY`.** `order by 1` names an output column by
-//     position. Resolving it needs the select list and the table's column order
-//     together, which is a second name resolution for a form nothing generates.
-//   - `numeric` beyond `Decimal`'s 96 bits and scale 28, `float4` rounding, and
-//     every locale-dependent function.
-//   - **Sequences under rollback.** Postgres does not roll back `nextval`, and
-//     neither does this — deliberately, because matching the surprising
-//     behaviour is the whole job.
 
 pub type MemTable = { def: Table, rows: List<Row> }
 
-// One entry per open scope. `tables` is the snapshot to restore on rollback — a
-// `List` and a `Map` share structure, so a snapshot is a pointer copy and a
-// rollback is dropping one.
+// One entry per open scope.
 pub type Frame = { tables: List<MemTable>, failed: Bool, level: Isolation, access: Access }
 
 pub type MemDb = {
@@ -742,8 +570,7 @@ fn sql_digits() -> Bytes = b"0123456789"
 fn ident_rest() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789$"
 fn ident_start() -> Bytes = b"abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"
 
-// `-1` is the end of the input, which is in no set. `bytes_index_of_byte`
-// refuses it rather than answering `None`, so the guard is here.
+// `-1` is the end of the input, which is in no set.
 fn in_set(set: Bytes, c: Int) -> Bool =
   if c < 0 { false } else { match bytes_index_of_byte(set, c) { Some(_) -> true, None -> false } }
 
@@ -768,8 +595,7 @@ fn lex(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
   if c < 0 {
     Ok(acc)
   } else if c == 59 {
-    // One `Stmt` is one statement. The driver refuses a second with `E0432`
-    // before anything runs; the twin has only values, so it refuses it as one.
+    // One `Stmt` is one statement.
     Err(unsupported("more than one statement in one `Stmt`"))
   } else if c == 45 && byte_at(src, j + 1) == 45 {
     lex(src, line_comment_end(src, j + 2), acc)
@@ -794,13 +620,12 @@ fn lex(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
   }
 }
 
-// A comment is whitespace. Ordinary SQL rather than a construct, and the twin
-// refusing it made every statement a program had annotated a `0A000`.
+// A comment is whitespace.
 fn line_comment_end(src: Bytes, i: Int) -> Int =
   if i >= bytes_len(src) || byte_at(src, i) == 10 { i + 1 } else { line_comment_end(src, i + 1) }
 
-// Postgres nests block comments, so a scan to the first `*/` would leave the
-// tail of an outer comment as statement text.
+// Postgres nests block comments, so a scan to the first `*/` would leave the tail of an outer
+// comment as statement text.
 fn block_comment_end(src: Bytes, i: Int, depth: Int) -> Option<Int> =
   if depth == 0 { Some(i) }
   else if i >= bytes_len(src) { None }
@@ -825,10 +650,7 @@ fn lex_number(src: Bytes, i: Int, acc: List<Tok>) -> Result<List<Tok>, DbError> 
   }
 }
 
-// `''` is an escaped quote, which is the only escape a standard-conforming
-// string has. `E'..'` and a dollar-quoted body are refused rather than parsed:
-// a twin that disagreed with postgres about where a literal *ended* would
-// disagree about the whole statement.
+// `''` is an escaped quote, which is the only escape a standard-conforming string has.
 fn lex_string(src: Bytes, i: Int, so_far: Bytes, acc: List<Tok>) -> Result<List<Tok>, DbError> = {
   let stop = if i >= bytes_len(src) { bytes_len(src) }
              else { bytes_scan_until(src, i, b"'", bytes_len(src)) };
@@ -896,10 +718,7 @@ fn int_of_string(s: String) -> Option<Int> = {
 
 // --- The statement, as the twin understands it -----------------------------------
 
-// One item of a select list: the column it reads and the name it comes back
-// under. The two differ exactly when the statement writes `AS`, which is the
-// shape `E0433` tells a program to write when a join returns two columns of one
-// name — so a twin that refused it refused the driver's own remedy.
+// One item of a select list: the column it reads and the name it comes back under.
 type Target = { column: String, name: String }
 
 type Proj = PStar | PCols(List<Target>) | PCount(String)
@@ -959,8 +778,7 @@ fn show_tok(ts: List<Tok>) -> String =
     [TNum(n), ..] -> "`" ++ n ++ "`",
     [TParam(n), ..] -> "`$" ++ int_to_string(n) ++ "`",
     [TSym(s), ..] -> "`" ++ s ++ "`",
-    // Unreachable: the six above are every constructor. The checker reasons
-    // about list length before it reasons about the head, so it asks anyway.
+    // Unreachable: the six above are every constructor.
     _ -> "a token",
   }
 
@@ -977,9 +795,7 @@ fn parse_name(ts: List<Tok>) -> Result<Cut<String>, DbError> =
     _ -> Err(expected("a name", ts)),
   }
 
-// `t.c` names the column `c`. The twin has one table per statement, so the
-// qualifier is checked for being a name and then dropped — a qualifier naming
-// something else would need a join, and a join is refused.
+// `t.c` names the column `c`.
 fn parse_colref(ts: List<Tok>) -> Result<Cut<String>, DbError> = {
   let c = parse_name(ts)?;
   if tok_sym(c.rest) == "." { parse_name(rest_of(c.rest)) } else { Ok(c) }
@@ -1132,10 +948,8 @@ fn parse_column_tail(name: String, ts: List<Tok>) -> Result<Cut<Expr>, DbError> 
     Ok(cut(XCol(name), ts))
   }
 
-// A literal with a `.` is `numeric` and one without is `integer`, which is what
-// postgres does with an unadorned constant. The distinction is load-bearing:
-// `1` and `1.0` are different values in a result set and comparing them is
-// where the twin's arithmetic would diverge if it had any.
+// A literal with a `.` is `numeric` and one without is `integer`, which is what postgres does with
+// an unadorned constant.
 fn num_literal(s: String, negative: Bool, ts: List<Tok>) -> Result<Cut<Expr>, DbError> = {
   let text = if negative { "-" ++ s } else { s };
   if string_contains(s, ".") {
@@ -1215,10 +1029,7 @@ fn parse_proj_columns(ts: List<Tok>, acc: List<Target>) -> Result<Cut<Proj>, DbE
   }
 }
 
-// `AS name`, or the default when there is none. Only the explicit form: a bare
-// alias — `select sku s from part` — is legal SQL and is refused, because the
-// twin cannot tell it from a `from` this parser failed to reach and guessing
-// would make a typo silently rename a column.
+// `AS name`, or the default when there is none.
 fn parse_alias(ts: List<Tok>, dflt: String) -> Result<Cut<String>, DbError> =
   if tok_word(ts) == "as" {
     let n = parse_name(rest_of(ts))?;
@@ -1256,8 +1067,8 @@ fn parse_order_keys(ts: List<Tok>, acc: List<OrderKey>) -> Result<Cut<List<Order
   }
 }
 
-// Postgres's default is `NULLS LAST` under `ASC` and `NULLS FIRST` under
-// `DESC`, so that the default is "nulls sort as if larger than everything".
+// Postgres's default is `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC`, so that the
+// default is "nulls sort as if larger than everything".
 fn parse_nulls(ts: List<Tok>, desc: Bool) -> Result<Cut<Bool>, DbError> =
   if tok_word(ts) == "nulls" {
     let w = tok_word(rest_of(ts));
@@ -1367,12 +1178,6 @@ fn parse_delete(ts: List<Tok>) -> Result<Cut<Query>, DbError> = {
 }
 
 // --- Evaluating an expression ----------------------------------------------------
-//
-// Three-valued, because SQL is. A `WHERE` keeps a row only when its predicate
-// is *true*; unknown and false both drop it, and a `CHECK` passes on unknown
-// and fails only on false. Those two rules disagree, they are both postgres's,
-// and a twin that used one boolean for both would be wrong on every nullable
-// column.
 
 type Tri = TriTrue | TriFalse | TriUnknown
 
@@ -1552,10 +1357,9 @@ fn like_of(xv: Datum, pv: Datum, negated: Bool) -> Result<Tri, DbError> =
     _ -> Err(db_error("42883", "", "operator does not exist: " ++ datum_type(xv) ++ " like ...")),
   }
 
-// `_` matches one **character**, which is what postgres does and what a
-// byte-indexed matcher gets wrong the moment a column holds anything outside
-// ASCII: `'ex' like '_x'` and `'\u00e9x' like '_x'` are both true there and only
-// the first was true here. Found by running this against a live server.
+// `_` matches one **character**, which is what postgres does and what a byte-indexed matcher gets
+// wrong the moment a column holds anything outside ASCII: `'ex' like '_x'` and `'\u00e9x' like
+// '_x'` are both true there and only the first was true here.
 fn like_match(s: String, p: String, si: Int, pi: Int) -> Bool =
   if pi >= string_len(p) {
     si >= string_len(s)
@@ -1595,9 +1399,6 @@ fn decimal_cmp(a: Decimal, b: Decimal) -> Int =
   if a < b { -1 } else if a > b { 1 } else { 0 }
 
 // `None` is SQL's unknown: a comparison with a `NULL` operand has no answer.
-// Mixed numeric types promote the way postgres's implicit casts do; anything
-// else is `42883`, the code postgres gives for an operator that does not exist
-// at those types.
 fn datum_cmp(a: Datum, b: Datum) -> Result<Option<Int>, DbError> =
   match a {
     CNull -> Ok(None),
@@ -1654,9 +1455,8 @@ fn decimal_scale_of(d: Decimal) -> Int = {
 
 fn zeros(n: Int) -> String = fold(range(0, n), "", |acc: String, i: Int| acc ++ "0")
 
-// A `numeric(p, s)` column stores exactly `s` fractional digits, so `1.00` in a
-// `numeric(10,4)` column comes back `1.0000`. Postgres rounds half away from
-// zero, which is `HalfUp` here.
+// A `numeric(p, s)` column stores exactly `s` fractional digits, so `1.00` in a `numeric(10,4)`
+// column comes back `1.0000`.
 fn rescale(d: Decimal, s: Int) -> Option<Decimal> = {
   let reduced = if decimal_scale_of(d) > s { decimal_round(d, s, HalfUp) } else { d };
   let text = decimal_to_string(reduced);
@@ -1683,11 +1483,8 @@ fn numeric_fits(d: Decimal, p: Int, s: Int) -> Bool = {
 
 fn is_text(v: Datum) -> Bool = match v { CText(_) -> true, _ -> false }
 
-// A string literal in statement text is `unknown`-typed and postgres coerces
-// it, so a bad one is `22P02`. A parameter crosses the wire with a type, so a
-// wrong one is `42804` and the server refuses it before it looks at the bytes.
-// The two are different codes for what a reader would call one mistake, and
-// getting them the wrong way round is exactly the drift this twin measures.
+// A string literal in statement text is `unknown`-typed and postgres coerces it, so a bad one is
+// `22P02`.
 fn wrong_type(c: Column, v: Datum, from_param: Bool, want: String) -> DbError =
   if !from_param && is_text(v) {
     db_error("22P02", "", "invalid input syntax for type " ++ want)
@@ -1702,8 +1499,8 @@ fn coerce(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum
     _ -> coerce_value(c, ty, v, from_param),
   }
 
-// The name postgres prints for a column type, which is what a `22P02` and a
-// `42804` both have to name for a reader to find the column.
+// The name postgres prints for a column type, which is what a `22P02` and a `42804` both have to
+// name for a reader to find the column.
 pub fn type_name(ty: ColumnType) -> String =
   match ty {
     TInt -> "bigint",
@@ -1716,16 +1513,9 @@ pub fn type_name(ty: ColumnType) -> String =
     TArray(_) -> "array",
   }
 
-// A string **in statement text** is `unknown`-typed: postgres resolves it
-// against the type it is being assigned or compared to and parses it there, so
-// `insert into part (price) values ('1')` stores `1.0000` and only a value that
-// does not parse is `22P02`. Answering `22P02` for the ones that *do* parse —
-// which is what never attempting the coercion amounts to — refuses statements
-// postgres executes, and it does so under the right code, which is the shape a
-// reader is least likely to look at twice.
-//
-// A parameter is not this. It crosses the wire with a type of its own, so the
-// wrong one is `42804` and the server refuses it before it looks at the bytes.
+// A string **in statement text** is `unknown`-typed: postgres resolves it against the type it is
+// being assigned or compared to and parses it there, so `insert into part (price) values ('1')`
+// stores `1.0000` and only a value that does not parse is `22P02`.
 fn coerce_value(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result<Datum, DbError> =
   match v {
     CText(s) -> if from_param { coerce_typed(c, ty, v, from_param) }
@@ -1743,10 +1533,7 @@ fn bad_input(ty: ColumnType, s: String) -> DbError =
   db_error("22P02", "",
     "invalid input syntax for type " ++ type_name(ty) ++ ": \"" ++ s ++ "\"")
 
-// What an `unknown` literal becomes at a given type, or `None` when postgres
-// would refuse the text. `bytea`, `jsonb` and an array are `None` rather than
-// parsed: their input syntaxes are their own grammars and the twin does not
-// carry one, so it refuses under the code postgres uses for text it cannot read.
+// What an `unknown` literal becomes at a given type, or `None` when postgres would refuse the text.
 fn unknown_datum(ty: ColumnType, s: String) -> Option<Datum> =
   match ty {
     TInt -> {
@@ -1768,9 +1555,8 @@ fn unknown_datum(ty: ColumnType, s: String) -> Option<Datum> =
     TArray(_) -> None,
   }
 
-// `'2.6'::bigint` is a syntax error in postgres rather than a rounding: text is
-// read at the target type, and `bigint`'s input syntax has no fractional part.
-// The *assignment* cast from `numeric` does round, and that is `coerce_typed`.
+// `'2.6'::bigint` is a syntax error in postgres rather than a rounding: text is read at the target
+// type, and `bigint`'s input syntax has no fractional part.
 fn whole_of_string(s: String) -> Option<Int> = {
   let d = decimal_of_string(s)?;
   let n = int_of_decimal(d, Down)?;
@@ -1788,11 +1574,8 @@ fn coerce_typed(c: Column, ty: ColumnType, v: Datum, from_param: Bool) -> Result
   match ty {
     TInt -> match v {
       CInt(_) -> Ok(v),
-      // Postgres's assignment cast: a `numeric` stored into a `bigint` column
-      // rounds **half away from zero**, so `2.5` is `3` and `-2.5` is `-3`.
-      // Refusing it instead makes ordinary `insert`s and `update`s — including
-      // `set n = price`, which is column to column — come back `Failed` for
-      // statements the server executes.
+      // Postgres's assignment cast: a `numeric` stored into a `bigint` column rounds **half away
+      // from zero**, so `2.5` is `3` and `-2.5` is `-3`.
       CNumeric(d) -> int_from_decimal(d),
       _ -> Err(wrong_type(c, v, from_param, "bigint")),
     },
@@ -1823,12 +1606,9 @@ fn int_from_decimal(d: Decimal) -> Result<Datum, DbError> =
     Some(n) -> Ok(CInt(n)),
   }
 
-// The overflow is decided **before** the rescale, because a value whose integer
-// part is already wider than `p - s` cannot be made to fit by rounding it — and
-// `rescale` of one that wide runs out of `Decimal` and would answer `0A000`,
-// which is the twin refusing where postgres has an answer. Found by the
-// agreement law on `price = -79228162514264337593543950335` into a
-// `numeric(10,4)`: postgres `22003`, twin `0A000`.
+// The overflow is decided **before** the rescale, because a value whose integer part is already
+// wider than `p - s` cannot be made to fit by rounding it — and `rescale` of one that wide runs out
+// of `Decimal` and would answer `0A000`, which is the twin refusing where postgres has an answer.
 fn numeric_into(c: Column, d: Decimal, p: Int, s: Int) -> Result<Datum, DbError> =
   if !numeric_fits(d, p, s) { Err(numeric_overflow(p, s)) } else {
   match rescale(d, s) {
@@ -1887,14 +1667,14 @@ fn index_from(xs: List<String>, s: String, i: Int) -> Option<Int> =
 fn cell_of(r: Row, n: String) -> Datum =
   match map_get(r, n) { None -> CNull, Some(v) -> v }
 
-// A primary key column is not-null whether or not the schema says so, which is
-// what postgres does with `PRIMARY KEY`.
+// A primary key column is not-null whether or not the schema says so, which is what postgres does
+// with `PRIMARY KEY`.
 fn not_null_here(def: Table, c: Column) -> Bool =
   !c.nullable || has_string(def.primary_key, c.name)
 
-// The order is postgres's, checked against a live server rather than guessed:
-// not-null, then check, then unique, and referential integrity last because it
-// is an after-statement trigger rather than a constraint on the tuple.
+// The order is postgres's, checked against a live server rather than guessed: not-null, then check,
+// then unique, and referential integrity last because it is an after-statement trigger rather than
+// a constraint on the tuple.
 fn validate_row(def: Table, rows: List<Row>, row: Row, skip: Int) -> Option<DbError> =
   match check_not_null(def, def.columns, row) {
     Some(e) -> Some(e),
@@ -1908,16 +1688,14 @@ fn check_not_null(def: Table, cs: List<Column>, row: Row) -> Option<DbError> =
   match cs {
     [] -> None,
     [c, ..t] -> if not_null_here(def, c) && is_null(cell_of(row, c.name)) {
-      // Postgres reports a column here and no constraint, so `constraint` is
-      // empty. Filling it in with `<table>_<column>_not_null` would be a name
-      // the server never sends.
+      // Postgres reports a column here and no constraint, so `constraint` is empty.
       Some(db_error("23502", "", "null value in column \"" ++ c.name
                     ++ "\" of relation \"" ++ def.name ++ "\" violates not-null constraint"))
     } else { check_not_null(def, t, row) },
   }
 
-// A `CHECK` passes when it is unknown and fails only when it is false, which is
-// the opposite of a `WHERE` and the reason `Tri` exists.
+// A `CHECK` passes when it is unknown and fails only when it is false, which is the opposite of a
+// `WHERE` and the reason `Tri` exists.
 fn check_checks(def: Table, cs: List<Check>, row: Row) -> Option<DbError> =
   match cs {
     [] -> None,
@@ -1949,9 +1727,7 @@ fn check_unique_list(def: Table, us: List<Unique>, rows: List<Row>, row: Row, sk
     },
   }
 
-// Two NULLs are distinct in a unique index, so a key with any NULL in it never
-// collides. Postgres 15 added `NULLS NOT DISTINCT`; W4's `Schema` cannot say it
-// and this twin does not offer it.
+// Two NULLs are distinct in a unique index, so a key with any NULL in it never collides.
 fn unique_violation(def: Table, rows: List<Row>, row: Row, skip: Int,
                     cols: List<String>, name: String) -> Option<DbError> =
   if len(cols) == 0 || key_has_null(row, cols) {
@@ -1976,12 +1752,9 @@ fn collides(rows: List<Row>, row: Row, cols: List<String>, skip: Int, i: Int) ->
 fn key_equal(a: Row, b: Row, cols: List<String>) -> Bool =
   fold(cols, true, |acc: Bool, c: String| acc && cell_of(a, c) == cell_of(b, c))
 
-// `NO ACTION`, which postgres checks at the end of the statement rather than
-// per row — so this is one pass over every foreign key in the schema after the
-// write has landed, and a violation restores the tables the statement started
-// with. Nothing cascades: `ON DELETE CASCADE` is a schema the driver refuses at
-// bind time with `E0438`, so a twin that implemented it would be modelling a
-// database W4 will not talk to.
+// `NO ACTION`, which postgres checks at the end of the statement rather than per row — so this is
+// one pass over every foreign key in the schema after the write has landed, and a violation
+// restores the tables the statement started with.
 fn check_referential(ts: List<MemTable>) -> Option<DbError> = check_ref_from(ts, ts)
 
 fn check_ref_from(all: List<MemTable>, ts: List<MemTable>) -> Option<DbError> =
@@ -2040,11 +1813,8 @@ fn fk_pairs(parent: Row, child: Row, cs: List<String>, rs: List<String>) -> Bool
 
 // --- Executing a statement -------------------------------------------------------
 
-// The shape of the answer follows the **statement**, not which of `query`,
-// `execute` or `returning` performed it: a `RETURNING` answers `Rows` and a
-// bare write answers `Count`. That is what makes a `returning` a schema change
-// turned into a plain `execute` a mismatch the program reads rather than a type
-// error at a call site that did not move.
+// The shape of the answer follows the **statement**, not which of `query`, `execute` or `returning`
+// performed it: a `RETURNING` answers `Rows` and a bare write answers `Count`.
 pub fn step(d: MemDb, s: Stmt, ps: List<Param>) -> Outcome =
   if d.failed {
     fail(d, in_failed_txn())
@@ -2066,10 +1836,7 @@ fn exec(d: MemDb, q: Query, ps: List<Param>) -> Outcome =
                    else { exec_delete(d, dq, ps) },
   }
 
-// The **outermost** scope decides, because a savepoint has no access mode. A
-// nested `ReadOnly` inside a `ReadWrite` is accepted and its statements are
-// still writable — postgres has no read-only savepoint — so the narrowing is
-// documentation and not enforcement, which is the only honest thing to say.
+// The **outermost** scope decides, because a savepoint has no access mode.
 fn read_only(d: MemDb) -> Bool =
   match nth(d.stack, 0) {
     None -> false,
@@ -2077,24 +1844,6 @@ fn read_only(d: MemDb) -> Bool =
   }
 
 // --- The plan --------------------------------------------------------------------
-//
-// Everything postgres decides **before it looks at a row**, and the reason it is
-// a pass of its own. A predicate evaluated per stored row makes every one of
-// these disappear exactly when no row is examined — on an empty table, which is
-// the state a test is most likely to start from — and makes some of them
-// disappear when a row *is* examined but the compared column is `NULL`, because
-// `datum_cmp` answers "unknown" before it looks at the operand types. Measured
-// against a live server, all four of these were `Rows([])` or `Count(0)` in the
-// twin:
-//
-//   select sku from part where nosuch = 1      42703
-//   delete from part where nosuch = $1         42703
-//   select sku, sku from part                  two columns, refused
-//   select sku from part where n = 'abc'       22P02, `n` bigint, every row NULL
-//
-// The last is the one that matters most: postgres resolves an `unknown`-typed
-// literal against the column on the other side of the operator when it plans,
-// so a literal that will not parse is refused there and no row is consulted.
 
 type Planned = { left: Expr, right: Expr }
 
@@ -2155,8 +1904,7 @@ fn plan_expr(def: Table, e: Expr) -> Result<Expr, DbError> =
     },
   }
 
-// An `unknown` literal takes its type from the column on the other side of the
-// operator. Symmetric, because `1 = n` is as ordinary as `n = 1`.
+// An `unknown` literal takes its type from the column on the other side of the operator.
 fn plan_operands(def: Table, a: Expr, b: Expr) -> Result<Planned, DbError> = {
   let pa = plan_expr(def, a)?;
   let pb = plan_expr(def, b)?;
@@ -2200,8 +1948,8 @@ fn column_type_of(def: Table, e: Expr) -> Option<ColumnType> =
     _ -> None,
   }
 
-// Only a string literal is `unknown`: a parameter carries its own type across
-// the wire, and any other literal already has one.
+// Only a string literal is `unknown`: a parameter carries its own type across the wire, and any
+// other literal already has one.
 fn retype(ty: ColumnType, e: Expr) -> Result<Expr, DbError> =
   match e {
     XLit(v) -> match v {
@@ -2214,10 +1962,8 @@ fn retype(ty: ColumnType, e: Expr) -> Result<Expr, DbError> =
     _ -> Ok(e),
   }
 
-// A result set with two columns of one name, and a column the table does not
-// have: both are the statement's shape rather than a row's, so both are decided
-// here. The twin's own check used to live in `project_row`, which runs per row
-// and therefore never ran on an empty table.
+// A result set with two columns of one name, and a column the table does not have: both are the
+// statement's shape rather than a row's, so both are decided here.
 fn check_projection(def: Table, proj: Proj) -> Option<DbError> =
   match proj {
     PStar -> None,
@@ -2361,14 +2107,7 @@ fn drop_n<a>(xs: List<a>, n: Int) -> List<a> =
 fn take_n<a>(xs: List<a>, n: Int, acc: List<a>) -> List<a> =
   if n <= 0 { acc } else { match xs { [] -> acc, [h, ..t] -> take_n(t, n - 1, push(acc, h)) } }
 
-// Insertion sort, and stable by construction: a row goes after every row it
-// compares equal to.
-//
-// **Stability is not agreement.** Postgres promises no order between equal keys
-// and its bounded sort does not deliver one, so a tie is a case where the two
-// sides differ and neither is wrong. What the stability buys is that the twin's
-// own tests are reproducible; what makes the *law* well posed is that
-// `render` orders by a key with no ties.
+// Insertion sort, and stable by construction: a row goes after every row it compares equal to.
 fn sort_rows(rows: List<Row>, keys: List<OrderKey>, acc: List<Row>)
   -> Result<List<Row>, DbError> =
   if len(keys) == 0 { Ok(concat_lists(acc, rows)) } else {
@@ -2401,8 +2140,8 @@ fn rows_cmp(a: Row, b: Row, keys: List<OrderKey>) -> Result<Int, DbError> =
     },
   }
 
-// `NULLS FIRST` / `NULLS LAST` is absolute rather than relative to `DESC`, so
-// the null arms are outside the `desc` flip.
+// `NULLS FIRST` / `NULLS LAST` is absolute rather than relative to `DESC`, so the null arms are
+// outside the `desc` flip.
 fn key_cmp(a: Row, b: Row, k: OrderKey) -> Result<Int, DbError> = {
   let av = cell_of(a, k.column);
   let bv = cell_of(b, k.column);
@@ -2434,9 +2173,7 @@ fn project_row(r: Row, proj: Proj) -> Result<Row, DbError> =
     PCols(ns) -> project_cols(r, ns, map_new()),
   }
 
-// A `Row` is a `Map`, so two output columns of one name would silently keep
-// one. The driver refuses that result description with `E0433`; the twin has
-// only values, so it refuses it as one.
+// A `Row` is a `Map`, so two output columns of one name would silently keep one.
 fn project_cols(r: Row, ns: List<Target>, acc: Row) -> Result<Row, DbError> =
   match ns {
     [] -> Ok(acc),
@@ -2481,9 +2218,9 @@ fn check_column_list(def: Table, cols: List<String>, seen: List<String>) -> Opti
     },
   }
 
-// A sequence advanced while building a row stays advanced even when the row is
-// refused, because postgres's sequences are not transactional and a twin that
-// gave the id back would make the second run of a test disagree with the first.
+// A sequence advanced while building a row stays advanced even when the row is refused, because
+// postgres's sequences are not transactional and a twin that gave the id back would make the second
+// run of a test disagree with the first.
 fn insert_build(d: MemDb, mt: MemTable, cols: List<String>, q: InsertQ, ps: List<Param>)
   -> Outcome = {
   let b = fold(q.tuples, {seqs: d.sequences, rows: [], err: None},
@@ -2626,12 +2363,9 @@ fn plan_update(def: Table, q: UpdateQ, ps: List<Param>) -> Result<UpdateQ, DbErr
     },
   }
 
-// A `set` whose right-hand side is a constant — a literal or a bound parameter
-// — is coerced to the column's type when the statement is **planned**, so
-// `update part set price = 1000000` on a `numeric(10,4)` column is `22003`
-// even when the `where` matches nothing. Checked against a live server: the
-// twin walked the rows first and answered `Count(0)` for a statement postgres
-// refuses to plan.
+// A `set` whose right-hand side is a constant — a literal or a bound parameter — is coerced to the
+// column's type when the statement is **planned**, so `update part set price = 1000000` on a
+// `numeric(10,4)` column is `22003` even when the `where` matches nothing.
 fn constant_sets(def: Table, sets: List<Assign>, ps: List<Param>) -> Option<DbError> =
   match sets {
     [] -> None,
@@ -2694,10 +2428,8 @@ fn apply_sets(def: Table, r: Row, sets: List<Assign>, ps: List<Param>) -> Result
     },
   }
 
-// `set c = default` on a sequence column would have to consume a `nextval`, and
-// this twin threads sequences through `insert` only. Refusing is the honest
-// answer; guessing the old value back is the one that would pass a test and
-// lose a row in production.
+// `set c = default` on a sequence column would have to consume a `nextval`, and this twin threads
+// sequences through `insert` only.
 fn set_value(c: Column, r: Row, e: Expr, ps: List<Param>) -> Result<Row, DbError> =
   match e {
     XDefault -> match c.default {
@@ -2789,13 +2521,7 @@ fn delete_walk(rows: List<Row>, q: DeleteQ, ps: List<Param>, acc: DelAcc) -> Del
 
 // --- The scope stack -------------------------------------------------------------
 
-// **A `begin` the driver refuses does not abort the transaction it was nested
-// inside.** The refusals below are decided by the scope table and nothing
-// reaches the server, so there is nothing to have aborted — postgres itself
-// answers a `BEGIN` inside a transaction with a `WARNING` and no state change.
-// Marking the scope failed here made the *outer* `commit` `25P02` in the twin
-// and `Count(0)` in the driver, which the agreement law found in eight
-// operations.
+// **A `begin` the driver refuses does not abort the transaction it was nested inside.**
 pub fn begin_step(d: MemDb, level: Isolation, access: Access) -> Outcome =
   if len(d.stack) == 0 {
     done(memdb(d.tables, d.sequences,
@@ -2814,10 +2540,8 @@ pub fn begin_step(d: MemDb, level: Isolation, access: Access) -> Outcome =
                   ++ isolation_name(outer.level) ++ " and this nested `begin` asks for "
                   ++ isolation_name(level)))
       } else if widens(outer.access, access) {
-        // A savepoint has no access mode, so a nested `begin` that asked to
-        // widen one is a call site saying a thing that does not happen. The
-        // driver refuses it in `ScopeTable::begin`; the twin refused nothing
-        // here, which made the one half of W4 accept what the other rejected.
+        // A savepoint has no access mode, so a nested `begin` that asked to widen one is a call
+        // site saying a thing that does not happen.
         fail_open(d, db_error("25001", "", "the open transaction is "
                   ++ access_name(outer.access) ++ " and this nested `begin` asks for "
                   ++ access_name(access) ++ "; a savepoint cannot widen what the transaction may do"))
@@ -2853,19 +2577,8 @@ pub fn isolation_name(a: Isolation) -> String =
     Serializable -> "serializable",
   }
 
-// **A `COMMIT` on a transaction a statement already aborted is `25P02`, in both
-// halves of W4, and neither half is what the bare server does.**
-//
-// Postgres answers that `COMMIT` with the command tag `ROLLBACK` and no error,
-// so a driver that asked only whether the server errored reports a success for a
-// transaction whose every write is gone — and `std.db`'s `transaction` matches
-// only `Failed` on the commit, so the caller is told its writes are durable.
-// `tokio_postgres::SimpleQueryMessage` does not carry the tag, so the driver
-// remembers instead: the first `Failed` inside a scope poisons it and the close
-// answers this. The twin does the same, from the same flag, because the two have
-// to agree and because the answer a program can act on is the true one.
-//
-// Releasing a **savepoint** in that state is `25P02` from the server itself.
+// **A `COMMIT` on a transaction a statement already aborted is `25P02`, in both halves of W4, and
+// neither half is what the bare server does.**
 pub fn commit_step(d: MemDb) -> Outcome =
   match last(d.stack) {
     None -> fail_open(d, no_transaction("`db.commit`")),
@@ -2876,11 +2589,8 @@ pub fn commit_step(d: MemDb) -> Outcome =
         done(memdb(d.tables, d.sequences, [], false), Count(0))
       }
     } else if d.failed {
-      // A failed `commit` **closes and rolls back its scope**, which is what
-      // the driver does with a connection whose `COMMIT` the server refused.
-      // The transaction as a whole stays aborted — releasing a savepoint does
-      // not un-abort it — so the outer `commit` still discards everything, and
-      // that is what postgres does with the same three commands.
+      // A failed `commit` **closes and rolls back its scope**, which is what the driver does with a
+      // connection whose `COMMIT` the server refused.
       {db: memdb(frame.tables, d.sequences, drop_last(d.stack), true),
        out: Failed(in_failed_txn())}
     } else {
@@ -2895,32 +2605,16 @@ pub fn abort_step(d: MemDb) -> Outcome =
                         Count(0)),
   }
 
-// A `commit` or an `abort` with nothing open, which is the one place W4's two
-// halves answered differently.
-//
-// Bare postgres emits a `WARNING` and succeeds; the driver refuses locally in
-// `ScopeTable::close` with `25P01` and never sends the command, and the twin
-// answered `Count(0)`. **The driver's answer is the one both keep**, and it is a
-// deliberate divergence from the server rather than an accident: `transaction`
-// reads only `Failed` on the commit, so a success for a transaction that never
-// existed is a caller told its writes are durable when nothing was ever opened
-// to hold them. The warning postgres emits is not a value a Ply program can
-// read, so matching the server here would mean discarding the only signal there
-// is.
+// A `commit` or an `abort` with nothing open, which is the one place W4's two halves answered
+// differently.
 fn no_transaction(what: String) -> DbError =
   db_error("25P01", "", what ++ " with no transaction open")
 
-// A failure with no open scope leaves the database where it was: there is no
-// transaction for it to poison, and the next statement is not `25P02`.
+// A failure with no open scope leaves the database where it was: there is no transaction for it to
+// poison, and the next statement is not `25P02`.
 fn fail_open(d: MemDb, e: DbError) -> Outcome = {db: d, out: Failed(e)}
 
 // --- The twin's own tests --------------------------------------------------------
-//
-// Every one is `det`, hermetic and cached: the twin performs no effect at all,
-// so there is nothing to handle and nothing to reach. What these do **not**
-// establish is agreement with postgres — that is `examples/agreement.ply`, and
-// the two are different claims. These pin the behaviour a reader can check by
-// eye; the law pins the behaviour only a server can settle.
 
 fn t_schema() -> Schema = {tables: [t_part(), t_bin()]}
 
@@ -3016,9 +2710,8 @@ test "a where, an order by, a limit and an offset" {
   assert_eq(t_count(t_out(d, "select count(*) from part", [])), 3)
 }
 
-// The rule a hand-written double gets wrong: a comparison with `NULL` is
-// unknown, and a `WHERE` keeps only what is true. `n <> 1` therefore drops the
-// row whose `n` is null rather than keeping it.
+// The rule a hand-written double gets wrong: a comparison with `NULL` is unknown, and a `WHERE`
+// keeps only what is true.
 test "a comparison with null is unknown, and a where keeps only what is true" {
   let d = t_seed();
   assert_eq(t_skus(t_out(d, "select sku from part where n = 1 order by sku", [])), ["a"]);
@@ -3029,8 +2722,8 @@ test "a comparison with null is unknown, and a where keeps only what is true" {
             ["a", "b"])
 }
 
-// `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC` is postgres's
-// default: nulls sort as if larger than everything.
+// `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC` is postgres's default: nulls sort as if
+// larger than everything.
 test "nulls order last under asc and first under desc, and the words override it" {
   let d = t_seed();
   assert_eq(t_skus(t_out(d, "select sku, n from part order by n, sku", [])), ["a", "c", "b"]);
@@ -3068,8 +2761,8 @@ test "a numeric column stores the column's scale and refuses what will not fit" 
             "22003")
 }
 
-// Postgres plans the coercion of a constant before it looks for a row, so this
-// is `22003` and not `Count(0)`.
+// Postgres plans the coercion of a constant before it looks for a row, so this is `22003` and not
+// `Count(0)`.
 test "a constant that will not fit the column fails even when no row matches" {
   let d = t_seed();
   assert_eq(t_code(t_out(d, "update part set price = 1000000 where sku = 'zz'", [])), "22003");
@@ -3136,17 +2829,16 @@ test "a committed scope is visible and an aborted one is not" {
   assert_eq(t_count(t_out(a2.db, "select count(*) from part", [])), 4)
 }
 
-// The state test doubles omit most often, and the one that makes a suite pass
-// and production fail.
+// The state test doubles omit most often, and the one that makes a suite pass and production fail.
 test "a statement that failed inside a scope makes every later one 25P02" {
   let d0 = t_seed();
   let b = begin_step(d0, ReadCommitted, ReadWrite);
   let bad = t_run(b.db, "insert into part (sku, price) values ('a', 1)", []);
   assert_eq(t_code(bad.out), "23505");
   assert_eq(t_code(t_out(bad.db, "select count(*) from part", [])), "25P02");
-  // The server answers this `COMMIT` with the `ROLLBACK` tag and no error, and
-  // both halves of W4 answer `25P02` all the same: a `Count(0)` here is a caller
-  // told its writes are durable when every one of them is gone.
+  // The server answers this `COMMIT` with the `ROLLBACK` tag and no error, and both halves of W4
+  // answer `25P02` all the same: a `Count(0)` here is a caller told its writes are durable when
+  // every one of them is gone.
   let c = commit_step(bad.db);
   assert_eq(t_code(c.out), "25P02");
   assert_eq(t_count(t_out(c.db, "select count(*) from part", [])), 3)
@@ -3173,8 +2865,8 @@ test "releasing a savepoint in an aborted transaction is 25P02 and commits nothi
   let bad = t_run(sp.db, "insert into part (sku, price) values ('z', 2)", []);
   let rel = commit_step(bad.db);
   assert_eq(t_code(rel.out), "25P02");
-  // Releasing an aborted savepoint does not un-abort the transaction, so the
-  // outer commit is `25P02` too and it commits nothing.
+  // Releasing an aborted savepoint does not un-abort the transaction, so the outer commit is
+  // `25P02` too and it commits nothing.
   let c = commit_step(rel.db);
   assert_eq(t_code(c.out), "25P02");
   assert_eq(t_count(t_out(c.db, "select count(*) from part", [])), 3)
@@ -3210,9 +2902,7 @@ fn t_deepen(d: MemDb, left: Int) -> Outcome = {
   if left <= 1 { r } else { t_deepen(r.db, left - 1) }
 }
 
-// Every one of these is something the twin does not model. It answers `0A000`
-// with the construct named, never a result, so a test that reaches one fails in
-// the run that introduced it rather than passing on a wrong answer.
+// Every one of these is something the twin does not model.
 test "what the twin does not model, it refuses by name" {
   let d = t_seed();
   let refused = [
@@ -3229,8 +2919,8 @@ test "what the twin does not model, it refuses by name" {
     "select sku from part where tag like 'a%' escape '!'",
     "select 1e3 from part",
     "select now() from part",
-    // An ordinal `ORDER BY` names an output column by position, which needs the
-    // select list and the table's own column order together. §5.3 names it.
+    // An ordinal `ORDER BY` names an output column by position, which needs the select list and the
+    // table's own column order together.
     "select sku from part order by 1",
   ];
   assert_eq(map(refused, |s: String| t_code(t_out(d, s, []))),
@@ -3238,10 +2928,6 @@ test "what the twin does not model, it refuses by name" {
 }
 
 // Three shapes postgres accepts that the twin used to refuse under `0A000`.
-// None of them is on §5.3's list, each is ordinary SQL rather than a construct,
-// and the alias is the one that cost something: `E0433` tells a program to write
-// `select a.id as a_id, b.id as b_id` when a statement returns two columns of
-// one name, and that statement was a `0A000` in the twin.
 test "a comment and a result-column alias are ordinary SQL rather than a refusal" {
   let d = t_seed();
   assert_eq(t_code(t_out(d, "select sku from part -- trailing", [])), "rows");
@@ -3254,8 +2940,8 @@ test "a comment and a result-column alias are ordinary SQL rather than a refusal
                   map_insert(map_new(), "ident", CText("c"))]));
   assert_eq(t_out(d, "select count(*) as c from part", []),
             Rows([map_insert(map_new(), "c", CInt(3))]));
-  // And two targets that come back under one name are still refused, because a
-  // `Row` is a `Map` and one of them would silently win.
+  // And two targets that come back under one name are still refused, because a `Row` is a `Map` and
+  // one of them would silently win.
   assert_eq(t_code(t_out(d, "select sku, sku from part", [])), "0A000");
   assert_eq(t_code(t_out(d, "select sku as x, tag as x from part", [])), "0A000");
   // An unclosed comment is a refusal rather than a statement that lost its tail.

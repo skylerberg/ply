@@ -2199,16 +2199,16 @@ $ ply std
    8 modules · 768 definitions · shipped with this compiler
 
    MODULE      DEFINITIONS  TESTS  BYTES
-   std.config  15           5      8713
-   std.db      292          34     135285
-   std.http    166          53     126515
-   std.json    137          38     67574
-   std.net     7            3      9128
-   std.router  105          31     55615
-   std.signal  7            2      3746
-   std.trace   39           10     21752
+   std.config  15           5      4810
+   std.db      292          34     110031
+   std.http    166          53     102893
+   std.json    137          38     55871
+   std.net     7            3      3720
+   std.router  105          31     44920
+   std.signal  7            2      1416
+   std.trace   39           10     12212
 
-   digest: b3:0ece7e896d7a
+   digest: b3:cc32db3e3fc6
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`

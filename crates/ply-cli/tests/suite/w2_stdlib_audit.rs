@@ -1,19 +1,4 @@
 //! An adversarial audit of the stdlib path.
-//!
-//! `stdlib.rs` asserts the mechanism works. This file assumes it is broken and
-//! goes looking for the break, because module resolution is where this project
-//! has repeatedly found soundness holes and `std` is a *second* resolution
-//! channel bolted beside the first.
-//!
-//! The questions, in the order they are asked below:
-//!
-//! - can a project module shadow, impersonate or be confused with a `std` one?
-//! - does importing `std` move a hash in a definition that does not import it?
-//! - under a warm cache written by a *different* compiler, is the invalidation
-//!   exact? Too many is a cost; **too few is a stale result over changed code**,
-//!   and that is the one this file exists for.
-//! - is renaming a `std` definition still free, as ADR 0001 requires of every
-//!   definition?
 
 use assert_cmd::prelude::*;
 use ply_cli::driver;
@@ -61,9 +46,8 @@ fn hash_of(loaded: &Loaded, name: &str) -> String {
         .to_hex()
 }
 
-/// A project that reaches `std.net` and handles every atom, so its test is
-/// `det` and cacheable — which is what makes "did it re-run?" a question with
-/// an answer.
+/// A project that reaches `std.net` and handles every atom, so its test is `det` and cacheable —
+/// which is what makes "did it re-run?"
 const IMPORTER: &str = "\
 import std.net (net, drain)
 
@@ -76,10 +60,7 @@ test \"reads to the end\" {
 
 // --- Can a project module impersonate a `std` one? --------------------------
 
-/// The reserved root, attacked from every direction a path can take. Reserving
-/// `std` is what removes the precedence question entirely, so a hole here is not
-/// a diagnostic bug — it is a program whose meaning depends on where a file
-/// sits.
+/// The reserved root, attacked from every direction a path can take.
 #[test]
 fn nothing_a_project_can_name_lands_under_the_reserved_root() {
     // Every one of these derives a module name at or under `std`.
@@ -101,8 +82,8 @@ fn nothing_a_project_can_name_lands_under_the_reserved_root() {
         );
     }
 
-    // And the near misses, which must keep working: reserving a prefix must not
-    // reserve every name that starts with the same three letters.
+    // And the near misses, which must keep working: reserving a prefix must not reserve every name
+    // that starts with the same three letters.
     for rel in ["stdlib.ply", "mine/std_helpers.ply", "a/std_thing.ply"] {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), rel, "pub fn f() -> Int = 1\n");
@@ -110,10 +91,7 @@ fn nothing_a_project_can_name_lands_under_the_reserved_root() {
     }
 }
 
-/// A project file inside a directory called `std`, named directly rather than
-/// discovered. The root becomes the file's parent, so the module is `json` — it
-/// cannot impersonate `std.json`, and the shipped module is still reachable
-/// beside it.
+/// A project file inside a directory called `std`, named directly rather than discovered.
 #[test]
 fn naming_a_file_under_std_directly_cannot_smuggle_it_in_as_a_std_module() {
     let dir = tempfile::tempdir().unwrap();
@@ -133,8 +111,6 @@ fn naming_a_file_under_std_directly_cannot_smuggle_it_in_as_a_std_module() {
 }
 
 /// Two modules that would bind the same name, one shipped and one the project's.
-/// The collision is an error rather than a precedence rule, which is the whole
-/// reason `std` is reserved: nothing silently wins.
 #[test]
 fn a_project_module_named_net_beside_std_net_is_a_loud_collision() {
     let dir = tempfile::tempdir().unwrap();
@@ -158,8 +134,8 @@ fn a_project_module_named_net_beside_std_net_is_a_loud_collision() {
         err.diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
     );
 
-    // `as` is the escape hatch, and both are then reachable and distinct: the
-    // two `net` effects produce atoms under different program-wide names.
+    // `as` is the escape hatch, and both are then reachable and distinct: the two `net` effects
+    // produce atoms under different program-wide names.
     write(
         dir.path(),
         "app.ply",
@@ -177,14 +153,12 @@ fn a_project_module_named_net_beside_std_net_is_a_loud_collision() {
     );
 }
 
-/// A `std` module cannot be made to import a project one, so a cycle between
-/// the two is unrepresentable rather than merely rejected. The check is asserted
-/// from the other side as well: a project module importing `std` and a `std`
-/// module importing nothing outside `std` is the only shape that exists.
+/// A `std` module cannot be made to import a project one, so a cycle between the two is
+/// unrepresentable rather than merely rejected.
 #[test]
 fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
-    // A project module named after the one `std.json` imports, in case a
-    // shipped module's import could be captured by a project file.
+    // A project module named after the one `std.json` imports, in case a shipped module's import
+    // could be captured by a project file.
     let dir = tempfile::tempdir().unwrap();
     write(
         dir.path(),
@@ -205,8 +179,8 @@ fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
         }
     }
 
-    // And a self-import written into a shipped module is E0505, not the user's
-    // problem — asserted through the same loader path a real one would take.
+    // And a self-import written into a shipped module is E0505, not the user's problem — asserted
+    // through the same loader path a real one would take.
     for (name, source) in ply_std::sources() {
         assert!(
             !source.contains("import ")
@@ -221,9 +195,7 @@ fn no_cycle_can_be_built_between_a_project_and_the_stdlib() {
 
 // --- Does importing `std` disturb anything that does not? -------------------
 
-/// ADR 0012 corollary 1: nothing outside a definition's own reachable graph may
-/// enter its hash. Adding a module that imports the whole stdlib next door must
-/// move nothing.
+/// ADR 0012 corollary 1: nothing outside a definition's own reachable graph may enter its hash.
 #[test]
 fn a_definition_that_does_not_import_std_is_unmoved_by_one_that_does() {
     let dir = tempfile::tempdir().unwrap();
@@ -260,11 +232,6 @@ fn a_definition_that_does_not_import_std_is_unmoved_by_one_that_does() {
 // --- The warm cache, across a compiler upgrade ------------------------------
 
 /// What the previous compiler left behind, rewritten as this one would find it.
-///
-/// A real upgrade cannot be staged in one process — only one `ply-std` is linked
-/// — so the *cache* is aged instead, which is the same state from the driver's
-/// point of view: a fingerprint filed under `<std>/net.ply` that was written
-/// against bytes this binary does not ship.
 fn age_the_shipped_fingerprint(dir: &Path, mut mutate: impl FnMut(&mut DefEntry)) {
     let path = ply_std::pseudo_path(&std_net());
     let mut store = Store::open(dir).unwrap();
@@ -285,10 +252,7 @@ fn age_the_shipped_fingerprint(dir: &Path, mut mutate: impl FnMut(&mut DefEntry)
     store.flush().unwrap();
 }
 
-/// The upgrade that changed nothing but the bytes — a comment, a reflow. Gate 1
-/// refuses the skip because the content moved, the definitions hash to exactly
-/// what they hashed to, and **nothing downstream re-runs**. Over-invalidation
-/// here would make every compiler upgrade a whole-project rebuild.
+/// The upgrade that changed nothing but the bytes — a comment, a reflow.
 #[test]
 fn an_upgrade_that_moves_no_definition_re_runs_nothing() {
     let dir = tempfile::tempdir().unwrap();
@@ -332,15 +296,8 @@ fn an_upgrade_that_moves_no_definition_re_runs_nothing() {
     );
 }
 
-/// The direction that is a blocker rather than a cost: the cache was written
-/// under a `std.net` whose definitions really did move, and the run must not
-/// believe any of it.
-///
-/// The perturbation is deliberately *self-consistent* — the aged fingerprint's
-/// `drain` hash is also what the aged project fingerprint recorded depending on
-/// — so nothing is corrupt and every gate has a coherent story to tell. If the
-/// driver skipped either file it would publish a hash the current sources do not
-/// produce, which is a stale result over changed code.
+/// The direction that is a blocker rather than a cost: the cache was written under a `std.net`
+/// whose definitions really did move, and the run must not believe any of it.
 #[test]
 fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
     let dir = tempfile::tempdir().unwrap();
@@ -366,9 +323,9 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
     });
     let aged = aged.expect("`std.net.drain` is in the shipped fingerprint");
 
-    // The project's own fingerprint, aged to agree: this is what the previous
-    // compiler would have written, and it is what makes the test sharp — every
-    // gate is internally consistent and only the embedded source disagrees.
+    // The project's own fingerprint, aged to agree: this is what the previous compiler would have
+    // written, and it is what makes the test sharp — every gate is internally consistent and only
+    // the embedded source disagrees.
     {
         let mut store = Store::open(dir.path()).unwrap();
         let path = PathBuf::from("app.ply");
@@ -406,8 +363,8 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
         "a module reaching nothing in `std` was invalidated by a stdlib upgrade"
     );
 
-    // The published hashes are what a from-scratch run computes — the assertion
-    // that "too few were invalidated" would actually fail on.
+    // The published hashes are what a from-scratch run computes — the assertion that "too few were
+    // invalidated" would actually fail on.
     let scratch = load(dir.path()).unwrap();
     for name in ["app.read_all", "std.net.drain", "elsewhere.untouched"] {
         assert_eq!(
@@ -418,10 +375,9 @@ fn an_upgrade_that_moved_a_definition_invalidates_exactly_its_dependents() {
     }
 }
 
-/// The cache written under one digest and read under another warns, and the
-/// number it reports is the number of definitions *this program reaches* whose
-/// hash moved — which is zero here, and must be said as zero rather than
-/// implied.
+/// The cache written under one digest and read under another warns, and the number it reports is
+/// the number of definitions *this program reaches* whose hash moved — which is zero here, and must
+/// be said as zero rather than implied.
 #[test]
 fn the_upgrade_notice_counts_what_moved_rather_than_what_exists() {
     let dir = tempfile::tempdir().unwrap();
@@ -463,11 +419,8 @@ fn the_upgrade_notice_counts_what_moved_rather_than_what_exists() {
 
 // --- Renaming a `std` definition is free ------------------------------------
 
-/// ADR 0001's headline invariant, asked of the stdlib: renaming a definition
-/// changes no hash anywhere. The shipped source cannot be edited in a test, so
-/// the check runs over a byte-identical copy — which, by required test 4, has
-/// **the same hashes as the shipped module**, so it is the same claim about the
-/// same definitions.
+/// ADR 0001's headline invariant, asked of the stdlib: renaming a definition changes no hash
+/// anywhere.
 #[test]
 fn renaming_a_shipped_definition_moves_no_hash() {
     let dir = tempfile::tempdir().unwrap();
@@ -518,13 +471,6 @@ fn renaming_a_shipped_definition_moves_no_hash() {
 }
 
 /// The invariant the driver's one documented constraint hazard rests on.
-///
-/// `Driver::restore_skipped` publishes a skipped definition with **no**
-/// `where` clauses, because `CachedDef` does not carry them. That is only safe
-/// while a parsed module can never reference a skipped one — which
-/// `close_over_imports` is supposed to guarantee. Asserting it here means the
-/// day that guarantee is relaxed, this fails rather than an `E0206` silently
-/// stopping firing.
 #[test]
 fn a_parsed_module_never_reaches_a_skipped_one() {
     let dir = tempfile::tempdir().unwrap();
@@ -540,8 +486,8 @@ fn a_parsed_module_never_reaches_a_skipped_one() {
     );
     ply(dir.path()).arg("check").output().unwrap();
 
-    // Only the importer changes, which is the case where skipping the callee
-    // would be most tempting.
+    // Only the importer changes, which is the case where skipping the callee would be most
+    // tempting.
     write(
         dir.path(),
         "app.ply",

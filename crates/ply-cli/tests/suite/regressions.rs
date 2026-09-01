@@ -1,8 +1,4 @@
 //! Regressions for defects that survived a previous round of audits.
-//!
-//! Each one is a case where a run produced a wrong or unstable *answer* while
-//! looking healthy: a skip that swallowed an error, an ordering that moved with
-//! the cache, and a warning that named the wrong file.
 
 use ply_cli::driver;
 use ply_cli::load::{Loaded, load};
@@ -36,11 +32,8 @@ fn file_report(loaded: &Loaded, name: &str) -> ply_cli::driver::FileReport {
         .clone()
 }
 
-/// A name a file imports but never uses appears in no `deps` entry — nothing
-/// references it — so deleting it downstream leaves the importer's bytes and
-/// every hash it names untouched. Only the declaring module's export digest
-/// moves, and gate 1 has to be reading it, or the dangling import is never
-/// reported and the program silently "compiles".
+/// A name a file imports but never uses appears in no `deps` entry — nothing references it — so
+/// deleting it downstream leaves the importer's bytes and every hash it names untouched.
 #[test]
 fn deleting_an_unused_selectively_imported_name_is_reported_not_skipped_past() {
     let dir = tempfile::tempdir().unwrap();
@@ -75,9 +68,9 @@ fn deleting_an_unused_selectively_imported_name_is_reported_not_skipped_past() {
     );
 }
 
-/// The mechanism on its own, with the program still compiling either way: a new
-/// export in `lib` reaches nothing in `app`, so every other gate-1 condition
-/// still holds and only the digest can refuse the skip.
+/// The mechanism on its own, with the program still compiling either way: a new export in `lib`
+/// reaches nothing in `app`, so every other gate-1 condition still holds and only the digest can
+/// refuse the skip.
 #[test]
 fn a_changed_export_set_refuses_an_importers_skip_by_digest() {
     let dir = tempfile::tempdir().unwrap();
@@ -107,8 +100,8 @@ fn a_changed_export_set_refuses_an_importers_skip_by_digest() {
     );
 }
 
-/// A module nothing parsed touches keeps skipping: the digest may not be a
-/// licence to re-parse the world on any edit anywhere.
+/// A module nothing parsed touches keeps skipping: the digest may not be a licence to re-parse the
+/// world on any edit anywhere.
 #[test]
 fn an_edit_in_an_unimported_module_leaves_the_digest_alone() {
     let dir = tempfile::tempdir().unwrap();
@@ -129,11 +122,9 @@ fn an_edit_in_an_unimported_module_leaves_the_digest_alone() {
     assert!(!file_report(&after, "lib.ply").parsed);
 }
 
-/// Inference walks modules dependency-first and never walks a skipped one at
-/// all, so a `CheckOutput` assembled in check order lists a project's
-/// definitions differently depending on what the cache held. Two runs of
-/// `ply check --types` over one unchanged tree would then diff against each
-/// other.
+/// Inference walks modules dependency-first and never walks a skipped one at all, so a
+/// `CheckOutput` assembled in check order lists a project's definitions differently depending on
+/// what the cache held.
 #[test]
 fn the_published_order_is_the_same_warm_as_cold() {
     let dir = tempfile::tempdir().unwrap();
@@ -169,21 +160,20 @@ fn the_published_order_is_the_same_warm_as_cold() {
     };
     assert_eq!(keys(&warm), keys(&full));
 
-    // And it is the run's own order, so a reader can predict it: files sorted,
-    // then each file's items as written.
+    // And it is the run's own order, so a reader can predict it: files sorted, then each file's
+    // items as written.
     let defs: Vec<&str> = full.check.defs.keys().map(|k| k.as_str()).collect();
     assert_eq!(defs, ["app.second", "app.first", "lib.base"]);
 }
 
-/// `Store::flush` writes the result cache and the front-end cache, and the
-/// driver used to label either failure as the front end's. A person told the
-/// wrong cache failed clears the wrong one and sees the same warning again.
+/// `Store::flush` writes the result cache and the front-end cache, and the driver used to label
+/// either failure as the front end's.
 #[test]
 fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
     let dir = tempfile::tempdir().unwrap();
     write(dir.path(), "m.ply", "fn f() -> Int = 1\n");
-    // A directory cannot be replaced by `rename`, so the result cache's atomic
-    // write fails while everything else about the run is fine.
+    // A directory cannot be replaced by `rename`, so the result cache's atomic write fails while
+    // everything else about the run is fine.
     fs::create_dir_all(dir.path().join(".ply-cache/results.json")).unwrap();
 
     let mut store = Store::open(dir.path()).unwrap();
@@ -209,12 +199,6 @@ fn a_result_cache_write_failure_is_not_blamed_on_the_front_end() {
 }
 
 /// `Stack::find_handler` selects a clause by `(effect, operation, resource)`.
-/// The duplicate-clause check was keyed on the *atom*, so a handler for
-/// `net.recv[conn]`, `net.send[conn]` and `net.close[conn]` — one atom, three
-/// operations, which is every serve loop in `std.http` — reported two of its
-/// three clauses unreachable. It was invisible on a clean run only because a
-/// successful check drops its warnings, so a user's unrelated typo turned into
-/// 22 warnings blaming the shipped stdlib.
 #[test]
 fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
     let dir = tempfile::tempdir().unwrap();
@@ -257,9 +241,8 @@ fn three_operations_sharing_one_atom_are_three_reachable_clauses() {
     );
 }
 
-/// The other half: the same operation twice really is unreachable, and the
-/// warning names the operation rather than the atom, because the atom is not
-/// what the second clause lost to.
+/// The other half: the same operation twice really is unreachable, and the warning names the
+/// operation rather than the atom, because the atom is not what the second clause lost to.
 #[test]
 fn the_same_operation_handled_twice_is_still_reported() {
     let dir = tempfile::tempdir().unwrap();

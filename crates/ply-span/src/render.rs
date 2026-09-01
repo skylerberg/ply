@@ -64,8 +64,8 @@ pub fn to_json(diag: &Diagnostic, sources: &SourceMap) -> JsonDiagnostic {
     }
 }
 
-/// Diagnostics whose spans are all dummy still print a header, so a builtin's
-/// error is never silently dropped.
+/// Diagnostics whose spans are all dummy still print a header, so a builtin's error is never
+/// silently dropped.
 pub fn to_terminal(diag: &Diagnostic, sources: &SourceMap) -> String {
     let kind = match diag.severity {
         Severity::Error => ReportKind::Error,

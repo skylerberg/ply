@@ -1,10 +1,5 @@
-//! Solving `{A | ρ1} ~ {B | ρ2}` as `ρ1 := (B\A) ∪ ρ3`, `ρ2 := (A\B) ∪ ρ3` is
-//! most general because it expands both sides to exactly `A ∪ B ∪ ρ3`.
-//!
-//! Variables introduced by a `<a, b | e>` generic list are *rigid*: the unifier
-//! refuses to bind them. That is skolemization done in the substitution rather
-//! than by rewriting types, and it is what makes a declared signature a promise
-//! instead of a hint.
+//! Solving `{A | ρ1} ~ {B | ρ2}` as `ρ1 := (B\A) ∪ ρ3`, `ρ2 := (A\B) ∪ ρ3` is most general because
+//! it expands both sides to exactly `A ∪ B ∪ ρ3`.
 
 use crate::ty::{EffectAtom, Row, RowVar, TyVar, Type};
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -46,8 +41,8 @@ pub struct Subst {
     rigid_row: FxHashSet<RowVar>,
 }
 
-/// Boxed at the `Result` boundary: a mismatch carries whole types, and every
-/// unification on the success path would otherwise pay for that.
+/// Boxed at the `Result` boundary: a mismatch carries whole types, and every unification on the
+/// success path would otherwise pay for that.
 pub type UnifyResult = Result<(), Box<UnifyError>>;
 
 #[derive(Clone, Debug)]
@@ -80,10 +75,8 @@ impl Subst {
         self.rigid_row.contains(&v)
     }
 
-    /// Borrowed rather than cloned: the traversals below visit every node of
-    /// every type in the program, and a clone per node makes each of them
-    /// quadratic in the size of a type. Terminates because [`Subst::bind_ty`]
-    /// occurs-checks, so a chain of variables is acyclic.
+    /// Borrowed rather than cloned: the traversals below visit every node of every type in the
+    /// program, and a clone per node makes each of them quadratic in the size of a type.
     fn shallow_ref<'a>(&'a self, t: &'a Type) -> &'a Type {
         let mut cur = t;
         while let Type::Var(v) = cur {
@@ -124,9 +117,7 @@ impl Subst {
         }
     }
 
-    /// The tail a row ends in once its variables are followed. Separate from
-    /// [`Subst::resolve_row`] because collecting the atoms along the way is
-    /// wasted work when only the tail is wanted.
+    /// The tail a row ends in once its variables are followed.
     pub fn resolved_tail(&self, r: &Row) -> Option<RowVar> {
         let mut tail = r.tail;
         let mut hops = 0usize;
@@ -135,8 +126,8 @@ impl Subst {
                 Some(next) if next.tail != Some(v) => tail = next.tail,
                 _ => return Some(v),
             }
-            // A row chain is acyclic by construction, but a corrupt one would
-            // hang inference rather than fail it.
+            // A row chain is acyclic by construction, but a corrupt one would hang inference rather
+            // than fail it.
             hops += 1;
             if hops > self.row.len() {
                 return tail;
@@ -188,19 +179,8 @@ impl Subst {
         Ok(())
     }
 
-    /// Solves the one row variable a self-occurrence is sound for: the row of a
-    /// `handle`'s continuation, which is by construction the residual row of the
-    /// `handle` itself.
-    ///
-    /// `ρ_κ := ρ_h` is self-referential because `ρ_h` is built from the clause
-    /// rows and a clause's row may end in `ρ_κ`. A row is a set and set union is
-    /// idempotent, so the least fixed point is reached in one step: drop the
-    /// self-occurrence from the tail and substituting back gives `A ∪ A = A`.
-    ///
-    /// Deliberately not routed through [`unify_row`], whose occurs check must
-    /// stay exactly as strict as it is — every *other* self-occurrence is a real
-    /// error. Does nothing if `v` was already solved, because then unification
-    /// has already decided what it is and this would overwrite that.
+    /// Solves the one row variable a self-occurrence is sound for: the row of a `handle`'s
+    /// continuation, which is by construction the residual row of the `handle` itself.
     pub fn solve_continuation_row(&mut self, v: RowVar, row: &Row) {
         if self.row.contains_key(&v) {
             return;

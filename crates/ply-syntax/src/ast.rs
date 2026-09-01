@@ -1,5 +1,5 @@
-//! Pinned: downstream crates are written against these shapes concurrently, so
-//! changing a variant is a cross-crate breaking change.
+//! Pinned: downstream crates are written against these shapes concurrently, so changing a variant
+//! is a cross-crate breaking change.
 
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use serde::{Deserialize, Serialize};
@@ -21,12 +21,8 @@ impl Ident {
     }
 }
 
-/// A reference to a top-level name, optionally qualified by a module binder:
-/// `place` or `orders::place`.
-///
-/// Only the bare form can be shadowed by a local binder. The qualified form is
-/// the escape hatch from every name collision, so it never resolves to anything
-/// but the named module's export.
+/// A reference to a top-level name, optionally qualified by a module binder: `place` or
+/// `orders::place`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QName {
     pub module: Option<Ident>,
@@ -77,8 +73,8 @@ impl fmt::Display for QName {
     }
 }
 
-/// A module's dotted name, derived from its file's path relative to the project
-/// root: `store/orders.ply` is `store.orders`.
+/// A module's dotted name, derived from its file's path relative to the project root:
+/// `store/orders.ply` is `store.orders`.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ModuleName(Symbol);
 
@@ -89,9 +85,7 @@ impl Default for ModuleName {
 }
 
 impl ModuleName {
-    /// The module of source that has no project root: a snippet handed to
-    /// [`crate::parse`]. It has the empty dotted name, [`ModuleName::qualify`]
-    /// leaves names bare, and it can neither be imported nor import.
+    /// The module of source that has no project root: a snippet handed to [`crate::parse`].
     pub fn anonymous() -> ModuleName {
         ModuleName(Symbol::new(""))
     }
@@ -100,8 +94,8 @@ impl ModuleName {
         self.0.as_str().is_empty()
     }
 
-    /// Every directory component and the file stem must be a Ply identifier;
-    /// anything else is [`codes::INVALID_MODULE_PATH`].
+    /// Every directory component and the file stem must be a Ply identifier; anything else is
+    /// [`codes::INVALID_MODULE_PATH`].
     pub fn from_relative_path(path: &Path) -> Result<ModuleName, Diagnostic> {
         let invalid = |what: &str| {
             Diagnostic::error(
@@ -158,8 +152,6 @@ impl ModuleName {
     }
 
     /// This module's `place` under its program-wide name, `store.orders.place`.
-    /// A `.` cannot occur in an identifier, so a qualified name can never
-    /// collide with one written in source.
     pub fn qualify(&self, name: &Symbol) -> Symbol {
         if self.is_anonymous() {
             return name.clone();
@@ -174,10 +166,7 @@ impl fmt::Display for ModuleName {
     }
 }
 
-/// `pub` exports an item. A `pub type` exports its constructors with it.
-///
-/// Visibility is namespace metadata: it is erased by normalization, so adding or
-/// removing `pub` changes no definition hash.
+/// `pub` exports an item.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Visibility {
     #[default]
@@ -207,7 +196,7 @@ impl Mode {
     }
 }
 
-/// One file, one module. `imports` are lexically before every item.
+/// One file, one module.
 #[derive(Clone, Debug)]
 pub struct Module {
     pub name: ModuleName,
@@ -227,8 +216,7 @@ impl Default for Module {
     }
 }
 
-/// Every module in the project. Order is the load order — paths sorted — which
-/// is metadata and never enters a hash.
+/// Every module in the project.
 #[derive(Clone, Debug, Default)]
 pub struct Program {
     pub modules: Vec<Module>,
@@ -250,12 +238,11 @@ impl Program {
     }
 }
 
-/// `import store.orders`, `import store.orders as ord`,
-/// `import store.orders (place, cancel)`.
+/// `import store.orders`, `import store.orders as ord`, `import store.orders (place, cancel)`.
 #[derive(Clone, Debug)]
 pub struct ImportDecl {
-    /// One `Ident` per dotted segment, so a diagnostic can point at the segment
-    /// that went wrong rather than the whole declaration.
+    /// One `Ident` per dotted segment, so a diagnostic can point at the segment that went wrong
+    /// rather than the whole declaration.
     pub path: Vec<Ident>,
     pub kind: ImportKind,
     pub span: Span,
@@ -288,8 +275,7 @@ impl ImportDecl {
         }
     }
 
-    /// The module binder this import introduces, if any. A selective import
-    /// introduces none.
+    /// The module binder this import introduces, if any.
     pub fn binder(&self) -> Option<Symbol> {
         match &self.kind {
             ImportKind::Module => self.path.last().map(|s| s.name.clone()),
@@ -307,28 +293,20 @@ impl ImportDecl {
     }
 }
 
-/// Boxed because a `fn` is several times the size of the other variants and a
-/// module holds one `Vec<Item>` per file: unboxed, a program of ten thousand
-/// definitions pays the largest variant's width for every item it has.
+/// Boxed because a `fn` is several times the size of the other variants and a module holds one
+/// `Vec<Item>` per file: unboxed, a program of ten thousand definitions pays the largest variant's
+/// width for every item it has.
 #[derive(Clone, Debug)]
 pub enum Item {
     Fn(Box<FnDef>),
     Type(Box<TypeDef>),
     Effect(Box<EffectDef>),
     Test(Box<TestDef>),
-    /// `law "label" forall (x: T) where g { body }`. Labelled like a `test`, so
-    /// nothing can reference it and it is never `pub`.
+    /// `law "label" forall (x: T) where g { body }`.
     Law(Box<LawDef>),
-    /// `derive json for Order`. Declares nothing itself: expansion walks the
-    /// target's structure and appends ordinary [`Item::Fn`]s to the module, and
-    /// those are what the rest of the pipeline sees. So every consumer that
-    /// enumerates definitions is right to skip this variant.
+    /// `derive json for Order`.
     Derive(Box<DeriveDef>),
-    /// `effect set Web = {db.read[users], log.write}`. Declares nothing a
-    /// reference can reach: the parser has already expanded every row that
-    /// names it, so what survives here is provenance for `--explain`. Skipped
-    /// by every consumer that enumerates definitions, exactly as
-    /// [`Item::Derive`] is.
+    /// `effect set Web = {db.read[users], log.write}`.
     EffectSet(Box<EffectSetDef>),
 }
 
@@ -345,11 +323,8 @@ impl Item {
         }
     }
 
-    /// `None` for a `test`, a `law`, a `derive` and an `effect set`, none of
-    /// which have a name a reference could reach. A `derive`'s generated
-    /// definitions do, and they are [`Item::Fn`]s of their own; an `effect
-    /// set`'s name is consumed by the parser and lives in no namespace
-    /// `resolve` knows about.
+    /// `None` for a `test`, a `law`, a `derive` and an `effect set`, none of which have a name a
+    /// reference could reach.
     pub fn name(&self) -> Option<&Ident> {
         match self {
             Item::Fn(d) => Some(&d.name),
@@ -359,9 +334,8 @@ impl Item {
         }
     }
 
-    /// A `derive` carries no `pub` of its own: its generated definitions take
-    /// the target type's visibility, so a type you can name is a type you can
-    /// encode and the two cannot drift.
+    /// A `derive` carries no `pub` of its own: its generated definitions take the target type's
+    /// visibility, so a type you can name is a type you can encode and the two cannot drift.
     pub fn visibility(&self) -> Visibility {
         match self {
             Item::Fn(d) => d.vis,
@@ -375,28 +349,6 @@ impl Item {
 }
 
 /// `effect set Web = {db.read[users], log.write, Inner}`.
-///
-/// An abbreviation for a row, and nothing more. Its name is namespace metadata
-/// — erased by normalization — while its [`expansion`] enters a hash exactly as
-/// the row it stands for would, because that expansion is the published upper
-/// bound a caller is checked against.
-///
-/// A member is an **atom** or another set, never a whole effect. "Every atom of
-/// `db`" is every resource label anywhere in the program, so an unrelated table
-/// in an unrelated module would change the expansion — and therefore the
-/// declared row, and therefore the hash — of every definition annotated with
-/// this set, which is exactly the rule that nothing outside a definition's own
-/// reachable graph may enter its hash.
-///
-/// Sets are **module-local**: [`includes`] is a [`QName`] only so that a
-/// qualified reference can be refused with a diagnostic that says why. Gate 1
-/// skips a file whose raw bytes are unchanged, so a set expanding across a
-/// module boundary would let an edit in the declaring module leave a stale
-/// published row behind — a footprint that under-reports, which is a green
-/// result rather than a loud one.
-///
-/// [`expansion`]: EffectSetDef::expansion
-/// [`includes`]: EffectSetDef::includes
 #[derive(Clone, Debug)]
 pub struct EffectSetDef {
     pub name: Ident,
@@ -404,21 +356,13 @@ pub struct EffectSetDef {
     pub atoms: Vec<AtomExpr>,
     /// Members naming another set, in source order.
     pub includes: Vec<QName>,
-    /// Every atom this set denotes, after expanding `includes` transitively:
-    /// sorted and deduplicated by written form.
-    ///
-    /// Sorted rather than left in the order the members were written, so that
-    /// reordering them — or splitting one set into two — produces the same
-    /// expansion. That is what a reader diffing two `--explain` outputs sees,
-    /// and it is one fewer thing they have to know the row encoder fixes up
-    /// later.
+    /// Every atom this set denotes, after expanding `includes` transitively: sorted and
+    /// deduplicated by written form.
     pub expansion: Vec<AtomExpr>,
     pub span: Span,
 }
 
-/// The derivations the language defines. Fixed: there are no user-defined
-/// derivers, and `row` waits for W4's `Row` type rather than shipping as a
-/// codec over a type that does not exist.
+/// The derivations the language defines.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum Deriver {
     Json,
@@ -455,9 +399,7 @@ impl Deriver {
         }
     }
 
-    /// Distinguishes derivers in a definition hash and in a stored body. Pinned
-    /// rather than derived from the variant order, which is a cache key nobody
-    /// should be able to move by sorting an enum.
+    /// Distinguishes derivers in a definition hash and in a stored body.
     pub fn tag(self) -> u8 {
         match self {
             Deriver::Json => 1,
@@ -483,11 +425,6 @@ impl fmt::Display for Deriver {
 }
 
 /// `derive json for Order`.
-///
-/// The target is an [`Ident`] and not a [`QName`] on purpose: a `derive` may
-/// only name a type its own module declares. Without that rule two modules can
-/// each derive for one type and produce two names for one canonical encoding,
-/// which is the divergence ADR 0010 has no resolution layer to prevent.
 #[derive(Clone, Debug)]
 pub struct DeriveDef {
     pub deriver: Deriver,
@@ -497,26 +434,16 @@ pub struct DeriveDef {
 }
 
 /// `where derivable(json, a)` on a signature.
-///
-/// Checked at the **signature** rather than at instantiation, which is the one
-/// axis on which bare structural reflection is genuinely worse than typeclasses:
-/// an error deep inside an expansion is a search, and a search inside an edit
-/// loop is what an agent actually pays for.
 #[derive(Clone, Debug)]
 pub struct Constraint {
     pub deriver: Deriver,
     pub deriver_span: Span,
-    /// A type parameter of the enclosing signature. Never a concrete type: a
-    /// constraint on a type the compiler can already see is either trivially
-    /// true or an error, and neither is worth writing.
+    /// A type parameter of the enclosing signature.
     pub param: Ident,
     pub span: Span,
 }
 
-/// What a generated definition was generated from. Provenance, so `--explain`
-/// and `ply check --types` can label it — and erased by normalization, because
-/// a hand-written definition byte-identical to a generated one is the same
-/// computation and must share its hash.
+/// What a generated definition was generated from.
 #[derive(Clone, Debug)]
 pub struct Derived {
     pub deriver: Deriver,
@@ -543,13 +470,7 @@ pub struct Generics {
 pub struct Param {
     pub name: Ident,
     pub ty: Option<TypeExpr>,
-    /// What a call that does not fill this parameter passes instead. Only a
-    /// `fn` parameter may carry one: a lambda has no name for a call to omit an
-    /// argument *of*, so the parser refuses it there.
-    ///
-    /// The expression is spliced into the caller by
-    /// [`crate::defaults::expand`], which is why it must be pure and closed —
-    /// the checker enforces both, and this field holds whatever was written.
+    /// What a call that does not fill this parameter passes instead.
     pub default: Option<Expr>,
     pub span: Span,
 }
@@ -561,26 +482,15 @@ pub struct FnDef {
     pub generics: Generics,
     pub params: Vec<Param>,
     pub ret: Option<TypeExpr>,
-    /// The `/ {...}` annotation. When present it is the published signature and
-    /// inference must produce a subset of it; when absent the row is inferred.
+    /// The `/ {...}` annotation.
     pub effects: Option<RowExpr>,
-    /// `where derivable(json, a), derivable(ord, k)`, written after the effect
-    /// row and before any `requires`.
-    ///
-    /// Part of the published signature and therefore **kept** by normalization,
-    /// unlike `spec`. Adding a constraint narrows the call sites the signature
-    /// admits, so a caller checked against the unconstrained form has to be
-    /// rechecked — and gate 2 only rechecks a definition whose dependency's
-    /// hash moved. Erasing this would leave that caller accepted against a
-    /// signature that no longer admits it.
+    /// `where derivable(json, a), derivable(ord, k)`, written after the effect row and before any
+    /// `requires`.
     pub constraints: Vec<Constraint>,
-    /// Set on a definition expansion generated from a `derive`, and `None` on
-    /// everything a human wrote. Provenance only: erased by normalization.
+    /// Set on a definition expansion generated from a `derive`, and `None` on everything a human
+    /// wrote.
     pub derived: Option<Derived>,
-    /// `requires` / `ensures`, in source order. A spec is a claim *about* this
-    /// definition rather than part of it, so it is erased by normalization:
-    /// writing one changes no definition hash and re-runs no test. The claim
-    /// gets its own hash, which covers this definition's.
+    /// `requires` / `ensures`, in source order.
     pub spec: Vec<SpecClause>,
     pub body: Expr,
     pub span: Span,
@@ -600,8 +510,7 @@ impl SpecKind {
         }
     }
 
-    /// Distinguishes the two in a spec hash. Part of a cache key, so it is
-    /// pinned rather than derived from the variant order.
+    /// Distinguishes the two in a spec hash.
     pub fn tag(self) -> u8 {
         match self {
             SpecKind::Requires => 1,
@@ -611,9 +520,6 @@ impl SpecKind {
 }
 
 /// `requires amount > 0`, `ensures result.balance == acct.balance - amount`.
-///
-/// The expression's row must be empty: a claim that can perform effects can
-/// change what it observes. `result` is bound only in an `ensures`.
 #[derive(Clone, Debug)]
 pub struct SpecClause {
     pub kind: SpecKind,
@@ -621,9 +527,7 @@ pub struct SpecClause {
     pub span: Span,
 }
 
-/// A `forall` binder. Its type is mandatory — inferring it would make a law's
-/// meaning depend on how its body happened to be written — so this is not a
-/// [`Param`].
+/// A `forall` binder.
 #[derive(Clone, Debug)]
 pub struct Binder {
     pub name: Ident,
@@ -631,38 +535,17 @@ pub struct Binder {
     pub span: Span,
 }
 
-/// ```text
-/// law "credit and debit cancel"
-///   forall (a: Account, n: Int) where n > 0 && n <= a.balance {
-///     credited(debited(a, n), n) == a
-///   }
-/// ```
-///
-/// `guard`'s row must be empty. `body`'s row must be empty too, unless it is
-/// exactly `{sim.read}`, which makes this a concurrency law discharged by
-/// exhaustive interleaving search rather than by a static argument — or unless
-/// the law is declared `law/host`, which is [`host`](LawDef::host).
+/// ```text law "credit and debit cancel" forall (a: Account, n: Int) where n > 0 && n <= a.balance
+/// { credited(debited(a, n), n) == a } ```.
 #[derive(Clone, Debug)]
 pub struct LawDef {
     pub name: String,
     pub name_span: Span,
-    /// `law/host`: the **body** may carry any row, and the law is then a claim
-    /// about the world rather than about the program alone.
-    ///
-    /// Declared rather than inferred, for the reason every other relaxation in
-    /// this language is declared: a law that could touch the world without
-    /// saying so is the one shape a reader cannot audit. Three things follow
-    /// from it and each is enforced somewhere else — it can never be `proved`
-    /// (`ply-prove` refuses to lower a body whose row is non-empty), it is never
-    /// cached in either direction, and under a hermetic run it is reported
-    /// `W0604 unattempted` rather than green.
-    ///
-    /// The **guard** is unaffected: it stays pure under `E0417`, because a guard
-    /// decides the domain and a guard that could act would be choosing which
-    /// cases to be judged on.
+    /// `law/host`: the **body** may carry any row, and the law is then a claim about the world
+    /// rather than about the program alone.
     pub host: bool,
-    /// Empty for a ground law, which is a claim over a domain of one point and
-    /// is therefore decided by evaluating it.
+    /// Empty for a ground law, which is a claim over a domain of one point and is therefore decided
+    /// by evaluating it.
     pub binders: Vec<Binder>,
     pub guard: Option<Expr>,
     pub body: Expr,
@@ -704,8 +587,8 @@ pub struct EffectDef {
 pub struct OpDef {
     pub name: Ident,
     pub mode: Mode,
-    /// Declared as `op[r](..)`: call sites must supply a resource label, and the
-    /// atom performed is keyed by it.
+    /// Declared as `op[r](..)`: call sites must supply a resource label, and the atom performed is
+    /// keyed by it.
     pub resource_param: bool,
     pub params: Vec<TypeExpr>,
     pub ret: TypeExpr,
@@ -724,8 +607,7 @@ pub struct TestDef {
 
 #[derive(Clone, Debug)]
 pub enum TypeExpr {
-    /// A type parameter. Never module-qualified — it is bound by the enclosing
-    /// `<..>`, not by any module.
+    /// A type parameter.
     Var(Ident),
     Con {
         name: QName,
@@ -759,32 +641,18 @@ impl TypeExpr {
     }
 }
 
-/// A written effect row: `{db.read[users], clock.read | e}`, or
-/// `{Web, random.read}` naming an [`EffectSetDef`].
-///
-/// `atoms` is always complete: [`crate::parse_module`] expands every set before
-/// it returns, so an unexpanded row never escapes the parser and no crate can
-/// forget to run the expander.
+/// A written effect row: `{db.read[users], clock.read | e}`, or `{Web, random.read}` naming an
+/// [`EffectSetDef`].
 #[derive(Clone, Debug)]
 pub struct RowExpr {
     pub atoms: Vec<AtomExpr>,
     /// The `effect set`s this row was written with, in source order.
-    ///
-    /// Provenance for `--explain` and nothing else: **erased by
-    /// normalization**, so a row written `{Web}` and one written with `Web`'s
-    /// expansion are the same definition and share a hash. A qualified name is
-    /// representable only so that it can be refused with a diagnostic saying
-    /// sets are module-local.
     pub aliases: Vec<QName>,
     pub tail: Option<Ident>,
     pub span: Span,
 }
 
 /// `db.read[users]`, or `store::db.read[users]` for an imported effect.
-///
-/// The resource label is deliberately not namespaced: two modules writing
-/// `[users]` name the same resource, and must, or the scheduler would run
-/// contending tests concurrently.
 #[derive(Clone, Debug)]
 pub struct AtomExpr {
     pub effect: QName,
@@ -798,19 +666,11 @@ pub enum Lit {
     Int(i64),
     Bool(bool),
     Str(String),
-    /// `b"GET "`. ASCII plus `\xNN`: a source character above `U+007F` is
-    /// refused, because the bytes of this literal may not depend on the file's
-    /// encoding.
+    /// `b"GET "`.
     Bytes(Vec<u8>),
-    /// IEEE-754 binary64. Two of these are one definition iff their **bit
-    /// patterns** agree, which is why `0.0` and `-0.0` are two definitions and
-    /// why a normalizer that folded them would be wrong: `1.0 / -0.0` still
-    /// tells them apart.
+    /// IEEE-754 binary64.
     Float(f64),
     /// Sign and magnitude in `mantissa`, digits after the point in `scale`.
-    /// The scale is **kept**: `1.50m` is `(150, 2)` and `1.5m` is `(15, 1)`, so
-    /// the two are equal in value and differently hashed. Both consequences of
-    /// one decision, and both stated rather than smoothed over.
     Decimal {
         mantissa: i128,
         scale: u32,
@@ -818,9 +678,7 @@ pub enum Lit {
     Unit,
 }
 
-/// The shortest text that reads back as this `f64`, always distinguishable from
-/// an integer. `{}` on an `f64` is already shortest-round-tripping; what it does
-/// not do is keep `1` and `1.0` apart, and those are two types here.
+/// The shortest text that reads back as this `f64`, always distinguishable from an integer.
 pub fn render_float(f: f64) -> String {
     if f.is_nan() {
         return "NaN".to_string();
@@ -828,11 +686,8 @@ pub fn render_float(f: f64) -> String {
     if f.is_infinite() {
         return if f > 0.0 { "Infinity" } else { "-Infinity" }.to_string();
     }
-    // Rust's `{}` is shortest-round-tripping in *digits* but always positional,
-    // so `1e300` comes back as three hundred and one characters. `{:e}` is the
-    // same value in the other notation; taking the shorter of the two is what
-    // "shortest" means, and positional wins a tie because it is the form
-    // somebody wrote.
+    // Rust's `{}` is shortest-round-tripping in *digits* but always positional, so `1e300` comes
+    // back as three hundred and one characters.
     let positional = format!("{f}");
     let exponential = format!("{f:e}");
     let text = if exponential.len() < positional.len() {
@@ -899,11 +754,8 @@ pub struct Expr {
     pub span: Span,
 }
 
-/// Hand-written so the copy grows the host stack once per level, as parsing,
-/// inference and normalization already do. A derived `Clone` recurses to the
-/// depth of the expression on whatever stack the caller happens to have, and the
-/// tree-walker copies a body per closure on a worker thread — so a chain of
-/// operators the front end accepts could abort the run rather than evaluate.
+/// Hand-written so the copy grows the host stack once per level, as parsing, inference and
+/// normalization already do.
 impl Clone for Expr {
     fn clone(&self) -> Expr {
         const RED_ZONE: usize = 256 * 1024;
@@ -936,14 +788,6 @@ pub enum ExprKind {
         func: Box<Expr>,
         args: Vec<Expr>,
         /// Arguments written `name: value`, which follow every positional one.
-        ///
-        /// **Empty everywhere except between the parser and
-        /// [`crate::defaults::expand`]**, which places each into the slot its
-        /// name selects and clears this. Nothing downstream reads it, and
-        /// `no_named_argument_survives_resolve_anywhere_in_the_tree`
-        /// (`crate::tests`) is what entitles them not to: a hash, a type and
-        /// an evaluation all see one fully-positional call, so `f(x, m: 1)`
-        /// and `f(x, 1)` are one definition.
         named: Vec<NamedArg>,
     },
     If {
@@ -963,18 +807,7 @@ pub enum ExprKind {
         fields: Vec<(Ident, Expr)>,
     },
 
-    /// `{..base, f: e}` — **parse-time only**. `crate::record_update::expand`
-    /// rewrites every one of these into a plain [`ExprKind::Record`] before
-    /// [`crate::parse_module`] returns, so that the sugar and the longhand are
-    /// one definition with one hash rather than two spellings of one value.
-    ///
-    /// No crate downstream of `ply-syntax` can observe this variant. That is an
-    /// invariant the suite asserts over every `.ply` file in the tree, at
-    /// `crates/ply-syntax/src/tests.rs`
-    /// `no_record_update_survives_parse_module_anywhere_in_the_tree` — not an
-    /// argument. The arms other crates carry for it are unreachable, and they
-    /// exist because `ExprKind` is matched exhaustively with no `_`: a new
-    /// variant has to be refused somewhere explicit rather than absorbed.
+    /// `{..base, f: e}` — **parse-time only**.
     RecordUpdate {
         base: Box<Expr>,
         fields: Vec<(Ident, Expr)>,
@@ -986,17 +819,6 @@ pub enum ExprKind {
     },
 
     /// `e?` — **parse-time only**, exactly as [`ExprKind::RecordUpdate`] is.
-    /// `crate::try_op::expand` rewrites every one of these into the `match` the
-    /// corpus hand-writes 129 times, before [`crate::parse_module`] returns, so
-    /// that `let x = e?;` and its longhand are one definition with one hash
-    /// rather than two spellings of one value.
-    ///
-    /// No crate downstream of `ply-syntax` can observe this variant, and that
-    /// is asserted over every `.ply` file in the tree plus a file that actually
-    /// writes a `?`: `crates/ply-syntax/src/tests.rs`
-    /// `no_try_survives_parse_module_anywhere_in_the_tree`. Neither evaluator
-    /// learns a node, no unwind exists to get wrong at a `handle` boundary, and
-    /// there is no row rule for `?` because there is no `?` after the parser.
     Try {
         operand: Box<Expr>,
     },
@@ -1019,9 +841,7 @@ pub enum ExprKind {
         return_clause: Option<Box<ReturnClause>>,
     },
 
-    /// `with_cell[users](init) { c -> body }`. A builtin rather than a
-    /// user-level effect so its atoms are discharged at the region boundary and
-    /// provably cannot escape.
+    /// `with_cell[users](init) { c -> body }`.
     WithCell {
         resource: Ident,
         init: Box<Expr>,
@@ -1029,24 +849,13 @@ pub enum ExprKind {
         body: Box<Expr>,
     },
 
-    /// `with_region[r] { body }`. A lexical allocation scope whose brand `r`
-    /// appears in the types of the values allocated in it, so that a value
-    /// cannot outlive the scope that allocated it.
-    ///
-    /// `with_cell[r]` is the special case where the value allocated is a cell:
-    /// written inside `with_region[r]` the cell belongs to the region and lives
-    /// as long as it does, and written on its own it opens a region of its own,
-    /// which is why no existing program moves.
+    /// `with_region[r] { body }`.
     WithRegion {
         region: Ident,
         body: Box<Expr>,
     },
 
-    /// `simulate { body }`. A `handle` with a fixed clause set: it installs the
-    /// seeded scheduler over `task`, `clock` and `random`, and its own row gains
-    /// `sim.read`, the seed dependency. There is no seed in the syntax — one
-    /// written in source would be part of the definition's hash, making every
-    /// seed a different definition.
+    /// `simulate { body }`.
     Simulate {
         body: Box<Expr>,
     },
@@ -1077,11 +886,8 @@ pub struct HandleClause {
     pub op: Ident,
     pub resource: Option<Ident>,
     pub params: Vec<Ident>,
-    /// `op(x) resume k -> ...` binds the delimited continuation as `k`, and the
-    /// clause's body then has the whole `handle`'s type rather than the
-    /// operation's. `None` is the tail-resumptive form, where the body's value
-    /// goes straight back to the perform site — which is `op(x) resume k ->
-    /// k(e)` with the resumption supplied by the machine.
+    /// `op(x) resume k -> ...` binds the delimited continuation as `k`, and the clause's body then
+    /// has the whole `handle`'s type rather than the operation's.
     pub resume: Option<Ident>,
     pub body: Expr,
     pub span: Span,
@@ -1119,25 +925,8 @@ pub enum PatternKind {
     },
 }
 
-/// Evaluates without calling anything and without performing anything, so it
-/// cannot diverge and cannot be observed by, or observe, its neighbours. It can
-/// still fail — on overflow, on a divisor of zero, on an unmatched scrutinee —
-/// but a failure that happens in one order happens in every order, because a
-/// block evaluates all of its `let`s regardless.
-///
-/// **One predicate, two callers, deliberately.** `ply_hash::normalize`'s
-/// `commutable_run` uses it to license writing a run of `let` statements in
-/// their sorted order, and [`crate::try_op`] uses it to license lifting a `?`'s
-/// operand to the head of its region. Both are the same question — *may these be
-/// reordered* — and the reason is the same one: a failure that happens in one
-/// order happens in every order, and a call or a `perform` breaks that. Two
-/// implementations of it could drift apart, and a drift would mean normalization
-/// reordering something `?` refused to, or the reverse.
-///
-/// This lived in `crates/ply-hash/src/normalize.rs` until ADR 0028 and moved
-/// here unchanged but for the [`ExprKind::Try`] arm, which is a variant that did
-/// not exist before. `crates/ply-hash/tests/suite/map.rs`'s pinned digest is the guard
-/// on the move being free.
+/// Evaluates without calling anything and without performing anything, so it cannot diverge and
+/// cannot be observed by, or observe, its neighbours.
 pub fn is_pure(e: &Expr) -> bool {
     crate::effect_set::grow(|| match &e.kind {
         ExprKind::App { .. }
@@ -1146,11 +935,9 @@ pub fn is_pure(e: &Expr) -> bool {
         | ExprKind::WithCell { .. }
         | ExprKind::WithRegion { .. }
         | ExprKind::Simulate { .. } => false,
-        // Conservative, and only ever consulted before expansion: a `?` that is
-        // being asked about here is one the scan did not reach in evaluation
-        // order, which means it sits behind a conditional or inside a nested
-        // block, and both of those are refused. Saying `false` refuses; saying
-        // `true` would license lifting an operand across it.
+        // Conservative, and only ever consulted before expansion: a `?` that is being asked about
+        // here is one the scan did not reach in evaluation order, which means it sits behind a
+        // conditional or inside a nested block, and both of those are refused.
         ExprKind::Try { .. } => false,
         ExprKind::Lit(_) | ExprKind::Var(_) => true,
         ExprKind::Binary { lhs, rhs, .. } => is_pure(lhs) && is_pure(rhs),
@@ -1182,27 +969,8 @@ pub fn is_pure(e: &Expr) -> bool {
     })
 }
 
-/// Whether an expression may be a parameter's default: [`is_pure`], widened to
-/// admit a *constructor* application.
-///
-/// The widening is the whole reason this is a second predicate rather than a
-/// call to the first. `is_pure` answers "may this be reordered", and for that
-/// question every [`ExprKind::App`] is impure — a call runs. A default is asked
-/// something narrower: *does copying this into a call site change what it
-/// means*. `Some(0)` copies fine, and it is the default a program reaches for
-/// first, so refusing it would leave `Option`-shaped parameters — the case that
-/// motivated this — unable to state their own absent value.
-///
-/// A constructor is recognised the way the rest of the grammar recognises one,
-/// by its leading uppercase (`crate::parser`'s `starts_upper`, the same rule
-/// patterns and types use). Nothing else about the callee is known here:
-/// expansion runs after resolution and re-checks that the name really denotes a
-/// constructor, so a lowercase-shy function called `Foo` is caught there rather
-/// than admitted here.
-///
-/// This is the *structural* half of the rule. That a default mentions no
-/// parameter and no local is the scope half, and it belongs to the checker,
-/// which knows what is in scope.
+/// Whether an expression may be a parameter's default: [`is_pure`], widened to admit a
+/// *constructor* application.
 pub fn is_default_expr(e: &Expr) -> bool {
     crate::effect_set::grow(|| match &e.kind {
         ExprKind::App { func, args, named } => {

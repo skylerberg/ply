@@ -1,39 +1,4 @@
 //! The other direction: a `Machine` entering compiled code.
-//!
-//! ADR 0018 §0 is the reason this file exists. The fragment reaches **52.58×**
-//! where it runs and **0.998×** end to end, and the gap is not the boundary —
-//! 102 crossings cost 0.017% of the run. It is that calls only ever went one
-//! way. A function the fragment accepted whose *callers* it refused was compiled
-//! and then never entered, so twenty compiled arithmetic functions moved a
-//! 57,700 µs program to 57,582 µs.
-//!
-//! [`SpikeBodies`] is the inverse: it implements `ply_eval::Compiled`, the
-//! machine's generic entry hook, so the interpreter runs the tree machinery and
-//! drops into native code at the leaves.
-//!
-//! # What the machine is promised, and who enforces it
-//!
-//! `Compiled::enter` hands over a name, some scalars and a call budget, and
-//! takes back at most one scalar. It is handed no arena, no stack, no handler
-//! stack, no host binding, no `&mut Machine` and no callback — so the promises
-//! below are kept by there being no route to break them, not by this file
-//! remembering to:
-//!
-//! | promise | kept by |
-//! | --- | --- |
-//! | a native body reaches no Ply function outside the compiled set | [`crate::jit::Denotes::Uncompiled`] refuses the caller at compile time |
-//! | it performs no effect and captures no continuation | there is no machine to perform into, and `perform`/`handle` are outside the fragment |
-//! | it touches no cell and opens no region | `cell_get`/`cell_set` refused at compile time; [`crate::rt::Ctx::touched_cells`] is the armed check |
-//! | it calls no user code from a builtin | `Builtin::higher_order` refused at compile time |
-//! | it cannot outrun `ply_eval::limit` | the fuel prologue, seeded from `budget` |
-//! | it raises nothing | a failure answers `None` and the machine raises its own diagnostic |
-//! | it cannot be entered from inside itself | one `Ctx` behind a `RefCell`, which declines rather than resetting |
-//!
-//! The one thing **not** structural, and it is worth saying plainly: a compiled
-//! body that computes the wrong `Int` is a wrong answer this boundary cannot
-//! detect. `values_equal` against the machine over generated inputs, and
-//! `differential::compare_answers` against the tree-walker, are what catch that;
-//! nothing here does.
 
 use crate::jit::{Compiled, Entry, Jit, Opts};
 use crate::program::Loaded;
@@ -46,61 +11,32 @@ use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 
 /// The widest arity this boundary carries without allocating an argument array.
-/// A wider function declines; nothing in the standard library or the kernel is
-/// near it, and a heap allocation per native call would price the hook rather
-/// than the code.
 const MAX_ARITY: usize = 16;
 
-/// One admitted definition: where its code is, how many arguments it takes, and
-/// how often the machine has entered it.
+/// One admitted definition: where its code is, how many arguments it takes, and how often the
+/// machine has entered it.
 struct Admitted {
     entry: Entry,
     arity: usize,
     entered: Cell<u64>,
 }
 
-/// Why an offered call was not taken. R4's null result was a speedup reported
-/// with zero entries and nothing in the harness that could say so, so a decline
-/// is counted by its reason rather than counted at all.
+/// Why an offered call was not taken.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
 pub struct Declines {
     /// The machine offered a name this unit did not compile.
     pub not_compiled: u64,
     /// It compiled the name and the call had the wrong number of arguments.
     pub arity: u64,
-    /// The body ran and failed — an overflow, a division by zero, a `match` with
-    /// no arm, a type the fragment's `Int` lowering could not unbox.
+    /// The body ran and failed — an overflow, a division by zero, a `match` with no arm, a type the
+    /// fragment's `Int` lowering could not unbox.
     pub failed: u64,
-    /// The body would have nested past the budget the machine handed it. The
-    /// machine then re-evaluates and raises its own bound.
-    ///
-    /// **Measured cost, 2026-08-21.** A runaway recursion is now a diagnostic in
-    /// both engines rather than a `SIGABRT` in one — which is the point — but it
-    /// is a *slow* diagnostic. `mcts.playouts(0, 1, 5_000_000)` takes 7.9 s with
-    /// a backend attached against 0.11 s without, over two runs at load 2.3
-    /// (`mcts --dir benches/kernel --probe compiled`, release). The machine
-    /// re-offers the same function at every one of the ten thousand interpreted
-    /// depths and each attempt burns its whole remaining fuel before declining,
-    /// so the work is O(`max_calls`²) native frames: 19,992 entries and 10,000
-    /// fuel declines on that run.
-    ///
-    /// Not fixed, deliberately. The obvious fix — remember the budget a function
-    /// last ran out of fuel at and decline anything smaller — is wrong on its
-    /// face, because whether a body fits its budget depends on the *arguments*,
-    /// so a wall set by one runaway call would silently decline the fast calls
-    /// underneath it and there would be nothing to say so. That is a lost
-    /// speedup with no symptom, which is the failure mode this milestone is
-    /// supposed to be avoiding. The cost is bounded, it is paid only by a
-    /// program that is about to die anyway, and no shipping command can install
-    /// a backend.
+    /// The body would have nested past the budget the machine handed it.
     pub out_of_fuel: u64,
-    /// An entry arrived while another was running. Structurally impossible —
-    /// nothing a compiled body can call re-enters a machine — and counted rather
-    /// than asserted, because the day it stops being impossible the count is the
-    /// only thing that would say so.
+    /// An entry arrived while another was running.
     pub reentered: u64,
-    /// A builtin allocated in the fragment's private arena, which means the
-    /// compile-time refusal of `cell_get`/`cell_set` has a hole in it.
+    /// A builtin allocated in the fragment's private arena, which means the compile-time refusal of
+    /// `cell_get`/`cell_set` has a hole in it.
     pub touched_cells: u64,
 }
 
@@ -115,37 +51,22 @@ impl Declines {
     }
 }
 
-/// Compiled bodies for one program, offered to a `Machine` through
-/// `ply_eval::Compiled`.
+/// Compiled bodies for one program, offered to a `Machine` through `ply_eval::Compiled`.
 pub struct SpikeBodies {
-    /// Identity, never dereferenced. `Compiled::describes` is a pointer
-    /// comparison for the reason `code::Lowering::describes` is one: a bisection
-    /// builds programs whose definitions carry the names of the ones they
-    /// replace, and a registry keyed on a bare name would answer for the wrong
-    /// body.
+    /// Identity, never dereferenced.
     program: *const Program,
     compiled: Compiled,
     admitted: HashMap<Symbol, Admitted>,
-    /// One context for every entry, and the `RefCell` is the proof rather than a
-    /// comment: [`crate::rt::Ctx::slots`] is a bump arena with no pop, so an
-    /// entry that began inside another would have to either reset it — leaving
-    /// the outer activation's handles indexing different values of the same type
-    /// — or let it grow for the life of the program. Both are silent. Declining
-    /// is neither.
+    /// One context for every entry, and the `RefCell` is the proof rather than a comment:
+    /// [`crate::rt::Ctx::slots`] is a bump arena with no pop, so an entry that began inside another
+    /// would have to either reset it — leaving the outer activation's handles indexing different
+    /// values of the same type — or let it grow for the life of the program.
     ctx: RefCell<Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
 }
 
 impl SpikeBodies {
-    /// Registers `compiled`'s functions as enterable bodies for `loaded`'s
-    /// program.
-    ///
-    /// `names` must be closed under calls — every dynamic callee of an admitted
-    /// function is itself admitted — which is what [`admissible`] computes and
-    /// what [`crate::jit::Denotes::Uncompiled`] enforces. Passing a set that is
-    /// not closed is not unsound, because the compile would have refused it; it
-    /// simply cannot happen.
     pub fn new(
         loaded: &'static Loaded,
         compiled: Compiled,
@@ -196,18 +117,11 @@ impl SpikeBodies {
         &self.compiled
     }
 
-    /// Whether a body was registered for `name`. What separates "the fragment
-    /// ran this and declined" from "this name was never given a body at all",
-    /// which is a distinction only a wrapper around this provider needs — see
-    /// [`crate::wrong::Mutation::Unoffered`].
     pub fn admits(&self, name: &Symbol) -> bool {
         self.admitted.contains_key(name)
     }
 
     /// Native bodies actually run, over this provider's whole life.
-    ///
-    /// The number R5 exists to move. A ratio reported beside a zero here is a
-    /// null result whatever it says.
     pub fn entered(&self) -> u64 {
         self.entered.get()
     }
@@ -216,59 +130,39 @@ impl SpikeBodies {
         self.declines.get()
     }
 
-    /// Runs `f` with the entry context borrowed, which is the state an entry in
-    /// progress leaves behind it.
-    ///
-    /// There is no way to produce a genuinely nested entry: nothing a native
-    /// body can call reaches a `Machine`, and `Denotes::Uncompiled` refuses any
-    /// caller that would try. So the reentrancy guard in [`SpikeBodies::enter`]
-    /// has no route that can fire it, and a counter that can never move is the
-    /// kind of armed-looking check `CONTRIBUTING.md` §"Do not state a guarantee
-    /// you have not armed" is about. This is the closest thing there is: the
-    /// borrow the guard actually tests, held while the machine is offered calls.
-    /// A test that does this and sees the interpreter answer correctly has
-    /// checked the guard's behaviour rather than its existence.
+    /// Runs `f` with the entry context borrowed, which is the state an entry in progress leaves
+    /// behind it.
     pub fn while_entered<T>(&self, f: impl FnOnce() -> T) -> T {
         let _held = self.ctx.borrow_mut();
         f()
     }
 
-    /// The value arena's length and capacity, which is what grows if an entry
-    /// ever stops resetting: `Ctx::slots` is a bump arena with no pop, so
-    /// unbounded growth here is memory proportional to executed work rather than
-    /// to live data.
-    ///
-    /// The length is **zero between entries** since `Ctx::end` — an entry gives
-    /// its slots back rather than leaving them for its successor to drop, which
-    /// is what stopped an entry costing O(the previous entry's peak arena). The
-    /// size the last entry used is [`SpikeBodies::arena_after_entry`].
+    /// The value arena's length and capacity, which is what grows if an entry ever stops resetting:
+    /// `Ctx::slots` is a bump arena with no pop, so unbounded growth here is memory proportional to
+    /// executed work rather than to live data.
     pub fn slots(&self) -> (usize, usize) {
         let ctx = self.ctx.borrow();
         (ctx.slots.len(), ctx.slots.capacity())
     }
 
-    /// How much of the value arena the entry that just finished used — the
-    /// independent variable of `mcts --carryover`, and the number
-    /// `CONTRIBUTING.md` item 12's curve is drawn against.
+    /// How much of the value arena the entry that just finished used — the independent variable of
+    /// `mcts --carryover`, and the number `CONTRIBUTING.md` item 12's curve is drawn against.
     pub fn arena_after_entry(&self) -> usize {
         self.ctx.borrow().arena_after_entry()
     }
 
-    /// Entries whose predecessor had not closed itself. Always zero; see
-    /// [`crate::rt::Ctx::unclosed_entries`].
+    /// Entries whose predecessor had not closed itself.
     pub fn unclosed_entries(&self) -> u64 {
         self.ctx.borrow().unclosed_entries()
     }
 
-    /// Builtin calls made from inside compiled code, over this provider's whole
-    /// life. Cumulative across entries and direct calls both, because the
-    /// context that counts them is shared.
+    /// Builtin calls made from inside compiled code, over this provider's whole life.
     pub fn builtin_calls(&self) -> u64 {
         self.ctx.borrow().builtin_calls
     }
 
-    /// Entries per admitted function, descending — so a report can say *which*
-    /// functions the interpreter dropped into rather than only how often.
+    /// Entries per admitted function, descending — so a report can say *which* functions the
+    /// interpreter dropped into rather than only how often.
     pub fn entries_by_name(&self) -> Vec<(String, u64)> {
         let mut out: Vec<(String, u64)> = self
             .admitted
@@ -296,11 +190,6 @@ impl SpikeBodies {
     }
 
     /// Runs a compiled body directly, outside any machine.
-    ///
-    /// This is ADR 0016's original measurement path — a whole entry, arguments
-    /// boxed, `Ctx` seeded — and it is *not* what the machine uses. It is kept
-    /// because `read_line` is measured this way and because a test that wants to
-    /// see the fragment's own failure needs the diagnostic the boundary discards.
     pub fn call_direct(&self, name: &str, args: &[Value], fuel: i64) -> Result<Value> {
         let entry = self
             .compiled
@@ -367,11 +256,9 @@ impl ply_eval::Compiled for SpikeBodies {
         let out = unsafe { (admitted.entry)(&mut *ctx as *mut Ctx, handles.as_ptr()) };
 
         if ctx.failed != 0 {
-            // The fragment's own diagnostic is deliberately dropped on the floor:
-            // it is `RUNTIME_ERROR` at `Span::DUMMY`, and the machine is about to
-            // evaluate the same definition and raise the real one. Which failure
-            // it was is still counted, because "the budget ran out" and "the
-            // arithmetic overflowed" are different facts about a run.
+            // The fragment's own diagnostic is deliberately dropped on the floor: it is
+            // `RUNTIME_ERROR` at `Span::DUMMY`, and the machine is about to evaluate the same
+            // definition and raise the real one.
             let out_of_fuel = ctx.failed == FAILED_OUT_OF_FUEL;
             ctx.end();
             drop(ctx);
@@ -398,14 +285,6 @@ impl ply_eval::Compiled for SpikeBodies {
 }
 
 /// Whether every parameter and the return type are written `Int` or `Bool`.
-///
-/// Necessary and not sufficient, and the machine's boundary is the authority on
-/// both sides anyway. It is here so that a function which would *always* decline
-/// is never registered: `std.http.read_line` takes `Bytes`, and `floaty.add`
-/// takes `Float`s the fragment has no path for and compiles as `Int` arithmetic
-/// regardless (ADR 0019 §5 item 4). Declining before the fact is cheaper than
-/// declining 120,000 times, and a refusal that fires constantly is a bug report
-/// rather than a fast path.
 pub fn scalar_signature(loaded: &Loaded, name: &str) -> bool {
     let Some((def, _)) = loaded.definition(name) else {
         return false;
@@ -420,27 +299,11 @@ pub fn scalar_signature(loaded: &Loaded, name: &str) -> bool {
 }
 
 /// The largest subset of `candidates` the fragment compiles **as one unit**.
-///
-/// Not a list somebody read off a census: a name survives only if every
-/// construct in its body is inside the fragment *and* every Ply function it can
-/// reach is also in the set. Dropping one function refuses its callers on the
-/// next round, so this is a fixpoint rather than a filter, and it terminates
-/// because every round that changes anything removes at least one name.
-///
-/// The result is what makes the promise [`SpikeBodies`] gives the machine true
-/// by construction: from inside a member there is no reachable call that leaves
-/// compiled code. It is **not** the set that gets registered — see
-/// [`enterable`], which is the scalar-signature subset of this.
 pub fn admissible(loaded: &'static Loaded, candidates: &[String]) -> Result<Vec<String>> {
     Ok(closure(loaded, candidates)?.0)
 }
 
 /// The members of a compiled set the machine may be offered.
-///
-/// A member whose signature is not `Int`/`Bool` throughout would decline on
-/// every call, so it is never registered — but it stays *compiled*, because a
-/// native body reaching it is what makes the set closed. `std.http.line_at` is
-/// the example: compiled, reachable from `read_line`, never entered.
 pub fn enterable(loaded: &Loaded, set: &[String]) -> Vec<String> {
     set.iter()
         .filter(|n| scalar_signature(loaded, n))
@@ -448,15 +311,7 @@ pub fn enterable(loaded: &Loaded, set: &[String]) -> Vec<String> {
         .collect()
 }
 
-/// Every function `candidates` loses, with the reason it lost, in the round it
-/// lost it.
-///
-/// The first round has every candidate present, so a call between two of them
-/// resolves as a direct call and the refusals name **constructs** — a field
-/// access, a list pattern, unary `-`. That is the ranking ADR 0018 §0's roadmap
-/// is read off, and it survives R5 unchanged. Later rounds name the callee that
-/// was dropped, which is a different fact and is reported as one: "a call to
-/// `mcts.iterate`" is not evidence that a field access is the roadmap.
+/// Every function `candidates` loses, with the reason it lost, in the round it lost it.
 pub fn refusals_over(
     loaded: &'static Loaded,
     candidates: &[String],

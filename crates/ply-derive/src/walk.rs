@@ -1,11 +1,4 @@
 //! The syntactic half of `derivable(D, t)`.
-//!
-//! It runs before resolution, so it knows only what the module's own text says —
-//! which the orphan rule makes enough: a `derive`'s target is declared here, and
-//! every named type in a field position is composed through by name rather than
-//! walked. `ply_core` runs the same rules over solved types afterwards and is
-//! the authority; this one exists to refuse a derivation *before* it generates a
-//! body, and to name the field while the field is still in hand.
 
 use crate::rules::{self, Shape};
 use ply_span::Span;
@@ -17,11 +10,10 @@ pub struct Blocker {
     pub span: Span,
     /// Completes "…^^^^ {reason}".
     pub reason: String,
-    /// The advice this particular refusal carries, when the reason alone does
-    /// not say what to do instead.
+    /// The advice this particular refusal carries, when the reason alone does not say what to do
+    /// instead.
     pub note: Option<&'static str>,
-    /// Named in the note when the blocking type sits inside a variant rather
-    /// than a record field.
+    /// Named in the note when the blocking type sits inside a variant rather than a record field.
     pub variant: Option<String>,
 }
 
@@ -40,9 +32,8 @@ impl Blocker {
         self
     }
 
-    /// A record field is blamed as a whole — `on_complete: (Order) -> Unit` —
-    /// because that is the line the user edits, whatever depth the refusal was
-    /// found at.
+    /// A record field is blamed as a whole — `on_complete: (Order) -> Unit` — because that is the
+    /// line the user edits, whatever depth the refusal was found at.
     fn at(mut self, span: Span) -> Blocker {
         self.span = span;
         self
@@ -67,9 +58,9 @@ pub fn check_decl(deriver: Deriver, def: &TypeDef) -> Result<(), Blocker> {
     }
 }
 
-/// A type parameter is derivable by assumption: the generated signature carries
-/// `where derivable(D, p)`, so a call site that instantiates it with something
-/// refused is the one that fails, and it fails naming its own type.
+/// A type parameter is derivable by assumption: the generated signature carries `where derivable(D,
+/// p)`, so a call site that instantiates it with something refused is the one that fails, and it
+/// fails naming its own type.
 pub fn check(deriver: Deriver, te: &TypeExpr) -> Result<(), Blocker> {
     match te {
         TypeExpr::Var(_) | TypeExpr::Unit { .. } => Ok(()),
@@ -96,8 +87,8 @@ pub fn check(deriver: Deriver, te: &TypeExpr) -> Result<(), Blocker> {
             {
                 return Err(Blocker::new(*span, rules::null_in_option(&rendered)));
             }
-            // A `Map`'s iteration order is what any encoding of it is a function
-            // of, so its key type must be ordered whichever deriver is walking.
+            // A `Map`'s iteration order is what any encoding of it is a function of, so its key
+            // type must be ordered whichever deriver is walking.
             if simple == rules::MAP
                 && let Some(key) = args.first()
             {
@@ -115,10 +106,6 @@ pub fn check(deriver: Deriver, te: &TypeExpr) -> Result<(), Blocker> {
 }
 
 /// The written type, when its JSON encoding is `null` for some value.
-///
-/// Syntactic, so a local alias to `Unit` is invisible here — `ply_core`'s walk
-/// runs over solved types, where an alias is already expanded, and is what
-/// closes that half.
 fn json_null_encoded(te: &TypeExpr) -> Option<String> {
     match te {
         TypeExpr::Unit { .. } => Some(String::from("Unit")),

@@ -1,10 +1,4 @@
 //! Turning a path into a checked [`Program`].
-//!
-//! A directory is not concatenated into one module: every `*.ply` under the
-//! root is its own module, named after its path relative to that root. The root
-//! is the directory given to `ply`, or the parent of a single named file, so a
-//! module name is derived and can never drift from where the file actually
-//! lives.
 
 use crate::driver::FrontEnd;
 use ply_core::{CheckOutput, DefInfo, ModuleInfo, TestInfo};
@@ -16,15 +10,12 @@ use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct Loaded {
-    /// The project root: what module names are derived relative to, and where
-    /// the cache lives.
+    /// The project root: what module names are derived relative to, and where the cache lives.
     pub root: PathBuf,
     /// One entry per module, in load order — paths sorted.
     pub files: Vec<PathBuf>,
     pub sources: SourceMap,
-    /// Only the modules this run actually parsed. On the incremental path gate 1
-    /// may have skipped some, in which case [`Loaded::complete`] is false and
-    /// nothing that needs an AST — evaluation above all — may use this.
+    /// Only the modules this run actually parsed.
     pub program: Program,
     pub resolved: Resolved,
     /// Every module, whether it was checked or restored from the cache.
@@ -34,8 +25,8 @@ pub struct Loaded {
     pub frontend: FrontEnd,
 }
 
-/// Carries the [`SourceMap`] even on failure: a parse error is useless without
-/// the text its spans point into.
+/// Carries the [`SourceMap`] even on failure: a parse error is useless without the text its spans
+/// point into.
 #[derive(Debug)]
 pub struct LoadError {
     pub sources: SourceMap,
@@ -72,9 +63,7 @@ impl Loaded {
         self.check.modules.len()
     }
 
-    /// Whether this module was parsed. Only a module with an AST can be
-    /// evaluated; [`Loaded::complete`] says every module was, which is stronger
-    /// than a run that only has to execute some of them needs.
+    /// Whether this module was parsed.
     pub fn has_ast(&self, module: &ModuleName) -> bool {
         self.program.modules.iter().any(|m| &m.name == module)
     }
@@ -106,8 +95,8 @@ impl Loaded {
             .collect()
     }
 
-    /// Tests declared by one module, paired with their index in
-    /// [`CheckOutput::tests`] — the index everything else is keyed by.
+    /// Tests declared by one module, paired with their index in [`CheckOutput::tests`] — the index
+    /// everything else is keyed by.
     pub fn tests_of(&self, module: &ModuleName) -> Vec<(usize, &TestInfo)> {
         self.check
             .tests
@@ -118,10 +107,6 @@ impl Loaded {
     }
 
     /// Every definition named `main`, whatever module declares it.
-    ///
-    /// A `std` module is excluded: `main` is a project's, and a shipped module
-    /// that declared one would make `ply run` ambiguous in a directory the user
-    /// did not write.
     pub fn entry_points(&self) -> Vec<&DefInfo> {
         let main = Symbol::new("main");
         self.check
@@ -132,9 +117,7 @@ impl Loaded {
     }
 }
 
-/// The directory module names are derived relative to, and the directory the
-/// caches live under. Answering this without reading the files lets a command
-/// that only touches the cache agree with one that compiles.
+/// The directory module names are derived relative to, and the directory the caches live under.
 pub fn project_root(path: &Path) -> PathBuf {
     match std::fs::metadata(path) {
         Ok(meta) if meta.is_file() => path
@@ -198,15 +181,9 @@ pub(crate) fn discover(path: &Path) -> Result<(PathBuf, Vec<Discovered>), Vec<Di
 }
 
 /// Every `.ply` file under `root`, sorted.
-///
-/// Unlike [`discover`], finding none is not an error: a cache whose sources have
-/// all been deleted is exactly the state compaction exists to clean up, and
-/// refusing there would leave the garbage permanently unreclaimable. An I/O
-/// failure *is* an error, because a partial walk names fewer files than exist
-/// and anything that prunes to it would throw away live work.
 pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
-    // A project rooted at `.` keys its cache under the empty path, which names
-    // the cache directory correctly and reads as no directory at all.
+    // A project rooted at `.` keys its cache under the empty path, which names the cache directory
+    // correctly and reads as no directory at all.
     let root = if root.as_os_str().is_empty() {
         Path::new(".")
     } else {
@@ -218,9 +195,8 @@ pub(crate) fn ply_files(root: &Path) -> std::io::Result<Vec<PathBuf>> {
     Ok(files)
 }
 
-/// Hidden directories are excluded, which is also what keeps `.ply-cache` and
-/// the VCS metadata out of the program. Directory symlinks are not followed, so
-/// a cycle cannot hang the walk.
+/// Hidden directories are excluded, which is also what keeps `.ply-cache` and the VCS metadata out
+/// of the program.
 fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -242,15 +218,13 @@ fn collect(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// `Path::new(".").join("a.ply")` is `./a.ply`, and that prefix would show up in
-/// every span this file ever renders.
+/// `Path::new(".").join("a.ply")` is `./a.ply`, and that prefix would show up in every span this
+/// file ever renders.
 fn tidy(path: &Path) -> PathBuf {
     path.strip_prefix("./").unwrap_or(path).to_path_buf()
 }
 
-/// [`ModuleName::from_relative_path`] has no source to point at. The file is in
-/// the map by the time it is called here, so its first line is a better anchor
-/// than none.
+/// [`ModuleName::from_relative_path`] has no source to point at.
 pub(crate) fn anchor(
     mut diagnostic: Diagnostic,
     sources: &SourceMap,

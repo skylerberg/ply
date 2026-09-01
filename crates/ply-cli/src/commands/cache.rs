@@ -1,10 +1,3 @@
-//! The cache's own interface.
-//!
-//! The front-end cache stopped being a file anybody could `cat`, and these
-//! commands are what has to be worth more than that was. `inspect` is the one
-//! that carries the trade: it prints a *resolved* type rather than a
-//! serialization of one, which `cat` never did.
-
 use super::common::{IND, diagnostic_json, emit_json, millis, plural, print_warnings};
 use crate::cli::{CacheScope, InspectArgs};
 use crate::style::Style;
@@ -19,10 +12,7 @@ use serde_json::{Value, json};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// A store and how long it took to open it. The time is reported rather than
-/// merely measured: `Store::open` under 5 ms at ten thousand definitions is the
-/// claim the binary format was chosen for, and a number nobody can see is a
-/// claim nobody can check.
+/// A store and how long it took to open it.
 struct Opened {
     store: Store,
     took: Duration,
@@ -126,9 +116,8 @@ pub fn stats(scope: &CacheScope, style: Style) -> i32 {
             style.yellow("more than half the data file is unreachable; run `ply cache compact`")
         );
     }
-    // A hybrid program is a real configuration with a real hash, so it earns a
-    // real cache entry — and a reader counting tests would otherwise read the
-    // surplus as corruption.
+    // A hybrid program is a real configuration with a real hash, so it earns a real cache entry —
+    // and a reader counting tests would otherwise read the surplus as corruption.
     if stats.results > 0 {
         println!(
             "{IND}  {}",
@@ -147,14 +136,11 @@ pub fn compact(scope: &CacheScope, style: Style) -> i32 {
     let notice = crate::migrate::notice(&store, &warnings);
     warnings.extend(notice);
 
-    // Compaction drops whatever the surviving files do not name, so a walk that
-    // saw less than the whole project would delete work no error would report.
+    // Compaction drops whatever the surviving files do not name, so a walk that saw less than the
+    // whole project would delete work no error would report.
     let keep = match crate::load::ply_files(store.root()) {
-        // A shipped module has no file on disk, so the walk cannot see it, and
-        // its entry is live: this binary still ships it. Taken from what the
-        // store already holds rather than from the whole table, so a project
-        // that imports nothing from `std` keeps nothing extra and its
-        // `files_kept` still counts its own files.
+        // A shipped module has no file on disk, so the walk cannot see it, and its entry is live:
+        // this binary still ships it.
         Ok(mut keep) => {
             keep.extend(
                 store
@@ -238,9 +224,9 @@ pub fn compact(scope: &CacheScope, style: Style) -> i32 {
         style.green("compacted"),
         style.dim(&store.dir().display().to_string())
     );
-    // Only when something was actually pruned: a compaction that reclaimed
-    // superseded records without dropping a live one is the common case, and
-    // four zeroes above the byte counts read as though it had done nothing.
+    // Only when something was actually pruned: a compaction that reclaimed superseded records
+    // without dropping a live one is the common case, and four zeroes above the byte counts read as
+    // though it had done nothing.
     if dropped.sources + dropped.defs + dropped.decls + dropped.bodies > 0 {
         println!(
             "{IND}  dropped {} {} · {} {} · {} {} · {} {}",
@@ -348,8 +334,8 @@ pub fn inspect(args: &InspectArgs, style: Style) -> i32 {
 
 // --- one inspected entry ----------------------------------------------------
 
-/// What `inspect` prints, gathered before anything is written so that the human
-/// and JSON forms cannot drift into disagreeing about what was found.
+/// What `inspect` prints, gathered before anything is written so that the human and JSON forms
+/// cannot drift into disagreeing about what was found.
 struct Entry {
     title: String,
     hash: String,
@@ -362,15 +348,13 @@ struct Entry {
     witness: Vec<NameRef>,
     body: Option<(u32, usize)>,
     outcome: Option<Outcome>,
-    /// Held once, as atoms: the human form renders it and the JSON form lists
-    /// it, and a second copy of the rendering is a second thing to keep true.
+    /// Held once, as atoms: the human form renders it and the JSON form lists it, and a second copy
+    /// of the rendering is a second thing to keep true.
     footprint: Option<Footprint>,
 }
 
-/// One variant per kind rather than a bag of labelled strings, so that a JSON
-/// consumer reading `interface.variants` always finds an array and
-/// `interface.type` always finds a string. A shape that changes with how many
-/// constructors a type happens to have is not a schema.
+/// One variant per kind rather than a bag of labelled strings, so that a JSON consumer reading
+/// `interface.variants` always finds an array and `interface.type` always finds a string.
 enum Interface {
     Fn {
         ty: String,
@@ -386,8 +370,8 @@ enum Interface {
     Test {
         nondet: bool,
     },
-    /// The fingerprint names a definition whose interface is not in the store —
-    /// a half-pruned cache, or a hash whose slots were written for other names.
+    /// The fingerprint names a definition whose interface is not in the store — a half-pruned
+    /// cache, or a hash whose slots were written for other names.
     Absent,
 }
 
@@ -496,8 +480,8 @@ impl Entry {
         println!("{IND}  {:<10} {}", "result", self.result_line());
     }
 
-    /// The label is blank on a continuation line so a multi-variant type reads
-    /// as one block rather than as repeated keys.
+    /// The label is blank on a continuation line so a multi-variant type reads as one block rather
+    /// than as repeated keys.
     fn rows(&self) -> Vec<(&'static str, String)> {
         let listed = |label: &'static str, values: &[String]| {
             values
@@ -586,10 +570,9 @@ impl Entry {
     }
 }
 
-/// A constructor's *name* is not in the interface a hash is keyed by — two types
-/// that differ only by their variants' names are one computation — so it comes
-/// from the declaring file's fingerprint, where variants are aligned by
-/// position. Without it this prints `(Int)` and nobody can tell which variant.
+/// A constructor's *name* is not in the interface a hash is keyed by — two types that differ only
+/// by their variants' names are one computation — so it comes from the declaring file's
+/// fingerprint, where variants are aligned by position.
 fn variant_names(store: &Store, def: &FoundDef) -> Vec<Symbol> {
     let Some(fingerprint) = store.fingerprint(&def.path) else {
         return Vec::new();
@@ -602,9 +585,9 @@ fn variant_names(store: &Store, def: &FoundDef) -> Vec<Symbol> {
         .unwrap_or_default()
 }
 
-/// Rendered here rather than by `Display` on the stored shapes: an operation's
-/// `[r]` and a variant's field list are presentation, and the store has no
-/// business knowing how a person likes to read them.
+/// Rendered here rather than by `Display` on the stored shapes: an operation's `[r]` and a
+/// variant's field list are presentation, and the store has no business knowing how a person likes
+/// to read them.
 fn declaration(cached: &CachedDecl, variants: &[Symbol]) -> Interface {
     match &cached.body {
         DeclBody::Type { arity, ctors } => Interface::Type {
@@ -658,13 +641,8 @@ fn kind_of(kind: DefKind) -> &'static str {
     }
 }
 
-/// A stored span is a byte range into the file *as it was cached*, so a line and
-/// column are only meaningful while the file still holds those bytes.
-///
-/// The offset is checked against the fingerprint's content hash rather than
-/// against the file's length: an edit that happens to preserve the length would
-/// otherwise yield a confident, wrong position, and a wrong line number is worse
-/// than none. Returns `(position, stale)`.
+/// A stored span is a byte range into the file *as it was cached*, so a line and column are only
+/// meaningful while the file still holds those bytes.
 fn locate(store: &Store, path: &Path, span: FileSpan) -> (Option<String>, bool) {
     let Ok(text) = std::fs::read_to_string(path) else {
         return (None, true);
@@ -684,8 +662,8 @@ fn locate(store: &Store, path: &Path, span: FileSpan) -> (Option<String>, bool) 
     (Some(format!("{}:{line}:{column}", path.display())), false)
 }
 
-/// Total and independent of the store's iteration order, so two runs over one
-/// cache print the same entries in the same order.
+/// Total and independent of the store's iteration order, so two runs over one cache print the same
+/// entries in the same order.
 fn order_key(found: &Found) -> (String, String, String) {
     let (name, hash) = match found {
         Found::Def(d) => (d.name.to_string(), d.hash),
@@ -744,8 +722,8 @@ pub fn clear(scope: &CacheScope, style: Style) -> i32 {
     EXIT_OK
 }
 
-/// Every failure inside a cache command reports the same way, so an agent can
-/// key off `action` and `exit_code` without knowing which one it asked for.
+/// Every failure inside a cache command reports the same way, so an agent can key off `action` and
+/// `exit_code` without knowing which one it asked for.
 fn fail(
     json: bool,
     action: &str,
@@ -819,9 +797,9 @@ fn garbage_ratio(stats: &CacheStats) -> Option<f64> {
     Some(garbage as f64 / stats.data_bytes as f64)
 }
 
-/// Suggested, never done: dropping an interface costs a recheck, and the
-/// definitions most likely to be garbage — a commented-out function, the other
-/// side of a branch — are the ones most likely to come back.
+/// Suggested, never done: dropping an interface costs a recheck, and the definitions most likely to
+/// be garbage — a commented-out function, the other side of a branch — are the ones most likely to
+/// come back.
 fn compact_suggested(stats: &CacheStats) -> bool {
     garbage_ratio(stats).is_some_and(|ratio| ratio > 0.5)
 }
@@ -875,8 +853,8 @@ mod tests {
         }
     }
 
-    /// Populates the front-end cache the only way anything ever should: by
-    /// running the real front end over a real project.
+    /// Populates the front-end cache the only way anything ever should: by running the real front
+    /// end over a real project.
     fn checked(files: &[(&str, &str)]) -> tempfile::TempDir {
         let dir = project(files);
         let mut store = Store::open(dir.path()).unwrap();
@@ -964,8 +942,8 @@ mod tests {
         );
     }
 
-    /// Three characters is not a hash prefix, and a name that happens to be hex
-    /// still has to match as a name.
+    /// Three characters is not a hash prefix, and a name that happens to be hex still has to match
+    /// as a name.
     #[test]
     fn a_query_shorter_than_four_characters_is_never_read_as_a_hash() {
         let dir = checked(&[("m.ply", "fn one() -> Int = 1\n")]);
@@ -1033,9 +1011,9 @@ mod tests {
         );
     }
 
-    /// Two modules declaring one simple name is an honest ambiguity — the store
-    /// holds no namespace that could pick between them — so both are printed,
-    /// in an order that must not depend on how the store iterates.
+    /// Two modules declaring one simple name is an honest ambiguity — the store holds no namespace
+    /// that could pick between them — so both are printed, in an order that must not depend on how
+    /// the store iterates.
     #[test]
     fn a_simple_name_declared_twice_yields_both_in_a_stable_order() {
         let dir = checked(&[
@@ -1070,8 +1048,7 @@ mod tests {
         assert_eq!(entry.location, None);
     }
 
-    /// The case a length check cannot catch. Every stored offset is still in
-    /// bounds here, so a position would be produced and would be wrong.
+    /// The case a length check cannot catch.
     #[test]
     fn an_edit_that_preserves_the_length_is_still_stale() {
         let dir = checked(&[("m.ply", "fn one() -> Int = 1\nfn two() -> Int = 2\n")]);
@@ -1118,8 +1095,6 @@ mod tests {
         assert!(store.lookup("dropped").is_empty());
     }
 
-    /// Compaction touches the front end only. A result is a claim about a hash,
-    /// and no source file being deleted makes that claim false.
     #[test]
     fn compact_never_drops_a_result() {
         let dir = checked(&[("m.ply", "fn one() -> Int = 1\n")]);

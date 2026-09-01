@@ -9,8 +9,8 @@ use ply_hash::HashOutput;
 use ply_span::Symbol;
 use serde_json::{Value, json};
 
-/// Printed under every listing, because the grouping below is the one thing in
-/// this output that could be mistaken for part of a hash.
+/// Printed under every listing, because the grouping below is the one thing in this output that
+/// could be mistaken for part of a hash.
 const MODULES_ARE_NOT_HASHED: &str = "module names, imports and `pub` are erased by normalization: moving a \
      definition between modules changes no hash";
 

@@ -1,36 +1,4 @@
 //! ADR 0018 §1 — re-pricing ADR 0016 §3's codegen spike against a compute kernel.
-//!
-//!     mcts [--dir benches/kernel] [--iterations N] [--repeats R] [--out mcts.json]
-//!          [--only agreement|entries] [--mutate <corruption>]
-//!
-//! ADR 0016 measured the spike on `std.http.read_line` and concluded 1.02–1.05×
-//! end to end, because the fragment it compiles is 2–5% of an HTTP request. ADR
-//! 0018 is ordered on the assumption that an MCTS inner loop is *almost
-//! entirely* that fragment, and says in as many words that §1 exists to test
-//! the assumption before anything is built.
-//!
-//! So this binary compiles a real MCTS kernel — `benches/kernel/mcts.ply`,
-//! three-heap Nim, bit-packed positions, UCB1 in integer fixed point, bounded
-//! playouts — and reports four things:
-//!
-//!   1. what fraction of the kernel the fragment accepts, statically and by
-//!      executed work;
-//!   2. what compiling the accepted part is worth **end to end**, not on the
-//!      kernel;
-//!   3. what is outside the fragment, ranked by the work it carries;
-//!   4. that the compiled code answers what both interpreters answer, on
-//!      generated inputs, before any of the above is timed.
-//!
-//! Nothing here reads a figure out of a document. Every number is taken in this
-//! process, in this run.
-//!
-//! `--mutate` is item 4's price tag. "0 disagreements" is also what a corpus
-//! that compares nothing reports, so the flag corrupts the backend on purpose —
-//! `--mutate off-by-one`, `inverted`, `stale`, `wrong-type`, `unoffered`,
-//! `exceeds-budget[={k}]`, `answers={int}@{function}`, each optionally
-//! `@function` — and the run fails if the corpus *fails to notice*. Every
-//! corruption and what caught it is tabulated in `tests/mutations.rs`, which is
-//! the standing version of the same experiment.
 
 use anyhow::{Result, bail};
 use ply_codegen_spike::entry::{Declines, admissible, enterable, refusals_over};
@@ -54,8 +22,8 @@ const WHOLE: &str = "mcts.plan_753";
 const PURE: &str = "mcts.playouts";
 /// The instrumented walk that counts the work one search does.
 const WORK: &str = "work.work_753";
-/// The playout length of one (state, seed), so a per-call cost can be turned
-/// into a per-ply cost and weighted by a real ply count.
+/// The playout length of one (state, seed), so a per-call cost can be turned into a per-ply cost
+/// and weighted by a real ply count.
 const PLIES: &str = "work.plies";
 
 struct Args {
@@ -65,20 +33,14 @@ struct Args {
     inner: u32,
     out: Option<String>,
     probe: Option<String>,
-    /// A deliberate corruption of the backend, for the run that prices the
-    /// corpus rather than the compiler. Nothing constructs one by default and
-    /// the accepted spellings are [`ply_codegen_spike::wrong::parse`]'s.
-    ///
-    /// A corpus that has never been run against a wrong backend reports the same
-    /// "0 disagreements" whether it tests the seam or nothing at all.
+    /// A deliberate corruption of the backend, for the run that prices the corpus rather than the
+    /// compiler.
     mutate: Option<String>,
-    /// The subject of [`carryover`]: one function, timed after predecessors of
-    /// every size the corpus generates for it.
+    /// The subject of [`carryover`]: one function, timed after predecessors of every size the
+    /// corpus generates for it.
     carryover: Option<String>,
-    /// `agreement` stops after the census, the agreement corpus and the entry
-    /// counts — everything deterministic — and takes no wall clock at all.
-    /// Correctness before timing is the house rule, and a mode that cannot time
-    /// is how it is kept on a loaded machine.
+    /// `agreement` stops after the census, the agreement corpus and the entry counts — everything
+    /// deterministic — and takes no wall clock at all.
     only: Option<String>,
     why: Option<String>,
 }
@@ -112,8 +74,8 @@ fn parse_args() -> Result<Args> {
             other => bail!("unknown argument: {other}"),
         }
     }
-    // Checked here rather than where it is used, so a misspelled corruption
-    // costs a message instead of a compile and a census.
+    // Checked here rather than where it is used, so a misspelled corruption costs a message instead
+    // of a compile and a census.
     if let Some(spec) = &a.mutate {
         ply_codegen_spike::wrong::parse(spec)?;
     }
@@ -121,9 +83,6 @@ fn parse_args() -> Result<Args> {
 }
 
 /// Best and worst per-call microseconds over `repeats` runs of `inner` calls.
-/// Best-of because the quantity of interest is the cost of the work; worst-of
-/// because a ratio between two best-of numbers is a claim the noise has not
-/// been asked about. The same rule `measure::band` follows.
 #[derive(Clone, Copy, Serialize)]
 struct Band {
     best: f64,
@@ -145,18 +104,14 @@ fn band(mut run: impl FnMut() -> Result<()>, inner: u32, repeats: u32) -> Result
     Ok(Band { best, worst })
 }
 
-// `getloadavg` is in libSystem on macOS and in libc on Linux; declaring it here
-// rather than taking a `libc` dependency keeps this frozen tree's manifests and
-// lock file untouched by the measurement they are being measured with.
+// `getloadavg` is in libSystem on macOS and in libc on Linux; declaring it here rather than taking
+// a `libc` dependency keeps this frozen tree's manifests and lock file untouched by the measurement
+// they are being measured with.
 unsafe extern "C" {
     fn getloadavg(loadavg: *mut f64, nelem: i32) -> i32;
 }
 
 /// The 1-minute load average, read **between** windows and never inside one.
-///
-/// `benches/r5-timing/PRE-REGISTERED.md` discards any window taken above 4.5,
-/// and a filter that cannot see the load cannot be applied afterwards without
-/// becoming the thing it exists to prevent.
 fn load1() -> f64 {
     let mut a = [0f64; 3];
     let n = unsafe { getloadavg(a.as_mut_ptr(), 3) };
@@ -164,20 +119,13 @@ fn load1() -> f64 {
 }
 
 /// A ratio taken **inside** one repeat rather than between two best-of numbers.
-///
-/// This machine is shared with other work and its load average moved between
-/// 15 and 47 while these numbers were taken, so a ratio between two separately
-/// timed loops is a ratio between two different machines. Timing both sides in
-/// the same window and reporting the median of the per-window ratios is the
-/// only form of this comparison that survives that.
 #[derive(Clone, Serialize)]
 struct Paired {
     a: Band,
     b: Band,
     ratios: Vec<f64>,
-    /// Per-window arm times and the load average at each window's start, kept
-    /// so a pre-registered window filter is applied to data rather than to a
-    /// median somebody already looked at.
+    /// Per-window arm times and the load average at each window's start, kept so a pre-registered
+    /// window filter is applied to data rather than to a median somebody already looked at.
     a_micros: Vec<f64>,
     b_micros: Vec<f64>,
     loads: Vec<f64>,
@@ -244,21 +192,12 @@ struct CensusRow {
     function: String,
     nodes: usize,
     accepted: bool,
-    /// Accepted **and** offered to the machine. A function the fragment compiles
-    /// whose signature is not `Int`/`Bool` throughout stays compiled — a native
-    /// body may call it, which is what makes the set closed — and is never
-    /// entered, because the boundary carries no other kind.
+    /// Accepted **and** offered to the machine.
     enterable: bool,
     refused_because: Option<String>,
 }
 
 /// What the fragment accepts, taken over the whole module **as one unit**.
-///
-/// Before R5 this compiled each function on its own and a call to an uncompiled
-/// function became a trampoline, so `mcts.search` counted as accepted while
-/// every iteration of it left the fragment. It cannot now: the compiled set is
-/// closed under calls, so a function is accepted only if everything it can reach
-/// is too, and the census is a census of what can actually run natively.
 fn census(loaded: &'static Loaded, module: &str) -> Result<(Vec<CensusRow>, Vec<String>)> {
     let all = loaded.functions_in(module);
     let accepted = admissible(loaded, &all)?;
@@ -268,8 +207,8 @@ fn census(loaded: &'static Loaded, module: &str) -> Result<(Vec<CensusRow>, Vec<
     for name in &all {
         let (def, _) = loaded.definition(name).expect("it was just listed");
         let nodes = node_count(&lower(&def.body));
-        // A function can be refused twice — once on its own construct, once
-        // again after a callee is dropped. The first refusal is the cause.
+        // A function can be refused twice — once on its own construct, once again after a callee is
+        // dropped.
         let why = refusals
             .iter()
             .find(|(f, _)| f == name)
@@ -285,8 +224,8 @@ fn census(loaded: &'static Loaded, module: &str) -> Result<(Vec<CensusRow>, Vec<
     Ok((rows, accepted))
 }
 
-/// Whether every parameter is written `Int` or `Bool` — the shapes a generic
-/// fuzz can supply without knowing what the function means.
+/// Whether every parameter is written `Int` or `Bool` — the shapes a generic fuzz can supply
+/// without knowing what the function means.
 fn scalar_params(loaded: &Loaded, name: &str) -> Option<Vec<&'static str>> {
     let (def, _) = loaded.definition(name)?;
     let mut out = Vec::new();
@@ -306,8 +245,8 @@ fn scalar_params(loaded: &Loaded, name: &str) -> Option<Vec<&'static str>> {
     Some(out)
 }
 
-/// A 64-bit xorshift, so the generated inputs are the same on every machine and
-/// a disagreement is reproducible from the seed printed beside it.
+/// A 64-bit xorshift, so the generated inputs are the same on every machine and a disagreement is
+/// reproducible from the seed printed beside it.
 struct Rng(u64);
 
 impl Rng {
@@ -318,13 +257,8 @@ impl Rng {
         self.0
     }
 
-    /// Small integers with the edges the kernel actually meets: zero, one, a
-    /// heap size, a packed position, a short fuel, a negative.
-    ///
-    /// Bounded at 512 on purpose. Three of the kernel's functions recurse to a
-    /// depth an *argument* names, and compiled code carries no equivalent of
-    /// the machine's nested-call bound — see [`probe_recursion`], which is a
-    /// finding this fuzz produced rather than a hazard it works around.
+    /// Small integers with the edges the kernel actually meets: zero, one, a heap size, a packed
+    /// position, a short fuel, a negative.
     fn int(&mut self) -> i64 {
         let r = self.next();
         match r % 8 {
@@ -339,8 +273,8 @@ impl Rng {
         }
     }
 
-    /// The magnitudes a seed and a visit count really reach, for the functions
-    /// whose recursion depth no argument names.
+    /// The magnitudes a seed and a visit count really reach, for the functions whose recursion
+    /// depth no argument names.
     fn large(&mut self) -> i64 {
         let r = self.next();
         match r % 4 {
@@ -352,8 +286,8 @@ impl Rng {
     }
 }
 
-/// The functions whose recursion depth is bounded by the *value* of an
-/// argument rather than by its magnitude, so a large draw is safe.
+/// The functions whose recursion depth is bounded by the *value* of an argument rather than by its
+/// magnitude, so a large draw is safe.
 const LARGE_SAFE: &[&str] = &[
     "mcts.heap",
     "mcts.turn",
@@ -374,17 +308,8 @@ const LARGE_SAFE: &[&str] = &[
     "work.ucb_if_sqrt_were_free",
 ];
 
-/// The functions whose last argument names a number of *iterations*, with the
-/// cap a corpus may draw there.
-///
-/// A wide draw in that position is not a wide input; it is a search that does
-/// not finish inside a corpus run. Stated here rather than left to [`Rng::int`]
-/// because the alternative is a hostile `i64::MAX` that costs the rest of the
-/// corpus its run and tests nothing [`deep_recursion`] does not test
-/// deliberately.
-///
-/// `mcts.playouts` is deliberately absent: its count is the one that reaches
-/// the machine's nested-call bound, and that case is wanted.
+/// The functions whose last argument names a number of *iterations*, with the cap a corpus may draw
+/// there.
 const COUNTED: &[(&str, i64)] = &[
     ("mcts.plan", 16),
     ("mcts.plan_753", 16),
@@ -392,10 +317,7 @@ const COUNTED: &[(&str, i64)] = &[
     ("work.size_753", 12),
 ];
 
-/// Functions that cost milliseconds a case on four evaluators, so they get
-/// fewer generated cases. Named rather than inferred from a timing, so that a
-/// function which becomes cheap leaves this list because somebody decided it
-/// had.
+/// Functions that cost milliseconds a case on four evaluators, so they get fewer generated cases.
 const HEAVY: &[&str] = &[
     "mcts.plan",
     "mcts.plan_753",
@@ -406,19 +328,8 @@ const HEAVY: &[&str] = &[
     "work.plies",
 ];
 
-/// Every kernel function a corpus can call directly: all parameters `Int` or
-/// `Bool`, whatever it answers.
-///
-/// > **Widened by the R5 audit, 2026-08-21.** This used to be the *enterable*
-/// > set — the functions the fragment compiles and the boundary will offer,
-/// > which is 19 of the kernel's 34 — and that leaves the claim untested exactly
-/// > where it is most interesting. `mcts.plan` and `mcts.plan_753` are refused
-/// > by the fragment and are the functions whose *callees* get entered; running
-/// > generated cases through them is what puts a corpus on the
-/// > interpreter-drives-and-drops-in path rather than only on the leaves.
-/// > Functions answering a `Node` or a `Tree` are here for the same reason: the
-/// > answer crosses no boundary, so any difference in one is a difference the
-/// > interpreter made while a backend was attached.
+/// Every kernel function a corpus can call directly: all parameters `Int` or `Bool`, whatever it
+/// answers.
 fn subjects(loaded: &'static Loaded) -> Vec<String> {
     let mut out = Vec::new();
     for module in ["mcts", "work"] {
@@ -434,43 +345,28 @@ fn subjects(loaded: &'static Loaded) -> Vec<String> {
 #[derive(Serialize)]
 struct Agreement {
     functions: usize,
-    /// The subjects the fragment compiles, of [`Agreement::functions`]. The rest
-    /// are the callers it refuses, and they are in the corpus on purpose.
+    /// The subjects the fragment compiles, of [`Agreement::functions`].
     compiled_functions: usize,
     cases: usize,
-    /// Cases whose arguments the boundary refuses on sight — a `Float`, a
-    /// `Str`, a `List`, a `Map`, a record, a `Decimal`, a `Secret`, `Unit`. The
-    /// hook must never be offered these, in any argument position, and the
-    /// interpreter must answer exactly what it answers with no backend at all.
+    /// Cases whose arguments the boundary refuses on sight — a `Float`, a `Str`, a `List`, a `Map`,
+    /// a record, a `Decimal`, a `Secret`, `Unit`.
     non_scalar_cases: usize,
-    /// Cases where the machine raised. Before R5 these were scored as agreement
-    /// on both sides raising and never compared at all, which is the weaker
-    /// check `ply_eval::differential` forbids by name.
     raising_cases: usize,
     whole_kernel_cases: usize,
-    /// Cases where the fragment failed and the machine did not — a decline, not
-    /// a disagreement, but counted because a fragment that declines everything
-    /// agrees with everything.
+    /// Cases where the fragment failed and the machine did not — a decline, not a disagreement, but
+    /// counted because a fragment that declines everything agrees with everything.
     fragment_declined: usize,
     /// Native entries the hybrid machine took over the whole corpus.
     entries: u64,
-    /// Distinct compiled functions the interpreter actually dropped into. A
-    /// corpus that entered one function a hundred thousand times has covered one
-    /// function.
+    /// Distinct compiled functions the interpreter actually dropped into.
     entered_functions: usize,
-    /// Entries the corpus declined for running out of fuel — i.e. generated
-    /// cases that reached the machine's own bound on nested calls, before
-    /// [`deep_recursion`] adds the deliberate ones. Recorded because "the corpus
-    /// reached the bound" is a fact about coverage rather than about the run.
+    /// Entries the corpus declined for running out of fuel — i.e. generated cases that reached the
+    /// machine's own bound on nested calls, before [`deep_recursion`] adds the deliberate ones.
     corpus_out_of_fuel: u64,
     disagreements: Vec<String>,
 }
 
 /// Every argument shape the boundary must refuse, one of each kind.
-///
-/// `Secret` is here because ADR 0019 §0.1 arms `argv`'s pool against exactly a
-/// table that keeps one past the call that carried it, and the fragment's
-/// `Ctx::slots` is such a table.
 fn non_scalar_arguments() -> Vec<(&'static str, Value)> {
     vec![
         ("Float", Value::Float(1.5)),
@@ -492,9 +388,8 @@ fn non_scalar_arguments() -> Vec<(&'static str, Value)> {
     ]
 }
 
-/// The values that make an arithmetic body fail rather than answer: an overflow
-/// in `next_seed`'s multiply, a division by zero in `below`, the extremes of the
-/// representation.
+/// The values that make an arithmetic body fail rather than answer: an overflow in `next_seed`'s
+/// multiply, a division by zero in `below`, the extremes of the representation.
 const HOSTILE: &[i64] = &[
     0,
     -1,
@@ -508,21 +403,12 @@ const HOSTILE: &[i64] = &[
 /// One generated call, and whether the boundary is allowed to carry it.
 struct Case {
     args: Vec<Value>,
-    /// False when some argument is a kind the boundary refuses. Such a case must
-    /// not move *this function's* entry count and must not make a compiled body
-    /// run and fail, which is a tighter claim than "the totals did not move":
-    /// `mcts.plan_753(1.5)` legitimately enters `mcts.pack` on its way to
-    /// raising.
+    /// False when some argument is a kind the boundary refuses.
     scalar: bool,
 }
 
-/// The whole case list for one function: generated, hostile everywhere, hostile
-/// in one position at a time, and every refused kind in every position.
-///
-/// > **Widened by the R5 audit.** The refused-kind sweep used to write the shape
-/// > into argument 0 only, so `ucb(3, "7", 3)` had never been offered to
-/// > anything. Position now varies, which is where a boundary that checked only
-/// > its first argument would show up.
+/// The whole case list for one function: generated, hostile everywhere, hostile in one position at
+/// a time, and every refused kind in every position.
 fn cases_for(
     rng: &mut Rng,
     name: &str,
@@ -553,9 +439,8 @@ fn cases_for(
 
     let mut out: Vec<Case> = Vec::new();
     if kinds.is_empty() {
-        // A nullary definition takes the constant memo path, and one case is the
-        // whole of its input domain. Two, so the memo is consulted as well as
-        // written.
+        // A nullary definition takes the constant memo path, and one case is the whole of its input
+        // domain.
         out.push(Case {
             args: Vec::new(),
             scalar: true,
@@ -617,25 +502,6 @@ fn cases_for(
 }
 
 /// Agreement, before anything is timed, and against every evaluator there is.
-///
-/// Three claims, checked separately because they fail separately:
-///
-///   1. **The hybrid machine answers what the machine answers.** This is R5's
-///      whole claim and it is checked with `differential::compare_answers`, so a
-///      difference in the diagnostic's code, message, labels, spans or notes, in
-///      the observed footprint, or in the cell arena is a disagreement — not
-///      only a difference in the value. The two sides are the same `Machine` over
-///      the same program; the backend is the only difference there is.
-///   2. **The tree-walker agrees too**, so the audit is against an independent
-///      implementation rather than against the engine under test.
-///   3. **The fragment, called directly, answers what the machine answers where
-///      it answers at all.** A fragment that fails where the machine succeeds is
-///      a decline and is counted; a fragment that *succeeds where the machine
-///      raises* is a wrong answer and is a disagreement.
-///
-/// A failing input is compared rather than waved through. `(Err(_), Err(_))`
-/// counted as agreement until R5, and lines 1–3 of `ply_eval::differential` say
-/// why that is the one comparison that hides what it exists to catch.
 fn verify(
     loaded: &'static Loaded,
     harness: &mut Harness,
@@ -677,11 +543,9 @@ fn verify(
             if expected.is_err() {
                 n_raising += 1;
             }
-            // A refused kind must not be carried into `name`'s own body, and must
-            // not make any compiled body run and fail — the two ways a boundary
-            // that checked one argument would show up. The totals are *not* the
-            // check: `mcts.plan_753(1.5)` enters `mcts.pack` legitimately before
-            // it raises.
+            // A refused kind must not be carried into `name`'s own body, and must not make any
+            // compiled body run and fail — the two ways a boundary that checked one argument would
+            // show up.
             if !scalar && (after.0 != before.0 || after.1.failed != before.1.failed) {
                 bad.push(format!(
                     "{name} case {case}: the boundary carried an argument kind it refuses \
@@ -701,10 +565,8 @@ fn verify(
                 bad.push(format!("{name} case {case}: the tree-walker {d}"));
             }
 
-            // And the fragment on its own, which is the only place its answers
-            // are visible at all: a decline is invisible through the machine by
-            // design. Only for the functions it compiled — a name it refused has
-            // no body to call and would report every case as a decline.
+            // And the fragment on its own, which is the only place its answers are visible at all:
+            // a decline is invisible through the machine by design.
             if !compiled {
                 continue;
             }
@@ -730,9 +592,8 @@ fn verify(
         }
     }
 
-    // And the whole kernel, which is the claim that actually matters: a search
-    // the interpreter drives, dropping into compiled code at the leaves, answers
-    // the move both interpreters answer.
+    // And the whole kernel, which is the claim that actually matters: a search the interpreter
+    // drives, dropping into compiled code at the leaves, answers the move both interpreters answer.
     let mut whole = 0;
     for case in 0..24 {
         let a = 1 + (rng.next() % 8) as i64;
@@ -780,9 +641,7 @@ fn verify(
     })
 }
 
-/// Native entries into one function, which is what a refused-kind case must not
-/// move. The totals cannot serve: a call that raises on a refused kind may
-/// legitimately have entered *other* functions first.
+/// Native entries into one function, which is what a refused-kind case must not move.
 fn entries_for(harness: &Harness, name: &str) -> u64 {
     harness
         .bodies
@@ -794,31 +653,6 @@ fn entries_for(harness: &Harness, name: &str) -> u64 {
 }
 
 /// Two deep recursions, both compared field by field rather than described.
-///
-/// ADR 0019 §5 item 6 records the nested-call bound as closed and the R5 audit
-/// asks to *see* it: a program the machine answers with `recursion limit of
-/// 10000 nested calls exceeded` must answer the same thing with a backend
-/// attached, down to the labels and the spans, and must not become a `SIGABRT`.
-///
-/// The two are different shapes and only the first reaches the bound:
-///
-///   * **`mcts.playouts` from a terminal position** recurses once per playout
-///     and plays no game, so what it exercises is the nesting. It is itself
-///     compiled, so the machine offers it, the native body burns its whole fuel,
-///     declines, and the machine evaluates one level and offers it again — the
-///     O(`max_calls`²) cost `entry::Declines::out_of_fuel` records. Two more
-///     cases in the corpus above reach the bound the same way, from
-///     `mcts.playouts(3, 3, i64::MAX)` and from `i64::MAX / 2`, which together
-///     with this one are the run's 30,000 fuel declines.
-///   * **`work.plies`** is *not* compiled, so the recursion is the machine's own
-///     and it drops into compiled `mcts.next_seed`/`mcts.below`/`mcts.nth_move`
-///     at every depth — the half the audit calls unobserved, since before R5 a
-///     crossing went through `Machine::call`, which resets `stack.calls()`. It
-///     does **not** reach the bound: a playout ends when the position is
-///     terminal, so the fuel argument is not what stops it. The version that
-///     does reach the bound with an entry at every depth is
-///     `tests/hazards.rs::an_interpreted_recursion_entering_compiled_code_at_every_depth_is_bounded`,
-///     over a fixture whose recursion no game terminates.
 fn deep_recursion(loaded: &'static Loaded, harness: &mut Harness) -> Vec<String> {
     let mut bad = Vec::new();
     let deep: [(&str, Vec<Value>); 2] = [
@@ -861,51 +695,34 @@ struct Rung {
     compiled: Vec<String>,
     interpreter: Band,
     hybrid: Band,
-    /// Interpreter best over hybrid worst — the conservative direction, the
-    /// same one ADR 0016's spike reports.
-    /// Median of the per-window ratios; `low` and `high` are the extremes.
+    /// Interpreter best over hybrid worst — the conservative direction, the same one ADR 0016's
+    /// spike reports.
     speedup: f64,
     low: f64,
     high: f64,
-    /// Native bodies entered during one call of the whole kernel. **The number
-    /// R5 exists to move.** In the hybrid ADR 0018 §0 reports, compiled code was
-    /// reached by exactly three functions and 102 crossings; a rung whose
-    /// interpreter never enters anything is a null result whatever its ratio
-    /// says, and this is the field that says so.
+    /// Native bodies entered during one call of the whole kernel.
     entries_per_call: f64,
     declines_per_call: f64,
     entries_by_function: Vec<(String, u64)>,
     /// Every window behind `speedup`, with the load average each was taken at.
-    /// A median is a summary and a pre-registered filter needs the data.
     windows: Paired,
 }
 
 /// One function timed alone, interpreted against hybrid, in the same windows.
-///
-/// The mean hides a regression and the worst does not: a function whose body is
-/// cheaper than the boundary that reaches it is slower with a backend attached,
-/// and an aggregate over a kernel dominated by `ucb` would never show it.
 #[derive(Clone, Serialize)]
 struct PerFunction {
     function: String,
-    /// Argument sets, from the same generator the agreement corpus draws on
-    /// rather than sets chosen by the person measuring.
+    /// Argument sets, from the same generator the agreement corpus draws on rather than sets chosen
+    /// by the person measuring.
     sets: usize,
     calls_per_window: u32,
     micros_per_interpreted_call: f64,
-    /// Native entries the hybrid arm took during **its own** timed windows. A
-    /// ratio over zero entries is a null result for one function exactly as it
-    /// is for a rung, and this is the field that says so.
+    /// Native entries the hybrid arm took during **its own** timed windows.
     entries_in_timed_run: u64,
     windows: Paired,
 }
 
 /// The compiled sets the ladder walks, each a superset of the one above.
-///
-/// They are *leaves* the interpreter drops into rather than drivers it is
-/// entered from. Before R5 a rung named the outermost function the harness could
-/// enter at, and the twenty arithmetic functions under it were compiled and
-/// never run — which is the whole of what ADR 0018 §0 measured as 0.998x.
 fn ladder_groups<'a>(everything: &[&'a str]) -> Vec<(&'static str, &'static str, Vec<&'a str>)> {
     let exploration: Vec<&str> = vec!["mcts.ilog2", "mcts.isqrt", "mcts.isqrt_step", "mcts.ucb"];
     let playout: Vec<&str> = {
@@ -1040,16 +857,14 @@ struct Report {
     micros_per_ucb: f64,
     micros_per_ucb_without_sqrt: f64,
     boundary_cost_by_tree_size: Vec<Crossing>,
-    /// Which functions the interpreter dropped into, and how often, over one
-    /// whole-kernel call with everything the fragment accepts compiled.
+    /// Which functions the interpreter dropped into, and how often, over one whole-kernel call with
+    /// everything the fragment accepts compiled.
     entries_by_function: Vec<(String, u64)>,
     entries_per_call: f64,
     /// Every function timed alone, sorted worst ratio first.
     per_function: Vec<PerFunction>,
-    /// Functions whose own cases were too expensive to time 21 times over, with
-    /// the per-call microseconds that disqualified them. Listed rather than
-    /// dropped: a per-function table that quietly omits its slowest members is
-    /// the green-over-unexplored-space result this project keeps finding.
+    /// Functions whose own cases were too expensive to time 21 times over, with the per-call
+    /// microseconds that disqualified them.
     per_function_not_timed: Vec<(String, f64)>,
     declines: Declines,
     recursion_bound_machine: String,
@@ -1058,14 +873,6 @@ struct Report {
 }
 
 /// A depth the machine refuses and compiled code does not.
-///
-/// `ply_eval::limit` bounds nested calls at 10,000 in *both* shipped engines,
-/// and reports the breach as a diagnostic rather than as a crash, precisely so
-/// that a deeply-recursive program does not take an unrelated test's process
-/// with it. ADR 0016 §3.2's fragment compiles a self-call to a native call and
-/// carries no such bound, so the same program aborts the process. This is run
-/// as a subprocess by the main report so the claim is observed rather than
-/// asserted.
 fn probe_recursion(dir: &std::path::Path, compiled: bool) -> Result<()> {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(dir)?));
     let names = [
@@ -1083,17 +890,17 @@ fn probe_recursion(dir: &std::path::Path, compiled: bool) -> Result<()> {
         "mcts.below",
     ];
     let mut h = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
-    // A terminal position, so every playout is instant and what the recursion
-    // measures is the nesting rather than the game.
+    // A terminal position, so every playout is instant and what the recursion measures is the
+    // nesting rather than the game.
     let args = vec![Value::Int(0), Value::Int(1), Value::Int(5_000_000)];
     if compiled {
         match h.hybrid_outcome("mcts.playouts", &args) {
             Ok(v) => println!("the hybrid answered {}", v.render()),
             Err(d) => println!("the hybrid raised: {}", d.message),
         }
-        // Which half did the work matters: a hybrid that was never offered the
-        // call would answer the machine's diagnostic for the machine's reason,
-        // and this probe would say nothing about the fragment's own bound.
+        // Which half did the work matters: a hybrid that was never offered the call would answer
+        // the machine's diagnostic for the machine's reason, and this probe would say nothing about
+        // the fragment's own bound.
         let d = h.bodies.declines();
         println!(
             "   the fragment was entered {} times and declined {} of them for running out of \
@@ -1111,21 +918,17 @@ fn probe_recursion(dir: &std::path::Path, compiled: bool) -> Result<()> {
     Ok(())
 }
 
-/// One function's per-function row, taken apart: the same argument sets the
-/// per-function table draws, timed one at a time, with the machine's entry count
-/// and the fragment's own decline reasons for each.
-///
-/// This exists because the per-function table found `mcts.playouts` running
-/// *slower* with a backend attached, and a mechanism inferred from a ratio is
-/// the kind of claim this project's reviews keep catching.
+/// One function's per-function row, taken apart: the same argument sets the per-function table
+/// draws, timed one at a time, with the machine's entry count and the fragment's own decline
+/// reasons for each.
 fn why(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(dir)?));
     let (_, accepted) = census(loaded, KERNEL)?;
     let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
     let mut harness = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
     let shapes = non_scalar_arguments();
-    // The same seed and the same draw order, so these are the very sets the
-    // per-function table timed rather than fresh ones that happen to be similar.
+    // The same seed and the same draw order, so these are the very sets the per-function table
+    // timed rather than fresh ones that happen to be similar.
     let mut rng = Rng(0x243F6A8885A308D3);
     for name in subjects(loaded) {
         let Some(kinds) = scalar_params(loaded, &name) else {
@@ -1197,9 +1000,9 @@ fn why(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
             );
         }
 
-        // And the very loop the per-function table uses, window by window, so a
-        // number that disagrees with the per-set table above is attributable to
-        // the loop rather than argued about.
+        // And the very loop the per-function table uses, window by window, so a number that
+        // disagrees with the per-set table above is attributable to the loop rather than argued
+        // about.
         println!("   -- the same sets through the per-function paired loop --");
         let inner = 1u32;
         let p = {
@@ -1238,27 +1041,14 @@ fn why(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
 }
 
 /// What one entry costs as a function of the *previous* entry's arena.
-///
-/// `CONTRIBUTING.md` §"Things known to be broken" item 12 is a curve, and a
-/// curve nobody can re-take is a number of unknown provenance the moment the
-/// code moves. This is the harness for it. Every row times the **same** call —
-/// the cheapest argument set the corpus generates for `which` — and varies only
-/// the call made immediately before it, which is drawn from the same eight sets
-/// `--why` uses. The interpreter column is the control: it runs the same two
-/// calls with no backend attached, so a slope that appears in both columns is
-/// the program and a slope that appears in one is the seam.
-///
-/// Best-of-`repeats` on the timed call, and the predecessor is **not** timed —
-/// what it costs is its own business, and the question here is what it charges
-/// the call after it.
 fn carryover(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(dir)?));
     let (_, accepted) = census(loaded, KERNEL)?;
     let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
     let mut harness = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
     let shapes = non_scalar_arguments();
-    // The same seed and the same draw order as `--why`, so these are the sets
-    // the per-function table timed rather than fresh ones that resemble them.
+    // The same seed and the same draw order as `--why`, so these are the sets the per-function
+    // table timed rather than fresh ones that resemble them.
     let mut rng = Rng(0x243F6A8885A308D3);
     let mut sets: Vec<Vec<Value>> = Vec::new();
     let mut found = false;
@@ -1300,8 +1090,8 @@ fn carryover(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
         );
     }
 
-    // What each set leaves behind, measured rather than assumed: the arena is a
-    // function of the work the body did and not of the arguments' magnitude.
+    // What each set leaves behind, measured rather than assumed: the arena is a function of the
+    // work the body did and not of the arguments' magnitude.
     let mut arenas: Vec<usize> = Vec::new();
     for set in &sets {
         harness.run_hybrid(which, set)?;
@@ -1372,23 +1162,12 @@ fn carryover(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
     Ok(())
 }
 
-/// What tells a re-executed `--mutate` run that it is the child and must do the
-/// work rather than guard it.
+/// What tells a re-executed `--mutate` run that it is the child and must do the work rather than
+/// guard it.
 const MUTANT_CHILD: &str = "PLY_SPIKE_MUTANT_CHILD";
 
-/// A mutated run, started as a child, so that a backend which takes the process
-/// down is a reported disagreement rather than a dead terminal.
-///
-/// `--mutate exceeds-budget` with no bound is a native recursion with no bound:
-/// `fatal runtime error: stack overflow`, exit 134, before a single case is
-/// compared. Nothing inside that process can report it, so the report comes from
-/// outside it. Every `--mutate` run is guarded and not only that one, because
-/// "which corruptions can crash" is exactly the thing a corpus is not supposed
-/// to have to know in advance.
-///
-/// The child's output is inherited rather than captured: a corpus run prints as
-/// it goes, and a guard that swallowed the output until the end would be paid
-/// for by every run that does not crash.
+/// A mutated run, started as a child, so that a backend which takes the process down is a reported
+/// disagreement rather than a dead terminal.
 fn guard_a_mutated_run() -> Result<()> {
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command
@@ -1430,7 +1209,6 @@ fn main() -> Result<()> {
     }
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::project(&a.dir)?));
 
-    // ---------------------------------------------------------- 1. census --
     let (rows, accepted) = census(loaded, KERNEL)?;
     let total_nodes: usize = rows.iter().map(|r| r.nodes).sum();
     let accepted_nodes: usize = rows.iter().filter(|r| r.accepted).map(|r| r.nodes).sum();
@@ -1476,7 +1254,6 @@ fn main() -> Result<()> {
         println!("   {nodes:>4} nodes  {n:>2} function(s)  {why}");
     }
 
-    // -------------------------------------------- 2. compile and verify --
     let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
     let mut harness = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
     let mutant = match &a.mutate {
@@ -1527,8 +1304,8 @@ fn main() -> Result<()> {
         }
     }
     if !agreement.disagreements.is_empty() {
-        // Capped, because a mutated run produces thousands of these and the
-        // first few name the case that caught it, which is the whole answer.
+        // Capped, because a mutated run produces thousands of these and the first few name the case
+        // that caught it, which is the whole answer.
         for d in agreement.disagreements.iter().take(12) {
             println!("   DISAGREEMENT  {d}");
         }
@@ -1536,9 +1313,7 @@ fn main() -> Result<()> {
             println!("   ... and {} more", agreement.disagreements.len() - 12);
         }
         if mutant.is_some() {
-            // Which subjects noticed, rather than only how many cases did. A
-            // corruption reported by one function's own cases and by no caller
-            // above it is a narrower result than a count suggests.
+            // Which subjects noticed, rather than only how many cases did.
             let mut by_subject: BTreeMap<&str, usize> = BTreeMap::new();
             for d in &agreement.disagreements {
                 *by_subject
@@ -1638,7 +1413,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    // --------------------------------------------------- 3. entry costs --
     let entry_interp = band(
         || {
             harness.interpret(ENTRY, &[])?;
@@ -1658,10 +1432,8 @@ fn main() -> Result<()> {
     let n = Value::Int(a.iterations);
     let n_probe = n.clone();
 
-    // The same search on the two `Machine`s this harness holds, with the backend
-    // attached to neither: nothing is entered on either side. It exists so that
-    // a rung's ratio can be read against what the harness costs rather than
-    // against 1.00x assumed.
+    // The same search on the two `Machine`s this harness holds, with the backend attached to
+    // neither: nothing is entered on either side.
     let floor = {
         let cell = std::cell::RefCell::new(&mut harness);
         paired(
@@ -1680,7 +1452,6 @@ fn main() -> Result<()> {
         )?
     };
 
-    // ------------------------------------------------- 4. the timing ladder --
     let mut rungs = Vec::new();
 
     let ladder = ladder_groups(&names);
@@ -1730,13 +1501,6 @@ fn main() -> Result<()> {
         });
     }
 
-    // ------------------------- 4b. every entered function, timed on its own --
-    //
-    // Pre-registered in `benches/r5-timing/PRE-REGISTERED.md`: the **worst**
-    // per-function ratio is reported rather than the mean, and a per-function
-    // median below 1.00 is a finding even under a winning aggregate. A kernel
-    // whose cost is 62.6% one function can carry a badly regressed one for free,
-    // and the ladder above cannot see it.
     let mut per_function: Vec<PerFunction> = Vec::new();
     let mut per_function_skipped: Vec<(String, f64)> = Vec::new();
     {
@@ -1747,8 +1511,6 @@ fn main() -> Result<()> {
                 continue;
             };
             // Sets both engines answer and on which the hybrid enters something.
-            // A set the machine raises on times the diagnostic path, and a set
-            // that enters nothing makes this row a null result.
             let mut sets: Vec<Vec<Value>> = Vec::new();
             for Case { args, scalar } in cases_for(&mut rng, &name, &kinds, 12, &shapes) {
                 if sets.len() >= 8 {
@@ -1769,10 +1531,9 @@ fn main() -> Result<()> {
             if sets.is_empty() {
                 continue;
             }
-            // Size the window from the work rather than fixing it: one call of
-            // `mcts.turn` is 0.4 µs and one of `mcts.plan_753` is milliseconds,
-            // and a fixed `inner` would time the work on one and the clock on
-            // the other.
+            // Size the window from the work rather than fixing it: one call of `mcts.turn` is 0.4
+            // µs and one of `mcts.plan_753` is milliseconds, and a fixed `inner` would time the
+            // work on one and the clock on the other.
             let probe = Instant::now();
             for set in &sets {
                 harness.interpret(&name, set)?;
@@ -1822,7 +1583,6 @@ fn main() -> Result<()> {
             .unwrap_or(std::cmp::Ordering::Equal)
     });
 
-    // ------------------------------- 5. the same fragment with no tree at all --
     let pure_state = Value::Int(7 + 5 * 16 + 3 * 256);
     let pure_args = vec![
         pure_state.clone(),
@@ -1847,7 +1607,6 @@ fn main() -> Result<()> {
     let (pure_interp, pure_hybrid) = (pure.a, pure.b);
     let pure_speedup = pure.median;
 
-    // ------------------------------------- 6. how much work a search does --
     let work = harness.interpret(WORK, std::slice::from_ref(&n))?;
     let counted = Counted {
         ucb_evaluations: field(&work, "ucb"),
@@ -1859,10 +1618,8 @@ fn main() -> Result<()> {
 
     // Per-call interpreter costs, on arguments the search actually produces.
     let e = entry_interp.best;
-    /// The mean cost of one call, over argument sets the search actually
-    /// produced rather than one set chosen by the person measuring. The
-    /// entry cost is subtracted because a call from inside the kernel does not
-    /// pay it.
+    /// The mean cost of one call, over argument sets the search actually produced rather than one
+    /// set chosen by the person measuring.
     fn per_call(
         harness: &mut Harness,
         name: &str,
@@ -1887,8 +1644,8 @@ fn main() -> Result<()> {
         Ok((b.best - entry).max(0.0))
     }
 
-    /// Every `(wins, visits, parent_visits)` a descent of this tree could hand
-    /// `ucb`, read out of the tree the search actually built.
+    /// Every `(wins, visits, parent_visits)` a descent of this tree could hand `ucb`, read out of
+    /// the tree the search actually built.
     fn ucb_arguments(tree: &Value) -> Vec<Vec<Value>> {
         let Value::Record(root) = tree else {
             return Vec::new();
@@ -1988,9 +1745,9 @@ fn main() -> Result<()> {
         a.repeats,
     )?;
 
-    // A playout's cost per ply, over the states the search really rolls out
-    // from, so that a per-call figure can be weighted by the ply count the
-    // search really played rather than by an assumed playout length.
+    // A playout's cost per ply, over the states the search really rolls out from, so that a
+    // per-call figure can be weighted by the ply count the search really played rather than by an
+    // assumed playout length.
     let t_rollout = per_call(
         &mut harness,
         "mcts.rollout",
@@ -2006,9 +1763,7 @@ fn main() -> Result<()> {
     let mean_plies = sampled_plies as f64 / rollout_sets.len() as f64;
     let t_ply = t_rollout / mean_plies.max(1.0);
 
-    // What it costs to hand the machine a whole tree at the boundary. The body
-    // of `work.touch` is one field read, so the difference between this and the
-    // nullary probe is what the crossing itself charges for the value.
+    // What it costs to hand the machine a whole tree at the boundary.
     let mut boundary = Vec::new();
     for k in [0i64, a.iterations / 4, a.iterations / 2, a.iterations] {
         let t = harness.interpret("mcts.search", &[built.clone(), Value::Int(k)])?;
@@ -2028,12 +1783,9 @@ fn main() -> Result<()> {
         });
     }
 
-    // The two big components, measured **against the whole search in the same
-    // window**: one side runs the search, the other runs exactly the `ucb`
-    // calls (or exactly the playout plies) that search makes, over the same
-    // arguments. The ratio is the share, and it is a ratio of two numbers taken
-    // on the same machine in the same second rather than of two bests taken
-    // minutes apart.
+    // The two big components, measured **against the whole search in the same window**: one side
+    // runs the search, the other runs exactly the `ucb` calls (or exactly the playout plies) that
+    // search makes, over the same arguments.
     let ucb_cycles = (counted.ucb_evaluations as usize).div_ceil(ucb_sets.len().max(1));
     let ucb_calls = (ucb_cycles * ucb_sets.len()) as f64;
     let ucb_paired = {
@@ -2203,9 +1955,8 @@ fn main() -> Result<()> {
 
     let ucb_now = counted.ucb_evaluations as f64 * t_ucb;
     let ucb_free = counted.ucb_evaluations as f64 * t_ucb_free;
-    // Amdahl over the two numbers this run measured: the share of the kernel
-    // the fragment covers, and the ratio the fragment reaches where it runs.
-    // Neither is assumed and neither is quoted.
+    // Amdahl over the two numbers this run measured: the share of the kernel the fragment covers,
+    // and the ratio the fragment reaches where it runs.
     let ceiling_at_measured_ratio = 1.0 / ((1.0 - fragment_share) + fragment_share / pure_speedup);
     let ceiling_at_infinite_ratio = 1.0 / (1.0 - fragment_share);
     println!("\n== the ceiling, from the two numbers above ==");

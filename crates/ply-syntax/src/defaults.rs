@@ -1,38 +1,4 @@
 //! Filling a call's unwritten arguments from the callee's signature.
-//!
-//! `f(x)` where `f`'s second parameter has a default becomes `f(x, <default>)`,
-//! and `f(x, m: 1)` becomes `f(x, 1)`. After this pass every [`ExprKind::App`]
-//! is fully positional and fully applied, which is what lets `ply-hash`,
-//! `ply-core`, `ply-eval` and `ply-prove` carry no notion of a default at all —
-//! ADR 0023's rule, that a construct with four implementations has four chances
-//! to disagree.
-//!
-//! **Why this runs in `resolve` and not in the parser**, where
-//! [`crate::record_update`] and [`crate::try_op`] run. Those read a shape out of
-//! the module in front of them. A default lives in the *callee's* module, so
-//! matching a call against a signature needs the whole program — which the
-//! parser, running one file at a time, does not have. `resolve` is the first
-//! point that does, and it is still before the driver hashes (ADR 0002: parse,
-//! resolve, hash, gate 2, infer), which is the deadline that matters: `f(x)` and
-//! `f(x, 1)` must reach normalization as the same bytes.
-//!
-//! It runs *inside* [`crate::resolve`] rather than beside it so that no entry
-//! point can forget it, which is the guarantee `parse_module` gives the other
-//! two passes. `no_named_argument_survives_resolve_anywhere_in_the_tree` in
-//! [`crate::tests`] is the check.
-//!
-//! **Why crossing a module boundary is safe here**, where ADR 0023 §"Decision 4"
-//! refused it for record update. That refusal rested on gate 1 skipping a file
-//! whose bytes are unchanged, leaving a stale expansion behind. Gate 1's second
-//! condition walks the file's *free names* and refuses any whose referent's hash
-//! moved (`ply_cli::driver`). A default is part of the callee's `DefHash` and a
-//! spliced default is a reference the caller now makes, so both halves are in
-//! `hashes.deps` and an edited default re-parses every caller. Record update had
-//! no such edge to ride: a record's field list is not a reference.
-//!
-//! A **builtin** is the one case with no hash to move — it normalizes as its own
-//! text — so changing a builtin default is a `RUNTIME_VERSION` bump, exactly as
-//! adding a builtin already is.
 
 use crate::ast::{
     Expr, ExprKind, Ident, Item, NamedArg, Pattern, PatternKind, Program, Stmt, is_ctor_name,
@@ -46,34 +12,22 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 #[derive(Clone)]
 struct ParamInfo {
     name: Symbol,
-    /// Already qualified against the module that wrote it, so splicing it into
-    /// any caller means what it meant where it was written.
+    /// Already qualified against the module that wrote it, so splicing it into any caller means
+    /// what it meant where it was written.
     default: Option<Expr>,
-    /// The module binders [`qualify`] introduced, which every module the
-    /// default lands in has to carry — including the one that wrote it, which
-    /// does not import itself.
+    /// The module binders [`qualify`] introduced, which every module the default lands in has to
+    /// carry — including the one that wrote it, which does not import itself.
     imports: Vec<(Symbol, usize)>,
 }
 
-/// A callee's parameters, plus the module that wrote them — needed because the
-/// implicit imports a spliced default requires are the *writer's* modules.
+/// A callee's parameters, plus the module that wrote them — needed because the implicit imports a
+/// spliced default requires are the *writer's* modules.
 #[derive(Clone)]
 struct Signature {
     params: Vec<ParamInfo>,
 }
 
 /// The builtins that carry a default.
-///
-/// The third table over the builtins, after the arities in
-/// `ply_eval::builtins` and the schemes in `ply_core::infer`. It is here rather
-/// than beside either because this crate depends on neither, and
-/// `ply_eval::tests::every_builtin_agrees_on_its_arity_everywhere` is what keeps
-/// the three from drifting.
-///
-/// `range` is deliberately absent. Its natural default is on the *leading*
-/// parameter, so `range(5)` would fill `lo` and leave `hi` empty; the spelling
-/// that works, `range(hi: 5)`, is longer than `range(0, 5)`. A default that
-/// makes every call site worse is not one worth having.
 fn builtin_signature(name: &Symbol) -> Option<Signature> {
     let span = Span::DUMMY;
     match name.as_str() {
@@ -86,9 +40,8 @@ fn builtin_signature(name: &Symbol) -> Option<Signature> {
                 },
                 ParamInfo {
                     name: Symbol::new("message"),
-                    // A prelude constructor, which is in every module's reach
-                    // without an import — so this one needs no qualifying, and
-                    // brings no module in with it.
+                    // A prelude constructor, which is in every module's reach without an import —
+                    // so this one needs no qualifying, and brings no module in with it.
                     default: Some(Expr {
                         kind: ExprKind::Var(crate::ast::QName::bare(Ident::new("None", span))),
                         span,
@@ -101,16 +54,8 @@ fn builtin_signature(name: &Symbol) -> Option<Signature> {
     }
 }
 
-/// The shape this pass believes a builtin has: how many parameters, and how
-/// many of them carry a default.
-///
-/// `None` for a builtin with no defaults, which is every one but `assert` —
-/// this table holds only the exceptions, so an absent name means "exactly
-/// applied, nothing to fill".
-///
-/// Public for one reader: the cross-crate audit in `ply_eval` that checks this
-/// table, `Builtin::arity` and the prelude's schemes still agree. They did not,
-/// for `assert` and `range`, from the first commit until ADR 0029.
+/// The shape this pass believes a builtin has: how many parameters, and how many of them carry a
+/// default.
 pub fn builtin_shape(name: &str) -> Option<(usize, usize)> {
     let sig = builtin_signature(&Symbol::new(name))?;
     let defaults = sig.params.iter().filter(|p| p.default.is_some()).count();
@@ -143,8 +88,8 @@ pub(crate) fn expand(program: &mut Program, resolved: &mut Resolved, diags: &mut
     program.modules = items.into_iter().map(|(_, module)| module).collect();
 }
 
-/// Every `fn` in the program by its program-wide name, with each default already
-/// qualified against the module that wrote it.
+/// Every `fn` in the program by its program-wide name, with each default already qualified against
+/// the module that wrote it.
 fn collect(
     program: &Program,
     resolved: &mut Resolved,
@@ -169,9 +114,8 @@ fn collect(
                         };
                     };
                     let (default, imports) = qualify(d, m, resolved, def.vis.is_public(), diags);
-                    // The writing module needs the binder as much as any caller
-                    // does: the checker types this default where it was
-                    // written, and a module does not import itself.
+                    // The writing module needs the binder as much as any caller does: the checker
+                    // types this default where it was written, and a module does not import itself.
                     for (binder, target) in &imports {
                         owner_imports.push((m, binder.clone(), *target));
                     }
@@ -192,10 +136,6 @@ fn collect(
 }
 
 /// Records that `module` now reaches `target` under `binder`.
-///
-/// The binder is the target's own dotted module name, which no written import
-/// can produce — a written binder is one identifier and contains no `.` — so
-/// this can neither capture a name the file uses nor be captured by one.
 fn bind_module(resolved: &mut Resolved, module: usize, binder: Symbol, target: usize) {
     if let Some(scope) = resolved.scopes.get_mut(module) {
         scope.modules.entry(binder).or_insert((target, Span::DUMMY));
@@ -203,21 +143,6 @@ fn bind_module(resolved: &mut Resolved, module: usize, binder: Symbol, target: u
 }
 
 /// Whether a default may be spliced at all, reporting why not.
-///
-/// Two rules, both about the same thing — *the expression is copied into the
-/// caller, so it has to mean there what it means here*:
-///
-/// * it is pure and closed in the structural sense
-///   ([`crate::ast::is_default_expr`]): no call but a constructor's, no
-///   `perform`, no `handle`. A call would run at the caller rather than here.
-/// * it names none of its own signature's parameters. Those do not exist at a
-///   call site, and the failure is quiet rather than loud when a parameter
-///   shares its name with a global — the mention would bind to the global and
-///   the program would compile, meaning something nobody wrote.
-///
-/// Refused here rather than in the checker so that nothing is spliced before
-/// the reason it should not be is reported. What the checker adds is the
-/// default's *type*, which needs inference and cannot be answered here.
 fn admissible(e: &Expr, params: &[&Symbol], diags: &mut Vec<Diagnostic>) -> bool {
     if !crate::ast::is_default_expr(e) {
         diags.push(
@@ -249,8 +174,7 @@ fn admissible(e: &Expr, params: &[&Symbol], diags: &mut Vec<Diagnostic>) -> bool
     true
 }
 
-/// Which of `params` the expression mentions free. Binders inside the default
-/// shadow, so a lambda whose own parameter is called `n` does not count.
+/// Which of `params` the expression mentions free.
 fn mentions(e: &Expr, params: &[&Symbol], out: &mut Vec<Symbol>) {
     struct M<'a> {
         params: &'a [&'a Symbol],
@@ -362,14 +286,6 @@ fn binders(p: &Pattern, out: &mut Vec<Symbol>) {
 }
 
 /// Rewrites a default's free names to the form they keep in any caller.
-///
-/// A name bound inside the default stays bare. A name the writing module can see
-/// becomes `<that module>::<name>`, with the module's own dotted name as the
-/// binder — a binder no user can write, because a written one is a single
-/// identifier and contains no `.`, so this can never capture or be captured.
-///
-/// A name neither of those is left alone: it is a builtin or a prelude
-/// constructor, and those are in every module's reach already.
 fn qualify(
     e: &Expr,
     owner: usize,
@@ -408,8 +324,8 @@ impl Qualify<'_> {
                     return;
                 }
                 let Some(binding) = self.resolved.find(self.owner, Namespace::Value, q) else {
-                    // A builtin or a prelude constructor: in reach everywhere,
-                    // so it needs no qualifying and gets none.
+                    // A builtin or a prelude constructor: in reach everywhere, so it needs no
+                    // qualifying and gets none.
                     return;
                 };
                 let owner = binding.owner;
@@ -504,9 +420,8 @@ impl Qualify<'_> {
             ExprKind::Field { base, .. } => self.expr(base),
             ExprKind::List { items } => items.iter_mut().for_each(|i| self.expr(i)),
             ExprKind::Try { operand } => self.expr(operand),
-            // Refused by `is_default_expr` before this runs, and reached only
-            // when the checker has already reported that. Walking them anyway
-            // keeps this from depending on the order of two diagnostics.
+            // Refused by `is_default_expr` before this runs, and reached only when the checker has
+            // already reported that.
             ExprKind::Perform { args, .. } => args.iter_mut().for_each(|a| self.expr(a)),
             ExprKind::Handle { body, .. }
             | ExprKind::WithCell { body, .. }
@@ -546,11 +461,10 @@ struct Cx<'a> {
     signatures: &'a IndexMap<Symbol, Signature>,
     resolved: &'a Resolved,
     module: usize,
-    /// Local binders, innermost last. A name bound here is not the global one,
-    /// so a call through it has no signature to match against.
+    /// Local binders, innermost last.
     scope: Vec<Symbol>,
-    /// Modules a spliced default made this one reference, to be added to its
-    /// scope once the walk lets go of `resolved`.
+    /// Modules a spliced default made this one reference, to be added to its scope once the walk
+    /// lets go of `resolved`.
     implicit: Vec<(Symbol, usize)>,
     diags: &'a mut Vec<Diagnostic>,
 }
@@ -563,9 +477,9 @@ impl Cx<'_> {
                 for p in &d.params {
                     self.scope.push(p.name.name.clone());
                 }
-                // A default is not walked here: it was qualified against this
-                // module in `collect`, and a call inside one is refused by
-                // `is_default_expr` before it could need expanding.
+                // A default is not walked here: it was qualified against this module in `collect`,
+                // and a call inside one is refused by `is_default_expr` before it could need
+                // expanding.
                 for s in &mut d.spec {
                     self.expr(&mut s.expr);
                 }
@@ -588,8 +502,8 @@ impl Cx<'_> {
         }
     }
 
-    /// Children first, then this node, so a call nested in another's argument is
-    /// filled before the outer one copies it.
+    /// Children first, then this node, so a call nested in another's argument is filled before the
+    /// outer one copies it.
     fn expr(&mut self, e: &mut Expr) {
         grow(|| {
             match &mut e.kind {
@@ -708,10 +622,8 @@ impl Cx<'_> {
             unreachable!("just matched")
         };
         let Some(sig) = self.signature_of(func) else {
-            // No signature in hand: a call through a value, a constructor, or a
-            // name that does not resolve. The first two are exactly applied by
-            // rule and the third is somebody else's diagnostic — but a name on
-            // an argument had nothing to select, and that is this pass's to say.
+            // No signature in hand: a call through a value, a constructor, or a name that does not
+            // resolve.
             for n in named.iter() {
                 self.diags.push(
                     Diagnostic::error(
@@ -729,17 +641,13 @@ impl Cx<'_> {
             return;
         };
 
-        // Over-application is `E0202`'s to report, with the callee's own type in
-        // hand. Bail rather than report a second, worse version of it.
+        // Over-application is `E0202`'s to report, with the callee's own type in hand.
         if args.len() > sig.params.len() {
             named.clear();
             return;
         }
 
-        // Kept so that a call this pass cannot complete is left exactly as it
-        // was written. A half-filled `args` would be a call whose arguments sit
-        // in the wrong positions, and while the diagnostic below stops the run,
-        // nothing should have to rely on that to avoid reading one.
+        // Kept so that a call this pass cannot complete is left exactly as it was written.
         let written: Vec<Expr> = args.clone();
         let was_named = !named.is_empty();
         let mut slots: Vec<Option<Expr>> = sig.params.iter().map(|_| None).collect();
@@ -793,35 +701,20 @@ impl Cx<'_> {
                 missing.push(p.name.as_str());
                 continue;
             };
-            // The default may name something in the module that wrote it, and
-            // this one may never have imported that module. Record the binder
-            // so the walk can add it: without this the splice is a reference
-            // the caller is not allowed to make.
+            // The default may name something in the module that wrote it, and this one may never
+            // have imported that module.
             for edge in &p.imports {
                 if !self.implicit.contains(edge) {
                     self.implicit.push(edge.clone());
                 }
             }
-            // Keeping the default's own span, not the call's. The expression
-            // is written in the callee, so that is where a diagnostic about it
-            // belongs — reporting at the call site names text the author of
-            // that file never wrote, once per call. Spans are not normalized,
-            // so this does not affect the identity `f(x)` and `f(x, d)` share.
+            // Keeping the default's own span, not the call's.
             out.push(default.clone());
         }
 
         if !missing.is_empty() {
-            // A call with no names in it that leaves a hole is under-applied,
-            // which was `E0202` from inference before defaults existed and
-            // stays `E0202` now. Hand back exactly what was written and let
-            // inference say so in the words it has always used: this pass
-            // changing either the code or the phase of an error that predates
-            // it would be a regression, and `ply-eval`'s
-            // `every_builtins_failure_mode` is the audit that catches one.
-            //
-            // With a name in play there is nothing to hand back — a call
-            // written `f(b: 2)` cannot be spelled positionally — so that is the
-            // one shape needing a diagnostic of its own.
+            // A call with no names in it that leaves a hole is under-applied, which was `E0202`
+            // from inference before defaults existed and stays `E0202` now.
             if was_named {
                 self.diags.push(
                     Diagnostic::error(
@@ -857,20 +750,15 @@ impl Cx<'_> {
         if q.is_bare() && is_ctor_name(q.symbol()) {
             return None;
         }
-        // A local binder wins over everything, so a call through one is a call
-        // through a value.
+        // A local binder wins over everything, so a call through one is a call through a value.
         if q.is_bare() && self.scope.contains(q.symbol()) {
             return None;
         }
-        // `find` and not `lookup`: this runs on every call in the program and
-        // most of them are builtins, which resolve to nothing here. `lookup`
-        // would build — and this would discard — a diagnostic for each,
-        // including a scan of every module for one that exports the name.
+        // `find` and not `lookup`: this runs on every call in the program and most of them are
+        // builtins, which resolve to nothing here.
         match self.resolved.find(self.module, Namespace::Value, q) {
             Some(binding) => self.signatures.get(&binding.qualified).cloned(),
             // A builtin, or a name whose own diagnostic is somebody else's.
-            // `builtin_signature` answers `None` for the second, which leaves
-            // the call exactly as written.
             None => q.is_bare().then(|| builtin_signature(q.symbol())).flatten(),
         }
     }

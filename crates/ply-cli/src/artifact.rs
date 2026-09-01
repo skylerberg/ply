@@ -1,29 +1,5 @@
-//! The deployable artifact: the transitive closure of one entry point, in the
-//! same bytes the content-addressed store already holds.
-//!
-//! ADR 0015 §5.1 settled the shape of this and the reasoning is worth repeating
-//! where the code is, because the interesting-sounding option was refused. Ply
-//! knows exactly which definitions changed, so a deploy *could* ship only those
-//! — but a deploy must ship a `ply` binary too, since the program is interpreted
-//! and every guarantee is the runtime's, and the binary is three orders of
-//! magnitude larger than the definitions. Shipping only the difference optimises
-//! the small side of a ratio, and it would additionally need an agent on the
-//! target, an authenticated channel, a negotiation, a rollback story and a
-//! garbage-collection policy, none of which exist. So the transfer is
-//! whole-program, `ply build` prints the artifact's bytes beside the binary's so
-//! the decision has a number attached, and the incremental story is delivered as
-//! *review* — [`diff`] — which is the part content addressing was actually
-//! buying.
-//!
-//! What content addressing does buy here, for almost nothing, is identity and
-//! verification: the hashes a body is filed under *are* the integrity check, so
-//! a corrupted transfer is a per-definition refusal rather than a plausible
-//! wrong program.
-//!
-//! Two builds of one source tree produce byte-identical artifacts, on any
-//! machine and from any directory. That is not engineered: bodies are the
-//! normalizer's stream and carry no names, spans or paths, every section is
-//! sorted by content, and nothing here records a time.
+//! The deployable artifact: the transitive closure of one entry point, in the same bytes the
+//! content-addressed store already holds.
 
 use crate::load::Loaded;
 use ply_core::{CheckOutput, DefInfo};
@@ -35,9 +11,7 @@ use ply_syntax::resolve::Resolved;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-/// The generation of the container below. A reader refuses any other value:
-/// the layout is not self-describing, so a shape change read as this one would
-/// decode into a plausible wrong program.
+/// The generation of the container below.
 pub const ARTIFACT_FORMAT: u32 = 1;
 
 /// The extension `ply run` recognises, and the reason it does not have to guess.
@@ -45,9 +19,8 @@ pub const EXTENSION: &str = "plyx";
 
 const MAGIC: &[u8; 8] = b"PLYPROG1";
 
-/// Domain tag, so a program digest can never be confused with a definition hash
-/// or with `ply hosts --digest`. The same device ADR 0003 uses for a component's
-/// member keys.
+/// Domain tag, so a program digest can never be confused with a definition hash or with `ply hosts
+/// --digest`.
 const DIGEST_DOMAIN: &[u8] = b"ply.program.1";
 
 /// Bit 0 of `flags`: the `SOURCES` section is present.
@@ -73,11 +46,6 @@ const KIND_STRINGS: u32 = 3;
 const KIND_SOURCES: u32 = 4;
 
 /// A checked program, identified by a digest.
-///
-/// Tests, laws and specs are absent, and that falls out of the closure rather
-/// than being filtered: a `test` is a definition nothing calls, so it is not in
-/// an entry point's closure and neither is its fixture data. A property that
-/// falls out is one nobody can forget to apply.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Artifact {
     pub frontend: [u8; 32],
@@ -87,13 +55,10 @@ pub struct Artifact {
     pub entry: DefHash,
     /// Sorted by hash, which is what makes two builds byte-identical.
     pub bodies: BTreeMap<DefHash, StoredBody>,
-    /// The namespace: program-wide name to hash, sorted. A name may own a run of
-    /// records — a `type` and a `fn` may share one — exactly as the store's
-    /// `DEFS` section admits.
+    /// The namespace: program-wide name to hash, sorted.
     pub names: Vec<(String, DefHash)>,
-    /// Source text, keyed by the path that names the module, relative to the
-    /// project root so that two builds from two roots agree. Empty unless the
-    /// artifact was built `--sources`.
+    /// Source text, keyed by the path that names the module, relative to the project root so that
+    /// two builds from two roots agree.
     pub sources: Vec<(String, String)>,
 }
 
@@ -102,9 +67,7 @@ impl Artifact {
         !self.sources.is_empty()
     }
 
-    /// The program-wide name the entry point was built under. Present in every
-    /// artifact this program writes; absent only in one whose `NAMES` section
-    /// disagrees with its header, which [`decode`] refuses.
+    /// The program-wide name the entry point was built under.
     pub fn entry_name(&self) -> Option<&str> {
         self.names
             .iter()
@@ -112,13 +75,8 @@ impl Artifact {
             .map(|(name, _)| name.as_str())
     }
 
-    /// BLAKE3 over every byte of the encoded file from `sections` onward: the
-    /// section table and every payload, domain-tagged.
-    ///
-    /// The `flags` word lives above that boundary and is covered all the same:
-    /// embedding sources adds a section, so the count, the descriptors and the
-    /// payloads all move. "Was this built with sources" is answerable from the
-    /// digest alone, which is the property ADR 0015 §5.5 asks for.
+    /// BLAKE3 over every byte of the encoded file from `sections` onward: the section table and
+    /// every payload, domain-tagged.
     pub fn digest(&self) -> [u8; 32] {
         let bytes = self.encode();
         digest_of(&bytes).unwrap_or([0; 32])
@@ -139,9 +97,8 @@ impl Artifact {
         }
         sections.push((KIND_BODIES, self.bodies.len() as u32, bodies));
 
-        // One string per distinct name, appended in the order the records are
-        // written, so the blob is a function of the record list and of nothing
-        // else.
+        // One string per distinct name, appended in the order the records are written, so the blob
+        // is a function of the record list and of nothing else.
         let mut strings: Vec<u8> = Vec::new();
         let mut offsets: BTreeMap<&str, u32> = BTreeMap::new();
         let mut names = Vec::new();
@@ -202,9 +159,9 @@ impl Artifact {
     }
 }
 
-/// The digest of an encoded artifact, read out of the bytes rather than out of
-/// the structure — so the writer and the reader compute it over the same thing
-/// by construction rather than by two functions agreeing.
+/// The digest of an encoded artifact, read out of the bytes rather than out of the structure — so
+/// the writer and the reader compute it over the same thing by construction rather than by two
+/// functions agreeing.
 fn digest_of(bytes: &[u8]) -> Option<[u8; 32]> {
     if bytes.len() < OFF_SECTIONS {
         return None;
@@ -215,8 +172,8 @@ fn digest_of(bytes: &[u8]) -> Option<[u8; 32]> {
     Some(*hasher.finalize().as_bytes())
 }
 
-/// `b3:` plus twelve hex characters, the shape `ply hosts --digest` and
-/// `ply std --digest` already print.
+/// `b3:` plus twelve hex characters, the shape `ply hosts --digest` and `ply std --digest` already
+/// print.
 pub fn short(digest: &[u8; 32]) -> String {
     let mut out = String::from("b3:");
     for byte in &digest[..6] {
@@ -227,46 +184,18 @@ pub fn short(digest: &[u8; 32]) -> String {
 
 // --- building ---------------------------------------------------------------
 
-/// What a build produced, and the facts a report needs that the artifact itself
-/// does not carry.
+/// What a build produced, and the facts a report needs that the artifact itself does not carry.
 pub struct Built {
     pub artifact: Artifact,
     pub entry_name: Symbol,
-    /// The start-up definitions shipped beside the entry point, in the order
-    /// they were named. Reported by `ply build`, because a deployment that
-    /// forgot one loses a refusal it cannot get back at run time.
+    /// The start-up definitions shipped beside the entry point, in the order they were named.
     pub startup: Vec<Symbol>,
     /// Definition name to everything it reaches, restricted to the artifact.
-    /// The reverse of this is what [`diff`] reports as reached by a change.
     pub closure: BTreeMap<String, BTreeSet<String>>,
 }
 
-/// The transitive closure of the entry point **and of the run's start-up
-/// definitions**, and nothing else.
-///
-/// ADR 0015 §5.2 said "one entry point, and nothing else", and §3.4 said a
-/// deployed service refuses to start when a required key is unset. Those were in
-/// direct conflict and the implementation resolved it against the deploy story:
-/// `desk.config` and `desk.schema` are nullary functions nothing in `main`
-/// calls, so they were not in the closure, so `ply run desk.plyx --host
-/// --config-schema desk.config` was `E0440` and the artifact only served with
-/// both flags dropped — at which point `E0441 CONFIG_MISSING` and `E0435` could
-/// never fire on the deployed form, and `config.get` could hand back the API key
-/// as an ordinary `String`.
-///
-/// So an artifact is the closure of its **roots**: the entry point, plus the
-/// `--config-schema` and `--db-schema` functions the build names. Those are
-/// start-up code — they run before the entry point does, exactly as the entry
-/// point runs — rather than an exception to the rule, and everything §5.2 relies
-/// on is unchanged: tests, laws and specs are still in no root's closure and
-/// still fall out rather than being filtered.
-///
-/// `loaded` must be complete — every module parsed — which is why `ply build`
-/// takes the full path rather than the incremental one. An artifact is what gets
-/// deployed, so it is built from a full check of the source tree rather than
-/// from whatever the cache happened to hold; that also makes "a cold cache and a
-/// warm cache produce the same bytes" true by construction rather than by a
-/// lookup order nobody can see.
+/// The transitive closure of the entry point **and of the run's start-up definitions**, and nothing
+/// else.
 pub fn build(
     loaded: &Loaded,
     entry: &DefInfo,
@@ -330,11 +259,6 @@ pub fn build(
 }
 
 /// Every project file, keyed by its path relative to the project root.
-///
-/// Relative, so that two builds from two absolute roots produce the same bytes;
-/// and separators are normalized so that the same tree built on Windows and on
-/// Unix does too. The shipped modules are excluded: they are in the binary and
-/// their digest is already in the header.
 fn embedded_sources(loaded: &Loaded) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for file in loaded.sources.files() {
@@ -404,17 +328,6 @@ impl<'a> Reader<'a> {
 }
 
 /// What a target checks, and each check answers a different question.
-///
-/// The order is the one the responses call for. Structure first, because
-/// nothing else can be read without it. Then the versions, because a mismatch
-/// there means *rebuild the artifact* and every check below it would be asking a
-/// different binary's questions of these bytes. Then every body against its own
-/// key, which is what makes a corrupted transfer name one definition rather than
-/// producing a plausible wrong program — before the whole-file digest, so that a
-/// flipped bit is reported at the definition it landed in rather than as one
-/// number disagreeing with another. Then the digest, which covers the parts no
-/// body key does. The reference closure is checked last, by `reconstruct`, since
-/// it is the only check that needs every body decoded.
 pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), Diagnostic> {
     let r = Reader { bytes, path };
     if bytes.len() < HEADER_LEN {
@@ -443,8 +356,8 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
     let stated = r.hash32(OFF_DIGEST)?;
     let count = r.u32(OFF_SECTIONS)? as usize;
 
-    // Bound before it is multiplied: a section count read out of a corrupt
-    // header is otherwise one allocation away from taking the process down.
+    // Bound before it is multiplied: a section count read out of a corrupt header is otherwise one
+    // allocation away from taking the process down.
     let table = HEADER_LEN.saturating_add(DESCRIPTOR_LEN.saturating_mul(count));
     if table > bytes.len() {
         return Err(truncated(path, HEADER_LEN, table - HEADER_LEN, bytes.len()));
@@ -656,30 +569,13 @@ pub struct Opened {
     pub program: Program,
     pub resolved: Resolved,
     pub check: CheckOutput,
-    /// The name the entry point answers to *in this program*. Synthesized when
-    /// the artifact carries no sources, which is why nothing may assume it is
-    /// the name the artifact was built under.
+    /// The name the entry point answers to *in this program*.
     pub entry: Symbol,
-    /// Whether spans point into real text. False for a bodies-only artifact, and
-    /// the reason a production diagnostic has no line number.
+    /// Whether spans point into real text.
     pub located: bool,
 }
 
 /// Turns an artifact into something runnable.
-///
-/// Two routes, and which one is taken is a fact about the artifact rather than a
-/// preference. Without sources the definitions are rebuilt from their bodies,
-/// under the names the `NAMES` section carries — that is what the namespace is
-/// *for*, and it is load-bearing rather than cosmetic: a host handler is
-/// registered against an effect's program-wide name, so a program rebuilt under
-/// synthesized names would bind nothing and `--config-schema` would name
-/// nothing. Spans are still [`Span::DUMMY`], because normalization erased them
-/// and no namespace brings them back.
-///
-/// With sources the text is re-parsed and re-checked, and then *re-hashed and
-/// compared against the artifact*: the sources are believed only if they build
-/// the artifact they arrived in, so `--sources` cannot smuggle a different
-/// program past the digest.
 pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>> {
     if artifact.has_sources() {
         return open_sources(artifact, path);
@@ -692,9 +588,8 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
     for (name, hash) in &artifact.names {
         namespace.entry(*hash).or_insert_with(|| Symbol::new(name));
     }
-    // `reconstruct_named` is where the reference closure is checked: a body
-    // naming a hash the artifact does not hold has no name the program could
-    // give it.
+    // `reconstruct_named` is where the reference closure is checked: a body naming a hash the
+    // artifact does not hold has no name the program could give it.
     let mut rebuilt = reconstruct_named(&set, &namespace).map_err(|diags| {
         vec![
             invalid(
@@ -704,10 +599,7 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
             .note(first_note(&diags)),
         ]
     })?;
-    // Mutable because `resolve` also fills defaults. On a reconstructed
-    // program that changes nothing — the encoding held only positional, fully
-    // applied calls — but it must run, so that a decoded body and a source one
-    // reach the checker in the same shape.
+    // Mutable because `resolve` also fills defaults.
     let resolved = ply_syntax::resolve(&mut rebuilt.program).map_err(|diags| {
         vec![invalid(path, "the artifact's definitions do not resolve").note(first_note(&diags))]
     })?;
@@ -738,10 +630,9 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
         inputs.push((id, name, text.clone()));
     }
 
-    // The shipped modules are not in the artifact — they are in this binary, and
-    // the header's `ply_std::digest()` is what pins them — so they are pulled in
-    // here by the same rule the driver uses, to a fixed point because a shipped
-    // module may import another.
+    // The shipped modules are not in the artifact — they are in this binary, and the header's
+    // `ply_std::digest()` is what pins them — so they are pulled in here by the same rule the
+    // driver uses, to a fixed point because a shipped module may import another.
     let mut program = parse(&inputs)?;
     loop {
         let mut added = false;
@@ -781,8 +672,6 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
     let check = ply_core::check_program(&program, &resolved)?;
 
     // The sources are believed only if they build the artifact they arrived in.
-    // Comparing the whole section rather than the entry point's hash alone is
-    // what makes this a check on the *program* rather than on one definition.
     let (hashes, bodies) = hash_program_with_bodies(&program, &resolved)?;
     let mut rebuilt: BTreeMap<DefHash, StoredBody> = BTreeMap::new();
     for (name, hash) in &artifact.names {
@@ -846,10 +735,6 @@ fn first_note(diags: &[Diagnostic]) -> String {
 // --- the difference between two artifacts ------------------------------------
 
 /// What is actually going out, in the language's own terms.
-///
-/// This is the incremental story delivered as *information* rather than as
-/// transport, and it costs a set difference over two hash sets plus a reverse
-/// closure the build already computed.
 #[derive(Default, Debug)]
 pub struct Diff {
     pub added: Vec<String>,
@@ -857,8 +742,6 @@ pub struct Diff {
     pub dropped: Vec<String>,
     pub unchanged: usize,
     /// Definitions in the new artifact that reach a changed or added one.
-    /// Sorted, and including the changed definitions themselves — a definition
-    /// reaches itself.
     pub reached: Vec<String>,
 }
 
@@ -902,11 +785,6 @@ fn group(names: &[(String, DefHash)]) -> BTreeMap<&str, BTreeSet<DefHash>> {
 // --- running one -------------------------------------------------------------
 
 /// `ply run FILE.plyx` — the target's side of a deploy.
-///
-/// Everything above the entry point is the same as running the source: the same
-/// registry, the same footprint check, the same engine choice. What differs is
-/// where the definitions came from and that they were *verified* on the way in,
-/// which is the whole of what content addressing buys a deployment.
 pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     use crate::commands::common::{
         IND, diagnostic_json, diagnostics_json, emit_json, print_diagnostics, print_warnings,
@@ -950,11 +828,8 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         .defs
         .get(&opened.entry)
         .map(|d| d.footprint.clone());
-    // An artifact is configured exactly as a source tree is, which is the point:
-    // the thing that differs between two deployments is the command line, not
-    // the program. A bodies-only artifact synthesizes its names, so a
-    // `--config-schema` naming one is `E0440` listing what the artifact actually
-    // carries rather than a schema silently not applied.
+    // An artifact is configured exactly as a source tree is, which is the point: the thing that
+    // differs between two deployments is the command line, not the program.
     let (configuration, config_warnings) = match crate::config::Configuration::open(
         &opened.program,
         &opened.resolved,
@@ -970,11 +845,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     if !args.json {
         print_diagnostics(&config_warnings, &opened.sources, style);
     }
-    // A deployed artifact drains exactly as a source tree does. It is the same
-    // command with the same flags on the same entry point, and a service that
-    // stopped gracefully when run from `.ply` and was killed outright when run
-    // from `.plyx` would make the deployed form the one W5's whole shutdown
-    // section does not apply to.
+    // A deployed artifact drains exactly as a source tree does.
     let shutdown = args
         .host
         .then(|| ply_host::signal::Shutdown::new(args.shutdown.bounds()));
@@ -1054,9 +925,8 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         declared.as_ref(),
     );
 
-    // ADR 0015 §4.4's pinned order, on the machine's own thread and never from a
-    // signal handler: roll every open transaction back, close every open span,
-    // flush the sink, close the pool.
+    // ADR 0015 §4.4's pinned order, on the machine's own thread and never from a signal handler:
+    // roll every open transaction back, close every open span, flush the sink, close the pool.
     let teardown =
         crate::commands::run::teardown(&hosts, shutdown.as_ref(), args.shutdown.drain_ms);
     let teardown_json =
@@ -1095,9 +965,9 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
             EXIT_OK
         }
         Err(diagnostic) => {
-            // A drain that expired is the run's configuration at fault rather
-            // than the artifact's, and the exit code is what carries it: a
-            // deployment that sees `3` knows it lost requests.
+            // A drain that expired is the run's configuration at fault rather than the artifact's,
+            // and the exit code is what carries it: a deployment that sees `3` knows it lost
+            // requests.
             let code = if ply_eval::is_drain_incomplete(&diagnostic) {
                 crate::EXIT_DRAIN_INCOMPLETE
             } else {
@@ -1126,10 +996,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 }
 
-/// The same two engines and the same disagreement check `ply run` applies to
-/// source. A deployed artifact is not a place to relax a check: `--engine both`
-/// over an artifact is exactly the claim that decoding a body did not change
-/// what it does.
+/// The same two engines and the same disagreement check `ply run` applies to source.
 fn evaluate(
     opened: &Opened,
     engine: ply_eval::EngineChoice,
@@ -1144,8 +1011,8 @@ fn evaluate(
     let mut interp = Interp::new(&opened.program, &opened.resolved, &opened.check);
     interp.set_host_binding(hosts.binding());
     let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
-    // See `commands::run::evaluate`: the region kinds belong to the program, so
-    // the two engines share one analysis instead of running it twice.
+    // See `commands::run::evaluate`: the region kinds belong to the program, so the two engines
+    // share one analysis instead of running it twice.
     machine.share_region_kinds(interp.shared_region_kinds());
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
@@ -1175,10 +1042,8 @@ fn evaluate(
 
 // --- diagnostics -------------------------------------------------------------
 
-/// An artifact has no source text, so there is no span to point at and inventing
-/// one would send a reader to a file that has nothing to do with the failure.
-/// The file and the offset go in the message instead, which is what a person
-/// checking a transfer actually needs.
+/// An artifact has no source text, so there is no span to point at and inventing one would send a
+/// reader to a file that has nothing to do with the failure.
 fn invalid(path: &Path, message: impl Into<String>) -> Diagnostic {
     Diagnostic::error(codes::ARTIFACT_INVALID, message.into())
         .primary(Span::DUMMY, format!("in `{}`", path.display()))
@@ -1244,10 +1109,8 @@ fn no_body(absent: &[Symbol]) -> Diagnostic {
 mod tests {
     use super::*;
 
-    /// Bodies that are not decodable definitions, deliberately: everything below
-    /// is about the *container*, and `decode` checks a body against its key and
-    /// nothing more. What a body means is `reconstruct`'s question and is asked
-    /// in `tests/suite/artifact.rs` against a real program.
+    /// Bodies that are not decodable definitions, deliberately: everything below is about the
+    /// *container*, and `decode` checks a body against its key and nothing more.
     fn sample() -> Artifact {
         let mut bodies = BTreeMap::new();
         let mut names = Vec::new();

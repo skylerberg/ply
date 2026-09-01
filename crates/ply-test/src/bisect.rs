@@ -1,18 +1,4 @@
 //! Bisection over the definition graph.
-//!
-//! A test that passed at one definition set and fails at another was broken by
-//! some subset of the definitions that moved between them. Because compilation
-//! is content-addressed, a *hybrid* program — some definitions at their old
-//! hashes, the rest at their new ones — is a legitimate program whose test hash
-//! is a legitimate cache key, so most of the search is answered without
-//! evaluating anything. That is why this milestone comes after the incremental
-//! front end rather than before it.
-//!
-//! This module owns the part of that which is a pure search problem: what the
-//! candidates are, which of them may be flipped apart, and how to find the
-//! smallest failure-inducing set. Materializing a hybrid program from stored
-//! bodies is behind [`Hybrid`], because it needs a store that holds definition
-//! bodies — see `docs/adr/0003` and `docs/adr/0004`.
 
 pub mod classify;
 pub mod renormalize;
@@ -27,19 +13,7 @@ use ply_hash::{DefHash, HashOutput};
 use ply_span::Symbol;
 use std::collections::{BTreeMap, BTreeSet};
 
-// --------------------------------------------------------------- namespaces
-
 /// Which namespace a program-wide name is being read in.
-///
-/// A `fn`, a `type` and an `effect` may share a name — they are separate
-/// namespaces — and they hash into separate maps. A bare name is therefore not
-/// enough to look a definition up by, and resolving one as
-/// `defs.get(name).or(decls.get(name))` silently drops whichever the other one
-/// is: the declaration's hash is never recorded, its edit never compared, and
-/// the definitions that mention it are re-normalized against a table that hands
-/// them the function's hash instead.
-///
-/// `Value` covers functions and constructors; `Decl` covers `type` and `effect`.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Default)]
 pub enum Ns {
     #[default]
@@ -56,8 +30,8 @@ impl Ns {
     }
 }
 
-/// The identity of one definition across two configurations: its program-wide
-/// name and the namespace that name is read in.
+/// The identity of one definition across two configurations: its program-wide name and the
+/// namespace that name is read in.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct DefKey {
     pub name: Symbol,
@@ -81,21 +55,12 @@ impl DefKey {
     }
 }
 
-// ------------------------------------------------------------------ changes
-
 /// Why a definition's hash differs between the two configurations.
-///
-/// The distinction that matters is `Edited` versus `Derived`. A reference
-/// contributes the referent's hash, so editing one definition moves the hash of
-/// every transitive dependent. Only the edited ones are candidates: there is no
-/// change to attribute to a definition whose text nobody touched, and offering
-/// one as a suspect is the noise M5 exists to remove.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ChangeKind {
     /// Its own normalized body differs.
     Edited,
-    /// Its body is byte-identical; its hash moved only because a dependency's
-    /// did.
+    /// Its body is byte-identical; its hash moved only because a dependency's did.
     Derived,
     /// Present now, absent from the baseline.
     Added,
@@ -113,9 +78,7 @@ impl ChangeKind {
         }
     }
 
-    /// Whether flipping this definition is a question worth asking. A derived
-    /// change carries no edit, and its body is the same on both sides, so
-    /// flipping it is a no-op.
+    /// Whether flipping this definition is a question worth asking.
     pub fn is_candidate(self) -> bool {
         !matches!(self, ChangeKind::Derived)
     }
@@ -127,22 +90,13 @@ pub struct Change {
     /// The program-wide name — `store.orders.place`.
     pub name: Symbol,
     pub ns: Ns,
-    /// Its hash when the test last passed. `None` for a definition that did not
-    /// exist then.
+    /// Its hash when the test last passed.
     pub before: Option<DefHash>,
-    /// Its hash now. `None` for a definition that has since been deleted.
+    /// Its hash now.
     pub after: Option<DefHash>,
     pub kind: ChangeKind,
-    /// Whether this definition's *published interface* — its scheme and its
-    /// footprint — is the same on both sides.
-    ///
-    /// This is the whole answer to "does the hybrid typecheck". A definition
-    /// whose interface is unchanged can be swapped under its callers without any
-    /// of them noticing; one whose interface moved cannot, and is fused with the
-    /// callers that had to change with it. The caller computes this by comparing
-    /// the stored interface for [`Change::before`] against the freshly inferred
-    /// one; when the stored side is unavailable it must pass `false`, which
-    /// costs a larger cluster and never a wrong answer.
+    /// Whether this definition's *published interface* — its scheme and its footprint — is the same
+    /// on both sides.
     pub independent: bool,
 }
 
@@ -158,8 +112,7 @@ impl Change {
         }
     }
 
-    /// The same change, read in `ns`. Every constructor above defaults to the
-    /// value namespace, which is where all but a `type` or an `effect` lives.
+    /// The same change, read in `ns`.
     pub fn in_namespace(mut self, ns: Ns) -> Change {
         self.ns = ns;
         self
@@ -172,8 +125,7 @@ impl Change {
         }
     }
 
-    /// A hash that moved only because a dependency's did. Never a candidate, so
-    /// its `independent` flag is not consulted.
+    /// A hash that moved only because a dependency's did.
     pub fn derived(name: Symbol, before: DefHash, after: DefHash) -> Change {
         Change {
             name,
@@ -185,8 +137,8 @@ impl Change {
         }
     }
 
-    /// Nothing that references a definition can be flipped without the
-    /// definition itself, so an added one is never independent.
+    /// Nothing that references a definition can be flipped without the definition itself, so an
+    /// added one is never independent.
     pub fn added(name: Symbol, after: DefHash) -> Change {
         Change {
             name,
@@ -198,8 +150,7 @@ impl Change {
         }
     }
 
-    /// Symmetrically: a baseline body that still references it cannot be kept
-    /// while it is deleted.
+    /// Symmetrically: a baseline body that still references it cannot be kept while it is deleted.
     pub fn removed(name: Symbol, before: DefHash) -> Change {
         Change {
             name,
@@ -216,15 +167,7 @@ impl Change {
     }
 }
 
-// ------------------------------------------------------------------- edges
-
 /// Which definitions mention which, unioned over both configurations.
-///
-/// Both eras are needed and neither is optional. Fusing on the current graph
-/// alone misses a baseline body that references a definition since deleted;
-/// fusing on the baseline alone misses a caller written against a definition
-/// since added. Unioning over-approximates, which merges two clusters that could
-/// have been searched apart — a slower search, never a wrong flip.
 #[derive(Clone, Debug, Default)]
 pub struct DepEdges {
     /// referent -> everything that mentions it.
@@ -267,26 +210,18 @@ impl From<&HashOutput> for DepEdges {
     }
 }
 
-// ---------------------------------------------------------------- clusters
-
 /// Why a group of changes has to be flipped as one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum FusionReason {
-    /// Nothing forced it: this definition's interface is unchanged, so it stands
-    /// alone and the search can name it exactly.
+    /// Nothing forced it: this definition's interface is unchanged, so it stands alone and the
+    /// search can name it exactly.
     Independent,
-    /// Its scheme or footprint moved, so its callers had to move with it and a
-    /// hybrid that split them would not typecheck.
+    /// Its scheme or footprint moved, so its callers had to move with it and a hybrid that split
+    /// them would not typecheck.
     InterfaceChanged,
-    /// It exists on only one side, so nothing that mentions it can be flipped
-    /// without it.
+    /// It exists on only one side, so nothing that mentions it can be flipped without it.
     Existence,
-    /// Its members are mutually recursive, so they share one component hash and
-    /// one stored body. There is no mixture that flips one of them without the
-    /// others: a body kept at its baseline still names its partner's baseline
-    /// hash, so a hybrid that split them would silently measure the baseline and
-    /// pass. Handing the search that partition would have it read two passing
-    /// singletons as "each is independently necessary".
+    /// Its members are mutually recursive, so they share one component hash and one stored body.
     Component,
 }
 
@@ -300,8 +235,8 @@ impl FusionReason {
         }
     }
 
-    /// The clause the artifact prints so that a fused group says *why* its
-    /// members are inseparable rather than only that they are.
+    /// The clause the artifact prints so that a fused group says *why* its members are inseparable
+    /// rather than only that they are.
     pub fn describe(self) -> &'static str {
         match self {
             FusionReason::Independent => "nothing forced these together",
@@ -324,12 +259,12 @@ impl FusionReason {
 /// A set of changes the search treats as one atom.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Cluster {
-    /// Program-wide names, ascending — the order is part of the artifact and has
-    /// to be reproducible.
+    /// Program-wide names, ascending — the order is part of the artifact and has to be
+    /// reproducible.
     pub members: Vec<Symbol>,
-    /// The same members with their namespaces, which is what a hybrid has to
-    /// flip: `members` deduplicates a name that is both a `fn` and a `type`, and
-    /// a builder handed only that cannot tell which of the two to swap.
+    /// The same members with their namespaces, which is what a hybrid has to flip: `members`
+    /// deduplicates a name that is both a `fn` and a `type`, and a builder handed only that cannot
+    /// tell which of the two to swap.
     pub keys: Vec<DefKey>,
     pub reason: FusionReason,
 }
@@ -340,42 +275,27 @@ impl Cluster {
     }
 }
 
-/// Everything that moved between the configuration a test last passed at and
-/// the one it fails at, classified and grouped into what the search may flip.
+/// Everything that moved between the configuration a test last passed at and the one it fails at,
+/// classified and grouped into what the search may flip.
 #[derive(Clone, Debug, Default)]
 pub struct Delta {
-    /// The test's own definition, when the test body itself was edited. It is
-    /// never a candidate: every hybrid runs the test as it is written now,
-    /// because the failure being explained is *this* test's failure.
+    /// The test's own definition, when the test body itself was edited.
     pub test: Option<Change>,
     pub changes: Vec<Change>,
     /// The atoms of the search, in ascending order of first member.
     pub clusters: Vec<Cluster>,
     /// How many changes could not be told apart from a hash that merely moved.
-    /// Each one is a split the search had to guess at, so a non-zero count is
-    /// the same disqualification an unresolved *trial* is: the answer may be
-    /// right, but it is not one the run can call minimal.
     pub unclassified: usize,
 }
 
 impl Delta {
     /// Classifies `changes` and fuses those that cannot be flipped apart.
-    ///
-    /// The fusion rule is one line: a change that is not `independent` is fused
-    /// with every candidate that mentions it. Transitivity comes out of the
-    /// union-find. That rule is exactly the typecheck condition — a caller only
-    /// notices a callee being swapped when the callee's published interface
-    /// moved, and a caller that had to be edited for that is itself a candidate.
     pub fn new(test: Option<Change>, changes: Vec<Change>, edges: &DepEdges) -> Delta {
         Delta::with_components(test, changes, edges, &[])
     }
 
-    /// [`Delta::new`] plus the second thing no hybrid can separate: the members
-    /// of a strongly connected component. They are hashed `blake3(component ‖
-    /// index)` off one shared body, so flipping one alone is not a mixture that
-    /// exists — see [`FusionReason::Component`]. Each entry of `components` is
-    /// the membership of one such component; entries naming fewer than two
-    /// candidates fuse nothing.
+    /// [`Delta::new`] plus the second thing no hybrid can separate: the members of a strongly
+    /// connected component.
     pub fn with_components(
         test: Option<Change>,
         changes: Vec<Change>,
@@ -389,8 +309,8 @@ impl Delta {
         for (at, &i) in candidates.iter().enumerate() {
             slot.insert(changes[i].key(), at);
         }
-        // Fusion by reference is decided on names, because `DepEdges` is a name
-        // graph: a mention reaches whichever namespace the referent lives in.
+        // Fusion by reference is decided on names, because `DepEdges` is a name graph: a mention
+        // reaches whichever namespace the referent lives in.
         let mut by_name: BTreeMap<&Symbol, Vec<usize>> = BTreeMap::new();
         for (at, &i) in candidates.iter().enumerate() {
             by_name.entry(&changes[i].name).or_default().push(at);
@@ -467,7 +387,7 @@ impl Delta {
         }
     }
 
-    /// Changes that carry an actual edit. Derived ones are excluded.
+    /// Changes that carry an actual edit.
     pub fn candidates(&self) -> usize {
         self.changes.iter().filter(|c| c.is_candidate()).count()
     }
@@ -476,10 +396,9 @@ impl Delta {
         self.clusters.is_empty()
     }
 
-    /// A candidate is preferred over a `Derived` one sharing the name: a suspect
-    /// annotated `derived` is one an agent stops reading, so where a `fn` and a
-    /// `type` share a name and only one of them was edited, the edit is what the
-    /// artifact has to show.
+    /// A candidate is preferred over a `Derived` one sharing the name: a suspect annotated
+    /// `derived` is one an agent stops reading, so where a `fn` and a `type` share a name and only
+    /// one of them was edited, the edit is what the artifact has to show.
     pub fn change(&self, name: &Symbol) -> Option<&Change> {
         self.changes
             .iter()
@@ -491,9 +410,8 @@ impl Delta {
         self.changes.iter().find(|c| c.key() == *key)
     }
 
-    /// The definitions a hybrid must take from the post-edit side, given the
-    /// cluster indices the search chose. This is the argument a [`Hybrid`]
-    /// implementation actually needs.
+    /// The definitions a hybrid must take from the post-edit side, given the cluster indices the
+    /// search chose.
     pub fn flipped_names(&self, flipped: &[usize]) -> Vec<Symbol> {
         let mut out: Vec<Symbol> = flipped
             .iter()
@@ -505,8 +423,7 @@ impl Delta {
         out
     }
 
-    /// [`Delta::flipped_names`] without the namespace collapse. This is what a
-    /// hybrid builder must use; the name list is for the artifact.
+    /// [`Delta::flipped_names`] without the namespace collapse.
     pub fn flipped_keys(&self, flipped: &[usize]) -> Vec<DefKey> {
         let mut out: Vec<DefKey> = flipped
             .iter()
@@ -534,24 +451,13 @@ fn union(parent: &mut [usize], a: usize, b: usize) {
     }
 }
 
-// ---------------------------------------------------------------- baseline
-
 /// The definition set a test was last seen to pass at.
-///
-/// Keyed by the test's `<module>.<label>` rather than by its hash, which is the
-/// one place in Ply a *name* is load-bearing for a cache and is deliberate: a
-/// test's hash covers its whole closure, so a regression has a different hash
-/// and there would be nothing to look up. Renaming a test's label therefore
-/// loses its baseline, and that costs one missing bisection, never a wrong one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Baseline {
     pub test_hash: DefHash,
     /// Program-wide name -> hash, for every *function* in the closure then.
     pub closure: BTreeMap<Symbol, DefHash>,
-    /// The same for the `type` and `effect` declarations. A second map rather
-    /// than a namespace-keyed one because the first is what the recorded shape
-    /// has always been; keeping the declarations out of it is what once hid an
-    /// edit to a `type` whose name a `fn` also carried.
+    /// The same for the `type` and `effect` declarations.
     pub decls: BTreeMap<Symbol, DefHash>,
 }
 
@@ -602,14 +508,11 @@ impl Baseline {
 #[derive(Clone, Debug, Default)]
 pub struct Diff {
     pub delta: Delta,
-    /// Definitions whose `Edited`/`Derived` split could not be decided, and
-    /// which are therefore candidates that may not have needed to be. A wider
-    /// search, never a wrong one.
+    /// Definitions whose `Edited`/`Derived` split could not be decided, and which are therefore
+    /// candidates that may not have needed to be.
     pub unclassified: Vec<Symbol>,
-    /// The test's own hash moved and nothing could say whether its body was
-    /// edited or merely inherited the move. `Verdict::TestChanged` is withheld
-    /// in that case, because accusing a test nobody touched is worse than
-    /// reporting that no change explains the failure.
+    /// The test's own hash moved and nothing could say whether its body was edited or merely
+    /// inherited the move.
     pub test_unclassified: bool,
 }
 
@@ -627,10 +530,7 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
     let current = regression.hashes;
     let baseline = regression.baseline;
 
-    // Both namespaces, separately. Collapsing them — `defs.get(n).or(decls.get(n))`
-    // — records one hash for a name that denotes two definitions, so an edit to
-    // whichever loses is invisible and the winner's hash is handed to everything
-    // that mentions either.
+    // Both namespaces, separately.
     let mut keys: BTreeSet<DefKey> = baseline.keys().collect();
     for name in current.closure.get(key).into_iter().flatten() {
         if current.defs.contains_key(name) {
@@ -643,16 +543,8 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
     keys.remove(&DefKey::value(key.clone()));
     keys.remove(&DefKey::decl(key.clone()));
 
-    // A rename moves a name and no hash, so a definition that has apparently
-    // vanished but whose hash is still somewhere in the program did not go
-    // anywhere. Reading it as a removal — and its new name as an addition —
-    // would manufacture two candidates out of an edit nobody made, and would
-    // break the one invariant the whole design rests on.
-    //
-    // The hash it kept is not enough on its own: rename a definition while
-    // editing something under it and its hash moves too. What did not move is
-    // its identity *in the baseline era*, which is what the re-normalized hash
-    // is, so that is compared as well.
+    // A rename moves a name and no hash, so a definition that has apparently vanished but whose
+    // hash is still somewhere in the program did not go anywhere.
     let now: BTreeSet<DefHash> = current
         .defs
         .values()
@@ -677,9 +569,7 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
             (Some(before), None) if now.contains(&before) => continue,
             (Some(before), None) if renamed_into.contains(&before) => continue,
             (None, Some(after)) => match classify.renormalized(key) {
-                // Renamed, and its hash moved as well because something under it
-                // was edited. It is the same definition under a new label, so it
-                // is no more a candidate than any other inherited move.
+                // Renamed, and its hash moved as well because something under it was edited.
                 Some(was) if then.contains(&was) => Change::derived(key.name.clone(), was, after),
                 _ => Change::added(key.name.clone(), after),
             },
@@ -734,15 +624,13 @@ pub fn diff(regression: &Regression<'_>, classify: &mut dyn Classify, edges: &De
     }
 }
 
-// ------------------------------------------------------------ preconditions
-
 /// `--bisect`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Mode {
     #[default]
     Auto,
-    /// Ignore the budget, and nothing else: no precondition can be waived
-    /// without inventing evidence.
+    /// Ignore the budget, and nothing else: no precondition can be waived without inventing
+    /// evidence.
     Always,
     Never,
 }
@@ -773,16 +661,13 @@ impl Mode {
     }
 }
 
-/// What [`precheck`] decides from. A struct rather than four positional
-/// arguments because three of them are booleans and transposing two would
-/// silently change which answer a consumer is given.
+/// What [`precheck`] decides from.
 #[derive(Clone, Copy, Debug)]
 pub struct Gate<'a> {
     pub mode: Mode,
     /// Ply failed rather than the program.
     pub defect: bool,
-    /// The failing run reached a host handler, so re-running it acts on the
-    /// world again.
+    /// The failing run reached a host handler, so re-running it acts on the world again.
     pub host: bool,
     pub nondet: bool,
     pub baseline: Option<&'a Baseline>,
@@ -806,15 +691,8 @@ impl<'a> Gate<'a> {
     }
 }
 
-/// The order is the order the answers are worth: a consumer that reads
-/// `never_passed` stops looking for a bug in the cache, and one that reads
-/// `no_bodies` goes and un-prunes it.
-///
-/// `host` outranks `nondet` — which nearly every host-backed test also is —
-/// because the two say different things to a reader. `nondet` says a hybrid's
-/// answer would be evidence about nothing; `host` says asking the question is
-/// itself an action on the world, and that is the fact a consumer deciding
-/// whether to re-run needs.
+/// The order is the order the answers are worth: a consumer that reads `never_passed` stops looking
+/// for a bug in the cache, and one that reads `no_bodies` goes and un-prunes it.
 pub fn precheck(gate: Gate<'_>) -> Result<(), Skipped> {
     if gate.mode == Mode::Never {
         return Err(Skipped::NotRequested);
@@ -834,9 +712,7 @@ pub fn precheck(gate: Gate<'_>) -> Result<(), Skipped> {
     Ok(())
 }
 
-/// The absence of a hybrid builder. Every mixture is unanswerable, so a search
-/// handed this one can still return the verdicts that need no mixture and must
-/// refuse the rest rather than concluding from silence.
+/// The absence of a hybrid builder.
 pub struct NoHybrid;
 
 impl Hybrid for NoHybrid {
@@ -845,20 +721,13 @@ impl Hybrid for NoHybrid {
     }
 }
 
-// ------------------------------------------------------------------- trials
-
 /// Why a hybrid could not answer the question.
-///
-/// None of these is an error to report to a user. They are the rough ground the
-/// search walks around, and their count is in the artifact so that a consumer
-/// can tell a clean bisection from one that had to guess.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Unresolved {
-    /// Old and new disagree about a signature, so this particular mixture is not
-    /// a well-typed program. Common rather than exotic — see the ADR.
+    /// Old and new disagree about a signature, so this particular mixture is not a well-typed
+    /// program.
     DoesNotCheck,
-    /// It failed, but not with the failure being explained. A different failure
-    /// is not evidence about this one.
+    /// It failed, but not with the failure being explained.
     DifferentFailure,
     /// The store cannot produce a body for some hash this mixture needs.
     MissingBody,
@@ -888,10 +757,7 @@ pub enum TrialOutcome {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Trial {
     pub outcome: TrialOutcome,
-    /// Answered from the result cache rather than by evaluating anything. A
-    /// cached trial costs nothing and is not charged against the budget, which
-    /// is the concrete form of "bisection is nearly free once builds are
-    /// cached".
+    /// Answered from the result cache rather than by evaluating anything.
     pub cached: bool,
 }
 
@@ -921,36 +787,27 @@ impl Trial {
 }
 
 /// Builds and evaluates one hybrid program.
-///
-/// The implementation lives wherever definition bodies do. It must run the test
-/// **as it is written now** against a program in which exactly the definitions
-/// named by `delta.flipped_names(flipped)` carry their post-edit bodies and
-/// every other definition in the test's closure carries its baseline body.
 pub trait Hybrid {
     fn trial(&mut self, delta: &Delta, flipped: &[usize]) -> Trial;
 }
 
-// ------------------------------------------------------------------ budget
-
-/// A cap in hybrid *evaluations*, deliberately not in seconds: a failure
-/// artifact that varies with machine load is not one an agent can diff against
-/// yesterday's.
+/// A cap in hybrid *evaluations*, deliberately not in seconds: a failure artifact that varies with
+/// machine load is not one an agent can diff against yesterday's.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Budget {
     pub max_trials: usize,
 }
 
 impl Budget {
-    /// Enough for a clean bisection over roughly 2^30 candidates, and small
-    /// enough that a pathological search cannot outlast the test run it explains.
+    /// Enough for a clean bisection over roughly 2^30 candidates, and small enough that a
+    /// pathological search cannot outlast the test run it explains.
     pub const DEFAULT: Budget = Budget { max_trials: 64 };
 
     pub fn new(max_trials: usize) -> Budget {
         Budget { max_trials }
     }
 
-    /// `--bisect=always` still needs a ceiling; this is one nothing realistic
-    /// reaches.
+    /// `--bisect=always` still needs a ceiling; this is one nothing realistic reaches.
     pub const UNLIMITED: Budget = Budget {
         max_trials: usize::MAX,
     };
@@ -966,66 +823,38 @@ impl Default for Budget {
 pub struct SearchStats {
     pub candidates: usize,
     pub clusters: usize,
-    /// Hybrids actually built and run. The budget caps this and nothing else.
+    /// Hybrids actually built and run.
     pub evaluated: usize,
     /// Hybrids the result cache answered for free.
     pub cached: usize,
     /// Subsets the search would have asked about twice.
     pub memoized: usize,
     pub unresolved: usize,
-    /// The budget ran out before the search finished, so the result is a
-    /// superset of the cause rather than a minimal set.
+    /// The budget ran out before the search finished, so the result is a superset of the cause
+    /// rather than a minimal set.
     pub exhausted: bool,
 }
 
-// ----------------------------------------------------------------- verdict
-
-/// What was skipped, and why. Each variant is a different thing for a consumer
-/// to do about it, which is the only reason to distinguish them.
+/// What was skipped, and why.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Skipped {
     /// `--bisect=never`, or a run that never asked.
     NotRequested,
-    /// This test key has no recorded pass. There is no "before" to bisect
-    /// against, and a first-ever red test is a different situation from a
-    /// regression.
+    /// This test key has no recorded pass.
     NeverPassed,
-    /// The failing run reached a host handler. Bisection re-runs a failing test
-    /// once per mixed definition set, and doing that to a test that sends
-    /// packets sends the packets that many times.
-    ///
-    /// Distinct from [`Skipped::Nondet`], which most host-backed tests also are:
-    /// that one says a hybrid's answer would prove nothing, this one says asking
-    /// the question at all is an action on the world. The suspect set is still
-    /// computed — it comes from hashes, not from running — so the artifact
-    /// degrades to its static half rather than to nothing.
+    /// The failing run reached a host handler.
     Host,
-    /// `test/nondet` outcomes are not a function of the definition set, so a
-    /// hybrid's answer would not be evidence about anything.
+    /// `test/nondet` outcomes are not a function of the definition set, so a hybrid's answer would
+    /// not be evidence about anything.
     Nondet,
-    /// The evaluator failed rather than the program: it unwound, or it reported
-    /// one of its own invariants broken. That is a defect in Ply, not a change
-    /// to attribute.
-    ///
-    /// A failure the language *defines* — `panic`, division by zero, a recursion
-    /// limit — is not this. It is the program's own behaviour, a change can
-    /// introduce it, and it bisects like an assertion.
+    /// The evaluator failed rather than the program: it unwound, or it reported one of its own
+    /// invariants broken.
     Panicked,
     /// Baseline and current agree on every definition in the closure.
     NoChanges,
     /// The store cannot produce the bodies a hybrid needs.
     NoBodies,
-    /// The bodies are there, but this build has no way to assemble them into a
-    /// mixed program. Distinct from [`Skipped::NoBodies`] because the two ask
-    /// different things of a consumer: that one is fixed by not pruning, this
-    /// one cannot be fixed from outside.
-    ///
-    /// A body is hash-linked, so a caller kept at its baseline still names its
-    /// callee's baseline hash. Flipping the callee alone therefore leaves the
-    /// caller pointing at the version that was not flipped, and the trial
-    /// silently measures nothing. Mixing eras needs the intermediate bodies
-    /// re-linked against the mixture's own hash table, which is a relinker
-    /// `ply-hash` does not have yet.
+    /// The bodies are there, but this build has no way to assemble them into a mixed program.
     NoHybrids,
 }
 
@@ -1077,12 +906,11 @@ pub enum Verdict {
     Bisected,
     /// Exactly one change could be flipped, so the answer needed no runs at all.
     Sole,
-    /// The baseline definitions with this test's current body already fail: the
-    /// edit to the test is the change that matters.
+    /// The baseline definitions with this test's current body already fail: the edit to the test is
+    /// the change that matters.
     TestChanged,
-    /// The same, but the test was not edited — so nothing in the definition
-    /// graph explains this failure. Look at a `nondet` effect, the environment,
-    /// or Ply itself.
+    /// The same, but the test was not edited — so nothing in the definition graph explains this
+    /// failure.
     NotInTheGraph,
     /// The current program did not reproduce the failure when replayed.
     NotReproduced,
@@ -1120,16 +948,15 @@ impl Verdict {
     }
 }
 
-/// How much the culprit set may be trusted. A consumer acts differently on each.
+/// How much the culprit set may be trusted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Confidence {
-    /// One definition per group, and dropping any group makes the failure go
-    /// away: the set is 1-minimal.
+    /// One definition per group, and dropping any group makes the failure go away: the set is
+    /// 1-minimal.
     Minimal,
-    /// Some group could not be split, because its members' interfaces changed
-    /// together. One of them is the cause.
+    /// Some group could not be split, because its members' interfaces changed together.
     Fused,
-    /// The search stopped early. The set contains the cause and probably more.
+    /// The search stopped early.
     Partial,
     /// No search ran.
     None,
@@ -1152,11 +979,8 @@ pub struct Bisection {
     pub verdict: Verdict,
     pub confidence: Confidence,
     /// The minimal failure-inducing change set, one entry per fused group.
-    /// Groups and members are both sorted, so two runs over the same inputs
-    /// produce byte-identical artifacts.
     pub groups: Vec<Vec<Symbol>>,
-    /// One sentence saying what happened and what to do about it. Rendered
-    /// verbatim in the terminal and carried in the JSON.
+    /// One sentence saying what happened and what to do about it.
     pub reason: String,
     pub search: SearchStats,
 }
@@ -1190,14 +1014,7 @@ impl Default for Bisection {
     }
 }
 
-// ------------------------------------------------------------------ search
-
 /// Finds the smallest set of changes that reproduces the failure.
-///
-/// Delta debugging rather than a plain binary search, because "flip half and see"
-/// assumes one cause and two edits that only break the test together are not
-/// exotic. The single-cause case is the fast path through the same algorithm and
-/// costs `2·log2(n)` trials, which is what makes this affordable at all.
 pub fn bisect(delta: &Delta, hybrid: &mut dyn Hybrid, budget: Budget) -> Bisection {
     let mut search = Search {
         delta,
@@ -1225,18 +1042,16 @@ impl Search<'_> {
     fn run(&mut self) -> Bisection {
         let n = self.delta.clusters.len();
         if n == 0 {
-            // Nothing to flip. If the test moved, it is the only thing that did
-            // and no hybrid can say more than that.
+            // Nothing to flip.
             return match &self.delta.test {
                 Some(test) => self.test_changed(test.name.clone()),
                 None => Bisection::not_attempted(Skipped::NoChanges),
             };
         }
         if n == 1 {
-            // One cluster is answered for free — unless the test was edited too,
-            // in which case the one definition that moved may be innocent and
-            // `H(∅)` is the question that separates them. Naming it without
-            // asking is how a bisection gets a confident wrong answer.
+            // One cluster is answered for free — unless the test was edited too, in which case the
+            // one definition that moved may be innocent and `H(∅)` is the question that separates
+            // them.
             let sole = self.delta.test.is_none() || self.ask(&[]) != TrialOutcome::Fails;
             let cluster = &self.delta.clusters[0];
             if sole {
@@ -1304,9 +1119,9 @@ impl Search<'_> {
             .map(|&i| self.delta.clusters[i].members.clone())
             .collect();
 
-        // Narrowing nothing while walking around unanswerable mixtures is not a
-        // bisection, and calling it one would have a consumer act on the whole
-        // change set as if the search had endorsed it.
+        // Narrowing nothing while walking around unanswerable mixtures is not a bisection, and
+        // calling it one would have a consumer act on the whole change set as if the search had
+        // endorsed it.
         if minimal.len() == n && self.stats.unresolved > 0 {
             return self.conclude(
                 Verdict::Inconclusive,
@@ -1331,9 +1146,9 @@ impl Search<'_> {
         self.conclude(Verdict::Bisected, groups, reason)
     }
 
-    /// A group of more than one is an answer a consumer has to read differently,
-    /// so the artifact says which constraint fused it rather than leaving the
-    /// reader to guess whether the search failed or the graph forbade the split.
+    /// A group of more than one is an answer a consumer has to read differently, so the artifact
+    /// says which constraint fused it rather than leaving the reader to guess whether the search
+    /// failed or the graph forbade the split.
     fn fused_because(&self) -> Option<&'static str> {
         let mut reasons: Vec<FusionReason> = self
             .delta
@@ -1361,9 +1176,8 @@ impl Search<'_> {
         )
     }
 
-    /// Zeller's ddmin over cluster indices, with the outcome three-valued so an
-    /// unresolved mixture simply is not evidence and the partition refines past
-    /// it.
+    /// Zeller's ddmin over cluster indices, with the outcome three-valued so an unresolved mixture
+    /// simply is not evidence and the partition refines past it.
     fn ddmin(&mut self, mut set: Vec<usize>) -> Vec<usize> {
         let mut parts = 2usize;
         'outer: while set.len() > 1 && !self.stats.exhausted {
@@ -1430,16 +1244,9 @@ impl Search<'_> {
     }
 
     fn conclude(&self, verdict: Verdict, groups: Vec<Vec<Symbol>>, reason: String) -> Bisection {
-        // An unresolved trial anywhere disqualifies the minimality claim, even
-        // one off the path to the answer: the search walked around a question it
-        // could not ask, so it cannot say that dropping any group would make the
-        // failure go away.
-        //
-        // An unresolved *classification* costs exactly the same. A change that
-        // could not be told apart from a hash that merely moved was carried into
-        // the search as a candidate on a guess, so the partition itself is a
-        // guess — and a `minimal` verdict over a guessed partition is the one
-        // way this artifact can be confidently wrong.
+        // An unresolved trial anywhere disqualifies the minimality claim, even one off the path to
+        // the answer: the search walked around a question it could not ask, so it cannot say that
+        // dropping any group would make the failure go away.
         let confidence = if groups.is_empty() {
             Confidence::None
         } else if self.stats.exhausted || self.stats.unresolved > 0 || self.delta.unclassified > 0 {
@@ -1463,8 +1270,8 @@ impl Search<'_> {
     }
 }
 
-/// Near-equal chunks in index order, so a run's partition — and therefore its
-/// trial sequence — is reproducible.
+/// Near-equal chunks in index order, so a run's partition — and therefore its trial sequence — is
+/// reproducible.
 fn split(set: &[usize], parts: usize) -> Vec<Vec<usize>> {
     let parts = parts.clamp(1, set.len().max(1));
     let mut chunks = Vec::with_capacity(parts);
@@ -1627,8 +1434,8 @@ mod tests {
         assert_eq!(delta.clusters[0].reason, FusionReason::Existence);
     }
 
-    /// A removed definition is only reachable through the *baseline* edges, so
-    /// the current program's graph alone would leave a dangling reference.
+    /// A removed definition is only reachable through the *baseline* edges, so the current
+    /// program's graph alone would leave a dangling reference.
     #[test]
     fn a_removed_definition_fuses_through_baseline_edges() {
         let mut changes = independent_changes(&["keeper"]);
@@ -1704,13 +1511,9 @@ mod tests {
         assert_eq!(out.groups, vec![vec![sym("callee"), sym("x")]]);
     }
 
-    /// The case the ADR insists is common: a mixture that does not typecheck is
-    /// not evidence, so the search walks around it, keeps the pair it could not
-    /// separate, and refuses to call the result minimal.
-    ///
-    /// This is also what the fusion pre-pass exists to avoid — had the caller
-    /// marked `b` interface-breaking, `b` and `c` would have been one cluster
-    /// and the answer would have been exact rather than a pair.
+    /// The case the ADR insists is common: a mixture that does not typecheck is not evidence, so
+    /// the search walks around it, keeps the pair it could not separate, and refuses to call the
+    /// result minimal.
     #[test]
     fn hybrids_that_do_not_typecheck_are_not_evidence() {
         let delta = Delta::new(
@@ -1846,8 +1649,8 @@ mod tests {
         assert_eq!(seen.len(), before, "a subset was evaluated twice");
     }
 
-    /// The artifact is diffed against yesterday's, so the same inputs have to
-    /// produce the same bytes — including the order of the culprit groups.
+    /// The artifact is diffed against yesterday's, so the same inputs have to produce the same
+    /// bytes — including the order of the culprit groups.
     #[test]
     fn the_same_inputs_produce_the_same_answer_every_time() {
         let names: Vec<String> = (0..9).map(|i| format!("d{i}")).collect();

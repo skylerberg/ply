@@ -1,14 +1,4 @@
-//! Definition bodies: the third element of `Hash -> (Definition, Type,
-//! Footprint)`.
-//!
-//! Two properties carry everything here. A body must be a *function of its
-//! hash*, so that storing one under a key can never be wrong; and decoding one
-//! must yield a definition that checks and evaluates to what the original did,
-//! so that a historical definition set can be rebuilt without knowing what
-//! anything is called now. The second is tested the only way it can be honestly
-//! tested: reconstruct, re-check, and re-hash — a reconstruction that hashes back
-//! to the keys it was rebuilt from is one nothing downstream can tell from the
-//! original.
+//! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`.
 
 use indexmap::IndexMap;
 use ply_core::ty::{EffectAtom, Footprint, Row, RowVar, Scheme, TyVar, Type};
@@ -61,9 +51,7 @@ fn compile(files: &[(&str, &str)]) -> Checked {
     }
 }
 
-/// Reconstructs, then checks and re-hashes what came back. Every definition must
-/// hash to the key its body was filed under — the round trip, stated as the only
-/// thing that actually matters.
+/// Reconstructs, then checks and re-hashes what came back.
 fn rebuild(original: &Checked) -> (Checked, IndexMap<DefHash, Symbol>) {
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = match ply_syntax::resolve(&mut rebuilt.program) {
@@ -104,7 +92,6 @@ fn rebuild(original: &Checked) -> (Checked, IndexMap<DefHash, Symbol>) {
 }
 
 /// Original program-wide name -> the name the reconstruction invented for it.
-/// Built through hashes, because that is the only thing the two programs share.
 fn translation(original: &Checked, names: &IndexMap<DefHash, Symbol>) -> BTreeMap<Symbol, Symbol> {
     original
         .hashes
@@ -158,9 +145,7 @@ fn rename_footprint(f: &Footprint, map: &BTreeMap<Symbol, Symbol>) -> Footprint 
     Footprint(f.0.iter().map(|a| rename_atom(a, map)).collect())
 }
 
-/// Quantified variables renumbered from zero in traversal order. Inference emits
-/// whatever its global counter reached, and two programs never reach the same
-/// numbers, so schemes are only comparable canonically.
+/// Quantified variables renumbered from zero in traversal order.
 fn canonical(scheme: &Scheme) -> Scheme {
     let mut tys: BTreeMap<TyVar, TyVar> = BTreeMap::new();
     let mut rows: BTreeMap<RowVar, RowVar> = BTreeMap::new();
@@ -225,9 +210,8 @@ fn renumber(
     }
 }
 
-/// Every definition must come back with the interface it went in with, modulo
-/// the names the reconstruction invented. Anything weaker would let a body that
-/// decodes into a *different* program pass.
+/// Every definition must come back with the interface it went in with, modulo the names the
+/// reconstruction invented.
 fn assert_interfaces_survive(files: &[(&str, &str)]) -> Checked {
     let original = compile(files);
     let (rebuilt, names) = rebuild(&original);
@@ -410,8 +394,8 @@ fn cross_module_references_resolve_after_reconstruction() {
     ]);
 }
 
-/// Self-recursion is one member in its own component, so its intra-component
-/// reference names the only class there is and comes back unambiguously.
+/// Self-recursion is one member in its own component, so its intra-component reference names the
+/// only class there is and comes back unambiguously.
 #[test]
 fn self_recursion_round_trips() {
     let original = assert_interfaces_survive(&[(
@@ -437,15 +421,9 @@ fn self_recursion_round_trips() {
     assert!(module.imports.is_empty());
 }
 
-/// A mutually recursive component's bytes label each intra-component reference
-/// with the class refinement assigned, and refinement runs to a *labelled* fixed
-/// point — so the label a reference mentions is the label its referent is filed
-/// under, and which member calls which is recoverable. This is the property the
-/// whole cycle encoding rests on: without it `f -> g, g -> h, h -> f` and
-/// `f -> h, h -> g, g -> f` would encode identically and collide.
-///
-/// `verify` inside `reconstruct` is what proves the wiring, since a cycle wired
-/// the other way round re-hashes to the other member's key.
+/// A mutually recursive component's bytes label each intra-component reference with the class
+/// refinement assigned, and refinement runs to a *labelled* fixed point — so the label a reference
+/// mentions is the label its referent is filed under, and which member calls which is recoverable.
 #[test]
 fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
     let original = compile(&[(
@@ -470,9 +448,7 @@ fn a_mutually_recursive_component_round_trips_wired_the_way_it_was_written() {
     assert_eq!(names.len(), 2);
 }
 
-/// Two three-cycles that differ only in the direction they are wired. Under a
-/// labelling the refinement stopped short of, every reference would read `class
-/// 0` and the two would be one definition set.
+/// Two three-cycles that differ only in the direction they are wired.
 #[test]
 fn two_cycles_wired_in_opposite_directions_do_not_collide() {
     let clockwise = compile(&[(
@@ -576,8 +552,8 @@ fn a_reference_with_no_body_is_named_rather_than_guessed() {
     );
 }
 
-/// Renaming is free for a hash, so it must be free for a body: the bytes a
-/// definition is stored under cannot move when its name does.
+/// Renaming is free for a hash, so it must be free for a body: the bytes a definition is stored
+/// under cannot move when its name does.
 #[test]
 fn renaming_changes_no_body() {
     let before = compile(&[("m", "fn f(x: Int) -> Int = x + 1\nfn g() -> Int = f(1)\n")]);
@@ -593,9 +569,9 @@ fn renaming_changes_no_body() {
     assert_eq!(lhs, rhs);
 }
 
-/// Moving a definition between modules changes no hash, so it must change no
-/// body either — this is the property a reconstruction of a historical set
-/// depends on, because the modules moved and the hashes did not.
+/// Moving a definition between modules changes no hash, so it must change no body either — this is
+/// the property a reconstruction of a historical set depends on, because the modules moved and the
+/// hashes did not.
 #[test]
 fn moving_a_definition_between_modules_changes_no_body() {
     let together = compile(&[(
@@ -621,9 +597,9 @@ fn moving_a_definition_between_modules_changes_no_body() {
     assert_eq!(lhs, rhs);
 }
 
-/// Checking is not the bar — M5 has to *evaluate* a historical definition set —
-/// so the reconstructed tests are run, in the reconstructed program, against the
-/// reconstructed definitions.
+/// Checking is not the bar — M5 has to *evaluate* a historical definition set — so the
+/// reconstructed tests are run, in the reconstructed program, against the reconstructed
+/// definitions.
 #[test]
 fn reconstructed_tests_evaluate() {
     let original = compile(&[(
@@ -679,18 +655,16 @@ fn the_examples_reconstruct() {
         .iter()
         .map(|(name, text)| (name.as_str(), text.as_str()))
         .collect();
-    // The corpus imports `std.net`, which `ply` pulls in on demand; this
-    // harness has no import graph to walk, so it loads the shipped set.
+    // The corpus imports `std.net`, which `ply` pulls in on demand; this harness has no import
+    // graph to walk, so it loads the shipped set.
     for (name, source) in ply_std::sources() {
         borrowed.push((name, source));
     }
     assert_interfaces_survive(&borrowed);
 }
 
-/// Every mutation is re-filed under *its own* key, so the self-check passes and
-/// the decoder is handed real garbage rather than being let off at the door.
-/// Corrupt bytes have to come back as a diagnostic; an abort takes the run down
-/// and a wild length prefix is one allocation away from one.
+/// Every mutation is re-filed under *its own* key, so the self-check passes and the decoder is
+/// handed real garbage rather than being let off at the door.
 #[test]
 fn no_mutation_of_a_body_can_abort_the_decoder() {
     let original = compile(&[("m", EVERY_ITEM_KIND)]);
@@ -708,8 +682,8 @@ fn no_mutation_of_a_body_can_abort_the_decoder() {
             let Some(key) = stored.key() else { continue };
             let mut set = BodySet::default();
             set.insert(key, stored);
-            // Succeeding is allowed — some mutations are still a definition —
-            // and only returning without aborting is being asserted.
+            // Succeeding is allowed — some mutations are still a definition — and only returning
+            // without aborting is being asserted.
             let _ = reconstruct(&set);
         }
     }
@@ -724,8 +698,7 @@ fn nothing_reconstructs_into_an_empty_program() {
     assert!(rebuilt.test_keys.is_empty());
 }
 
-/// The reconstruction is an artifact something else will diff, so it may not
-/// vary run to run.
+/// The reconstruction is an artifact something else will diff, so it may not vary run to run.
 #[test]
 fn reconstruction_is_deterministic() {
     let original = compile(&[("m", EVERY_ITEM_KIND)]);
@@ -756,11 +729,10 @@ fn reconstruction_is_deterministic() {
 
 // --- reconstructing under the names a definition was written with ------------
 
-/// Everything the `Namespace` is for, in one program: two definitions in one
-/// module (so units have to be *merged* rather than each given a module of its
-/// own), a cross-module reference (so a dotted import path has to be rebuilt),
-/// and an effect (whose program-wide name is the thing a host handler is
-/// registered against, and the whole reason this exists).
+/// Everything the `Namespace` is for, in one program: two definitions in one module (so units have
+/// to be *merged* rather than each given a module of its own), a cross-module reference (so a
+/// dotted import path has to be rebuilt), and an effect (whose program-wide name is the thing a
+/// host handler is registered against, and the whole reason this exists).
 const NAMED: [(&str, &str); 2] = [
     (
         "store.wire",
@@ -807,9 +779,9 @@ fn a_namespace_restores_the_names_and_the_modules() {
             "`{hash}` came back under a name the namespace did not give it"
         );
     }
-    // Module *order* is the units' — hash order, so a reconstruction is
-    // byte-identical run to run — but the set is the program's, which is the
-    // claim: five definitions came back as two modules rather than five.
+    // Module *order* is the units' — hash order, so a reconstruction is byte-identical run to run —
+    // but the set is the program's, which is the claim: five definitions came back as two modules
+    // rather than five.
     let mut modules: Vec<String> = rebuilt
         .program
         .modules
@@ -819,8 +791,8 @@ fn a_namespace_restores_the_names_and_the_modules() {
     modules.sort();
     assert_eq!(modules, ["app", "store.wire"], "units were not merged");
 
-    // And it is a program, not just a naming: it resolves, it typechecks, and
-    // every definition hashes back to the key its body was filed under.
+    // And it is a program, not just a naming: it resolves, it typechecks, and every definition
+    // hashes back to the key its body was filed under.
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
     assert!(check.defs.contains_key(&Symbol::new("app.main")));
@@ -850,10 +822,7 @@ fn a_namespace_restores_the_names_and_the_modules() {
     }
 }
 
-/// A namespace that cannot be applied consistently is not applied at all. A
-/// program named half one way and half the other would make the names in a
-/// diagnostic depend on which definitions happened to be nameable, which is an
-/// answer that varies with something a reader cannot see.
+/// A namespace that cannot be applied consistently is not applied at all.
 #[test]
 fn a_partial_or_colliding_namespace_falls_back_to_synthesized_names() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
@@ -886,9 +855,8 @@ fn a_partial_or_colliding_namespace_falls_back_to_synthesized_names() {
     }
 }
 
-/// Bisection's route is untouched: it deliberately reconstructs without a
-/// namespace, because a historical definition set has to be rebuildable without
-/// knowing what anything is called now.
+/// Bisection's route is untouched: it deliberately reconstructs without a namespace, because a
+/// historical definition set has to be rebuildable without knowing what anything is called now.
 #[test]
 fn reconstruct_without_a_namespace_is_unchanged() {
     let original = compile(&NAMED.map(|(n, s)| (n, s)));
@@ -901,10 +869,9 @@ fn reconstruct_without_a_namespace_is_unchanged() {
     assert_eq!(bare.program.modules.len(), original.bodies.len());
 }
 
-/// Two effect declarations that normalize identically are one hash, so a
-/// reconstruction cannot tell them apart — and the encoding only records that a
-/// definition *did* tell them apart when one component reached both. This pins
-/// where the line actually is, because `the_examples_reconstruct` walked into it.
+/// Two effect declarations that normalize identically are one hash, so a reconstruction cannot tell
+/// them apart — and the encoding only records that a definition *did* tell them apart when one
+/// component reached both.
 #[test]
 fn two_identical_effect_declarations_are_one_hash() {
     let original = compile(&[
@@ -919,14 +886,8 @@ fn two_identical_effect_declarations_are_one_hash() {
     );
 }
 
-/// A slot is a de Bruijn level into **one component's** effect enumeration, and
-/// each test is its own component. Two tests that reach different effect sets
-/// therefore number the effects they share differently, and neither is wrong.
-///
-/// Reading that as one effect at two slots — which a slot map shared across the
-/// whole reconstructed test module does — refuses a corpus that is perfectly
-/// well formed. `examples/` walked into it the moment a second effect reached
-/// some tests and not others, so this is the pin.
+/// A slot is a de Bruijn level into **one component's** effect enumeration, and each test is its
+/// own component.
 #[test]
 fn two_tests_that_number_one_effect_differently_both_reconstruct() {
     let original = compile(&[(

@@ -1,8 +1,4 @@
 //! What has to hold before the spike's number means anything.
-//!
-//! The rules are ADR 0016 §3.4 and §7.11–14: three inputs at least, agreement
-//! with **both** evaluators on every one of them, a loud refusal for anything
-//! outside the fragment, and a reported ratio that is the weakest input's.
 
 use ply_codegen_spike::jit::{Jit, Opts};
 use ply_codegen_spike::measure::{
@@ -18,8 +14,8 @@ fn args(buf: &[u8], from: i64, budget: i64) -> Vec<Value> {
     vec![Value::bytes(buf), Value::Int(from), Value::Int(budget)]
 }
 
-/// Heads, offsets and budgets that reach every arm of `read_line` and
-/// `line_at`, including the ones only a hostile peer produces.
+/// Heads, offsets and budgets that reach every arm of `read_line` and `line_at`, including the ones
+/// only a hostile peer produces.
 fn inputs() -> Vec<Input> {
     let mut out = Vec::new();
     let head = b"GET /items HTTP/1.1\r\nHost: 127.0.0.1\r\nAccept: */*\r\n\r\n".to_vec();
@@ -139,20 +135,6 @@ fn folding_a_literal_into_the_code_object_changes_no_answer() {
     }
 }
 
-/// **Corrected in R5.** This test used to read
-/// `a_call_the_spike_did_not_compile_goes_through_the_machine_and_still_agrees`,
-/// compiled `read_line` alone, and asserted that `harness.ctx.machine_calls > 0`
-/// — that the trampoline ADR 0016 §3.2 allows was taken and still agreed. There
-/// is no trampoline now.
-///
-/// It was a whole `Machine::call` entry point on a second, privately held
-/// machine: `escape::check`, `reset()`, `close_regions`, `end_entry_point`. That
-/// was invisible while the only way into compiled code was at the top of a pure
-/// integer kernel. Once the interpreter can *enter* compiled code, the same
-/// helper is a route out of a live machine's frame into a different machine's
-/// `reset()` — the caller's handler stack, trail, region generations and
-/// footprint discarded in silence. So a call to a function outside the unit
-/// refuses the unit, and the compiled set is closed under calls.
 #[test]
 fn a_unit_missing_a_callee_is_refused_and_names_the_call() {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library().expect("the stdlib")));
@@ -172,40 +154,15 @@ fn a_unit_missing_a_callee_is_refused_and_names_the_call() {
         message.contains("std.http.line_stops") || message.contains("std.http.line_at"),
         "the refusal does not name the function that was missing: {message}"
     );
-    // And the whole group still compiles, so the refusal is about closure rather
-    // than about `read_line`.
+    // And the whole group still compiles, so the refusal is about closure rather than about
+    // `read_line`.
     Jit::compile(loaded, GROUP).expect("the closed group compiles");
 }
 
-/// > **Corrected in R5.** `std.http.list_field` was listed here as refused for a
-/// > "list literal". It is now refused earlier, for `fold` — a builtin that calls
-/// > user code.
-/// >
-/// > That is not a cosmetic reordering. `fold`, `map`, `filter`, `map_fold` and
-/// > `bytes_position` used to compile clean and then raise at run time out of
-/// > `rt_builtin`, because `builtins::call` answers `Step::Apply` for them and a
-/// > native frame has no machine to run the callback on. A census counting such
-/// > a function as compiled was counting one that could not run — the same
-/// > defect ADR 0019 §5 item 4 records for `Float`. They are refused at compile
-/// > time now, so the refusal fires before the list literal does.
-/// >
-/// > `std.http.contains_string` moved for the same reason, and it was this
-/// > list's only lambda. The lambda refusal is still armed — see
-/// > [`a_lambda_is_refused_by_name`], which reaches it through a Ply function
-/// > rather than through a builtin.
 #[test]
 fn the_fragment_refuses_what_it_cannot_compile_and_names_it() {
     let loaded: &'static Loaded = Box::leak(Box::new(Loaded::std_library().expect("the stdlib")));
     for (name, expected) in [
-        // > **Corrected (fragment widening, 2026-08-24).** This row read
-        // > `("std.http.parse_head", "field access")`. A field access is inside
-        // > the fragment now, so the *first* construct `parse_head` is refused
-        // > for has moved on to its call to `read_line`, which this compiled
-        // > unit does not hold. The row still tests what it was there to test —
-        // > that a refusal names a construct rather than failing silently — and
-        // > it is a standing illustration of why the ranked census in ADR 0018
-        // > §0 is a first-refusal census: removing the named construct moves the
-        // > name rather than admitting the function.
         ("std.http.parse_head", "a call to `std.http.read_line`"),
         ("std.http.list_field", "a builtin that calls user code"),
         ("std.net.send_from", "perform"),
@@ -281,12 +238,6 @@ fn a_measured_input_carries_four_times_and_an_agreement() {
 }
 
 /// The lambda refusal, reached where a higher-order *builtin* does not shadow it.
-///
-/// `Fx::app` resolves the callee before it lowers the arguments, so a lambda
-/// handed to `fold` is refused as `fold` and the lambda is never reached. Handed
-/// to a Ply function it is the first thing outside the fragment, which is what
-/// this probe arranges. Kept because `the_fragment_refuses_what_it_cannot_compile_and_names_it`
-/// used to cover it and no longer can.
 #[test]
 fn a_lambda_is_refused_by_name() {
     let dir = std::env::temp_dir().join(format!("ply-lambda-probe-{}", std::process::id()));

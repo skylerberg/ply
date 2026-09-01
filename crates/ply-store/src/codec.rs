@@ -1,8 +1,4 @@
 //! The encoding of one stored entry's payload.
-//!
-//! Deterministic: the same value always produces the same bytes, which is what
-//! lets a writer decide "already stored, nothing to do" by comparing bytes
-//! rather than by decoding what is on disk.
 
 use crate::DefBody;
 use crate::binary::{Decoded, Reader, Writer};
@@ -14,9 +10,7 @@ use ply_core::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type
 use ply_syntax::ast::Mode;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Discriminants. Distinct across every shape rather than per enum, so that a
-/// field read at the wrong offset lands on a tag that belongs to something else
-/// and is refused, instead of being accepted as the neighbouring variant.
+/// Discriminants.
 mod tag {
     pub(super) const TYPE_VAR: u8 = 0x10;
     pub(super) const TYPE_CON: u8 = 0x11;
@@ -54,18 +48,12 @@ mod tag {
     pub(super) const DEF_BODY: u8 = 0x66;
     pub(super) const FINGERPRINT: u8 = 0x67;
 
-    /// Closes every composite. A shape that grew or lost a field ends somewhere
-    /// this byte is not, so the drift is caught at the point it happened rather
-    /// than at the end of the frame.
+    /// Closes every composite.
     pub(super) const END: u8 = 0xee;
 }
 
-/// Neither side of this codec may bound nesting the other does not: an encoder
-/// that writes what the decoder refuses makes a healthy cache report itself
-/// corrupt on every run, with no remedy. So both walks grow the stack on demand
-/// rather than refusing a depth. A frame is checksum-verified before it is
-/// decoded and every level costs at least two bytes, so the frame length bounds
-/// the depth without a constant having to.
+/// Neither side of this codec may bound nesting the other does not: an encoder that writes what the
+/// decoder refuses makes a healthy cache report itself corrupt on every run, with no remedy.
 pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
@@ -352,8 +340,8 @@ fn get_symbols(r: &mut Reader, what: &'static str) -> Decoded<Vec<ply_span::Symb
     Ok(out)
 }
 
-/// The witness comes first so that [`peek_names`] can identify which definition
-/// an entry belongs to without decoding a scheme it is about to discard.
+/// The witness comes first so that [`peek_names`] can identify which definition an entry belongs to
+/// without decoding a scheme it is about to discard.
 pub(crate) fn encode_def(def: &CachedDef) -> Vec<u8> {
     let mut w = Writer::new();
     w.tag(tag::CACHED_DEF);
@@ -664,10 +652,7 @@ pub(crate) fn decode_fingerprint(bytes: &[u8]) -> Decoded<SourceFingerprint> {
     })
 }
 
-/// The witness of a `CachedDef` or `CachedDecl` payload, without the scheme
-/// behind it. Which of several entries sharing a hash belongs to a given name is
-/// decided by this, and deciding it is on the write path for every definition a
-/// run re-derives.
+/// The witness of a `CachedDef` or `CachedDecl` payload, without the scheme behind it.
 pub(crate) fn peek_names(kind: u8, bytes: &[u8]) -> Decoded<Vec<NameRef>> {
     const WHAT: &str = "malformed cached interface";
     let mut r = Reader::new(bytes);

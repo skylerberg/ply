@@ -1,9 +1,4 @@
 //! What a run says when it could not use the front-end cache it found.
-//!
-//! Degrading to an empty front-end cache is the designed answer to a format
-//! change; doing it quietly is not. A user whose project suddenly recompiles
-//! whole has one question — did I just lose my test results — and the answer is
-//! no, because the two caches are versioned apart.
 
 use ply_span::{Diagnostic, codes};
 use ply_store::Store;
@@ -11,9 +6,8 @@ use ply_store::Store;
 /// The name the front-end cache had while it was a single JSON document.
 const LEGACY_FRONTEND_FILE: &str = "frontend.json";
 
-/// `warnings` is what the store collected while opening; a caller that has
-/// already drained them must pass what it drained, because a store reports each
-/// degradation once.
+/// `warnings` is what the store collected while opening; a caller that has already drained them
+/// must pass what it drained, because a store reports each degradation once.
 pub fn notice(store: &Store, warnings: &[Diagnostic]) -> Option<Diagnostic> {
     let legacy = store.dir().join(LEGACY_FRONTEND_FILE);
     let superseded = legacy != store.frontend_path() && legacy.is_file();
@@ -38,9 +32,8 @@ pub fn notice(store: &Store, warnings: &[Diagnostic]) -> Option<Diagnostic> {
     )
 }
 
-/// Both caches degrade with the same three codes, so the file a warning names is
-/// the only thing that tells them apart — and only the front-end one costs a
-/// recompile worth explaining.
+/// Both caches degrade with the same three codes, so the file a warning names is the only thing
+/// that tells them apart — and only the front-end one costs a recompile worth explaining.
 fn frontend_refused(store: &Store, warnings: &[Diagnostic]) -> bool {
     let path = store.frontend_path().display().to_string();
     warnings.iter().any(|w| {
@@ -66,8 +59,8 @@ mod tests {
         assert!(notice(&store, &[]).is_none());
     }
 
-    /// The result cache degrading is not this: its contents are lost, but no
-    /// type or hash is recomputed and the reassurance below would be a lie.
+    /// The result cache degrading is not this: its contents are lost, but no type or hash is
+    /// recomputed and the reassurance below would be a lie.
     #[test]
     fn a_result_cache_warning_is_not_a_front_end_migration() {
         let dir = tempfile::tempdir().unwrap();
@@ -98,8 +91,8 @@ mod tests {
         );
     }
 
-    /// Inert while the store's own front-end file is the legacy one, which is
-    /// what makes this detection safe to ship before the binary store does.
+    /// Inert while the store's own front-end file is the legacy one, which is what makes this
+    /// detection safe to ship before the binary store does.
     #[test]
     fn a_superseded_json_cache_is_named_even_without_a_warning() {
         let dir = tempfile::tempdir().unwrap();

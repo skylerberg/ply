@@ -1,16 +1,8 @@
 //! The evaluator.
-//!
-//! Two engines during M6: the tree-walking `Interp` that has run every test to
-//! date, and the explicit-control machine that replaces it. `Engine` selects
-//! between them so both can run every test and be compared; the tree-walker is
-//! deleted at the end of the milestone.
-//!
-//! `Value` holds `Rc`, so an `Interp` and every value it produces belong to one
-//! thread. The scheduler hands each worker its own.
 
-// `Value` pins `Arc` for its shared payloads and `Rc` for shared code and
-// continuations, so none of those `Arc`s can ever be `Send` — which is the
-// intended design, not an oversight the lint should keep reporting.
+// `Value` pins `Arc` for its shared payloads and `Rc` for shared code and continuations, so none of
+// those `Arc`s can ever be `Send` — which is the intended design, not an oversight the lint should
+// keep reporting.
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod arena;
@@ -44,13 +36,12 @@ pub mod task_regions;
 pub mod trace;
 mod value;
 
-// `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: they are the
-// allocator's own vocabulary and each of those names means something else
-// somewhere in this crate.
+// `Slot`, `RegionId` and `Snapshot` stay behind `arena::`: they are the allocator's own vocabulary
+// and each of those names means something else somewhere in this crate.
 pub use arena::{Arena, RegionKind};
-// The one thing outside this crate needs from `argv`: the attribution harness
-// splits a request's surviving argument vectors at the free list's widest class
-// and must split at the same number this crate serves.
+// The one thing outside this crate needs from `argv`: the attribution harness splits a request's
+// surviving argument vectors at the free list's widest class and must split at the same number this
+// crate serves.
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{
     Compilation, Counters, Fragment, Kind as BackendKind, Mutant, Mutation, Offers, Policed,
@@ -75,8 +66,8 @@ pub use host::{
     is_drain_incomplete,
 };
 pub use task_regions::{Fixture, TaskRegions};
-// `explore::Step` is deliberately not re-exported: `Step` at the root is the
-// builtin's, and one name for two things is worse than a qualified path.
+// `explore::Step` is deliberately not re-exported: `Step` at the root is the builtin's, and one
+// name for two things is worse than a qualified path.
 pub use explore::{
     Dependence, Explored, Interleaving, Simulation, Verdict, explore, explore_under,
     measure_reduction,
@@ -97,9 +88,7 @@ pub use value::{
     first_difference, values_equal,
 };
 
-/// The default is the engine whose results are authoritative. Flipping it is a
-/// `RUNTIME_VERSION` bump, because a cached `Pass` is a claim about what the
-/// authoritative engine did.
+/// The default is the engine whose results are authoritative.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Engine {
     Treewalk,
@@ -125,9 +114,7 @@ impl Engine {
     }
 }
 
-/// What a `--engine` flag selects. `Both` is not an engine — it is a request to
-/// run two and fail on any disagreement — so it lives beside [`Engine`] rather
-/// than inside it, and nothing that must name a single evaluator can hold one.
+/// What a `--engine` flag selects.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum EngineChoice {
     Treewalk,
@@ -154,9 +141,7 @@ impl EngineChoice {
         }
     }
 
-    /// The engine whose verdict is reported. Under `Both` the authoritative
-    /// engine answers and the other one audits it, so which engine a run
-    /// *reports* never depends on whether auditing was switched on.
+    /// The engine whose verdict is reported.
     pub fn primary(self) -> Engine {
         match self {
             EngineChoice::Treewalk => Engine::Treewalk,
@@ -175,8 +160,8 @@ impl EngineChoice {
         }
     }
 
-    /// A cached `Pass` is a claim about what the authoritative engine did, so a
-    /// run that is not purely that engine may neither read one nor write one.
+    /// A cached `Pass` is a claim about what the authoritative engine did, so a run that is not
+    /// purely that engine may neither read one nor write one.
     pub fn bypasses_cache(self) -> bool {
         self.primary() != Engine::default() || self.auditor().is_some()
     }

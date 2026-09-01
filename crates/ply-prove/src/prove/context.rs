@@ -1,18 +1,4 @@
 //! The facts about a program that the prover reads, indexed once per run.
-//!
-//! Three of them decide whether a rule may fire at all, and each is refused in
-//! the conservative direction when it cannot be established:
-//!
-//! - **which constructors a type has.** A case split is only exhaustive if the
-//!   list is complete, so a split happens only for a type this index built from
-//!   whole-program check output. Everything else stays uninterpreted.
-//! - **whether a definition is recursive.** Unfolding one needs induction to
-//!   reach a general statement and M8 has none, so a definition in a cycle is
-//!   never unfolded. The call graph over-approximates — a local that shadows a
-//!   top-level name still counts as a reference — which can only mark more
-//!   definitions recursive than are.
-//! - **whether a definition is pure.** A body that performs is not a value the
-//!   fragment reasons about, so it is never unfolded either.
 
 use ply_core::{CheckOutput, CtorInfo, TyVar, Type};
 use ply_span::Symbol;
@@ -24,8 +10,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 pub struct Unfoldable<'a> {
     pub name: Symbol,
     pub def: &'a FnDef,
-    /// Index into `Program::modules`, which is what the body's bare names
-    /// resolve against.
+    /// Index into `Program::modules`, which is what the body's bare names resolve against.
     pub module: usize,
 }
 
@@ -41,11 +26,10 @@ pub struct Context<'a> {
     defs: HashMap<Symbol, (usize, &'a FnDef)>,
     recursive: BTreeSet<Symbol>,
     by_type: BTreeMap<Symbol, Vec<Symbol>>,
-    /// The sum types with at least one value, by least fixed point. A type all
-    /// of whose constructors recurse — `type Bad = Wrap(Bad)` — has none.
+    /// The sum types with at least one value, by least fixed point.
     inhabited_types: BTreeSet<Symbol>,
-    /// Every nominal type whose *declaration* reaches a `Float`, by least fixed
-    /// point over the constructors. See [`Context::reaches_float`].
+    /// Every nominal type whose *declaration* reaches a `Float`, by least fixed point over the
+    /// constructors.
     float_types: BTreeSet<Symbol>,
     sort_names: BTreeMap<TyVar, Symbol>,
 }
@@ -72,9 +56,9 @@ impl<'a> Context<'a> {
                 .or_default()
                 .push((info.index, name.clone()));
         }
-        // A type whose declaration the prover cannot see in full is one it must
-        // never split on, so an alias and a builtin are both absent by
-        // construction — neither contributes a `CtorInfo`.
+        // A type whose declaration the prover cannot see in full is one it must never split on, so
+        // an alias and a builtin are both absent by construction — neither contributes a
+        // `CtorInfo`.
         let mut sums: BTreeMap<Symbol, Vec<Symbol>> = BTreeMap::new();
         for (ty, mut ctors) in by_type {
             ctors.sort();
@@ -98,26 +82,13 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Whether a type reaches a `Float` — through its arguments, its fields, or
-    /// **its own declaration**.
-    ///
-    /// The declaration is the half a walk over the written type misses, and
-    /// missing it is a false `proved`: `type Money = Cents(Float)` is
-    /// `Type::Con("Money", [])`, nothing in it says `Float`, and the value it
-    /// quantifies over is still `Cents(NaN)` — at which `==` is false and every
-    /// rule here assumes it is true. `ply_core::derivable` answers this same
-    /// question over the same declarations, which is what refuses
-    /// `Map<Money, v>`; the two must not disagree.
-    ///
-    /// Over-approximates on a parameterised declaration — `type W<a> = W(Float,
-    /// a)` marks every `W<_>` — which costs completeness and never soundness.
+    /// Whether a type reaches a `Float` — through its arguments, its fields, or **its own
+    /// declaration**.
     pub fn reaches_float(&self, ty: &Type) -> bool {
         reaches_float(ty, &self.float_types)
     }
 
-    /// Names for the type variables a proof leaves as uninterpreted sorts. A
-    /// caller that has them makes `Certificate::sorts` read as the law was
-    /// written; without them the sorts are rendered as the checker names them.
+    /// Names for the type variables a proof leaves as uninterpreted sorts.
     pub fn with_sort_names(mut self, names: BTreeMap<TyVar, Symbol>) -> Context<'a> {
         self.sort_names = names;
         self
@@ -130,17 +101,8 @@ impl<'a> Context<'a> {
             .unwrap_or_else(|| Symbol::new(Type::Var(v).to_string()))
     }
 
-    /// The program-wide name a reference denotes, or `None` when it denotes
-    /// nothing this crate can see — in which case the term becomes a fresh
-    /// symbol rather than a guess.
-    /// The program-wide name a value reference denotes.
-    ///
-    /// A bare name no module declares falls back to the prelude's constructors,
-    /// which no module *can* declare. Without it a `match o { None -> .., Some(v)
-    /// -> .. }` reads `None` as a binder rather than a nullary constructor, the
-    /// arm becomes undecidable, and an obligation the fragment can decide comes
-    /// back `Unknown` — a weaker tier for a resolution failure, which is a cost
-    /// with no argument behind it.
+    /// The program-wide name a reference denotes, or `None` when it denotes nothing this crate can
+    /// see — in which case the term becomes a fresh symbol rather than a guess.
     pub fn resolve_value(&self, module: usize, q: &QName) -> Option<Symbol> {
         if let Ok(binding) = self.resolved.lookup(module, Namespace::Value, q) {
             return Some(binding.qualified.clone());
@@ -153,8 +115,8 @@ impl<'a> Context<'a> {
         self.check.ctors.get(name)
     }
 
-    /// `None` unless every constructor of the type is in hand, because a split
-    /// over a partial list is not a case analysis.
+    /// `None` unless every constructor of the type is in hand, because a split over a partial list
+    /// is not a case analysis.
     pub fn variants(&self, type_name: &Symbol) -> Option<Variants<'a>> {
         let names = self.by_type.get(type_name)?;
         let mut ctors = Vec::with_capacity(names.len());
@@ -172,12 +134,6 @@ impl<'a> Context<'a> {
     }
 
     /// Whether a type has at least one value.
-    ///
-    /// Asked only about a guard's domain: `guard ⟹ body` over an empty domain
-    /// is valid and says nothing, so a certificate may not claim
-    /// `guard_satisfiable` without this. A type variable counts as inhabited,
-    /// which is the standard reading of an uninterpreted sort and is what the
-    /// property tier assumes when it monomorphises one.
     pub fn inhabited(&self, ty: &Type) -> bool {
         match ty {
             Type::Var(_) => true,
@@ -190,16 +146,8 @@ impl<'a> Context<'a> {
         }
     }
 
-    /// Whether two calls to this definition with equal arguments must answer
-    /// equally — the assumption behind sharing one term between them.
-    ///
-    /// A name this crate cannot see is **not** pure. An unestablished purity has
-    /// to read as impure: a call that performs may answer differently each time,
-    /// so `f() - f() == 0` is not a theorem about an effectful `f`, and a term
-    /// shared between the two would make it one.
-    ///
-    /// The row is checked as well as the footprint, because a row-polymorphic
-    /// definition has an empty footprint and an instantiation that performs.
+    /// Whether two calls to this definition with equal arguments must answer equally — the
+    /// assumption behind sharing one term between them.
     pub fn is_pure(&self, name: &Symbol) -> bool {
         let Some(def) = self.check.defs.get(name) else {
             return false;
@@ -215,8 +163,8 @@ impl<'a> Context<'a> {
         self.recursive.contains(name)
     }
 
-    /// A definition the prover may inline: not in a recursive component, and
-    /// with an empty footprint.
+    /// A definition the prover may inline: not in a recursive component, and with an empty
+    /// footprint.
     pub fn unfoldable(&self, name: &Symbol) -> Option<Unfoldable<'a>> {
         if self.recursive.contains(name) {
             return None;
@@ -233,15 +181,12 @@ impl<'a> Context<'a> {
     }
 }
 
-/// Removes any sum type whose declared variant count disagrees with the number
-/// of constructors in hand. Splitting over a partial list would be a case
-/// analysis that missed a case, which is the one way this rule turns unsound.
+/// Removes any sum type whose declared variant count disagrees with the number of constructors in
+/// hand.
 fn drop_incomplete(program: &Program, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) {
     let mut declared: BTreeMap<Symbol, usize> = BTreeMap::new();
-    // The prelude's ADTs are declared by the *language* rather than by a file,
-    // so the check below — which reads the program's `type` items — would drop
-    // them and refuse to split on an `Option`. Their declaration is no less
-    // complete for having no source: `prelude::ADTS` is the whole of it.
+    // The prelude's ADTs are declared by the *language* rather than by a file, so the check below —
+    // which reads the program's `type` items — would drop them and refuse to split on an `Option`.
     for adt in ply_core::prelude::ADTS {
         declared.insert(Symbol::new(adt.name), adt.variants.len());
     }
@@ -272,9 +217,8 @@ fn reaches_float(ty: &Type, declared: &BTreeSet<Symbol>) -> bool {
     }
 }
 
-/// Every nominal type some constructor of which reaches a `Float`, as a least
-/// fixed point so that a chain — `type Rate = R(Float)`, `type Row = W(Rate)` —
-/// and a recursive declaration both settle.
+/// Every nominal type some constructor of which reaches a `Float`, as a least fixed point so that a
+/// chain — `type Rate = R(Float)`, `type Row = W(Rate)` — and a recursive declaration both settle.
 fn float_reaching_types(check: &CheckOutput) -> BTreeSet<Symbol> {
     let mut fields: BTreeMap<Symbol, Vec<&Type>> = BTreeMap::new();
     for ctor in check.ctors.values() {
@@ -301,8 +245,8 @@ fn float_reaching_types(check: &CheckOutput) -> BTreeSet<Symbol> {
     }
 }
 
-/// The sum types with at least one value: a type is inhabited once some
-/// constructor's every field is, which is the least fixed point of that rule.
+/// The sum types with at least one value: a type is inhabited once some constructor's every field
+/// is, which is the least fixed point of that rule.
 fn inhabited_sum_types(
     check: &CheckOutput,
     sums: &BTreeMap<Symbol, Vec<Symbol>>,
@@ -346,8 +290,8 @@ fn field_inhabited(
     }
 }
 
-/// Every definition in a cycle of the call graph, by Tarjan's algorithm, run
-/// iteratively so a deep program cannot overflow the host stack.
+/// Every definition in a cycle of the call graph, by Tarjan's algorithm, run iteratively so a deep
+/// program cannot overflow the host stack.
 fn recursive_definitions(
     defs: &HashMap<Symbol, (usize, &FnDef)>,
     resolved: &Resolved,
@@ -435,10 +379,7 @@ fn tarjan(edges: &[Vec<usize>]) -> Vec<Vec<usize>> {
     components
 }
 
-/// Every top-level value a body could name. Local binders are not tracked, so a
-/// local that shadows a definition still contributes an edge — which can only
-/// grow the recursive set, and a definition wrongly called recursive is one the
-/// prover declines to unfold.
+/// Every top-level value a body could name.
 fn collect_references(expr: &Expr, module: usize, resolved: &Resolved, out: &mut BTreeSet<Symbol>) {
     let mut stack = vec![expr];
     while let Some(e) = stack.pop() {

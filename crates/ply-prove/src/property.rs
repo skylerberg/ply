@@ -1,25 +1,5 @@
-//! The property tier: drawing a value of every Ply type from a seed, running an
-//! obligation's cases against its guard, and reporting what the guard let
-//! through.
-//!
-//! Three rules carry the honesty of this tier, and none of them is an opinion:
-//!
-//! - A run keeping fewer than [`MIN_PROPERTY_CASES`] tuples is `example`, not
-//!   `property`. That follows from [`Evidence::tier`] rather than from anything
-//!   decided here, so this module cannot report a coverage claim it did not
-//!   earn.
-//! - A run keeping **none** is [`Discharge::Vacuous`], an error. `guard ⟹ body`
-//!   over an empty domain is valid and says nothing, so counting it as a pass
-//!   would turn a typo in a guard into a proof of everything.
-//! - Generation is a pure function of the root, the obligation key and the draw
-//!   counter, so a reported `(root, case)` names a tuple that can be drawn again
-//!   without re-running anything.
-//!
-//! The stream is keyed by the **obligation** as well as by the root. Without
-//! that, adding a law would shift every later law's cases, so an unrelated edit
-//! would change which counterexample a failing obligation reports and a
-//! bisection over it would name the wrong definition — ADR 0006 §4.2's argument
-//! for separating the `sched` and `rand` streams, applied here.
+//! The property tier: drawing a value of every Ply type from a seed, running an obligation's cases
+//! against its guard, and reporting what the guard let through.
 
 #[cfg(test)]
 pub(crate) mod tests;
@@ -39,27 +19,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
 
-/// Case indices below this draw the **edge** of their type rather than a biased
-/// sample: an `Int` takes each of [`EDGE_INTS`] in turn.
-///
-/// This is what makes ADR 0007 §5.1(a)'s mitigation a guarantee rather than a
-/// probability. The prover reasons over mathematical integers while Ply's `Int`
-/// is an `i64`, which is a disclosed unsoundness at the boundary; the sampled
-/// tier is what catches a law that is false only there, and "drawn with fixed
-/// probability" would miss `i64::MAX` on one run in a few hundred thousand. A
-/// run of at least five cases now draws both ends, every time.
+/// Case indices below this draw the **edge** of their type rather than a biased sample: an `Int`
+/// takes each of [`EDGE_INTS`] in turn.
 pub const EDGE_CASES: u32 = 5;
 
 /// Drawn first, in this order, one per edge case index.
 pub const EDGE_INTS: [i64; 5] = [0, 1, -1, i64::MIN, i64::MAX];
 
 /// The `Float` edge, and the *whole* edge on purpose.
-///
-/// `NaN` first: it is the value that makes `==` non-reflexive, which is the
-/// single fact every restriction on this type follows from, and a generator that
-/// drew it rarely would let `forall (x: Float) { x == x }` pass a two-hundred
-/// case run. `-0.0` is here for the same reason — it is `==` to `0.0` and orders
-/// below it — and the infinities because `1.0 / 0.0` produces one.
 pub const EDGE_FLOATS: [f64; 8] = [
     f64::NAN,
     0.0,
@@ -74,8 +41,8 @@ pub const EDGE_FLOATS: [f64; 8] = [
 /// How many `Decimal` edge points [`edge_decimal`] offers.
 const EDGE_DECIMAL_COUNT: usize = 6;
 
-/// The `Decimal` edge: zero at two scales, one, minus one, and the ends of the
-/// range where an exact addition overflows.
+/// The `Decimal` edge: zero at two scales, one, minus one, and the ends of the range where an exact
+/// addition overflows.
 fn edge_decimal(index: usize) -> Decimal {
     match index {
         0 => Decimal::ZERO,
@@ -88,41 +55,27 @@ fn edge_decimal(index: usize) -> Decimal {
     }
 }
 
-/// Sixteen characters starting at `'a'`, because the shrinker lowers a character
-/// toward `'a'` and a character outside the alphabet would shrink into it.
+/// Sixteen characters starting at `'a'`, because the shrinker lowers a character toward `'a'` and a
+/// character outside the alphabet would shrink into it.
 pub const GEN_ALPHABET: &[u8; 16] = b"abcdefghijklmnop";
 
 /// The longest `List` or `String` a draw produces.
 pub const MAX_GEN_LEN: u64 = 16;
 
-/// The most entries a generated `Map` holds. Shorter than [`MAX_GEN_LEN`]
-/// because a map costs two draws per entry and a counterexample with nine of
-/// them is not one anybody reads.
+/// The most entries a generated `Map` holds.
 pub const MAX_GEN_ENTRIES: usize = 8;
 
-/// An absolute ceiling on how deep generation may nest, independent of
-/// [`GEN_DEPTH`]. Past [`GEN_DEPTH`] a collection is drawn empty and an ADT
-/// takes a shallowest constructor, so this is unreachable for any type the
-/// checker admits; it exists so that no arrangement of mutually recursive types
-/// can make generation run away, and it fails with an [`Ungeneratable`] rather
-/// than with a panic.
+/// An absolute ceiling on how deep generation may nest, independent of [`GEN_DEPTH`].
 pub const HARD_GEN_DEPTH: u32 = 64;
 
 const GEN_DOMAIN: &[u8] = b"ply.gen.stream.1";
 
-/// Env slots on a generated function value. `#` cannot start a Ply identifier,
-/// so none of these can collide with a parameter or with a user name.
+/// Env slots on a generated function value.
 const FN_SIZE: &str = "#size";
 const FN_CONST: &str = "#c";
 const FN_DEFAULT: &str = "#d";
 
-/// The value source: counter-mode BLAKE3, keyed by the root **and** the
-/// obligation.
-///
-/// A PRNG crate would make "the same seed produces the same cases" a promise
-/// about which version of that crate was compiled in. BLAKE3 is already in the
-/// workspace, is byte-specified, and is its own test vector — ADR 0006 §4.2's
-/// reasoning, unchanged.
+/// The value source: counter-mode BLAKE3, keyed by the root **and** the obligation.
 #[derive(Clone, Debug)]
 pub struct GenStream {
     root: u64,
@@ -135,9 +88,7 @@ impl GenStream {
         GenStream::at(root, key, 0)
     }
 
-    /// A stream that has already served `counter` draws. One root's cases share
-    /// a counter rather than each restarting it, so the counter counts the draws
-    /// of the run.
+    /// A stream that has already served `counter` draws.
     pub fn at(root: u64, key: DefHash, counter: u64) -> GenStream {
         GenStream { root, key, counter }
     }
@@ -148,9 +99,9 @@ impl GenStream {
         value
     }
 
-    /// Uniform over `0..n` by rejection, specified exactly rather than described
-    /// as unbiased: a different unbiased rule is a different sequence, and every
-    /// `(root, case)` ever printed would name a different tuple.
+    /// Uniform over `0..n` by rejection, specified exactly rather than described as unbiased: a
+    /// different unbiased rule is a different sequence, and every `(root, case)` ever printed would
+    /// name a different tuple.
     pub fn below(&mut self, n: u64) -> Option<u64> {
         if n == 0 {
             return None;
@@ -172,8 +123,8 @@ impl GenStream {
         self.root
     }
 
-    /// Pure, so a caller replaying a recorded run can ask for draw *i* without
-    /// having served the ones before it.
+    /// Pure, so a caller replaying a recorded run can ask for draw *i* without having served the
+    /// ones before it.
     pub fn draw(root: u64, key: &DefHash, counter: u64) -> u64 {
         let mut hasher = blake3::Hasher::new();
         hasher.update(GEN_DOMAIN);
@@ -194,32 +145,24 @@ impl GenStream {
 pub struct Variant {
     /// Program-wide constructor name, which is what a [`Value::Ctor`] carries.
     pub name: Symbol,
-    /// Position among the owning type's variants, in declaration order. The
-    /// shrinker walks toward a lower one.
+    /// Position among the owning type's variants, in declaration order.
     pub index: usize,
     /// Declared field types, still written in the owning type's parameters.
     pub fields: Vec<Type>,
-    /// Nested constructor applications a value of this variant needs, at
-    /// declaration level. `None` when no finite value inhabits it. Generation
-    /// past [`GEN_DEPTH`] and the shrinker's floor both take a smallest one,
-    /// which is what makes a recursive type terminate rather than a rule about
-    /// "no recursive field" that mutual recursion walks straight through.
+    /// Nested constructor applications a value of this variant needs, at declaration level.
     pub depth: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
 struct TypeDecl {
-    /// The owning type's parameters, in declaration order, so a `Type::Con`'s
-    /// arguments can be substituted into a variant's field types.
+    /// The owning type's parameters, in declaration order, so a `Type::Con`'s arguments can be
+    /// substituted into a variant's field types.
     params: Vec<TyVar>,
     variants: Vec<Variant>,
     depth: Option<u64>,
 }
 
 /// What generation and shrinking need to know about the program's sum types.
-///
-/// Built from [`ply_core::CheckOutput::ctors`]; a program with no sum types
-/// needs [`TypeWorld::default`] and nothing else.
 #[derive(Clone, Debug, Default)]
 pub struct TypeWorld {
     types: BTreeMap<Symbol, TypeDecl>,
@@ -256,13 +199,11 @@ impl TypeWorld {
         world
     }
 
-    /// Least fixpoint of "how deep must a value of this type nest". A type that
-    /// never reaches a finite depth is uninhabited, and saying so up front is
-    /// what stops generation from descending into it forever.
+    /// Least fixpoint of "how deep must a value of this type nest".
     fn solve_depths(&mut self) {
         let names: Vec<Symbol> = self.types.keys().cloned().collect();
-        // Each round settles at least one type or the fixpoint is reached, so
-        // one round per type is enough.
+        // Each round settles at least one type or the fixpoint is reached, so one round per type is
+        // enough.
         for _ in 0..=names.len() {
             let mut changed = false;
             for name in &names {
@@ -303,9 +244,7 @@ impl TypeWorld {
         }
     }
 
-    /// Nested constructor applications a value of this type needs, given what is
-    /// known so far. A type parameter counts as `Int`, which is what the
-    /// property tier monomorphises it to.
+    /// Nested constructor applications a value of this type needs, given what is known so far.
     fn type_depth(&self, ty: &Type) -> Option<u64> {
         match ty {
             Type::Var(_) => Some(0),
@@ -330,14 +269,14 @@ impl TypeWorld {
         self.types.get(ty).map(|d| d.variants.as_slice())
     }
 
-    /// The owning type and the position of a constructor, by its program-wide
-    /// name — what a [`Value::Ctor`] carries and the shrinker needs back.
+    /// The owning type and the position of a constructor, by its program-wide name — what a
+    /// [`Value::Ctor`] carries and the shrinker needs back.
     pub fn ctor(&self, name: &Symbol) -> Option<(&Symbol, usize)> {
         self.ctors.get(name).map(|(ty, index)| (ty, *index))
     }
 
-    /// A variant's field types with a `Type::Con`'s arguments substituted for
-    /// the owning type's parameters.
+    /// A variant's field types with a `Type::Con`'s arguments substituted for the owning type's
+    /// parameters.
     pub fn fields(&self, ty: &Symbol, variant: &Variant, args: &[Type]) -> Vec<Type> {
         let Some(decl) = self.types.get(ty) else {
             return variant.fields.clone();
@@ -382,33 +321,23 @@ fn substitute(ty: &Type, subst: &BTreeMap<TyVar, Type>) -> Type {
 }
 
 /// Why no value of a type can be drawn.
-///
-/// For a `forall` binder this is `E0418` at check time — a law nobody can ever
-/// check is a claim nobody will ever read. For a definition's parameter it is
-/// [`Gap::Ungeneratable`] at prove time, because forbidding it would forbid
-/// attaching a spec to a higher-order definition.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Ungeneratable {
-    /// A cell belongs to the region that opened it, and an obligation opens
-    /// none.
+    /// A cell belongs to the region that opened it, and an obligation opens none.
     Cell,
     /// A task belongs to a `simulate` region, and a binder is not one.
     Task,
-    /// A credential. Refused twice: `E0418` at the binder is what a user sees,
-    /// and this is what a caller that reached the generator anyway gets — a
-    /// generator that minted credentials and a shrinker that printed
-    /// counterexamples is a leak by construction.
+    /// A credential.
     Secret,
-    /// A function type with a non-empty row: applying it inside a spec would
-    /// make the spec impure, so the binder would be unusable.
+    /// A function type with a non-empty row: applying it inside a spec would make the spec impure,
+    /// so the binder would be unusable.
     Effectful(Row),
     /// An unsolved effect-row tail, which is not pure for every instantiation.
     RowVariable,
-    /// Every constructor of this type needs a value of a type that needs it, so
-    /// no finite value inhabits it.
+    /// Every constructor of this type needs a value of a type that needs it, so no finite value
+    /// inhabits it.
     Uninhabited(Symbol),
-    /// A type constructor nothing declares. Inference rejects this first; the
-    /// generator reports it rather than assuming inference ran.
+    /// A type constructor nothing declares.
     Unknown(Symbol),
     /// Nesting reached [`HARD_GEN_DEPTH`].
     TooDeep,
@@ -436,15 +365,10 @@ impl fmt::Display for Ungeneratable {
 }
 
 /// Whether a value of this type can be drawn at all.
-///
-/// Conservative on purpose in one place: `Con(T, args)` requires every argument
-/// to be generatable even when `T` never uses it, because reporting a gap costs
-/// a line of output and assuming a phantom parameter is unused costs a wrong
-/// answer at prove time.
 pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
     match ty {
-        // Monomorphised to `Int`, and recorded in `CaseReport::instantiations`
-        // so a sampled polymorphic law says which instantiation it is about.
+        // Monomorphised to `Int`, and recorded in `CaseReport::instantiations` so a sampled
+        // polymorphic law says which instantiation it is about.
         Type::Var(_) => Ok(()),
         Type::Record(fields) => fields.values().try_for_each(|f| generatable(f, world)),
         Type::Fn {
@@ -481,9 +405,6 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
 }
 
 /// Draw one value of `ty` for case `case`.
-///
-/// `case` drives both the size parameter, which grows with it, and the edge
-/// bias of the first [`EDGE_CASES`] cases.
 pub fn generate(
     ty: &Type,
     world: &TypeWorld,
@@ -500,10 +421,6 @@ pub fn generate(
 }
 
 /// Every tuple a root draws, in order.
-///
-/// Deterministic and independent of whether the obligation was ever run, so a
-/// reported `(root, case)` is replayable — the property-tier analogue of
-/// `ply test --seed`.
 pub fn draw_cases(
     binders: &[LawBinder],
     world: &TypeWorld,
@@ -523,9 +440,7 @@ pub fn draw_cases(
     Ok(out)
 }
 
-/// The size parameter, growing with the case index and then flat. Early cases
-/// are small values, which are the ones a reader can act on; later ones reach
-/// the full width of the type.
+/// The size parameter, growing with the case index and then flat.
 fn size_for(case: u32) -> u64 {
     (case as u64).min(63)
 }
@@ -538,8 +453,8 @@ struct Gen<'a> {
     world: &'a TypeWorld,
     stream: &'a mut GenStream,
     size: u64,
-    /// `Some(i)` for an edge case: leaves take their `i`th edge point rather
-    /// than a draw, and collections take a short fixed length.
+    /// `Some(i)` for an edge case: leaves take their `i`th edge point rather than a draw, and
+    /// collections take a short fixed length.
     edge: Option<u32>,
 }
 
@@ -612,10 +527,7 @@ impl Gen<'_> {
         }))
     }
 
-    /// Finite values **and the specials**. A generator that never produced a
-    /// `NaN`, a `-0.0` or an infinity would make `property` a lie about the
-    /// type: those are exactly the values every `Float` law is wrong at, and
-    /// they are why nothing about a `Float` may be `proved`.
+    /// Finite values **and the specials**.
     fn float(&mut self) -> f64 {
         if let Some(i) = self.edge {
             return EDGE_FLOATS[i as usize % EDGE_FLOATS.len()];
@@ -624,9 +536,9 @@ impl Gen<'_> {
         if (selector as usize) < EDGE_FLOATS.len() {
             return EDGE_FLOATS[selector as usize];
         }
-        // A draw over the bit pattern would be almost all NaN; a draw over a
-        // bounded mantissa and a bounded exponent reaches both the ordinary
-        // scale a program works at and the ends of the range.
+        // A draw over the bit pattern would be almost all NaN; a draw over a bounded mantissa and a
+        // bounded exponent reaches both the ordinary scale a program works at and the ends of the
+        // range.
         let mantissa = (self.stream.next_u64() >> 11) as f64;
         let exponent = (self.stream.next_u64() % (1 + self.size.min(60))) as i32 - 30;
         let sign = if self.stream.next_u64() & 1 == 0 {
@@ -637,10 +549,7 @@ impl Gen<'_> {
         sign * mantissa * 2f64.powi(exponent)
     }
 
-    /// Scale `0..=6` around zero, plus the ends of the range. Money is written
-    /// at two places and a rate at four, so the interesting cases are small
-    /// scales — and `MIN`/`MAX` are where an exact addition overflows, which is
-    /// the failure this type reports rather than hides.
+    /// Scale `0..=6` around zero, plus the ends of the range.
     fn decimal(&mut self) -> Decimal {
         if let Some(i) = self.edge {
             return edge_decimal(i as usize % EDGE_DECIMAL_COUNT);
@@ -664,9 +573,8 @@ impl Gen<'_> {
         }
     }
 
-    /// Length biased small by taking the lesser of two draws, then capped by the
-    /// size parameter, so a case-3 counterexample is short and a case-200 one
-    /// still reaches the full width.
+    /// Length biased small by taking the lesser of two draws, then capped by the size parameter, so
+    /// a case-3 counterexample is short and a case-200 one still reaches the full width.
     fn length(&mut self) -> usize {
         if let Some(i) = self.edge {
             return (i % 3) as usize;
@@ -687,9 +595,8 @@ impl Gen<'_> {
         Value::str(out)
     }
 
-    /// The whole byte range, unlike [`Generator::string`]'s alphabet: a `Bytes`
-    /// that never contains `0x00` or `0xff` is a `Bytes` whose laws are checked
-    /// over the cases that never break.
+    /// The whole byte range, unlike [`Generator::string`]'s alphabet: a `Bytes` that never contains
+    /// `0x00` or `0xff` is a `Bytes` whose laws are checked over the cases that never break.
     fn bytes(&mut self) -> Value {
         let len = self.length();
         let mut out = Vec::with_capacity(len);
@@ -700,10 +607,7 @@ impl Gen<'_> {
     }
 
     fn list(&mut self, elem: &Type, depth: u32) -> Result<Value, Ungeneratable> {
-        // Past `GEN_DEPTH` a collection is empty. Together with taking a
-        // shallowest constructor for an ADT, that is what makes generation
-        // terminate for every recursive type rather than for the ones an
-        // implementer thought of.
+        // Past `GEN_DEPTH` a collection is empty.
         let len = if depth >= GEN_DEPTH { 0 } else { self.length() };
         let mut items = Vec::with_capacity(len);
         for _ in 0..len {
@@ -712,15 +616,7 @@ impl Gen<'_> {
         Ok(Value::list(items))
     }
 
-    /// At most [`MAX_GEN_ENTRIES`] entries, drawn from the key and value
-    /// generators. Duplicate keys collapse — later wins, exactly as
-    /// `map_insert` does — so a drawn length is an upper bound on the size, and
-    /// that is correct rather than a defect: a generator that rejected and
-    /// redrew until it had *n* distinct keys would loop forever on `Bool`.
-    ///
-    /// Leaving `Map` ungeneratable would regress M8's guarantee on contact with
-    /// a new primitive, which is the same argument, and the same required test,
-    /// as `Bytes` in W1.
+    /// At most [`MAX_GEN_ENTRIES`] entries, drawn from the key and value generators.
     fn map(&mut self, key: &Type, value: &Type, depth: u32) -> Result<Value, Ungeneratable> {
         let len = if depth >= GEN_DEPTH {
             0
@@ -742,9 +638,9 @@ impl Gen<'_> {
         };
         let variants = decl.variants.clone();
 
-        // Only variants every one of whose *substituted* fields can be drawn:
-        // `type Box<a> = B(a)` is generatable at `Box<Int>` and not at
-        // `Box<Cell<Int>>`, and the declaration alone cannot tell the two apart.
+        // Only variants every one of whose *substituted* fields can be drawn: `type Box<a> = B(a)`
+        // is generatable at `Box<Int>` and not at `Box<Cell<Int>>`, and the declaration alone
+        // cannot tell the two apart.
         let mut usable: Vec<(&Variant, Vec<Type>)> = Vec::new();
         for variant in &variants {
             let fields = self.world.fields(name, variant, args);
@@ -756,9 +652,7 @@ impl Gen<'_> {
             return Err(Ungeneratable::Uninhabited(name.clone()));
         }
 
-        // Past `GEN_DEPTH`, only the shallowest constructors. A recursive type's
-        // recursive variants have a strictly greater declaration depth than its
-        // base ones, so this both terminates and reaches a real value.
+        // Past `GEN_DEPTH`, only the shallowest constructors.
         if depth >= GEN_DEPTH {
             let shallowest = usable
                 .iter()
@@ -785,9 +679,9 @@ impl Gen<'_> {
         Ok(Value::ctor(ctor, out))
     }
 
-    /// A member of a fixed family, every one of which is pure, total,
-    /// extensionally deterministic and printable — so a counterexample naming a
-    /// function names something a reader can act on rather than `<fn>`.
+    /// A member of a fixed family, every one of which is pure, total, extensionally deterministic
+    /// and printable — so a counterexample naming a function names something a reader can act on
+    /// rather than `<fn>`.
     fn function(
         &mut self,
         params: &[Type],
@@ -824,8 +718,7 @@ impl Gen<'_> {
     }
 }
 
-/// Whether `==` on this type answers rather than raising. Comparing functions is
-/// a runtime error in Ply, so a table keyed on one would not be total.
+/// Whether `==` on this type answers rather than raising.
 fn comparable(ty: &Type) -> bool {
     match ty {
         Type::Fn { .. } => false,
@@ -850,9 +743,9 @@ fn param_names(arity: usize) -> Vec<Symbol> {
     (0..arity).map(|i| Symbol::new(format!("x{i}"))).collect()
 }
 
-/// The synthesized body names only its own parameters and the values bound
-/// beside it, so the module scope is never consulted and index 0 is a
-/// placeholder rather than a claim about which module this came from.
+/// The synthesized body names only its own parameters and the values bound beside it, so the module
+/// scope is never consulted and index 0 is a placeholder rather than a claim about which module
+/// this came from.
 fn closure(params: Vec<Symbol>, body: Expr, env: Env, description: String) -> Value {
     Value::Closure(Arc::new(Closure {
         name: Some(Symbol::new(description)),
@@ -876,8 +769,7 @@ fn binder_list(arity: usize, names: &[Symbol]) -> String {
         .join(", ")
 }
 
-/// `\(..) -> c`. The family's floor, and the only candidate the shrinker offers
-/// for a function value.
+/// `\(..) -> c`.
 pub(crate) fn const_fn(arity: usize, value: Value, world: &TypeWorld) -> Value {
     let description = format!("|{}| {}", binder_list(arity, &[]), value.render());
     let env = Env::empty()
@@ -891,8 +783,7 @@ pub(crate) fn const_fn(arity: usize, value: Value, world: &TypeWorld) -> Value {
     closure(param_names(arity), var(FN_CONST), env, description)
 }
 
-/// `\(x0, ..) -> xi` where `xi` has the return type. The identity of the family,
-/// and the member that makes a law about `map` say something.
+/// `\(x0, ..) -> xi` where `xi` has the return type.
 fn projection_fn(arity: usize, index: usize) -> Value {
     let names = param_names(arity);
     let picked = names[index].to_string();
@@ -901,9 +792,8 @@ fn projection_fn(arity: usize, index: usize) -> Value {
     closure(names, var(&picked), env, description)
 }
 
-/// `\(x0, ..) -> if x0 == k { v } else .. else d`: a lookup table over the first
-/// parameter with a default. Pure, total, and the member that can actually
-/// distinguish two inputs.
+/// `\(x0, ..) -> if x0 == k { v } else .. else d`: a lookup table over the first parameter with a
+/// default.
 fn table_fn(arity: usize, table: Vec<(Value, Value)>, default: Value, world: &TypeWorld) -> Value {
     let names = param_names(arity);
     let subject = names[0].to_string();
@@ -950,9 +840,7 @@ fn saturating_i64(n: u64) -> i64 {
     i64::try_from(n).unwrap_or(i64::MAX)
 }
 
-/// The size a generated function value was built with. `None` for a closure this
-/// module did not make, which the shrinker treats as already minimal rather than
-/// guessing.
+/// The size a generated function value was built with.
 pub(crate) fn fn_size(value: &Value) -> Option<u64> {
     let Value::Closure(closure) = value else {
         return None;
@@ -967,18 +855,13 @@ pub(crate) fn fn_size(value: &Value) -> Option<u64> {
 }
 
 /// What one case did.
-///
-/// `Rejected` is the guard's answer and is never a failure: it is the number
-/// that separates `property` from `example`, and hiding it is exactly the
-/// misreport this tier exists to avoid.
 #[derive(Debug)]
 pub enum Outcome {
     /// The guard did not admit this tuple.
     Rejected,
     Held,
     Failed,
-    /// The guard or the body raised. A spec that raises is not false, so this is
-    /// neither a refutation nor a hold.
+    /// The guard or the body raised.
     Raised(Diagnostic),
 }
 
@@ -992,16 +875,8 @@ impl Outcome {
 }
 
 /// How the property tier asks about one tuple of binder values.
-///
-/// The seam is here rather than inside this module because evaluating a clause
-/// means calling the definition it is attached to, binding `result`, and
-/// possibly entering a `simulate` region — all of which belong to whoever owns
-/// the program, not to the generator. The generator's contract is only that it
-/// asks about the guard **before** the body, and never accepts a shrunk value it
-/// did not ask about again.
 pub trait Judge {
-    /// `Ok(false)` means the guard rejected this tuple. An obligation with no
-    /// guard answers `Ok(true)`.
+    /// `Ok(false)` means the guard rejected this tuple.
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic>;
     /// `Ok(true)` means the obligation held at this tuple.
     fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic>;
@@ -1016,8 +891,7 @@ impl<T: Judge + ?Sized> Judge for &mut T {
     }
 }
 
-/// Guard first, always. A body evaluated at a tuple the guard rejects is a claim
-/// about a value the obligation never spoke about.
+/// Guard first, always.
 pub fn judge_case(judge: &mut dyn Judge, values: &[Value]) -> Outcome {
     match judge.guard(values) {
         Err(d) => Outcome::Raised(d),
@@ -1030,17 +904,8 @@ pub fn judge_case(judge: &mut dyn Judge, values: &[Value]) -> Outcome {
     }
 }
 
-/// Draw, filter by the guard, evaluate, and report what happened — including the
-/// two outcomes that are not tiers.
-///
-/// `binders` are the values this tier **generates**: a law's `forall` binders,
-/// or a definition's parameters. `result` is not among them — it is what calling
-/// the definition produces, which is the [`Judge`]'s job — so a counterexample
-/// names the input rather than the intermediate.
-///
-/// A plan with `cases == 0` draws nothing and is therefore [`Discharge::Vacuous`]
-/// rather than a hold: a run that evaluated no case demonstrated nothing, and
-/// failing loudly is the only reading of that which cannot mislead.
+/// Draw, filter by the guard, evaluate, and report what happened — including the two outcomes that
+/// are not tiers.
 pub fn run_property(
     key: DefHash,
     binders: &[LawBinder],
@@ -1103,8 +968,8 @@ pub fn run_property(
                     });
                 }
                 Outcome::Raised(diagnostic) => {
-                    // A minimal raising input is worth exactly what a minimal
-                    // falsifying one is, so it gets the same treatment.
+                    // A minimal raising input is worth exactly what a minimal falsifying one is, so
+                    // it gets the same treatment.
                     let shrunk = shrink::shrink(
                         &values,
                         &types,
@@ -1123,8 +988,7 @@ pub fn run_property(
     }
 
     if kept == 0 {
-        // Never a pass. An unsatisfiable guard makes `guard ⟹ body` valid and
-        // meaningless, and a system that counted it green would reward a typo.
+        // Never a pass.
         return Discharge::Vacuous(Vacuity {
             guard: guard_span,
             kind: VacuityKind::NoCaseKept { generated },
@@ -1153,11 +1017,6 @@ fn bindings(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
 }
 
 /// Every type variable the binders mention, monomorphised to `Int`.
-///
-/// The property tier cannot generate a value of an unknown type, so a
-/// `property` on a polymorphic law is a claim about `Int` and the report says
-/// so. The prover, which leaves a variable as an uninterpreted sort, is the one
-/// that can make the polymorphic claim.
 pub fn instantiations(types: &[Type]) -> Vec<(Symbol, Type)> {
     let mut seen: BTreeSet<TyVar> = BTreeSet::new();
     let mut out = Vec::new();

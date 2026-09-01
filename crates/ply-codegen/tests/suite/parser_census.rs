@@ -1,18 +1,4 @@
 //! What the code generator refuses over the bootstrap target.
-//!
-//! `fragment.rs`'s census runs over the standard library plus one arithmetic
-//! module and asks whether the fragment is neither empty nor everything. This
-//! one runs over `spikes/ply-parser` — the front end Ply is being bootstrapped
-//! onto, and the workload every end-to-end number in ADRs 0030 and 0031 is
-//! taken on — and asks a different question: of the definitions the *seam* now
-//! admits, how many does the code generator have a body for, and what does it
-//! name as the reason for the rest.
-//!
-//! It exists because those two sets have parted company. The seam admits 84.0%
-//! of body calls on this corpus (ADR 0031 §1); this backend registers 6
-//! definitions of it. A census that only ever runs over arithmetic cannot see
-//! that, and the gap between the two numbers is the whole of the remaining
-//! limit.
 
 use ply_eval::Provider;
 use ply_syntax::ast::{ModuleName, Program};
@@ -23,8 +9,8 @@ struct Loaded {
     check: &'static ply_core::CheckOutput,
 }
 
-/// The shipped standard library plus every `.ply` module in `dir`, each named
-/// by its file stem — which is how the spike imports them (`import items ..`).
+/// The shipped standard library plus every `.ply` module in `dir`, each named by its file stem —
+/// which is how the spike imports them (`import items ..`)
 fn load_dir(dir: &str) -> Loaded {
     let mut sources = ply_span::SourceMap::new();
     let mut owned: Vec<(ModuleName, &'static str)> = ply_std::sources()
@@ -91,13 +77,7 @@ fn the_census_over_the_parser_spike() {
     }
     println!("the enterable set: {:?}", unit.compiled());
 
-    // The floor is the measurement, not a guess. This corpus reads **22**
-    // enterable today, of 489 that survive the fixpoint; W1 -- the same six
-    // modules plus `probe.ply` -- reads 6 through the shipping command, and the
-    // two differ because `probe.ply` changes which definitions are reachable.
-    // Set below the measured 22 so benign drift does not fail the build, and
-    // far enough above 0 that a registry that stops registering is caught.
-    // `items.parse` is in neither number: ADR 0032 §4 is what that costs.
+    // The floor is the measurement, not a guess.
     assert!(
         unit.len() >= 20,
         "the enterable fragment over the parser fell to {} (22 when measured)",

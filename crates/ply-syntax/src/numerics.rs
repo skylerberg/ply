@@ -1,9 +1,4 @@
 //! Lexing and parsing the two numeric literals W2 adds.
-//!
-//! The property under test throughout is that `1`, `1.0` and `1m` are three
-//! *different* literals rather than three spellings of one: they have three
-//! types, three normalized forms and three definition hashes, and a lexer that
-//! collapsed any pair would make that impossible to recover downstream.
 
 use crate::ast::{Expr, ExprKind, Lit, Pattern, PatternKind, render_float};
 use crate::lexer::{TokenKind, lex, render_decimal};
@@ -47,9 +42,7 @@ fn the_three_numeric_literals_are_three_tokens() {
     );
 }
 
-/// The scale is what the literal said, not what its value needs. `1.50m` and
-/// `1.5m` are equal in value, differently written, and therefore differently
-/// hashed — all three of those are consequences of this one line.
+/// The scale is what the literal said, not what its value needs.
 #[test]
 fn a_decimal_literal_keeps_its_trailing_zeros() {
     assert_eq!(
@@ -84,8 +77,8 @@ fn floats_take_a_fraction_an_exponent_or_both() {
     assert_eq!(kinds("1_000.5")[0], TokenKind::Float(1000.5));
 }
 
-/// `..` is the range separator and `e` starts an identifier, so both have to be
-/// distinguishable from a number's continuation by lookahead alone.
+/// `..` is the range separator and `e` starts an identifier, so both have to be distinguishable
+/// from a number's continuation by lookahead alone.
 #[test]
 fn a_number_stops_before_a_range_and_before_a_bare_letter() {
     assert_eq!(
@@ -97,13 +90,13 @@ fn a_number_stops_before_a_range_and_before_a_bare_letter() {
             TokenKind::Eof
         ]
     );
-    // No digits behind the `e`, so it is not an exponent — and an identifier
-    // glued to a number is the suffix error it has always been.
+    // No digits behind the `e`, so it is not an exponent — and an identifier glued to a number is
+    // the suffix error it has always been.
     assert!(lex_err("1else").contains("invalid suffix"));
 }
 
-/// `m` is a suffix only when nothing follows it that could continue a name;
-/// otherwise `1max` would silently become `1m` followed by `ax`.
+/// `m` is a suffix only when nothing follows it that could continue a name; otherwise `1max` would
+/// silently become `1m` followed by `ax`.
 #[test]
 fn the_decimal_suffix_is_only_a_suffix_when_it_ends_the_literal() {
     assert_eq!(
@@ -131,9 +124,8 @@ fn a_decimal_outside_the_types_range_names_the_limit() {
     assert!(exponent.contains("no exponent"), "{exponent}");
 }
 
-/// A decimal-to-binary conversion that overflows produces an infinity; that is
-/// what IEEE says, and refusing it here would give `Float` a range the standard
-/// does not.
+/// A decimal-to-binary conversion that overflows produces an infinity; that is what IEEE says, and
+/// refusing it here would give `Float` a range the standard does not.
 #[test]
 fn a_float_literal_beyond_the_range_is_an_infinity_rather_than_an_error() {
     assert_eq!(kinds("1e400")[0], TokenKind::Float(f64::INFINITY));
@@ -171,8 +163,8 @@ fn literals_parse_into_the_expression_and_the_pattern_grammar() {
     ));
 }
 
-/// A negative decimal pattern is one literal, not an operator applied to one:
-/// a pattern is not an expression and there is nothing to apply.
+/// A negative decimal pattern is one literal, not an operator applied to one: a pattern is not an
+/// expression and there is nothing to apply.
 #[test]
 fn a_negative_decimal_pattern_is_one_literal() {
     let module = parse(
@@ -196,9 +188,8 @@ fn a_negative_decimal_pattern_is_one_literal() {
     ));
 }
 
-/// A `Float` never renders as an `Int`: the two are different types, and a
-/// diagnostic that printed `1` for both would make an expected/actual pair
-/// unreadable at exactly the moment it matters.
+/// A `Float` never renders as an `Int`: the two are different types, and a diagnostic that printed
+/// `1` for both would make an expected/actual pair unreadable at exactly the moment it matters.
 #[test]
 fn a_float_always_renders_with_a_point_or_an_exponent() {
     assert_eq!(render_float(1.0), "1.0");

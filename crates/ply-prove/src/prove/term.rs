@@ -1,20 +1,4 @@
 //! The prover's term language: one hash-consed DAG per obligation.
-//!
-//! Two properties of this representation carry the soundness of everything
-//! above it.
-//!
-//! **Anything the fragment does not interpret becomes a fresh symbol.** A
-//! `perform`, a `handle`, a lambda, an arithmetic expression whose coefficients
-//! left the range this module computes in — each becomes a [`Node::Sym`] with no
-//! constraints attached. Proving a statement about a fresh symbol proves it for
-//! every value that symbol could have taken, so an over-approximation here can
-//! only cost reach.
-//!
-//! **Integer arithmetic is canonical and checked.** `+`, binary `-`, unary `-`
-//! and multiplication by a literal fold into a [`Poly`] as they are built, so
-//! `x + 0` and `x` are one term. Every coefficient operation is checked in
-//! `i128`; an overflow yields `None` and the caller substitutes an opaque
-//! symbol rather than a wrong number.
 
 use ply_core::Type;
 use ply_span::Symbol;
@@ -22,25 +6,14 @@ use std::collections::HashMap;
 
 pub type TermId = usize;
 
-/// The names the prover reserves for operators it does not interpret. A Ply
-/// identifier cannot contain a parenthesis, so none of these can collide with a
-/// program-wide name.
-///
-/// There is one per operator, including for the three that are interpreted
-/// whenever they fold. `MAX + MAX` and `MAX * MAX` both leave `Int` and both
-/// become uninterpreted, and they are not the same value — sharing one symbol
-/// between them would prove them equal by congruence, which is a wrong `proved`
-/// assembled out of two correct refusals to fold.
+/// The names the prover reserves for operators it does not interpret.
 pub const ADD: &str = "(+)";
 pub const SUB: &str = "(-)";
 pub const MUL: &str = "(*)";
 pub const DIV: &str = "(/)";
 pub const REM: &str = "(%)";
 pub const CONCAT: &str = "(++)";
-/// The ordered comparisons, uninterpreted. [`Node::Cmp`] is over `Int` alone —
-/// its rules are linear-arithmetic rules — so a `Float` or `Decimal` comparison
-/// becomes an application of one of these instead of a `Cmp` the arithmetic
-/// would then reason about at the wrong sort.
+/// The ordered comparisons, uninterpreted.
 pub const LT: &str = "(<)";
 pub const LE: &str = "(<=)";
 pub const GT: &str = "(>)";
@@ -54,8 +27,8 @@ pub enum CmpOp {
     Ge,
 }
 
-/// `Σ coefficient · term + konst`, ascending by term with no zero coefficients
-/// and no nested [`Node::Lin`].
+/// `Σ coefficient · term + konst`, ascending by term with no zero coefficients and no nested
+/// [`Node::Lin`].
 #[derive(Clone, PartialEq, Eq, Hash, Debug, Default)]
 pub struct Poly {
     pub monomials: Vec<(TermId, i128)>,
@@ -128,10 +101,6 @@ impl Poly {
 }
 
 /// One arm of a [`Node::Match`], already lowered.
-///
-/// The pattern's variables were bound to `binds` — or, for a bare variable
-/// pattern, to the scrutinee itself — before `body` was lowered, so an arm
-/// carries no names and cannot capture.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct Arm {
     pub test: ArmTest,
@@ -148,10 +117,7 @@ pub enum ArmTest {
     Ctor(Symbol),
     /// Taken iff the scrutinee equals this literal.
     Lit(TermId),
-    /// A pattern the fragment does not decide — a nested constructor, a record
-    /// or a list pattern. The `match` containing it never reduces and stays an
-    /// uninterpreted term, which is the conservative answer rather than a
-    /// guessed one.
+    /// A pattern the fragment does not decide — a nested constructor, a record or a list pattern.
     Undecidable,
 }
 
@@ -160,30 +126,20 @@ pub enum Node {
     Int(i64),
     Bool(bool),
     Str(String),
-    /// A `Decimal` literal, **normalized to its numeric value**: `1.5m` and
-    /// `1.50m` are one node.
-    ///
-    /// That normalization carries a soundness obligation rather than a
-    /// convenience. Two distinct literal nodes are treated as distinct *values*
-    /// by [`super::egraph::conflict`], so a representation that kept the scale
-    /// would let the prover certify `1.5m != 1.50m` — which is false, because
-    /// the language's `==` on `Decimal` compares numeric value. There is no
-    /// `Float` counterpart for the mirror-image reason: `==` on `Float` is not
-    /// reflexive, so no literal node for it can be sound at all.
+    /// A `Decimal` literal, **normalized to its numeric value**: `1.5m` and `1.50m` are one node.
     Decimal {
         mantissa: i128,
         scale: u32,
     },
     Unit,
-    /// A `forall` binder, `result`, a constructor field exposed by a case
-    /// split, or an opaque stand-in for a term outside the fragment.
+    /// A `forall` binder, `result`, a constructor field exposed by a case split, or an opaque
+    /// stand-in for a term outside the fragment.
     Sym(u32),
-    /// A top-level definition named as a value, or an operator the fragment
-    /// leaves uninterpreted: `*` over two symbolics, `/`, `%`, `++`.
+    /// A top-level definition named as a value, or an operator the fragment leaves uninterpreted:
+    /// `*` over two symbolics, `/`, `%`, `++`.
     Opaque(Symbol),
     Lin(Poly),
-    /// An application of an arbitrary head. Congruence over `(head, args)` is
-    /// what makes `f(x) == f(x)` a proof for an arbitrary `f`.
+    /// An application of an arbitrary head.
     App {
         head: TermId,
         args: Vec<TermId>,
@@ -192,8 +148,7 @@ pub enum Node {
         name: Symbol,
         args: Vec<TermId>,
     },
-    /// A list literal. Injective in its length and its elements, exactly as a
-    /// constructor is.
+    /// A list literal.
     List(Vec<TermId>),
     /// Ascending by field name.
     Record(Vec<(Symbol, TermId)>),
@@ -204,9 +159,7 @@ pub enum Node {
     Not(TermId),
     And(TermId, TermId),
     Or(TermId, TermId),
-    /// Over `Int` only. `<` and its converses are defined at `Float` and
-    /// `Decimal` too, and those become an [`Node::App`] of [`LT`] and friends —
-    /// this node's rules are the linear arithmetic's, which is a theory of `Int`.
+    /// Over `Int` only.
     Cmp {
         op: CmpOp,
         lhs: TermId,
@@ -230,9 +183,8 @@ pub enum Node {
 pub struct Terms {
     nodes: Vec<Node>,
     sorts: Vec<Option<Type>>,
-    /// Set for anything the type system has already proved is an `Int`: a
-    /// literal, a linear combination, and every operand of an arithmetic
-    /// operator or a comparison.
+    /// Set for anything the type system has already proved is an `Int`: a literal, a linear
+    /// combination, and every operand of an arithmetic operator or a comparison.
     int: Vec<bool>,
     index: HashMap<Node, TermId>,
     next_sym: u32,
@@ -282,8 +234,7 @@ impl Terms {
         self.int[t]
     }
 
-    /// Records what the type system already knows. Only called where the
-    /// operator itself pins the type.
+    /// Records what the type system already knows.
     pub fn force_int(&mut self, t: TermId) {
         self.int[t] = true;
     }
@@ -317,8 +268,8 @@ impl Terms {
         self.mk(Node::Str(s), Some(Type::string()))
     }
 
-    /// Interned by numeric value: trailing zeros are stripped so that two
-    /// literals the language calls equal are one term. See [`Node::Decimal`].
+    /// Interned by numeric value: trailing zeros are stripped so that two literals the language
+    /// calls equal are one term.
     pub fn decimal(&mut self, mantissa: i128, scale: u32) -> TermId {
         let (mut mantissa, mut scale) = (mantissa, scale);
         while scale > 0 && mantissa % 10 == 0 {
@@ -332,18 +283,14 @@ impl Terms {
         self.mk(Node::Unit, Some(Type::unit()))
     }
 
-    /// A fresh symbolic constant. Every one is distinct from every other term,
-    /// carries no constraint, and is what the prover substitutes for anything it
-    /// declines to interpret.
+    /// A fresh symbolic constant.
     pub fn sym(&mut self, sort: Option<Type>) -> TermId {
         let n = self.next_sym;
         self.next_sym += 1;
         self.mk(Node::Sym(n), sort)
     }
 
-    /// The linear view of a term. Every non-linear term is one monomial over
-    /// itself, which is what lets the arithmetic and the congruence closure
-    /// share variables without either trusting the other.
+    /// The linear view of a term.
     pub fn poly(&self, t: TermId) -> Poly {
         match &self.nodes[t] {
             Node::Int(k) => Poly::constant(*k as i128),
@@ -356,8 +303,8 @@ impl Terms {
         if p.monomials.is_empty() {
             return match i64::try_from(p.konst) {
                 Ok(k) => Some(self.int_lit(k)),
-                // A constant no `Int` can hold is not a Ply value, so there is
-                // nothing honest to fold it to.
+                // A constant no `Int` can hold is not a Ply value, so there is nothing honest to
+                // fold it to.
                 Err(_) => None,
             };
         }
@@ -385,9 +332,7 @@ impl Terms {
         self.intern_poly(p)
     }
 
-    /// Multiplication is in the fragment only when a factor is an integer
-    /// literal. `x * y` with both symbolic is uninterpreted, which is why
-    /// `x * y == y * x` is not proved and must not be.
+    /// Multiplication is in the fragment only when a factor is an integer literal.
     pub fn mul(&mut self, a: TermId, b: TermId) -> Option<TermId> {
         let (poly, factor) = match (&self.nodes[a], &self.nodes[b]) {
             (Node::Int(k), _) => (self.poly(b), *k as i128),
@@ -398,8 +343,8 @@ impl Terms {
         self.intern_poly(p)
     }
 
-    /// Projection reduces over a record literal on sight; the same reduction up
-    /// to a proved equality is a rule in the solver.
+    /// Projection reduces over a record literal on sight; the same reduction up to a proved
+    /// equality is a rule in the solver.
     pub fn field(&mut self, base: TermId, field: Symbol) -> TermId {
         if let Node::Record(fields) = &self.nodes[base]
             && let Some((_, v)) = fields.iter().find(|(n, _)| *n == field)
@@ -427,18 +372,8 @@ impl Terms {
         self.mk(Node::Eq { lhs, rhs }, Some(Type::bool()))
     }
 
-    /// Intern `a.f` and `b.f` for every field of a record-sorted equality, so
-    /// that the solver's extensionality rule has projections to compare.
-    ///
-    /// Records are equal iff every field is (ADR 0007 §5.1(d)), but the
-    /// *introduction* direction can only fire on terms that exist: an opaque
-    /// record never mentioned field-wise in the source has no projection to
-    /// compare. Seeding them here is what lets a record literal be proved equal
-    /// to a symbolic record — the shape of every `ensures` that rebuilds a
-    /// record from its parts.
-    ///
-    /// Recursion is on the *type*, which is structural and finite: a recursive
-    /// type must pass through a `Type::Con`, which this does not descend into.
+    /// Intern `a.f` and `b.f` for every field of a record-sorted equality, so that the solver's
+    /// extensionality rule has projections to compare.
     fn project_fields(&mut self, a: TermId, b: TermId) {
         let (Some(Type::Record(left)), Some(Type::Record(right))) =
             (self.sorts[a].clone(), self.sorts[b].clone())
@@ -487,8 +422,7 @@ mod tests {
         assert_eq!(back, x);
     }
 
-    /// The prover's own arithmetic must never wrap. An overflow is reported as
-    /// "no term", and the caller substitutes an opaque symbol.
+    /// The prover's own arithmetic must never wrap.
     #[test]
     fn a_coefficient_that_overflows_produces_no_term() {
         let mut terms = Terms::new();
@@ -500,8 +434,8 @@ mod tests {
         assert!(terms.mul(again, big).is_none());
     }
 
-    /// A sum of two `i64::MAX`s is not an `Int`, so there is no literal to fold
-    /// it to and the prover declines rather than wrapping.
+    /// A sum of two `i64::MAX`s is not an `Int`, so there is no literal to fold it to and the
+    /// prover declines rather than wrapping.
     #[test]
     fn a_constant_outside_int_produces_no_term() {
         let mut terms = Terms::new();

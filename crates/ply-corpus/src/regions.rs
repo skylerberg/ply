@@ -1,38 +1,4 @@
 //! ADR 0017 §6: what removing the forkable world costs the scheduler.
-//!
-//! The claim to be priced is that tests which "share a resource label but have
-//! disjoint state" stop parallelizing once every test no longer gets its own
-//! forked `World`. Today's headline — `isolated 176 of 186` —
-//! overstates it, because a pure test has an empty footprint and conflicts with
-//! nothing whether or not anything is forked.
-//!
-//! So the number this module computes is the counterfactual: colour the same
-//! test set twice, once with the world-backed exemption the scheduler applied
-//! under ADR 0005 and once without it, and report the difference in groups, in
-//! the critical path, and in modelled wall clock.
-//!
-//! Three things about the model are load-bearing.
-//!
-//! **Only `cell` changes.** `ply_test::REGION_SCOPED` is exactly `["cell"]`, so
-//! that exemption was the entire mechanism by which forking bought the scheduler
-//! anything. `ply_test::AMBIENT` — `sim.read`, a seed — is a claim about inputs
-//! rather than about memory, and ADR 0017 does not touch it, so it stays exempt
-//! on both sides. Dropping it too would report a loss this design does not cause.
-//!
-//! **The colouring is the runner's own.** [`colour`] is `group_by_conflict`
-//! with the projection lifted out, and a test asserts it reproduces
-//! `ply_test::group_by_conflict` exactly on the projection that crate applies.
-//! A counterfactual coloured by a second-best heuristic would report a cost
-//! that is the heuristic's. `ply-test` applies [`region_footprint`] now, so that
-//! is the side the assertion is made against and [`forked_footprint`] is stated
-//! here — a baseline that is a call into the thing being changed measures
-//! nothing.
-//!
-//! **Groups are a barrier.** `ply_test::run` executes one group to completion
-//! before starting the next, and inside a group `jobs` workers pull the next
-//! index off a counter. [`makespan`] replays exactly that, so the modelled
-//! number can be checked against a measured run — [`IsolationCost::model_error`]
-//! is that check, and it is printed rather than assumed.
 
 use crate::rng::Rng;
 use anyhow::{Context, Result, bail};
@@ -46,14 +12,8 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use std::time::Instant;
 
-// ---------------------------------------------------------------- projections
-
-/// The atoms the scheduler let contend under the forkable world: the ambient
-/// ones dropped, and the region-scoped ones dropped too because every test ran
-/// against its own fork.
-///
-/// Stated here rather than called on `ply-test`, which no longer applies it:
-/// the baseline of a counterfactual has to survive the change it is measuring.
+/// The atoms the scheduler let contend under the forkable world: the ambient ones dropped, and the
+/// region-scoped ones dropped too because every test ran against its own fork.
 pub fn forked_footprint(f: &Footprint) -> Footprint {
     Footprint::from_atoms(
         f.atoms()
@@ -62,39 +22,27 @@ pub fn forked_footprint(f: &Footprint) -> Footprint {
     )
 }
 
-/// The atoms that contend once a test no longer gets its own world — which is
-/// what `ply_test::shared_footprint` now is.
-///
-/// `sim` stays exempt: a seed is handed to a test rather than shared between
-/// two, and no memory model changes that. `cell` does not, because a region
-/// closed at the end of a test is not a fork — two tests naming one label are
-/// two tests naming one label.
+/// The atoms that contend once a test no longer gets its own world — which is what
+/// `ply_test::shared_footprint` now is.
 pub fn region_footprint(f: &Footprint) -> Footprint {
     ply_test::shared_footprint(f)
 }
 
-/// Whether this test was isolated under the forkable world only because its
-/// state was forked: it carries an atom the world-backed exemption hid.
+/// Whether this test was isolated under the forkable world only because its state was forked: it
+/// carries an atom the world-backed exemption hid.
 pub fn isolated_by_forking(f: &Footprint) -> bool {
     forked_footprint(f).is_empty() && f.atoms().any(ply_test::is_region_scoped)
 }
 
-/// Isolated under the forkable world: the classification `isolated n of m`
-/// counted before ADR 0017 §6, kept here because the counterfactual's baseline
-/// is that number and `ply-test` no longer computes it.
+/// Isolated under the forkable world: the classification `isolated n of m` counted before ADR 0017
+/// §6, kept here because the counterfactual's baseline is that number and `ply-test` no longer
+/// computes it.
 fn was_world_isolated(f: &Footprint) -> bool {
     forked_footprint(f).is_empty()
 }
 
-// ------------------------------------------------------------------ colouring
-
-/// `ply_test::group_by_conflict` with the projection lifted out, so the
-/// baseline and the counterfactual are coloured by one function.
-///
-/// `projected[i]` is the footprint `tests[i]` contends over. The greedy
-/// largest-first order is the runner's and is not incidental: colouring in
-/// source order routinely produces one more group than it needs to, and a group
-/// costs a whole round of wall clock.
+/// `ply_test::group_by_conflict` with the projection lifted out, so the baseline and the
+/// counterfactual are coloured by one function.
 pub fn colour(tests: &[(usize, Footprint)], projected: &[Footprint]) -> Vec<Vec<usize>> {
     assert_eq!(tests.len(), projected.len());
 
@@ -131,17 +79,9 @@ pub fn colour(tests: &[(usize, Footprint)], projected: &[Footprint]) -> Vec<Vec<
         .collect()
 }
 
-/// Wall clock for a schedule, in the shape `ply_test::run` actually executes it:
-/// one group at a time, and within a group `jobs` workers each taking the next
-/// index off a shared counter as they come free.
-///
-/// `millis` is indexed by test index. `jobs == 0` means unbounded, which makes
-/// a group cost its slowest member and the suite cost the critical path.
-///
-/// `setup_millis` is what one worker costs to build. `execute_group` builds a
-/// worker per pool thread **per group**, so it is charged per group rather than
-/// once — which is most of the reason an extra group is not free, and leaving it
-/// out would flatter every counterfactual that adds one.
+/// Wall clock for a schedule, in the shape `ply_test::run` actually executes it: one group at a
+/// time, and within a group `jobs` workers each taking the next index off a shared counter as they
+/// come free.
 pub fn makespan(groups: &[Vec<usize>], millis: &[f64], jobs: usize, setup_millis: f64) -> f64 {
     let mut total = 0.0;
     for group in groups {
@@ -169,8 +109,6 @@ pub fn makespan(groups: &[Vec<usize>], millis: &[f64], jobs: usize, setup_millis
     total
 }
 
-// -------------------------------------------------------------------- results
-
 /// One colouring, priced.
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct Split {
@@ -181,9 +119,8 @@ pub struct Split {
     /// The suite at `jobs` workers, modelled the way the runner schedules.
     pub makespan_millis: f64,
     /// The same at unbounded workers: `Σ over groups of the slowest member`.
-    /// No amount of hardware goes below it.
     pub critical_path_millis: f64,
-    /// Every test one after another. The denominator a speedup is read against.
+    /// Every test one after another.
     pub sequential_millis: f64,
 }
 
@@ -203,8 +140,8 @@ fn split(groups: &[Vec<usize>], millis: &[f64], jobs: usize, setup: f64) -> Spli
     }
 }
 
-/// A test that changes classification, named rather than counted, because a
-/// count nobody can check is the shape of claim this project keeps finding wrong.
+/// A test that changes classification, named rather than counted, because a count nobody can check
+/// is the shape of claim this project keeps finding wrong.
 #[derive(Clone, Debug, Serialize)]
 pub struct NewlySerialized {
     pub index: usize,
@@ -223,42 +160,33 @@ pub struct IsolationCost {
     /// `isolated n of m`, as `ply test` prints it.
     pub isolated_today: usize,
     pub shared_today: usize,
-    /// Of the isolated: how many have an empty footprint and therefore conflict
-    /// with nothing whatever the memory model is.
+    /// Of the isolated: how many have an empty footprint and therefore conflict with nothing
+    /// whatever the memory model is.
     pub pure: usize,
-    /// Of the isolated: how many carry only `sim.read`, which ADR 0017 does not
-    /// touch.
+    /// Of the isolated: how many carry only `sim.read`, which ADR 0017 does not touch.
     pub seeded_only: usize,
-    /// Of the isolated: how many carry a `cell` atom — the exemption forking
-    /// pays for, and the only population that can lose anything here.
+    /// Of the isolated: how many carry a `cell` atom — the exemption forking pays for, and the only
+    /// population that can lose anything here.
     pub world_backed: usize,
 
-    /// The answer. Tests isolated today that conflict with another test once the
-    /// exemption is gone.
     pub newly_serialized: usize,
     pub newly_serialized_tests: Vec<NewlySerialized>,
 
     pub today: Split,
     pub without_forking: Split,
 
-    /// Measured, at `jobs`, over the whole suite. `None` when durations were
-    /// supplied rather than taken.
+    /// Measured, at `jobs`, over the whole suite.
     pub measured_suite_millis: Option<f64>,
-    /// The same suite measured at one worker: the denominator the parallel run
-    /// is actually buying against.
+    /// The same suite measured at one worker: the denominator the parallel run is actually buying
+    /// against.
     pub measured_sequential_millis: Option<f64>,
     pub worker_setup_millis: f64,
-    /// `modelled / measured − 1` for today's schedule. The model's own error
-    /// bar, printed rather than assumed, because the counterfactual's number is
-    /// only as good as the baseline's. It is negative here: a test measured
-    /// alone is faster than the same test measured against seven others, and no
-    /// per-test duration taken at one job can carry that. Both colourings pay
-    /// it, so it cancels out of the ratio and does not out of the absolutes.
+    /// `modelled / measured − 1` for today's schedule.
     pub model_error: Option<f64>,
 }
 
 impl IsolationCost {
-    /// What the change costs the suite at `jobs`, as a multiple. `1.0` is free.
+    /// What the change costs the suite at `jobs`, as a multiple.
     pub fn wall_clock_ratio(&self) -> f64 {
         if self.today.makespan_millis <= 0.0 {
             return 1.0;
@@ -271,19 +199,14 @@ impl IsolationCost {
     }
 }
 
-// ------------------------------------------------------------------- analysis
-
-/// The footprints and per-test costs an analysis runs on. Splitting it out is
-/// what lets the same colouring be applied to a measured corpus and to a
-/// hypothetical one.
+/// The footprints and per-test costs an analysis runs on.
 pub struct Corpus {
     pub root: String,
     pub keys: Vec<String>,
     pub footprints: Vec<Footprint>,
-    /// Positional, aligned with `footprints`. All-equal is a legitimate input;
-    /// it makes the wall-clock columns counts of tests rather than milliseconds.
+    /// Positional, aligned with `footprints`.
     pub millis: Vec<f64>,
-    /// What one worker costs to build. Charged once per pool thread per group.
+    /// What one worker costs to build.
     pub worker_setup_millis: f64,
     pub measured_suite_millis: Option<f64>,
     pub measured_sequential_millis: Option<f64>,
@@ -369,19 +292,9 @@ pub fn analyse(corpus: &Corpus, jobs: usize) -> IsolationCost {
     }
 }
 
-// ------------------------------------------------------------------ measuring
-
-/// Loads a project the way `ply` does — shipped modules resolve, which
-/// `crate::pipeline::front` deliberately does not arrange — runs every test
-/// once at one job, and returns the per-test durations the runner itself
-/// measured.
-///
-/// Scope is `ply_cli::commands::test::Plan`'s, so the denominator here is the
-/// `n of m` a reader sees on the terminal. Without it a shipped module's tests
-/// would join the corpus and the counts would answer a question nobody asked.
-///
-/// The cache lives in a scratch directory rather than under `root`: a
-/// measurement that wrote into `examples/` would change the next run it took.
+/// Loads a project the way `ply` does — shipped modules resolve, which `crate::pipeline::front`
+/// deliberately does not arrange — runs every test once at one job, and returns the per-test
+/// durations the runner itself measured.
 pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     let loaded = ply_cli::load::load(root).map_err(|e| {
         anyhow::anyhow!(
@@ -461,10 +374,8 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
         Ok((visible.iter().map(|&i| by_index[i]).collect(), wall))
     };
 
-    // Per-test costs come from a one-job pass, where a test's duration is its
-    // own work rather than its share of a contended machine. The suite number
-    // the model is checked against comes from a pass at `jobs`, because that is
-    // the schedule being modelled.
+    // Per-test costs come from a one-job pass, where a test's duration is its own work rather than
+    // its share of a contended machine.
     let (millis, sequential) = run(1)?;
     let (_, measured) = run(jobs)?;
 
@@ -494,23 +405,15 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     })
 }
 
-// -------------------------------------------------------------- hypotheticals
-
-/// A corpus that does not exist, so that the risk can be priced rather than
-/// asserted away.
-///
-/// A `cell` atom in a test's footprint is what forking pays for, and the
-/// measured corpora carry none. These are footprints only — no source, no
-/// evaluation — because what is being coloured is a footprint and inventing a
-/// program to carry one would price the program.
+/// A corpus that does not exist, so that the risk can be priced rather than asserted away.
 #[derive(Clone, Copy, Debug, Serialize)]
 pub struct Hypothetical {
     /// Tests carrying a `cell` atom.
     pub cell_tests: usize,
-    /// Distinct region labels they spread over. One label is the worst case.
+    /// Distinct region labels they spread over.
     pub labels: usize,
-    /// Tests carrying a real, contending resource atom, so the counterfactual
-    /// is read against a graph that already has edges.
+    /// Tests carrying a real, contending resource atom, so the counterfactual is read against a
+    /// graph that already has edges.
     pub shared_tests: usize,
     /// Distinct labels those spread over.
     pub shared_labels: usize,
@@ -563,8 +466,6 @@ pub fn hypothetical(h: Hypothetical) -> Corpus {
         measured_sequential_millis: None,
     }
 }
-
-// ------------------------------------------------------------------ rendering
 
 pub fn render(costs: &[IsolationCost]) -> String {
     let mut s = String::new();
@@ -634,10 +535,8 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-// ---------------------------------------------------------------------- audit
-
-/// Effects that appear in a test footprint anywhere in the corpus, which is how
-/// a claim about `cell` is checked rather than believed.
+/// Effects that appear in a test footprint anywhere in the corpus, which is how a claim about
+/// `cell` is checked rather than believed.
 pub fn effects_present(footprints: &[Footprint]) -> BTreeSet<String> {
     footprints
         .iter()
@@ -659,9 +558,7 @@ mod tests {
         Footprint::from_atoms(atoms)
     }
 
-    /// The counterfactual is only worth anything if the baseline is the
-    /// runner's. `colour` is `group_by_conflict` with the projection lifted
-    /// out, and this is the assertion that keeps it that way.
+    /// The counterfactual is only worth anything if the baseline is the runner's.
     #[test]
     fn colouring_reproduces_the_runners_own_grouping() {
         let tests: Vec<(usize, Footprint)> = vec![
@@ -683,9 +580,8 @@ mod tests {
         );
     }
 
-    /// The mechanism, in the smallest corpus that has it: two tests whose only
-    /// atoms name one `cell` label. Forking makes them one group; a region does
-    /// not.
+    /// The mechanism, in the smallest corpus that has it: two tests whose only atoms name one
+    /// `cell` label.
     #[test]
     fn two_tests_sharing_one_cell_label_split_without_forking() {
         let corpus = Corpus {
@@ -708,8 +604,8 @@ mod tests {
         assert_eq!(cost.wall_clock_ratio(), 2.0);
     }
 
-    /// The overstatement ADR 0017 §6 warns about, stated as a test: a pure test
-    /// is free either way, so adding a hundred of them must move nothing.
+    /// The overstatement ADR 0017 §6 warns about, stated as a test: a pure test is free either way,
+    /// so adding a hundred of them must move nothing.
     #[test]
     fn pure_tests_cost_nothing_under_either_model() {
         let mut footprints = vec![fp([atom("db", "a", Mode::Write)])];
@@ -729,9 +625,7 @@ mod tests {
         assert_eq!(cost.pure, 100);
     }
 
-    /// A seed is an input, not memory. Losing the world must not be reported as
-    /// losing the ambient exemption too, or the cost is inflated by every
-    /// simulated test in the corpus.
+    /// A seed is an input, not memory.
     #[test]
     fn a_seeded_test_is_untouched_by_the_change() {
         let corpus = Corpus {
@@ -752,9 +646,8 @@ mod tests {
         assert_eq!(cost.without_forking.groups, 1);
     }
 
-    /// A `cell` atom that no other test names conflicts with nothing, so it
-    /// does not serialize even though the exemption stopped applying to it.
-    /// Counting it would be counting the population rather than the cost.
+    /// A `cell` atom that no other test names conflicts with nothing, so it does not serialize even
+    /// though the exemption stopped applying to it.
     #[test]
     fn a_lone_cell_label_does_not_serialize() {
         let corpus = Corpus {
@@ -775,8 +668,8 @@ mod tests {
         assert_eq!(cost.without_forking.groups, 1);
     }
 
-    /// Groups are a barrier and a group costs its slowest member, so a schedule
-    /// is not `sum / jobs`. One slow test alone in group 1 is a whole round.
+    /// Groups are a barrier and a group costs its slowest member, so a schedule is not `sum /
+    /// jobs`.
     #[test]
     fn makespan_charges_a_barrier_between_groups() {
         let groups = vec![vec![0, 1, 2, 3], vec![4]];

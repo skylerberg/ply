@@ -1,21 +1,5 @@
-//! The two numbers ADR 0017 §4 is judged on, taken on the source in the
-//! repository rather than on shapes chosen to flatter them.
-//!
-//! - **Elision** — of the `dup` and `drop` operations the naive scheme would
-//!   emit, the fraction the pass removes statically. The denominator is one
-//!   `dup` per read of a tracked binding and one `drop` per binding, which is
-//!   what a reference-counting implementation that reasoned about nothing would
-//!   cost.
-//! - **In place** — of the operations that answer their argument with one
-//!   element changed, the fraction that rewrote it instead of copying it. This
-//!   is the number the milestone exists for: an implementation that counted
-//!   correctly and never reached a count of one would pay for the counting and
-//!   buy nothing.
-//!
-//! Both are printed per corpus and in total, and both carry a floor. A floor
-//! rather than an equality because the corpora on disk are the milestone's to
-//! grow; what may not happen is either number quietly going to zero, which is
-//! what a pass that stopped firing would look like from the outside.
+//! The two numbers ADR 0017 §4 is judged on, taken on the source in the repository rather than on
+//! shapes chosen to flatter them.
 
 use ply_eval::rc;
 use ply_eval::{Machine, TaskRegions};
@@ -132,9 +116,9 @@ fn corpora(root: &Path) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
     out
 }
 
-/// Counters are per thread and cumulative, so a corpus is measured by taking
-/// them before and after rather than by resetting between programs — a reset
-/// would discard whatever a neighbouring test on this thread had counted.
+/// Counters are per thread and cumulative, so a corpus is measured by taking them before and after
+/// rather than by resetting between programs — a reset would discard whatever a neighbouring test
+/// on this thread had counted.
 fn delta(before: rc::Stats, after: rc::Stats) -> rc::Stats {
     rc::Stats {
         dup_sites: after.dup_sites - before.dup_sites,
@@ -176,8 +160,8 @@ fn the_elision_and_reuse_this_milestone_claims_are_printed_as_numbers() {
         machine.set_regions(TaskRegions::new());
         let before = rc::stats();
         for index in 0..machine.test_count() {
-            // A fixture is often a deliberately failing program; what it
-            // answered is `differential_corpus`'s business and not this one's.
+            // A fixture is often a deliberately failing program; what it answered is
+            // `differential_corpus`'s business and not this one's.
             let _ = machine.eval_test(index);
             tests += 1;
         }

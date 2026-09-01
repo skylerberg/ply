@@ -1,5 +1,5 @@
-//! One seed is one call graph, and a divergence that depends on the shape of a
-//! call graph is invisible to a single generated corpus.
+//! One seed is one call graph, and a divergence that depends on the shape of a call graph is
+//! invisible to a single generated corpus.
 
 use ply_corpus::{CorpusSpec, build::generate, pipeline, write};
 use ply_eval::differential::compare_tests;
@@ -27,8 +27,8 @@ fn the_two_engines_agree_over_a_sweep_of_generated_corpora() {
         let mut machine = Machine::for_program(&front.program, &front.resolved);
         let report = compare_tests(&mut treewalk, &mut machine, &Fixture::empty());
         assert!(report.is_clean(), "seed {seed}\n{report}");
-        // A sweep that compared no footprints agrees on two axes of three, and
-        // a generated corpus is where the third one earns its keep.
+        // A sweep that compared no footprints agrees on two axes of three, and a generated corpus
+        // is where the third one earns its keep.
         assert_eq!(report.footprints_compared, report.compared, "seed {seed}");
         compared += report.compared;
         atoms += machine.trace().performs();

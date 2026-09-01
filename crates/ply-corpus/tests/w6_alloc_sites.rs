@@ -1,31 +1,4 @@
 //! Which call sites a request's allocations come from.
-//!
-//! `w6_request_cost.rs` says how many allocations a layer costs. It does not say
-//! *which code* allocates, and a lever chosen from a layer total is a lever
-//! chosen from an aggregate. This captures a backtrace per allocation and ranks
-//! the sites, so an optimization is aimed at a frame rather than at a rung.
-//!
-//! The capture is re-entrant-guarded because `Backtrace` allocates; the guard is
-//! why the numbers here are a *sample of sites* and the counts in
-//! `w6_request_cost.rs` remain the authority on totals.
-//!
-//! # The window is part of the measurement
-//!
-//! `w3::Loaded::over_sim` builds one `Machine` for the whole script, so anything
-//! a machine does once — lowering a definition the first time it is reached,
-//! deciding a region's kind, building the definition table — is divided by
-//! however many requests the script carries. Two windows over the same code
-//! therefore disagree about the total *and about the ranking*, because the
-//! one-time work's share falls as the window grows while the per-request work's
-//! share rises.
-//!
-//! That is the whole difference between this file's figure and
-//! `./target/release/w6-alloc --repo . --requests 200`, and
-//! [`the_two_allocation_harnesses_are_one_measurement_read_at_two_windows`]
-//! asserts it rather than leaving it to be rediscovered: the two are checked
-//! against each other at the *same* window, and the per-request slope is
-//! reported separately from the per-machine intercept so a lever is chosen
-//! against the one it would actually move.
 
 use ply_eval::Value;
 use std::alloc::{GlobalAlloc, Layout, System};
@@ -37,8 +10,7 @@ thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
     static INSIDE: Cell<bool> = const { Cell::new(false) };
     static SITES: RefCell<HashMap<String, (usize, usize)>> = RefCell::new(HashMap::new());
-    /// Code address -> the `ply_*` names at it. Written inside the allocator
-    /// under `INSIDE`, so what it allocates is not counted as the program's.
+    /// Code address -> the `ply_*` names at it.
     static NAMES: RefCell<HashMap<usize, Vec<String>>> = RefCell::new(HashMap::new());
     static TOTAL: Cell<usize> = const { Cell::new(0) };
 }
@@ -71,14 +43,8 @@ unsafe impl GlobalAlloc for Tracing {
 #[global_allocator]
 static ALLOCATOR: Tracing = Tracing;
 
-/// The nearest few `ply_*` frames, which is the attribution that matters: a
-/// `RawVec::grow` frame names the allocator, not the code that wanted the room.
-///
-/// The resolve is memoised per code address. `tests/r4_value_construction.rs`
-/// carries the reasoning at its own `frames`; the short version is that
-/// `Backtrace::force_capture()` plus `format!("{bt}")` symbolicates the whole
-/// stack, this runs on every allocation, and the set of addresses that
-/// allocate is small and fixed.
+/// The nearest few `ply_*` frames, which is the attribution that matters: a `RawVec::grow` frame
+/// names the allocator, not the code that wanted the room.
 fn site() -> String {
     let mut frames: Vec<String> = Vec::new();
     backtrace::trace(|frame| {
@@ -93,8 +59,7 @@ fn site() -> String {
     }
 }
 
-/// The `ply_*` names at one frame, or empty for a frame this file drops. A
-/// `Vec` because one address can carry several inlined frames.
+/// The `ply_*` names at one frame, or empty for a frame this file drops.
 fn named(frame: &backtrace::Frame) -> Vec<String> {
     let ip = frame.ip() as usize;
     if let Some(hit) = NAMES.with(|c| c.borrow().get(&ip).cloned()) {
@@ -123,9 +88,6 @@ fn repo() -> PathBuf {
 }
 
 /// One armed window: what it allocated, and where.
-///
-/// The map is handed back rather than left in the thread-local, because the
-/// question this file exists to answer needs two windows side by side.
 struct Window {
     requests: usize,
     total: usize,
@@ -156,8 +118,8 @@ fn capture<T>(requests: usize, f: impl FnOnce() -> T) -> Window {
     }
 }
 
-/// One connection per request, which is the script `w6-alloc` drives and so the
-/// only shape whose totals are comparable with it.
+/// One connection per request, which is the script `w6-alloc` drives and so the only shape whose
+/// totals are comparable with it.
 fn script(request: &[u8], requests: usize) -> Vec<Vec<Vec<u8>>> {
     (0..requests).map(|_| vec![request.to_vec()]).collect()
 }
@@ -193,14 +155,7 @@ fn the_request_paths_allocation_sites_are_ranked() {
     report("whole request over SimNet", &window);
 }
 
-/// The share above which one site owning a request is a finding rather than a
-/// profile.
-///
-/// W6 found the control stack's link push at 47% across its three call sites and
-/// pooled it; the largest single site after that is 29%. A regression that put a
-/// fresh allocation back on a per-step path would show here as one frame owning
-/// the request, and so would a build whose symbols did not resolve — every
-/// sample would land in `<no ply frame>`, which is 100% and is meant to fail.
+/// The share above which one site owning a request is a finding rather than a profile.
 const CONCENTRATION_LIMIT: f64 = 0.50;
 
 fn report(name: &str, window: &Window) {
@@ -239,24 +194,14 @@ fn report(name: &str, window: &Window) {
     );
 }
 
-// ------------------------------------------------- the two windows, reconciled
-
 /// The window this file's ranking has always been taken over.
 const SMALL: usize = 20;
 
-/// The window `w6-alloc` is published at, and the one ADR 0017's readings are
-/// taken over.
+/// The window `w6-alloc` is published at, and the one ADR 0017's readings are taken over.
 const LARGE: usize = 200;
 
-/// How far the two harnesses may disagree at the same window before the
-/// disagreement is a defect in one of them rather than the noise of a warm-up.
-///
-/// They count the same event through two different global allocators over the
-/// same call, so the only legitimate spread is the handful of allocations one
-/// process makes before arming that the other does not. It has measured well
-/// inside a tenth of a percent; the band is wide enough that a lazily-built
-/// table moving between them is not a failure and narrow enough that a route or
-/// a script change is.
+/// How far the two harnesses may disagree at the same window before the disagreement is a defect in
+/// one of them rather than the noise of a warm-up.
 const HARNESS_BAND: f64 = 0.02;
 
 #[test]
@@ -286,8 +231,8 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
             .expect("the service serves")
     });
 
-    // The per-request slope and the per-machine intercept, from two points on
-    // one line rather than from an assumption about which frames are one-time.
+    // The per-request slope and the per-machine intercept, from two points on one line rather than
+    // from an assumption about which frames are one-time.
     let span = (LARGE - SMALL) as f64;
     let marginal = |site: &str| (large.count(site) - small.count(site)) / span;
     let per_machine = |site: &str| small.count(site) - marginal(site) * SMALL as f64;
@@ -351,10 +296,9 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         );
     }
 
-    // The two candidates R3 was planned against, rolled up over every chain a
-    // frame of theirs appears in: both are whole-program compile-time analyses
-    // and a per-site row understates them by splitting one pass across its
-    // recursion depths.
+    // The two candidates R3 was planned against, rolled up over every chain a frame of theirs
+    // appears in: both are whole-program compile-time analyses and a per-site row understates them
+    // by splitting one pass across its recursion depths.
     println!("\n== the two hoist candidates, over every site their frames appear in");
     println!(
         "  {:>9} {:>10} {:>9} {:>9}  family",
@@ -369,10 +313,8 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
         );
     }
 
-    // `Machine::definition` memoizes a lowered top-level body; the
-    // `ClosureKind::Fn` arm beside it does not, and lowers a lambda's body on
-    // every apply. So a slope of zero on one route is not a property of
-    // lowering, and a second path is fitted rather than generalized to.
+    // `Machine::definition` memoizes a lowered top-level body; the `ClosureKind::Fn` arm beside it
+    // does not, and lowers a lambda's body on every apply.
     let routing = loaded
         .full("w6_bench")
         .expect("the driver declares w6_bench");
@@ -429,10 +371,6 @@ fn the_two_allocation_harnesses_are_one_measurement_read_at_two_windows() {
 }
 
 /// The two compile-time analyses R3 proposes to hoist off the request path.
-///
-/// Rolled up over every chain a frame of theirs appears in, because both are
-/// recursive whole-program passes and a per-site row splits one pass across its
-/// own recursion depths.
 const HOISTS: [&str; 2] = ["ply_eval::region_kind", "ply_eval::code::lower"];
 
 fn family_count(family: &str, window: &Window) -> f64 {
@@ -444,8 +382,7 @@ fn family_count(family: &str, window: &Window) -> f64 {
         .sum()
 }
 
-/// A family's per-iteration slope and its per-`Machine` intercept, from the two
-/// windows.
+/// A family's per-iteration slope and its per-`Machine` intercept, from the two windows.
 fn fit(family: &str, small: &Window, large: &Window) -> (f64, f64) {
     let slope = (family_count(family, large) - family_count(family, small))
         / (large.requests - small.requests) as f64;
@@ -455,12 +392,8 @@ fn fit(family: &str, small: &Window, large: &Window) -> (f64, f64) {
     )
 }
 
-/// The counting binary beside this test binary — `target/<profile>/w6-alloc`
-/// against `target/<profile>/deps/w6_alloc_sites-<hash>`.
-///
-/// `cargo test -p ply-corpus` builds the package's binaries, so it is normally
-/// there; a `--test` run against a target directory that has never built the
-/// workspace is the case that skips.
+/// The counting binary beside this test binary — `target/<profile>/w6-alloc` against
+/// `target/<profile>/deps/w6_alloc_sites-<hash>`.
 fn w6_alloc_binary() -> Option<PathBuf> {
     let mine = std::env::current_exe().ok()?;
     let path = mine.parent()?.parent()?.join("w6-alloc");

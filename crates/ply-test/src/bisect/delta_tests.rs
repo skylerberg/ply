@@ -1,9 +1,5 @@
-//! Delta construction over real programs: the `Edited`/`Derived` split, the
-//! fusion rule, and the classifier's refusals.
-//!
-//! The search itself is exercised against an oracle; these tests are about what
-//! the search is handed, which is where a wrong answer would be silent rather
-//! than loud.
+//! Delta construction over real programs: the `Edited`/`Derived` split, the fusion rule, and the
+//! classifier's refusals.
 
 use super::classify::{Classify, Unknown};
 use super::{
@@ -76,9 +72,8 @@ impl Compiled {
     }
 }
 
-/// A classifier with the real re-normalizer and no interface evidence, so every
-/// edit is fused-eligible. Interface comparison needs the front-end cache, which
-/// `StoreClassify` supplies; the split being tested here is the other one.
+/// A classifier with the real re-normalizer and no interface evidence, so every edit is
+/// fused-eligible.
 struct Renormalizing<'a> {
     renormalizer: Renormalizer<'a>,
     table: EraTable,
@@ -145,8 +140,8 @@ test "chain" {
 }
 "#;
 
-/// The whole point of doing this in a content-addressed system: one edit moves
-/// three hashes, and only one of them is a change anybody made.
+/// The whole point of doing this in a content-addressed system: one edit moves three hashes, and
+/// only one of them is a change anybody made.
 #[test]
 fn an_edit_to_a_leaf_leaves_its_dependents_derived() {
     let before = Compiled::new(CHAIN);
@@ -195,8 +190,8 @@ fn two_edits_are_two_candidates() {
     assert_eq!(diff.delta.clusters.len(), 2);
 }
 
-/// A rename moves no hash, so there is nothing for the delta to explain — the
-/// headline invariant, observed from the far end of the pipeline.
+/// A rename moves no hash, so there is nothing for the delta to explain — the headline invariant,
+/// observed from the far end of the pipeline.
 #[test]
 fn renaming_a_definition_produces_no_change_at_all() {
     let before = Compiled::new(CHAIN);
@@ -220,8 +215,8 @@ fn editing_the_test_body_is_recorded_on_the_test_rather_than_on_a_definition() {
     assert!(!diff.test_unclassified);
 }
 
-/// A test whose closure moved has a different hash too, and reading that as an
-/// edit to the test would name the one definition nobody touched.
+/// A test whose closure moved has a different hash too, and reading that as an edit to the test
+/// would name the one definition nobody touched.
 #[test]
 fn a_test_whose_closure_moved_is_not_itself_a_change() {
     let before = Compiled::new(CHAIN);
@@ -269,8 +264,8 @@ fn a_removed_definition_is_a_candidate() {
     assert_eq!(kind_of(&diff, "mid"), Some(ChangeKind::Edited));
 }
 
-/// Mutual recursion goes through component hashing, which this classifier
-/// reproduces; the assertion is that it stays exact rather than degrading.
+/// Mutual recursion goes through component hashing, which this classifier reproduces; the assertion
+/// is that it stays exact rather than degrading.
 #[test]
 fn a_mutually_recursive_pair_is_classified_rather_than_given_up_on() {
     let src = r#"
@@ -294,8 +289,8 @@ test "parity holds" {
     assert!(diff.unclassified.is_empty(), "{:?}", diff.unclassified);
 }
 
-/// Editing one member of a recursive component moves both members' hashes, and
-/// neither is derived: the component is the unit of identity.
+/// Editing one member of a recursive component moves both members' hashes, and neither is derived:
+/// the component is the unit of identity.
 #[test]
 fn editing_one_member_of_a_component_moves_the_whole_component() {
     let src = r#"
@@ -317,8 +312,7 @@ test "parity holds" {
     assert_eq!(kind_of(&diff, "even"), Some(ChangeKind::Edited));
 }
 
-/// The refusal path. A classifier that cannot decide must widen the search, and
-/// must never quietly mark something derived.
+/// The refusal path.
 #[test]
 fn a_classifier_with_no_evidence_calls_everything_edited() {
     let before = Compiled::new(CHAIN);
@@ -348,9 +342,7 @@ fn a_classifier_with_no_evidence_calls_everything_edited() {
     assert_eq!(diff.delta.clusters.len(), 1);
 }
 
-/// The witness is what makes a private copy of the hashing algorithm safe. If it
-/// ever fails on a program this simple, the copy has drifted and every `Derived`
-/// it would have produced is a guess.
+/// The witness is what makes a private copy of the hashing algorithm safe.
 #[test]
 fn the_renormalizer_reproduces_every_hash_ply_hash_published() {
     for src in [CHAIN, include_str!("../../../../examples/ledger.ply")] {
@@ -381,8 +373,6 @@ fn re_normalizing_against_the_current_table_is_the_identity() {
     }
 }
 
-// ------------------------------------------------------- the real classifier
-
 struct TempRoot(std::path::PathBuf);
 
 impl TempRoot {
@@ -406,8 +396,8 @@ impl Drop for TempRoot {
     }
 }
 
-/// Files the baseline's interface into the store the way a passing run would
-/// have, so `StoreClassify` has both sides to compare.
+/// Files the baseline's interface into the store the way a passing run would have, so
+/// `StoreClassify` has both sides to compare.
 fn stored(before: &Compiled, names: &[&str]) -> (TempRoot, ply_store::Store) {
     let root = TempRoot::new();
     let mut store = ply_store::Store::open(&root.0).expect("open store");
@@ -432,9 +422,8 @@ test "totals" {
 }
 "#;
 
-/// An edit that leaves the published interface alone can be swapped under its
-/// callers without any of them noticing, which is exactly the condition under
-/// which a hybrid still typechecks.
+/// An edit that leaves the published interface alone can be swapped under its callers without any
+/// of them noticing, which is exactly the condition under which a hybrid still typechecks.
 #[test]
 fn an_interface_preserving_edit_is_independent() {
     let before = Compiled::new(SIGNATURE);
@@ -452,8 +441,8 @@ fn an_interface_preserving_edit_is_independent() {
     );
 }
 
-/// A signature change is what makes most mixtures ill-typed, and it is the one
-/// the fusion rule exists for.
+/// A signature change is what makes most mixtures ill-typed, and it is the one the fusion rule
+/// exists for.
 #[test]
 fn a_signature_change_is_not_independent() {
     let before = Compiled::new(SIGNATURE);
@@ -478,8 +467,8 @@ fn a_signature_change_is_not_independent() {
     );
 }
 
-/// A pruned cache costs a fused cluster, not a wrong answer, so the refusal has
-/// to be distinguishable from a "yes".
+/// A pruned cache costs a fused cluster, not a wrong answer, so the refusal has to be
+/// distinguishable from a "yes".
 #[test]
 fn an_interface_the_store_never_saw_is_a_refusal_rather_than_a_yes() {
     let before = Compiled::new(SIGNATURE);
@@ -498,8 +487,8 @@ fn an_interface_the_store_never_saw_is_a_refusal_rather_than_a_yes() {
     );
 }
 
-/// The real classifier, end to end: the store answers the interface question and
-/// the re-normalizer answers the edited/derived one.
+/// The real classifier, end to end: the store answers the interface question and the re-normalizer
+/// answers the edited/derived one.
 #[test]
 fn the_store_backed_classifier_produces_the_same_split() {
     let before = Compiled::new(SIGNATURE);
@@ -525,8 +514,6 @@ fn the_store_backed_classifier_produces_the_same_split() {
     assert_eq!(diff.delta.clusters.len(), 1);
     assert_eq!(diff.delta.clusters[0].members, vec![Symbol::new("scale")]);
 }
-
-// ------------------------------------------------------------ across modules
 
 fn compiled_program(modules: &[(&str, &str)]) -> Compiled {
     use ply_syntax::ast::ModuleName;
@@ -572,10 +559,8 @@ test "doubling" {
 }
 "#;
 
-/// Effect slots are a de Bruijn level over the effects a component can reach,
-/// and they are computed from the reference graph rather than from any name. A
-/// copy that got that wrong would still produce plausible hashes, so the witness
-/// has to see a program with an effect and a module boundary in it.
+/// Effect slots are a de Bruijn level over the effects a component can reach, and they are computed
+/// from the reference graph rather than from any name.
 #[test]
 fn the_witness_holds_across_a_module_boundary() {
     let compiled = compiled_program(&[("store", STORE), ("app", APP)]);
@@ -584,8 +569,8 @@ fn the_witness_holds_across_a_module_boundary() {
     assert!(renormalizer.witnessed_test(&Symbol::new("app.doubling")));
 }
 
-/// Moving a definition between modules changes no hash, so it must produce no
-/// change for a bisection to chase either.
+/// Moving a definition between modules changes no hash, so it must produce no change for a
+/// bisection to chase either.
 #[test]
 fn an_edit_in_one_module_leaves_its_importer_derived() {
     let before = compiled_program(&[("store", STORE), ("app", APP)]);

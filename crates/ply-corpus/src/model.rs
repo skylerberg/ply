@@ -1,9 +1,4 @@
 //! The corpus as data, plus the reference evaluator.
-//!
-//! Every generated definition is mirrored here in Rust so a test can assert a
-//! real expected value instead of a tautology. That mirror is the load-bearing
-//! part of this file: if it disagrees with `ply-eval` by one, the corpus does
-//! not pass and the generator refuses to write it.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -12,8 +7,7 @@ pub type DefId = usize;
 pub type ModuleId = usize;
 pub type SpecimenId = usize;
 
-/// `prim::clamp`'s modulus. Every generated body funnels through it, which is
-/// what keeps a value in a range where no intermediate can overflow `Int`.
+/// `prim::clamp`'s modulus.
 pub const CLAMP: i64 = 100_003;
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -80,38 +74,28 @@ impl Atom {
 pub type Footprint = BTreeSet<Atom>;
 
 /// What the generator built a claim to be discharged by.
-///
-/// The prover is free to do better or worse than this, and a measurement is
-/// worth having in both directions: a `proved` where the generator expected
-/// sampling is worth a second look, and a sampled result where it expected a
-/// decision is reach the prover does not have. It is an expectation, never an
-/// assertion — nothing here may be read back as a tier.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Intent {
-    /// Settled statically: linear arithmetic, a split over a constructor set, a
-    /// ground evaluation or a finite enumeration.
+    /// Settled statically: linear arithmetic, a split over a constructor set, a ground evaluation
+    /// or a finite enumeration.
     Decided,
-    /// Reaches a recursive definition or a builtin the prover has no rule for,
-    /// so the strongest honest answer is a case report.
+    /// Reaches a recursive definition or a builtin the prover has no rule for, so the strongest
+    /// honest answer is a case report.
     Sampled,
-    /// The owner performs an effect nothing supplies a handler for, so the
-    /// obligation cannot be attempted at all.
+    /// The owner performs an effect nothing supplies a handler for, so the obligation cannot be
+    /// attempted at all.
     Gap,
 }
 
 /// The claim attached to an ordinary generated definition.
-///
-/// One `requires` and one `ensures`, so that "obligations" and "definitions
-/// carrying an obligation" differ by exactly the specimens below — a measurement
-/// pricing discharge per obligation should not have to divide first.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Claim {
     pub intent: Intent,
 }
 
-/// A shape drives both the emitted source and the reference evaluator, so the
-/// two cannot drift apart.
+/// A shape drives both the emitted source and the reference evaluator, so the two cannot drift
+/// apart.
 #[derive(Clone, Debug)]
 pub struct Def {
     pub id: DefId,
@@ -119,8 +103,7 @@ pub struct Def {
     pub name: String,
     pub arity: usize,
     pub shape: Shape,
-    /// Extra calls folded into the definition's tail. This is what pushes the
-    /// mean out-degree above what a single shape provides.
+    /// Extra calls folded into the definition's tail.
     pub extras: Vec<Call>,
     pub footprint: Footprint,
     pub weight: u32,
@@ -203,16 +186,14 @@ impl Shape {
         matches!(self, Shape::TableAppend { .. } | Shape::CachePoke { .. })
     }
 
-    /// A body that emits as exactly one expression on one line. The benchmark's
-    /// edit sites need one, because a one-line body can be rewritten textually
-    /// without a parser.
+    /// A body that emits as exactly one expression on one line.
     pub fn is_one_liner(&self) -> bool {
         !self.is_block() && !matches!(self, Shape::Sum { .. })
     }
 }
 
-/// The per-module `stage` helper: the only definition that returns the module's
-/// sum type, and the reason a `match` appears in generated code at all.
+/// The per-module `stage` helper: the only definition that returns the module's sum type, and the
+/// reason a `match` appears in generated code at all.
 #[derive(Clone, Debug)]
 pub struct Helper {
     pub name: String,
@@ -237,8 +218,8 @@ pub struct Module {
 }
 
 impl Module {
-    /// The name another module refers to this one by: `ImportDecl::binder` is
-    /// the last path segment.
+    /// The name another module refers to this one by: `ImportDecl::binder` is the last path
+    /// segment.
     pub fn binder(&self) -> &str {
         self.name.rsplit('.').next().unwrap_or(&self.name)
     }
@@ -253,25 +234,21 @@ pub struct Test {
     pub calls: Vec<Vec<i64>>,
     pub expected: Vec<i64>,
     pub world: World,
-    /// Exactly the atoms the mirror saw performed. A declared atom that never
-    /// fires gets no clause, so it survives into the test's own footprint —
-    /// which is where a non-trivial conflict graph comes from.
+    /// Exactly the atoms the mirror saw performed.
     pub granted: Footprint,
-    /// Table index -> length after every call, asserted at the end so a write
-    /// that silently does nothing cannot pass.
+    /// Table index -> length after every call, asserted at the end so a write that silently does
+    /// nothing cannot pass.
     pub final_table_len: Vec<(usize, usize)>,
     pub final_region: Vec<(usize, i64)>,
 }
 
-/// The state a test's handlers stand in for. Read-only resources never change,
-/// so the same value serves as both the handler's literal and the mirror's seed.
+/// The state a test's handlers stand in for.
 #[derive(Clone, Debug, Default)]
 pub struct World {
     pub tables: Vec<(usize, Vec<i64>)>,
     pub regions: Vec<(usize, i64)>,
     pub clock: i64,
-    /// Every atom performed so far. Under-reporting here becomes an unhandled
-    /// effect at runtime, which is why `verify` runs on every generated corpus.
+    /// Every atom performed so far.
     pub touched: Footprint,
 }
 
@@ -322,14 +299,8 @@ impl World {
     }
 }
 
-/// One task of a concurrent test: a `fn` of its own that bumps one shard
-/// `steps.len()` times with a `task.yield()` between each pair.
-///
-/// A bump is a single operation, so the handler's read-modify-write of the
-/// backing cell cannot be split by any schedule and the shard's total is the
-/// same under all of them. The *order* the bumps land in is not, which is the
-/// point: the outcome is interleaving-invariant so the corpus stays green, and
-/// the search still has every order to prune.
+/// One task of a concurrent test: a `fn` of its own that bumps one shard `steps.len()` times with a
+/// `task.yield()` between each pair.
 #[derive(Clone, Debug)]
 pub struct TaskBody {
     pub name: String,
@@ -344,9 +315,7 @@ impl TaskBody {
     }
 }
 
-/// A `simulate` test. Conflict density is expressed as nothing but the mapping
-/// of tasks to shards, because that mapping is the whole of what the dependence
-/// relation reads.
+/// A `simulate` test.
 #[derive(Clone, Debug)]
 pub struct ConcurrentTest {
     pub module: ModuleId,
@@ -369,9 +338,7 @@ impl ConcurrentTest {
         self.tasks.iter().map(TaskBody::contributed).sum()
     }
 
-    /// Tasks that share their shard with another task, over all tasks. The
-    /// measured counterpart of `CorpusSpec::conflict_density`, so a measurement
-    /// reports what the corpus has rather than what was asked for.
+    /// Tasks that share their shard with another task, over all tasks.
     pub fn contention(&self) -> f64 {
         if self.tasks.is_empty() {
             return 0.0;
@@ -386,11 +353,6 @@ impl ConcurrentTest {
 }
 
 /// A definition written for its obligation rather than for its call graph.
-///
-/// The ordinary generated bodies all funnel through `prim::clamp`, whose `%` is
-/// outside the proved fragment on purpose, so every claim about one of them is
-/// sampled. A corpus of nothing but sampled obligations measures one column of
-/// the tier table and calls it a distribution. These are the other columns.
 #[derive(Clone, Debug)]
 pub struct Specimen {
     pub id: SpecimenId,
@@ -401,16 +363,12 @@ pub struct Specimen {
 
 #[derive(Clone, Copy, Debug)]
 pub enum SpecimenKind {
-    /// `x * a + b`, with a postcondition that is the same claim rearranged, so
-    /// closing it is linear arithmetic rather than syntactic identity.
+    /// `x * a + b`, with a postcondition that is the same claim rearranged, so closing it is linear
+    /// arithmetic rather than syntactic identity.
     Linear { a: i64, b: i64 },
-    /// A split over the module's own two-constructor status type. Both arms are
-    /// literals, so every branch closes and the split is over the constructor
-    /// set rather than the value space.
+    /// A split over the module's own two-constructor status type.
     Status,
-    /// A walk down a list, calling itself. A member of a recursive component is
-    /// never unfolded — that is where induction would be needed and there is
-    /// none — so a claim about it is sampled however simple it looks.
+    /// A walk down a list, calling itself.
     Length,
 }
 
@@ -423,7 +381,7 @@ impl SpecimenKind {
     }
 }
 
-/// A standalone claim. Labelled like a test, so nothing can reference it.
+/// A standalone claim.
 #[derive(Clone, Debug)]
 pub struct Law {
     pub module: ModuleId,
@@ -435,8 +393,8 @@ pub struct Law {
 pub enum LawKind {
     /// No binders: a domain of one point, decided by evaluating it.
     Ground { a: i64, b: i64 },
-    /// Two `Bool` binders, so the domain is four points and enumerating it is a
-    /// decision rather than a sample.
+    /// Two `Bool` binders, so the domain is four points and enumerating it is a decision rather
+    /// than a sample.
     Finite,
     /// Over a [`SpecimenKind::Length`] definition, so it is sampled.
     Length { specimen: SpecimenId },
@@ -482,8 +440,8 @@ pub fn total(xs: &[i64]) -> i64 {
 }
 
 impl Corpus {
-    /// The value `def(args)` evaluates to under `world`, which is mutated by
-    /// exactly the writes the definition performs.
+    /// The value `def(args)` evaluates to under `world`, which is mutated by exactly the writes the
+    /// definition performs.
     pub fn eval(&self, def: DefId, args: &[i64], world: &mut World) -> i64 {
         let def = &self.defs[def];
         let p0 = args.first().copied().unwrap_or(0);
@@ -607,9 +565,7 @@ impl Corpus {
         self.laws.iter().filter(move |l| l.module == module)
     }
 
-    /// Every obligation the corpus carries, by what the generator built it to be
-    /// discharged by. A `requires` is not one: it filters the domain of the
-    /// `ensures` beside it rather than making a claim of its own.
+    /// Every obligation the corpus carries, by what the generator built it to be discharged by.
     pub fn obligations_by_intent(&self) -> [usize; 3] {
         let mut out = [0usize; 3];
         let mut count = |intent: Intent| match intent {
@@ -634,8 +590,8 @@ impl Corpus {
     }
 }
 
-/// A second parameter is synthesized from the call's own offset rather than
-/// drawn, so emission and evaluation cannot pick different values for it.
+/// A second parameter is synthesized from the call's own offset rather than drawn, so emission and
+/// evaluation cannot pick different values for it.
 pub fn call_args(arity: usize, first: i64, offset: i64) -> Vec<i64> {
     if arity >= 2 {
         vec![first, second_arg(offset)]

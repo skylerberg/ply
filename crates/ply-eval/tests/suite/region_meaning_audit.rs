@@ -1,22 +1,4 @@
 //! The observables that decide whether the region model preserved meaning.
-//!
-//! ADR 0017's governing property is that **program meaning does not change**:
-//! representation and cost move, semantics do not. That property is only
-//! checkable against programs whose answer *differs* between the two candidate
-//! readings, so this file is exactly those programs and nothing else.
-//!
-//! Every test here asserts the answer ADR 0005 §3 fixed and the current engines
-//! produce. Each one names, in its own doc comment, the number the alternative
-//! reading — snapshot the region's arena at capture and restore it at every
-//! resumption — would produce instead. A file of programs that answer the same
-//! under both readings would prove nothing; these are the discriminators.
-//!
-//! **`--engine both` cannot stand in for this.** That oracle compares the
-//! tree-walker against the machine. Both hold the same state representation, so
-//! a change to the memory model moves both of them together and the comparison
-//! stays green whatever it did to meaning. The only oracle for "meaning did not
-//! move" is a fixed expected value, written down before the change, which is
-//! what this file is.
 
 use ply_core::check_program;
 use ply_eval::differential::compare_tests;
@@ -38,10 +20,6 @@ fn load(src: &str) -> (Program, Resolved) {
 }
 
 /// Runs every test on both engines and requires all of them to pass.
-///
-/// A probe that fails to compile, or that both engines refuse in the same way,
-/// would "agree" and prove nothing about the observable it was written for, so
-/// passing is asserted separately from agreeing.
 #[track_caller]
 fn holds(src: &str) {
     let (program, resolved) = load(src);
@@ -74,17 +52,6 @@ effect state {
 "#;
 
 /// **ADR 0005 §3.1's canonical state handler, in the general clause form.**
-///
-/// The `put` clause writes the cell and *then* resumes. Threaded, the resumed
-/// computation runs after the write and `get` answers `5`. Under
-/// snapshot-at-capture the clause's own write is discarded before the
-/// computation that asked for it ever runs, and the answer is `0`.
-///
-/// ADR 0017 §3 lists exactly this shape as its "one resumption — the ordinary
-/// case" and claims a `shared` region's snapshot reading is "indistinguishable
-/// from ADR 0005". This program is the counterexample to that claim, and it is
-/// the reason ADR 0005 §3.1 rejected snapshotting: it does not merely cost
-/// something, it makes a cell-backed state handler unwritable.
 #[test]
 fn a_general_clause_write_is_visible_to_the_computation_it_resumes() {
     holds(&format!(
@@ -104,17 +71,8 @@ test "put then get answers what was put" {{
     ));
 }
 
-/// The same handler in the **tail-resumptive** form, which is the shape every
-/// handler in the standard library and the examples is written in.
-///
-/// `op(x) -> e` is `op(x) resume k -> k(e)`, so the machine captures a
-/// continuation here too — ADR 0005 §1.3's `Perform` rule runs `K.capture(n)`
-/// for both clause forms. A region kind inferred from "is a continuation
-/// captured across this region" therefore classifies **every** region
-/// containing a `handle` as `shared`, and snapshot-at-capture then discards
-/// this clause's write exactly as it discards the general clause's above.
-///
-/// Threaded: `5`. Snapshot: `0`.
+/// The same handler in the **tail-resumptive** form, which is the shape every handler in the
+/// standard library and the examples is written in.
 #[test]
 fn a_tail_resumptive_clause_write_is_visible_to_the_computation_it_resumes() {
     holds(&format!(
@@ -134,19 +92,7 @@ test "a tail-resumptive put is seen by the following get" {{
     ));
 }
 
-/// **ADR 0005 §3.2's "resumes twice", which ADR 0017 §3 as amended requires the
-/// same answer for.**
-///
-/// One threaded state: the first branch increments the cell to `1`, the second
-/// resumption starts from that and reaches `2`, so the total is `1 + 2*10 = 21`
-/// and the cell ends at `2`. Under snapshot-at-capture both branches see `0`,
-/// the total is `1 + 1*10 = 11` and the cell ends at `1`.
-///
-/// The threaded numbers are the ones asserted. ADR 0017 §3's first draft asked
-/// for the snapshot ones and was retracted, because restoring the region at a
-/// resumption discards the clause's own write and makes every cell-backed state
-/// handler unwritable; a reader tempted to re-propose it should read the
-/// amendment rather than this file.
+/// **ADR 0005 §3.2's "resumes twice", which ADR 0017 §3 as amended requires the same answer for.**
 #[test]
 fn two_resumptions_thread_one_state_rather_than_branching_it() {
     holds(
@@ -171,15 +117,8 @@ test "the second resumption starts from the first one's writes" {
     );
 }
 
-/// **The same discriminator with `handle` and `with_cell` swapped**, which is
-/// the shape ADR 0017 §3 writes its two-resumption example in.
-///
-/// The cell is allocated before the capture, so one cell serves both
-/// resumptions and the machine confirms both write it: the total is `21`,
-/// exactly as when the region encloses the handler. This is the program
-/// `ply_eval::region_kind` used to answer `unique` for — a claim that the
-/// region's slots may go back to the bump pointer at its close, made about a
-/// region the enclosing handler resumes into twice.
+/// **The same discriminator with `handle` and `with_cell` swapped**, which is the shape ADR 0017 §3
+/// writes its two-resumption example in.
 #[test]
 fn two_resumptions_thread_one_region_the_enclosing_handler_answers_for() {
     holds(
@@ -203,14 +142,7 @@ test "the region under an enclosing handler is written by both resumptions" {
     );
 }
 
-/// Per-resumption state is what a handler *builds*, not what the machine
-/// imposes — ADR 0005 §3.3.
-///
-/// The direction matters more than either answer: a handler can build snapshot
-/// semantics out of threaded semantics in four lines, and cannot build threaded
-/// semantics out of snapshot semantics at all. That asymmetry is the argument
-/// against making snapshot the default, and it is only checkable if the
-/// save-and-restore idiom keeps working, which is what this asserts.
+/// Per-resumption state is what a handler *builds*, not what the machine imposes — ADR 0005 §3.3.
 #[test]
 fn a_handler_builds_per_branch_state_out_of_threaded_state() {
     holds(
@@ -241,19 +173,6 @@ test "save and restore around each resumption gives both branches one start" {
 }
 
 /// **ADR 0005 required test 6, which ADR 0017 §2 turns into a compile error.**
-///
-/// A continuation is parked in an enclosing region's cell and applied after the
-/// `with_cell` whose cell it reads has already returned its value. The world is
-/// monotone, so the read succeeds and the answer is `7`.
-///
-/// ADR 0017 §2 says "capturing it in a closure that outlives the region" is an
-/// escape and therefore a type error reported where the value would escape.
-/// This program is that shape, it is landed, and it passes. Refusing it is a
-/// change of meaning from "answers 7" to "does not compile", which is the one
-/// thing §"The property this ADR must not break" forbids — so if the brand is
-/// to refuse it, ADR 0005's required test 6 has to be retired by an explicit
-/// decision recorded in ADR 0017, not by an implementation that happens to
-/// reject it.
 #[test]
 fn a_continuation_outliving_its_region_still_reads_that_regions_cell() {
     holds(
@@ -284,14 +203,8 @@ test "a continuation resumed after its region returned reads that region's cell"
     );
 }
 
-/// A `with_cell` inside a handled body runs once per resumption and each run
-/// allocates its own cell, so the two branches of a search do not share their
-/// scratch state.
-///
-/// The tally discriminates: `1 + 1 = 2` when each branch starts from its own
-/// zero, and `1 + 2 = 3` when the second branch inherits the first's. This is
-/// the property a region arena has to keep when a `shared` region is entered
-/// twice — an arena reused across resumptions would answer `3`.
+/// A `with_cell` inside a handled body runs once per resumption and each run allocates its own
+/// cell, so the two branches of a search do not share their scratch state.
 #[test]
 fn each_resumption_allocates_its_own_region_cell() {
     holds(
@@ -320,10 +233,6 @@ test "each resumption allocates its own region cell" {
 }
 
 /// A cell reached through a continuation captured inside `map`'s callback.
-///
-/// `map` is a frame rather than host recursion precisely so this is expressible
-/// (ADR 0005 §1.2). The cell count is the discriminator again: `2` threaded,
-/// `1` snapshotted.
 #[test]
 fn a_continuation_captured_inside_map_threads_the_same_state() {
     holds(
@@ -345,17 +254,8 @@ test "a continuation captured inside a map callback produces two lists" {
     );
 }
 
-/// The shape `std.db.transaction` is: a handler whose clause **does not**
-/// resume, installed by a function called from inside a region whose cell the
-/// clauses write.
-///
-/// Two things are pinned. The journal ends `["begin", "one", "abort"]`: the
-/// body's writes before the `perform` survive, the clause's own write survives,
-/// and the discarded continuation's writes never happened. And the capture that
-/// decides this region's kind is **not lexically inside it** — it is in
-/// `scoped`, which a region-kind inference has to reach through a call to see.
-/// An inference that only looks at a region's own syntax infers `unique` here
-/// and skips a snapshot that its own rules said was required.
+/// The shape `std.db.transaction` is: a handler whose clause **does not** resume, installed by a
+/// function called from inside a region whose cell the clauses write.
 #[test]
 fn a_non_resuming_clause_keeps_the_writes_that_preceded_it() {
     holds(
@@ -396,15 +296,6 @@ test "a rollback discards the continuation and keeps what preceded it" {
 }
 
 /// W5's collecting trace sink, reduced to its discriminating core.
-///
-/// Every clause writes the sink cell and tail-resumes, so the record list is
-/// built entirely out of writes that a snapshot at each `perform` would throw
-/// away. Threaded, the three operations produce three records in order.
-/// Snapshotted, each clause's write is undone before the next `perform`, the
-/// sink is still empty at the end, and the test reads a length of `0`.
-///
-/// This is the whole of `std.trace`'s twin, and the same shape appears 30 times
-/// across the standard library.
 #[test]
 fn a_collecting_sink_accumulates_across_handler_boundaries() {
     holds(
@@ -435,24 +326,7 @@ test "a collecting handler accumulates every record it was handed" {
     );
 }
 
-/// **The invariant with the highest stakes: a race is found and reproduced from
-/// its seed.**
-///
-/// Two tasks each read a counter, cross a scheduling point, and write back. The
-/// search finds the lost update only because both tasks reach **one** cell in
-/// **one** world, so the second task's read can observe — or fail to observe —
-/// the first task's write. ADR 0006's first required test is this program.
-///
-/// ADR 0017 §5 gives every task its own region stack and says values cannot
-/// cross tasks. ADR 0017 §3 makes the region `shared`, since a continuation is
-/// captured at every one of these `perform`s, and gives each resumption the
-/// arena as of capture. Under either rule the two tasks stop being able to
-/// clobber each other, the assertion holds under every interleaving, and the
-/// search reports `exhaustive` with no failure.
-///
-/// That is not a slower answer or a wider suspect set. It is a green run on a
-/// program with a race in it, produced by a memory model that made the race
-/// unrepresentable — the false-green shape this project has found five times.
+/// **The invariant with the highest stakes: a race is found and reproduced from its seed.**
 #[test]
 fn two_tasks_sharing_one_cell_can_still_lose_an_update() {
     let src = r#"

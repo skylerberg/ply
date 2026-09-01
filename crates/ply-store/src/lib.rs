@@ -1,22 +1,6 @@
-//! Two caches over one `.ply-cache` directory: results,
-//! `(RUNTIME_VERSION, DefHash) -> Outcome` beside the set of definitions a run
-//! has already seen, and the front end,
-//! `(FRONTEND_VERSION, path | DefHash) -> fingerprint | interface | body`.
-//!
-//! Selection in Ply is exact rather than heuristic, so the cache is load-bearing
-//! — a wrong answer here is a test that never runs. Every path in this crate is
-//! arranged so the only two outcomes are "no result", which is safe because the
-//! test re-runs, and "the result that was recorded"; never anything between.
-//!
-//! The two caches get different formats because they answer different
-//! questions. The **result** cache is pretty-printed JSON keyed by hex hash:
-//! it is small, and `cat`ting it to find out why a test did not re-run is worth
-//! far more than its parse cost. The **front-end** cache is a binary
-//! content-addressed store — a small index over an append-only data file, with
-//! entries decoded on demand — because nobody has ever debugged anything by
-//! reading fifteen megabytes of serialized type schemes, while everybody pays
-//! for parsing them. `ply cache inspect` is the readable interface, and prints a
-//! resolved type rather than a serialization of one.
+//! Two caches over one `.ply-cache` directory: results, `(RUNTIME_VERSION, DefHash) -> Outcome`
+//! beside the set of definitions a run has already seen, and the front end, `(FRONTEND_VERSION,
+//! path | DefHash) -> fingerprint | interface | body`.
 
 mod binary;
 mod bodies;
@@ -52,157 +36,26 @@ pub use obligations::{
 pub use reviews::ReviewRecord;
 pub use schema::fingerprint as schema_fingerprint;
 
-/// Bumping this invalidates every cached result in existence: a cache file
-/// written by a different runtime version is discarded whole, never merged.
-/// Bump it for any change to evaluation semantics, to a prelude builtin, to the
-/// hashing scheme, or to the on-disk shape of an [`Outcome`] — none of those
-/// necessarily change a test's `DefHash`, and all of them can change what a
-/// cache hit means.
-///
-/// The shape half of that rule is enforced: a pin test in this crate fails when
-/// the serialized form changes, and says to bump this. The semantic half is
-/// not — no test can see that the evaluator started rounding differently — so a
-/// change to `ply-eval` or to normalization must bump this by hand. **And a
-/// Rust toolchain upgrade counts**: `string_trim`, `string_lower` and
-/// `string_upper` read `std`'s Unicode tables, which is the one thing the
-/// evaluator does that this repository does not decide.
-/// 0.11.0 is W5: `Value::Secret` and the three builtins over it, `render`,
-/// `values_equal` and `compare_values` answering differently on a variant that
-/// did not exist, `HostRuntime::shutdown` and `stopping`, `HostOp::secrets`,
-/// and `end_entry_point` closing spans. Every one of those changes what a
-/// cached `Pass` is a claim about.
-/// 0.11.1 completes it: `map_of_entries` and `map_merge` refuse a `Secret` key
-/// rather than ordering it, and a span id is minted per entry point rather than
-/// per run — so a program that passed by reading an ordering oracle, or by
-/// observing an id another entry point moved, is not a program this evaluator
-/// passes.
-/// 0.11.2: both engines remember what a nullary pure definition evaluated to.
-/// No value moves — that is the argument for doing it — but the calls pending
-/// under a second reference to one do, so a test that recorded `E0502` at the
-/// recursion budget is not a test this evaluator still fails.
-/// 0.12.0 adds `iterate`, an early-terminating loop driven by the same
-/// `Step::Apply` protocol `fold` rides. A bare `iterate` now denotes a builtin
-/// rather than being unresolved, the two engines answer a new pair of
-/// diagnostics — an exhausted budget and a budget below one — and neither says
-/// "recursion limit", which is what a consumer classifying on that string
-/// would have keyed on. A cached `Pass` written before this is a claim about a
-/// program in which `iterate` meant nothing.
-/// 0.13.0 adds `list_at`, the list index. The hazard here is the opposite of a
-/// moved hash: `fn f(xs: List<Int>) -> Option<Int> = list_at(xs, 0)` normalizes
-/// to the same bytes before and after — a builtin call is `tag::FREE` plus a
-/// name, which is nothing but the name — and means `E0101 UNKNOWN_NAME` before
-/// and a value after. A cached `Pass` under that hash is a claim about the
-/// program in which the name meant nothing.
-/// 0.14.0 gives `assert` its second parameter, `message: Option<String> =
-/// None`, and takes `range`'s optional lower bound away. Both arms existed in
-/// this evaluator from the first commit and neither was reachable: the
-/// checker's signatures were one argument and two. Two things move under this.
-/// A failing `assert` can now carry a note it could not carry before, so a
-/// cached `Fail` is a claim about a diagnostic with different text. And every
-/// `assert(c)` in the tree is spliced to `assert(c, None)` before it is hashed,
-/// so its call sites' `DefHash`es move once — the splice is what makes
-/// `assert(c)` and `assert(c, None)` one definition, and the price of that is
-/// paid here, once.
+/// Bumping this invalidates every cached result in existence: a cache file written by a different
+/// runtime version is discarded whole, never merged.
 pub const RUNTIME_VERSION: &str = "0.14.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
-///
-/// Deliberately separate from [`RUNTIME_VERSION`]: a change to the evaluator
-/// invalidates results without invalidating types, and a change to inference
-/// invalidates types without invalidating a result that was proved by running
-/// the code. Bump this for any change to normalization, to inference, to the
-/// representation of `Scheme` or `Footprint`, or to the prelude's signatures —
-/// none of those necessarily changes a `DefHash`, and all of them change what
-/// the front end would compute for one.
-///
-/// A change to any *stored* type — `Type`, `Scheme`, `Footprint`, a
-/// fingerprint's fields, the canonicalization rule — is caught by a pin test in
-/// this crate, which fails and says to bump this. A change to inference or
-/// normalization that leaves those shapes alone is not caught by anything, and
-/// is the case a contributor has to remember: the stale entry it leaves behind
-/// is a wrong *type*, which corrupts every hash keyed on it.
-/// 0.13.0 is W5: `Secret` joins `BUILTIN_TYPE_CONS`, so a project's own
-/// `type Secret` becomes reserved; `derivable(json/ord/row, Secret<a>)` is
-/// false and `derivable(eq, ·)` is true, which changes what `E0206` fires on;
-/// and a `Secret` binder is `E0418`.
-/// 0.14.0 makes a handler clause for a polymorphic operation universally
-/// quantified: the operation's own type variables are rigid where the clause is
-/// checked, so a clause answering a concrete type for an operation declared
-/// `-> a` is `E0201` where it used to be accepted. A cached interface written
-/// before that is an interface for a program this front end refuses.
-/// 0.15.0 is ADR 0017's region surface: `with_region[r] { .. }` enters
-/// inference with a brand that the escape check reads off resolved types, a
-/// `with_cell[r]` written under a region of its name is discharged and checked
-/// at the region rather than at itself, and a variant field declared as a
-/// concrete `Cell` is `E0446` where it used to be accepted. A cached interface
-/// written before that is an interface for a program this front end refuses.
-/// 0.16.0 adds the prelude's fifth ADT, `Iter<s, r> = Continue(s) | Stop(r)`,
-/// and `iterate`'s scheme. `Iter` joins `builtin_types()`, so a project's own
-/// `type Iter` is `E0105` where it used to check; `iterate` gains a stored type
-/// where it used to be an unresolved name; and the prover's case split will
-/// now split on an `Iter`, because `prelude::ADTS` is what tells it the
-/// declaration is complete. A cached interface written before this is an
-/// interface for a program this front end reads differently.
-/// 0.17.0 adds the scheme for `list_at`. It declares no type, so there is no
-/// `E0105` story as 0.16.0 had; what changes is that one bare name gains a
-/// stored type where it was unresolved, and a definition that calls it gains an
-/// interface where it used to have a diagnostic. Its hash does not move — a
-/// builtin call contributes no dependency, which
-/// `ply_hash::tests::builtins_and_unknown_names_are_not_dependencies` pins — so
-/// the cached interface under it is a stale entry rather than an unreachable
-/// one, and only this bump discards it.
-/// 0.18.0 widens `assert`'s scheme to `(Bool, Option<String>) -> Unit`. A
-/// prelude signature change, which is this constant's own listed reason: a
-/// definition whose stored interface was computed against the one-argument
-/// `assert` was computed against a prelude this front end no longer has.
 pub const FRONTEND_VERSION: &str = "0.18.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
-///
-/// Independent of [`RUNTIME_VERSION`] in both directions, which is the whole
-/// point of a second constant: a prover that learns a new rule must be able to
-/// upgrade a tier without invalidating a single test result, and a change to
-/// evaluation must invalidate test results without invalidating a proof that
-/// never ran a program.
-///
-/// Bump it for any change to the fragment, to a rule's meaning, to generation or
-/// shrinking, or to the on-disk shape of a [`CachedObligation`] — none of those
-/// moves an obligation's key, and all of them change what a cache hit claims.
-/// 0.5.0 is `law/host`: a new discharge mode, with a new ceiling — `property`,
-/// structurally, because the static tier and the finite enumeration are both
-/// skipped for a body whose row is non-empty — and a new unattempted reason.
-/// 0.6.0 puts `list_at` into `TOTAL_BUILTINS`, which is a change to the
-/// fragment: a call to it is now a value, so a term that contains one can be a
-/// value and an obligation over it can close where it used to be
-/// `Reason::Open`. No *existing* obligation changes its answer — an obligation
-/// mentioning the name did not check at all before this. **The change is also
-/// currently unobservable**: nothing over a `List` reaches the static tier at
-/// all, so no tier moves either way (ADR 0027 §2). Bumped anyway, because the
-/// rule for this constant is "any change to the fragment" and a bump that
-/// re-attempts obligations and re-runs no test costs a discharge and nothing
-/// else — and because a decision recorded is better than a side effect
-/// discovered.
 pub const PROVER_VERSION: &str = "0.6.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
-///
-/// Separate from [`FRONTEND_VERSION`], which says what the *front end* computes;
-/// this says how what it computed is written down. Either one moving discards
-/// the cache, and both are checked before an entry is read.
 pub const FRONTEND_FORMAT: u32 = 4;
 
 /// The version of the definition-body encoding, which lives in `ply-hash`.
-/// Folded into [`schema_fingerprint`], so bumping it invalidates the front-end
-/// cache without anything else having to remember to.
 pub const BODY_ENCODING: u32 = ply_hash::body::BODY_ENCODING;
 
 /// Directory created under the root passed to [`Store::open`].
 pub const CACHE_DIR_NAME: &str = ".ply-cache";
 
-/// BLAKE3 over raw bytes: a source file's contents, or a digest of a module's
-/// exports. Distinct from [`DefHash`], which is over a *normalized definition* —
-/// keeping the two in separate types is what stops a caller from asking the
-/// definition-keyed maps a question only raw content can answer.
+/// BLAKE3 over raw bytes: a source file's contents, or a digest of a module's exports.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct ContentHash(pub [u8; 32]);
 
@@ -261,15 +114,9 @@ impl<'de> Deserialize<'de> for ContentHash {
 
 pub use ply_span::codes;
 
-/// One definition's canonical body bytes, keyed by its [`DefHash`]: the
-/// `Definition` that a codebase is supposed to map a hash to alongside its type
-/// and footprint, and that this store never held.
-///
-/// Opaque here on purpose: the encoding is the normalizer's byte stream and
-/// belongs beside it in `ply-hash`, where a change to normalization and a change
-/// to the body encoding are the same edit. This crate only has to store it,
-/// hand it back, and refuse it when the encoding is not the one this build
-/// speaks.
+/// One definition's canonical body bytes, keyed by its [`DefHash`]: the `Definition` that a
+/// codebase is supposed to map a hash to alongside its type and footprint, and that this store
+/// never held.
 #[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
 pub struct DefBody {
     encoding: u32,
@@ -332,30 +179,19 @@ mod hex_bytes {
 }
 
 /// The definition set a test last passed against, keyed by `<module>.<label>`.
-///
-/// Keyed by *name*, which is the one place in Ply a name is load-bearing for a
-/// cache. `DefHash -> Pass` cannot answer this: a test's hash covers its whole
-/// closure, so a regression moves it and there is nothing to look up. A baseline
-/// has to be found under a key the edit did not move. The cost is that renaming
-/// a test's label loses its baseline — one missing bisection, never a wrong one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PassRecord {
     pub test_hash: DefHash,
-    /// The *functions* in the closure, by program-wide name as
-    /// [`crate::CachedTest::key`] qualifies them.
+    /// The *functions* in the closure, by program-wide name as [`crate::CachedTest::key`] qualifies
+    /// them.
     pub closure: std::collections::BTreeMap<Symbol, DefHash>,
-    /// The `type` and `effect` declarations, kept apart because a `fn` and a
-    /// `type` may share a name. One map for both would record whichever the
-    /// writer preferred and drop the other, so an edit to the loser would be
-    /// invisible to every later bisection and the winner's hash would be handed
-    /// to everything that mentions either.
+    /// The `type` and `effect` declarations, kept apart because a `fn` and a `type` may share a
+    /// name.
     pub decls: std::collections::BTreeMap<Symbol, DefHash>,
 }
 
 impl PassRecord {
-    /// Every hash the record names, in either namespace. Retention has to see
-    /// all of them: a body kept for the value half and dropped for the
-    /// declaration half is a baseline that cannot be rebuilt.
+    /// Every hash the record names, in either namespace.
     pub fn hashes(&self) -> impl Iterator<Item = DefHash> {
         self.closure.values().chain(self.decls.values()).copied()
     }
@@ -365,9 +201,7 @@ impl PassRecord {
 struct PassRecordRepr {
     test_hash: DefHash,
     closure: std::collections::BTreeMap<String, DefHash>,
-    /// Absent from records written before declarations were tracked. Reading one
-    /// as empty is what the writer meant then, and costs nothing beyond the
-    /// first pass that rewrites it.
+    /// Absent from records written before declarations were tracked.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     decls: std::collections::BTreeMap<String, DefHash>,
 }
@@ -436,8 +270,8 @@ enum OutcomeRepr {
     },
 }
 
-/// Hand-written rather than derived: `Diagnostic` deserializes only from
-/// `&'static` input, which no file read at runtime can offer.
+/// Hand-written rather than derived: `Diagnostic` deserializes only from `&'static` input, which no
+/// file read at runtime can offer.
 impl Serialize for Outcome {
     fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
         let repr = match self {
@@ -487,10 +321,6 @@ pub struct Store {
 }
 
 /// The stdlib digest this cache was last written under.
-///
-/// Read on the first question rather than at [`Store::open`], because a run that
-/// never asks — every command that does not compile — should not pay a file read
-/// for it. It keys nothing: see [`disk::load_stdlib`].
 #[derive(Default)]
 struct Stdlib {
     path: PathBuf,
@@ -499,14 +329,7 @@ struct Stdlib {
     pending: Option<String>,
 }
 
-/// The pass records, read on the first question rather than at
-/// [`Store::open`].
-///
-/// A record is a whole closure — every name a test reached and what it hashed
-/// to — so they are by far the largest thing the result cache holds, and only a
-/// *failing* test ever reads one. Charging every green run for that file is what
-/// put `Store::open` an order of magnitude over the budget the store was
-/// rebuilt to meet.
+/// The pass records, read on the first question rather than at [`Store::open`].
 #[derive(Default)]
 struct Passes {
     path: PathBuf,
@@ -514,8 +337,7 @@ struct Passes {
     /// This run's, which shadow anything on disk under the same key.
     added: disk::Passes,
     dirty: bool,
-    /// Carried over from a format 1 result cache, which held them inline. Used
-    /// only while the file they moved to does not exist yet.
+    /// Carried over from a format 1 result cache, which held them inline.
     inline: disk::Passes,
     warnings: Mutex<Vec<Diagnostic>>,
 }
@@ -543,10 +365,8 @@ impl Passes {
         }
     }
 
-    /// Comparing against what is on disk is what forces the read, and it is
-    /// worth it: without it a re-proved baseline rewrites the file on every run
-    /// that re-ran anything. A run that records a pass has just executed a test,
-    /// so it can afford the read; a run that recorded none never gets here.
+    /// Comparing against what is on disk is what forces the read, and it is worth it: without it a
+    /// re-proved baseline rewrites the file on every run that re-ran anything.
     fn put(&mut self, key: Symbol, record: PassRecord) {
         if self.get(&key) == Some(&record) {
             return;
@@ -582,11 +402,6 @@ impl Passes {
 }
 
 /// A map read on its first question rather than at [`Store::open`].
-///
-/// The obligation cache and the review records are both in this shape for
-/// [`Passes`]' reason: a run that asks neither of them anything must not pay to
-/// parse either, and `Store::open` has a 5 ms budget at ten thousand
-/// definitions that predates all three files.
 struct Lazy<K: Ord, V> {
     path: PathBuf,
     stored: OnceLock<std::collections::BTreeMap<K, V>>,
@@ -615,9 +430,9 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Lazy<K, V> {
         }
     }
 
-    /// A file that cannot be read is an **empty** map, never a partial one: the
-    /// only two answers either of these caches may give are "nothing recorded",
-    /// which costs work, and "what was recorded".
+    /// A file that cannot be read is an **empty** map, never a partial one: the only two answers
+    /// either of these caches may give are "nothing recorded", which costs work, and "what was
+    /// recorded".
     fn stored(&self) -> &std::collections::BTreeMap<K, V> {
         self.stored.get_or_init(|| match (self.load)(&self.path) {
             Ok(entries) => entries,
@@ -639,8 +454,8 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Lazy<K, V> {
         }
     }
 
-    /// Re-recording what is already on disk is not a write, so a run that
-    /// answered every question from the cache leaves the file alone.
+    /// Re-recording what is already on disk is not a write, so a run that answered every question
+    /// from the cache leaves the file alone.
     fn put(&mut self, key: K, value: V) {
         if self.get(&key) == Some(&value) {
             return;
@@ -660,8 +475,8 @@ impl<K: Ord + Clone, V: Clone + PartialEq> Lazy<K, V> {
         self.all().count()
     }
 
-    /// Folds this run's entries into whatever is on disk, under the caller's
-    /// lock — so two concurrent runs cannot discard each other's work.
+    /// Folds this run's entries into whatever is on disk, under the caller's lock — so two
+    /// concurrent runs cannot discard each other's work.
     fn write(
         &mut self,
         dir: &Path,
@@ -739,15 +554,12 @@ pub struct CacheStats {
     pub results_bytes: u64,
     pub index_bytes: u64,
     pub data_bytes: u64,
-    /// What [`Store::compact`] would reclaim: the region of the append-only data
-    /// file that no index record names.
+    /// What [`Store::compact`] would reclaim: the region of the append-only data file that no index
+    /// record names.
     pub garbage_bytes: Option<u64>,
 }
 
-/// A cached entry [`Store::lookup`] matched. Tests are their own variant because
-/// a test has no name a reference could reach, and what one is asked about — did
-/// it pass, may it run beside that other one — is not what a definition is
-/// asked about.
+/// A cached entry [`Store::lookup`] matched.
 #[derive(Clone, PartialEq, Debug)]
 pub enum Found {
     Def(FoundDef),
@@ -789,16 +601,14 @@ impl Found {
     }
 }
 
-/// A missing file is nothing cached, which is zero bytes rather than an error:
-/// every caller here is reporting sizes, and none of them wants a run to fail
-/// because a cache it does not need is absent.
+/// A missing file is nothing cached, which is zero bytes rather than an error: every caller here is
+/// reporting sizes, and none of them wants a run to fail because a cache it does not need is
+/// absent.
 fn file_bytes(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
 /// A query is a hash prefix when it is short-but-not-too-short lowercase hex.
-/// Four characters is two bytes, which is ambiguous often enough to be worth
-/// showing every match and short enough to type.
 fn hash_prefix(query: &str) -> Option<Vec<u8>> {
     let query = query.to_ascii_lowercase();
     if query.len() < 4 || query.len() > 64 || !query.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -812,20 +622,17 @@ fn starts_with(hash: DefHash, prefix: Option<&[u8]>) -> bool {
     hash.to_hex().as_bytes().starts_with(prefix)
 }
 
-/// A program-wide name matches in full, and its last segment matches on its own,
-/// because a person reading a diagnostic sees `place` and types `place`.
+/// A program-wide name matches in full, and its last segment matches on its own, because a person
+/// reading a diagnostic sees `place` and types `place`.
 fn names_match(name: &Symbol, query: &str) -> bool {
     name.as_str() == query || name.as_str().rsplit('.').next() == Some(query)
 }
 
 /// The front-end cache as a single JSON document, which nothing reads any more.
-/// Kept only so that a flush can delete it once there is something to replace it
-/// with.
 const LEGACY_FRONTEND_FILE: &str = "frontend.json";
 
 impl Store {
-    /// Opens/creates `<root>/.ply-cache`. Fails only if that directory cannot
-    /// exist; an unusable cache *file* degrades to an empty cache instead.
+    /// Opens/creates `<root>/.ply-cache`.
     pub fn open(root: &Path) -> anyhow::Result<Store> {
         let dir = root.join(CACHE_DIR_NAME);
         std::fs::create_dir_all(&dir)
@@ -876,8 +683,8 @@ impl Store {
             Ok(cache) => {
                 store.entries = cache.results;
                 store.definitions = cache.definitions;
-                // A format 1 file is rewritten on the way out whether or not it
-                // held any records, so the next run never pays to scan it again.
+                // A format 1 file is rewritten on the way out whether or not it held any records,
+                // so the next run never pays to scan it again.
                 if cache.migrating {
                     store.passes.inline = cache.inline_passes;
                     store.passes.dirty = !store.passes.inline.is_empty();
@@ -887,8 +694,8 @@ impl Store {
             Err(disk::LoadError::Missing) => {}
             Err(e) => {
                 store.warnings.push(e.into_diagnostic(&store.path));
-                // Nothing was loaded, so nothing is pending; the flag exists
-                // here only to get the unusable file replaced.
+                // Nothing was loaded, so nothing is pending; the flag exists here only to get the
+                // unusable file replaced.
                 store.dirty = true;
             }
         }
@@ -908,9 +715,8 @@ impl Store {
         self.passes.get(key)
     }
 
-    /// The caller must observe the same rule that governs [`Outcome::Pass`]:
-    /// **never for a failing or `nondet` test**. A baseline taken from a red run
-    /// would have bisection compare one broken configuration against another.
+    /// The caller must observe the same rule that governs [`Outcome::Pass`]: **never for a failing
+    /// or `nondet` test**.
     pub fn put_pass_record(&mut self, key: Symbol, record: PassRecord) {
         self.passes.put(key, record);
     }
@@ -919,20 +725,13 @@ impl Store {
         self.passes.all().count()
     }
 
-    /// What an obligation was discharged with, under the key the caller decided
-    /// on. Two keys reach this map — the bare obligation key for a proof and
-    /// `prove_key(key, plan)` for everything weaker — and this store deliberately
-    /// does not know which is which: a claim about *which plan a discharge is
-    /// valid under* belongs beside the tier rule, in the crate that owns it.
+    /// What an obligation was discharged with, under the key the caller decided on.
     pub fn obligation(&self, key: DefHash) -> Option<&CachedObligation> {
         self.obligations.get(&key)
     }
 
-    /// The caller owes the rule the type here cannot state: **only a `Held`
-    /// discharge is written**, and only under [`crate::obligations`]' key for
-    /// its tier. A refutation and a vacuity are errors that re-run until they go
-    /// green, exactly as a failing test does, and there is no [`CachedEvidence`]
-    /// that can spell either.
+    /// The caller owes the rule the type here cannot state: **only a `Held` discharge is written**,
+    /// and only under [`crate::obligations`]' key for its tier.
     pub fn put_obligation(&mut self, key: DefHash, entry: CachedObligation) {
         self.obligations.put(key, entry);
     }
@@ -958,13 +757,8 @@ impl Store {
         self.reviews.len()
     }
 
-    /// Folds in whatever another process wrote since [`Store::open`], so two
-    /// concurrent runs cannot silently discard each other's results.
-    ///
-    /// A writer that cannot take the cache lock within the bounded wait writes
-    /// **nothing** and warns: two processes appending to one data file
-    /// interleave frames, which is corruption, where a lost update is only a
-    /// recheck.
+    /// Folds in whatever another process wrote since [`Store::open`], so two concurrent runs cannot
+    /// silently discard each other's results.
     pub fn flush(&mut self) -> anyhow::Result<()> {
         if !self.dirty
             && !self.passes.dirty
@@ -990,9 +784,9 @@ impl Store {
             return Ok(());
         }
 
-        // Before the results, because writing them is what drops the inline
-        // copy a format 1 file still carries: the records have to be somewhere
-        // else first or a crash between the two loses every baseline.
+        // Before the results, because writing them is what drops the inline copy a format 1 file
+        // still carries: the records have to be somewhere else first or a crash between the two
+        // loses every baseline.
         self.write_passes()?;
         self.write_results()?;
         let dir = self.dir.clone();
@@ -1011,9 +805,7 @@ impl Store {
         Ok(())
     }
 
-    /// Folds this run's results into whatever is on disk. The caller holds the
-    /// lock, which is what stops two writers from each reading the same cache
-    /// and the second rename dropping the first one's entries.
+    /// Folds this run's results into whatever is on disk.
     fn write_results(&mut self) -> anyhow::Result<()> {
         if !self.dirty {
             return Ok(());
@@ -1030,12 +822,8 @@ impl Store {
         Ok(())
     }
 
-    /// Folds this run's pass records into whatever is on disk, under the same
-    /// lock and for the same reason as the results.
-    ///
-    /// Last writer wins per test, which is what "the configuration it last
-    /// passed at" means. A foreign record is as good as a local one: both name a
-    /// set of hashes that test actually went green against.
+    /// Folds this run's pass records into whatever is on disk, under the same lock and for the same
+    /// reason as the results.
     fn write_passes(&mut self) -> anyhow::Result<()> {
         if !self.passes.dirty {
             return Ok(());
@@ -1064,14 +852,6 @@ impl Store {
     }
 
     /// Discards every cache: results, obligations *and* the front end.
-    /// `ply cache clear` has to mean "prove everything again", and leaving
-    /// cached types behind would make it mean "run the tests again against types
-    /// I am still assuming".
-    ///
-    /// The **review records survive**, and that is not an oversight. Everything
-    /// else here is something a machine computed and can compute again; a
-    /// baseline is something a person accepted, and discarding it costs a
-    /// re-read of the whole project that no amount of CPU can give back.
     pub fn clear(&mut self) -> anyhow::Result<()> {
         self.entries.clear();
         self.definitions.clear();
@@ -1080,8 +860,8 @@ impl Store {
         self.frontend.clear();
         self.warnings.clear();
         self.dirty = false;
-        // Forgotten with the rest: after a clear there is nothing left for a
-        // moved stdlib to have invalidated, so warning about it would be noise.
+        // Forgotten with the rest: after a clear there is nothing left for a moved stdlib to have
+        // invalidated, so warning about it would be noise.
         self.stdlib.pending = None;
         self.stdlib.stored = OnceLock::from(None);
         let _lock = disk::Lock::acquire(&self.dir);
@@ -1108,23 +888,12 @@ impl Store {
         self.entries.contains_key(&hash)
     }
 
-    /// Whether some earlier run already saw this definition. What is unknown
-    /// here is what the last edit produced, and intersecting that with a failing
-    /// test's closure is that failure's suspect set.
-    ///
-    /// Deliberately not answerable from [`Store::get`]: an outcome is a claim
-    /// about a *test*, so reading one as "unchanged" lets any green test that
-    /// shares a definition vouch for it.
+    /// Whether some earlier run already saw this definition.
     pub fn knows_definition(&self, hash: DefHash) -> bool {
         self.definitions.contains(&hash)
     }
 
     /// Records definition hashes as seen, returning how many were new.
-    ///
-    /// Recording a definition ends its life as a suspect, so a caller that has
-    /// just watched a test fail must withhold everything that failure reached:
-    /// nothing about it has been resolved, and the next run has to be able to
-    /// name the same suspects.
     pub fn observe_definitions(&mut self, hashes: impl IntoIterator<Item = DefHash>) -> usize {
         let mut added = 0;
         for hash in hashes {
@@ -1142,10 +911,8 @@ impl Store {
         self.definitions.len()
     }
 
-    /// Every degradation this cache took, including the ones a *read* found: an
-    /// entry is decoded on demand, so a frame that does not verify is discovered
-    /// long after the store was opened. A caller that never reports these turns a
-    /// corrupt cache into silence.
+    /// Every degradation this cache took, including the ones a *read* found: an entry is decoded on
+    /// demand, so a frame that does not verify is discovered long after the store was opened.
     pub fn warnings(&self) -> Vec<Diagnostic> {
         let mut warnings = self.warnings.clone();
         warnings.extend(self.passes.warnings());
@@ -1176,13 +943,8 @@ impl Store {
         &self.root
     }
 
-    /// The stdlib digest this cache was last written under, or `None` for a
-    /// cache no run has recorded one in.
-    ///
-    /// A caller compares it against `ply_std::digest_short()` and warns
-    /// `W0605 STDLIB_CHANGED` when the two differ. Nothing keys on it: a digest
-    /// in a cache key would invalidate a project on an edit to a `std` module it
-    /// never imports, which is the conservative selection Ply exists to beat.
+    /// The stdlib digest this cache was last written under, or `None` for a cache no run has
+    /// recorded one in.
     pub fn stdlib_digest(&self) -> Option<String> {
         self.stdlib
             .pending
@@ -1196,9 +958,7 @@ impl Store {
             .get_or_init(|| disk::load_stdlib(&self.stdlib.path))
     }
 
-    /// Records the digest this run compiled under. Writing is deferred to
-    /// [`Store::flush`] and skipped when nothing moved, so an unchanged compiler
-    /// touches no file.
+    /// Records the digest this run compiled under.
     pub fn set_stdlib_digest(&mut self, digest: String) {
         if self.stdlib_stored().as_deref() == Some(digest.as_str()) {
             return;
@@ -1210,23 +970,19 @@ impl Store {
         &self.frontend_path
     }
 
-    /// The append-only data file the index points into. Both live under
-    /// [`Store::dir`].
+    /// The append-only data file the index points into.
     pub fn frontend_data_path(&self) -> &Path {
         &self.frontend_data_path
     }
 
-    /// What this file compiled to last time — trustworthy only after its
-    /// `content_hash` has been compared against the bytes on disk now.
+    /// What this file compiled to last time — trustworthy only after its `content_hash` has been
+    /// compared against the bytes on disk now.
     pub fn fingerprint(&self, path: &Path) -> Option<Arc<SourceFingerprint>> {
         self.frontend.fingerprint(&self.key(path)?)
     }
 
-    /// Returns `false` for a path that cannot be keyed relative to the root, in
-    /// which case the file is simply never eligible for the fast path.
-    ///
-    /// Re-storing what is already here is not a write, so a run that re-derives
-    /// exactly what is cached leaves the cache clean and flushes nothing.
+    /// Returns `false` for a path that cannot be keyed relative to the root, in which case the file
+    /// is simply never eligible for the fast path.
     pub fn put_source(&mut self, path: &Path, fingerprint: SourceFingerprint) -> bool {
         let Some(key) = self.key(path) else {
             return false;
@@ -1254,10 +1010,7 @@ impl Store {
         self.frontend.sources_len()
     }
 
-    /// Some interface stored under this hash. Correct only where any of them
-    /// will do — to reuse one as a definition's published type, ask for it by
-    /// name with [`Store::def_of`], because several definitions can share a hash
-    /// and their schemes are not interchangeable.
+    /// Some interface stored under this hash.
     pub fn def(&self, hash: DefHash) -> Option<Arc<CachedDef>> {
         self.frontend.def(hash)
     }
@@ -1274,10 +1027,7 @@ impl Store {
         self.frontend.decl_of(hash, name)
     }
 
-    /// Stores the canonical form of `def`, which is what comes back out. A
-    /// caller comparing a freshly-inferred scheme against a cached one must
-    /// canonicalize its own side with [`canonicalize_scheme`] first, or the two
-    /// differ by nothing but the numbers its counter reached.
+    /// Stores the canonical form of `def`, which is what comes back out.
     pub fn put_def(&mut self, hash: DefHash, def: CachedDef) {
         self.frontend.put_def(hash, def);
     }
@@ -1295,8 +1045,7 @@ impl Store {
         self.frontend.decls_len()
     }
 
-    /// The stored body of the definition this hash names, if this build speaks
-    /// its encoding.
+    /// The stored body of the definition this hash names, if this build speaks its encoding.
     pub fn body(&self, hash: DefHash) -> Option<Arc<DefBody>> {
         let body = self.frontend.body(hash)?;
         (body.encoding() == BODY_ENCODING).then_some(body)
@@ -1306,13 +1055,9 @@ impl Store {
         self.body(hash).is_some()
     }
 
-    /// A body is name-free, so it is a function of its hash and one hash has one
-    /// body — unlike an interface, which is written in names a hash erases and
-    /// therefore needs a slot per declaring name.
-    ///
-    /// A second, *different* body for a hash is that assumption failing. It is
-    /// kept out and reported rather than overwriting what is there, because
-    /// which of the two is wrong is exactly what nobody knows at that point.
+    /// A body is name-free, so it is a function of its hash and one hash has one body — unlike an
+    /// interface, which is written in names a hash erases and therefore needs a slot per declaring
+    /// name.
     pub fn put_body(&mut self, hash: DefHash, body: DefBody) {
         if let frontend::StoredBody::Conflict = self.frontend.put_body(hash, body) {
             self.warnings.push(
@@ -1336,28 +1081,21 @@ impl Store {
         self.frontend.bodies_len()
     }
 
-    /// Only call this after a run that discovered every `.ply` file under the
-    /// root: `ply check one.ply` sees one file, and pruning to that would throw
-    /// away the rest of the project's work. A caller that is unsure must not
-    /// call it — the cost of skipping it is disk, the cost of getting it wrong
-    /// is a full recompile.
+    /// Only call this after a run that discovered every `.ply` file under the root: `ply check
+    /// one.ply` sees one file, and pruning to that would throw away the rest of the project's work.
     pub fn prune(&mut self, keep: &[PathBuf]) -> Pruned {
         let keep: std::collections::BTreeSet<String> =
             keep.iter().filter_map(|p| self.key(p)).collect();
-        // Asked before the roots are gathered, because gathering them reads the
-        // pass records — and a run over an unchanged project has nothing to
-        // prune, so it must not be charged for that file.
+        // Asked before the roots are gathered, because gathering them reads the pass records — and
+        // a run over an unchanged project has nothing to prune, so it must not be charged for that
+        // file.
         if !self.frontend.prune_would_change(&keep) {
             return Pruned::default();
         }
         self.frontend.prune(&keep, &self.baseline_hashes())
     }
 
-    /// The second retention root. A baseline names definitions that are no
-    /// longer in any source file — that is the entire point of one — so pruning
-    /// to what the files declare now would delete exactly the bodies bisection
-    /// exists to compare against, and every later failure would degrade to
-    /// `no_bodies` with nothing to say why.
+    /// The second retention root.
     fn baseline_hashes(&self) -> std::collections::BTreeSet<DefHash> {
         self.passes
             .all()
@@ -1365,13 +1103,8 @@ impl Store {
             .collect()
     }
 
-    /// Reclaims the space [`Store::prune`] makes unreachable, which on an
-    /// append-only data file is the only thing that ever shrinks it.
-    ///
-    /// Carries `prune`'s precondition for the same reason: it takes the files
-    /// discovered by a run that saw the whole root, and dropping an entry
-    /// because a partial run did not mention it would throw away work no error
-    /// would ever report.
+    /// Reclaims the space [`Store::prune`] makes unreachable, which on an append-only data file is
+    /// the only thing that ever shrinks it.
     pub fn compact(&mut self, keep: &[PathBuf]) -> anyhow::Result<Compaction> {
         let bytes_before = self.frontend_bytes();
         let dropped = self.prune(keep);
@@ -1413,12 +1146,8 @@ impl Store {
         }
     }
 
-    /// Every cached entry a query names: a program-wide name, a name as its
-    /// module wrote it, or a hash prefix of at least four hex characters.
-    ///
-    /// Several matches are returned rather than refused. For a prefix that is
-    /// what was asked for, and for a simple name declared in two modules it is
-    /// the honest answer — the store holds no namespace that could pick one.
+    /// Every cached entry a query names: a program-wide name, a name as its module wrote it, or a
+    /// hash prefix of at least four hex characters.
     pub fn lookup(&self, query: &str) -> Vec<Found> {
         let prefix = hash_prefix(query);
         let mut found = Vec::new();
@@ -1459,8 +1188,7 @@ impl Store {
         self.frontend.is_empty()
     }
 
-    /// Whether [`Store::flush`] would rewrite the front-end cache. A run that
-    /// found everything already cached must leave this `false`.
+    /// Whether [`Store::flush`] would rewrite the front-end cache.
     pub fn frontend_is_dirty(&self) -> bool {
         self.frontend.is_dirty()
     }

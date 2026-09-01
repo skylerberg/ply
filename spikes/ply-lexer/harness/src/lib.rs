@@ -1,33 +1,9 @@
 //! The reference dump, and the two things the comparison needs around it.
-//!
-//! The dump is the whole comparison: one line of text per token, in a format
-//! both lexers can emit, so that "these two lexers agree" is a string equality
-//! a reader can check by eye rather than a claim.
-//!
-//! Every character is printable ASCII and neither `"` nor `\` occurs. That is
-//! not decoration: `ply run --json` renders a `String` through
-//! `ply_eval::value::escape`, so a dump containing either character would come
-//! back escaped and the harness would be comparing its own unescaper against
-//! the lexer. Unwrapping is removing the first and last character.
 
 use ply_span::SourceId;
 use ply_syntax::lexer::{TokenKind, lex};
 
-/// One token or diagnostic. Records are `;`-terminated.
-///
-/// Tokens first, in source order, then diagnostics, in the order the lexer
-/// raised them.
-///
-/// - `S:E:i:NAME` identifier
-/// - `S:E:n:DIGITS` integer
-/// - `S:E:f:BITS` float, as the 16 hex digits of `f64::to_bits`
-/// - `S:E:d:DIGITS:SCALE` decimal
-/// - `S:E:s:HEX` string, hex of the decoded UTF-8
-/// - `S:E:b:HEX` byte string, hex of the decoded bytes
-/// - `S:E:k:NAME` keyword
-/// - `S:E:p:NAME` punctuation
-/// - `S:E:e` end of file
-/// - `S:E:!:CODE` diagnostic
+/// One token or diagnostic.
 pub fn reference_dump(text: &str) -> String {
     let (tokens, diags) = lex(SourceId(0), text);
     let mut out = String::new();
@@ -115,20 +91,8 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
-/// The one substitution the comparison makes, and the reason it is named here
-/// rather than buried in the test.
-///
-/// Ply has no `float_of_string` and cannot build a `Float` out of digits at
-/// all, so the Ply lexer emits a float's **normalised literal text** — the
-/// exact string `lexer.rs` hands to `f64::from_str` — where the reference dump
-/// emits the resulting bits. This converts the former into the latter with
-/// Rust's parser, so what is compared is the decision the lexer made (that this
-/// is a float, that it spans these bytes, that these are its digits) and not
-/// the decimal-to-binary conversion, which is delegated and *not* checked.
-///
-/// A record that is not a float passes through unchanged. A float record whose
-/// text does not parse is left as it is, so it fails the comparison loudly
-/// instead of being smoothed into a passing one.
+/// The one substitution the comparison makes, and the reason it is named here rather than buried in
+/// the test.
 pub fn floats_to_bits(dump: &str) -> String {
     let mut out = String::new();
     for record in dump.split_terminator(';') {
@@ -149,17 +113,14 @@ fn convert(record: &str) -> String {
     }
 }
 
-/// The dump as a list of records, for a diff that names the first disagreement
-/// instead of printing two 300-kilobyte strings.
+/// The dump as a list of records, for a diff that names the first disagreement instead of printing
+/// two 300-kilobyte strings.
 pub fn records(dump: &str) -> Vec<&str> {
     dump.split_terminator(';').collect()
 }
 
-/// A `b"..."` literal holding exactly these bytes, for embedding a source file
-/// in a generated Ply program.
-///
-/// Ply is the only way in: there is no file-reading host handler, so a source
-/// file reaches a Ply program as a literal or not at all.
+/// A `b"..."` literal holding exactly these bytes, for embedding a source file in a generated Ply
+/// program.
 pub fn byte_literal(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(bytes.len() + 16);
     out.push_str("b\"");

@@ -1,61 +1,44 @@
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
-/// Everything the shape of a corpus depends on. Two runs with equal specs and
-/// equal seeds produce byte-identical files.
+/// Everything the shape of a corpus depends on.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct CorpusSpec {
     pub seed: u64,
     pub modules: usize,
     pub defs_per_module: usize,
     pub tests: usize,
-    /// Layers in the module DAG. A module only imports from a lower layer, so
-    /// this is the longest import chain the corpus can have.
+    /// Layers in the module DAG.
     pub depth: usize,
-    /// Distinct `db` resource labels, shared across every module — this is what
-    /// makes the conflict graph non-trivial rather than one clique per file.
+    /// Distinct `db` resource labels, shared across every module — this is what makes the conflict
+    /// graph non-trivial rather than one clique per file.
     pub tables: usize,
     /// Distinct `cache` resource labels.
     pub regions: usize,
     pub effect_fraction: f64,
     pub nondet_fraction: f64,
     pub hub_modules: usize,
-    /// Cap on `1 + sum(callee weights)`. Without it a random call graph is
-    /// exponential to interpret and the corpus stops being realistic.
+    /// Cap on `1 + sum(callee weights)`.
     pub max_weight: u32,
-    /// `simulate` tests, on top of `tests`. Zero leaves a corpus that never
-    /// reaches a region, which is what every measurement before M7 wants — and
-    /// is what a manifest written before M7 deserializes to.
+    /// `simulate` tests, on top of `tests`.
     #[serde(default)]
     pub concurrent_tests: usize,
-    /// Tasks spawned by each of them. Fully contended, a test of `t` tasks and
-    /// `s` steps has `(t·s)! / (s!)^t` schedules, so 4×3 is already 369,600 and
-    /// well past any sensible `--sim-budget`. 3×2 is 90, which a search can
-    /// exhaust.
+    /// Tasks spawned by each of them.
     #[serde(default)]
     pub tasks_per_test: usize,
-    /// `counter.bump` calls per task, separated by a `task.yield()`. Steps are
-    /// what an interleaving is a sequence of, so this is the exponent the naive
-    /// schedule count grows in.
+    /// `counter.bump` calls per task, separated by a `task.yield()`.
     #[serde(default)]
     pub steps_per_task: usize,
-    /// How much the tasks contend, from 0.0 — one shard each, so no two steps
-    /// conflict and the search collapses to a single interleaving — to 1.0, one
-    /// shard for everybody, where every pair of steps is dependent and the
-    /// reduction has nothing to prune.
+    /// How much the tasks contend, from 0.0 — one shard each, so no two steps conflict and the
+    /// search collapses to a single interleaving — to 1.0, one shard for everybody, where every
+    /// pair of steps is dependent and the reduction has nothing to prune.
     #[serde(default)]
     pub conflict_density: f64,
     /// Fraction of generated definitions carrying a `requires`/`ensures` pair.
-    /// The claim is one every generated body satisfies by construction, so the
-    /// corpus is green at any density, and the density is the axis a measurement
-    /// varies to price discharge against definition count. Zero leaves a corpus
-    /// with no obligations at all, which is what every measurement before M8
-    /// wants and what a manifest written before M8 deserializes to.
     #[serde(default)]
     pub spec_fraction: f64,
-    /// Definitions per module written for their obligation rather than for their
-    /// call graph, so that the tier distribution spans the table instead of
-    /// landing in one bucket. Each contributes one law as well.
+    /// Definitions per module written for their obligation rather than for their call graph, so
+    /// that the tier distribution spans the table instead of landing in one bucket.
     #[serde(default)]
     pub specimens_per_module: usize,
 }
@@ -132,18 +115,16 @@ impl CorpusSpec {
         Ok(())
     }
 
-    /// Shards a test of this shape spreads its tasks over: every task its own at
-    /// density 0, one between all of them at density 1. The count is what the
-    /// dependence relation reads, so it is derived once here and both the
-    /// generator and the manifest use it.
+    /// Shards a test of this shape spreads its tasks over: every task its own at density 0, one
+    /// between all of them at density 1.
     pub fn shards_per_test(&self) -> usize {
         let tasks = self.tasks_per_test.max(1);
         let spread = (1.0 - self.conflict_density) * (tasks - 1) as f64;
         1 + spread.round() as usize
     }
 
-    /// Generated `fn`s only: the two hand-written core modules and the per-module
-    /// `stage` helpers are counted separately by the manifest.
+    /// Generated `fn`s only: the two hand-written core modules and the per-module `stage` helpers
+    /// are counted separately by the manifest.
     pub fn generated_defs(&self) -> usize {
         self.modules * self.defs_per_module
     }
@@ -225,9 +206,8 @@ mod tests {
         );
     }
 
-    /// A manifest written before M8 has no `spec_fraction`, and deserializing
-    /// one must produce a corpus with no obligations rather than a default
-    /// density nobody asked for.
+    /// A manifest written before M8 has no `spec_fraction`, and deserializing one must produce a
+    /// corpus with no obligations rather than a default density nobody asked for.
     #[test]
     fn a_spec_written_before_m8_deserializes_to_a_corpus_with_no_obligations() {
         let spec: CorpusSpec = serde_json::from_str(
