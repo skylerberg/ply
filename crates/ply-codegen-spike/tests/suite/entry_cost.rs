@@ -1,6 +1,6 @@
 //! What an entry into the backend costs, and which entry pays for it.
 
-use ply_codegen_spike::rt::{Ctx, SLACK, Tables};
+use ply_codegen_spike::rt::{Ctx, Tables};
 use ply_eval::Value;
 use ply_span::Symbol;
 use std::collections::BTreeMap;
