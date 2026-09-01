@@ -241,6 +241,17 @@ work.** ADR 0025 separately concedes that P1 is a `Code` IR change plus
 lowering rather than an edit to eight call sites. **If the IR is changing anyway,
 change it to slots and get an O(1) answer instead of an O(depth) one.**
 
+**The shape the measurements leave standing, stated so the rewrite has a target.** With a slot
+stack, "the frame carries less" is not a construction at all: the slots stay where they are and the
+carry *clears* the dead ones. That is O(dead) writes and no allocation, which is the only row of
+§4's table that matches today's free clone. Everything else follows from it — a closure copies its
+free variables out (done), a continuation copies the window it captured, and a `Var` reads an index.
+
+`slots.rs` is the half of that which can be checked before any of it runs: a forward pass assigning
+every binding an index and resolving every occurrence to one, with the runtime still answering by
+name. A wrong slot costs nothing today and would cost a wrong value the moment the machine reads by
+index, which is a check that cannot be written afterwards.
+
 **The cost is owed for a second reason.** `Env::lookup` walking an `Rc` chain
 comparing `Symbol`s is not a runtime a bootstrapped compiler can keep, and ADR
 0030 puts the Ply front end far enough behind the Rust one that the representation
@@ -515,7 +526,8 @@ small lists, and G2 is measured there. That number needs the change to exist, so
 | **S4″** | both of ADR 0025's fallback primitives for P1, priced | done — both roughly double request-path allocations; §4 has the table |
 | **S6′** | §6's flat record representation, which the fifth pair needs | **next**, and ahead of S4 rather than behind it |
 | **S4a** | §4's flat closure conversion — a lambda captures its free variables, not the scope | done; +0.6 points of reuse, +2.6 allocations, both marginal |
-| **S4** | §4, slot frames | gated on **G1**, then **G2** |
+| **S4b** | slot resolution at lowering, verified against the names | done — no runtime change; the assignment the rewrite switches to is wrong-checked first |
+| **S4** | §4, slot frames — the machine reads by index | gated on **G1**, then **G2** |
 | **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |
