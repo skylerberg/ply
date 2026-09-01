@@ -301,6 +301,13 @@ machine"'s threshold of 4: **182.29s real, 226.88s user, 24.85s sys**, and
 **Budget three minutes**, and do not run it under load. It said *ten* until
 2026-08-31.
 
+> **Provenance, and what has not been re-taken.** That reading is the merge of
+> #64. #65 landed after it and touches the compiled seam, and the figure has
+> **not** been re-taken against that tree — the machine was at a load average
+> of 53 with another session's builds on it, and a wall clock taken there is
+> the load and not the tree, which is the whole lesson of the block below.
+> Re-take it on an idle machine rather than trusting this line to the second.
+
 **This section deliberately does not record how many tests there are.** It used
 to, in a table row and a chain of blocks re-taking it, and the number was found
 stale on every one of those re-takes — never by anything failing, and the last

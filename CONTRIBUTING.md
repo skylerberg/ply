@@ -173,7 +173,14 @@ this one is not. What matters at this line is that nothing failed.
 > already-built `target/`, at a 1-minute load below §"Gate on an idle machine"'s
 > threshold of 4. **Both rows are one tree** — the same commit with
 > `r4_value_construction.rs` and `w6_alloc_sites.rs` reverted, then restored —
-> so the pair isolates one change and nothing else:
+> so the pair isolates one change and nothing else.
+>
+> **That tree is the merge of #64 and not of #65**, which landed the closed
+> fragment while this branch was in review. The pair below still isolates what
+> it says it isolates, on the tree it was taken on; the *absolute* figures have
+> **not** been re-taken against #65, and #65 touches the compiled seam that
+> `differential_corpus` exercises, so expect them to move. Re-take on an idle
+> machine before quoting either as this tree's number:
 >
 > | | wall | user | sys | in-target |
 > | --- | --- | --- | --- | --- |
