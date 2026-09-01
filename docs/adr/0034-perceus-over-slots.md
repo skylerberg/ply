@@ -640,8 +640,11 @@ longer needs stating.
    diverge between two — **which also removes the differential that would have
    caught a lowering change altering an answer.**
 6. **If the request path is bytes-bound rather than list-bound.** ADR 0024
-   counted the concatenation sites and two documented quadratics. **Not measured,
-   and it should be measured before the rewrite.**
+   counted the concatenation sites and two documented quadratics. **Measured at
+   the representation's landing, and it was list-bound**: the request path's
+   bytes roughly halved when `[x, ..rest]` stopped copying the tail, with no
+   concatenation site touched (`README.md` carries the figures). What remains
+   is the byte side, which "What this does not do" leaves alone on purpose.
 7. **If the size estimate is wrong by the margin this record's estimates usually
    are.**
 
