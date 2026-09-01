@@ -294,10 +294,10 @@ occurrences outside its own definition.
 
 ```
 $ grep -rn 'SliceBuilder::new()\|SliceBuilder::with_cap(' --include='*.rs' . | grep -v '^\./target'
-crates/ply-test/tests/suite/bisect_audit.rs:993    SliceBuilder::new()      test
-crates/ply-test/tests/suite/bisect_audit.rs:1021   SliceBuilder::new()      test
-crates/ply-test/tests/suite/bisect_audit.rs:1038   SliceBuilder::with_cap(2) test
-crates/ply-test/tests/suite/bisect_audit.rs:1079   SliceBuilder::new()      test
+crates/ply-test-tests/tests/suite/bisect_audit.rs:993    SliceBuilder::new()      test
+crates/ply-test-tests/tests/suite/bisect_audit.rs:1021   SliceBuilder::new()      test
+crates/ply-test-tests/tests/suite/bisect_audit.rs:1038   SliceBuilder::with_cap(2) test
+crates/ply-test-tests/tests/suite/bisect_audit.rs:1079   SliceBuilder::new()      test
 crates/ply-test/src/slice.rs:188             SliceBuilder::with_cap(DEFAULT_CAP)  its own Default impl
 crates/ply-test/src/slice.rs:433             SliceBuilder::new()      its own #[cfg(test)] mod
 crates/ply-test/src/slice.rs:485             SliceBuilder::with_cap(2) its own #[cfg(test)] mod
@@ -309,7 +309,7 @@ crates/ply-test/src/slice.rs:505             its own unit test
 
 > **Correcting the brief and `CONTRIBUTING.md` item 15 in the same breath.** Both
 > say `SliceBuilder` *"is constructed in exactly one place in the workspace —
-> `crates/ply-test/tests/suite/bisect_audit.rs`, four times, all tests"*. It is
+> `crates/ply-test-tests/tests/suite/bisect_audit.rs`, four times, all tests"*. It is
 > **seven sites in two files**: the four in `bisect_audit.rs`, two more in
 > `slice.rs`'s own `#[cfg(test)]` module, and one inside its own `Default` impl
 > at `slice.rs:188`, which is a definition rather than a use. The substantive
@@ -871,8 +871,8 @@ recommendation quotes:
 ```
 $ grep -rn 'contains("recursion limit' --include='*.rs' . | grep -v '^\./target' \
     | sed 's|^\./||'                 # grep prepends when rooted at `.`; nothing else is filtered
-crates/ply-eval/tests/suite/equivalence_audit.rs:1940:            .contains("recursion limit of 50 nested calls exceeded"),
-crates/ply-eval/tests/suite/equivalence_audit.rs:2048:    assert!(machine.message.contains("recursion limit"), "{machine:?}");
+crates/ply-eval-tests/tests/suite/equivalence_audit.rs:1940:            .contains("recursion limit of 50 nested calls exceeded"),
+crates/ply-eval-tests/tests/suite/equivalence_audit.rs:2048:    assert!(machine.message.contains("recursion limit"), "{machine:?}");
 crates/ply-eval/src/compiled.rs:1508:            baseline.contains("recursion limit of 8 nested calls exceeded"),
 crates/ply-eval/src/tests.rs:313:    assert!(d.message.contains("recursion limit"), "{}", d.message);
 crates/ply-eval/src/tests.rs:408:    assert!(message.contains("recursion limit"), "{message}");
@@ -885,7 +885,7 @@ crates/ply-test/src/tests.rs:1359:        failure.diagnostic.message.contains("r
 crates/ply-codegen-spike/tests/hazards.rs:625:        message.contains("recursion limit of 400 nested calls exceeded"),
 crates/ply-codegen-spike/tests/hazards.rs:649:            .contains("recursion limit of 10000 nested calls exceeded")),
 crates/ply-codegen-spike/tests/hazards.rs:675:            .contains("recursion limit of 600 nested calls exceeded")),
-crates/ply-test/tests/suite/hybrid.rs:298:        diagnostic.message.contains("recursion limit"),
+crates/ply-test-tests/tests/suite/hybrid.rs:298:        diagnostic.message.contains("recursion limit"),
 crates/ply-codegen-spike/tests/mutations.rs:539:            .contains("recursion limit of 600 nested calls exceeded")),
 ```
 
@@ -921,7 +921,7 @@ crates/ply-codegen-spike/tests/mutations.rs:539:            .contains("recursion
 > re-derived. The "four" traces to
 > `crates/ply-eval/src/limit.rs:80`'s own correction block, which names four
 > *files* (`ply-cli/tests/suite/failure_classification_audit.rs`,
-> `ply-test/tests/suite/hybrid.rs`, `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`)
+> `ply-test-tests/tests/suite/hybrid.rs`, `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`)
 > and misses six more, `crates/ply-codegen-spike`'s three among them. Recorded
 > for the next change in §5.
 >
@@ -1109,9 +1109,9 @@ every file. The shipping CLI has no route to a backend.
 ```
 $ grep -rn 'impl .*Compiled for ' --include='*.rs' . | grep -v '^\./target'
 crates/ply-eval/src/compiled.rs:658:    impl Compiled for Double {          # inside #[cfg(test)] (boundary at :578)
-crates/ply-eval/tests/suite/differential_corpus.rs:352:    impl Compiled for Declining {
-crates/ply-eval/tests/suite/differential_corpus.rs:394:    impl Compiled for TreeWalker {
-crates/ply-eval/tests/suite/equivalence_audit.rs:1775:    impl Compiled for Budgeted {
+crates/ply-eval-tests/tests/suite/differential_corpus.rs:352:    impl Compiled for Declining {
+crates/ply-eval-tests/tests/suite/differential_corpus.rs:394:    impl Compiled for TreeWalker {
+crates/ply-eval-tests/tests/suite/equivalence_audit.rs:1775:    impl Compiled for Budgeted {
 crates/ply-codegen-spike/src/wrong.rs:275:impl Compiled for Mutant {
 crates/ply-codegen-spike/src/entry.rs:346:impl ply_eval::Compiled for SpikeBodies {
 ```
@@ -1134,8 +1134,8 @@ files containing a set_compiled CALL                     6
 | --- | --- | --- |
 | `crates/ply-eval/src/compiled.rs` | 27 | its own `#[cfg(test)]` module |
 | `crates/ply-codegen-spike/tests/hazards.rs` | 5 | the spike |
-| `crates/ply-eval/tests/suite/differential_corpus.rs` | 3 | `ply-eval`'s own test |
-| `crates/ply-eval/tests/suite/equivalence_audit.rs` | 3 | `ply-eval`'s own test |
+| `crates/ply-eval-tests/tests/suite/differential_corpus.rs` | 3 | `ply-eval`'s own test |
+| `crates/ply-eval-tests/tests/suite/equivalence_audit.rs` | 3 | `ply-eval`'s own test |
 | `crates/ply-codegen-spike/tests/mutations.rs` | 2 | the spike |
 | `crates/ply-codegen-spike/src/measure.rs` | 2 | the spike's harness |
 | | **42** | across **6** files |
@@ -1145,10 +1145,10 @@ files containing a set_compiled CALL                     6
 > Both read: *"all five `set_compiled` call sites in the workspace are tests or
 > the spike's own harness (2 in `ply-codegen-spike/src/measure.rs`, 5 in its
 > `hazards.rs`, 3 in its `mutations.rs`, 27 in `ply-eval/src/compiled.rs`'s own
-> tests, 2 in `ply-eval/tests/suite/differential_corpus.rs`)."* That enumerates
+> tests, 2 in `ply-eval-tests/tests/suite/differential_corpus.rs`)."* That enumerates
 > 2+5+3+27+2 = **39 across 5 files**. Actual: **42 across 6**. `mutations.rs` has
 > 2 calls and a doc comment, not 3; `differential_corpus.rs` has 3, not 2; and
-> `crates/ply-eval/tests/suite/equivalence_audit.rs`'s 3 are counted by neither
+> `crates/ply-eval-tests/tests/suite/equivalence_audit.rs`'s 3 are counted by neither
 > document — they were added by the items 9/10 fix. **The substantive claim
 > survives untouched:** every one of the 42 is a test or the spike's harness, and
 > `crates/ply-cli` contains zero. Handed on, not fixed here.
@@ -1525,9 +1525,9 @@ leaving the declaration, the registry row, the `RESERVED_CODES` entry and
       declaration   crates/ply-span/src/lib.rs:332
       listing       crates/ply-eval/src/host.rs:1096
       test          crates/ply-cli/tests/suite/w5_trace_audit.rs:310,
-                    crates/ply-eval/tests/suite/host_boundary.rs:316,
-                    crates/ply-eval/tests/suite/host_linearity_audit.rs:218, :318, :366, :436, :475, :599, :640,
-                    crates/ply-eval/tests/suite/transaction_scope_audit.rs:364, :391,
+                    crates/ply-eval-tests/tests/suite/host_boundary.rs:316,
+                    crates/ply-eval-tests/tests/suite/host_linearity_audit.rs:218, :318, :366, :436, :475, :599, :640,
+                    crates/ply-eval-tests/tests/suite/transaction_scope_audit.rs:364, :391,
                     crates/ply-span/src/lib.rs:760
 GATE: FAIL — unarmed and not allow-listed: ['E0426']
 exit 1
@@ -1616,7 +1616,7 @@ the next change does not have to rediscover them.
 
 2. **The "five `set_compiled` call sites" count**, §3.1: `CONTRIBUTING.md:1530-1533`
    and `crates/ply-eval/src/compiled.rs:201-205` both enumerate 39 across 5 files.
-   Actual: 42 across 6; `crates/ply-eval/tests/suite/equivalence_audit.rs`'s 3 are in
+   Actual: 42 across 6; `crates/ply-eval-tests/tests/suite/equivalence_audit.rs`'s 3 are in
    neither.
 
 3. **`SliceBuilder` "constructed in exactly one place"**, §1.1:
@@ -1662,12 +1662,12 @@ the next change does not have to rediscover them.
    on the "recursion limit" string; 15 `#[test]` functions in 10 files contain
    the phrase and 14 depend on it**, §2.1 (added 2026-08-27). Its text — *"the phrase is load-bearing only for
    whatever matches on the string, which is four tests
-   (`ply-cli/tests/suite/failure_classification_audit.rs`, `ply-test/tests/suite/hybrid.rs`,
+   (`ply-cli/tests/suite/failure_classification_audit.rs`, `ply-test-tests/tests/suite/hybrid.rs`,
    `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`)"* — names four files.
    Actual: `grep -rn 'contains("recursion limit' --include='*.rs' .` finds **16
    occurrences in 10 files, in 15 distinct `#[test]` functions**; 13 assert the
    phrase is present, one asserts it is absent, one is a doc comment. The six
-   files it misses are `ply-eval/tests/suite/equivalence_audit.rs`,
+   files it misses are `ply-eval-tests/tests/suite/equivalence_audit.rs`,
    `ply-eval/src/compiled.rs`, `ply-eval/src/machine/tests.rs`, and
    `ply-codegen-spike/tests/{hazards,mcts_kernel,mutations}.rs`. This is a
    correction block that is itself stale — the same second-order shape as item 1

@@ -7,7 +7,7 @@
 >
 > | gate | where | when it skips | says so? |
 > | --- | --- | --- | --- |
-> | `cluster::available()` | `crates/ply-host/tests/support/cluster.rs:38` | no `initdb`/`postgres` on the machine | yes, on stderr of a passing test |
+> | `cluster::available()` | `crates/ply-host-tests/tests/support/cluster.rs:38` | no `initdb`/`postgres` on the machine | yes, on stderr of a passing test |
 > | `PLY_PG_URL` | `crates/ply-host/src/db/scope/tests/live.rs:101` | the variable is unset — nothing sets it on a stock local checkout, and **CI sets it** | yes, on stderr of a passing test |
 > | `#![cfg(unix)]` | `crates/ply-cli/tests/suite/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
 > | its own `[workspace]` | `crates/ply-codegen-spike/Cargo.toml` | always, under `cargo test --workspace` | no |
@@ -153,7 +153,7 @@ trade R2 took is only legible with both:
 - What replaced it is not free. Opening a 10,000-cell region-scoped fixture and
   writing one cell costs **about 100 µs per test**: ADR 0017 published
   95.7 µs, and this audit re-ran
-  `crates/ply-eval/tests/allocation/fixture_open_cost.rs` and measured **105.8 µs**. Read it
+  `crates/ply-eval-tests/tests/allocation/fixture_open_cost.rs` and measured **105.8 µs**. Read it
   as an order of magnitude — the test *prints* the figure and asserts only a
   2 ms ceiling, about twenty times the reading, deliberately, so it is a
   staleness guard and not a performance gate. It is paid per test rather than per
@@ -595,9 +595,9 @@ own terms:
 `with_cell` allocated through the arena, and no region ever closed. The gap was
 found by a benchmark rather than by a report, which is stated in the tests that
 now exist to prevent its recurrence —
-`crates/ply-eval/tests/suite/cell_arena_wiring.rs:5` ("R1 built the allocator and
+`crates/ply-eval-tests/tests/suite/cell_arena_wiring.rs:5` ("R1 built the allocator and
 connected nothing, and a benchmark rather than a report is what found that out")
-and `crates/ply-eval/tests/suite/region_wiring_audit.rs:6`. R1's own tests were green
+and `crates/ply-eval-tests/tests/suite/region_wiring_audit.rs:6`. R1's own tests were green
 throughout, because every one of them attacked the allocator or the analysis
 directly and none asked whether an engine had ever called either.
 
@@ -610,7 +610,7 @@ test, and snapshot-at-capture answers `1` for that cell. Since ADR 0017's
 governing property is that program meaning does not change, ADR 0005 won and §3
 was rewritten to say so. The retraction is in the ADR rather than hidden by a
 deletion, and the discriminating programs are landed in
-`crates/ply-eval/tests/suite/region_meaning_audit.rs` and
+`crates/ply-eval-tests/tests/suite/region_meaning_audit.rs` and
 `resumption_semantics_audit.rs`.
 
 ## R2 — the wiring, and the first real free
@@ -628,7 +628,7 @@ R2 put R1's machinery on the evaluation path and deleted what it replaced:
   is a node in `ply_syntax::ast`, in `ply_eval::code`, and in both engines
   (`machine.rs:992`, `interp.rs:422`)
 - **The close is a real free**, deferred by an `Arena::pin` when a capture can
-  still reach the slots — which is why `crates/ply-eval/tests/suite/use_after_free_audit.rs`
+  still reach the slots — which is why `crates/ply-eval-tests/tests/suite/use_after_free_audit.rs`
   exists: before R2 a region's memory was never handed back, so an escape the
   checks missed was harmless. R2 makes the same escape this language's first
   possible use-after-free, and every program in that file is written to produce
@@ -710,8 +710,8 @@ hoisted both — the region-kind analysis and the lowered bodies are now scoped 
 the *program*, so an engine built next over the same program is handed the answer
 instead of recomputing it (`Machine::share_region_kinds`,
 `Machine::share_lowering`; the new tests are
-`ply-eval/tests/suite/region_kind_sharing.rs`, `ply-eval/tests/allocation/lowering_sharing.rs` and
-`ply-corpus/tests/suite/region_kind_hoisted.rs`).
+`ply-eval-tests/tests/suite/region_kind_sharing.rs`, `ply-eval-tests/tests/allocation/lowering_sharing.rs` and
+`ply-corpus-tests/tests/suite/region_kind_hoisted.rs`).
 
 R3 did **not** do unboxing, evidence passing or codegen. Those were the planned
 next milestone, and the premise under them is the one that had just failed.
@@ -725,7 +725,7 @@ lowering was on the request path, and it is not re-takeable now whether it ever
 was. The region-kind half of that run is different: its cost was one whole-program
 traversal per `Machine`, both harnesses build a `Machine` per call, and the
 before-and-after pair is written down in
-`crates/ply-corpus/tests/suite/region_kind_hoisted.rs`'s header — which says in the
+`crates/ply-corpus-tests/tests/suite/region_kind_hoisted.rs`'s header — which says in the
 same breath that only the *after* half of it is re-takeable from this tree. What
 R3 can show is where both families are now, and it is zero per request for both.
 
@@ -756,7 +756,7 @@ delta.
 | | measured | command |
 | --- | --- | --- |
 | allocations per `/health`, 200 requests | **1,081.87**, 127,954.65 bytes | `./target/release/w6-alloc --repo . --requests 200` |
-| the same, against the file that holds the baseline | *"the report says 1035 allocations and 0.12 MB per /health request; this tree makes 1082 and 0.128 MB"* | `cargo test -p ply-corpus --release --test allocation -- w6_report_allocations --nocapture` |
+| the same, against the file that holds the baseline | *"the report says 1035 allocations and 0.12 MB per /health request; this tree makes 1082 and 0.128 MB"* | `cargo test -p ply-corpus-tests --release --test allocation -- w6_report_allocations --nocapture` |
 | the same at 800 requests | **961.92**, 277,417.23 bytes | `./target/release/w6-alloc --repo . --requests 800` |
 | the two-window fit | **911.5 per request + 34,465 once per `Machine`** | `cargo test -p ply-corpus --release --test w6_alloc_sites -- --nocapture` |
 
@@ -879,14 +879,14 @@ Re-run rather than assumed. Every row is a command whose output was read.
 | postgres transactions commit and roll back | `examples/same-tests.sh`: **29 requests byte for byte identical**, committed 201 with orders 3→4, rolled back 409 with the sequence still consumed |
 | `Store::open` under 5 ms at 10,000 definitions | **1.79 ms** over 4,841 results, 9,821 definitions seen |
 | simulation seed rate | **5,331–7,107 seeds/s** over 5 trials on a `--concurrent-tests` corpus; every exploration exhaustive, 54 interleavings after reduction from ≥4,096 (`ply-corpus sim`). That a seeded replay is *exact* is asserted by the suite, not by this row |
-| the two-resumption trace cell reads 2 | `region_meaning_audit` (11 tests) and `resumption_semantics_audit` (11) all pass. The cell is pinned literally: `assert_eq(cell_get(c), 2)` at `crates/ply-eval/tests/suite/region_meaning_audit.rs:167`, inside `two_resumptions_thread_one_state_rather_than_branching_it`, with the handle answering 21 |
+| the two-resumption trace cell reads 2 | `region_meaning_audit` (11 tests) and `resumption_semantics_audit` (11) all pass. The cell is pinned literally: `assert_eq(cell_get(c), 2)` at `crates/ply-eval-tests/tests/suite/region_meaning_audit.rs:167`, inside `two_resumptions_thread_one_state_rather_than_branching_it`, with the handle answering 21 |
 
 The remaining invariants are asserted by the suite rather than re-run by hand,
 and each has a name to grep for rather than a claim to take:
-`ply-hash/tests/suite/modules.rs::moving_a_definition_between_modules_changes_no_hash`,
+`ply-hash-tests/tests/suite/modules.rs::moving_a_definition_between_modules_changes_no_hash`,
 `ply-cli/tests/suite/cli.rs::moving_a_definition_between_modules_re_runs_nothing`,
-`ply-test/tests/suite/hybrid.rs::a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit`,
-`ply-eval/tests/suite/secrets.rs`, and — for `E0412` on an unsimulated nondeterministic
+`ply-test-tests/tests/suite/hybrid.rs::a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit`,
+`ply-eval-tests/tests/suite/secrets.rs`, and — for `E0412` on an unsimulated nondeterministic
 effect in a `det` test —
 `ply-cli/tests/suite/cli.rs:570 a_nondet_test_in_a_det_test_is_a_compile_error`, which
 runs `ply test --json` on a two-line project and asserts exit code 2 with
@@ -914,14 +914,14 @@ Neither moved what a request allocates:
 `{"allocations_per_request":1081.87,"bytes_per_request":127954.65,...}` after
 both, the same pair to the hundredth as before them. The region census did not
 move either — still `113 regions, 0 unique, 113 shared` from
-`cargo test -p ply-eval --test region_kind_inference --
+`cargo test -p ply-eval-tests --test region_kind_inference --
 the_split_over_the_repositorys_own_examples --nocapture`.
 
 The same audit found `README.md`'s request-path allocation sentence stale for the
 **second** time in this milestone, the second time inside the correction block
 written for the first. That sentence is now the one line of prose in this
 repository that a test reads —
-`ply-corpus/tests/allocation/w6_report_allocations.rs:163
+`ply-corpus-tests/tests/allocation/w6_report_allocations.rs:163
 the_readme_still_describes_this_request_path`, both numbers, within 1%.
 `docs/ONBOARDING.md` §7's checked/written boundary moved by exactly that line and
 says so.
@@ -939,9 +939,9 @@ What that does **not** license is ripping regions out. Two things the region
 track bought are measured and are not in dispute. The **escape discipline** is a
 safety property, not an allocation claim: the arena is what made a use-after-free
 constructible in this language at all, and the brand is what refuses it at
-compile time (`crates/ply-eval/tests/suite/use_after_free_audit.rs`). And the **arena
+compile time (`crates/ply-eval-tests/tests/suite/use_after_free_audit.rs`). And the **arena
 beats the persistent map it replaced**, re-taken here with
-`cargo test -p ply-eval --release --test allocation -- region_arena_cost --nocapture`, which
+`cargo test -p ply-eval-tests --release --test allocation -- region_arena_cost --nocapture`, which
 prints for 10,000 cells:
 
 ```
@@ -971,7 +971,7 @@ The first is false — `Int`, `Bool`, `Float`, `Unit`, `Decimal`, `Cell` and
 allocator — and the second is a **20-request window** fitting to 65.0 per
 request plus 925 once per `Machine`, which is one-time work divided by twenty.
 Both are corrected in place in ADR 0018 with the originals beside them.
-`cargo test -p ply-corpus --release --test r4_value_construction -- --nocapture`
+`cargo test -p ply-corpus-tests --release --test r4_value_construction -- --nocapture`
 prints the zeroes by name.
 
 **So the milestone as scoped had nothing to remove**, and this is R3's lesson
@@ -1273,7 +1273,7 @@ the deletability of the spike, the falsification table's reproducibility, and th
 > ```
 >
 > Crossover measured at depth 9,990: k = 90 passes, k = 100 raises.
-> `crates/ply-eval/tests/suite/equivalence_audit.rs::the_two_engines_agree_on_the_recursion_bound`
+> `crates/ply-eval-tests/tests/suite/equivalence_audit.rs::the_two_engines_agree_on_the_recursion_bound`
 > therefore holds only below that ratio — both its programs pend two frames a
 > level — and its name and doc claimed the general statement.
 >
