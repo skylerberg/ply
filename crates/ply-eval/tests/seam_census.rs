@@ -7,6 +7,7 @@ use ply_syntax::parse_program;
 use ply_syntax::resolve::{Resolved, resolve};
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -140,15 +141,94 @@ impl ply_eval::Compiled for Declining {
     }
 }
 
+const EXAMPLES: &str = "examples";
+
+/// Round-robin over the fixtures in their on-disk order, so a run of same-cost siblings spreads.
+const BUCKETS: usize = 8;
+
+/// The census counters are process-wide, so the tests here take turns and read deltas.
+static TURN: Mutex<()> = Mutex::new(());
+
+/// What one test sweeps.
+#[derive(Clone, Copy)]
+enum Selection {
+    /// The one real program, and the only selection whose counts prove anything.
+    Examples,
+    Fixtures(usize),
+}
+
+impl Selection {
+    fn corpora(self) -> Vec<(String, PathBuf, Vec<PathBuf>)> {
+        let all = corpora(&workspace_root());
+        match self {
+            Selection::Examples => all.into_iter().filter(|c| c.0 == EXAMPLES).collect(),
+            Selection::Fixtures(bucket) => all
+                .into_iter()
+                .filter(|c| c.0 != EXAMPLES)
+                .enumerate()
+                .filter(|(position, _)| position % BUCKETS == bucket)
+                .map(|(_, c)| c)
+                .collect(),
+        }
+    }
+
+    fn is_examples(self) -> bool {
+        matches!(self, Selection::Examples)
+    }
+}
+
+impl std::fmt::Display for Selection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Selection::Examples => f.write_str(EXAMPLES),
+            Selection::Fixtures(bucket) => write!(f, "fixture bucket {bucket}"),
+        }
+    }
+}
+
 #[test]
-fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_offered() {
+fn every_fixture_is_in_exactly_one_bucket_and_examples_is_its_own() {
+    assert_eq!(
+        Selection::Examples.corpora().len(),
+        1,
+        "examples/ is not a corpus"
+    );
+    let mut expected: Vec<String> = corpora(&workspace_root())
+        .into_iter()
+        .map(|c| c.0)
+        .filter(|label| label != EXAMPLES)
+        .collect();
+    assert!(
+        expected.len() > BUCKETS,
+        "{} fixtures over {BUCKETS} buckets leaves buckets that sweep nothing",
+        expected.len()
+    );
+    let mut seen: Vec<String> = (0..BUCKETS)
+        .flat_map(|bucket| Selection::Fixtures(bucket).corpora())
+        .map(|c| c.0)
+        .collect();
+    expected.sort_unstable();
+    seen.sort_unstable();
+    assert_eq!(
+        seen, expected,
+        "the buckets are not a partition of the fixtures"
+    );
+    assert_eq!(BUCKETS, 8, "`over_every_corpus!` names one test per bucket");
+}
+
+fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_offered(
+    selection: Selection,
+) {
+    let _turn = TURN.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     ply_eval::census::enable();
-    let root = workspace_root();
+    let (body0, admitted0, scalar0, gates0) = ply_eval::census::snapshot();
+    let type_gated0 = ply_eval::census::type_gated_shipping();
+    let walked0 = ply_eval::census::carried_sig_walked();
     let mut offered = 0u64;
     let mut compared = 0usize;
 
-    let mut prev = (0u64, 0u64, 0u64);
-    for (_label, dir, files) in corpora(&root) {
+    let mut prev = (body0, admitted0, scalar0);
+    for (label, dir, files) in selection.corpora() {
         let Some((program, resolved)) = load(&dir, &files) else {
             continue;
         };
@@ -173,7 +253,7 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
         let (b, a, sc, _) = ply_eval::census::snapshot();
         println!(
             "PER-CORPUS {:<28} body={:<9} admitted={:<8} scalar={:<7} tests={}",
-            _label,
+            label,
             b - prev.0,
             a - prev.1,
             sc - prev.2,
@@ -183,42 +263,110 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
     }
 
     let (body, admitted, scalar, gates) = ply_eval::census::snapshot();
-    println!("{}", ply_eval::census::report());
+    let body = body - body0;
+    let admitted = admitted - admitted0;
+    let scalar = scalar - scalar0;
+    let refused: u64 = gates
+        .iter()
+        .map(|(gate, count)| count - gates0.get(gate).copied().unwrap_or(0))
+        .sum();
+    let argument_type = gates.get("ArgumentType").copied().unwrap_or(0)
+        - gates0.get("ArgumentType").copied().unwrap_or(0);
     println!(
-        "CROSS-CHECK  body_calls={body}  admitted={admitted}  scalar_sig={scalar}  \
-         declining-backend offered={offered}  tests={compared}"
+        "CROSS-CHECK over {selection}  body_calls={body}  admitted={admitted}  \
+         scalar_sig={scalar}  declining-backend offered={offered}  tests={compared}"
     );
-    let refused: u64 = gates.values().sum();
-    assert!(compared > 0, "no corpus ran");
-    assert!(body > 0, "the census hook never fired");
     assert_eq!(
         admitted, offered,
-        "the census counted a different set from the one the backend was handed"
+        "over {selection}, the census counted a different set from the one the backend was handed"
     );
-    assert_eq!(body - admitted, refused, "the gate histogram does not sum");
+    assert_eq!(
+        body - admitted,
+        refused,
+        "over {selection}, the gate histogram does not sum"
+    );
 
     // The two halves of the argument test, separated over a corpus.
-    let type_gated = ply_eval::census::type_gated_shipping();
+    let type_gated = ply_eval::census::type_gated_shipping() - type_gated0;
     assert_eq!(
         type_gated,
         admitted,
-        "the type gate and the kind gate disagree over this corpus: the kind gate refused          {} call(s) the declared types admitted",
+        "the type gate and the kind gate disagree over {selection}: the kind gate refused {} \
+         call(s) the declared types admitted",
         type_gated.saturating_sub(admitted)
     );
 
     // The two ends of the seam's one table, over a corpus.
-    let walked = ply_eval::census::carried_sig_walked();
+    let walked = ply_eval::census::carried_sig_walked() - walked0;
     assert_eq!(
         walked,
         scalar,
-        "the declared-type walk and the per-definition precompute disagree over this corpus by \
+        "the declared-type walk and the per-definition precompute disagree over {selection} by \
          {} call(s)",
         walked.abs_diff(scalar)
     );
 
-    // And the gate is not vacuous on this corpus: it refuses something.
-    assert!(
-        gates.get("ArgumentType").copied().unwrap_or(0) > 0,
-        "`Gate::ArgumentType` refused nothing over the whole corpus, so this run says          nothing about it: {gates:?}"
-    );
+    if selection.is_examples() {
+        // Cumulative for the process, which is exactly this selection under nextest.
+        println!("{}", ply_eval::census::report());
+        assert!(compared > 0, "no corpus ran");
+        assert!(body > 0, "the census hook never fired");
+        // And the gate is not vacuous on this corpus: it refuses something.
+        assert!(
+            argument_type > 0,
+            "`Gate::ArgumentType` refused nothing over examples, so this run says nothing about \
+             it: {gates:?}"
+        );
+    }
 }
+
+/// One test per selection: `over_examples` carries the liveness assertions, the buckets the
+/// cross-checks over one slice of the fixtures.
+macro_rules! over_every_corpus {
+    ($family:ident) => {
+        mod $family {
+            use super::Selection;
+
+            #[test]
+            fn over_examples() {
+                super::$family(Selection::Examples);
+            }
+            #[test]
+            fn over_fixture_bucket_0() {
+                super::$family(Selection::Fixtures(0));
+            }
+            #[test]
+            fn over_fixture_bucket_1() {
+                super::$family(Selection::Fixtures(1));
+            }
+            #[test]
+            fn over_fixture_bucket_2() {
+                super::$family(Selection::Fixtures(2));
+            }
+            #[test]
+            fn over_fixture_bucket_3() {
+                super::$family(Selection::Fixtures(3));
+            }
+            #[test]
+            fn over_fixture_bucket_4() {
+                super::$family(Selection::Fixtures(4));
+            }
+            #[test]
+            fn over_fixture_bucket_5() {
+                super::$family(Selection::Fixtures(5));
+            }
+            #[test]
+            fn over_fixture_bucket_6() {
+                super::$family(Selection::Fixtures(6));
+            }
+            #[test]
+            fn over_fixture_bucket_7() {
+                super::$family(Selection::Fixtures(7));
+            }
+        }
+    };
+}
+
+over_every_corpus!(
+    the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_offered
+);

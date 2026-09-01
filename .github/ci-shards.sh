@@ -2,44 +2,29 @@
 #
 # The table CI's test jobs are cut from, and the check that the cut is total.
 #
-# `cargo test --workspace` is 178.1s of in-target time — the `test result:`
-# lines summed, excluding compilation — and CI runs it as several jobs rather
-# than one.
+# CI runs the suite as several jobs rather than one, each compiling only the
+# packages it tests, because a job's wall clock is compile plus run and the
+# compile is the larger half. Every job pays the dependency graph under its
+# packages, so a shard is cut on that graph first and on run time second.
 #
-# **That figure read 915.8s until 2026-08-31 and the 5x is two changes, neither
-# of them this table's.** `[profile.dev] opt-level = 2` landed in the root
-# manifest, which that file records at 6.5x on one binary; and the two
-# allocation-attribution suites in `ply-corpus` stopped symbolicating a
-# backtrace per allocation, which is 86.6s to 9.2s of the total on its own —
-# `r4_value_construction` 46.2s to 6.7s and `w6_alloc_sites` 40.4s to 2.6s.
-# Re-taken on the machine in docs/ONBOARDING.md §Provenance at a load below 4,
-# on this tree both ways: 246.9s with those two reverted, 178.1s with them.
-#
-# **The sharding decision below has NOT been re-derived from the new figure,
-# and it is the obvious thing to check next** — the more so because 86.6s of
-# what just came off was `ply-corpus`, which is the shard the split below is
-# built around as the long pole. 178.1s of in-target time is a ten-core
-# reading; the runners are two-core, where `ply-corpus` and `ply-eval` measured
-# 90.7s and 144.0s with `-j 2 -- --test-threads=2` on that same machine — taken
-# at 54a568d, before cranelift shipped and before the change above, so they are
-# the shape and not the figures. Whether three shards is still the right number
-# is an open question and this comment is not an answer to it. A partition is a chance to lose a package silently,
-# which is this repository's most expensive defect class, so the partition lives
-# here once and `verify` reads the workspace members out of `Cargo.toml` and
-# fails if a member is in no shard, in two shards, or named here and absent from
-# the tree.
+# A partition is a chance to lose a package silently, which is this
+# repository's most expensive defect class, so the partition lives here once and
+# `verify` reads the workspace members out of `Cargo.toml` and fails if a member
+# is in no shard, in two shards, or named here and absent from the tree.
 #
 #   ci-shards.sh verify        every member is in exactly one shard, every
 #                              deferred test and every tree check exists where
-#                              this table says, and every directory under
-#                              `spikes/` is either run by a named CI job or
-#                              listed as deliberately outside with a reason
+#                              this table says, `.config/nextest.toml` names
+#                              exactly the deferred tests, and every directory
+#                              under `spikes/` is either run by a named CI job
+#                              or listed as deliberately outside with a reason
 #   ci-shards.sh matrix        the JSON matrix for the parallel test job
 #   ci-shards.sh packages ID   `-p` arguments for one shard
-#   ci-shards.sh skips         `--skip` arguments the parallel shards need
 #   ci-shards.sh deferred      one `package target test` line per deferred test
-#   ci-shards.sh deferred-packages
-#                              the `-p` arguments for one build covering them all
+#   ci-shards.sh deferred-filter
+#                              the nextest filterset selecting exactly the
+#                              deferred tests; `.config/nextest.toml` carries it
+#                              verbatim and `verify` checks that it does
 #   ci-shards.sh tree-checks   one `package target test` line per tree check
 
 set -euo pipefail
@@ -64,40 +49,23 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # packages sat in the `cli` shard, linking twelve-odd test binaries against the
 # heaviest graph in the tree.
 #
-# What the previous arrangement cost, from run 33472886832 (`main`, warm
-# dependency cache -- the last such run before `df32f9b` poisoned it; see the
-# `rust-cache` note in `.github/workflows/ci.yml`):
+# **The imbalance is compile and linking, not tests.** Balancing on test
+# seconds, which is what earlier revisions of this table did, was measuring the
+# smaller half. So: `cli` keeps only what needs cranelift, `corpus` and
+# `postgres` are their own graphs, and the light packages sit on the light one.
 #
-#   shard   build   test    binaries
-#   cli     199s     43s    ~20
-#   corpus  144s     45s      9
-#   eval     62s     92s     10
-#
-# **The imbalance is compile and linking, not tests.** Test execution across
-# the whole `cli` shard is 42s, and 31s of that is `ply-cli` itself; the other
-# ten packages run in 11s between them. Balancing on test seconds -- which is
-# what every earlier revision of this comment did -- was measuring the smaller
-# half.
-#
-# So: `cli` keeps only what needs cranelift, `light` takes the rest, `corpus`
-# and `postgres` are unchanged.
-#
-# **The arithmetic below is an estimate and has not been confirmed on a
-# runner.** Reassigning the light packages should move roughly twelve links out
-# of the heavy graph and into the light one, putting the three parallel shards
-# near 145s / 175s / 215s against the 242s / 190s / 155s above -- so the pole
-# moves from `cli` to `light` and comes down. Re-take it from the first warm
-# `main` run after this lands and correct these numbers in place; if `light` is
-# the pole while `cli` idles, move one or two packages back.
-#
-# **Three parallel shards, not four, and cache pressure is why.** Splitting
-# `ply-eval` away from the other light packages would balance better still --
-# it is one package with a 92s suite sharing a shard with ten that run in 11s.
-# But GitHub evicts Actions caches LRU past 10GB per repository and this one
-# measured 7.96GB across eight entries on 2026-09-01, with several generations
-# of each key alive at once. An eighth cache risks evicting a seventh, and an
-# evicted cache is a cold dependency build, which is the thing this whole file
-# is trying to avoid paying. Revisit if the cache budget grows.
+# `ply-eval` is a shard of its own because it is the one light package whose
+# suite is long: on the light graph the other nine run in seconds between
+# them, while `ply-eval`'s integration suite sweeps every corpus on disk under
+# a dozen backends. Splitting it off puts that suite on a runner that compiles
+# only its own graph, and leaves `light` compiling `ply-eval`'s library once
+# without its tests. Cache pressure was the reason this was not done earlier,
+# and it is no longer a reason: a shard's dependency cache is a fraction of a
+# gigabyte now that dependencies carry no debuginfo, the budget is 10GB per
+# repository and eviction is LRU, so one more shard is one more entry rather
+# than a cold build for everyone. Re-take the shard wall clocks from the first
+# warm `main` run after a rebalance and move a package if one shard is the pole
+# while another idles.
 #
 # Splitting `ply-corpus` further would mean partitioning by test target, which
 # would give up the property `verify` checks -- that every *package* is
@@ -121,7 +89,8 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SHARDS=(
   "corpus:ply-corpus"
   "cli:ply-cli ply-codegen"
-  "light:ply-eval ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std"
+  "eval:ply-eval"
+  "light:ply-span ply-syntax ply-derive ply-core ply-hash ply-store ply-test ply-prove ply-std"
   "postgres:ply-host"
 )
 
@@ -181,11 +150,15 @@ declare -a KNOWN_OUTSIDE=(
 # `target` is an integration test binary or the literal `lib` for a unit test.
 #
 # Each passes or fails on how much CPU it was given rather than on what the code
-# does, so several test binaries at once on a two-core hosted runner is the
-# wrong place for them. The parallel shards `--skip` them by name; the timing
-# job runs them alone, one at a time, single-threaded, with `--nocapture` so the
-# figures they print reach the log. Names are matched with `--exact`, so a unit
-# test is named by its full module path.
+# does, so several test binaries at once is the wrong place for them. nextest
+# runs them last and alone: `.config/nextest.toml` gives exactly these tests
+# every test thread and the lowest priority, so each one starts only when the
+# rest of the shard has finished and nothing else runs beside it. That file
+# carries this table's filterset verbatim (`deferred-filter`), and `verify`
+# fails when the two disagree, because a test that drops out of the override
+# quietly goes back to running under contention. What they print is shown,
+# since a measurement nobody can read is not a measurement. Names are matched
+# exactly, so a unit test is named by its full module path.
 #
 # **This list is maintained by running the shards, not by surveying the tree.**
 # Two surveys have been done and each declared itself complete; each was proved
@@ -321,20 +294,6 @@ cmd_packages() {
   printf '\n'
 }
 
-cmd_skips() {
-  local package target test
-  while read -r package target test; do
-    printf -- '--skip %s ' "$test"
-  done < <(cmd_deferred)
-  printf '\n'
-}
-
-# Where a named test's `fn` is defined. A target is either a single
-# `tests/<target>.rs` or a directory target rooted at `tests/<target>/main.rs`;
-# in the directory form the test name carries the module path to the file that
-# defines it, so `suite:simulation::a_long_sleep_is_a_jump` resolves to
-# `tests/suite/simulation.rs`. Resolving the module rather than grepping the
-# whole directory keeps the check as sharp as it was against one file per test.
 test_source_file() {
   local package=$1 target=$2 test=$3 dir modpath
   dir="$root/crates/$package/tests"
@@ -364,15 +323,24 @@ cmd_deferred() {
 # resolves features over *the selected packages*, so each entry got its own
 # resolution and the tree recompiled between them. One selection is one
 # resolution, so this is what keeps the build to one.
-cmd_deferred_packages() {
-  local package
-  while read -r package _ _; do
-    printf '%s\n' "$package"
-  done < <(cmd_deferred) | sort -u | tr '\n' ' ' | sed 's/ $//'
-  echo
+# One `(binary_id(=…) & test(=…))` term per deferred test, joined with `|`.
+# Exact matchers on both sides: `binary_id(ply-corpus)` would also match
+# `ply-corpus::suite`, and a substring on the test name would widen the set the
+# moment somebody names a test after another.
+cmd_deferred_filter() {
+  local package target test id first=1
+  while read -r package target test; do
+    if [[ $target == lib ]]; then
+      id=$package
+    else
+      id="$package::$target"
+    fi
+    ((first)) || printf ' | '
+    first=0
+    printf '(binary_id(=%s) & test(=%s))' "$id" "$test"
+  done < <(cmd_deferred)
+  printf '\n'
 }
-
-# Same three-field split as `cmd_deferred`, for the same reason.
 cmd_tree_checks() {
   local entry rest
   for entry in "${TREE_CHECKS[@]}"; do
@@ -543,6 +511,15 @@ cmd_verify() {
   #
   # Same three questions as the crate half: is every directory accounted for,
   # does every job this table names exist, and is it actually required.
+  local nextest="$root/.config/nextest.toml" filter
+  filter=$(cmd_deferred_filter)
+  if [[ ! -f $nextest ]]; then
+    echo "FAIL: no $nextest, so nothing runs the deferred tests alone" >&2
+    failures=$((failures + 1))
+  elif [[ $(grep -cxF "filter = '$filter'" "$nextest") -ne 1 ]]; then
+    echo "FAIL: $nextest does not carry this table's deferred filter exactly once; paste the output of 'ci-shards.sh deferred-filter' into the override, single-quoted, on one line" >&2
+    failures=$((failures + 1))
+  fi
   local workflow="$root/.github/workflows/ci.yml"
   local -a spike_listed=()
   local spike job needs block
@@ -645,12 +622,11 @@ case "${1:-}" in
   verify) cmd_verify ;;
   matrix) cmd_matrix ;;
   packages) cmd_packages "${2:?a shard id}" ;;
-  skips) cmd_skips ;;
   deferred) cmd_deferred ;;
-  deferred-packages) cmd_deferred_packages ;;
+  deferred-filter) cmd_deferred_filter ;;
   tree-checks) cmd_tree_checks ;;
   *)
-    echo "usage: ci-shards.sh {verify|matrix|packages ID|skips|deferred|deferred-packages|tree-checks}" >&2
+    echo "usage: ci-shards.sh {verify|matrix|packages ID|deferred|deferred-filter|tree-checks}" >&2
     exit 2
     ;;
 esac

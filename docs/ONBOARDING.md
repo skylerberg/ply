@@ -142,14 +142,21 @@ Two live caveats:
 ## 2. Test
 
 ```
-cargo test --workspace
+cargo nextest run --workspace
 ```
 
+[nextest](https://nexte.st) is the one tool the loop needs that `rustup` does
+not install: `cargo install cargo-nextest --locked`, or a pre-built binary from
+its site. `cargo test --workspace` still works and is what runs doctests;
+nextest is faster because it runs every binary's tests as one pool, one process
+per test, instead of one binary after another. `CONTRIBUTING.md` §"The loop"
+says what `.config/nextest.toml` does with the wall-clock tests.
+
 **Budget a few minutes on an unloaded machine, and do not run it under load.**
-The wall clock on this command has ranged from three minutes to nearly thirty
-across its history, and the slow readings are the machine rather than the tree —
-in the worst of them *user time was below real time*, which is a run spending
-minutes waiting for cores rather than using them.
+The wall clock on this command has ranged widely across its history, and the
+slow readings are the machine rather than the tree — in the worst of them *user
+time was below real time*, which is a run spending minutes waiting for cores
+rather than using them.
 
 No test count is given here on purpose. It changes on every commit that adds a
 test, nothing in the tree checks it, and every re-take this file used to carry
@@ -159,7 +166,7 @@ that nothing failed.
 Two sections follow that are worth reading before you trust a green run.
 ### Five things a green suite does not prove
 
-`cargo test --workspace` green is weaker than it looks, and the reason is always
+`cargo nextest run --workspace` green is weaker than it looks, and the reason is always
 the same: **a gate that is closed makes its tests pass without running them.**
 
 | gate | what goes quiet | how to open it |

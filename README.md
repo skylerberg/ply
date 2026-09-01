@@ -405,9 +405,9 @@ brands the values allocated in a scope so one escaping it is `E0446` at the
 escape site and one reaching a runtime boundary is `E0449`. That is why
 [DESIGN.md](DESIGN.md) §2 talks about regions and brands at all.
 
-`cargo test --workspace` takes about **three minutes** on an unloaded machine,
-and all of it passes. (That reading predates #65; `docs/ONBOARDING.md` §2 has
-its provenance and says what has not been re-taken.)
+`cargo nextest run --workspace` passes on an unloaded machine;
+`docs/ONBOARDING.md` §2 has the command's provenance and what it does not
+prove.
 
 **It is deliberately not described here by a test count.** This paragraph used
 to carry one, re-taken through a chain of nested blocks each recording what the
@@ -447,7 +447,7 @@ reopen it.
 
 ```
 cargo build --workspace
-cargo test --workspace
+cargo nextest run --workspace
 ./target/debug/ply test examples/
 ./target/debug/ply prove examples/desk.ply
 ./target/debug/ply hosts examples/desk.ply --host
