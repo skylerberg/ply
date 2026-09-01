@@ -319,7 +319,7 @@ and [ADR 0030](docs/adr/0030-compiled-code-on-the-front-end.md) carry the series
 and the conditions; do not re-derive the ratios here, and do not read a loss on
 one workload as a bound on the idea.
 **The request-path allocation count is large.** One `/health` request makes
-**773 allocations and 108,200 bytes** to produce a 107-byte response.
+**742 allocations and 89,666 bytes** to produce a 107-byte response.
 
 **The profile has a −7.8% residue.** The layer table above sums to 638.96µs
 against a measured total of 592.64µs, because six of the rungs are taken in

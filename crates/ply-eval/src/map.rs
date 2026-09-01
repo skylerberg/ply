@@ -1,9 +1,8 @@
 //! The `Map` builtins.
 
 use crate::cont::Frame;
-use crate::value::{Map, Value};
+use crate::value::{Fields, Map, Value};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -21,7 +20,7 @@ fn none() -> Value {
 }
 
 fn entry(k: Value, v: Value) -> Value {
-    Value::Record(Arc::new(BTreeMap::from([
+    Value::Record(Arc::new(Fields::from_iter([
         (Symbol::new(KEY), k),
         (Symbol::new(VALUE), v),
     ])))

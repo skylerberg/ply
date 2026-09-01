@@ -1019,9 +1019,7 @@ fn the_shape_of_every_value_variant_is_measured() {
         Value::ctor(none, Vec::new())
     });
     let record = shape("Value::Record(1 field)", || {
-        let mut fields = BTreeMap::new();
-        fields.insert(x, Value::Int(1));
-        Value::Record(Arc::new(fields))
+        Value::Record(Arc::new(ply_eval::Fields::from_iter([(x, Value::Int(1))])))
     });
     shape("Value::map(4 entries)", || {
         Value::map((0..4).map(|i| (Value::Int(i), Value::Int(i))))
@@ -1122,9 +1120,10 @@ fn the_shape_of_every_value_variant_is_measured() {
     );
     assert_eq!(
         record.1,
-        vec![40, 544],
-        "a one-field record no longer costs a 40-byte `Arc` and one 544-byte B-tree node: it \
-         cost {:?}, and the `Value::Record` bucket's bytes are read against that node",
+        vec![40, 48],
+        "a one-field record no longer costs a 40-byte `Arc` and one 48-byte field vector: it \
+         cost {:?}. It was a 544-byte B-tree node until `Fields` replaced the map, and the \
+         `Value::Record` bucket's bytes are read against whichever this is",
         record.1
     );
     assert_eq!(

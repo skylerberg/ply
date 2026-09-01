@@ -409,6 +409,7 @@ mod tests {
     use crate::env::Env;
     use crate::limit::DEFAULT_MAX_CALLS;
     use crate::machine::Machine;
+    use crate::value::Fields;
     use crate::value::{Closure, ClosureKind};
     use ply_core::{CheckOutput, check_program};
     use ply_span::Diagnostic;
@@ -1142,7 +1143,7 @@ mod tests {
         );
         // Re-taken for the type gate (ADR 0030 §9.2 registered this debt): a `Record` argument is
         // NOT in the lookup-free half any more.
-        let record = Value::Record(Arc::new(BTreeMap::new()));
+        let record = Value::Record(Arc::new(Fields::default()));
         assert_eq!(
             gate(&c, &unknown, std::slice::from_ref(&record)),
             Err(Gate::PublishedRow),
@@ -1899,7 +1900,7 @@ mod tests {
             ))),
         );
         fields.insert(Symbol::new("tag"), Value::Int(1));
-        let holding = Value::Record(Arc::new(fields));
+        let holding = Value::Record(Arc::new(fields.into_iter().collect()));
 
         assert_eq!(
             gate(&c, &named(&c, "use_box"), &[holding]),
@@ -1915,7 +1916,7 @@ mod tests {
             gate(
                 &c,
                 &named(&c, "use_plain"),
-                &[Value::Record(Arc::new(plain))]
+                &[Value::Record(Arc::new(plain.into_iter().collect()))]
             ),
             Ok(("use_plain".to_string(), DEFAULT_MAX_CALLS)),
             "a record of `Int` did not cross, so the widening bought nothing"
@@ -1927,7 +1928,7 @@ mod tests {
             gate(
                 &c,
                 &named(&c, "use_box"),
-                &[Value::Record(Arc::new(BTreeMap::new()))]
+                &[Value::Record(Arc::new(Fields::default()))]
             ),
             Err(Gate::ArgumentType),
             "an empty record under a closure-bearing declared type crossed"
@@ -2120,7 +2121,7 @@ mod tests {
         assert_eq!(backend.names(), vec!["first"]);
         assert_eq!(
             backend.offers()[0].args,
-            vec![Value::Record(Arc::new(BTreeMap::from([
+            vec![Value::Record(Arc::new(Fields::from_iter([
                 (Symbol::new("a"), Value::Int(7)),
                 (Symbol::new("b"), Value::bytes(b"x")),
             ])))],
@@ -2561,7 +2562,7 @@ mod tests {
         for (name, value) in fields {
             map.insert(Symbol::new(name), value.clone());
         }
-        Value::Record(Arc::new(map))
+        Value::Record(Arc::new(map.into_iter().collect()))
     }
 
     /// A `Float` in flight is what `crossable` refuses; this is the same statement about the answer

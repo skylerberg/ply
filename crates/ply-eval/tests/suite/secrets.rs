@@ -535,5 +535,5 @@ fn entry(k: Value, v: Value) -> Value {
     let mut fields = BTreeMap::new();
     fields.insert(Symbol::new("key"), k);
     fields.insert(Symbol::new("value"), v);
-    Value::Record(Arc::new(fields))
+    Value::Record(Arc::new(fields.into_iter().collect()))
 }

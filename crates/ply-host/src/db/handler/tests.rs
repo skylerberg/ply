@@ -66,7 +66,7 @@ impl Driver for Counting {
 fn stmt(sql: &str) -> Value {
     let mut fields = BTreeMap::new();
     fields.insert(Symbol::new("sql"), Value::str(sql));
-    Value::Record(Arc::new(fields))
+    Value::Record(Arc::new(fields.into_iter().collect()))
 }
 
 fn declaration(op: Op) -> HostOp {
