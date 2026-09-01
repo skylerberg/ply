@@ -29,9 +29,7 @@ use crate::window::{SlotVal, Windows};
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{
-    BinOp, Expr, FnDef, Item, Mode, Program, QName, TypeDefBody, UnOp,
-};
+use ply_syntax::ast::{BinOp, Expr, FnDef, Item, Mode, Program, QName, TypeDefBody, UnOp};
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, OnceCell};
@@ -1049,9 +1047,7 @@ impl<'a> Machine<'a> {
                                 None => Got::Fall,
                             },
                         },
-                        SlotVal::Full(other) => {
-                            Got::NotRecord(other.type_name(), other.render())
-                        }
+                        SlotVal::Full(other) => Got::NotRecord(other.type_name(), other.render()),
                         SlotVal::Moved => Got::Moved,
                         SlotVal::Vacant => Got::Fall,
                     };
@@ -1148,13 +1144,8 @@ impl<'a> Machine<'a> {
                     module,
                     span,
                 });
-                let transition = handler::enter_handle(
-                    &self.stack,
-                    body,
-                    prompt,
-                    module,
-                    self.windows.window(),
-                );
+                let transition =
+                    handler::enter_handle(&self.stack, body, prompt, module, self.windows.window());
                 self.take(transition)?;
             }
 
@@ -1879,7 +1870,16 @@ impl<'a> Machine<'a> {
                 let lowered = self.closure_code.of(&pre, params, body);
                 let pre_values: Vec<Value> = bindings.iter().map(|(_, v)| v.clone()).collect();
                 let (arity, module) = (params.len(), *module);
-                self.enter_code(closure, arity, lowered, None, &pre_values, module, args, span)
+                self.enter_code(
+                    closure,
+                    arity,
+                    lowered,
+                    None,
+                    &pre_values,
+                    module,
+                    args,
+                    span,
+                )
             }
             ClosureKind::Ctor { name, arity } => {
                 if crate::census::enabled() {

@@ -211,3 +211,33 @@ test "nested captures each restore their own scope" {
 fn nested_captures_each_restore_their_own_scope() {
     passes(NESTED, "nested captures each restore their own scope");
 }
+
+const SIBLINGS: &str = r#"
+effect amb {
+  read flip[coin]() -> Bool
+}
+
+// Each resumption binds `tag` into the same slot of the re-entered extent. If the two resumptions
+// shared one window rather than each restoring its own copy of the capture's snapshot, the second
+// would start from the first's leavings — a stale `tag`, or a `b` already moved out, which the
+// machine reports loudly — and the sum would not survive.
+test "sibling resumptions do not share slot writes" {
+  let out = handle {
+    let b = amb.flip[coin]();
+    let tag = if b { 1 } else { 2 };
+    tag * 10 + (if b { 1 } else { 2 })
+  } with {
+    amb.flip[coin]() resume k -> k(true) + k(false),
+    return x -> x
+  };
+  assert_eq(out, 33)
+}
+"#;
+
+/// Sibling isolation — the probe ADR 0034's note in this file asked for. Unlike the first probe,
+/// this one arms itself on the slot machine: a shared window would hand the second resumption a
+/// moved-out slot, which is an internal error rather than a wrong sum.
+#[test]
+fn sibling_resumptions_do_not_share_slot_writes() {
+    passes(SIBLINGS, "sibling resumptions do not share slot writes");
+}

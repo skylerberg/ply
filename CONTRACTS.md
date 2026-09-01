@@ -1673,18 +1673,24 @@ teardown falls back to the allocator instead of aborting a worker.
 ### `ply-eval::cont` — landed
 
 ```rust
-pub enum Frame { .. }                // 23 kinds as shipped; the ADR's table
-                                     // describes the 20 M6 landed. The three
-                                     // added since are `CloseRegion` (ADR 0017)
-                                     // and the `MapFoldStep` / `BytesPositionStep`
-                                     // builtin steps.
+pub enum Frame { .. }                // 26 kinds as shipped; the ADR's table
+                                     // describes the 20 M6 landed. Added since:
+                                     // `CloseRegion` (ADR 0017), the
+                                     // `MapFoldStep` / `BytesPositionStep`
+                                     // builtin steps, and ADR 0034's window
+                                     // bookkeeping, `Exit` and `Restore`.
 pub struct Prompt {
     pub clauses: Rc<Vec<Clause>>,
     /// Program-wide effect names, parallel to `clauses`, resolved where the
     /// `handle` was written.
     pub effects: Rc<Vec<Symbol>>,
     pub ret: Option<Rc<ReturnArm>>,
-    pub env: Env, pub module: usize, pub span: Span,
+    /// Per clause, and for the return arm, the values their free variables
+    /// were bound to where the handler was installed — copied out of the
+    /// installing window at handle entry (ADR 0034).
+    pub clause_captures: Vec<Rc<[Value]>>,
+    pub ret_captures: Rc<[Value]>,
+    pub module: usize, pub span: Span,
 }
 impl Prompt {
     pub fn clause_for(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>)
@@ -7930,8 +7936,9 @@ because of that guard.
 - **The canonical expansion**: copies first, sorted by field name, valued
   `base.<name>`; then the written fields in the order written. Sorted because
   `reordering_the_fields_of_a_record_type_is_free` is an invariant the suite
-  asserts; written-last because `GAPS.md` §1 measures a growing sub-expression
-  out of last position as quadratic. Sorted **by name and not by length** is a
+  asserts; written-last was chosen when field position decided an append's
+  cost, and is kept because the expansion participates in definition hashes
+  (position decides nothing since ADR 0034). Sorted **by name and not by length** is a
   separate claim and is pinned separately, because a suite written in
   one-character field names orders identically under either comparator and says
   nothing. Each of `crates/ply-syntax/src/tests.rs

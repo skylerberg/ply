@@ -519,7 +519,11 @@ fn every_pair_is_pinned_to_what_it_costs_today() {
             (200, 200, 1),
             (200, 200, 1),
         ),
-        ("let binding against parameter", (200, 200, 1), (200, 200, 1)),
+        (
+            "let binding against parameter",
+            (200, 200, 1),
+            (200, 200, 1),
+        ),
         ("fold closure accumulator", (200, 200, 1), (200, 200, 1)),
     ];
 

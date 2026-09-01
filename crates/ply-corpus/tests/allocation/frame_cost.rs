@@ -1,8 +1,8 @@
 //! What a step costs the allocator, exactly.
 
 use crate::counting::charge;
-use ply_eval::cont::{Frame, Prompt, Segment};
 use ply_eval::Stack;
+use ply_eval::cont::{Frame, Prompt, Segment};
 use ply_span::Span;
 use std::hint::black_box;
 use std::rc::Rc;

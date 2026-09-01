@@ -251,10 +251,7 @@ pub fn perform(
                 caller_window: (entry - floor) as u32,
             });
             open_clause(windows, clause, &prompt.clause_captures[clause_at], args);
-            windows.write(
-                clause.params.len() as u32,
-                Value::Continuation(Rc::new(k)),
-            );
+            windows.write(clause.params.len() as u32, Value::Continuation(Rc::new(k)));
             below
         }
         // A tail-resumptive clause takes no pin, and no snapshot either. Both are claims about

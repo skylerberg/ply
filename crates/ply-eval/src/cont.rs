@@ -426,6 +426,9 @@ pub struct Segment {
     /// subtracts to find the floor its snapshot starts at. A size, not a position, so a spliced
     /// segment needs no rebasing.
     window: u32,
+    /// The summed [`frame_delta`] of this segment's pending frames, kept incrementally so a
+    /// capture reads its slot height in O(segments) rather than walking every frame.
+    deltas: usize,
 }
 
 impl Segment {
@@ -443,6 +446,7 @@ impl Segment {
             delimiter: Some(delimiter),
             calls: 0,
             window,
+            deltas: 0,
         }
     }
 
@@ -525,6 +529,7 @@ impl Stack {
     /// The owned form.
     pub fn pushed(mut self, frame: Frame) -> Stack {
         let calls = is_call(&frame);
+        self.top.deltas += frame_delta(&frame);
         self.top.frames = std::mem::take(&mut self.top.frames).push(frame);
         self.top.calls += calls;
         self.frames += 1;
@@ -610,6 +615,7 @@ impl Stack {
     pub fn into_next(mut self) -> Next {
         if let Some(frame) = self.top.frames.pop_front() {
             let calls = is_call(&frame);
+            self.top.deltas -= frame_delta(&frame);
             self.top.calls -= calls;
             self.frames -= 1;
             self.calls -= calls;
@@ -684,7 +690,7 @@ impl Stack {
             calls += cut.calls();
             rest.frames -= cut.frames();
             rest.calls -= cut.calls();
-            cut_deltas += cut.frames.iter().map(frame_delta).sum::<usize>();
+            cut_deltas += cut.deltas;
             cut_window = cut.window;
             taken.push(cut);
         }
@@ -867,12 +873,7 @@ impl Continuation {
     /// where the delimiter lands after a splice.
     pub fn deltas_through_sim(&self) -> Option<usize> {
         let (_, at) = self.sim_at()?;
-        Some(
-            self.segments[..=at]
-                .iter()
-                .map(|s| s.frames.iter().map(frame_delta).sum::<usize>())
-                .sum(),
-        )
+        Some(self.segments[..=at].iter().map(|s| s.deltas).sum())
     }
 }
 
