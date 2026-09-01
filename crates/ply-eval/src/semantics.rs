@@ -98,7 +98,7 @@ thread_local! {
 /// A mention is a compile-time constant — the value is a function of the name
 /// and the arity and of nothing else — and rebuilding it per mention cost 21.0
 /// nullary `Value::Ctor`s and 24.0 `Arc<Closure>`s per `/health` request,
-/// measured by `cargo test -p ply-corpus --release --test r4_value_construction
+/// measured by `cargo test -p ply-corpus-tests --release --test r4_value_construction
 /// -- --nocapture`. [`Value::builtin`] has shared a builtin's closure since W6
 /// for the same reason and its note carries the argument that sharing one is
 /// invisible: a `Closure` is immutable and [`Value::cmp`] answers `Equal` for

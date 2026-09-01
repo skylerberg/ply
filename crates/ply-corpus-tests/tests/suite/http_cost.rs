@@ -117,7 +117,7 @@ fn many_fields(fields: usize) -> Vec<u8> {
 
 /// The W2 property, re-run against the module that replaced the endpoint's hand-written parser.
 #[test]
-#[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
+#[ignore = "timing; run with `cargo test -p ply-corpus-tests --test suite -- --ignored --nocapture http_cost::`"]
 fn the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read() {
     let bench = Bench::open();
     let calls = 2_000;
@@ -142,7 +142,7 @@ fn the_cost_of_a_head_is_flat_in_the_length_of_a_field_it_does_not_read() {
 /// The other axis, and the one a smuggling-safe parser is allowed to pay for: cost rises with the
 /// number of fields, and rises *linearly*.
 #[test]
-#[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
+#[ignore = "timing; run with `cargo test -p ply-corpus-tests --test suite -- --ignored --nocapture http_cost::`"]
 fn the_cost_of_a_head_is_linear_in_the_number_of_fields() {
     let bench = Bench::open();
     let calls = 2_000;
@@ -200,7 +200,7 @@ fn accept_loop(l: Int, count: Int) -> Int / {net.write[listener], net.write[conn
 /// One request per connection, answered over the simulated network — every layer of `std.http` and
 /// the host boundary, and no syscall.
 #[test]
-#[ignore = "timing; run with `cargo test -p ply-corpus --test suite -- --ignored --nocapture http_cost::`"]
+#[ignore = "timing; run with `cargo test -p ply-corpus-tests --test suite -- --ignored --nocapture http_cost::`"]
 fn a_whole_request_through_the_host_boundary() {
     use ply_host::tcp::{Net, SimNet};
     use std::sync::Arc;

@@ -4373,7 +4373,7 @@ pub struct TestResult { /* ... */ pub host: Option<HostUse> }  // NOT SHIPPED
   is "still not cacheable"; it is cacheable. A hermetic pass by a test
   whose footprint reaches the binding is read back under `--host` and the test is
   skipped without the host being consulted.
-  `crates/ply-test/tests/suite/host_selection_audit.rs` pins that behaviour under a
+  `crates/ply-test-tests/tests/suite/host_selection_audit.rs` pins that behaviour under a
   `documents_` name so a fix shows up as a diff.
 - There is no `TestResult::host`. `Failure::host: bool` is what carries the fact
   to a failing test, read off what the runtime did.
@@ -7859,7 +7859,7 @@ command line.
    refused everything with a call in it would satisfy 1 and 2.
 4. Deleting the gate fails at corpus scale, not only in unit tests:
    `tests/fixtures/self_handled_effect.ply` under
-   `crates/ply-eval/tests/suite/differential_corpus.rs`.
+   `crates/ply-eval-tests/tests/suite/differential_corpus.rs`.
 
 **It over-approximates, by how much is measured, and the direction is stated.**
 An edge is any reference that denotes a definition of this program, minus the
@@ -7998,7 +7998,7 @@ because of that guard.
 `RUNTIME_VERSION` bump**. The sugar is gone before `ply-hash` sees anything, and
 that is the whole design: `{..s, a: 1}` and `{b: s.b, c: s.c, a: 1}` are one
 definition with one `DefHash`
-(`crates/ply-hash/tests/suite/audit.rs record_update_hashes_as_its_expansion`).
+(`crates/ply-hash-tests/tests/suite/audit.rs record_update_hashes_as_its_expansion`).
 
 ### `ply-core` — landed
 
@@ -8019,7 +8019,7 @@ ever constrains, and is marked so in ADR 0023 rather than claimed.
 
 Fixtures: `tests/fixtures/record_update_shape.ply`,
 `tests/fixtures/record_update_field.ply`, checked by
-`crates/ply-core/tests/suite/record_update.rs
+`crates/ply-core-tests/tests/suite/record_update.rs
 the_fixtures_produce_the_codes_they_are_named_for`.
 
 ### `std.http` — landed
@@ -8183,14 +8183,14 @@ region  C[e?]              =>  match e { Err(er) -> Err(er), Ok(x) -> C[x] }
   and everything evaluated before it `ply_syntax::ast::is_pure`. That predicate
   **moved here from `ply-hash`'s `normalize.rs`** so that `?`'s safety rule and
   `commutable_run`'s reordering rule are one implementation. The move was free:
-  `crates/ply-hash/tests/suite/map.rs a_map_body_normalizes_to_a_pinned_hash` is
+  `crates/ply-hash-tests/tests/suite/map.rs a_map_body_normalizes_to_a_pinned_hash` is
   unmoved.
 
 ### `ply-hash` — landed
 
 **Nothing.** No new tag, no encoding change, **no `FRONTEND_VERSION` and no
 `RUNTIME_VERSION` bump**. `e?` and the `match` it stands for are one definition
-with one `DefHash` (`crates/ply-hash/tests/suite/audit.rs try_hashes_as_its_longhand`,
+with one `DefHash` (`crates/ply-hash-tests/tests/suite/audit.rs try_hashes_as_its_longhand`,
 which carries a reversed longhand and an `assert_ne!` so the pair cannot pass
 vacuously).
 
@@ -8213,7 +8213,7 @@ guessed.
 **Effect rows are untouched by construction.** The pass emits a `match` and two
 constructor applications, all pure, so the row of `C[e?]` is the row of the
 longhand. There is no row rule for `?` because there is no `?` after the parser
-(`crates/ply-core/tests/suite/try_op.rs a_try_adds_nothing_to_the_row`).
+(`crates/ply-core-tests/tests/suite/try_op.rs a_try_adds_nothing_to_the_row`).
 
 ### New diagnostic codes — landed
 
@@ -8228,7 +8228,7 @@ ordinary `E0201`; `?` performs **no error conversion**, there being no `From` in
 Ply, and the eight corpus sites that map their error keep their `match`.
 
 Fixtures: `tests/fixtures/try_scope.ply`, `tests/fixtures/try_position.ply`,
-checked by `crates/ply-core/tests/suite/try_op.rs
+checked by `crates/ply-core-tests/tests/suite/try_op.rs
 the_fixtures_produce_the_codes_they_are_named_for`.
 
 ### The conversion — landed
