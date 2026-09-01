@@ -189,13 +189,6 @@ test "a cell holding a closure over itself" {
 /// which is ADR 0025 §Decision 3 P2, whose landing condition was that the case
 /// analysis be written rather than assumed. It is written at the seeding site in
 /// `code.rs`; these are its six cases, run.
-///
-/// The failure mode is not a wrong answer. It is `Slot::Released` reaching
-/// `machine.rs`'s `err_released` as `INTERNAL_ERROR` on a legal program — loud
-/// rather than silent, but a new way to reach a diagnostic whose whole point is
-/// being unreachable. Each probe below reads its parameter *after* the statement
-/// that would have been its last direct read, by a route that is not a direct
-/// read, and `passes` fails on either a raised diagnostic or a wrong integer.
 #[test]
 fn a_parameter_a_later_construct_still_reaches_is_not_released() {
     // 1. Captured by a closure written after the last direct read.
@@ -255,16 +248,6 @@ test "shadowed" { assert_eq(go([1, 2, 3]), 5) }
 
 /// The half of P2 that is the point of it: threaded as a parameter, an
 /// accumulator is now reused, and the count says so rather than the clock.
-///
-/// The append is in last position, because that is a *different* precondition
-/// and this test is not about it: written as `grow(push(xs, n), m)` the same
-/// program copies all 50, which is the positional rule ADR 0033 §4 is aimed at
-/// and which S3 does not touch.
-///
-/// `a_fold_accumulator_nothing_else_holds_is_rewritten_in_place` above is the
-/// `let`-threaded twin this was measured against — before ADR 0033 §11 S3 the
-/// two disagreed, and `position_invariance_g1`'s "let binding against parameter"
-/// pair is the same finding pinned at 200 appends.
 #[test]
 fn an_accumulator_threaded_as_a_parameter_is_rewritten_in_place() {
     let stats = passes(

@@ -342,28 +342,8 @@ fn runs_held_inside_a_region_are_absorbed_into_it_when_it_closes() {
     assert_eq!(arena.stats().slots_reclaimed_late, 64);
 }
 
-<<<<<<< HEAD
 /// The interaction ADR 0017's Consequences call the hardest to see: `unique` inferred where a
 /// capture is reachable frees memory a continuation still holds.
-///
-/// A tail-resumptive clause is deliberately not among the shapes — ADR 0033 §8 — and its
-/// demonstration is `region_meaning_adversarial::a_tail_resumptive_clause_writing_its_own_region_still_threads`.
-=======
-// ------------------------------------------------ the inference this depends on
-
-/// The interaction ADR 0017's Consequences call the hardest to see: `unique`
-/// inferred where a capture is reachable frees memory a continuation still
-/// holds. Reclamation is built on the inference answering `shared` for every
-/// region a capture can be taken inside, so the shapes it depends on are checked
-/// here rather than assumed.
-/// A tail-resumptive clause is deliberately **not** among the shapes below —
-/// ADR 0033 §8. Its continuation reaches no binder and is spliced by a `Resume`
-/// frame above the region's close, so such a region is `unique`, and the
-/// demonstration is
-/// `region_meaning_adversarial::a_tail_resumptive_clause_writing_its_own_region_still_threads`
-/// rather than an assertion here. The shape that *does* escape and is still
-/// below is a handle lexically enclosing the region.
->>>>>>> bcbf910 (Renumber to ADR 0033, rewrite the docs to the new convention, unbreak codegen)
 #[test]
 fn no_region_a_capture_can_be_taken_inside_is_inferred_unique() {
     const AMB: &str = "effect amb { read flip[coin]() -> Bool }\n";

@@ -129,7 +129,6 @@ fn a_region_kind_from_the_wrong_program_cannot_free_a_region_a_continuation_reac
 /// The staleness arm is vacuous since ADR 0033 §8 — `unique` is now the honest inference for this
 /// shape, so injecting it injects the honest answer — and is kept as a regression guard: it reddens
 /// at the `Unique` assertion if the clause form goes back to forcing `shared`.
->>>>>>> 886598f (Renumber to ADR 0033, rewrite the docs to the new convention, unbreak codegen)
 #[test]
 fn a_tail_resumptive_region_is_unique_and_a_stale_kind_does_not_move_it() {
     let pure = Compiled::new(&tail_fixture(TAIL_PURE));

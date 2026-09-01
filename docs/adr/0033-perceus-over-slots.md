@@ -287,6 +287,30 @@ close, consumed before it, reachable from no binder. `region_kind`'s header
 carries the case analysis and `region_meaning_adversarial` runs the shape on both
 engines with the clause writing the cell of the region it is now `unique` over.
 
+**The case analysis, which is the condition on landing it**, since freeing memory a continuation
+still reaches is a wrong program rather than a slow one. `k` is the continuation `K.capture(n)`
+produces at a `perform`; `R` is a region whose scan records the clause, which by construction means
+the `handle` is written inside `R`.
+
+1. **`k` reaches no binder.** ADR 0005 §1.3 evaluates a tail-resumptive clause body under
+   `P.env[x̄ ↦ v̄]` — no `κ`. The tail-resumptive rule is the only one that builds a `Resume` frame,
+   so the single reference to `k` is that frame, and nothing in the clause body can name it.
+2. **The frame runs before the close.** `Resume(k)` is pushed onto `K′`, the stack below the
+   handler's prompt, and `R`'s close sits below that prompt because the `handle` is inside `R`.
+   Frames run innermost first, so `k` is spliced before `R` closes.
+3. **A clause body that escapes is a different cause and is still counted.** If the clause body
+   performs an operation answered outside `R`, that perform is `Cause::Escapes`: a clause body is
+   walked under the enclosing context, and `walk_region` clears `handled` at every region boundary.
+   This is why `Scan::tail` is its own slot rather than a filter at `settle` — `direct` keeps only
+   the first cause in source order and the clause is recorded before its own body is walked, so a
+   `TailClause` in `direct` would *hide* this case.
+4. **Every other route out is already its own cause** — a second clause binding `resume`, a
+   `perform` the region does not answer, `task`, `simulate`, an unknown callee, a callback builtin.
+
+Demonstrated rather than argued, because the entry it replaces was argued:
+`region_meaning_adversarial::a_tail_resumptive_clause_writing_its_own_region_still_threads` runs the
+shape on both engines with the clause writing the cell of the region it is now `unique` over.
+
 **It is worth zero regions on this corpus, and that is the finding.** Every region
 the corpus opens has another, independent reason to be `shared`. The estimate that
 said otherwise came from reading a first-cause tally as a lower bound:
@@ -300,6 +324,36 @@ load-bearing ones, and that a `TailClause` in the `direct` slot can no longer
 makes such a clause unsafe. **This item was sequenced first because it is cheap,
 and being cheap is what let its estimate be refuted before anything expensive was
 built on it.**
+
+### §8.1 Why releasing a parameter releases nothing still read
+
+S3 seeds `lower_block`'s `cumulative` with the enclosing barrier's parameters, so a parameter can
+appear in a `Dead` set. ADR 0025 made writing this down the condition for landing it, and the code
+comment is one sentence, so it is here.
+
+The filters are unchanged and a parameter has to clear all of them: absent from `after[i]`, what is
+still read once statement `i` has finished, and present in `before`, what is read entering it.
+`Live` is a backward pass, so those are exact for direct reads. Five routes are not direct reads,
+and each keeps the name in `after[i]`:
+
+- **captured by a closure, a handler clause or a `simulate` body** — `Live::close` replays a
+  barrier's still-live names into the enclosing set as reads *at the construct that captured them*,
+  never last ones, so every statement left of the lambda sees the name live;
+- **stored in a cell** — `cell_set(c, xs)` is an ordinary read at that statement, and the value is
+  then the arena's rather than this binding's to release;
+- **read in a later `match` arm** — `lower_arm` walks the arm inside the enclosing walk, so the read
+  is recorded before the walk reaches any statement to its left;
+- **read in the tail** — the tail is lowered first, which puts its reads in the live set before any
+  statement is visited;
+- **shadowed by an inner binder of the same name** — `shadow`/`union` keep the two apart, and the
+  `bound[i]` arm of the filter names the shadowing binder rather than the parameter.
+
+Only parameters are seeded. `ownable` holds every name bound anywhere in the barrier, and one from a
+sibling block is not in scope at this block at all.
+
+The failure mode is `Slot::Released` reaching `INTERNAL_ERROR` on a legal program — loud, but a new
+way to reach a diagnostic whose point is being unreachable. All five routes are run in
+`reference_counting_audit::a_parameter_a_later_construct_still_reaches_is_not_released`.
 
 ---
 
@@ -316,7 +370,10 @@ built on it.**
 - **No second lint.** `W0611` was built and refuted.
 - **`Own` is not promoted to a permission.**
 - **`ply check --costs` is not made unnecessary** — but after §4 it reports a
-  residue rather than a rule, which is the tier a reporting flag fits.
+  residue rather than a rule, which is the tier a reporting flag fits. It prints
+  `unknown` rather than rounding to `reuses` or `COPIES`: `ply_eval::costs`'s
+  header lists four shapes no analysis of one body can decide, and rounding them
+  is the one thing that would make the checker worse than not having it.
 - **No `Bytes` quadratic is touched.** ADR 0025's item 7 stands unaddressed.
 
 ---

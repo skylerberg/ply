@@ -142,19 +142,8 @@ fn search() -> Int =
     assert!(site.through.is_empty(), "the site is written in the region");
 }
 
-<<<<<<< HEAD
 /// A tail-resumptive clause captures, and its continuation still cannot outlive the region — ADR
 /// 0033 §8.
-=======
-/// A tail-resumptive clause captures — ADR 0005 §1.3 runs `K.capture(n)` for
-/// both forms — and its continuation still cannot outlive the region, so the
-/// region is `unique`. `region_kind`'s module comment carries the case analysis;
-/// ADR 0033 §8 is the decision.
-///
-/// The runtime half is
-/// `region_meaning_adversarial::a_tail_resumptive_clause_writing_its_own_region_still_threads`,
-/// because this file cannot run a program.
->>>>>>> bcbf910 (Renumber to ADR 0033, rewrite the docs to the new convention, unbreak codegen)
 #[test]
 fn a_tail_resumptive_clause_inside_the_region_leaves_it_unique() {
     let src = &format!(

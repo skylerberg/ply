@@ -46,13 +46,6 @@ pub enum NodeKind {
         /// ADR 0033 §11 S4's probe. Empty everywhere unless the probe is armed,
         /// so the shipped lowering allocates one empty `Rc` per `App` and the
         /// machine's `carry` takes exactly the branch it takes today.
-        ///
-        /// `dead[i]` is what [`crate::rc::carry_released`] removes from the
-        /// scope a pending `AppArgs` frame holds while arguments after `i` run.
-        /// It is sound for the same reason [`crate::rc::Own::Owned`] is: `Live`
-        /// is a backward pass over the whole activation, so a name it reports
-        /// here is read by nothing to the right of this argument — not by a
-        /// later argument, not by the callee application, not after the call.
         dead: Rc<Vec<crate::rc::Dead>>,
     },
     If {
@@ -184,30 +177,6 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
 pub type Params = Rc<Vec<Symbol>>;
 
 /// Lowered bodies, shared by every machine built from one program.
-///
-/// A machine is built per pool thread per concurrency group, per interleaving of
-/// a search and per sampled case of a spec, so the same traversal would other-
-/// wise run hundreds of times over one program.
-///
-/// The key is the body's address, and what makes an address an identity is the
-/// lifetime rather than the map: everything keyed here is borrowed for `'a` and
-/// this cache cannot outlive `'a`, so nothing it has keyed can be freed and
-/// something else allocated in its place while it is still readable.
-///
-/// **That holds only because `invariant` below makes `Lowering<'a>` invariant in
-/// `'a`, and it is false without it.** Covariant, `&Lowering<'long>` coerces to
-/// `&Lowering<'short>` and [`Lowering::of`] takes `&self`, so a long-lived cache
-/// accepts a body borrowed for any shorter lifetime; keying a `Box<Expr>`
-/// through that coercion and dropping it leaves an entry under a dangling
-/// address. A variance property is a compile-time property and a `#[test]`
-/// cannot observe it, so the guard is this doc-test:
-///
-/// ```compile_fail
-/// use ply_eval::Lowering;
-/// fn shrink<'long: 'short, 'short>(c: &'short Lowering<'long>) -> &'short Lowering<'short> {
-///     c
-/// }
-/// ```
 pub struct Lowering<'a> {
     program: &'a Program,
     bodies: RefCell<FxHashMap<usize, (Params, Code)>>,
@@ -517,11 +486,6 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
 
 /// [`lower_all`], also answering which bindings each argument is the last reader
 /// of — ADR 0033 §11 S4.
-///
-/// The walk is already in reverse evaluation order, which is what makes this a
-/// diff rather than a second pass: when argument `i` is walked, `live`'s set
-/// holds everything read to its right, so a name that appears *during* its walk
-/// and was not there before is one nothing to the right reads.
 fn lower_args(exprs: &[Expr], live: &mut Live) -> (Rc<Vec<Code>>, Rc<Vec<crate::rc::Dead>>) {
     if !crate::rc::probe_armed() {
         return (lower_all(exprs, live), Rc::new(Vec::new()));
@@ -621,39 +585,10 @@ fn lower_block(
     }
     let entry = live.snapshot();
 
-    // Seeded with the enclosing barrier's parameters — ADR 0033 §11 S3, which
-    // is ADR 0025 §Decision 3 P2. Without them a parameter can never appear in
-    // a `Dead` set, so the block's continuation carries a scope that still
-    // reaches it: an accumulator threaded as a `let` is reused and the
-    // identical accumulator threaded as a parameter is not.
-    //
-    // **Why this cannot release a name something still reads.** The filters
-    // below are unchanged, and a parameter has to clear all three: it must not
-    // be in `after[i]` — what is still read once statement `i` has finished —
-    // and it must be in `before`, what is read entering it. `Live` is a
-    // backward pass, so those are exact for direct reads. The cases that are
-    // not direct reads, each of which keeps the name in `after[i]`:
-    //
-    // - **captured by a closure, a handler clause or a `simulate` body.**
-    //   `Live::close` replays a barrier's still-live names into the enclosing
-    //   `later` as reads *at the construct that captured them*, "never last
-    //   ones" — so the capture is a read positioned at the statement holding
-    //   the lambda, and every statement left of it sees the name in `after`.
-    // - **stored in a cell.** `cell_set(c, xs)` is an ordinary read of `xs` at
-    //   that statement; the value is then the arena's and no longer this
-    //   binding's to release.
-    // - **read in a later `match` arm.** `lower_arm` walks the arm inside the
-    //   enclosing walk, so the read lands in `later` before the walk reaches
-    //   any statement to its left.
-    // - **read in the tail.** The tail is lowered *first* (above), which is what
-    //   puts its reads in `later` before any statement is visited.
-    // - **shadowed by an inner binder of the same name.** `shadow`/`union`
-    //   already keep the two apart, and the `bound[i].contains(name)` arm of the
-    //   filter is what names the shadowing binder rather than the parameter.
-    //
-    // Only parameters are seeded, not every name in `ownable`: that frame holds
-    // every name bound *anywhere* in the barrier, and one from a sibling block
-    // is not in scope here at all. See `Live::barrier_params`.
+    // Seeded with the barrier's parameters, so a parameter can appear in a `Dead` set at all —
+    // ADR 0033 §8.1, which carries the case analysis for why this releases nothing still read.
+    // Parameters only, not every name in `ownable`: that frame holds names from sibling blocks
+    // which are not in scope here.
     let mut cumulative: Vec<Symbol> = live.barrier_params().to_vec();
     let mut out: Vec<Stmt> = Vec::with_capacity(n);
     for i in 0..n {
