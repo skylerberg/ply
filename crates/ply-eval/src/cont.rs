@@ -49,6 +49,9 @@ pub enum Frame {
 
     AppCallee {
         args: Rc<Vec<Code>>,
+        /// Per argument, what it is the last reader of. Empty unless ADR 0032
+        /// §11 S4's probe is armed — see [`crate::code::NodeKind::App`].
+        dead: Rc<Vec<crate::rc::Dead>>,
         env: Env,
         module: usize,
         span: Span,
@@ -59,6 +62,7 @@ pub enum Frame {
         callee: Value,
         done: Vec<Value>,
         args: Rc<Vec<Code>>,
+        dead: Rc<Vec<crate::rc::Dead>>,
         next: usize,
         env: Env,
         module: usize,
@@ -121,6 +125,7 @@ pub enum Frame {
     RecordField {
         done: Vec<(Symbol, Value)>,
         fields: Rc<Vec<(Symbol, Code)>>,
+        dead: Rc<Vec<crate::rc::Dead>>,
         next: usize,
         env: Env,
         module: usize,

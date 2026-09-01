@@ -228,6 +228,32 @@ Traced against the two rows that refuted the documented rule:
   value arrives at count 1. **The chain composes across calls with no annotation,
   which is why Koka needs no ownership in its surface types.**
 
+> **Measured (2026-08-31, ADR 0032 §11 S4's probe) — §4 is confirmed on four of
+> the five shapes G1 holds, and the fifth needs something §4 does not say.**
+>
+> The probe is P1 at two carry sites (`App` arguments and `Record` fields),
+> behind `PLY_ADR0032_PROBE=1`, at `rc::carry_released`. With it armed, G1's gap
+> goes to **0.000** on *call argument*, *compounding: field last / record first*,
+> *let binding against parameter* and *fold closure accumulator* — from 1.000 on
+> three of them. **ADR 0025 §Context row five, the case that refuted the
+> documented rule, is among the four.**
+>
+> The fifth, *record field*, stays at 1.000, and the reason is exact rather than
+> a shortfall in the probe's coverage: its pessimal spelling is
+> `{out: push(s.out, i), k: s.k + 1}`, and field 1 **genuinely reads `s`**. No
+> release keyed by *name* can free `s.out` there, because `s` is not dead — only
+> `s.out` is. That is **path-granular liveness**, which is the general form of
+> ADR 0025's P3, and which that ADR records the regions proposal as having
+> "explicitly declined to build, on the grounds that a wrong answer there is a
+> wrong program rather than a slow one".
+>
+> **So this section's claim is narrowed.** Slot frames as described here — one
+> slot per *binding* — remove position dependence wherever the enclosing node's
+> other sub-expressions do not read the same binding. Where they read a
+> *different field of it*, the slot has to be finer than the binding. §6's flat
+> record representation is a precondition for that and is sequenced after S4
+> rather than before it, which on this evidence is the wrong order.
+
 **This subsumes ADR 0025's P1, P2 and P3 rather than competing with them, and
 that is the argument for doing it instead of them.** P1 (`carry` takes a dead
 set) computes *the same thing* — a frame holding exactly the live bindings — but
@@ -420,6 +446,11 @@ measurement, in code where possible", modelled on
 `ply_corpus::w6::Criteria::default()`. The thresholds live in code so a
 measurement file cannot supply them.
 
+> **Result (2026-08-31): 4 of 5 pairs meet G1 under the S4 probe; 1 does not.**
+> §4 carries the analysis. G1 is **not** green and stays armed and `#[ignore]`d;
+> what it has done is separate a confirmed claim from an over-broad one before
+> the region-track-sized rewrite was started, which is what it was for.
+
 **G1 — the central claim, and the only one that can kill this ADR early.**
 *Position invariance.* A corpus of paired programs, each pair the same
 computation written in canonical and pessimal order (growing sub-expression last,
@@ -584,8 +615,9 @@ Each item is landable alone and each is gated on the one above only where said.
 | **S2** | Wire `ply check --costs` (ADR 0025 §2a, never built; `costs.rs` exists and is unreachable from the CLI) | §17 of the guide, `cli.rs` | small |
 | **S3** | ADR 0025's P2 — a parameter may appear in a `Dead` set | its own landing condition: the case analysis ADR 0025 §What would make this wrong item 2 requires | small, **already measured**: http 0.2% → 65.7%, router 0.5% → 65.3% |
 | **S4** | §4, slot frames and flat closure conversion | **G1**, then **G2** | large |
+| **S4′** | §4's probe — P1 at the `App` and `Record` carry sites, behind `PLY_ADR0032_PROBE=1` | **done**; 4 of 5 G1 pairs to gap 0.000, see §4's measurement block | small |
 | **S5** | §5, the chunked vector | **G3** | medium |
-| **S6** | §6, flat records, then reuse | G2 does not regress | large |
+| **S6** | §6, flat records, then reuse — **and the fifth G1 pair, which needs field-granular liveness, is here rather than in S4** | G2 does not regress | large |
 | **S7** | §7, `fip` | — | medium |
 
 **S3 is kept even though S4 subsumes it**, because it is ten lines against a
@@ -608,9 +640,14 @@ dropping a shape is four, across two tests, which is the intended friction.
 
 ## §12 What would make this wrong
 
-1. **If G1 stays red after S4.** Then position dependence is not scope
-   granularity and §1 is a wrong diagnosis. §5 survives on its own terms; §4 does
-   not.
+1. ~~**If G1 stays red after S4.**~~ **Partly fired, 2026-08-31.** Four of five
+   pairs went to 0.000 under the probe, so §1's diagnosis holds for those; the
+   fifth is unmoved and is a *field*-granular case §4 did not distinguish from a
+   binding-granular one. §4 carries the measurement and the narrowed claim. What
+   would still refute §1 outright is the four pairs regressing under real slot
+   frames, or the fifth proving unreachable without the path-granular analysis
+   ADR 0025 declined on soundness grounds — in which case §5 is again the whole
+   of what survives.
 2. **If slot frames cost more on the hot path than they save.** The change
    removes an `Rc` bump per binding read and adds a frame allocation per call
    with a known slot count. `w6-alloc` is the instrument, it is G2, and ADR 0017

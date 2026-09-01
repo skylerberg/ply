@@ -18,6 +18,29 @@ pub enum Own {
     Owned,
 }
 
+/// Whether ADR 0033 §11 S4's probe is armed, read once per process. Off by default: it is a probe
+/// and not a landed change, and `Env::release` is O(scope depth) on the machine's hottest path, so
+/// do not arm it in anything being timed.
+pub fn probe_armed() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED.get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1"))
+}
+
+/// [`carry`], minus the bindings the sub-expression just started is the last reader of.
+///
+/// Sound for the reason [`Own::Owned`] is: a wrong `dead` costs the continuation it was computed
+/// for an `INTERNAL_ERROR`, never a wrong value, because [`Env::release`] never writes through a
+/// shared link.
+pub(crate) fn carry_released(env: &Env, remaining: bool, dead: &[Symbol]) -> Env {
+    if !remaining {
+        return Env::empty();
+    }
+    if dead.is_empty() {
+        return env.clone();
+    }
+    env.release(dead)
+}
+
 /// The scope a pending frame carries while the subexpression it is waiting for runs.
 pub(crate) fn carry(env: &Env, remaining: bool) -> Env {
     if remaining { env.clone() } else { Env::empty() }
@@ -307,6 +330,13 @@ impl Live {
         self.ownable
             .last()
             .is_some_and(|scope| scope.iter().any(|n| n == name))
+    }
+
+    /// Whether this name is a binding of the current barrier — [`Live::tracked`]
+    /// in public form, for the ADR 0032 §11 S4 probe, which may only release a
+    /// name whose last use this body can bound.
+    pub fn is_ownable(&self, name: &Symbol) -> bool {
+        self.tracked(name)
     }
 
     pub fn is_live(&self, name: &Symbol) -> bool {

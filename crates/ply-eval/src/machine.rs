@@ -784,11 +784,12 @@ impl<'a> Machine<'a> {
                 })));
             }
 
-            NodeKind::App { func, args } => {
+            NodeKind::App { func, args, dead } => {
                 let carried = crate::rc::carry(&env, !args.is_empty());
                 self.push(
                     Frame::AppCallee {
                         args: args.clone(),
+                        dead: dead.clone(),
                         env: carried,
                         module,
                         span,
@@ -837,15 +838,20 @@ impl<'a> Machine<'a> {
                 self.enter_block(stmts.clone(), 0, tail.clone(), env, module)?;
             }
 
-            NodeKind::Record { fields } => {
+            NodeKind::Record { fields, dead } => {
                 if fields.is_empty() {
                     self.go_return(Value::Record(Arc::new(BTreeMap::new())));
                 } else {
-                    let carried = crate::rc::carry(&env, fields.len() > 1);
+                    let carried = crate::rc::carry_released(
+                        &env,
+                        fields.len() > 1,
+                        dead.first().map(|d| &**d).unwrap_or(&[]),
+                    );
                     self.push(
                         Frame::RecordField {
                             done: Vec::with_capacity(fields.len()),
                             fields: fields.clone(),
+                            dead: dead.clone(),
                             next: 1,
                             env: carried,
                             module,

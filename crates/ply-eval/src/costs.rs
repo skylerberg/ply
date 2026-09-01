@@ -700,7 +700,7 @@ impl Walk<'_, '_> {
                 Owner::Fresh
             }
 
-            NodeKind::App { func, args } => {
+            NodeKind::App { func, args, .. } => {
                 let builtin = self.builtin_of(func, st);
                 let callee = self.callee_of(func, st);
                 // `Value::Closure` holds the whole chain, so a lambda written here keeps every
@@ -849,7 +849,7 @@ impl Walk<'_, '_> {
                 answer
             }
 
-            NodeKind::Record { fields } => {
+            NodeKind::Record { fields, .. } => {
                 let outer = st.frontier;
                 for (i, (_, value)) in fields.iter().enumerate() {
                     st.frontier = if i + 1 == fields.len() {
