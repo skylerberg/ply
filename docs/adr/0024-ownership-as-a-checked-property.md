@@ -2,7 +2,7 @@
 
 **Status:** accepted as a direction, and **its central mechanism was declined by
 [ADR 0025](0025-ownership-design.md) on a measurement.** Read that first.
-Continued by [ADR 0033](0033-perceus-over-slots.md), which takes up §7's `fip`
+Continued by [ADR 0034](0034-perceus-over-slots.md), which takes up §7's `fip`
 pointer and locates the defect in the evaluator's environment rather than in the
 language.
 

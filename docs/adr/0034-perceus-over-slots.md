@@ -1,4 +1,4 @@
-# ADR 0033 — The append cliff is a calculus mismatch: Perceus over slots, and a bounded worst case
+# ADR 0034 — The append cliff is a calculus mismatch: Perceus over slots, and a bounded worst case
 
 **Status:** proposed. §4's diagnosis is confirmed on four of the five shapes
 §10's gate holds and narrowed by the fifth; §5 is unmeasured; §6 and §7 are

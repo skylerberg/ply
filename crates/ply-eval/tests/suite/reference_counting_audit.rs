@@ -185,7 +185,7 @@ test "a cell holding a closure over itself" {
     );
 }
 
-/// A parameter released at the statement that last reads it — ADR 0033 §11 S3,
+/// A parameter released at the statement that last reads it — ADR 0034 §11 S3,
 /// which is ADR 0025 §Decision 3 P2, whose landing condition was that the case
 /// analysis be written rather than assumed. It is written at the seeding site in
 /// `code.rs`; these are its six cases, run.
