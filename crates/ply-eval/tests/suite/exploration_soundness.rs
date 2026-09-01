@@ -1,32 +1,10 @@
 //! An adversarial audit of exploration soundness.
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::explore::Interleaving;
 use ply_eval::{Dependence, Machine, Plan, Seed, explore, explore_under};
-use ply_span::SourceId;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
 use std::cell::RefCell;
 use std::collections::BTreeSet;
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("parses");
-    let resolved = resolve(&mut program).expect("resolves");
-    let check = check_program(&program, &resolved).expect("checks");
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
 
 /// What one interleaving is observable as: how the test ended, and the world it left behind.
 fn observe(c: &Compiled, seed: &Seed) -> (Interleaving, String) {
@@ -119,7 +97,7 @@ fn search(c: &Compiled) -> Searched {
 /// The property pruning has to preserve, checked against the independent enumerator rather than
 /// argued.
 fn assert_reaches_every_outcome(name: &str, source: &str) {
-    let compiled = compile(source);
+    let compiled = Compiled::named("t", source);
     let searched = search(&compiled);
     let all = every_schedule(&compiled);
     // A search that stopped at a failure is not claiming to have seen the rest, so only a search
@@ -252,7 +230,7 @@ test "the lost update is in the second of two regions" {
 
 #[test]
 fn the_control_finds_the_lost_update() {
-    let searched = search(&compile(RACE_IN_ONE_REGION));
+    let searched = search(&Compiled::named("t", RACE_IN_ONE_REGION));
     assert!(
         searched.failed,
         "the fixture proves nothing unless the one-region form of it fails"
@@ -263,7 +241,7 @@ fn the_control_finds_the_lost_update() {
 /// is reported as an exhaustive proof.
 #[test]
 fn a_race_in_the_first_of_two_regions_is_reachable_and_must_be_found() {
-    let compiled = compile(RACE_IN_THE_FIRST_OF_TWO_REGIONS);
+    let compiled = Compiled::named("t", RACE_IN_THE_FIRST_OF_TWO_REGIONS);
     let sampled = (0..64u64)
         .filter(|&root| !observe(&compiled, &Seed::root(root)).1.starts_with("ok "))
         .count();
@@ -283,7 +261,7 @@ fn a_race_in_the_first_of_two_regions_is_reachable_and_must_be_found() {
 /// The same defect from the other side.
 #[test]
 fn a_search_over_two_regions_does_not_report_a_simulation_divergence() {
-    let searched = search(&compile(RACE_IN_THE_SECOND_OF_TWO_REGIONS));
+    let searched = search(&Compiled::named("t", RACE_IN_THE_SECOND_OF_TWO_REGIONS));
     let diverged: Vec<&String> = searched
         .outcomes
         .iter()
@@ -409,7 +387,7 @@ test "two orders, one value, two effect sequences" {
 
 #[test]
 fn a_race_that_differs_only_in_the_effects_performed_is_explored() {
-    let compiled = compile(SAME_VALUE_DIFFERENT_EFFECTS);
+    let compiled = Compiled::named("t", SAME_VALUE_DIFFERENT_EFFECTS);
     assert_reaches_every_outcome(
         "same value, different effects",
         SAME_VALUE_DIFFERENT_EFFECTS,
@@ -449,7 +427,7 @@ test "a deadlock only some interleavings reach" {
 
 #[test]
 fn a_deadlock_that_only_some_interleavings_reach_is_found() {
-    let searched = search(&compile(CONDITIONAL_DEADLOCK));
+    let searched = search(&Compiled::named("t", CONDITIONAL_DEADLOCK));
     assert!(
         searched.failed,
         "a deadlock behind a cell read must be reachable by the search, not only by a lucky seed"
@@ -530,7 +508,7 @@ test "a handler installed inside the region" {
 
 #[test]
 fn a_handler_inside_the_region_covers_the_tasks_it_encloses() {
-    let compiled = compile(HANDLER_INSIDE_THE_REGION);
+    let compiled = Compiled::named("t", HANDLER_INSIDE_THE_REGION);
     let (_, outcome) = observe(&compiled, &Seed::default());
     assert!(
         !outcome.contains("E0303"),
@@ -581,7 +559,7 @@ test "a multi-shot handler with no region" {
 
 #[test]
 fn a_region_does_not_silently_swallow_a_second_resumption() {
-    let control = compile(MULTI_SHOT_WITHOUT_A_REGION);
+    let control = Compiled::named("t", MULTI_SHOT_WITHOUT_A_REGION);
     let mut machine = Machine::new(&control.program, &control.resolved, &control.check);
     machine.cells_mut().journal();
     machine.eval_test(0).expect("the control passes");
@@ -597,7 +575,10 @@ fn a_region_does_not_silently_swallow_a_second_resumption() {
         "the control must resume twice, or it pins nothing"
     );
 
-    let (_, outcome) = observe(&compile(MULTI_SHOT_ACROSS_A_REGION), &Seed::default());
+    let (_, outcome) = observe(
+        &Compiled::named("t", MULTI_SHOT_ACROSS_A_REGION),
+        &Seed::default(),
+    );
     assert!(
         !outcome.starts_with("ok | #0=1"),
         "a `simulate` region dropped a resumption without saying so: {outcome}"
@@ -617,7 +598,7 @@ fn the_naive_baseline_enumerates_every_schedule() {
         ),
         ("a shared random stream", SHARED_RANDOM_STREAM),
     ] {
-        let compiled = compile(source);
+        let compiled = Compiled::named("t", source);
         let naive = search_with(&compiled, Dependence::All);
         assert!(
             !naive.failed,
@@ -635,7 +616,7 @@ fn the_naive_baseline_enumerates_every_schedule() {
 /// world a passing program delivers.
 #[test]
 fn widening_the_budget_does_not_change_what_a_program_means() {
-    let compiled = compile(SAME_VALUE_DIFFERENT_EFFECTS);
+    let compiled = Compiled::named("t", SAME_VALUE_DIFFERENT_EFFECTS);
     let at = |budget: u32| {
         let plan = Plan {
             budget,

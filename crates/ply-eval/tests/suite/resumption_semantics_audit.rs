@@ -1,44 +1,10 @@
 //! What a resumption observes, pinned as numbers.
 
-use ply_core::{CheckOutput, check_program};
-use ply_eval::{Machine, Plan, Seed, Value, explore};
-use ply_span::{Diagnostic, SourceId, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
+use crate::fixture::Compiled;
+use ply_eval::{Plan, Seed, Value, explore};
+use ply_span::{Diagnostic, codes};
 
 impl Compiled {
-    fn new(src: &str) -> Compiled {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-        }
-    }
-
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn index_of(&self, name: &str) -> usize {
-        self.check
-            .tests
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap_or_else(|| panic!("no test named {name:?}"))
-    }
-
     /// Runs one test and requires it to pass; the oracle is the integer each
     /// probe writes down, which [`Compiled::ints_after`] reads.
     fn passes(&self, name: &str) {

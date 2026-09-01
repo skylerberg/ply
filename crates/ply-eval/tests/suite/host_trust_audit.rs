@@ -1,50 +1,18 @@
 //! What a **hostile** host handler can do, and what — if anything — notices.
 
+use crate::fixture::Compiled;
 use ply_core::ty::{EffectAtom, Footprint, Resource};
-use ply_core::{CheckOutput, check_program};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Machine, TaskId, Value};
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
-use ply_syntax::ast::{Mode, ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_syntax::ast::Mode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-fn compile(source: &str) -> Compiled {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    let check = check_program(&program, &resolved).expect("the fixture typechecks");
-    Compiled {
-        program,
-        resolved,
-        check,
-    }
-}
-
-fn compile_error(source: &str) -> Vec<Diagnostic> {
-    let mut program =
-        ply_syntax::parse_program(vec![(SourceId(0), ModuleName::from_dotted("t"), source)])
-            .expect("the fixture parses");
-    let resolved = resolve(&mut program).expect("the fixture resolves");
-    check_program(&program, &resolved).expect_err("the fixture was expected not to typecheck")
-}
-
 impl Compiled {
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
     fn bound(&self, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> Machine<'_> {
         let mut registry = HostRegistry::new();
         for (op, handler) in entries {
@@ -113,7 +81,7 @@ test/nondet "second" { assert_eq(lookup(1), 2) }
 /// **The headline.**
 #[test]
 fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
-    let compiled = compile(READS);
+    let compiled = Compiled::named("t", READS);
     let handler = Arc::new(Mutates::default());
     let mut machine = compiled.bound(vec![(any("db", "get"), handler.clone())]);
     machine.set_declared_footprint(Footprint::from_atoms([atom("t.db", "users", Mode::Read)]));
@@ -141,7 +109,7 @@ fn documents_a_read_declared_handler_that_writes_is_recorded_as_a_read() {
 /// Rust-side state carries between them.
 #[test]
 fn documents_a_lying_handler_couples_two_entry_points_that_share_nothing() {
-    let compiled = compile(READS);
+    let compiled = Compiled::named("t", READS);
     let handler = Arc::new(Mutates::default());
     let mut machine = compiled.bound(vec![(any("db", "get"), handler.clone())]);
 
@@ -175,7 +143,8 @@ fn documents_a_narrow_registration_may_touch_a_resource_it_never_named() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect db {
   read  get[r](key: Int) -> Int
@@ -239,7 +208,8 @@ fn a_blocking_handler_that_answers_a_value_inline_is_refused() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -304,7 +274,8 @@ fn a_blocking_handler_is_still_entered_on_the_machines_thread() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -340,7 +311,8 @@ fn documents_a_panicking_handler_unwinds_out_of_the_machine() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -375,7 +347,8 @@ fn documents_a_wrongly_typed_host_answer_is_a_diagnostic_that_blames_the_program
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -405,7 +378,8 @@ fn a_fabricated_task_handle_from_a_host_answer_is_refused() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Task<Int>
@@ -438,7 +412,8 @@ test/nondet "a handle from nowhere" {
 /// operation's declared signature at all.
 #[test]
 fn a_cell_cannot_cross_a_host_operations_signature() {
-    let cell = compile_error(
+    let cell = Compiled::rejected_in(
+        "t",
         r#"
 nondet effect net {
   write send[s](c: Cell<Int>) -> Cell<Int>
@@ -455,7 +430,8 @@ test/nondet "smuggle a cell" {
         cell.iter().map(|d| d.code).collect::<Vec<_>>()
     );
 
-    let closure = compile_error(
+    let closure = Compiled::rejected_in(
+        "t",
         r#"
 nondet effect net {
   write send[s](f: () -> Int) -> () -> Int
@@ -524,7 +500,7 @@ fn helper(k: Int) -> Int / {{net.write[socket]}} = net.send[socket](k)
 {body}
 "#
         );
-        let compiled = compile(&source);
+        let compiled = Compiled::named("t", &source);
         let handler = Arc::new(Mutates::default());
         let mut registry = HostRegistry::new();
         registry.register(any("net", "send"), handler.clone());
@@ -551,7 +527,8 @@ fn helper(k: Int) -> Int / {{net.write[socket]}} = net.send[socket](k)
 /// inside one sends a packet per schedule explored and then calls the total a proof.
 #[test]
 fn a_region_never_reaches_the_host_bound_or_not() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -588,7 +565,8 @@ test/nondet "a socket inside a region" { simulate { assert_eq(helper(1), 1) } }
 /// is that idle really means unreachable.
 #[test]
 fn an_idle_any_registration_contributes_no_atom_and_serves_nothing() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -631,7 +609,8 @@ test/nondet "only net" { assert_eq(net.send[socket](1), 1) }
 /// `Linearity::Repeatable` is a handler author's unverifiable claim that replay costs nothing.
 #[test]
 fn documents_a_false_repeatable_claim_buys_a_replay_and_nothing_notices() {
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -678,7 +657,7 @@ test/nondet "resumed three times over a send" {
 /// states it at all.
 #[test]
 fn documents_a_declared_footprint_outlives_the_entry_point_that_stated_it() {
-    let compiled = compile(READS);
+    let compiled = Compiled::named("t", READS);
     let handler = Arc::new(Mutates::default());
     let mut machine = compiled.bound(vec![(any("db", "get"), handler.clone())]);
 
@@ -708,7 +687,8 @@ fn a_handler_may_not_choose_the_code_its_failure_is_classified_under() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -779,7 +759,8 @@ fn an_unreserved_code_from_a_handler_is_kept_and_attributed() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write send[s](payload: Int) -> Int
@@ -846,7 +827,8 @@ fn a_token_nothing_resolves_is_diagnosed_inside_a_production_region() {
         }
     }
 
-    let compiled = compile(
+    let compiled = Compiled::named(
+        "t",
         r#"
 nondet effect net {
   write accept[s](listener: Int) -> Int

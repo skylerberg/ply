@@ -4,60 +4,16 @@
 // own allow rather than something these fixtures choose.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::{CheckOutput, check_program};
+use crate::fixture::Compiled;
 use ply_eval::escape::{Boundary, Handle, carries};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
-use ply_eval::{Arena, Machine, RegionKind, TaskRegions, Value};
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::resolve::{Resolved, resolve};
+use ply_eval::{Arena, RegionKind, TaskRegions, Value};
+use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-struct Compiled {
-    program: Program,
-    resolved: Resolved,
-    check: CheckOutput,
-}
-
-impl Compiled {
-    fn new(src: &str) -> Compiled {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        Compiled {
-            program,
-            resolved,
-            check,
-        }
-    }
-
-    fn refused(src: &str) -> Vec<Diagnostic> {
-        let inputs = [(SourceId(0), ModuleName::from_dotted("m"), src)];
-        let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
-        let resolved =
-            resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        check_program(&program, &resolved).err().unwrap_or_default()
-    }
-
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    fn index_of(&self, name: &str) -> usize {
-        self.check
-            .tests
-            .iter()
-            .position(|t| t.name == name)
-            .unwrap_or_else(|| panic!("no test named {name:?}"))
-    }
-}
 
 /// A `Value::Cell` over a slot from a region that is still open — the shape a legitimate one has,
 /// so that what is under test is the boundary and not the slot being stale.
@@ -171,7 +127,7 @@ fn the_value_the_open_route_produces_is_one_the_walk_finds() {
 /// a closure** rather than a continuation — and it does not exist.
 #[test]
 fn the_constructor_erasure_does_not_also_launder_a_cell_inside_a_closure() {
-    let diags = Compiled::refused(
+    let diags = Compiled::rejected(
         r#"
 type Boxed = Empty | Wrap(() -> Int)
 fn boxed() -> Boxed = with_cell[log](41) { c -> Wrap(|| cell_get(c)) }
@@ -534,7 +490,7 @@ fn a_stale_slot_reports_rather_than_reading_what_replaced_it() {
 /// witness can hold a handle in the first place.
 #[test]
 fn a_law_cannot_quantify_over_a_record_that_reaches_a_region() {
-    let diags = Compiled::refused(r#"law "no" forall (r: {c: Cell<Int>}) { true }"#);
+    let diags = Compiled::rejected(r#"law "no" forall (r: {c: Cell<Int>}) { true }"#);
     assert!(
         diags.iter().any(|d| d.code == codes::UNQUANTIFIABLE_TYPE),
         "a record holding a cell must be refused where the law is written: {diags:#?}"
