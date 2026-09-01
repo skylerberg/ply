@@ -139,7 +139,9 @@ fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
             let types: Vec<Type> = fields.values().cloned().collect();
             let values = tuple_at(&types, world, index)?;
             let map: BTreeMap<Symbol, Value> = fields.keys().cloned().zip(values).collect();
-            Some(Value::Record(std::sync::Arc::new(map)))
+            Some(Value::Record(std::sync::Arc::new(
+                map.into_iter().collect(),
+            )))
         }
         Type::Var(_) | Type::Fn { .. } => None,
     }

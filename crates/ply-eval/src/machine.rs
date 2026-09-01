@@ -23,7 +23,7 @@ use crate::semantics::{
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
 use crate::task_regions::TaskRegions;
 use crate::trace::Trace;
-use crate::value::{Closure, ClosureKind, Value};
+use crate::value::{Closure, ClosureKind, Fields, Value};
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -33,7 +33,6 @@ use ply_syntax::ast::{
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
 use std::cell::{Cell, OnceCell};
-use std::collections::BTreeMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -845,7 +844,7 @@ impl<'a> Machine<'a> {
 
             NodeKind::Record { fields, dead } => {
                 if fields.is_empty() {
-                    self.go_return(Value::Record(Arc::new(BTreeMap::new())));
+                    self.go_return(Value::Record(Arc::new(Fields::default())));
                 } else {
                     let carried = crate::rc::carry_released(
                         &env,

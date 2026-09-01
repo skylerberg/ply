@@ -348,7 +348,7 @@ fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
 #[test]
 fn a_decimal_anywhere_under_a_key_is_canonical() {
     let field = |d: &str| {
-        Value::Record(std::sync::Arc::new(std::collections::BTreeMap::from([(
+        Value::Record(std::sync::Arc::new(ply_eval::Fields::from_iter([(
             ply_span::Symbol::new("price"),
             dec(d),
         )])))
