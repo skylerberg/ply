@@ -2457,6 +2457,34 @@ fn poly(params: [u32; 2], ret: u32, e: u32, quantifiers: [u32; 2]) -> ply_core::
     }
 }
 
+/// A constraint names a quantifier by an index into `Scheme::ty_vars`, so a
+/// caller that reorders that list before passing it attributes the constraint to
+/// the wrong variable.
+#[test]
+fn a_constraint_follows_its_quantifier_rather_than_its_position() {
+    use ply_core::{DefConstraint, Footprint};
+    let empty = Footprint::empty();
+    let eq = |param| {
+        [DefConstraint {
+            deriver: Deriver::Eq,
+            param,
+        }]
+    };
+
+    // One definition, its quantifiers collected in the two orders a run might
+    // have collected them, the constraint naming `TyVar(9)` in both.
+    assert_eq!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(&poly([9, 3], 9, 5, [3, 9]), &empty, &eq(1)),
+    );
+    // Sorting `ty_vars` and keeping the index is what `canonicalize_scheme`
+    // would do to the pair, and it names the other variable.
+    assert_ne!(
+        interface_hash(&poly([9, 3], 9, 5, [9, 3]), &empty, &eq(0)),
+        interface_hash(&poly([9, 3], 9, 5, [3, 9]), &empty, &eq(0)),
+    );
+}
+
 /// `generalize` quantifies over whatever numbers the run's counter handed out,
 /// so the same definition reaches [`interface_hash`] under different numbers
 /// depending on what subset of the program was checked. Without canonicalization

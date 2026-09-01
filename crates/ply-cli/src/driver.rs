@@ -1895,11 +1895,9 @@ fn simple_name(module: &ModuleName, qualified: &Symbol) -> Symbol {
 ///
 /// All three parts come from one `DefInfo`: `DefConstraint::param` indexes that scheme's `ty_vars`.
 fn iface_of(info: &DefInfo) -> DefHash {
-    ply_hash::interface_hash(
-        &canonicalize_scheme(&info.scheme),
-        &info.footprint,
-        &info.constraints,
-    )
+    // As published, not canonicalized: a `DefConstraint::param` indexes this
+    // scheme's `ty_vars`, and `canonicalize_scheme` sorts them.
+    ply_hash::interface_hash(&info.scheme, &info.footprint, &info.constraints)
 }
 
 /// The witness this run would write, with the definition's own hash put back to the one the stored
