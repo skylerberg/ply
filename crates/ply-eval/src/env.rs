@@ -124,6 +124,46 @@ impl Env {
     }
 
     /// The scope with `dead`'s bindings dropped — Perceus' `drop`.
+    /// The scope narrowed to `live`, built up from empty rather than rebuilt down from the head.
+    ///
+    /// [`Env::release`] costs one link per binding *above* the deepest one it drops, which for a
+    /// parameter is the whole scope; this costs one per name in `live`. The innermost binding of a
+    /// shadowed name wins, which is what a lookup would have found.
+    ///
+    /// **A name missing from `live` is gone**, so an under-approximating caller turns a legal
+    /// program into `INTERNAL_ERROR` at the read. That is the opposite direction from `release`,
+    /// which only ever drops what was proven dead, and it is why the only caller computes `live`
+    /// from the same backward pass that decides ownership.
+    pub fn keep_only(&self, live: &[Symbol]) -> Env {
+        if live.is_empty() {
+            return Env::empty();
+        }
+        let mut kept: Vec<(Symbol, Value)> = Vec::new();
+        let mut cur = self.head.as_deref();
+        while let Some(node) = cur {
+            if let Some(binding) = &node.value
+                && !binding.released
+                && live.contains(&binding.name)
+                && !kept.iter().any(|(n, _)| *n == binding.name)
+            {
+                kept.push((binding.name.clone(), binding.value.clone()));
+            }
+            cur = node.next.as_deref();
+        }
+        let mut out = Env::empty();
+        for (name, value) in kept.into_iter().rev() {
+            out.head = Some(pool::link(
+                Binding {
+                    name,
+                    value,
+                    released: false,
+                },
+                out.head.take(),
+            ));
+        }
+        out
+    }
+
     pub fn release(&self, dead: &[Symbol]) -> Env {
         if dead.is_empty() {
             return self.clone();

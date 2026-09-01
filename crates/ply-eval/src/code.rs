@@ -362,29 +362,23 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             }
         }
         ExprKind::Record { fields } => {
-            let armed = crate::rc::probe_armed();
+            let armed = crate::rc::probe_carries();
             let mut lowered: Vec<(Symbol, Code)> = Vec::with_capacity(fields.len());
-            let mut dead: Vec<crate::rc::Dead> = Vec::new();
+            let mut keep: Vec<crate::rc::Dead> = Vec::new();
             for (name, value) in fields.iter().rev() {
-                let before = if armed { live.snapshot() } else { Vec::new() };
-                lowered.push((name.name.clone(), lower_in(value, live)));
                 if armed {
-                    let fresh: Vec<Symbol> = live
-                        .snapshot()
-                        .into_iter()
-                        .filter(|n| !before.contains(n) && live.is_ownable(n))
-                        .collect();
-                    dead.push(Rc::from(fresh));
+                    keep.push(Rc::from(live.snapshot()));
                 }
+                lowered.push((name.name.clone(), lower_in(value, live)));
             }
             lowered.reverse();
-            dead.reverse();
+            keep.reverse();
             NodeKind::Record {
                 fields: Rc::new(lowered),
-                dead: if dead.is_empty() {
+                dead: if keep.is_empty() {
                     no_arg_dead()
                 } else {
-                    Rc::new(dead)
+                    Rc::new(keep)
                 },
             }
         }
@@ -503,24 +497,22 @@ fn no_arg_dead() -> Rc<Vec<crate::rc::Dead>> {
 }
 
 fn lower_args(exprs: &[Expr], live: &mut Live) -> (Rc<Vec<Code>>, Rc<Vec<crate::rc::Dead>>) {
-    if !crate::rc::probe_armed() {
+    if !crate::rc::probe_carries() {
         return (lower_all(exprs, live), no_arg_dead());
     }
+    // Walked in reverse, so before argument `i` is lowered the live set holds everything the
+    // arguments to its right read — along with what is read after the call, which the frame does
+    // not need. Keeping those too over-approximates, and that is the only safe direction: a name
+    // missing here is `cannot find` at the read, not a slower program.
     let mut out: Vec<Code> = Vec::with_capacity(exprs.len());
-    let mut dead: Vec<crate::rc::Dead> = Vec::with_capacity(exprs.len());
+    let mut keep: Vec<crate::rc::Dead> = Vec::with_capacity(exprs.len());
     for e in exprs.iter().rev() {
-        let before = live.snapshot();
+        keep.push(Rc::from(live.snapshot()));
         out.push(lower_in(e, live));
-        let fresh: Vec<Symbol> = live
-            .snapshot()
-            .into_iter()
-            .filter(|n| !before.contains(n) && live.is_ownable(n))
-            .collect();
-        dead.push(Rc::from(fresh));
     }
     out.reverse();
-    dead.reverse();
-    (Rc::new(out), Rc::new(dead))
+    keep.reverse();
+    (Rc::new(out), Rc::new(keep))
 }
 
 fn lower_all(exprs: &[Expr], live: &mut Live) -> Rc<Vec<Code>> {

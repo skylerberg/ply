@@ -23,18 +23,27 @@ pub enum Own {
 /// do not arm it in anything being timed.
 pub fn probe_armed() -> bool {
     static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ARMED.get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1"))
+    *ARMED
+        .get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1" || v == "params"))
+}
+
+/// Whether the probe's *carry-site* half is armed — the `App` and `Record` per-argument releases,
+/// as against the statement-level parameter releases [`probe_armed`] gates.
+pub fn probe_carries() -> bool {
+    static ARMED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ARMED
+        .get_or_init(|| std::env::var("PLY_ADR0033_PROBE").is_ok_and(|v| v == "1" || v == "carry"))
 }
 
 /// [`carry`], minus the bindings the sub-expression just started is the last reader of.
-pub(crate) fn carry_released(env: &Env, remaining: bool, dead: &[Symbol]) -> Env {
+pub(crate) fn carry_released(env: &Env, remaining: bool, live: &[Symbol]) -> Env {
     if !remaining {
         return Env::empty();
     }
-    if dead.is_empty() {
+    if !probe_carries() {
         return env.clone();
     }
-    env.release(dead)
+    env.keep_only(live)
 }
 
 /// The scope a pending frame carries while the subexpression it is waiting for runs.
