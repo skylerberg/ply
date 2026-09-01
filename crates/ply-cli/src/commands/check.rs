@@ -154,6 +154,22 @@ fn print_explain(loaded: &Loaded, style: Style) {
     super::common::print_phases(&loaded.frontend.phases, style);
 }
 
+/// ADR 0025 §Decision 2a: for every `push`, whether it grows its list in place or copies it.
+///
+/// A program with no `push` prints a line saying so, because otherwise a reader cannot tell a
+/// clean program from a flag that did nothing.
+fn print_costs(loaded: &Loaded, style: Style) {
+    println!();
+    match crate::costs::lines(&loaded.program, &loaded.resolved, &loaded.sources, style) {
+        Some(lines) => {
+            for line in lines {
+                println!("{line}");
+            }
+        }
+        None => println!("{IND}{}", style.dim("no appends: nothing to cost")),
+    }
+}
+
 /// Grouped by module and printed with simple names: the module heading already carries the
 /// qualification, and repeating it on every line would bury the signatures the flag was asked for.
 fn print_types(loaded: &Loaded, explain: bool, style: Style) {

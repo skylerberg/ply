@@ -1019,27 +1019,11 @@ because the literal is not last in the call.
 **Do not work this out by hand. Run `ply check --costs`**, which answers it per
 `push` site and names the edit.
 
-> **Corrected: the rule as this section stated it was local, and the property is
-> not.** It read:
->
-> > Which branch you get is decided by *position*: an accumulator written in the
-> > **last** position of its enclosing expression stays linear, and one written
-> > earlier copies. `{..s, toks: push(s.toks, t)}` is the linear spelling;
-> > `{toks: push(s.toks, t), pos: p}` is not.
->
-> Both spellings are classified correctly and the conclusion drawn from them was
-> too weak. `docs/adr/0025-ownership-design.md` §Context measures
-> `go({k: s.k + 1, out: push(s.out, i)}, i + 1)` at **0 of 200** in place with
-> the growing field last, which is what this paragraph told you to write. An
-> author who learned this rule and applied it correctly still got the quadratic.
-> `crates/ply-eval/tests/position_invariance_g1.rs` is the same finding as a
-> test, red on five shapes.
->
-> **This whole subsection is scheduled for deletion, not further correction.**
-> `docs/adr/0032-perceus-over-slots.md` argues the rule is an artifact of the
+> This subsection is scheduled for **deletion, not further correction**.
+> `docs/adr/0033-perceus-over-slots.md` argues the rule is an artifact of the
 > evaluator's environment representation rather than a property of the language,
-> and its §11 deletes these paragraphs when the gate above goes green. A rule
-> that still has to be documented is still there.
+> and deletes these paragraphs when its gate goes green.
+> `crates/ply-eval/tests/position_invariance_g1.rs` is the gate.
 
 ### 6.8 Effect performs, `handle`, `with_cell`, `with_region`, `simulate`
 
@@ -2961,9 +2945,8 @@ rather than left to be discovered.
   in between runs both as one step, and no schedule separates them.
 * An accumulator written anywhere but the last position of its enclosing
   expression copies instead of growing in place — and "enclosing expression"
-  means *every* node above it, not just the nearest one. `ply check --costs`
-  answers it per site; §6.7 has the correction and `docs/adr/0032-perceus-over-slots.md`
-  has the argument that this should not be a rule at all.
+  means *every* node above it, not just the nearest one. Do not work it out by
+  hand: `ply check --costs` answers it per site.
 * `string_find` raises when the needle is absent; guard with `string_contains`.
 * `bytes_at` and `string_slice` **raise** out of range. `list_at` does not — it
   answers `None`. The two containers are indexed by different conventions on

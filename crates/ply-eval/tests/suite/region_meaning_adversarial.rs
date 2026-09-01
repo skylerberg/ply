@@ -720,7 +720,7 @@ test "the trace cell ends at two, every time" {
 }
 
 /// A tail-resumptive clause writing the cell of the region that encloses its own
-/// handler — the shape ADR 0032 §8 moved from `shared` to `unique`.
+/// handler — the shape ADR 0033 §8 moved from `shared` to `unique`.
 ///
 /// This is shape 1 of the three above, aimed at the change that made it
 /// reachable. The clause writes `c` before each of its two resumptions and the

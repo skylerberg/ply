@@ -43,7 +43,7 @@ pub enum NodeKind {
         func: Code,
         args: Rc<Vec<Code>>,
         /// Per argument, the bindings that argument is the **last reader** of —
-        /// ADR 0032 §11 S4's probe. Empty everywhere unless the probe is armed,
+        /// ADR 0033 §11 S4's probe. Empty everywhere unless the probe is armed,
         /// so the shipped lowering allocates one empty `Rc` per `App` and the
         /// machine's `carry` takes exactly the branch it takes today.
         ///
@@ -71,7 +71,7 @@ pub enum NodeKind {
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
         /// Per field, what that field's value is the last reader of — the same
-        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0032
+        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0033
         /// §11 S4's probe covers. Empty unless the probe is armed.
         dead: Rc<Vec<crate::rc::Dead>>,
     },
@@ -516,7 +516,7 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
 }
 
 /// [`lower_all`], also answering which bindings each argument is the last reader
-/// of — ADR 0032 §11 S4.
+/// of — ADR 0033 §11 S4.
 ///
 /// The walk is already in reverse evaluation order, which is what makes this a
 /// diff rather than a second pass: when argument `i` is walked, `live`'s set
@@ -621,7 +621,7 @@ fn lower_block(
     }
     let entry = live.snapshot();
 
-    // Seeded with the enclosing barrier's parameters — ADR 0032 §11 S3, which
+    // Seeded with the enclosing barrier's parameters — ADR 0033 §11 S3, which
     // is ADR 0025 §Decision 3 P2. Without them a parameter can never appear in
     // a `Dead` set, so the block's continuation carries a scope that still
     // reaches it: an accumulator threaded as a `let` is reused and the
