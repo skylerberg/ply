@@ -1,9 +1,4 @@
 //! `Float` and `Decimal` through the real binary.
-//!
-//! The unit tests cover the arithmetic; these cover the things only a whole run
-//! can show: that a money program checks, runs and caches; that `E0209` reaches
-//! a user with the call it should have written; and that a tier over a `Float`
-//! is never `proved` no matter which command asks.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -77,8 +72,8 @@ fn repo(relative: &str) -> PathBuf {
         .join(relative)
 }
 
-/// The exit criterion for this half of the milestone, in one run: a program
-/// written in `Decimal` checks, runs, and reports a total that lost no cent.
+/// The exit criterion for this half of the milestone, in one run: a program written in `Decimal`
+/// checks, runs, and reports a total that lost no cent.
 #[test]
 fn a_decimal_program_checks_runs_and_tests_clean() {
     let dir = project(BILLING);
@@ -98,8 +93,7 @@ fn a_decimal_program_checks_runs_and_tests_clean() {
     assert_eq!(test.status.code(), Some(0), "{}", combined(&test));
 }
 
-/// The four tests above are cached like any other, so a second run selects
-/// none of them. `Decimal` is a value, not a private channel into a cache key.
+/// The four tests above are cached like any other, so a second run selects none of them.
 #[test]
 fn decimal_tests_are_cached_exactly_as_any_other_are() {
     let dir = project(BILLING);
@@ -117,9 +111,6 @@ fn decimal_tests_are_cached_exactly_as_any_other_are() {
     assert_eq!(report["selection"]["cached"], 4, "{report}");
 }
 
-/// The diagnostic a user meets. It has to name the call they should have
-/// written, because "this is not allowed" without a replacement is the shape of
-/// a rule people work around.
 #[test]
 fn decimal_division_is_e0209_and_names_decimal_div() {
     let dir = project("pub fn unit(total: Decimal, count: Decimal) -> Decimal = total / count\n");
@@ -134,9 +125,7 @@ fn decimal_division_is_e0209_and_names_decimal_div() {
     );
 }
 
-/// The fixture `tests/fixtures/` owes for `E0209`. It also shows the boundary —
-/// `%`, `+`, `-` and `*` are exact and accepted — so a reader learns what to do
-/// rather than only what not to.
+/// The fixture `tests/fixtures/` owes for `E0209`.
 #[test]
 fn the_decimal_division_fixture_reports_e0209_and_nothing_else() {
     let dir = tempfile::tempdir().unwrap();
@@ -177,9 +166,9 @@ law "a float is a float" forall (x: Float, y: Float) where x < y { !(y < x) }
 pub fn main() -> Int = 0
 "#;
 
-/// The worst defect this project can ship is a wrong `proved`, and this is the
-/// shape most likely to produce one: two false laws that are true everywhere
-/// except `NaN`, and two that are true *everywhere*. None may be certified.
+/// The worst defect this project can ship is a wrong `proved`, and this is the shape most likely to
+/// produce one: two false laws that are true everywhere except `NaN`, and two that are true
+/// *everywhere*.
 #[test]
 fn no_float_law_is_ever_reported_proved() {
     let dir = project(FLOAT_LAWS);
@@ -199,8 +188,8 @@ fn no_float_law_is_ever_reported_proved() {
     }
     assert_eq!(report["summary"]["proved"], 0, "{text}");
 
-    // And the generator earns the refutation rather than the prover guessing at
-    // it: the counterexample to `x == x` is the value the type is defined by.
+    // And the generator earns the refutation rather than the prover guessing at it: the
+    // counterexample to `x == x` is the value the type is defined by.
     let refuted = obligations
         .iter()
         .find(|o| {
@@ -217,9 +206,9 @@ fn no_float_law_is_ever_reported_proved() {
     );
 }
 
-/// The `Decimal` half of the same claim, and the control that shows the refusal
-/// above is about `Float` rather than about numerics in general: a congruence
-/// over `Decimal` *is* provable, because its `==` is an equivalence relation.
+/// The `Decimal` half of the same claim, and the control that shows the refusal above is about
+/// `Float` rather than about numerics in general: a congruence over `Decimal` *is* provable,
+/// because its `==` is an equivalence relation.
 #[test]
 fn a_decimal_congruence_is_proved_and_decimal_arithmetic_is_not() {
     let dir = project(
@@ -250,8 +239,8 @@ fn a_decimal_congruence_is_proved_and_decimal_arithmetic_is_not() {
     assert_ne!(tier("additive"), "proved", "{text}");
 }
 
-/// A `Float` in a program does not stop the two engines from agreeing, and
-/// `-0.0` is the value most likely to make them disagree.
+/// A `Float` in a program does not stop the two engines from agreeing, and `-0.0` is the value most
+/// likely to make them disagree.
 #[test]
 fn the_two_engines_agree_over_the_numeric_types() {
     let dir = project(
@@ -280,8 +269,7 @@ fn the_two_engines_agree_over_the_numeric_types() {
     );
 }
 
-/// A `Decimal` overflow is a diagnostic, not a wrap and not a rounding. The
-/// whole reason to prefer an exact bounded type is that it says so.
+/// A `Decimal` overflow is a diagnostic, not a wrap and not a rounding.
 #[test]
 fn a_decimal_overflow_is_reported_rather_than_absorbed() {
     let dir = project(

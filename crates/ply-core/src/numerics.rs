@@ -1,11 +1,4 @@
 //! Inference over the three numeric types, and the prelude's ADTs.
-//!
-//! Ply has no type-directed dispatch, so `+` cannot be resolved by looking at
-//! the operand type at the node — it is usually still a variable there. The
-//! operand type is unified across the two sides on sight and *which* numeric
-//! type it is settled once the enclosing definition has been inferred, which is
-//! what these tests pin down: the settlement has to happen before generalization
-//! and after every body in a recursive component.
 
 use crate::check_program;
 use crate::print::print_scheme;
@@ -74,13 +67,8 @@ fn arithmetic_works_at_each_of_the_three_numeric_types() {
     );
 }
 
-/// The operand type is often unknown at the node and known three tokens later,
-/// which is why the decision is deferred rather than taken on sight.
-///
-/// The binder that learns it is a **lambda's**: a top-level parameter is
-/// written since `MISSING_SIGNATURE`, so the deferral has nowhere to show
-/// itself in a signature. The mechanism is unchanged — both sides are unified
-/// on sight and the numeric type is settled once the component is solved.
+/// The operand type is often unknown at the node and known three tokens later, which is why the
+/// decision is deferred rather than taken on sight.
 #[test]
 fn the_operand_type_is_learned_from_either_side() {
     ok("pub fn f() -> Float = { let g = |a| a + 1.0; 0.0 }");
@@ -88,9 +76,8 @@ fn the_operand_type_is_learned_from_either_side() {
     ok("pub fn f() -> Int = { let g = |a| a < 1.5; 0 }");
 }
 
-/// A caller inside the same recursive component can be what pins a callee's
-/// operand type, so settling one body at a time would decide `Int` before the
-/// other body said `Decimal`.
+/// A caller inside the same recursive component can be what pins a callee's operand type, so
+/// settling one body at a time would decide `Int` before the other body said `Decimal`.
 #[test]
 fn a_recursive_component_settles_after_every_member() {
     assert_eq!(
@@ -104,14 +91,6 @@ fn a_recursive_component_settles_after_every_member() {
 }
 
 /// An operand type nothing pins is `NUMERIC_UNDETERMINED`, not a default.
-///
-/// This used to default to `Int` before generalization, on the argument that
-/// leaving it open would publish `add` as `<t>(t, t) -> t` — a signature whose
-/// body works at three types and whose declaration claims every one. That
-/// argument was answered by writing the signature instead: with
-/// `MISSING_SIGNATURE` in force there is no unpinned *parameter* to default, and
-/// what is left is a lambda binder or a `let`, where choosing `Int` for the
-/// author is a guess that no annotation asked for.
 #[test]
 fn an_unconstrained_operand_is_e0210_rather_than_defaulting_to_int() {
     assert_eq!(
@@ -126,9 +105,9 @@ fn an_unconstrained_operand_is_e0210_rather_than_defaulting_to_int() {
     ok("pub fn f() -> Int = { let g = |a| 0 - a; 0 }");
 }
 
-/// A top-level `fn` publishes what a human wrote, so an omitted parameter type
-/// or return type is `MISSING_SIGNATURE` — and the diagnostic names the type
-/// inference would have given, which is what makes the fix mechanical.
+/// A top-level `fn` publishes what a human wrote, so an omitted parameter type or return type is
+/// `MISSING_SIGNATURE` — and the diagnostic names the type inference would have given, which is
+/// what makes the fix mechanical.
 #[test]
 fn an_omitted_signature_is_e0126_and_the_message_carries_the_fix() {
     let diags = errors("pub fn shout(m: String) = string_upper(m)");
@@ -147,8 +126,8 @@ fn an_omitted_signature_is_e0126_and_the_message_carries_the_fix() {
     );
 }
 
-/// An effect row is the deliberate exception: derived from what the body calls
-/// rather than chosen, so it stays inferred with every type written.
+/// An effect row is the deliberate exception: derived from what the body calls rather than chosen,
+/// so it stays inferred with every type written.
 #[test]
 fn an_omitted_effect_row_is_still_inferred() {
     assert_eq!(
@@ -157,9 +136,7 @@ fn an_omitted_effect_row_is_still_inferred() {
     );
 }
 
-/// Only a top-level `fn` publishes a signature, so only a top-level `fn` has to
-/// write one. A handler clause binds its operation's declared parameter types
-/// and a lambda binds from context; neither is a published claim.
+/// Only a top-level `fn` publishes a signature, so only a top-level `fn` has to write one.
 #[test]
 fn a_handler_clause_binder_and_a_lambda_binder_still_infer() {
     ok("effect log { write emit(m: String) -> Unit }\n\
@@ -185,8 +162,8 @@ fn decimal_division_is_e0209_and_names_its_replacement() {
     assert!(diags[0].primary_span().is_some());
 }
 
-/// `%` is allowed where `/` is not: the remainder of a decimal division is a
-/// decimal even when the quotient is not.
+/// `%` is allowed where `/` is not: the remainder of a decimal division is a decimal even when the
+/// quotient is not.
 #[test]
 fn decimal_remainder_is_accepted() {
     ok("pub fn f(a: Decimal, b: Decimal) -> Decimal = a % b");
@@ -257,8 +234,7 @@ fn negation_is_defined_at_each_numeric_type() {
     );
 }
 
-/// Three types, so a literal of one is not a literal of another. Without this
-/// the deferral would have nothing to settle.
+/// Three types, so a literal of one is not a literal of another.
 #[test]
 fn the_three_literal_forms_have_three_types() {
     assert_eq!(scheme("pub fn f() -> Int = 1", "m.f"), "() -> Int");
@@ -270,8 +246,8 @@ fn the_three_literal_forms_have_three_types() {
 
 // -- The prelude's ADTs -----------------------------------------------------
 
-/// A builtin whose type mentions a type the user has to import first would be
-/// incoherent, so these four are in scope with no declaration anywhere.
+/// A builtin whose type mentions a type the user has to import first would be incoherent, so these
+/// four are in scope with no declaration anywhere.
 #[test]
 fn the_prelude_adts_are_in_scope_without_a_declaration() {
     ok("pub fn f(d: Decimal) -> Option<Int> = int_of_decimal(d, HalfEven)");
@@ -338,19 +314,16 @@ fn the_decimal_builtins_have_the_signatures_the_contract_names() {
         ("decimal_of_string", "(String) -> Option<Decimal>"),
         ("decimal_to_string", "(Decimal) -> String"),
     ] {
-        // Checking through a definition that names it is what proves the builtin
-        // is reachable *and* has the type, in one step. The return type is
-        // *written* (`MISSING_SIGNATURE`), which makes this stronger than it was
-        // when it was read off inference: the builtin must now unify with the
-        // contract's type rather than merely print as it.
+        // Checking through a definition that names it is what proves the builtin is reachable *and*
+        // has the type, in one step.
         let source = format!("pub fn f() -> Int = 1\npub fn g() -> {want} = {name}");
         let printed = scheme(&source, "m.g");
         assert_eq!(printed, format!("() -> {want}"), "`{name}`");
     }
 }
 
-/// A scale is an argument rather than a default, and a rounding mode is a value
-/// the caller writes down. That is the whole content of refusing `/`.
+/// A scale is an argument rather than a default, and a rounding mode is a value the caller writes
+/// down.
 #[test]
 fn decimal_div_will_not_typecheck_without_a_rounding_mode() {
     assert_eq!(
@@ -363,9 +336,8 @@ fn decimal_div_will_not_typecheck_without_a_rounding_mode() {
     );
 }
 
-/// The property generator builds its `TypeWorld` from `CheckOutput::ctors`, so
-/// a prelude ADT that never reached that map would be `E0418` — a law over an
-/// `Option` nobody can check.
+/// The property generator builds its `TypeWorld` from `CheckOutput::ctors`, so a prelude ADT that
+/// never reached that map would be `E0418` — a law over an `Option` nobody can check.
 #[test]
 fn the_prelude_adts_reach_the_check_output() {
     let out = ok("pub fn f() -> Option<Int> = None");

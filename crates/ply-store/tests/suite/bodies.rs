@@ -1,6 +1,5 @@
-//! Definition bodies through the store: what a run writes comes back out as a
-//! program that checks, and bytes that are not the ones their key names never
-//! become a definition.
+//! Definition bodies through the store: what a run writes comes back out as a program that checks,
+//! and bytes that are not the ones their key names never become a definition.
 
 use ply_core::check_program;
 use ply_hash::body::BodySet;
@@ -67,9 +66,8 @@ fn every_hash(hashes: &HashOutput) -> Vec<DefHash> {
         .collect()
 }
 
-/// The whole point, end to end: a run stores bodies, a later process opens the
-/// cache and rebuilds a program it can typecheck — without the source, and
-/// without knowing what anything was called.
+/// The whole point, end to end: a run stores bodies, a later process opens the cache and rebuilds a
+/// program it can typecheck — without the source, and without knowing what anything was called.
 #[test]
 fn a_stored_definition_set_rebuilds_into_a_program_that_checks() {
     let root = TempRoot::new("rebuild");
@@ -120,8 +118,7 @@ fn bytes_that_are_not_a_body_have_no_key() {
     assert_eq!(junk.stored(), None);
 }
 
-/// A build that does not speak the encoding must not decode under it. This is
-/// the gate that stops a shape change from being read as a plausible definition.
+/// A build that does not speak the encoding must not decode under it.
 #[test]
 fn a_body_written_under_another_encoding_is_not_decoded() {
     let (hashes, bodies) = compile(SOURCE);
@@ -157,8 +154,8 @@ fn a_definition_with_no_stored_body_is_named_rather_than_skipped() {
     );
 }
 
-/// A body filed under the wrong key is not a difference of opinion, so it is not
-/// handed back as a definition even though the store kept the bytes.
+/// A body filed under the wrong key is not a difference of opinion, so it is not handed back as a
+/// definition even though the store kept the bytes.
 #[test]
 fn a_misfiled_body_is_not_handed_back() {
     let root = TempRoot::new("misfiled");
@@ -174,8 +171,8 @@ fn a_misfiled_body_is_not_handed_back() {
     assert_eq!(missing, vec![lookup]);
 }
 
-/// Bodies survive a flush and a reopen byte for byte; anything else and a
-/// rebuilt program would differ from the one that was stored.
+/// Bodies survive a flush and a reopen byte for byte; anything else and a rebuilt program would
+/// differ from the one that was stored.
 #[test]
 fn bodies_survive_a_round_trip_through_the_cache_file() {
     let root = TempRoot::new("persist");

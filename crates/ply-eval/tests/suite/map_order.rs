@@ -1,14 +1,8 @@
-//! The property everything else in `Map` rests on: **iteration order is a
-//! function of the values, and of nothing else**.
-//!
-//! Content addressing, the result cache, seeded replay and `--engine both` all
-//! assume a value has one canonical form. A hash-ordered map would break every
-//! one of them at once, and every one of those failures is a green result over
-//! space nobody explored or a red one over correct code — so this file tests the
-//! order directly, across permutations, across runs, and across processes.
+//! The property everything else in `Map` rests on: **iteration order is a function of the values,
+//! and of nothing else**.
 
-// `Value` pins `Arc` for its shared payloads and `Rc` for shared code, so none
-// of those `Arc`s can ever be `Send` — the intended design, not an oversight.
+// `Value` pins `Arc` for its shared payloads and `Rc` for shared code, so none of those `Arc`s can
+// ever be `Send` — the intended design, not an oversight.
 #![allow(clippy::arc_with_non_send_sync)]
 
 use ply_eval::{Map, Value, values_equal};
@@ -18,8 +12,8 @@ use std::cmp::Ordering;
 use std::process::Command;
 use std::str::FromStr;
 
-/// A tiny xorshift, so a permutation is reproducible without a dependency and
-/// without a seed nobody can write down.
+/// A tiny xorshift, so a permutation is reproducible without a dependency and without a seed nobody
+/// can write down.
 struct Rng(u64);
 
 impl Rng {
@@ -57,8 +51,8 @@ fn dec(s: &str) -> Value {
     Value::Decimal(Decimal::from_str(s).expect("a decimal literal"))
 }
 
-/// Required test: `map_keys` is ascending regardless of insertion order, over
-/// 10,000 random insertion permutations of one key set.
+/// Required test: `map_keys` is ascending regardless of insertion order, over 10,000 random
+/// insertion permutations of one key set.
 #[test]
 fn iteration_is_ascending_under_every_insertion_order() {
     let base: Vec<Value> = (0..24)
@@ -87,8 +81,8 @@ fn iteration_is_ascending_under_every_insertion_order() {
     }
 }
 
-/// The same claim in the other direction: two maps built by different insertion
-/// orders are one value, not two that happen to agree entry by entry.
+/// The same claim in the other direction: two maps built by different insertion orders are one
+/// value, not two that happen to agree entry by entry.
 #[test]
 fn two_insertion_orders_build_one_value() {
     let forward = map_of(vec![
@@ -106,9 +100,8 @@ fn two_insertion_orders_build_one_value() {
     assert_eq!(forward.cmp(&backward), Ordering::Equal);
 }
 
-/// A pin, and therefore a check across runs *and* across processes: the digest
-/// below was computed by this order and by nothing else. A hash-ordered map
-/// would move it on the next run, on another machine, or under another build.
+/// A pin, and therefore a check across runs *and* across processes: the digest below was computed
+/// by this order and by nothing else.
 #[test]
 fn the_iteration_order_is_pinned() {
     let mut rng = Rng(0xfeed_face_dead_beef);
@@ -127,9 +120,8 @@ fn the_iteration_order_is_pinned() {
     );
 }
 
-/// The process half of "across runs and processes", asserted rather than
-/// assumed: a second process builds the same map from a shuffled order and must
-/// print the same keys. Re-runs this binary rather than compiling a second one.
+/// The process half of "across runs and processes", asserted rather than assumed: a second process
+/// builds the same map from a shuffled order and must print the same keys.
 #[test]
 fn a_second_process_iterates_in_the_same_order() {
     let exe = std::env::current_exe().expect("the test binary");
@@ -144,18 +136,9 @@ fn a_second_process_iterates_in_the_same_order() {
     );
 }
 
-/// Required test: `Value::cmp(a, b) == Equal` iff `values_equal(a, b)`, over the
-/// range the generator draws from — with the exceptions asserted explicitly
-/// rather than excluded, because an exception nobody wrote down is how the two
-/// drift apart.
-///
-/// There are **two**, and both are `Float`, and both are the same fact from
-/// opposite ends: `total_cmp` is a total order and IEEE `==` is not an
-/// equivalence relation, so they disagree exactly where IEEE is peculiar —
-/// `NaN`, which `==` says differs from itself, and `0.0`/`-0.0`, which `==` says
-/// are one value and which have different bit patterns. ADR 0012 §2 names only
-/// the first; the second is here because it is real, and because both are the
-/// same argument for `Float` not being an ordered key type.
+/// Required test: `Value::cmp(a, b) == Equal` iff `values_equal(a, b)`, over the range the
+/// generator draws from — with the exceptions asserted explicitly rather than excluded, because an
+/// exception nobody wrote down is how the two drift apart.
 #[test]
 fn the_order_and_the_language_agree_except_on_float() {
     let values = corpus();
@@ -193,9 +176,8 @@ fn signed_zeros_are_two_keys_and_are_one_value() {
     let neg = Value::Float(-0.0);
     assert_ne!(pos.cmp(&neg), Ordering::Equal);
     assert!(eq(&pos, &neg));
-    // Two keys where the language sees one value: a lookup for `-0.0` would
-    // miss what `0.0` inserted. This is the second half of why `Float` is
-    // refused as a key type, and `E0206` is what a program meets instead.
+    // Two keys where the language sees one value: a lookup for `-0.0` would miss what `0.0`
+    // inserted.
     let m = map_of(vec![(pos, Value::Int(1)), (neg, Value::Int(2))]);
     let Value::Map(inner) = &m else { panic!() };
     assert_eq!(inner.size(), 2);
@@ -206,8 +188,8 @@ fn two_nans_are_one_key_and_are_not_equal() {
     let nan = Value::Float(f64::NAN);
     assert_eq!(nan.cmp(&Value::Float(f64::NAN)), Ordering::Equal);
     assert!(!eq(&nan, &Value::Float(f64::NAN)));
-    // Which is exactly why `Float` is not an ordered key type: this map would
-    // hold a key the language's `==` cannot find.
+    // Which is exactly why `Float` is not an ordered key type: this map would hold a key the
+    // language's `==` cannot find.
     let m = map_of(vec![(nan, Value::Int(1))]);
     let Value::Map(m) = &m else { panic!() };
     assert_eq!(m.size(), 1);
@@ -272,8 +254,8 @@ fn corpus() -> Vec<Value> {
     out
 }
 
-/// The order is total, which is what a search tree requires of it: irreflexive
-/// nowhere, antisymmetric, and transitive over the whole corpus.
+/// The order is total, which is what a search tree requires of it: irreflexive nowhere,
+/// antisymmetric, and transitive over the whole corpus.
 #[test]
 fn the_order_is_total() {
     let values = corpus();
@@ -308,18 +290,8 @@ fn the_order_is_total() {
     }
 }
 
-/// `1.50m` and `1.5m` are one key, the **value** is the last inserted, and the
-/// key is the canonical member of the class whichever spelling arrived last.
-///
-/// **The second half of this test asserted the opposite until 2026-08-21**, and
-/// had since W2: under the name `an_equal_key_is_replaced_key_and_value_both`
-/// it required `keys(&other)` to be `["1.50"]` — the spelling written last —
-/// because `map_insert` replaced the key as well as the value. That made
-/// `map_keys` a function of insertion history, which is the failure this
-/// file's module note says the whole design exists to prevent.
-/// `ply_eval::value::canonical_key` is the fix, and the two `render` and `eq`
-/// assertions below are new: two maps that `assert_eq` as one value now render
-/// one string and serve one set of encoded bytes.
+/// `1.50m` and `1.5m` are one key, the **value** is the last inserted, and the key is the canonical
+/// member of the class whichever spelling arrived last.
 #[test]
 fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
     let m = map_of(vec![
@@ -351,12 +323,8 @@ fn an_equal_key_replaces_the_value_and_the_key_is_canonical_either_way() {
     );
 }
 
-/// A `Decimal` under a compound key is canonical too, at every position
-/// [`Value::cmp`] descends into — a list, a record field, a constructor
-/// argument and a nested map's key *and* value.
-///
-/// `Map<{sku: String, price: Decimal}, _>` typechecks, so the compound case is
-/// reachable from a well-typed program and is not a Rust-level curiosity.
+/// A `Decimal` under a compound key is canonical too, at every position [`Value::cmp`] descends
+/// into — a list, a record field, a constructor argument and a nested map's key *and* value.
 #[test]
 fn a_decimal_anywhere_under_a_key_is_canonical() {
     let field = |d: &str| {
@@ -429,9 +397,7 @@ fn a_map_is_itself_an_ordered_key() {
     assert_eq!(keys(&outer), vec!["{1: 1}", "{1: 2}"]);
 }
 
-/// Dropping a deeply nested chain of maps must not abort the process. The chain
-/// is built by iteration, which is the only way to reach a depth the call bound
-/// does not.
+/// Dropping a deeply nested chain of maps must not abort the process.
 #[test]
 fn a_deep_chain_of_maps_drops_without_aborting() {
     let mut v = Value::empty_map();
@@ -443,9 +409,7 @@ fn a_deep_chain_of_maps_drops_without_aborting() {
     drop(v);
 }
 
-/// An `assert_eq` over two maps has to point at the entry that differs, not at
-/// two whole maps. The path is the rendered key, because a map has no field
-/// names and no indices a reader could match up.
+/// An `assert_eq` over two maps has to point at the entry that differs, not at two whole maps.
 #[test]
 fn a_failing_comparison_locates_the_entry_that_differs() {
     let a = map_of(vec![
@@ -462,10 +426,8 @@ fn a_failing_comparison_locates_the_entry_that_differs() {
     assert_eq!(expected, "9");
     assert_eq!(actual, "2");
 
-    // Different key *sets* have no entry to blame, so the pair is reported whole
-    // rather than walked entry by entry — which would misalign and name the
-    // wrong key. `None` is how this function says "at the top", as it already
-    // does for two lists of different lengths.
+    // Different key *sets* have no entry to blame, so the pair is reported whole rather than walked
+    // entry by entry — which would misalign and name the wrong key.
     let c = map_of(vec![(Value::str("x"), Value::Int(1))]);
     assert!(ply_eval::first_difference(&a, &c).is_none());
 }

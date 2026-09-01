@@ -1,5 +1,5 @@
-//! Selection, scheduling, and running — where "a test re-runs iff its hash is
-//! absent from the cache" stops being a claim and becomes an observable.
+//! Selection, scheduling, and running — where "a test re-runs iff its hash is absent from the
+//! cache" stops being a claim and becomes an observable.
 
 pub mod bisect;
 pub mod diagnose;
@@ -65,7 +65,7 @@ pub enum Reason {
     New,
     /// `test/nondet` opts out of the cache in both directions.
     Nondet,
-    /// The store holds a failure for this hash. A red test re-runs until green.
+    /// The store holds a failure for this hash.
     PreviousFailure,
     /// The hash is present and green; re-running cannot reveal anything new.
     Cached,
@@ -94,33 +94,19 @@ pub struct Selection {
     pub total: usize,
     pub cached: Vec<(usize, Outcome)>,
     pub to_run: Vec<usize>,
-    /// Concurrency groups over `to_run`; every pair within a group has
-    /// non-conflicting footprints. This is the schedule of record — `run`
-    /// executes these, in order.
+    /// Concurrency groups over `to_run`; every pair within a group has non-conflicting footprints.
     pub groups: Vec<Vec<usize>>,
     /// Indexed by test index, length `total`.
     pub reasons: Vec<Reason>,
-    /// Indexed by test index, length `total`. Covers cached tests too: whether
-    /// a test could disturb another is a fact about the test, not about this
-    /// run.
+    /// Indexed by test index, length `total`.
     pub isolation: Vec<Isolation>,
     pub parallelism: Parallelism,
-    /// The search this selection was made against, and the key a seeded test's
-    /// result is published under. A selection read against one plan says nothing
-    /// about another, which is why it travels with the answer.
+    /// The search this selection was made against, and the key a seeded test's result is published
+    /// under.
     pub plan: Plan,
-    /// What a seeded test still owes, when the cache already covers part of the
-    /// plan. Only `random` decomposes, so only `random` ever narrows: sixty-four
-    /// roots become a hundred and twenty-eight for the cost of sixty-four runs.
+    /// What a seeded test still owes, when the cache already covers part of the plan.
     pub narrowed: BTreeMap<usize, Plan>,
-    /// Test indices this run was never asked to decide: a shipped module's
-    /// tests without `--std`. They are not `filtered out` and not in `total`,
-    /// and — the part that matters — they withhold nothing from
-    /// [`Store::observe_definitions`]. A filter-dropped test still implicates
-    /// its closure, because the project chose not to run a test it owns; a
-    /// shipped test was never in the denominator, so leaving `std.http`'s
-    /// definitions permanently unrecorded would put all of them in every
-    /// suspect set for the life of the cache.
+    /// Test indices this run was never asked to decide: a shipped module's tests without `--std`.
     pub out_of_scope: BTreeSet<usize>,
 }
 
@@ -129,8 +115,8 @@ impl Selection {
         self.reasons.get(index).copied()
     }
 
-    /// What this test will actually search: the run's plan, unless the cache
-    /// already answered for some of its roots.
+    /// What this test will actually search: the run's plan, unless the cache already answered for
+    /// some of its roots.
     pub fn plan_for(&self, index: usize) -> &Plan {
         self.narrowed.get(&index).unwrap_or(&self.plan)
     }
@@ -148,8 +134,7 @@ impl Selection {
     }
 }
 
-/// Hand-written so that `Selection` stays printable no matter what `Outcome`
-/// derives.
+/// Hand-written so that `Selection` stays printable no matter what `Outcome` derives.
 impl fmt::Debug for Selection {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let cached: Vec<usize> = self.cached.iter().map(|(i, _)| *i).collect();
@@ -172,9 +157,8 @@ impl fmt::Debug for Selection {
 pub enum Status {
     Passed,
     Failed,
-    /// Ply failed rather than the program: the evaluator unwound, or it reported
-    /// one of its own invariants broken. Kept distinct from `Failed` so a defect
-    /// in Ply cannot be read as a red test the user should go and fix.
+    /// Ply failed rather than the program: the evaluator unwound, or it reported one of its own
+    /// invariants broken.
     Panicked,
 }
 
@@ -187,23 +171,16 @@ pub struct TestResult {
     pub duration: Duration,
     pub status: Status,
     pub failure: Option<Diagnostic>,
-    /// What the search did. `None` — never a zeroed [`Exploration`] — when this
-    /// test reached no `simulate` region, because a consumer cannot tell a zero
-    /// from a test that never simulated anything.
+    /// What the search did.
     pub simulation: Option<Exploration>,
-    /// Absent when nothing was written: a spent budget proved nothing, and a
-    /// seeded test whose search went unobserved is a run nobody watched.
+    /// Absent when nothing was written: a spent budget proved nothing, and a seeded test whose
+    /// search went unobserved is a run nobody watched.
     pub recorded: Option<Record>,
-    /// Whether the differential oracle actually compared two engines on this
-    /// test. `None` outside `--engine both`, where there is no oracle to have a
-    /// coverage; `Some(false)` for a test only one engine could run.
+    /// Whether the differential oracle actually compared two engines on this test.
     pub audited: Option<bool>,
-    /// What this test asked of a compiled backend, and the fact ADR 0026 §4.6's
-    /// stage two reads: a written `Pass` beside a non-zero `entries` is a run
-    /// that cached a third execution strategy's verdict.
-    ///
-    /// `None` outside `--backend`, so a consumer that has not been taught about
-    /// it reads the run exactly as it did before.
+    /// What this test asked of a compiled backend, and the fact ADR 0026 §4.6's stage two reads: a
+    /// written `Pass` beside a non-zero `entries` is a run that cached a third execution strategy's
+    /// verdict.
     pub backend: Option<BackendUse>,
 }
 
@@ -212,27 +189,22 @@ impl TestResult {
         self.status == Status::Passed
     }
 
-    /// Green, and re-runs next time anyway. The one place a passing `det` test
-    /// is not cacheable, and the summary says so rather than leaving a reader to
-    /// wonder why selection did not shrink.
+    /// Green, and re-runs next time anyway.
     pub fn green_but_uncached(&self) -> bool {
         self.passed() && matches!(self.recorded, Some(Record::Exhausted | Record::Unobserved))
     }
 }
 
 /// A bare name is a list to read; these fields are what turn it into a ranking.
-/// Every one of them is tri-state where the evidence may be missing, because a
-/// consumer that cannot tell "did not run" from "was not traced" will act on the
-/// wrong one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Suspect {
     /// The program-wide name.
     pub name: Symbol,
     pub hash: Option<DefHash>,
-    /// Its hash when the test last passed. `None` when no baseline is known.
+    /// Its hash when the test last passed.
     pub before: Option<DefHash>,
-    /// `None` when the two configurations were never compared, so nothing
-    /// distinguishes an edit from a hash that merely moved underneath it.
+    /// `None` when the two configurations were never compared, so nothing distinguishes an edit
+    /// from a hash that merely moved underneath it.
     pub change: Option<ChangeKind>,
     /// `None` when the failing execution was not traced.
     pub ran: Option<bool>,
@@ -255,10 +227,9 @@ impl Suspect {
         }
     }
 
-    /// Most-likely-first: a bisected culprit, then whatever was on the stack when
-    /// it blew up (innermost first), then whatever else ran, then an edit over a
-    /// hash that only moved, then the name. Total and deterministic, because two
-    /// runs over the same failure have to produce the same artifact.
+    /// Most-likely-first: a bisected culprit, then whatever was on the stack when it blew up
+    /// (innermost first), then whatever else ran, then an edit over a hash that only moved, then
+    /// the name.
     fn rank(&self) -> (u8, usize, u8, &str) {
         let tier = match (self.culprit, self.ran, self.depth) {
             (true, ..) => 0,
@@ -277,13 +248,11 @@ impl Suspect {
     }
 }
 
-/// The diagnosis the system is in a position to do, so that a consumer does not
-/// have to re-derive it.
+/// The diagnosis the system is in a position to do, so that a consumer does not have to re-derive
+/// it.
 #[derive(Clone, Debug, Default)]
 pub struct Attribution {
-    /// The same set as [`Failure::suspects`], ranked and annotated. The order
-    /// differs deliberately: `Failure::suspects` is the raw intersection and this
-    /// is the answer.
+    /// The same set as [`Failure::suspects`], ranked and annotated.
     pub suspects: Vec<Suspect>,
     pub bisection: Bisection,
     /// `None` until a traced re-run has happened.
@@ -291,8 +260,7 @@ pub struct Attribution {
 }
 
 impl Attribution {
-    /// What a run knows before any bisection or tracing: the names, and their
-    /// hashes now.
+    /// What a run knows before any bisection or tracing: the names, and their hashes now.
     pub fn from_suspects(names: &[Symbol], hashes: &HashOutput) -> Attribution {
         let mut suspects: Vec<Suspect> = names
             .iter()
@@ -313,9 +281,7 @@ impl Attribution {
         }
     }
 
-    /// Folds a bisection and a trace into the suspects, then re-ranks. Called
-    /// once both are in hand; the ordering is not stable under partial updates
-    /// and is not meant to be read before this.
+    /// Folds a bisection and a trace into the suspects, then re-ranks.
     pub fn resolve(&mut self, bisection: Bisection, slice: Option<CausalSlice>) {
         let culprits = bisection.culprits();
         for suspect in &mut self.suspects {
@@ -328,9 +294,9 @@ impl Attribution {
                 suspect.depth = slice.depth_of(&suspect.name);
             }
         }
-        // A culprit bisection found outside the suspect set is still the answer:
-        // the suspect set is "changed and in the closure", and a definition can
-        // be a cause without the store having noticed it change.
+        // A culprit bisection found outside the suspect set is still the answer: the suspect set is
+        // "changed and in the closure", and a definition can be a cause without the store having
+        // noticed it change.
         for name in culprits {
             if !self.suspects.iter().any(|s| s.name == name) {
                 let mut extra = Suspect::new(name, None);
@@ -350,42 +316,25 @@ impl Attribution {
 
 #[derive(Clone, Debug)]
 pub struct Failure {
-    /// The label as the source wrote it. Not unique program-wide; `key` is.
+    /// The label as the source wrote it.
     pub name: String,
     /// `<module>.<label>`, and the key this failure's closure is looked up by.
     pub key: Symbol,
     pub diagnostic: Diagnostic,
-    /// Ply's fault rather than the program's, so there is nothing in the
-    /// definition graph to attribute it to.
-    ///
-    /// Four things say so, and no fifth: the run watched the evaluator unwind,
-    /// the evaluator said `INTERNAL_ERROR`, the two engines disagreed, or a host
-    /// answer landed outside the entry point's declared footprint. Reading it off
-    /// `RUNTIME_ERROR` is what made a runaway recursion — a documented limit, and
-    /// as bisectable a regression as any assertion — report itself as a defect in
-    /// Ply and decline to be bisected.
+    /// Ply's fault rather than the program's, so there is nothing in the definition graph to
+    /// attribute it to.
     pub defect: bool,
-    /// This failing run reached a host handler, so re-running it acts on the
-    /// world again. Read off what the runtime did, never off the prediction
-    /// selection made from footprints.
+    /// This failing run reached a host handler, so re-running it acts on the world again.
     pub host: bool,
-    /// Definitions in this test's closure whose hash is not in the store —
-    /// the suspects for this failure.
+    /// Definitions in this test's closure whose hash is not in the store — the suspects for this
+    /// failure.
     pub suspects: Vec<Symbol>,
-    /// What failed, structured. `None` until the evaluator carries the payload
-    /// rather than rendering it into the diagnostic's notes.
+    /// What failed, structured.
     pub assertion: Option<Assertion>,
     pub attribution: Attribution,
-    /// The interleaving this failure happened in. The whole point of M7 is that
-    /// the repro handed to an agent is this rather than a stack trace, so it is
-    /// the field the artifact leads the reproduction with.
-    ///
-    /// `None` on a failure no simulation produced — never a default seed, which
-    /// would replay a different run.
+    /// The interleaving this failure happened in.
     pub seed: Option<Seed>,
-    /// The two steps whose reordering flipped a passing interleaving to this
-    /// one. `Some` only when the search actually observed the flip: under
-    /// `once` and `random` there is nothing to observe.
+    /// The two steps whose reordering flipped a passing interleaving to this one.
     pub race: Option<Race>,
 }
 
@@ -403,41 +352,26 @@ pub struct RunReport {
     pub cached: usize,
     pub failures: Vec<Failure>,
     pub duration: Duration,
-    /// Carried through from the selection this run executed, so a consumer of
-    /// the report alone can still see how much of the corpus is trivially
-    /// parallel.
+    /// Carried through from the selection this run executed, so a consumer of the report alone can
+    /// still see how much of the corpus is trivially parallel.
     pub parallelism: Parallelism,
     /// Every test that actually ran, in execution order.
     pub results: Vec<TestResult>,
-    /// Problems with the run itself rather than with any test — a cache that
-    /// could not be written, a selection naming a test that does not exist.
+    /// Problems with the run itself rather than with any test — a cache that could not be written,
+    /// a selection naming a test that does not exist.
     pub warnings: Vec<Diagnostic>,
-    /// What the run's simulated tests searched. Zeroed, not absent: it is
-    /// aggregated over the tests that ran, and `simulated == 0` is the honest
-    /// answer for a corpus with no `simulate` region.
+    /// What the run's simulated tests searched.
     pub simulation: SimSummary,
-    /// How much of this run the differential oracle actually covered. `None`
-    /// when no oracle ran, so a consumer cannot read a zero as "nothing was
-    /// skipped".
+    /// How much of this run the differential oracle actually covered.
     pub audit: Option<AuditSummary>,
 }
 
 /// What `--engine both` compared, and what it could not.
-///
-/// A run that reports `0 failed` under two engines invites the reading that two
-/// engines agreed about every test in it. They did not agree about the ones only
-/// one engine can run — a clause binding a continuation is `E0504` on the
-/// tree-walker (ADR 0005 required test 3) and a searched test is re-run per
-/// interleaving on the machine alone — and those are exactly the constructs a
-/// change to the memory model moves. ADR 0017 §6 states the trap for the
-/// isolation counts; the oracle's own coverage is the same trap, so it is
-/// counted here and printed rather than left to be inferred from a green run.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize)]
 pub struct AuditSummary {
     /// Tests both engines ran and whose outcomes were compared.
     pub compared: usize,
-    /// Tests one engine could not run, and which the oracle therefore says
-    /// nothing about.
+    /// Tests one engine could not run, and which the oracle therefore says nothing about.
     pub unaudited: usize,
 }
 
@@ -465,13 +399,7 @@ impl RunReport {
     }
 }
 
-/// Runs a single test. `run` supplies the tree-walking interpreter; splitting it
-/// out lets the scheduler, the cache rules, and panic containment be tested
-/// without an evaluator in the loop.
-///
-/// `Worker` deliberately carries no `Send` bound: it is built on the thread that
-/// will use it and never crosses one, which is what lets an interpreter full of
-/// `Rc`s be a worker.
+/// Runs a single test.
 pub trait Executor: Sync {
     type Worker;
 
@@ -479,72 +407,41 @@ pub trait Executor: Sync {
 
     fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic>;
 
-    /// What the search the last [`Executor::execute`] performed did, read off
-    /// the worker that performed it.
-    ///
-    /// `None` means the test reached no `simulate` region, which is how a test
-    /// that simulates nothing pays nothing. It is deliberately not a zeroed
-    /// [`Exploration`]: the cache rules branch on the difference.
+    /// What the search the last [`Executor::execute`] performed did, read off the worker that
+    /// performed it.
     fn exploration(&self, _worker: &Self::Worker) -> Option<Exploration> {
         None
     }
 
     /// What the last [`Executor::execute`] reached across the host boundary.
-    ///
-    /// `None` means it reached nothing, and it is the **authority** on whether
-    /// the pass may be cached — the footprint-based prediction decides only what
-    /// runs. Never a zeroed [`HostUse`]: "reached no host handler" and "reached
-    /// one that touched nothing" are different claims and the cache branches on
-    /// the difference.
     fn host_use(&self, _worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
         None
     }
 
     /// Whether the last [`Executor::execute`] compared two engines.
-    ///
-    /// `None` when this run has no differential oracle at all, which is not the
-    /// same claim as "the oracle covered nothing" — see [`AuditSummary`].
     fn audited(&self, _worker: &Self::Worker) -> Option<bool> {
         None
     }
 
     /// What the last [`Executor::execute`] asked of a compiled backend.
-    ///
-    /// `None` when this run installed none, and never a zeroed [`BackendUse`]:
-    /// "no backend ran" and "a backend ran and entered nothing" are different
-    /// claims, and ADR 0026 §4.6's `backend_escapes` branches on the difference
-    /// exactly as the host rule does.
     fn backend_use(&self, _worker: &Self::Worker) -> Option<BackendUse> {
         None
     }
 
-    /// What the host runtime reported while closing the entry point, and
-    /// forgotten by the worker once read.
-    ///
-    /// Warnings, never failures, and never the test's verdict. A connection the
-    /// driver had to discard because its `ROLLBACK` failed is the *run's* own
-    /// resource: the program asked for nothing and did nothing wrong, and
-    /// attributing it to whichever test happened to be running would send a
-    /// reader looking for a defect in their own program.
+    /// What the host runtime reported while closing the entry point, and forgotten by the worker
+    /// once read.
     fn teardown(&self, _worker: &mut Self::Worker) -> Vec<Diagnostic> {
         Vec::new()
     }
 }
 
-/// The search each test runs, and whether to measure what an unpruned one would
-/// have cost.
-///
-/// `narrowed` is [`Selection::narrowed`], carried here because the plan a test
-/// searches is decided by what the cache already covers and the executor is what
-/// installs it.
+/// The search each test runs, and whether to measure what an unpruned one would have cost.
 #[derive(Clone, Debug, Default)]
 pub struct Search {
     pub plan: Plan,
     pub narrowed: BTreeMap<usize, Plan>,
-    /// Run the same search a second time with the dependence relation forced to
-    /// `true`, so the reduction is a measured number rather than a slogan. Off
-    /// by default: the claim is a benchmark, not something every run pays double
-    /// for.
+    /// Run the same search a second time with the dependence relation forced to `true`, so the
+    /// reduction is a measured number rather than a slogan.
     pub measure_reduction: bool,
 }
 
@@ -568,43 +465,28 @@ impl Search {
 }
 
 /// What a run may reach outside the program.
-///
-/// Hermetic by default, and the default is the guarantee: a suite that acquires
-/// a live dependency without anyone deciding to is the failure mode this
-/// language exists to prevent, so binding a real handler is something a caller
-/// has to write down.
-///
-/// A hermetic binding is **not** an absent one. [`HostBinding::hermetic_with`]
-/// carries the registry without binding it, which is what lets the refusal be
-/// `E0424` — naming the handler that would have served the operation under
-/// `--host` — rather than `E0303`, which means inference should have prevented
-/// the perform and did not. The two call for opposite responses.
 #[derive(Default)]
 pub struct Hosting<'a> {
     binding: Option<Arc<HostBinding>>,
-    /// A factory rather than a value, for the reason [`InterpExecutor::with_fixture`]
-    /// is one: a runtime handle belongs to the one thread its machine runs on,
-    /// and the runner has a machine per worker.
+    /// A factory rather than a value, for the reason [`InterpExecutor::with_fixture`] is one: a
+    /// runtime handle belongs to the one thread its machine runs on, and the runner has a machine
+    /// per worker.
     runtime: Option<&'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync)>,
 }
 
 impl<'a> Hosting<'a> {
-    /// Nothing bound and nothing to name. What every caller that does not
-    /// mention the host gets.
+    /// Nothing bound and nothing to name.
     pub fn hermetic() -> Hosting<'a> {
         Hosting::default()
     }
 
-    /// The binding the run's machines get. Pass
-    /// `HostBinding::hermetic_with(registry)` to stay hermetic and still be able
-    /// to name what would have served a perform.
+    /// The binding the run's machines get.
     pub fn with_binding(mut self, binding: Arc<HostBinding>) -> Hosting<'a> {
         self.binding = Some(binding);
         self
     }
 
-    /// What a [`ply_eval::host::HostAnswer::Pending`] is polled on. Absent for a
-    /// hermetic run, where nothing can answer `Pending` in the first place.
+    /// What a [`ply_eval::host::HostAnswer::Pending`] is polled on.
     pub fn with_runtime(
         mut self,
         runtime: &'a (dyn Fn() -> Rc<dyn HostRuntime> + Sync),
@@ -619,43 +501,18 @@ pub struct InterpExecutor<'a> {
     pub resolved: &'a Resolved,
     pub check: &'a CheckOutput,
     /// Per test, its module and its position among that module's tests.
-    ///
-    /// The evaluator indexes tests within the AST it was given, and the
-    /// incremental front end reports tests from modules it never parsed, so a
-    /// position in `check.tests` is not a position in `program`. This is the
-    /// key that means the same thing in both.
     addresses: Vec<(Symbol, usize)>,
     fixture: Option<&'a (dyn Fn(&mut TaskRegions) -> Value + Sync)>,
     hosts: Hosting<'a>,
     engine: EngineChoice,
-    /// The backend this run installs, and which of the eight corruptions it is
-    /// wearing. `None` — the default, and every run that did not ask — is what
-    /// keeps the seam inert.
-    ///
-    /// The [`ply_eval::Provider`] is the run's, leaked once, and shared by
-    /// every worker; the `Rc<dyn Compiled>` built from it is a worker's,
-    /// because a backend evaluates on the thread its machine runs on.
+    /// The backend this run installs, and which of the eight corruptions it is wearing.
     backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
     search: Search,
     /// This program's region kinds, shared by every engine this run builds.
-    /// The analysis is a whole-program one and a run builds an engine per
-    /// worker per group, so leaving each to infer its own is a whole-program
-    /// traversal per worker per group.
     region_kinds: ply_eval::region_kind::Kinds,
 }
 
-/// One test's evaluator. Under [`EngineChoice::Both`] it is two of them, run
-/// over the same test so that a disagreement fails the run at the test that
-/// produced it.
-///
-/// With a backend installed it is **three**, and ADR 0016 §2.2 priced that as a
-/// permanent cost before it existed. The third is a machine with the backend
-/// attached, and it is `Some` only when a run asked for one, so `--engine both`
-/// without `--backend` runs exactly the two engines it always did. What the
-/// third pair buys is attribution: a divergence between the tree-walker and the
-/// plain machine is the *machine's*, and one between the plain machine and the
-/// backed one is the *backend's*. Auditing a backend against the tree-walker
-/// alone reports both as the same thing.
+/// One test's evaluator.
 pub enum Engines<'a> {
     Treewalk(Box<Interp<'a>>),
     Machine(Box<Machine<'a>>),
@@ -663,45 +520,24 @@ pub enum Engines<'a> {
 }
 
 /// One pool thread's evaluators, plus what its last test searched.
-///
-/// The search lives here rather than in the return of `execute` because
-/// `Executor::execute` answers the same question it always did — did this test
-/// pass — and a runner that has no simulation to report should not have to
-/// mention one.
 pub struct Worker<'a> {
     pub engines: Engines<'a>,
     exploration: Option<Exploration>,
-    /// What the last test reached across the host boundary. Held here rather
-    /// than read off `engines` because a searched test runs on a machine built
-    /// per interleaving, and reading the worker's own machine would answer with
-    /// whatever the *previous* test did.
+    /// What the last test reached across the host boundary.
     host: Option<ply_eval::host::HostUse>,
     /// The region this worker's tests run in, built once and mutated in place.
-    /// A worker lives for exactly one concurrency group, but a group is executed
-    /// by up to `--jobs` of them, so this is one build per worker and not
-    /// ADR 0017 §6's one per group. What makes the difference unobservable is
-    /// the colouring, not the count: no two tests that could name one piece of
-    /// fixture state share a group, so nothing may depend on which worker ran
-    /// which test.
     region: GroupRegion,
-    /// Whether the last test was actually compared on two engines. See
-    /// [`AuditSummary`].
+    /// Whether the last test was actually compared on two engines.
     audited: Option<bool>,
-    /// This worker's backend, built once and installed on every machine it
-    /// builds — including the machines a search rebuilds per interleaving, which
-    /// would otherwise each construct their own evaluator.
+    /// This worker's backend, built once and installed on every machine it builds — including the
+    /// machines a search rebuilds per interleaving, which would otherwise each construct their own
+    /// evaluator.
     backend: Option<Rc<dyn ply_eval::Compiled>>,
-    /// What the last test entered natively. A *delta*, taken across the test,
-    /// because `Machine::compiled_counts` is cumulative over a machine's whole
-    /// life and one machine serves a whole group.
+    /// What the last test entered natively.
     backend_use: Option<BackendUse>,
 }
 
 /// What one test asked of the backend.
-///
-/// `None` on a run with no backend, and never a zeroed value: "no backend ran"
-/// and "a backend ran and entered nothing" are different claims, and the
-/// result-cache rule branches on the difference exactly as the host rule does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct BackendUse {
     /// Bodies this test ran natively instead of evaluating.
@@ -724,10 +560,6 @@ impl<'a> Worker<'a> {
     }
 
     /// The machine carrying this run's backend, if one is installed.
-    ///
-    /// Under `--engine both` that is the *third* engine and never the
-    /// authoritative one: the verdict is the plain machine's, so a backend
-    /// cannot turn a red test green.
     fn backed(&self) -> Option<&Machine<'a>> {
         match (&self.engines, self.backend.is_some()) {
             (Engines::Machine(m), true) => Some(m.as_ref()),
@@ -743,15 +575,14 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// The group's region as it stands: the fixture, plus every write the tests
-    /// run so far made to it.
+    /// The group's region as it stands: the fixture, plus every write the tests run so far made to
+    /// it.
     pub fn region(&self) -> &GroupRegion {
         &self.region
     }
 
-    /// What this worker's machine has already lowered, for the machines a search
-    /// builds per interleaving. `None` under `--engine treewalk`, which lowers
-    /// nothing.
+    /// What this worker's machine has already lowered, for the machines a search builds per
+    /// interleaving.
     fn lowering(&self) -> Option<Rc<Lowering<'a>>> {
         match &self.engines {
             Engines::Machine(m) | Engines::Both(_, m, _) => Some(m.share_lowering()),
@@ -759,22 +590,8 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Hands each engine a stack seeded from the group's region, one each, so
-    /// that two engines under `--engine both` cannot write through to one
-    /// another.
-    ///
-    /// Called per test rather than per worker, because the region moves as the
-    /// group's tests write to it and an engine holding the stack it was built
-    /// with would run against a fixture that is one test out of date.
-    ///
-    /// **Nothing at all when the region is empty**, which is every corpus in
-    /// this repository. An engine resets its own stack to its fixture at every
-    /// entry point, so an empty region is already what the next test opens, and
-    /// installing a fresh stack would throw away an arena whose chunks are warm
-    /// — the allocation this milestone exists to stop paying.
-    ///
-    /// The fixture's handle is dropped here because no test can name it: there
-    /// is no surface syntax that binds one. Whoever adds it binds this value.
+    /// Hands each engine a stack seeded from the group's region, one each, so that two engines
+    /// under `--engine both` cannot write through to one another.
     fn open_region(&mut self) {
         if self.region.is_empty() {
             return;
@@ -792,15 +609,8 @@ impl<'a> Worker<'a> {
         }
     }
 
-    /// Closes the test's region: its own slots go back to the bump pointer at
-    /// the next entry point, and its writes to the fixture are carried here.
-    ///
-    /// Read off the authoritative engine rather than [`Worker::cells`], which
-    /// answers with the tree-walker under `Both`. The two have just been proved
-    /// to end with equal cells *unless* the test was machine-only, in which case
-    /// the tree-walker refused it and its stack is the region untouched — and
-    /// carrying that forward would silently drop the test's writes under
-    /// `--engine both` and keep them under `--engine machine`.
+    /// Closes the test's region: its own slots go back to the bump pointer at the next entry point,
+    /// and its writes to the fixture are carried here.
     fn close_region(&mut self) {
         if self.region.is_empty() {
             return;
@@ -860,20 +670,7 @@ impl<'a> InterpExecutor<'a> {
         }
     }
 
-    /// The fixture a group's tests share. A region stack holds `Rc` and cannot
-    /// cross a thread, so this is a seed called on each worker's own thread
-    /// rather than a value: it runs **once per worker**, which is ADR 0017 §6's
-    /// "once per group" only at `--jobs 1` and is *w* builds at *w* workers. The
-    /// cost is stated rather than rounded down, because a fixture that is
-    /// expensive to seed is charged for it once per worker per group.
-    ///
-    /// Every test a worker runs then mutates that one fixture in place, and a
-    /// write is visible only to the later tests that land on the same worker.
-    /// What makes that safe — and what makes it unnecessary to say which worker
-    /// ran what — is the colouring: since a region label conflicts like any
-    /// other resource, no two tests in a group can name one piece of fixture
-    /// state, so neither the order they run in nor the worker they run on can
-    /// decide a verdict.
+    /// The fixture a group's tests share.
     pub fn with_fixture(mut self, fixture: &'a (dyn Fn(&mut TaskRegions) -> Value + Sync)) -> Self {
         self.fixture = Some(fixture);
         self
@@ -885,35 +682,6 @@ impl<'a> InterpExecutor<'a> {
     }
 
     /// Install a backend on every machine this run builds.
-    ///
-    /// A run with a backend attached is a third execution strategy, and a cached
-    /// `Pass` is a claim about the authoritative engine — so a caller that calls
-    /// this owes `--no-cache`, and `ply test` enforces it twice: `cache_bypassed`
-    /// refuses to read or write the store, and `backend_escapes` fails the run if
-    /// a `Pass` was written by a test that entered native code anyway. See
-    /// ADR 0026 §4.6.
-    ///
-    /// **The parameter is a `dyn Provider`, and it was a concrete `Fragment`
-    /// until 2026-08-31.** This paragraph read:
-    ///
-    /// > **The parameter is a `Fragment` and not a `dyn Compiled`, and that is
-    /// > the limit of what a shipping command can install.** Every backend this
-    /// > can build comes from `Fragment::attach`, which is
-    /// > `ply_eval::backend::Reference` or one of the eight corruptions wrapping
-    /// > it. A second implementation of `Compiled` — a code generator — does not
-    /// > fit through here, and the eight would not be wrapping it if it did,
-    /// > because two of them need a registry query and a run on fuel that is not
-    /// > the machine's budget, neither of which is on the trait. See
-    /// > `ply_eval::backend::Mutant`'s header and ADR 0026 §4.5, annotated
-    /// > 2026-08-30.
-    ///
-    /// Every clause of that was true and the last sentence named the fix.
-    /// `ply_eval::Provider` is the run-scoped source of per-worker backends and
-    /// `ply_eval::Policed` carries the two operations the corruptions need, so
-    /// `ply_codegen::Cranelift` fits through here and the eight wrap it. What
-    /// does **not** change is the obligation: catching the eight is a condition
-    /// on each backend separately, because what a corruption can bite depends
-    /// on which definitions the backend has a body for.
     pub fn with_backend(
         mut self,
         provider: &'static dyn ply_eval::Provider,
@@ -923,24 +691,19 @@ impl<'a> InterpExecutor<'a> {
         self
     }
 
-    /// What this run may reach outside the program. Hermetic unless said
-    /// otherwise, in every constructor and at every call site.
+    /// What this run may reach outside the program.
     pub fn with_hosts(mut self, hosts: Hosting<'a>) -> Self {
         self.hosts = hosts;
         self
     }
 
-    /// The search every simulated test in this run performs. Installed on the
-    /// machine per test rather than per worker, because a narrowed plan is a
-    /// fact about one test.
+    /// The search every simulated test in this run performs.
     pub fn with_search(mut self, search: Search) -> Self {
         self.search = search;
         self
     }
 
-    /// The region this worker's group runs in, built on the worker's own
-    /// thread. Empty when no fixture was supplied, which is every corpus that
-    /// has not been handed one.
+    /// The region this worker's group runs in, built on the worker's own thread.
     fn build_region(&self) -> GroupRegion {
         match self.fixture {
             Some(build) => GroupRegion::build(build),
@@ -957,32 +720,24 @@ impl<'a> InterpExecutor<'a> {
         Box::new(interp)
     }
 
-    /// The run's one answer about this program's regions. Handed to every
-    /// engine below, including the machines a search rebuilds per interleaving.
+    /// The run's one answer about this program's regions.
     pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
         ply_eval::region_kind::Kinds::clone(&self.region_kinds)
     }
 
-    /// A machine, with the run's binding and — on this worker's own thread — its
-    /// own handle on the reactor.
+    /// A machine, with the run's binding and — on this worker's own thread — its own handle on the
+    /// reactor.
     fn machine(&self) -> Box<Machine<'a>> {
         self.machine_lowering(None, None)
     }
 
-    /// A backend for one worker, or `None` when this run installs none. Built on
-    /// the worker's own thread, because a backend is `Rc` all the way down.
+    /// A backend for one worker, or `None` when this run installs none.
     fn backend(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
         let (provider, spec) = self.backend.as_ref()?;
         Some(provider.attach(spec))
     }
 
-    /// The same machine, lowering into `lowering` rather than into a cache of
-    /// its own.
-    ///
-    /// A search builds one of these per interleaving and every one of them would
-    /// otherwise re-lower the test and every definition it reaches. Unlike the
-    /// region kinds beside it this cannot be shared beyond one thread — lowered
-    /// code is `Rc` — so it is the worker's rather than the run's.
+    /// The same machine, lowering into `lowering` rather than into a cache of its own.
     fn machine_lowering(
         &self,
         lowering: Option<Rc<Lowering<'a>>>,
@@ -1012,33 +767,16 @@ impl<'a> InterpExecutor<'a> {
         }
     }
 
-    /// State this entry point's footprint claim, so a host answer outside it is
-    /// `E0427` rather than a quiet uncached pass.
-    ///
-    /// Without this the check is inert in the one command that runs a corpus. A
-    /// footprint is an upper bound on what a test performs, so a host answer
-    /// outside it is the run observing its own two answers disagree — and it is
-    /// reachable without any dishonest handler: a `handle` whose clause set
-    /// covers some but not all operations of an atom discharges the atom out of
-    /// the row and leaves the uncovered operation to fall through to the
-    /// binding. That test is then scheduled as region-isolated over a footprint
-    /// that says it touches nothing, while it touches a socket.
-    ///
-    /// Restated per test because one `Machine` serves many of them: a claim that
-    /// outlived its entry point would judge the next test by the last one's row.
+    /// State this entry point's footprint claim, so a host answer outside it is `E0427` rather than
+    /// a quiet uncached pass.
     fn arm_footprint_check(&self, machine: &mut Machine<'a>, index: usize) {
         if let Some(test) = self.check.tests.get(index) {
             machine.set_declared_footprint(test.footprint.clone());
         }
     }
 
-    /// Whether this test's outcome is a function of a seed as well as of its
-    /// definitions, and therefore something to search rather than to run.
-    ///
-    /// Under `--engine treewalk` it never is: `simulate` is machine-only, and
-    /// the tree-walker's job there is to refuse the region with `E0504` rather
-    /// than to have the region scheduled around it. Under `--engine both` the
-    /// search runs once, on the machine, for the same reason.
+    /// Whether this test's outcome is a function of a seed as well as of its definitions, and
+    /// therefore something to search rather than to run.
     fn searches(&self, index: usize) -> bool {
         self.engine.primary() == Engine::Machine
             && self
@@ -1048,23 +786,7 @@ impl<'a> InterpExecutor<'a> {
                 .is_some_and(|t| is_seeded(&t.footprint))
     }
 
-    /// The whole test, once per interleaving, each opening the group's region as
-    /// the test found it.
-    ///
-    /// Whole-test replay rather than re-entering the region: restoring the
-    /// arena as of region entry is the snapshot/restore capability ADR 0005
-    /// refused as having no type-level account, and ADR 0017 §3 keeps it off
-    /// this path — putting it here would make resumption *n* stop observing
-    /// resumption *n−1*'s writes. A test is re-run, so its writes are re-done
-    /// rather than un-done. It costs re-doing whatever setup precedes the
-    /// region, per interleaving.
-    ///
-    /// Nothing is written back into the group's region here, and that is the
-    /// point: a replayed test would otherwise apply its writes once per
-    /// interleaving, and which state the group ended up with would depend on
-    /// which schedule the search happened to explore last. A seed has to
-    /// reproduce a run exactly, so every interleaving starts from the same
-    /// fixture.
+    /// The whole test, once per interleaving, each opening the group's region as the test found it.
     #[allow(clippy::type_complexity)]
     fn search(
         &self,
@@ -1077,21 +799,13 @@ impl<'a> InterpExecutor<'a> {
         Option<BackendUse>,
     ) {
         let plan = self.search.plan_for(index);
-        // A search re-runs the test whole, so a host operation anywhere in it —
-        // not only inside the region — is performed once per interleaving.
-        // `measure_reduction` runs the whole search a second time, unpruned,
-        // which doubles it again.
+        // A search re-runs the test whole, so a host operation anywhere in it — not only inside the
+        // region — is performed once per interleaving.
         let re_executed = plan.re_executes() || self.search.measure_reduction;
         let mut observed = true;
-        // Every interleaving's, unioned. A search re-runs the whole test per
-        // schedule, so an operation reached in one of them is one this run
-        // performed, and reporting only the last would let the cache believe a
-        // pass that a socket answered.
+        // Every interleaving's, unioned.
         let mut host: Option<ply_eval::host::HostUse> = None;
-        // Every interleaving's, summed. A search re-runs the whole test per
-        // schedule on a machine of its own, so the worker's counters never move
-        // and a run that entered native code under a search would otherwise be
-        // invisible to the result-cache rule.
+        // Every interleaving's, summed.
         let mut used: Option<BackendUse> = None;
         let region = &worker.region;
         let lowering = worker.lowering();
@@ -1118,9 +832,7 @@ impl<'a> InterpExecutor<'a> {
             }
             match sim::interleaving_of(machine.as_ref(), &outcome) {
                 Some(interleaving) => interleaving,
-                // The verdict is still the run's own. An unobserved search must
-                // report nothing about interleavings and must not turn a red
-                // test green on the way.
+                // The verdict is still the run's own.
                 None => {
                     observed = false;
                     match outcome {
@@ -1171,8 +883,8 @@ impl<'a> Executor for InterpExecutor<'a> {
             self.build_region(),
         );
         worker.backend = backend;
-        // So that a worker holds the group's region from the moment it exists,
-        // rather than only from its first test.
+        // So that a worker holds the group's region from the moment it exists, rather than only
+        // from its first test.
         worker.open_region();
         worker
     }
@@ -1193,15 +905,11 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.backend_use
     }
 
-    /// Only the machine has a runtime to close anything on: the tree-walker
-    /// refuses a bound host operation rather than driving one, so there is never
-    /// a scope of its to hear about. A reference cycle is either engine's to
-    /// find, so that one is taken whatever ran.
+    /// Only the machine has a runtime to close anything on: the tree-walker refuses a bound host
+    /// operation rather than driving one, so there is never a scope of its to hear about.
     fn teardown(&self, worker: &mut Worker<'a>) -> Vec<Diagnostic> {
-        // A cycle among escaped values is never collected (ADR 0017 §4), so the
-        // run that built one is the only place it can be reported at all. Both
-        // engines reach the same write, so the report is deduplicated at its
-        // site rather than here.
+        // A cycle among escaped values is never collected (ADR 0017 §4), so the run that built one
+        // is the only place it can be reported at all.
         let mut out = ply_eval::rc::take_cycles();
         out.extend(match &mut worker.engines {
             Engines::Machine(m) | Engines::Both(_, m, _) => m.take_teardown_warnings(),
@@ -1215,22 +923,18 @@ impl<'a> Executor for InterpExecutor<'a> {
         worker.host = None;
         let auditing = matches!(worker.engines, Engines::Both(_, _, _));
         worker.audited = None;
-        // Cumulative over the machine's life, so this test's own is the
-        // difference. Taken here rather than inside `execute_directly` because a
-        // searched test runs on machines this worker never keeps, and those are
-        // counted by `search` into the same counters.
+        // Cumulative over the machine's life, so this test's own is the difference.
         let before = worker.backed().map(Machine::compiled_counts);
         worker.backend_use = None;
         if self.searches(index) {
-            // A searched test is re-run per interleaving on a machine built for
-            // the schedule, so the tree-walker never sees it and there is no
-            // second answer to compare against.
+            // A searched test is re-run per interleaving on a machine built for the schedule, so
+            // the tree-walker never sees it and there is no second answer to compare against.
             worker.audited = auditing.then_some(false);
             let (outcome, exploration, host, searched) = self.search(worker, index);
             worker.exploration = exploration;
             worker.host = host;
-            // A searched test runs on machines built per interleaving, so the
-            // worker's own counters never moved and the search reports its own.
+            // A searched test runs on machines built per interleaving, so the worker's own counters
+            // never moved and the search reports its own.
             worker.backend_use = searched;
             return outcome;
         }
@@ -1244,25 +948,22 @@ impl<'a> Executor for InterpExecutor<'a> {
             }),
             _ => None,
         };
-        // Only the machine can reach a host handler: the tree-walker refuses one
-        // as machine-only rather than driving it, so under `--engine both` there
-        // is one answer here and never two to reconcile.
+        // Only the machine can reach a host handler: the tree-walker refuses one as machine-only
+        // rather than driving it, so under `--engine both` there is one answer here and never two
+        // to reconcile.
         worker.host = match &worker.engines {
             Engines::Machine(m) | Engines::Both(_, m, _) => m.host_use().cloned(),
             Engines::Treewalk(_) => None,
         };
-        // A failing test closes its region like a passing one: what it
-        // allocated is still gone, and the next test in the group must not
-        // inherit it because this one was red.
+        // A failing test closes its region like a passing one: what it allocated is still gone, and
+        // the next test in the group must not inherit it because this one was red.
         worker.close_region();
         outcome
     }
 }
 
 impl<'a> InterpExecutor<'a> {
-    /// The verdict, and whether two engines produced it. The second half is
-    /// `false` whenever one engine declined the test, which is a claim about the
-    /// oracle's coverage and not about the program — see [`AuditSummary`].
+    /// The verdict, and whether two engines produced it.
     fn execute_directly(
         &self,
         worker: &mut Worker<'a>,
@@ -1279,18 +980,17 @@ impl<'a> InterpExecutor<'a> {
                 if let Some(b) = backed.as_mut() {
                     self.arm_footprint_check(b.as_mut(), index);
                 }
-                // Both are stepped even when the first has already failed: an
-                // engine that skipped a test is at a different point in the
-                // corpus, and every later comparison becomes meaningless.
+                // Both are stepped even when the first has already failed: an engine that skipped a
+                // test is at a different point in the corpus, and every later comparison becomes
+                // meaningless.
                 let left = self.run_one(i.as_mut(), index);
                 let right = self.run_one(m.as_mut(), index);
-                // And the third, for the same reason: a backed machine that
-                // skipped a test has a different constant memo and a different
-                // stale answer from here on.
+                // And the third, for the same reason: a backed machine that skipped a test has a
+                // different constant memo and a different stale answer from here on.
                 let third = backed.as_mut().map(|b| self.run_one(b.as_mut(), index));
-                // Comparing a refusal against an answer reports a divergence
-                // between an engine that declined to start and one that did the
-                // work, which is not a disagreement about what the program means.
+                // Comparing a refusal against an answer reports a divergence between an engine that
+                // declined to start and one that did the work, which is not a disagreement about
+                // what the program means.
                 if matches!(&left, Err(d) if ply_eval::is_machine_only(d)) {
                     return (right, false);
                 }
@@ -1308,19 +1008,9 @@ impl<'a> InterpExecutor<'a> {
                 let engines =
                     compare_outcomes(i.as_ref(), m.as_ref(), &subject, Some(index), &left, &right)
                         .map(|d| d.to_diagnostic(Engine::Treewalk, Engine::Machine, span));
-                // The backend's own pair, against the plain machine rather than
-                // against the tree-walker, so that a divergence reported here is
-                // the backend's and nothing else's.
-                //
-                // Taken **whatever the pair above said**, and that is the whole
-                // of the care this needs. Comparing only where the engines
-                // already agreed on a pass would make a backend that turns a red
-                // test *green* the one thing this cannot see — which is `(Err,
-                // Err)` scored as agreement wearing a third engine's clothes,
-                // the comparison this project shipped until R5. Measured rather
-                // than reasoned: with `--backend wrong:exceeds-budget=4` over a
-                // recursion past the machine's bound, the guarded form reported
-                // nothing at all and the unguarded one reports the verdict.
+                // The backend's own pair, against the plain machine rather than against the
+                // tree-walker, so that a divergence reported here is the backend's and nothing
+                // else's.
                 let backend = match (&third, backed.as_ref()) {
                     (Some(third), Some(b)) => compare_outcomes(
                         m.as_ref(),
@@ -1334,14 +1024,11 @@ impl<'a> InterpExecutor<'a> {
                     _ => None,
                 };
                 let verdict = match (engines, backend) {
-                    // The engines first: a backend cannot be blamed for a
-                    // disagreement between the two evaluators that offered it
-                    // the call.
+                    // The engines first: a backend cannot be blamed for a disagreement between the
+                    // two evaluators that offered it the call.
                     (Some(d), _) | (None, Some(d)) => Err(d),
-                    // The authoritative engine's answer, so that which engine
-                    // a run reports never depends on whether auditing was on.
-                    // The two have just been proved equal, so this is a
-                    // statement about provenance rather than about the value.
+                    // The authoritative engine's answer, so that which engine a run reports never
+                    // depends on whether auditing was on.
                     (None, None) => match EngineChoice::Both.primary() {
                         Engine::Machine => right,
                         Engine::Treewalk => left,
@@ -1357,11 +1044,8 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<DefHash> {
     hashes.tests.get(index).copied()
 }
 
-/// `plan` is what a seeded test's cache entry is keyed on, so a selection made
-/// against one plan says nothing about another. It is a parameter rather than a
-/// second entry point beside the old one for exactly that reason: a caller that
-/// kept the old signature while running a widened search would read and write
-/// the wrong entry, silently.
+/// `plan` is what a seeded test's cache entry is keyed on, so a selection made against one plan
+/// says nothing about another.
 pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Plan) -> Selection {
     let plan = plan.clone().normalized();
     let total = check.tests.len();
@@ -1375,9 +1059,8 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
         let hash = test_hash(hashes, index);
         let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan)));
 
-        // A `random` plan decomposes into one standalone claim per root, so a
-        // widened root set owes only the roots nothing has answered for. The
-        // plan key is what publishes the widened claim, and this run writes it.
+        // A `random` plan decomposes into one standalone claim per root, so a widened root set owes
+        // only the roots nothing has answered for.
         let owed = match (seeded, hash) {
             (true, Some(hash)) if writes_seed_keys(&plan) => plan
                 .roots
@@ -1398,14 +1081,12 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
         } else {
             match stored {
                 None => Reason::Unhashed,
-                // Every root already passed on its own, so the widened plan is
-                // proved by the roots it is made of and nothing needs running.
+                // Every root already passed on its own, so the widened plan is proved by the roots
+                // it is made of and nothing needs running.
                 Some(None) if owed.is_empty() => Reason::Cached,
                 Some(None) => Reason::New,
                 Some(Some(Outcome::Pass)) => Reason::Cached,
-                // Never trust a stored failure. Nothing here writes one, so it
-                // can only have come from an older or foreign writer, and
-                // re-running is the only safe reading of it.
+                // Never trust a stored failure.
                 Some(Some(Outcome::Fail { .. })) => Reason::PreviousFailure,
             }
         };
@@ -1459,13 +1140,7 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
     }
 }
 
-/// Turns each failure's raw suspect list into the ranked, annotated attribution
-/// of ADR 0004. Separate from [`run_with`] because it needs the AST — a delta is
-/// decided by re-normalizing bodies, not by comparing hashes — and because a
-/// caller with no evaluator still wants the answers that need no hybrid.
-///
-/// Returns the diagnoser's own warnings, which are never failures: a diagnosis
-/// that cannot be made leaves the failure exactly as it was.
+/// Turns each failure's raw suspect list into the ranked, annotated attribution of ADR 0004.
 pub fn diagnose_failures(
     report: &mut RunReport,
     program: &Program,
@@ -1479,8 +1154,8 @@ pub fn diagnose_failures(
         return Vec::new();
     }
 
-    // Built once for the whole run and shared: it re-normalizes the entire
-    // program, which is the expensive half of deciding `Edited` from `Derived`.
+    // Built once for the whole run and shared: it re-normalizes the entire program, which is the
+    // expensive half of deciding `Edited` from `Derived`.
     let test_keys: Vec<Symbol> = check.tests.iter().map(|t| t.key.clone()).collect();
     let (renormalizer, mut warnings) =
         match Renormalizer::new(program, resolved, hashes, &test_keys) {
@@ -1489,19 +1164,13 @@ pub fn diagnose_failures(
         };
     let edges = DepEdges::from(hashes);
 
-    // This run's own normalized bytes. A definition it introduced has no stored
-    // body until the cache is flushed, and a hybrid that could not reach the
-    // *current* side of a change would have nothing to flip to. The bytes are
-    // only used where they reproduce the hash the run published, so a program
-    // the front end assembled from cached pieces contributes nothing rather than
-    // something stale.
+    // This run's own normalized bytes.
     let fresh = ply_hash::hash_program_with_bodies(program, resolved)
         .map(|(_, bodies)| bodies)
         .unwrap_or_default();
 
-    // A hybrid that went green is a true claim about exactly its own closure, so
-    // it may be cached — but only after the borrow the search holds on the store
-    // has ended.
+    // A hybrid that went green is a true claim about exactly its own closure, so it may be cached —
+    // but only after the borrow the search holds on the store has ended.
     let mut proved: Vec<DefHash> = Vec::new();
 
     for failure in &mut report.failures {
@@ -1537,9 +1206,7 @@ pub fn diagnose_failures(
             slice: failure.attribution.slice.clone(),
         };
 
-        // Everything the mixture could need, on either side. `NoBodies` is a
-        // cache somebody pruned — go and stop pruning; `NoHybrids` is a build
-        // that cannot mix eras at all, which nothing outside can fix.
+        // Everything the mixture could need, on either side.
         let mixture = baseline
             .as_ref()
             .map(|baseline| hybrid::mixture_for(hashes, &failure.key, baseline));
@@ -1551,18 +1218,10 @@ pub fn diagnose_failures(
             (Some(_), false) => Skipped::NoBodies,
             _ => Skipped::NoHybrids,
         };
-        // Every hybrid runs at the interleaving this failure happened in. A
-        // hybrid that searches for its own answers a different question, and the
-        // bisection then names whichever definition the other interleaving ran
-        // through.
+        // Every hybrid runs at the interleaving this failure happened in.
         let seed = failure.seed.clone();
         let mut builder = match (mixture, test_body, complete) {
-            // A host-backed failure gets no builder at all. `precheck` already
-            // refuses to search one, and this is the second lock: a trial is an
-            // evaluation of the failing test, and the run that failed reached
-            // the world outside the program. Nothing here may be reachable by
-            // threading a binding into the trials to "make bisection work under
-            // `--host`" — that is the change this arm exists to stop.
+            // A host-backed failure gets no builder at all.
             _ if failure.host => None,
             (Some(mixture), Some(test), true) => {
                 let hybrid = BodyHybrid::new(
@@ -1580,9 +1239,8 @@ pub fn diagnose_failures(
             _ => None,
         };
 
-        // Without a renormalizer nothing can be told apart from a hash that
-        // merely moved, so every change stays a candidate: a wider answer, never
-        // a wrong one.
+        // Without a renormalizer nothing can be told apart from a hash that merely moved, so every
+        // change stays a candidate: a wider answer, never a wrong one.
         let mut unknown = bisect::Unknown;
         let mut store_classify;
         let classify: &mut dyn Classify = match (&renormalizer, &baseline) {
@@ -1602,11 +1260,7 @@ pub fn diagnose_failures(
             absent,
         );
         if let Some(builder) = &mut builder {
-            // Never the failing test's own key. `H(all)` *is* the current
-            // program, so a replay that goes green would otherwise cache a
-            // `Pass` for the test this run just watched fail — and a red test
-            // has to re-run until it goes green. Under a pinned seed the key is
-            // derived, so the bare hash alone is not the whole of it.
+            // Never the failing test's own key.
             let forbidden: Vec<DefHash> = test_hash
                 .into_iter()
                 .flat_map(|hash| {
@@ -1626,11 +1280,8 @@ pub fn diagnose_failures(
         }
     }
 
-    // A hybrid's test hash covers its whole closure, so `Pass` under it is true
-    // of that configuration and of nothing else. `observe_definitions` is a
-    // different claim entirely and must never be made here: a definition proved
-    // fine *in a hybrid* has not been vindicated in the real program, and
-    // recording it would empty the next run's suspect set.
+    // A hybrid's test hash covers its whole closure, so `Pass` under it is true of that
+    // configuration and of nothing else.
     for hash in proved {
         store.put(hash, Outcome::Pass);
     }
@@ -1717,8 +1368,8 @@ pub fn run_with<E: Executor>(
                 failed += 1;
                 let suspects = suspects_for(hashes, &test.key, &changed);
                 let mut attribution = Attribution::from_suspects(&suspects, hashes);
-                // The same order `precheck` applies, so a report nobody
-                // diagnosed says what a diagnosed one would have.
+                // The same order `precheck` applies, so a report nobody diagnosed says what a
+                // diagnosed one would have.
                 if defect {
                     attribution.bisection = Bisection::not_attempted(Skipped::Panicked);
                 } else if host_backed {
@@ -1739,19 +1390,15 @@ pub fn run_with<E: Executor>(
                     race: exploration.as_ref().and_then(|e| e.race.clone()),
                 });
             } else if executed.backend.is_some_and(|b| b.entries > 0) {
-                // A backend is a third execution strategy: this test's green
-                // verdict is a claim about what a native body answered, and a
-                // stored `Pass` is a claim about what the authoritative engine
-                // did. Nothing is written, in either direction, whatever the
-                // flags said — which is what makes the rule hold for a backend
-                // that arrives by a route no flag names.
+                // A backend is a third execution strategy: this test's green verdict is a claim
+                // about what a native body answered, and a stored `Pass` is a claim about what the
+                // authoritative engine did.
                 passed += 1;
                 recorded = Some(Record::Backend);
             } else if executed.host.is_some() {
-                // The runtime is authoritative: this run reached a socket, so
-                // its green verdict is a statement about that socket at that
-                // moment and about nothing the next run will face. Nothing is
-                // written, in either direction, whatever the prediction said.
+                // The runtime is authoritative: this run reached a socket, so its green verdict is
+                // a statement about that socket at that moment and about nothing the next run will
+                // face.
                 passed += 1;
                 recorded = Some(Record::Host);
             } else {
@@ -1832,8 +1479,8 @@ pub fn run_with<E: Executor>(
     }
 }
 
-/// `None` unless at least one test knew whether it had been audited, so a run
-/// with no oracle reports no coverage rather than a coverage of zero.
+/// `None` unless at least one test knew whether it had been audited, so a run with no oracle
+/// reports no coverage rather than a coverage of zero.
 fn summarize_audit(results: &[TestResult]) -> Option<AuditSummary> {
     let mut summary = AuditSummary::default();
     let mut seen = false;
@@ -1870,11 +1517,8 @@ fn summarize_simulation(selection: &Selection, results: &[TestResult]) -> SimSum
     summary
 }
 
-/// The test's row says something in its closure entered a `simulate` region and
-/// the evaluator reported no search. Nothing is known about what actually ran,
-/// so nothing is written — and a green run that quietly stopped caching would
-/// look like a bug in selection, which is the one thing this system asks to be
-/// trusted on.
+/// The test's row says something in its closure entered a `simulate` region and the evaluator
+/// reported no search.
 fn unobserved_search(key: &Symbol) -> Diagnostic {
     Diagnostic::warning(
         codes::INTERNAL_ERROR,
@@ -1884,8 +1528,8 @@ fn unobserved_search(key: &Symbol) -> Diagnostic {
     .note("this is a defect in Ply rather than in the test; please report it")
 }
 
-/// A selected test that no group claims would be silently skipped, which is the
-/// one outcome a test runner may never produce.
+/// A selected test that no group claims would be silently skipped, which is the one outcome a test
+/// runner may never produce.
 fn schedule_of(selection: &Selection, warnings: &mut Vec<Diagnostic>) -> Vec<Vec<usize>> {
     let scheduled: BTreeSet<usize> = selection.groups.iter().flatten().copied().collect();
     let orphans: Vec<usize> = selection
@@ -1918,20 +1562,19 @@ struct Executed {
     failure: Option<Diagnostic>,
     panicked: bool,
     exploration: Option<Exploration>,
-    /// What this test actually reached across the boundary, which decides
-    /// whether its pass may be written.
+    /// What this test actually reached across the boundary, which decides whether its pass may be
+    /// written.
     host: Option<ply_eval::host::HostUse>,
-    /// What the host runtime reported while closing the entry point. A run-level
-    /// warning rather than part of the verdict.
+    /// What the host runtime reported while closing the entry point.
     teardown: Vec<Diagnostic>,
-    /// Whether two engines produced this verdict. `None` when no oracle ran.
+    /// Whether two engines produced this verdict.
     audited: Option<bool>,
-    /// What this test asked of a compiled backend. `None` when none ran.
+    /// What this test asked of a compiled backend.
     backend: Option<BackendUse>,
 }
 
-/// One worker per pool thread, built lazily so a group smaller than the pool
-/// does not pay to construct interpreters that never run anything.
+/// One worker per pool thread, built lazily so a group smaller than the pool does not pay to
+/// construct interpreters that never run anything.
 fn execute_group<E: Executor>(
     executor: &E,
     indices: &[usize],
@@ -1958,14 +1601,14 @@ fn execute_group<E: Executor>(
                 Ok(Ok(())) => (None, false),
                 Ok(Err(d)) => (Some(d), false),
                 Err(payload) => {
-                    // Unwinding out of the middle of a worker leaves its
-                    // invariants unknown, so the next test gets a fresh one.
+                    // Unwinding out of the middle of a worker leaves its invariants unknown, so the
+                    // next test gets a fresh one.
                     worker = None;
                     (Some(panic_diagnostic(payload, check, index)), true)
                 }
             };
-            // After the unwind check: a worker whose invariants are unknown has
-            // nothing to report about what it searched.
+            // After the unwind check: a worker whose invariants are unknown has nothing to report
+            // about what it searched.
             let exploration = worker.as_ref().and_then(|w| executor.exploration(w));
             let host = worker.as_ref().and_then(|w| executor.host_use(w));
             let audited = worker.as_ref().and_then(|w| executor.audited(w));
@@ -1993,37 +1636,14 @@ fn execute_group<E: Executor>(
     out
 }
 
-/// Two evaluators of one language disagreeing is a defect in Ply by definition:
-/// whatever the program means, at most one of the answers is it, and nothing in
-/// the user's definition graph decides which. Bisecting it would name whichever
-/// definition the disagreement happened to run through.
-///
-/// One seed producing two runs is the same class of defect and gets the same
-/// treatment: a simulated run is meant to be a pure function of its definitions
-/// and its seed, so a replay that reproduced something else is Ply's fault, and
-/// no definition in the program decides which of the two runs was meant.
-///
-/// The two codes that must be read rather than observed. An unwind and an
-/// `INTERNAL_ERROR` are things the run watched happen; both of these are
-/// comparisons the run made and reported as an ordinary `Err`, so there is no
-/// observation to read them off.
+/// Two evaluators of one language disagreeing is a defect in Ply by definition: whatever the
+/// program means, at most one of the answers is it, and nothing in the user's definition graph
+/// decides which.
 fn is_divergence(d: &Diagnostic) -> bool {
     d.code == codes::ENGINE_DIVERGENCE || d.code == codes::SIMULATION_DIVERGENCE
 }
 
 /// Ply's fault rather than the program's, read off the diagnostic.
-///
-/// `E0427` belongs here for the reason the divergence codes do: a host answer
-/// outside the entry point's declared footprint is the run knowing that two of
-/// its own answers disagree, and nothing in the definition graph decides which
-/// was meant. Bisecting it would name whichever definition the disagreement
-/// happened to run through — and the diagnostic's own last note already tells
-/// the reader this is Ply's fault, so classifying it as the program's would
-/// contradict the text the run prints.
-///
-/// `E0439` belongs here for the same reason and one more: bisecting a credential
-/// that reached the boundary would re-run the program that carried it, once per
-/// candidate, against the handler that must not receive it.
 fn is_defect(d: &Diagnostic) -> bool {
     d.code == codes::INTERNAL_ERROR
         || d.code == codes::HOST_FOOTPRINT_ESCAPE
@@ -2054,8 +1674,7 @@ fn panic_diagnostic(payload: Box<dyn Any + Send>, check: &CheckOutput, index: us
     .note("the other tests still ran, and this one was not cached")
 }
 
-/// Definitions the store has never recorded seeing. Against a warm cache that
-/// is exactly what the last edit touched, transitively.
+/// Definitions the store has never recorded seeing.
 fn changed_definitions(hashes: &HashOutput, store: &Store) -> BTreeSet<Symbol> {
     hashes
         .defs
@@ -2065,17 +1684,13 @@ fn changed_definitions(hashes: &HashOutput, store: &Store) -> BTreeSet<Symbol> {
         .collect()
 }
 
-/// The single place a test's key becomes a key into the hash graph: two callers
-/// disagreeing about that convention would silently mis-attribute a failure
-/// rather than fail.
+/// The single place a test's key becomes a key into the hash graph: two callers disagreeing about
+/// that convention would silently mis-attribute a failure rather than fail.
 fn closure_of<'a>(hashes: &'a HashOutput, key: &Symbol) -> Option<&'a BTreeSet<Symbol>> {
     hashes.closure.get(key)
 }
 
-/// Names are how two eras of a program are lined up; hashes are what they are
-/// compared by. A baseline needs both — and it needs one entry per *namespace*,
-/// because a `fn` and a `type` may share a name and preferring either drops the
-/// other's hash from the record for good.
+/// Names are how two eras of a program are lined up; hashes are what they are compared by.
 fn closure_hashes(
     hashes: &HashOutput,
     key: &Symbol,
@@ -2107,13 +1722,8 @@ fn suspects_for(hashes: &HashOutput, key: &Symbol, changed: &BTreeSet<Symbol>) -
     }
 }
 
-/// Hands the store every definition except those an *unresolved* test reached:
-/// one that failed, or that was selected and never executed because a filter or
-/// a stale selection dropped it.
-///
-/// Recording a definition retires it as a suspect, and neither of those
-/// outcomes is evidence that anything under it is fine. Recording them anyway is
-/// what empties the suspect set on the second `ply test` of the same red code.
+/// Hands the store every definition except those an *unresolved* test reached: one that failed, or
+/// that was selected and never executed because a filter or a stale selection dropped it.
 fn observe_definitions(
     store: &mut Store,
     hashes: &HashOutput,

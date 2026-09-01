@@ -1,16 +1,5 @@
-//! Arming the ownership checker: two programs whose cost is known before the
-//! checker is asked, and the counters beside every answer.
-//!
-//! `ownership_checker_oracle` measures the checker over the shipped corpus. It
-//! cannot tell whether the instrument works, because a checker that answered
-//! `Copies` everywhere would agree with a corpus that copies everywhere and a
-//! checker that answered `Reuses` everywhere would agree with one that does
-//! not. What this file adds is the pair: **the same append, written the two
-//! ways, one linear and one quadratic**, so no constant answer passes.
-//!
-//! Every assertion here is made twice — once against `ply_eval::costs` and once
-//! against `ply_eval::rc::sites` — so neither the checker nor the expectation
-//! can be wrong alone and still be green.
+//! Arming the ownership checker: two programs whose cost is known before the checker is asked, and
+//! the counters beside every answer.
 
 use ply_eval::costs::{Costs, Verdict};
 use ply_eval::rc;
@@ -27,9 +16,7 @@ struct Program1 {
     source: SourceId,
 }
 
-/// One inline module, parsed and resolved. Panics rather than answering
-/// `Option`: a test whose program does not parse has measured nothing, and
-/// skipping it silently is how an armed test disarms itself.
+/// One inline module, parsed and resolved.
 fn inline(src: &str) -> Program1 {
     let name = ModuleName::from_dotted("armed");
     let mut map = SourceMap::new();
@@ -97,8 +84,8 @@ fn line_of(map: &SourceMap, span: Span) -> u32 {
         .unwrap_or(0)
 }
 
-/// The one `push` the program contains, with the checker's verdict and the run's
-/// count side by side.
+/// The one `push` the program contains, with the checker's verdict and the run's count side by
+/// side.
 fn only_site(p: &Program1) -> (Verdict, String, rc::SiteCount) {
     let said = verdicts(p);
     assert_eq!(
@@ -121,10 +108,8 @@ fn only_site(p: &Program1) -> (Verdict, String, rc::SiteCount) {
     (said[0].1, said[0].2.clone(), ran[0].1)
 }
 
-/// `push` at argument 0 of 3: the enclosing call's frame carries the scope for
-/// the whole of the append, so the accumulator is at two owners and the whole
-/// array is copied on every iteration. ADR 0025 §Context measures this shape at
-/// 0 of 200 in place.
+/// `push` at argument 0 of 3: the enclosing call's frame carries the scope for the whole of the
+/// append, so the accumulator is at two owners and the whole array is copied on every iteration.
 const QUADRATIC: &str = r#"
 fn grow(acc: List<Int>, i: Int, n: Int) -> List<Int> =
   if i >= n { acc } else { grow(push(acc, i), i + 1, n) }
@@ -134,8 +119,8 @@ test "a growing accumulator in a non-last argument position" {
 }
 "#;
 
-/// The identical loop with the append moved into last position, which ADR 0025
-/// §Context measures at 200 of 200 in place.
+/// The identical loop with the append moved into last position, which ADR 0025 §Context measures at
+/// 200 of 200 in place.
 const LINEAR_BY_POSITION: &str = r#"
 fn grow(i: Int, n: Int, acc: List<Int>) -> List<Int> =
   if i >= n { acc } else { grow(i + 1, n, push(acc, i)) }
@@ -145,8 +130,8 @@ test "a growing accumulator in last argument position" {
 }
 "#;
 
-/// A `fold` accumulator, which is the shape the standard library is written in
-/// and the one a checker must not call shared.
+/// A `fold` accumulator, which is the shape the standard library is written in and the one a
+/// checker must not call shared.
 const LINEAR_BY_FOLD: &str = r#"
 fn build(n: Int) -> List<Int> = fold(range(0, n), [], |acc, x| push(acc, x))
 
@@ -155,38 +140,7 @@ test "an accumulator threaded through a fold" {
 }
 "#;
 
-/// A `push` onto an element read out of a list by index. The list still holds
-/// the element, so every round copies — and `costs.rs` has to say so.
-///
-/// This is the pair's third shape and it exists because `result_owner`'s
-/// fallback is `_ => Owner::Fresh`: a builtin with no case of its own is
-/// *claimed* to hand back a value nothing else holds. `map_get` has a case for
-/// exactly this reason and the list index needs the same one. Without it the
-/// checker reports an in-place append over a list every element of which is
-/// shared, which is a wrong claim rather than a wrong answer — `costs.rs` is a
-/// checker and nothing else — and it is the kind of wrong claim no corpus
-/// measurement can see.
-///
-/// `NodeKind::Match` binds an arm's binders to the **scrutinee's** owner, so
-/// whatever `list_at` is classified as is what `row` carries into the `push`.
-/// That is the route by which the verdict is observable at all: the `Some` a
-/// peek answers is fresh, and the element inside it is not.
-///
-/// **The `push` is in last position on purpose, and the first version of this
-/// program was not.** It read
-///
-/// ```ignore
-/// Some(row) -> len(push(row, i)) + touch(rows, i + 1, n),
-/// ```
-///
-/// which the *position* rule already flags — `row` is a scope binding an
-/// enclosing frame still holds — so it answered `Copies` with the reason *"the
-/// scope binding `row` is still held by an enclosing frame"* whether or not
-/// `result_owner` had a `ListAt` arm at all. Deleting the arm left this test
-/// **green**, which is the defect the arm exists to prevent, wearing this
-/// file's own clothes. Moving the `push` into `head_plus`'s tail takes the
-/// position rule out of the answer, and `assert_reason_names_the_index` below
-/// pins that the verdict arrives by the route this test claims.
+/// A `push` onto an element read out of a list by index.
 const COPIES_VIA_LIST_AT: &str = r#"
 fn head_plus(rows: List<List<Int>>, i: Int) -> List<Int> =
   match list_at(rows, 0) { Some(row) -> push(row, i), None -> [] }
@@ -199,15 +153,8 @@ test "an append onto an element matched out of an Option" {
 }
 "#;
 
-/// The control for both: the identical loop, the identical helper, the
-/// identical `push` in the helper's tail — over a list the round built itself
-/// rather than one read out of a container.
-///
-/// Without it, a checker that answered `Copies` at every `push` would agree
-/// with the two above and have been checked by nothing. It is written in
-/// `COPIES_VIA_LIST_AT`'s shape down to the call in a non-last position, so the
-/// only thing that differs between the pair is **where the pushed list came
-/// from** — not the nesting, and not the position rule.
+/// The control for both: the identical loop, the identical helper, the identical `push` in the
+/// helper's tail — over a list the round built itself rather than one read out of a container.
 const FRESH_LIST_IN_THE_SAME_SHAPE: &str = r#"
 fn head_plus(i: Int) -> List<Int> = push(range(0, 3), i)
 
@@ -332,11 +279,8 @@ fn a_fold_accumulator_is_not_flagged_and_the_counters_confirm_it() {
     );
 }
 
-/// The pair, stated as one assertion: two programs that compute the same answer
-/// and differ only in argument order must get **different** verdicts.
-///
-/// This is what a constant answer cannot pass, and it is the whole reason the
-/// two shapes are in one file.
+/// The pair, stated as one assertion: two programs that compute the same answer and differ only in
+/// argument order must get **different** verdicts.
 #[test]
 fn the_two_shapes_get_different_verdicts_which_is_what_a_constant_answer_cannot_do() {
     let (slow, _, slow_count) = only_site(&inline(QUADRATIC));

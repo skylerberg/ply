@@ -1,33 +1,5 @@
-//! The ownership checker, judged against the counters rather than against
-//! itself — ADR 0025 §Decision 2b.
-//!
-//! `ply_eval::costs` answers, before a program runs, whether each `push` will
-//! copy. `ply_eval::rc::sites` answers, after it has run, whether each one did.
-//! The two are keyed by the same span, so they can be put side by side, and
-//! this test is the place that does it. A checker whose verdicts no measurement
-//! contradicts is a checker nobody has tested; the assertions below are
-//! therefore about **agreement with the run**, not about the checker being
-//! quiet.
-//!
-//! What is asserted, and why each one is here rather than printed:
-//!
-//! - **No false green.** A [`Verdict::Reuses`] at a site the run shows copying
-//!   is the one error that makes a checker worse than nothing: it tells an
-//!   author their accumulator is linear when it is quadratic. Zero is the bar
-//!   and it was fixed before the first run.
-//! - **Agreement on decided, executed sites at or above 0.80**, which is the
-//!   floor below which the verdicts are not usable even as a warning.
-//! - **`std.json`'s `escape_runs` is reported as copying**, checked against the
-//!   counters as well as against the checker so it cannot pass because both are
-//!   wrong in the same direction. It is the shipped quadratic ADR 0024 §1 was
-//!   written about.
-//!
-//! The two *controls* — a quadratic loop that must be flagged and the same loop
-//! written linearly that must not be — are in `ownership_checker_armed.rs`,
-//! which is where an answer that is constant in either direction is caught.
-//! Both files were shown to fail before either was believed: the arming tests
-//! by forcing every verdict to one value and watching them go red in both
-//! directions, this one by the same mutation.
+//! The ownership checker, judged against the counters rather than against itself — ADR 0025
+//! §Decision 2b.
 
 use ply_eval::costs::{Cause, Costs, DefKind, Definition, Verdict};
 use ply_eval::rc;
@@ -113,18 +85,17 @@ fn load_std(module: &str) -> Option<Loaded> {
     load(&name, ply_std::pseudo_path(&name), text)
 }
 
-/// The module name is given rather than derived: `spikes/ply-lexer/` is not an
-/// identifier path, so `ModuleName::from_relative_path` refuses it, and a file
-/// the brief names as the hardest realistic program in the tree would then have
-/// been silently absent from the table.
+/// The module name is given rather than derived: `spikes/ply-lexer/` is not an identifier path, so
+/// `ModuleName::from_relative_path` refuses it, and a file the brief names as the hardest realistic
+/// program in the tree would then have been silently absent from the table.
 fn load_file(root: &Path, relative: &str, module: &str) -> Option<Loaded> {
     let path = root.join(relative);
     let text = std::fs::read_to_string(&path).ok()?;
     load(&ModuleName::from_dotted(module), path, text)
 }
 
-/// Every target the brief names: the eight shipped `std` modules, the example
-/// service, and the hardest realistic program in the tree.
+/// Every target the brief names: the eight shipped `std` modules, the example service, and the
+/// hardest realistic program in the tree.
 fn targets(root: &Path) -> Vec<(String, Loaded)> {
     let mut out = Vec::new();
     for module in [
@@ -158,8 +129,7 @@ fn run(loaded: &Loaded) -> Vec<(Span, rc::SiteCount)> {
     machine.set_regions(TaskRegions::new());
     rc::record_sites(true);
     for index in 0..machine.test_count() {
-        // A test's answer is `differential_corpus`'s business; what it *cost*
-        // is this one's.
+        // A test's answer is `differential_corpus`'s business; what it *cost* is this one's.
         let _ = machine.eval_test(index);
     }
     let mut sites: Vec<(Span, rc::SiteCount)> = rc::sites()
@@ -177,10 +147,7 @@ fn line_of(map: &SourceMap, span: Span) -> u32 {
         .unwrap_or(0)
 }
 
-/// One file's counts. Kept twice per file — once over `fn` definitions alone
-/// and once over every body including `test` and `law` — because a `test` body
-/// is not part of a module's interface and mixing the two overstates what the
-/// standard library would have to change.
+/// One file's counts.
 #[derive(Default, Clone)]
 struct Tally {
     defs: usize,
@@ -191,16 +158,14 @@ struct Tally {
     defs_needing_edit: usize,
     /// No append copies but at least one is undecidable.
     defs_undecided: usize,
-    /// Of `defs_needing_edit`, the ones whose only copying causes are
-    /// positional — ADR 0025's P1 and P2 are evaluator changes that remove
-    /// these with **no source edit at all**.
+    /// Of `defs_needing_edit`, the ones whose only copying causes are positional — ADR 0025's P1
+    /// and P2 are evaluator changes that remove these with **no source edit at all**.
     edit_position: usize,
-    /// Of `defs_needing_edit`, the ones that need a mechanical library
-    /// migration and nothing else: `cell_update` / `map_update`.
+    /// Of `defs_needing_edit`, the ones that need a mechanical library migration and nothing else:
+    /// `cell_update` / `map_update`.
     edit_mechanical: usize,
-    /// Of `defs_needing_edit`, the ones where an author has to restructure —
-    /// a closure captured the scope, or a caller keeps what it passes. These
-    /// are the only ones no scheduled change removes.
+    /// Of `defs_needing_edit`, the ones where an author has to restructure — a closure captured the
+    /// scope, or a caller keeps what it passes.
     edit_hard: usize,
     reuses: usize,
     copies: usize,
@@ -209,11 +174,9 @@ struct Tally {
     agree: usize,
     disagree: usize,
     unknown_executed: usize,
-    /// `Reuses` at a site the run shows copying — the error that certifies a
-    /// quadratic as linear. Counted apart from `disagree` because the two are
-    /// not the same kind of wrong.
+    /// `Reuses` at a site the run shows copying — the error that certifies a quadratic as linear.
     false_green: usize,
-    /// `Copies` at a site the run shows reusing. Costs precision, not safety.
+    /// `Copies` at a site the run shows reusing.
     false_red: usize,
     /// Every copying or undecidable site, by what caused it.
     causes: BTreeMap<Cause, usize>,
@@ -243,8 +206,8 @@ impl Tally {
         }
     }
 
-    /// The number the brief asks for: of the definitions that contain an
-    /// append, the fraction that need nothing done to them.
+    /// The number the brief asks for: of the definitions that contain an append, the fraction that
+    /// need nothing done to them.
     fn clean_rate(&self) -> Option<f64> {
         (self.defs_with_push > 0).then(|| self.defs_clean as f64 / self.defs_with_push as f64)
     }
@@ -708,10 +671,8 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
     let rate = all.agree as f64 / decided as f64;
     println!("agreement on decided, executed sites: {:.1}%", rate * 100.0);
 
-    // Both bars were fixed in `/tmp/ownership-burden/prereg.md` before the
-    // first run of this test, and neither has moved since. Each was shown to
-    // fail: forcing every verdict to `Reuses` raises 65 false greens, forcing
-    // every verdict to `Copies` takes agreement to 62.9%.
+    // Both bars were fixed in `/tmp/ownership-burden/prereg.md` before the first run of this test,
+    // and neither has moved since.
     assert!(
         false_greens.is_empty(),
         "the checker told {} site(s) they reuse where the run copied. That is the \
@@ -727,45 +688,8 @@ fn the_checker_is_measured_against_the_counters_over_every_shipped_module() {
     );
 }
 
-/// `std.json`'s `escape_runs` is the quadratic that shipped, on
-/// client-influenced input, and it is the site this whole line of work exists
-/// because of. A checker that does not flag it is not a checker.
-///
-/// Asserted against the counters as well as against the checker, so it cannot
-/// pass by both being wrong in the same direction.
-/// The checker's verdict is judged against what the run actually did, in both
-/// directions, over every exercised append in `std.json`.
-///
-/// > **Renamed and re-aimed (2026-08-29). This was
-/// > `the_shipped_quadratic_in_std_json_is_flagged_and_the_counters_confirm_it`,
-/// > and it asserted that the checker flags a copying append in `escape_runs`
-/// > "which is the shipped quadratic ADR 0024 §1 was written about".** That
-/// > subject no longer exists: `escape_runs` was made linear on PR #38 — one
-/// > `push` per escape in last-argument position — and the checker now reads it
-/// > `reuses` at both sites while the counters read 592 and 220 in place against
-/// > **0** copied. The checker was right and the test was stale, which is the
-/// > correct way round but still a red suite.
-/// >
-/// > Asserting the defect was always the weaker claim. What the oracle exists to
-/// > establish is that the static verdict and the dynamic count **agree**, and
-/// > agreement is falsifiable in both directions: a checker that says `Copies`
-/// > everywhere fails it as surely as one that says `Reuses` everywhere. That
-/// > property survives the standard library being fixed, which the old one could
-/// > not — and a test that a bug fix turns red is a test measuring the wrong
-/// > thing.
-///
-/// The non-vacuity floor is the load-bearing half. Both halves pass trivially
-/// over an empty site set, so the count of *exercised* sites is asserted before
-/// the agreement is.
-///
-/// **Armed, and the first two attempts missed.** Forcing `Verdict::Copies`
-/// everywhere does not compile, and flipping the `Res::Unique` arm compiles and
-/// changes **nothing here** — the six exercised sites in `std.json` all report
-/// through `Res::Param`, so a corruption of the arm they do not take proves
-/// only that the corruption was aimed wrong. Flipping `ParamState::Sole` to
-/// `Verdict::Copies` reddens it at **5 of 6** sites, and restoring it returns
-/// green. Recorded because "I corrupted the checker and the test held" is the
-/// sentence that would have shipped an unarmed oracle.
+/// `std.json`'s `escape_runs` is the quadratic that shipped, on client-influenced input, and it is
+/// the site this whole line of work exists because of.
 #[test]
 fn the_checker_and_the_counters_agree_on_every_append_in_std_json() {
     let loaded = load_std("std.json").expect("`std.json` must load");
@@ -804,15 +728,8 @@ fn the_checker_and_the_counters_agree_on_every_append_in_std_json() {
         }
     }
 
-    // Non-vacuity first: an agreement over nothing agrees with anything, and
-    // that is this repository's signature defect.
-    //
-    // The floor is 5 against **6 exercised today**, measured rather than
-    // guessed — a first draft picked 10 out of the air and the floor caught it,
-    // which is the floor working. It is a staleness guard, not a target: it
-    // fires when this test stops reaching the module, and it is deliberately
-    // not set at 6, because a floor equal to the reading turns every ordinary
-    // change to `std.json` into a failure here.
+    // Non-vacuity first: an agreement over nothing agrees with anything, and that is this
+    // repository's signature defect.
     assert!(
         exercised >= 5,
         "only {exercised} append site(s) in `std.json` were exercised, against 6 when \

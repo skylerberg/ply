@@ -1,7 +1,4 @@
-/// Tarjan's algorithm, iterative so that a deep definition graph cannot blow the
-/// Rust stack. Components come out in reverse topological order, so a component
-/// is always emitted before the components that depend on it — exactly the order
-/// generalization needs.
+/// Tarjan's algorithm, iterative so that a deep definition graph cannot blow the Rust stack.
 pub fn sccs(n: usize, adj: &[Vec<usize>]) -> Vec<Vec<usize>> {
     const UNVISITED: usize = usize::MAX;
     let mut index = vec![UNVISITED; n];

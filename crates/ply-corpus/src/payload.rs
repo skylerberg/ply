@@ -1,25 +1,4 @@
 //! What W2's payload types cost, measured rather than assumed.
-//!
-//! [`crate::serve`] prices a request. This prices the three things W2 put on
-//! the request path and ADR 0010 and 0012 declined to guess at:
-//!
-//! - **JSON**, encoded and decoded through a *derived* codec on a payload the
-//!   size a real endpoint receives. A codec nobody wrote is only worth having
-//!   if it is fast enough to be on the path, and megabytes per second beside a
-//!   request's own cost is what says whether it is.
-//! - **`Map`**, at sizes a header table, a query string and a JSON object
-//!   actually reach, with the interpreter's own loop cost subtracted so the row
-//!   is the map and not the `fold` around it.
-//! - **derivation's cost to the system** — ADR 0010 flagged definition-count
-//!   inflation as the thing to measure rather than assume, "because derivation
-//!   is exactly the feature that makes definition counts jump". Two projects
-//!   differing only in whether their types carry a `derive`, and the four
-//!   numbers the incremental front end is supposed to absorb it with.
-//!
-//! Every program here is written to a temp directory and compiled by the real
-//! front end — `ply_cli::driver`, the same path `ply check` takes — because a
-//! measurement over a program the compiler has not accepted is not a
-//! measurement.
 
 use anyhow::{Context, Result, bail};
 use ply_cli::driver;
@@ -31,9 +10,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Megabytes are 1e6 bytes here, and stated rather than assumed: a throughput
-/// quoted in MiB against one quoted in MB differs by five percent, which is
-/// inside the range these numbers are argued over.
+/// Megabytes are 1e6 bytes here, and stated rather than assumed: a throughput quoted in MiB against
+/// one quoted in MB differs by five percent, which is inside the range these numbers are argued
+/// over.
 const MEGABYTE: f64 = 1e6;
 
 fn best_of(repeats: usize, mut run: impl FnMut() -> Result<Duration>) -> Result<Duration> {
@@ -55,13 +34,7 @@ fn millis(d: Duration) -> f64 {
     d.as_secs_f64() * 1000.0
 }
 
-// --------------------------------------------------------------- the harness
-
 /// A checked project and a machine over it.
-///
-/// The whole front end rather than [`crate::pipeline::front`]: these programs
-/// `import std.json` and carry a `derive`, and demand-loading a shipped module
-/// and expanding a derivation are things only the driver does.
 struct Checked {
     loaded: ply_cli::load::Loaded,
 }
@@ -91,8 +64,8 @@ impl Checked {
         )
     }
 
-    /// `Machine::call` takes a program-wide name, so a simple one is looked up
-    /// rather than guessed at from the file it was written in.
+    /// `Machine::call` takes a program-wide name, so a simple one is looked up rather than guessed
+    /// at from the file it was written in.
     fn full(&self, simple: &str) -> Result<String> {
         self.loaded
             .check
@@ -118,13 +91,9 @@ fn write_project(files: &[(&str, String)]) -> Result<tempfile::TempDir> {
     Ok(dir)
 }
 
-// ------------------------------------------------------------------ the JSON
-
-/// An order with `lines` line items, which is the shape a payload benchmark
-/// should have: a record of scalars and a list of records, with a `String`
-/// needing escape analysis, an `Int`, a `Decimal` and a `Bool` in every element.
-/// Nothing here is a corner case; a codec that is fast on `[1,2,3]` has
-/// demonstrated nothing.
+/// An order with `lines` line items, which is the shape a payload benchmark should have: a record
+/// of scalars and a list of records, with a `String` needing escape analysis, an `Int`, a `Decimal`
+/// and a `Bool` in every element.
 const JSON_SRC: &str = r#"import std.json
 
 pub type Line = { sku: String, qty: Int, unit_price: Decimal, note: String, active: Bool }
@@ -223,10 +192,6 @@ pub struct JsonPoint {
 }
 
 /// Encode and decode a derived codec, at several payload sizes.
-///
-/// The value being encoded is built once and outside the clock: `order(n)` is
-/// itself a list comprehension over the interpreter, and charging it to the
-/// encoder would report the generator's speed.
 pub fn json_throughput(sizes: &[usize], iterations: u32, repeats: usize) -> Result<Vec<JsonPoint>> {
     let dir = write_project(&[("payload.ply", JSON_SRC.to_string())])?;
     let checked = Checked::open(dir.path())?;
@@ -243,10 +208,9 @@ pub fn json_throughput(sizes: &[usize], iterations: u32, repeats: usize) -> Resu
         };
         let payload_bytes = raw.len();
 
-        // The machine lowers a body on first call and caches nothing across
-        // calls, but a first call still pays for whatever the engine defers —
-        // and charged to a twenty-iteration batch that is a fifth of the
-        // number. One call outside the clock removes it.
+        // The machine lowers a body on first call and caches nothing across calls, but a first call
+        // still pays for whatever the engine defers — and charged to a twenty-iteration batch that
+        // is a fifth of the number.
         call(&mut machine, &encode, vec![value.clone()])?;
         call(&mut machine, &decode, vec![bytes.clone()])?;
 
@@ -280,14 +244,10 @@ pub fn json_throughput(sizes: &[usize], iterations: u32, repeats: usize) -> Resu
     Ok(out)
 }
 
-// ------------------------------------------------------- what JSON is priced by
-
 #[derive(Clone, Debug, Serialize)]
 pub struct ShapePoint {
     pub lines: usize,
-    /// Bytes of filler inside one string field. It is content, not whitespace:
-    /// a parser that skipped it would not have to unescape it, and unescaping
-    /// is the work a string field costs.
+    /// Bytes of filler inside one string field.
     pub note_width: usize,
     pub payload_bytes: usize,
     /// Leaf values the codec visits: five per line, plus the order's own four.
@@ -296,23 +256,15 @@ pub struct ShapePoint {
     pub decode_micros: f64,
     /// `json::parse` alone: bytes to a `Json`, before any codec runs.
     pub parse_micros: f64,
-    /// The derived codec's own half — walking an already-parsed `Json` into the
-    /// ADT, timed on its own rather than as `decode - parse`.
+    /// The derived codec's own half — walking an already-parsed `Json` into the ADT, timed on its
+    /// own rather than as `decode - parse`.
     pub codec_micros: f64,
     pub decode_micros_per_byte: f64,
     pub decode_micros_per_field: f64,
 }
 
-/// Whether a decode is priced by the fields it visits or by the bytes it
-/// crosses — the question ADR 0012 §5 asks of the request head, asked of the
-/// payload.
-///
-/// Two series over one derived codec. Growing the line count grows fields and
-/// bytes together and says nothing on its own; growing one string field's width
-/// at a fixed line count grows the bytes alone. If `µs/req` is flat down the
-/// second series the cost is the fields, and JSON is as cheap as the head
-/// parser became. If it rises with the bytes, the byte builtins did not reach
-/// this path and the remaining cost is a per-byte interpreter constant.
+/// Whether a decode is priced by the fields it visits or by the bytes it crosses — the question ADR
+/// 0012 §5 asks of the request head, asked of the payload.
 pub fn json_shape(
     points: &[(usize, usize)],
     iterations: u32,
@@ -390,12 +342,7 @@ pub fn json_shape(
     Ok(out)
 }
 
-// ------------------------------------------------------------------- the map
-
-/// `loop_only` is the subtrahend, and it is why these rows are about `Map` and
-/// not about `fold`. It walks the same range, calls the same closure and
-/// computes the same key, and does no map operation at all — so the difference
-/// between it and `build` is `map_insert` and nothing else.
+/// `loop_only` is the subtrahend, and it is why these rows are about `Map` and not about `fold`.
 const MAP_SRC: &str = r#"
 fn key(i: Int) -> Int = (i * 2654435761) % 1000003
 
@@ -425,10 +372,8 @@ test "insertion order changes neither the map nor the order it iterates in" {
 #[derive(Clone, Debug, Serialize)]
 pub struct MapPoint {
     pub entries: usize,
-    /// `map_insert`, with the enclosing `fold` and the key computation
-    /// subtracted — measured alternately with that scaffold rather than against
-    /// a separate run of it. The map is persistent, so this is an O(log n)
-    /// insert plus the O(log n) nodes it allocates rather than a copy.
+    /// `map_insert`, with the enclosing `fold` and the key computation subtracted — measured
+    /// alternately with that scaffold rather than against a separate run of it.
     pub insert_nanos: f64,
     /// `map_get` on a key that is present, same subtraction.
     pub get_nanos: f64,
@@ -437,18 +382,11 @@ pub struct MapPoint {
     /// `map_fold`, per entry, which is the iteration that allocates no list.
     pub fold_nanos_per_entry: f64,
     /// What the `fold`/`range`/`key` scaffold cost per iteration on its own.
-    /// Printed rather than hidden: it is the interpreter constant these rows
-    /// were measured against, and a reader is entitled to check the subtraction
-    /// did not remove most of the number.
     pub loop_nanos: f64,
 }
 
-/// Times two calls that differ by one operation, alternating them call by call
-/// so that whatever the machine was doing landed on both.
-///
-/// Returns `(target, subtrahend)`, each already divided by `batch`, from the
-/// repeat whose target ran fastest — which is the repeat with the least
-/// interference, and the one whose subtrahend was measured beside it.
+/// Times two calls that differ by one operation, alternating them call by call so that whatever the
+/// machine was doing landed on both.
 fn paired(
     machine: &mut Machine<'_>,
     target: (&str, Vec<Value>),
@@ -493,10 +431,8 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
         let n = Value::Int(entries as i64);
         let map = call(&mut machine, &build, vec![n.clone()])?;
 
-        // Enough calls that one call's fixed cost is spread over a batch, and
-        // few enough that the largest size still finishes. The per-entry
-        // columns divide by `entries` as well, so a row is comparable across
-        // sizes whatever this works out to.
+        // Enough calls that one call's fixed cost is spread over a batch, and few enough that the
+        // largest size still finishes.
         let batch = (500_000 / entries.max(1)).clamp(1, 200) as u32;
         let time = |machine: &mut Machine<'_>, name: &str, args: Vec<Value>| -> Result<Duration> {
             call(machine, name, args.clone())?;
@@ -510,15 +446,8 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
             Ok(taken / batch)
         };
 
-        // `map_insert` and `map_get` cannot be called without a `fold` around
-        // them, so these two rows are subtractions and there is no way to make
-        // them anything else. What *is* under this crate's control is when the
-        // two halves are measured: **alternated call by call inside one batch**,
-        // rather than as two separately-timed runs whose minima came from
-        // different moments. A scheduler that descheduled the process then hit
-        // whichever run was in flight and the difference came out negative — a
-        // number about the machine's load, clamped to zero and wearing the units
-        // of a measurement.
+        // `map_insert` and `map_get` cannot be called without a `fold` around them, so these two
+        // rows are subtractions and there is no way to make them anything else.
         let (built, scaffold) = paired(
             &mut machine,
             (&build, vec![n.clone()]),
@@ -537,9 +466,7 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
         let folds = time(&mut machine, &folded, vec![map.clone()])?;
 
         let per = |d: Duration| d.as_secs_f64() * 1e9 / entries as f64;
-        // Not clamped. Each call of the pair does strictly more work than the
-        // call beside it, so a negative here is a measurement that failed and
-        // reporting it as zero would say the operation was free.
+        // Not clamped.
         out.push(MapPoint {
             entries,
             insert_nanos: per(built) - per(scaffold),
@@ -552,16 +479,8 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
     Ok(out)
 }
 
-// ------------------------------------------------- iteration order, elsewhere
-
-/// A program whose whole output is what `map_keys` answered, under three
-/// insertion orders that build one key set.
-///
-/// Ascending, descending and a multiplicative shuffle. If the order were a
-/// function of insertion history the three would differ inside one process; if
-/// it were a function of a hasher's seed they would differ between processes.
-/// The claim is neither, so `ply run` is spawned repeatedly and every line of
-/// every run must be the same line.
+/// A program whose whole output is what `map_keys` answered, under three insertion orders that
+/// build one key set.
 const ORDER_SRC: &str = r#"
 fn key(i: Int) -> Int = (i * 2654435761) % 100003
 
@@ -597,17 +516,12 @@ pub struct OrderCheck {
     pub identical_across_processes: bool,
     /// All three insertion orders produced one key sequence.
     pub identical_across_insertion_orders: bool,
-    /// That sequence is strictly ascending, which is the contract rather than
-    /// merely a stable order.
+    /// That sequence is strictly ascending, which is the contract rather than merely a stable
+    /// order.
     pub ascending: bool,
 }
 
-/// Runs `ply run` in `processes` separate processes and compares what each
-/// printed.
-///
-/// A separate process rather than a loop, because the failure this rules out —
-/// an order that is a function of a per-process hasher seed — is invisible
-/// inside one address space by construction.
+/// Runs `ply run` in `processes` separate processes and compares what each printed.
 pub fn map_order(ply: &Path, processes: usize) -> Result<OrderCheck> {
     let dir = write_project(&[("order.ply", ORDER_SRC.to_string())])?;
 
@@ -632,10 +546,9 @@ pub fn map_order(ply: &Path, processes: usize) -> Result<OrderCheck> {
     let first = outputs[0].clone();
     let identical_across_processes = outputs.iter().all(|o| *o == first);
 
-    // `ply run` renders the returned `String` with its own framing — an indent
-    // and the quotes a `String` is printed inside — so the three renderings are
-    // recovered from the separator the program wrote after that framing is
-    // stripped, rather than from the whole line.
+    // `ply run` renders the returned `String` with its own framing — an indent and the quotes a
+    // `String` is printed inside — so the three renderings are recovered from the separator the
+    // program wrote after that framing is stripped, rather than from the whole line.
     let body = first.trim().trim_matches('"');
     let runs: Vec<&str> = body.split('|').skip(1).collect();
     if runs.len() != 3 {
@@ -656,14 +569,7 @@ pub fn map_order(ply: &Path, processes: usize) -> Result<OrderCheck> {
     })
 }
 
-// ------------------------------------------------------ derivation's own cost
-
 /// One module of `types` record types, with or without a `derive` for each.
-///
-/// The two variants are the *same* types with the *same* tests: the derived one
-/// round-trips through its generated codec and the plain one asserts the same
-/// field of the same value, so the definition-count difference is the
-/// derivation and the import it needs, and nothing else.
 fn derived_module(index: usize, types: usize, derived: bool) -> String {
     let mut s = String::new();
     if derived {
@@ -705,17 +611,14 @@ pub struct DerivePoint {
     pub modules: usize,
     /// Everything the front end checked, the stdlib included.
     pub definitions: usize,
-    /// The project's own. `definitions - project_definitions` is what
-    /// `import std.json` costs, and it is a constant rather than a per-type
-    /// price — which is the distinction a single "extra definitions" number
-    /// would hide, and the one that decides whether derivation scales.
+    /// The project's own.
     pub project_definitions: usize,
-    /// Tests the project declares. A shipped module's are not a project's.
+    /// Tests the project declares.
     pub tests: usize,
     /// A check with no cache at all.
     pub cold_check_millis: f64,
-    /// A check against a cache a previous identical run filled — both gates
-    /// hit, which is what a project's second `ply check` costs.
+    /// A check against a cache a previous identical run filled — both gates hit, which is what a
+    /// project's second `ply check` costs.
     pub warm_check_millis: f64,
     /// Selecting and running every test, from an empty result cache.
     pub cold_test_millis: f64,
@@ -758,8 +661,8 @@ fn one_derivation_point(
         })
         .collect();
 
-    // A fresh copy per timing, so a cold number is cold: a store the previous
-    // measurement filled would make the second project's cold check a warm one.
+    // A fresh copy per timing, so a cold number is cold: a store the previous measurement filled
+    // would make the second project's cold check a warm one.
     let cold = best_of(repeats, || {
         let dir = write_files(&files)?;
         let mut store = Store::open(dir.path())?;
@@ -821,12 +724,6 @@ fn one_derivation_point(
 }
 
 /// Every test the *project* declares, which is what `ply test` runs.
-///
-/// `ply_test::select` selects over every test the front end saw, `std.json`'s
-/// included, and ADR 0012 §1 is explicit that a shipped module's tests are not
-/// a project's. Leaving them in would put a hundred stdlib tests in the derived
-/// variant's column and none in the plain one, and the difference would read as
-/// derivation's cost.
 fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Duration> {
     let started = Instant::now();
     let selection = ply_test::select(
@@ -896,13 +793,10 @@ fn directory_bytes(dir: &Path) -> Result<u64> {
     Ok(total)
 }
 
-/// Where the `ply` binary is, given this one. Siblings in the same profile
-/// directory, so a `--release` measurement never drives a debug server.
+/// Where the `ply` binary is, given this one.
 pub fn ply_binary() -> Result<PathBuf> {
     crate::serve::ply_binary()
 }
-
-// ------------------------------------------------------------------ reporting
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Measurements {
@@ -1084,9 +978,8 @@ pub fn render(m: &Measurements) -> String {
 mod tests {
     use super::*;
 
-    /// The three programs are the measurement, so a change that stops one of
-    /// them compiling has to fail here rather than at the moment somebody wants
-    /// a number.
+    /// The three programs are the measurement, so a change that stops one of them compiling has to
+    /// fail here rather than at the moment somebody wants a number.
     #[test]
     fn every_measurement_program_compiles_and_its_own_test_passes() {
         for (name, source) in [
@@ -1103,15 +996,7 @@ mod tests {
         }
     }
 
-    /// The subtraction has to leave something. A `map_insert` measuring at or
-    /// below the scaffold that contains it would mean the rows are noise around
-    /// zero rather than the map's cost. Nothing clamps it, so a failed
-    /// measurement reads as negative rather than as a free operation.
-    ///
-    /// It does not assert that the map *dominates* the scaffold, and that is a
-    /// finding rather than a weakened test: an insert into a persistent tree is
-    /// cheaper than the `fold` iteration that asks for it, because a Ply
-    /// closure call costs more than an O(log n) descent.
+    /// The subtraction has to leave something.
     #[test]
     fn the_map_rows_survive_subtracting_the_fold_around_them() {
         for p in map_ops(&[256, 4_096], 2).unwrap() {
@@ -1127,10 +1012,8 @@ mod tests {
         }
     }
 
-    /// The two axes have to move independently, or the table cannot separate a
-    /// per-field cost from a per-byte one — which is the only question it is
-    /// there to answer. Widening the padding must grow the payload and leave the
-    /// field count alone; adding lines must grow both.
+    /// The two axes have to move independently, or the table cannot separate a per-field cost from
+    /// a per-byte one — which is the only question it is there to answer.
     #[test]
     fn widening_a_field_grows_the_bytes_and_not_the_field_count() {
         let points = json_shape(&[(2, 0), (2, 200), (8, 0)], 2, 1).unwrap();
@@ -1140,8 +1023,8 @@ mod tests {
         assert_eq!(narrow.fields, wide.fields);
         assert!(wide.payload_bytes > narrow.payload_bytes + 200);
         assert!(longer.fields > narrow.fields && longer.payload_bytes > narrow.payload_bytes);
-        // Both halves are timed on their own, so each is a duration rather than
-        // a difference: a zero here means a half that did not run.
+        // Both halves are timed on their own, so each is a duration rather than a difference: a
+        // zero here means a half that did not run.
         assert!(
             narrow.parse_micros > 0.0 && narrow.codec_micros > 0.0,
             "parse {} µs, codec {} µs of a {} µs decode",
@@ -1151,9 +1034,8 @@ mod tests {
         );
     }
 
-    /// Both variants have to be the same program in everything but the
-    /// derivation, or the comparison prices two projects rather than one
-    /// feature.
+    /// Both variants have to be the same program in everything but the derivation, or the
+    /// comparison prices two projects rather than one feature.
     #[test]
     fn the_two_derivation_variants_declare_the_same_types_and_the_same_tests() {
         let plain = derived_module(0, 3, false);
@@ -1168,8 +1050,8 @@ mod tests {
         assert_eq!(derived.matches("derive json for").count(), 3);
     }
 
-    /// Small, but it exercises the whole path — two projects, four timings, a
-    /// cache measured — which is what a table nobody can reproduce would hide.
+    /// Small, but it exercises the whole path — two projects, four timings, a cache measured —
+    /// which is what a table nobody can reproduce would hide.
     #[test]
     fn a_derivation_point_is_produced_for_both_variants() {
         let points = derivation_cost(&[4], 4, 1).unwrap();

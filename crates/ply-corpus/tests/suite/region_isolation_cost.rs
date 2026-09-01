@@ -1,18 +1,4 @@
-//! ADR 0017 §6's number, taken against real projects rather than against
-//! footprints somebody typed.
-//!
-//! The claim being checked is narrow and load-bearing: the only mechanism by
-//! which the forkable world buys the scheduler anything is
-//! `ply_test::REGION_SCOPED`, which is exactly `["cell"]`. So the isolation cost
-//! of removing it is a function of how many tests carry a `cell` atom, and of
-//! how many labels those atoms spread over.
-//!
-//! Two halves. The first is that a `cell` atom in a test's footprint is
-//! **reachable** — a corpus is written that has them, the runner calls every one
-//! of its tests isolated under the forkable world, and dropping the exemption
-//! splits them. The
-//! second is that no corpus in this repository actually has one, which is why
-//! the measured answer is zero rather than small.
+//! ADR 0017 §6's number, taken against real projects rather than against footprints somebody typed.
 
 use ply_core::Footprint;
 use ply_corpus::regions::{self, Corpus, Hypothetical};
@@ -26,8 +12,8 @@ fn repo_root() -> PathBuf {
         .to_path_buf()
 }
 
-/// One test per label, so the counterfactual is a clique of `per_label` tests
-/// per label and the group count is exactly `per_label`.
+/// One test per label, so the counterfactual is a clique of `per_label` tests per label and the
+/// group count is exactly `per_label`.
 fn cell_project(dir: &Path, cells: usize, labels: usize, pure: usize) {
     let mut src = String::new();
     for i in 0..cells {
@@ -48,13 +34,8 @@ fn cell_project(dir: &Path, cells: usize, labels: usize, pure: usize) {
     std::fs::write(dir.join("main.ply"), src).expect("writing the scratch project");
 }
 
-/// The mechanism, end to end and on the real runner: a declared `cell`
-/// footprint reaches a test, the scheduler calls the test isolated anyway, and
-/// the counterfactual is one group per label.
-///
-/// The annotation is what makes the corpus writable — an annotated row is an
-/// upper bound and is what gets published — and the shape it produces is the
-/// one ADR 0005 §5 says a captured continuation reaches by inference.
+/// The mechanism, end to end and on the real runner: a declared `cell` footprint reaches a test,
+/// the scheduler calls the test isolated anyway, and the counterfactual is one group per label.
 #[test]
 fn a_cell_atom_reaches_a_footprint_and_only_forking_hides_it() {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -85,9 +66,7 @@ fn a_cell_atom_reaches_a_footprint_and_only_forking_hides_it() {
     );
 }
 
-/// A label nobody else names conflicts with nothing, so the exemption was
-/// buying it nothing. Counting the population rather than the conflicts is the
-/// single easiest way to over-state ADR 0017's cost.
+/// A label nobody else names conflicts with nothing, so the exemption was buying it nothing.
 #[test]
 fn cell_tests_on_distinct_labels_are_free_to_lose_the_exemption() {
     let dir = tempfile::tempdir().expect("a scratch directory");
@@ -101,12 +80,7 @@ fn cell_tests_on_distinct_labels_are_free_to_lose_the_exemption() {
     assert_eq!(cost.today.groups, cost.without_forking.groups);
 }
 
-/// The measured answer for the corpus ADR 0017 §6 quotes. `examples/` is the
-/// 186-test suite behind `isolated 176 of 186`, and none of the 176 is isolated
-/// by forking: 165 are pure and 11 carry only a seed.
-///
-/// This is the assertion that would fail if a later change made the cost real,
-/// which is the only reason to pin a zero.
+/// The measured answer for the corpus ADR 0017 §6 quotes.
 #[test]
 fn the_examples_suite_loses_nothing_to_the_region_model() {
     let root = repo_root().join("examples");
@@ -131,9 +105,8 @@ fn the_examples_suite_loses_nothing_to_the_region_model() {
     );
 }
 
-/// The colouring the counterfactual is read off has to be the one the runner
-/// uses, on a real corpus and not only on the seven hand-made footprints the
-/// unit test carries.
+/// The colouring the counterfactual is read off has to be the one the runner uses, on a real corpus
+/// and not only on the seven hand-made footprints the unit test carries.
 #[test]
 fn the_examples_colouring_is_the_runners_own() {
     let root = repo_root().join("examples");
@@ -151,9 +124,8 @@ fn the_examples_colouring_is_the_runners_own() {
     );
 }
 
-/// What the cost would be if the shape existed, so the verdict rests on a
-/// measured exposure rather than on the absence of an example. One label is the
-/// worst case available and it is a group per test.
+/// What the cost would be if the shape existed, so the verdict rests on a measured exposure rather
+/// than on the absence of an example.
 #[test]
 fn the_exposure_is_a_group_per_test_only_at_one_label() {
     let shape = |labels: usize| {
@@ -177,8 +149,6 @@ fn the_exposure_is_a_group_per_test_only_at_one_label() {
 }
 
 /// A group is a barrier, so the wall-clock model must not be `sum / jobs`.
-/// Getting this wrong would report the cost of the change as whatever the
-/// arithmetic mean said.
 #[test]
 fn the_wall_clock_model_charges_the_barrier_it_claims_to() {
     let corpus = Corpus {

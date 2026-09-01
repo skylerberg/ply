@@ -1,18 +1,4 @@
 //! An adversarial audit of `derive` and of `where derivable(D, a)`.
-//!
-//! Two claims are under test.
-//!
-//! **Constraints move errors from instantiation to the signature** (ADR 0010
-//! decision 4). The failure that matters is not a constraint that is too strict;
-//! it is one that passes and then fails deeper, because that promises locality
-//! and does not deliver.
-//!
-//! **A derivation is canonical.** ADR 0012 §3's orphan rule exists so that "one
-//! type has one canonical encoding rather than one per module that thought of
-//! it", and §2 rests a `Map`'s iteration order on there being exactly one
-//! `derivable(ord, ·)` and one order. A `derive` whose generated body binds to
-//! something the *module* supplies rather than to what the language supplies
-//! breaks both, silently and with no diagnostic at the `derive` line.
 
 use assert_cmd::prelude::*;
 use ply_span::codes;
@@ -63,14 +49,9 @@ fn codes_of(source: &str) -> Vec<String> {
 
 // --- Constraints: does the boundary hold? -----------------------------------
 
-/// The claim in one table: every one of these instantiates a constraint with a
-/// type that does not satisfy it, and every one must be `E0206` — at the call
-/// site or at the signature, but *statically*, and never as something that
-/// checks here and fails deeper.
-///
-/// The interesting rows are the last four. A `Float` behind a nominal
-/// declaration, behind a list, behind a type parameter, or two calls away is
-/// still a `Float`, and `derivable` is what has to know that.
+/// The claim in one table: every one of these instantiates a constraint with a type that does not
+/// satisfy it, and every one must be `E0206` — at the call site or at the signature, but
+/// *statically*, and never as something that checks here and fails deeper.
 #[test]
 fn no_unsatisfiable_constraint_is_accepted_at_a_boundary() {
     let attempts: &[&str] = &[
@@ -80,16 +61,16 @@ fn no_unsatisfiable_constraint_is_accepted_at_a_boundary() {
         // Under a container the signature writes.
         "fn needs<a>(xs: List<a>) -> Int where derivable(ord, a) = 1\n\
          fn go() -> Int = needs([1.5])",
-        // Through a first-class use, where the constraint could have been lost
-        // with the function's name.
+        // Through a first-class use, where the constraint could have been lost with the function's
+        // name.
         "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n\
          fn apply(f: (Float) -> Int, x: Float) -> Int = f(x)\n\
          fn go() -> Int = apply(needs, 1.5)",
         // Through a lambda, same question with a different binder.
         "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n\
          fn go() -> Int = { let f = |x: Float| needs(x); f(1.5) }",
-        // A body that assumes one constraint and calls something needing
-        // another: the error belongs in the body, against the inner call.
+        // A body that assumes one constraint and calls something needing another: the error belongs
+        // in the body, against the inner call.
         "fn needs<a>(x: a) -> Int where derivable(ord, a) = 1\n\
          fn caller<a>(x: a) -> Int where derivable(json, a) = needs(x)",
         // A `Float` behind a nominal declaration.
@@ -119,9 +100,8 @@ fn no_unsatisfiable_constraint_is_accepted_at_a_boundary() {
     }
 }
 
-/// The other half: a constraint that *is* satisfiable must not be reported, and
-/// a body must be able to assume its own. Without this the test above passes for
-/// a checker that refuses everything.
+/// The other half: a constraint that *is* satisfiable must not be reported, and a body must be able
+/// to assume its own.
 #[test]
 fn a_satisfiable_constraint_is_assumed_inside_the_body() {
     for source in [
@@ -143,10 +123,8 @@ fn a_satisfiable_constraint_is_assumed_inside_the_body() {
     }
 }
 
-/// A `Map` key is checked wherever the type is inferred rather than written,
-/// which is where a check hung off the surface syntax would miss it. Every one
-/// of these builds a map whose key type reaches a `Float` without any signature
-/// naming `Map`.
+/// A `Map` key is checked wherever the type is inferred rather than written, which is where a check
+/// hung off the surface syntax would miss it.
 #[test]
 fn an_inferred_map_key_is_checked_like_a_written_one() {
     for source in [
@@ -171,10 +149,9 @@ fn an_inferred_map_key_is_checked_like_a_written_one() {
     );
 }
 
-/// Adding a `where` clause narrows what a signature admits, so it must move the
-/// definition's hash — otherwise a caller already checked against the
-/// unconstrained form is never rechecked and stays accepted. Reordering two
-/// clauses and renaming the constrained parameter must not.
+/// Adding a `where` clause narrows what a signature admits, so it must move the definition's hash —
+/// otherwise a caller already checked against the unconstrained form is never rechecked and stays
+/// accepted.
 #[test]
 fn a_constraint_is_in_the_hash_and_its_spelling_is_not() {
     let hashes = |source: &str| -> Vec<String> {
@@ -200,8 +177,8 @@ fn a_constraint_is_in_the_hash_and_its_spelling_is_not() {
 
 // --- Derivation: is a derived dictionary canonical? -------------------------
 
-/// A control, so the two failures below are about hijacking rather than about
-/// derivation being broken.
+/// A control, so the two failures below are about hijacking rather than about derivation being
+/// broken.
 #[test]
 fn a_derivation_composed_through_the_module_binder_is_canonical() {
     let printed = run_main(
@@ -216,18 +193,8 @@ fn a_derivation_composed_through_the_module_binder_is_canonical() {
     );
 }
 
-/// `derive ord for T` emits `compare(a, b)` as a **bare** name, and ADR 0001
-/// says a module's own items shadow the prelude. So a module that happens to
-/// declare a function called `compare` gets a derived `OrdDict<T>` built out of
-/// it — no import, no warning, and nothing at the `derive` line to read.
-///
-/// That is exactly the second order ADR 0012 §3 says must not exist: the
-/// dictionary now disagrees with the total order a `Map<T, v>` iterates in,
-/// while `derivable(ord, T)` — the predicate that is supposed to be the *same*
-/// question — still says the type is ordered.
-///
-/// **This test fails today.** It asserts what a canonical derivation means:
-/// `compare` on two equal values is `Equal`.
+/// `derive ord for T` emits `compare(a, b)` as a **bare** name, and ADR 0001 says a module's own
+/// items shadow the prelude.
 #[test]
 fn a_derived_ord_is_the_languages_order_and_not_the_modules() {
     let printed = run_main(
@@ -243,17 +210,8 @@ fn a_derived_ord_is_the_languages_order_and_not_the_modules() {
     );
 }
 
-/// The same hazard on the `json` deriver, reached through the import form rather
-/// than through the prelude.
-///
-/// `import std.json (..)` binds names bare, so `Emitter::runtime_prefix` writes
-/// an **empty** prefix and the generated body calls `int_json()` and
-/// `string_json()` unqualified. A module that defines either of those names — and
-/// does not import the shipped one, so there is no `E0108` to warn it — supplies
-/// the leaf codecs its own `derive json` composes with.
-///
-/// **This test fails today.** It asserts that `derive json for Order` produces
-/// the encoding of `Order` rather than an encoding of `Order`.
+/// The same hazard on the `json` deriver, reached through the import form rather than through the
+/// prelude.
 #[test]
 fn a_derived_json_codec_cannot_be_supplied_by_the_deriving_module() {
     let printed = run_main(
@@ -276,9 +234,9 @@ fn a_derived_json_codec_cannot_be_supplied_by_the_deriving_module() {
     );
 }
 
-/// `derive eq` is the shape that is safe, and knowing why is what says how the
-/// two above should be fixed: it emits the `==` **operator**, which is a token
-/// rather than a name, so nothing in scope can stand in for it.
+/// `derive eq` is the shape that is safe, and knowing why is what says how the two above should be
+/// fixed: it emits the `==` **operator**, which is a token rather than a name, so nothing in scope
+/// can stand in for it.
 #[test]
 fn a_derived_eq_uses_an_operator_and_so_cannot_be_shadowed() {
     let printed = run_main(

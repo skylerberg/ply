@@ -1,6 +1,4 @@
-//! Drives the real binary. Everything here is a claim about the *interface* —
-//! exit codes, what lands on stdout, what `--json` promises — which is exactly
-//! the part a unit test cannot reach.
+//! Drives the real binary.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -72,8 +70,8 @@ fn check_types_prints_signatures_and_footprints() {
     let out = ply(dir.path()).args(["check", "--types"]).output().unwrap();
     assert_eq!(out.status.code(), Some(0));
     let text = stdout_of(&out);
-    // W3 moved the row onto its own line under the type, because at a hundred
-    // endpoints a row run onto the end of a signature is a row nobody reads.
+    // W3 moved the row onto its own line under the type, because at a hundred endpoints a row run
+    // onto the end of a signature is a row nobody reads.
     assert!(
         text.contains("     rows : () -> List<Int>\n            / {m.db.read[users]}\n"),
         "got:\n{text}"
@@ -192,12 +190,8 @@ fn editing_a_body_re_runs_exactly_the_tests_that_reach_it() {
     assert_eq!(ran, ["a is one"]);
 }
 
-/// `ply test` loads twice: once to select, and once more to parse the modules a
-/// selected test needs a body from. Between the two the first load writes its
-/// fingerprints back, so a file it parsed because its bytes changed is a file
-/// the second load will skip — and the second load is the one that has to
-/// produce the body. A `nondet` test is never cached, so it forces the second
-/// load on every run and makes this reachable from an ordinary edit.
+/// `ply test` loads twice: once to select, and once more to parse the modules a selected test needs
+/// a body from.
 #[test]
 fn a_nondet_test_elsewhere_does_not_cost_an_edited_module_its_body() {
     let dir = tempfile::tempdir().unwrap();
@@ -292,8 +286,8 @@ fn test_json_is_exactly_one_object_on_stdout() {
     assert_eq!(failure["diagnostic"]["code"], "E0501");
     assert_eq!(failure["diagnostic"]["labels"][0]["file"], "m.ply");
     assert!(failure["diagnostic"]["labels"][0]["start"]["line"].is_number());
-    // Schema v2: a ranked object per suspect, so that a consumer reading only
-    // `suspects[0]` gets the best guess rather than the alphabetically first.
+    // Schema v2: a ranked object per suspect, so that a consumer reading only `suspects[0]` gets
+    // the best guess rather than the alphabetically first.
     assert_eq!(failure["suspects"][0]["name"], "m.balance");
     assert_eq!(failure["suspects"].as_array().unwrap().len(), 1);
 
@@ -383,19 +377,13 @@ fn explain_reports_a_reason_per_test_and_a_footprint_per_group() {
     assert!(text.contains("region-isolated and free"), "got:\n{text}");
 }
 
-/// ADR 0017 §6 through ADR 0008 §6: a report that still said `world` after the
-/// world was gone would over-claim by exactly the tests that moved, so
-/// `--explain` names the contention *and* what kind it is.
-///
-/// The two tests here contend only because they name one region label, which is
-/// a contention their author can remove by renaming one. Saying `shared` and
-/// stopping would leave that indistinguishable from needing a database.
+/// ADR 0017 §6 through ADR 0008 §6: a report that still said `world` after the world was gone would
+/// over-claim by exactly the tests that moved, so `--explain` names the contention *and* what kind
+/// it is.
 #[test]
 fn explain_separates_a_region_label_contention_from_a_real_one() {
-    // The `cell` atoms reach the footprint through a written row: ADR 0017 §2
-    // closed every route that carried a cell out of its region, so an
-    // annotation is the only way one gets there. The call is outside the region
-    // because a region discharges its own label.
+    // The `cell` atoms reach the footprint through a written row: ADR 0017 §2 closed every route
+    // that carried a cell out of its region, so an annotation is the only way one gets there.
     let dir = project(
         "fn touches(n: Int) -> Int / {cell.read[table], cell.write[table]} = n\n\
          test \"a\" {\n  \
@@ -436,17 +424,16 @@ fn explain_separates_a_region_label_contention_from_a_real_one() {
     assert_eq!(v["selection"]["parallelism"]["isolated"], 1);
 }
 
-/// The milestone's claim has to be a number a project can watch, on every run
-/// and not only under `--explain`.
+/// The milestone's claim has to be a number a project can watch, on every run and not only under
+/// `--explain`.
 #[test]
 fn a_run_reports_how_many_tests_cannot_disturb_another() {
     let dir = project(GREEN);
     let text = stdout_of(&ply(dir.path()).arg("test").output().unwrap());
     assert!(text.contains("isolated 2 of 2"), "got:\n{text}");
 
-    // The writing test cannot pass — an atom that escapes the test is an
-    // operation nothing handles — but the schedule is still an artifact about
-    // it, which is the half being asserted here.
+    // The writing test cannot pass — an atom that escapes the test is an operation nothing handles
+    // — but the schedule is still an artifact about it, which is the half being asserted here.
     let effectful = project(
         "effect db {\n  write put[t](v: Int) -> Unit\n}\n\
          fn store(v: Int) -> Int / {db.write[users]} = { db.put[users](v); v }\n\
@@ -834,13 +821,6 @@ fn two_mains_are_reported_rather_than_resolved_by_load_order() {
 }
 
 // --- hosts ------------------------------------------------------------------
-//
-// The listing is meant to be diffed in CI, so what is claimed here is stability
-// and exit codes rather than a particular set of handlers: which handlers exist
-// is `ply-host`'s decision, and a test that pinned them would fail on the day
-// one is legitimately added. What may not move is that hermetic is the default,
-// that the digest is a function of the trusted computing base and not of a flag,
-// and that a run says which binding produced it.
 
 #[test]
 fn hosts_defaults_to_hermetic_and_still_says_what_would_bind() {
@@ -853,8 +833,8 @@ fn hosts_defaults_to_hermetic_and_still_says_what_would_bind() {
         text.contains("no host handler is bound"),
         "an empty listing is indistinguishable from a registry that failed to load:\n{text}"
     );
-    // Never a bare "nothing here": the reader has to be able to tell an empty
-    // trusted computing base from a binding that was simply not asked for.
+    // Never a bare "nothing here": the reader has to be able to tell an empty trusted computing
+    // base from a binding that was simply not asked for.
     assert!(text.lines().filter(|l| !l.trim().is_empty()).count() >= 2);
 }
 
@@ -869,9 +849,7 @@ fn hosts_is_byte_identical_across_runs() {
     assert!(stdout_of(&once).contains("digest: b3:"));
 }
 
-/// The one line a CI check pins. It is a property of the registry and the
-/// program, so it may not depend on whether `--host` was passed — a digest that
-/// moved with a flag would pin nothing.
+/// The one line a CI check pins.
 #[test]
 fn hosts_digest_is_one_line_and_does_not_depend_on_the_flag() {
     let dir = project(GREEN);
@@ -939,8 +917,8 @@ fn test_is_hermetic_without_the_flag_and_says_which_binding_it_used() {
     assert_eq!(v["binding"], "hermetic");
     assert_eq!(v["hosts"]["operations"], 0);
     assert!(v["hosts"]["digest"].as_str().unwrap().starts_with("b3:"));
-    // Nothing is bound, so no test can reach a host handler, and every test is
-    // classified exactly as it was before W1.
+    // Nothing is bound, so no test can reach a host handler, and every test is classified exactly
+    // as it was before W1.
     assert_eq!(v["selection"]["host"], 0);
     for test in v["selection"]["tests"].as_array().unwrap() {
         assert_eq!(test["host"], false);
@@ -968,8 +946,8 @@ fn host_changes_the_binding_a_run_reports() {
     );
 }
 
-/// Visible without `--json`: a person reading the terminal has to be able to see
-/// that this run reached outside itself.
+/// Visible without `--json`: a person reading the terminal has to be able to see that this run
+/// reached outside itself.
 #[test]
 fn a_host_run_says_so_in_the_summary_a_person_reads() {
     let dir = project(GREEN);
@@ -979,14 +957,13 @@ fn a_host_run_says_so_in_the_summary_a_person_reads() {
     assert!(text.contains("not cached"), "got:\n{text}");
     assert!(text.contains("binding host"), "got:\n{text}");
 
-    // And silent when nothing was asked for, so the ordinary run reads exactly
-    // as it did before W1.
+    // And silent when nothing was asked for, so the ordinary run reads exactly as it did before W1.
     let hermetic = stdout_of(&ply(dir.path()).args(["test"]).output().unwrap());
     assert!(!hermetic.contains("binding host"), "got:\n{hermetic}");
 }
 
-/// The trivially-parallel count is a claim, and a claim that grew when a socket
-/// was bound would be the over-claim ADR 0008 §6 exists to prevent.
+/// The trivially-parallel count is a claim, and a claim that grew when a socket was bound would be
+/// the over-claim ADR 0008 §6 exists to prevent.
 #[test]
 fn explain_never_reports_more_isolation_under_host_than_without_it() {
     let dir = project(GREEN);
@@ -1027,9 +1004,9 @@ fn run_is_hermetic_by_default_and_reports_its_binding() {
     );
 }
 
-/// Corollary 1 of ADR 0011, checked end to end: if a binding moved a hash, a
-/// row or an E0412 verdict, `ply check` would answer differently under `--host`
-/// and every cache in the system would split on a flag.
+/// Corollary 1 of ADR 0011, checked end to end: if a binding moved a hash, a row or an E0412
+/// verdict, `ply check` would answer differently under `--host` and every cache in the system would
+/// split on a flag.
 #[test]
 fn a_binding_changes_nothing_the_front_end_computes() {
     let dir = project(GREEN);
@@ -1145,10 +1122,8 @@ fn moving_a_definition_between_modules_re_runs_nothing() {
     );
 }
 
-/// A module is loaded in path order but checked in dependency order, and test
-/// indices are shared between the two. Getting that wrong selects a test on
-/// another test's hash, so an edit re-runs the wrong one and the edited one
-/// stays green from the cache — the exact failure this asserts against.
+/// A module is loaded in path order but checked in dependency order, and test indices are shared
+/// between the two.
 #[test]
 fn an_edit_re_runs_the_test_that_reaches_it_when_load_order_is_not_dependency_order() {
     let dir = tempfile::tempdir().unwrap();
@@ -1229,10 +1204,8 @@ fn a_corrupt_cache_degrades_to_an_empty_one_rather_than_crashing() {
     );
 }
 
-/// Attribution re-normalizes against the loaded AST, and gate 1 leaves no AST
-/// for a file it skipped. Anything the diagnosis reads positionally therefore
-/// lines two different orders up as soon as an *earlier* module is skipped —
-/// which is the ordinary case, not a corner one.
+/// Attribution re-normalizes against the loaded AST, and gate 1 leaves no AST for a file it
+/// skipped.
 #[test]
 fn a_skipped_earlier_module_does_not_lose_the_attribution() {
     let dir = tempfile::tempdir().unwrap();
@@ -1274,10 +1247,8 @@ fn a_skipped_earlier_module_does_not_lose_the_attribution() {
     assert_eq!(culprit["definitions"][0], "b.b holds");
 }
 
-/// The baseline is read during the *diagnosis* of a failure, which happens
-/// after every other point the run collects warnings from the store. A corrupt
-/// one is therefore the case most likely to degrade in silence, and its silent
-/// form is an artifact that says `never_passed` about a test that passed.
+/// The baseline is read during the *diagnosis* of a failure, which happens after every other point
+/// the run collects warnings from the store.
 #[test]
 fn a_corrupt_baseline_is_reported_rather_than_read_as_never_passed() {
     let dir = project(GREEN);
@@ -1367,8 +1338,7 @@ fn cache_compact_drops_a_deleted_file_and_keeps_the_rest() {
             .unwrap(),
     );
     assert_eq!(v["frontend"]["sources"], 1);
-    // Compaction is a front-end garbage collection. A result is a claim about a
-    // hash, and deleting a file does not make that claim false.
+    // Compaction is a front-end garbage collection.
     assert!(v["entries"].as_u64().unwrap() >= 2);
 
     let text = stdout_of(&ply(dir.path()).arg("test").output().unwrap());
@@ -1516,9 +1486,8 @@ fn cache_inspect_reports_a_test_and_whether_it_is_proven() {
     assert_eq!(v["matches"][0]["interface"]["nondet"], false);
 }
 
-/// The whole point of telling the user: a front-end cache this build cannot read
-/// costs a recompile and *no* test re-runs, and only saying the first half reads
-/// as though the results went too.
+/// The whole point of telling the user: a front-end cache this build cannot read costs a recompile
+/// and *no* test re-runs, and only saying the first half reads as though the results went too.
 #[test]
 fn an_unreadable_front_end_cache_says_the_results_survived_it() {
     let dir = project(GREEN);
@@ -1545,9 +1514,8 @@ fn an_unreadable_front_end_cache_says_the_results_survived_it() {
     );
 }
 
-/// The migration proper: a project whose cache directory still holds the JSON
-/// front-end cache and none of the binary one. There is no reader for it, so the
-/// run must say what it cost, and say that the results survived.
+/// The migration proper: a project whose cache directory still holds the JSON front-end cache and
+/// none of the binary one.
 #[test]
 fn a_leftover_json_front_end_cache_is_explained_and_then_removed() {
     let dir = project(GREEN);
@@ -1645,10 +1613,9 @@ fn test_json_carries_schema_version_four_and_a_ranked_suspect_object() {
     assert!(f["causal_slice"].is_null());
 }
 
-/// A first-ever red test and a regression are different situations, and this is
-/// where the difference shows: a regression leads with a name, a test that has
-/// never passed leads with why there is no name to lead with. Neither leads with
-/// an apology, and neither may silently print nothing.
+/// A first-ever red test and a regression are different situations, and this is where the
+/// difference shows: a regression leads with a name, a test that has never passed leads with why
+/// there is no name to lead with.
 #[test]
 fn a_test_that_has_never_passed_says_why_it_has_no_culprit() {
     let dir = project(RED);
@@ -1686,8 +1653,8 @@ fn bisect_never_reports_not_requested_and_is_still_one_json_object() {
     assert_eq!(v["failures"][0]["culprit"]["search"]["evaluated"], 0);
 }
 
-/// Two runs over one failure must produce the same bytes, or an agent cannot
-/// diff today's artifact against yesterday's.
+/// Two runs over one failure must produce the same bytes, or an agent cannot diff today's artifact
+/// against yesterday's.
 #[test]
 fn two_runs_over_one_failure_emit_the_same_artifact() {
     let dir = project(RED);
@@ -1750,8 +1717,8 @@ fn check_explain_names_the_reason_a_file_was_parsed() {
     );
 }
 
-/// `--no-incremental` has to be observable, or nobody can use it to decide
-/// whether a wrong answer came from the cache.
+/// `--no-incremental` has to be observable, or nobody can use it to decide whether a wrong answer
+/// came from the cache.
 #[test]
 fn no_incremental_parses_everything_and_leaves_the_cache_alone() {
     let dir = project("fn f() -> Int = 1\n");
@@ -1800,8 +1767,8 @@ fn test_no_incremental_still_selects_the_same_tests() {
     );
 }
 
-/// A warm run has to be observably cheaper, not just observably skipping, so
-/// the phase breakdown is part of the reported interface.
+/// A warm run has to be observably cheaper, not just observably skipping, so the phase breakdown is
+/// part of the reported interface.
 #[test]
 fn the_front_end_reports_where_its_time_went() {
     let dir = project("fn f() -> Int = 1\ntest \"f is one\" { assert_eq(f(), 1) }\n");
@@ -1852,13 +1819,7 @@ fn the_front_end_reports_where_its_time_went() {
     );
 }
 
-/// A selected test needs a body, so its module and everything it imports have
-/// to be parsed. Every *other* module must stay skipped.
-///
-/// Without this the front-end cache buys nothing where it matters most: one
-/// edited definition is the normal case, and reparsing the whole project the
-/// moment one test is selected is exactly the from-scratch run the cache exists
-/// to avoid.
+/// A selected test needs a body, so its module and everything it imports have to be parsed.
 #[test]
 fn one_selected_test_reparses_its_module_and_not_the_project() {
     let dir = tempfile::tempdir().unwrap();
@@ -1932,14 +1893,6 @@ fn presented(a: Int, b: Int, c: Int) -> Int = balance(a, b, c) * normal_sign(a)
 test \"balance never goes negative\" { assert_eq(presented(1, 2, 3), 6) }
 ";
 
-/// Claim 15 through the product. With more than one independent candidate change
-/// nothing but *running* a mixture can say which one broke the test, so before
-/// the hybrid engine existed this failure carried `not_attempted` / `no_hybrids`,
-/// an empty `definitions`, and a `suspects[0]` that was not the culprit.
-///
-/// The edit to `balance` is a reassociation and preserves every value; the edit
-/// to `normal_sign` is the regression. The true minimal culprit set is
-/// `{m.normal_sign}`.
 #[test]
 fn two_candidate_edits_are_narrowed_to_the_culprit_by_running_the_mixture() {
     let dir = project(LEDGER);
@@ -1982,17 +1935,12 @@ fn two_candidate_edits_are_narrowed_to_the_culprit_by_running_the_mixture() {
     assert_eq!(failure["suspects"][1]["culprit"], false);
 }
 
-/// The same narrowing, in a project where the incremental front end skips a
-/// file. `ply-test` is handed only the re-parsed modules, so the fresh body set
-/// covers a prefix of the program's tests while the published test list covers
-/// all of them; looking the failing test's body up by position instead of by
-/// hash silently disabled every hybrid and the failure fell back to
-/// `not_attempted` / `no_hybrids`.
+/// The same narrowing, in a project where the incremental front end skips a file.
 #[test]
 fn a_skipped_file_does_not_cost_the_failure_its_culprit() {
     let dir = project(LEDGER);
-    // Sorts before `m.ply`, so its tests take the indices the fresh body set
-    // would otherwise line `m`'s up against.
+    // Sorts before `m.ply`, so its tests take the indices the fresh body set would otherwise line
+    // `m`'s up against.
     std::fs::write(
         dir.path().join("a.ply"),
         "pub fn untouched(x: Int) -> Int = x\n\
@@ -2025,8 +1973,7 @@ fn a_skipped_file_does_not_cost_the_failure_its_culprit() {
     assert!(culprit["search"]["evaluated"].as_u64().unwrap() > 0);
 }
 
-/// `--bisect never` must still cost nothing, now that there is an engine it
-/// could have driven.
+/// `--bisect never` must still cost nothing, now that there is an engine it could have driven.
 #[test]
 fn bisect_never_runs_no_mixture_even_when_one_could_be_built() {
     let dir = project(LEDGER);
@@ -2052,10 +1999,7 @@ fn bisect_never_runs_no_mixture_even_when_one_could_be_built() {
     assert_eq!(culprit["search"]["evaluated"], 0);
 }
 
-/// Bisection proves things about *mixtures*, never about the program the user
-/// wrote. If it recorded a definition as seen, the next run over the same red
-/// code would report an empty suspect set and the failure would lose its
-/// attribution entirely.
+/// Bisection proves things about *mixtures*, never about the program the user wrote.
 #[test]
 fn a_bisected_failure_leaves_the_next_runs_suspects_unchanged() {
     let dir = project(LEDGER);
@@ -2097,10 +2041,8 @@ fn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }
 test \"parity\" { assert(even(4)) }
 ";
 
-/// Members of one strongly connected component share a component hash and one
-/// stored body, so no hybrid can flip one without the other. The honest report
-/// is a single fused group that says why — not two groups the search would read
-/// as independently necessary.
+/// Members of one strongly connected component share a component hash and one stored body, so no
+/// hybrid can flip one without the other.
 #[test]
 fn a_recursive_pair_is_reported_as_one_fused_group_that_says_why() {
     let dir = project(PARITY);
@@ -2129,9 +2071,7 @@ fn a_recursive_pair_is_reported_as_one_fused_group_that_says_why() {
 
 // --- engines ----------------------------------------------------------------
 
-/// A clause that binds a continuation. `--engine machine` runs it; ADR 0005 §3.2
-/// pins both halves of the answer, the value and the cell the two resumptions
-/// left behind.
+/// A clause that binds a continuation.
 const MULTI_SHOT: &str = "\
 effect amb {
   read flip[coin]() -> Bool
@@ -2153,11 +2093,6 @@ test \"both branches\" {
 }
 ";
 
-/// The milestone's headline capability and the project's headline capability
-/// have to hold at once. A multi-shot program is machine-only, and only the
-/// authoritative engine may write a cached `Pass` — so while the default was
-/// the tree-walker, every program with a `resume` clause needed `--engine
-/// machine`, which implies `--no-cache`, and could never be cached at all.
 #[test]
 fn a_multi_shot_program_runs_and_caches_with_no_flags_at_all() {
     let dir = project(MULTI_SHOT);
@@ -2189,9 +2124,7 @@ fn the_machine_runs_a_clause_that_binds_a_continuation() {
     assert!(stdout_of(&out).contains("1 passed"), "{}", stdout_of(&out));
 }
 
-/// ADR 0005 §6: under `both` a machine-only test runs once, on the machine. A
-/// refusal compared against an answer would fail every run over a corpus that
-/// contains one — which is every corpus the flag exists to audit.
+/// ADR 0005 §6: under `both` a machine-only test runs once, on the machine.
 #[test]
 fn engine_both_does_not_call_a_refusal_a_divergence() {
     let dir = project(MULTI_SHOT);
@@ -2203,13 +2136,8 @@ fn engine_both_does_not_call_a_refusal_a_divergence() {
     assert!(!stdout_of(&out).contains("E0503"), "{}", stdout_of(&out));
 }
 
-/// …and says so, rather than letting a green run under two engines be read as
-/// two engines having agreed about it.
-///
-/// This is ADR 0017 §6's reporting rule applied to the oracle instead of to the
-/// schedule: the tests `--engine both` cannot audit are exactly the ones that
-/// bind a continuation, which is the construct a memory-model change moves, so a
-/// count that silently includes them over-claims in the one place it matters.
+/// …and says so, rather than letting a green run under two engines be read as two engines having
+/// agreed about it.
 #[test]
 fn engine_both_reports_the_tests_it_could_not_audit() {
     let dir = project(MULTI_SHOT);
@@ -2232,8 +2160,8 @@ fn engine_both_reports_the_tests_it_could_not_audit() {
     assert!(text.contains("ran on one engine only"), "{text}");
 }
 
-/// A test both engines ran is counted as audited, or the count would be a
-/// constant rather than a coverage.
+/// A test both engines ran is counted as audited, or the count would be a constant rather than a
+/// coverage.
 #[test]
 fn engine_both_counts_a_test_two_engines_ran() {
     let dir = project("test \"plain\" { assert_eq(1 + 1, 2) }\n");
@@ -2248,8 +2176,7 @@ fn engine_both_counts_a_test_two_engines_ran() {
     assert_eq!(v["results"][0]["audited"], true, "{v}");
 }
 
-/// A run with one engine reports no coverage at all. Zero would be a claim that
-/// an oracle ran and covered nothing, which is a different and false statement.
+/// A run with one engine reports no coverage at all.
 #[test]
 fn a_single_engine_run_reports_no_audit_coverage() {
     let dir = project(MULTI_SHOT);
@@ -2288,13 +2215,7 @@ fn the_tree_walker_refuses_it_and_names_the_engine_that_runs_it() {
     assert!(text.contains("--engine machine"), "{text}");
 }
 
-/// The refusal is derived from the AST, and gate 1 skips a file whose bytes did
-/// not change. A `ply check` that answered differently on the second run over
-/// untouched source would be the worst kind of cache defect: invisible.
-///
-/// Only the tree-walker refuses, so only it is asked twice. The default engine
-/// runs a multi-shot program, which is the milestone's headline capability and
-/// is asserted here rather than assumed.
+/// The refusal is derived from the AST, and gate 1 skips a file whose bytes did not change.
 #[test]
 fn check_refuses_the_same_program_cold_and_warm() {
     let dir = project(MULTI_SHOT);
@@ -2324,8 +2245,8 @@ fn check_refuses_the_same_program_cold_and_warm() {
     assert_eq!(default.status.code(), Some(0), "{}", stdout_of(&default));
 }
 
-/// The pre-filter that decides which skipped files to re-parse keys on the text
-/// `resume`, so a project without one must not start parsing everything again.
+/// The pre-filter that decides which skipped files to re-parse keys on the text `resume`, so a
+/// project without one must not start parsing everything again.
 #[test]
 fn a_project_with_no_general_clause_still_skips_every_unchanged_file() {
     let dir = project(GREEN);
@@ -2338,9 +2259,8 @@ fn a_project_with_no_general_clause_still_skips_every_unchanged_file() {
     assert!(text.contains("skipped   m.ply"), "{text}");
 }
 
-/// One unreadable file is found by more than one read — a lazy consult and a
-/// flush that re-reads to merge — and each reports it. The reader is told once,
-/// and human output and `--json` have to agree on that.
+/// One unreadable file is found by more than one read — a lazy consult and a flush that re-reads to
+/// merge — and each reports it.
 #[test]
 fn an_unreadable_cache_file_is_reported_once_not_once_per_read() {
     let dir = project(GREEN);
@@ -2423,8 +2343,8 @@ fn a_seed_that_is_not_a_seed_is_refused_before_anything_runs() {
     }
 }
 
-/// A flag that cannot mean anything is refused rather than ignored: silently
-/// dropped, it reads as a search that was widened and was not.
+/// A flag that cannot mean anything is refused rather than ignored: silently dropped, it reads as a
+/// search that was widened and was not.
 #[test]
 fn a_flag_with_nothing_to_mean_is_refused() {
     let dir = project(GREEN);
@@ -2451,9 +2371,7 @@ fn a_flag_with_nothing_to_mean_is_refused() {
     assert!(stderr.contains("--sim-budget"), "{stderr}");
 }
 
-/// Every field of the plan is in a seeded test's cache key, so changing one has
-/// to be visible. Nothing in this corpus simulates, so the *selection* is
-/// unaffected — which is the other half of the claim.
+/// Every field of the plan is in a seeded test's cache key, so changing one has to be visible.
 #[test]
 fn widening_the_search_does_not_disturb_a_corpus_that_never_simulates() {
     let dir = project(GREEN);
@@ -2471,8 +2389,7 @@ fn widening_the_search_does_not_disturb_a_corpus_that_never_simulates() {
     assert_eq!(v["simulation"]["interleavings"], 0);
 }
 
-/// `ply run` chooses which interleaving rather than how many: exploration is a
-/// test-time activity.
+/// `ply run` chooses which interleaving rather than how many: exploration is a test-time activity.
 #[test]
 fn run_accepts_a_seed_and_takes_only_that_interleaving() {
     let dir = project(GREEN);

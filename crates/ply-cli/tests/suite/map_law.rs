@@ -1,9 +1,4 @@
 //! A law quantified over a `Map`, through the real binary.
-//!
-//! Leaving a new primitive ungeneratable would regress M8's guarantee on contact
-//! with it — the law would report `E0418` and the coverage line would count a
-//! definition as unclaimed for a reason nobody could act on. This is the same
-//! argument, and the same required test, that `Bytes` got in W1.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -42,8 +37,7 @@ law \"inserting a key you already have does not grow the map\"
   }
 ";
 
-/// Required test: a `forall (m: Map<String, Int>)` law is discharged rather than
-/// `E0418`.
+/// Required test: a `forall (m: Map<String, Int>)` law is discharged rather than `E0418`.
 #[test]
 fn a_law_over_a_map_is_discharged() {
     let dir = project(HOLDS);
@@ -53,23 +47,22 @@ fn a_law_over_a_map_is_discharged() {
     let obligations = v["obligations"].as_array().unwrap();
     assert_eq!(obligations.len(), 2, "{v}");
     for o in obligations {
-        // A tier at all is the claim: a binder the generator refuses reports a
-        // gap and no tier, which is what `E0418` looks like from out here.
+        // A tier at all is the claim: a binder the generator refuses reports a gap and no tier,
+        // which is what `E0418` looks like from out here.
         assert!(
             o["tier"].is_string(),
             "a map law must earn a tier rather than a gap: {o}"
         );
         assert!(o["gap"].is_null(), "{o}");
     }
-    // The unguarded one is sampled over the whole domain, so it earns the
-    // stronger of the two labels a map can reach.
+    // The unguarded one is sampled over the whole domain, so it earns the stronger of the two
+    // labels a map can reach.
     assert_eq!(obligations[0]["tier"], "property", "{v}");
 }
 
-/// The other half: a false law over a map is refuted, and the counterexample
-/// shrinks toward `map_new()` — entries come out before values do, so the
-/// witness is the smallest map that still breaks it rather than whatever the
-/// generator happened to draw.
+/// The other half: a false law over a map is refuted, and the counterexample shrinks toward
+/// `map_new()` — entries come out before values do, so the witness is the smallest map that still
+/// breaks it rather than whatever the generator happened to draw.
 #[test]
 fn a_refuted_map_law_shrinks_toward_the_empty_map() {
     let dir = project(
@@ -82,9 +75,8 @@ fn a_refuted_map_law_shrinks_toward_the_empty_map() {
     assert_eq!(o["outcome"], "refuted", "{o}");
     let binding = &o["counterexample"]["bindings"][0];
     assert_eq!(binding["name"], "m", "{o}");
-    // One entry, and the smallest key and value the generators reach: any larger
-    // witness means the shrinker stopped early or never entered the map. The
-    // draw it started from is reported beside it, and is bigger.
+    // One entry, and the smallest key and value the generators reach: any larger witness means the
+    // shrinker stopped early or never entered the map.
     assert_eq!(binding["value"], "{\"\": 0}", "{o}");
     assert_ne!(
         o["counterexample"]["original"][0]["value"], binding["value"],

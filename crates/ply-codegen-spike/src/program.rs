@@ -1,6 +1,6 @@
-//! The program the spike compiles out of: the shipped standard library, loaded
-//! the way `ply` loads it, so the function under measurement is the one a
-//! request actually runs rather than a copy written for a benchmark.
+//! The program the spike compiles out of: the shipped standard library, loaded the way `ply` loads
+//! it, so the function under measurement is the one a request actually runs rather than a copy
+//! written for a benchmark.
 
 use anyhow::{Result, anyhow};
 use ply_core::CheckOutput;
@@ -49,13 +49,7 @@ impl Loaded {
         })
     }
 
-    /// The shipped standard library plus every `.ply` file in `dir`, loaded as
-    /// one program.
-    ///
-    /// `ply` derives a module name from a file's path relative to the project
-    /// root, so a project of one directory names its modules by file stem; this
-    /// does the same, and takes the files in sorted order so that two runs on
-    /// one directory produce one program.
+    /// The shipped standard library plus every `.ply` file in `dir`, loaded as one program.
     pub fn project(dir: &Path) -> Result<Loaded> {
         let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
             .map_err(|e| anyhow!("{}: {e}", dir.display()))?
@@ -133,8 +127,8 @@ impl Loaded {
         out
     }
 
-    /// The definition a program-wide name denotes, and the index of the module
-    /// its bare names resolve in — the pair the machine keys everything on.
+    /// The definition a program-wide name denotes, and the index of the module its bare names
+    /// resolve in — the pair the machine keys everything on.
     pub fn definition(&self, name: &str) -> Option<(&FnDef, usize)> {
         for (index, module) in self.ast.modules.iter().enumerate() {
             for item in &module.items {
@@ -148,8 +142,8 @@ impl Loaded {
         None
     }
 
-    /// Every sum-type constructor in the program, by program-wide name, with its
-    /// arity — the table `Machine::build` assembles and `lookup` reads.
+    /// Every sum-type constructor in the program, by program-wide name, with its arity — the table
+    /// `Machine::build` assembles and `lookup` reads.
     pub fn ctors(&self) -> Vec<(Symbol, usize)> {
         let mut out: Vec<(Symbol, usize)> = ply_core::prelude::ctor_arities();
         for module in &self.ast.modules {

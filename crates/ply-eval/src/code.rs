@@ -1,23 +1,4 @@
-//! The AST, lowered so that a subexpression can be held by a continuation
-//! frame.
-//!
-//! A frame has to name the expression it will evaluate next, and a closure has
-//! to name its body. Neither can be `&Expr` without a lifetime on [`Value`],
-//! which would spread through `Env` and every crate that holds an
-//! evaluated value; and neither can be an owned `Expr`, because a frame is
-//! pushed per node and cloning a subtree per push is quadratic. `Rc` on every
-//! node is the representation that is cheap in both directions: [`Lowering`]
-//! runs `lower` once per body per *program*, and after it every handle to a
-//! subexpression is one pointer.
-//!
-//! The shape mirrors `ply_syntax::ast::ExprKind` one to one. Anything the
-//! machine never has to suspend inside — patterns, names, literals, operators —
-//! is reused from the AST rather than mirrored.
-//!
-//! Lowering also **is** the reference-counting pass ([`crate::rc`]): it visits
-//! children in reverse evaluation order, so at every occurrence it already knows
-//! what the rest of the activation still reads. One traversal does both jobs
-//! rather than a second traversal of every definition body.
+//! The AST, lowered so that a subexpression can be held by a continuation frame.
 
 use crate::rc::{Dead, Live, Own};
 use crate::value::Value;
@@ -37,25 +18,12 @@ pub type Code = Rc<Node>;
 pub struct Node {
     pub kind: NodeKind,
     pub span: Span,
-    /// How a `Var` takes its value. [`Own::Borrowed`] on every other node.
+    /// How a `Var` takes its value.
     pub own: Own,
 }
 
 pub enum NodeKind {
-    /// The literal, and the [`Value`] it denotes, built once here rather than
-    /// per evaluation.
-    ///
-    /// A literal is a compile-time constant, so `Str` and `Bytes` were the only
-    /// two that ever reached the allocator and they reached it on every
-    /// evaluation; cloning the value instead is a refcount bump. Sharing is
-    /// unobservable for the same reason [`Value::builtin`] is: no Ply
-    /// expression reads an address, and nothing mutates a `Str` or a `Bytes` in
-    /// place — the one in-place path, `builtins::push`, is `List`-only and no
-    /// literal builds a `List`.
-    ///
-    /// The `Lit` stays because `crates/ply-codegen-spike` dispatches on it to
-    /// choose a Cranelift type; it is outside the workspace, so nothing in
-    /// `cargo test --workspace` would catch its loss.
+    /// The literal, and the [`Value`] it denotes, built once here rather than per evaluation.
     Lit(Lit, Value),
     Var(QName),
     Unary {
@@ -152,13 +120,6 @@ impl Stmt {
     }
 
     /// The bindings this statement's end kills.
-    ///
-    /// The machine drops them out of the scope it hands its *continuation*,
-    /// while the statement itself still evaluates under the full scope. That
-    /// ordering is the whole of what makes a uniquely-owned value reachable: at
-    /// `let ys = push(xs, 1)` the frame waiting for `ys` no longer holds `xs`,
-    /// so once the argument evaluation's scope goes the list in hand is the only
-    /// one left and `push` rewrites it rather than copying it.
     pub fn dead(&self) -> &Dead {
         match self {
             Stmt::Let { dead, .. } | Stmt::Expr { dead, .. } => dead,
@@ -171,9 +132,7 @@ pub struct Clause {
     pub op: Symbol,
     pub resource: Option<Symbol>,
     pub params: Rc<Vec<Symbol>>,
-    /// The continuation binder of a general clause. `None` is the
-    /// tail-resumptive form, whose body's value goes straight back to the
-    /// perform site and which therefore needs no capture at all.
+    /// The continuation binder of a general clause.
     pub resume: Option<Symbol>,
     pub body: Code,
     pub span: Span,
@@ -185,17 +144,15 @@ pub struct ReturnArm {
     pub span: Span,
 }
 
-/// Grows the host stack rather than bounding the nesting: the parser, inference
-/// and normalization all accept an expression of any depth by growing, and a
-/// bound here would refuse — on the machine only — a program `ply check` and
-/// `ply run` accept. That is an `E0503` divergence on every corpus with a long
-/// operator chain in it.
+/// Grows the host stack rather than bounding the nesting: the parser, inference and normalization
+/// all accept an expression of any depth by growing, and a bound here would refuse — on the machine
+/// only — a program `ply check` and `ply run` accept.
 pub fn lower(e: &Expr) -> Code {
     lower_fn(&[], e)
 }
 
-/// A function body, whose parameters are bindings of its own scope and are
-/// therefore ownable inside it.
+/// A function body, whose parameters are bindings of its own scope and are therefore ownable inside
+/// it.
 pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(e, &mut ownable);
@@ -204,67 +161,45 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
     lower_in(e, &mut live)
 }
 
-/// A body's parameters, shared with the closure the machine builds from it
-/// rather than copied into the cache — the cache's own storage is a cost on a
-/// request path that lowers nothing, so it is kept to the map's slots.
+/// A body's parameters, shared with the closure the machine builds from it rather than copied into
+/// the cache — the cache's own storage is a cost on a request path that lowers nothing, so it is
+/// kept to the map's slots.
 pub type Params = Rc<Vec<Symbol>>;
 
 /// Lowered bodies, shared by every machine built from one program.
 ///
-/// A body is lowered once per *machine* without this, and a machine is built
-/// per pool thread per concurrency group, per interleaving of a search, and per
-/// sampled case of a spec — so the same traversal runs hundreds of times over
-/// one program. Lowering depends on the syntax and on nothing else a machine
-/// holds, so one result serves all of them.
+/// A machine is built per pool thread per concurrency group, per interleaving of
+/// a search and per sampled case of a spec, so the same traversal would other-
+/// wise run hundreds of times over one program.
 ///
 /// The key is the body's address, and what makes an address an identity is the
 /// lifetime rather than the map: everything keyed here is borrowed for `'a` and
 /// this cache cannot outlive `'a`, so nothing it has keyed can be freed and
-/// something else allocated in its place while it is still readable. That is
-/// the reuse a bare pointer key would otherwise admit.
+/// something else allocated in its place while it is still readable.
 ///
-/// **That argument holds only because `invariant` below makes `Lowering<'a>`
-/// invariant in `'a`, and it is false without it.** With the type covariant —
-/// which it was until a regression audit, its only `'a`-carrying field being
-/// `&'a Program` — `&Lowering<'long>` coerces to `&Lowering<'short>`, and
-/// [`Lowering::of`] takes `&self`, so a shared reference to a long-lived cache
-/// accepts a body borrowed for any shorter lifetime at all. Keying a `Box<Expr>`
+/// **That holds only because `invariant` below makes `Lowering<'a>` invariant in
+/// `'a`, and it is false without it.** Covariant, `&Lowering<'long>` coerces to
+/// `&Lowering<'short>` and [`Lowering::of`] takes `&self`, so a long-lived cache
+/// accepts a body borrowed for any shorter lifetime; keying a `Box<Expr>`
 /// through that coercion and dropping it leaves an entry under a dangling
-/// address, and the next allocation to land there is answered with the freed
-/// expression's code. Reproduced on the first attempt of a thousand before the
-/// field was added. The refusal is machine-checked by the `compile_fail` example
-/// below, which runs under `cargo test --workspace` as a doc-test — a variance
-/// property is a compile-time property and a `#[test]` cannot observe it.
+/// address. A variance property is a compile-time property and a `#[test]`
+/// cannot observe it, so the guard is this doc-test:
 ///
 /// ```compile_fail
 /// use ply_eval::Lowering;
-/// // Covariance in `'a` is what would let a body outlived by the cache be keyed
-/// // in it, so this coercion must not compile.
 /// fn shrink<'long: 'short, 'short>(c: &'short Lowering<'long>) -> &'short Lowering<'short> {
 ///     c
 /// }
 /// ```
-///
-/// [`Lowering::describes`] is the second guard and it is about intent rather
-/// than safety: a cache filled from one program tells a machine over another
-/// nothing — two live programs have distinct addresses, so every lookup would
-/// miss — and refusing it at the point it is handed over says so once instead of
-/// leaving a reader to re-derive it. `params` is stored and compared on a hit
-/// rather than assumed, so a caller that lowers one body under two parameter
-/// lists gets two answers instead of the first one twice.
 pub struct Lowering<'a> {
     program: &'a Program,
     bodies: RefCell<FxHashMap<usize, (Params, Code)>>,
-    /// The parameter list of a test body and of a spec clause, so that the
-    /// overwhelmingly common empty one is one allocation for the cache rather
-    /// than one per entry.
+    /// The parameter list of a test body and of a spec clause, so that the overwhelmingly common
+    /// empty one is one allocation for the cache rather than one per entry.
     nullary: Params,
-    /// Load-bearing, not decoration: a function pointer is contravariant in its
-    /// argument and covariant in its result, so `'a` occurring in both makes
-    /// this field — and therefore the whole type — invariant in `'a`. See the
-    /// type's own note for what that buys. `PhantomData<&'a mut Program>` does
-    /// **not** work here and was the first attempt: `&'a mut T` is invariant in
-    /// `T` but still covariant in `'a`.
+    /// Load-bearing, not decoration: a function pointer is contravariant in its argument and
+    /// covariant in its result, so `'a` occurring in both makes this field — and therefore the
+    /// whole type — invariant in `'a`.
     invariant: PhantomData<fn(&'a Program) -> &'a Program>,
 }
 
@@ -278,14 +213,12 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Whether this cache was taken over `program`. See the type's own note for
-    /// why this is intent rather than safety.
+    /// Whether this cache was taken over `program`.
     pub fn describes(&self, program: &Program) -> bool {
         std::ptr::eq(self.program, program)
     }
 
-    /// [`lower_fn`] over a body that takes no parameters: a test, a law, a spec
-    /// clause.
+    /// [`lower_fn`] over a body that takes no parameters: a test, a law, a spec clause.
     pub fn body(&self, body: &'a Expr) -> Code {
         self.of(&self.nullary, body)
     }
@@ -319,22 +252,15 @@ impl<'a> Lowering<'a> {
     }
 }
 
-/// The lowered body of the last closure the tree-walker made that the machine
-/// applied.
-///
-/// Such a body is a deep clone rather than a node of the program, so [`Lowering`]
-/// cannot hold it: its address is an identity only for as long as something owns
-/// it, which is why the `Arc` is kept beside the code. One slot rather than a
-/// map, because the shape this exists for is a closure applied in a loop and a
-/// map keyed on a value the program can mint would grow without a bound.
+/// The lowered body of the last closure the tree-walker made that the machine applied.
 #[derive(Default)]
 pub struct ClosureCode {
     last: Option<(Arc<Expr>, Vec<Symbol>, Code)>,
 }
 
 impl ClosureCode {
-    /// [`lower_fn`], skipped when this is the same body and the same parameters
-    /// as the previous call.
+    /// [`lower_fn`], skipped when this is the same body and the same parameters as the previous
+    /// call.
     pub fn of(&mut self, params: &[Symbol], body: &Arc<Expr>) -> Code {
         if let Some((held, cached, code)) = &self.last
             && Arc::ptr_eq(held, body)
@@ -360,9 +286,8 @@ fn node(kind: NodeKind, span: Span) -> Code {
     })
 }
 
-/// Children are visited in **reverse** evaluation order throughout, so that
-/// `live` holds what the rest of the activation still reads by the time an
-/// occurrence is reached. Construction order is irrelevant; this order is not.
+/// Children are visited in **reverse** evaluation order throughout, so that `live` holds what the
+/// rest of the activation still reads by the time an occurrence is reached.
 fn lower_node(e: &Expr, live: &mut Live) -> Code {
     let kind = match &e.kind {
         ExprKind::Lit(lit) => NodeKind::Lit(lit.clone(), crate::interp::literal(lit)),
@@ -428,9 +353,9 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
                 merged.extend(live.snapshot());
             }
             lowered.reverse();
-            // A `match` with no arms reads nothing and answers nothing, so the
-            // union over its arms is empty and restoring it would forget every
-            // binding the enclosing activation still reads.
+            // A `match` with no arms reads nothing and answers nothing, so the union over its arms
+            // is empty and restoring it would forget every binding the enclosing activation still
+            // reads.
             live.restore(if lowered.is_empty() {
                 after
             } else {
@@ -460,16 +385,16 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
                 fields: Rc::new(lowered),
             }
         }
-        // Unreachable: the sugar is gone before any module reaches this crate,
-        // and lowering it as if it were a plain record would drop the base's
-        // untouched fields — a wrong value, silently.
+        // Unreachable: the sugar is gone before any module reaches this crate, and lowering it as
+        // if it were a plain record would drop the base's untouched fields — a wrong value,
+        // silently.
         ExprKind::RecordUpdate { .. } => unreachable!(
             "`{{..b, f: e}}` is expanded away by `ply_syntax::parse_module`; the guard is \
              `no_record_update_survives_parse_module_anywhere_in_the_tree`"
         ),
-        // Unreachable for the same reason and with the same guard: `?` is a
-        // `match` before it leaves the parser, so the machine has no early-exit
-        // node to get wrong at a `handle` boundary.
+        // Unreachable for the same reason and with the same guard: `?` is a `match` before it
+        // leaves the parser, so the machine has no early-exit node to get wrong at a `handle`
+        // boundary.
         ExprKind::Try { .. } => unreachable!(
             "`e?` is expanded away by `ply_syntax::parse_module`; the guard is \
              `no_try_survives_parse_module_anywhere_in_the_tree`"
@@ -530,15 +455,13 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
                 body,
             }
         }
-        // A barrier: a region's tasks interleave, so a binding in scope may be
-        // read by any of them at any point and no occurrence inside is the last
-        // use of anything outside.
+        // A barrier: a region's tasks interleave, so a binding in scope may be read by any of them
+        // at any point and no occurrence inside is the last use of anything outside.
         ExprKind::Simulate { body } => NodeKind::Simulate {
             body: lower_barrier(&[], body, live),
         },
-        // Kept as a node rather than lowered away: the machine opens an arena
-        // scope here and closes it at the body's end, and the span is the key
-        // `region_kind` filed its decision under.
+        // Kept as a node rather than lowered away: the machine opens an arena scope here and closes
+        // it at the body's end, and the span is the key `region_kind` filed its decision under.
         ExprKind::WithRegion { body, .. } => NodeKind::WithRegion {
             body: lower_in(body, live),
         },
@@ -546,12 +469,8 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
     node(kind, e.span)
 }
 
-/// A construct whose body may run more than once, or later, or beside another
-/// task: a lambda, a handler clause, a `return` clause, a `simulate` region.
-///
-/// Its free variables become reads *at* the construct, and never last ones: what
-/// captured the body holds them for as long as it lives, which is not something
-/// an analysis of this body can bound.
+/// A construct whose body may run more than once, or later, or beside another task: a lambda, a
+/// handler clause, a `return` clause, a `simulate` region.
 fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(body, &mut ownable);
@@ -593,8 +512,7 @@ fn lower_arm(arm: &MatchArm, live: &mut Live) -> Arm {
     }
 }
 
-/// The statements and tail of a block, with the bindings each statement's end
-/// kills.
+/// The statements and tail of a block, with the bindings each statement's end kills.
 fn lower_block(
     stmts: &[AstStmt],
     tail: Option<&Expr>,
@@ -620,9 +538,8 @@ fn lower_block(
                 for name in &bound[i] {
                     live.kill(name);
                 }
-                // Left of this binder the name is the outer binding's again, and
-                // it is live exactly when the enclosing activation still reads
-                // it.
+                // Left of this binder the name is the outer binding's again, and it is live exactly
+                // when the enclosing activation still reads it.
                 live.union(
                     shadowed
                         .iter()
@@ -654,9 +571,9 @@ fn lower_block(
             }
         }
         let before = if i == 0 { &entry } else { &after[i - 1] };
-        // Bound at or before this statement, not read after it, and either
-        // introduced by it or still read up to it — so a binding is named by
-        // exactly the statement that kills it and by no other.
+        // Bound at or before this statement, not read after it, and either introduced by it or
+        // still read up to it — so a binding is named by exactly the statement that kills it and by
+        // no other.
         let dead = live.released(
             cumulative
                 .iter()
@@ -679,9 +596,9 @@ fn lower_block(
             },
         );
     }
-    // Every name here was handed back at the binder that shadowed it; saying so
-    // unconditionally is what makes the invariant hold for a binder the walk
-    // never crossed rather than only for the ones it did.
+    // Every name here was handed back at the binder that shadowed it; saying so unconditionally is
+    // what makes the invariant hold for a binder the walk never crossed rather than only for the
+    // ones it did.
     live.union(shadowed);
     (out, tail)
 }
@@ -722,12 +639,6 @@ fn stmt_binders(stmt: &AstStmt) -> Vec<Symbol> {
 }
 
 /// Every name a pattern can bind.
-///
-/// A bare `Var` pattern naming a nullary constructor is a constructor pattern
-/// and binds nothing, and this cannot tell the two apart — resolution needs the
-/// module, which lowering does not have. Over-approximating is safe in both
-/// directions that matter: releasing a name no scope holds does nothing, and
-/// ownership is a hint the machine re-checks against the scope itself.
 fn pattern_binders(p: &Pattern, out: &mut Vec<Symbol>) {
     crate::limit::grow(|| match &p.kind {
         PatternKind::Wildcard | PatternKind::Lit(_) => {}
@@ -907,9 +818,8 @@ mod tests {
         assert_eq!(lowering.len(), 1, "one body, {} entries", lowering.len());
     }
 
-    /// The parameter list is what makes a name ownable inside the body, so a
-    /// cache that answered for one from the other would hand out a liveness
-    /// analysis of a different function.
+    /// The parameter list is what makes a name ownable inside the body, so a cache that answered
+    /// for one from the other would hand out a liveness analysis of a different function.
     #[test]
     fn one_body_under_two_parameter_lists_is_lowered_twice() {
         let (program, _) = standalone(vec![fn_def("f", &["x"], var("x"))]);

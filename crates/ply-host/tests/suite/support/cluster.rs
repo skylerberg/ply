@@ -1,23 +1,10 @@
 //! A postgres cluster this test binary owns, start to finish.
-//!
-//! It is its own `initdb` in its own temporary directory on its own port. No
-//! test here assumes a running server and none touches an existing cluster: a
-//! suite that connected to whatever was on 5432 would pass or fail on what the
-//! machine happened to be running, which is the opposite of what this project
-//! is for.
-//!
-//! `LC_COLLATE=C LC_CTYPE=C ENCODING=UTF8`, because the in-memory engine orders
-//! `String` by byte order and any other collation makes `ORDER BY` on text
-//! disagree. Stated here rather than discovered by a flaky law.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 /// Where the postgres binaries are, if this machine has them.
-///
-/// `PATH` first, then homebrew's prefix, because a developer with postgres
-/// installed and not on `PATH` is the ordinary case on macOS.
 fn binary(name: &str) -> Option<PathBuf> {
     if let Ok(path) = std::env::var("PATH") {
         for dir in std::env::split_paths(&path) {
@@ -40,9 +27,8 @@ pub fn available() -> bool {
     binary("initdb").is_some() && binary("postgres").is_some()
 }
 
-/// A running server, stopped when this is dropped — including while a panic
-/// unwinds, which is the case that would otherwise leak a postgres process per
-/// failing test.
+/// A running server, stopped when this is dropped — including while a panic unwinds, which is the
+/// case that would otherwise leak a postgres process per failing test.
 pub struct Cluster {
     directory: tempfile::TempDir,
     server: Child,
@@ -51,9 +37,7 @@ pub struct Cluster {
 }
 
 impl Cluster {
-    /// `initdb`, start, and create the database. Panics rather than returning an
-    /// error: a harness that could not start the thing under test has nothing
-    /// useful to say afterwards.
+    /// `initdb`, start, and create the database.
     pub fn start(database: &str) -> Cluster {
         let directory = tempfile::tempdir().expect("a temporary directory");
         let data = directory.path().join("data");
@@ -83,9 +67,8 @@ impl Cluster {
 
         let port = free_port();
         let postgres = binary("postgres").expect("postgres");
-        // Run the server directly rather than through `pg_ctl`, so it is this
-        // process's child and dies with the harness rather than being
-        // daemonised past it.
+        // Run the server directly rather than through `pg_ctl`, so it is this process's child and
+        // dies with the harness rather than being daemonised past it.
         let server = Command::new(&postgres)
             .args([
                 "-D",
@@ -133,10 +116,6 @@ impl Cluster {
     }
 
     /// Run SQL out of band, through `psql`.
-    ///
-    /// Out of band on purpose: a test that asserts what the driver did needs a
-    /// second channel to look through, and the driver's own bookkeeping is not
-    /// evidence about the driver.
     pub fn psql(&self, database: &str, sql: &str) -> String {
         let psql = binary("psql").expect("psql");
         let out = Command::new(&psql)
@@ -197,13 +176,7 @@ impl Cluster {
 
 impl Drop for Cluster {
     fn drop(&mut self) {
-        // `pg_ctl stop` rather than `Child::kill`, and the difference is not
-        // tidiness. A postmaster killed with `SIGKILL` never runs its exit hook,
-        // so the System V segment it holds for its own interlock outlives it —
-        // and macOS ships `SHMMNI` at 32, so thirty-odd cluster starts exhaust
-        // the machine's supply and every `initdb` afterwards fails with "could
-        // not create shared memory segment" until somebody runs `ipcrm` by hand.
-        // The kill below is the backstop for a server that will not stop.
+        // `pg_ctl stop` rather than `Child::kill`, and the difference is not tidiness.
         if let Some(pg_ctl) = binary("pg_ctl") {
             let stopped = Command::new(pg_ctl)
                 .args([
@@ -230,11 +203,6 @@ impl Drop for Cluster {
 }
 
 /// A port nothing is listening on, at the moment it is asked for.
-///
-/// Racy by construction — the port is released before postgres takes it — and
-/// that is why the default is never used: colliding with another test's server
-/// would be a confusing failure, and colliding with a developer's own database
-/// would be a dangerous one.
 fn free_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("a free port");
     let port = listener.local_addr().expect("an address").port();

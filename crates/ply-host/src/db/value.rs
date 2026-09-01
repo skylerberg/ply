@@ -1,14 +1,4 @@
 //! Where a Ply value becomes a parameter and a row becomes a Ply value.
-//!
-//! This is the whole of the boundary crossing, and it happens on the machine's
-//! thread in both directions. A [`Value`] holds `Rc` and is not `Send`, so the
-//! reactor speaks [`Param`] and [`Datum`] — postgres's own types — and nothing
-//! that touches a socket ever holds a Ply value.
-//!
-//! Every decode here is total or a diagnostic. A `Param` the program built out
-//! of a constructor `std.db` does not declare cannot happen through the type
-//! system, so reaching one means the evaluator was handed a module that was
-//! never checked, and it says so rather than guessing a wire type.
 
 use super::scope::{Access, Isolation};
 use super::stmt::{Answer, Row};
@@ -19,9 +9,7 @@ use rust_decimal::Decimal;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-/// The module `Json` ships in. A constructor's identity in a `Value` is its
-/// **program-wide** name, so a `Str` built here has to be spelled `std.json.Str`
-/// or no pattern in any program matches it.
+/// The module `Json` ships in.
 const JSON_MODULE: &str = "std.json";
 
 /// A constructor of `module`, as the qualified symbol a `Value` carries.
@@ -29,12 +17,7 @@ fn ctor(module: &str, name: &str) -> Symbol {
     Symbol::new(format!("{module}.{name}"))
 }
 
-/// The simple name of a constructor a `Value` carries, when it is one of
-/// `module`'s.
-///
-/// Qualified rather than matched on the last segment: two modules may declare
-/// the same simple name, and a decoder that accepted either would read a
-/// `json::Str` as a `db::Str` the first time somebody wrote one.
+/// The simple name of a constructor a `Value` carries, when it is one of `module`'s.
 fn simple<'a>(name: &'a Symbol, module: &str) -> Option<&'a str> {
     name.as_str()
         .strip_prefix(module)
@@ -147,8 +130,7 @@ pub fn json(value: &Value, span: Span) -> Result<Json, Diagnostic> {
     })
 }
 
-/// `ReadCommitted | RepeatableRead | Serializable`, as the `SET TRANSACTION`
-/// text postgres wants.
+/// `ReadCommitted | RepeatableRead | Serializable`, as the `SET TRANSACTION` text postgres wants.
 pub fn isolation(value: &Value, span: Span) -> Result<Isolation, Diagnostic> {
     match value {
         Value::Ctor { name, .. } => {
@@ -196,9 +178,8 @@ pub fn answer(answer: &Answer) -> Value {
     }
 }
 
-/// A `Map` from column name to value, which is what gives a row one canonical
-/// form: two rows built in different column orders are one value, and a golden
-/// test over a result set is stable.
+/// A `Map` from column name to value, which is what gives a row one canonical form: two rows built
+/// in different column orders are one value, and a golden test over a result set is stable.
 pub fn row(row: &Row) -> Value {
     Value::map(
         row.iter()
@@ -252,14 +233,13 @@ pub fn error(e: &DbError) -> Value {
     Value::Record(Arc::new(fields))
 }
 
-/// A `Failed` answer built from a SQLSTATE the driver produced rather than the
-/// server: a pool that could not reach anything, a connection that went away.
+/// A `Failed` answer built from a SQLSTATE the driver produced rather than the server: a pool that
+/// could not reach anything, a connection that went away.
 pub fn failed(code: &str, detail: impl Into<String>) -> Value {
     answer(&Answer::Failed(DbError::new(code, "", detail)))
 }
 
-/// The `Decimal` a `Number` carries, for a caller that wants it without the
-/// wrapper.
+/// The `Decimal` a `Number` carries, for a caller that wants it without the wrapper.
 pub fn as_decimal(value: &Value) -> Option<Decimal> {
     match value {
         Value::Decimal(d) => Some(*d),
@@ -267,8 +247,8 @@ pub fn as_decimal(value: &Value) -> Option<Decimal> {
     }
 }
 
-/// Inference checks a perform's shape, so reaching one of these means the
-/// evaluator ran a module that was never checked. Ply's fault, and it says so.
+/// Inference checks a perform's shape, so reaching one of these means the evaluator ran a module
+/// that was never checked.
 #[cold]
 fn malformed(wanted: &str, span: Span) -> Diagnostic {
     Diagnostic::error(

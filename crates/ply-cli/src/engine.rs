@@ -1,32 +1,4 @@
 //! Which prover a run drives.
-//!
-//! One file, because it is the only place the two halves of `ply prove` meet:
-//! `ply-test` owns what a cached discharge means and `ply-prove` owns what a
-//! fresh one is worth, and neither may quietly acquire the other's
-//! responsibility. `ply-prove` does not depend on `ply-test` and never will, so
-//! the [`Discharger`] that ties them together lives here, in the one crate that
-//! depends on both.
-//!
-//! **The order every obligation is attempted in is the whole honesty of this
-//! module**, and it is ADR 0007's:
-//!
-//! 1. the **static prover**, because a proof needs to run nothing and is valid
-//!    under every plan. It answers `proved`, `vacuous`, or nothing at all —
-//!    never a refutation, because a model over uninterpreted symbols need not
-//!    correspond to any Ply value;
-//! 2. **exhaustive enumeration** of a finite value domain, which is a proof for
-//!    the same reason the prover's answer is: the domain was covered rather
-//!    than sampled. A ground claim is the degenerate case with one point;
-//! 3. the **property tier**, which is where refutation happens, with a value
-//!    that actually ran;
-//! 4. a **directed witness search**, reached only where the sampled run kept no
-//!    case. It answers one question — does the guard admit anything? — by
-//!    evaluating it at the points the guard's own literals name, and it is what
-//!    separates "the search missed the domain" from "there is no domain".
-//!
-//! An inconclusive step falls through to the next one. Nothing here can report
-//! `proved` without a [`Certificate`], and nothing constructs one except a
-//! decided proof or a covered domain.
 
 use ply_core::{CheckOutput, LawBinder};
 use ply_eval::host::{HostBinding, HostRuntime};
@@ -46,13 +18,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-/// The discharger this build drives, and what the reader has to be told about
-/// it.
-///
-/// `obligations` is how many claims are in front of it. A project with none is
-/// told nothing: there is no gap to disclose when nothing was going to be
-/// attempted, and a warning on every run of an unspecified project is noise
-/// that teaches a reader to skip warnings.
+/// The discharger this build drives, and what the reader has to be told about it.
 pub fn of<'a>(
     program: &'a Program,
     resolved: &'a Resolved,
@@ -64,11 +30,8 @@ pub fn of<'a>(
     Box<dyn ply_test::obligation::Discharger + 'a>,
     Option<Diagnostic>,
 ) {
-    // Every clause and every law body is an AST this run has to hold: a claim
-    // is discharged by reasoning about the expression that states it, and there
-    // is no cached form of one. A partial parse would silently answer
-    // `unattempted` for everything it did not read, which reports a gap where
-    // there is a claim.
+    // Every clause and every law body is an AST this run has to hold: a claim is discharged by
+    // reasoning about the expression that states it, and there is no cached form of one.
     if !complete {
         return (
             Box::new(ply_test::obligation::Undecided),
@@ -113,9 +76,7 @@ impl<'a> Claim<'a> {
         }
     }
 
-    /// The propositions that narrow the domain: an owner's `requires` clauses,
-    /// or a law's `where`. A `requires` is never an obligation of its own — it
-    /// is a filter on the domain of the `ensures` clauses beside it.
+    /// The propositions that narrow the domain: an owner's `requires` clauses, or a law's `where`.
     fn guards(&self) -> Vec<&'a Expr> {
         match self {
             Claim::Ensures { def, .. } => def
@@ -135,9 +96,7 @@ impl<'a> Claim<'a> {
         }
     }
 
-    /// Where a vacuity points. The first guard if there is one, else the claim
-    /// itself — a domain nothing narrowed is empty because its binders' types
-    /// are.
+    /// Where a vacuity points.
     fn guard_span(&self, fallback: Span) -> Span {
         self.guards().first().map_or(fallback, |g| g.span)
     }
@@ -148,25 +107,14 @@ pub struct Prover<'a> {
     resolved: &'a Resolved,
     check: &'a CheckOutput,
     world: TypeWorld,
-    /// Built once. Its construction walks every definition's body and runs
-    /// Tarjan over the call graph, so building one per obligation makes a run
-    /// cost the program size times the obligation count — which is what it did
-    /// until this was hoisted.
+    /// Built once.
     ctx: prove::Context<'a>,
     defs: HashMap<Symbol, (usize, &'a FnDef)>,
     laws: HashMap<Symbol, (usize, &'a LawDef)>,
-    /// What a `law/host` is discharged against. `None` in a hermetic run, which
-    /// makes every one of them `Gap::ReachesHost` rather than green.
-    ///
-    /// A **factory** for the runtime rather than a handle, for the reason
-    /// `ply test` uses one: obligations are discharged on a rayon pool, a
-    /// reactor handle belongs to the one thread its machine runs on, and each of
-    /// those machines needs an identity of its own so that two host laws in
-    /// flight are two scope stacks.
+    /// What a `law/host` is discharged against.
     hosting: Option<Hosting<'a>>,
-    /// This program's region kinds, for the reason `ctx` is built once: the
-    /// analysis behind them is whole-program, and `machine()` is called per
-    /// obligation.
+    /// This program's region kinds, for the reason `ctx` is built once: the analysis behind them is
+    /// whole-program, and `machine()` is called per obligation.
     region_kinds: ply_eval::region_kind::Kinds,
 }
 
@@ -209,8 +157,7 @@ impl<'a> Prover<'a> {
         }
     }
 
-    /// Bind the host, so that a `law/host` is attempted rather than reported as
-    /// a gap.
+    /// Bind the host, so that a `law/host` is attempted rather than reported as a gap.
     pub fn with_hosting(mut self, hosting: Hosting<'a>) -> Prover<'a> {
         self.hosting = Some(hosting);
         self
@@ -246,8 +193,8 @@ impl<'a> Prover<'a> {
         machine
     }
 
-    /// The machine a `law/host`'s body runs on: the run's binding, and a reactor
-    /// minted for this thread.
+    /// The machine a `law/host`'s body runs on: the run's binding, and a reactor minted for this
+    /// thread.
     fn host_machine(&self, hosting: &Hosting<'a>) -> Machine<'a> {
         let mut machine = self.machine();
         machine.set_host_binding(Arc::clone(&hosting.binding));
@@ -257,13 +204,6 @@ impl<'a> Prover<'a> {
         machine
     }
 
-    /// Step 1. Answers `proved`, `vacuous`, or "carry on".
-    ///
-    /// A [`Proof`] whose guard the prover could not show inhabited is **not** a
-    /// certificate yet: `guard ⟹ body` over an empty domain is valid and says
-    /// nothing. It is carried forward so that a run which keeps a case can
-    /// witness the domain the prover could not, which is the one place a
-    /// sampled run upgrades a static argument rather than replacing it.
     fn attempt_static(
         &self,
         obligation: &Obligation,
@@ -298,14 +238,7 @@ impl<'a> Prover<'a> {
         }
     }
 
-    /// What the static tier alone answered, and where the obligation left the
-    /// fragment on the way.
-    ///
-    /// A measurement of the prover's reach, and nothing else: the answer here
-    /// is the one [`Prover::discharge_with`] already acts on, and a [`Blocker`]
-    /// never reaches a discharge. `None` for a concurrency law, which is
-    /// decided by execution rather than by this fragment, and for an obligation
-    /// whose claim is not in the program.
+    /// What the static tier alone answered, and where the obligation left the fragment on the way.
     pub fn reach(&self, obligation: &Obligation, plan: &ProvePlan) -> Option<Reach> {
         if obligation.is_concurrency_law() {
             return None;
@@ -334,8 +267,8 @@ impl<'a> Prover<'a> {
     }
 }
 
-/// What the static tier answered for one obligation, and the fragment
-/// boundaries it crossed getting there.
+/// What the static tier answered for one obligation, and the fragment boundaries it crossed getting
+/// there.
 pub struct Reach {
     pub decision: Decision,
     pub blockers: Vec<Blocker>,
@@ -358,11 +291,6 @@ impl ply_test::obligation::Discharger for Prover<'_> {
 
 impl<'a> Prover<'a> {
     /// One obligation, at the strongest tier this build can demonstrate.
-    ///
-    /// Inherent as well as a [`ply_test::obligation::Discharger`] method so that
-    /// an audit can drive it without the trait in scope — the trait exists to
-    /// keep the cache rule and the fragment in different crates, not to hide
-    /// this.
     pub fn discharge_with(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
         let Some(claim) = self.claim(obligation) else {
             return Discharge::Unattempted(Gap::UnhandledEffect(obligation.footprint.clone()));
@@ -388,10 +316,8 @@ impl<'a> Prover<'a> {
             Static::Inconclusive => None,
         };
 
-        // Checking an `ensures` at either running tier means *calling* the
-        // definition, and a definition that performs needs a handler nothing
-        // supplies. Inventing one would be inventing a behaviour and then
-        // testing against it, so this is a reported gap rather than a claim.
+        // Checking an `ensures` at either running tier means *calling* the definition, and a
+        // definition that performs needs a handler nothing supplies.
         if let Some(footprint) = self.unhandled(obligation) {
             return Discharge::Unattempted(Gap::UnhandledEffect(footprint));
         }
@@ -414,12 +340,8 @@ impl<'a> Prover<'a> {
             &mut cases,
         );
         match discharge {
-            // A sampled run that kept nothing has **not** established that the
-            // guard admits nothing: it has established that the generator drew
-            // nothing the guard wanted. Those are different claims, and only the
-            // first is `E0420`. So the domain is looked for directly before that
-            // error is reported, and a value found here settles the same
-            // question a kept case would have.
+            // A sampled run that kept nothing has **not** established that the guard admits
+            // nothing: it has established that the generator drew nothing the guard wanted.
             Discharge::Vacuous(Vacuity {
                 kind: VacuityKind::NoCaseKept { generated },
                 ..
@@ -438,15 +360,6 @@ impl<'a> Prover<'a> {
     }
 
     /// A `law/host`, discharged by running it.
-    ///
-    /// **The static tier and the finite enumeration are both skipped, and that is
-    /// structural rather than a convention.** Either would be a claim about every
-    /// value of the domain, and a claim about every value is exactly what a law
-    /// whose body reaches the world cannot make: the world is not a function of
-    /// the arguments. `property` is the ceiling and the tier says so.
-    ///
-    /// Under a hermetic run there is nothing to run it against, and the answer is
-    /// a gap naming the flag rather than a green tick.
     fn discharge_host(
         &self,
         obligation: &Obligation,
@@ -471,20 +384,8 @@ impl<'a> Prover<'a> {
         )
     }
 
-    /// A tuple of binder values the guard admits, found by evaluating the guard
-    /// at points the guard's own literals name.
-    ///
-    /// The generator draws from the whole of a type, so a guard admitting nine
-    /// integers a million away from zero is one that two hundred draws will
-    /// never satisfy. That is a fact about the search, not about the program,
-    /// and two decisions must not confuse the two: [`Proof::certify`] needs
-    /// *something* to vouch for the domain of an argument it has already made,
-    /// and [`Discharge::Vacuous`] is the claim that there is no domain at all.
-    ///
-    /// It is a witness and never a refutation: finding nothing here says only
-    /// that this search found nothing. A value it does find was evaluated, so
-    /// what it establishes is established by a run and not by an assumption —
-    /// the same standard a kept case meets.
+    /// A tuple of binder values the guard admits, found by evaluating the guard at points the
+    /// guard's own literals name.
     fn witness(
         &self,
         obligation: &Obligation,
@@ -501,11 +402,8 @@ impl<'a> Prover<'a> {
         for binder in &cases.binders {
             let column = match self.candidates(&binder.ty, &literals) {
                 Some(column) => column,
-                // A shape whose candidates the guard's literals do not name —
-                // a list, a record, an ADT, a function. One drawn value keeps
-                // the binder out of the way of the ones that *are* named, which
-                // is the whole point: what a sampled run misses is a narrow
-                // numeric window, not a list.
+                // A shape whose candidates the guard's literals do not name — a list, a record, an
+                // ADT, a function.
                 None => vec![property::generate(&binder.ty, &self.world, &mut stream, 0).ok()?],
             };
             points = points.checked_mul(column.len())?;
@@ -522,8 +420,8 @@ impl<'a> Prover<'a> {
                 values.push(column[rest % column.len()].clone());
                 rest /= column.len();
             }
-            // A point the guard raises at is not a point it admits, and a raise
-            // here is the property tier's business rather than this one's.
+            // A point the guard raises at is not a point it admits, and a raise here is the
+            // property tier's business rather than this one's.
             if cases.guard(&values).unwrap_or(false) {
                 return Some(values);
             }
@@ -532,11 +430,6 @@ impl<'a> Prover<'a> {
     }
 
     /// The values one binder is tried at, smallest and most literal first.
-    ///
-    /// `None` for a type whose candidates this search does not enumerate — a
-    /// record, an ADT, a function. Those are the shapes a *sampled* run reaches
-    /// perfectly well; what it cannot reach is a narrow numeric window, which is
-    /// exactly what the guard's own literals name.
     fn candidates(&self, ty: &ply_core::Type, literals: &Literals) -> Option<Vec<Value>> {
         let ply_core::Type::Con(name, args) = ty else {
             return None;
@@ -558,9 +451,8 @@ impl<'a> Prover<'a> {
                 out
             }
             "Int" => {
-                // A bound and the two integers beside it: `x > 1000000` is
-                // satisfied by `1000001` and by nothing the literal itself
-                // names.
+                // A bound and the two integers beside it: `x > 1000000` is satisfied by `1000001`
+                // and by nothing the literal itself names.
                 let mut out = vec![0i64, 1, -1];
                 for &k in &literals.ints {
                     for candidate in [k, k.saturating_add(1), k.saturating_sub(1)] {
@@ -578,18 +470,6 @@ impl<'a> Prover<'a> {
     }
 
     /// The sampled tier alone, with the static tier and the enumeration skipped.
-    ///
-    /// This is the seam ADR 0007 §11's **differential tier audit** needs, and it
-    /// exists for the same reason `--engine both` does: a claim that two
-    /// mechanisms agree is only worth what the comparison costs. Every
-    /// obligation a run reports `proved` is re-run here at a widened plan, and a
-    /// refutation is a **defect in Ply** rather than in the program — a wrong
-    /// `proved` is the one failure this milestone cannot ship, and the only way
-    /// to catch it is to go and look.
-    ///
-    /// A concurrency law is not resampled: its proof comes from an exhaustive
-    /// interleaving search rather than from a static argument, and sampling
-    /// schedules is not an independent check on having covered them all.
     pub fn resample(&self, obligation: &Obligation, plan: &ProvePlan) -> Discharge {
         let Some(claim) = self.claim(obligation) else {
             return Discharge::Unattempted(Gap::UnhandledEffect(obligation.footprint.clone()));
@@ -614,8 +494,7 @@ impl<'a> Prover<'a> {
         )
     }
 
-    /// The owner's footprint, when it is one no obligation can supply handlers
-    /// for. A law's own row is `{}` or `{sim.read}` and neither needs one.
+    /// The owner's footprint, when it is one no obligation can supply handlers for.
     fn unhandled(&self, obligation: &Obligation) -> Option<ply_core::Footprint> {
         let ObligationKind::Ensures { .. } = obligation.kind else {
             return None;
@@ -650,8 +529,6 @@ impl<'a> Prover<'a> {
         })
     }
 
-    /// Step 2. Every point of a finite domain, which is a **proof** when they
-    /// all hold: the domain was covered, not sampled.
     fn enumerate(
         &self,
         obligation: &Obligation,
@@ -662,9 +539,9 @@ impl<'a> Prover<'a> {
     ) -> Discharge {
         let mut kept = 0u64;
         for point in 0..finite.points {
-            // A domain that cannot produce one of its own points is not one
-            // this tier may claim to have covered, and reporting anything but a
-            // gap for it would be claiming coverage nothing established.
+            // A domain that cannot produce one of its own points is not one this tier may claim to
+            // have covered, and reporting anything but a gap for it would be claiming coverage
+            // nothing established.
             let Some(values) = finite.point(&self.world, point) else {
                 return Discharge::Unattempted(Gap::Ungeneratable {
                     param: obligation.generated()[0].name.clone(),
@@ -675,9 +552,9 @@ impl<'a> Prover<'a> {
                 Outcome::Rejected => {}
                 Outcome::Held => kept += 1,
                 Outcome::Failed => {
-                    // No shrinking: the point is already a member of a domain
-                    // enumerated in a fixed order, so it is the same value on
-                    // every run and there is nothing smaller to find.
+                    // No shrinking: the point is already a member of a domain enumerated in a fixed
+                    // order, so it is the same value on every run and there is nothing smaller to
+                    // find.
                     let bindings = bindings_of(obligation.generated(), &values);
                     return Discharge::Refuted(Counterexample {
                         original: bindings.clone(),
@@ -699,17 +576,16 @@ impl<'a> Prover<'a> {
         }
 
         if kept == 0 {
-            // Enumerating a finite domain and keeping nothing *decides* the
-            // guard unsatisfiable — §5.1(f) applied to the guard rather than to
-            // the body.
+            // Enumerating a finite domain and keeping nothing *decides* the guard unsatisfiable —
+            // §5.1(f) applied to the guard rather than to the body.
             return Discharge::Vacuous(Vacuity {
                 guard: claim.guard_span(obligation.span),
                 kind: VacuityKind::ProvedUnsatisfiable,
             });
         }
 
-        // A kept point witnesses the domain, so a static argument the prover
-        // could not vouch for is now vouched for — by a value that actually ran.
+        // A kept point witnesses the domain, so a static argument the prover could not vouch for is
+        // now vouched for — by a value that actually ran.
         if let Some(proof) = witness
             && let Some(certificate) = proof.certify(true)
         {
@@ -732,15 +608,8 @@ impl<'a> Prover<'a> {
         }))
     }
 
-    /// A law whose body reaches a `simulate` region: discharged by execution,
-    /// and the only place in this milestone a `proved` does not come from a
-    /// static argument.
-    ///
-    /// The value domain is decided **here** and handed to
-    /// [`concurrency::discharge`] as a [`ValueDomain`], because that is ADR 0007
-    /// §6's condition 5 and it is the one an implementer drops: an exhaustive
-    /// interleaving search over sampled values proves something about those
-    /// values and nothing about the law.
+    /// A law whose body reaches a `simulate` region: discharged by execution, and the only place in
+    /// this milestone a `proved` does not come from a static argument.
     fn search_interleavings(
         &self,
         obligation: &Obligation,
@@ -769,12 +638,7 @@ impl<'a> Prover<'a> {
         concurrency::discharge(obligation, &plan.sim, &domain, &mut search).discharge
     }
 
-    /// The points a concurrency law is searched at, and what claim covering
-    /// them supports.
-    ///
-    /// A guard is exactly pure, so it is applied here — before any interleaving
-    /// runs — rather than inside the search: which values the law speaks about
-    /// is not a question a schedule can answer.
+    /// The points a concurrency law is searched at, and what claim covering them supports.
     fn law_domain(
         &self,
         obligation: &Obligation,
@@ -842,9 +706,7 @@ impl<'a> Prover<'a> {
     }
 }
 
-/// The most guard evaluations one witness search spends. A bound on the work,
-/// not on the correctness: the search only ever answers "here is a value" or
-/// "this search found none", and the second is what it already said.
+/// The most guard evaluations one witness search spends.
 const WITNESS_POINTS: usize = 4096;
 
 /// The most candidate values one binder contributes.
@@ -884,9 +746,8 @@ impl Literals {
                     stack.push(rhs);
                 }
                 ExprKind::Unary { op, operand } => {
-                    // `-1000000` is a negation of a literal in the AST and a
-                    // bound in the guard, so the value the search wants is the
-                    // negated one.
+                    // `-1000000` is a negation of a literal in the AST and a bound in the guard, so
+                    // the value the search wants is the negated one.
                     if let (
                         ply_syntax::ast::UnOp::Neg,
                         ExprKind::Lit(ply_syntax::ast::Lit::Int(k)),
@@ -949,8 +810,8 @@ impl Literals {
     }
 }
 
-/// A static argument the prover made but could not vouch for the domain of,
-/// upgraded by a run that kept a case.
+/// A static argument the prover made but could not vouch for the domain of, upgraded by a run that
+/// kept a case.
 fn upgrade(discharge: Discharge, witness: Option<Proof>) -> Discharge {
     let Some(proof) = witness else {
         return discharge;
@@ -980,10 +841,6 @@ fn bindings_of(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
 }
 
 /// How a tuple of binder values is judged: guard first, always.
-///
-/// For an `ensures` this calls the definition to get `result`, which is why
-/// `result` is not something the generator draws. For a law it evaluates the
-/// body directly.
 struct Cases<'a> {
     machine: Machine<'a>,
     module: usize,
@@ -1043,18 +900,13 @@ impl Judge for Cases<'_> {
     }
 }
 
-/// One law body, run at a point of its value domain under a seed the
-/// interleaving search chooses.
-///
-/// A fresh machine per interleaving, exactly as `ply test` re-runs a whole test
-/// per interleaving: restoring the arena as of region entry is a snapshot
-/// capability the language does not have.
+/// One law body, run at a point of its value domain under a seed the interleaving search chooses.
 struct Search<'a, 'p> {
     prover: &'p Prover<'a>,
     module: usize,
     body: &'a Expr,
     binders: Vec<LawBinder>,
-    /// The points the guard kept, in order. A point index names one of these.
+    /// The points the guard kept, in order.
     points: Vec<Vec<Value>>,
     steps: u32,
     span: Span,

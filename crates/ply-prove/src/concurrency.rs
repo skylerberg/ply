@@ -1,36 +1,4 @@
 //! Concurrency laws: the bridge from an obligation to M7's interleaving search.
-//!
-//! A concurrency law claims something holds under **every** interleaving, and
-//! M7 already answers whether its footprint-guided search covered every one.
-//! This module is the reading of that answer, and it is the only place in M8
-//! where a [`Tier::Proved`] comes from running a program rather than from
-//! reasoning about one — which is what makes the exhaustiveness condition
-//! load-bearing rather than decorative.
-//!
-//! Two coverage claims, and a proof needs both:
-//!
-//! - **schedules.** [`Exploration::exhaustive`] means the frontier emptied, so
-//!   every interleaving at scheduler-visible granularity ran (ADR 0006 §3.3 is
-//!   what "scheduler-visible" costs, and it is a disclosed limit rather than a
-//!   hole).
-//! - **values.** A law over `n: Int` ranges over 2⁶⁴ of them, and an exhaustive
-//!   search over sampled values proves something about those values and nothing
-//!   about the law. [`ValueDomain::Enumerated`] is the only domain a proof may
-//!   be reported over.
-//!
-//! [`crate::interleaving_proves`] states the five conditions. This module adds
-//! the sixth that ADR 0007 §6 leaves implicit because ADR 0006 states it
-//! elsewhere: **a search that reached no `simulate` region is exhaustive over
-//! nothing.** `explore` is handed a run with no steps, empties its frontier
-//! immediately, and reports `exhaustive: true` over a program it never
-//! scheduled. `ply-test` plugs that hole in its driver rather than in
-//! `Exploration`, so a second consumer of the flag has to plug it again —
-//! [`body_run`] is where this one does, and `observed` is private for exactly
-//! that reason: outside this crate the only way to obtain a `BodyRun` that
-//! claims a region ran is to hand over a [`Machine`] that recorded one.
-//!
-//! `docs/adr/0007-specs.md` §6 is the specification; `docs/adr/0006-deterministic-simulation.md`
-//! §3.3, §3.6 and §6.4 are what `exhaustive` means.
 
 use crate::{
     Binding, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, Rule,
@@ -41,26 +9,18 @@ use ply_eval::{Exploration, Interleaving, Machine, Plan, Seed, Value, Verdict, e
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
 /// How much of a law's value domain the points it was run at cover.
-///
-/// This is ADR 0007 §6's condition 5, as a type rather than as a `bool` a caller
-/// can pass the wrong way round. Only [`ValueDomain::Enumerated`] admits a
-/// proof, and it means what §5.1(f) means: every binder's type is finite, the
-/// product of their cardinalities is at most [`crate::ENUMERATION_BOUND`], and
-/// every point of that product was visited.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum ValueDomain {
     /// The law has no binders, or every point of a finite domain was visited.
     Enumerated {
-        /// The domain, rendered, for [`Rule::ExhaustiveEnumeration`]. `unit` for
-        /// a ground law, whose domain is the single empty tuple.
+        /// The domain, rendered, for [`Rule::ExhaustiveEnumeration`].
         domain: Symbol,
         /// Points of the whole domain, guard-rejected ones included.
         points: u64,
         /// Points the guard kept, and therefore points the body ran at.
         kept: u64,
     },
-    /// The points were drawn. Whatever the interleaving search reports, the
-    /// value claim is a sample, so the obligation is `property` at best.
+    /// The points were drawn.
     Sampled {
         generated: u32,
         kept: u32,
@@ -71,8 +31,7 @@ pub enum ValueDomain {
 }
 
 impl ValueDomain {
-    /// The ground domain: one point, the empty tuple, and no way to miss any of
-    /// it.
+    /// The ground domain: one point, the empty tuple, and no way to miss any of it.
     pub fn ground() -> ValueDomain {
         ValueDomain::Enumerated {
             domain: "unit".into(),
@@ -81,8 +40,7 @@ impl ValueDomain {
         }
     }
 
-    /// ADR 0007 §6 condition 5. False for every sampled domain, whatever its
-    /// case count: two hundred draws from `Int` is not `Int`.
+    /// ADR 0007 §6 condition 5.
     pub fn covers_every_value(&self) -> bool {
         matches!(self, ValueDomain::Enumerated { .. })
     }
@@ -111,24 +69,15 @@ impl ValueDomain {
 
     fn vacuity(&self) -> VacuityKind {
         match *self {
-            // Enumerating a finite domain and keeping nothing *decides* the
-            // guard unsatisfiable, which is §5.1(f) applied to the guard rather
-            // than to the body.
+            // Enumerating a finite domain and keeping nothing *decides* the guard unsatisfiable,
+            // which is §5.1(f) applied to the guard rather than to the body.
             ValueDomain::Enumerated { .. } => VacuityKind::ProvedUnsatisfiable,
             ValueDomain::Sampled { generated, .. } => VacuityKind::NoCaseKept { generated },
         }
     }
 }
 
-/// One evaluation of a law body, at one point of the value domain, under one
-/// seed.
-///
-/// `observed` is private and there is one public constructor, [`body_run`],
-/// which takes the [`Machine`] that ran the body. That is the whole defence
-/// against this module's worst available defect: an exhaustive search over a
-/// body that entered no `simulate` region reports `exhaustive: true` having
-/// scheduled nothing, and a caller that could write `observed: true` by hand
-/// could hand a proof to a law nobody searched.
+/// One evaluation of a law body, at one point of the value domain, under one seed.
 #[derive(Clone, Debug)]
 pub struct BodyRun {
     interleaving: Interleaving,
@@ -142,8 +91,7 @@ impl BodyRun {
         self.observed
     }
 
-    /// Whether the body raised instead of coming to a Boolean. A law that raises
-    /// is not false, so this is a [`Gap`] rather than a refutation.
+    /// Whether the body raised instead of coming to a Boolean.
     pub fn raised(&self) -> bool {
         self.raised
     }
@@ -154,11 +102,6 @@ impl BodyRun {
 }
 
 /// The one way to build a [`BodyRun`]: from the machine that just ran the body.
-///
-/// `value` is what the body came to. A law body is a proposition, so `false` is
-/// the failure the search is hunting for and a raise is not a failure of the law
-/// at all — the two are separated here, on the value, rather than recovered
-/// later from a diagnostic code.
 pub fn body_run(machine: &Machine<'_>, value: Result<Value, Diagnostic>, span: Span) -> BodyRun {
     let (outcome, raised) = match value {
         Ok(Value::Bool(true)) => (Ok(()), false),
@@ -170,9 +113,8 @@ pub fn body_run(machine: &Machine<'_>, value: Result<Value, Diagnostic>, span: S
     BodyRun {
         interleaving: match record {
             Some(record) => record.interleaving(&outcome),
-            // The verdict is still the run's own: a body that reached no region
-            // must report nothing about interleavings and must not turn a false
-            // law true on the way past.
+            // The verdict is still the run's own: a body that reached no region must report nothing
+            // about interleavings and must not turn a false law true on the way past.
             None => match outcome {
                 Ok(()) => Interleaving::passed(Vec::new()),
                 Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
@@ -200,54 +142,37 @@ fn body_was_not_boolean(value: &Value, span: Span) -> Diagnostic {
     .note("the type checker rejects a non-`Bool` law body with E0201, so reaching this is a defect in Ply")
 }
 
-/// Running a law body at a point of its value domain, under a seed the search
-/// chooses.
-///
-/// The generator, the finite-domain enumerator and the evaluator all live
-/// outside this module; a point is an index into whatever the caller drew, so
-/// nothing here knows how a value was made. What this module owns is the
-/// decision the runs add up to.
+/// Running a law body at a point of its value domain, under a seed the search chooses.
 pub trait LawSearch {
-    /// Evaluate the law body with the binders bound to point `point`, under
-    /// `seed`.
-    ///
-    /// Must be a pure function of the definition set, `point` and `seed`:
-    /// [`explore`] re-runs prefixes and reports [`codes::SIMULATION_DIVERGENCE`]
-    /// when it catches a driver that is not.
+    /// Evaluate the law body with the binders bound to point `point`, under `seed`.
     fn run(&mut self, point: u64, seed: &Seed) -> BodyRun;
 
-    /// The bindings at `point`, as a counterexample renders them. Empty for a
-    /// ground law.
+    /// The bindings at `point`, as a counterexample renders them.
     fn bindings(&self, point: u64) -> Vec<Binding>;
 }
 
 /// What discharging a concurrency law did, beside the discharge itself.
-///
-/// Reported rather than derived by a consumer: `interleavings` is the number the
-/// certificate names and the number a summary line prints, and `observed` is the
-/// answer to "was there a search here at all", which a zero cannot distinguish.
 #[derive(Clone, Debug)]
 pub struct Searched {
     pub discharge: Discharge,
-    /// Interleavings that actually entered a `simulate` region, summed over the
-    /// points the guard kept.
+    /// Interleavings that actually entered a `simulate` region, summed over the points the guard
+    /// kept.
     pub interleavings: u32,
     /// Body evaluations, whether or not they reached a region.
     pub evaluations: u32,
     /// Every point's frontier emptied within its budget.
     pub exhaustive: bool,
-    /// Some point's search spent its budget, so it proved nothing about the
-    /// interleavings it did not reach.
+    /// Some point's search spent its budget, so it proved nothing about the interleavings it did
+    /// not reach.
     pub exhausted: bool,
-    /// Every run entered a `simulate` region. A `false` here is why an
-    /// `exhaustive` search is still not a proof.
+    /// Every run entered a `simulate` region.
     pub observed: bool,
     /// Points the body ran at.
     pub points: u64,
 }
 
 impl Searched {
-    /// `12 interleavings · exhaustive`, or why not. `None` when nothing ran.
+    /// `12 interleavings · exhaustive`, or why not.
     pub fn line(&self) -> Option<String> {
         if self.evaluations == 0 {
             return None;
@@ -282,11 +207,6 @@ fn plural(n: u32) -> &'static str {
 }
 
 /// Discharge a concurrency law by searching every point of its value domain.
-///
-/// The tier is not chosen here; it is [`Evidence::tier`]'s, and the only way out
-/// of this function with a [`crate::Tier::Proved`] is a [`Certificate`] every
-/// one of ADR 0007 §6's conditions signed off on — plus the sixth this module's
-/// header names.
 pub fn discharge(
     obligation: &Obligation,
     plan: &Plan,
@@ -325,11 +245,8 @@ pub fn discharge(
                 )
                 .primary(obligation.span, "this law's search")
             });
-            // A raise is not a refutation: a law that divides by zero says
-            // nothing about whether it is true. `check_recording` and
-            // `check_replay` failures land here too — the driver never saw them,
-            // so `Raised` is what they are, and E0415 is carried out whole
-            // rather than relabelled as a counterexample.
+            // A raise is not a refutation: a law that divides by zero says nothing about whether it
+            // is true.
             return totals.finish(if failing.unwrap_or(Failing::Raised) == Failing::Raised {
                 Discharge::Unattempted(Gap::Raised {
                     bindings: search.bindings(point),
@@ -339,13 +256,7 @@ pub fn discharge(
                 Discharge::Refuted(Counterexample {
                     bindings: search.bindings(point),
                     original: search.bindings(point),
-                    // Neither half is shrunk. The schedule is ADR 0006 §6.5:
-                    // truncating a choice path changes what the suffix means.
-                    // The values are un-shrunk because a candidate has to be
-                    // re-refuted by a fresh interleaving search, and a point
-                    // index cannot name a value the caller did not draw — the
-                    // seam for that is a `LawSearch` that admits arbitrary
-                    // values, and it is not built.
+                    // Neither half is shrunk.
                     shrinks: 0,
                     root: seed.root,
                     case: u32::try_from(point).unwrap_or(u32::MAX),
@@ -360,9 +271,8 @@ pub fn discharge(
     totals.finish(discharge)
 }
 
-/// Aggregated over every point of the value domain, because a law is a claim
-/// about all of them: one point whose search spent its budget is a law whose
-/// search spent its budget.
+/// Aggregated over every point of the value domain, because a law is a claim about all of them: one
+/// point whose search spent its budget is a law whose search spent its budget.
 struct Totals {
     points: u64,
     interleavings: u32,
@@ -370,9 +280,8 @@ struct Totals {
     exhaustive: bool,
     exhausted: bool,
     observed: bool,
-    /// Carried rather than inferred from the early return a failure takes:
-    /// [`Totals::proves`] must be false on a failing search whatever the shape
-    /// of the loop above it later becomes.
+    /// Carried rather than inferred from the early return a failure takes: [`Totals::proves`] must
+    /// be false on a failing search whatever the shape of the loop above it later becomes.
     failure: Option<Seed>,
 }
 
@@ -382,8 +291,8 @@ impl Totals {
             points,
             interleavings: 0,
             evaluations: 0,
-            // Vacuously true over no points, and `proves` requires an
-            // interleaving to have run before it reads this.
+            // Vacuously true over no points, and `proves` requires an interleaving to have run
+            // before it reads this.
             exhaustive: true,
             exhausted: false,
             observed: true,
@@ -408,8 +317,8 @@ impl Totals {
             failure: self.failure.clone(),
             ..Exploration::default()
         };
-        // The five of ADR 0007 §6, and then the sixth: a search that entered no
-        // region emptied a frontier it never filled.
+        // The five of ADR 0007 §6, and then the sixth: a search that entered no region emptied a
+        // frontier it never filled.
         crate::interleaving_proves(plan, &exploration, domain.covers_every_value())
             && self.observed
             && self.interleavings > 0
@@ -426,12 +335,9 @@ impl Totals {
             return Discharge::Held(Evidence::Proof(self.certificate(obligation, domain)));
         }
         Discharge::Held(Evidence::Cases(CaseReport {
-            // Interleavings rather than value points, because what a concurrency
-            // law samples is schedules: a ground law whose search spent its
-            // budget ran 256 cases, and calling that one case would report
-            // `example` for the strongest sampled evidence in the language.
-            // `rejected` is the odd one out and counts value points, which is
-            // the only thing a guard can reject.
+            // Interleavings rather than value points, because what a concurrency law samples is
+            // schedules: a ground law whose search spent its budget ran 256 cases, and calling that
+            // one case would report `example` for the strongest sampled evidence in the language.
             generated: self.evaluations,
             kept: self.evaluations,
             rejected: u32::try_from(domain.rejected()).unwrap_or(u32::MAX),
@@ -442,15 +348,8 @@ impl Totals {
 
     fn certificate(&self, obligation: &Obligation, domain: &ValueDomain) -> Certificate {
         let mut rules = Vec::new();
-        // Both coverage claims are named, so an audit can check condition 5
-        // against the certificate rather than re-deriving it from the law.
-        //
-        // The condition is "the law has binders and every point of their domain
-        // ran", **not** "more than one point ran". A law over `Unit` has one
-        // point and no way to miss any of it, and a certificate that stayed
-        // silent about covering it made ADR 0007 §11's audit reject a proof that
-        // was correct — a false red where the whole file is about false greens,
-        // and still a defect.
+        // Both coverage claims are named, so an audit can check condition 5 against the certificate
+        // rather than re-deriving it from the law.
         if let ValueDomain::Enumerated {
             domain: name,
             points,
@@ -469,8 +368,7 @@ impl Totals {
         Certificate {
             rules,
             steps: self.interleavings,
-            // A point was kept, so the guard admits a value. An empty domain
-            // took the `Vacuous` path above and never reaches here.
+            // A point was kept, so the guard admits a value.
             guard_satisfiable: true,
             // A proof about one program, not about an uninterpreted sort.
             sorts: Vec::new(),
@@ -504,10 +402,7 @@ struct Driver<'a> {
     observed: bool,
     /// Runs that reached a `simulate` region.
     entered: u32,
-    /// Which of the two things happened at each seed that ended badly. Recorded
-    /// rather than read back off the diagnostic's code, because a user program
-    /// can raise a diagnostic and only this driver knows whether the body came
-    /// to `false`.
+    /// Which of the two things happened at each seed that ended badly.
     failures: Vec<(Seed, Failing)>,
 }
 
@@ -543,19 +438,12 @@ impl ply_eval::Simulation for Driver<'_> {
 }
 
 /// The command that replays exactly this failure.
-///
-/// M7's artifact with one word changed: an obligation is not a test, so the
-/// command is `ply prove`, and the seed means what it means in `ply test`.
 pub fn replay_command(seed: &Seed, law: &str) -> String {
     format!("ply prove --seed {seed} --filter \"{law}\"")
 }
 
-/// The failure artifact for a refuted concurrency law: the search's own
-/// diagnostic, with the seed, the race and the replay command attached.
-///
-/// The same three lines `ply test` prints for a race, because a concurrency law
-/// failure *is* a race — the assertion it flipped is the law rather than a
-/// `assert_eq` inside a test, and nothing else about reproducing it differs.
+/// The failure artifact for a refuted concurrency law: the search's own diagnostic, with the seed,
+/// the race and the replay command attached.
 pub fn refutation(law: &str, counterexample: &Counterexample, found: Diagnostic) -> Diagnostic {
     let Some(seed) = &counterexample.sim_seed else {
         return found;
@@ -590,14 +478,8 @@ fn race_site(site: &ply_eval::RaceSite) -> String {
     format!("{}  {definition}   {}", site.task, site.access)
 }
 
-/// What ADR 0007 §11's concurrency-law condition test asserts, as a function so
-/// that the assertion is one call rather than a re-derivation that can drift
-/// from the thing it audits.
-///
-/// A certificate naming [`Rule::ExhaustiveInterleaving`] is an execution-derived
-/// proof, and the two things that make one honest are checkable from the
-/// certificate and the obligation alone: the guard admitted something, and a law
-/// with binders also carries the enumeration that covered them.
+/// What ADR 0007 §11's concurrency-law condition test asserts, as a function so that the assertion
+/// is one call rather than a re-derivation that can drift from the thing it audits.
 pub fn audit_interleaving_proof(
     obligation: &Obligation,
     certificate: &Certificate,
@@ -645,9 +527,8 @@ pub fn audit_interleaving_proof(
 
 #[cfg(test)]
 impl BodyRun {
-    /// The constructor `body_run` is deliberately the only public one, so a
-    /// model search inside this crate needs its own. Nothing outside it can
-    /// claim a region ran without a machine that recorded one.
+    /// The constructor `body_run` is deliberately the only public one, so a model search inside
+    /// this crate needs its own.
     fn model(interleaving: Interleaving, observed: bool, raised: bool) -> BodyRun {
         BodyRun {
             interleaving,
@@ -668,14 +549,8 @@ mod tests {
     use ply_hash::DefHash;
     use ply_syntax::ast::Mode;
 
-    /// `tasks` tasks, each reading a shared counter and writing it back — the
-    /// lost update, which is the shape every concurrency law worth writing is
-    /// about. Every step touches one cell, so no pair commutes and the search
-    /// enumerates every interleaving that respects per-task order.
-    ///
-    /// A model rather than the machine for the same reason `ply_eval::explore`
-    /// is tested against one: what is under test here is the decision the runs
-    /// add up to, and a model scheduler is the only way to fix the runs.
+    /// `tasks` tasks, each reading a shared counter and writing it back — the lost update, which is
+    /// the shape every concurrency law worth writing is about.
     struct Model {
         tasks: usize,
         /// What the law claims of the counter when every task has finished.
@@ -741,8 +616,8 @@ mod tests {
                     }]),
                     definition: Some(Symbol::new("transfer")),
                     span: Span::DUMMY,
-                    // No synchronization at all, so no pair is ordered and every
-                    // dependent pair is a candidate.
+                    // No synchronization at all, so no pair is ordered and every dependent pair is
+                    // a candidate.
                     stamp: Vec::new(),
                 });
             }
@@ -769,8 +644,8 @@ mod tests {
                 );
             }
             if self.unobserved {
-                // What a body that never reaches a `simulate` region hands the
-                // search: a run with no steps and the body's own verdict.
+                // What a body that never reaches a `simulate` region hands the search: a run with
+                // no steps and the body's own verdict.
                 return BodyRun::model(Interleaving::passed(Vec::new()), false, false);
             }
             BodyRun::model(self.interleave(seed), true, false)
@@ -823,10 +698,7 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------- the four cases
-
     /// A law that holds under **every** interleaving, discharged as a proof.
-    /// The one place in M8 a `proved` comes from execution.
     #[test]
     fn a_law_that_holds_under_every_interleaving_is_proved() {
         let obligation = law(0);
@@ -852,13 +724,12 @@ mod tests {
         assert_eq!(audit_interleaving_proof(&obligation, certificate), Ok(()));
     }
 
-    /// A law that holds under *some* interleavings: a failure carrying the seed
-    /// that reproduces it.
+    /// A law that holds under *some* interleavings: a failure carrying the seed that reproduces it.
     #[test]
     fn a_law_that_holds_only_sometimes_is_refuted_with_a_seed() {
         let obligation = law(0);
-        // The lost update: two tasks that each read the counter and write it
-        // back reach 1 in the interleavings where the reads precede both writes.
+        // The lost update: two tasks that each read the counter and write it back reach 1 in the
+        // interleavings where the reads precede both writes.
         let mut model = Model::new(2, |counter| counter == 2);
         let searched = discharge(&obligation, &dpor(64), &ValueDomain::ground(), &mut model);
 
@@ -884,8 +755,8 @@ mod tests {
         );
     }
 
-    /// A search that spends its budget proved nothing about the interleavings it
-    /// did not reach, so it reports the sampled tier and says how many it ran.
+    /// A search that spends its budget proved nothing about the interleavings it did not reach, so
+    /// it reports the sampled tier and says how many it ran.
     #[test]
     fn a_search_that_spends_its_budget_is_property_and_says_how_many() {
         let obligation = law(0);
@@ -903,8 +774,8 @@ mod tests {
         assert!(searched.line().unwrap().contains("budget spent"));
     }
 
-    /// A spent budget is a claim about the plan that spent it, so it may never
-    /// be read back under a wider one.
+    /// A spent budget is a claim about the plan that spent it, so it may never be read back under a
+    /// wider one.
     #[test]
     fn a_spent_budget_is_not_written_under_the_bare_key() {
         let obligation = law(0);
@@ -917,8 +788,8 @@ mod tests {
         );
     }
 
-    /// The artifact is M7's: `--seed` replays the interleaving exactly, and the
-    /// replay refutes the same law with the same seed and the same trace.
+    /// The artifact is M7's: `--seed` replays the interleaving exactly, and the replay refutes the
+    /// same law with the same seed and the same trace.
     #[test]
     fn a_reported_failure_replays_exactly() {
         let obligation = law(0);
@@ -949,18 +820,14 @@ mod tests {
             vec![failing_trace],
             "byte-for-byte the same interleaving"
         );
-        // `once` observes no flip, so it invents no race — the seed is the
-        // exact half and the pair is the half the search happened to see.
+        // `once` observes no flip, so it invents no race — the seed is the exact half and the pair
+        // is the half the search happened to see.
         assert!(replayed.race.is_none());
         assert_eq!(again.discharge.tier(), None);
     }
 
-    // ------------------------------------------------ condition 5, and the sixth
-
-    /// ADR 0007 §6's condition 5, and the required test that goes with it: the
-    /// same law with a binder is `property` however exhaustive the schedules
-    /// were. `exhaustive: true` is a claim about schedules; `n: Int` is 2⁶⁴
-    /// values.
+    /// ADR 0007 §6's condition 5, and the required test that goes with it: the same law with a
+    /// binder is `property` however exhaustive the schedules were.
     #[test]
     fn an_exhaustive_search_over_sampled_values_is_never_proved() {
         let obligation = law(1);
@@ -984,9 +851,8 @@ mod tests {
         );
     }
 
-    /// The same law over a domain that *was* covered is proved, and its
-    /// certificate names both coverage claims so an audit can check condition 5
-    /// without re-deriving it.
+    /// The same law over a domain that *was* covered is proved, and its certificate names both
+    /// coverage claims so an audit can check condition 5 without re-deriving it.
     #[test]
     fn an_enumerated_value_domain_proves_and_names_its_enumeration() {
         let obligation = law(1);
@@ -1016,9 +882,8 @@ mod tests {
         assert_eq!(searched.points, 2);
     }
 
-    /// The audit catches a certificate that claims an exhaustive search over a
-    /// law whose values nobody covered. This is the shape of the defect ADR 0007
-    /// §6 calls the milestone's worst available one.
+    /// The audit catches a certificate that claims an exhaustive search over a law whose values
+    /// nobody covered.
     #[test]
     fn the_audit_rejects_an_interleaving_proof_that_covered_no_value_domain() {
         let forged = Certificate {
@@ -1043,10 +908,7 @@ mod tests {
         assert!(audit_interleaving_proof(&law(0), &unguarded).is_err());
     }
 
-    /// **The sixth condition.** A body that reaches no `simulate` region hands
-    /// the search a run with no steps; the frontier empties on the first
-    /// interleaving and `Exploration::exhaustive` is `true` over a program
-    /// nothing scheduled. The five conditions of ADR 0007 §6 all pass on it.
+    /// **The sixth condition.**
     #[test]
     fn a_search_that_reached_no_region_is_exhaustive_over_nothing() {
         let plan = dpor(64);
@@ -1084,10 +946,8 @@ mod tests {
         assert!(searched.line().unwrap().contains("no `simulate` region"));
     }
 
-    // ------------------------------------------------------- the other outcomes
-
-    /// Under `once` and `random` there is no frontier to empty, so there is
-    /// nothing exhaustive to claim whatever the run reports.
+    /// Under `once` and `random` there is no frontier to empty, so there is nothing exhaustive to
+    /// claim whatever the run reports.
     #[test]
     fn a_sampled_plan_never_proves() {
         for plan in [Plan::random(4), Plan::once(Seed::root(7))] {
@@ -1099,8 +959,8 @@ mod tests {
         }
     }
 
-    /// A law that raises is not a law that is false, so a raise is a gap and the
-    /// raising input is reported rather than presented as a counterexample.
+    /// A law that raises is not a law that is false, so a raise is a gap and the raising input is
+    /// reported rather than presented as a counterexample.
     #[test]
     fn a_body_that_raises_is_a_gap_and_not_a_refutation() {
         let mut model = Model::new(2, |_| true);
@@ -1117,9 +977,7 @@ mod tests {
         assert_eq!(bindings.len(), 1);
     }
 
-    /// A guard that admits nothing makes the obligation trivially valid and
-    /// therefore silent. Reporting it `proved` would turn a typo into a proof of
-    /// everything.
+    /// A guard that admits nothing makes the obligation trivially valid and therefore silent.
     #[test]
     fn a_domain_the_guard_emptied_is_vacuous_and_not_proved() {
         let mut model = Model::new(2, |_| true);
@@ -1162,9 +1020,8 @@ mod tests {
         ));
     }
 
-    /// One point of a law's domain whose search spent its budget is a law whose
-    /// search spent its budget: a claim about every value is only as strong as
-    /// its weakest point.
+    /// One point of a law's domain whose search spent its budget is a law whose search spent its
+    /// budget: a claim about every value is only as strong as its weakest point.
     #[test]
     fn one_unexhausted_point_costs_the_whole_law_its_proof() {
         struct Mixed {
@@ -1176,8 +1033,8 @@ mod tests {
         impl LawSearch for Mixed {
             fn run(&mut self, point: u64, seed: &Seed) -> BodyRun {
                 if point == self.starved && seed.path.len() > 1 {
-                    // A run the search cannot branch past, standing in for a
-                    // point whose space is larger than the budget.
+                    // A run the search cannot branch past, standing in for a point whose space is
+                    // larger than the budget.
                     return BodyRun::model(Interleaving::passed(Vec::new()), true, false);
                 }
                 self.inner.run(point, seed)
@@ -1207,9 +1064,7 @@ mod tests {
         assert_ne!(searched.discharge.tier(), Some(Tier::Proved));
     }
 
-    /// Two runs over one law produce one artifact — the same tier, the same
-    /// counts, the same seed. A search that varied would make today's report
-    /// undiffable against yesterday's.
+    /// Two runs over one law produce one artifact — the same tier, the same counts, the same seed.
     #[test]
     fn two_runs_over_one_law_agree() {
         let run = || {
@@ -1232,8 +1087,8 @@ mod tests {
         );
     }
 
-    /// The failure artifact carries what M7's carries: the seed, the race sites,
-    /// and the command that replays it.
+    /// The failure artifact carries what M7's carries: the seed, the race sites, and the command
+    /// that replays it.
     #[test]
     fn a_refutation_reports_the_seed_the_race_and_the_replay() {
         let obligation = law(1);
@@ -1264,8 +1119,8 @@ mod tests {
         assert!(notes.contains("n = 0"));
     }
 
-    /// A concurrency law is discharged by execution, and `is_concurrency_law` is
-    /// what routes it here. A law whose row is empty is not one.
+    /// A concurrency law is discharged by execution, and `is_concurrency_law` is what routes it
+    /// here.
     #[test]
     fn only_a_law_carrying_sim_read_is_routed_to_a_search() {
         assert!(law(0).is_concurrency_law());
@@ -1276,17 +1131,9 @@ mod tests {
         assert!(!pure.is_concurrency_law());
     }
 
-    // ------------------------------------------------------------ end to end
-
-    /// The bridge, against the real machine rather than a model: a ground
-    /// concurrency law whose body the evaluator runs, whose region the scheduler
-    /// records, and whose search this module reads.
-    ///
-    /// Ground only. A law with binders needs the body evaluated under an
-    /// environment binding them, and `ply-eval` exposes no entry point that
-    /// takes one — `Machine::eval_expr_for_test` binds `Env::empty()` and
-    /// `Machine::drive` is private. That is the gap between this path and a
-    /// wired `ply prove`, and it is named here rather than worked around.
+    /// The bridge, against the real machine rather than a model: a ground concurrency law whose
+    /// body the evaluator runs, whose region the scheduler records, and whose search this module
+    /// reads.
     mod machine {
         use super::*;
         use ply_core::CheckOutput;
@@ -1334,9 +1181,8 @@ mod tests {
 
         impl LawSearch for Ground<'_> {
             fn run(&mut self, _point: u64, seed: &Seed) -> BodyRun {
-                // A fresh machine per interleaving, so each one starts from the
-                // same world: replay is whole-body, exactly as `ply-test`
-                // replays a whole test.
+                // A fresh machine per interleaving, so each one starts from the same world: replay
+                // is whole-body, exactly as `ply-test` replays a whole test.
                 let mut machine = Machine::new(
                     &self.compiled.program,
                     &self.compiled.resolved,
@@ -1384,8 +1230,8 @@ mod tests {
             );
         }
 
-        /// The same shape with a false body: the machine's search finds it and
-        /// the failure names the seed that replays it.
+        /// The same shape with a false body: the machine's search finds it and the failure names
+        /// the seed that replays it.
         #[test]
         fn a_false_ground_concurrency_law_is_refuted_with_a_replayable_seed() {
             let compiled = compile(
@@ -1411,9 +1257,9 @@ mod tests {
             assert!(counterexample.sim_seed.is_some());
         }
 
-        /// A body that reaches no `simulate` region: the machine records nothing,
-        /// `body_run` says so, and the law is held on the evidence it has rather
-        /// than proved on evidence it does not.
+        /// A body that reaches no `simulate` region: the machine records nothing, `body_run` says
+        /// so, and the law is held on the evidence it has rather than proved on evidence it does
+        /// not.
         #[test]
         fn a_law_body_with_no_region_is_never_proved_by_the_machine() {
             let compiled = compile("law \"ground truth\" {\n \x201 + 1 == 2\n}\n");

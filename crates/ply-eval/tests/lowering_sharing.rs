@@ -1,31 +1,4 @@
 //! One program, one lowering — however many machines run it.
-//!
-//! Lowering is a traversal per body, and until R3 the cache holding the result
-//! was a field of the `Machine`. A `Machine` is built per worker per concurrency
-//! group under `ply test`, **per interleaving** of a simulated test, and per
-//! obligation under `ply prove`, so a body was lowered once per machine rather
-//! than once per program.
-//!
-//! What R3 changed is where the result lives: `ply_eval::Lowering` is a cache a
-//! machine can be handed rather than a field it owns. Two things have to hold of
-//! that:
-//!
-//! - a second machine handed the first one's cache lowers nothing again, and
-//!   costs measurably less to run because of it;
-//! - a machine handed a cache built over a *different* program refuses it, and
-//!   answers with its own program's body. A bisection builds a program whose
-//!   definitions carry the names of the ones they replace, which is the nearest
-//!   thing in this tree to a caller passing the wrong cache.
-//!
-//! Its own binary with a `#[global_allocator]`, for the reason
-//! `region_arena_cost.rs` has one: a counter on every allocation in `ply-eval`'s
-//! unit tests would perturb every other number the crate takes.
-//!
-//! What this does **not** claim is that the cache pays for itself on a served
-//! request. It does not: `w6-alloc` drives one machine over many requests, where
-//! lowering was already once per definition, and the cache's own storage is a
-//! small net cost there. It pays where machines are built, which is what is
-//! counted below.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Machine, Value};
@@ -100,8 +73,8 @@ impl Compiled {
     }
 }
 
-/// Wide enough that lowering it is more than a rounding error and narrow enough
-/// to read: eleven definitions, every one of them reached from `top`.
+/// Wide enough that lowering it is more than a rounding error and narrow enough to read: eleven
+/// definitions, every one of them reached from `top`.
 const SOURCE: &str = r#"
 fn scale(x: Int) -> Int = x * 3 + 1
 fn clip(x: Int) -> Int = if x > 40 { 40 } else { x }
@@ -120,9 +93,7 @@ fn spread(x: Int) -> Int = fold_up([step1(x), step2(x), step3(x), step4(x), step
 fn top() -> Int = spread(2) + spread(3) + spread(4)
 "#;
 
-/// The number this milestone is about: what a *second* machine over one program
-/// pays. Every allocation of building it and running the same entry point, with
-/// the first machine's lowering and without it.
+/// The number this milestone is about: what a *second* machine over one program pays.
 fn second_machine_cost(compiled: &Compiled, share: bool) -> (i64, usize) {
     let mut first = compiled.machine();
     let expected = compiled.run(&mut first);
@@ -165,8 +136,8 @@ fn a_second_machine_over_one_program_costs_less_when_it_is_handed_the_first_ones
     );
 }
 
-/// The count, so that a regression putting lowering back on the per-machine path
-/// fails rather than merely costing.
+/// The count, so that a regression putting lowering back on the per-machine path fails rather than
+/// merely costing.
 #[test]
 fn a_second_machine_lowers_no_body_the_first_already_lowered() {
     let compiled = Compiled::new(SOURCE);
@@ -190,8 +161,7 @@ fn a_second_machine_lowers_no_body_the_first_already_lowered() {
     );
 }
 
-/// Two programs, same module, same definition names, different answers. A
-/// bisection builds exactly this, and the cache is keyed on an address.
+/// Two programs, same module, same definition names, different answers.
 #[test]
 fn a_machine_refuses_a_lowering_built_over_a_different_program() {
     let one = Compiled::new("fn top() -> Int = 11\n");

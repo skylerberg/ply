@@ -1,5 +1,4 @@
-//! Hand-written lexer. Never fails: a malformed token yields a diagnostic and a
-//! best-effort replacement so the parser still sees a well-formed stream.
+//! Hand-written lexer.
 
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 
@@ -65,27 +64,20 @@ impl Kw {
     }
 }
 
-/// `Eq` is deliberately absent: [`TokenKind::Float`] carries an `f64`, whose
-/// `==` is not reflexive. Nothing keys a collection on a token, and claiming an
-/// equivalence relation the payload does not have is how a NaN ends up compared
-/// two ways in two places.
+/// `Eq` is deliberately absent: [`TokenKind::Float`] carries an `f64`, whose `==` is not reflexive.
 #[derive(Clone, PartialEq, Debug)]
 pub enum TokenKind {
     Ident(Symbol),
     Int(i64),
-    /// `1.5`, `1e9`. IEEE-754 binary64, and the value is what the source said
-    /// rounded once — the lexer does no arithmetic of its own.
+    /// `1.5`, `1e9`.
     Float(f64),
-    /// `1.50m`. Carried as mantissa and scale rather than as a decimal so that
-    /// this crate takes no numeric dependency; `1.50m` is `(150, 2)` and keeps
-    /// its trailing zero, because the scale is part of what the literal says.
+    /// `1.50m`.
     Decimal {
         mantissa: i128,
         scale: u32,
     },
     Str(String),
-    /// `b"GET "`. Distinct from [`TokenKind::Str`] all the way down: the two
-    /// have different types and must not share a definition hash.
+    /// `b"GET "`.
     Bytes(Vec<u8>),
     Kw(Kw),
 
@@ -125,10 +117,7 @@ pub enum TokenKind {
     Pipe,
     PipePipe,
 
-    /// `e?` — the postfix try operator (GUIDE §6.10). Added by
-    /// `docs/adr/0028-the-question-mark-operator.md`; no `.ply` file in the
-    /// tree contained a `?` outside a string or a comment before it, so the
-    /// token is strictly additive and no existing file tokenizes differently.
+    /// `e?` — the postfix try operator (GUIDE §6.10).
     Question,
 
     Eof,
@@ -197,9 +186,8 @@ impl TokenKind {
     }
 }
 
-/// The digits a `(mantissa, scale)` pair stands for, with the scale's trailing
-/// zeros kept: `(150, 2)` is `1.50`. Shared by the lexer's diagnostics and by
-/// the AST's rendering so the two cannot print one literal two ways.
+/// The digits a `(mantissa, scale)` pair stands for, with the scale's trailing zeros kept: `(150,
+/// 2)` is `1.50`.
 pub fn render_decimal(mantissa: i128, scale: u32) -> String {
     let sign = if mantissa < 0 { "-" } else { "" };
     let digits = mantissa.unsigned_abs().to_string();
@@ -240,8 +228,8 @@ struct Lexer<'a> {
     diags: Vec<Diagnostic>,
 }
 
-/// Public because module names are derived from file and directory names, which
-/// never pass through the lexer.
+/// Public because module names are derived from file and directory names, which never pass through
+/// the lexer.
 pub fn is_ident(s: &str) -> bool {
     let mut chars = s.chars();
     chars.next().is_some_and(is_ident_start) && chars.all(is_ident_continue)
@@ -370,19 +358,15 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `1`, `1.5`, `1e9`, `1.50m`. Which of the three numeric types a literal
-    /// has is decided here and nowhere else: a fraction or an exponent makes it
-    /// a `Float`, an `m` suffix makes it a `Decimal`, and the bare form stays an
-    /// `Int`. The three have three types and three definition hashes, so a
-    /// literal that guessed would make `1` and `1.0` one definition.
+    /// `1`, `1.5`, `1e9`, `1.50m`.
     fn number(&mut self) -> TokenKind {
         let start = self.pos;
         let mut whole = String::new();
         self.digits(&mut whole);
 
         let mut fraction = String::new();
-        // `..` is the range separator and `.` alone cannot open a field name, so
-        // a fraction is exactly a dot with a digit behind it.
+        // `..` is the range separator and `.` alone cannot open a field name, so a fraction is
+        // exactly a dot with a digit behind it.
         let has_fraction =
             self.peek() == Some('.') && self.peek2().is_some_and(|c| c.is_ascii_digit());
         if has_fraction {
@@ -439,10 +423,8 @@ impl<'a> Lexer<'a> {
             text.push('e');
             text.push_str(e);
         }
-        // Rust's parser is correctly rounded and saturates to an infinity rather
-        // than failing, which is what IEEE says decimal-to-binary conversion
-        // does. Refusing an overflow here would make `Float` a type with a range
-        // the standard does not give it.
+        // Rust's parser is correctly rounded and saturates to an infinity rather than failing,
+        // which is what IEEE says decimal-to-binary conversion does.
         match text.parse::<f64>() {
             Ok(v) => TokenKind::Float(v),
             Err(_) => {
@@ -457,8 +439,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// The `e` of an exponent and its digits, consumed only when digits actually
-    /// follow: `1e9` is a float and `1 else` is two tokens.
+    /// The `e` of an exponent and its digits, consumed only when digits actually follow: `1e9` is a
+    /// float and `1 else` is two tokens.
     fn exponent(&mut self) -> Option<String> {
         if !matches!(self.peek(), Some('e' | 'E')) {
             return None;
@@ -478,9 +460,8 @@ impl<'a> Lexer<'a> {
         Some(out)
     }
 
-    /// `rust_decimal`'s domain, checked here so that every `Lit::Decimal` in the
-    /// AST is one the evaluator can build. The bounds are the type's, not a
-    /// policy: a 96-bit mantissa and a scale of `0..=28`.
+    /// `rust_decimal`'s domain, checked here so that every `Lit::Decimal` in the AST is one the
+    /// evaluator can build.
     fn decimal(
         &mut self,
         start: usize,
@@ -598,10 +579,6 @@ impl<'a> Lexer<'a> {
     }
 
     /// `b"..."`, entered with the `b` already consumed.
-    ///
-    /// A source character above `U+007F` is refused rather than encoded: the
-    /// bytes of this literal must not depend on how the file was saved, and
-    /// `\xNN` says what the author meant in any encoding.
     fn bytes(&mut self) -> TokenKind {
         let open = self.pos - 1;
         self.bump();
@@ -658,8 +635,8 @@ impl<'a> Lexer<'a> {
                 Some(c) => {
                     let start = self.pos;
                     self.bump();
-                    // The file was read as UTF-8 or it did not parse at all, so
-                    // these are the bytes the author is looking at.
+                    // The file was read as UTF-8 or it did not parse at all, so these are the bytes
+                    // the author is looking at.
                     let encoded: String = c
                         .to_string()
                         .bytes()
@@ -679,10 +656,6 @@ impl<'a> Lexer<'a> {
     }
 
     /// The two hex digits of a `\xNN`, with the backslash and `x` consumed.
-    ///
-    /// A malformed escape yields `0` and a diagnostic, and consumes only the
-    /// digits that were actually there, so lexing resumes inside the literal
-    /// rather than swallowing its closing quote.
     fn hex_byte(&mut self, esc_start: usize) -> u8 {
         let start = self.pos;
         for _ in 0..2 {
@@ -708,8 +681,8 @@ impl<'a> Lexer<'a> {
         }
     }
 
-    /// `None` means the character was not punctuation: an error was reported and
-    /// the character consumed, so the caller should just carry on.
+    /// `None` means the character was not punctuation: an error was reported and the character
+    /// consumed, so the caller should just carry on.
     fn punct(&mut self) -> Option<TokenKind> {
         let start = self.pos;
         let c = self.bump()?;
@@ -946,8 +919,8 @@ mod tests {
         );
     }
 
-    /// The `b` prefix binds only when the quote is the very next character, so
-    /// an ordinary identifier called `b` keeps working.
+    /// The `b` prefix binds only when the quote is the very next character, so an ordinary
+    /// identifier called `b` keeps working.
     #[test]
     fn b_is_a_prefix_only_when_the_quote_follows_immediately() {
         assert_eq!(
@@ -968,8 +941,8 @@ mod tests {
         );
     }
 
-    /// The bytes of a literal may not depend on how the file was saved, so the
-    /// diagnostic hands back the exact escapes the author should have written.
+    /// The bytes of a literal may not depend on how the file was saved, so the diagnostic hands
+    /// back the exact escapes the author should have written.
     #[test]
     fn a_non_ascii_character_in_a_byte_literal_is_refused_with_its_escapes() {
         let (toks, diags) = lex(SourceId(0), "b\"é\"");

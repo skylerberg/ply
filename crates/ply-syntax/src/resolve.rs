@@ -1,10 +1,5 @@
-//! Name resolution over a whole [`Program`], done once so that inference,
-//! hashing and evaluation cannot disagree about what a name means.
-//!
-//! Resolution is purely syntactic — it needs no types — and its output is the
-//! only place the module namespace lives. Everything downstream works in
-//! program-wide qualified names, which is what makes the namespace metadata
-//! over hashes rather than part of them.
+//! Name resolution over a whole [`Program`], done once so that inference, hashing and evaluation
+//! cannot disagree about what a name means.
 
 use crate::ast::{
     Ident, ImportDecl, ImportKind, Item, Module, ModuleName, Program, QName, TypeDefBody,
@@ -14,8 +9,7 @@ use indexmap::IndexMap;
 use indexmap::map::Entry;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
-/// Ply's three name spaces. Constructors live in [`Namespace::Value`] alongside
-/// functions, because an expression cannot tell them apart.
+/// Ply's three name spaces.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Namespace {
     Value,
@@ -82,22 +76,18 @@ impl Declarations {
     }
 }
 
-/// A [`Declared`] as seen from a module that can use it unqualified — its own,
-/// or one that imported it selectively.
+/// A [`Declared`] as seen from a module that can use it unqualified — its own, or one that imported
+/// it selectively.
 #[derive(Clone, Debug)]
 pub struct Binding {
     pub qualified: Symbol,
     /// Index into [`Program::modules`] of the module that declares it.
     pub owner: usize,
-    /// Where the name entered this file: the item's own name, or the import
-    /// that brought it in.
+    /// Where the name entered this file: the item's own name, or the import that brought it in.
     pub span: Span,
 }
 
-/// Every name a module declares, as a [`Binding`]. Parallel to
-/// [`Resolved::declarations`], and the reason a qualified lookup can hand back a
-/// reference: a `binder::name` reference denotes a declaration in *another*
-/// module, which is therefore in no scope at all.
+/// Every name a module declares, as a [`Binding`].
 #[derive(Clone, Debug, Default)]
 pub struct Bindings {
     pub values: IndexMap<Symbol, Binding>,
@@ -123,19 +113,14 @@ impl Bindings {
     }
 }
 
-/// The unqualified names a module's bodies see. Local binders are absent and
-/// always win over everything here.
+/// The unqualified names a module's bodies see.
 #[derive(Clone, Debug, Default)]
 pub struct Scope {
     pub module: ModuleName,
-    /// Module binder -> index into [`Program::modules`]. A separate namespace
-    /// from the three below, reachable only through `binder::name`, so a local
-    /// variable can share a module binder's name without hiding it.
+    /// Module binder -> index into [`Program::modules`].
     pub modules: IndexMap<Symbol, (usize, Span)>,
-    /// Modules this file imported names from without binding them as a module,
-    /// keyed by the binder such an import would *not* introduce. Kept only so
-    /// that `orders::place` after `import store.orders (place)` can say why
-    /// `orders` is not in scope, which is the mistake the rule invites.
+    /// Modules this file imported names from without binding them as a module, keyed by the binder
+    /// such an import would *not* introduce.
     pub selective: IndexMap<Symbol, (usize, Span)>,
     pub values: IndexMap<Symbol, Binding>,
     pub types: IndexMap<Symbol, Binding>,
@@ -170,8 +155,7 @@ pub struct Resolved {
     pub declared: Vec<Bindings>,
     /// Module name -> index into [`Program::modules`].
     pub index: IndexMap<Symbol, usize>,
-    /// Dependency-first order over [`Program::modules`]. Acyclic by
-    /// construction: a cycle is rejected before this is built.
+    /// Dependency-first order over [`Program::modules`].
     pub order: Vec<usize>,
 }
 
@@ -184,15 +168,7 @@ impl Resolved {
         self.index.get(name.as_symbol()).copied()
     }
 
-    /// [`Self::lookup`] without the diagnostic: whether the name denotes
-    /// something, and what.
-    ///
-    /// The two answer the same question; `lookup` additionally answers *why
-    /// not*, and building that answer is not free — `unknown_bare` scans every
-    /// module for one that exports the name, to suggest an import. A caller
-    /// that only wants the binding must not pay for a suggestion it discards,
-    /// and [`crate::defaults`] asks this of every call in the program, most of
-    /// which are builtins and resolve to nothing here.
+    /// [`Self::lookup`] without the diagnostic: whether the name denotes something, and what.
     pub fn find(&self, module: usize, ns: Namespace, q: &QName) -> Option<&Binding> {
         let scope = self.scopes.get(module)?;
         let Some(binder) = &q.module else {
@@ -209,9 +185,8 @@ impl Resolved {
         self.declared[owner].get(ns, q.symbol())
     }
 
-    /// A bare name must already have failed local lookup — locals are not in
-    /// scope here and win unconditionally. A qualified name never consults the
-    /// current module's scope at all.
+    /// A bare name must already have failed local lookup — locals are not in scope here and win
+    /// unconditionally.
     pub fn lookup(&self, module: usize, ns: Namespace, q: &QName) -> Result<&Binding, Diagnostic> {
         let Some(scope) = self.scopes.get(module) else {
             return Err(Diagnostic::error(
@@ -270,8 +245,8 @@ impl Resolved {
         d
     }
 
-    /// The first module that exports this name, for a "you meant this import"
-    /// note on a bare name that resolves nowhere.
+    /// The first module that exports this name, for a "you meant this import" note on a bare name
+    /// that resolves nowhere.
     fn exporter_of(&self, ns: Namespace, name: &Symbol) -> Option<usize> {
         self.declarations
             .iter()
@@ -360,24 +335,8 @@ impl Resolved {
     }
 }
 
-/// Reports, per module: unknown modules, import cycles, duplicate import
-/// bindings, imports that collide with a local definition, and selective
-/// imports of a name that is missing or private.
-///
-/// Two items declaring the same name in one module is *not* reported here —
-/// inference reports it, where the declaration's own span and kind are known.
-/// The first declaration wins so that resolution can continue.
-///
-/// Reference-site failures are not found here — bodies are walked by the
-/// consumer, which calls [`Resolved::lookup`] and reports what it returns.
-/// Builds the program's name tables, then fills every call's unwritten
-/// arguments from the callee's signature ([`crate::defaults`]).
-///
-/// The expansion is *inside* this function, and takes `program` mutably for it,
-/// so that no entry point can build tables and skip the rewrite — the guarantee
-/// `parse_module` gives `record_update` and `try_op`. A caller that only wants
-/// the tables still gets the rewrite, which is the point: everything downstream
-/// is entitled to assume a call is positional and fully applied.
+/// Reports, per module: unknown modules, import cycles, duplicate import bindings, imports that
+/// collide with a local definition, and selective imports of a name that is missing or private.
 pub fn resolve(program: &mut Program) -> Result<Resolved, Vec<Diagnostic>> {
     let mut diags: Vec<Diagnostic> = Vec::new();
     let mut index: IndexMap<Symbol, usize> = IndexMap::new();
@@ -437,9 +396,8 @@ pub fn resolve(program: &mut Program) -> Result<Resolved, Vec<Diagnostic>> {
         diags.push(cycle_diagnostic(program, cycle));
     }
 
-    // Only with a consistent set of tables: expansion resolves names through
-    // them, and a program with a duplicate module or an import cycle has none
-    // it could trust.
+    // Only with a consistent set of tables: expansion resolves names through them, and a program
+    // with a duplicate module or an import cycle has none it could trust.
     if !diags.is_empty() {
         return Err(diags);
     }
@@ -473,16 +431,13 @@ fn declarations_of(module: &Module) -> Declarations {
                 declare(&mut out, Namespace::Type, module, &def.name, vis);
                 if let TypeDefBody::Sum(variants) = &def.body {
                     for variant in variants {
-                        // A type you can name but cannot match on is not a
-                        // useful export, so a constructor is as public as it is.
+                        // A type you can name but cannot match on is not a useful export, so a
+                        // constructor is as public as it is.
                         declare(&mut out, Namespace::Value, module, &variant.name, vis);
                     }
                 }
             }
-            // None declares a name a reference could reach. A `derive`'s
-            // generated definitions are appended as `Item::Fn` before this
-            // runs, and are declared by the arm above; an `effect set` is
-            // consumed by the parser, which expands every row that names it.
+            // None declares a name a reference could reach.
             Item::Test(_) | Item::Law(_) | Item::Derive(_) | Item::EffectSet(_) => {}
         }
     }
@@ -714,8 +669,8 @@ impl ScopeBuilder<'_> {
         }
     }
 
-    /// Local-wins was rejected deliberately: adding a local `place` beside
-    /// `import m (place)` would silently steal every existing call site.
+    /// Local-wins was rejected deliberately: adding a local `place` beside `import m (place)` would
+    /// silently steal every existing call site.
     fn ambiguous(&mut self, name: &Ident, ns: Namespace, local: Span, module: &ModuleName) {
         self.diags.push(
             Diagnostic::error(
@@ -761,8 +716,8 @@ struct Cycle {
     closing: Span,
 }
 
-/// One iterative DFS: it finds every cycle and, when there is none, leaves a
-/// postorder that is exactly the dependency-first load order.
+/// One iterative DFS: it finds every cycle and, when there is none, leaves a postorder that is
+/// exactly the dependency-first load order.
 fn traverse(edges: &[Vec<(usize, Span)>]) -> (Vec<Cycle>, Vec<usize>) {
     #[derive(Clone, Copy, PartialEq)]
     enum Color {
@@ -820,8 +775,8 @@ fn traverse(edges: &[Vec<(usize, Span)>]) -> (Vec<Cycle>, Vec<usize>) {
     (cycles, order)
 }
 
-/// Rotated so the smallest index leads: the same cycle reached from two roots
-/// must compare equal, or it would be reported twice.
+/// Rotated so the smallest index leads: the same cycle reached from two roots must compare equal,
+/// or it would be reported twice.
 fn canonical(nodes: &[usize]) -> Vec<usize> {
     let Some(at) = nodes
         .iter()
@@ -1325,8 +1280,8 @@ mod tests {
         assert_eq!(first.qualified.as_str(), "app.f");
     }
 
-    /// The graph walk is iterative for the same reason the definition-level SCC
-    /// pass is: a generated project can be deeper than the native stack.
+    /// The graph walk is iterative for the same reason the definition-level SCC pass is: a
+    /// generated project can be deeper than the native stack.
     #[test]
     fn a_deep_import_chain_does_not_overflow_the_stack() {
         let depth = 20_000;

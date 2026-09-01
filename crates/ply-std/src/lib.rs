@@ -1,30 +1,4 @@
 //! The modules that ship with the compiler.
-//!
-//! `import std.net` names a module whose source is compiled into this binary.
-//! Two decisions make that safe for content addressing, and both are the whole
-//! reason this crate exists rather than a directory somewhere:
-//!
-//! - **`std` is a reserved first segment.** No project file can derive a module
-//!   name under it ([`codes::RESERVED_MODULE_NAME`]), so there is no precedence
-//!   order between the project and the stdlib, no shadowing rule, and no way for
-//!   what `import std.net` means to depend on where a file happens to sit.
-//! - **The sources are embedded by the explicit [`MODULES`] table**, not found
-//!   by scanning a directory and not resolved against the executable's location
-//!   at run time. A path resolved at run time would make a program's hashes a
-//!   function of the installation layout, and two machines with different
-//!   layouts would compute different hashes for one source tree and swap cache
-//!   entries that mean different things. There is no `--std-path`.
-//!
-//! A stdlib definition normalizes exactly as any other: no `std` marker and no
-//! stdlib version enters a hash. Copying a shipped module's source into a
-//! project therefore produces definitions with **identical** hashes that share
-//! its cache entries, which is the same sentence as "moving a definition between
-//! modules changes no hash".
-//!
-//! [`digest`] exists for visibility rather than for correctness. It is
-//! deliberately in no cache key: a digest in the key would invalidate a project
-//! on an edit to a `std` module it never imports, which is precisely the
-//! conservative selection Ply exists to beat.
 
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::ModuleName;
@@ -34,55 +8,37 @@ use std::path::{Path, PathBuf};
 pub const ROOT: &str = "std";
 
 /// The pseudo-path prefix an embedded module's cache entries are keyed under.
-///
-/// `<` is not an identifier character and a project path component that
-/// contained one would be `E0111 INVALID_MODULE_PATH` long before anything was
-/// cached, so no discovered file can ever produce a key in this space.
 pub const PSEUDO_ROOT: &str = "<std>";
 
-/// The configuration effect, the schema a run checks itself against before it
-/// binds, and the twin a test supplies values through. Named so that
-/// `ply-host`'s snapshot registers against the exact bytes this crate ships.
+/// The configuration effect, the schema a run checks itself against before it binds, and the twin a
+/// test supplies values through.
 pub const CONFIG: &str = include_str!("../ply/config.ply");
 
-/// The database effect and the values that cross it. Named so that
-/// `ply-host`'s postgres driver registers against the exact bytes this crate
-/// ships, for the reason [`NET`] gives: the signature the driver binds to and
-/// the signature the program performs are one text.
+/// The database effect and the values that cross it.
 pub const DB: &str = include_str!("../ply/db.ply");
 
-/// The JSON value, its parser and serializer, and the primitives a
-/// `derive json for T` composes out of.
+/// The JSON value, its parser and serializer, and the primitives a `derive json for T` composes out
+/// of.
 pub const JSON: &str = include_str!("../ply/json.ply");
 
-/// HTTP/1.1 framing: the head parser, the body decoder, the response encoder and
-/// the serve loop. Ply rather than Rust, so `ply test` selects it exactly and a
-/// smuggling defect is a failing test rather than a line in the trusted
-/// computing base — ADR 0013 §2.
+/// HTTP/1.1 framing: the head parser, the body decoder, the response encoder and the serve loop.
 pub const HTTP: &str = include_str!("../ply/http.ply");
 
-/// The network effect. Named so that `ply-host` can register against the exact
-/// bytes this crate ships without reaching across the workspace for a file.
+/// The network effect.
 pub const NET: &str = include_str!("../ply/net.ply");
 
-/// Routing: the table as ordinary data, the pure function that matches over it,
-/// and the two checks a service asserts about the table's own shape. Imports
-/// `std.http` for `Method`; the edge never goes the other way.
+/// Routing: the table as ordinary data, the pure function that matches over it, and the two checks
+/// a service asserts about the table's own shape.
 pub const ROUTER: &str = include_str!("../ply/router.ply");
 
-/// The observability effect, its values, and the collecting twin a test
-/// substitutes for a sink. Named so that `ply-host`'s sink registers against the
-/// exact bytes this crate ships, for the reason [`NET`] gives.
+/// The observability effect, its values, and the collecting twin a test substitutes for a sink.
 pub const TRACE: &str = include_str!("../ply/trace.ply");
 
-/// The stop signal, and the `Stop` twin a test handles it over. Named so that
-/// `ply-host`'s shutdown coordinator registers against the exact bytes this
-/// crate ships.
+/// The stop signal, and the `Stop` twin a test handles it over.
 pub const SIGNAL: &str = include_str!("../ply/signal.ply");
 
-/// The trusted list, read top to bottom — the same property that makes
-/// `ply-host`'s registry a reviewable trusted computing base. Sorted by name and
-/// free of duplicates, which this crate's own suite checks rather than assumes.
+/// The trusted list, read top to bottom — the same property that makes `ply-host`'s registry a
+/// reviewable trusted computing base.
 pub const MODULES: &[(&str, &str)] = &[
     ("std.config", CONFIG),
     ("std.db", DB),
@@ -109,10 +65,6 @@ pub fn modules() -> impl Iterator<Item = ModuleName> {
 }
 
 /// Every embedded module as `(program-wide name, source)`.
-///
-/// This is the whole-set form, for a harness that checks the shipped modules as
-/// one program. A project's loader pulls modules one at a time instead, so that
-/// a program importing nothing from `std` loads nothing.
 pub fn sources() -> impl Iterator<Item = (&'static str, &'static str)> {
     MODULES.iter().copied()
 }
@@ -122,34 +74,26 @@ pub fn is_std(module: &ModuleName) -> bool {
     is_reserved(module.as_str())
 }
 
-/// The same question for a name that is not a [`ModuleName`] yet — the check a
-/// path-derived name has to pass before it can become one.
+/// The same question for a name that is not a [`ModuleName`] yet — the check a path-derived name
+/// has to pass before it can become one.
 pub fn is_reserved(name: &str) -> bool {
     name == ROOT || name.starts_with(&format!("{ROOT}."))
 }
 
-/// Where an embedded module's fingerprint is filed. `std.net` is
-/// `<std>/net.ply`, and a nested `std.http.server` would be
-/// `<std>/http/server.ply`.
-///
-/// Always `/`-separated, whatever the host platform uses, so that a cache
-/// written on one machine names the same modules on another.
+/// Where an embedded module's fingerprint is filed.
 pub fn pseudo_path(module: &ModuleName) -> PathBuf {
     let rest: Vec<&str> = module.segments().skip(1).collect();
     PathBuf::from(format!("{PSEUDO_ROOT}/{}.ply", rest.join("/")))
 }
 
-/// Whether a path is one [`pseudo_path`] produced, which is what tells a cache
-/// entry for an embedded module apart from one for a file on disk.
+/// Whether a path is one [`pseudo_path`] produced, which is what tells a cache entry for an
+/// embedded module apart from one for a file on disk.
 pub fn is_pseudo_path(path: &Path) -> bool {
     path.to_str()
         .is_some_and(|p| p.starts_with(&format!("{PSEUDO_ROOT}/")))
 }
 
 /// BLAKE3 over the canonical list of `(module name, hash of source bytes)`.
-///
-/// Length-prefixed, so no two tables can be confused by where one name ends and
-/// the next begins.
 pub fn digest() -> [u8; 32] {
     let mut hasher = blake3::Hasher::new();
     for (name, source) in MODULES {
@@ -160,8 +104,8 @@ pub fn digest() -> [u8; 32] {
     *hasher.finalize().as_bytes()
 }
 
-/// The form a CI check pins: `b3:` plus twelve hex characters, exactly as
-/// `ply hosts --digest` prints.
+/// The form a CI check pins: `b3:` plus twelve hex characters, exactly as `ply hosts --digest`
+/// prints.
 pub fn digest_short() -> String {
     let bytes = digest();
     let mut out = String::from("b3:");
@@ -172,9 +116,6 @@ pub fn digest_short() -> String {
 }
 
 /// A project file whose path derives a name under the reserved root.
-///
-/// Reported against the file, because the file is the thing to rename: there is
-/// no flag and no precedence order that would let it keep the name.
 pub fn reserved_diagnostic(path: &Path, name: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RESERVED_MODULE_NAME,
@@ -197,12 +138,8 @@ pub fn unknown_module(name: &ModuleName, span: Span) -> Diagnostic {
     .note("`ply std` lists them with the digest this binary was built from")
 }
 
-/// A shipped module importing something this build does not ship — a module
-/// outside `std`, or a `std.x` the table does not hold.
-///
-/// Ply's fault either way, by construction: the user did not write the module,
-/// cannot fix it, and calling it their error would send them looking in their
-/// own tree.
+/// A shipped module importing something this build does not ship — a module outside `std`, or a
+/// `std.x` the table does not hold.
 pub fn foreign_import(importer: &ModuleName, imported: &Symbol, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
@@ -222,9 +159,8 @@ pub fn foreign_import(importer: &ModuleName, imported: &Symbol, span: Span) -> D
 mod tests {
     use super::*;
 
-    /// Sorted and unique, because both [`digest`] and `ply std` present the
-    /// table in its own order and a duplicate would make [`source`] answer with
-    /// whichever entry came first.
+    /// Sorted and unique, because both [`digest`] and `ply std` present the table in its own order
+    /// and a duplicate would make [`source`] answer with whichever entry came first.
     #[test]
     fn the_table_is_canonical() {
         let names: Vec<&str> = MODULES.iter().map(|(name, _)| *name).collect();
@@ -234,8 +170,8 @@ mod tests {
         assert_eq!(names, sorted, "the module table is not sorted, or repeats");
     }
 
-    /// Every shipped module is under the reserved root, has a source that is not
-    /// empty, and names itself the way an `import` would have to write it.
+    /// Every shipped module is under the reserved root, has a source that is not empty, and names
+    /// itself the way an `import` would have to write it.
     #[test]
     fn every_shipped_module_is_addressable() {
         for (name, source) in MODULES {
@@ -281,8 +217,8 @@ mod tests {
         assert!(!is_reserved(""));
     }
 
-    /// The digest is what a CI check pins, so it may not move between two calls
-    /// in one build, and it has to cover the sources rather than only the names.
+    /// The digest is what a CI check pins, so it may not move between two calls in one build, and
+    /// it has to cover the sources rather than only the names.
     #[test]
     fn the_digest_is_stable_and_covers_the_source_bytes() {
         assert_eq!(digest(), digest());
@@ -308,8 +244,7 @@ mod tests {
         assert_ne!(digest(), *moved.finalize().as_bytes());
     }
 
-    /// The shipped sources are a program, so they have to parse. A parse failure
-    /// here would reach a user as a diagnostic against source they never wrote.
+    /// The shipped sources are a program, so they have to parse.
     #[test]
     fn every_shipped_module_parses() {
         for (i, (name, source)) in MODULES.iter().enumerate() {
@@ -319,8 +254,8 @@ mod tests {
         }
     }
 
-    /// A shipped module may import only `std.*`, and the check is here as well
-    /// as in the loader so that a bad edit fails this crate's own suite.
+    /// A shipped module may import only `std.*`, and the check is here as well as in the loader so
+    /// that a bad edit fails this crate's own suite.
     #[test]
     fn no_shipped_module_imports_outside_std() {
         for (i, (name, source)) in MODULES.iter().enumerate() {

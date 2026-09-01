@@ -1,16 +1,4 @@
 //! `examples/orders.ply` over a real socket, with a derived codec on both ends.
-//!
-//! `http_endpoint.rs` proves a Ply program can reach the host at all. This one
-//! proves the thing W2 exists for: the bytes a client reads back were written by
-//! a definition nobody wrote. `derive json for Receipt` generates the encoder,
-//! `derive json for Order` generates the decoder, and the assertions below are
-//! written against the wire rather than against a Ply value — a codec that only
-//! round-trips inside the language has demonstrated nothing about a payload.
-//!
-//! The rejected case is here for the same reason the 400 is in `http_endpoint`:
-//! a client sends what it likes, and `$.lines[0].qty: expected a number, found a
-//! string` is a message built by `std.json` from a path the deriver emitted, so
-//! it is the part of the format most likely to be quietly wrong.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -31,10 +19,8 @@ fn reserve_port() -> u16 {
     listener.local_addr().expect("a bound address").port()
 }
 
-/// The example verbatim, plus the entry point it deliberately does not carry:
-/// `examples/hello.ply` holds the only `main` under `examples/`, so `ply run
-/// examples` has one. Copying rather than editing is what keeps this test from
-/// being a test of a file only this test has ever seen.
+/// The example verbatim, plus the entry point it deliberately does not carry: `examples/hello.ply`
+/// holds the only `main` under `examples/`, so `ply run examples` has one.
 fn project(port: u16, connections: u32) -> tempfile::TempDir {
     let dir = tempfile::tempdir().expect("a temp dir");
     let orders = std::fs::read_to_string(repo("examples/orders.ply")).expect("examples/orders.ply");
@@ -191,9 +177,7 @@ fn a_json_payload_over_a_real_socket_is_decoded_and_answered_by_a_derived_codec(
         accepted.contains("Content-Type: application/json\r\n"),
         "got:\n{accepted}"
     );
-    // 3 x 1.05 exactly, and rendered at the scale the arithmetic produced. A
-    // codec that had routed the price through binary64 would answer
-    // 3.1500000000000004 here.
+    // 3 x 1.05 exactly, and rendered at the scale the arithmetic produced.
     assert_eq!(
         body_of(&accepted),
         r#"{"tag":"Accepted","values":[{"customer":"ada","items":3,"total":3.15}]}"#

@@ -1,23 +1,4 @@
 //! An adversarial audit of exploration soundness.
-//!
-//! Footprint-guided pruning skips interleavings it believes cannot produce a
-//! distinct outcome. If that belief is ever wrong a real race becomes invisible,
-//! and the user is handed a green run over a state space with a hole in it —
-//! which is worse than not pruning at all, because `exhaustive: true` is read as
-//! a proof.
-//!
-//! Every test here is built the same way: a program is run once per schedule by
-//! an enumerator that shares **nothing** with `ply_eval::explore` — it drives the
-//! machine directly, reading each run's recorded enabled sets and taking every
-//! choice they admit — and the set of outcomes it observes is compared against
-//! the set the search observes. A missing outcome is invisible in the counts:
-//! the pruned search simply looks cheaper.
-//!
-//! The enumerator is also the check on the measurement. `--measure-reduction`
-//! counts the pruned search against `Dependence::All`, and a denominator
-//! produced by the same code as the numerator is a number that cannot disagree
-//! with itself; [`the_naive_baseline_enumerates_every_schedule`] is what says it
-//! is the real one.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::explore::Interleaving;
@@ -47,14 +28,7 @@ fn compile(source: &str) -> Compiled {
     }
 }
 
-/// What one interleaving is observable as: how the test ended, and the world it
-/// left behind. Comparing the verdict alone would pass on a run whose world
-/// differed and whose assertions happened not to notice, which is the whole
-/// class of defect this file exists to catch.
-/// The state half of an outcome is what the run **reclaimed**, not what it left
-/// behind: a region hands its cells back at its lexical close, so the arena
-/// afterwards is empty on every schedule alike and an outcome built from it
-/// cannot tell two interleavings apart.
+/// What one interleaving is observable as: how the test ended, and the world it left behind.
 fn observe(c: &Compiled, seed: &Seed) -> (Interleaving, String) {
     let mut machine = Machine::new(&c.program, &c.resolved, &c.check);
     machine.cells_mut().journal();
@@ -82,10 +56,6 @@ fn observe(c: &Compiled, seed: &Seed) -> (Interleaving, String) {
 const ENUMERATION_CAP: usize = 3000;
 
 /// Every schedule the recorded enabled sets admit, run exactly once.
-///
-/// Independent of `ply_eval::explore` on purpose: a search audited against a
-/// baseline built from its own backtracking cannot report a disagreement it has
-/// in both halves.
 fn every_schedule(c: &Compiled) -> BTreeSet<String> {
     let mut seen = BTreeSet::new();
     let mut frontier: Vec<Vec<u16>> = vec![Vec::new()];
@@ -146,14 +116,14 @@ fn search(c: &Compiled) -> Searched {
     search_with(c, Dependence::Exact)
 }
 
-/// The property pruning has to preserve, checked against the independent
-/// enumerator rather than argued.
+/// The property pruning has to preserve, checked against the independent enumerator rather than
+/// argued.
 fn assert_reaches_every_outcome(name: &str, source: &str) {
     let compiled = compile(source);
     let searched = search(&compiled);
     let all = every_schedule(&compiled);
-    // A search that stopped at a failure is not claiming to have seen the rest,
-    // so only a search that reached its frontier owes the whole set.
+    // A search that stopped at a failure is not claiming to have seen the rest, so only a search
+    // that reached its frontier owes the whole set.
     if !searched.failed {
         let missing: Vec<&String> = all.difference(&searched.outcomes).collect();
         assert!(
@@ -171,12 +141,7 @@ fn assert_reaches_every_outcome(name: &str, source: &str) {
     }
 }
 
-// --------------------------------------------------------------- two regions
-
-/// A test may contain two `simulate` regions in sequence: only *nesting* is
-/// `E0416`. The machine keeps one record per entry point, so the search's whole
-/// input is one of the two regions and the other one's interleavings are never
-/// explored — while `exhaustive: true` is still reported.
+/// A test may contain two `simulate` regions in sequence: only *nesting* is `E0416`.
 const RACE_IN_THE_FIRST_OF_TWO_REGIONS: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -213,8 +178,8 @@ test "the lost update is in the first of two regions" {
 }
 "#;
 
-/// The same race with one region, which is the control: whatever the two-region
-/// fixture reports, this one must find the lost update.
+/// The same race with one region, which is the control: whatever the two-region fixture reports,
+/// this one must find the lost update.
 const RACE_IN_ONE_REGION: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -247,8 +212,8 @@ test "the lost update with one region" {
 }
 "#;
 
-/// The same two regions in the other order, so that the race is in the region
-/// the recording covers and the region before it is the one the search perturbs.
+/// The same two regions in the other order, so that the race is in the region the recording covers
+/// and the region before it is the one the search perturbs.
 const RACE_IN_THE_SECOND_OF_TWO_REGIONS: &str = r#"
 effect counter {
   read  get[r]() -> Int
@@ -294,16 +259,8 @@ fn the_control_finds_the_lost_update() {
     );
 }
 
-/// A second `simulate` region in the same test hides the first one's races
-/// completely, and the run is reported as an exhaustive proof.
-///
-/// The machine records one region per entry point, so `Machine::simulated`
-/// answers with the *last* region — one step of one task — and the search reads
-/// its backtrack points off that. Nothing about the first region's schedule is
-/// ever varied: `Plan::default` is one root, and both regions draw from one
-/// `Domain::Sched` stream that each of them restarts at counter zero. Under
-/// `--sim random` twenty-two of sixty-four roots fail this program, so the race
-/// is not a corner of the space; the default mode simply cannot see it.
+/// A second `simulate` region in the same test hides the first one's races completely, and the run
+/// is reported as an exhaustive proof.
 #[test]
 fn a_race_in_the_first_of_two_regions_is_reachable_and_must_be_found() {
     let compiled = compile(RACE_IN_THE_FIRST_OF_TWO_REGIONS);
@@ -323,12 +280,7 @@ fn a_race_in_the_first_of_two_regions_is_reachable_and_must_be_found() {
     );
 }
 
-/// The same defect from the other side. With the race in the *second* region,
-/// the choice path the search builds pins scheduling points in **both** regions
-/// — each region reads `Seed::choice(i)` from its own point zero — so a branch
-/// meant for one region perturbs the other and the replay check reports
-/// `E0415`, which is classified as Ply's defect rather than as the program's
-/// race.
+/// The same defect from the other side.
 #[test]
 fn a_search_over_two_regions_does_not_report_a_simulation_divergence() {
     let searched = search(&compile(RACE_IN_THE_SECOND_OF_TWO_REGIONS));
@@ -343,13 +295,8 @@ fn a_search_over_two_regions_does_not_report_a_simulation_divergence() {
     );
 }
 
-// ------------------------------------------------------- an abandoned region
-
-/// A handler installed outside a `simulate` region may discard the continuation
-/// it is handed, which abandons the region with tasks still runnable. Every
-/// step after that point is missing from the recording, so a task whose only
-/// conflicting access lies beyond it looks like a task that touches nothing —
-/// and the search reports `exhaustive: true` after one interleaving.
+/// A handler installed outside a `simulate` region may discard the continuation it is handed, which
+/// abandons the region with tasks still runnable.
 const ABANDONED_REGION: &str = r#"
 effect bail {
   read stop[r]() -> Int
@@ -372,21 +319,15 @@ test "a handler outside the region that never resumes" {
 }
 "#;
 
-/// Whether `b` got to write before `a` aborted the region is a real difference
-/// with a real assertion behind it, and the enumerator reaches both. The search
-/// reaches one and calls the space exhausted.
+/// Whether `b` got to write before `a` aborted the region is a real difference with a real
+/// assertion behind it, and the enumerator reaches both.
 #[test]
 fn an_abandoned_region_does_not_hide_the_schedules_it_cut_short() {
     assert_reaches_every_outcome("an abandoned region", ABANDONED_REGION);
 }
 
-// -------------------------------------------------------- cell allocation
-
-/// ADR 0006 §6.1: "Two steps that are not dependent commute: executing them in
-/// either order from the same configuration reaches the same world and the same
-/// result." A `with_cell` allocates from the world's own counter and records no
-/// [`ply_eval::Access`], so two tasks that allocate look independent and reach
-/// two different worlds.
+/// ADR 0006 §6.1: "Two steps that are not dependent commute: executing them in either order from
+/// the same configuration reaches the same world and the same result."
 const ALLOCATING_TASKS: &str = r#"
 test "two tasks that each allocate a cell" {
   with_cell[o](0) { out -> {
@@ -412,11 +353,8 @@ fn allocation_order_is_part_of_the_world_and_must_not_be_pruned_away() {
     assert_reaches_every_outcome("two allocating tasks", ALLOCATING_TASKS);
 }
 
-// ------------------------------------------ interference the search must see
-
-/// A conflict on one resource that is *conditional* on a value read from
-/// another: `b` writes the shared cell one way or the other depending on
-/// whether it saw `a`'s write. Both branches are reachable and both must be run.
+/// A conflict on one resource that is *conditional* on a value read from another: `b` writes the
+/// shared cell one way or the other depending on whether it saw `a`'s write.
 const CONDITIONAL_CONFLICT: &str = r#"
 test "a conflict conditional on a value from elsewhere" {
   with_cell[f](0) { flag ->
@@ -441,9 +379,8 @@ fn a_conditional_conflict_is_explored_in_both_directions() {
     assert_reaches_every_outcome("a conditional conflict", CONDITIONAL_CONFLICT);
 }
 
-/// A race whose two orders agree on every value and differ only in the order
-/// the effects were performed. The log makes the difference observable; nothing
-/// about the dependence relation may collapse the two.
+/// A race whose two orders agree on every value and differ only in the order the effects were
+/// performed.
 const SAME_VALUE_DIFFERENT_EFFECTS: &str = r#"
 effect log {
   write note[r](v: Int) -> Unit
@@ -484,10 +421,8 @@ fn a_race_that_differs_only_in_the_effects_performed_is_explored() {
     );
 }
 
-/// A deadlock reachable only through some interleavings: the cycle exists only
-/// when `first` reads the slot after the body has filled it. Enabledness is what
-/// keeps an impossible schedule ungenerated, and it must not also keep a
-/// possible one out of reach.
+/// A deadlock reachable only through some interleavings: the cycle exists only when `first` reads
+/// the slot after the body has filled it.
 const CONDITIONAL_DEADLOCK: &str = r#"
 type Slot =
   | Empty
@@ -521,9 +456,7 @@ fn a_deadlock_that_only_some_interleavings_reach_is_found() {
     );
 }
 
-/// Two tasks whose only shared channel is the region's `random` stream. A draw
-/// is a read-modify-write of state the *program* observes, so the two orders are
-/// a real difference and the search must run both.
+/// Two tasks whose only shared channel is the region's `random` stream.
 const SHARED_RANDOM_STREAM: &str = r#"
 test "two tasks drawing from one stream" {
   with_cell[o](0) { out -> {
@@ -543,12 +476,7 @@ fn a_shared_random_stream_is_interference_the_search_reaches() {
     assert_reaches_every_outcome("a shared random stream", SHARED_RANDOM_STREAM);
 }
 
-// --------------------------------------------- the handler as a shared channel
-
-/// The handler that discharges a task's effect is itself shared state. Here two
-/// tasks perform operations on *different* resource labels, so their atoms do
-/// not conflict — and the one handler behind both writes one cell, which is the
-/// only reason the search can see the interference at all.
+/// The handler that discharges a task's effect is itself shared state.
 const ONE_HANDLER_TWO_LABELS: &str = r#"
 effect shard {
   read  take[r]() -> Int
@@ -579,11 +507,7 @@ fn a_handler_that_shares_state_across_two_labels_is_still_a_race() {
     assert_reaches_every_outcome("one handler, two labels", ONE_HANDLER_TWO_LABELS);
 }
 
-/// A handler installed *inside* a `simulate` region, wrapping the `spawn`. The
-/// spawner's row carries the spawned body's effects and the enclosing `handle`
-/// discharges them, so the program type-checks; a spawned task runs on the
-/// region's entry stack, which the inner handler is not on, so the perform finds
-/// no handler at run time.
+/// A handler installed *inside* a `simulate` region, wrapping the `spawn`.
 const HANDLER_INSIDE_THE_REGION: &str = r#"
 effect counter {
   write bump[r]() -> Unit
@@ -614,12 +538,8 @@ fn a_handler_inside_the_region_covers_the_tasks_it_encloses() {
     );
 }
 
-/// A `resume k` clause outside the region may resume more than once; the
-/// machine's continuations are multi-shot and the control fixture below proves
-/// it. With a `simulate` region between the perform and the handler the second
-/// resumption is silently dropped: the region delivers its value by restoring
-/// the stack it was entered on, which discards whatever the clause body still
-/// had pending.
+/// A `resume k` clause outside the region may resume more than once; the machine's continuations
+/// are multi-shot and the control fixture below proves it.
 const MULTI_SHOT_ACROSS_A_REGION: &str = r#"
 effect pick {
   read choose[r]() -> Int
@@ -684,12 +604,8 @@ fn a_region_does_not_silently_swallow_a_second_resumption() {
     );
 }
 
-// ----------------------------------------------------------- the measurement
-
-/// The reduction is a ratio, and a denominator produced by the same search as
-/// the numerator is a number that cannot disagree with itself. This is the
-/// independent check: forcing the dependence relation to `true` must enumerate
-/// exactly the schedules an outside enumerator enumerates.
+/// The reduction is a ratio, and a denominator produced by the same search as the numerator is a
+/// number that cannot disagree with itself.
 #[test]
 fn the_naive_baseline_enumerates_every_schedule() {
     for (name, source) in [
@@ -715,8 +631,8 @@ fn the_naive_baseline_enumerates_every_schedule() {
     }
 }
 
-/// The budget is a search parameter and not a semantics: raising it may not
-/// change the value or the world a passing program delivers.
+/// The budget is a search parameter and not a semantics: raising it may not change the value or the
+/// world a passing program delivers.
 #[test]
 fn widening_the_budget_does_not_change_what_a_program_means() {
     let compiled = compile(SAME_VALUE_DIFFERENT_EFFECTS);

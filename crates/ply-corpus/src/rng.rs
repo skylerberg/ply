@@ -1,7 +1,5 @@
-//! SplitMix64, written out rather than pulled in, so that a corpus generated
-//! from a seed today is byte-identical to one generated from it in a year. A
-//! crate's RNG is free to change its stream across a semver-compatible release;
-//! a benchmark that cannot be re-generated is not a benchmark.
+//! SplitMix64, written out rather than pulled in, so that a corpus generated from a seed today is
+//! byte-identical to one generated from it in a year.
 
 #[derive(Clone, Debug)]
 pub struct Rng {
@@ -15,9 +13,7 @@ impl Rng {
         }
     }
 
-    /// A sub-stream keyed by `tag`. Two draws made from forks with different
-    /// tags stay independent of the order their callers ran in, which is what
-    /// keeps one extra definition from shifting every later one.
+    /// A sub-stream keyed by `tag`.
     pub fn fork(&self, tag: u64) -> Rng {
         Rng::new(self.state ^ tag.wrapping_mul(0xD1B5_4A32_D192_ED03))
     }
@@ -59,9 +55,7 @@ impl Rng {
         xs.get(i)
     }
 
-    /// The smallest of `bias + 1` uniform draws from `0..n`. This is how a
-    /// handful of definitions end up widely depended upon without a hand-written
-    /// list of hubs.
+    /// The smallest of `bias + 1` uniform draws from `0..n`.
     pub fn skewed_below(&mut self, n: usize, bias: u32) -> usize {
         let mut best = self.below(n);
         for _ in 0..bias {
@@ -132,8 +126,7 @@ mod tests {
                 front += 1;
             }
         }
-        // A uniform draw would put ~500 in the front quarter; the minimum of
-        // four puts ~1368 there.
+        // A uniform draw would put ~500 in the front quarter; the minimum of four puts ~1368 there.
         assert!(
             front > 1200,
             "expected a strong front bias, got {front}/2000"

@@ -1,32 +1,4 @@
 //! A literal is a compile-time constant, and its `Value` is built once.
-//!
-//! `Lit::Str` and `Lit::Bytes` are the only two literals that ever reached the
-//! allocator — `Int`, `Bool`, `Float`, `Decimal` and `Unit` are inline variants
-//! of `Value` — and they reached it on **every evaluation**, because
-//! `NodeKind::Lit` carried only the `Lit` and the machine called
-//! `interp::literal` per step. ADR 0019 §2 is that node carrying the `Value`
-//! too, built at lowering; the machine clones it, and an `Arc` clone is a
-//! refcount bump.
-//!
-//! Two claims have to hold and they pull in opposite directions:
-//!
-//! - the sharing is **real** — a second evaluation of one literal hands back
-//!   the same `Arc`, and a loop over one costs the allocator nothing per
-//!   iteration;
-//! - the sharing is **unobservable** — no Ply expression reads an address, so
-//!   a shared `Str` has to compare, order, render and match exactly as a freshly
-//!   built one does. This is `Value::builtin`'s argument (`value.rs:200`)
-//!   applied to a second kind of constant, and it is checked here rather than
-//!   asserted.
-//!
-//! Its own binary with a `#[global_allocator]`, for the reason
-//! `lowering_sharing.rs` has one: a counter on every allocation in `ply-eval`'s
-//! unit tests would perturb every other number the crate takes.
-//!
-//! What this does **not** claim is a figure for a served request. That is
-//! `crates/ply-corpus/tests/r4_value_construction.rs`, which fits a slope over
-//! two request windows so that per-`Machine` setup cannot masquerade as
-//! per-request work.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::{Machine, Value};
@@ -68,18 +40,8 @@ fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, ALLOCS.with(Cell::get))
 }
 
-/// The three loops are the same shape down to the node — one `if`, one
-/// comparison, one self-call — and differ in **the kind of the two literals
-/// compared**. `Int` literals are inline `Value` variants and never touched the
-/// allocator; `Str` and `Bytes` literals did, once per evaluation. So the
-/// difference between the `Int` loop's slope and either of the others is the
-/// literal construction and nothing else.
-///
-/// The occurrence under test sits in a comparison rather than in a call, and
-/// deliberately: a control that differs by a call differs by that call's
-/// argument vector too, which is `size_of::<Value>()` per argument and is a
-/// larger line than the literal. The self-call the three loops share cancels;
-/// an unmatched one would not.
+/// The three loops are the same shape down to the node — one `if`, one comparison, one self-call —
+/// and differ in **the kind of the two literals compared**.
 const SOURCE: &str = r#"
 fn loop_int(n: Int, acc: Int) -> Int =
   if n <= 0 { acc } else { loop_int(n - 1, if 11 == 11 { acc + 1 } else { acc }) }
@@ -98,17 +60,15 @@ fn flag(k: Int) -> Bool = true
 fn nothing(k: Int) -> Unit = ()
 "#;
 
-/// Every fixture below takes an argument it ignores, and that is load-bearing:
-/// `Machine::constant` memoizes a **nullary** pure definition, so a nullary
-/// `fn text() -> String = "abcd"` hands back one `Value` on every call whether
-/// or not the literal itself is shared. A test written against one would pass
-/// before this change and prove nothing.
+/// Every fixture below takes an argument it ignores, and that is load-bearing: `Machine::constant`
+/// memoizes a **nullary** pure definition, so a nullary `fn text() -> String = "abcd"` hands back
+/// one `Value` on every call whether or not the literal itself is shared.
 fn once(machine: &mut Machine<'_>, name: &str) -> Value {
     call(machine, name, vec![Value::Int(0)])
 }
 
-/// Small enough to run in a test and large enough that one allocation per
-/// iteration is unmistakable against the frame pool settling.
+/// Small enough to run in a test and large enough that one allocation per iteration is unmistakable
+/// against the frame pool settling.
 const SMALL: usize = 100;
 const LARGE: usize = 1000;
 
@@ -144,19 +104,17 @@ fn call(machine: &mut Machine<'_>, name: &str, args: Vec<Value>) -> Value {
         .unwrap_or_else(|d| panic!("`m.{name}` raised: {d:#?}"))
 }
 
-/// Allocations the loop body costs per iteration, on a machine whose lowering
-/// and frame pool are already warm — so what is measured is evaluation and not
-/// the one-time construction this change moves the work *into*.
+/// Allocations the loop body costs per iteration, on a machine whose lowering and frame pool are
+/// already warm — so what is measured is evaluation and not the one-time construction this change
+/// moves the work *into*.
 fn per_iteration(compiled: &Compiled, name: &str) -> f64 {
     let mut machine = compiled.machine();
     let at = |machine: &mut Machine<'_>, n: usize| {
         call(machine, name, vec![Value::Int(n as i64), Value::Int(0)])
     };
-    // To the deepest recursion the measurement will reach, and twice, because
-    // `crate::pool`'s free list of frame links is **thread-local**: a loop run
-    // after a deeper one reuses its links and reads near zero whatever it does.
-    // That is order dependence, not a saving, and it is what makes a shallow
-    // warm-up useless here.
+    // To the deepest recursion the measurement will reach, and twice, because `crate::pool`'s free
+    // list of frame links is **thread-local**: a loop run after a deeper one reuses its links and
+    // reads near zero whatever it does.
     at(&mut machine, LARGE);
     at(&mut machine, LARGE);
     let (_, small) = counted(|| at(&mut machine, SMALL));
@@ -165,8 +123,8 @@ fn per_iteration(compiled: &Compiled, name: &str) -> f64 {
     (large as f64 - small as f64) / (LARGE - SMALL) as f64
 }
 
-/// The number this change exists to move: a `Str` literal in a loop body used to
-/// add exactly one allocation per iteration and now adds none.
+/// The number this change exists to move: a `Str` literal in a loop body used to add exactly one
+/// allocation per iteration and now adds none.
 #[test]
 fn a_string_literal_in_a_loop_costs_the_allocator_nothing_per_iteration() {
     let compiled = Compiled::new(SOURCE);
@@ -184,8 +142,8 @@ fn a_string_literal_in_a_loop_costs_the_allocator_nothing_per_iteration() {
     );
 }
 
-/// The same for `Bytes`, which mirrors `Str` deliberately and would be the half
-/// a change to one of them forgot.
+/// The same for `Bytes`, which mirrors `Str` deliberately and would be the half a change to one of
+/// them forgot.
 #[test]
 fn a_bytes_literal_in_a_loop_costs_the_allocator_nothing_per_iteration() {
     let compiled = Compiled::new(SOURCE);
@@ -217,9 +175,8 @@ fn bytes_arc(v: &Value) -> Arc<[u8]> {
     }
 }
 
-/// The mechanism, stated so that a regression that merely *costs* less without
-/// sharing — a smaller allocation, say — cannot pass the two slope tests above
-/// while the constant is still rebuilt.
+/// The mechanism, stated so that a regression that merely *costs* less without sharing — a smaller
+/// allocation, say — cannot pass the two slope tests above while the constant is still rebuilt.
 #[test]
 fn two_evaluations_of_one_literal_hand_back_one_arc() {
     let compiled = Compiled::new(SOURCE);
@@ -240,10 +197,8 @@ fn two_evaluations_of_one_literal_hand_back_one_arc() {
     );
 }
 
-/// Sharing is per lowering, and a second machine that lowered the program for
-/// itself holds its own constants. Nothing depends on that — it is recorded so
-/// that a reader who finds two `Arc`s for one literal knows which case they are
-/// in before calling it a defect.
+/// Sharing is per lowering, and a second machine that lowered the program for itself holds its own
+/// constants.
 #[test]
 fn a_second_machine_with_its_own_lowering_holds_its_own_copy_and_answers_the_same() {
     let compiled = Compiled::new(SOURCE);
@@ -267,9 +222,9 @@ fn a_second_machine_with_its_own_lowering_holds_its_own_copy_and_answers_the_sam
     );
 }
 
-/// The half that matters more than the saving: a shared constant has to be
-/// indistinguishable from a rebuilt one at every place meaning is decided —
-/// equality, ordering, rendering and the pattern match that reads it back.
+/// The half that matters more than the saving: a shared constant has to be indistinguishable from a
+/// rebuilt one at every place meaning is decided — equality, ordering, rendering and the pattern
+/// match that reads it back.
 #[test]
 fn a_shared_literal_is_indistinguishable_from_a_freshly_built_value() {
     let compiled = Compiled::new(SOURCE);
@@ -277,8 +232,8 @@ fn a_shared_literal_is_indistinguishable_from_a_freshly_built_value() {
 
     let shared = once(&mut machine, "text");
     let fresh = Value::str("abcd");
-    // Built by `string_concat` at run time, so it is a third `Arc` with the same
-    // bytes and no relationship to either.
+    // Built by `string_concat` at run time, so it is a third `Arc` with the same bytes and no
+    // relationship to either.
     let computed = once(&mut machine, "computed");
 
     for (label, other) in [
@@ -316,10 +271,8 @@ fn a_shared_literal_is_indistinguishable_from_a_freshly_built_value() {
     );
 }
 
-/// Every literal kind still denotes what it denoted, including the five that
-/// never allocated and are now carried beside the `Lit` anyway. `Secret` is not
-/// among them and cannot be: there is no secret literal, and an interned
-/// credential would have program lifetime (ADR 0019 §0.1).
+/// Every literal kind still denotes what it denoted, including the five that never allocated and
+/// are now carried beside the `Lit` anyway.
 #[test]
 fn every_literal_kind_denotes_what_it_did_and_none_of_them_is_a_secret() {
     let compiled = Compiled::new(SOURCE);

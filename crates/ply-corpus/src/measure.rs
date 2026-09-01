@@ -1,22 +1,4 @@
 //! The four numbers ADR 0005 spends and never priced.
-//!
-//! [`crate::bench`] reports a whole run's phase split, which answers "did the
-//! milestone cost anything" and not "where". These measure the machine's own
-//! claims one at a time:
-//!
-//! - **throughput** — the two engines on one corpus, with per-worker setup
-//!   separated from evaluation. `ply-test` builds a worker per rayon thread per
-//!   concurrency group, so a setup cost proportional to the program is charged
-//!   many times over and would otherwise be read as interpreter speed.
-//! - **fixture** — opening a region-scoped fixture against rebuilding it,
-//!   which is what is left of "build a fixture once, hand it to every test"
-//!   now that a region stack is not a persistent value.
-//! - **multi-shot** — resuming a continuation zero, one, two and four times,
-//!   beside direct measurements of `Stack::capture` and `Stack::resume` at
-//!   growing pending-frame counts. The end-to-end number cannot separate the
-//!   residual computation from the splice; the microbenchmarks can.
-//! - **scheduling** — how much of a corpus is trivially parallel, and what the
-//!   colouring of the remainder costs in groups.
 
 use crate::pipeline::{Front, front};
 use anyhow::{Context, Result, bail};
@@ -34,9 +16,7 @@ use std::path::Path;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-/// The fastest of several attempts. A slower one only ever means the machine
-/// did something else as well, so a minimum is the least noisy estimator
-/// available without a statistics dependency.
+/// The fastest of several attempts.
 fn best_of(repeats: usize, mut run: impl FnMut() -> Duration) -> Duration {
     (0..repeats.max(1))
         .map(|_| run())
@@ -52,24 +32,18 @@ fn nanos(d: Duration) -> f64 {
     d.as_secs_f64() * 1e9
 }
 
-// ---------------------------------------------------------------- throughput
-
 #[derive(Clone, Debug, Serialize)]
 pub struct EnginePass {
     pub engine: String,
-    /// Constructing one worker: what `ply-test` pays per rayon thread per
-    /// concurrency group.
+    /// Constructing one worker: what `ply-test` pays per rayon thread per concurrency group.
     pub worker_setup_millis: f64,
-    /// Every test once on a freshly built worker — setup, plus whatever the
-    /// engine defers to first call.
+    /// Every test once on a freshly built worker — setup, plus whatever the engine defers to first
+    /// call.
     pub first_pass_millis: f64,
-    /// Every test again on the same worker. Nothing is left to warm, so this is
-    /// the interpreter alone — and it is the same worker's life as
-    /// `first_pass_millis`, so the two are comparable.
+    /// Every test again on the same worker.
     pub steady_pass_millis: f64,
     pub tests: usize,
-    /// Atoms performed in one pass, from the tracer. The two engines must agree
-    /// on it or they were not running the same program.
+    /// Atoms performed in one pass, from the tracer.
     pub performs: u64,
 }
 
@@ -79,15 +53,12 @@ pub struct Throughput {
     pub definitions: usize,
     pub tests: usize,
     pub engines: Vec<EnginePass>,
-    /// `lower` over every test body once. `Machine::eval_test` lowers the body
-    /// it is about to run on every call and caches nothing, so this is a floor
-    /// on the machine's pass that no amount of interpreter speed removes.
+    /// `lower` over every test body once.
     pub lower_test_bodies_millis: f64,
-    /// Machine over tree-walker on the steady pass: the interpreter ratio with
-    /// per-worker setup excluded. `None` when only one engine was asked for.
+    /// Machine over tree-walker on the steady pass: the interpreter ratio with per-worker setup
+    /// excluded.
     pub steady_ratio: Option<f64>,
-    /// Machine over tree-walker on a fresh worker, which is what a real run
-    /// charges.
+    /// Machine over tree-walker on a fresh worker, which is what a real run charges.
     pub first_pass_ratio: Option<f64>,
 }
 
@@ -169,9 +140,7 @@ fn one_engine(front: &Front, engine: Engine, repeats: usize) -> Result<EnginePas
         started.elapsed()
     });
 
-    // Both passes come from the least disturbed attempt, as a pair. Minimizing
-    // them apart reports one worker's first pass against another's steady pass,
-    // which is a ratio no worker ever produced.
+    // Both passes come from the least disturbed attempt, as a pair.
     let mut performs = 0u64;
     let mut best: Option<(Duration, Duration)> = None;
     for _ in 0..repeats.max(1) {
@@ -200,9 +169,7 @@ fn one_engine(front: &Front, engine: Engine, repeats: usize) -> Result<EnginePas
     })
 }
 
-/// Every test once, returning the atoms performed across the pass. A failure is
-/// an error rather than a number, because a corpus that stopped passing is not
-/// a corpus whose speed means anything.
+/// Every test once, returning the atoms performed across the pass.
 fn run_every_test(worker: &mut dyn Evaluator) -> Result<u64> {
     let mut performs = 0u64;
     for index in 0..worker.test_count() {
@@ -215,32 +182,22 @@ fn run_every_test(worker: &mut dyn Evaluator) -> Result<u64> {
     Ok(performs)
 }
 
-// ------------------------------------------------------------------- fixture
-
-/// What ADR 0017 §6's region-scoped fixture costs, measured the way `fork`'s
-/// 1 ns was.
-///
-/// `fork` was a pointer clone at every fixture size, because state was a
-/// persistent map. A region stack is not a persistent value, so opening a
-/// fixture replays its allocations: O(the fixture) instead of O(1). These are
-/// the numbers that says what that is worth in nanoseconds rather than in
-/// asymptotics, and `rebuild_over_open` is what is left of the claim.
+/// What ADR 0017 §6's region-scoped fixture costs, measured the way `fork`'s 1 ns was.
 #[derive(Clone, Debug, Serialize)]
 pub struct FixturePoint {
     pub cells: usize,
     pub open_nanos: f64,
-    /// An opened fixture a test then writes to — a slot write, where the
-    /// persistent map paid for copy-on-write down a root-to-leaf path.
+    /// An opened fixture a test then writes to — a slot write, where the persistent map paid for
+    /// copy-on-write down a root-to-leaf path.
     pub open_and_write_nanos: f64,
-    /// Building the same fixture by running the setup again — the alternative
-    /// to opening one, and the denominator of the claim.
+    /// Building the same fixture by running the setup again — the alternative to opening one, and
+    /// the denominator of the claim.
     pub rebuild_nanos: f64,
     pub rebuild_over_open: f64,
     pub rebuild_over_open_and_write: f64,
 }
 
-/// Records rather than integers, so a copy is a copy of something. The handle
-/// is the list of cells, so the write path names a cell the way a test would.
+/// Records rather than integers, so a copy is a copy of something.
 fn seeded(cells: usize) -> Fixture {
     Fixture::build(|regions| {
         let handles = (0..cells)
@@ -274,10 +231,9 @@ pub fn fixture_cost(sizes: &[usize], repeats: usize) -> Vec<FixturePoint> {
         .map(|&cells| {
             let fixture = seeded(cells);
             let slots = cells_of(fixture.handle());
-            // Enough iterations that a nanosecond-scale operation is not read
-            // off the clock's own resolution, and few enough that an O(n) open
-            // of a 10,000-cell fixture still finishes: the product is what is
-            // held roughly constant, not the count.
+            // Enough iterations that a nanosecond-scale operation is not read off the clock's own
+            // resolution, and few enough that an O(n) open of a 10,000-cell fixture still finishes:
+            // the product is what is held roughly constant, not the count.
             let iterations = (1_000_000 / (cells as u32 + 1)).max(16);
 
             let open = best_of(repeats, || {
@@ -318,15 +274,11 @@ pub fn fixture_cost(sizes: &[usize], repeats: usize) -> Vec<FixturePoint> {
         .collect()
 }
 
-// ---------------------------------------------------------------- multi-shot
-
 #[derive(Clone, Debug, Serialize)]
 pub struct Resumptions {
     pub resumptions: usize,
     pub micros: f64,
-    /// What this resumption added over the previous count. Constant marginal
-    /// cost is the whole claim: a splice that copied the captured frames would
-    /// make each one dearer than the last.
+    /// What this resumption added over the previous count.
     pub marginal_micros: f64,
 }
 
@@ -336,8 +288,8 @@ pub struct StackPoint {
     pub segments: usize,
     pub capture_nanos: f64,
     pub resume_nanos: f64,
-    /// What `Continuation::frames` reports, to show the frames really were
-    /// pending and the capture still did not walk them.
+    /// What `Continuation::frames` reports, to show the frames really were pending and the capture
+    /// still did not walk them.
     pub captured_frames: usize,
 }
 
@@ -348,8 +300,6 @@ pub struct MultiShot {
 }
 
 /// A handler resuming a fixed residual computation a varying number of times.
-/// The residual is the same in every case, so the difference between two rows
-/// is exactly one more resumption.
 const MULTISHOT_SRC: &str = r#"
 effect amb {
   read pick[coin]() -> Int
@@ -400,8 +350,8 @@ pub fn multi_shot(repeats: usize) -> Result<MultiShot> {
     let mut rows: Vec<Resumptions> = Vec::new();
     for (count, name) in [(0usize, "r0"), (1, "r1"), (2, "r2"), (4, "r4")] {
         let qualified = format!("multishot.{name}");
-        // One call outside the clock, so lazy lowering is not charged to the
-        // first row and read as a cost of resuming zero times.
+        // One call outside the clock, so lazy lowering is not charged to the first row and read as
+        // a cost of resuming zero times.
         machine
             .call(&qualified, Vec::new(), Span::DUMMY)
             .map_err(|d| anyhow::anyhow!("`{qualified}` failed: {}", d.message))?;
@@ -443,9 +393,8 @@ fn empty_prompt() -> Rc<Prompt> {
     })
 }
 
-/// `Stack::capture` and `Stack::resume` against the number of frames pending
-/// inside the captured segment. Flat is the claim; growth would mean the
-/// segment is being walked.
+/// `Stack::capture` and `Stack::resume` against the number of frames pending inside the captured
+/// segment.
 fn stack_cost(repeats: usize) -> Vec<StackPoint> {
     [8usize, 1_000, 100_000]
         .into_iter()
@@ -487,8 +436,6 @@ fn stack_cost(repeats: usize) -> Vec<StackPoint> {
         .collect()
 }
 
-// ---------------------------------------------------------------- scheduling
-
 #[derive(Clone, Debug, Serialize)]
 pub struct Scheduling {
     pub root: String,
@@ -497,19 +444,18 @@ pub struct Scheduling {
     pub shared: usize,
     /// Groups over every test, which is what a cold run schedules.
     pub groups: usize,
-    /// Groups the shared tests need on their own. The two are equal, which is
-    /// ADR 0005 §5's property stated as a measurement.
+    /// Groups the shared tests need on their own.
     pub shared_groups: usize,
     pub largest_group: usize,
     pub smallest_group: usize,
-    /// Tests in the largest group over tests scheduled: the fraction that runs
-    /// in one concurrent wave.
+    /// Tests in the largest group over tests scheduled: the fraction that runs in one concurrent
+    /// wave.
     pub largest_group_share: f64,
 }
 
-/// A cold run selects every test, so the schedule is a function of the corpus
-/// alone and the cache need not be touched — which matters, because clearing it
-/// to observe a cold schedule would destroy the state `store_open` measures.
+/// A cold run selects every test, so the schedule is a function of the corpus alone and the cache
+/// need not be touched — which matters, because clearing it to observe a cold schedule would
+/// destroy the state `store_open` measures.
 pub fn scheduling(root: &Path) -> Result<Scheduling> {
     let front = front(root)?;
     let footprints: Vec<Footprint> = front
@@ -540,8 +486,6 @@ pub fn scheduling(root: &Path) -> Result<Scheduling> {
     })
 }
 
-// --------------------------------------------------------------- store::open
-
 #[derive(Clone, Debug, Serialize)]
 pub struct StoreOpen {
     pub root: String,
@@ -553,9 +497,7 @@ pub struct StoreOpen {
     pub results_bytes: u64,
 }
 
-/// `Store::open` against a cache the corpus has already filled. ADR 0003's
-/// budget is 5 ms at 10,000 definitions and it covers both caches, so the
-/// measurement is only meaningful on a root a full run has been through.
+/// `Store::open` against a cache the corpus has already filled.
 pub fn store_open(root: &Path, repeats: usize) -> Result<StoreOpen> {
     let store = ply_store::Store::open(root).context("opening the cache")?;
     let stats = store.stats();
@@ -583,8 +525,6 @@ pub fn store_open(root: &Path, repeats: usize) -> Result<StoreOpen> {
         results_bytes: stats.results_bytes,
     })
 }
-
-// -------------------------------------------------------------------- report
 
 #[derive(Clone, Debug, Serialize)]
 pub struct Measurements {
@@ -726,16 +666,16 @@ mod tests {
 
         let t = throughput(&root, &[Engine::Treewalk, Engine::Machine], 1).unwrap();
         assert_eq!(t.engines.len(), 2);
-        // `throughput` refuses a mismatch, so reaching here already proves the
-        // two agreed; asserting it keeps the reason visible.
+        // `throughput` refuses a mismatch, so reaching here already proves the two agreed;
+        // asserting it keeps the reason visible.
         assert_eq!(t.engines[0].performs, t.engines[1].performs);
         assert!(t.engines.iter().all(|e| e.steady_pass_millis > 0.0));
         assert!(t.steady_ratio.is_some_and(|r| r > 0.0));
         assert!(t.lower_test_bodies_millis > 0.0);
     }
 
-    /// A ratio between two engines is meaningless when only one ran, and a
-    /// silent `1.0` would read as parity.
+    /// A ratio between two engines is meaningless when only one ran, and a silent `1.0` would read
+    /// as parity.
     #[test]
     fn one_engine_reports_no_ratio() {
         let dir = tempfile::tempdir().unwrap();
@@ -748,14 +688,8 @@ mod tests {
         assert!(t.first_pass_ratio.is_none());
     }
 
-    /// The tree-walker deep-clones every body per worker and the machine lowers
-    /// on first call, so setup must not be read as interpreter speed. This is
-    /// the reason the two passes are separated at all.
-    ///
-    /// The tree-walker defers nothing to first call, so its two passes measure
-    /// the same work and the bound below is what catches one of them measuring
-    /// something else. Several repeats, because a pass here is under a
-    /// millisecond and this test runs beside every other one in the crate.
+    /// The tree-walker deep-clones every body per worker and the machine lowers on first call, so
+    /// setup must not be read as interpreter speed.
     #[test]
     fn setup_is_reported_apart_from_evaluation() {
         let dir = tempfile::tempdir().unwrap();
@@ -774,17 +708,8 @@ mod tests {
         }
     }
 
-    /// The forkable world's version of this asserted that a fork of a
-    /// 10,000-cell fixture cost what a fork of a one-cell fixture did. That is
-    /// no longer true and asserting it would be asserting the design away: an
-    /// open replays the fixture's allocations.
-    ///
-    /// What is asserted instead is what is actually true, and it is narrower
-    /// than the claim it replaces. At one cell an open and a rebuild cost the
-    /// same, because both are dominated by standing up a region stack; the
-    /// advantage is in *not re-running the setup*, so it only appears once the
-    /// setup is doing work. The ratio is therefore asserted at the large end
-    /// and printed at both.
+    /// The forkable world's version of this asserted that a fork of a 10,000-cell fixture cost what
+    /// a fork of a one-cell fixture did.
     #[test]
     fn opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real() {
         let points = fixture_cost(&[1, 10_000], 3);
@@ -809,16 +734,8 @@ mod tests {
         );
     }
 
-    /// If `capture` walked the segment it cut, the 100,000-frame row would cost
-    /// four orders of magnitude more than the 8-frame one.
-    ///
-    /// The bound is a hundredfold rather than a fourfold, and the slack is
-    /// deliberate: two nanosecond measurements taken at different moments differ
-    /// by an order of magnitude under a loaded machine, and a tolerance tight
-    /// enough to catch that is a test about the scheduler. A hundredfold is
-    /// still **two orders of magnitude** below what walking the segment would
-    /// cost, so the hypothesis this test exists to refute is refuted with room
-    /// to spare.
+    /// If `capture` walked the segment it cut, the 100,000-frame row would cost four orders of
+    /// magnitude more than the 8-frame one.
     #[test]
     fn capture_and_resume_are_flat_in_the_frames_they_move() {
         let points = stack_cost(3);

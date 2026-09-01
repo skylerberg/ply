@@ -1,60 +1,4 @@
 //! The deterministic scheduler.
-//!
-//! A task is a suspended machine state, which is what ADR 0005's explicit
-//! control stack bought. This module holds the set of them, decides which one
-//! runs next, and does it as a pure function of a [`Seed`]: same seed, same
-//! interleaving, same result, on any machine, at any thread count, in any order
-//! the corpus happens to be run in.
-//!
-//! **One region stack, threaded.** The scheduler holds no [`TaskRegions`] and
-//! opens none. ADR 0006 §3.4 is the reason: there is exactly one current state
-//! at every point of a simulated run, so task *B* observes task *A*'s writes
-//! when *B* next runs and not before — which is what shared memory *is*. A
-//! per-task stack would mean no task ever observes another, every interleaving
-//! would reach the same result, and the milestone would be silently vacuous
-//! rather than loudly broken. Reset happens one level up, per interleaving: a test is
-//! replayed whole from a fresh fork of the base world, which is what every entry
-//! point already does.
-//!
-//! **What the machine owes the scheduler.** The seam is three calls and one
-//! rule. When a task performs a scheduler-visible operation the machine captures
-//! its continuation up to the simulated region's delimiter — exactly as it would
-//! for a general Ply clause — and hands it to [`Scheduler::suspend`],
-//! [`Scheduler::join`] or [`Scheduler::sleep_until`]. When a task's body returns
-//! to that delimiter the machine calls [`Scheduler::finish`]. Between the two it
-//! asks [`Scheduler::next`] for the task to run and installs the [`Resumption`]
-//! it is handed. The rule is that a step ends at a perform: the machine never
-//! resumes a second task while one is running.
-//!
-//! **What the scheduler does not own.** Virtual time and the `rand` stream are
-//! [`Handlers`]', which is why [`Scheduler::next`] takes a [`Clock`] rather than
-//! keeping one: the clock holds the timers and the scheduler holds enabledness,
-//! and time may advance only when the enabled set is empty — a precondition only
-//! this side can check. The region's world is the machine's, threaded. The seed,
-//! the `sched` stream and the step record are the *entry point's* — a
-//! [`Trail`] — because a test may run several regions in sequence and one seed
-//! has to mean one thing across all of them.
-//!
-//! **Two policies, one scheduler.** ADR 0011 §9: the production scheduler is
-//! not a second scheduler. A Ply task cannot move between OS threads — [`Value`]
-//! holds `Rc` and a `Machine` is single-threaded by construction — so the
-//! production side is this same cooperative loop over this same task table,
-//! choosing by real readiness rather than by a seed. Only [`Scheduler::next`]
-//! versus [`Scheduler::next_host`] differ, and everything a race depends on —
-//! enabledness, spawn, join, finish, the deadlock report — is one
-//! implementation. A `Scheduler` living in `ply-host` would be exactly the drift
-//! M7's design exists to prevent.
-//!
-//! **Hygiene.** Nothing here may name a hash-based collection, read a clock,
-//! observe a thread identity, an address, a refcount or an allocation order. The
-//! task table is a `Vec` indexed by [`TaskId`], every set the scheduler derives
-//! from it is built by an ascending scan of that `Vec`, and the test at the
-//! bottom of this file checks the part of the rule that is greppable. The
-//! production policy reaches the outside world only through the
-//! [`HostRuntime`] it is handed, which no seeded path can name.
-//!
-//! [`Handlers`]: crate::sim::Handlers
-//! [`TaskRegions`]: crate::task_regions::TaskRegions
 
 use crate::arena::Pin;
 use crate::cont::{Continuation, Delimiter, SimId};
@@ -64,35 +8,21 @@ use crate::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use crate::value::Value;
 use ply_span::{Diagnostic, Span, codes};
 
-/// The task a `simulate` region's own body runs as. Every other task is spawned
-/// by one that is already running, so this is the only id that exists before the
-/// region has taken a step.
+/// The task a `simulate` region's own body runs as.
 pub const ROOT: TaskId = TaskId(0);
 
 /// What the machine must do to give a task its step.
-///
-/// The scheduler decides *which* control runs; installing it is the machine's
-/// half, because only the machine holds the stack the simulated region's
-/// delimiter sits on. All three land the task under that delimiter, so a perform
-/// inside the task finds the scheduler again.
 pub enum Resumption {
-    /// Evaluate the region's own body. Delivered exactly once, to [`ROOT`].
+    /// Evaluate the region's own body.
     Enter,
-    /// Apply this closure to no arguments, under the delimiters that were in
-    /// scope where it was spawned. A spawned body that has not started.
-    ///
-    /// `over` is innermost first and ends at the region's own delimiter, so a
-    /// task spawned inside a `handle` written *within* the region runs under
-    /// that handler — which is what `spawn`'s row already promises, since the
-    /// spawned body's effects are in the spawner's row and the enclosing
-    /// `handle` is what discharges them.
+    /// Apply this closure to no arguments, under the delimiters that were in scope where it was
+    /// spawned.
     Start {
         body: Value,
         over: Vec<Delimiter>,
         span: Span,
     },
-    /// Splice this continuation onto the current stack and return `value` into
-    /// it. The captured segments carry the delimiter, so resuming reinstalls it.
+    /// Splice this continuation onto the current stack and return `value` into it.
     Resume { k: Continuation, value: Value },
 }
 
@@ -102,20 +32,11 @@ pub enum Turn {
         task: TaskId,
         resumption: Resumption,
     },
-    /// Every task has finished, so the region delivers its body's value. A task
-    /// still runnable when the body returned has already been run to completion:
-    /// spawn is structured and the handler is the scope.
+    /// Every task has finished, so the region delivers its body's value.
     Complete(Value),
 }
 
 /// Which of the two schedulers a region is.
-///
-/// The names are the whole difference. [`Policy::Seeded`] draws its choice from
-/// the [`Trail`] and its time from the virtual [`Clock`]; [`Policy::Host`] takes
-/// the lowest-numbered ready task, waits on a [`HostRuntime`] when none is
-/// ready, records no step and reports no exploration. Nothing else about a
-/// region differs, which is what makes "the signature is declared once so the
-/// two handlers cannot disagree" a fact about the code rather than a hope.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Policy {
     Seeded,
@@ -131,56 +52,31 @@ impl Policy {
     }
 }
 
-/// Permission to build a [`Policy::Host`] scheduler, and the first of the locks
-/// that make real threads unreachable from a hermetic run.
-///
-/// It has a private field, no `Clone` and no `Default`, and exactly one
-/// constructor — [`HostPolicy::of`], which answers `None` for a hermetic
-/// [`HostBinding`]. `ply test` binds `HostBinding::hermetic()`, so there is no
-/// expression a hermetic run can write that produces one of these, and
-/// [`Scheduler::production`] consumes it: a token cannot be minted under
-/// `--host` and stashed for a later run, because every production region has to
-/// present the binding again.
-///
-/// This is not the only lock (ADR 0011 §9 names three more, all in the front end
-/// and the control stack), and it is deliberately the one that does not depend
-/// on any of them holding.
+/// Permission to build a [`Policy::Host`] scheduler, and the first of the locks that make real
+/// threads unreachable from a hermetic run.
 pub struct HostPolicy(());
 
 impl HostPolicy {
-    /// `None` when nothing is bound. A hermetic run has no host handlers, so a
-    /// production scheduler would have nothing to wait on and no reason to
-    /// exist — and being unable to *build* one is a stronger statement than
-    /// being unlikely to.
+    /// `None` when nothing is bound.
     pub fn of(binding: &HostBinding) -> Option<HostPolicy> {
         (!binding.is_hermetic()).then_some(HostPolicy(()))
     }
 }
 
-/// Why a task cannot run. Each is an answer to *enabledness*, which is a
-/// different mechanism from the dependence relation on purpose: enabledness says
-/// what could run, dependence says whether the order matters. Encoding "join
-/// happens after the child finishes" as a conflict instead would generate
-/// impossible schedules and then prune them.
+/// Why a task cannot run.
 enum Wait {
     Join {
         task: TaskId,
         span: Span,
     },
-    /// The timer itself is the [`Clock`]'s; this is the task's side of it, and
-    /// `until` is carried so a diagnostic can say what the task is waiting for
-    /// without asking the clock about a timer it has already fired.
+    /// The timer itself is the [`Clock`]'s; this is the task's side of it, and `until` is carried
+    /// so a diagnostic can say what the task is waiting for without asking the clock about a timer
+    /// it has already fired.
     Timer {
         until: i64,
         span: Span,
     },
-    /// A host operation answered [`HostAnswer::Pending`]. Reachable only under
-    /// [`Policy::Host`]: [`Scheduler::park_on_host`] refuses to park a seeded
-    /// task on a real token, which is what stops a `--host` run from smuggling
-    /// wall-clock waiting into a region whose answer must be a function of its
-    /// seed.
-    ///
-    /// [`HostAnswer::Pending`]: crate::host::HostAnswer::Pending
+    /// A host operation answered [`HostAnswer::Pending`].
     Host {
         pending: Pending,
         span: Span,
@@ -188,8 +84,7 @@ enum Wait {
 }
 
 enum TaskState {
-    /// Enabled: suspended at a scheduling point with the control that continues
-    /// it already decided.
+    /// Enabled: suspended at a scheduling point with the control that continues it already decided.
     Ready(Resumption),
     /// The machine is executing this task's step right now.
     Running,
@@ -198,82 +93,40 @@ enum TaskState {
         k: Continuation,
     },
     Done(Value),
-    /// Raised a diagnostic. The region is over; nothing else will be scheduled.
+    /// Raised a diagnostic.
     Failed,
 }
 
 struct Task {
     state: TaskState,
-    /// The `spawn` that created it, or the region for [`ROOT`]. The deadlock
-    /// diagnostic points at it when a task is blocked with no wait site of its
-    /// own.
+    /// The `spawn` that created it, or the region for [`ROOT`].
     origin: Span,
     /// This task's claim on the regions that were open at its `spawn`.
-    ///
-    /// A spawned body is a closure, not a continuation, so it takes no pin from
-    /// a capture — and ADR 0017 §2 lets a cell reach a task, so the closure may
-    /// hold one. `with_cell[s](0) { c -> spawn(|| cell_set(c, 1)) }` returns from
-    /// the region before the child has run, and without this the region's close
-    /// would hand back the slot the child is about to write.
-    ///
-    /// Held, never read: dropping it with the task is the whole of its job.
     #[allow(dead_code)]
     pin: Option<Pin>,
 }
 
 /// One step of one task, as the search reads it back.
-///
-/// `enabled` is the set the choice was made from and `choice` indexes into it,
-/// so a searcher can name the sibling interleaving — "like this one but taking
-/// the other branch at point *i*" — without re-deriving what could have run.
 pub struct StepRecord {
-    /// Which of the entry point's regions took this step. Two regions run in
-    /// sequence, never interleaved, so a pair of steps from different regions
-    /// can never be reordered and the search must not queue one.
+    /// Which of the entry point's regions took this step.
     pub region: SimId,
     pub task: TaskId,
-    /// Ascending by id. The order is part of the seed's meaning: `path[i]`
-    /// indexes *this* sequence.
+    /// Ascending by id.
     pub enabled: Vec<TaskId>,
     pub choice: u16,
     /// Virtual time when the step began.
     pub at: i64,
     /// What the step touched, excluding the scheduler's own bookkeeping.
     pub accesses: StepFootprint,
-    /// The acting task's vector clock as of this step. Two steps ordered by it
-    /// cannot be reordered by any schedule, so the search must not queue a
-    /// backtrack point for them; see [`Stamp`].
+    /// The acting task's vector clock as of this step.
     pub stamp: Stamp,
 }
 
 /// A task's vector clock, indexed by [`TaskId`], as of one step.
-///
-/// This is the *synchronization* half of the search's input, and it is a
-/// different question from the dependence relation. Dependence asks whether the
-/// order of two steps is observable; a stamp answers whether the order is
-/// **reachable at all**. `spawn` and `join` are the only two edges a simulated
-/// region has, and a pair of steps the edges already order can never appear in
-/// the other order however the scheduler chooses — so exploring the reversal is
-/// not conservative, it is unreachable.
-///
-/// Omitting it is not unsound and that is exactly why it is easy to omit: the
-/// search still finds every race, it just runs a schedule for each pair the join
-/// graph had already decided. On a test whose parent reads what its children
-/// wrote — which is what an assertion after a join *is* — that is the difference
-/// between one interleaving and hundreds.
-///
-/// A timer waking a task adds no edge. Time advancing is the scheduler's
-/// decision rather than the program's, so two tasks that wake together are
-/// racing and must be treated as racing.
 pub type Stamp = Vec<u32>;
 
-/// `earlier` happens before `later`: `later`'s task had already observed that
-/// step, transitively through spawns and joins, when it ran.
-///
-/// An empty stamp on either side means the recording carries no
-/// synchronization, and the answer is `false` — no pair is ordered, every pair
-/// is a candidate. That is the direction to err in, and it is what keeps a
-/// recording made without clocks behaving exactly as it did before they existed.
+/// `earlier` happens before `later`: `later`'s task had already observed that step, transitively
+/// through spawns and joins, when it ran.
 pub fn happens_before(earlier: &Stamp, earlier_task: TaskId, later: &Stamp) -> bool {
     if earlier.is_empty() || later.is_empty() {
         return false;
@@ -284,18 +137,7 @@ pub fn happens_before(earlier: &Stamp, earlier_task: TaskId, later: &Stamp) -> b
     mine > 0 && theirs >= mine
 }
 
-/// Whether an access is the scheduler's own bookkeeping rather than the
-/// program's state.
-///
-/// Every step ends in a `task.*`, `clock.*` or `random.*` perform, and all of
-/// those write one singleton resource. Counted as accesses, every pair of steps
-/// would be dependent and the reduction would be exactly 1×. Excluding them is
-/// sound because the scheduler is the *explorer*: its state is a function of the
-/// choice sequence and the search enumerates choice sequences.
-///
-/// `random` is not bookkeeping and must not be excluded with the rest: the value
-/// a draw returns is observed by the program, so a draw is a genuine
-/// read-modify-write of shared state and two steps that both draw are dependent.
+/// Whether an access is the scheduler's own bookkeeping rather than the program's state.
 pub fn is_scheduler_bookkeeping(access: &Access) -> bool {
     match access {
         Access::Atom(atom) => matches!(atom.effect.as_str(), "task" | "clock"),
@@ -303,61 +145,37 @@ pub fn is_scheduler_bookkeeping(access: &Access) -> bool {
     }
 }
 
-/// The set of runnable tasks of one region, and the enabledness that decides
-/// which of them may be picked. The seed that picks between them belongs to the
-/// entry point's [`Trail`], not here: two regions in sequence make one choice
-/// sequence.
+/// The set of runnable tasks of one region, and the enabledness that decides which of them may be
+/// picked.
 pub struct Scheduler {
-    /// Which of the entry point's regions this is. Every step it records carries
-    /// it, so the search can tell two regions' steps apart — they run in
-    /// sequence, never interleaved, and a task id means a different task in each.
+    /// Which of the entry point's regions this is.
     region: SimId,
-    /// Indexed by [`TaskId`]. A `Vec` rather than a map so that "the tasks, in
-    /// order" is the only order there is, and an ascending scan of it is the
-    /// only way any set here is built.
+    /// Indexed by [`TaskId`].
     tasks: Vec<Task>,
-    /// One vector clock per task, indexed by [`TaskId`] alongside `tasks`. A
-    /// `Vec` of `Vec`s rather than a map, for the reason the task table is one:
-    /// an ascending scan is the only order there is.
+    /// One vector clock per task, indexed by [`TaskId`] alongside `tasks`.
     clocks: Vec<Stamp>,
     max_steps: u32,
-    /// Steps handed out, which only [`Policy::Host`] counts: a seeded region's
-    /// budget is spent against the [`Trail`]'s scheduling points, and one entry
-    /// point's regions share that count.
+    /// Steps handed out, which only [`Policy::Host`] counts: a seeded region's budget is spent
+    /// against the [`Trail`]'s scheduling points, and one entry point's regions share that count.
     steps: u32,
     policy: Policy,
-    /// Where [`Policy::Host`]'s round-robin scan starts. Untouched by the seeded
-    /// path, whose choice is the seed's and must stay a function of it alone.
+    /// Where [`Policy::Host`]'s round-robin scan starts.
     resume_from: usize,
     current: Option<TaskId>,
-    /// The region, for a diagnostic that is about the region rather than about
-    /// any one task.
+    /// The region, for a diagnostic that is about the region rather than about any one task.
     span: Span,
-    /// Set once a task fails. The region is over: every later call answers with
-    /// this rather than scheduling anything.
+    /// Set once a task fails.
     failure: Option<Diagnostic>,
 }
 
 impl Scheduler {
-    /// The seeded scheduler. `span` is the `simulate` region's own span, which
-    /// is what a deadlock is reported against.
+    /// The seeded scheduler.
     pub fn new(region: SimId, span: Span) -> Scheduler {
         Scheduler::rooted(region, span, Policy::Seeded, DEFAULT_STEPS)
     }
 
-    /// The production scheduler: this same state machine, choosing by real
-    /// readiness instead of by a seed.
-    ///
-    /// Taking [`HostPolicy`] **by value** is the mutual exclusion ADR 0011 §9
-    /// asks for, expressed as a type rather than as a convention. `simulate`
-    /// reaches [`Scheduler::new`] and nothing else, so a simulated region is
-    /// [`Policy::Seeded`] by construction; a production one needs a token that
-    /// only a bound [`HostBinding`] mints, and `ply test` binds hermetically.
-    ///
-    /// The step budget starts unbounded, unlike a seeded region's. A server is
-    /// supposed to keep scheduling, and a production region that stopped at
-    /// step 100,000 would be a runtime with a bug rather than a livelock guard.
-    /// A caller that wants one sets [`Scheduler::with_step_budget`].
+    /// The production scheduler: this same state machine, choosing by real readiness instead of by
+    /// a seed.
     pub fn production(region: SimId, span: Span, _permit: HostPolicy) -> Scheduler {
         Scheduler::rooted(region, span, Policy::Host, u32::MAX)
     }
@@ -368,8 +186,8 @@ impl Scheduler {
             tasks: vec![Task {
                 state: TaskState::Ready(Resumption::Enter),
                 origin: span,
-                // The root task is the region's own control; it holds no claim
-                // of its own, because the region it runs in outlives it.
+                // The root task is the region's own control; it holds no claim of its own, because
+                // the region it runs in outlives it.
                 pin: None,
             }],
             clocks: vec![vec![0]],
@@ -384,15 +202,6 @@ impl Scheduler {
     }
 
     /// Opens the region with its root task already **running**.
-    ///
-    /// The perform that opened a lazy region is a `task.*` that has not been
-    /// answered yet, and its answer is not a value the opener has: `spawn`
-    /// answers a handle only the scheduler can mint and `join` may not answer at
-    /// all. So the root starts running and the ordinary
-    /// [`spawn`](Scheduler::spawn) / [`join`](Scheduler::join) /
-    /// [`suspend`](Scheduler::suspend) path answers it — one implementation of
-    /// what `task.*` means, rather than a second one for the operation that
-    /// happened to be first.
     pub fn rooted_running(mut self) -> Result<Scheduler, Diagnostic> {
         if self.steps > 0 || self.current.is_some() || self.tasks.len() > 1 {
             return Err(self.internal("a region's root was re-rooted after it had begun"));
@@ -403,10 +212,7 @@ impl Scheduler {
         Ok(self)
     }
 
-    /// Scheduling steps this interleaving may take before it is
-    /// [`codes::DEADLOCK`]. This is what bounds a livelock — a region that keeps
-    /// running and never finishes — where a runaway recursion *inside* one step
-    /// is bounded by [`crate::limit::DEFAULT_MAX_CALLS`] instead.
+    /// Scheduling steps this interleaving may take before it is [`codes::DEADLOCK`].
     pub fn with_step_budget(mut self, steps: u32) -> Scheduler {
         self.max_steps = steps.max(1);
         self
@@ -417,24 +223,11 @@ impl Scheduler {
     }
 
     /// Whether this region contributes to the [`Trail`] the search reads.
-    ///
-    /// False under [`Policy::Host`], and that is load-bearing: a production run
-    /// records no step, so it cannot fabricate an [`Exploration`] and a caller
-    /// cannot mistake "the server ran" for "the interleavings were searched".
-    ///
-    /// [`Exploration`]: crate::sim::Exploration
     pub fn records_steps(&self) -> bool {
         self.policy == Policy::Seeded
     }
 
     /// Whether this region's delimiter answers `effect.op`.
-    ///
-    /// A seeded region answers `task`, `clock` and `random`. A production one
-    /// answers `task` **only**: under `--host` a real clock and a real generator
-    /// are host handlers, and a region that answered `clock.now` from the seeded
-    /// table would hand a production run virtual time that starts at zero and
-    /// only moves when every task is asleep. That is a wrong answer no test
-    /// would go red on, which is the failure mode this milestone is about.
     pub fn answers(&self, effect: &str, op: &str) -> bool {
         match self.policy {
             Policy::Seeded => crate::sim::is_scheduled(effect, op),
@@ -455,9 +248,7 @@ impl Scheduler {
         (task.0 as usize) < self.tasks.len()
     }
 
-    /// The tasks that have not finished, ascending. A region whose control is
-    /// discarded while any of these exist is a region whose tasks were destroyed
-    /// unfinished, which is what [`codes::TASK_ESCAPES_SCOPE`] names.
+    /// The tasks that have not finished, ascending.
     pub fn unfinished(&self) -> Vec<TaskId> {
         self.tasks
             .iter()
@@ -468,11 +259,6 @@ impl Scheduler {
     }
 
     /// Which task runs next, or that the region is over.
-    ///
-    /// Virtual time advances here and only here, and only once nothing is
-    /// enabled: it jumps to the earliest deadline and every task waiting for
-    /// that instant becomes enabled at once. Nothing can be pre-empted by a
-    /// timer, so a simulated timeout can never fire early.
     pub fn next(&mut self, clock: &mut Clock, trail: &mut Trail) -> Result<Turn, Diagnostic> {
         self.require(Policy::Seeded)?;
         if let Some(failure) = &self.failure {
@@ -536,28 +322,7 @@ impl Scheduler {
         Ok(Turn::Run { task, resumption })
     }
 
-    /// Which task runs next under [`Policy::Host`], waiting on `rt` when none
-    /// can.
-    ///
-    /// The next ready task in round-robin order, which is where this departs
-    /// from ADR 0011 §9's "lowest-numbered ready task" — deliberately, because
-    /// the literal rule starves. A task that yields in a loop is ready again the
-    /// moment it suspends, so under strict lowest-first it is picked forever and
-    /// every task above it stops running: a server whose first connection loops
-    /// serves no second one, and the way that shows up is a hang rather than a
-    /// failure. Round-robin keeps everything else §9 asked for — no seed, no
-    /// choice recorded, no draw — and makes "many concurrent tasks making
-    /// progress" true rather than merely likely.
-    ///
-    /// The choice is not where a production run gets its nondeterminism anyway.
-    /// That comes from the order host operations complete in, which is the
-    /// runtime's answer and nothing this module has a view of.
-    ///
-    /// It takes no [`Trail`] and no [`Clock`], and that is the point rather than
-    /// an omission: a production region cannot write a choice into a seed's
-    /// choice sequence, cannot spend a seeded step budget, and cannot move
-    /// virtual time. The two policies share every line that decides *what* is
-    /// enabled and share none that decides *which*.
+    /// Which task runs next under [`Policy::Host`], waiting on `rt` when none can.
     pub fn next_host(&mut self, rt: &dyn HostRuntime) -> Result<Turn, Diagnostic> {
         self.require(Policy::Host)?;
         if let Some(failure) = &self.failure {
@@ -569,12 +334,8 @@ impl Scheduler {
             )));
         }
 
-        // Once per scheduling decision, and this is the only place the machine
-        // gives control back while a request is still running. W5 has no
-        // cancellation, so a drain that expired cannot hand the task a `503`;
-        // what it can do is stop scheduling before the task issues its next
-        // statement, which is what leaves the teardown a transaction to roll
-        // back rather than a half-finished body to commit.
+        // Once per scheduling decision, and this is the only place the machine gives control back
+        // while a request is still running.
         if let Some(expired) = rt.drain_expired() {
             return Err(expired);
         }
@@ -598,11 +359,9 @@ impl Scheduler {
                     _ => Err(self.internal("the region finished without its body returning")),
                 };
             }
-            // A stop turns "nothing can make progress" from a verdict into a
-            // wait: the listening sockets are being closed under the run, so an
-            // `accept` that was the only outstanding token has already resolved
-            // and the tasks below it are about to become ready. Calling this a
-            // deadlock would report `E0414` on the ordinary shutdown path.
+            // A stop turns "nothing can make progress" from a verdict into a wait: the listening
+            // sockets are being closed under the run, so an `accept` that was the only outstanding
+            // token has already resolved and the tasks below it are about to become ready.
             if !self.waiting_on_host() && !rt.stopping() {
                 return Err(self.err_host_deadlock());
             }
@@ -610,10 +369,9 @@ impl Scheduler {
             if let Some(expired) = rt.drain_expired() {
                 return Err(expired);
             }
-            // A park that woke on a stop resolved no token and is not fruitless:
-            // it is `park` doing the one thing that lets an idle service observe
-            // a signal at all, and counting it would report the runtime as
-            // broken for working.
+            // A park that woke on a stop resolved no token and is not fruitless: it is `park` doing
+            // the one thing that lets an idle service observe a signal at all, and counting it
+            // would report the runtime as broken for working.
             if !rt.stopping() {
                 fruitless += 1;
                 if fruitless > FRUITLESS_PARKS {
@@ -622,9 +380,8 @@ impl Scheduler {
             }
         };
 
-        // `u32::MAX` is the absence of a budget rather than a very large one, so
-        // a server that legitimately schedules four billion times is not told it
-        // spent a limit nobody set.
+        // `u32::MAX` is the absence of a budget rather than a very large one, so a server that
+        // legitimately schedules four billion times is not told it spent a limit nobody set.
         if self.max_steps != u32::MAX && self.steps >= self.max_steps {
             return Err(self.err_host_step_budget());
         }
@@ -643,14 +400,7 @@ impl Scheduler {
         Ok(Turn::Run { task, resumption })
     }
 
-    /// Blocks the current task on a host token. It becomes enabled again when
-    /// [`HostRuntime::poll`] answers for that token, and never before.
-    ///
-    /// Refused under [`Policy::Seeded`] with [`codes::HOST_IN_SIMULATION`],
-    /// because that call means a host operation was answered inside a `simulate`
-    /// region: the region would then park on wall-clock readiness and its answer
-    /// would stop being a function of its seed, silently, while every assertion
-    /// in it still passed.
+    /// Blocks the current task on a host token.
     pub fn park_on_host(
         &mut self,
         k: Continuation,
@@ -669,9 +419,7 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Collects every host token that has resolved, ascending by task, and
-    /// answers whether any had. Non-blocking: parking is the caller's next move
-    /// and only once this has said no.
+    /// Collects every host token that has resolved, ascending by task, and answers whether any had.
     fn collect(&mut self, rt: &dyn HostRuntime) -> Result<bool, Diagnostic> {
         let mut resolved: Vec<(usize, Value)> = Vec::new();
         for (at, task) in self.tasks.iter().enumerate() {
@@ -681,10 +429,9 @@ impl Scheduler {
             } = &task.state
                 && let Some(value) = rt.poll(pending)?
             {
-                // The third route a host answer takes back into the program, and
-                // the one the machine's own two checks cannot see: the task
-                // parked, so nothing on this path knows which registration
-                // minted the token. See `crate::escape`.
+                // The third route a host answer takes back into the program, and the one the
+                // machine's own two checks cannot see: the task parked, so nothing on this path
+                // knows which registration minted the token.
                 crate::escape::check(
                     &crate::escape::Boundary::HostToken {
                         label: pending.label,
@@ -714,10 +461,9 @@ impl Scheduler {
         Ok(woke)
     }
 
-    /// The next enabled task after the one that ran last, wrapping, and without
-    /// building the set: `next_host` asks once per step of a run that may serve
-    /// a great many connections, and the set it would build is one it does not
-    /// record.
+    /// The next enabled task after the one that ran last, wrapping, and without building the set:
+    /// `next_host` asks once per step of a run that may serve a great many connections, and the set
+    /// it would build is one it does not record.
     fn first_ready(&self) -> Option<TaskId> {
         let n = self.tasks.len();
         let start = self.resume_from % n.max(1);
@@ -739,18 +485,9 @@ impl Scheduler {
         })
     }
 
-    /// Creates a task and leaves the current one running, because the handle has
-    /// to reach the program before its step can end: the caller builds a value
-    /// from this id and passes it to [`Scheduler::suspend`].
-    ///
-    /// The id comes from this region's own counter at the `spawn`, so it is a
-    /// function of the interleaving and therefore of the seed — which is what
-    /// lets a failure artifact name `@2` and mean the same task on replay.
-    ///
-    /// `over` is the delimiters the spawn site sat under, innermost first and
-    /// ending at the region's own: a `handle` written inside the region body
-    /// encloses the tasks it lexically contains, which is what makes the row
-    /// `spawn` publishes true of them.
+    /// Creates a task and leaves the current one running, because the handle has to reach the
+    /// program before its step can end: the caller builds a value from this id and passes it to
+    /// [`Scheduler::suspend`].
     pub fn spawn(
         &mut self,
         body: Value,
@@ -764,11 +501,8 @@ impl Scheduler {
             origin: span,
             pin,
         });
-        // Everything the parent had done by the spawn happens before everything
-        // the child does, so the child starts from the parent's clock. Nothing
-        // reads a production region's clocks — it records no step for a search
-        // to prune — so it keeps none, and a server does not pay a vector per
-        // connection for a search nobody will run.
+        // Everything the parent had done by the spawn happens before everything the child does, so
+        // the child starts from the parent's clock.
         let inherited = match (self.policy, self.current) {
             (Policy::Seeded, Some(parent)) => self.clocks[parent.0 as usize].clone(),
             _ => Vec::new(),
@@ -777,8 +511,8 @@ impl Scheduler {
         id
     }
 
-    /// Extends every clock to cover a task that did not exist when they were
-    /// last written, so an index is never a length check at a call site.
+    /// Extends every clock to cover a task that did not exist when they were last written, so an
+    /// index is never a length check at a call site.
     fn tick(&mut self, task: usize) {
         let width = self.tasks.len();
         for clock in &mut self.clocks {
@@ -787,8 +521,7 @@ impl Scheduler {
         self.clocks[task][task] += 1;
     }
 
-    /// `into` observes everything `from` had observed. The join edge, and the
-    /// only other edge a simulated region has.
+    /// `into` observes everything `from` had observed.
     fn absorb(&mut self, into: usize, from: usize) {
         if self.policy != Policy::Seeded {
             return;
@@ -803,9 +536,8 @@ impl Scheduler {
         }
     }
 
-    /// Ends the current task's step; it stays enabled and is resumed with
-    /// `value` whenever the scheduler picks it again. `task.yield`, `spawn`,
-    /// `clock.now` and `random.*` all end this way.
+    /// Ends the current task's step; it stays enabled and is resumed with `value` whenever the
+    /// scheduler picks it again.
     pub fn suspend(&mut self, k: Continuation, value: Value) -> Result<(), Diagnostic> {
         let at = self.running()?;
         self.tasks[at].state = TaskState::Ready(Resumption::Resume { k, value });
@@ -813,8 +545,8 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Blocks the current task until `target` finishes, or resumes it
-    /// immediately with `target`'s value if it already has.
+    /// Blocks the current task until `target` finishes, or resumes it immediately with `target`'s
+    /// value if it already has.
     pub fn join(&mut self, k: Continuation, target: TaskId, span: Span) -> Result<(), Diagnostic> {
         let at = self.running()?;
         let Some(task) = self.tasks.get(target.0 as usize) else {
@@ -838,16 +570,8 @@ impl Scheduler {
         Ok(())
     }
 
-    /// Blocks the current task until virtual time reaches `deadline`, which the
-    /// region's [`Clock`] has already registered a timer for. A sleep of no
-    /// duration never reaches here: it answers `Unit` and the task stays
-    /// enabled, because a sleep that blocks for no time must not be able to
-    /// advance the clock past work that could still run.
-    ///
-    /// Refused under [`Policy::Host`]: a production region has no virtual clock,
-    /// so reaching here means `clock.sleep` was routed to a region that
-    /// [`Scheduler::answers`] says does not answer it. Parking on a deadline no
-    /// clock will ever reach is a hang; saying so is not.
+    /// Blocks the current task until virtual time reaches `deadline`, which the region's [`Clock`]
+    /// has already registered a timer for.
     pub fn sleep_until(
         &mut self,
         k: Continuation,
@@ -875,8 +599,7 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The current task's body returned. Every task blocked joining it becomes
-    /// enabled, in ascending id order.
+    /// The current task's body returned.
     pub fn finish(&mut self, value: Value) -> Result<(), Diagnostic> {
         let at = self.running()?;
         let done = TaskId(at as u32);
@@ -896,13 +619,7 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The current task raised `failure`. The region is over: the other tasks
-    /// are abandoned where they stand and every later call answers with this
-    /// diagnostic, so a caller that keeps driving the scheduler cannot turn a
-    /// failure into a hang.
-    ///
-    /// The returned diagnostic names the task when there was more than one, so
-    /// that a failure inside a concurrent region says so.
+    /// The current task raised `failure`.
     pub fn fail(&mut self, failure: Diagnostic, seed: &Seed) -> Diagnostic {
         let mut failure = failure;
         if let Some(task) = self.current {
@@ -912,8 +629,8 @@ impl Scheduler {
                 .filter(|t| !matches!(t.state, TaskState::Done(_) | TaskState::Running))
                 .count();
             if self.tasks.len() > 1 {
-                // A production region has no seed to replay, and a note offering
-                // one would be an instruction that does not work.
+                // A production region has no seed to replay, and a note offering one would be an
+                // instruction that does not work.
                 failure = failure.note(match self.policy {
                     Policy::Seeded => format!(
                         "failed in task {task} of a simulated region, with {live} other task(s) unfinished; replay with seed {seed}"
@@ -951,11 +668,9 @@ impl Scheduler {
             .collect()
     }
 
-    /// Makes the tasks a timer fired for enabled, in the order the clock
-    /// reported them — ascending, so that two tasks waking at one instant race
-    /// in an order the seed decides rather than one the host does.
-    ///
-    /// They resume with `Unit`, which is `clock.sleep`'s declared return.
+    /// Makes the tasks a timer fired for enabled, in the order the clock reported them — ascending,
+    /// so that two tasks waking at one instant race in an order the seed decides rather than one
+    /// the host does.
     fn wake(&mut self, woken: &[TaskId]) -> Result<(), Diagnostic> {
         for id in woken {
             let at = id.0 as usize;
@@ -983,11 +698,8 @@ impl Scheduler {
         Ok(())
     }
 
-    /// The seed's path decides while it lasts and the `sched` stream decides
-    /// after it, both counted over the whole entry point rather than over this
-    /// region. A path entry that does not index the enabled set means the run
-    /// was not a function of the seed, which is Ply's defect and not the
-    /// program's.
+    /// The seed's path decides while it lasts and the `sched` stream decides after it, both counted
+    /// over the whole entry point rather than over this region.
     fn choose(&self, trail: &mut Trail, enabled: &[TaskId]) -> Result<usize, Diagnostic> {
         let point = trail.point();
         match trail.pinned() {
@@ -1036,15 +748,13 @@ impl Scheduler {
                 Wait::Join { task, span } => {
                     (*span, format!("{id} waits here for {task} to finish"))
                 }
-                // Unreachable while the clock still has a timer, since time
-                // would have advanced instead. Reported rather than assumed
-                // away, so a scheduler and a clock that disagree say so.
+                // Unreachable while the clock still has a timer, since time would have advanced
+                // instead.
                 Wait::Timer { until, span } => (
                     *span,
                     format!("{id} sleeps here until {until}ns, and it is {now}ns"),
                 ),
                 // A seeded region never parks on one: `park_on_host` refuses.
-                // Reported rather than assumed away, for the reason above.
                 Wait::Host { pending, span } => (
                     *span,
                     format!("{id} waits here on host operation {pending}"),
@@ -1059,8 +769,7 @@ impl Scheduler {
             .note(format!("replay with seed {seed}"))
     }
 
-    /// The production form. Every task is blocked, none on a host token, and no
-    /// virtual clock exists to advance: nothing can ever make one runnable.
+    /// The production form.
     fn err_host_deadlock(&self) -> Diagnostic {
         let mut diagnostic = Diagnostic::error(
             codes::DEADLOCK,
@@ -1088,13 +797,7 @@ impl Scheduler {
             .note("break the wait cycle, or make the task being waited on finish")
     }
 
-    /// The host runtime answered [`HostRuntime::park`] repeatedly without any
-    /// token resolving.
-    ///
-    /// A hot spin is the one failure a scheduler must not have: it burns a core
-    /// and reports nothing, which is indistinguishable from working. `park`'s
-    /// contract is to wait until at least one outstanding token resolves, so a
-    /// run of fruitless returns is the runtime's defect and is named as such.
+    /// The host runtime answered [`HostRuntime::park`] repeatedly without any token resolving.
     fn err_park_made_no_progress(&self) -> Diagnostic {
         Diagnostic::error(
             codes::INTERNAL_ERROR,
@@ -1134,12 +837,6 @@ impl Scheduler {
     }
 
     /// The mutual exclusion, at the point a scheduler is driven.
-    ///
-    /// Neither entry point can be reached with the wrong policy, so a caller
-    /// that got hold of a production scheduler in a seeded run — or the reverse
-    /// — is refused rather than silently served. This is the lock that does not
-    /// depend on [`HostPolicy`] being unforgeable, which is why it exists
-    /// alongside it.
     fn require(&self, wanted: Policy) -> Result<(), Diagnostic> {
         if self.policy == wanted {
             return Ok(());
@@ -1191,9 +888,7 @@ impl Scheduler {
         .note(format!("the seed replayed was {seed}"))
     }
 
-    /// Reaching one of these means the machine drove the scheduler in an order
-    /// the seam forbids. A user program cannot reach it, and naming the mistake
-    /// beats guessing at it.
+    /// Reaching one of these means the machine drove the scheduler in an order the seam forbids.
     fn internal(&self, message: impl Into<String>) -> Diagnostic {
         Diagnostic::error(codes::INTERNAL_ERROR, message).primary(
             self.span,
@@ -1213,20 +908,12 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     }
 }
 
-/// Returns from [`HostRuntime::park`] with nothing resolved that this scheduler
-/// tolerates before it calls the runtime broken. Large enough that a runtime
-/// with a legitimate spurious wakeup is never troubled, small enough that a
-/// runtime with a broken `park` is reported in well under a second.
+/// Returns from [`HostRuntime::park`] with nothing resolved that this scheduler tolerates before it
+/// calls the runtime broken.
 const FRUITLESS_PARKS: u32 = 1024;
 
-/// A host operation reached a `simulate` region — ADR 0011 §7's `E0425`, caught
-/// at the scheduler because that is where it would otherwise take effect.
-///
-/// DPOR re-runs a test whole per interleaving, so a region that reaches a socket
-/// sends one packet per interleaving explored and calls the result a proof. That
-/// this is refused where the task would have parked, rather than only where the
-/// binding is consulted, is deliberate: it holds even if some later path reaches
-/// the boundary another way.
+/// A host operation reached a `simulate` region — ADR 0011 §7's `E0425`, caught at the scheduler
+/// because that is where it would otherwise take effect.
 #[cold]
 #[inline(never)]
 fn err_host_in_simulation(span: Span, pending: &Pending, region: Span) -> Diagnostic {
@@ -1264,9 +951,9 @@ mod tests {
     use ply_syntax::ast::Mode;
     use std::rc::Rc;
 
-    /// A continuation is control, and none of the scheduler's decisions look
-    /// inside one — so a captured empty segment is a faithful stand-in for a
-    /// suspended task and lets the state machine be tested on its own.
+    /// A continuation is control, and none of the scheduler's decisions look inside one — so a
+    /// captured empty segment is a faithful stand-in for a suspended task and lets the state
+    /// machine be tested on its own.
     fn suspended() -> Continuation {
         let prompt = Rc::new(Prompt {
             clauses: Rc::new(Vec::new()),
@@ -1279,9 +966,7 @@ mod tests {
         Stack::new().push_prompt(prompt).capture(1, 0).0
     }
 
-    /// What a task does, in the order it does it. The harness plays these
-    /// against the scheduler exactly as the machine would: every action but
-    /// `Mark` is a perform, and a perform ends a step.
+    /// What a task does, in the order it does it.
     #[derive(Clone)]
     enum Act {
         Mark(&'static str),
@@ -1290,19 +975,18 @@ mod tests {
         Spawn(usize),
         Join(u32),
         Sleep(i64),
-        /// Serve the `rand` stream without ending the step, so that a run with
-        /// draws and a run without have the same step structure and their
-        /// schedules can be compared point for point.
+        /// Serve the `rand` stream without ending the step, so that a run with draws and a run
+        /// without have the same step structure and their schedules can be compared point for
+        /// point.
         Draw,
         Fail,
     }
 
-    /// A whole program: script 0 is the region's body and every other script is
-    /// something spawned.
+    /// A whole program: script 0 is the region's body and every other script is something spawned.
     type Program = Vec<Vec<Act>>;
 
-    /// A scheduler, its clock and the entry point's trail, for the tests that
-    /// drive the seam by hand rather than through a program.
+    /// A scheduler, its clock and the entry point's trail, for the tests that drive the seam by
+    /// hand rather than through a program.
     fn solo(root: u64) -> (Scheduler, Clock, Trail) {
         (
             Scheduler::new(SimId(0), Span::DUMMY),
@@ -1311,8 +995,8 @@ mod tests {
         )
     }
 
-    /// A `Turn` holds control, which has no `Debug` and wants none, so an
-    /// expected refusal is unwrapped here rather than through `expect_err`.
+    /// A `Turn` holds control, which has no `Debug` and wants none, so an expected refusal is
+    /// unwrapped here rather than through `expect_err`.
     fn refused(turn: Result<Turn, Diagnostic>, why: &str) -> Diagnostic {
         match turn {
             Ok(_) => panic!("the scheduler handed out a task: {why}"),
@@ -1322,15 +1006,15 @@ mod tests {
 
     #[derive(Debug)]
     struct Run {
-        /// `(task, mark)` in the order the marks were reached — the observable
-        /// that distinguishes one interleaving from another.
+        /// `(task, mark)` in the order the marks were reached — the observable that distinguishes
+        /// one interleaving from another.
         marks: Vec<(u32, &'static str)>,
         /// Virtual time at the end.
         clock: i64,
         choices: Vec<u16>,
         steps: Vec<(u32, Vec<u32>, u16)>,
-        /// `(task, stamp)` per step, which is what the search reads to decide
-        /// whether two steps could have run in the other order.
+        /// `(task, stamp)` per step, which is what the search reads to decide whether two steps
+        /// could have run in the other order.
         stamps: Vec<(TaskId, Stamp)>,
     }
 
@@ -1338,9 +1022,9 @@ mod tests {
         run_with(program, seed, DEFAULT_STEPS)
     }
 
-    /// Drives the scheduler exactly as the machine's seeded prompt will: a
-    /// perform ends a step, `clock` and `random` are answered by [`Handlers`],
-    /// and what the handler answers decides whether the task stays enabled.
+    /// Drives the scheduler exactly as the machine's seeded prompt will: a perform ends a step,
+    /// `clock` and `random` are answered by [`Handlers`], and what the handler answers decides
+    /// whether the task stays enabled.
     fn run_with(program: &Program, seed: Seed, budget: u32) -> Result<Run, Diagnostic> {
         let root = seed.root;
         let mut trail = Trail::new(seed);
@@ -1477,9 +1161,6 @@ mod tests {
         assert_eq!(run.choices, vec![0], "the body's own step is a step");
     }
 
-    /// The property the whole milestone rests on. Not "the same answer" — the
-    /// same *interleaving*, which is what an assertion that happens not to
-    /// notice a reordering would hide.
     #[test]
     fn one_seed_produces_one_interleaving_however_often_it_is_run() {
         let program = two_workers();
@@ -1508,8 +1189,8 @@ mod tests {
         );
     }
 
-    /// Whatever the interleaving, every task runs to completion and the marks
-    /// of one task keep their own order.
+    /// Whatever the interleaving, every task runs to completion and the marks of one task keep
+    /// their own order.
     #[test]
     fn every_interleaving_runs_every_task_in_its_own_order() {
         let program = two_workers();
@@ -1528,8 +1209,8 @@ mod tests {
         }
     }
 
-    /// The realized choice sequence — not the seed's path, which runs out — is
-    /// what names an interleaving to replay.
+    /// The realized choice sequence — not the seed's path, which runs out — is what names an
+    /// interleaving to replay.
     #[test]
     fn the_realized_choice_sequence_replays_the_run_it_came_from() {
         let program = two_workers();
@@ -1539,8 +1220,8 @@ mod tests {
         assert_eq!(pinned.choices, free.choices);
     }
 
-    /// A prefix pins its own steps and the stream decides the rest, which is
-    /// what makes a backtrack point a seed rather than a whole schedule.
+    /// A prefix pins its own steps and the stream decides the rest, which is what makes a backtrack
+    /// point a seed rather than a whole schedule.
     #[test]
     fn a_path_prefix_pins_only_the_steps_it_names() {
         let program = two_workers();
@@ -1550,8 +1231,8 @@ mod tests {
         assert_eq!(&branched.choices[..3], &prefix[..]);
     }
 
-    /// Ply's fault, not the program's: a path that does not index the enabled
-    /// set means the run was not a function of the seed.
+    /// Ply's fault, not the program's: a path that does not index the enabled set means the run was
+    /// not a function of the seed.
     #[test]
     fn a_choice_that_does_not_index_the_enabled_set_is_a_divergence() {
         let program = two_workers();
@@ -1595,8 +1276,8 @@ mod tests {
         }
     }
 
-    /// Structured concurrency: the region does not deliver its value until every
-    /// task it spawned has finished, joined or not.
+    /// Structured concurrency: the region does not deliver its value until every task it spawned
+    /// has finished, joined or not.
     #[test]
     fn a_task_nobody_joins_still_runs_to_completion() {
         let program: Program = vec![
@@ -1612,14 +1293,8 @@ mod tests {
         }
     }
 
-    /// The two edges a simulated region has, as the search sees them: a child's
-    /// steps happen before everything its parent does after the join, and
-    /// nothing orders two siblings.
-    ///
-    /// The search prunes on this, so an edge the scheduler forgets to record is
-    /// a schedule explored for nothing, and an edge it invents is a race never
-    /// found. The second is the dangerous one, which is why the sibling pair is
-    /// asserted in both directions.
+    /// The two edges a simulated region has, as the search sees them: a child's steps happen before
+    /// everything its parent does after the join, and nothing orders two siblings.
     #[test]
     fn a_join_orders_the_child_before_the_parent_and_siblings_against_nobody() {
         let program: Program = vec![
@@ -1657,8 +1332,8 @@ mod tests {
         }
     }
 
-    /// The second join answers immediately from the recorded value: a task that
-    /// has finished is joinable for as long as its region lasts.
+    /// The second join answers immediately from the recorded value: a task that has finished is
+    /// joinable for as long as its region lasts.
     #[test]
     fn joining_a_task_that_already_finished_does_not_block() {
         let program: Program = vec![
@@ -1676,8 +1351,8 @@ mod tests {
         }
     }
 
-    /// A hang is never an answer: every task blocked with none runnable is a
-    /// diagnostic naming the tasks and what each waits on.
+    /// A hang is never an answer: every task blocked with none runnable is a diagnostic naming the
+    /// tasks and what each waits on.
     #[test]
     fn a_join_cycle_is_a_deadlock_naming_both_tasks() {
         let program: Program = vec![vec![Act::Spawn(1), Act::Join(1)], vec![Act::Join(0)]];
@@ -1715,8 +1390,8 @@ mod tests {
         );
     }
 
-    /// A livelock is the same class of problem as a deadlock from the program's
-    /// side, so it is the same code with a different message.
+    /// A livelock is the same class of problem as a deadlock from the program's side, so it is the
+    /// same code with a different message.
     #[test]
     fn a_region_that_never_stops_spends_its_step_budget() {
         let mut forever = vec![Act::Yield; 64];
@@ -1749,8 +1424,8 @@ mod tests {
         assert!(err.notes.iter().any(|n| n.contains("replay with seed 4")));
     }
 
-    /// A failed region stays failed: a caller that keeps driving the scheduler
-    /// cannot turn a failure into a hang or into a second, different answer.
+    /// A failed region stays failed: a caller that keeps driving the scheduler cannot turn a
+    /// failure into a hang or into a second, different answer.
     #[test]
     fn a_failed_region_answers_with_its_failure_forever() {
         let (mut sched, mut clock, mut trail) = solo(0);
@@ -1804,8 +1479,8 @@ mod tests {
         }
     }
 
-    /// The timer-coalescing race that is nearly impossible to hit on a real
-    /// clock: two tasks waking at one instant race, and the race is explored.
+    /// The timer-coalescing race that is nearly impossible to hit on a real clock: two tasks waking
+    /// at one instant race, and the race is explored.
     #[test]
     fn tasks_sleeping_to_one_deadline_wake_together_and_their_order_is_explored() {
         let program: Program = vec![
@@ -1868,7 +1543,6 @@ mod tests {
     }
 
     /// Every step records the set it was chosen from, and the choice indexes it.
-    /// The search reads backtrack points off exactly this.
     #[test]
     fn every_step_records_the_set_its_choice_indexed() {
         let program = two_workers();
@@ -1897,11 +1571,8 @@ mod tests {
         ))
     }
 
-    /// The single most expensive mistake available in this milestone is a
-    /// dependence relation that is too coarse *or* too fine. The scheduler's own
-    /// bookkeeping is dropped here rather than at the call site, so no caller can
-    /// make every pair of steps dependent and report a 1× reduction for it — and
-    /// a `random` draw is kept, because the program observes what it returns.
+    /// The single most expensive mistake available in this milestone is a dependence relation that
+    /// is too coarse *or* too fine.
     #[test]
     fn the_schedulers_own_bookkeeping_is_not_an_access_but_a_draw_is() {
         let (mut sched, mut clock, mut trail) = solo(0);
@@ -1925,8 +1596,8 @@ mod tests {
         assert_eq!(trail.steps()[0].accesses.len(), 3);
     }
 
-    /// Cell accesses are in the relation at cell granularity: two tasks share
-    /// one world, so a cell is the main way two of them touch the same state.
+    /// Cell accesses are in the relation at cell granularity: two tasks share one world, so a cell
+    /// is the main way two of them touch the same state.
     #[test]
     fn two_steps_touching_one_cell_are_dependent() {
         let (mut sched, mut clock, mut trail) = solo(0);
@@ -1953,10 +1624,8 @@ mod tests {
         assert!(!steps[0].accesses.conflicts_with(&StepFootprint::new()));
     }
 
-    /// The two domains have their own counters, so a program that draws random
-    /// numbers gets the same schedule as one that does not. Sharing one counter
-    /// would make adding a `random.next()` call shift the interleaving, and a
-    /// bisection over it would name the wrong definition.
+    /// The two domains have their own counters, so a program that draws random numbers gets the
+    /// same schedule as one that does not.
     #[test]
     fn drawing_random_numbers_does_not_disturb_the_schedule() {
         let plain = two_workers();
@@ -2005,10 +1674,8 @@ mod tests {
         assert_eq!(err.code, codes::INTERNAL_ERROR);
     }
 
-    /// A rule about how a type is *used* is a rule nobody enforces; a rule about
-    /// which types may be *named* is greppable. Anything on this list would put
-    /// the host's memory layout, its clock or its thread count into a scheduling
-    /// decision, and the way that property breaks is never loudly.
+    /// A rule about how a type is *used* is a rule nobody enforces; a rule about which types may be
+    /// *named* is greppable.
     #[test]
     fn this_module_names_nothing_a_seeded_run_may_not_depend_on() {
         let source = include_str!("sched.rs");
@@ -2037,16 +1704,14 @@ mod tests {
         }
     }
 
-    // ------------------------------------------------------- the two policies
-
     use crate::host::{
         Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
         HostResource, Linearity,
     };
     use std::sync::Arc;
 
-    /// Enough of a program to bind against, and nothing else: what these tests
-    /// need from a binding is only that it is *bound*.
+    /// Enough of a program to bind against, and nothing else: what these tests need from a binding
+    /// is only that it is *bound*.
     fn binding() -> HostBinding {
         let source = "nondet effect db { read get[r](k: Int) -> Int }\n\
                       fn lookup(k: Int) -> Int / {db.read[users]} = db.get[users](k)";
@@ -2084,8 +1749,8 @@ mod tests {
         }
     }
 
-    /// A runtime that owns no token: enough to drive a region whose tasks never
-    /// wait, and it fails loudly if one does.
+    /// A runtime that owns no token: enough to drive a region whose tasks never wait, and it fails
+    /// loudly if one does.
     struct Idle;
 
     impl HostRuntime for Idle {
@@ -2114,8 +1779,8 @@ mod tests {
         Scheduler::production(SimId(0), Span::DUMMY, permit)
     }
 
-    /// `simulate` reaches `Scheduler::new` and nothing else, so a simulated
-    /// region is seeded by construction rather than by anyone remembering.
+    /// `simulate` reaches `Scheduler::new` and nothing else, so a simulated region is seeded by
+    /// construction rather than by anyone remembering.
     #[test]
     fn a_simulated_region_is_seeded_by_construction() {
         let (sched, _clock, _trail) = solo(0);
@@ -2130,9 +1795,9 @@ mod tests {
         assert!(HostPolicy::of(&binding()).is_some());
     }
 
-    /// The lock that does not depend on the permit being unforgeable: whichever
-    /// scheduler a caller is holding, driving it through the other loop is a
-    /// diagnostic rather than a different answer.
+    /// The lock that does not depend on the permit being unforgeable: whichever scheduler a caller
+    /// is holding, driving it through the other loop is a diagnostic rather than a different
+    /// answer.
     #[test]
     fn each_entry_point_refuses_the_other_policys_region() {
         let (mut seeded, mut clock, mut trail) = solo(0);
@@ -2152,9 +1817,9 @@ mod tests {
         assert!(err.message.contains("host region"), "{}", err.message);
     }
 
-    /// A seeded region that parked on a real token would stop being a function
-    /// of its seed while every assertion in it still passed, so the refusal is at
-    /// the park rather than only at the binding.
+    /// A seeded region that parked on a real token would stop being a function of its seed while
+    /// every assertion in it still passed, so the refusal is at the park rather than only at the
+    /// binding.
     #[test]
     fn a_seeded_region_refuses_to_park_a_task_on_a_host_token() {
         let (mut sched, mut clock, mut trail) = solo(0);
@@ -2178,8 +1843,7 @@ mod tests {
         assert!(sched.current().is_some(), "the task was parked anyway");
     }
 
-    /// There is no virtual clock to reach the deadline, so parking on one is a
-    /// hang. A production `clock.sleep` is a host operation answering `Pending`.
+    /// There is no virtual clock to reach the deadline, so parking on one is a hang.
     #[test]
     fn a_production_region_refuses_a_virtual_sleep() {
         let mut sched = production();
@@ -2193,9 +1857,6 @@ mod tests {
     }
 
     /// Round-robin, so a task that yields in a loop cannot hold the region.
-    /// Under a strict lowest-first rule `@0` here is ready again the moment it
-    /// suspends and `@1` and `@2` never run at all — a starvation that shows up
-    /// as a hang rather than as a failure.
     #[test]
     fn the_production_scheduler_starves_nobody() {
         let mut sched = production();
@@ -2218,18 +1879,16 @@ mod tests {
         assert_eq!(order, vec![1, 2, 0, 1, 2, 0, 1, 2, 0]);
     }
 
-    /// A lazily-opened region's root is the computation that opened it, so it
-    /// starts *running*: the `task.*` that opened the region has not been
-    /// answered yet, and only the ordinary spawn/join/suspend path can answer
-    /// it. Re-rooting one that has already run is refused, because it would
-    /// abandon whatever the root was doing.
+    /// A lazily-opened region's root is the computation that opened it, so it starts *running*: the
+    /// `task.*` that opened the region has not been answered yet, and only the ordinary
+    /// spawn/join/suspend path can answer it.
     #[test]
     fn a_lazily_opened_region_roots_on_the_control_that_opened_it() {
         let mut sched = production().rooted_running().expect("nothing has run yet");
         assert_eq!(sched.current(), Some(ROOT));
 
-        // The opening perform is answered through the same path every later one
-        // takes, which is what stops `spawn` meaning two things.
+        // The opening perform is answered through the same path every later one takes, which is
+        // what stops `spawn` meaning two things.
         let child = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
         sched
             .suspend(suspended(), Value::Task(child))
@@ -2252,12 +1911,8 @@ mod tests {
         assert_eq!(err.code, codes::INTERNAL_ERROR);
     }
 
-    /// A production region writes no step, so it can neither fabricate an
-    /// exploration nor disturb one a seeded region of the same entry point made.
-    ///
-    /// The guarantee is structural — [`Scheduler::next_host`] takes no [`Trail`]
-    /// — and this pins the observable half of it, which is what a reader who has
-    /// not checked the signature can see.
+    /// A production region writes no step, so it can neither fabricate an exploration nor disturb
+    /// one a seeded region of the same entry point made.
     #[test]
     fn a_production_region_records_nothing_in_the_trail() {
         let trail = Trail::new(Seed::root(9));
@@ -2275,11 +1930,6 @@ mod tests {
         assert_eq!(trail.point(), 0);
     }
     /// A runtime that is stopping and has nothing outstanding.
-    ///
-    /// The shape of an idle service at a signal: the accept it was parked on has
-    /// resolved, no task is enabled and none is waiting on the host. Without
-    /// `stopping()` in the deadlock check this is `E0414` — a service reporting
-    /// that it deadlocked because someone pressed ctrl-C.
     struct Stopping {
         parks: std::cell::Cell<u32>,
         expire_after: u32,
@@ -2309,10 +1959,8 @@ mod tests {
         }
     }
 
-    /// Two tasks each waiting for the other: nothing is enabled, nothing is
-    /// waiting on the host, and no virtual clock exists to advance. The exact
-    /// condition `err_host_deadlock` reports, and the one a stop has to turn
-    /// into a wait rather than a verdict.
+    /// Two tasks each waiting for the other: nothing is enabled, nothing is waiting on the host,
+    /// and no virtual clock exists to advance.
     fn deadlock(sched: &mut Scheduler) {
         let other = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
         sched
@@ -2328,13 +1976,8 @@ mod tests {
             .expect("the spawned task is running");
     }
 
-    /// An idle service observes a signal and stops, and the deadlock check does
-    /// not report `E0414` on the way.
-    ///
-    /// The park is what makes this reachable at all: nothing is enabled, nothing
-    /// is waiting on a token, and the only thing that will ever change is the
-    /// drain running out. A run that called that a deadlock would tell an
-    /// operator their service was wedged every time it shut down cleanly.
+    /// An idle service observes a signal and stops, and the deadlock check does not report `E0414`
+    /// on the way.
     #[test]
     fn a_stopping_region_with_nothing_outstanding_drains_rather_than_deadlocking() {
         let mut sched = production();
@@ -2347,9 +1990,8 @@ mod tests {
         else {
             panic!("expected the root's step");
         };
-        // The root blocks on a task that will never finish: nothing is enabled
-        // and nothing is waiting on the host, which is `err_host_deadlock`'s
-        // exact condition.
+        // The root blocks on a task that will never finish: nothing is enabled and nothing is
+        // waiting on the host, which is `err_host_deadlock`'s exact condition.
         deadlock(&mut sched);
 
         let runtime = Stopping {
@@ -2373,10 +2015,7 @@ mod tests {
         );
     }
 
-    /// A park that woke on a stop resolved no token and is not fruitless. Without
-    /// the exemption a drain longer than `FRUITLESS_PARKS` bounded parks reports
-    /// the host runtime as broken for doing the one thing that lets an idle
-    /// service observe a signal.
+    /// A park that woke on a stop resolved no token and is not fruitless.
     #[test]
     fn a_park_that_woke_on_a_stop_is_not_counted_as_fruitless() {
         let mut sched = production();
@@ -2406,9 +2045,8 @@ mod tests {
         assert!(runtime.parks.get() > FRUITLESS_PARKS);
     }
 
-    /// The same region with no stop in progress *is* a deadlock, so the exemption
-    /// above is not a hole: what it turns off is the verdict for a run that is
-    /// stopping and nothing else.
+    /// The same region with no stop in progress *is* a deadlock, so the exemption above is not a
+    /// hole: what it turns off is the verdict for a run that is stopping and nothing else.
     #[test]
     fn a_region_that_is_not_stopping_still_deadlocks() {
         let mut sched = production();

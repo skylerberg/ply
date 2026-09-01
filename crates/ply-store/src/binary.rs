@@ -1,14 +1,4 @@
 //! Tagged, length-prefixed primitives for the front-end cache's entry payloads.
-//!
-//! Every composite writes a discriminant byte before its fields and a terminator
-//! after them, and every variable-length field carries its own length. That is
-//! the difference between this and a `serde`-derived binary encoding: there, the
-//! shape is implicit in field declaration order, so swapping two fields of the
-//! same type is a silent wire change that the decoder reads happily as the old
-//! shape. Here it is a tag the decoder refuses.
-//!
-//! Refusing matters more than it sounds: a misparsed entry is a wrong
-//! `Footprint`, and footprints decide which tests may run concurrently.
 
 use crate::ContentHash;
 use ply_hash::DefHash;
@@ -50,9 +40,7 @@ impl Writer {
         self.buf.extend_from_slice(&value.to_le_bytes());
     }
 
-    /// A collection's element count. Saturating rather than fallible: a cached
-    /// entry with four billion members cannot exist, and a decoder that reads a
-    /// count larger than the bytes that could hold it rejects the frame anyway.
+    /// A collection's element count.
     pub(crate) fn count(&mut self, count: usize) {
         self.u32(u32::try_from(count).unwrap_or(u32::MAX));
     }
@@ -133,9 +121,7 @@ impl<'a> Reader<'a> {
         Ok(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
-    /// Rejected when it exceeds the bytes left, since every element occupies at
-    /// least one. Without that a corrupt length reserves gigabytes before the
-    /// frame is found to be nonsense.
+    /// Rejected when it exceeds the bytes left, since every element occupies at least one.
     pub(crate) fn count(&mut self, what: &'static str) -> Decoded<usize> {
         let at = self.pos;
         let count = self.u32(what)? as usize;
@@ -172,9 +158,8 @@ impl<'a> Reader<'a> {
         Ok(ContentHash(out))
     }
 
-    /// Trailing bytes mean the payload was written by something that does not
-    /// agree with this decoder about the shape, which is exactly the case that
-    /// must not be read as a value.
+    /// Trailing bytes mean the payload was written by something that does not agree with this
+    /// decoder about the shape, which is exactly the case that must not be read as a value.
     pub(crate) fn end(self, what: &'static str) -> Decoded<()> {
         if self.remaining() != 0 {
             return Err(DecodeError { what, at: self.pos });

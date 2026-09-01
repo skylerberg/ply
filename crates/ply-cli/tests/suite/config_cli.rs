@@ -1,17 +1,5 @@
-//! Configuration as the command line sees it: `--set`, `--config`, the process
-//! environment, `--config-schema`, and what each of them refuses.
-//!
-//! ADR 0015 §3. Two claims are checked end to end here rather than at a unit
-//! boundary, because both are about a *run*:
-//!
-//! - **A missing, malformed or wrongly-shaped value stops the run at start-up.**
-//!   Every refusal below is raised before anything is bound, which is what
-//!   separates a service that will not start from one that starts and then
-//!   answers wrongly on its two hundredth request.
-//! - **A secret's bytes appear in no projection of the run.** Not on stdout, not
-//!   on stderr, not in `--json`. The tests search the whole of both streams for
-//!   the credential rather than asserting on the line that should have redacted
-//!   it, because the interesting failure is the line nobody thought of.
+//! Configuration as the command line sees it: `--set`, `--config`, the process environment,
+//! `--config-schema`, and what each of them refuses.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -19,10 +7,6 @@ use std::path::Path;
 use tempfile::TempDir;
 
 /// A program with a schema, one key per shape, and a `main` that reads one.
-///
-/// `DESK_API_KEY` is `SSecret`, so `config.get` cannot answer it at all and
-/// `config.secret` answers a `Secret<String>` — which is the whole of §2's
-/// containment for a configured value.
 const DESK: &str = "\
 import std.config
 import std.config (config)
@@ -51,8 +35,8 @@ test \"a handled read is hermetic\" {
 }
 ";
 
-/// The same program with a `main` that reads the credential, for the tests that
-/// search a run's whole output for it.
+/// The same program with a `main` that reads the credential, for the tests that search a run's
+/// whole output for it.
 const SECRET_MAIN: &str = "\
 import std.config
 import std.config (config)
@@ -78,9 +62,8 @@ fn ply(dir: &Path) -> Command {
     cmd.arg("--color")
         .arg("never")
         .current_dir(dir)
-        // The parent's environment is a source, so a test that did not clear it
-        // would be a test whose answer depended on the machine it ran on. Every
-        // environment value below is set explicitly.
+        // The parent's environment is a source, so a test that did not clear it would be a test
+        // whose answer depended on the machine it ran on.
         .env_remove("DESK_REGION")
         .env_remove("DESK_PORT")
         .env_remove("DESK_API_KEY");
@@ -99,8 +82,8 @@ fn json_of(output: &std::process::Output) -> Value {
     serde_json::from_str(&stdout_of(output)).expect("`--json` writes one document on stdout")
 }
 
-/// `ply hosts --host --json`, which is the command whose whole output is the
-/// resolved configuration, so it is what precedence is read from.
+/// `ply hosts --host --json`, which is the command whose whole output is the resolved
+/// configuration, so it is what precedence is read from.
 fn hosts(dir: &Path, extra: &[&str], env: &[(&str, &str)]) -> std::process::Output {
     let mut cmd = ply(dir);
     cmd.arg("hosts").arg("--host").arg("--json");
@@ -123,8 +106,6 @@ fn key_of(report: &Value, name: &str) -> Value {
 
 // --- precedence -------------------------------------------------------------
 
-/// Required test 19. One key supplied by all four sources resolves to `--set`,
-/// and removing them in order walks it down to the schema's default.
 #[test]
 fn precedence_is_set_then_file_then_environment_then_default() {
     let dir = project(DESK);
@@ -168,9 +149,7 @@ fn precedence_is_set_then_file_then_environment_then_default() {
     assert_eq!(region["source"], "default");
 }
 
-/// The environment supplies a value and never causes a binding. Without
-/// `--host` nothing is opened, and the arguments that would configure it are
-/// refused rather than silently ignored.
+/// The environment supplies a value and never causes a binding.
 #[test]
 fn without_host_no_source_is_opened_and_the_flags_are_refused() {
     let dir = project(DESK);
@@ -203,8 +182,6 @@ fn without_host_no_source_is_opened_and_the_flags_are_refused() {
 
 // --- the file format --------------------------------------------------------
 
-/// Required test 22. Each malformed shape is `E0440`, naming the file and the
-/// line so the fix is an edit rather than a hunt.
 #[test]
 fn a_malformed_config_file_is_e0440_naming_the_file_and_line() {
     let dir = project(DESK);
@@ -248,8 +225,6 @@ fn an_unreadable_config_file_is_e0440() {
 
 // --- the schema -------------------------------------------------------------
 
-/// Required test 23. A required key nothing supplies stops the run before
-/// anything is bound, and says where it looked.
 #[test]
 fn a_required_key_nothing_supplies_is_e0441_at_startup() {
     let dir = project(DESK);
@@ -293,9 +268,7 @@ fn a_value_that_is_not_of_its_shape_is_e0442_naming_the_source() {
     assert!(text.contains("eight"), "a plain value is shown: {text}");
 }
 
-/// The one refusal that must not quote what it refused. A diagnostic's message
-/// reaches stderr, `--json` and a cached failure report, so a credential in one
-/// is a credential in a store designed never to forget.
+/// The one refusal that must not quote what it refused.
 #[test]
 fn a_malformed_secret_is_e0442_and_prints_no_value() {
     let dir = project(DESK);
@@ -317,8 +290,6 @@ fn a_malformed_secret_is_e0442_and_prints_no_value() {
     assert!(text.contains("not printed"), "{text}");
 }
 
-/// Required test 24. A `--set` the schema does not declare is `W0607` and does
-/// not stop the run; an environment variable it does not declare is neither.
 #[test]
 fn an_undeclared_set_warns_and_an_undeclared_environment_key_does_not() {
     let dir = project(DESK);
@@ -345,8 +316,8 @@ fn an_undeclared_set_warns_and_an_undeclared_environment_key_does_not() {
     );
 }
 
-/// A `--config-schema` naming nothing is refused with the candidates, because
-/// the fix is a different argument rather than an edit to the program.
+/// A `--config-schema` naming nothing is refused with the candidates, because the fix is a
+/// different argument rather than an edit to the program.
 #[test]
 fn a_config_schema_naming_no_definition_lists_what_the_program_has() {
     let dir = project(DESK);
@@ -365,8 +336,6 @@ fn a_config_schema_naming_no_definition_lists_what_the_program_has() {
 
 // --- the secret gate --------------------------------------------------------
 
-/// Required test 25. `config.get` will not answer a key the schema declares
-/// `SSecret`, so there is no window in which the credential is a `String`.
 #[test]
 fn get_cannot_read_a_key_the_schema_declares_secret() {
     let source = DESK.replace(
@@ -396,8 +365,8 @@ fn get_cannot_read_a_key_the_schema_declares_secret() {
     );
 }
 
-/// The credential arrives as a `Secret` and is usable through `secret_verify`,
-/// and its bytes appear in neither stream.
+/// The credential arrives as a `Secret` and is usable through `secret_verify`, and its bytes appear
+/// in neither stream.
 #[test]
 fn a_secret_arrives_as_a_secret_and_appears_in_no_stream() {
     let dir = project(SECRET_MAIN);
@@ -422,8 +391,8 @@ fn a_secret_arrives_as_a_secret_and_appears_in_no_stream() {
     }
 }
 
-/// And the same for `--json`, whose one document on stdout carries the key's
-/// name and the source that won it and never its value.
+/// And the same for `--json`, whose one document on stdout carries the key's name and the source
+/// that won it and never its value.
 #[test]
 fn the_json_report_carries_a_secrets_key_and_source_and_not_its_value() {
     let dir = project(SECRET_MAIN);
@@ -446,9 +415,6 @@ fn the_json_report_carries_a_secrets_key_and_source_and_not_its_value() {
 
 // --- hermetic supply --------------------------------------------------------
 
-/// Required test 26. A test that handles `config.*` needs no `--host`, is
-/// `det`, and is cached — and the same test with the handler removed is `E0424`
-/// naming the handler that would have served it.
 #[test]
 fn a_test_supplying_configuration_is_hermetic_det_and_cached() {
     let dir = project(DESK);
@@ -475,8 +441,8 @@ fn a_test_supplying_configuration_is_hermetic_det_and_cached() {
     assert_eq!(report["selection"]["selected"], 0, "{report:#}");
 }
 
-/// The other half: an unhandled `config` operation in a `det` test is `E0412` at
-/// compile time, with `--host` and without it, because the effect is `nondet`.
+/// The other half: an unhandled `config` operation in a `det` test is `E0412` at compile time, with
+/// `--host` and without it, because the effect is `nondet`.
 #[test]
 fn an_unhandled_config_read_in_a_det_test_is_e0412() {
     let source = "\
@@ -499,10 +465,8 @@ test \"reaches the environment\" {
     }
 }
 
-/// And a run that reaches the boundary with nothing bound is `E0424` naming the
-/// handler that *would* have served it — never a silent read of the
-/// environment. The registry is compiled in either way; what `--host` adds is
-/// the binding rather than the knowledge.
+/// And a run that reaches the boundary with nothing bound is `E0424` naming the handler that
+/// *would* have served it — never a silent read of the environment.
 #[test]
 fn a_hermetic_run_that_reaches_config_is_e0424_naming_the_handler() {
     let dir = project(DESK);

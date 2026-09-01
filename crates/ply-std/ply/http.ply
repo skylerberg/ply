@@ -1,38 +1,4 @@
 // std.http — HTTP/1.1 framing, in Ply.
-//
-// ADR 0013's first rule is why this file exists rather than a Rust crate behind
-// a host handler: "the trusted computing base does not grow to hold a protocol".
-// Framing is a pure function from bytes to a request, so `parse_head`,
-// `body_step` and `encode` have empty rows, `ply test` selects them exactly, and
-// a smuggling defect is a failing test rather than a line nobody checks. Only
-// the serve loop performs `net`, and it performs nothing else.
-//
-// Three things decide the shape of everything below.
-//
-// **Every ambiguity is a refusal.** Request smuggling is a parser disagreeing
-// with itself — or with the proxy in front of it — about where a message ends.
-// Where RFC 9112 permits a choice, this takes the branch that refuses, and no
-// refusal is resynchronised from: the position of the next message is exactly
-// what was not established, so a `Refusal` closes the connection.
-//
-// **A bound costs the bound, not the buffer.** Every scan carries a
-// `Limits`-derived budget, so a 20-megabyte header line costs
-// `max_header_bytes` and not 20 megabytes. The read loop never re-scans what it
-// has already searched, and accumulates a `List<Bytes>` joined once by
-// `bytes_concat_all` rather than folding `bytes_concat`, which would be
-// quadratic in the size of a message a peer chooses.
-//
-// **Recursion is bounded by a limit, never by the interpreter.** Ply has no
-// loop, so every loop here is a tail call and the evaluator caps nested calls
-// (10,000). A loop whose depth a peer chooses is a denial of service that
-// arrives as a recursion-limit diagnostic ending the whole run rather than as a
-// refusal ending one connection. So the header loop is bounded by
-// `max_header_count`, the read loop by `max_reads`, and the chunk decoder by
-// `chunk_budget` per step — each stated, each tested.
-//
-// What is deliberately *not* here: routing (ADR 0013 §5), TLS (§6),
-// compression, `Upgrade`, and any decoding of `Content-Encoding`, which is end
-// to end and is passed through untouched.
 
 import std.net (net, send_all)
 
@@ -42,13 +8,8 @@ pub type Method = Get | Head | Post | Put | Patch | Delete | Options | Other(Str
 
 pub type Version = Http10 | Http11
 
-// Field names are lowercased on parse; a name may repeat, so the value is the
-// list of its field lines in order of appearance. Nothing is combined: a
-// comma-joined `set-cookie` is a different document, and combining is where a
-// header the program reads stops being the header that arrived.
-//
-// A `Map`, so iteration is ascending by name and canonical (ADR 0012 §2), which
-// is what makes a response's bytes a function of its value.
+// Field names are lowercased on parse; a name may repeat, so the value is the list of its field
+// lines in order of appearance.
 pub type Headers = Map<String, List<String>>
 
 pub type Request = {
@@ -67,10 +28,9 @@ pub type Response = { status: Int, headers: Headers, body: Bytes }
 
 // --- Limits -----------------------------------------------------------------
 
-// A record, because Ply has no top-level values and because a limit set is data
-// like a route table: a test can quantify over it, a service can print the
-// bounds it is running under, and two runs of one program cannot differ in what
-// they refuse. There is no global, no environment variable and no flag.
+// A record, because Ply has no top-level values and because a limit set is data like a route table:
+// a test can quantify over it, a service can print the bounds it is running under, and two runs of
+// one program cannot differ in what they refuse.
 pub type Limits = {
   max_request_line:  Int,
   max_header_bytes:  Int,
@@ -80,25 +40,7 @@ pub type Limits = {
   max_chunk_line:    Int,
   max_trailer_bytes: Int,
   max_keep_alive:    Int,
-  // The most chunks one streamed response may produce. A bound on a *write*,
-  // and here rather than in a constant because ADR 0013 §4 puts every bound a
-  // program runs under in this record — `respond_chunked` spent a read bound on
-  // it, which is a number a reviewer reading `Limits` could not see.
-  //
-  // A policy number and nothing else. Exceeding it terminates the response
-  // properly and closes the connection.
-  //
-  // > **Corrected (2026-08-27, ADR 0022).** This read: *"It is also a recursion
-  // > bound: `stream_chunks` is a tail call and the evaluator caps nested calls
-  // > at 10,000, so a producer that must emit more than this emits larger
-  // > chunks instead."* That was true and it was an interpreter's implementation
-  // > detail leaking into an HTTP server's public configuration surface: the
-  // > largest usable value of a field in this record was set by
-  // > `ply_eval::limit::DEFAULT_MAX_CALLS`. `stream_chunks` now drives its loop
-  // > with `iterate`, which is depth 1 however long it runs, so this number is
-  // > answerable from how many chunks a response may have and from nothing
-  // > else. 50,000 is a configuration this module now serves; before the change
-  // > it raised `recursion limit of 10000 nested calls exceeded`.
+  // The most chunks one streamed response may produce.
   max_stream_chunks: Int,
   header_timeout_ms: Int,
   body_timeout_ms:   Int,
@@ -122,15 +64,9 @@ pub fn default_limits() -> Limits = {
   write_timeout_ms:  30000,
 }
 
-// A limit that is zero or negative is a configuration nobody meant — a server
-// with `max_body: 0` accepts no request with a body — so it is refused at
-// `serve`, naming the field, rather than producing a server that answers every
-// request with a 413.
-//
-// At `serve` and not per connection: the limits a program passes are the same
-// value on every iteration of the accept loop, so checking them per connection
-// is twelve calls per request that can only ever answer the same way. A program
-// that calls `serve_connection` on a socket of its own calls this itself.
+// A limit that is zero or negative is a configuration nobody meant — a server with `max_body: 0`
+// accepts no request with a body — so it is refused at `serve`, naming the field, rather than
+// producing a server that answers every request with a 413.
 pub fn check_limits(l: Limits) -> Unit = {
   bad_limit("max_request_line", l.max_request_line);
   bad_limit("max_header_bytes", l.max_header_bytes);
@@ -155,34 +91,19 @@ fn bad_limit(field: String, value: Int) -> Unit =
     ()
   }
 
-// The most `net.recv` answers one head or one body will be assembled from, and
-// therefore the number of slices its deadline is divided into (`slice_ms`).
-//
-// Not tuning, and two bounds at once. Each read is one Ply call deep and the
-// evaluator caps nested calls, so a peer that sends one byte per packet would
-// otherwise turn a request into a recursion-limit diagnostic that ends the run
-// rather than a 408 that ends one connection. And a deadline divided into this
-// many slices is granular enough that a client delivering `max_body` inside
-// `body_timeout_ms` — 512 bytes per slice at the defaults — never runs out.
+// The most `net.recv` answers one head or one body will be assembled from, and therefore the number
+// of slices its deadline is divided into (`slice_ms`).
 pub fn max_reads() -> Int = 2048
 
 // The most chunks one `body_step` will decode before answering `Await`.
-//
-// The same bound for the same reason, one level down: a megabyte of one-byte
-// chunks is a million chunks, and the decoder recurses once per chunk. Spending
-// the budget is not a refusal — the caller loops — so no legal body is refused
-// by it.
 pub fn chunk_budget() -> Int = 512
 
-// The most bytes one `net.recv` asks for. Larger than a TCP segment so that a
-// whole head usually arrives in one answer, and small enough that a read
-// loop's buffer is not itself the denial of service.
+// The most bytes one `net.recv` asks for.
 pub fn read_size() -> Int = 65536
 
 // --- Refusals ---------------------------------------------------------------
 
-// Every framing refusal is a status and a sentence, and every one of them closes
-// the connection. There is no refusal that is safe to resynchronise from.
+// Every framing refusal is a status and a sentence, and every one of them closes the connection.
 pub type Refusal = { status: Int, reason: String }
 
 pub type Framing = NoBody | Length(Int) | Chunked
@@ -206,15 +127,8 @@ pub fn empty_headers() -> Headers = map_new()
 
 // --- Byte classes -----------------------------------------------------------
 
-// Every byte that ends a header line or is illegal inside one: CR, LF, and every
-// other control byte except HTAB, plus DEL.
-//
-// One class rather than two is the whole of this parser's cost model. Scanning
-// for CR and LF alone would take the fast `memchr2` path and then need a second
-// pass per field to reject a NUL — two passes over the block. Scanning for the
-// union stops on the first byte that is *either* a terminator or illegal, so the
-// header block is examined exactly once and a smuggled control character is
-// found by the same scan that finds the line end.
+// Every byte that ends a header line or is illegal inside one: CR, LF, and every other control byte
+// except HTAB, plus DEL.
 fn line_stops() -> Bytes =
   b"\x00\x01\x02\x03\x04\x05\x06\x07\x08\x0a\x0b\x0c\x0d\x0e\x0f\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f\x7f"
 
@@ -236,20 +150,16 @@ fn all_digits(b: Bytes) -> Bool =
 
 // --- Lines ------------------------------------------------------------------
 
-// A line is terminated by CRLF and by nothing else. A bare LF is the classic
-// desync — two implementations disagreeing about where a line ended is two
-// implementations disagreeing about where a message ended — and a bare CR is the
-// same hazard written the other way.
+// A line is terminated by CRLF and by nothing else.
 pub type Line =
   | LineAt({ start: Int, stop: Int, next: Int })
   | LineIncomplete
   | LineTooLong
   | LineIllegal({ at: Int, why: String })
 
-// `budget` is the most *content* bytes the line may hold, and the scan window is
-// one byte wider so that "a terminator exactly at the bound" and "no terminator
-// within the bound" are different answers. Nothing past `from + budget + 1` is
-// ever examined, which is what makes an over-long line cost the bound.
+// `budget` is the most *content* bytes the line may hold, and the scan window is one byte wider so
+// that "a terminator exactly at the bound" and "no terminator within the bound" are different
+// answers.
 fn read_line(buf: Bytes, from: Int, budget: Int) -> Line = {
   let n = bytes_len(buf);
   if from > n {
@@ -283,9 +193,7 @@ fn line_at(buf: Bytes, from: Int, stop: Int, n: Int) -> Line = {
 
 // --- The head ---------------------------------------------------------------
 
-// The whole of ADR 0013 §3, and its row is `{}`: bytes and limits in, a result
-// out. `consumed` is where the body begins in `buf`, so a caller never
-// re-derives it and a pipelined second request begins at `consumed + body_len`.
+// The whole of ADR 0013 §3, and its row is `{}`: bytes and limits in, a result out.
 pub fn parse_head(buf: Bytes, limits: Limits) -> HeadResult =
   match read_line(buf, 0, limits.max_request_line) {
     LineIncomplete -> Incomplete,
@@ -304,10 +212,7 @@ fn after_request_line(buf: Bytes, limits: Limits, l: { start: Int, stop: Int, ne
         FieldsIncomplete -> Incomplete,
         FieldsRefused(r) -> Refused(r),
         FieldsDone(done) ->
-          // One function rather than the four this reads as. Each `match` on a
-          // `Result` would otherwise need its own definition to bind the `Ok`
-          // in, and a Ply call is the unit of cost this parser is measured in:
-          // four of them per request is four the interpreter need not make.
+          // One function rather than the four this reads as.
           match host_of(start, done.headers) {
             Err(r) -> Refused(r),
             Ok(authority) ->
@@ -344,12 +249,10 @@ type Start = { method: Method, target: String, path: String, query: String,
 
 // --- The request line -------------------------------------------------------
 
-// `line_stops` omits HTAB because HTAB is legal inside a *field value*, and the
-// same scan reads the request line, where it is not: RFC 9112 §3 is
-// `method SP request-target SP HTTP-version` and §11.2 names recovering from
-// whitespace here as a smuggling vector, because a recipient that splits on HTAB
-// and one that does not disagree about what the target was. One scan over the
-// request line, before it is split, so no part of it can carry one.
+// `line_stops` omits HTAB because HTAB is legal inside a *field value*, and the same scan reads the
+// request line, where it is not: RFC 9112 §3 is `method SP request-target SP HTTP-version` and
+// §11.2 names recovering from whitespace here as a smuggling vector, because a recipient that
+// splits on HTAB and one that does not disagree about what the target was.
 fn request_line(line: Bytes) -> Result<Start, Refusal> = {
   let n = bytes_len(line);
   let sp1 = bytes_scan_until(line, 0, b" ", n);
@@ -380,9 +283,8 @@ fn request_parts(method: Bytes, target: Bytes, version: Bytes) -> Result<Start, 
     with_target(method_of(method), target, v)
   }
 
-// An unrecognised but token-valid method parses as `Other(name)` and reaches
-// routing, which answers 405. Refusing it here would make a service unable to
-// answer a method it does not implement with the status that says so.
+// An unrecognised but token-valid method parses as `Other(name)` and reaches routing, which answers
+// 405.
 fn method_of(m: Bytes) -> Method =
   if m == b"GET" {
     Get
@@ -414,9 +316,9 @@ pub fn method_name(m: Method) -> String =
     Other(name) -> name,
   }
 
-// A request line with no version is HTTP/0.9, which is not served; any other
-// `HTTP/x.y` is a version this server does not speak, which is 505 rather than
-// 400 because the message was well formed and the client can act on it.
+// A request line with no version is HTTP/0.9, which is not served; any other `HTTP/x.y` is a
+// version this server does not speak, which is 505 rather than 400 because the message was well
+// formed and the client can act on it.
 fn version_of(v: Bytes) -> Result<Version, Refusal> =
   if v == b"HTTP/1.1" {
     Ok(Http11)
@@ -437,21 +339,15 @@ fn with_target(method: Method, target: Bytes, version: Version) -> Result<Start,
   } else if !bytes_is_utf8(target) {
     Err({status: 400, reason: "a request target must be valid UTF-8"})
   } else if bytes_scan_until(target, 0, b"#", bytes_len(target)) < bytes_len(target) {
-    // RFC 9112 §3.2 gives the request-target no fragment component, and a `#`
-    // is where the two readings of a target diverge: an intermediary that parses
-    // the target as a URI reference drops everything from the `#`, while a
-    // recipient that does not keeps it. Under absolute-form it is worse than a
-    // disagreement — `http://h#a/b` would make `Request::path` `#a/b`, which
-    // `std.router` splits into the same two segments `/a/b` does, and every
-    // other consumer of `path` is written against a path that starts with `/`.
+    // RFC 9112 §3.2 gives the request-target no fragment component, and a `#` is where the two
+    // readings of a target diverge: an intermediary that parses the target as a URI reference drops
+    // everything from the `#`, while a recipient that does not keeps it.
     Err({status: 400, reason: "a request target carries no fragment"})
   } else {
     target_form(method, target, version)
   }
 
 // Origin-form, absolute-form, or asterisk-form and only with OPTIONS.
-// Authority-form is 400: this is a server, not a proxy, and `CONNECT` is not
-// served.
 fn target_form(method: Method, target: Bytes, version: Version) -> Result<Start, Refusal> =
   if target == b"*" {
     match method {
@@ -478,16 +374,9 @@ fn origin_form(method: Method, target: Bytes, version: Version) -> Start = {
            "", version)
 }
 
-// Under absolute-form the target's authority is the request's, and the `Host`
-// field is not consulted for it (RFC 9112 §3.2.2) — but both stay visible as
-// data, so a program that cares about a mismatch can say so. The parser does not
-// decide that question; it refuses to hide it.
-// The scheme is compared as `Bytes` and never sliced into a `String`. Slicing
-// the first eight bytes and decoding them was a remote kill: the target is
-// checked for UTF-8 as a whole, but a slice at byte eight cuts wherever the
-// eighth byte falls, and `string_of_bytes` is strict — `GET €€€ HTTP/1.1` is
-// nine bytes cut mid-character, which is `E0502` unwinding out of the serve loop
-// rather than a 400 ending one connection.
+// Under absolute-form the target's authority is the request's, and the `Host` field is not
+// consulted for it (RFC 9112 §3.2.2) — but both stay visible as data, so a program that cares about
+// a mismatch can say so.
 fn absolute_form(method: Method, target: Bytes, version: Version) -> Result<Start, Refusal> = {
   let n = bytes_len(target);
   let after = if starts_with_ascii_ci(target, b"http://") {
@@ -504,9 +393,8 @@ fn absolute_form(method: Method, target: Bytes, version: Version) -> Result<Star
   }
 }
 
-// A scheme is ASCII and case-insensitive, and nothing else here is either, so
-// the fold is byte-wise and stops at the first difference. `want` is written
-// lowercase by every caller.
+// A scheme is ASCII and case-insensitive, and nothing else here is either, so the fold is byte-wise
+// and stops at the first difference.
 fn starts_with_ascii_ci(b: Bytes, want: Bytes) -> Bool =
   bytes_len(b) >= bytes_len(want) && ascii_ci_from(b, want, 0, bytes_len(want))
 
@@ -529,17 +417,12 @@ fn split_authority(method: Method, target: Bytes, version: Version, after: Int, 
   if a == 0 {
     Err({status: 400, reason: "an absolute-form target needs an authority"})
   } else if bytes_scan_until(authority, 0, b"@", a) < a {
-    // ADR 0013 §3.2 rule 8 exposes the authority so a program can compare it
-    // against `Host`. `http://trusted.example@evil.example/x` would hand it
-    // `trusted.example@evil.example`, which any prefix, substring or logging
-    // check reads in the attacker's favour. RFC 9110 §4.2.4 deprecates userinfo
-    // in `http` URIs and says to treat it as an error in a reference from an
-    // untrusted source, and every request-target is one.
+    // ADR 0013 §3.2 rule 8 exposes the authority so a program can compare it against `Host`.
     Err({status: 400, reason: "a request target's authority carries no userinfo"})
   } else {
-    // The target holds no `#` — `with_target` refused one — so `rest` is empty
-    // or begins with `/` or `?`, and the path this computes always begins with
-    // `/`, which is the invariant `std.router` splits against.
+    // The target holds no `#` — `with_target` refused one — so `rest` is empty or begins with `/`
+    // or `?`, and the path this computes always begins with `/`, which is the invariant
+    // `std.router` splits against.
     let rest = bytes_slice(target, end, n);
     let m = bytes_len(rest);
     let q = bytes_scan_until(rest, 0, b"?", m);
@@ -566,10 +449,9 @@ type FieldsResult =
 fn fields(buf: Bytes, block_start: Int, from: Int, limits: Limits) -> FieldsResult =
   field_lines(buf, block_start, from, limits, empty_headers(), 0)
 
-// One call per field line, so the recursion is bounded by `max_header_count` and
-// the block by `max_header_bytes` — and each line's scan carries what is left of
-// the block as its budget, so an over-long line costs the remaining bound rather
-// than the buffer.
+// One call per field line, so the recursion is bounded by `max_header_count` and the block by
+// `max_header_bytes` — and each line's scan carries what is left of the block as its budget, so an
+// over-long line costs the remaining bound rather than the buffer.
 fn field_lines(buf: Bytes, block_start: Int, from: Int, limits: Limits,
                acc: Headers, count: Int) -> FieldsResult = {
   let used = from - block_start;
@@ -613,9 +495,7 @@ fn parse_field(content: Bytes) -> Result<Field, Refusal> = {
   let n = bytes_len(content);
   let first = bytes_at(content, 0);
   if first == 32 || first == 9 {
-    // RFC 9112 §5.2 permits replacing an obs-fold with SP. Refusing is safe,
-    // nothing has sent one since 2007, and a folded `Content-Length` is a
-    // smuggle two implementations will unfold differently.
+    // RFC 9112 §5.2 permits replacing an obs-fold with SP.
     Err({status: 400, reason: "obsolete line folding is not accepted"})
   } else {
     let colon = bytes_scan_until(content, 0, b":", n);
@@ -630,8 +510,8 @@ fn parse_field(content: Bytes) -> Result<Field, Refusal> = {
 fn named_field(content: Bytes, colon: Int, n: Int) -> Result<Field, Refusal> = {
   let raw = bytes_slice(content, 0, colon);
   if colon > 0 && (bytes_at(content, colon - 1) == 32 || bytes_at(content, colon - 1) == 9) {
-    // RFC 9112 §5.1 makes this a MUST, and it is a MUST because `Foo : bar` is
-    // read as `Foo` by one implementation and dropped by another.
+    // RFC 9112 §5.1 makes this a MUST, and it is a MUST because `Foo : bar` is read as `Foo` by one
+    // implementation and dropped by another.
     Err({status: 400, reason: "whitespace between a field name and its colon"})
   } else if !is_token(raw) {
     Err({status: 400, reason: "a field name must be a token"})
@@ -641,18 +521,16 @@ fn named_field(content: Bytes, colon: Int, n: Int) -> Result<Field, Refusal> = {
 }
 
 fn field_value(name: String, value: Bytes) -> Result<Field, Refusal> =
-  // A control character other than HTAB was already refused by the line scan, so
-  // what is left is a value that is not text. Lossy decoding would put a U+FFFD
-  // into a header the program compares against, which is a value that arrived
-  // and a value that is read differing silently.
+  // A control character other than HTAB was already refused by the line scan, so what is left is a
+  // value that is not text.
   if !bytes_is_utf8(value) {
     Err({status: 400, reason: "the value of `" ++ name ++ "` is not valid UTF-8"})
   } else {
     Ok({name: name, value: string_of_bytes(value)})
   }
 
-// Optional leading and trailing whitespace around a field value, which RFC 9112
-// §5 says is not part of it.
+// Optional leading and trailing whitespace around a field value, which RFC 9112 §5 says is not part
+// of it.
 fn trim_ows(content: Bytes, from: Int, to: Int) -> Bytes = {
   let start = bytes_scan(content, from, ows(), to - from);
   bytes_slice(content, start, trim_end(content, start, to))
@@ -675,8 +553,7 @@ fn add_field(h: Headers, name: String, value: String) -> Headers =
 
 // --- Reading a header -------------------------------------------------------
 
-// Every field line under this name, in order of appearance. Nothing is combined:
-// see the note on `Headers`.
+// Every field line under this name, in order of appearance.
 pub fn header_lines(h: Headers, name: String) -> List<String> =
   match map_get(h, name) {
     Some(vs) -> vs,
@@ -697,9 +574,8 @@ pub fn set_header(h: Headers, name: String, value: String) -> Headers =
 pub fn add_header(h: Headers, name: String, value: String) -> Headers =
   add_field(h, string_lower(name), value)
 
-// A comma-separated list field, split, trimmed and lowercased — the shape
-// `Connection` and `Transfer-Encoding` are written in. Applied per field line,
-// so two lines produce one list in order of appearance.
+// A comma-separated list field, split, trimmed and lowercased — the shape `Connection` and
+// `Transfer-Encoding` are written in.
 fn list_field(h: Headers, name: String) -> List<String> =
   fold(header_lines(h, name), [], |acc: List<String>, line: String|
     fold(string_split(line, ","), acc, |inner: List<String>, part: String|
@@ -708,9 +584,6 @@ fn list_field(h: Headers, name: String) -> List<String> =
 // --- Host -------------------------------------------------------------------
 
 // An HTTP/1.1 request with no `Host` is 400 and more than one `Host` is 400.
-// Both are RFC 9112 §3.2 MUSTs, and both are routing-confusion vectors: a
-// request with two `Host` fields is a request a cache and an origin may route to
-// two different places.
 fn host_of(start: Start, h: Headers) -> Result<String, Refusal> = {
   let lines = header_lines(h, "host");
   if len(lines) > 1 {
@@ -735,17 +608,13 @@ fn framing_of(h: Headers, limits: Limits) -> Result<Framing, Refusal> = {
   let cl = header_lines(h, "content-length");
   let te = header_lines(h, "transfer-encoding");
   if len(cl) > 0 && len(te) > 0 {
-    // RFC 9112 §6.1 lets a server reject. Preferring one and ignoring the other
-    // is correct only if every hop in front of this server made the same choice,
-    // and CL.TE / TE.CL smuggling is exactly the case where one did not.
+    // RFC 9112 §6.1 lets a server reject.
     Err({status: 400,
          reason: "a request carries `Content-Length` or `Transfer-Encoding`, never both"})
   } else if len(te) > 0 {
     chunked_of(list_field(h, "transfer-encoding"))
   } else if len(cl) > 1 {
-    // RFC 9112 §6.3 permits treating identical values as one. Refused: agreement
-    // between two field lines in *this* message says nothing about how an
-    // intermediary in front of this server picked one.
+    // RFC 9112 §6.3 permits treating identical values as one.
     Err({status: 400,
          reason: "a request carries at most one `Content-Length` field line"})
   } else {
@@ -756,13 +625,9 @@ fn framing_of(h: Headers, limits: Limits) -> Result<Framing, Refusal> = {
   }
 }
 
-// Rule 16 before rule 17, and rule 17 before accepting: a coding list whose last
-// coding is not `chunked` has no decidable length and is 400, and one this server
-// cannot decode is 501 — including when `chunked` is the last of them.
-// `Transfer-Encoding: gzip, chunked` is unambiguously framed and was accepted,
-// which handed the handler gzip bytes as `Request::body` with nothing saying so,
-// and left an intermediary that honours `gzip` and a server that ignores it
-// disagreeing about what the body was.
+// Rule 16 before rule 17, and rule 17 before accepting: a coding list whose last coding is not
+// `chunked` has no decidable length and is 400, and one this server cannot decode is 501 —
+// including when `chunked` is the last of them.
 fn chunked_of(codings: List<String>) -> Result<Framing, Refusal> =
   if !contains_string(codings, "chunked") {
     Err({status: 501, reason: "the only transfer coding this server decodes is `chunked`"})
@@ -785,9 +650,8 @@ fn count_string(xs: List<String>, want: String) -> Int =
 
 fn last_string(xs: List<String>) -> String = fold(xs, "", |prev: String, x: String| x)
 
-// No sign, no internal whitespace, no `0x`, no non-ASCII digit, and a value with
-// a comma in it is a list rather than a length. A value over `max_body` is
-// decided here, before a single body byte is read.
+// No sign, no internal whitespace, no `0x`, no non-ASCII digit, and a value with a comma in it is a
+// list rather than a length.
 fn length_of(raw: String, limits: Limits) -> Result<Framing, Refusal> = {
   let b = bytes_of_string(raw);
   if !all_digits(b) {
@@ -800,16 +664,15 @@ fn length_of(raw: String, limits: Limits) -> Result<Framing, Refusal> = {
   }
 }
 
-// At most 18 digits by the guard above, so the accumulator cannot overflow and
-// the recursion is 18 deep.
+// At most 18 digits by the guard above, so the accumulator cannot overflow and the recursion is 18
+// deep.
 fn digits_to_int(b: Bytes, i: Int, acc: Int) -> Int =
   if i >= bytes_len(b) { acc } else { digits_to_int(b, i + 1, acc * 10 + (bytes_at(b, i) - 48)) }
 
 // --- Expect and Connection --------------------------------------------------
 
-// A client that waits for a `100` it never gets is a hang, and a hang is the
-// failure shape with nothing to read. So an `Expect` this server does not
-// implement is 417 rather than ignored.
+// A client that waits for a `100` it never gets is a hang, and a hang is the failure shape with
+// nothing to read.
 fn expect_of(h: Headers) -> Result<Bool, Refusal> = {
   let lines = header_lines(h, "expect");
   if len(lines) == 0 {
@@ -860,9 +723,7 @@ pub fn body_start(framing: Framing, limits: Limits) -> BodyState =
    received: 0,
    limits: limits}
 
-// Decoding is pure; only refilling the buffer performs `net`. `buf` begins at
-// the first byte this state has not seen, `consumed` is how much of it was
-// absorbed, and `out` is the body bytes it produced.
+// Decoding is pure; only refilling the buffer performs `net`.
 pub fn body_step(state: BodyState, buf: Bytes) -> BodyStep =
   match state.framing {
     NoBody -> Complete({consumed: 0, out: b"", trailers: empty_headers()}),
@@ -883,10 +744,8 @@ fn length_step(state: BodyState, buf: Bytes) -> BodyStep = {
   }
 }
 
-// One call per chunk, bounded by `chunk_budget()` per step so that a body of
-// one-byte chunks costs the caller another loop rather than the interpreter's
-// call stack. `out` accumulates as a list and is joined once, because folding
-// `bytes_concat` across k chunks copies the prefix k times.
+// One call per chunk, bounded by `chunk_budget()` per step so that a body of one-byte chunks costs
+// the caller another loop rather than the interpreter's call stack.
 fn chunk_step(state: BodyState, buf: Bytes, at: Int, out: List<Bytes>, fuel: Int) -> BodyStep =
   if fuel <= 0 {
     Await({state: state, consumed: at, out: bytes_concat_all(out)})
@@ -907,11 +766,7 @@ fn phased(state: BodyState, phase: ChunkPhase, remaining: Int, received: Int) ->
   {framing: state.framing, phase: phase, remaining: remaining, received: received,
    limits: state.limits}
 
-// A chunk-size line is hex digits, optionally followed by `;` and extensions,
-// terminated by CRLF. The extensions are parsed for framing and discarded;
-// nothing reads them and they are bounded by `max_chunk_line` and by nothing
-// else — which the scan carries as its budget rather than discovering after
-// buffering.
+// A chunk-size line is hex digits, optionally followed by `;` and extensions, terminated by CRLF.
 fn chunk_size(state: BodyState, buf: Bytes, at: Int, out: List<Bytes>, fuel: Int) -> BodyStep =
   match read_line(buf, at, state.limits.max_chunk_line) {
     LineIncomplete -> waiting(state, at, out),
@@ -938,17 +793,9 @@ fn sized(state: BodyState, buf: Bytes, out: List<Bytes>, fuel: Int, line: Bytes,
   }
 }
 
-// Sixteen hex digits is sixty-four bits and `Int` is signed, so the digit bound
-// of ADR 0013 §3.6 rule 19 does *not* keep the accumulator from overflowing —
-// every size at or above `8000000000000000` does. An overflow is `E0502
-// RUNTIME_ERROR`, which is not a `Refusal`: it unwinds out of `body_step`, out
-// of `serve_connection` and past the accept loop, so one unauthenticated packet
-// ended the whole run. A size that does not fit is a size larger than any
-// `max_chunk_size` a program can configure, so it earns the same 413.
-//
-// Leading zeros are skipped rather than counted, because `0000000000000005` is a
-// legal spelling of five and refusing it would be a second parser disagreeing
-// about a length.
+// Sixteen hex digits is sixty-four bits and `Int` is signed, so the digit bound of ADR 0013 §3.6
+// rule 19 does *not* keep the accumulator from overflowing — every size at or above
+// `8000000000000000` does.
 fn fits_in_int(b: Bytes, i: Int, n: Int) -> Bool =
   if i >= n {
     true
@@ -976,8 +823,8 @@ fn chunk_sized(state: BodyState, buf: Bytes, out: List<Bytes>, fuel: Int, size: 
     chunk_step(phased(state, InData, size, state.received), buf, next, out, fuel - 1)
   }
 
-// `sized` has already checked with `fits_in_int` that the value this accumulates
-// is representable; the digit bound alone would not.
+// `sized` has already checked with `fits_in_int` that the value this accumulates is representable;
+// the digit bound alone would not.
 fn hex_to_int(b: Bytes, i: Int, acc: Int) -> Int =
   if i >= bytes_len(b) { acc } else { hex_to_int(b, i + 1, acc * 16 + hex_value(bytes_at(b, i))) }
 
@@ -1004,9 +851,7 @@ fn chunk_data(state: BodyState, buf: Bytes, at: Int, out: List<Bytes>, fuel: Int
   }
 }
 
-// A chunk's data must be followed by CRLF. Anything else means the size and the
-// data disagree, which is a message boundary two implementations would place
-// differently.
+// A chunk's data must be followed by CRLF.
 fn chunk_crlf(state: BodyState, buf: Bytes, at: Int, out: List<Bytes>, fuel: Int) -> BodyStep =
   if bytes_len(buf) < at + 2 {
     waiting(state, at, out)
@@ -1016,16 +861,10 @@ fn chunk_crlf(state: BodyState, buf: Bytes, at: Int, out: List<Bytes>, fuel: Int
     chunk_step(phased(state, AtSize, 0, state.received), buf, at + 2, out, fuel - 1)
   }
 
-// The trailer section is parsed under the same rules as the header block, with
-// `max_trailer_bytes`, and is handed back separately. It is never merged into
-// `headers`: a trailer named `content-length`, `transfer-encoding`, `host` or
-// `authorization` changes nothing about framing, routing or authorization, and
-// merging them is a documented smuggling and privilege-escalation route.
+// The trailer section is parsed under the same rules as the header block, with `max_trailer_bytes`,
+// and is handed back separately.
 fn chunk_trailers(state: BodyState, buf: Bytes, at: Int, out: List<Bytes>) -> BodyStep = {
-  // The trailer block is the header block's rules with one bound swapped. Every
-  // other field is copied rather than re-spelled, so adding a field to `Limits`
-  // cannot produce a wrong bound *here* — the twelve fields this used to write
-  // out are the twelve it can no longer mispair.
+  // The trailer block is the header block's rules with one bound swapped.
   let trailer_limits = {..state.limits, max_header_bytes: state.limits.max_trailer_bytes};
   match fields(buf, at, at, trailer_limits) {
     FieldsIncomplete -> waiting(state, at, out),
@@ -1051,13 +890,6 @@ pub fn refusal_response(r: Refusal) -> Response =
   text_response(r.status, r.reason ++ "\n")
 
 // The 405, built rather than remembered.
-//
-// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and a MUST a program can
-// forget is a MUST a program will forget — `std.router` answers
-// `MethodNotAllowed(ms)` with the methods sorted and deduplicated precisely so
-// that this call is the whole of the rest of it. ADR 0013 §5.4 names this
-// function; before it existed the guarantee was a convention one example
-// happened to follow.
 pub fn method_not_allowed(ms: List<Method>) -> Response = {
   let allow = allow_field(ms);
   let body = text_response(405, "the methods this resource allows are " ++ allow ++ "\n");
@@ -1119,25 +951,12 @@ pub fn reason_phrase(status: Int) -> String =
     "Unknown"
   }
 
-// A status with no body: 1xx, 204 and 304 carry neither a body nor a
-// `Content-Length`, because a client reads one of those as the start of the next
-// message.
+// A status with no body: 1xx, 204 and 304 carry neither a body nor a `Content-Length`, because a
+// client reads one of those as the start of the next message.
 fn bodiless(status: Int) -> Bool =
   (status >= 100 && status < 200) || status == 204 || status == 304
 
 // The one thing `encode` refuses.
-//
-// A header name that is not a token, or a value containing CR or LF, is a
-// runtime error naming the header — never stripped and never escaped. That value
-// came from the program: a path segment, a database row, a redirect target.
-// Silently sanitizing it turns a response-splitting attempt into a response the
-// attacker partly controls and nobody noticed. A refusal is loud, attributable
-// and bisectable.
-//
-// The framing fields are refused too, and for the same reason one level up: a
-// program that set its own `Content-Length` beside the one computed here would
-// have written two, and two is a message length a client and a proxy may read
-// differently.
 pub fn encode(method: Method, version: Version, keep_alive: Bool, r: Response) -> Bytes = {
   let head = bytes_of_string(
     "HTTP/1.1 " ++ int_to_string(r.status) ++ " " ++ reason_phrase(r.status) ++ "\r\n");
@@ -1168,8 +987,8 @@ fn reserved_field(name: String) -> Bool = {
   lower == "content-length" || lower == "transfer-encoding" || lower == "connection"
 }
 
-// A response to `HEAD` carries the `Content-Length` the same request would have
-// produced under `GET`, and no body.
+// A response to `HEAD` carries the `Content-Length` the same request would have produced under
+// `GET`, and no body.
 fn framing_fields(r: Response) -> Bytes =
   if bodiless(r.status) {
     b""
@@ -1194,13 +1013,6 @@ fn connection_field(version: Version, keep_alive: Bool) -> Bytes =
   }
 
 // The head of a streamed response.
-//
-// `Transfer-Encoding: chunked` under HTTP/1.1, and **nothing** under HTTP/1.0,
-// which has no chunked transfer coding: a 1.0 message with no `Content-Length`
-// is delimited by the connection closing, which is why `connection_field` is
-// handed `false` there and why `respond_chunked` never reuses such a connection.
-// Either way the response carries exactly one framing, which is the claim ADR
-// 0013 §2.5 makes.
 pub fn encode_chunked_head(version: Version, keep_alive: Bool, r: Response) -> Bytes = {
   let head = bytes_of_string(
     "HTTP/1.1 " ++ int_to_string(r.status) ++ " " ++ reason_phrase(r.status) ++ "\r\n");
@@ -1239,29 +1051,21 @@ pub fn continue_response() -> Bytes = b"HTTP/1.1 100 Continue\r\n\r\n"
 
 // --- The read loop ----------------------------------------------------------
 
-// Reading a head is where a parser that re-scans its buffer becomes quadratic,
-// so nothing here re-scans. The pieces are kept as a list and joined once by
-// `bytes_concat_all`; the terminator is searched for in the *new* bytes plus the
-// three carried from the previous piece, which is the only place a CRLF CRLF can
-// straddle a read boundary. Total work is one pass over the head, whatever
-// packet boundaries the peer chose.
+// Reading a head is where a parser that re-scans its buffer becomes quadratic, so nothing here
+// re-scans.
 pub type HeadRead =
   | HeadBytes({ buf: Bytes, complete: Bool })
   // The head began arriving and did not finish inside `header_timeout_ms`: 408.
   | HeadTimedOut
-  // Nothing arrived at all between two messages on a kept-alive connection:
-  // there is no request to answer, so the connection closes and nothing is
-  // written (ADR 0013 §3.9 rule 33).
+  // Nothing arrived at all between two messages on a kept-alive connection: there is no request to
+  // answer, so the connection closes and nothing is written (ADR 0013 §3.9 rule 33).
   | HeadIdle
   | HeadClosed(Bytes)
 
 type Reading = { pieces: List<Bytes>, total: Int, tail: Bytes, found: Bool }
 
-// `idle` is the wait for the *first* byte of a message on a connection that has
-// already answered one. It is one `recv` carrying the whole `idle_timeout_ms`,
-// because rule 33 is a deadline before the first byte and nothing is being
-// assembled yet. Once a byte has arrived, rule 31's deadline starts and the loop
-// below enforces it.
+// `idle` is the wait for the *first* byte of a message on a connection that has already answered
+// one.
 pub fn read_head(c: Int, carried: Bytes, limits: Limits, idle: Bool) -> HeadRead
   / {net.write[conn]} = {
   let cap = limits.max_request_line + limits.max_header_bytes;
@@ -1287,21 +1091,6 @@ fn head_deadline(c: Int, limits: Limits, cap: Int, r: Reading) -> HeadRead / {ne
                  read_budget(limits.header_timeout_ms), r)
 
 // **A deadline that restarts on every read is not a deadline.**
-//
-// ADR 0013 §3.9 rule 31 measures `header_timeout_ms` from the first byte of the
-// request, and rule 32 says the same of the body. Passing the whole timeout to
-// each individual `net.recv` — which is what `ply_host::tcp::recv` turns into one
-// `set_read_timeout` per syscall — restarts it on every byte, so the only real
-// bound was the read count: 2048 reads x 5000 ms is 2.8 hours on one socket, and
-// `serve` is a sequential accept loop, so that is the whole server.
-//
-// Ply has no clock, so the deadline is enforced by **dividing** it. Each read
-// carries a slice of the budget and there are at most `read_budget` slices, so
-// the whole head costs at most `header_timeout_ms` whatever the peer does — and
-// a peer sending data as fast as the deadline requires never notices, because a
-// slice expiring with no bytes is an ordinary read rather than a refusal. What a
-// slice costs is granularity: a client whose bytes arrive slower than
-// `total / header_timeout_ms` runs out of slices, which is exactly the deadline.
 fn slice_ms(timeout_ms: Int) -> Int =
   if timeout_ms / max_reads() < 1 { 1 } else { timeout_ms / max_reads() }
 
@@ -1312,16 +1101,15 @@ fn read_head_loop(c: Int, limits: Limits, cap: Int, slice: Int, reads: Int, r: R
   if r.found {
     HeadBytes({buf: bytes_concat_all(r.pieces), complete: true})
   } else if r.total >= cap {
-    // Stop accumulating at the bound rather than buffering past it and deciding
-    // afterwards: what is here is handed to `parse_head`, which answers 431 or
-    // 414 against the bound it was given.
+    // Stop accumulating at the bound rather than buffering past it and deciding afterwards: what is
+    // here is handed to `parse_head`, which answers 431 or 414 against the bound it was given.
     HeadBytes({buf: bytes_concat_all(r.pieces), complete: false})
   } else if reads <= 0 {
     HeadTimedOut
   } else {
     match net.recv[conn](c, min_int(read_size(), cap - r.total), slice) {
-      // A slice that expired with no bytes, which is not the deadline: the
-      // deadline is the budget running out, and that is the branch above.
+      // A slice that expired with no bytes, which is not the deadline: the deadline is the budget
+      // running out, and that is the branch above.
       None -> read_head_loop(c, limits, cap, slice, reads - 1, r),
       Some(chunk) ->
         if bytes_len(chunk) == 0 {
@@ -1340,10 +1128,7 @@ fn absorb(r: Reading, chunk: Bytes) -> Reading = {
    found: terminated(probe, 0)}
 }
 
-// A blank line ends the head. Both spellings are searched for: a head terminated
-// by a bare LF is refused by `parse_head` with a 400, and a read loop that
-// waited for a CRLF CRLF that was never coming would turn that refusal into a
-// timeout.
+// A blank line ends the head.
 fn terminated(b: Bytes, from: Int) -> Bool =
   match bytes_index_of_from(b, b"\r\n\r\n", from) {
     Some(_) -> true,
@@ -1366,17 +1151,7 @@ pub type BodyResult =
   | BodyTimedOut
   | BodyClosed
 
-// The buffered form, for a handler that wants a whole body. `rest` is the
-// leftover, which is the next pipelined request's beginning.
-//
-// The serve loop calls this whether or not the handler will look at the body,
-// which is not politeness: an unread body is the next message's bytes as far as
-// the connection is concerned, so framing the next request out of one is a
-// smuggle the server performs on itself.
-// The body's deadline is `body_timeout_ms` from the moment the head ended, and
-// it is enforced exactly as the head's is: divided into slices, one per read,
-// with the budget exhausted rather than the peer relenting being what answers
-// 408. See `slice_ms`.
+// The buffered form, for a handler that wants a whole body.
 pub fn read_body(c: Int, framing: Framing, buf: Bytes, limits: Limits) -> BodyResult
   / {net.write[conn]} =
   body_loop(c, body_start(framing, limits), buf, [], slice_ms(limits.body_timeout_ms),
@@ -1401,8 +1176,8 @@ fn body_more(c: Int, step: { state: BodyState, consumed: Int, out: Bytes }, buf:
   if reads <= 0 {
     BodyTimedOut
   } else if step.consumed > 0 && bytes_len(rest) > 0 {
-    // The step spent its chunk budget rather than its input; loop without a read
-    // so a body of many small chunks costs reads proportional to its bytes.
+    // The step spent its chunk budget rather than its input; loop without a read so a body of many
+    // small chunks costs reads proportional to its bytes.
     body_loop(c, step.state, rest, taken, slice, reads - 1, limits)
   } else {
     match net.recv[conn](c, read_size(), slice) {
@@ -1419,38 +1194,27 @@ fn body_more(c: Int, step: { state: BodyState, consumed: Int, out: Bytes }, buf:
 
 // --- Serving ----------------------------------------------------------------
 
-// One connection, start to finish: read a head, answer it, and either close or
-// go round again with whatever was left over.
-//
-// Every connection `serve` handles shares the resource label `conn`, because a
-// resource label is a ground identifier in the source. Two connections therefore
-// conflict, which costs nothing inside one run — a production region schedules
-// on readiness, not on footprints — and means two *tests* that each serve a
-// connection are placed in one concurrency group.
+// One connection, start to finish: read a head, answer it, and either close or go round again with
+// whatever was left over.
 pub fn serve_connection<| e>(c: Int, limits: Limits, app: (Request) -> Response / e) -> Unit
   / {net.write[conn] | e} = {
   connection_loop(c, limits, app, b"", limits.max_keep_alive, false);
   net.close[conn](c)
 }
 
-// One function rather than the five this reads as, and that is a language
-// constraint rather than a style: a set of mutually recursive definitions is
-// checked as one component against its *declared* signatures, so each would
-// carry its own rigid `e` and a call between them would be two effect variables
-// that cannot unify. Only self-recursion keeps one variable, so the loop is one
-// definition and the arms are its shape.
+// One function rather than the five this reads as, and that is a language constraint rather than a
+// style: a set of mutually recursive definitions is checked as one component against its *declared*
+// signatures, so each would carry its own rigid `e` and a call between them would be two effect
+// variables that cannot unify.
 fn connection_loop<| e>(c: Int, limits: Limits, app: (Request) -> Response / e, carried: Bytes,
                         left: Int, reused: Bool) -> Unit / {net.write[conn] | e} =
   if left <= 0 {
     ()
   } else {
-    // The idle timeout applies between the previous response and the next
-    // request's first byte; the header timeout applies from that first byte.
-    // `read_head` tells the two apart, because deciding it here would mean
-    // answering an idle close to a head that had begun.
+    // The idle timeout applies between the previous response and the next request's first byte; the
+    // header timeout applies from that first byte.
     match read_head(c, carried, limits, reused) {
-      // The peer went away, or went quiet between messages. An idle timeout
-      // closes with no response: there is no request to answer.
+      // The peer went away, or went quiet between messages.
       HeadClosed(_) -> (),
       HeadIdle -> (),
       HeadTimedOut ->
@@ -1458,8 +1222,8 @@ fn connection_loop<| e>(c: Int, limits: Limits, app: (Request) -> Response / e, 
                        text_response(408, "the request head did not arrive\n")),
       HeadBytes(read) ->
         match parse_head(read.buf, limits) {
-          // The head stopped mid-way and no more is coming, or it overran the
-          // bound without a terminator. Either way nothing framed a message.
+          // The head stopped mid-way and no more is coming, or it overran the bound without a
+          // terminator.
           Incomplete ->
             if read.complete {
               write_response(c, limits, Get, Http11, false,
@@ -1472,18 +1236,16 @@ fn connection_loop<| e>(c: Int, limits: Limits, app: (Request) -> Response / e, 
           Refused(r) -> write_response(c, limits, Get, Http11, false, refusal_response(r)),
           Parsed(head) -> {
             let rest = bytes_slice(read.buf, head.consumed, bytes_len(read.buf));
-            // A client that waits for a `100` it never gets is a hang, so the
-            // interim response goes out before the body is read, and a write
-            // that fails there ends the connection rather than leaving the
-            // client waiting.
+            // A client that waits for a `100` it never gets is a hang, so the interim response goes
+            // out before the body is read, and a write that fails there ends the connection rather
+            // than leaving the client waiting.
             if head.expects_continue
                && !send_all(c, continue_response(), limits.write_timeout_ms) {
               ()
             } else {
-              // Read even when the handler will not look at it: an unread body
-              // is the next message's bytes as far as the connection is
-              // concerned, and framing the next request out of one is a smuggle
-              // the server performs on itself.
+              // Read even when the handler will not look at it: an unread body is the next
+              // message's bytes as far as the connection is concerned, and framing the next request
+              // out of one is a smuggle the server performs on itself.
               match read_body(c, head.framing, rest, limits) {
                 BodyTimedOut ->
                   write_response(c, limits, head.request.method, head.request.version, false,
@@ -1519,20 +1281,8 @@ fn write_response(c: Int, limits: Limits, method: Method, version: Version, keep
   ()
 }
 
-// A streamed response needs no new language feature — it needs a row variable,
-// which the language has. The producer is an ordinary function with its own row
-// and this threads it, so a handler that streams a database cursor publishes the
-// cursor's atoms and nothing else.
-//
-// `version` is the *request's*, and it decides the framing. HTTP/1.0 has no
-// chunked transfer coding: a 1.0 client reads `5\r\nhello\r\n` as body bytes, so
-// sending it chunked framing is a corrupted response and sending it the
-// `Connection: keep-alive` it asked for is worse. For a 1.0 peer the message
-// length is the connection closing — the head says `Connection: close`, the
-// chunks go out as the bytes they are, and `false` is what tells the caller to
-// close, which is the framing.
-//
-// `true` means the whole response was written and the connection may be reused.
+// A streamed response needs no new language feature — it needs a row variable, which the language
+// has.
 pub fn respond_chunked<s | e>(c: Int, version: Version, r: Response, keep_alive: Bool,
                              limits: Limits, seed: s,
                              produce: (s) -> Option<{ chunk: Bytes, next: s }> / e) -> Bool
@@ -1552,31 +1302,13 @@ pub fn respond_chunked<s | e>(c: Int, version: Version, r: Response, keep_alive:
       },
   }
 
-// **A chunked response that stops without its terminating chunk is response
-// smuggling.** The fuel running out used to answer `false` having written
-// neither `0\r\n\r\n` nor anything else that ends the message, and a caller that
-// kept the connection alive after that had its next response read as chunk data
-// by the client. So the message is always terminated, and `false` says the
-// response was cut short and the connection must not be reused.
-//
-// The loop is an `iterate` rather than a tail call, which is what makes `fuel`
-// a policy number: `iterate` is one frame however many rounds it runs, so the
-// bound this honours is the one written above it and not the evaluator's.
-//
-// The budget handed to `iterate` is `fuel + 1` and is a **backstop that cannot
-// fire**. The step counts its own `left` down and answers `Stop` at zero, which
-// takes at most `fuel + 1` rounds — the extra round being the one that observes
-// zero and writes the terminator. Spending the policy inside the step rather
-// than as `iterate`'s budget is deliberate: an exhausted `iterate` budget is a
-// diagnostic, and a diagnostic here would abort the run with the response
-// framed and unterminated, which is the smuggling this function exists to
-// prevent.
+// **A chunked response that stops without its terminating chunk is response smuggling.**
 fn stream_chunks<s | e>(c: Int, limits: Limits, seed: s,
                        produce: (s) -> Option<{ chunk: Bytes, next: s }> / e, fuel: Int) -> Bool
   / {net.write[conn] | e} =
   if fuel <= 0 {
-    // The framing is closed even though the body is short: a truncated message
-    // a client can see the end of is recoverable, and one it cannot is not.
+    // The framing is closed even though the body is short: a truncated message a client can see the
+    // end of is recoverable, and one it cannot is not.
     send_all(c, last_chunk(), limits.write_timeout_ms);
     false
   } else {
@@ -1597,9 +1329,9 @@ fn stream_chunks<s | e>(c: Int, limits: Limits, seed: s,
       })
   }
 
-// The HTTP/1.0 form: the body is the bytes and the message ends when the
-// connection does, so there is no terminator to write and no answer but `false`
-// — the caller closes, and the close is the framing.
+// The HTTP/1.0 form: the body is the bytes and the message ends when the connection does, so there
+// is no terminator to write and no answer but `false` — the caller closes, and the close is the
+// framing.
 fn stream_raw<s | e>(c: Int, limits: Limits, seed: s,
                     produce: (s) -> Option<{ chunk: Bytes, next: s }> / e, fuel: Int) -> Bool
   / {net.write[conn] | e} =
@@ -1623,19 +1355,7 @@ fn stream_raw<s | e>(c: Int, limits: Limits, seed: s,
       })
   }
 
-// Accept `count` connections and answer each. A count rather than a loop,
-// because this loop is still a tail call charged against the evaluator's call
-// budget; the bound is named where a reader can see it rather than discovered at
-// connection ten thousand.
-//
-// > **Narrowed (2026-08-27, ADR 0022).** This read *"because **every** loop here
-// > is a tail call charged against the evaluator's call budget"*. That is no
-// > longer true of the file: `stream_chunks` and `stream_raw` are `iterate`
-// > drivers and are depth 1. It is still true of `serve` and of
-// > `connection_loop`, which are deliberately out of that change's scope — the
-// > same rewrite applies to both and neither was done here. `max_keep_alive`
-// > (100) and a caller's `count` sit far enough below 10,000 that neither is
-// > shaped by the ceiling the way `max_stream_chunks` was.
+// Accept `count` connections and answer each.
 pub fn serve<| e>(listener: Int, count: Int, limits: Limits, app: (Request) -> Response / e) -> Int
   / {net.write[listener], net.write[conn] | e} =
   if count <= 0 {
@@ -1661,16 +1381,10 @@ pub fn listen_and_serve<| e>(port: Int, count: Int, limits: Limits,
 }
 
 // --- Tests: helpers ---------------------------------------------------------
-//
-// Every test below is `det`, hermetic and cacheable, because everything it
-// reaches has an empty row. That is ADR 0013's first rule paying for itself: a
-// framing rule is a case in a test file rather than a line in the trusted
-// computing base, and a regression in one is a red test rather than a CVE.
 
 fn head_status(raw: Bytes) -> Int = head_status_with(raw, default_limits())
 
-// `-1` is incomplete and `0` is accepted, so a table of cases reads as the
-// status each input earns.
+// `-1` is incomplete and `0` is accepted, so a table of cases reads as the status each input earns.
 fn head_status_with(raw: Bytes, limits: Limits) -> Int =
   match parse_head(raw, limits) {
     Refused(r) -> r.status,
@@ -1692,11 +1406,9 @@ fn parsed(raw: Bytes) -> Head =
     Incomplete -> panic("expected a parse, got an incomplete head"),
   }
 
-// The six bounds these helpers do not vary were re-spelled by hand until W4, and
-// re-spelling `Limits` is what makes a mispairing possible: every field is `Int`,
-// so `max_chunk_size: chunk_line` type-checks. The `let` is not a style choice —
-// a record update's base must be a repeatable path (ADR 0023 §Decision 3), and
-// `default_limits()` is a call.
+// The six bounds these helpers do not vary were re-spelled by hand until W4, and re-spelling
+// `Limits` is what makes a mispairing possible: every field is `Int`, so `max_chunk_size:
+// chunk_line` type-checks.
 fn limits_with(request_line: Int, header_bytes: Int, header_count: Int, body: Int,
                chunk_size: Int, chunk_line: Int, trailer_bytes: Int) -> Limits = {
   let base: Limits = default_limits();
@@ -1750,8 +1462,7 @@ test "a request line that is not `METHOD SP TARGET SP VERSION` is refused" {
   assert_eq(head_status(b"OPTIONS * HTTP/1.1\r\nHost: x\r\n\r\n"), 0)
 }
 
-// ADR 0013 §3.2 rule 8: the parser does not decide the mismatch question, it
-// refuses to hide it.
+// ADR 0013 §3.2 rule 8: the parser does not decide the mismatch question, it refuses to hide it.
 test "an absolute-form target's authority is the request's, and Host stays visible" {
   let h = parsed(b"GET http://a.example/orders?x=1 HTTP/1.1\r\nHost: b.example\r\n\r\n");
   assert_eq(h.request.authority, "a.example");
@@ -1765,12 +1476,8 @@ test "an absolute-form target's authority is the request's, and Host stays visib
             "a.example")
 }
 
-// A target that is not origin-form and not `*` reaches the scheme comparison,
-// and that comparison used to slice the target at byte eight and hand the slice
-// to the strict `string_of_bytes`. Three U+20AC are nine bytes and byte eight
-// falls inside the third, so `GET €€€ HTTP/1.1` was `E0502` unwinding out of the
-// serve loop — one unauthenticated packet ending the whole run rather than one
-// connection.
+// A target that is not origin-form and not `*` reaches the scheme comparison, and that comparison
+// used to slice the target at byte eight and hand the slice to the strict `string_of_bytes`.
 test "a target that is not origin-form is refused rather than ending the run" {
   assert_eq(head_status(b"GET \xe2\x82\xac\xe2\x82\xac\xe2\x82\xac HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
   assert_eq(head_status(b"GET \xf0\x9f\x92\xa9\xf0\x9f\x92\xa9 HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
@@ -1778,11 +1485,9 @@ test "a target that is not origin-form is refused rather than ending the run" {
   assert_eq(head_status(b"GET htt\xe2\x82\xac://a/x HTTP/1.1\r\nHost: x\r\n\r\n"), 400)
 }
 
-// RFC 9112 §3 is `method SP request-target SP HTTP-version`, and §11.2 names
-// recovering from whitespace in the request line as a smuggling vector: a
-// recipient that splits on HTAB and one that does not disagree about what the
-// target was. `line_stops` omits HTAB because HTAB is legal in a field *value*,
-// so the request line needs its own scan.
+// RFC 9112 §3 is `method SP request-target SP HTTP-version`, and §11.2 names recovering from
+// whitespace in the request line as a smuggling vector: a recipient that splits on HTAB and one
+// that does not disagree about what the target was.
 test "whitespace inside a request target is refused" {
   assert_eq(head_status(b"GET /a\tb HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
   assert_eq(head_status(b"GET\t/a HTTP/1.1\r\nHost: x\r\n\r\n"), 400);
@@ -1794,11 +1499,7 @@ test "whitespace inside a request target is refused" {
             Some("a\tb"))
 }
 
-// ADR 0013 §3.2 rule 8 exposes the authority so a program can compare it against
-// `Host` and decide. A userinfo subcomponent makes that comparison wrong in the
-// attacker's favour — a prefix or substring check on
-// `trusted.example@evil.example` reads the trusted name — and RFC 9110 §4.2.4
-// says to treat userinfo in an `http` URI from an untrusted source as an error.
+// ADR 0013 §3.2 rule 8 exposes the authority so a program can compare it against `Host` and decide.
 test "an absolute-form target carrying userinfo is refused" {
   assert_eq(head_status(b"GET http://trusted.example@evil.example/x HTTP/1.1\r\nHost: h\r\n\r\n"),
             400);
@@ -1806,11 +1507,7 @@ test "an absolute-form target carrying userinfo is refused" {
   assert_eq(head_status(b"GET http:///x HTTP/1.1\r\nHost: h\r\n\r\n"), 400)
 }
 
-// RFC 9112 §3.2 gives the request-target no fragment. Under absolute-form a `#`
-// used to become the *path*: `http://h#a/b` produced `Request::path = "#a/b"`,
-// which `std.router` splits into exactly the two segments `/a/b` does, while any
-// intermediary that parses the target as a URI reference sees `/`. Two answers
-// to "which path is this" is how a route and an authorization check disagree.
+// RFC 9112 §3.2 gives the request-target no fragment.
 test "a request target carrying a fragment is refused" {
   assert_eq(head_status(b"GET http://h#a/b HTTP/1.1\r\nHost: h\r\n\r\n"), 400);
   assert_eq(head_status(b"GET http://h/x#a HTTP/1.1\r\nHost: h\r\n\r\n"), 400);
@@ -1825,8 +1522,8 @@ test "a request line over the bound is 414 and is not buffered past it" {
   let small = limits_with(32, 1024, 8, 64, 64, 64, 64);
   let long = bytes_concat_all([b"GET /", filler(4096), b" HTTP/1.1\r\nHost: x\r\n\r\n"]);
   assert_eq(head_status_with(long, small), 414);
-  // The same input under the default bound frames a message, so 414 is the
-  // bound speaking and not the parser failing on length.
+  // The same input under the default bound frames a message, so 414 is the bound speaking and not
+  // the parser failing on length.
   assert_eq(head_status(long), 0)
 }
 
@@ -1834,9 +1531,7 @@ fn filler(n: Int) -> Bytes = bytes_concat_all(map(range(0, n), |i: Int| b"a"))
 
 // --- Tests: line terminators ------------------------------------------------
 
-// ADR 0013 §3.1, required test 16. Every one of these is a desync: two
-// implementations disagreeing about where a line ended is two implementations
-// disagreeing about where a message ended.
+// ADR 0013 §3.1, required test 16.
 test "a line ends with CRLF and with nothing else" {
   assert_eq(head_status(b"GET / HTTP/1.1\nHost: x\r\n\r\n"), 400);
   assert_eq(head_status(b"GET / HTTP/1.1\r\nHost: x\n\r\n"), 400);
@@ -1910,15 +1605,13 @@ test "a Content-Length over the bound is 413 before a body byte is read" {
   let small = limits_with(8192, 65536, 100, 16, 64, 64, 64);
   assert_eq(head_status_with(post(b"Content-Length: 17\r\n", b""), small), 413);
   assert_eq(head_status_with(post(b"Content-Length: 16\r\n", b""), small), 0);
-  // A value too long to be any body at all, refused without arithmetic that
-  // could overflow.
+  // A value too long to be any body at all, refused without arithmetic that could overflow.
   assert_eq(head_status(post(b"Content-Length: 99999999999999999999999999\r\n", b"")), 413)
 }
 
 // --- Tests: Transfer-Encoding -----------------------------------------------
 
-// ADR 0013 §3.5, required tests 9 and 12. This is the CL.TE / TE.CL smuggling
-// case, and it is the reason W3 refuses where the RFC permits a choice.
+// ADR 0013 §3.5, required tests 9 and 12.
 test "Content-Length and Transfer-Encoding together is refused" {
   assert_eq(head_status(post(b"Content-Length: 5\r\nTransfer-Encoding: chunked\r\n", b"")), 400);
   assert_eq(head_status(post(b"Transfer-Encoding: chunked\r\nContent-Length: 5\r\n", b"")), 400);
@@ -1933,11 +1626,7 @@ test "chunked must be the final transfer coding and may be applied once" {
   assert_eq(head_status(post(b"Transfer-Encoding: gzip, chunked, chunked\r\n", b"")), 400);
   assert_eq(head_status(post(b"Transfer-Encoding: gzip\r\n", b"")), 501);
   assert_eq(head_status(post(b"Transfer-Encoding: identity\r\n", b"")), 501);
-  // Rule 17: a coding this server cannot decode is 501 even when `chunked` is
-  // the last of them. The framing is unambiguous, but accepting it would hand
-  // the handler gzip bytes as `Request::body` with nothing saying so, and would
-  // leave an intermediary that honours `gzip` and this server disagreeing about
-  // what the body was.
+  // Rule 17: a coding this server cannot decode is 501 even when `chunked` is the last of them.
   assert_eq(head_status(post(b"Transfer-Encoding: gzip, chunked\r\n", b"0\r\n\r\n")), 501);
   // Two field lines are one list, in order of appearance.
   assert_eq(head_status(post(b"Transfer-Encoding: gzip\r\nTransfer-Encoding: chunked\r\n",
@@ -1966,9 +1655,8 @@ fn decode_body(framing: Framing, buf: Bytes) -> Result<Decoded, Refusal> =
 fn decode_body_with(framing: Framing, buf: Bytes, limits: Limits) -> Result<Decoded, Refusal> =
   decode_from(body_start(framing, limits), buf, 0, [], 64)
 
-// The driver a caller writes, in miniature: step until `Complete`, and treat a
-// step that consumed nothing and produced nothing as "the message is truncated"
-// rather than looping.
+// The driver a caller writes, in miniature: step until `Complete`, and treat a step that consumed
+// nothing and produced nothing as "the message is truncated" rather than looping.
 fn decode_from(state: BodyState, buf: Bytes, at: Int, out: List<Bytes>, fuel: Int)
   -> Result<Decoded, Refusal> =
   if fuel <= 0 {
@@ -2008,8 +1696,8 @@ test "a length-framed body stops at its length and leaves the rest" {
   assert_eq(decoded(NoBody, b"anything").consumed, 0)
 }
 
-// The streaming shape: the same bytes arriving in pieces decode to the same
-// body, which is what makes `body_step` usable from a read loop.
+// The streaming shape: the same bytes arriving in pieces decode to the same body, which is what
+// makes `body_step` usable from a read loop.
 test "a body arriving in pieces decodes to the same bytes" {
   let whole = decoded(Length(11), b"hello world");
   assert_eq(whole.bytes, b"hello world");
@@ -2046,28 +1734,24 @@ test "a chunked body decodes, and every malformed chunk is refused" {
   assert_eq(body_status(Chunked, b"-5\r\nhello\r\n0\r\n\r\n", l), 400);
   assert_eq(body_status(Chunked, b"0x5\r\nhello\r\n0\r\n\r\n", l), 400);
   assert_eq(body_status(Chunked, b"11111111111111111\r\nx\r\n0\r\n\r\n", l), 400);
-  // The data and the size disagree: a boundary two implementations would place
-  // differently, which is the definition of the bug.
+  // The data and the size disagree: a boundary two implementations would place differently, which
+  // is the definition of the bug.
   assert_eq(body_status(Chunked, b"5\r\nhelloX\r\n0\r\n\r\n", l), 400);
   assert_eq(body_status(Chunked, b"5\r\nhello\n0\r\n\r\n", l), 400)
 }
 
-// Sixteen hex digits is sixty-four bits and `Int` is signed, so ADR 0013 §3.6
-// rule 19's digit bound does not by itself keep the accumulator from
-// overflowing. An overflow is `E0502 RUNTIME_ERROR` rather than a `Refusal`: it
-// unwinds out of `body_step`, out of `serve_connection` and past the accept
-// loop, so `POST / HTTP/1.1` with `Transfer-Encoding: chunked` and a body
-// beginning `FFFFFFFFFFFFFFFF` was a whole-server kill in one packet.
+// Sixteen hex digits is sixty-four bits and `Int` is signed, so ADR 0013 §3.6 rule 19's digit bound
+// does not by itself keep the accumulator from overflowing.
 test "a chunk size that does not fit in an Int is refused rather than overflowing" {
   let l = default_limits();
   assert_eq(body_status(Chunked, b"FFFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n", l), 413);
   assert_eq(body_status(Chunked, b"8000000000000000\r\nx\r\n0\r\n\r\n", l), 413);
   assert_eq(body_status(Chunked, b"ffffffffffffffff;e=1\r\nx\r\n0\r\n\r\n", l), 413);
-  // The largest size that does fit is still over `max_chunk_size`, and answers
-  // the same way — which is why the two share a refusal.
+  // The largest size that does fit is still over `max_chunk_size`, and answers the same way — which
+  // is why the two share a refusal.
   assert_eq(body_status(Chunked, b"7FFFFFFFFFFFFFFF\r\nx\r\n0\r\n\r\n", l), 413);
-  // Leading zeros are a legal spelling of a small size and stay accepted, so the
-  // guard counts significant digits rather than digits.
+  // Leading zeros are a legal spelling of a small size and stay accepted, so the guard counts
+  // significant digits rather than digits.
   assert_eq(decoded(Chunked, b"0000000000000005\r\nhello\r\n0\r\n\r\n").bytes, b"hello");
   assert_eq(body_status(Chunked, b"0000000000000000\r\n\r\n", l), 0)
 }
@@ -2080,9 +1764,7 @@ test "a chunk over the size bound and a body over the length bound are 413" {
   assert_eq(body_status(Chunked, b"4\r\nhell\r\n4\r\nabcd\r\n4\r\nefgh\r\n0\r\n\r\n", small), 413)
 }
 
-// Required test 14. The line is not buffered past the bound: the scan carries
-// `max_chunk_line` as its budget, so the refusal costs the bound rather than the
-// megabyte a peer sent.
+// Required test 14.
 test "a chunk-size line over the bound is 400" {
   let small = limits_with(8192, 65536, 100, 1048576, 1048576, 16, 64);
   let long = bytes_concat_all([b"5;", filler(1024), b"\r\nhello\r\n0\r\n\r\n"]);
@@ -2090,12 +1772,10 @@ test "a chunk-size line over the bound is 400" {
   assert_eq(body_status(Chunked, long, default_limits()), 0)
 }
 
-// ADR 0013 §3.7, required test 15. Merging trailers into headers is a
-// documented smuggling and privilege-escalation route, and the merge is not an
-// optimisation anybody asked for.
+// ADR 0013 §3.7, required test 15.
 test "trailers are exposed separately and never merged into headers" {
-  // A trailer section written where a chunk-size line belongs frames nothing,
-  // and is refused rather than read as either.
+  // A trailer section written where a chunk-size line belongs frames nothing, and is refused rather
+  // than read as either.
   assert_eq(body_status(Chunked,
                         b"5\r\nhello\r\nContent-Length: 0\r\nAuthorization: root\r\n\r\n0\r\n\r\n",
                         default_limits()),
@@ -2106,8 +1786,8 @@ test "trailers are exposed separately and never merged into headers" {
   assert_eq(header(t.trailers, "content-length"), Some("0"));
   assert_eq(header(t.trailers, "authorization"), Some("root"));
 
-  // The head that framed this message carries neither, whatever the trailers
-  // said, and the framing decision was made before they arrived.
+  // The head that framed this message carries neither, whatever the trailers said, and the framing
+  // decision was made before they arrived.
   let h = parsed(post(b"Transfer-Encoding: chunked\r\n", b""));
   assert_eq(h.framing, Chunked);
   assert_eq(header(h.request.headers, "authorization"), None);
@@ -2163,8 +1843,7 @@ test "a repeated field keeps every line in order and combines nothing" {
   let h = parsed(b"GET / HTTP/1.1\r\nHost: x\r\nSet-Cookie: a=1\r\nSet-Cookie: b=2\r\n\r\n");
   assert_eq(header_lines(h.request.headers, "set-cookie"), ["a=1", "b=2"]);
   assert_eq(header(h.request.headers, "set-cookie"), Some("a=1"));
-  // Names are lowercased on parse, so a lookup cannot depend on what the peer
-  // capitalised.
+  // Names are lowercased on parse, so a lookup cannot depend on what the peer capitalised.
   assert(has_header(h.request.headers, "set-cookie"));
   assert(!has_header(h.request.headers, "Set-Cookie"));
   assert_eq(header_lines(h.request.headers, "absent"), [])
@@ -2180,10 +1859,7 @@ test "a field value that is not text is refused rather than decoded lossily" {
 
 // --- Tests: the framing property --------------------------------------------
 
-// ADR 0013 §3.10, required test 25. The framing rules are one claim: for every
-// input, `parse_head` either refuses or determines exactly one message
-// boundary. This is that claim over the adversarial corpus, checked against a
-// reference table computed independently of the parser.
+// ADR 0013 §3.10, required test 25.
 fn adversarial() -> List<Bytes> = [
   b"GET / HTTP/1.1\r\nHost: x\r\n\r\n",
   b"POST / HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhello",
@@ -2207,9 +1883,8 @@ fn adversarial() -> List<Bytes> = [
   b"GET / HTTP/1.1\r\nHost: x\r\n\r\nGET /two HTTP/1.1\r\nHost: x\r\n\r\n",
 ]
 
-// The reference: what the message length *is*, read off the field lines with no
-// call into the parser under test. `-1` is "two framings were available", which
-// is the answer no accepted head may have; `-2` is chunked.
+// The reference: what the message length *is*, read off the field lines with no call into the
+// parser under test.
 fn reference_length(raw: Bytes) -> Int = {
   let head_end = match bytes_index_of(raw, b"\r\n\r\n") {
     Some(at) -> at + 4,
@@ -2259,9 +1934,7 @@ fn one_framing(raw: Bytes) -> Unit =
     Refused(_) -> (),
     Incomplete -> (),
     Parsed(h) -> {
-      // The reference found exactly one framing available, and the parser chose
-      // that one. A head where two were available is never accepted, which is
-      // the anti-smuggling property in one sentence.
+      // The reference found exactly one framing available, and the parser chose that one.
       let reference = reference_length(raw);
       assert(reference >= -2);
       assert(reference != -1);
@@ -2270,8 +1943,8 @@ fn one_framing(raw: Bytes) -> Unit =
         Chunked -> -2,
         NoBody -> 0,
       }, reference);
-      // `consumed` lands on the terminator the reference found, so the body's
-      // first byte is the same byte for both.
+      // `consumed` lands on the terminator the reference found, so the body's first byte is the
+      // same byte for both.
       assert_eq(h.consumed, match bytes_index_of(raw, b"\r\n\r\n") {
         Some(at) -> at + 4,
         None -> -1,
@@ -2279,9 +1952,8 @@ fn one_framing(raw: Bytes) -> Unit =
     },
   }
 
-// The same claim, over whatever the generator draws rather than over the cases
-// someone thought to write above. A head that parses has a `consumed` inside its
-// own buffer — the one invariant every caller slices on.
+// The same claim, over whatever the generator draws rather than over the cases someone thought to
+// write above.
 law "an accepted head names a boundary inside the bytes it was given"
   forall (raw: Bytes) {
     match parse_head(raw, default_limits()) {
@@ -2291,8 +1963,8 @@ law "an accepted head names a boundary inside the bytes it was given"
     }
   }
 
-// Framing never depends on bytes past the terminator, which is what makes a
-// pipelined stream safe to carry across iterations of the serve loop.
+// Framing never depends on bytes past the terminator, which is what makes a pipelined stream safe
+// to carry across iterations of the serve loop.
 law "a head frames the same message however much follows it"
   forall (raw: Bytes) {
     parse_head(raw, default_limits()) == parse_head(raw, default_limits())
@@ -2330,10 +2002,7 @@ test "a response carries exactly one framing field" {
             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\nhi")
 }
 
-// ADR 0013 §5.4 and required test 29. RFC 9110 §15.5.6 makes `Allow` a MUST on a
-// 405, and `std.router` answers `MethodNotAllowed(ms)` with the methods sorted
-// and deduplicated so that this call is the whole of the rest of it — a MUST a
-// program has to remember is a MUST a program will forget.
+// ADR 0013 §5.4 and required test 29.
 test "a 405 built here carries the Allow field it must" {
   let r = method_not_allowed([Get, Head, Post]);
   assert_eq(r.status, 405);
@@ -2341,8 +2010,8 @@ test "a 405 built here carries the Allow field it must" {
   assert_eq(method_not_allowed([]).status, 405);
   assert_eq(allow_field([Delete]), "DELETE");
   assert_eq(allow_field([Get, Other("PROPFIND")]), "GET, PROPFIND");
-  // It survives `encode`, which is where a header a program built wrongly is
-  // refused rather than sanitized.
+  // It survives `encode`, which is where a header a program built wrongly is refused rather than
+  // sanitized.
   assert(match bytes_index_of(encode(Get, Http11, false, r), b"allow: GET, HEAD, POST\r\n") {
     Some(_) -> true,
     None -> false,
@@ -2358,8 +2027,8 @@ test "1xx, 204 and 304 carry no body and no Content-Length" {
             b"HTTP/1.1 100 Continue\r\n\r\n")
 }
 
-// A HEAD response carries the length a GET would have produced, and no body: a
-// client reads that number and a server that answered 0 would have lied.
+// A HEAD response carries the length a GET would have produced, and no body: a client reads that
+// number and a server that answered 0 would have lied.
 test "a HEAD response carries Content-Length and no body" {
   assert_eq(encode(Head, Http11, true, response(200, b"hello")),
             b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n");
@@ -2400,16 +2069,6 @@ law "a chunk-encoded body decodes back to itself"
   }
 
 // --- Tests: the serve loop --------------------------------------------------
-//
-// The twin ADR 0008 §5 asks for, written in Ply: one cell holding what the peer
-// will say, one holding what the server said back. Every test below is `det` and
-// cacheable, and only because these clauses discharge every `net` atom the serve
-// loop can perform — leave one out and the test does not become flaky, it fails
-// to compile with `E0412`.
-//
-// The script is a list of `Option<Bytes>`, which is what makes a deadline
-// testable without a clock: `None` is a `recv` whose deadline expired, `Some`
-// of empty is the peer having stopped, and an exhausted script is the latter.
 
 fn next_answer(queued: List<Option<Bytes>>) -> Option<Bytes> =
   match queued {
@@ -2427,8 +2086,8 @@ fn echo_app(req: Request) -> Response =
   text_response(200, method_name(req.method) ++ " " ++ req.path ++ "|"
                      ++ string_of_bytes_lossy(req.body))
 
-// A handler that never looks at the body, which is the case that decides whether
-// the server frames the next request out of an unread one.
+// A handler that never looks at the body, which is the case that decides whether the server frames
+// the next request out of an unread one.
 fn ignore_body_app(req: Request) -> Response = text_response(200, req.path)
 
 fn limits_keeping(n: Int) -> Limits = {
@@ -2468,8 +2127,8 @@ test "a 1.1 connection is reused and its requests are answered in order" {
 }
 
 test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connection" {
-  // `Connection: close` is answered and then nothing more is read, so the
-  // second scripted request is never seen.
+  // `Connection: close` is answered and then nothing more is read, so the second scripted request
+  // is never seen.
   with_cell[inbox]([Some(b"GET /a HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n"),
                     Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
@@ -2516,10 +2175,8 @@ test "Connection: close, HTTP/1.0 and the keep-alive bound each end the connecti
   } }
 }
 
-// The smuggle a server performs on itself: an unread body is the next message's
-// bytes as far as the connection is concerned. Both requests arrive in one
-// packet and the handler never reads the first one's body, so a server that did
-// not drain it would frame `helloGET /b ...` as the next request.
+// The smuggle a server performs on itself: an unread body is the next message's bytes as far as the
+// connection is concerned.
 test "a body the handler ignores is drained before the next request is framed" {
   with_cell[inbox]([Some(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\n\r\nhelloGET /b HTTP/1.1\r\nHost: x\r\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
@@ -2543,8 +2200,8 @@ test "a body the handler ignores is drained before the next request is framed" {
   } }
 }
 
-// A chunked request, read whole by the serve loop, with its trailers reaching
-// the handler and never its headers.
+// A chunked request, read whole by the serve loop, with its trailers reaching the handler and never
+// its headers.
 test "a chunked request is decoded and its trailers reach the handler separately" {
   with_cell[inbox]([Some(b"POST /c HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"),
                     Some(b"6\r\n world\r\n0\r\nX-Checksum: 7\r\n\r\n")]) { inbox -> {
@@ -2574,8 +2231,7 @@ fn trailer_app(req: Request) -> Response =
                      ++ "|"
                      ++ (match header(req.headers, "x-checksum") { Some(v) -> v, None -> "none" }))
 
-// Required test 44. A slow client cannot hold a connection: each of the three
-// deadlines fires, and each answers the way a peer can act on.
+// Required test 44.
 test "a header timeout is 408, a body timeout is 408, and an idle timeout writes nothing" {
   // Nothing arrives at all.
   with_cell[outbox](b"") { outbox -> {
@@ -2593,9 +2249,7 @@ test "a header timeout is 408, a body timeout is 408, and an idle timeout writes
               encode(Get, Http11, false,
                      text_response(408, "the request head did not arrive\n")))
   } };
-  // The head arrives and the body never does. Every read after the head expires
-  // with no bytes, which is not itself the deadline — the deadline is the whole
-  // body budget being spent, which is what `slice_ms` divides.
+  // The head arrives and the body never does.
   with_cell[reads](0) { reads -> {
   with_cell[outbox](b"") { outbox -> {
     handle {
@@ -2621,8 +2275,7 @@ test "a header timeout is 408, a body timeout is 408, and an idle timeout writes
                      text_response(408, "the request body did not arrive\n")))
   } }
   } };
-  // One request answered, then silence between messages. There is no request to
-  // answer, so nothing is written and the connection closes.
+  // One request answered, then silence between messages.
   with_cell[inbox]([Some(b"GET /a HTTP/1.1\r\nHost: x\r\n\r\n"), None]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
   with_cell[closed](0) { closed -> {
@@ -2648,15 +2301,6 @@ test "a header timeout is 408, a body timeout is 408, and an idle timeout writes
 }
 
 // **The deadline is the sum of the reads, not each of them.**
-//
-// ADR 0013 §3.9 rule 31 measures `header_timeout_ms` from the first byte of the
-// request. Passing the whole timeout to every `net.recv` restarts it on every
-// byte, and the only real bound was the read count — 2048 reads times 5000 ms is
-// 2.8 hours on one socket, and `serve` is a sequential accept loop, so that is
-// the whole server. Ply has no clock, so the deadline is divided: this asserts
-// that every timeout the server asks for over one dribbling head adds up to no
-// more than the deadline it was given, which is the property, and that the
-// answer is the 408 rule 31 specifies.
 test "the whole head is bounded by header_timeout_ms and not by each read" {
   with_cell[granted](0) { granted -> {
   with_cell[outbox](b"") { outbox -> {
@@ -2712,8 +2356,8 @@ test "the whole head is bounded by header_timeout_ms and not by each read" {
   } }
 }
 
-// A head split across packets is ordinary TCP, and a read loop that assumed
-// otherwise would be wrong against every real client.
+// A head split across packets is ordinary TCP, and a read loop that assumed otherwise would be
+// wrong against every real client.
 test "a head arriving in pieces is read to its terminator" {
   with_cell[inbox]([Some(b"GET /a HT"), Some(b"TP/1.1\r\nHost: x\r"), Some(b"\n\r\n")]) { inbox -> {
   with_cell[outbox](b"") { outbox -> {
@@ -2736,8 +2380,8 @@ test "a head arriving in pieces is read to its terminator" {
   } }
 }
 
-// A refusal ends the connection: the position of the next message is exactly
-// what was not established, so there is nothing safe to resynchronise from.
+// A refusal ends the connection: the position of the next message is exactly what was not
+// established, so there is nothing safe to resynchronise from.
 test "a framing refusal is answered once and the connection is not reused" {
   with_cell[inbox]([Some(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\nhello"),
                     Some(b"GET /b HTTP/1.1\r\nHost: x\r\n\r\n")]) { inbox -> {
@@ -2765,8 +2409,8 @@ test "a framing refusal is answered once and the connection is not reused" {
   } }
 }
 
-// `Expect: 100-continue` gets its interim response before the body is read, and
-// a client that waited for one it never got would simply hang.
+// `Expect: 100-continue` gets its interim response before the body is read, and a client that
+// waited for one it never got would simply hang.
 test "a 100-continue is written before the body is read" {
   with_cell[inbox]([Some(b"POST /a HTTP/1.1\r\nHost: x\r\nContent-Length: 5\r\nExpect: 100-continue\r\n\r\n"),
                     Some(b"hello")]) { inbox -> {
@@ -2833,11 +2477,7 @@ test "a streamed response stops at a dead peer rather than writing into it" {
   }
 }
 
-// A producer with more chunks than `max_stream_chunks`. A chunked response left
-// framed and unterminated is response smuggling: a caller that kept the
-// connection alive would have its next response read as chunk data by the
-// client. So the terminator is always written, and `false` is what says the
-// connection may not be reused.
+// A producer with more chunks than `max_stream_chunks`.
 fn endless(seed: Int) -> Option<{ chunk: Bytes, next: Int }> =
   Some({chunk: b"x", next: seed + 1})
 
@@ -2856,9 +2496,9 @@ test "a streamed response always ends with its terminating chunk" {
   } }
 }
 
-// An HTTP/1.0 peer has no chunked transfer coding, so it is sent none: the head
-// says `Connection: close` and carries no `Transfer-Encoding`, the body is the
-// bytes themselves, and the message ends when the connection does.
+// An HTTP/1.0 peer has no chunked transfer coding, so it is sent none: the head says `Connection:
+// close` and carries no `Transfer-Encoding`, the body is the bytes themselves, and the message ends
+// when the connection does.
 test "a streamed response to an HTTP/1.0 peer is delimited by the close" {
   with_cell[outbox](b"") { outbox -> {
     handle {

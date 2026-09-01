@@ -1,16 +1,5 @@
-//! What the defect/program-error split does with *every* code an evaluator can
-//! attach to a failure, and what each `Skipped` variant is actually applied to.
-//!
-//! The classifier is two clauses — the run watched an unwind, or the diagnostic
-//! said `INTERNAL_ERROR` — so its correctness is entirely a claim about the
-//! codes the nine crates emit. A code that arrives here and means "Ply is
-//! broken" without saying `E0505` is silently reported as the user's bug; a
-//! code that means "your program is wrong" and says `E0505` costs the failure
-//! its bisection. Both directions are enumerated below rather than sampled,
-//! because the cost of the split being wrong is paid per class and not per run.
-//!
-//! Where a case shows the split getting it wrong the test is named `documents_`
-//! and its doc comment says what the right answer is.
+//! What the defect/program-error split does with *every* code an evaluator can attach to a failure,
+//! and what each `Skipped` variant is actually applied to.
 
 use ply_core::CheckOutput;
 use ply_eval::Plan;
@@ -25,8 +14,6 @@ use ply_test::{
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
-
-// ------------------------------------------------------------------ harness
 
 struct TempRoot(PathBuf);
 
@@ -79,9 +66,8 @@ impl Compiled {
     }
 }
 
-/// Answers with whatever the case wants the evaluator to have said, so the
-/// classifier is measured against a code rather than against whichever program
-/// happens to produce it today.
+/// Answers with whatever the case wants the evaluator to have said, so the classifier is measured
+/// against a code rather than against whichever program happens to produce it today.
 struct Answering {
     diagnostic: Option<Diagnostic>,
     unwind: bool,
@@ -133,12 +119,7 @@ fn classified(code: &'static str) -> (bool, Status, Verdict) {
     )
 }
 
-// ------------------------------------------------- the two clauses, directly
-
-/// Every code the language uses for "the program did something the language
-/// defines it may do". None of them may set `defect`, because each is a
-/// behaviour an edit can introduce and remove, and the bisection is the whole
-/// value of the artifact.
+/// Every code the language uses for "the program did something the language defines it may do".
 #[test]
 fn no_program_level_code_is_read_as_a_defect_in_ply() {
     for code in [
@@ -162,9 +143,7 @@ fn no_program_level_code_is_read_as_a_defect_in_ply() {
     }
 }
 
-/// The other direction, and the more expensive one. `INTERNAL_ERROR` is the
-/// only code that says Ply broke its own invariant, and an unwind is the only
-/// evidence that needs no code at all.
+/// The other direction, and the more expensive one.
 #[test]
 fn an_internal_error_and_an_unwind_are_both_defects() {
     let (defect, status, verdict) = classified(codes::INTERNAL_ERROR);
@@ -190,10 +169,7 @@ fn an_internal_error_and_an_unwind_are_both_defects() {
     );
 }
 
-/// A warning is not a failure, and the severity is not what the split reads. If
-/// an evaluator ever hands back `Err` on a non-error diagnostic the run still
-/// has to call it a failure — silently passing would cache a green result for a
-/// test that did not finish.
+/// A warning is not a failure, and the severity is not what the split reads.
 #[test]
 fn a_non_error_severity_is_still_a_failure() {
     let report = report_for(&Answering {
@@ -205,17 +181,7 @@ fn a_non_error_severity_is_still_a_failure() {
     assert!(!report.failures[0].defect);
 }
 
-/// **A divergence between the two engines is a defect in Ply.** `E0503` is
-/// emitted only by the `--engine both` audit, and it means precisely that two
-/// evaluators of one language disagree — the failure mode the code's own doc
-/// comment calls "never a warning" because the result cache would make it
-/// sticky. There is nothing in the definition graph to attribute it to, and an
-/// agent handed `defect: false` goes looking for the bug in source that is
-/// correct.
-///
-/// So it lands where `INTERNAL_ERROR` lands: both are "Ply is broken", and the
-/// classifier used to distinguish them only because it matched one constant
-/// instead of a set.
+/// **A divergence between the two engines is a defect in Ply.**
 #[test]
 fn an_engine_divergence_is_a_defect_in_ply() {
     let (defect, status, verdict) = classified(codes::ENGINE_DIVERGENCE);
@@ -224,17 +190,7 @@ fn an_engine_divergence_is_a_defect_in_ply() {
     assert_eq!(verdict, Verdict::NotAttempted(Skipped::Panicked));
 }
 
-/// **A refusal to run is classified as the program's fault.** `E0504` is the
-/// tree-walker declining to start on a handler clause that binds a
-/// continuation; the diagnostic itself says "run this with `--engine machine`".
-/// Nothing about the program is wrong, and a bisection that names a definition
-/// for it is naming the definition that happens to contain the clause.
-///
-/// The code's own doc comment says it exists "so that a consumer can tell a
-/// refusal to run from a defect while running: the two call for opposite
-/// responses" — and the one consumer that has to act on the difference does not
-/// read it. A third classification is what this wants; a red test is the wrong
-/// one of the two that exist.
+/// **A refusal to run is classified as the program's fault.**
 #[test]
 fn documents_a_machine_only_clause_is_classified_as_the_programs_fault() {
     let (defect, status, verdict) = classified(codes::MACHINE_ONLY_CLAUSE);
@@ -247,8 +203,6 @@ fn documents_a_machine_only_clause_is_classified_as_the_programs_fault() {
     assert_ne!(verdict, Verdict::NotAttempted(Skipped::Panicked));
 }
 
-// ---------------------------------------------- one variant, one description
-
 fn hash(seed: &str) -> ply_hash::DefHash {
     ply_hash::DefHash::from_hex(&seed.repeat(32)).expect("a well-formed hash")
 }
@@ -257,12 +211,9 @@ fn baseline() -> Baseline {
     Baseline::with_decls(hash("a1"), BTreeMap::new(), BTreeMap::new())
 }
 
-/// Each variant answers a different question for a consumer, so each has to be
-/// reachable from exactly the condition its `describe` claims — and the order
-/// has to be the order the answers are worth. `NotRequested` outranks
-/// everything: a run told not to look has learned nothing about the failure.
-/// `Panicked` outranks `Host`, `Nondet` and `NeverPassed` because a defect in
-/// Ply makes all three questions moot.
+/// Each variant answers a different question for a consumer, so each has to be reachable from
+/// exactly the condition its `describe` claims — and the order has to be the order the answers are
+/// worth.
 #[test]
 fn precheck_maps_each_condition_to_exactly_its_own_variant() {
     struct Case {
@@ -388,9 +339,8 @@ fn precheck_maps_each_condition_to_exactly_its_own_variant() {
     );
 }
 
-/// `Mode::Always` must not be able to talk the gate out of a skip that is about
-/// evidence rather than about effort. Every one of these is "there is nothing to
-/// compare", and running an unlimited search over nothing is still nothing.
+/// `Mode::Always` must not be able to talk the gate out of a skip that is about evidence rather
+/// than about effort.
 #[test]
 fn bisect_always_does_not_override_a_missing_premise() {
     for (defect, host, nondet) in [
@@ -406,10 +356,8 @@ fn bisect_always_does_not_override_a_missing_premise() {
     }
 }
 
-/// The strings are the artifact's contract with a consumer that branches on
-/// them, so no two may collide and none may be empty. A duplicate would make
-/// two different situations indistinguishable in JSON, which is the one thing
-/// the enum exists to prevent.
+/// The strings are the artifact's contract with a consumer that branches on them, so no two may
+/// collide and none may be empty.
 #[test]
 fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
     let all = [
@@ -423,9 +371,9 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
         Skipped::NoHybrids,
     ];
 
-    // `all` is a hand-written list and this is what keeps it honest: the `match`
-    // makes a new variant a compile error, and the ordinals make forgetting to
-    // add it to `all` a failure here rather than a variant nothing ever tested.
+    // `all` is a hand-written list and this is what keeps it honest: the `match` makes a new
+    // variant a compile error, and the ordinals make forgetting to add it to `all` a failure here
+    // rather than a variant nothing ever tested.
     let ordinal = |s: Skipped| match s {
         Skipped::NotRequested => 0,
         Skipped::NeverPassed => 1,
@@ -461,8 +409,8 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
         "two variants share a description"
     );
 
-    // A skip is never a verdict about the program: a consumer must be able to
-    // tell "no answer" from "the answer is the empty set".
+    // A skip is never a verdict about the program: a consumer must be able to tell "no answer" from
+    // "the answer is the empty set".
     for skipped in all {
         let bisection = Bisection::not_attempted(skipped);
         assert_eq!(bisection.verdict, Verdict::NotAttempted(skipped));
@@ -476,9 +424,8 @@ fn every_skipped_variant_has_its_own_tag_and_its_own_description() {
     }
 }
 
-/// `NoChanges` is the one skip that is a statement about the *program* rather
-/// than about the run or the build, so it has to be reachable from an empty
-/// delta and from nothing else. One cluster is an answer, not a skip.
+/// `NoChanges` is the one skip that is a statement about the *program* rather than about the run or
+/// the build, so it has to be reachable from an empty delta and from nothing else.
 #[test]
 fn no_changes_is_reached_only_when_nothing_moved() {
     use ply_test::bisect::{NoHybrid, bisect};
@@ -502,8 +449,8 @@ fn no_changes_is_reached_only_when_nothing_moved() {
     );
     assert_eq!(out.groups, vec![vec![name]], "{:?}", out.groups);
 
-    // A change that is only `Derived` is no candidate, so the delta is again
-    // empty — and `no_changes` is the honest answer even though a hash moved.
+    // A change that is only `Derived` is no candidate, so the delta is again empty — and
+    // `no_changes` is the honest answer even though a hash moved.
     let derived = Change::derived(ply_span::Symbol::new("m.g"), hash("c3"), hash("d4"));
     let only_derived = Delta::new(None, vec![derived], &DepEdges::from(&HashOutput::default()));
     assert_eq!(
@@ -512,11 +459,8 @@ fn no_changes_is_reached_only_when_nothing_moved() {
     );
 }
 
-/// `NoHybrids` says "this build cannot mix two eras", which is only an honest
-/// answer to a question that needed a mixture. With one cluster and an unedited
-/// test the search decides by counting, and withholding that answer because no
-/// hybrid could be built would make the default useless on the commonest
-/// failure there is.
+/// `NoHybrids` says "this build cannot mix two eras", which is only an honest answer to a question
+/// that needed a mixture.
 #[test]
 fn no_hybrids_is_reported_only_where_a_mixture_was_actually_needed() {
     use ply_span::Symbol;
@@ -553,12 +497,7 @@ fn no_hybrids_is_reported_only_where_a_mixture_was_actually_needed() {
     );
 }
 
-/// `Skipped::Panicked` still says "the interpreter failed rather than the
-/// program". That sentence is what an agent acts on, and it is now reached only
-/// by an unwind or `INTERNAL_ERROR` — so the class of failures it describes and
-/// the class that can produce it have to stay the same class. This pins the
-/// wording against a future edit that widens the trigger without widening the
-/// sentence.
+/// `Skipped::Panicked` still says "the interpreter failed rather than the program".
 #[test]
 fn the_panicked_description_still_describes_only_ply_defects() {
     let described = Skipped::Panicked.describe();
@@ -576,10 +515,8 @@ fn the_panicked_description_still_describes_only_ply_defects() {
     }
 }
 
-/// `Options::never()` is the only way a caller asks for no bisection at all, and
-/// it has to reach `NotRequested` rather than any of the reasons that are about
-/// the failure. Asserted through `Options` because that is the value the CLI
-/// builds, and a default that drifted would be invisible to `precheck` alone.
+/// `Options::never()` is the only way a caller asks for no bisection at all, and it has to reach
+/// `NotRequested` rather than any of the reasons that are about the failure.
 #[test]
 fn options_never_is_the_only_thing_that_reads_as_not_requested() {
     let never = Options::never();
@@ -594,9 +531,8 @@ fn options_never_is_the_only_thing_that_reads_as_not_requested() {
     );
 }
 
-/// A diagnostic with no span at all still has to be classified — the split
-/// reads the code, and a defensive path that forgot its span is exactly where a
-/// missing `primary` would come from.
+/// A diagnostic with no span at all still has to be classified — the split reads the code, and a
+/// defensive path that forgot its span is exactly where a missing `primary` would come from.
 #[test]
 fn a_spanless_diagnostic_is_classified_by_its_code_alone() {
     let report = report_for(&Answering {

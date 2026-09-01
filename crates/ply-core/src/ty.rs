@@ -12,8 +12,7 @@ pub struct TyVar(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct RowVar(pub u32);
 
-/// The resource an atom touches. Operations declared without `[r]` collapse to
-/// `Singleton`, which conflicts with itself and nothing else.
+/// The resource an atom touches.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub enum Resource {
     Named(Symbol),
@@ -29,8 +28,7 @@ impl fmt::Display for Resource {
     }
 }
 
-/// Ordering is structural so rows are canonical, which content addressing
-/// depends on.
+/// Ordering is structural so rows are canonical, which content addressing depends on.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
 pub struct EffectAtom {
     pub effect: Symbol,
@@ -47,8 +45,8 @@ impl EffectAtom {
         }
     }
 
-    /// Two atoms contend iff they name the same resource of the same effect and
-    /// at least one writes. This is the whole basis of test scheduling.
+    /// Two atoms contend iff they name the same resource of the same effect and at least one
+    /// writes.
     pub fn conflicts_with(&self, other: &EffectAtom) -> bool {
         self.effect == other.effect
             && self.resource == other.resource
@@ -62,8 +60,7 @@ impl fmt::Display for EffectAtom {
     }
 }
 
-/// A set of atoms plus an optional tail variable. Because atoms are ground
-/// labels, unification is set unification rather than general row polymorphism.
+/// A set of atoms plus an optional tail variable.
 #[derive(Clone, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
 pub struct Row {
     pub atoms: BTreeSet<EffectAtom>,
@@ -101,8 +98,6 @@ impl Row {
         self.atoms.is_empty() && self.tail.is_none()
     }
 
-    /// Row union. A tail on either side is kept; two distinct tails cannot both
-    /// be preserved, so callers must unify them first.
     pub fn union(&self, other: &Row) -> Row {
         Row {
             atoms: self.atoms.union(&other.atoms).cloned().collect(),
@@ -121,7 +116,7 @@ impl Row {
         self.atoms.contains(atom)
     }
 
-    /// Discards the tail. Only valid once inference has closed the row.
+    /// Discards the tail.
     pub fn to_footprint(&self) -> Footprint {
         Footprint(self.atoms.clone())
     }
@@ -138,8 +133,7 @@ impl fmt::Display for Row {
     }
 }
 
-/// A closed row: exactly what a definition can do. Scheduling and the
-/// determinism check operate on these.
+/// A closed row: exactly what a definition can do.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug, Default, Serialize, Deserialize)]
 pub struct Footprint(pub BTreeSet<EffectAtom>);
 
@@ -169,8 +163,8 @@ impl Footprint {
     }
 
     pub fn conflicts_with(&self, other: &Footprint) -> bool {
-        // Both sides are sorted by (effect, resource, mode), so a merge walk
-        // would beat this; the sets are small enough that it has not mattered.
+        // Both sides are sorted by (effect, resource, mode), so a merge walk would beat this; the
+        // sets are small enough that it has not mattered.
         self.0
             .iter()
             .any(|a| other.0.iter().any(|b| a.conflicts_with(b)))
@@ -216,14 +210,11 @@ impl Type {
     pub fn bytes() -> Type {
         Type::con("Bytes")
     }
-    /// IEEE-754 binary64. Deliberately distinct from [`Type::decimal`]: `==` on
-    /// this type is not reflexive, so nothing about it may be `proved`.
+    /// IEEE-754 binary64.
     pub fn float() -> Type {
         Type::con("Float")
     }
-    /// Exact base-10, sign plus a 96-bit mantissa and a scale of `0..=28`. What
-    /// money is written in, and the only numeric type whose `==` is an
-    /// equivalence relation over its whole domain besides `Int`.
+    /// Exact base-10, sign plus a 96-bit mantissa and a scale of `0..=28`.
     pub fn decimal() -> Type {
         Type::con("Decimal")
     }
@@ -233,9 +224,7 @@ impl Type {
     pub fn list(t: Type) -> Type {
         Type::Con(Symbol::new("List"), vec![t])
     }
-    /// Iteration is ascending by key, always. The key type must be ordered —
-    /// `derivable(ord, k)` — which is what makes that order a function of the
-    /// value rather than of insertion history or a hasher's seed.
+    /// Iteration is ascending by key, always.
     pub fn map(key: Type, value: Type) -> Type {
         Type::Con(Symbol::new("Map"), vec![key, value])
     }
@@ -248,15 +237,12 @@ impl Type {
     pub fn iter(seed: Type, stop: Type) -> Type {
         Type::Con(Symbol::new("Iter"), vec![seed, stop])
     }
-    /// A credential. Nothing in the language destructures one: it declares no
-    /// constructors, so no pattern binds the payload, and no builtin over it
-    /// returns the payload's type.
+    /// A credential.
     pub fn secret(inner: Type) -> Type {
         Type::Con(Symbol::new(SECRET), vec![inner])
     }
 
-    /// Whether a solved type mentions a `Secret` anywhere. What the
-    /// quantification check, the derivation walk and the `Map` key rule all ask.
+    /// Whether a solved type mentions a `Secret` anywhere.
     pub fn mentions_secret(&self) -> bool {
         match self {
             Type::Con(name, args) => {

@@ -1,11 +1,4 @@
 //! What [`ply_eval::region_kind`] decides, on programs written in Ply.
-//!
-//! ADR 0017 §3's inference rule is one sentence — "picks `unique` unless a
-//! capture is reachable" — and the whole of its value is in which way it errs.
-//! Every test here is a program where the two answers differ, and the ones that
-//! matter most are the ones asserting `shared`: a wrong `shared` costs a copy,
-//! and a wrong `unique` is a resumption silently observing another resumption's
-//! writes.
 
 use ply_eval::RegionKind;
 use ply_eval::region_kind::{Cause, Region, Regions, check, infer};
@@ -36,8 +29,7 @@ fn regions_of(src: &str) -> Regions {
     regions
 }
 
-/// The region carrying this brand. Probes name each region distinctly, so one
-/// brand is one region.
+/// The region carrying this brand.
 #[track_caller]
 fn region<'a>(regions: &'a Regions, brand: &str) -> &'a Region {
     regions
@@ -60,10 +52,8 @@ const AMB: &str = r#"
 effect amb { read flip[coin]() -> Bool }
 "#;
 
-// ------------------------------------------------------------------- unique
-
-/// The case ADR 0017 §3 says is common and free: a region that allocates,
-/// reads and writes its own cells and performs nothing.
+/// The case ADR 0017 §3 says is common and free: a region that allocates, reads and writes its own
+/// cells and performs nothing.
 #[test]
 fn a_region_that_performs_nothing_and_handles_nothing_is_unique() {
     let src = r#"
@@ -76,8 +66,7 @@ fn total() -> Int =
     assert!(region(&regions_of(src), "acc").capture.is_none());
 }
 
-/// Nesting does not make a region shared. An inner region's slots sit above the
-/// outer one's mark, so closing the inner one frees only its own.
+/// Nesting does not make a region shared.
 #[test]
 fn nested_pure_regions_are_both_unique() {
     let src = r#"
@@ -92,9 +81,8 @@ fn nested() -> Int =
     assert_eq!(regions.unique(), 2);
 }
 
-/// A `with_cell[r]` written inside `with_region[r]` allocates into that region
-/// rather than opening one of its own — ADR 0017 §1. Two regions here would be
-/// two closes, and the cell would be freed at the inner one.
+/// A `with_cell[r]` written inside `with_region[r]` allocates into that region rather than opening
+/// one of its own — ADR 0017 §1.
 #[test]
 fn a_cell_inside_a_region_of_its_own_brand_opens_no_second_region() {
     let src = r#"
@@ -115,8 +103,8 @@ fn shaped() -> Int =
     assert_eq!(regions_of(src).len(), 2);
 }
 
-/// A higher-order program with no handler, no `simulate` and no `task` has no
-/// capture for an unknown callee to reach, so the unknown callee costs nothing.
+/// A higher-order program with no handler, no `simulate` and no `task` has no capture for an
+/// unknown callee to reach, so the unknown callee costs nothing.
 #[test]
 fn an_unknown_callee_in_a_program_with_no_capture_stays_unique() {
     let src = r#"
@@ -127,8 +115,6 @@ fn go() -> Int =
 "#;
     assert_eq!(kind_of(src, "acc"), RegionKind::Unique);
 }
-
-// ------------------------------------------------------------------- shared
 
 /// Through a handler written inside the region.
 #[test]
@@ -156,9 +142,8 @@ fn search() -> Int =
     assert!(site.through.is_empty(), "the site is written in the region");
 }
 
-/// A tail-resumptive clause captures too — ADR 0005 §1.3 runs `K.capture(n)`
-/// for both forms — and the difference is observable, because the clause writes
-/// the region before it resumes.
+/// A tail-resumptive clause captures too — ADR 0005 §1.3 runs `K.capture(n)` for both forms — and
+/// the difference is observable, because the clause writes the region before it resumes.
 #[test]
 fn a_tail_resumptive_clause_inside_the_region_makes_it_shared() {
     let src = &format!(
@@ -184,8 +169,8 @@ fn once() -> Int =
     );
 }
 
-/// The handler is the caller's, so the capture crosses the region's boundary
-/// and this analysis cannot see the other side of it.
+/// The handler is the caller's, so the capture crosses the region's boundary and this analysis
+/// cannot see the other side of it.
 #[test]
 fn a_perform_the_region_does_not_answer_makes_it_shared() {
     let src = &format!(
@@ -205,8 +190,8 @@ fn inside() -> Bool =
     );
 }
 
-/// Through a called function: the capture is written two definitions away and
-/// the diagnostic has to be able to say so.
+/// Through a called function: the capture is written two definitions away and the diagnostic has to
+/// be able to say so.
 #[test]
 fn a_capture_reachable_through_a_called_function_makes_the_region_shared() {
     let src = &format!(
@@ -235,8 +220,8 @@ fn outer() -> Int =
     );
 }
 
-/// Through a task: the scheduler parks the performing task and resumes it,
-/// which is a capture whoever wrote it.
+/// Through a task: the scheduler parks the performing task and resumes it, which is a capture
+/// whoever wrote it.
 #[test]
 fn a_task_spawned_in_the_region_makes_it_shared() {
     let src = r#"
@@ -256,8 +241,8 @@ fn spawner() -> Unit =
     );
 }
 
-/// Through a task reached from a called function, which is the shape a service
-/// has: the accept loop spawns, and the region is opened by whatever called it.
+/// Through a task reached from a called function, which is the shape a service has: the accept loop
+/// spawns, and the region is opened by whatever called it.
 #[test]
 fn a_task_spawned_by_a_called_function_makes_the_region_shared() {
     let src = r#"
@@ -295,8 +280,8 @@ fn go() -> Int =
     ));
 }
 
-/// A callee held in a local binding could be any closure in the program, and
-/// this program has a capture for it to be.
+/// A callee held in a local binding could be any closure in the program, and this program has a
+/// capture for it to be.
 #[test]
 fn an_unknown_callee_in_a_program_that_captures_makes_the_region_shared() {
     let src = &format!(
@@ -321,18 +306,8 @@ fn apply(f: () -> Int) -> Int =
     );
 }
 
-// ------------------------- a handler that encloses the region, not the perform
-
-/// ADR 0017 §3's own two-resumption example with `handle` and `with_cell`
-/// swapped, which is the shape every backtracking handler over scratch state
-/// has.
-///
-/// The cell is allocated *before* the capture, so one cell serves both
-/// resumptions and both write it. A `handle` that lexically encloses the region
-/// answers **across** the region's boundary, so it does not make `amb.flip`
-/// local to `trace` — and an analysis that inherited the enclosing handler's
-/// operations across the region boundary would record nothing here and answer
-/// `unique`, skipping the snapshot the region needs.
+/// ADR 0017 §3's own two-resumption example with `handle` and `with_cell` swapped, which is the
+/// shape every backtracking handler over scratch state has.
 #[test]
 fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
     let src = &format!(
@@ -361,8 +336,7 @@ fn search() -> Int =
     );
 }
 
-/// The same, with the enclosing clause **tail-resumptive**. A rule that only
-/// looked for a `resume` binder outside the region would miss this too.
+/// The same, with the enclosing clause **tail-resumptive**.
 #[test]
 fn a_tail_resumptive_handle_enclosing_the_region_does_not_hide_the_capture() {
     let src = &format!(
@@ -379,11 +353,9 @@ fn once() -> Int =
     assert_eq!(kind_of(src, "trace"), RegionKind::Shared);
 }
 
-/// Every shape of region, under one enclosing handler: `with_region[r]` with a
-/// `with_cell[r]` inside it — ADR 0017 §3's own syntax — two nested regions,
-/// and a region opened inside a `map` callback. A rule that leaked the
-/// enclosing handler's operations into the region answered `unique` for all
-/// four.
+/// Every shape of region, under one enclosing handler: `with_region[r]` with a `with_cell[r]`
+/// inside it — ADR 0017 §3's own syntax — two nested regions, and a region opened inside a `map`
+/// callback.
 #[test]
 fn the_enclosing_handle_hides_the_capture_for_no_shape_of_region() {
     let shapes: [(&str, &[&str]); 4] = [
@@ -425,11 +397,7 @@ fn shaped() -> Int =
     }
 }
 
-/// The analysis must not depend on where the `perform` is *written*. Hoisting
-/// it into a helper already answered `shared`, because the helper's own scan
-/// carries no enclosing handler; the region has to answer `shared` either way,
-/// or the kind of a region is a fact about its spelling rather than about the
-/// program.
+/// The analysis must not depend on where the `perform` is *written*.
 #[test]
 fn hoisting_the_perform_into_a_helper_does_not_move_the_inferred_kind() {
     let inline = &format!(
@@ -452,9 +420,9 @@ fn search() -> Int =
     assert_eq!(kind_of(hoisted, "trace"), RegionKind::Shared);
 }
 
-/// The annotation is the backstop, so it has to fire on the same programs the
-/// inference does — ADR 0017 §3: forcing `unique` where a capture is reachable
-/// "is a compile error naming the capture site".
+/// The annotation is the backstop, so it has to fire on the same programs the inference does — ADR
+/// 0017 §3: forcing `unique` where a capture is reachable "is a compile error naming the capture
+/// site".
 #[test]
 fn forcing_unique_over_a_capture_an_enclosing_handle_answers_is_refused() {
     let src = &format!(
@@ -478,8 +446,8 @@ fn search() -> Int =
     assert!(ds[0].message.contains("`trace`"), "{}", ds[0].message);
 }
 
-/// An outer region is shared whenever an inner one is: the inner region's body
-/// is part of the outer region's body.
+/// An outer region is shared whenever an inner one is: the inner region's body is part of the outer
+/// region's body.
 #[test]
 fn an_inner_regions_capture_makes_the_enclosing_region_shared_too() {
     let src = &format!(
@@ -495,8 +463,8 @@ fn nested() -> Bool =
     assert_eq!(regions.shared(), 2);
 }
 
-/// A region the analysis never saw is `shared`, because the safe answer to "was
-/// a capture reachable" is always yes.
+/// A region the analysis never saw is `shared`, because the safe answer to "was a capture
+/// reachable" is always yes.
 #[test]
 fn a_region_the_inference_never_saw_is_shared() {
     let src = r#"
@@ -505,8 +473,6 @@ fn pure() -> Int = with_cell[acc](0) { c -> cell_get(c) }
     let regions = regions_of(src);
     assert_eq!(regions.kind(Span::DUMMY), RegionKind::Shared);
 }
-
-// --------------------------------------------------------- forced `unique`
 
 #[track_caller]
 fn refusals(src: &str, brand: &str, kind: RegionKind) -> Vec<Diagnostic> {
@@ -519,8 +485,8 @@ fn refusals(src: &str, brand: &str, kind: RegionKind) -> Vec<Diagnostic> {
     }
 }
 
-/// ADR 0017 §3: forcing `unique` where a capture is reachable is a compile
-/// error naming the capture site.
+/// ADR 0017 §3: forcing `unique` where a capture is reachable is a compile error naming the capture
+/// site.
 #[test]
 fn forcing_unique_where_a_capture_is_reachable_is_refused_and_names_the_site() {
     let src = &format!(
@@ -563,8 +529,7 @@ fn search() -> Int =
     );
 }
 
-/// The refusal names the *chain*, so a capture written three definitions away
-/// is still actionable.
+/// The refusal names the *chain*, so a capture written three definitions away is still actionable.
 #[test]
 fn a_refusal_names_the_definitions_between_the_region_and_the_capture() {
     let src = &format!(
@@ -593,9 +558,8 @@ fn outer() -> Int =
     );
 }
 
-/// A declaration that agrees with the inference is not a refusal, and neither
-/// is one that asks for the conservative kind over no capture at all: declaring
-/// `shared` can only cost a copy.
+/// A declaration that agrees with the inference is not a refusal, and neither is one that asks for
+/// the conservative kind over no capture at all: declaring `shared` can only cost a copy.
 #[test]
 fn declaring_the_kind_the_inference_would_have_chosen_is_accepted() {
     let src = r#"
@@ -617,8 +581,8 @@ fn pure() -> Int = with_cell[acc](0) { c -> cell_get(c) }
     );
 }
 
-/// Two regions declared wrong are two refusals, not one: a run that reported
-/// the first and stopped would make fixing a program iterative.
+/// Two regions declared wrong are two refusals, not one: a run that reported the first and stopped
+/// would make fixing a program iterative.
 #[test]
 fn every_wrongly_declared_region_is_refused() {
     let src = &format!(
@@ -639,11 +603,7 @@ fn b() -> Bool = with_cell[two](0) {{ c -> amb.flip[coin]() }}
     assert_eq!(ds.len(), 2, "{ds:#?}");
 }
 
-// -------------------------------------------------------------- determinism
-
 /// The same program inferred twice gives the same answer in the same order.
-/// An artifact renders these, and a byte-identical artifact needs an order that
-/// is not a hasher's.
 #[test]
 fn inference_is_a_function_of_the_program_alone() {
     let src = &format!(
@@ -691,19 +651,7 @@ fn three() -> Int = with_cell[d](0) {{ c -> one() }}
     assert_eq!(first.len(), 3);
 }
 
-// ------------------------------------------------------------------ census
-
 /// What the rule decides on the repository's own programs.
-///
-/// ADR 0017 §3 claims `unique` is "the common case and it is free". That is a
-/// claim about real code, so it is answered against real code and the answer is
-/// **printed**: a rule this conservative could easily decide `shared`
-/// everywhere, and a milestone that shipped a bump allocator nothing ever used
-/// would look exactly like a milestone that shipped one everything used.
-///
-/// The only assertion is that a region was seen at all. A threshold on the
-/// split would be a threshold on `examples/`, which is not a property of the
-/// analysis.
 #[test]
 fn the_split_over_the_repositorys_own_examples() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -765,9 +713,7 @@ fn the_split_over_the_repositorys_own_examples() {
         regions.unique(),
         regions.shared()
     );
-    // The *first* cause found, which is what the diagnostic would name. A
-    // region counted under one of these may reach others behind it, so a row is
-    // an upper bound on what relaxing that one rule would move.
+    // The *first* cause found, which is what the diagnostic would name.
     let mut tally: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
     for r in regions.iter() {
         let cause = match r.capture.as_ref().map(|c| &c.cause) {
@@ -792,10 +738,8 @@ fn the_split_over_the_repositorys_own_examples() {
     );
 }
 
-// ------------------------------------ the key this analysis may be cached under
-
-/// The module that decides nothing about itself: byte-identical in both
-/// programs below, naming nothing outside itself.
+/// The module that decides nothing about itself: byte-identical in both programs below, naming
+/// nothing outside itself.
 const UNCHANGED: &str = r#"
 fn go(f: (Int) -> Int) -> Int =
   with_cell[acc](0) { c -> { cell_set(c, f(1)); cell_get(c) } }
@@ -833,22 +777,6 @@ fn regions_over(modules: &[(&str, &str)]) -> Regions {
 }
 
 /// **A region's kind may not be cached under its own definition's hash.**
-///
-/// `acc` holds a call to `f`, which is a parameter — so the callee is whatever
-/// the caller passed and could be any closure in the program. Whether that
-/// costs anything is decided by whether the *program* writes a capture
-/// anywhere: with none there is nothing for an unknown callee to reach
-/// (`Analysis::promote_indirect`), and with one there is.
-///
-/// So `elsewhere`, which `unchanged` neither imports nor names nor transitively
-/// reaches, flips `acc` from `unique` to `shared`. `unchanged`'s source is the
-/// same `&str` in both runs, and `ply-hash` erases names and hashes referents
-/// (`crates/ply-hash/src/normalize.rs:1-11`), so nothing in `unchanged`'s
-/// hashed closure moved either. A cache keyed by that hash would answer
-/// `unique` for the second program and free an arena a continuation can still
-/// reach — which is a use-after-free, not a lost optimization. The sound key is
-/// the whole `(Program, Resolved)` pair, and `ply_eval::region_kind::Kinds` is
-/// keyed by construction, one per loaded program.
 #[test]
 fn a_capture_in_an_unrelated_module_makes_a_region_shared() {
     let alone = regions_over(&[("unchanged", UNCHANGED)]);

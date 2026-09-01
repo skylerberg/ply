@@ -1,28 +1,17 @@
 //! Where a Ply value becomes something a sink can write.
-//!
-//! Every decode here runs on the **emit** path only: the handler asks
-//! [`Sink::wants`] first, so a run with tracing off reaches none of it. That
-//! ordering is the whole of §1.4's cost claim, and it is a property of the
-//! caller rather than of this module — which is why the caller is one `match`
-//! in one file.
-//!
-//! [`Sink::wants`]: super::Sink::wants
 
 use super::sink::Field;
 use super::{Level, Outcome};
 use ply_eval::Value;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 
-/// The module `std.trace` ships as. A constructor's identity in a `Value` is its
-/// **program-wide** name, so `Info` is `std.trace.Info` and a decoder that
-/// matched on the last segment would read another module's `Info` as this one's.
+/// The module `std.trace` ships as.
 const MODULE: &str = super::MODULE;
 
 /// The module `Json` ships in, for the one field that carries one.
 const JSON_MODULE: &str = "std.json";
 
-/// The simple name of a constructor a `Value` carries, when it is one of
-/// `module`'s.
+/// The simple name of a constructor a `Value` carries, when it is one of `module`'s.
 fn simple<'a>(name: &'a Symbol, module: &str) -> Option<&'a str> {
     name.as_str()
         .strip_prefix(module)
@@ -30,9 +19,6 @@ fn simple<'a>(name: &'a Symbol, module: &str) -> Option<&'a str> {
 }
 
 /// `Debug | Info | Warn | Error`.
-///
-/// Decoded **before** anything else, because it is what the level filter reads
-/// and the filter runs before a name, a field or a clock is touched.
 pub fn level(value: &Value, span: Span) -> Result<Level, Diagnostic> {
     match value {
         Value::Ctor { name, .. } => match simple(name, MODULE) {
@@ -77,10 +63,6 @@ pub fn outcome(value: &Value, span: Span) -> Result<Outcome, Diagnostic> {
 }
 
 /// `{ id: Int, channel: String }` — the span a `trace.exit` names.
-///
-/// The channel is read but not trusted: the driver compares it against the
-/// channel the span was opened on, because a `Span` is an ordinary record and a
-/// program can build one.
 pub fn span_id(value: &Value, span: Span) -> Result<i64, Diagnostic> {
     match value {
         Value::Record(fields) => match fields.get(&super::ID) {
@@ -95,9 +77,6 @@ pub fn span_id(value: &Value, span: Span) -> Result<i64, Diagnostic> {
 }
 
 /// `Map<String, Field>`, in the map's own ascending key order.
-///
-/// That order is what makes a golden test over a trace line stable: two field
-/// sets built in different orders are one `Map` and render identically.
 pub fn fields(value: &Value, span: Span) -> Result<Vec<(String, Field)>, Diagnostic> {
     let entries = value.as_map(span, "a `Fields` map")?;
     let mut out = Vec::with_capacity(entries.size());
@@ -148,20 +127,10 @@ fn decode_field(value: &Value, span: Span) -> Result<Field, Diagnostic> {
     })
 }
 
-/// The bound on how deep a `json::Json` field may nest before the writer
-/// refuses.
-///
-/// A recursive writer over a value a program built is host recursion with no
-/// budget on it, and a deep enough value would abort the process from inside a
-/// log line. The bound is generous by two orders of magnitude against any
-/// document an operator reads.
+/// The bound on how deep a `json::Json` field may nest before the writer refuses.
 const MAX_JSON_DEPTH: usize = 64;
 
 /// `json::Json`, straight to its serialized form.
-///
-/// There is one JSON writer in this crate and it is this plus
-/// [`super::sink::write_json`]; a second model of a `json::Json` in the trusted
-/// computing base would be a second thing to keep in agreement with `std.json`.
 fn write_json(out: &mut String, value: &Value, span: Span, depth: usize) -> Result<(), Diagnostic> {
     if depth >= MAX_JSON_DEPTH {
         return Err(Diagnostic::error(
@@ -219,8 +188,8 @@ fn write_json(out: &mut String, value: &Value, span: Span, depth: usize) -> Resu
     Ok(())
 }
 
-/// Inference checks a perform's shape, so reaching one of these means the
-/// evaluator ran a module that was never checked. Ply's fault, and it says so.
+/// Inference checks a perform's shape, so reaching one of these means the evaluator ran a module
+/// that was never checked.
 #[cold]
 fn malformed(wanted: &str, span: Span) -> Diagnostic {
     Diagnostic::error(

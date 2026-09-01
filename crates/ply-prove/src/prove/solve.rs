@@ -1,25 +1,5 @@
-//! The decision procedure: case analysis over a saturating congruence closure,
-//! with linear integer arithmetic at every leaf.
-//!
-//! The whole procedure answers one question — *is this set of assertions
-//! contradictory?* — and it has exactly three answers: `Closed` (it is),
-//! `Open` (a branch survived), `Exhausted` (the budget or the split depth ran
-//! out). Only `Closed` may become a proof, and every step that can produce it
-//! is an implication that holds of every Ply value:
-//!
-//! - **every split is exhaustive.** A Boolean term is `true` or `false`; a
-//!   value of a sum type has exactly one outermost constructor, and the split
-//!   only runs when the *complete* constructor list is in hand; an `Int`
-//!   disequality is `<` or `>`. Nothing else is ever split.
-//! - **every propagation is a valid implication.** Congruence, constructor
-//!   injectivity and disjointness, distinct literals, projection over a record,
-//!   and the unit propagations of `&&`, `||`, `!` and `if`.
-//! - **every contradiction is a real one.** Two distinct literals or
-//!   constructors in one class, a disequality between terms proved equal, or a
-//!   linear system with no integer solution.
-//!
-//! Anything else leaves the branch open. `Open` is always a safe answer, and it
-//! is what the fragment's boundary looks like from the inside.
+//! The decision procedure: case analysis over a saturating congruence closure, with linear integer
+//! arithmetic at every leaf.
 
 use super::context::Context;
 use super::egraph::{Classes, conflict, shape_of};
@@ -32,10 +12,9 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Answer {
-    /// Every branch contradicted. This, and only this, becomes a proof.
+    /// Every branch contradicted.
     Closed,
-    /// A branch survived. The fragment does not decide the goal — which says
-    /// nothing about whether the goal is true.
+    /// A branch survived.
     Open,
     /// The step budget or the split depth ran out.
     Exhausted,
@@ -90,8 +69,8 @@ impl<'a, 'p> Solver<'a, 'p> {
         self.budget
     }
 
-    /// `Closed` iff the assertions are contradictory — which is what makes the
-    /// goal they negate valid.
+    /// `Closed` iff the assertions are contradictory — which is what makes the goal they negate
+    /// valid.
     pub fn refute(&mut self, assertions: &[(TermId, bool)]) -> Answer {
         let mut branch = Branch {
             classes: Classes::new(self.terms.len()),
@@ -206,8 +185,7 @@ impl<'a, 'p> Solver<'a, 'p> {
             changed |= self.propagate(branch);
             branch.classes.check_diseqs();
             if branch.classes.contradiction {
-                // Two terms asserted distinct were proved equal, which is what
-                // the closure is for.
+                // Two terms asserted distinct were proved equal, which is what the closure is for.
                 self.rules.note(Rule::Congruence);
                 return Answer::Closed;
             }
@@ -225,16 +203,14 @@ impl<'a, 'p> Solver<'a, 'p> {
         }
     }
 
-    /// Merges every pair of terms whose arguments are already equal, then
-    /// applies the two rules a constructor obeys within each class.
+    /// Merges every pair of terms whose arguments are already equal, then applies the two rules a
+    /// constructor obeys within each class.
     fn congruence(&mut self, branch: &mut Branch) -> bool {
         let n = self.terms.len();
         let mut signatures: HashMap<Node, TermId> = HashMap::with_capacity(n);
         let mut changed = false;
         for term in 0..n {
-            // A term whose signature does not exist is one no congruence may
-            // merge. That is only reachable through a coefficient that left
-            // `i128`, where the alternative is a wrong number.
+            // A term whose signature does not exist is one no congruence may merge.
             let Some(signature) = self.canonical(branch, term) else {
                 continue;
             };
@@ -254,13 +230,7 @@ impl<'a, 'p> Solver<'a, 'p> {
         changed
     }
 
-    /// A node with every argument replaced by its class representative. Two
-    /// nodes sharing one is the congruence rule, `x == y ⟹ f(x) == f(y)`.
-    ///
-    /// `None` where collecting a linear combination's coefficients would leave
-    /// `i128`. A saturated coefficient is a *different* linear combination, and
-    /// two of them agreeing would merge two terms that are not equal — so the
-    /// term is left out of the closure instead.
+    /// A node with every argument replaced by its class representative.
     fn canonical(&self, branch: &Branch, term: TermId) -> Option<Node> {
         let find = |t: TermId| branch.classes.find(t);
         Some(match self.terms.node(term) {
@@ -331,10 +301,8 @@ impl<'a, 'p> Solver<'a, 'p> {
         })
     }
 
-    /// Constructor injectivity and disjointness, and the same for list literals
-    /// and record literals. Two members of one class are only compared when
-    /// they are the same kind of value, so a sort the lowering guessed wrong
-    /// cannot manufacture a contradiction.
+    /// Constructor injectivity and disjointness, and the same for list literals and record
+    /// literals.
     fn structural(&mut self, branch: &mut Branch, n: usize) -> bool {
         let mut changed = false;
         for (_, members) in branch.classes.groups(n) {
@@ -441,9 +409,7 @@ impl<'a, 'p> Solver<'a, 'p> {
         changed | self.propagate_disequalities(branch)
     }
 
-    /// `a != b` at `Bool` decides one side from the other, because `Bool` has
-    /// exactly two values. It says nothing at any other sort, and the sort has
-    /// to be *known* — an unknown one is not an invitation to assume.
+    /// `a != b` at `Bool` decides one side from the other, because `Bool` has exactly two values.
     fn propagate_disequalities(&mut self, branch: &mut Branch) -> bool {
         let pairs: Vec<(TermId, TermId)> = branch.classes.diseqs().to_vec();
         let mut changed = false;
@@ -468,9 +434,7 @@ impl<'a, 'p> Solver<'a, 'p> {
             if name.as_str() == "Bool" && args.is_empty())
     }
 
-    /// `&&` when `dominant` is `true`, `||` when it is `false`. The two are one
-    /// rule with the polarities swapped, and writing them twice is how one of
-    /// them ends up wrong.
+    /// `&&` when `dominant` is `true`, `||` when it is `false`.
     fn junction(
         &mut self,
         branch: &mut Branch,
@@ -509,11 +473,9 @@ impl<'a, 'p> Solver<'a, 'p> {
     }
 
     fn equality(&mut self, branch: &mut Branch, term: TermId, lhs: TermId, rhs: TermId) -> bool {
-        // Extensionality does not depend on what this equality was *asserted*
-        // to be: it establishes that the two records are the same value, which
-        // settles a positive occurrence and contradicts a negative one. The
-        // prover works by refutation, so the negative case is the one that
-        // proves an `ensures` rebuilding a record from its own fields.
+        // Extensionality does not depend on what this equality was *asserted* to be: it establishes
+        // that the two records are the same value, which settles a positive occurrence and
+        // contradicts a negative one.
         let mut changed = false;
         if !branch.classes.equal(lhs, rhs) && self.fields_all_equal(branch, lhs, rhs) {
             self.rules.note(Rule::Congruence);
@@ -607,16 +569,7 @@ impl<'a, 'p> Solver<'a, 'p> {
         })
     }
 
-    /// Record extensionality: two records of one type are equal when every
-    /// field is. The elimination direction lives in [`Self::unify_arguments`]
-    /// and needs two literals; this is the introduction direction, and it is
-    /// what proves a rebuilt record equal to the one it was rebuilt from.
-    ///
-    /// Sound because a Ply record *is* its fields — `Value::Record` is a field
-    /// map with no identity beside it. Conservative in three ways, each of which
-    /// only ever costs a proof: both sorts must be known records, the field sets
-    /// must agree, and a field whose projection has not been interned yields
-    /// `false` rather than an assumption.
+    /// Record extensionality: two records of one type are equal when every field is.
     fn fields_all_equal(&self, branch: &Branch, a: TermId, b: TermId) -> bool {
         let (Some(Type::Record(left)), Some(Type::Record(right))) =
             (self.terms.sort(a), self.terms.sort(b))
@@ -637,8 +590,8 @@ impl<'a, 'p> Solver<'a, 'p> {
         })
     }
 
-    /// The term standing for `base.field`: the field of a record literal in
-    /// `base`'s class, or an interned `Field` node over it.
+    /// The term standing for `base.field`: the field of a record literal in `base`'s class, or an
+    /// interned `Field` node over it.
     fn projection(&self, branch: &Branch, base: TermId, field: &Symbol) -> Option<TermId> {
         if let Some(found) = self.record_field(branch, base, field) {
             return Some(found);
@@ -684,8 +637,7 @@ impl<'a, 'p> Solver<'a, 'p> {
         branch.classes.union(term, target)
     }
 
-    /// Whether the two are provably different values. Only a comparison of two
-    /// same-kind shapes concludes anything.
+    /// Whether the two are provably different values.
     fn distinct(&self, branch: &Branch, a: TermId, b: TermId) -> bool {
         let (ra, rb) = (branch.classes.find(a), branch.classes.find(b));
         if ra == rb {
@@ -714,8 +666,7 @@ impl<'a, 'p> Solver<'a, 'p> {
     }
 
     fn choose_split(&self, branch: &Branch) -> Option<Split> {
-        // An `if` or a `match` first: reducing one exposes the structure every
-        // other rule works on.
+        // An `if` or a `match` first: reducing one exposes the structure every other rule works on.
         for term in 0..self.terms.len() {
             match self.terms.node(term).clone() {
                 Node::If { cond, .. } if self.truth(branch, cond).is_none() => {
@@ -736,8 +687,8 @@ impl<'a, 'p> Solver<'a, 'p> {
             }
         }
 
-        // Then the propositional split: a disjunction that must hold with
-        // neither side decided, or a conjunction that must fail.
+        // Then the propositional split: a disjunction that must hold with neither side decided, or
+        // a conjunction that must fail.
         for term in 0..self.terms.len() {
             let (a, b, wanted) = match *self.terms.node(term) {
                 Node::And(a, b) => (a, b, false),
@@ -752,8 +703,8 @@ impl<'a, 'p> Solver<'a, 'p> {
             }
         }
 
-        // Then an `Int` disequality, which is `<` or `>` and is the only way one
-        // reaches the arithmetic at all.
+        // Then an `Int` disequality, which is `<` or `>` and is the only way one reaches the
+        // arithmetic at all.
         for (a, b) in branch.classes.diseqs() {
             let key = ((*a).min(*b), (*a).max(*b));
             if branch.split.contains(&key) {
@@ -764,19 +715,12 @@ impl<'a, 'p> Solver<'a, 'p> {
             }
         }
 
-        // Last, a Boolean atom of a formula this branch constrains. It is what
-        // decides a claim whose top-level structure is an equivalence rather
-        // than a connective — `!(b && c) == (!b || !c)` reaches no other rule.
+        // Last, a Boolean atom of a formula this branch constrains.
         self.undecided_atom(branch).map(Split::Boolean)
     }
 
-    /// A `Bool`-sorted term that is not itself a connective, is reachable from
-    /// something this branch has constrained, and whose truth neither
-    /// propagation nor an earlier split settled.
-    ///
-    /// Splitting one is exhaustive because `Bool` has exactly two values, and
-    /// the lowest term id wins so the search is a function of the obligation
-    /// rather than of the order the graph was built in.
+    /// A `Bool`-sorted term that is not itself a connective, is reachable from something this
+    /// branch has constrained, and whose truth neither propagation nor an earlier split settled.
     fn undecided_atom(&self, branch: &Branch) -> Option<TermId> {
         let mut stack: Vec<TermId> = (0..self.terms.len())
             .filter(|t| self.truth(branch, *t).is_some())
@@ -814,9 +758,7 @@ impl<'a, 'p> Solver<'a, 'p> {
         best
     }
 
-    /// The complete constructor list of the scrutinee's type, with each
-    /// constructor's field sorts. `None` whenever the list is not in hand,
-    /// because a split over a partial list is not a case analysis.
+    /// The complete constructor list of the scrutinee's type, with each constructor's field sorts.
     fn constructor_split(&self, scrutinee: TermId) -> Option<Split> {
         let sort = self.terms.sort(scrutinee)?.clone();
         let Type::Con(type_name, _) = &sort else {
@@ -835,10 +777,7 @@ impl<'a, 'p> Solver<'a, 'p> {
         })
     }
 
-    /// The linear system this branch asserts. Its variables are the class
-    /// representatives of the `Int` terms, so an equality the congruence
-    /// closure derived is already an equality here — the two share variables
-    /// rather than trading conclusions.
+    /// The linear system this branch asserts.
     fn arithmetic(&mut self, branch: &Branch) -> arith::Feasibility {
         let find = |t: TermId| branch.classes.find(t);
         let mut system = arith::System::default();
@@ -867,8 +806,8 @@ impl<'a, 'p> Solver<'a, 'p> {
             relevant.insert(find(*a));
             relevant.insert(find(*b));
         }
-        // Only the definitions a comparison can reach, so an unfolded body full
-        // of unrelated literals does not blow the elimination up.
+        // Only the definitions a comparison can reach, so an unfolded body full of unrelated
+        // literals does not blow the elimination up.
         let mut definitions: Vec<(BTreeMap<TermId, i128>, i128)> = Vec::new();
         for (term, node) in self.terms.nodes() {
             match node {
@@ -895,9 +834,9 @@ impl<'a, 'p> Solver<'a, 'p> {
             }
         }
 
-        // A definition whose variables all cancelled is a bare claim about a
-        // constant — `x == x + 1` collapses to `1 = 0` — and it reaches nothing,
-        // so the closure below would never pick it up.
+        // A definition whose variables all cancelled is a bare claim about a constant — `x == x +
+        // 1` collapses to `1 = 0` — and it reaches nothing, so the closure below would never pick
+        // it up.
         let mut used: Vec<bool> = definitions
             .iter()
             .map(|(coefficients, _)| coefficients.is_empty())

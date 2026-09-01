@@ -1,15 +1,4 @@
 //! What a run's searches are written under, and what it reports about them.
-//!
-//! [`crate::key`] answers "which `DefHash` names this claim"; this module
-//! answers the prior question of whether there is a claim to write at all. A
-//! green simulated run is not automatically a cacheable one: a search that spent
-//! its budget proved nothing about the interleavings it did not reach, and a
-//! test whose row says it simulated but whose evaluator reported no search is a
-//! run nobody observed.
-//!
-//! Both of those are reported green and re-run next time. That is the direction
-//! to err in — the opposite mistake caches a pass a different seed would have
-//! failed, and it is silent.
 
 use crate::key::{result_key, seed_key, writes_seed_keys};
 use ply_eval::explore::Interleaving;
@@ -18,23 +7,11 @@ use ply_hash::DefHash;
 use ply_span::Diagnostic;
 
 /// Fix the interleaving the next entry point will take.
-///
-/// This and [`interleaving_of`] are the whole of what `ply-test` owes
-/// `ply-eval`: the machine installs `ply_eval::sched::Scheduler` as a native
-/// prompt at a `simulate` region, resumes the task the seed names at every
-/// scheduling point, and reports the steps it took. The search over those
-/// interleavings is `ply_eval::explore`, and driving it is this crate's job —
-/// exploration is a test-time activity, because a `simulate` region's value is
-/// the one its seed names and every other interleaving is a search.
 pub fn seed_run(machine: &mut Machine<'_>, seed: &Seed, steps: u32) {
     machine.set_seed(seed.clone(), steps);
 }
 
 /// The interleaving the last entry point took, given how it ended.
-///
-/// `None` means no interleaving was observed. That is not a silent hole: a test
-/// whose footprint carries `sim.read` and whose search observed nothing is
-/// [`Record::Unobserved`] — reported green, warned about, and never cached.
 pub fn interleaving_of(
     machine: &Machine<'_>,
     outcome: &Result<(), Diagnostic>,
@@ -49,32 +26,16 @@ pub fn interleaving_of(
 pub enum Record {
     /// Write `Pass` under each of these, in order.
     Under(Vec<DefHash>),
-    /// The search spent its budget. Green, and not a proof.
+    /// The search spent its budget.
     Exhausted,
-    /// The test's footprint carries `sim.read` and the evaluator reported no
-    /// search, so what actually ran is unknown.
+    /// The test's footprint carries `sim.read` and the evaluator reported no search, so what
+    /// actually ran is unknown.
     Unobserved,
-    /// The run reached a host handler, so its green verdict is a statement about
-    /// a socket at one moment and about nothing else.
-    ///
-    /// Decided by what the machine **did**, never by the prediction selection
-    /// made from footprints: the prediction drives which tests run, and this
-    /// drives the write. When the two disagree the run has observed a footprint
-    /// that under-reports, which is the failure mode the whole boundary is built
-    /// around, so it is reported rather than silently uncached.
+    /// The run reached a host handler, so its green verdict is a statement about a socket at one
+    /// moment and about nothing else.
     Host,
-    /// The run entered natively compiled code, so its green verdict is a
-    /// statement about a third execution strategy and not about the
-    /// authoritative engine.
-    ///
-    /// The same shape as [`Record::Host`] and for the same reason, one field
-    /// over: decided by what the machine **did** — a non-zero native entry count
-    /// — never by the flag that installed the backend. ADR 0026 §4.6 is why the
-    /// two halves are separate: `--engine both` already bypasses the cache, so a
-    /// backend installed on that path would be cache-safe *by accident*, and a
-    /// rule enforced by an accident is not enforced. `ply test`'s
-    /// `backend_escapes` is the check that this variant was chosen, and it fires
-    /// when the runner and the backend disagree about what the run may record.
+    /// The run entered natively compiled code, so its green verdict is a statement about a third
+    /// execution strategy and not about the authoritative engine.
     Backend,
 }
 
@@ -91,14 +52,9 @@ impl Record {
     }
 }
 
-/// `run` is the plan the run was selected against and whose key the result is
-/// published under; `ran` is what this test actually searched, which differs
-/// only when `random` narrowed a widened root set to the roots no per-seed key
-/// covered.
-///
-/// The full plan's key is still written in that case, and legitimately: the
-/// roots that were narrowed away were narrowed away *because* their per-seed
-/// keys already hold a pass.
+/// `run` is the plan the run was selected against and whose key the result is published under;
+/// `ran` is what this test actually searched, which differs only when `random` narrowed a widened
+/// root set to the roots no per-seed key covered.
 pub fn record_under(
     test_hash: DefHash,
     seeded: bool,
@@ -109,9 +65,8 @@ pub fn record_under(
     if seeded && exploration.is_none() {
         return Record::Unobserved;
     }
-    // Applied to an unseeded test too: a handler answering `sim.seed()` closes
-    // `sim.read` out of the row, and the region inside it still searched under a
-    // budget it may have spent.
+    // Applied to an unseeded test too: a handler answering `sim.seed()` closes `sim.read` out of
+    // the row, and the region inside it still searched under a budget it may have spent.
     if exploration.is_some_and(|e| !e.is_cacheable()) {
         return Record::Exhausted;
     }
@@ -131,10 +86,6 @@ pub fn record_under(
 }
 
 /// What this run's simulated tests searched, aggregated.
-///
-/// `simulated` counts the tests that reached a `simulate` region rather than the
-/// tests that ran, because a test that reached none contributes nothing a
-/// consumer could tell from a zero.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct SimSummary {
     pub simulated: usize,
@@ -145,7 +96,7 @@ pub struct SimSummary {
     pub interleavings: u64,
     /// Searches that emptied their frontier: every interleaving ran.
     pub exhaustive: usize,
-    /// Searches that spent their budget. Reported green and not cached.
+    /// Searches that spent their budget.
     pub exhausted: usize,
     /// Searches that reported a failing seed.
     pub failed: usize,
@@ -156,9 +107,7 @@ impl SimSummary {
         self.simulated > 0
     }
 
-    /// `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`. Empty when
-    /// nothing simulated, so a corpus with no `simulate` region reads exactly as
-    /// it does today.
+    /// `simulated: 3 of 47 · 61 interleavings · 3 exhaustive`.
     pub fn line(&self) -> Option<String> {
         if !self.any() {
             return None;
@@ -180,9 +129,7 @@ impl SimSummary {
     }
 }
 
-/// The command that replays exactly this failure. The point of the milestone is
-/// that the repro handed to an agent is a seed, so the artifact prints the
-/// command rather than describing it.
+/// The command that replays exactly this failure.
 pub fn replay_command(seed: &Seed, test_name: &str) -> String {
     format!("ply test --seed {seed} --filter \"{test_name}\"")
 }
@@ -213,8 +160,8 @@ mod tests {
         );
     }
 
-    /// The rule whose absence is silent: a run under one plan must not be able
-    /// to read a pass another plan earned.
+    /// The rule whose absence is silent: a run under one plan must not be able to read a pass
+    /// another plan earned.
     #[test]
     fn a_seeded_test_is_never_written_under_its_bare_hash() {
         let plan = Plan::default();
@@ -253,8 +200,8 @@ mod tests {
         );
     }
 
-    /// The first green `det` test in the language that is not cacheable, and it
-    /// is correct that it is not.
+    /// The first green `det` test in the language that is not cacheable, and it is correct that it
+    /// is not.
     #[test]
     fn a_spent_budget_writes_nothing_under_either_mode() {
         let spent = Exploration {
@@ -269,8 +216,8 @@ mod tests {
         }
     }
 
-    /// A handler answering `sim.seed()` takes `sim.read` out of the row, but the
-    /// region inside it still searched under a budget it may have spent.
+    /// A handler answering `sim.seed()` takes `sim.read` out of the row, but the region inside it
+    /// still searched under a budget it may have spent.
     #[test]
     fn a_spent_budget_stops_an_unseeded_test_caching_too() {
         let plan = Plan::default();

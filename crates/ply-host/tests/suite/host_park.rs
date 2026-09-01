@@ -1,20 +1,4 @@
 //! A park that holds two facilities has to wake for either of them.
-//!
-//! `Facilities` composes a socket pool and a database reactor, and each of them
-//! blocks on a condition variable of its own. Nothing signals both. So a park
-//! that waits on one alone sits through the other's completion — and that is not
-//! a corner case: a task-per-connection server always has an `accept`
-//! outstanding, so *every* query a spawned task issues would wait for the next
-//! connection to arrive before the scheduler noticed it had an answer.
-//!
-//! The failure shape is the one this project audits for: not a crash and not a
-//! wrong answer, but a request that never comes back, invisible to a sequential
-//! accept loop and therefore to every benchmark and every test that used one.
-//! `db::pool::Reactor::park_timeout` was written for this caller and was not
-//! being called by it.
-//!
-//! The test is a stopwatch, which is usually the wrong instrument — but the
-//! defect *is* a wait, so what has to be asserted is that one ended.
 
 use crate::support::cluster::{self, Cluster};
 use ply_core::ty::Resource;
@@ -29,9 +13,7 @@ use std::time::{Duration, Instant};
 
 const ALONE: Owner = (MachineId(0), None);
 
-/// How long the query is given once the socket is also outstanding. Three orders
-/// of magnitude above the alternation bound and two above the query, so a
-/// failure here is the hang rather than a slow machine.
+/// How long the query is given once the socket is also outstanding.
 const PATIENCE: Duration = Duration::from_secs(10);
 
 fn free_port() -> u16 {
@@ -110,9 +92,7 @@ fn a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding() {
     let host = open(&cluster);
     let runtime = host.runtime();
 
-    // The socket half: a listener nobody will ever connect to, with an `accept`
-    // parked on it. This is a task-per-connection server between requests, and
-    // it is outstanding for the whole life of such a server.
+    // The socket half: a listener nobody will ever connect to, with an `accept` parked on it.
     let at = Resource::Named(Symbol::new("listener"));
     let listener = value(
         host.net().listen(&at, free_port(), Span::DUMMY),
@@ -123,8 +103,8 @@ fn a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding() {
     };
     let accept = pending(host.net().accept(&at, listener, Span::DUMMY), "the accept");
 
-    // The database half, issued after the accept is already parked, which is the
-    // order a spawned task would produce.
+    // The database half, issued after the accept is already parked, which is the order a spawned
+    // task would produce.
     let db = host.database().expect("a database").clone();
     let answer = query(&db);
 
@@ -145,19 +125,16 @@ fn a_query_resolves_while_an_accept_nobody_will_answer_is_outstanding() {
         "the query answered {resolved}"
     );
 
-    // And the socket is still waiting, which is what makes the assertion above
-    // about the park rather than about an accept that happened to return.
+    // And the socket is still waiting, which is what makes the assertion above about the park
+    // rather than about an accept that happened to return.
     assert!(
         runtime.poll(&accept).expect("the token is ours").is_none(),
         "the accept resolved, so the park had a socket event to wake on and this proved nothing"
     );
 }
 
-/// And the reason it resolves: the two facilities mint from disjoint ranges, so
-/// "did you mint this token" has one answer.
-///
-/// Asserted on the tokens themselves rather than on the constant, because what
-/// matters is the pair and either half moving is what would break it.
+/// And the reason it resolves: the two facilities mint from disjoint ranges, so "did you mint this
+/// token" has one answer.
 #[test]
 fn the_two_facilities_mint_tokens_that_cannot_collide() {
     if !cluster::available() {

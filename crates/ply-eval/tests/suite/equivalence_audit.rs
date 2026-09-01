@@ -1,13 +1,5 @@
-//! The equivalence audit: the machine against the tree-walker, on programs
-//! written to make them disagree.
-//!
-//! Auditing the source that happens to exist finds the disagreements somebody
-//! already wrote down. These cases are adversarial instead: the shapes where the
-//! tree-walker's handler *stack* and the machine's segment *capture* could
-//! plausibly encode one language two ways.
-//!
-//! A disagreement is a failure and never a warning, because the result cache
-//! records whichever engine ran first and never recomputes it.
+//! The equivalence audit: the machine against the tree-walker, on programs written to make them
+//! disagree.
 
 use ply_eval::differential::compare_tests;
 use ply_eval::{Fixture, Interp, Machine};
@@ -27,8 +19,8 @@ fn load(src: &str) -> (Program, Resolved) {
     (program, resolved)
 }
 
-/// Returns how many tests were compared, and refuses a case that compared
-/// nothing: an all-skipped run and a clean run must not look alike.
+/// Returns how many tests were compared, and refuses a case that compared nothing: an all-skipped
+/// run and a clean run must not look alike.
 #[track_caller]
 fn agree(src: &str) -> usize {
     let (program, resolved) = load(src);
@@ -40,9 +32,9 @@ fn agree(src: &str) -> usize {
         report.compared > 0 || report.machine_only > 0,
         "this case declares no test\n{src}"
     );
-    // Agreement on a subject whose footprint was never compared is agreement on
-    // two axes of three, and the missing one is the only one that sees a
-    // `perform` with no effect on the value or the world.
+    // Agreement on a subject whose footprint was never compared is agreement on two axes of three,
+    // and the missing one is the only one that sees a `perform` with no effect on the value or the
+    // world.
     assert_eq!(
         report.footprints_compared, report.compared,
         "an engine stopped reporting what it performed\n{report}"
@@ -50,9 +42,8 @@ fn agree(src: &str) -> usize {
     report.compared
 }
 
-/// A program broken in some unrelated way would "agree" on the resulting
-/// failure and prove nothing about the shape it was written for, so passing is
-/// asserted separately.
+/// A program broken in some unrelated way would "agree" on the resulting failure and prove nothing
+/// about the shape it was written for, so passing is asserted separately.
 #[track_caller]
 fn agree_and_pass(src: &str) {
     let compared = agree(src);
@@ -70,8 +61,8 @@ fn agree_and_pass(src: &str) {
     }
 }
 
-/// Auditing a diagnostic is worthless once the program stops producing it, so
-/// the code is pinned as well as compared.
+/// Auditing a diagnostic is worthless once the program stops producing it, so the code is pinned as
+/// well as compared.
 #[track_caller]
 fn agree_and_fail(src: &str, code: &str) {
     agree(src);
@@ -285,8 +276,8 @@ test "rem" { assert_eq(1 % 0, 0) }
 
 #[test]
 fn every_builtins_failure_mode() {
-    // One program per code: a case that changed its mind about which failure it
-    // produces must fail rather than quietly audit something else.
+    // One program per code: a case that changed its mind about which failure it produces must fail
+    // rather than quietly audit something else.
     agree_and_fail(
         r#"
 test "assert" { assert(false) }
@@ -357,8 +348,6 @@ test "field access on a non-record" { assert_eq((1).a, 1) }
 }
 
 /// Order is incidental until an effect can see it, and then it is semantics.
-/// Each case performs once per position and asserts the sequence the handler
-/// recorded.
 #[test]
 fn evaluation_order_is_observable_and_identical() {
     agree_and_pass(
@@ -869,15 +858,12 @@ test "operators over calls over performs" {
     );
 }
 
-/// The whole equivalence of the two clause forms, checked across the engines
-/// that can each run one of them: ADR 0005 §1.3 says `op(x̄) -> e` *is*
-/// `op(x̄) resume k -> k(e)`, so the tree-walker running the first and the
-/// machine running the second must agree on value, diagnostic and world.
+/// The whole equivalence of the two clause forms, checked across the engines that can each run one
+/// of them: ADR 0005 §1.3 says `op(x̄) -> e` *is* `op(x̄) resume k -> k(e)`, so the tree-walker
+/// running the first and the machine running the second must agree on value, diagnostic and world.
 fn tail_and_general_forms_agree(tail: &str, general: &str) {
-    // The comparison includes every label's span, so the clause bodies are
-    // padded to start at the same byte offset in both programs. Without that a
-    // diagnostic raised anywhere after the clause head would "diverge" purely
-    // because `resume k -> k(` is longer than `->`.
+    // The comparison includes every label's span, so the clause bodies are padded to start at the
+    // same byte offset in both programs.
     assert_eq!(tail.len(), general.len(), "the two programs must line up");
     let (a, ra) = load(tail);
     let (b, rb) = load(general);
@@ -941,9 +927,8 @@ fn depth(n: Int) -> Int / {{state.read[s]}} =
         )
     };
 
-    // The clause writes a cell and only then produces its answer, so world
-    // threading, the stack the clause runs on, and where its value goes are all
-    // observable in one expression.
+    // The clause writes a cell and only then produces its answer, so world threading, the stack the
+    // clause runs on, and where its value goes are all observable in one expression.
     tail_and_general_forms_agree(
         &program("state.get[s]() ->            { cell_set(c, 7); 41 } "),
         &program("state.get[s]() resume k -> k({ cell_set(c, 7); 41 })"),
@@ -985,10 +970,8 @@ test "the clause runs under whatever handler the perform site had" {{
     );
 }
 
-/// A `Cell` reached through a continuation resumed after its `with_cell`
-/// returned is ADR 0005 §2's monotone world, and it is a *success*. Only the
-/// machine can express it, so the audit here is against the ADR rather than
-/// against the other engine.
+/// A `Cell` reached through a continuation resumed after its `with_cell` returned is ADR 0005 §2's
+/// monotone world, and it is a *success*.
 #[test]
 fn a_continuation_escaping_its_region_still_reads_the_cell() {
     let src = r#"
@@ -1108,10 +1091,9 @@ test "a continuation applied to the wrong argument count" {
     assert_eq!(d.code, "E0202", "{}", d.message);
 }
 
-/// The world after a *failing* test is part of what the harness compares, and
-/// it is the half a verdict-only check would miss: one engine abandoning a
-/// write the other made is a divergence even though both reported the same
-/// failure.
+/// The world after a *failing* test is part of what the harness compares, and it is the half a
+/// verdict-only check would miss: one engine abandoning a write the other made is a divergence even
+/// though both reported the same failure.
 #[test]
 fn the_world_a_failure_leaves_behind_is_identical() {
     agree(
@@ -1152,10 +1134,8 @@ test "a region whose initial value fails allocates nothing" {
     );
 }
 
-/// A seeded generator over the whole expression grammar, because the shapes a
-/// human writes down are the shapes a human already thought about. Each program
-/// stores its result in a cell, so a wrong *value* is caught by the world
-/// comparison even when neither engine reports anything.
+/// A seeded generator over the whole expression grammar, because the shapes a human writes down are
+/// the shapes a human already thought about.
 mod fuzz {
     pub struct Rng(pub u64);
 
@@ -1391,8 +1371,7 @@ mod fuzz {
         }
     }
 
-    /// One program of `tests` tests. An unhandled `st` reaching the top is a
-    /// diagnostic both engines must produce identically, so it is left in.
+    /// One program of `tests` tests.
     pub fn program(seed: u64, tests: usize, depth: usize) -> String {
         let mut g = Gen::new(seed);
         let mut src =
@@ -1406,10 +1385,8 @@ mod fuzz {
         src
     }
 
-    /// One program written twice: the outer handler's clause in the derived
-    /// tail-resumptive form and in the primitive `resume` form. The tail form's
-    /// head is padded so the clause body starts at the same byte offset in
-    /// both, which keeps every label span comparable.
+    /// One program written twice: the outer handler's clause in the derived tail-resumptive form
+    /// and in the primitive `resume` form.
     pub fn clause_pair(seed: u64, tests: usize, depth: usize) -> (String, String) {
         let mut g = Gen::new(seed);
         let head = "effect st { read get[a]() -> Int  write put[b](v: Int) -> Int }\n";
@@ -1450,8 +1427,8 @@ fn generated_programs_agree_on_value_diagnostic_and_world() {
             .count();
     }
     assert_eq!(compared as u64, SEEDS * 4);
-    // Agreement is only evidence if some of the corpus actually failed: a run
-    // in which everything passed would say nothing about diagnostic equality.
+    // Agreement is only evidence if some of the corpus actually failed: a run in which everything
+    // passed would say nothing about diagnostic equality.
     assert!(failures > 50, "only {failures} of {compared} failed");
 }
 
@@ -1472,9 +1449,9 @@ fn load_modules(files: &[(&str, &str)]) -> (Program, Resolved) {
     (program, resolved)
 }
 
-/// A bare name means what it meant where it was *written*, and the two engines
-/// carry that differently: the tree-walker swaps a `module` field in and out
-/// around every call and clause body, the machine puts it on every frame.
+/// A bare name means what it meant where it was *written*, and the two engines carry that
+/// differently: the tree-walker swaps a `module` field in and out around every call and clause
+/// body, the machine puts it on every frame.
 #[test]
 fn names_resolve_identically_across_modules() {
     let files = &[
@@ -1533,8 +1510,8 @@ test "a clause for another resource does not catch it" {
     assert_eq!(report.compared, 6, "{report}");
 }
 
-/// `eval_test_in` is the entry point the incremental front end uses, and it is
-/// a different lookup from `eval_test` on both engines.
+/// `eval_test_in` is the entry point the incremental front end uses, and it is a different lookup
+/// from `eval_test` on both engines.
 #[test]
 fn addressing_a_test_by_module_and_ordinal_agrees() {
     let files = &[
@@ -1560,8 +1537,8 @@ fn addressing_a_test_by_module_and_ordinal_agrees() {
     }
 }
 
-/// `ply run`'s path: a named entry point called with arguments, whose answer is
-/// a value rather than a verdict.
+/// `ply run`'s path: a named entry point called with arguments, whose answer is a value rather than
+/// a verdict.
 #[test]
 fn calling_a_definition_by_name_agrees_on_the_value_and_the_world() {
     let src = r#"
@@ -1598,9 +1575,8 @@ fn takes(a: Int, b: Int) -> Int = a - b
     }
 }
 
-/// A fixture built once and opened per test is the milestone's mechanism, and
-/// it has to mean the same thing on both engines: every test sees the seed and
-/// no test sees another's writes.
+/// A fixture built once and opened per test is the milestone's mechanism, and it has to mean the
+/// same thing on both engines: every test sees the seed and no test sees another's writes.
 #[test]
 fn a_seeded_fixture_opens_identically_on_both_engines() {
     let src = r#"
@@ -1623,9 +1599,8 @@ test "writes over its own region again" { with_cell[extra](0) { c -> cell_set(c,
     assert_eq!(machine.cells().get(id).unwrap().render(), "7");
 }
 
-/// ADR 0005 §4.1: an operation is performed once, at the `perform`, and every
-/// resumption receives that one value — which is why multi-shot introduces no
-/// nondeterminism and E0412 needs no change.
+/// ADR 0005 §4.1: an operation is performed once, at the `perform`, and every resumption receives
+/// that one value — which is why multi-shot introduces no nondeterminism and E0412 needs no change.
 #[test]
 fn a_nondet_operation_resumed_twice_delivers_one_value() {
     let src = r#"
@@ -1650,10 +1625,7 @@ test/nondet "both resumptions see one reading" {
         .expect("each resumption receives the value its own call produced");
 }
 
-/// The two clause forms, generatively. ADR 0005 §1.3 makes `op(x̄) -> e` a
-/// derived form of `op(x̄) resume k -> k(e)`, so a random clause body under a
-/// random handled computation is the sharpest available check on the machine's
-/// `Frame::Resume`: one engine runs the derived form, the other the primitive.
+/// The two clause forms, generatively.
 #[test]
 fn the_two_clause_forms_agree_on_generated_programs() {
     const SEEDS: u64 = 2000;
@@ -1682,27 +1654,7 @@ fn the_two_clause_forms_agree_on_generated_programs() {
     assert!(failures > 50, "only {failures} of {compared} failed");
 }
 
-/// Both engines bound the same thing at the same number and say so in the same
-/// words. This was a divergence: the tree-walker bounded *nested calls* at
-/// 10,000 while the machine bounded *pending frames* at 1,000,000, so every
-/// program recursing between the two budgets failed `--engine both` — and one
-/// past both still diverged, because the messages and notes differed.
-///
-/// The budget is now `DEFAULT_MAX_CALLS` on both sides, counted as pending
-/// calls: the tree-walker's own nesting, the machine's `Frame::Call`s. Both
-/// halves of the original finding are asserted, one program each.
-///
-/// > **Still narrow, no longer a gap (2026-08-24).** An R5 review narrowed this
-/// > doc in place, correctly: *"Both bodies pend two frames per level, so both
-/// > reach `DEFAULT_MAX_CALLS` first and the frame bound is never in play … So
-/// > what this test holds is: **the two engines agree on the recursion bound for
-/// > bodies pending fewer than 100 frames per call.** Nothing in the suite arms
-/// > the rest, and nothing here is changed to assert the divergence … carries it
-/// > as open."* The two programs below still pend two frames a level and this
-/// > test still holds only what R5 said it holds. What changed is the rest:
-/// > there is no frame bound to reach any more, and
-/// > `the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends`
-/// > below arms the ratio R5 measured, at the scale it measured it.
+/// Both engines bound the same thing at the same number and say so in the same words.
 #[test]
 fn the_two_engines_agree_on_the_recursion_bound() {
     let between = r#"
@@ -1731,13 +1683,9 @@ test "no base case at all" { assert_eq(forever(0), 0) }
     );
 }
 
-/// A backend that is honest about its budget: it runs the body on its own
-/// engine, capped at exactly the `budget` the seam handed it, so it provably
-/// cannot outrun the bound the machine is holding the program to.
-///
-/// This is the shape R5's review used to reproduce the seam defect inside this
-/// crate, kept because it is the only thing here that exercises the accept path
-/// under a budget that matters.
+/// A backend that is honest about its budget: it runs the body on its own engine, capped at exactly
+/// the `budget` the seam handed it, so it provably cannot outrun the bound the machine is holding
+/// the program to.
 mod honest {
     use ply_eval::{Compiled, Machine, Value};
     use ply_span::{Span, Symbol};
@@ -1753,8 +1701,8 @@ mod honest {
     }
 
     impl Budgeted {
-        /// The program is leaked because a backend may not borrow one — see the
-        /// `compiled` field on `Machine`.
+        /// The program is leaked because a backend may not borrow one — see the `compiled` field on
+        /// `Machine`.
         pub fn over(program: &Program) -> Budgeted {
             let copy: &'static mut Program = Box::leak(Box::new(program.clone()));
             let resolved: &'static Resolved =
@@ -1791,9 +1739,8 @@ mod honest {
     }
 }
 
-/// `hog(n) = k * n`, spelled so that descending to the recursive call leaves `k`
-/// binary operands pending — one machine frame each, one native tree-walker
-/// level each. `k + 1` frames a call, times `depth` calls.
+/// `hog(n) = k * n`, spelled so that descending to the recursive call leaves `k` binary operands
+/// pending — one machine frame each, one native tree-walker level each.
 fn hog(k: usize, depth: usize) -> String {
     let plus = vec!["+ 1"; k].join(" ");
     format!(
@@ -1803,58 +1750,18 @@ fn hog(k: usize, depth: usize) -> String {
     )
 }
 
-/// How many frames a body pends per call changes nothing about the answer, on
-/// any of the three ways a program can be run here.
-///
-/// The bound is nested calls, `DEFAULT_MAX_CALLS`. The tree-walker counts its
-/// own nesting, the machine counts the `Frame::Call`s on its stack, and a
-/// backend is handed the remainder as `budget` — one number, three engines. The
-/// operands pending around those calls bound nothing: on the tree-walker they
-/// are native stack, on the machine they are heap cells, and a natively
-/// compiled body has neither.
-///
-/// > **This is the test the catalogue said did not exist (2026-08-24).**
-/// > `CONTRIBUTING.md` §"Things known to be broken" item 10 read *"nothing in
-/// > the suite arms the true bound"*, and item 9 recorded the same ratio
-/// > reaching the compiled seam: *"`machine alone: Err("recursion limit of
-/// > 1000000 pending frames exceeded")` / `machine + spike: Ok(1350000)`"*. Both
-/// > are closed by removing the machine's default frame ceiling — see
-/// > `Machine::with_max_frames` — and this is what would notice if it came back.
-/// > The ceiling sat at 1,000,000 and a body pending `k` frames a call crossed
-/// > it at `depth × (k + 1) > 1_000_000`; R5 measured the crossover at depth
-/// > 9,990, k = 90 passing and k = 100 raising, and both are asserted below.
-///
-/// **This is the memory-heaviest test in the crate and that is inherent.** The
-/// tree-walker spends kilobytes of native stack per pending level in a debug
-/// build, so the smallest program that crosses a ceiling of 1,000,000 frames
-/// costs it gigabytes of peak RSS. There is no cheaper witness: the machine's
-/// frame stack is the tree-walker's native stack reified, one frame per level,
-/// so any program pending a million machine frames nests a million native
-/// levels. So the tree-walker runs **once** here, over the smallest crossing
-/// program, and every other leg is a machine — which measured **4,243 MiB**
-/// peak for the whole test, `/usr/bin/time -l`, debug, 2026-08-24.
-///
-/// The per-level figures behind that, peak RSS in one process each, three of
-/// them from one run of a three-point series: 1,529 MiB at 304,000 levels,
-/// 3,054 MiB at 608,000, 5,036 MiB at 1,003,200 — 5,274, 5,267 and 5,264 bytes
-/// a level, flat — and 5,365 MiB at 1,350,000, which is 4,167 bytes a level and
-/// so does not sit on that line. Five KiB a level is the number to plan with,
-/// not a constant to quote.
+/// How many frames a body pends per call changes nothing about the answer, on any of the three ways
+/// a program can be run here.
 #[test]
 fn the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends() {
-    // 6,700 * 151 = 1,011,700 pending frames: the least this can cost and still
-    // cross where the machine used to stop, against 6,701 nested calls.
+    // 6,700 * 151 = 1,011,700 pending frames: the least this can cost and still cross where the
+    // machine used to stop, against 6,701 nested calls.
     let crossing = hog(150, 6_700);
     let (program, resolved) = load(&crossing);
     let check = ply_core::check_program(&program, &resolved).expect("the witness type-checks");
 
-    // Strategy 1 against strategy 2: the comparison `--engine both` makes, and
-    // the one that printed "this is a defect in Ply". The machine on the right
-    // has to be the *plain* one. Comparing the tree-walker against a machine
-    // with a backend attached passes even with the ceiling restored, because the
-    // backend answers at the first level shallow enough to fit and the machine
-    // takes it — that masking is item 9 itself, and it is asserted below rather
-    // than being allowed to stand in for this.
+    // Strategy 1 against strategy 2: the comparison `--engine both` makes, and the one that printed
+    // "this is a defect in Ply".
     let mut plain = Machine::new(&program, &resolved, &check);
     let mut treewalk = Interp::new(&program, &resolved, &check);
     let report = compare_tests(&mut treewalk, &mut plain, &Fixture::empty());
@@ -1862,16 +1769,14 @@ fn the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends() {
     assert_eq!(report.compared, 1, "{report}");
     assert_eq!(report.footprints_compared, report.compared, "{report}");
 
-    // The value rather than merely agreement: two engines that both raised would
-    // "agree" and prove nothing.
+    // The value rather than merely agreement: two engines that both raised would "agree" and prove
+    // nothing.
     let mut plain = Machine::new(&program, &resolved, &check);
     plain
         .eval_test(0)
         .unwrap_or_else(|d| panic!("the machine alone raised: [{}] {}", d.code, d.message));
 
-    // Strategy 2 against strategy 3. `budget` is now the whole of what the
-    // machine holds the program to, so there is nothing left for a backend to be
-    // on the wrong side of.
+    // Strategy 2 against strategy 3.
     let backend = std::rc::Rc::new(honest::Budgeted::over(&program));
     let mut entered = Machine::new(&program, &resolved, &check);
     entered.set_compiled(backend.clone());
@@ -1884,11 +1789,7 @@ fn the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends() {
         "the backend was never entered, so this compared the machine with itself"
     );
 
-    // Proof that the three legs above are not vacuous, without needing a source
-    // edit to get it. A test that passes over a program too small to have
-    // reached the old ceiling would prove nothing at all, so: hand this same
-    // program to this same machine with a ceiling of exactly the 1,000,000 that
-    // used to be the default, and it must still be too big for it.
+    // Proof that the three legs above are not vacuous, without needing a source edit to get it.
     let ceilinged = Machine::for_program(&program, &resolved)
         .with_max_frames(1_000_000)
         .eval_test(0)
@@ -1901,9 +1802,8 @@ fn the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends() {
         ceilinged.message
     );
 
-    // And the exact crossover R5 measured, at the depth it measured it: k = 90
-    // passed and k = 100 raised. Machines only from here — the tree-walker has
-    // answered for this shape above and costs gigabytes each time it is asked.
+    // And the exact crossover R5 measured, at the depth it measured it: k = 90 passed and k = 100
+    // raised.
     for k in [90, 100, 150] {
         let src = hog(k, 9_990);
         let (p, r) = load(&src);
@@ -1916,11 +1816,8 @@ fn the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends() {
         );
     }
 
-    // The one number that does bound it still bites, and bites identically on
-    // both engines for a body pending 150 frames a call. Held to a budget of 50
-    // rather than the default 10,000 on purpose: at the default the tree-walker
-    // would nest 1,510,000 levels to reach the conclusion it reaches here in
-    // 7,550.
+    // The one number that does bound it still bites, and bites identically on both engines for a
+    // body pending 150 frames a call.
     let past = hog(150, 20_000);
     let (p, r) = load(&past);
     let m = Machine::for_program(&p, &r)
@@ -1944,10 +1841,9 @@ fn the_two_engines_and_a_backend_agree_however_many_frames_a_body_pends() {
     );
 }
 
-/// A frame ceiling is one engine's resource guard, so a machine carrying one
-/// offers nothing to a backend: a native body pends no frames and could not
-/// honour it, and an answer only one of the three strategies can give is the
-/// thing this seam exists to make structurally impossible.
+/// A frame ceiling is one engine's resource guard, so a machine carrying one offers nothing to a
+/// backend: a native body pends no frames and could not honour it, and an answer only one of the
+/// three strategies can give is the thing this seam exists to make structurally impossible.
 #[test]
 fn a_machine_asked_for_a_frame_ceiling_offers_nothing_to_a_backend() {
     let src = hog(4, 20);
@@ -1960,8 +1856,8 @@ fn a_machine_asked_for_a_frame_ceiling_offers_nothing_to_a_backend() {
     open.eval_test(0).expect("no ceiling, so this is entered");
     assert!(offered.entries() > 0, "the control never reached the seam");
 
-    // Far above what this program needs, so nothing here is about running out:
-    // the ceiling's mere presence is what withdraws the offer.
+    // Far above what this program needs, so nothing here is about running out: the ceiling's mere
+    // presence is what withdraws the offer.
     let refused = std::rc::Rc::new(honest::Budgeted::over(&program));
     let mut capped = Machine::new(&program, &resolved, &check).with_max_frames(1_000_000);
     capped.set_compiled(refused.clone());
@@ -1973,15 +1869,8 @@ fn a_machine_asked_for_a_frame_ceiling_offers_nothing_to_a_backend() {
     );
 }
 
-/// A clause body runs on the stack *below* its own handler, so the calls the
-/// handled body made since the handler was installed are not pending while the
-/// clause runs. The machine gets that from `capture` for free; the tree-walker
-/// has to hold them aside deliberately, and if it did not, one budget would be
-/// spent twice over and the two engines would part company at the boundary
-/// where handlers and recursion meet.
-///
-/// Twenty-one calls each side of the `perform`, under a budget of thirty: it
-/// fits only if the two halves are not summed.
+/// A clause body runs on the stack *below* its own handler, so the calls the handled body made
+/// since the handler was installed are not pending while the clause runs.
 #[test]
 fn a_handler_clause_is_charged_from_below_its_own_handler_on_both_engines() {
     let src = r#"
@@ -2002,8 +1891,8 @@ test "recursion on both sides of a perform" {
         .eval_test(0)
         .expect("the tree-walker holds them aside the same way");
 
-    // And they are put back: the value returns to the perform site inside the
-    // body, whose own calls are pending again.
+    // And they are put back: the value returns to the perform site inside the body, whose own calls
+    // are pending again.
     for budget in [21, 25] {
         let m = Machine::for_program(&program, &resolved)
             .with_max_calls(budget)
@@ -2019,14 +1908,9 @@ test "recursion on both sides of a perform" {
     }
 }
 
-/// The finding with the worse failure mode: a tail-recursive runaway was a
-/// diagnostic on the tree-walker in milliseconds and an unbounded loop on the
-/// machine, so `--engine both` hung after the authoritative engine had already
-/// answered.
-///
-/// A tail call now costs a `Frame::Call` like any other, so the shared call
-/// budget bounds it. The bounds are small here so the property is asserted
-/// without running the non-terminating program.
+/// The finding with the worse failure mode: a tail-recursive runaway was a diagnostic on the
+/// tree-walker in milliseconds and an unbounded loop on the machine, so `--engine both` hung after
+/// the authoritative engine had already answered.
 #[test]
 fn a_tail_recursive_runaway_is_bounded_on_both_engines() {
     let src = r#"
@@ -2056,13 +1940,7 @@ test "no base case in tail position" { assert_eq(spin(0), 0) }
     agree_and_fail(runaway, ply_span::codes::RUNTIME_ERROR);
 }
 
-/// The audit's third axis. ADR 0005 §6 says `--engine both` compares the
-/// verdict, the observed footprint *and* the final world; the footprint half
-/// was dead code, because neither engine overrode `observed_footprint` and
-/// `footprints_compared` was zero on every corpus.
-///
-/// It is the only axis that sees a `perform` whose result is discarded and
-/// whose clause is pure — one that changes no value and no cell.
+/// The audit's third axis.
 #[test]
 fn both_engines_report_the_footprint_they_observed() {
     let src = r#"
@@ -2091,9 +1969,9 @@ test "performs one atom" {
     assert_eq!(machine.trace().performs(), 1);
 }
 
-/// The axis has to bite, or reporting it is worse than not having it: an
-/// engine that performed a different atom, or the same atom a different number
-/// of times, must fail the audit even when the value and the world agree.
+/// The axis has to bite, or reporting it is worse than not having it: an engine that performed a
+/// different atom, or the same atom a different number of times, must fail the audit even when the
+/// value and the world agree.
 #[test]
 fn a_footprint_divergence_fails_the_audit_on_its_own() {
     let src = r#"
@@ -2112,8 +1990,8 @@ test "the result is discarded and the clauses are pure" {
         "the two engines agree on this program"
     );
 
-    // The same test, run twice on one engine: two performs against one, with an
-    // identical value and an identical world.
+    // The same test, run twice on one engine: two performs against one, with an identical value and
+    // an identical world.
     let twice = r#"
 effect state { read get[s]() -> Int }
 test "performs twice" {
@@ -2131,13 +2009,8 @@ test "performs twice" {
     assert!(d.right.contains("performed 2 times"), "{}", d.right);
 }
 
-/// `ply check` reports a refused clause before anything runs and the
-/// tree-walker reports it on reaching the `handle`. Both are E0504 and both
-/// must name the same clause, or a consumer cannot tell one report from two.
-///
-/// They differ today in the *effect name*: the static walk prints the name as
-/// written, the runtime refusal prints the program-wide one. Same code, same
-/// span, two spellings of one clause.
+/// `ply check` reports a refused clause before anything runs and the tree-walker reports it on
+/// reaching the `handle`.
 #[test]
 fn a_refused_clause_is_reported_at_the_same_place_by_both_paths() {
     let src = r#"
@@ -2162,9 +2035,9 @@ test "t" {
 
 // --- `iterate`, the one loop that is depth 1 however long it runs ------------
 
-/// The program both halves of the depth claim are made about: a loop of
-/// `n` steps, written once over `iterate` and once as the tail recursion it
-/// replaces, so the only difference between the two legs is the driver.
+/// The program both halves of the depth claim are made about: a loop of `n` steps, written once
+/// over `iterate` and once as the tail recursion it replaces, so the only difference between the
+/// two legs is the driver.
 fn loop_and_recursion(n: i64) -> (String, String) {
     let driven = format!(
         "fn step(s: {{ i: Int, acc: Int }}) -> Iter<{{ i: Int, acc: Int }}, Int> =\n  \
@@ -2181,22 +2054,13 @@ fn loop_and_recursion(n: i64) -> (String, String) {
     (driven, recursive)
 }
 
-/// **The claim the builtin exists for.** `iterate` rides the `Step::Apply`
-/// protocol, so the machine pushes one `Frame::IterateStep` and pops it again
-/// every round and the tree-walker keeps the loop on the host stack in
-/// `Interp::call_builtin`. Neither nests. A budget three orders of magnitude
-/// *below* `DEFAULT_MAX_CALLS` therefore runs a loop fifty times *above* it, on
-/// both engines, to the same answer.
-///
-/// The recursive leg is what makes that non-vacuous: the identical loop written
-/// as the tail recursion `iterate` replaces must raise at the same cap, or the
-/// cap is not measuring depth and the first half proves nothing.
+/// **The claim the builtin exists for.**
 #[test]
 fn an_iterate_of_five_hundred_thousand_steps_is_depth_one_on_both_engines() {
     let (driven, recursive) = loop_and_recursion(500_000);
 
-    // The arming leg first, so a cap that turned out to bound nothing fails
-    // here rather than passing silently above.
+    // The arming leg first, so a cap that turned out to bound nothing fails here rather than
+    // passing silently above.
     let (p, r) = load(&recursive);
     for (engine, d) in [
         (
@@ -2228,9 +2092,9 @@ fn an_iterate_of_five_hundred_thousand_steps_is_depth_one_on_both_engines() {
         .expect("the tree-walker drives the same protocol on its host stack");
 }
 
-/// The frame count, which the call count does not imply: a machine may be asked
-/// for a ceiling on its own pending frames, and a driver that accumulated one
-/// frame per round would pass the test above and fail this one.
+/// The frame count, which the call count does not imply: a machine may be asked for a ceiling on
+/// its own pending frames, and a driver that accumulated one frame per round would pass the test
+/// above and fail this one.
 #[test]
 fn an_iterate_of_any_length_fits_under_a_frame_ceiling_that_bounds_nothing_else() {
     let (driven, recursive) = loop_and_recursion(500_000);
@@ -2253,10 +2117,8 @@ fn an_iterate_of_any_length_fits_under_a_frame_ceiling_that_bounds_nothing_else(
         .expect("the loop is one frame however many times it goes round");
 }
 
-/// A runaway is a diagnostic and not a hang — the property ADR 0005 §7.1
-/// removed tail-call elision to keep, and the reason `iterate`'s budget is an
-/// argument rather than a constant. There is no per-test timeout anywhere in
-/// `ply-test` or `ply-cli`, so an unbounded loop here would hang the suite.
+/// A runaway is a diagnostic and not a hang — the property ADR 0005 §7.1 removed tail-call elision
+/// to keep, and the reason `iterate`'s budget is an argument rather than a constant.
 #[test]
 fn an_iterate_whose_step_never_stops_is_a_diagnostic_on_both_engines() {
     agree_and_fail(
@@ -2285,13 +2147,12 @@ test "no Stop" { assert_eq(iterate(0, 5000, never), 0) }
         "{}",
         m.message
     );
-    // Not phrased as a recursion limit: nothing nested, and four consumers
-    // classify on that string. See `limit::err_iterate_budget`.
+    // Not phrased as a recursion limit: nothing nested, and four consumers classify on that string.
     assert!(!m.message.contains("recursion limit"), "{}", m.message);
 }
 
-/// A budget that is not a count of steps is refused before the loop starts,
-/// identically on both engines.
+/// A budget that is not a count of steps is refused before the loop starts, identically on both
+/// engines.
 #[test]
 fn an_iterate_budget_below_one_is_refused_by_both_engines() {
     for budget in ["0", "-3"] {
@@ -2311,12 +2172,7 @@ fn an_iterate_budget_below_one_is_refused_by_both_engines() {
     }
 }
 
-/// The surface `iterate` newly reaches. `cont.rs`'s `MapStep` records that a
-/// builtin's callback runs across a frame the tree-walker cannot re-enter, and
-/// `iterate`'s step is user code with an open row — so an effect performed
-/// inside one is the case that reaches the two engines' handler machinery from
-/// a position nothing put it in before. Asserted rather than inferred from the
-/// `fold` precedent.
+/// The surface `iterate` newly reaches.
 #[test]
 fn an_effect_performed_inside_an_iterate_step_agrees_on_both_engines() {
     agree_and_pass(
@@ -2339,15 +2195,8 @@ test "a perform inside an iterate step" {
     );
 }
 
-/// A record update runs on both engines, and it runs on the *same* path the
-/// longhand does — because expansion in the parser makes it the same tree.
-///
-/// That is the claim worth auditing here. The alternative design, a
-/// `RecordUpdate` node each engine evaluates for itself, is two implementations
-/// of one construct and two chances to disagree: ADR 0001 rejected `.` for
-/// qualified references on exactly that ground. Both engines carry an
-/// `unreachable!` for the node instead, guarded by
-/// `no_record_update_survives_parse_module_anywhere_in_the_tree`.
+/// A record update runs on both engines, and it runs on the *same* path the longhand does — because
+/// expansion in the parser makes it the same tree.
 #[test]
 fn a_record_update_agrees_with_its_longhand_on_both_engines() {
     agree_and_pass(
@@ -2373,16 +2222,8 @@ test "the sugar and the longhand compute one value" {
     );
 }
 
-/// A `?` runs on both engines, and it runs on the *same* path the `match` does —
-/// because expansion in the parser makes it the same tree.
-///
-/// This is `a_record_update_agrees_with_its_longhand_on_both_engines`'s claim
-/// for `docs/adr/0027`, and the alternative it rules out is worse here: a real
-/// early-return node would have needed an unwind in the tree-walker's handler
-/// stack *and* one in the machine's segment capture, which is exactly where
-/// these two implementations can encode one language two ways. Both engines
-/// carry an `unreachable!` for `ExprKind::Try` instead, guarded by
-/// `no_try_survives_parse_module_anywhere_in_the_tree`.
+/// A `?` runs on both engines, and it runs on the *same* path the `match` does — because expansion
+/// in the parser makes it the same tree.
 #[test]
 fn a_try_agrees_with_its_longhand_on_both_engines() {
     agree_and_pass(
@@ -2422,11 +2263,6 @@ test "the sugar and the longhand compute one value, on the failing path too" {
 }
 
 /// **A `?` that fails stops the work after it, and it does so on both engines.**
-///
-/// This is the case a value comparison alone would miss: `sugar` and `longhand`
-/// could agree on `Err` while one of them had already performed the second step.
-/// The footprint is counted rather than assumed, which is what
-/// `a_replacement_value_performs_once_on_both_engines` learned to do below.
 #[test]
 fn a_failing_try_skips_what_follows_it_on_both_engines() {
     agree_and_pass(
@@ -2476,9 +2312,8 @@ test "both steps run when the first succeeds" {
     );
 }
 
-/// A replacement value may perform, and it performs exactly once — the base is
-/// copied field-wise, so an effect in a *written* field is not duplicated by the
-/// twelve copies beside it.
+/// A replacement value may perform, and it performs exactly once — the base is copied field-wise,
+/// so an effect in a *written* field is not duplicated by the twelve copies beside it.
 #[test]
 fn a_replacement_value_performs_once_on_both_engines() {
     agree_and_pass(

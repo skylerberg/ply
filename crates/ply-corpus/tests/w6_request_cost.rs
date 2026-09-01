@@ -1,12 +1,4 @@
 //! What one request allocates, exactly, layer by layer.
-//!
-//! The W6 ladder says where a request's *time* goes. This says where its
-//! *allocations* go, which is the same decomposition in a unit that does not
-//! change between machines — so a later change is measured against it rather
-//! than against a wall clock on somebody else's laptop.
-//!
-//! The counting allocator is why this is its own test binary: a
-//! `#[global_allocator]` is a whole-binary decision.
 
 use ply_eval::Value;
 use ply_span::Span;
@@ -53,11 +45,6 @@ fn repo() -> PathBuf {
 }
 
 /// Allocations per request, on the same rungs the ladder times.
-///
-/// Each mode of the driver is the one below it plus exactly one layer, so a
-/// difference is that layer's allocation cost. The whole-request row is the
-/// service over `SimNet`, which adds the read loop, the effect performs and the
-/// handler-stack walk to the pure pieces above it.
 #[test]
 fn a_request_allocates_where_the_ladder_says_its_time_goes() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
@@ -113,9 +100,7 @@ fn a_request_allocates_where_the_ladder_says_its_time_goes() {
         whole > 0.0,
         "a request that allocates nothing is a measurement that did not run"
     );
-    // Every rung adds work, so every rung must allocate at least as much as the
-    // one below it. A layer that allocated *less* would mean the driver's modes
-    // are not nested, and every difference in this table would be meaningless.
+    // Every rung adds work, so every rung must allocate at least as much as the one below it.
     for pair in rows.windows(2) {
         assert!(
             pair[1].1 >= pair[0].1,
@@ -128,10 +113,9 @@ fn a_request_allocates_where_the_ladder_says_its_time_goes() {
     }
 }
 
-/// The twin's store is not on a served request path, and this is why it is kept
-/// out of the ladder's `endpoint` rung: `std.db`'s memory engine parses its SQL
-/// in Ply on every call, so a `/items` handler over it allocates several times
-/// what the same handler costs against postgres.
+/// The twin's store is not on a served request path, and this is why it is kept out of the ladder's
+/// `endpoint` rung: `std.db`'s memory engine parses its SQL in Ply on every call, so a `/items`
+/// handler over it allocates several times what the same handler costs against postgres.
 #[test]
 fn the_in_memory_store_is_priced_apart_from_the_endpoint() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
@@ -163,10 +147,7 @@ fn the_in_memory_store_is_priced_apart_from_the_endpoint() {
     );
 }
 
-/// Entering the machine is not the cost. W1 said the host boundary was 0.5µs of
-/// a 601µs request; this is the same statement about the call itself, in
-/// allocations, and it is what keeps `Machine::call` out of every layer above
-/// it.
+/// Entering the machine is not the cost.
 #[test]
 fn entering_the_machine_allocates_a_bounded_amount() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");
@@ -191,9 +172,8 @@ fn entering_the_machine_allocates_a_bounded_amount() {
     );
 }
 
-/// The two engines answer the same value on the same request path, which is
-/// what makes the W6 engine substitution a ratio rather than a comparison
-/// between two programs.
+/// The two engines answer the same value on the same request path, which is what makes the W6
+/// engine substitution a ratio rather than a comparison between two programs.
 #[test]
 fn both_engines_answer_the_request_path_alike() {
     let loaded = ply_corpus::w6_run::program(&repo()).expect("the service must compile");

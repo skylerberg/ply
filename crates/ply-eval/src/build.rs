@@ -1,5 +1,4 @@
-//! AST constructors for the tests. The evaluator is tested against the AST
-//! directly so a parser change cannot silently redefine what is being checked.
+//! AST constructors for the tests.
 
 use ply_span::{SourceId, Span};
 use ply_syntax::ast::*;
@@ -293,8 +292,7 @@ pub fn clause(
     }
 }
 
-/// `op(x̄) resume κ -> body`. The body's value is the whole `handle`'s result,
-/// and reaching the resumption is up to the body.
+/// `op(x̄) resume κ -> body`.
 pub fn general_clause(
     effect: &str,
     op: &str,
@@ -474,8 +472,8 @@ pub fn effect_def(name: &str, ops: &[(&str, Mode, bool)]) -> Item {
     }))
 }
 
-/// One anonymous module standing alone: bare names stay bare, so a hand-built
-/// AST reads exactly as it did before modules existed.
+/// One anonymous module standing alone: bare names stay bare, so a hand-built AST reads exactly as
+/// it did before modules existed.
 pub fn module(items: Vec<Item>) -> Module {
     Module {
         name: ModuleName::anonymous(),

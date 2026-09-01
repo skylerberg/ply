@@ -1,20 +1,4 @@
 //! What the region model is worth on the repository's own programs, counted.
-//!
-//! `region_kind_inference.rs::the_split_over_the_repositorys_own_examples`
-//! reports the **static** split — 113 regions, 0 `unique`, 113 `shared`, every
-//! one of them because of a tail-resumptive clause. Read alone, that says ADR
-//! 0017 §3's "this is the common case and it is free" does not survive contact
-//! with the corpus.
-//!
-//! It is not the number that decides what reclamation is worth, because the
-//! kinds do not decide when a close reclaims — the pins do. A `shared` region
-//! that no continuation outlived hands its slots back at its close exactly as a
-//! `unique` one would. So this file runs every test in `examples/` and reports
-//! the **dynamic** split: closes that freed against closes that had to defer,
-//! and the peak live slots against the slots ever bumped.
-//!
-//! It asserts a floor rather than an exact figure — the corpus moves and this is
-//! evidence, not a gate — and prints the census so a report can quote it.
 
 use ply_eval::Machine;
 use ply_span::{SourceId, SourceMap};
@@ -92,9 +76,9 @@ fn what_the_examples_reclaim_and_what_they_have_to_hold() {
     let mut census = Census::default();
     let mut machine = Machine::new(&program, &resolved, &check);
     for index in 0..machine.test_count() {
-        // A test that reaches a real socket or a real database is refused
-        // hermetically, which is the default this project ships; it still ran
-        // whatever it ran before the refusal, so its regions count.
+        // A test that reaches a real socket or a real database is refused hermetically, which is
+        // the default this project ships; it still ran whatever it ran before the refusal, so its
+        // regions count.
         match machine.eval_test(index) {
             Ok(()) => census.tests_run += 1,
             Err(_) => census.tests_refused += 1,

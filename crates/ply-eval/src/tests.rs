@@ -4,10 +4,7 @@ use crate::{Interp, Machine, Value};
 use ply_span::{Diagnostic, codes};
 use ply_syntax::ast::{BinOp, Expr, Item, Mode, UnOp};
 
-/// Runs both engines, so that every test below is a differential test. The
-/// comparison lives here rather than in a suite of its own so that a divergence
-/// fails the test that found it: a run leaves a cache entry behind, and a wrong
-/// one is permanent.
+/// Runs both engines, so that every test below is a differential test.
 fn eval_in(items: Vec<Item>, e: Expr) -> Result<Value, Diagnostic> {
     let (program, resolved) = standalone(items);
     let mut treewalk = Interp::for_program(&program, &resolved);
@@ -313,8 +310,8 @@ fn unbounded_recursion_becomes_a_diagnostic_not_a_stack_overflow() {
     assert!(d.message.contains("recursion limit"), "{}", d.message);
 }
 
-/// The depth limit is only a real bound if the native stack underneath it
-/// never runs out first, on a stack far smaller than a worker's default.
+/// The depth limit is only a real bound if the native stack underneath it never runs out first, on
+/// a stack far smaller than a worker's default.
 #[test]
 fn recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack() {
     let handle = std::thread::Builder::new()
@@ -347,9 +344,8 @@ fn recursion_to_the_depth_limit_survives_a_one_mebibyte_thread_stack() {
     );
 }
 
-/// Runs `f` on a stack half a worker's default, where an unbounded host
-/// recursion aborts the whole test binary rather than failing one test — which
-/// is exactly the failure mode being pinned.
+/// Runs `f` on a stack half a worker's default, where an unbounded host recursion aborts the whole
+/// test binary rather than failing one test — which is exactly the failure mode being pinned.
 fn on_a_small_stack<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> R {
     std::thread::Builder::new()
         .stack_size(1024 * 1024)
@@ -367,9 +363,7 @@ fn chain(depth: usize) -> Value {
     v
 }
 
-/// An expression nests without calling anything, so `DEFAULT_MAX_CALLS` never
-/// sees it. Both engines evaluate this — through `eval_in` — and the tree-walker
-/// is the one that recurses natively per node.
+/// An expression nests without calling anything, so `DEFAULT_MAX_CALLS` never sees it.
 #[test]
 fn a_deeply_nested_expression_evaluates_on_a_one_mebibyte_thread_stack() {
     let rendered = on_a_small_stack(|| {
@@ -384,8 +378,8 @@ fn a_deeply_nested_expression_evaluates_on_a_one_mebibyte_thread_stack() {
     assert_eq!(rendered, Ok("3001".to_string()));
 }
 
-/// A value is as deep as the recursion that built it, so anything the call bound
-/// permits has to compare — and then drop, which is drop glue and recurses too.
+/// A value is as deep as the recursion that built it, so anything the call bound permits has to
+/// compare — and then drop, which is drop glue and recurses too.
 #[test]
 fn a_value_the_call_bound_permits_compares_and_drops_on_a_small_stack() {
     assert!(on_a_small_stack(|| {
@@ -394,8 +388,7 @@ fn a_value_the_call_bound_permits_compares_and_drops_on_a_small_stack() {
     }));
 }
 
-/// Past the bound the answer is a diagnostic. Only iteration gets here, which is
-/// why the bound sits where the call bound does.
+/// Past the bound the answer is a diagnostic.
 #[test]
 fn a_value_past_the_bound_is_a_diagnostic_and_not_an_abort() {
     let (code, message) = on_a_small_stack(|| {
@@ -409,9 +402,8 @@ fn a_value_past_the_bound_is_a_diagnostic_and_not_an_abort() {
     assert!(message.contains("nested values"), "{message}");
 }
 
-/// The diff walks the same structure the comparison does, so it needs the same
-/// bound — and it is reached only after a comparison came back false, which is
-/// what this builds.
+/// The diff walks the same structure the comparison does, so it needs the same bound — and it is
+/// reached only after a comparison came back false, which is what this builds.
 #[test]
 fn the_first_difference_of_two_deep_values_is_found_on_a_small_stack() {
     let found = on_a_small_stack(|| {
@@ -441,8 +433,7 @@ fn the_depth_counter_unwinds_so_sequential_calls_are_not_penalized() {
             callv("down", vec![bin(BinOp::Sub, var("n"), int(1))]),
         ),
     )];
-    // Twenty separate 10-deep call chains under a limit of 12: only a leaking
-    // counter would trip.
+    // Twenty separate 10-deep call chains under a limit of 12: only a leaking counter would trip.
     let mut body = int(0);
     for _ in 0..20 {
         body = bin(BinOp::Add, body, callv("down", vec![int(10)]));
@@ -523,8 +514,8 @@ fn nested_constructor_patterns_bind_inner_values() {
 #[test]
 fn a_nullary_constructor_pattern_tests_rather_than_binds() {
     let items = vec![type_def("Option", &[("Some", 1), ("None", 0)])];
-    // The parser cannot distinguish `None` the binder from `None` the variant,
-    // so a bare name that is a known nullary constructor must not match `Some`.
+    // The parser cannot distinguish `None` the binder from `None` the variant, so a bare name that
+    // is a known nullary constructor must not match `Some`.
     let e = match_(
         callv("Some", vec![int(7)]),
         vec![
@@ -638,8 +629,6 @@ fn a_refutable_let_that_fails_is_a_diagnostic() {
     assert!(d.message.contains("`let` pattern"), "{}", d.message);
 }
 
-/// ADR 0005 §6. Approximating a general clause as tail-resumptive would produce
-/// a plausible wrong answer, and the result cache would keep it.
 #[test]
 fn the_tree_walker_refuses_a_clause_that_binds_a_continuation() {
     let items = vec![state_effect()];
@@ -846,8 +835,7 @@ fn a_self_performing_handler_with_nothing_outside_it_is_unhandled_not_looping() 
 #[test]
 fn the_handler_stack_is_restored_after_a_clause_returns() {
     let items = vec![state_effect()];
-    // The clause escapes to the outer handler; the second perform must still
-    // find the inner one.
+    // The clause escapes to the outer handler; the second perform must still find the inner one.
     let e = handle(
         handle(
             bin(
@@ -1225,10 +1213,9 @@ fn filter_requires_a_boolean_predicate() {
     assert!(d.message.contains("Bool"), "{}", d.message);
 }
 
-/// `range` takes two arguments and always did to the checker; this suite used
-/// to call it with one, which is how a builtin can be covered here and
-/// unreachable from every program the checker accepts (ADR 0029). Both bounds
-/// are now written.
+/// `range` takes two arguments and always did to the checker; this suite used to call it with one,
+/// which is how a builtin can be covered here and unreachable from every program the checker
+/// accepts (ADR 0029).
 #[test]
 fn range_builds_half_open_intervals_and_refuses_runaways() {
     assert_eq!(
@@ -1285,8 +1272,8 @@ fn string_builtins_reject_non_strings() {
     );
 }
 
-/// The literal is ASCII in source, so the multi-byte character has to arrive as
-/// escapes; this is what a socket hands the program.
+/// The literal is ASCII in source, so the multi-byte character has to arrive as escapes; this is
+/// what a socket hands the program.
 const EURO: &[u8] = b"\xe2\x82\xac";
 
 #[track_caller]
@@ -1329,8 +1316,8 @@ fn bytes_indexing_out_of_range_is_reported_rather_than_wrapped() {
     }
 }
 
-/// A clamp is the failure this project exists to refuse: it turns an off-by-one
-/// into a shorter answer every later assertion agrees with.
+/// A clamp is the failure this project exists to refuse: it turns an off-by-one into a shorter
+/// answer every later assertion agrees with.
 #[test]
 fn bytes_slice_out_of_range_is_refused_and_never_clamped() {
     for (start, end) in [(0, 4), (2, 1), (-1, 2), (4, 4)] {
@@ -1373,8 +1360,8 @@ fn invalid_utf8_is_a_value_the_program_can_test_for() {
     assert_eq!(ok_render(callv("bytes_is_utf8", vec![bytes(b"")])), "true");
 }
 
-/// The requirement stated as a program: cutting a multi-byte character in half
-/// is an error naming where, not a `U+FFFD` chosen on the program's behalf.
+/// The requirement stated as a program: cutting a multi-byte character in half is an error naming
+/// where, not a `U+FFFD` chosen on the program's behalf.
 #[test]
 fn a_slice_that_splits_a_character_fails_and_names_the_offset() {
     let half = callv("bytes_slice", vec![bytes(EURO), int(0), int(2)]);
@@ -1407,8 +1394,7 @@ fn string_of_bytes_names_the_offset_of_the_first_bad_sequence() {
     );
 }
 
-/// Character indices, not byte offsets, so no argument can name a position
-/// inside a character.
+/// Character indices, not byte offsets, so no argument can name a position inside a character.
 #[test]
 fn string_slice_counts_characters() {
     let s = string("héllo");
@@ -1429,8 +1415,8 @@ fn string_slice_counts_characters() {
     assert!(d.message.contains("characters"), "{}", d.message);
 }
 
-/// Characters, so it is the number `string_slice` indexes in; `bytes_len` of
-/// the encoding is the other number, and the two differ wherever text does.
+/// Characters, so it is the number `string_slice` indexes in; `bytes_len` of the encoding is the
+/// other number, and the two differ wherever text does.
 #[test]
 fn string_len_counts_characters_and_bytes_len_counts_bytes() {
     assert_eq!(ok_render(callv("string_len", vec![string("héllo")])), "5");
@@ -1486,8 +1472,8 @@ fn string_search_and_split_are_what_a_header_parser_needs() {
     );
 }
 
-/// A character index rather than a byte offset, so it composes with
-/// `string_slice` over text that is not ASCII.
+/// A character index rather than a byte offset, so it composes with `string_slice` over text that
+/// is not ASCII.
 #[test]
 fn string_find_indexes_characters_and_refuses_to_invent_a_sentinel() {
     let s = string("héllo—world");
@@ -1558,8 +1544,8 @@ fn a_bytes_pattern_matches_exactly_and_never_a_string() {
     );
 }
 
-/// Both engines run every test in this file, so this is really a claim about
-/// the machine and the tree-walker agreeing on a value neither had before.
+/// Both engines run every test in this file, so this is really a claim about the machine and the
+/// tree-walker agreeing on a value neither had before.
 #[test]
 fn a_large_bytes_value_renders_truncated_rather_than_in_full() {
     let big: Vec<u8> = (0..=255u8).collect();
@@ -1570,9 +1556,8 @@ fn a_large_bytes_value_renders_truncated_rather_than_in_full() {
     assert!(rendered.starts_with("b\"\\x00\\x01"), "{rendered}");
 }
 
-/// What an assertion failure prints has to be something the author can paste
-/// back into the source, or the diff is unusable for the one value whose
-/// contents are not readable on sight.
+/// What an assertion failure prints has to be something the author can paste back into the source,
+/// or the diff is unusable for the one value whose contents are not readable on sight.
 #[test]
 fn every_rendered_byte_lexes_back_to_the_byte_it_came_from() {
     let all: Vec<u8> = (0..=255u8).collect();
@@ -1631,9 +1616,8 @@ fn panic_carries_its_message() {
 fn every_builtin_checks_its_argument_count() {
     for b in crate::Builtin::all() {
         let (min, max) = b.arity();
-        // `map_new` is nullary — Ply has no top-level constants, so the empty
-        // map is a call — and there is no such thing as too few arguments for
-        // one. The other leg still runs, so it is not exempt from the check.
+        // `map_new` is nullary — Ply has no top-level constants, so the empty map is a call — and
+        // there is no such thing as too few arguments for one.
         if min > 0 {
             let too_few: Vec<Expr> = (0..min - 1).map(|_| int(0)).collect();
             let d = err(callv(b.name(), too_few));
@@ -1665,11 +1649,8 @@ fn a_user_definition_shadows_a_builtin_of_the_same_name() {
     }
 }
 
-/// The message is a parameter now, not an optional trailing argument: source
-/// writes `assert(c)` and `ply_syntax::defaults` splices `None` in, so what
-/// reaches here always has two. This suite used to call it with one, which is
-/// exactly how the arm below stayed unreachable from source for the whole
-/// history of the language (ADR 0029).
+/// The message is a parameter now, not an optional trailing argument: source writes `assert(c)` and
+/// `ply_syntax::defaults` splices `None` in, so what reaches here always has two.
 #[test]
 fn assert_passes_on_true_and_reports_its_message_on_false() {
     // A nullary constructor is a bare name, not a nullary call.
@@ -1821,8 +1802,8 @@ fn a_failed_test_does_not_poison_the_next_one() {
     );
 }
 
-/// There is no longer one `main` per program, so choosing an entry point is
-/// the caller's job; the evaluator only answers to a program-wide name.
+/// There is no longer one `main` per program, so choosing an entry point is the caller's job; the
+/// evaluator only answers to a program-wide name.
 #[test]
 fn call_invokes_a_definition_by_its_program_wide_name() {
     let (program, resolved) =
@@ -1852,12 +1833,8 @@ fn values_render_readably_for_a_report_reader() {
     assert!(long.ends_with("… 8 more]"), "{long}");
 }
 
-/// The default engine is the authoritative one, and only the authoritative one
-/// may read or write a cached `Pass`. A multi-shot program is machine-only, so
-/// while the default was the tree-walker the milestone's headline capability
-/// and the project's headline capability were mutually exclusive: every
-/// program with a `resume` clause needed a non-default engine and was
-/// therefore uncacheable.
+/// The default engine is the authoritative one, and only the authoritative one may read or write a
+/// cached `Pass`.
 #[test]
 fn the_default_engine_is_the_one_whose_results_may_be_cached() {
     use crate::{Engine, EngineChoice};
@@ -1866,8 +1843,8 @@ fn the_default_engine_is_the_one_whose_results_may_be_cached() {
     assert!(!EngineChoice::default().bypasses_cache());
     assert_eq!(Engine::default(), Engine::Machine);
 
-    // An explicit choice is reported as itself, never as whatever the default
-    // happens to be — the bug the flip exposed.
+    // An explicit choice is reported as itself, never as whatever the default happens to be — the
+    // bug the flip exposed.
     assert_eq!(EngineChoice::Treewalk.primary(), Engine::Treewalk);
     assert_eq!(EngineChoice::Machine.primary(), Engine::Machine);
 

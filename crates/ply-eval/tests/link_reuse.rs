@@ -1,15 +1,5 @@
-//! What a frame push and a scope binding cost the allocator once the machine is
-//! warm, and that reusing a link cannot make two owners disagree.
-//!
-//! W6 measured the control stack and the environment as 47% and 8.5% of a
-//! request's allocations: both are `Rc`-linked persistent chains rewritten on
-//! almost every step, and both freed the link they had just allocated. The fix
-//! is a thread-local free list, and the hazard a free list introduces is
-//! exactly one — recycling a link somebody else still holds — so the third test
-//! here is the one that matters.
-//!
-//! The counting allocator is why this is its own test binary: a
-//! `#[global_allocator]` is a whole-binary decision.
+//! What a frame push and a scope binding cost the allocator once the machine is warm, and that
+//! reusing a link cannot make two owners disagree.
 
 use ply_eval::{Env, Frame, Next, ScopeSlot, Stack, Value};
 use ply_span::{Span, Symbol};
@@ -42,8 +32,8 @@ fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
     (out, ALLOCS.with(Cell::get))
 }
 
-/// A frame that carries a value the test can read back, so a recycled link is
-/// checked for what it holds rather than only for how many it holds.
+/// A frame that carries a value the test can read back, so a recycled link is checked for what it
+/// holds rather than only for how many it holds.
 fn marker(n: i64) -> Frame {
     Frame::BinaryApply {
         op: ply_syntax::ast::BinOp::Add,
@@ -54,8 +44,8 @@ fn marker(n: i64) -> Frame {
     }
 }
 
-/// Pops the whole stack into `out`, which the caller supplies so that a
-/// measured region does not pay for the test's own bookkeeping.
+/// Pops the whole stack into `out`, which the caller supplies so that a measured region does not
+/// pay for the test's own bookkeeping.
 fn drain_into(mut stack: Stack, out: &mut Vec<i64>) {
     loop {
         match stack.into_next() {
@@ -120,13 +110,8 @@ fn a_warm_scope_binding_allocates_nothing() {
     );
 }
 
-/// The hazard a free list introduces, and the only one: a link two owners hold
-/// must not be recycled when the first of them lets go.
-///
-/// The shared prefix here is what a captured continuation holds — `Stack::clone`
-/// is what `capture` and `resume` are built out of — so a pool that recycled a
-/// shared link would show up as the survivor reading frames the other owner's
-/// pushes had overwritten.
+/// The hazard a free list introduces, and the only one: a link two owners hold must not be recycled
+/// when the first of them lets go.
 #[test]
 fn a_chain_two_owners_hold_survives_the_first_letting_go() {
     let mut shared = Stack::new();
@@ -138,8 +123,8 @@ fn a_chain_two_owners_hold_survives_the_first_letting_go() {
     // The first owner retires every link and offers each to the pool.
     assert_eq!(drain(shared).len(), DEPTH as usize);
 
-    // Enough pushes to hand out every link the pool could have taken, each
-    // carrying a marker that would be visible if a shared link were reused.
+    // Enough pushes to hand out every link the pool could have taken, each carrying a marker that
+    // would be visible if a shared link were reused.
     let mut later = Stack::new();
     for n in 0..DEPTH * 4 {
         later = later.pushed(marker(-1 - n));
@@ -154,9 +139,8 @@ fn a_chain_two_owners_hold_survives_the_first_letting_go() {
     assert_eq!(drain(later).len(), (DEPTH * 4) as usize);
 }
 
-/// The same statement for a scope: a closure captures its defining environment
-/// by cloning one pointer, and the pool must not be able to rewrite what that
-/// pointer reaches.
+/// The same statement for a scope: a closure captures its defining environment by cloning one
+/// pointer, and the pool must not be able to rewrite what that pointer reaches.
 #[test]
 fn a_captured_scope_survives_the_scope_it_was_taken_from() {
     let name = Symbol::new("captured");
@@ -176,9 +160,7 @@ fn a_captured_scope_survives_the_scope_it_was_taken_from() {
     );
 }
 
-/// What the free list can hold, so its memory cost is a number rather than a
-/// hope. The bound is per link type per thread, and a worker thread pays it
-/// only once it has run something that deep.
+/// What the free list can hold, so its memory cost is a number rather than a hope.
 #[test]
 fn the_pools_upper_bound_is_stated_in_bytes() {
     let frame = std::mem::size_of::<Frame>();

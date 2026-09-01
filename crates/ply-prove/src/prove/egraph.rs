@@ -1,19 +1,14 @@
 //! Union-find over terms, plus the two structural rules a constructor obeys.
-//!
-//! A branch of the case analysis is exactly one of these plus a list of
-//! disequalities. Branches are explored by cloning, which is affordable because
-//! an obligation's term graph is small and which removes every question about
-//! restoring state on backtracking.
 
 use super::term::{Node, TermId, Terms};
 
 #[derive(Clone, Default)]
 pub struct Classes {
     parent: Vec<TermId>,
-    /// Pairs the branch has asserted distinct. Checked after every closure.
+    /// Pairs the branch has asserted distinct.
     diseqs: Vec<(TermId, TermId)>,
-    /// A contradiction was derived: two distinct constructors, two distinct
-    /// literals, or an asserted disequality between terms proved equal.
+    /// A contradiction was derived: two distinct constructors, two distinct literals, or an
+    /// asserted disequality between terms proved equal.
     pub contradiction: bool,
 }
 
@@ -26,8 +21,8 @@ impl Classes {
         }
     }
 
-    /// Terms created after this branch started — a case split's constructor
-    /// fields — join as their own classes.
+    /// Terms created after this branch started — a case split's constructor fields — join as their
+    /// own classes.
     pub fn grow(&mut self, size: usize) {
         while self.parent.len() < size {
             self.parent.push(self.parent.len());
@@ -47,8 +42,8 @@ impl Classes {
         if a == b {
             return false;
         }
-        // Lower id wins, so a branch's class representatives are a function of
-        // the assertions rather than of the order they arrived in.
+        // Lower id wins, so a branch's class representatives are a function of the assertions
+        // rather than of the order they arrived in.
         let (keep, drop) = if a < b { (a, b) } else { (b, a) };
         self.parent[drop] = keep;
         true
@@ -90,16 +85,14 @@ impl Classes {
     }
 }
 
-/// What a class is known to be, structurally. Two members of one class with
-/// different shapes of the **same kind** are a contradiction; two of different
-/// kinds are not, because a wrong sort must never be able to close a branch.
+/// What a class is known to be, structurally.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Shape<'a> {
     Int(i64),
     Bool(bool),
     Str(&'a str),
-    /// Already normalized by [`Terms::decimal`](super::term::Terms::decimal), so
-    /// two shapes differ exactly when the two values do.
+    /// Already normalized by [`Terms::decimal`](super::term::Terms::decimal), so two shapes differ
+    /// exactly when the two values do.
     Decimal(i128, u32),
     Ctor(&'a Node),
     List(usize),
@@ -119,8 +112,7 @@ pub fn shape_of<'a>(terms: &'a Terms, t: TermId) -> Option<Shape<'a>> {
     }
 }
 
-/// Whether two shapes of the same kind name different values. `None` means the
-/// question was not asked of comparable shapes and nothing may be concluded.
+/// Whether two shapes of the same kind name different values.
 pub fn conflict(a: &Shape<'_>, b: &Shape<'_>) -> Option<bool> {
     match (a, b) {
         (Shape::Int(x), Shape::Int(y)) => Some(x != y),
@@ -168,8 +160,7 @@ mod tests {
         assert!(classes.contradiction);
     }
 
-    /// Shapes of different kinds never conflict. A sort the lowering guessed
-    /// wrong must not be able to close a branch.
+    /// Shapes of different kinds never conflict.
     #[test]
     fn shapes_of_different_kinds_conclude_nothing() {
         assert_eq!(conflict(&Shape::Int(1), &Shape::Bool(true)), None);

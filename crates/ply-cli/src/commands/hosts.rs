@@ -1,12 +1,4 @@
 //! `ply hosts` — the trusted computing base, enumerable in one command.
-//!
-//! This is the listing ADR 0008 calls "the change most worth a human's
-//! attention in the entire system", so two properties decide the whole
-//! implementation: it is ordered deterministically, and it never abbreviates. A
-//! handler that claims every table prints one line per table it got, and the
-//! digest at the foot covers every column of every row — including the flags,
-//! because a handler that quietly became repeatable is exactly the change a
-//! diff has to show.
 
 use super::common::{
     IND, diagnostics_json, emit_json, print_diagnostics, report_bind_error, report_load_error,
@@ -20,8 +12,7 @@ use ply_host::tls;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-/// The `--json` object's shape. Independent of `ply test`'s, because a consumer
-/// pinning a TCB is not the consumer reading a run.
+/// The `--json` object's shape.
 pub const SCHEMA_VERSION: u32 = 1;
 
 pub fn execute(args: &HostsArgs, style: Style) -> i32 {
@@ -30,17 +21,8 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         Err(err) => return report_load_error("hosts", &err, args.json, style),
     };
 
-    // Resolved whether or not `--host` was passed: the TCB is a property of the
-    // registry and the program, and a digest that moved when a flag moved would
-    // pin nothing.
-    // The sink and the drain window this run was configured with, resolved
-    // whether or not `--host` was passed. The digest is a property of the
-    // registry, the program and the run's configuration — never of the flag
-    // that decides whether any of it is used, because a digest that moved with
-    // `--host` would pin nothing.
-    //
-    // Built here rather than listened on: `ply hosts` prints what a serving run
-    // would do at a signal and installs no handler of its own.
+    // Resolved whether or not `--host` was passed: the TCB is a property of the registry and the
+    // program, and a digest that moved when a flag moved would pin nothing.
     let trace = args.trace.open();
     let shutdown = ply_host::signal::Shutdown::new(args.shutdown.bounds());
     let listing = match hosts::Hosts::preview(&loaded.check, Some(Arc::clone(&trace))) {
@@ -62,19 +44,17 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
         }
     };
 
-    // Loaded here rather than only under `--host`, because `ply hosts` is the
-    // command that answers "what does this run trust" and a credential that
-    // will not load is a run that will not start. `E0430` before anything else
-    // is printed, so a listing is never produced over material that is broken.
+    // Loaded here rather than only under `--host`, because `ply hosts` is the command that answers
+    // "what does this run trust" and a credential that will not load is a run that will not start.
     let credentials = match tls::Credentials::load(&args.tls.tls) {
         Ok(credentials) => credentials,
         Err(diagnostics) => {
             return report_bind_error("hosts", &diagnostics, &loaded.sources, args.json, style);
         }
     };
-    // Resolved here for the same reason the credentials are: `ply hosts` is the
-    // command that answers "what does this run trust", and a connection string
-    // that will not parse is a run that will not start.
+    // Resolved here for the same reason the credentials are: `ply hosts` is the command that
+    // answers "what does this run trust", and a connection string that will not parse is a run that
+    // will not start.
     let db = match args.db.resolve(args.host) {
         Ok(db) => db,
         Err(diagnostics) => {
@@ -93,11 +73,9 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             );
         }
     };
-    // Resolved here for the reason the credentials and the connection string
-    // are: `ply hosts` answers "what does this run trust", and a required key
-    // nothing supplies is a run that will not start. The warnings are printed
-    // beside the listing rather than swallowed, because a `--set` the schema
-    // does not declare is the classic silent deploy failure.
+    // Resolved here for the reason the credentials and the connection string are: `ply hosts`
+    // answers "what does this run trust", and a required key nothing supplies is a run that will
+    // not start.
     let (configuration, config_warnings) = match crate::config::Configuration::open(
         &loaded.program,
         &loaded.resolved,
@@ -137,9 +115,7 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             "handlers": listing.handlers,
             "operations": listing.rows.len(),
             "digest": hosts::digest_short(&listing, &disclosures),
-            // Present in both bindings. `binding` says what this run would use;
-            // the rows say what exists, and an agent should not have to invoke
-            // the command twice to learn both.
+            // Present in both bindings.
             "hosts": hosts::rows_json(&listing),
             "diagnostics": Value::Array(Vec::new()),
         });
@@ -176,18 +152,12 @@ pub fn execute(args: &HostsArgs, style: Style) -> i32 {
             println!("{IND}{line}");
         }
     }
-    // Rendered like the errors of its class rather than as a bare line: a
-    // `W0607` is the run's configuration at fault, exactly as `E0440` is, and a
-    // deploy check greps for the code.
+    // Rendered like the errors of its class rather than as a bare line: a `W0607` is the run's
+    // configuration at fault, exactly as `E0440` is, and a deploy check greps for the code.
     print_diagnostics(&config_warnings, &loaded.sources, style);
     EXIT_OK
 }
 
-/// The `--db-schema` function, resolved and materialised.
-///
-/// `ply hosts` is the one command whose whole output is this block, so it pays
-/// for the evaluation that fills in the counts. A name that resolves to nothing
-/// is `E0431` here rather than at the first statement.
 fn schema_view(
     loaded: &crate::load::Loaded,
     db: Option<&crate::db::DbConfig>,
@@ -231,8 +201,8 @@ mod tests {
         assert_eq!(args.path, PathBuf::from("src"));
     }
 
-    /// `--digest` is the one-line form a CI check pins, so it may not also carry
-    /// a table for a human.
+    /// `--digest` is the one-line form a CI check pins, so it may not also carry a table for a
+    /// human.
     #[test]
     fn digest_and_json_cannot_both_be_asked_for() {
         assert!(Cli::try_parse_from(["ply", "hosts", "--digest", "--json"]).is_err());

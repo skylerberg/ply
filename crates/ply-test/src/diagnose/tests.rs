@@ -1,10 +1,4 @@
-//! The five situations a failure can be in, driven end to end through
-//! [`diagnose`].
-//!
-//! The hybrid is an oracle rather than a real mixed program — building one needs
-//! the body store — so what is under test here is the gating, the delta the
-//! search is handed, and the artifact that comes out. Those are the parts where
-//! a wrong answer is confident rather than absent.
+//! The five situations a failure can be in, driven end to end through [`diagnose`].
 
 use super::{Evidence, Options, diagnose};
 use crate::bisect::{
@@ -50,11 +44,10 @@ fn baseline(defs: &[(&str, u8)], test: u8) -> Baseline {
     )
 }
 
-/// Answers the classification questions from a table, so a test says exactly
-/// what the system was told rather than deriving it.
+/// Answers the classification questions from a table, so a test says exactly what the system was
+/// told rather than deriving it.
 struct Told {
-    /// Names the current body re-normalizes to the baseline hash for — the
-    /// `Derived` ones.
+    /// Names the current body re-normalizes to the baseline hash for — the `Derived` ones.
     derived: Vec<Symbol>,
     interface_moved: Vec<Symbol>,
     test_edited: bool,
@@ -127,8 +120,7 @@ impl Hybrid for Culprits {
     }
 }
 
-/// Which of the preconditions hold. Grouped so a call site reads as the
-/// situation it is describing rather than as four bare booleans.
+/// Which of the preconditions hold.
 #[derive(Clone, Copy)]
 struct Situation {
     baseline: bool,
@@ -136,8 +128,7 @@ struct Situation {
     defect: bool,
     /// The failing run reached a host handler.
     host: bool,
-    /// Which way a missing hybrid builder is reported. Only reachable when the
-    /// search would have had to run a mixture.
+    /// Which way a missing hybrid builder is reported.
     absent: Skipped,
 }
 
@@ -162,9 +153,8 @@ struct Case {
 }
 
 impl Case {
-    /// **Every** definition's hash moves — that is what one edit to a leaf does
-    /// to a closure — and `edited` says which of them anybody actually wrote.
-    /// The rest are `Derived`, and separating the two is the thing under test.
+    /// **Every** definition's hash moves — that is what one edit to a leaf does to a closure — and
+    /// `edited` says which of them anybody actually wrote.
     fn edits(defs: &[&'static str], edited: &[&'static str]) -> Case {
         let before: Vec<(&'static str, u8)> = defs
             .iter()
@@ -234,10 +224,7 @@ fn simple(case: &Case, culprits: &mut Culprits) -> crate::Attribution {
     )
 }
 
-// ------------------------------------------------------------------- cases
-
-/// A single-culprit regression. Four hashes moved, three of them because one
-/// leaf did, so the search has one question to ask and does not need to.
+/// A single-culprit regression.
 #[test]
 fn a_single_culprit_regression_is_named_exactly() {
     let case = Case::edits(&["a", "b", "c", "d"], &["a"]);
@@ -265,8 +252,7 @@ fn a_single_culprit_regression_is_named_exactly() {
     }
 }
 
-/// Two edits that only break the test together. A binary search returns
-/// whichever half it tried first; ddmin returns both and neither alone.
+/// Two edits that only break the test together.
 #[test]
 fn a_multi_culprit_regression_names_both() {
     let case = Case::edits(&["a", "b", "c", "d", "e"], &["a", "b", "c", "d", "e"]);
@@ -283,9 +269,7 @@ fn a_multi_culprit_regression_names_both() {
     );
 }
 
-/// The case ADR 0004 calls common rather than exotic. A signature change means
-/// old and new callers disagree, so most mixtures are not well-typed programs.
-/// A program that does not compile is not evidence that the test broke.
+/// The case ADR 0004 calls common rather than exotic.
 #[test]
 fn a_hybrid_that_does_not_typecheck_is_not_evidence_and_costs_the_minimality_claim() {
     let case = Case::edits(&["a", "b", "c", "d"], &["a", "b", "c", "d"]);
@@ -303,8 +287,8 @@ fn a_hybrid_that_does_not_typecheck_is_not_evidence_and_costs_the_minimality_cla
     );
 }
 
-/// Fusing the pair up front is strictly better than letting ddmin discover it:
-/// the same answer, exactly, with no unresolved trial to pay for.
+/// Fusing the pair up front is strictly better than letting ddmin discover it: the same answer,
+/// exactly, with no unresolved trial to pay for.
 #[test]
 fn fusing_an_interface_change_with_its_caller_beats_discovering_it() {
     let case = Case::edits(
@@ -354,9 +338,7 @@ fn fusing_an_interface_change_with_its_caller_beats_discovering_it() {
     );
 }
 
-/// A first-ever-red test. There is no "before", and inventing one — against an
-/// empty program, or against `main` — would produce a confident answer to a
-/// question nobody asked.
+/// A first-ever-red test.
 #[test]
 fn a_test_that_never_passed_is_not_bisected() {
     let case = Case::edits(&["a", "b"], &["a", "b"]);
@@ -380,8 +362,8 @@ fn a_test_that_never_passed_is_not_bisected() {
     assert_eq!(hybrid.trials, 0);
     assert!(out.culprits().is_empty());
     assert!(out.bisection.reason.contains("never passed"));
-    // Without a baseline nothing can be said about what changed, and saying
-    // nothing is the point: `change: None` is not `change: derived`.
+    // Without a baseline nothing can be said about what changed, and saying nothing is the point:
+    // `change: None` is not `change: derived`.
     assert!(out.suspects.iter().all(|s| s.change.is_none()));
 }
 
@@ -428,9 +410,8 @@ fn a_test_that_never_passed_still_carries_its_causal_slice() {
     assert_eq!(out.suspects[1].ran, Some(false), "b never ran");
 }
 
-/// The flaky-looking case: the failure reproduces against the definitions as
-/// they were, and the test was not edited, so nothing in the definition graph
-/// explains it. That is a useful answer, and it is not a culprit.
+/// The flaky-looking case: the failure reproduces against the definitions as they were, and the
+/// test was not edited, so nothing in the definition graph explains it.
 #[test]
 fn a_failure_no_change_explains_is_reported_rather_than_attributed() {
     let case = Case::edits(&["a", "b", "c"], &["a", "b", "c"]);
@@ -441,8 +422,8 @@ fn a_failure_no_change_explains_is_reported_rather_than_attributed() {
     assert_eq!(out.bisection.confidence, Confidence::None);
     assert!(out.culprits().is_empty());
     assert!(out.bisection.reason.contains("nondet"));
-    // Still annotated: an agent that reads no culprit still learns which three
-    // definitions it edited.
+    // Still annotated: an agent that reads no culprit still learns which three definitions it
+    // edited.
     assert!(
         out.suspects
             .iter()
@@ -450,8 +431,7 @@ fn a_failure_no_change_explains_is_reported_rather_than_attributed() {
     );
 }
 
-/// The same shape, with the test itself edited. Accusing the test is only
-/// correct when the test moved, which is why the two verdicts are distinct.
+/// The same shape, with the test itself edited.
 #[test]
 fn editing_only_the_test_body_names_the_test() {
     let case = Case::edits(&["a", "b"], &[]);
@@ -511,11 +491,6 @@ fn a_panic_is_not_bisected() {
 }
 
 /// A host-backed failure runs no trial at all, and the suspect list survives.
-///
-/// Both halves are the contract. Every trial is a re-evaluation of the failing
-/// test, so a search over one that reached a socket would reach it once per
-/// candidate set; and the suspects come from hashes rather than from running, so
-/// the artifact degrades to its static half rather than to nothing.
 #[test]
 fn a_host_backed_failure_is_not_bisected_and_keeps_its_suspects() {
     let case = Case::edits(&["a", "b"], &["a"]);
@@ -541,8 +516,8 @@ fn a_host_backed_failure_is_not_bisected_and_keeps_its_suspects() {
         [sym("a"), sym("b")],
         "the static half of the artifact is still owed to the reader"
     );
-    // And `--bisect always` does not talk it out of the refusal: the reason is
-    // an action on the world rather than a budget.
+    // And `--bisect always` does not talk it out of the refusal: the reason is an action on the
+    // world rather than a budget.
     let out = case.run(
         &Options {
             bisect: Mode::Always,
@@ -582,8 +557,8 @@ fn bisect_never_evaluates_nothing() {
     assert_eq!(hybrid.trials, 0);
 }
 
-/// One edit is decided by counting the clusters, so a cold body store costs
-/// nothing on the failure the default exists for.
+/// One edit is decided by counting the clusters, so a cold body store costs nothing on the failure
+/// the default exists for.
 #[test]
 fn a_single_edit_is_answered_without_a_body_store() {
     let case = Case::edits(&["a", "b", "c"], &["a"]);
@@ -608,8 +583,8 @@ fn a_single_edit_is_answered_without_a_body_store() {
     );
 }
 
-/// A search that would have had to run a mixture says `no_bodies` rather than
-/// concluding from the silence, and still annotates what it could.
+/// A search that would have had to run a mixture says `no_bodies` rather than concluding from the
+/// silence, and still annotates what it could.
 #[test]
 fn a_pruned_body_store_refuses_the_searches_that_need_one() {
     let case = Case::edits(&["a", "b", "c"], &["a", "b"]);
@@ -636,9 +611,8 @@ fn a_pruned_body_store_refuses_the_searches_that_need_one() {
     assert_eq!(out.suspects[2].change, Some(ChangeKind::Derived));
 }
 
-/// A pruned cache and a build that cannot mix eras both stop the search, and a
-/// consumer can act on the first and not the second — so they must not collapse
-/// onto one verdict.
+/// A pruned cache and a build that cannot mix eras both stop the search, and a consumer can act on
+/// the first and not the second — so they must not collapse onto one verdict.
 #[test]
 fn a_build_with_no_hybrid_builder_is_not_reported_as_a_pruned_cache() {
     let case = Case::edits(&["a", "b", "c"], &["a", "b"]);
@@ -668,8 +642,8 @@ fn a_build_with_no_hybrid_builder_is_not_reported_as_a_pruned_cache() {
     assert_eq!(out.suspects[2].change, Some(ChangeKind::Derived));
 }
 
-/// One cluster is answered by counting, so the absence of a hybrid builder must
-/// not withhold it — this is the overwhelmingly common failure.
+/// One cluster is answered by counting, so the absence of a hybrid builder must not withhold it —
+/// this is the overwhelmingly common failure.
 #[test]
 fn a_single_edit_is_still_named_without_any_hybrid_builder() {
     let case = Case::edits(&["a", "b", "c"], &["a"]);
@@ -689,8 +663,8 @@ fn a_single_edit_is_still_named_without_any_hybrid_builder() {
     assert_eq!(out.bisection.search.evaluated, 0);
 }
 
-/// A derived change sorts below every edited one, because the reading list an
-/// agent is handed is the ranking.
+/// A derived change sorts below every edited one, because the reading list an agent is handed is
+/// the ranking.
 #[test]
 fn derived_suspects_sort_below_edited_ones() {
     let case = Case::edits(&["aaa", "zzz"], &["zzz"]);
@@ -706,8 +680,8 @@ fn derived_suspects_sort_below_edited_ones() {
     assert_eq!(out.suspects[1].name, sym("aaa"));
 }
 
-/// Two runs over one failure must produce byte-identical artifacts, or the
-/// artifact cannot be diffed against yesterday's.
+/// Two runs over one failure must produce byte-identical artifacts, or the artifact cannot be
+/// diffed against yesterday's.
 #[test]
 fn two_runs_over_one_failure_agree_exactly() {
     let case = Case::edits(
@@ -737,9 +711,7 @@ fn two_runs_over_one_failure_agree_exactly() {
     assert_eq!(render(), render());
 }
 
-/// A spent budget is a superset of the cause, and says so. Returning it under a
-/// `minimal` label would have a consumer act as though the search had endorsed
-/// it.
+/// A spent budget is a superset of the cause, and says so.
 #[test]
 fn a_spent_budget_downgrades_confidence_and_keeps_the_cause() {
     let names: Vec<&'static str> = vec!["d0", "d1", "d2", "d3", "d4", "d5", "d6", "d7"];
@@ -801,8 +773,8 @@ fn always_waives_the_budget_but_not_the_preconditions() {
     );
 }
 
-/// A trace that went green is evidence about a different execution, so it must
-/// not be folded into `ran` and `depth`.
+/// A trace that went green is evidence about a different execution, so it must not be folded into
+/// `ran` and `depth`.
 #[test]
 fn a_slice_that_did_not_reproduce_does_not_annotate_the_suspects() {
     let case = Case::edits(&["a", "b"], &["a"]);
@@ -876,8 +848,8 @@ fn an_unanswerable_classification_is_stated_in_the_reason() {
     );
 }
 
-/// The whole delta being derived is not a delta: there is nothing to flip, and
-/// saying so is different from saying the search found nothing.
+/// The whole delta being derived is not a delta: there is nothing to flip, and saying so is
+/// different from saying the search found nothing.
 #[test]
 fn a_delta_of_only_derived_changes_is_no_changes() {
     let case = Case::edits(&["a", "b"], &[]);
@@ -896,8 +868,8 @@ fn a_delta_of_only_derived_changes_is_no_changes() {
     assert_eq!(hybrid.trials, 0);
 }
 
-/// A culprit the store never noticed change is still the answer, so it has to
-/// appear in the list that is ranked.
+/// A culprit the store never noticed change is still the answer, so it has to appear in the list
+/// that is ranked.
 #[test]
 fn a_culprit_outside_the_raw_suspect_set_is_added_to_it() {
     let base = baseline(&[("a", 1), ("b", 2)], 200);
@@ -944,8 +916,6 @@ fn the_trial_outcomes_are_distinguishable_in_the_artifact() {
     );
 }
 
-// ---------------------------------------------------------------- rendering
-
 fn failure_with(attribution: crate::Attribution) -> crate::Failure {
     crate::Failure {
         name: "a regression".to_string(),
@@ -984,9 +954,7 @@ fn position_of(lines: &[String], needle: &str) -> Option<usize> {
     lines.iter().position(|l| l.contains(needle))
 }
 
-/// The culprit is the answer and the diff is the evidence, so the culprit comes
-/// first. A reader who knows which definition broke does not have to work
-/// backwards from an expected/actual pair.
+/// The culprit is the answer and the diff is the evidence, so the culprit comes first.
 #[test]
 fn the_culprit_line_comes_before_the_assertion() {
     let case = Case::edits(&["a", "b", "c", "d"], &["a"]);
@@ -998,8 +966,8 @@ fn the_culprit_line_comes_before_the_assertion() {
     assert!(culprit < assertion, "{lines:#?}");
 }
 
-/// A failure the system could say nothing about gets no culprit line, rather
-/// than a line naming something it has no evidence for.
+/// A failure the system could say nothing about gets no culprit line, rather than a line naming
+/// something it has no evidence for.
 #[test]
 fn a_failure_with_no_culprit_names_nobody() {
     let case = Case::edits(&["a"], &["a"]);
@@ -1019,8 +987,8 @@ fn a_failure_with_no_culprit_names_nobody() {
     assert!(position_of(&lines, "assertion failed").is_some());
 }
 
-/// The JSON is the artifact an agent branches on, so the fields it branches on
-/// have to be there and have to mean what the ADR says.
+/// The JSON is the artifact an agent branches on, so the fields it branches on have to be there and
+/// have to mean what the ADR says.
 #[test]
 fn the_json_artifact_leads_with_the_verdict() {
     let case = Case::edits(&["a", "b"], &["a"]);

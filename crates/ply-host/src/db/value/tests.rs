@@ -7,10 +7,7 @@ fn dec(s: &str) -> Decimal {
     Decimal::from_str(s).expect("a decimal")
 }
 
-/// A `std.db` constructor as a `Value` carries one: **qualified**. A
-/// constructor's identity in the evaluator is its program-wide name, so a bare
-/// `PText` here would be a value no pattern in any program matches — which is
-/// exactly the defect these tests exist to catch.
+/// A `std.db` constructor as a `Value` carries one: **qualified**.
 fn ctor(name: &str, args: Vec<Value>) -> Value {
     Value::ctor(super::ctor(crate::db::MODULE, name), args)
 }
@@ -51,9 +48,8 @@ fn every_param_constructor_decodes_to_its_wire_type() {
     }
 }
 
-/// Inference checks a perform's argument types, so a constructor `std.db` does
-/// not declare cannot arrive. Reaching one means the evaluator ran a module that
-/// was never checked, and it is Ply's fault rather than the program's.
+/// Inference checks a perform's argument types, so a constructor `std.db` does not declare cannot
+/// arrive.
 #[test]
 fn a_param_the_declaration_does_not_have_is_ply_s_fault() {
     let d = param(&ctor("PTimestamp", vec![Value::Int(0)]), Span::DUMMY)
@@ -96,16 +92,14 @@ fn json_crosses_the_boundary_in_both_directions() {
     let value = json_value(&document);
     let back = json(&value, Span::DUMMY).expect("decodes");
     assert_eq!(back, document);
-    // A `Map` canonicalises key order, so the way back out is sorted rather than
-    // the order the document had. Both render to the same document read by the
-    // same parser, which is the property that matters.
+    // A `Map` canonicalises key order, so the way back out is sorted rather than the order the
+    // document had.
     assert_eq!(back.render(), document.render());
 }
 
-/// A `Json` built here has to carry `std.json`'s own constructor names, not
-/// `std.db`'s and not bare ones: a `Value::Ctor`'s identity is its program-wide
-/// name, and a document spelled `Str` rather than `std.json.Str` is one no
-/// `match` in any program can take apart.
+/// A `Json` built here has to carry `std.json`'s own constructor names, not `std.db`'s and not bare
+/// ones: a `Value::Ctor`'s identity is its program-wide name, and a document spelled `Str` rather
+/// than `std.json.Str` is one no `match` in any program can take apart.
 #[test]
 fn a_json_document_carries_the_module_that_declares_it() {
     match &json_value(&Json::Str("x".into())) {
@@ -123,8 +117,8 @@ fn a_json_document_carries_the_module_that_declares_it() {
         json(&written, Span::DUMMY).expect("decodes"),
         Json::Object(vec![("a".into(), Json::Number(dec("2")))])
     );
-    // A `db` constructor of the same simple name is not a `Json` one: the
-    // qualifier is what keeps two modules' `Array`s apart.
+    // A `db` constructor of the same simple name is not a `Json` one: the qualifier is what keeps
+    // two modules' `Array`s apart.
     assert!(json(&ctor("Array", vec![Value::list(Vec::new())]), Span::DUMMY).is_err());
 }
 
@@ -141,9 +135,7 @@ fn a_row_is_a_map_so_two_column_orders_are_one_value() {
     assert_eq!(forward, backward);
 }
 
-/// The name a `Value::Ctor` must carry: `std.db`'s own, qualified. The
-/// evaluator resolves a pattern's constructor to its program-wide name, so a
-/// bare one is a value nothing matches.
+/// The name a `Value::Ctor` must carry: `std.db`'s own, qualified.
 fn qualified(name: &str) -> String {
     format!("{}.{name}", crate::db::MODULE)
 }
@@ -192,8 +184,7 @@ fn an_answer_is_one_of_three_shapes() {
                         fields.get(&Symbol::new("constraint")),
                         Some(&Value::str("part_pkey"))
                     );
-                    // The message is carried for a person and compared by
-                    // nothing.
+                    // The message is carried for a person and compared by nothing.
                     assert!(fields.contains_key(&Symbol::new("detail")));
                 }
                 other => panic!("{}", other.type_name()),
@@ -222,8 +213,8 @@ fn isolation_and_access_decode_to_the_levels_the_scope_table_names() {
         isolation(&ctor("RepeatableRead", vec![]), Span::DUMMY).expect("decodes"),
         Isolation::RepeatableRead
     );
-    // `ReadUncommitted` is not offered, because postgres implements it as read
-    // committed and a name that promised dirty reads would be a name that lies.
+    // `ReadUncommitted` is not offered, because postgres implements it as read committed and a name
+    // that promised dirty reads would be a name that lies.
     assert!(isolation(&ctor("ReadUncommitted", vec![]), Span::DUMMY).is_err());
     assert_eq!(
         access(&ctor("ReadOnly", vec![]), Span::DUMMY).expect("decodes"),

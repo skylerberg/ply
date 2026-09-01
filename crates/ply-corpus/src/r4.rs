@@ -1,88 +1,29 @@
 //! The bar each of ADR 0019's levers has to clear, written before the lever is.
-//!
-//! `ply_corpus::w6::Criteria` is the model and the reason: a threshold a
-//! measurement supplies is a threshold the measurement cannot fail. Everything
-//! here is fixed by the attribution that motivated ADR 0019 and by nothing that
-//! comes after it.
-//!
-//! # The route a lever is judged on
-//!
-//! `/health` over SimNet, not the pure-call routing rung. The two disagree on
-//! ranking and both are reported by
-//! `cargo test -p ply-corpus --release --test r4_value_construction --
-//! --nocapture`; the SimNet path is the only one that pays for framing, the
-//! host boundary and the response encode, so it is the one a served request
-//! resembles.
-//!
-//! # Allocations, not bytes
-//!
-//! `CONTRIBUTING.md` §"Things known to be broken" item 8 is reproduced on this
-//! path — `r4_value_construction::the_per_request_slope_is_the_same_between_the_second_and_third_window`
-//! prints an allocation slope that holds to 1.0% and a byte slope that moves
-//! 95.3% between the (20, 200) and (200, 400) window pairs. So a verdict here
-//! reads the allocation count, the window pair is pinned, and no threshold in
-//! this file is stated in bytes.
-//!
-//! **Re-taken after §1 and §2 landed (regression audit, 2026-08-21). Those two
-//! figures are the pre-lever tree's and neither comes back from that command
-//! any more: it prints 1.5% and 113.4%**, three runs identical to the digit.
-//! They are left above because they are what the paragraph was written against.
-//! Nothing in this file is stated in either — they are the reason a threshold
-//! here is in allocations — and the conclusion is unchanged and slightly
-//! stronger, because the byte slope moved further rather than less.
 
 /// The window pair every figure a verdict reads must be fitted from.
-///
-/// Pinned because a slope taken at another pair is not comparable to the
-/// baseline: `w3::Loaded::over_sim` builds one `Machine` per script, so a
-/// window charges every one-time cost to the requests in it, and the intercept
-/// only divides out at the pair the baseline used.
 pub const WINDOW: (usize, usize) = (20, 200);
 
 /// Allocations per `/health` over SimNet at [`WINDOW`], before any lever.
-///
-/// Not a threshold — the number a threshold is a fraction of. Re-taken rather
-/// than quoted: it is the `fit:` line of the `/health` section printed by the
-/// command in this module's note.
 pub const BASELINE: f64 = 911.5;
 
 /// One of ADR 0019's changes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Lever {
-    /// §1. Recycle the call-argument vector instead of freeing it.
     ArgumentVectors,
-    /// §2. Build a compile-time constant's `Value` once and clone the handle.
     ConstantValues,
-    /// §3. A record's fields as one flat sorted allocation.
     RecordLayout,
 }
 
 impl Lever {
-    /// The allocations per request the attribution places under this lever, as
-    /// a share of [`BASELINE`]. A lever cannot save more than this, so a report
-    /// claiming it did is a measurement error rather than a result.
+    /// The allocations per request the attribution places under this lever, as a share of
+    /// [`BASELINE`].
     pub fn attributed_share(self) -> f64 {
         match self {
-            // 341.4 transient argument vectors of the 372.4 built; the other
-            // 31.0 are retained as `Ctor.args` and are not the pool's to take.
-            //
-            // **That number is wrong and is deliberately left standing.** It
-            // assumes every transient buffer reaches `Machine::enter_code`.
-            // Measured after the lever landed: 178.0 do, 140.4 are consumed by
-            // `ply_eval::builtins::call` — which takes its `Vec<Value>` by
-            // value, so it cannot hand one back — and 23.0 are wider than the
-            // free list's four capacity classes. The share the lever could ever
-            // remove is 178.0/BASELINE = 19.53%, under the 20% floor below it,
-            // so `judge` answers `Verdict::Short` on a lever that removed
-            // everything its mechanism can reach. Editing either number after
-            // the fact is exactly what this module exists to prevent, so
-            // neither has been; the correction is in
-            // `docs/adr/0019-value-representation.md` §1 with the original
-            // beside it, and re-deriving the floor is a decision for whoever
-            // amends that ADR.
+            // 341.4 transient argument vectors of the 372.4 built; the other 31.0 are retained as
+            // `Ctor.args` and are not the pool's to take.
             Lever::ArgumentVectors => 341.4 / BASELINE,
-            // 65.0 literal `Str`/`Bytes` + 21.0 nullary constructor mentions +
-            // 24.0 constructor-closure mentions.
+            // 65.0 literal `Str`/`Bytes` + 21.0 nullary constructor mentions + 24.0
+            // constructor-closure mentions.
             Lever::ConstantValues => 110.0 / BASELINE,
             // 33.0 B-tree nodes.
             Lever::RecordLayout => 33.0 / BASELINE,
@@ -90,14 +31,6 @@ impl Lever {
     }
 
     /// The share of [`BASELINE`] this lever must actually remove to be kept.
-    ///
-    /// Each is a little over half of what the attribution places under it,
-    /// which is the margin between "the mechanism works" and "the mechanism
-    /// fires on the cases that were counted". A lever that lands under its own
-    /// floor removed something, but not the thing it was built for, and the
-    /// answer to that is another attribution rather than the next lever —
-    /// which is R3's lesson and is why the floor is a fraction of a measured
-    /// share rather than a round number.
     pub fn floor(self) -> f64 {
         match self {
             Lever::ArgumentVectors => 0.20,
@@ -111,11 +44,8 @@ impl Lever {
 #[derive(Clone, Copy, Debug)]
 pub struct Criteria {
     /// Wall-clock regression a lever may not exceed on the served request.
-    /// A free list that trades an allocation for a branch has to be shown not
-    /// to, and ADR 0018 §2 says in as many words that this was never measured.
     pub max_time_regression: f64,
     /// Below this the ladder did not separate and nothing is decided from it.
-    /// `w6::Criteria::max_negative_share` is the same idea.
     pub min_separation: f64,
     /// Divergences `--engine both` may report over the corpora on disk.
     pub max_divergences: usize,
@@ -133,14 +63,13 @@ impl Default for Criteria {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Verdict {
-    /// The lever cleared its floor and cost nothing measurable. Keep it.
+    /// The lever cleared its floor and cost nothing measurable.
     Keep,
-    /// It fired, but under its own floor. The next step is an attribution run,
-    /// not the next lever.
+    /// It fired, but under its own floor.
     Short,
-    /// It cost more than it saved somewhere else. Revert.
+    /// It cost more than it saved somewhere else.
     Revert,
-    /// The measurement did not decide it. Not the same as `Short`.
+    /// The measurement did not decide it.
     Undecided,
 }
 

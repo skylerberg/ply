@@ -1,17 +1,4 @@
 //! What an `effect set` does to a check, at the source level.
-//!
-//! Three claims, from ADR 0009 and ADR 0013 §1.5:
-//!
-//! 1. **Annotation-only.** Inference still produces the precise atom set. An
-//!    alias buys legibility and gives up no precision, so `DefInfo::performed`
-//!    is what the body reaches and `DefInfo::footprint` is what the signature
-//!    published — and everything downstream reads atoms, never a name.
-//! 2. **Checked as an upper bound, exactly as a written row already is.** There
-//!    is one code path and it is the existing one, so a violation names the
-//!    atoms that were not permitted and quotes the *expansion*.
-//! 3. **A set name reaches no namespace.** Expansion has erased it before
-//!    `resolve` runs, so `effect set Web` beside `type Web` is two things in two
-//!    positions.
 
 use ply_core::{CheckOutput, check_program};
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
@@ -81,8 +68,7 @@ fn program(rest: &str) -> String {
 
 // --- 1. annotation-only -----------------------------------------------------
 
-/// The published row is the expansion, and the *precise* row the body reaches
-/// is kept beside it. Nothing collapses one into the other.
+/// The published row is the expansion, and the *precise* row the body reaches is kept beside it.
 #[test]
 fn an_alias_publishes_its_expansion_and_keeps_the_precise_row() {
     let out = ok(&program(
@@ -97,8 +83,8 @@ fn an_alias_publishes_its_expansion_and_keeps_the_precise_row() {
     assert_eq!(aliases(&out, "m.handler"), ["Web"]);
 }
 
-/// An unannotated definition publishes what it performs, so the two agree and
-/// the alias is the only thing that can separate them.
+/// An unannotated definition publishes what it performs, so the two agree and the alias is the only
+/// thing that can separate them.
 #[test]
 fn without_an_annotation_the_published_row_is_the_precise_one() {
     let out = ok(&program("fn handler() -> Int = db.all[users]()\n"));
@@ -107,9 +93,8 @@ fn without_an_annotation_the_published_row_is_the_precise_one() {
     assert!(aliases(&out, "m.handler").is_empty());
 }
 
-/// A caller's row is inferred from the callee's *published* row, which is the
-/// expansion — atoms, never a name. This is the sentence "nothing downstream
-/// ever sees the alias" as a value a test can read.
+/// A caller's row is inferred from the callee's *published* row, which is the expansion — atoms,
+/// never a name.
 #[test]
 fn a_caller_of_an_aliased_definition_infers_atoms() {
     let out = ok(&program(
@@ -123,9 +108,8 @@ fn a_caller_of_an_aliased_definition_infers_atoms() {
     );
 }
 
-/// A set's atoms reach the determinism check as atoms: `E0412` fires for a
-/// `nondet` effect a `det` test can reach through an aliased signature, exactly
-/// as it would for one written out.
+/// A set's atoms reach the determinism check as atoms: `E0412` fires for a `nondet` effect a `det`
+/// test can reach through an aliased signature, exactly as it would for one written out.
 #[test]
 fn a_nondet_atom_reached_through_an_alias_still_fires_e0412() {
     let diags = errors(&program(
@@ -154,9 +138,8 @@ fn a_body_inside_the_expansion_checks() {
     );
 }
 
-/// The violation names the atoms that were not permitted, and the secondary
-/// label quotes the **expansion** — never the alias, which is not what the body
-/// failed to satisfy.
+/// The violation names the atoms that were not permitted, and the secondary label quotes the
+/// **expansion** — never the alias, which is not what the body failed to satisfy.
 #[test]
 fn a_body_outside_the_expansion_is_e0302_quoting_the_expansion() {
     let diags = errors(&program(
@@ -185,8 +168,8 @@ fn a_body_outside_the_expansion_is_e0302_quoting_the_expansion() {
     );
 }
 
-/// A nested set is one upper bound, not two: the inner set's atoms are as
-/// permitted as the outer set's own.
+/// A nested set is one upper bound, not two: the inner set's atoms are as permitted as the outer
+/// set's own.
 #[test]
 fn a_nested_set_bounds_the_body_by_its_transitive_expansion() {
     let out = ok(&program(
@@ -216,8 +199,8 @@ fn an_atom_only_the_inner_set_omits_is_still_refused() {
     assert!(d.message.contains("m.db.write[orders]"), "{d:#?}");
 }
 
-/// A set beside written atoms and a row variable: the alias contributes atoms
-/// and nothing else, so the tail keeps the meaning it had.
+/// A set beside written atoms and a row variable: the alias contributes atoms and nothing else, so
+/// the tail keeps the meaning it had.
 #[test]
 fn a_set_composes_with_written_atoms_and_a_row_variable() {
     let out = ok(&program(
@@ -250,9 +233,9 @@ fn a_pub_set_is_e0114() {
     only(&diags, codes::UNKNOWN_EFFECT_SET);
 }
 
-/// A member is an atom or another set, never a whole effect: "every atom of
-/// `db`" is every resource label anywhere in the program, and an unrelated
-/// table in an unrelated module would then move this definition's hash.
+/// A member is an atom or another set, never a whole effect: "every atom of `db`" is every resource
+/// label anywhere in the program, and an unrelated table in an unrelated module would then move
+/// this definition's hash.
 #[test]
 fn a_member_naming_a_whole_effect_is_e0114() {
     let diags = errors(&program(
@@ -265,8 +248,7 @@ fn a_member_naming_a_whole_effect_is_e0114() {
     );
 }
 
-/// A set is expanded by the parser, so one bad member reaches every row that
-/// names it. It is reported once, at the one place there is to fix.
+/// A set is expanded by the parser, so one bad member reaches every row that names it.
 #[test]
 fn a_bad_atom_in_a_set_is_reported_once_however_many_rows_name_it() {
     let diags = errors(&program(
@@ -317,8 +299,8 @@ fn two_sets_with_one_name_are_e0105() {
     only(&diags, codes::DUPLICATE_DEFINITION);
 }
 
-/// Expansion has erased the set's name before `resolve` runs, so it lives in no
-/// namespace `resolve` knows about and collides with nothing.
+/// Expansion has erased the set's name before `resolve` runs, so it lives in no namespace `resolve`
+/// knows about and collides with nothing.
 #[test]
 fn a_set_and_a_type_may_share_a_name() {
     let out = ok(&program(
@@ -329,8 +311,8 @@ fn a_set_and_a_type_may_share_a_name() {
     assert_eq!(published(&out, "m.handler"), "{m.log.write}");
 }
 
-/// The fixtures `tests/fixtures/` owes for the two new codes, checked here
-/// rather than left as files nothing reads.
+/// The fixtures `tests/fixtures/` owes for the two new codes, checked here rather than left as
+/// files nothing reads.
 #[test]
 fn the_fixtures_produce_the_codes_they_are_named_for() {
     for (path, code) in [

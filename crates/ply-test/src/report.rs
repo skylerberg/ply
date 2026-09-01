@@ -1,8 +1,4 @@
 //! Two projections of one run: lines for a person and JSON for an agent.
-//!
-//! The JSON is not a summary of the text. A failure carries its full diagnostic
-//! and its suspect set, because the point of the whole system is that an agent
-//! can act on a failure without re-deriving which of its edits caused it.
 
 use crate::bisect::Bisection;
 use crate::schedule::{Isolation, Parallelism, shared_footprint};
@@ -16,31 +12,6 @@ use serde_json::{Value, json};
 use std::time::Duration;
 
 /// Bumped whenever a field in the failure artifact changes meaning or leaves.
-/// A machine consumer that acts without asking a follow-up question needs to
-/// know what it is parsing before it parses it.
-///
-/// v3 adds `failures[].seed`, `failures[].replay`, `failures[].race` and a
-/// per-test `simulation` object.
-///
-/// v4 is ADR 0017 §6: `tests[].isolation` says `region` where it said `world`,
-/// and it means something narrower — a test whose footprint carries a region
-/// label is now `shared`, because the label is a name two tests can write and
-/// nothing forks their state apart any more. `parallelism.region_contended`
-/// counts the tests that moved. A consumer that kept reading `world` would read
-/// a claim the runner stopped making.
-///
-/// `audit` and `tests[].audited` were added within v4 and are not a bump:
-/// nothing changed meaning and nothing left. Both are absent rather than zeroed
-/// outside `--engine both`, so a consumer that has not been taught about them
-/// reads the run exactly as it did before.
-///
-/// `backend` was added the same way (2026-08-28, ADR 0026 §4.6): a top-level
-/// object naming the compiled backend `ply test --backend` installed, what it
-/// was offered and what it entered. Absent rather than zeroed when none was
-/// installed, for the reason `audit` is — a consumer cannot tell "entered
-/// nothing" from "there was nothing to enter with", and a speedup reported with
-/// zero entries is a null result. Nothing changed meaning and nothing left, so
-/// it is not a bump either.
 pub const SCHEMA_VERSION: u32 = 4;
 
 fn millis(d: Duration) -> f64 {
@@ -48,8 +19,7 @@ fn millis(d: Duration) -> f64 {
 }
 
 impl Selection {
-    /// One line per test plus one per group, in the order `run` will execute
-    /// them.
+    /// One line per test plus one per group, in the order `run` will execute them.
     pub fn explain(&self, check: &CheckOutput, hashes: &HashOutput) -> Vec<String> {
         let mut lines = Vec::with_capacity(self.total + self.groups.len());
         for (index, reason) in self.reasons.iter().enumerate() {
@@ -140,10 +110,8 @@ fn shared_atoms(footprint: &Footprint) -> Vec<String> {
         .collect()
 }
 
-/// A shared test is told which atoms made it shared, and — when every one of
-/// them is a region label — that the contention is one it can remove by
-/// renaming a label. Saying only `shared` about a test that used to be free
-/// would leave the cost of ADR 0017 §6 invisible on the line where it lands.
+/// A shared test is told which atoms made it shared, and — when every one of them is a region label
+/// — that the contention is one it can remove by renaming a label.
 fn explain_isolation(footprint: &Footprint) -> String {
     match Isolation::of(footprint) {
         Isolation::Region => "  isolation: region".to_string(),
@@ -169,9 +137,8 @@ fn explain_parallelism(p: &Parallelism) -> Vec<String> {
         "isolated: {} of {} — {} can contend with another test",
         p.isolated, p.total, p.shared
     )];
-    // ADR 0008 §6: when a population stops being isolated, the report has to
-    // say so, or the trivially-parallel count over-claims by exactly the tests
-    // that moved.
+    // ADR 0008 §6: when a population stops being isolated, the report has to say so, or the
+    // trivially-parallel count over-claims by exactly the tests that moved.
     if p.region_contended > 0 {
         lines.push(format!(
             "{} of the {} contend only over a region label; a region is closed per test, \
@@ -217,12 +184,8 @@ impl RunReport {
         })
     }
 
-    /// The human summary, without the per-test lines: one line of counts, then
-    /// each failure led by its culprit.
-    ///
-    /// The culprit comes before the diff because the culprit is the answer. A
-    /// reader who already knows which definition broke does not need to work
-    /// backwards from an expected/actual pair to find out.
+    /// The human summary, without the per-test lines: one line of counts, then each failure led by
+    /// its culprit.
     pub fn summary(&self) -> Vec<String> {
         let mut lines = vec![format!(
             "{} failed, {} passed, {} cached ({:.2}s)",
@@ -261,10 +224,6 @@ impl RunReport {
 }
 
 /// The seed, the race it came from, and the command that replays it.
-///
-/// The replay line is printed rather than described because the point of the
-/// milestone is that reproducing a concurrency failure is one command with one
-/// argument, and a reader should not have to assemble it.
 pub fn seed_lines(failure: &Failure) -> Vec<String> {
     let Some(seed) = &failure.seed else {
         return Vec::new();
@@ -290,9 +249,8 @@ fn race_site(site: &RaceSite) -> String {
     format!("{}  {definition}   {}", site.task, site.access)
 }
 
-/// Silent when there is no culprit to lead with, so that a run which could not
-/// bisect reads exactly as it does today rather than gaining a line of
-/// apologies.
+/// Silent when there is no culprit to lead with, so that a run which could not bisect reads exactly
+/// as it does today rather than gaining a line of apologies.
 fn culprit_lines(attribution: &Attribution) -> Vec<String> {
     let bisection = &attribution.bisection;
     if !bisection.is_conclusive() {
@@ -356,21 +314,18 @@ fn test_json(result: &TestResult) -> Value {
     })
 }
 
-/// Absent — not zeroed — on a test that reached no `simulate` region. A consumer
-/// cannot tell an explored count of zero from a test that never simulated.
+/// Absent — not zeroed — on a test that reached no `simulate` region.
 pub fn exploration_json(exploration: &Exploration) -> Value {
     json!({
         "explored": exploration.explored,
-        // The headline. `true` means every interleaving of this test ran, up to
-        // an equivalence that provably preserves outcomes — a proof rather than
-        // a sample.
+        // The headline.
         "exhaustive": exploration.exhaustive,
         // The budget was spent, so the run is green and not cached.
         "exhausted": exploration.exhausted,
         "naive": exploration.naive.map(|naive| json!({
             "explored": naive.explored,
-            // A spent naive budget is a lower bound, and a lower bound reported
-            // as an exact count is a number nobody observed.
+            // A spent naive budget is a lower bound, and a lower bound reported as an exact count
+            // is a number nobody observed.
             "bounded": naive.bounded,
             "rendered": naive.to_string(),
         })),
@@ -410,24 +365,18 @@ fn race_site_json(site: &RaceSite) -> Value {
     })
 }
 
-/// The per-failure artifact. Every field answers a question a consumer would
-/// otherwise have to come back and ask.
+/// The per-failure artifact.
 pub fn failure_json(failure: &Failure) -> Value {
     json!({
         "key": failure.key,
         "name": failure.name,
         "diagnostic": failure.diagnostic,
-        // Whether to go and read the program or go and report a bug in Ply. Not
-        // derivable from the rest of the artifact: `culprit.skipped` says
-        // `panicked` only when a bisection was attempted and refused, so under
-        // `--bisect never` every failure would look alike.
+        // Whether to go and read the program or go and report a bug in Ply.
         "defect": failure.defect,
-        // The repro artifact. Null on a failure no simulation produced — never
-        // a default seed, which would replay a different run.
+        // The repro artifact.
         "seed": failure.seed.as_ref().map(|s| s.to_string()),
         "replay": failure.replay(),
-        // Only when the search actually observed the flip. Under `once` and
-        // `random` there is nothing to observe, and a race is never inferred.
+        // Only when the search actually observed the flip.
         "race": failure.race.as_ref().map(race_json),
         "assertion": failure.assertion.as_ref().map(assertion_json),
         "culprit": culprit_json(&failure.attribution.bisection),
@@ -436,9 +385,7 @@ pub fn failure_json(failure: &Failure) -> Value {
     })
 }
 
-/// Leads with the answer: what to change, how sure the system is, and how it
-/// found out. `verdict` is what a consumer branches on; `reason` is what it
-/// prints when it has to hand the failure back to a person.
+/// Leads with the answer: what to change, how sure the system is, and how it found out.
 fn culprit_json(bisection: &Bisection) -> Value {
     let search = &bisection.search;
     json!({

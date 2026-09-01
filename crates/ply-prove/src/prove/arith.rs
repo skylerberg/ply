@@ -1,25 +1,4 @@
-//! Linear integer arithmetic, by Fourier–Motzkin elimination with integer
-//! tightening.
-//!
-//! This module answers exactly one question — *is this conjunction of linear
-//! constraints infeasible?* — and it may answer `Unknown` whenever it likes.
-//! Two properties make that answer safe to build a certificate on.
-//!
-//! **Elimination is exact over the rationals**, and an infeasible rational
-//! relaxation is infeasible over ℤ. So a `Yes` from here is a genuine
-//! contradiction even where the tightening below contributes nothing.
-//!
-//! **The tightening is valid over ℤ.** A row `Σ cᵢxᵢ + k ≤ 0` with `g = gcd(cᵢ)`
-//! is divided through and its constant raised to `⌈k/g⌉`: every *integer*
-//! solution of the original satisfies the tightened row, so a contradiction
-//! found from tightened rows is a contradiction over ℤ. It is what decides
-//! `2x == 1` and `x < y && y < x + 1`.
-//!
-//! What it does **not** do is claim feasibility. `Unknown` covers a satisfiable
-//! system, an overflow, and a spent budget alike, because the prover never
-//! refutes: a model over uninterpreted symbols need not correspond to any Ply
-//! value, and reporting one as a counterexample is the failure symmetric to a
-//! wrong `proved`.
+//! Linear integer arithmetic, by Fourier–Motzkin elimination with integer tightening.
 
 use std::collections::BTreeMap;
 
@@ -32,25 +11,19 @@ pub struct Row {
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Feasibility {
-    /// No integer solution exists. The only answer a proof may rest on.
+    /// No integer solution exists.
     Infeasible,
     /// Everything else: satisfiable, out of budget, or out of range.
     Unknown,
 }
 
-/// The largest row set an elimination may grow to before the answer becomes
-/// `Unknown`. Fourier–Motzkin is doubly exponential in the worst case and the
-/// obligations in this fragment are tiny, so a cap costs reach on nothing that
-/// was going to terminate usefully anyway.
+/// The largest row set an elimination may grow to before the answer becomes `Unknown`.
 const MAX_ROWS: usize = 512;
 
 #[derive(Default)]
 pub struct System {
     rows: Vec<Row>,
-    /// Set when a caller's coefficient left `i128`. The system is then a
-    /// fragment of what was asserted, so it may still be used — a subset of an
-    /// unsatisfiable set can be satisfiable, never the other way round — but
-    /// nothing here rests on it.
+    /// Set when a caller's coefficient left `i128`.
     overflowed: bool,
 }
 
@@ -63,9 +36,7 @@ impl System {
         });
     }
 
-    /// `Σ cᵢvᵢ + k = 0`, as the two inequalities. The tightening then applies in
-    /// both directions, which is what makes the gcd test fall out rather than
-    /// being a separate rule.
+    /// `Σ cᵢvᵢ + k = 0`, as the two inequalities.
     pub fn eq(&mut self, coefficients: BTreeMap<usize, i128>, konst: i128) {
         let mut negated = BTreeMap::new();
         let mut ok = true;
@@ -88,8 +59,7 @@ impl System {
         self.rows.is_empty()
     }
 
-    /// `Infeasible` iff no assignment of integers to the variables satisfies
-    /// every row. `steps` is charged for the work done.
+    /// `Infeasible` iff no assignment of integers to the variables satisfies every row.
     pub fn feasibility(mut self, budget: &mut u32) -> Feasibility {
         for row in &mut self.rows {
             tighten(row);
@@ -114,15 +84,7 @@ impl System {
                     if !charge(budget, 1) {
                         return Feasibility::Unknown;
                     }
-                    // A combination whose coefficients left `i128` is
-                    // **dropped**, not fatal. Eliminating a variable replaces
-                    // the rows mentioning it by their combinations, and a
-                    // projection missing some of them admits more solutions
-                    // than the exact one — so a contradiction found in it is
-                    // still a contradiction in the original. Aborting the whole
-                    // elimination instead costs the answer for a system that
-                    // merely mentions `i64::MIN`, which every definedness
-                    // requirement does.
+                    // A combination whose coefficients left `i128` is **dropped**, not fatal.
                     let Some(mut combined) = combine(p, n, variable) else {
                         continue;
                     };
@@ -145,8 +107,8 @@ impl System {
         }
     }
 
-    /// The variable whose elimination produces the fewest rows, with the lowest
-    /// index winning a tie, so the search is a function of the input alone.
+    /// The variable whose elimination produces the fewest rows, with the lowest index winning a
+    /// tie, so the search is a function of the input alone.
     fn next_variable(&self) -> Option<usize> {
         let mut counts: BTreeMap<usize, (usize, usize)> = BTreeMap::new();
         for row in &self.rows {
@@ -222,8 +184,8 @@ fn combine(positive: &Row, negative: &Row, variable: usize) -> Option<Row> {
     })
 }
 
-/// Divides a row through by the gcd of its coefficients and raises the constant
-/// to the next integer, which is valid because the variables are integers.
+/// Divides a row through by the gcd of its coefficients and raises the constant to the next
+/// integer, which is valid because the variables are integers.
 fn tighten(row: &mut Row) {
     row.coefficients.retain(|_, c| *c != 0);
     let mut g: i128 = 0;
@@ -286,8 +248,8 @@ mod tests {
         assert_eq!(f, Feasibility::Infeasible);
     }
 
-    /// The false instance, which matters more: a satisfiable system must never
-    /// come back infeasible.
+    /// The false instance, which matters more: a satisfiable system must never come back
+    /// infeasible.
     #[test]
     fn a_satisfiable_system_is_not_infeasible() {
         let f = decide(|s| {
@@ -300,7 +262,7 @@ mod tests {
         assert_eq!(f, Feasibility::Unknown);
     }
 
-    /// Feasible over ℚ, infeasible over ℤ. The tightening is what sees it.
+    /// Feasible over ℚ, infeasible over ℤ.
     #[test]
     fn an_equation_no_integer_satisfies_is_infeasible() {
         let f = decide(|s| {

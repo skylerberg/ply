@@ -1,11 +1,4 @@
-//! The denominator: what one whole request costs, end to end, through the
-//! shipped binary.
-//!
-//! A kernel speedup means nothing without it — a function that is a fifth of a
-//! request cannot make a request more than a quarter faster however fast it
-//! gets — so the spike measures the request as well as the function, with its
-//! own client, against `examples/desk.ply` served over loopback exactly as
-//! `examples/serve.sh --memory` serves it.
+//! The denominator: what one whole request costs, end to end, through the shipped binary.
 
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
@@ -14,13 +7,13 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The request the client sends, the shape W1 and W2 measured: one packet, a
-/// complete head, no body.
+/// The request the client sends, the shape W1 and W2 measured: one packet, a complete head, no
+/// body.
 pub const REQUEST: &[u8] =
     b"GET /items HTTP/1.1\r\nHost: 127.0.0.1\r\nUser-Agent: ply-bench\r\n\r\n";
 
-/// The two rewrites `examples/serve.sh --memory` makes, and the same refusal to
-/// guess: a silent miss would serve a program this measured something else.
+/// The two rewrites `examples/serve.sh --memory` makes, and the same refusal to guess: a silent
+/// miss would serve a program this measured something else.
 const MAIN_ROW: (&str, &str) = (
     "fn main() -> Int / {Serving, config.read[server], net.write[conn], net.write[listener]} = {",
     "fn main() -> Int / {config.read[server], config.read[credentials], net.write[conn], net.write[listener]} = {",
@@ -89,8 +82,8 @@ impl Server {
     }
 }
 
-/// One response, read to its end so the next request on the connection begins
-/// where this one stopped.
+/// One response, read to its end so the next request on the connection begins where this one
+/// stopped.
 fn read_response(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> Result<usize> {
     let mut scratch = [0u8; 8192];
     loop {
@@ -133,15 +126,13 @@ pub struct Load {
     pub head_bytes: usize,
 }
 
-/// Sequential, one connection at a time. `desk.ply` answers one connection at a
-/// time, so anything else would measure a queue.
+/// Sequential, one connection at a time.
 pub fn drive(port: u16, connections: u32, per_connection: u32) -> Result<Load> {
     drive_with(port, connections, per_connection, REQUEST)
 }
 
-/// The same, over a head the caller chooses: W1's whole finding was that a
-/// request's cost was a function of its head length, so one head length is one
-/// point on a curve.
+/// The same, over a head the caller chooses: W1's whole finding was that a request's cost was a
+/// function of its head length, so one head length is one point on a curve.
 pub fn drive_with(
     port: u16,
     connections: u32,

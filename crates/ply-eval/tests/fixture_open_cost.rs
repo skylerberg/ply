@@ -1,24 +1,4 @@
 //! What replaced the fork, as a number rather than a slogan.
-//!
-//! ADR 0005 §2's claim was that forking a seeded world costs one pointer clone
-//! at any fixture size, so building a fixture once and forking it per test stops
-//! being a design decision. ADR 0017 §6 takes the fork away and owes the
-//! replacement's price in the same units: **this file is that measurement**, and
-//! it is deliberately blunt about the half that got dearer.
-//!
-//! Three numbers:
-//!
-//! 1. **Opening a fixture** — O(the fixture), where a fork was O(1). Measured at
-//!    three sizes so the slope is visible rather than asserted away.
-//! 2. **Resetting to the fixture** — what an entry point actually does, which is
-//!    the operation a fork was on the path of. It allocates nothing, whatever
-//!    the run allocated, which is what a bump arena buys and a persistent map
-//!    could not.
-//! 3. **A fixture per test, with a write** — the loop `ply-test` runs.
-//!
-//! The counting allocator is why this is its own test binary: a
-//! `#[global_allocator]` is a whole-binary decision and has no business in the
-//! crate's unit tests.
 
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Value};
@@ -94,15 +74,12 @@ fn slots_of(fixture: &Fixture) -> Vec<Slot> {
     }
 }
 
-/// The fastest of a few repeats: a slower one only ever means the machine did
-/// something else too.
+/// The fastest of a few repeats: a slower one only ever means the machine did something else too.
 fn best_of(repeats: usize, mut run: impl FnMut() -> Duration) -> Duration {
     (0..repeats).map(|_| run()).min().expect("at least one run")
 }
 
-/// The half that got dearer, stated rather than hidden. A fork allocated
-/// nothing at every size; an open replays the fixture's allocations, so it
-/// allocates in proportion to it.
+/// The half that got dearer, stated rather than hidden.
 #[test]
 fn opening_a_fixture_costs_the_fixture_and_the_number_is_printed() {
     println!("\n  cells   open allocations   open bytes");
@@ -127,11 +104,6 @@ fn opening_a_fixture_costs_the_fixture_and_the_number_is_printed() {
 }
 
 /// The half that got cheaper, and the one on the path a run actually takes.
-///
-/// A fork put a fresh persistent map in place and dropped the old one, freeing
-/// a tree node per cell the run allocated. A reset truncates the bump pointer
-/// and keeps the chunks, so a run of a given size charges the allocator once in
-/// the machine's whole life rather than once per entry point.
 #[test]
 fn resetting_to_the_fixture_allocates_nothing_however_much_the_run_did() {
     let fixture = seeded(1_000);
@@ -152,13 +124,6 @@ fn resetting_to_the_fixture_allocates_nothing_however_much_the_run_did() {
     }
 }
 
-/// The milestone's claim, run as the loop `ply-test` runs: one fixture, opened
-/// per test, written to by each.
-///
-/// The bound is a ceiling on the replacement rather than a restatement of the
-/// fork's. A fork of a 10,000-cell fixture plus a write was under 50 µs; an open
-/// is a replay, so this asks only that a 10,000-cell fixture still opens in the
-/// same order of magnitude as the tests it is opened for.
 #[test]
 fn a_seeded_fixture_opens_per_test_in_microseconds() {
     const TESTS: usize = 1_000;
@@ -198,8 +163,7 @@ fn a_seeded_fixture_opens_per_test_in_microseconds() {
     }
 }
 
-/// A fixture is a seed rather than a live parent, and the two stacks it hands
-/// out are independent. That is what the fork's sibling isolation bought, kept.
+/// A fixture is a seed rather than a live parent, and the two stacks it hands out are independent.
 #[test]
 fn two_stacks_opened_from_one_fixture_share_no_storage() {
     let fixture = seeded(64);

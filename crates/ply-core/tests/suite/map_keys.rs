@@ -1,8 +1,5 @@
-//! `Map`'s type surface: the twelve builtins' signatures, and the one rule that
-//! makes the iteration order well defined — **a key type must be ordered**.
-//!
-//! Written at the source level, because the signature and the `where` clause are
-//! what a user edits.
+//! `Map`'s type surface: the twelve builtins' signatures, and the one rule that makes the iteration
+//! order well defined — **a key type must be ordered**.
 
 use ply_core::{CheckOutput, check_program, print_type};
 use ply_span::{Diagnostic, SourceId, Symbol, codes};
@@ -46,13 +43,13 @@ fn sig(out: &CheckOutput, name: &str) -> String {
     print_type(&out.defs[&key].scheme.ty)
 }
 
-/// The whole surface at once: a signature that moved would otherwise be caught
-/// only by whichever downstream test happened to use it.
+/// The whole surface at once: a signature that moved would otherwise be caught only by whichever
+/// downstream test happened to use it.
 #[test]
 fn the_map_builtins_have_the_types_the_contract_states() {
-    // The middle column is the probe's own generic list: the type and row
-    // variables the contract's type mentions have to be *bound* now that the
-    // return type is written down, and `<| e>` is the row namespace.
+    // The middle column is the probe's own generic list: the type and row variables the contract's
+    // type mentions have to be *bound* now that the return type is written down, and `<| e>` is the
+    // row namespace.
     let expected = [
         ("map_new", "<a, b>", "() -> Map<a, b>"),
         ("map_insert", "<a, b>", "(Map<a, b>, a, b) -> Map<a, b>"),
@@ -79,12 +76,10 @@ fn the_map_builtins_have_the_types_the_contract_states() {
             "(Map<a, b>, c, (c, a, b) -> c / e) -> c / e",
         ),
     ];
-    // `fn probe_f() -> T = f` returns the builtin itself under a *written*
-    // return type (`MISSING_SIGNATURE`), so the printed signature of the probe
-    // still carries the builtin's whole type — but the builtin must now
-    // *unify* with the contract's type rather than merely print as it, which is
-    // strictly stronger. `where derivable(ord, a)` is the clause a written
-    // `Map<a, _>` owes; a probe cannot name a key type it has not ordered.
+    // `fn probe_f() -> T = f` returns the builtin itself under a *written* return type
+    // (`MISSING_SIGNATURE`), so the printed signature of the probe still carries the builtin's
+    // whole type — but the builtin must now *unify* with the contract's type rather than merely
+    // print as it, which is strictly stronger.
     let source: String = expected
         .iter()
         .map(|(name, generics, ty)| {
@@ -116,13 +111,8 @@ fn a_float_key_is_refused_where_it_is_written() {
     );
 }
 
-/// The same refusal where nothing wrote `Map<Float, _>` down: the key is a
-/// variable when the call is walked, and only unification pins it. This is why
-/// the check is deferred rather than made at `conv_type`.
-///
-/// `MISSING_SIGNATURE` means the fixture must write *a* return type, so the map
-/// is measured and the signature says `Int`: the key stays a variable that only
-/// the `1.5` argument pins, which is the whole point of the test.
+/// The same refusal where nothing wrote `Map<Float, _>` down: the key is a variable when the call
+/// is walked, and only unification pins it.
 #[test]
 fn an_inferred_float_key_is_refused_too() {
     let d = only_code(
@@ -132,8 +122,7 @@ fn an_inferred_float_key_is_refused_too() {
     assert!(d.message.contains("Float"), "{}", d.message);
 }
 
-/// A `Float` nested inside a key is named as the field that blocks it, not the
-/// key as a whole.
+/// A `Float` nested inside a key is named as the field that blocks it, not the key as a whole.
 #[test]
 fn a_float_inside_a_key_is_refused_and_named() {
     let d = only_code(
@@ -143,8 +132,8 @@ fn a_float_inside_a_key_is_refused_and_named() {
     assert!(d.message.contains("Float"), "{}", d.message);
 }
 
-/// Required test: `Map<k, v>` under an unconstrained `k` is `E0206` naming the
-/// clause to add, and adding it fixes it.
+/// Required test: `Map<k, v>` under an unconstrained `k` is `E0206` naming the clause to add, and
+/// adding it fixes it.
 #[test]
 fn an_unconstrained_type_parameter_is_refused_at_the_signature() {
     let d = only_code(
@@ -164,8 +153,8 @@ fn an_unconstrained_type_parameter_is_refused_at_the_signature() {
     );
 }
 
-/// Inside the body the constraint is assumed, so a nested map built from the
-/// parameter needs no second clause.
+/// Inside the body the constraint is assumed, so a nested map built from the parameter needs no
+/// second clause.
 #[test]
 fn a_body_may_assume_its_own_constraint() {
     ok(
@@ -174,8 +163,7 @@ fn a_body_may_assume_its_own_constraint() {
     );
 }
 
-/// A constraint for another deriver does not make a key ordered. `ord` is the
-/// predicate, and `json` is a different claim about the same type.
+/// A constraint for another deriver does not make a key ordered.
 #[test]
 fn a_json_constraint_does_not_order_a_key() {
     let d = only_code(
@@ -209,8 +197,8 @@ fn a_function_and_a_cell_are_refused_as_keys() {
     assert!(c.message.contains("Cell"), "{}", c.message);
 }
 
-/// Everything the contract lists as ordered, in one program, so a leaf dropped
-/// from the predicate is caught here rather than by whatever used it.
+/// Everything the contract lists as ordered, in one program, so a leaf dropped from the predicate
+/// is caught here rather than by whatever used it.
 #[test]
 fn the_ordered_types_are_accepted() {
     ok("type Colour = Red | Green\n\
@@ -229,8 +217,8 @@ fn the_ordered_types_are_accepted() {
         fn l() -> Map<Option<Int>, Int> = map_new()\n");
 }
 
-/// A recursive key type terminates rather than looping: the predicate refuses to
-/// enter a type it is already inside, which is the same rule derivation needs.
+/// A recursive key type terminates rather than looping: the predicate refuses to enter a type it is
+/// already inside, which is the same rule derivation needs.
 #[test]
 fn a_recursive_key_type_terminates() {
     ok("type Tree = Leaf | Node(Tree, Tree)\nfn m() -> Map<Tree, Int> = map_new()\n");
@@ -241,9 +229,7 @@ fn a_recursive_key_type_terminates() {
     assert!(d.message.contains("Float"), "{}", d.message);
 }
 
-/// A map whose key nothing pinned is not an error. `map_new()` bound to a name
-/// and only ever measured never names a key type, and reporting one would make
-/// a legal program fail on a variable the program does not have.
+/// A map whose key nothing pinned is not an error.
 #[test]
 fn an_unsolved_key_is_not_reported() {
     ok("fn m() -> Int = map_len(map_new())\n");
@@ -256,9 +242,7 @@ fn the_value_type_carries_no_constraint() {
     ok("fn m<v>(v: v) -> Map<Int, v> = map_insert(map_new(), 1, v)\n");
 }
 
-/// The fixture `tests/fixtures/` owes for `E0206`'s map-key shape. A fixture
-/// that stopped producing its code would otherwise sit there looking like
-/// documentation.
+/// The fixture `tests/fixtures/` owes for `E0206`'s map-key shape.
 #[test]
 fn the_map_key_fixture_produces_the_code_it_is_named_for() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))

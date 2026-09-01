@@ -1,17 +1,4 @@
 //! Canonical form for a stored interface.
-//!
-//! `ply_core::env::generalize` quantifies over whatever `TyVar` / `RowVar`
-//! numbers the run's global counter happened to hand out, so checking a
-//! different subset of the program yields an alpha-equivalent scheme with
-//! different numbers. The front-end cache's whole safety argument is that the
-//! incremental path produces *byte-identical* schemes to a from-scratch check,
-//! and byte-identity does not survive a counter.
-//!
-//! Renumbering by first occurrence in a fixed traversal is invariant under any
-//! injective renaming, which has a consequence worth relying on: canonicalizing
-//! an already-canonicalized scheme — or one some other pass renamed first —
-//! yields the same bytes. So applying this at the point of storage is safe even
-//! if a caller has already applied its own.
 
 use ply_core::{Row, RowVar, Scheme, TyVar, Type};
 use std::collections::HashMap;
@@ -23,10 +10,9 @@ pub fn canonicalize_scheme(scheme: &Scheme) -> Scheme {
     Renumber::default().scheme(scheme)
 }
 
-/// Canonicalizes a declaration's signatures under **one** numbering, because a
-/// type's parameters are shared by every constructor: renumbering each
-/// constructor independently would make `P(a)` and `Q(b)` of `type Pair<a, b>`
-/// both mention `t0`.
+/// Canonicalizes a declaration's signatures under **one** numbering, because a type's parameters
+/// are shared by every constructor: renumbering each constructor independently would make `P(a)`
+/// and `Q(b)` of `type Pair<a, b>` both mention `t0`.
 pub fn canonicalize_decl_body(body: &DeclBody) -> DeclBody {
     Renumber::default().decl_body(body)
 }
@@ -67,8 +53,8 @@ impl Renumber {
                 ret: Box::new(self.ty(ret)),
                 effects: self.row(effects),
             },
-            // A `BTreeMap` iterates in key order, so the traversal does not
-            // depend on how the record was built.
+            // A `BTreeMap` iterates in key order, so the traversal does not depend on how the
+            // record was built.
             Type::Record(fields) => Type::Record(
                 fields
                     .iter()
@@ -86,8 +72,8 @@ impl Renumber {
     }
 
     fn scheme(&mut self, scheme: &Scheme) -> Scheme {
-        // The body first: a variable's canonical number is where it is *used*,
-        // so that a quantifier list in a different order cannot change it.
+        // The body first: a variable's canonical number is where it is *used*, so that a quantifier
+        // list in a different order cannot change it.
         let ty = self.ty(&scheme.ty);
         let mut ty_vars: Vec<TyVar> = scheme.ty_vars.iter().map(|v| self.ty_var(*v)).collect();
         let mut row_vars: Vec<RowVar> = scheme.row_vars.iter().map(|v| self.row_var(*v)).collect();
@@ -143,8 +129,8 @@ mod tests {
         Type::Var(TyVar(n))
     }
 
-    /// `fn f<a, b, e>(a, b) -> a / e`, quantified over whatever numbers the run
-    /// happened to hand out.
+    /// `fn f<a, b, e>(a, b) -> a / e`, quantified over whatever numbers the run happened to hand
+    /// out.
     fn identity_pair(a: u32, b: u32, e: u32) -> Scheme {
         Scheme {
             ty_vars: vec![TyVar(a), TyVar(b)],
@@ -294,8 +280,8 @@ mod tests {
 
     #[test]
     fn one_numbering_spans_a_declaration_so_its_constructors_stay_related() {
-        // `type Pair<a, b> = | P(a, b) | Q(b)` — `Q`'s field is the *second*
-        // parameter, and numbering each constructor on its own would erase that.
+        // `type Pair<a, b> = | P(a, b) | Q(b)` — `Q`'s field is the *second* parameter, and
+        // numbering each constructor on its own would erase that.
         let pair = |a: u32, b: u32| DeclBody::Type {
             arity: 2,
             ctors: vec![

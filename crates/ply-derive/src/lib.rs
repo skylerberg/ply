@@ -1,23 +1,4 @@
 //! `derive json for Order` becomes an ordinary definition.
-//!
-//! Expansion runs immediately after parse and before resolution, and is purely
-//! syntactic: it reads the module's own type declarations — which the orphan
-//! rule guarantees is where the target is — and emits references to other
-//! types' codecs by name, leaving resolution to check them.
-//!
-//! Generated `FnDef`s are **appended to `Module::items`**, after every source
-//! item, in the order their `derive`s were written. One list rather than two: a
-//! second list is a thing every walker can forget, and forgetting it drops a
-//! definition silently. Appending leaves the index of every `test` and `law`
-//! untouched, which `HashOutput::tests` is parallel to. The `Item::Derive` stays
-//! in place as the declaration and contributes no definition of its own.
-//!
-//! Determinism is the property this file exists to keep. The same type must
-//! produce byte-identical source on every run and every machine, or a generated
-//! definition's hash — and therefore the cache entry, the test selection and the
-//! wire format it describes — depends on something outside the program. Nothing
-//! below iterates a hash map or sorts by anything but a total order that is
-//! already written down.
 
 pub mod emit;
 pub mod retarget;
@@ -38,9 +19,7 @@ use ply_syntax::parser::parse_recovering;
 pub use rules::{generated_name, snake_case};
 pub use walk::Blocker;
 
-/// Expands every module in place. A module with no `derive` is untouched, and a
-/// program with none has hashes byte-identical to what it had before this
-/// existed.
+/// Expands every module in place.
 pub fn expand_program(program: &mut Program) -> Vec<Diagnostic> {
     let mut diags = Vec::new();
     for module in &mut program.modules {
@@ -66,12 +45,6 @@ pub fn expand_module(module: &mut Module) -> Vec<Diagnostic> {
 }
 
 /// The source each of this module's derivations generates, in `derive` order.
-///
-/// This is what the golden pin test renders. A change to a deriver moves these
-/// bytes, which moves the generated definition's hash — and gate 1 keys on raw
-/// file content, so a compiler upgrade that changed them without a
-/// `FRONTEND_VERSION` bump would let a file be skipped and a stale generated
-/// definition be reused.
 pub fn preview(module: &Module) -> Vec<String> {
     Expander::new(module)
         .run()
@@ -84,8 +57,8 @@ pub fn preview(module: &Module) -> Vec<String> {
 /// What one module's derivations produced.
 struct Expansion {
     generated: Vec<(String, FnDef)>,
-    /// Module binders the generated bodies write, for a runtime module the file
-    /// imported without binding one. See [`Expander::runtime_prefix`].
+    /// Module binders the generated bodies write, for a runtime module the file imported without
+    /// binding one.
     imports: Vec<ImportDecl>,
     diags: Vec<Diagnostic>,
 }
@@ -94,15 +67,15 @@ struct Expander<'a> {
     module: &'a Module,
     /// The module's own type declarations, by simple name, in source order.
     types: IndexMap<Symbol, &'a TypeDef>,
-    /// Those of them that are parameterless aliases, which a written type is
-    /// resolved through before a `Map`'s key form is chosen.
+    /// Those of them that are parameterless aliases, which a written type is resolved through
+    /// before a `Map`'s key form is chosen.
     aliases: emit::Aliases<'a>,
-    /// Generated name -> the `derive` that claimed it, for the collision that
-    /// `snake_case` being total makes possible.
+    /// Generated name -> the `derive` that claimed it, for the collision that `snake_case` being
+    /// total makes possible.
     claimed: IndexMap<String, &'a DeriveDef>,
     generated: Vec<(String, FnDef)>,
-    /// Runtime module name -> the binder its calls are written under, and the
-    /// import that binds it when this expansion had to add one.
+    /// Runtime module name -> the binder its calls are written under, and the import that binds it
+    /// when this expansion had to add one.
     runtimes: IndexMap<String, (String, Option<ImportDecl>)>,
     diags: Vec<Diagnostic>,
 }
@@ -180,9 +153,9 @@ impl<'a> Expander<'a> {
         }
     }
 
-    /// Parsing what was just printed is the deriver's own round-trip check: a
-    /// generated body that does not parse is Ply's fault and is caught here
-    /// rather than as a syntax error against a file that does not contain it.
+    /// Parsing what was just printed is the deriver's own round-trip check: a generated body that
+    /// does not parse is Ply's fault and is caught here rather than as a syntax error against a
+    /// file that does not contain it.
     fn parse_generated(&self, source: &str) -> Option<FnDef> {
         let (parsed, diags) =
             parse_recovering(self.module.source, self.module.name.clone(), source);
@@ -196,24 +169,6 @@ impl<'a> Expander<'a> {
     }
 
     /// How this module writes a name that lives in the deriver's runtime module.
-    /// `None` means it cannot write one at all, and the diagnostic has been
-    /// recorded.
-    ///
-    /// **Always a module binder, never bare.** A bare name is resolved in the
-    /// *deriving* module, and ADR 0001 says a module's own items come first — so
-    /// under `import std.json (..)`, which binds no module name, a generated
-    /// body writing `int_json()` would compose with whatever the deriving module
-    /// called `int_json`. No import to look at, no `AMBIGUOUS_IMPORT`, no
-    /// diagnostic at the `derive` line, and one type with two encodings, which
-    /// is the divergence the orphan rule exists to prevent. So when the file
-    /// bound no module name for the runtime module, expansion adds one: a
-    /// synthesized `import std.json as <binder>` that only generated code
-    /// writes.
-    ///
-    /// The binder is a function of the file's own imports, so expansion stays a
-    /// function of the module — and it enters no hash, because a free reference
-    /// normalizes to its referent's hash rather than to the name it was written
-    /// under.
     fn runtime_prefix(&mut self, def: &DeriveDef) -> Option<String> {
         let Some(wanted) = rules::runtime_module(def.deriver) else {
             return Some(String::new());
@@ -261,8 +216,7 @@ impl<'a> Expander<'a> {
         Some(prefix)
     }
 
-    /// A module binder nothing in this file already binds. Deterministic: the
-    /// module's default binder, then that name with underscores appended.
+    /// A module binder nothing in this file already binds.
     fn free_binder(&self, wanted: &str) -> String {
         let mut binder = wanted.rsplit('.').next().unwrap_or(wanted).to_string();
         while self

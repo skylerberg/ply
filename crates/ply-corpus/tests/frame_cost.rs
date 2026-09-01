@@ -1,12 +1,4 @@
 //! What a step costs the allocator, exactly.
-//!
-//! Wall clock says the machine is slower than the tree-walker per test and does
-//! not say why. A profile says the allocator; an allocation count says how many
-//! and where, and it is the same number on every machine — so it is what a
-//! later change should be measured against.
-//!
-//! The counting allocator is why this is its own test binary: a
-//! `#[global_allocator]` is a whole-binary decision.
 
 use ply_corpus::build::generate;
 use ply_corpus::pipeline::front;
@@ -57,14 +49,7 @@ fn call_frame() -> Frame {
     }
 }
 
-/// One allocation to push a frame — the link that holds it — and none at all to
-/// pop one. That is the floor: a persistent stack has to put the frame
-/// somewhere, and taking it back out is reading a pointer.
-///
-/// It was four and two. `Stack` kept its innermost segment as the head of a
-/// persistent list, so both halves of the cycle rebuilt a shared segment node
-/// for a segment nothing else was looking at, and `rpds::List` boxed the frame
-/// separately from the link holding it.
+/// One allocation to push a frame — the link that holds it — and none at all to pop one.
 #[test]
 fn pushing_one_frame_costs_one_allocation_and_popping_costs_none() {
     let mut stack = Stack::new();
@@ -83,9 +68,8 @@ fn pushing_one_frame_costs_one_allocation_and_popping_costs_none() {
     });
     let per_push = allocs as f64 / PUSHES as f64;
 
-    // `into_next` rather than `next`, because that is what the machine's return
-    // transition uses: it owns its stack, so the frame is moved out of its link
-    // rather than cloned.
+    // `into_next` rather than `next`, because that is what the machine's return transition uses: it
+    // owns its stack, so the frame is moved out of its link rather than cloned.
     let (_, pop_allocs) = allocations_of(|| {
         let mut s = grown.clone();
         for _ in 0..PUSHES {
@@ -117,10 +101,9 @@ fn pushing_one_frame_costs_one_allocation_and_popping_costs_none() {
     );
 }
 
-/// Opening a prompt is the operation that genuinely needs a new segment, and a
-/// frame push must never cost more than it: a `handle` is rare and a push
-/// happens on all but a handful of transitions. The two were four and two the
-/// wrong way round, which is the inversion this test was written over.
+/// Opening a prompt is the operation that genuinely needs a new segment, and a frame push must
+/// never cost more than it: a `handle` is rare and a push happens on all but a handful of
+/// transitions.
 #[test]
 fn pushing_a_frame_costs_no_more_than_opening_a_prompt() {
     let prompt = Rc::new(Prompt {
@@ -177,8 +160,7 @@ fn corpus(root: &Path) {
     write(root, &spec, &generate(&spec)).expect("the corpus must be writable");
 }
 
-/// The same programs, on both engines, counted rather than timed. This is the
-/// number a later change has to move.
+/// The same programs, on both engines, counted rather than timed.
 #[test]
 fn the_machine_allocates_more_per_test_than_the_tree_walker() {
     let dir = tempfile::tempdir().expect("a temporary directory");
@@ -221,10 +203,8 @@ fn the_machine_allocates_more_per_test_than_the_tree_walker() {
     let tree = counts[0].1;
     let machine = counts[1].1;
     assert!(tree > 0 && machine > 0);
-    // A ceiling rather than an equality: this documents the gap the profile
-    // found and fails if it widens, without pretending the current ratio is a
-    // target. It was twelve before the stack stopped rebuilding its innermost
-    // segment on every push and every pop.
+    // A ceiling rather than an equality: this documents the gap the profile found and fails if it
+    // widens, without pretending the current ratio is a target.
     assert!(
         machine < tree * 4,
         "the machine allocated {machine} against the tree-walker's {tree}, which is worse than the gap this test was written over"

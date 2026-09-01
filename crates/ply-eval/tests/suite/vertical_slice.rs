@@ -1,5 +1,4 @@
-//! Exercises the contract entry point on real source: parse, resolve, check,
-//! evaluate.
+//! Exercises the contract entry point on real source: parse, resolve, check, evaluate.
 
 use ply_core::{CheckOutput, check_program};
 use ply_eval::Interp;
@@ -87,10 +86,8 @@ fn a_failing_test_yields_an_assertion_diagnostic() {
     );
 }
 
-/// The effect, the code that performs it and the handler that discharges it are
-/// each in a different module and spell the effect differently. They only meet
-/// because a perform and a clause are both resolved to `store.db` before they
-/// are compared.
+/// The effect, the code that performs it and the handler that discharges it are each in a different
+/// module and spell the effect differently.
 #[test]
 fn a_handler_discharges_an_effect_declared_in_another_module() {
     let compiled = Compiled::new(&[
@@ -124,10 +121,8 @@ fn a_handler_discharges_an_effect_declared_in_another_module() {
         .expect("the cross-module handler should discharge `store.db`");
 }
 
-/// A clause body runs when a perform deep inside another module reaches it, but
-/// its bare names still mean what they meant where the `handle` was written.
-/// Both modules define a `fixture`, so resolving the clause body in the
-/// performing module would silently return the other one's answer.
+/// A clause body runs when a perform deep inside another module reaches it, but its bare names
+/// still mean what they meant where the `handle` was written.
 #[test]
 fn a_handler_clause_body_resolves_where_the_handler_was_written() {
     let compiled = Compiled::new(&[
@@ -157,8 +152,8 @@ fn a_handler_clause_body_resolves_where_the_handler_was_written() {
         .expect("the clause body must resolve `fixture` in `app`, not in `store`");
 }
 
-/// Two modules declaring the same simple names is the case a flat global table
-/// would silently get wrong, so each definition has to reach its own.
+/// Two modules declaring the same simple names is the case a flat global table would silently get
+/// wrong, so each definition has to reach its own.
 #[test]
 fn same_named_definitions_in_two_modules_do_not_collide() {
     let compiled = Compiled::new(&[
@@ -189,9 +184,8 @@ fn same_named_definitions_in_two_modules_do_not_collide() {
     );
 }
 
-/// A constructor's identity is its program-wide name: two modules may each
-/// declare a `Wrapped`, and a value built by one must not match the other's
-/// pattern.
+/// A constructor's identity is its program-wide name: two modules may each declare a `Wrapped`, and
+/// a value built by one must not match the other's pattern.
 #[test]
 fn constructors_from_two_modules_are_distinct_values() {
     let compiled = Compiled::new(&[

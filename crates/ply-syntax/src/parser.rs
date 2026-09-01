@@ -1,13 +1,12 @@
-//! Errors are collected, not returned: a failed item is abandoned, the token
-//! stream is resynchronised on the next item keyword, and parsing continues, so
-//! one run reports as many independent syntax errors as it can find.
+//! Errors are collected, not returned: a failed item is abandoned, the token stream is
+//! resynchronised on the next item keyword, and parsing continues, so one run reports as many
+//! independent syntax errors as it can find.
 
 use crate::ast::*;
 use crate::lexer::{Kw, Token, TokenKind, lex};
 use ply_span::{Diagnostic, SourceId, Span, codes};
 
-/// Signals that the enclosing construct was abandoned. The diagnostic explaining
-/// why has already been recorded.
+/// Signals that the enclosing construct was abandoned.
 pub struct Bail;
 
 /// What one comma-separated member of `{..}` turned out to be.
@@ -24,12 +23,11 @@ enum Arg {
 
 type PResult<T> = Result<T, Bail>;
 
-/// Recursive descent walks the Rust stack, so nesting has to be capped before it
-/// overflows. Real code stays far below this; generated code need not.
+/// Recursive descent walks the Rust stack, so nesting has to be capped before it overflows.
 const MAX_DEPTH: u32 = 128;
 
-/// Parses a snippet as the anonymous module: it can neither import nor be
-/// imported, which is all a test or an editor scratch buffer needs.
+/// Parses a snippet as the anonymous module: it can neither import nor be imported, which is all a
+/// test or an editor scratch buffer needs.
 pub fn parse(source: SourceId, text: &str) -> Result<Module, Vec<Diagnostic>> {
     parse_module(source, ModuleName::anonymous(), text)
 }
@@ -47,9 +45,7 @@ pub fn parse_module(
     }
 }
 
-/// Parses as much as possible and hands back both the partial tree and every
-/// diagnostic. Editors and `--json` consumers want the tree even when it is
-/// wrong; [`parse`] is the strict wrapper.
+/// Parses as much as possible and hands back both the partial tree and every diagnostic.
 pub fn parse_recovering(
     source: SourceId,
     name: ModuleName,
@@ -59,37 +55,6 @@ pub fn parse_recovering(
 }
 
 /// **The tree before `effect_set`, `record_update` and `try_op` rewrite it.**
-/// Not for compiling anything: it is here so that a *second* parser can be
-/// compared against this one over what the **grammar** decided, rather than
-/// over what three later passes made of it.
-///
-/// [`parse_recovering`] runs the grammar and then three rewrites
-/// ([`Parser::run`]). Each is a tree-to-tree pass and none of them is parsing:
-/// `effect_set` splices a set's atoms into every row that names it,
-/// `record_update` turns `{..b, f: e}` into the plain [`ast::ExprKind::Record`]
-/// a reader would have written by hand, and `try_op` turns `e?` into the
-/// `match` it stands for. All three are `pub(crate)` in private modules, so no
-/// external caller can decline them, and that is the only reason this function
-/// exists.
-///
-/// **Who calls it.** `spikes/ply-parser`, and nothing else. That spike is a
-/// hand port of *this file* into Ply, differentially compared node for node and
-/// diagnostic for diagnostic over every `.ply` in the tree; it ports the
-/// grammar and not the three rewrites, so a post-rewrite comparison would be
-/// measuring four things at once and does today report 28 of 763 inputs
-/// disagreeing over sugar the port never claimed to expand.
-/// `spikes/ply-parser/GAPS.md` §11R.D is the decision and its cost, and
-/// `spikes/ply-parser/harness/src/lib.rs`'s `dumper_boundaries` states what the
-/// resulting comparison does and does not cover.
-///
-/// **What it is not.** It is not an editor entry point and not a public API:
-/// the two variants it lets through are `unreachable!()` in `ply-hash`,
-/// `ply-core` and `ply-eval`, and the invariants asserted by
-/// `no_try_survives_parse_module_anywhere_in_the_tree` and its record-update
-/// twin are invariants of [`parse_recovering`], not of this. A caller that
-/// hands this tree to anything downstream gets a panic, and that is the design.
-/// `parse_unexpanded_is_reached_by_no_shipping_caller` (`crate::tests`) fails
-/// if any crate in the workspace starts naming it.
 #[doc(hidden)]
 pub fn parse_unexpanded(
     source: SourceId,
@@ -99,8 +64,7 @@ pub fn parse_unexpanded(
     Parser::new(source, text).run_unexpanded(name)
 }
 
-/// Each input becomes its own module. Nothing is concatenated: a name in one
-/// file is invisible in another until it is exported and imported.
+/// Each input becomes its own module.
 pub fn parse_program<'a>(
     inputs: impl IntoIterator<Item = (SourceId, ModuleName, &'a str)>,
 ) -> Result<Program, Vec<Diagnostic>> {
@@ -122,17 +86,13 @@ pub fn parse_expr(source: SourceId, text: &str) -> Result<Expr, Vec<Diagnostic>>
     let mut p = Parser::new(source, text);
     match p.expr() {
         Ok(mut e) if p.at(&TokenKind::Eof) && p.diags.is_empty() => {
-            // A bare expression has no module around it, so a record update here
-            // has no shape to resolve and every one refuses. It still runs: the
-            // alternative is an unexpanded node escaping to a caller that has no
-            // arm for it.
+            // A bare expression has no module around it, so a record update here has no shape to
+            // resolve and every one refuses.
             if p.uses_record_update {
                 crate::record_update::expand_bare(&mut e, &mut p.diags);
             }
-            // Every `?` here refuses: a bare expression has no enclosing `fn`,
-            // so there is no written return type to read `Ok`/`Err` off. It
-            // still runs, for `expand_bare`'s reason — the alternative is an
-            // unexpanded node escaping to a caller that has no arm for it.
+            // Every `?` here refuses: a bare expression has no enclosing `fn`, so there is no
+            // written return type to read `Ok`/`Err` off.
             if p.uses_try {
                 crate::try_op::expand_bare(&mut e, &mut p.diags);
             }
@@ -154,18 +114,15 @@ struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diags: Vec<Diagnostic>,
-    /// Inside an `if`/`match` scrutinee a `{` starts the arm block, never a
-    /// record or block expression. Reset by every opening delimiter.
+    /// Inside an `if`/`match` scrutinee a `{` starts the arm block, never a record or block
+    /// expression.
     no_brace: bool,
     depth: u32,
-    /// Whether the file declared an `effect set` or named one in a row. A file
-    /// that did neither skips the expansion walk entirely, so the feature costs
-    /// nothing to a program that does not use it.
+    /// Whether the file declared an `effect set` or named one in a row.
     uses_effect_sets: bool,
-    /// Whether the file wrote `{..b, ...}` anywhere. Same bargain as
-    /// `uses_effect_sets`: a file that did not write one never walks.
+    /// Whether the file wrote `{..b, ...}` anywhere.
     uses_record_update: bool,
-    /// Whether the file wrote a `?` anywhere. Same bargain again.
+    /// Whether the file wrote a `?` anywhere.
     uses_try: bool,
 }
 
@@ -218,8 +175,7 @@ impl Parser {
         matches!(self.kind(), TokenKind::Eof)
     }
 
-    /// The token `n` ahead, clamped at the end. Only a named argument needs
-    /// this: `f(x)` and `f(x: 1)` share a first token.
+    /// The token `n` ahead, clamped at the end.
     fn peek_is(&self, n: usize, k: &TokenKind) -> bool {
         let i = (self.pos + n).min(self.tokens.len() - 1);
         &self.tokens[i].kind == k
@@ -278,8 +234,8 @@ impl Parser {
         }
     }
 
-    /// `>=` immediately after a type parameter list is really `>` then `=`, as in
-    /// `type Pair<a>= ..`. Split the token rather than reject the program.
+    /// `>=` immediately after a type parameter list is really `>` then `=`, as in `type Pair<a>=
+    /// ..`
     fn expect_gt(&mut self, what: &str) -> PResult<Span> {
         match self.kind() {
             TokenKind::Gt => Ok(self.advance()),
@@ -297,8 +253,8 @@ impl Parser {
     }
 
     fn push(&mut self, d: Diagnostic) {
-        // A single mistake usually trips several expectations at the same
-        // offset; only the first is informative.
+        // A single mistake usually trips several expectations at the same offset; only the first is
+        // informative.
         if let Some(last) = self.diags.last()
             && last.code == d.code
             && last.primary_span() == d.primary_span()
@@ -308,14 +264,7 @@ impl Parser {
         self.diags.push(d);
     }
 
-    /// Out of line, and that is not a style preference. `postfix_expr` and
-    /// `call_args` sit on the recursion path of every nested expression, so
-    /// anything the compiler has to reserve stack for in their frames is paid
-    /// once per level of nesting. A `Diagnostic` builder written inline in
-    /// either was enough to turn `[[[[...20,000...]]]]` from a depth diagnostic
-    /// into a stack overflow —
-    /// `pathological_nesting_is_a_diagnostic_rather_than_a_stack_overflow` is
-    /// what caught it.
+    /// Out of line, and that is not a style preference.
     #[cold]
     #[inline(never)]
     fn no_named_arguments_on_a_perform(&mut self, effect: &QName, op: &Ident, named: &[NamedArg]) {
@@ -386,39 +335,22 @@ impl Parser {
         if self.uses_record_update {
             crate::record_update::expand(&mut module, &mut self.diags);
         }
-        // Last, by convention rather than by necessity. ADR 0028 first said the
-        // order was load-bearing, on the grounds that `record_update` reads
-        // written `let x: T` annotations and a `?` expanded first would have
-        // turned `let x: T = e?;` into an untyped `Ok(x)` arm binder — but that
-        // shape is refused outright (`try_op::Cx::annotated_let`, `E0119`), so
-        // no annotation is ever lost. Each pass walks through the other's node,
-        // and swapping the two moves no hash in either corpus. Nothing gates
-        // this order; the ADR's Decision 1 withdraws the claim that something
-        // does.
+        // Last, by convention rather than by necessity.
         if self.uses_try {
             crate::try_op::expand(&mut module, &mut self.diags);
         }
         (module, self.diags)
     }
 
-    /// [`run`](Self::run) with the three rewrites above **not** run: the tree
-    /// exactly as the grammar built it, `ExprKind::Try` and
-    /// `ExprKind::RecordUpdate` still in it and every effect row still holding
-    /// only the atoms that were written.
-    ///
-    /// Reached from outside the crate only through [`parse_unexpanded`], which
-    /// carries the whole argument for why it exists. Nothing in the workspace
-    /// calls it and `parse_unexpanded_is_reached_by_no_shipping_caller`
-    /// (`crate::tests`) is what keeps that true.
+    /// [`run`](Self::run) with the three rewrites above **not** run: the tree exactly as the
+    /// grammar built it, `ExprKind::Try` and `ExprKind::RecordUpdate` still in it and every effect
+    /// row still holding only the atoms that were written.
     fn run_unexpanded(mut self, name: ModuleName) -> (Module, Vec<Diagnostic>) {
         let module = self.parse_all(name);
         (module, self.diags)
     }
 
-    /// The grammar and the recovery loop, with no rewrite after them. Split out
-    /// of [`run`](Self::run) so that the four lines which gate the rewrites are
-    /// the *only* difference between the expanded and unexpanded entry points —
-    /// a second copy of this loop would be a second parser to keep in step.
+    /// The grammar and the recovery loop, with no rewrite after them.
     fn parse_all(&mut self, name: ModuleName) -> Module {
         let source = self.source;
         let mut imports = self.imports();
@@ -447,8 +379,8 @@ impl Parser {
         }
     }
 
-    /// Every `import` precedes every item, so the import table is complete
-    /// before any body is parsed.
+    /// Every `import` precedes every item, so the import table is complete before any body is
+    /// parsed.
     fn imports(&mut self) -> Vec<ImportDecl> {
         let mut out = Vec::new();
         while self.at(&TokenKind::Kw(Kw::Import)) {
@@ -460,8 +392,8 @@ impl Parser {
         out
     }
 
-    /// Reported rather than silently accepted: a later pass would otherwise have
-    /// to look ahead to know what a name in an earlier body could mean.
+    /// Reported rather than silently accepted: a later pass would otherwise have to look ahead to
+    /// know what a name in an earlier body could mean.
     fn import_out_of_order(&mut self, first_item: Option<&Item>) {
         let span = self.span();
         let mut d = Diagnostic::error(
@@ -550,9 +482,8 @@ impl Parser {
             || self.at_derive_start()
     }
 
-    /// `law` is contextual: it opens an item only when a quoted label follows,
-    /// so `fn law(..)` and a local named `law` keep their meaning. `law/host`
-    /// puts a `/` and a name between the two, exactly as `test/nondet` does.
+    /// `law` is contextual: it opens an item only when a quoted label follows, so `fn law(..)` and
+    /// a local named `law` keep their meaning.
     fn at_law_start(&self) -> bool {
         self.at_ident_text("law")
             && (matches!(self.kind_at(1), TokenKind::Str(_))
@@ -560,18 +491,16 @@ impl Parser {
                     && matches!(self.kind_at(2), TokenKind::Ident(_))))
     }
 
-    /// `derive` is contextual for the same reason `law` is. Two identifiers in a
-    /// row cannot open any other item, so the deriver's name being wrong is
-    /// still reported as a bad `derive` rather than as an unrecognized item.
+    /// `derive` is contextual for the same reason `law` is.
     fn at_derive_start(&self) -> bool {
         self.at_ident_text("derive") && matches!(self.kind_at(1), TokenKind::Ident(_))
     }
 
     fn recover_to_item(&mut self) {
         let mut depth = 0i32;
-        // Both callers consume the leading keyword before they can fail, so
-        // already being at an item start means progress was made and the token
-        // belongs to the next construct rather than the abandoned one.
+        // Both callers consume the leading keyword before they can fail, so already being at an
+        // item start means progress was made and the token belongs to the next construct rather
+        // than the abandoned one.
         if !self.at_eof() && !self.at_item_start() {
             self.advance();
         }
@@ -593,9 +522,9 @@ impl Parser {
         }
     }
 
-    /// A qualified reference uses `::` rather than `.` because with `.` it would
-    /// be token-identical to a perform and to a field access, and telling those
-    /// apart needs scope information the parser does not have.
+    /// A qualified reference uses `::` rather than `.` because with `.` it would be token-identical
+    /// to a perform and to a field access, and telling those apart needs scope information the
+    /// parser does not have.
     fn qname(&mut self, what: &str) -> PResult<QName> {
         let first = self.expect_ident(what)?;
         if !self.eat(&TokenKind::ColonColon) {
@@ -696,9 +625,6 @@ impl Parser {
     }
 
     /// `effect set Web = {..}`.
-    ///
-    /// `set` is contextual: `effect set { .. }` is still an effect named `set`,
-    /// because only the third token being an identifier too can open a set.
     fn at_effect_set_start(&self) -> bool {
         self.at(&TokenKind::Kw(Kw::Effect))
             && matches!(self.kind_at(1), TokenKind::Ident(n) if n.as_str() == "set")
@@ -727,8 +653,8 @@ impl Parser {
                 break;
             }
         }
-        // A set denotes a ground set of atoms, so there is no tail to abstract
-        // over and `| e` here would have no meaning to give.
+        // A set denotes a ground set of atoms, so there is no tail to abstract over and `| e` here
+        // would have no meaning to give.
         if self.at(&TokenKind::Pipe) {
             let span = self.span();
             self.push(
@@ -750,8 +676,8 @@ impl Parser {
             name,
             atoms,
             includes,
-            // Filled by `effect_set::expand`, which needs every set in the file
-            // before it can resolve one.
+            // Filled by `effect_set::expand`, which needs every set in the file before it can
+            // resolve one.
             expansion: Vec::new(),
             span: start.to(close),
         })
@@ -775,9 +701,9 @@ impl Parser {
         })
     }
 
-    /// The derivers are fixed — there are no user-defined ones — so an
-    /// unrecognized name is reported here with the whole list rather than left
-    /// to fail as an unknown reference in generated code the user never wrote.
+    /// The derivers are fixed — there are no user-defined ones — so an unrecognized name is
+    /// reported here with the whole list rather than left to fail as an unknown reference in
+    /// generated code the user never wrote.
     fn deriver(&mut self, name: &Ident) -> PResult<Deriver> {
         match Deriver::from_name(name.name.as_str()) {
             Some(d) => Ok(d),
@@ -796,10 +722,7 @@ impl Parser {
         }
     }
 
-    /// `where derivable(json, a), derivable(ord, k)`, between the effect row and
-    /// any `requires`. Contextual: the grammar admits nothing but `=`, `{`,
-    /// `requires` and `ensures` at this position, so no ordinary name loses its
-    /// meaning.
+    /// `where derivable(json, a), derivable(ord, k)`, between the effect row and any `requires`.
     fn where_clause(&mut self) -> PResult<Vec<Constraint>> {
         if !self.at_ident_text("where") {
             return Ok(Vec::new());
@@ -885,9 +808,9 @@ impl Parser {
         })
     }
 
-    /// `requires` and `ensures` are contextual, recognized only between a `fn`
-    /// header and its body — where the grammar previously admitted nothing but
-    /// `=` and `{`, so no ordinary name loses its meaning.
+    /// `requires` and `ensures` are contextual, recognized only between a `fn` header and its body
+    /// — where the grammar previously admitted nothing but `=` and `{`, so no ordinary name loses
+    /// its meaning.
     fn spec_clauses(&mut self) -> PResult<Vec<SpecClause>> {
         let mut out = Vec::new();
         loop {
@@ -899,9 +822,8 @@ impl Parser {
                 return Ok(out);
             };
             let start = self.advance();
-            // Parsed like an `if` condition: a `{` closes the clause and opens
-            // the function's block body, so `ensures p(x) { .. }` is a clause
-            // plus a body and never a record literal.
+            // Parsed like an `if` condition: a `{` closes the clause and opens the function's block
+            // body, so `ensures p(x) { .. }` is a clause plus a body and never a record literal.
             let expr = self.scrutinee()?;
             let span = start.to(expr.span);
             out.push(SpecClause { kind, expr, span });
@@ -962,8 +884,8 @@ impl Parser {
         })
     }
 
-    /// A binder's type is mandatory: inferring it would make a law's meaning
-    /// depend on how its body happened to be written.
+    /// A binder's type is mandatory: inferring it would make a law's meaning depend on how its body
+    /// happened to be written.
     fn binder(&mut self) -> PResult<Binder> {
         let name = self.expect_ident("a binder name")?;
         self.expect(
@@ -980,9 +902,7 @@ impl Parser {
         self.param_inner(true)
     }
 
-    /// A lambda parameter, which may not. A default exists so that a *call* can
-    /// leave the argument out, and a lambda is reached through a value rather
-    /// than through a name a call site could match against a signature.
+    /// A lambda parameter, which may not.
     fn param(&mut self) -> PResult<Param> {
         self.param_inner(false)
     }
@@ -994,8 +914,8 @@ impl Parser {
         } else {
             None
         };
-        // Parsed either way, so that a default written on a lambda is refused
-        // with the reason rather than with `expected `,` or `|``.
+        // Parsed either way, so that a default written on a lambda is refused with the reason
+        // rather than with `expected `,` or `|``.
         let default = if self.at(&TokenKind::Eq) {
             let eq = self.advance();
             let e = self.expr()?;
@@ -1094,8 +1014,8 @@ impl Parser {
         })
     }
 
-    /// `type T = A` is an alias; a sum needs either a leading `|`, a payload, or
-    /// a second variant, so that `type Id = Int` keeps meaning what it looks like.
+    /// `type T = A` is an alias; a sum needs either a leading `|`, a payload, or a second variant,
+    /// so that `type Id = Int` keeps meaning what it looks like.
     fn looks_like_variants(&self) -> bool {
         match self.kind() {
             TokenKind::Pipe => true,
@@ -1179,8 +1099,8 @@ impl Parser {
         })
     }
 
-    /// An operation parameter may be written `name: Type` for documentation; only
-    /// the type is part of the signature.
+    /// An operation parameter may be written `name: Type` for documentation; only the type is part
+    /// of the signature.
     fn op_param(&mut self) -> PResult<TypeExpr> {
         if matches!(self.kind(), TokenKind::Ident(_)) && matches!(self.kind_at(1), TokenKind::Colon)
         {
@@ -1295,8 +1215,8 @@ impl Parser {
                         span: start.to(close),
                     });
                 }
-                // A type parameter is bound by the enclosing `<..>`, never by a
-                // module, so only a bare lowercase name can be one.
+                // A type parameter is bound by the enclosing `<..>`, never by a module, so only a
+                // bare lowercase name can be one.
                 if q.is_bare() && !starts_upper(q.symbol()) {
                     return Ok(TypeExpr::Var(q.name));
                 }
@@ -1368,8 +1288,8 @@ impl Parser {
                 span: start.to(close),
             });
         }
-        // A whole row that is a bare name is still a row *variable*: a set is
-        // only ever written inside braces, so `/ e` keeps the meaning it has.
+        // A whole row that is a bare name is still a row *variable*: a set is only ever written
+        // inside braces, so `/ e` keeps the meaning it has.
         let tail = self.expect_ident("an effect row: `{..}` or a row variable")?;
         Ok(RowExpr {
             atoms: Vec::new(),
@@ -1379,9 +1299,7 @@ impl Parser {
         })
     }
 
-    /// One member of a row or of an `effect set`. A `.` after the name makes it
-    /// an atom and nothing else can; one token of lookahead decides it, so no
-    /// name is reserved and `effect set` needs no keyword of its own.
+    /// One member of a row or of an `effect set`.
     fn row_member(&mut self, what: &str) -> PResult<RowMember> {
         let name = self.qname(what)?;
         if !self.at(&TokenKind::Dot) {
@@ -1475,8 +1393,6 @@ impl Parser {
                 TokenKind::LParen => e = self.apply_to(e)?,
                 TokenKind::Dot => {
                     // `db.get[users](k)` performs an effect; `r.f` reads a field.
-                    // Only a name can be an effect, and an operation is always
-                    // applied to a resource or an argument list.
                     let effect = match &e.kind {
                         ExprKind::Var(v)
                             if matches!(self.kind_at(1), TokenKind::Ident(_))
@@ -1504,9 +1420,8 @@ impl Parser {
                     };
                     e = self.perform_on(e, effect)?;
                 }
-                // Tightest tier, alongside `f(x)` and `r.field`, so `f(x)?.g`
-                // is `(f(x)?).g` and `-x?` is `-(x?)`. Ply has no ternary, so
-                // nothing else can claim the token.
+                // Tightest tier, alongside `f(x)` and `r.field`, so `f(x)?.g` is `(f(x)?).g` and
+                // `-x?` is `-(x?)`
                 TokenKind::Question => {
                     let close = self.advance();
                     let span = e.span.to(close);
@@ -1535,14 +1450,6 @@ impl Parser {
     }
 
     /// `f(..)`, out of line.
-    ///
-    /// `postfix_expr` runs once per level of a nested expression, so its frame
-    /// is paid per level and the whole of a program's nesting depth is bounded
-    /// by how large it is. Holding an argument list, a named-argument list and
-    /// a built `ExprKind::App` there cost enough of that budget to turn
-    /// `[[[[...20,000...]]]]` from a depth diagnostic into a stack overflow.
-    /// `pathological_nesting_is_a_diagnostic_rather_than_a_stack_overflow` is
-    /// the test that says so; keep this and [`Self::perform_on`] out of line.
     #[inline(never)]
     fn apply_to(&mut self, func: Expr) -> PResult<Expr> {
         let (args, named, close) = self.call_args()?;
@@ -1563,8 +1470,8 @@ impl Parser {
         let op = self.expect_ident("an operation name")?;
         let resource = self.opt_resource()?;
         let (args, named, close) = self.call_args()?;
-        // An operation has no defaults to fill and a handler clause must bind
-        // exactly what it declares, so there is nothing for a name to select.
+        // An operation has no defaults to fill and a handler clause must bind exactly what it
+        // declares, so there is nothing for a name to select.
         if !named.is_empty() {
             self.no_named_arguments_on_a_perform(&effect, &op, &named);
         }
@@ -1592,9 +1499,9 @@ impl Parser {
             for arg in parsed {
                 match arg {
                     Arg::Positional(e) => {
-                        // Ordering is the parser's to enforce because it is a
-                        // property of the text; which *names* are legal needs
-                        // the callee's signature and is `defaults::expand`'s.
+                        // Ordering is the parser's to enforce because it is a property of the text;
+                        // which *names* are legal needs the callee's signature and is
+                        // `defaults::expand`'s.
                         if let Some(first) = named.first() {
                             self.positional_after_named(e.span, first.span);
                         }
@@ -1610,9 +1517,6 @@ impl Parser {
     }
 
     /// `name: value` is a named argument; anything else is positional.
-    ///
-    /// The lookahead is two tokens and cannot be one: `f(x)` and `f(x: 1)` share
-    /// a first token, and `x` alone is an ordinary variable reference.
     fn call_arg(&mut self) -> PResult<Arg> {
         if let TokenKind::Ident(name) = self.kind()
             && self.peek_is(1, &TokenKind::Colon)
@@ -1687,10 +1591,7 @@ impl Parser {
                 {
                     return self.with_region_expr();
                 }
-                // Contextual, like `with_cell`: `simulate` stays an identifier
-                // everywhere else. Where a `{` cannot open an expression it
-                // opens the enclosing construct's block instead, so `simulate`
-                // is an ordinary name there and a region has to be parenthesized.
+                // Contextual, like `with_cell`: `simulate` stays an identifier everywhere else.
                 if name.as_str() == "simulate"
                     && !self.no_brace
                     && matches!(self.kind_at(1), TokenKind::LBrace)
@@ -1756,8 +1657,6 @@ impl Parser {
     }
 
     /// `{x: e}` and `{x, y}` are records; `{x}` is a block whose value is `x`.
-    /// `{..b, ...}` is a record update, and `..` cannot begin a statement, so
-    /// one token of lookahead settles it.
     fn at_record_literal(&self) -> bool {
         if matches!(self.kind_at(1), TokenKind::DotDot) {
             return true;
@@ -1778,8 +1677,8 @@ impl Parser {
         let base = if self.at(&TokenKind::DotDot) {
             self.uses_record_update = true;
             let b = self.record_update_base()?;
-            // `{..b}` is the whole expression when no comma follows; otherwise
-            // the comma separates the base from the fields that replace.
+            // `{..b}` is the whole expression when no comma follows; otherwise the comma separates
+            // the base from the fields that replace.
             if !self.at(&TokenKind::RBrace) {
                 self.expect(&TokenKind::Comma, "`,` after the record being updated")?;
             }
@@ -1799,19 +1698,12 @@ impl Parser {
         })
     }
 
-    /// The base of an update is a **path** — `s`, `state.limits` — and not an
-    /// arbitrary expression.
-    ///
-    /// This is not a parser convenience. The expansion writes `base.f` once per
-    /// field it copies, exactly as the longhand does, so a base with a call or
-    /// a `perform` in it would run that base once per field. Restricting it to
-    /// a repeatable, pure path is what makes `{..b, a: 1}` and its longhand the
-    /// same definition rather than merely the same value.
+    /// The base of an update is a **path** — `s`, `state.limits` — and not an arbitrary expression.
     fn record_update_base(&mut self) -> PResult<Expr> {
         let dots = self.advance();
         if matches!(self.kind(), TokenKind::Dot) {
-            // `...b`: `..` then `.`, which would otherwise report the useless
-            // "expected a name, found `.`".
+            // `...b`: `..` then `.`, which would otherwise report the useless "expected a name,
+            // found `.`"
             let span = self.span();
             self.push(
                 Diagnostic::error(
@@ -2093,9 +1985,6 @@ impl Parser {
             "`)` to close the clause parameters",
         )?;
         // `resume` is a keyword only here, between a clause's `)` and its `->`.
-        // Nothing else is grammatical in that position, so consuming it on
-        // sight costs no ordinary name its meaning and lets a missing binder be
-        // reported against `resume` rather than against `->`.
         let resume = if self.at_ident_text("resume") {
             self.advance();
             Some(self.expect_ident("a name to bind the continuation to")?)
@@ -2231,9 +2120,8 @@ impl Parser {
                     span: start,
                 })
             }
-            // A negative literal is one pattern rather than an operator applied
-            // to one, because a pattern is not an expression and there is
-            // nothing to apply.
+            // A negative literal is one pattern rather than an operator applied to one, because a
+            // pattern is not an expression and there is nothing to apply.
             TokenKind::Minus
                 if matches!(
                     self.kind_at(1),
@@ -2426,8 +2314,8 @@ impl Parser {
     }
 }
 
-/// One implementation, in `ast`, because [`ast::is_default_expr`] asks the same
-/// question of a default's callee that the grammar asks of a pattern.
+/// One implementation, in `ast`, because [`ast::is_default_expr`] asks the same question of a
+/// default's callee that the grammar asks of a pattern.
 use crate::ast::is_ctor_name as starts_upper;
 
 /// Expressions that end in `}` may stand as a statement without a `;`.

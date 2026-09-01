@@ -1,10 +1,4 @@
 //! `ply prove` — every obligation, and the tier it was discharged at.
-//!
-//! The coverage line is **first** and is not behind a flag. A project with three
-//! proved obligations and four hundred unspecified definitions must not print
-//! three green ticks and stop, because that artifact is worse than the one M7
-//! shipped: it invites a reviewer to stop reading at the moment there is most
-//! left to read.
 
 use super::common::{
     IND, build_pool, diagnostic_json, diagnostics_json, emit_json, location, millis, once_each,
@@ -73,15 +67,14 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
 
     let collected = crate::obligations::collect(&loaded.program, &scoped, &hashes);
     warnings.extend(collected.warnings);
-    // Counted before the filter and before anything is discharged: "carries a
-    // claim" is a fact about the program, not about what this run chose to look
-    // at or managed to establish.
+    // Counted before the filter and before anything is discharged: "carries a claim" is a fact
+    // about the program, not about what this run chose to look at or managed to establish.
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
     let (obligations, filtered_out) = filter(collected.obligations, args.filter.as_deref());
 
-    // The row a `law/host` will enter, which is what decides whether this run
-    // needs a database at all: a file whose laws are all hermetic binds nothing,
-    // exactly as `ply test` binds nothing for a suite that installs the twin.
+    // The row a `law/host` will enter, which is what decides whether this run needs a database at
+    // all: a file whose laws are all hermetic binds nothing, exactly as `ply test` binds nothing
+    // for a suite that installs the twin.
     let reach = ply_core::ty::Footprint::from_atoms(
         scoped
             .laws
@@ -196,9 +189,7 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     }
 }
 
-/// Every module parsed, because a clause the run did not read is a claim nobody
-/// checked. Gate 1 may skip a file whose bytes are unchanged, and a skipped file
-/// has no clause AST to collect from.
+/// Every module parsed, because a clause the run did not read is a claim nobody checked.
 pub(crate) fn load_complete(
     path: &std::path::Path,
     incremental: bool,
@@ -250,8 +241,8 @@ fn filter(obligations: Vec<Obligation>, filter: Option<&str>) -> (Vec<Obligation
     (kept, filtered_out)
 }
 
-/// A law is labelled rather than named, so the report prints the label it was
-/// written with and not the `<module>.<label>` its key is.
+/// A law is labelled rather than named, so the report prints the label it was written with and not
+/// the `<module>.<label>` its key is.
 pub(crate) fn law_labels(check: &CheckOutput) -> BTreeMap<Symbol, String> {
     check
         .laws
@@ -272,16 +263,7 @@ pub(crate) fn outcome_of(discharge: &Discharge) -> &'static str {
     }
 }
 
-/// What an `ensures` gives up when its owner's declared row is wider than its
-/// body's.
-///
-/// The footprint is the frame condition: an `ensures` means *this holds of the
-/// result, and every resource outside the footprint's writes is unchanged*. An
-/// annotation wider than the body — which an `effect set` makes systematic,
-/// since one set is written for a whole service — therefore promises less about
-/// less, at the same tier and with no other sign that anything was lost. Here
-/// it is a scheduling cost nobody wrote down; on an obligation it is a weakened
-/// claim, so `ply prove --explain` names the atoms.
+/// What an `ensures` gives up when its owner's declared row is wider than its body's.
 fn weakened_frame(loaded: &Loaded, obligation: &Obligation) -> Vec<String> {
     if obligation.kind == ObligationKind::Law {
         return Vec::new();
@@ -315,10 +297,6 @@ pub(crate) fn owner_label(obligation: &Obligation, labels: &BTreeMap<Symbol, Str
 }
 
 /// Why an obligation is `proved`, as the certificate itself says.
-///
-/// Every rule it names, in application order, deduplicated — a reader is being
-/// told which arguments were used, not how many times each fired. The step count
-/// is last because it is the cost, not the claim.
 pub(crate) fn certificate_summary(certificate: &Certificate) -> String {
     let mut parts: Vec<String> = Vec::new();
     let mut unfoldings = 0;
@@ -365,11 +343,6 @@ fn describe_rule(rule: &Rule) -> String {
     }
 }
 
-/// What a sampled run did, in the words that make the tier honest.
-///
-/// An `example` says how much of its budget the guard threw away, because being
-/// told `property, 200 cases` when seven cases ran is exactly the misreport this
-/// tier exists to avoid.
 pub(crate) fn cases_summary(cases: &CaseReport) -> String {
     let mut line = if cases.kept >= ply_prove::MIN_PROPERTY_CASES {
         format!(
@@ -467,9 +440,6 @@ fn quantifier(obligation: &Obligation) -> String {
 // --- Diagnostics ------------------------------------------------------------
 
 /// One diagnostic per outcome that is not a hold.
-///
-/// A refutation leads with the shrunk bindings, because the input is the answer
-/// and the search is only the evidence for it.
 pub(crate) fn diagnostics(
     report: &ProveReport,
     labels: &BTreeMap<Symbol, String>,
@@ -547,10 +517,6 @@ fn refutation(obligation: &Obligation, counterexample: &Counterexample, what: &s
 // --- Human output -----------------------------------------------------------
 
 /// The two lines every run of either command starts with.
-///
-/// The count of definitions carrying no obligation is exactly the surface where
-/// review still costs what it costs today, so it is here rather than behind a
-/// flag, and it is ahead of the results rather than after them.
 pub(crate) fn print_coverage(coverage: &Coverage, specified: usize, explain: bool, style: Style) {
     let unspecified = coverage.definitions.saturating_sub(specified);
     println!(
@@ -561,9 +527,9 @@ pub(crate) fn print_coverage(coverage: &Coverage, specified: usize, explain: boo
     if coverage.uncovered.is_empty() {
         return;
     }
-    // Not the same number as `unspecified`, and the difference is the point: a
-    // definition can carry a claim the machine could not establish, and such a
-    // definition is one a reviewer still has to read.
+    // Not the same number as `unspecified`, and the difference is the point: a definition can carry
+    // a claim the machine could not establish, and such a definition is one a reviewer still has to
+    // read.
     let shown = if explain {
         coverage.uncovered.len()
     } else {

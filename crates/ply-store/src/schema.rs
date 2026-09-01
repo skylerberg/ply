@@ -1,24 +1,4 @@
 //! What the front-end cache's on-disk shape is, as a value.
-//!
-//! The front-end cache is discarded whole when the version it was written under
-//! does not match this build's, so a shape change that is *not* paired with a
-//! bump is read back as though it were the old shape. Against JSON that is a
-//! loud parse error. Against a binary encoding it is a wrong `Scheme` or a wrong
-//! `Footprint` — and footprints decide which tests may run concurrently, so it
-//! is a wrong answer rather than a slow one.
-//!
-//! Three gates stop that, and this module is the first two:
-//!
-//! - `variant` names every variant of every stored enum through a `match` with
-//!   no wildcard arm, so under `cargo test` a new variant does not compile until
-//!   it is named, and the coverage test then fails until [`COVERED`] lists it
-//!   and an exemplar reaches it.
-//! - [`fingerprint`] digests [`COVERED`] together with the encoding of those
-//!   exemplars. The value half is computed *from the encoder*, so unlike a
-//!   hand-maintained description it cannot go stale.
-//!
-//! The third gate is the file header, which carries [`fingerprint`] and rejects
-//! anything else.
 
 use crate::frontend::{
     CachedCtor, CachedDecl, CachedDef, CachedOp, CachedTest, DeclBody, DefEntry, DefKind, FileSpan,
@@ -30,9 +10,7 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Mode;
 use std::collections::BTreeMap;
 
-/// Every variant name the exemplars below must between them mention. Adding a
-/// variant to a stored enum breaks the corresponding `match` in [`variant`]
-/// first; adding it here without an exemplar breaks `every_variant_is_covered`.
+/// Every variant name the exemplars below must between them mention.
 pub(crate) const COVERED: &[&str] = &[
     "Type::Var",
     "Type::Con",
@@ -101,9 +79,7 @@ mod variant {
     }
 }
 
-/// One value of every stored type, between them reaching every variant of every
-/// stored enum. This is the digest's input, so it is also the definition of
-/// what "the schema" means.
+/// One value of every stored type, between them reaching every variant of every stored enum.
 pub(crate) struct Exemplars {
     pub(crate) fingerprint: SourceFingerprint,
     pub(crate) def: CachedDef,
@@ -137,10 +113,8 @@ fn every_type() -> Type {
         params: vec![
             Type::Var(TyVar(0)),
             Type::Con(sym("List"), vec![Type::Var(TyVar(1))]),
-            // A two-argument `Con`, which no other exemplar reaches: `List` has
-            // one and `Map` is the first stored type whose arity the codec has
-            // to carry. It is here so the pin moves when `Map` arrives rather
-            // than only when something about `Type` itself does.
+            // A two-argument `Con`, which no other exemplar reaches: `List` has one and `Map` is
+            // the first stored type whose arity the codec has to carry.
             Type::map(Type::string(), Type::Var(TyVar(1))),
             Type::Record(BTreeMap::from([(sym("id"), Type::int())])),
         ],
@@ -258,33 +232,29 @@ pub(crate) fn exemplars() -> Exemplars {
     }
 }
 
-/// Digested over the *encoded* exemplars rather than over a description of
-/// the types: an encoder that starts writing a field differently changes this
-/// even though every type declaration is untouched, which is exactly the drift
-/// a reader cannot otherwise detect.
+/// Digested over the *encoded* exemplars rather than over a description of the types: an encoder
+/// that starts writing a field differently changes this even though every type declaration is
+/// untouched, which is exactly the drift a reader cannot otherwise detect.
 pub fn fingerprint() -> ContentHash {
     fingerprint_at(BODY_ENCODING)
 }
 
 /// The digest as it would be under another generation of the body encoding.
-/// A new literal tag — `LIT_BYTES` was one — changes no type in this file, so
-/// the encoding generation is the only thing that carries it into the digest,
-/// and a test proves that rather than assuming it.
 fn fingerprint_at(body_encoding: u32) -> ContentHash {
     let e = exemplars();
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"ply-store schema v1");
     hasher.update(&FRONTEND_FORMAT.to_le_bytes());
     hasher.update(&body_encoding.to_le_bytes());
-    // The declared variant set as well as the values, so that a variant added
-    // to a stored enum moves the digest at the point it is *named* rather than
-    // only once an exemplar happens to reach it.
+    // The declared variant set as well as the values, so that a variant added to a stored enum
+    // moves the digest at the point it is *named* rather than only once an exemplar happens to
+    // reach it.
     for name in COVERED {
         hasher.update(&(name.len() as u64).to_le_bytes());
         hasher.update(name.as_bytes());
     }
-    // `Outcome` goes through serde because the result cache is still JSON, and
-    // its shape is what a bump of `RUNTIME_VERSION` is for.
+    // `Outcome` goes through serde because the result cache is still JSON, and its shape is what a
+    // bump of `RUNTIME_VERSION` is for.
     let outcomes = serde_json::to_vec(&e.outcomes)
         .unwrap_or_else(|e| format!("unserializable: {e}").into_bytes());
     for bytes in [
@@ -375,10 +345,7 @@ fn mentioned() -> Vec<&'static str> {
 mod tests {
     use super::*;
 
-    /// The digest of the shapes this build stores. When this fails, the on-disk
-    /// schema changed: paste the digest the failure prints, and bump
-    /// `FRONTEND_VERSION` — a build that reads an entry written under the old
-    /// shape has no other way to know.
+    /// The digest of the shapes this build stores.
     const PINNED: &str = "7091c9ad2872af85b47eef81d2cf6060b78401f57550cd008a52bd139223c40d";
 
     #[test]
@@ -392,9 +359,8 @@ mod tests {
         );
     }
 
-    /// A variant no exemplar reaches contributes nothing to the digest, so a
-    /// change to it would be invisible to the pin. This is what makes the pin
-    /// exhaustive rather than merely present.
+    /// A variant no exemplar reaches contributes nothing to the digest, so a change to it would be
+    /// invisible to the pin.
     #[test]
     fn every_variant_is_covered() {
         let mentioned = mentioned();
@@ -419,9 +385,8 @@ mod tests {
         );
     }
 
-    /// `Bytes` added a normalization tag and no stored type, so `BODY_ENCODING`
-    /// is the whole path by which it reaches this digest. If that path were
-    /// broken, a store written before `b"..."` existed would look current.
+    /// `Bytes` added a normalization tag and no stored type, so `BODY_ENCODING` is the whole path
+    /// by which it reaches this digest.
     #[test]
     fn the_digest_follows_the_body_encoding_generation() {
         assert_ne!(

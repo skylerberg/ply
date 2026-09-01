@@ -8,8 +8,7 @@ use crate::{Interp, build};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{BinOp, Ident, Item, Lit, Mode, Pattern, PatternKind, QName};
 
-// Building lowered code directly. The `resume` binder has no surface syntax
-// yet, so a general clause cannot be reached through `ply_syntax`.
+// Building lowered code directly.
 
 fn sp() -> Span {
     Span::new(SourceId(0), 0, 1)
@@ -165,13 +164,11 @@ fn cell_set(cell: Code, value: Code) -> Code {
     callv("cell_set", vec![cell, value])
 }
 
-/// Every test below runs on the real machine. The `resume` binder has no
-/// surface syntax yet, so a general clause is built as lowered `Code` and fed
-/// in through `Machine::go_eval` rather than through `eval_expr_for_test`.
+/// Every test below runs on the real machine.
 struct Outcome {
     result: Result<Value, Diagnostic>,
-    /// The run's cells, ascending by slot index — the order `Arena::slots`
-    /// hands them out, so two runs of one program compare byte for byte.
+    /// The run's cells, ascending by slot index — the order `Arena::slots` hands them out, so two
+    /// runs of one program compare byte for byte.
     cells: Vec<Value>,
 }
 
@@ -239,9 +236,8 @@ impl Outcome {
     }
 }
 
-/// Runs an AST on both engines and fails on any divergence in value,
-/// diagnostic, footprint or final world. A disagreement between two evaluators
-/// of one language is made sticky by the cache, so it is never a warning.
+/// Runs an AST on both engines and fails on any divergence in value, diagnostic, footprint or final
+/// world.
 #[track_caller]
 fn both_engines(items: Vec<Item>, e: &ply_syntax::ast::Expr) -> Result<Value, Diagnostic> {
     let (program, resolved) = build::standalone(items);
@@ -277,9 +273,7 @@ fn a_tail_resumptive_clause_that_performs_its_own_operation_reaches_the_next_han
 
 #[test]
 fn a_multi_shot_clause_that_performs_its_own_operation_reaches_the_next_handler_out() {
-    // The inner clause performs `pick` twice and resumes twice. Every `pick` it
-    // performs must be answered by the outer handler; catching itself would not
-    // terminate.
+    // The inner clause performs `pick` twice and resumes twice.
     let e = handle_(
         handle_(
             bin(BinOp::Mul, perform_("nd", "pick", None, vec![]), int(10)),
@@ -396,8 +390,7 @@ fn a_resumption_sees_the_write_the_clause_made_before_calling_it() {
     assert_eq!(run.cell(0), 5);
 }
 
-/// ADR 0005 §3.2, "resumes twice". The value is half the test; the trace cell
-/// is the half that distinguishes a threaded world from a snapshotted one.
+/// ADR 0005 §3.2, "resumes twice".
 #[test]
 fn two_resumptions_run_against_one_threaded_world() {
     let e = with_cell_(
@@ -507,8 +500,7 @@ fn the_return_clause_runs_once_per_resumption_and_not_on_the_clause_s_own_value(
 
 #[test]
 fn a_nondeterministic_operation_delivers_one_value_to_both_resumptions() {
-    // `flip` is performed once. Both resumptions receive whatever the clause
-    // hands them, so nothing about resuming twice can introduce a second draw.
+    // `flip` is performed once.
     let e = with_cell_(
         "draws",
         int(0),
@@ -632,9 +624,7 @@ fn an_inner_handler_that_does_not_name_the_operation_falls_through() {
     assert_eq!(run(&e).int(), 7);
 }
 
-/// ADR 0005's escape case, and required test 6: this is a success, not an
-/// error. The world is monotone, so the cell the region allocated is still
-/// there when control comes back to it.
+/// ADR 0005's escape case, and required test 6: this is a success, not an error.
 #[test]
 fn a_continuation_captured_in_a_cell_region_still_reads_the_cell_after_the_region_returned() {
     let region = with_cell_(
@@ -854,9 +844,8 @@ fn a_capture_costs_one_segment_per_enclosing_handler_and_not_one_per_frame() {
     }
 }
 
-/// `map`'s loop is frames rather than host recursion precisely so this works: a
-/// continuation captured inside the callback has somewhere to return to on the
-/// second resumption.
+/// `map`'s loop is frames rather than host recursion precisely so this works: a continuation
+/// captured inside the callback has somewhere to return to on the second resumption.
 #[test]
 fn a_continuation_captured_inside_a_map_callback_produces_a_complete_list_per_resumption() {
     let e = handle_(
@@ -884,9 +873,9 @@ fn a_continuation_captured_inside_a_map_callback_produces_a_complete_list_per_re
         None,
     );
 
-    // The first `flip` is performed at element 0, so each resumption rebuilds
-    // the whole list from there with its own answer for that element and its
-    // own further performs answered by the same clause.
+    // The first `flip` is performed at element 0, so each resumption rebuilds the whole list from
+    // there with its own answer for that element and its own further performs answered by the same
+    // clause.
     let got = run(&e).rendered();
     assert_eq!(
         got,
