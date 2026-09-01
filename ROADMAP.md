@@ -13,47 +13,9 @@
 > | its own `[workspace]` | `crates/ply-codegen-spike/Cargo.toml` | always, under `cargo test --workspace` | no |
 > | `PLY_TEST_DB` | `crates/ply-host/src/db/pool/tests.rs:25` | the variable is unset | **no — nothing is printed at all, on either stream** |
 >
-> **Audit note (CI pass, 2026-08-24): the table describes a stock local
-> checkout, and since `.github/workflows/ci.yml` was added it no longer
-> describes CI.** All five are supplied there — the first four are also
-> *asserted* open, and the run fails if any of them skips. §W4's exit criterion
-> carries the gate-by-gate reading, the commands, and — the part that matters —
-> what was and was not actually executed before the claim was written.
->
-> **The fifth is the one to be careful about, and it is the row added on
-> 2026-08-24.** `PLY_TEST_DB` is set by the same job, but nothing in CI can
-> check that it *arrived unset*, because the 26 tests behind it print no notice
-> on either stream. Re-measured on the machine in `docs/ONBOARDING.md`
-> §Provenance on 2026-08-24, `cargo test -p ply-host --lib db::pool` against a
-> local postgres 18.3 — three rows, and this table previously carried only the
-> first two, with the second reading `1.35s` where `CONTRIBUTING.md` read
-> `1.55s` for the same measurement:
->
-> | `PLY_TEST_DB` | result |
-> | --- | --- |
-> | unset | **26 passed**, `0.00s` — silent, and green |
-> | set, server reachable | **26 passed**, `0.94s` |
-> | set, server unreachable | **20 FAILED**, `0.02s`, `E0431` |
->
-> **The third row is the one nobody had taken, and it changes the conclusion.**
-> `crates/ply-host/src/db/pool/tests.rs:41` does
-> `Reactor::start(config).expect("the test database is reachable")`, so a set
-> but wrong `PLY_TEST_DB` is a loud red build. The gate is not unassertable;
-> only the *unset* case is silent, and CI fails on that with `test -n`. Every
-> other gate here can be asserted open after the fact by grepping for the notice
-> it prints; this one cannot, so what the
-> workflow does for it is supply the variable and say so, and no more than
-> that. A timing assertion was considered and rejected: a check that fails when
-> a runner is slow is a check people learn to ignore, which is the failure mode
-> `CONTRACTS.md` names twice.
->
-> `cargo test --workspace` green therefore proves the W4 database claims only on
-> a machine with postgres, the W5 shutdown claims only on Unix, and none of ADR
-> 0016's spike claims anywhere. Four required properties are enforced by nothing
-> at all: ADR 0014 required tests **14** and **16**, ADR 0015 required test
-> **18**'s harness, and the second clause of ADR 0013 required test **26a**.
-> Each is annotated in place. Milestone entries below carry an audit note where
-> their criterion depends on one of these.
+> **This table describes a stock local checkout, not CI.** All five gates are
+> supplied in CI and the first four are *asserted* open — the run fails if any of
+> them skips. §W4's exit criterion carries the gate-by-gate reading.
 
 Each milestone has an exit criterion that is demonstrable, not aspirational.
 M0–M4 are the vertical slice: the smallest system that proves the thesis end to
@@ -82,16 +44,6 @@ re-argues — see the M9 and W6 entries. It is *not* the only thing unbuilt: ADR
 *before* M9 and one of which is M9. **[What is next](#what-is-next)** is at the
 foot of this file and is the entry a reader continuing this project should start
 from.
-
-> **Audit note (docs pass, 2026-08-17): this line read "M0–M8 and W1–W6 are
-> complete" and "M9 is the one milestone still deferred".** Both were written
-> before the region track and neither was updated by it. R1 and R2 had landed —
-> `World` is gone from `ply-eval`, `Isolation::World` is `Isolation::Region`
-> (`crates/ply-test/src/schedule.rs:101`), and both engines consult
-> `region_kind::infer` on the evaluation path — and this file mentioned neither
-> milestone anywhere in 456 lines. A roadmap that omits the milestone which
-> deleted a subsystem two other milestones are described in terms of is the
-> failure mode this audit exists for.
 
 ---
 
@@ -247,23 +199,6 @@ on how memory is represented. Nothing else in this entry moved.
 reported reduction against the naive interleaving count; and `exhaustive: true`
 on a test, which is a proof over every interleaving rather than a sample.
 
-> **Audit note (docs pass, 2026-08-17): re-checked, because this is the claim
-> M7 originally got wrong.** `exhaustive: true` over regions never examined was
-> the first of the seven defects this project's reviews found, and the guard
-> against it is now real and adversarial rather than incidental:
-> `crates/ply-eval/tests/exploration_soundness.rs` runs each reduced search
-> against a reference and fails on a program that reports `exhaustive` while
-> never reaching a reachable state — its header states the failure mode
-> directly, that over-pruning "is worse than not pruning at all, because
-> `exhaustive: true` is read as a proof". The budget direction is covered by
-> `a_spent_budget_is_exhausted_and_not_exhaustive`
-> (`crates/ply-eval/src/explore.rs:1598`), and the caching consequence by
-> `an_exhausted_search_is_not_cacheable` (`crates/ply-eval/src/sim.rs:1346`).
-> The tier consequence — that an exhaustive search over a *value* domain still
-> only earns `property` — is `a_concurrency_law_over_a_binder_is_property_however_exhaustive_the_search`
-> (`crates/ply-cli/tests/tiers.rs:527`), with the positive case at line 542.
-> All of these are hermetic, in the workspace, and behind no gate.
-
 `docs/adr/0006-deterministic-simulation.md`. Not in M7: real threads, a real
 network effect, and finding races in Rust code.
 
@@ -305,201 +240,38 @@ a resource.
 
 ## M9 — Native codegen
 
-**Still deferred — decided by W6 against criteria written before the numbers
-existed. The reason is not the one that carried this milestone through M0–M8.**
+**A code generator ships; the milestone's criteria are still not met, and those
+are two different statements.**
 
-> **Read this before the rest of this section: a code generator ships as of
-> 2026-08-31, and the heading above is not yet wrong.** `ply test --backend
-> cranelift` installs `ply_codegen::Cranelift`, a real cranelift JIT in the
-> shipping workspace — 31 new packages in `Cargo.lock`, no feature flag, no
-> second toolchain, `crates/ply-cli` depending on `crates/ply-codegen`. It
-> compiles the ADR 0016 §3.2 fragment and the machine enters it.
->
-> **What that discharges is ADR 0026 §4.5's precondition, not M9's criteria.**
-> §4.5 is *"a backend must be policeable before it is fast"*, and it is now
-> discharged for a code generator: the eight wrong backends run against it from
-> a shipping command, eight of eight accounted for, in
-> `crates/ply-cli/tests/backend.rs`. **C3 is untouched** — nothing cheaper has
-> been priced on the workload being decided, and ADR 0019 §5 item 5's
-> `sqrt`/`ln` is still unpriced end to end.
->
-> **And the honest headline, which belongs here rather than only in the ADR:**
-> on `benches/kernel` the code generator is **4.871×** against no backend, min
-> of 21 interleaved windows. On `examples/` it is **0.363×** — 2.76× *slower*
-> than no backend — because it enters 1.1% of offers there and pays 382 ms of
-> analysis plus 83 ms per worker of code generation on every run. ADR 0026 §4.9
-> has the pre-registration, the null control, the load caveat and the three
-> named routes out. This milestone still has to be argued on its criteria and
-> the argument is not "there is a code generator now".
+`ply test --backend cranelift` installs a real cranelift JIT from the shipping
+workspace — no feature flag, no second toolchain. It compiles the ADR 0016 §3.2
+fragment and the machine enters it.
 
-> **Both re-taken independently on rotated arms, 2026-08-31, and one line above
-> is corrected.** `benches/kernel` **4.927×** and `examples/` **0.353×** — the
-> two figures replicate. What does not is calling `examples/` the front end.
-> ADR 0030's front end is `spikes/ply-parser` parsing `examples/*.ply` as 13
-> byte literals, a 2.85 s run rather than a 468 ms one, and **on that corpus the
-> code generator is 0.969× — a 3.2% loss, not 2.76× slower**, while `reference`
-> comes back at **1.087×** against ADR 0030's published 1.0887×. The sign this
-> paragraph reports is right; the magnitude was an artefact of measuring a short
-> corpus where the fixpoint is most of the window. **The real obstacle is
-> narrower than the timing suggests and is a fourth route out**: on the front end
-> `reference` enters 190,617 offers over 69 definitions and `cranelift` enters
-> 89,912 over 6 — the code generator's fragment is *smaller than the
-> tree-walker's*. ADR 0026 §4.9 carries the correction and the series.
+**What decides whether that is worth anything is fragment coverage, not backend
+speed.** On a compute kernel, which is almost entirely inside the fragment, it is
+several times faster. On a program built out of the standard library it enters a
+fraction of a percent of the calls it is offered, and the fixed cost of analysis
+and code generation exceeds what entering them saves — so the run is *slower*.
+Both directions are measured; ADRs 0026 and 0030 carry the series, the
+pre-registration, the null controls and the load caveats.
 
-The old reason was that the interpreter is not the bottleneck. In a *test* run
-that is still true, but by far less than this file used to claim. **The
-`3.3% of a warm run` (10.4ms of 310.7ms) this paragraph carried, and the `93%`
-for typecheck plus hash plus parse beside it, are both withdrawn.** README.md's
-warm-loop table was re-taken on the documented corpus — which regenerates
-byte-identically, and whose selection counts all reproduce exactly — and
-`execute` came back at **125.1ms of 437.2ms, 28.6%**, with typecheck plus hash
-plus parse at **68.6%**. Every other phase in that table reproduced its published
-value closely, so it is one row that was wrong rather than a machine difference.
-A second, independent re-take under background load agreed on the direction and
-put `execute` at 17–19% of a much larger total; the cleaner run is the one
-README.md publishes and the one to quote. Either way the conclusion survives —
-a warm loop is still front-end and hash bound — but at 28.6% a faster evaluator
-is worth *something* in a test run, where at 3.3% it was worth nothing, and M9's
-case should not be argued from this number in the old terms again.
+**What that discharges is ADR 0026 §4.5's precondition — "a backend must be
+policeable before it is fast" — and not M9's criteria.** The eight deliberately
+wrong backends now run against a real code generator from a shipping command.
+**C3 is untouched**: nothing cheaper has been priced on the workload being
+decided.
 
-That figure was README's warm-loop table, taken by its own run of `ply-corpus gen`
-and `ply test` on W6's machine — **not** by W6, which did not re-take it: ADR
-0016 §0 carries M9's original deferral number, **4.2%** — now marked there as
-contradicted by this re-measurement, and by the audit's own third take of the
-`warm` scenario (`execute 125.47 ms 29.2%` of `total 429.04 ms`) — and the nine rungs of
-§8.1 are a *request* ladder with no warm-run row in it. `benches/w6-ladder.json`
-contains no such measurement either. In a *served* request the old reason is less false than
-it looks, and W6 did measure that: the interpreter is **35% of a request** (209.3µs of
-592.6µs, after the ladder's own seam is charged against it), a Ply request costs
-**37.8x** the same syscalls answering the same bytes, and a Cranelift spike on
-`std.http.read_line` hit **11.67x** on its weakest input — which projects
-**1.48x** end to end by Amdahl, against a **1.55x** ceiling an infinitely fast
-backend would have.
+**And the request path is still the workload being decided.** The interpreter is
+roughly a third of a request, so even an infinitely fast backend sits under the
+bar fixed before any of these numbers existed. That is Amdahl, not Cranelift.
+[ADR 0016](docs/adr/0016-w6-performance.md) is the argument.
 
-So three of the four criteria fail: the share is under the 50% C1 asks for, the
-projection is under the 1.50x C2 asks for, and **six of the seven cheaper levers
-are still unpriced**, which W6's criteria made independently sufficient on its
-own.
-
-**The seventh was priced, because it landed.** `ply-eval`'s constant memo
-evaluates a nullary pure definition once per process, which is ADR 0016 §4's
-"caching derived work" lever built rather than argued about: **1.77x on
-`/health` and 1.15x on `/items`**, end to end on the real binary against the
-same service with its constants disabled. That is the third time in this project
-that a cheap algorithmic change beat a predicted codegen win — and it is why the
-interpreter's share fell from the 67% W6's first take measured. Every cheaper
-lever that lands makes M9's case weaker.
-
-**What reopens it, computed rather than argued:** the share reaches 50% (it is
-35%), the projection reaches 1.50x (it is 1.48x), and the six unpriced levers in
-ADR 0016 §4 are priced with the best of them at or below **1.24x** end to end.
-Two of them carry bounds worth looking at first: the tree-walker beats the
-control-stack machine **2.73x** on the same pure request path, and one `/health`
-request makes **1,035 allocations and 0.124 MB** to produce a 107-byte response.
-
-> **Corrected (docs pass, 2026-08-17): the allocation figure has moved, and the
-> direction matters.** 1,035 / 0.124 MB is what W6 published and what
-> `benches/w6-ladder.json` still holds. R2 then put the arena and the lexical
-> close on the evaluation path, and this audit re-ran the measurement on the
-> shipped tree:
->
-> ```
-> $ ./target/release/w6-alloc --repo . --requests 200
-> {"allocations_per_request":1122.335,"bytes_per_request":131677.4,
->  "requests":200,"response_bytes":107,"route":"/health"}
-> ```
->
-> **1,122 against 1,035 — the region milestone moved this number the wrong
-> way.** ADR 0017 "What must be measured" §1 records why and is worth reading
-> before treating it as a regression: about 40 of the 87 are `region_kind::infer`
-> run once per `Machine`, which amortizes to nothing over a server's lifetime,
-> and the rest is the arena wiring on a route that allocates no cells at all.
-> The lever is unaffected either way — `/health`'s ~1,000 allocations are
-> `Rc<Value>` boxes on the framing, routing and encode path, which is what
-> unboxed representation and monomorphization attack and what a region model
-> does not touch.
-
-**And what W6 measured that argues even the 1.48x is optimistic**, recorded so a
-future contributor re-measures rather than re-argues: compiling `read_line`
-alone and trampolining its two callees back into the machine gives **1.71x**, not
-11.67x — coverage is a cliff, not a slope. The spike's fragment accepts **141 of
-366** functions across `std.http`, `std.router` and `std.json`, refusing field
-accesses, constructor patterns, lambdas and list literals — which is what
-endpoints and derived codecs are made of. And `read_line`'s own directly
-measured end-to-end value is **1.02x**.
-
-**And what R2 changed about all of the above.** Every number in this entry was
-priced against the representation W6 measured, and R2 replaced part of it. ADR
-0017's Consequences say so directly: "Codegen's ceiling should be re-measured
-after this lands, because ADR 0016's 1.05× was a verdict on the old
-representation and this ADR changes exactly what made that ceiling low." So the
-**1.48x** projection and the **1.55x** ceiling are pre-R2 figures, and the first
-of the three reopen conditions to re-take is the share `S`, because it is the one
-a change of representation moves. Nothing in R2 measured it: ADR 0017 re-took
-allocations per request and the isolation cost, not the ladder. **The ladder has
-not been re-taken since the region track landed**, and re-taking it is the
-concrete first step of any future M9 argument. The command is in ADR 0016 "The
-result".
-
-`docs/adr/0016-w6-performance.md` §8–§11. The spike lives in
-`crates/ply-codegen-spike`, in its own workspace, depended on by nothing; ADR
-0016 §3.5 requires that closing W6 delete it, and **some** of its numbers survive
-in `benches/w6-spike.json` — the headline five inputs, `nodes` and
-`compile_micros`, and nothing else. The **1.71x**, the **1.02x** and the
-**141 of 366** quoted above are *not* in that file, nor in any other measurement
-file; ADR 0016 §9.1 and §9.2 are their only record, so deleting the crate would
-strand three of the four figures this entry rests on. **Verified still present in
-this audit** — it is absent
-from `Cargo.toml`'s `members` and no crate under `crates/*` names it as a
-dependency, so `rm -r crates/ply-codegen-spike` remains the whole deletion, as
-ADR 0016 §11 says.
-
-> **Audit note (docs pass, 2026-08-17): ADR 0017's Context once gave the spike
-> 8.44×; it now gives 11.67×, and this file agrees with it.** Checked against
-> `benches/w6-spike.json` rather than against either prose: the conservative
-> ratio per input (interpreter best ÷ spike worst) is 12.97, 12.83, **11.67**,
-> 12.97 and 12.31, and `k` is defined as the minimum — so **11.67× is what the
-> shipped measurement file supports**, and the 1.02–1.05× end-to-end band is
-> §10.3's directly measured `read_line` value (1.021× at a 63-byte head, 1.050×
-> at a browser-sized one), not the projection.
->
-> **A first pass of this note said the discrepancy was live and deferred it to
-> the ADR owner. It is not live and was not deferred.** ADR 0017's Context at
-> `docs/adr/0017-regions.md:35` reads "ADR 0016 measured codegen at **11.67× on
-> the fragment it can compile**", and `grep -n '8.44' docs/adr/0017-regions.md`
-> now returns only lines 46 and 50 — both inside that ADR's own correction block,
-> recording the retired figure. The two documents agree. Two passes of the same
-> audit fixed the same discrepancy without reading each other's output, and this
-> note is what was left pointing at a conflict that no longer exists. Where 8.44×
-> came from is still not established; nothing in the tree produces it.
-
-> **Audit note (docs pass, 2026-08-17): "in its own workspace" has a cost this
-> line does not price.** `cargo test --workspace` does not reach
-> `crates/ply-codegen-spike/tests/spike.rs`, so ADR 0016's required tests 12,
-> 13 and 14 — the ones establishing that the spike compiled what it claims to
-> have compiled, and that its output matches both evaluators — are not run by
-> the suite anyone runs. Running them means `cargo test` inside that directory,
-> and on the audit machine that fails to resolve: cranelift `0.134.3` needs
-> `rustc 1.94.0` and the installed toolchain is `1.93.1`, with no
-> `rust-toolchain.toml` pinning anything. The **11.67x** and the **141 of 366**
-> above therefore rest on numbers no green suite re-checks. The ladder side —
-> the 35% share, the 1.48x projection, the 1.55x ceiling and `w6::decide`
-> itself — is fully covered inside the workspace by
-> `crates/ply-corpus/src/w6.rs` and `crates/ply-corpus/tests/w6_report_integrity.rs`,
-> and the deferral does not turn on the spike's magnitude in any case.
-
----
-
-# Web track — complete, W1 through W6
-
-M0–M8 built a language that can prove things about programs that never leave
-memory. The web track is what it takes to serve an HTTP API, and the ordering was
-driven by one fact true when it was written: **Ply had no I/O at all**. Not
-limited I/O — none. Every handler ever written for it was in-memory or simulated.
-
-So a postgres driver is not the first problem. The first problem is that the
-runtime's knowledge of what a computation can do is the foundation of every
-guarantee here, and reaching the host is by construction a hole in it.
+> **The trap this section exists to prevent.** It is tempting to read a
+> disappointing multiplier as a number to improve. The multiplier is a
+> *consequence* of where the time is, and it moves when the fragment covers more
+> of a real program — or when the front end, which dominates the warm loop, gets
+> cheaper. Argue about coverage and about which workload is being decided.
+> Re-deriving the ratio on the same workload settles nothing.
 
 ## W1 — The boundary, and one endpoint
 
@@ -520,26 +292,6 @@ throw away.
 handler with its footprint; `ply test` is hermetic without `--host` and says so;
 resuming a host continuation twice is a diagnostic; and **a measured per-request
 interpreter cost**, which is the number W6 turns on.
-
-> **Audit note (docs pass, 2026-08-17): re-checked, because W1 is the milestone
-> that advertised a footprint check it had not armed.** It is armed now, and by
-> hermetic tests behind no gate. The boundary check that a handler may not
-> report an atom outside the entry point's declared footprint is
-> `codes::HOST_FOOTPRINT_ESCAPE`, raised at `crates/ply-eval/src/machine.rs:2311`
-> and `:2331` and asserted from both sides in
-> `crates/ply-eval/tests/host_boundary.rs:566,612`,
-> `crates/ply-eval/tests/host_trust_audit.rs:822,868` and
-> `crates/ply-test/tests/host_trust_audit.rs:543`. W4's database-specific
-> version, `DB_FOOTPRINT_UNDECLARED`, is raised at
-> `crates/ply-host/src/db.rs:247,267` and asserted by unit tests that need no
-> server (`crates/ply-host/src/db/tests.rs:111,142,196`,
-> `crates/ply-host/src/db/handler/tests.rs:180,216`) as well as by the
-> postgres-gated integration tests. The remaining clauses hold too:
-> "hermetic without `--host` and says so" is
-> `test_is_hermetic_without_the_flag_and_says_which_binding_it_used`
-> (`crates/ply-cli/tests/cli.rs:936`), and resuming a host continuation twice
-> is `codes::HOST_CONTINUATION_RESUMED`, asserted five times in
-> `crates/ply-eval/tests/host_linearity_audit.rs`.
 
 `docs/adr/0008-host-effect-boundary.md`
 
@@ -608,93 +360,6 @@ the in-memory handler with no source change; and the agreement law discharged as
 `property` with its case count — the mock-drift claim every backend team makes
 and none of them check.
 
-> **Audit note (docs pass, 2026-08-17): the "against real postgres" half of this
-> exit criterion is conditional on the machine.** Every W4 test that touches a
-> server is behind `cluster::available()`
-> (`crates/ply-host/tests/support/cluster.rs:38`), which returns `false` when
-> `initdb` and `postgres` are not findable — and the tests then print a skip
-> line and return green. Six `#[test]`s and roughly thirty-five sequenced
-> phases are behind it, seventeen of them in
-> `db_transaction_audit.rs::transactions_the_pool_and_parameters_under_adversarial_conditions`
-> alone. A second gate, `PLY_PG_URL`, hides ten more tests in
-> `crates/ply-host/src/db/scope/tests/live.rs` and is set by nothing on a stock
-> local checkout, so those skip even on a machine that has postgres — CI sets
-> it, per the audit note below. The twin half
-> of the criterion, and the agreement law, are hermetic and unconditional.
-> **Audit note (CI pass, 2026-08-24): all four of the gates in the preamble
-> table are forced open on every push, and that table now describes a stock
-> local checkout rather than CI.** The `PLY_PG_URL` cell read *"the variable is
-> unset — and **nothing in the repo sets it**"*, and the paragraph above read
-> *"A second gate, `PLY_PG_URL`, hides ten more tests in
-> `crates/ply-host/src/db/scope/tests/live.rs` and is set by nothing in the
-> repository"*. Both were true until `.github/workflows/ci.yml` was added. Read
-> against that file, gate by gate — and read the last paragraph of this note
-> before believing any of it, because what CI does on GitHub is not what was
-> checked here:
->
-> - **`PLY_PG_URL`** — the `test ply-host (postgres)` job sets it to a
->   `postgres:18.6` service container. It then runs `cargo test -p ply-host
->   --lib db::scope::tests::live -- --nocapture --test-threads=1 2>&1 | tee`,
->   fails if the output matches
->   `skipp(ed|ing): (PLY_PG_URL is unset|this machine has no)`, and fails unless
->   the run reports `10 passed`. Checked here against a local postgres 18.3:
->   with the variable set, exit 0, **10 passed in 0.29s**, zero notices; with it
->   unset, exit 0, **10 passed in 0.00s**, and **ten** notices.
->
->   Three separate things in that command are load-bearing and each was wrong
->   here first, which is the reason for the detail. **`--nocapture`**: without
->   it the notice appears **zero** times, because cargo captures a passing
->   test's output. **`2>&1`**: the notice is an `eprintln!`, so a bare
->   `cargo test | tee log` carries none of it — measured, with the variable
->   unset, **0** notices in the log piping stdout alone against **10** with
->   `2>&1 | tee`. **An unanchored pattern**: libtest prints the notice on the
->   same line as the test name, so `^skipped:` matches nothing. And the
->   `10 passed` assertion covers none of the three — the ten return early and
->   *pass*, so that line reads `10 passed` with no server anywhere.
-> - **`cluster::available()`** — the same job puts a
->   `/usr/lib/postgresql/<major>/bin` holding `initdb`, `postgres` and `psql` on
->   `PATH`, `apt-get install`ing `postgresql` if the image has none, and fails
->   if it still cannot find them; `available()` searches `PATH` first, so that
->   is the same statement as the gate being open. It then runs the cheapest
->   cluster-gated binary, `host_park`, with the same grep. Checked here on a
->   machine that has the binaries: exit 0, **2 passed in 2.87s**, zero notices.
->   The `apt-get` and `PATH` half is Linux-only and was **not** executed here.
-> - **`#![cfg(unix)]`** — every job runs on `ubuntu-24.04`, so
->   `crates/ply-cli/tests/w5_shutdown.rs` is compiled rather than empty, and a
->   step in the shard holding `ply-cli` fails unless that binary reports at
->   least one passing test. Being compiled is not left to speak for itself,
->   because it speaks by saying nothing.
-> - **its own `[workspace]`** — the `crates/ply-codegen-spike` job runs
->   `cargo test --locked --release` from inside that directory on a **pinned
->   1.94.0**, which `cranelift 0.134.3` requires. Checked here: exit 0, **45
->   tests** across `hazards.rs` (16), `mutations.rs` (11), `mcts_kernel.rs` (9)
->   and `spike.rs` (9), 438.9s including the cold release build. It is not
->   linted: that crate is not clippy-clean and never has been.
->
-> A **fifth** gate exists and is not in the table: `PLY_TEST_DB`, at
-> `crates/ply-host/src/db/pool/tests.rs:25`, hides 26 pool tests and prints
-> nothing at all when it is unset. CI sets it at the same container, but there
-> is no notice to grep, so it is the one gate with no positive proof.
-> `docs/ONBOARDING.md` §2 has the measurement.
->
-> **What was not checked.** The commands quoted in this note were run on the
-> machine in `docs/ONBOARDING.md` §Provenance and the figures are that
-> machine's, but that is not true of `ci.yml` as a whole: `CONTRIBUTING.md`
-> §"There is CI" carries the per-command ledger, including the shard command
-> that **failed** and the three steps that were stopped unfinished rather than
-> measured on a machine at load 27. Nothing in `ci.yml` has ever run on GitHub
-> Actions. The runner image, the service
-> container, the `apt-get` fallback and the cache action are exercised by a push
-> and by nothing else, and the first push is where they are tested. Nothing here
-> is a claim about a *local* run, which is unchanged.
->
-> `docs/adr/0014-w4-contract.md` §13.1 has the full inventory and says which
-> required tests depend on which gate. **Two of W4's required tests are
-> enforced by nothing at all** — 14, the `EXPLAIN (GENERIC_PLAN)` differential
-> over `scan`, and 16, the `E0438` refusal of a trigger or cascade reaching
-> outside its atom. The second is the guard on the very failure the "risk that
-> matters" section below names, and it is not armed.
-
 `docs/adr/0014-w4-contract.md`. Not in W4: query building, an ORM,
 connection-level `LISTEN`/`NOTIFY`, replication, migrations as a tool, cursors,
 a time type, and a database per test.
@@ -744,20 +409,6 @@ in-flight requests — with `examples/desk.ply`'s accept loop draining with **no
 source change**, a credential that appears in no log line, no cache entry and no
 definition hash, and two builds of one tree producing identical digests.
 
-> **Audit note (docs pass, 2026-08-17): the draining half of this criterion is
-> demonstrated only on Unix, and only where postgres is installed.** The eight
-> tests that drive the real binary over a real socket and send it a real signal
-> live in `crates/ply-cli/tests/w5_shutdown.rs`, whose first non-comment line is
-> `#![cfg(unix)]` — so on any other host the file is not compiled and, unlike
-> the postgres gates, **prints nothing**. The transaction-rollback half needs
-> `initdb` on the machine as well. The other two clauses of this criterion are
-> unconditional: the credential-leak sweep and the byte-identical-build check
-> are hermetic and run everywhere. `docs/adr/0015-w5-contract.md` §12.1 maps
-> required tests 27–34 onto the three gates. Separately, required test 18's
-> constant-time *harness* for `secret_verify` was never written — the property
-> holds by construction in `ply_eval::value::constant_time_eq`, but it is
-> established by reading the function, not by measuring it.
-
 `docs/adr/0015-w5-contract.md`. Not in W5: metrics backends, log shipping,
 orchestration, autoscaling, distributed tracing propagation, sampling,
 cancellation, live config reload, incremental deploy transport, artifact signing,
@@ -804,22 +455,6 @@ ladder was re-taken on the tree that has it. Two obligations are still open: the
 spike crate has not been deleted, and the memo is refused inside any open
 **task/simulation** region — so a service whose accept loop calls `task.spawn`
 memoizes nothing, measured at **1.00x against 1.77x** on the same route.
-
-> **Clarified (docs pass, 2026-08-17): "region" in that sentence is not the
-> region R1 and R2 built.** This line was written before the region track and
-> reads, on the current tree, as though every `with_cell` disabled the memo. It
-> does not. `Machine::constant` (`crates/ply-eval/src/machine.rs:1775`) refuses
-> the memo on `!self.sims.is_empty()` — `sims` is the *scheduler* region stack, a
-> `simulate { .. }` block or the production region `task.spawn` opens, and it is
-> untouched by ADR 0017's memory regions, which live in `self.regions`. A
-> `with_cell` opens an arena scope and leaves the memo alone; `/health` still
-> serves from it, which is why ADR 0017's allocation reading calls its body "a
-> nullary pure definition served from ADR 0016 §12.1's constant memo".
-> CONTRACTS.md ("The constant memo") states the same thing and goes further:
-> the implementation is **"wider than the reason"**, because a production region
-> keeps no trail and records no step yet disables the memo anyway, and CONTRACTS
-> calls that "a defect rather than a rule". The obligation is therefore a code
-> fix with a known shape, not an accepted design constraint.
 
 ## Where the web track landed
 
@@ -896,23 +531,6 @@ boundary is where that failure mode is easiest to reintroduce and hardest to
 detect, and it deserved harder adversarial review than anything else in the
 track.
 
-> **Audit note (docs pass, 2026-08-17): one route into exactly this failure is
-> open, and W4 documented the guard as though it were closed.** ADR 0014 §2.5
-> specifies `E0438 DB_UNMODELLED_SIDE_EFFECT` — a trigger, a rewrite rule, or a
-> foreign key with a cascading action reaching a table outside the atom it
-> fires under is refused at bind time, before anything runs. That check was
-> never built. `E0438` exists as a registered code and as a `RESERVED_CODES`
-> entry so no handler can impersonate it, and it is raised nowhere; nothing in
-> the tree queries `pg_trigger`, `pg_rewrite` or a constraint's delete action.
-> Against a database carrying such an object, a statement touches a table its
-> text never names, the published row does not say so, and two host-backed
-> tests over what look like disjoint tables are scheduled concurrently on the
-> strength of that row. This is not a host handler misreporting — it is the
-> database doing work the handler cannot see — but the consequence is the one
-> described above, and it is the one place in the track where the stated
-> mitigation is structurally absent rather than merely partial. Reported as a
-> code gap; not fixed in this documentation pass.
-
 It also arrived through a feature that looks like nothing. An `effect set` is
 "an abbreviation for a row", and letting one cross a module boundary would have
 let an edit in the declaring module leave a stale published footprint behind a
@@ -937,17 +555,6 @@ forkable world and the zero-cost path are mutually exclusive. ADR 0005 had picke
 the forkable world over branding the region **because branding looked heavy in
 the type system**; building regions for memory means building that branding
 anyway, so the objection that decided M6 stopped applying and the world went.
-
-> **Audit note (R3, 2026-08-18): the paragraph above states the premise as fact
-> and it was never measured.** It is left standing because it is what the track
-> was decided from, and because ADR 0017's Context now carries the same
-> correction beside the same sentence. Three milestones of measurement did not
-> support it: R1 and R2 removed the world and allocations per `/health` went
-> **up**; R3 removed the compile-time work that had landed on the request path
-> and they came back down to **1,082**, against a pre-region **1,035**. What
-> the region model demonstrably bought is safety (the escape discipline) and the
-> arena against the persistent map it replaced. What it has never been shown to
-> buy is the request path. §R3 below.
 
 `docs/adr/0017-regions.md`, which supersedes ADR 0005 §2 and amends ADR 0008 §6.
 
@@ -1441,58 +1048,9 @@ Take the same numbers before R4. This work was done under a rule forbidding git,
 so the per-lever A/B deltas in `README.md` are as the build agents measured them
 and are not re-derivable from this tree without re-editing the two function
 bodies by hand. The claim that survives is the narrow one: `w6-alloc` reads
-773.4 here, and it read 1,082 in the block above.
-
-> **Audit note (regression audit, 2026-08-21): the before-number was
-> re-derived, by re-editing the bodies by hand exactly as the paragraph above
-> says would be needed.** The three lever bodies were reverted in place —
-> `argv::take` back to `Vec::with_capacity` and `argv::give` back to a drop,
-> `NodeKind::Lit`'s arm in `Machine::eval` back to calling `interp::literal`
-> per evaluation, and `interp::ctor_value` back to building a fresh value per
-> mention — `cargo build --workspace --release` re-run, and the same command
-> taken twice:
->
-> ```
-> $ ./target/release/w6-alloc --repo . --requests 200
-> {"allocations_per_request":1084.09,"bytes_per_request":128024.73,
->  "requests":200,"response_bytes":107,"route":"/health"}
-> ```
->
-> **1,084.09 against the 1,081.87 this tree recorded on 2026-08-17**, on this
-> machine, with this command — a 0.2% gap, and the residue is expected rather
-> than unexplained: the revert cannot un-widen `NodeKind::Lit`, so a literal's
-> `Value` is still built once at lowering and charged to the per-`Machine`
-> intercept. The three bodies were restored and the tree re-verified byte-for-
-> byte (`shasum` on all three files, and `w6-alloc` back to 773.4) before this
-> note was written. So the before/after is one rig and one command, and
-> 773.4 → 1,084.09 → 773.4 was walked in both directions here.
+773.4 here.
 
 ### A defect R4 did not cause and R4's audit closed: a `Map` key was a function of insertion history
-
-> **Audit note (second regression audit, 2026-08-21).** Not an R4 regression —
-> it predates the milestone and neither lever touches it — but it is a
-> value-representation defect and this is where the value-representation work
-> is recorded.
->
-> `Value::cmp` compares a `Decimal` by numeric value so that `1.50m` and `1.5m`
-> are one map key; `Value::write` and `decimal_to_string` print the scale as
-> stored. Both deliberate. Together they made `map_insert` replace an equal
-> key's **key**, so `map_keys`, `map_entries`, `map_fold` and every derived
-> encoding over a `Map<Decimal, _>` answered as a function of which spelling was
-> written last. Two maps a test had proved equal with `assert_eq` served two
-> different `derive json` bodies. Three comments in the tree —
-> `ply-eval/src/value.rs`'s `Map` note and its note on `Value::cmp`, and
-> `ply-core/src/infer.rs`'s on `map_fold` — asserted the opposite, as do ADR
-> 0012 §"Iteration order is the property that matters" and `CONTRACTS.md`; all
-> five now carry the correction.
->
-> Fixed in the representation rather than in either deliberate decision:
-> `ply_eval::value::canonical_key` reduces a key to one representative per
-> equivalence class on the way in, at every position `Value::cmp` descends into,
-> reached from the single `ply_eval::value::insert_key`.
-> `docs/adr/0019-value-representation.md` §7 is the write-up. It costs nothing
-> on the request path — `./target/release/w6-alloc --repo . --requests 200`
-> reads **773.4**, three runs identical, the same figure as before it.
 
 ## R5 — the interpreter can enter compiled code, and three of four reviews refuted the write-up
 
@@ -1653,24 +1211,6 @@ all. `DEFAULT_MAX_FRAMES`'s own doc asserted the opposite — *"every recursion
 reaches [`DEFAULT_MAX_CALLS`] first, since a call costs at least one frame"* — and
 that is false: a **call** costs one frame, a **body** costs as many as it pends.
 
-> **Audit note (docs pass, 2026-08-24): the paragraph above ended "Both that doc
-> and `limit.rs`'s are corrected in place, and `compiled.rs`'s 'Recursion'
-> bullet is narrowed. **Not fixed.** All three candidate fixes change shipping
-> semantics."** It is fixed. Of the three candidates the finding listed, the one
-> that holds is the one it did not: **the frame count was never semantics**, so
-> the fix is to stop the machine defaulting to a ceiling on it rather than to
-> estimate a frame cost for an entry or to refuse entry near the bound. What
-> settles it is that the ceiling was a function of spelling — at `hog(9000)`,
-> `hog(n - 1) + 150` answered and `hog(n - 1) + 1 + 1 + ...` raised, same
-> function, same 9,001 nested calls, measured on the shipping release binary
-> 2026-08-24. `Machine::with_max_frames` is what is left: opt-in, off by
-> default, and a machine holding one enters no compiled body, because a native
-> body pends no frames and could not honour it. Charging an entry an estimate
-> was rejected on evidence, not taste: the only conservative charge is
-> `budget × the body's static pend`, which declines every recursive entry the
-> seam exists for. Item 9 of `CONTRIBUTING.md` §"Things known to be broken"
-> carries the close.
-
 **2. The per-function regression was the backend, and R5 blamed its own filter.**
 `benches/r5-timing/RESULTS.md` §3 reported `mcts.playouts` at 0.068× — a 14.7×
 regression — then withdrew it as an artifact of R5's own stall filter, saying
@@ -1708,28 +1248,6 @@ refuses `handle` at compile time — which is a backend remembering an invariant
 place. It also reaches past the seam: `ply-test` reads a declared-but-unobserved
 atom as "a branch was not taken", so an entered definition would say a branch was
 not taken when it was.
-
-> **Audit note (item 11's fix, 2026-08-24): the finding held, its last sentence
-> did not.** The bullet above is left as R5's review wrote it. Two corrections.
->
-> The finding is **fixed**: `ply_core::DefInfo::internally_effectful` is a
-> second published fact — transitive over the call graph, because
-> `fn wrapper(x) = handled(x)` publishes two empty rows and performs anyway —
-> and `ply_eval::compiled::admit` refuses on it as its own `Gate` variant. The
-> bullet's own diagnosis, *"No published row can close it"*, is why the fix is
-> not a row.
->
-> The last sentence — *"It also reaches past the seam: `ply-test` reads a
-> declared-but-unobserved atom as "a branch was not taken", so an entered
-> definition would say a branch was not taken when it was."* — is **withdrawn**.
-> It does not follow: entering a body can only lose atoms discharged *inside*
-> it, an escaping atom is refused by the row gate one line earlier, and a
-> discharged atom is in no declared row anywhere — so no *declared* atom can go
-> missing this way. The cost is an `observed_footprint` that under-reports a
-> run, which is a wrong answer to a user but not that one. And no report has
-> ever carried one: nothing in the workspace constructs a `SliceBuilder`, so
-> `ply test --trace always --json` answers `"causal_slice": null`. That is
-> `CONTRIBUTING.md` item 15, opened by this pass.
 
 **The fourth lens held**, and it held after being executed rather than argued:
 the deletability of the spike, the falsification table's reproducibility, and the
@@ -1783,537 +1301,30 @@ the deletability of the spike, the falsification table's reproducibility, and th
 
 ### What R5 did not do
 
-- **Wall clock on `/health`, with and without the hook.** Both binaries existed
+Kept as a list because each line is a gap somebody could close, and because the
+*kinds* recur:
+
+- **Wall clock on `/health` with and without the hook.** Both binaries existed
   and the A/B was never run.
-- **Any allocation figure with a backend attached, anywhere.** The 6.199× is
-  wall clock only.
-- **Replicate.** One run, one kernel, one program, one box; the pre-registration
-  forbade re-running, so the reported run is a sample of size one. The two
-  reviewer replications are above the load gate and formally void.
-- **Test its own filters.** Zero windows were dropped by either pre-registered
-  filter on any rung. The load filter never fired; on macOS the 1-minute average
-  updates every ~5 s against a ~190 ms window, so it can only drop a whole rung
-  or none — it is a per-rung gate wearing a per-window filter's clothes. The only
-  place the stall filter fired, it produced a false regression.
-- **Source the decisive gate reading.** RESULTS.md's "load average immediately
-  before the timed section: **2.63**" appears nowhere in `mcts-r5.json`; the
-  provenance line records `2.78 3.34 4.66` and `analyze.py` recomputes the gate
-  from the first ladder window's 2.52. The gate passes on all three, so nothing
-  turns on it, but the input to a refusal rule is prose only.
-- **Exercise the seam under the rest of the language.** Effects, handlers,
-  continuations captured across an entry, `simulate`, secrets, `Float`/`Str`/
-  `Decimal`/`Bytes`, higher-order closures, the store, the test cache,
-  `ply prove` and the host path were never run with a backend attached. The
-  kernel declares no effect at all, so the purity gate and the effect path cost
-  nothing here because nothing reached them.
-- **Mutate `jit.rs`'s lowering, or the oracle.** Every wrong backend R5 built
-  corrupts *answers*. A real instruction-selection bug is untested, and if the
-  tree-walker and the machine were wrong in the same way every comparison here
-  agrees.
-- **Update `benches/adr0018-mcts.json`.** It still holds the pre-R5 numbers,
-  including `end_to_end` 0.998× measured with zero entries. R5 wrote to
-  `benches/r5-timing/mcts-r5.json` instead. The two disagree on the fragment's
-  shape and the newer one is right: the census moved from 22 of 34 functions and
-  386 of 745 nodes to **19 and 352**, because removing the trampoline made a
-  compiled set closed under calls. `benches/README.md` carries that correction;
-  ADR 0018 §0.5 carries it for §1's premise; ADR 0019 still states the old shape
-  in two places.
+- **Any allocation figure with a backend attached.** The speedups are wall clock
+  only.
+- **Replicate.** One run, one kernel, one program, one box. The pre-registration
+  forbade re-running, so the reported run is a sample of size one, and the two
+  later replications were taken above the load gate and are formally void.
+- **Test its own filters.** No window was dropped by either pre-registered
+  filter on any rung. The load filter *cannot* fire as written: the 1-minute
+  average updates on a timescale far longer than one window, so it is a per-rung
+  gate wearing a per-window filter's clothes. Where the stall filter did fire it
+  produced a false regression.
+- **Source the decisive gate reading.** The load figure the write-up quotes
+  appears in no data file; the provenance line and the analysis script disagree
+  with it and with each other. Nothing turns on it because the gate passes on
+  all three readings — but the input to a *refusal rule* was prose only.
 
-  > **Audit note (fragment widening, 2026-08-24): the census moved again, and
-  > ADR 0019's two places are now annotated rather than merely flagged.** All
-  > four censused constructs and a fifth nobody censused are lowered, so the
-  > kernel is **34 of 34 functions and 745 of 745 nodes**, 0 refusals, 0
-  > disagreements. `benches/adr0018-mcts.json` is *still* the pre-R5 file and
-  > this bullet still stands as work. The widening also found that the ranked
-  > table this roadmap and ADR 0019 both quote is a **first-refusal** census and
-  > cannot be read as a work list — the 253-node row bought one function — which
-  > is corrected in place in ADR 0018 §0.
-
----
-
-# What is next
-
-> **The standing goal, and it is written down now rather than assumed:**
-> [ADR 0021](docs/adr/0021-why-bootstrap.md). Nothing in this file, `README.md`
-> or `DESIGN.md` mentioned self-hosting or bootstrapping before 2026-08-24,
-> which meant the reason for a whole track of work existed only in a
-> conversation. The short form: Ply's verification loop is O(the change) and
-> every toolchain it competes with is O(the project) — 915.8s of in-target time
-> for `cargo test --workspace` against 0.070s for a warm `ply test` with 185 of
-> 186 selected out — so compiler work done *in Ply* would verify in time
-> proportional to the edit and compiler work done in Rust never will.
-> [ADR 0020](docs/adr/0020-self-hosting-the-front-end.md) says not yet and
-> measures why; 0021 §4 is the critical path, and none of its four items are
-> self-hosting work.
->
-> > **Audit note (2026-08-27): ADR 0021 §4 item 2 is discharged, and not the
-> > way it asked.** The item was *"the nested-call ceiling. 10,000, no flag. A
-> > parser needs it raised or needs the bound to stop being reachable by
-> > ordinary sequence recursion."* The second half is delivered and the first is
-> > **refused**: [ADR 0022](docs/adr/0022-the-call-ceiling.md) adds `iterate`, an
-> > early-terminating loop that costs depth 1 on both engines however long it
-> > runs, and declines a bare `--max-calls` flag because results are cached as
-> > `(RUNTIME_VERSION, DefHash) -> Outcome` and shipping code writes only
-> > `Outcome::Pass` — raising the bound is monotone, lowering it would return a
-> > cached `Pass` for a program that now raises. 0022 also withdraws ADR 0020
-> > §5.1's premise, which is what made the item critical-path: the reference
-> > parser drives every sequence with a loop and bounds its own grammar nesting
-> > at 128. **Item 2 only.** Items 1, 3 and 4 are untouched, and ADR 0021's live
-> > objection — throughput at 12.6× — is untouched too.
->
-> > **Audit note (mechanism sweep, 2026-08-28): item 1 is superseded, and this
-> > sentence is the pointer that still sends a reader at it.** The sentence
-> > above — *"0021 §4 is the critical path, and none of its four items are
-> > self-hosting work"* — remains true as written; what moved is item 1, *"a
-> > lint for the field-order rule"*. The lint was built (`W0611`, a field-order
-> > pass in `ply-core`, PR #41) and refuted by adversarial review against the
-> > interpreter's own counters: it fires on `len(push([], i))` at argument 0 of
-> > 2, which copies nothing, and is silent on `{a: s.a, b: push(s.a, i)}`, which
-> > is fully quadratic — a false negative on the exact shape it existed for. The
-> > pass is closed. **ADR 0024, "Ownership as a checked property, not an inferred
-> > hint", supersedes the item** (branch `adr/ownership`, PR #43; ADR 0021 §4
-> > item 1 is corrected in place on that branch, and neither the ADR nor the
-> > correction is in this tree yet). Its argument is that a lint is a partial
-> > oracle over a dynamic property, so the answer is to check ownership and carry
-> > it in the signature — the effect row's precedent — rather than to warn about
-> > it. **Item 1 only.** Items 3 and 4 are untouched.
-> >
-> > The underlying rule is unchanged and it is not a defect of `push`: a growing
-> > container must be built in the **last sub-expression of its enclosing node**
-> > or the program is quadratic, because `rc::carry`
-> > (`crates/ply-eval/src/rc.rs:98`) keeps the scope alive for whatever follows
-> > without asking what it reads. `push` itself grows a list in place whenever
-> > its caller is the last owner. A contributor arriving at item 1 should read
-> > ADR 0024 first and should not start by writing a better lint.
-
-**R3's decision rule fired on its second branch, and that is what sets this
-queue.** Allocations per `/health` came back at **1,082** against a pre-region
-**1,035** — measured, `./target/release/w6-alloc --repo . --requests 200` — so
-the milestone that was planned to follow R3 is *not* automatically the right one.
-§R3 is where the reading and its provenance are, and it should be read before
-this list rather than after it.
-
-> **Audit note (R4, 2026-08-21): the 1,082 above is R3's reading and this tree
-> makes 773.4.** Same command, three runs byte-identical. R4's two levers took
-> 288 allocations off `/health` and the figure is now **below** the pre-region
-> 1,035 for the first time. That does **not** close item 0 — R4 changed how a
-> value is *built*, not whether a region is the right memory model, and no
-> number for what the forkable world cost has been taken. The paragraph is left
-> as R3 wrote it because it is what set this queue; §R4 is the newer reading.
-
-M9 remains deferred on a measurement and is not the front of the queue; the
-ladder was re-taken after R3 and the verdict did not move
-(`./target/release/ply-corpus w6 benches/w6-ladder-r3.json benches/w6-spike.json`).
-
-0. **Decide the regions question, because R3 reopened it and it is upstream of
-   everything below.** The claim that motivated the whole track — that the
-   persistent forkable world is what held allocations up — is now contradicted by
-   three milestones of measurement, and the two hoists that could have explained
-   the gap are gone from the request path. What is owed is a *number for what the
-   world cost*, taken the way R3's was, against which "keep regions" or "the trade
-   was not worth it" can be decided instead of asserted. Note what is not in
-   question: the escape discipline is a safety property and the arena beats the
-   persistent map it replaced by every measurement in ADR 0017 §"What must be
-   measured". This item is about the request path and about nothing else. It is
-   also the item most likely to be skipped, because everything below it is more
-   fun and the previous entry in this position was skipped for exactly that
-   reason.
-1. ~~**Unboxed primitive representation, and monomorphization.**~~ **Half of
-   this item did not exist and R4 measured it. Read §R4 before re-adding it.**
-
-   > **Audit note (R4, 2026-08-21).** The item read as printed below, and
-   > "unboxed primitive representation" is the half that was never there:
-   > `Int`, `Bool`, `Float`, `Unit`, `Decimal`, `Cell` and `Task` are inline
-   > variants of a 32-byte `Value` and allocate nothing. R3's `frame::dispatch`
-   > at 415.0 a request was a **frame** ranking, and the frame is three
-   > different things; attributed by the value instead, its bulk was the
-   > **call-argument vector** — 372.4 per request, 40.9%, now 194.4 after ADR
-   > 0019 §1. Narrowing `Value` below 32 bytes is **rejected** with its number
-   > in ADR 0019 §4: zero allocations saved, one added per applied constructor.
-   >
-   > **Monomorphization is untouched and is still open.** So is the successor
-   > R4 named and did not take: 140.4 argument vectors a request are freed
-   > inside `ply_eval::builtins::call`, which takes its `Vec<Value>` by value
-   > and so cannot hand one back. That is a change to a signature across a
-   > ~100-arm match, and it is larger than ADR 0019 §3.
-
-1. **Unboxed primitive representation, and monomorphization.** R3's attribution
-   is what now points at this, and more sharply than ADR 0017's did: with both
-   compile-time passes hoisted off, the largest per-request allocation site is
-   `frame::dispatch < Machine::step < Machine::call` at **415.0 allocations a
-   request, 45.5%** of the marginal cost, and the rest are `Rc<Value>` boxes on
-   the framing, routing and encode path rather than in any cell.
-2. **Evidence passing and handler specialization.** A bound is measured and it is
-   one of the three ADR 0016 §10.1 calls large enough to matter: re-taken after
-   R3, the tree-walker beats the control-stack machine **2.82×** on the same pure
-   request path (56.34µs against 158.92µs), which prices ADR 0005's
-   four-heap-allocations-per-frame-push as a lever rather than restating it as a
-   fact. The other two on that list — allocation, and framing at **101.41µs and
-   15.4%** of a request in the re-taken ladder — are item 1 above and W2's
-   precedent respectively, and none of the three has an end-to-end price yet.
-3. **Re-measure codegen's ceiling — and do it before arguing about M9 again.**
-
-   > **Audit note (R4, 2026-08-21): the spike compiles again and the ceiling was
-   > measured.** The closing sentence of this item says the spike half "cannot
-   > be re-taken at all". It can: `crates/ply-codegen-spike` builds under
-   > `+1.94.0`, `benches/w6-spike-r4.json` is the re-take of the `read_line`
-   > half at **11.68×** against 11.67× before it, and
-   > `benches/adr0018-mcts.json` is the same instrument pointed at a compute
-   > kernel. The answer is worse for M9 than the projection this item calls a
-   > projection: **0.998× end to end** on a kernel that is 81.0% inside the
-   > fragment, and a **4.86×** ceiling, because the interpreter cannot enter
-   > compiled code. That last sentence is a prerequisite for every codegen
-   > lever and it is in no ADR yet — ADR 0019 §5 item 3.
-
-   > **Audit note (R5, 2026-08-22): the prerequisite was built, and the ceiling
-   > above is withdrawn as a bound.** The interpreter can enter compiled code
-   > (§R5). On the same kernel, same harness, pre-registered before any number
-   > existed, end to end is **6.199× [6.143, 6.226]** over 21 of 21 paired
-   > windows with 2,162 native entries, against 0.998× with zero entries — and
-   > 6.199× is **above** the 4.86× and 5.26× this item quotes, with 19 of 34
-   > functions accepted rather than all of them. ADR 0018 §0.5 says why: the
-   > ceiling priced each function's *body* and charged the call-site machinery
-   > to an unattributed bucket, and entry deletes that machinery too — 43,320
-   > interpreted calls per search stop existing.
-   >
-   > **This does not re-open M9 and nothing here argues that it does.** The
-   > 6.199× is measured at a seam **no shipping command can reach**:
-   > `set_compiled` has no caller in `crates/*` outside `ply-eval`'s own tests
-   > and the deletable spike, `ply test --engine both` cannot attach a backend,
-   > and the rule that a backend run must not populate the result cache is
-   > unenforced because it is unreachable. What this item now owes is not
-   > another ratio. It is a decision about whether a backend is ever reachable
-   > from a shipping command, which is M9 with an ADR, and ADR 0016 §3.5 still
-   > requires the spike be deleted rather than promoted.
-
-   > **That decision is taken: [ADR 0026](docs/adr/0026-a-reachable-backend.md),
-   > 2026-08-28. This item is discharged; what it hands on is a shorter list.**
-   > The answer is **yes, reachable, and not today**, and the ground shifted
-   > rather than the verdict: M9 is no longer deferred by the W6 ladder, which
-   > §4.2 there **withdraws from the role**, because `Ladder::missing()` refuses
-   > any workload without all nine served-HTTP rungs (a compute kernel and a
-   > lexer both answer `Undecided`), because the share fell between the two
-   > ladders while the interpreter got *slower* — 209.3µs → 227.4µs against a
-   > request growing 592.6µs → 658.9µs — and because the reopen sentence's first
-   > clause is satisfiable only by a regression: a counterfactual with all seven
-   > levers priced and a 52.55× spike still returns `Defer`.
-   >
-   > It is deferred instead on two criteria that name work rather than a number
-   > that must rise — **C3**, nothing cheaper priced on the workload being
-   > decided (on `benches/kernel` that is ADR 0019 §5 item 5's `sqrt`/`ln` at an
-   > inferred ≈2.5×, unpriced end to end), and **C4**, which now requires the
-   > eight wrong backends be caught by a command a user can run. §4.5 makes that
-   > a precondition on any backend shipping at all: **a backend must be
-   > policeable before it is fast.** §4.6 arms the result-cache rule *before* a
-   > backend exists, and §4.7 honours ADR 0016 §3.5's refusal to promote the
-   > spike while **amending** its deletion requirement, whose stated reason R5
-   > had already falsified.
-   >
-   > One thing that ADR found and this file should carry: the basis for a
-   > compiled backend that is actually written down in this tree is **ADR 0021
-   > §4 item 3**, "the fragment, entered at token granularity", on the bootstrap
-   > critical path — not throughput on a served request, and not a
-   > compiled-workload target, which appears in no file here (§3.1).
-
-   > **Audit note (2026-08-30): "entered at token granularity" has been measured
-   > on the front end itself, and the ceiling it buys is 1.121×.**
-   > [ADR 0030](docs/adr/0030-compiled-code-on-the-front-end.md). With the seam
-   > widened to `Bytes`, `ply test --backend reference` over
-   > `spikes/ply-parser` parsing `examples/` — the corpus GAPS.md §13/§13R took
-   > the gap on — enters **190,618 times, 4.23 per token**, and takes the run
-   > from 2.70 s to 2.48 s: **1.089×** measured, counterbalanced arms, null
-   > control at 0.000%. That moves the Ply front end from **26.9×** the Rust
-   > front end to 24.8×, and an *infinitely fast* backend over the same fragment
-   > could never take it below **24.0×**.
-   >
-   > Two things fall out that this list should carry. **Effects are not the
-   > obstacle on a front end**: `Gate::PublishedRow` and `Gate::InternalEffects`
-   > refuse **zero** calls, and **100.00%** of refusals are `Gate::ArgumentShape`
-   > over **3,048,368 `Record`** arguments. And the single call that matters is
-   > refused on its **return** type — `lexer.lex` is admitted 13 times, once per
-   > file, and declined 13 times, and accepting it would have replaced the other
-   > 188,779 entries with nothing.
-   >
-   > Nothing in ADR 0030 re-opens M9 and it argues that it does not: 1.121× is
-   > not a reason to take cranelift into `Cargo.lock`, and §4.5's precondition
-   > and ADR 0016 §3.5 are untouched. What it hands on is a *choice between
-   > widenings*, priced: the type-level argument gate reaches **82.855%** of body
-   > calls against today's 8.631% at O(1) per call, the deep value walk reaches
-   > 10.4% and does not finish on this workload, and `Str` buys nothing.
-
-   > **Audit note (2026-08-31): the choice was taken, and the two facts above
-   > that are about *what refuses* are withdrawn.** The type-level argument gate
-   > ships as `compiled::CarriedTypes` behind a new `Gate::ArgumentType`, and on
-   > the same workload the seam goes from admitting **12.205%** of body calls to
-   > **84.014%** — the counterfactual said 82.855% and was accurate to 1.2 pp.
-   > (12.205% and 8.631% are the same gate on two denominators; ADR 0030 §6's
-   > amendment shows the arithmetic.)
-   >
-   > *"**100.00%** of refusals are `Gate::ArgumentShape` over **3,048,368
-   > `Record`** arguments"* is withdrawn: records cross. What refuses now is
-   > **98.51% `Gate::Anonymous`** — 380,176 lambdas — and 5,764 calls whose
-   > argument *is* a closure. Every other gate refuses **zero**. The obstacle on
-   > a front end was never effects and is no longer the argument shape; it is
-   > the lambda, and `jit.rs::admissible_builtin` refusing all six higher-order
-   > builtins on its first branch is the shape of it.
-   >
-   > *"the single call that matters is refused on its **return** type"* stands
-   > and is now the largest thing left: **79.7%** of admitted calls are offered
-   > and declined on the return, 1,273,832 of them. The measured speedup goes
-   > **1.089× → 1.170×** and the ceiling **1.121× → 1.294×**.
-   >
-   > **What that is against the gap is deliberately not restated here.** ADR
-   > 0030 §3's 26.9× came from a Rust arm interleaved run-by-run with the Ply
-   > arms in one sitting, and no such sitting was available for this change: the
-   > machine carried another workstream at a load of 6 to 9 throughout, above
-   > this project's 4.0 gate, and an attempt to re-take the Rust arm read 0.01 s
-   > — the *warm* figure, because `ply check` had already cached — which is not
-   > the arm §3 used. A ratio computed from ADR 0030's Rust number and this
-   > change's Ply number would be two sittings divided by each other. The two
-   > figures that are safe are the ones above, both of which are ratios *within*
-   > one counterbalanced series with a 0.000% null control.
-   >
-   > §4.5's precondition and ADR 0016 §3.5 are still untouched: 1.294× is still
-   > not a reason to take cranelift into `Cargo.lock`.
-
-   > **Audit note (2026-08-31, later the same day): the return type was taken
-   > too, and the sentence above about it is withdrawn.** *"the single call that
-   > matters is refused on its **return** type … **79.7%** of admitted calls are
-   > offered and declined on the return, 1,273,832 of them"* — that is now
-   > **zero** on this workload. `Machine::compiled_answer` decides an answer
-   > from the definition's declared return type the way `admit` decides an
-   > argument, and `ply test <W1> --backend reference` goes
-   >
-   > ```
-   > before  306931 of 1580763 offers entered · 1273832 declined · 146 in the fragment
-   > after        26 of      26 offers entered ·       0 declined · 413 in the fragment
-   > ```
-   >
-   > **The entry count fell by four orders of magnitude and that is the win.**
-   > `items.parse` is entered once per file — 13 of the 26 — and its whole
-   > subtree runs inside that entry. It is PR #30's shape (crossings 721 → 1),
-   > and ADR 0030 §1 predicted it in those words before it was observed. The
-   > share of body calls a backend can *answer* goes **17.033% → 84.014%** of
-   > 2,414,170, which is every call the seam admits.
-   >
-   > **Three things a reader will get wrong unless they are said here.**
-   >
-   > 1. **The run gets SLOWER**, 1.71×, and against the unbacked machine it goes
-   >    from 1.165× faster to 1.47× slower. That is what a total collapse does
-   >    when the only backend in the tree is a tree-walker: ADR 0030 §5 measured
-   >    `Reference` at 3.63× faster *per body call inside its fragment* and
-   >    1.51× slower *as a whole engine over this program*, and the second
-   >    number now governs. The speed claim moved entirely into the ceiling.
-   > 2. **The ceiling is the result.** `f`, the share of the unbacked run an
-   >    infinitely fast backend would delete, goes **22.97% → 97.53%**, measured
-   >    in-gate (load 2.98 → 2.05) with a 0.353% null control. `1/(1−f)` is 40×
-   >    and is not a resolvable number that close to 1; the model-free statement
-   >    is `B − r` = 0.07 s of 4.15 s, i.e. **98.3% of the backed run is inside
-   >    `enter`**. §4.5's precondition and ADR 0016 §3.5 are still untouched —
-   >    but "1.294× is not a reason to take cranelift into `Cargo.lock`" is now
-   >    the wrong sentence to quote, and what would have to be argued instead is
-   >    whether a real code generator can compile `items.parse` at all.
-   > 3. **`Gate::Anonymous` refuses 0 with the backend attached, and the lambda
-   >    wall is stepped over rather than solved.** The machine makes **26 body
-   >    calls** in the whole run against 1,964,958 before, of which 378,431 were
-   >    lambda refusals — the lambdas are inside the entry now. What that leaves
-   >    is a *code generator* problem: `jit.rs::admissible_builtin` refuses all
-   >    six higher-order builtins, so a cranelift backend would decline the very
-   >    entry this change opens. See ADR 0030 §6.4.
-   >
-   >    > **Priced, 2026-08-31 — nothing above is withdrawn, ADR 0030 §10.**
-   >    > *"Stepped over rather than solved"* is right and does not say by how
-   >    > much. Narrowing the backend's registry to the definitions a
-   >    > *callback-free* code generator could compile — 223 of the front end's
-   >    > 426, its 36 callback users and everything whose call closure reaches
-   >    > one removed — and re-running the same counterbalanced series gives
-   >    > **61.06%** of body calls covered against 100%, and a ceiling of
-   >    > **2.074×** against an `f` of 99.65% that `1/(1−f)` can no longer
-   >    > resolve. So the lambdas are worth roughly the whole of what the two
-   >    > levers bought, and they are worth it **to a code generator and not to
-   >    > the seam**: `Gate::Anonymous` refuses 0 with a backend attached and
-   >    > 380,176 without one, and under the callback-free registry it refuses
-   >    > 380,176 *again* — a fragment closed under calls with no callback user
-   >    > in it cannot hide a lambda, so for such a backend those refusals are
-   >    > irreducible.
-   >    >
-   >    > The narrow escape — a `fold` whose callback is a **named** definition
-   >    > rather than an anonymous lambda — was measured and **not built**: 38
-   >    > of the front end's 43 higher-order call sites pass a lambda written at
-   >    > the call site, all 28 sites inside `closure(items.parse)` do, and
-   >    > applying the widening moves the compilable fixpoint from 223 to 223.
-   >    >
-   >    > One thing the callback-free fragment is strictly **better** at, and it
-   >    > is the audit note above's own subject: the three corruptions the
-   >    > collapse switched off on W1 all fire again under it and are all
-   >    > caught — `off-by-one` 17,599 entries, `inverted` 6,009,842,
-   >    > `unoffered` 26, each **13 failed, 0 passed**. A workload that enters
-   >    > one call per file cannot police a corruption of a scalar answer; one
-   >    > that enters half a million leaves can.
-   >
-   > And the cost, stated because it is the thing this widening gave up: the
-   > machine no longer proves structurally that no handle comes back. A
-   > container answer is checked for its **kind** and not for its contents, so a
-   > backend that puts a `Cell` inside a well-kinded record is believed. A ninth
-   > wrong backend, `ply test --backend wrong:handle`, exists so that limit has
-   > something standing on it: 388 answers changed over `examples/` and
-   > `tests/fixtures/`, **237 of 1,127** tests report it, 890 do not.
-
-   > **Audit note (2026-08-31, end of the day): the closed fragment measured end
-   > to end, and one bound above is withdrawn.**
-   > [ADR 0031](docs/adr/0031-the-closed-fragment.md). Ten arms, ten blocks,
-   > every arm in every position once, in gate (load 2.84 → 1.63), null control
-   > **0.352%** against an effect of 46.1%.
-   >
-   > - **The ceiling is 56.8× and it is now resolvable.** ADR 0030 §6.3 could
-   >   only say that `1/(1−f)` *"is not a resolvable quantity"* at `f` = 97.53%.
-   >   A second instrument that shares no mechanism with the doubling one — a
-   >   **floor arm**, the same command with a `--filter` that selects no test,
-   >   which still typechecks all seven modules — measures the residue directly:
-   >   `F` = **0.05 s** of `A` = 2.84 s. The two agree on the linear quantity to
-   >   **0.36%** (`t` 2.780 against `A − F` 2.790), and a third — the runner's
-   >   own per-test milliseconds, 2,782.2 ms — lands on the same number to 0.08%.
-   >   Model-free: `B − r` = 0.06 s of 4.15, so **98.6% of the backed run is
-   >   inside `enter`**.
-   > - **The brief's "5–7× if the fragment closed" is a lower bound by an order
-   >   of magnitude**, and ADR 0030 §4's *"an infinitely fast backend … could
-   >   never take it below **24.0×**, 11.2% of the absolute gap"* is **withdrawn
-   >   as a bound on this fragment**: it was a bound on a fragment admitting
-   >   8.6% of body calls, and this one admits every call it is offered.
-   > - **The gap, re-taken with the Rust arm interleaved.** 2.84 s against a cold
-   >   `ply check examples` of 0.09 s is **31.6×**; with the shipping tree-walker
-   >   backend attached it is **46.1×**, i.e. the backend *opens* the absolute gap
-   >   by 47.6% of its width; the whole of that gap — `A − Rn` = 2.750 s against
-   >   `A − F` = 2.790 s — is now **inside the fragment**. And the cold arm ADR
-   >   0030 §3 spelled with `rm -rf $root/.ply-cache` was never cold: the
-   >   front-end cache is written **beside the target** (`examples/.ply-cache`),
-   >   which is why §6.3's re-take read the warm 0.01 s.
-   > - **What a code generator can actually reach is 2.10×**, not 56.8× — ADR
-   >   0030 §10's callback-free registry re-measured independently in the same
-   >   sitting (§10 read 2.074×). The difference between the two is the price of
-   >   `jit.rs`'s three refusals, and it is the largest number left in this line
-   >   of work. **The next piece of work is in `crates/ply-codegen-spike`, not in
-   >   `crates/ply-eval`: the seam is closed.**
-   > - **W1 is retired as a policing workload.** `off-by-one`, `inverted` and
-   >   `unoffered` fire **0** times on it and pass vacuously, and a fourth case
-   >   joins them — `wrong:answers=7@lexer.at` now gets **zero offers**, because
-   >   `lexer.at` is inside `items.parse`. Every mutation that fires is still
-   >   caught, on `examples/`: 95, 74, 138, 115, 119 and 68 failures for the six
-   >   that fire. `--engine both --backend reference` audits 13 of 13 on W1 and
-   >   166 of 186 on `examples/`, 0 failed.
-
-   > **And ADR 0026's §6 list is no longer entirely owed, 2026-08-28.** Items 1,
-   > 2, 3 and 6 are built; 4 is measured and refused; 5, 7 and 8 stand.
-   >
-   > - **1 — the ladder no longer claims M9, in code.** `w6::Verdict::label`
-   >   reads *"keep deferring a code generator for this workload"*, `Decision`
-   >   carries `workload`, and the rendered report prints it under the verdict.
-   >   No threshold and no arithmetic moved: `ply-corpus w6
-   >   benches/w6-ladder-r3.json benches/w6-spike-r4.json` reads the same 35%
-   >   (227.4µs of 658.9µs), the same 1.53× ceiling and the same `Defer`.
-   >   `a_verdict_names_the_workload_it_was_taken_on_and_never_names_a_milestone`
-   >   holds it, seen red both ways.
-   > - **2 and 6 — a backend is reachable and the cache rule is armed.**
-   >   `ply test --backend reference` installs `ply_eval::backend::Reference`;
-   >   `--backend wrong:<mutation>` installs one of the eight. Under `--engine
-   >   both` the backend is a third engine compared against the plain machine.
-   >   `backend_escapes` sits beside `cache_escapes`, `Record::Backend` beside
-   >   `Record::Host`, and `crates/ply-span/tests/armed.rs` carries the source
-   >   tripwire. §4.7 promotes nothing: `Cargo.lock` still has no cranelift and
-   >   `ply-cli` gains no dependency.
-   > - **3 — the eight are in the workspace**, over the shipping `Reference`
-   >   rather than over a hand-built double, because `unoffered` needs a backend
-   >   that can *miss*. Five fire on the workspace corpus at 1,116 tests;
-   >   `answers=` stands on an offer count of zero as it always has;
-   >   `exceeds-budget` needs a corpus that outruns the machine's bound and is
-   >   checked from `ply test`.
-   > - **4 — the spike is NOT deleted, and the condition is what refuses it.**
-   >   See the amended paragraph below.
-   >
-   > What `ply test --backend reference` costs is stated rather than rounded
-   > down, because it is a real property of this seam and not of this backend: a
-   > body the backend **declines** is re-run to exhaustion once per offer, so a
-   > recursion that outruns the machine's bound is O(n²). One test over a
-   > 20,000-deep ladder, `/usr/bin/time -p`, release binary checked current by
-   > `.github/binary-is-current.sh` first: **26.45s real / 18.28s user with
-   > `--backend reference`, against 0.04s real / 0.01s user with no backend**,
-   > 10,000 offers each re-running the remaining recursion. Taken at a 1-minute
-   > load average of 9.2 falling to 8.6 — well over the 4.0 gate — so these are
-   > **observations rather than figures**; the effect is three orders of
-   > magnitude and load does not reach it. A cranelift fragment has the same
-   > shape; it burns fuel per offer too.
-
-   ~~and the ladder has not been re-taken since~~ — **it has now.**
-   `benches/w6-ladder-r3.json` is the post-R3 take and the verdict machinery
-   re-derives from it unchanged: interpreter share **35%** (34.3%–34.7%), ceiling
-   **1.53×**, projection **1.46×**, `keep deferring M9`. Every absolute in that
-   ladder is larger than W6's and the Rust floor moved with them (15.68µs →
-   17.13µs), so read the ratios and not the microseconds. What is still owed here
-   is the *spike* half, which cannot be re-taken at all: `crates/ply-codegen-spike`
-   does not compile (`CONTRIBUTING.md` §"Things known to be broken" item 1), so
-   `E = 1.46×` is a projection from a file rather than from a rebuilt spike.
-
-Two smaller obligations are open and both are recorded above rather than in a
-tracker: `crates/ply-codegen-spike` is still present and ADR 0016 §3.5 requires
-its deletion — R5 verified the deletion still leaves the workspace green by
-performing it (3,680 tests, 0 failed) and also made §3.5's *other* half false,
-which is corrected in place there — and `Machine::constant` disables the
-constant memo inside any open *scheduler* region, which CONTRACTS.md calls a
-defect rather than a rule and which costs a spawning service **1.78× on `/health`** — re-taken after R3, at
-273.0µs sequential against 488.7µs spawning on the same service, and printed by
-`ply-corpus w6` over `benches/w6-ladder-r3.json`.
-
-> **The first of those two is now a condition rather than an open obligation
-> ([ADR 0026](docs/adr/0026-a-reachable-backend.md) §4.7, 2026-08-28).** §3.5's
-> refusal to *promote* the spike is honoured — nothing depends on it, `Cargo.lock`
-> still has no cranelift *(the parenthetical stopped being true on 2026-08-31:*
-> `crates/ply-codegen` *is a cranelift JIT in the shipping workspace and*
-> `grep -c cranelift Cargo.lock` *answers 44. The clause it supports —* nothing
-> depends on the spike *— is unchanged, and ADR 0026 §4.7 records the condition
-> below as **met**)* — and its *deletion* requirement is amended, because the
-> reason §3.5 gives for it ("nothing else in the workspace knows it existed") is
-> the half R5 falsified: the seam in `crates/ply-eval/src/compiled.rs` survives
-> the `rm -r`, so deleting the spike today removes the only implementation of
-> `Compiled` in existence and leaves the `pub` declaration behind. The spike goes
-> when its eight wrong backends have been reproduced over the `Compiled` doubles
-> in `crates/ply-eval/tests/` and run under `cargo test --workspace` — the only
-> measured sensitivity the seam has, re-taken 2026-08-28 at **1,649
-> disagreements** over 152,548 offered calls. `.github/ci-shards.sh`'s
-> `KNOWN_OUTSIDE` entry carries that condition now, in place of the reason that
-> stopped being true.
->
-> > **The reproduction was done the same day and the condition came back
-> > NOT satisfied. The spike stays.** Seven of the eight configurations moved —
-> > five of them into `cargo test --workspace` at corpus scale (1,116 tests;
-> > `unoffered` reported by 901 of them, `wrong-type` by 515, `stale` by 259,
-> > `off-by-one` by 146, `inverted` by 51), `exceeds-budget=4` through `ply test`
-> > on a corpus that outruns the machine's bound, and `answers=` on the offer
-> > count of zero that is its whole point. The eighth does not move, for a
-> > structural reason rather than a missing afternoon: the spike's backend is
-> > native code on a fixed stack, so ignoring the budget entirely **crashes**
-> > and `run_guarded` reports the corpse from outside; `Reference` is a
-> > tree-walker whose frames grow on the heap, so the same corruption **hangs**
-> > — no output and no exit in 45 seconds, against 0.03s for the run that
-> > reports. Nothing in this workspace can report a run that never comes back.
-> >
-> > So the spike remains the only demonstration this repository has that a
-> > backend which ignores its budget entirely would be noticed, which is exactly
-> > what the condition names. `CONTRIBUTING.md` §"Things known to be broken"
-> > item 1 carries the table.
-
-The one thing a contributor should not do is re-argue M9 from the numbers in this
-file. They were measured, they are re-derivable from
-`benches/w6-ladder-r3.json` (or `benches/w6-ladder.json`, the pre-region
-baseline) and `benches/w6-spike.json` by `ply-corpus w6`, and every one of them
-is stale in the same direction: **every cheaper lever that lands makes M9's case
-weaker**, and three have now landed where a code generator was predicted to be
-the answer.
-
-**The one thing this file should not be allowed to do is quietly close the
-regions question.** It was reopened by a rule fixed in advance, by a measurement,
-and it stays open until another measurement closes it. If a later revision of
-this section presents item 0 as settled without a number beside it, that revision
-is the defect.
+**Two of those generalise and are worth carrying into any measured milestone
+here.** A filter that never fires has not been shown to work — arrange for it to
+fire once on purpose. And a number that a decision rule reads must live in the
+data file the rule reads, not in the write-up.
 
 ## Compute kernels — is Ply ever the right choice for MCTS-shaped work?
 
@@ -2334,16 +1345,6 @@ spike at 11.67x on its compilable fragment and 1.02-1.05x end to end, because th
 fragment is 2-5% of an HTTP request. An MCTS inner loop may be *mostly* that
 fragment. Re-pricing the existing spike against a kernel is cheap, and every other
 item is ordered on an assumption only that measurement can test.
-
-> **Audit note (R5, 2026-08-22): that measurement has now been taken twice.**
-> R4 took it and got **0.998x** on a kernel 81.0% inside the fragment, because
-> the interpreter could not enter compiled code. R5 made entry possible and got
-> **6.199x [6.143, 6.226]** with 2,162 native entries — above the 4.86x/5.26x
-> ceiling ADR 0018 derived, which §0.5 there withdraws as an artifact of a
-> body-only attribution. Read §R5 before this paragraph: none of the 6.199x is
-> reachable by any user of Ply, three of the four reviews of R5 refuted what it
-> wrote, and the seam carries only one of the machine's two recursion bounds, so
-> a backend can answer where the machine raises.
 
 Available today, and it is the design working rather than a concession: the kernel
 in Rust behind a host handler with a declared footprint, the strategy and
