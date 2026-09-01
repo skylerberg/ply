@@ -398,7 +398,16 @@ impl<'s> Driver<'s> {
                 })?;
                 break (check, gate.cached);
             }
+            // Every wave has to give up something it had not already given up, or it will run
+            // forever: a name gate 2 restores on a path that does not consult `widened` comes back
+            // unchanged however many times it is handed over. Spinning is the worst way to learn
+            // that, so it is an assertion rather than a hang.
+            let before = self.widened.len();
             self.widened.extend(more);
+            assert!(
+                self.widened.len() > before,
+                "a wave gave up only names it had already given up, so it cannot make progress"
+            );
         };
         self.merge(program, resolved, hashes, bodies, check, cached)
     }
@@ -450,7 +459,10 @@ impl<'s> Driver<'s> {
                 let Some(ident) = item.name() else { continue };
                 let name = file.module.qualify(&ident.name);
                 for dep in hashes.deps.get(&name).into_iter().flatten() {
-                    if gate.cached.contains(dep) {
+                    // Definitions only. A `type` or `effect` is restored on a path that does not
+                    // consult `widened`, so returning one would hand back a name the next wave
+                    // still calls cached, and the loop would never grow its way out.
+                    if gate.cached.contains(dep) && hashes.defs.contains_key(dep) {
                         out.insert(dep.clone());
                     }
                 }
