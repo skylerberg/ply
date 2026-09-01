@@ -3,7 +3,10 @@
 Status: accepted — **not implemented**, except the one change named as P2 below,
 which was built and measured while this document was written and then reverted.
 Implements the decision recorded as ADR 0024. Amends ADR 0017 §4 and
-`crates/ply-eval/src/rc.rs`'s module contract.
+`crates/ply-eval/src/rc.rs`'s module contract. **Re-sequenced by
+[ADR 0033](0033-perceus-over-slots.md)**, which lands P2, subsumes P1 and P3 into
+a slot-based environment, and re-poses the `Vector<T>` gate; every measurement
+here is accepted by it and none re-taken.
 
 > **ADR 0024 is not in this repository, and this document was written without
 > it.** `docs/adr/` holds `0001`–`0021` and no `0022`, `0023` or `0024`;

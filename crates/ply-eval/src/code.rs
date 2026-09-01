@@ -42,6 +42,11 @@ pub enum NodeKind {
     App {
         func: Code,
         args: Rc<Vec<Code>>,
+        /// Per argument, the bindings that argument is the **last reader** of —
+        /// ADR 0033 §11 S4's probe. Empty everywhere unless the probe is armed,
+        /// so the shipped lowering allocates one empty `Rc` per `App` and the
+        /// machine's `carry` takes exactly the branch it takes today.
+        dead: Rc<Vec<crate::rc::Dead>>,
     },
     If {
         cond: Code,
@@ -58,6 +63,10 @@ pub enum NodeKind {
     },
     Record {
         fields: Rc<Vec<(Symbol, Code)>>,
+        /// Per field, what that field's value is the last reader of — the same
+        /// thing [`NodeKind::App`]'s `dead` is, at the other carry site ADR 0033
+        /// §11 S4's probe covers. Empty unless the probe is armed.
+        dead: Rc<Vec<crate::rc::Dead>>,
     },
     Field {
         base: Code,
@@ -157,6 +166,7 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(e, &mut ownable);
     let mut live = Live::new(ownable);
+    live.params_are(params.len());
     live.declare(params.len());
     lower_in(e, &mut live)
 }
@@ -167,30 +177,6 @@ pub fn lower_fn(params: &[Symbol], e: &Expr) -> Code {
 pub type Params = Rc<Vec<Symbol>>;
 
 /// Lowered bodies, shared by every machine built from one program.
-///
-/// A machine is built per pool thread per concurrency group, per interleaving of
-/// a search and per sampled case of a spec, so the same traversal would other-
-/// wise run hundreds of times over one program.
-///
-/// The key is the body's address, and what makes an address an identity is the
-/// lifetime rather than the map: everything keyed here is borrowed for `'a` and
-/// this cache cannot outlive `'a`, so nothing it has keyed can be freed and
-/// something else allocated in its place while it is still readable.
-///
-/// **That holds only because `invariant` below makes `Lowering<'a>` invariant in
-/// `'a`, and it is false without it.** Covariant, `&Lowering<'long>` coerces to
-/// `&Lowering<'short>` and [`Lowering::of`] takes `&self`, so a long-lived cache
-/// accepts a body borrowed for any shorter lifetime; keying a `Box<Expr>`
-/// through that coercion and dropping it leaves an entry under a dangling
-/// address. A variance property is a compile-time property and a `#[test]`
-/// cannot observe it, so the guard is this doc-test:
-///
-/// ```compile_fail
-/// use ply_eval::Lowering;
-/// fn shrink<'long: 'short, 'short>(c: &'short Lowering<'long>) -> &'short Lowering<'short> {
-///     c
-/// }
-/// ```
 pub struct Lowering<'a> {
     program: &'a Program,
     bodies: RefCell<FxHashMap<usize, (Params, Code)>>,
@@ -321,9 +307,9 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             }
         }
         ExprKind::App { func, args, .. } => {
-            let args = lower_all(args, live);
+            let (args, dead) = lower_args(args, live);
             let func = lower_in(func, live);
-            NodeKind::App { func, args }
+            NodeKind::App { func, args, dead }
         }
         ExprKind::If {
             cond,
@@ -376,13 +362,30 @@ fn lower_node(e: &Expr, live: &mut Live) -> Code {
             }
         }
         ExprKind::Record { fields } => {
+            let armed = crate::rc::probe_armed();
             let mut lowered: Vec<(Symbol, Code)> = Vec::with_capacity(fields.len());
+            let mut dead: Vec<crate::rc::Dead> = Vec::new();
             for (name, value) in fields.iter().rev() {
+                let before = if armed { live.snapshot() } else { Vec::new() };
                 lowered.push((name.name.clone(), lower_in(value, live)));
+                if armed {
+                    let fresh: Vec<Symbol> = live
+                        .snapshot()
+                        .into_iter()
+                        .filter(|n| !before.contains(n) && live.is_ownable(n))
+                        .collect();
+                    dead.push(Rc::from(fresh));
+                }
             }
             lowered.reverse();
+            dead.reverse();
             NodeKind::Record {
                 fields: Rc::new(lowered),
+                dead: if dead.is_empty() {
+                    no_arg_dead()
+                } else {
+                    Rc::new(dead)
+                },
             }
         }
         // Unreachable: the sugar is gone before any module reaches this crate, and lowering it as
@@ -475,6 +478,7 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
     let mut ownable: Vec<Symbol> = params.to_vec();
     barrier_binders(body, &mut ownable);
     let outer = live.open(ownable);
+    live.params_are(params.len());
     live.declare(params.len());
     let code = lower_in(body, live);
     for p in params {
@@ -482,6 +486,41 @@ fn lower_barrier(params: &[Symbol], body: &Expr, live: &mut Live) -> Code {
     }
     live.close(outer);
     code
+}
+
+/// [`lower_all`], also answering which bindings each argument is the last reader
+/// of — ADR 0033 §11 S4.
+/// The empty per-argument dead set, shared rather than allocated per node.
+///
+/// `App` and `Record` carry one of these on every lowering and it is empty unless the ADR 0033 §11
+/// S4 probe is armed, so allocating a fresh `Rc` per node put ~10 allocations on each `/health`
+/// request for a vector nothing reads.
+fn no_arg_dead() -> Rc<Vec<crate::rc::Dead>> {
+    thread_local! {
+        static EMPTY: Rc<Vec<crate::rc::Dead>> = Rc::new(Vec::new());
+    }
+    EMPTY.with(Rc::clone)
+}
+
+fn lower_args(exprs: &[Expr], live: &mut Live) -> (Rc<Vec<Code>>, Rc<Vec<crate::rc::Dead>>) {
+    if !crate::rc::probe_armed() {
+        return (lower_all(exprs, live), no_arg_dead());
+    }
+    let mut out: Vec<Code> = Vec::with_capacity(exprs.len());
+    let mut dead: Vec<crate::rc::Dead> = Vec::with_capacity(exprs.len());
+    for e in exprs.iter().rev() {
+        let before = live.snapshot();
+        out.push(lower_in(e, live));
+        let fresh: Vec<Symbol> = live
+            .snapshot()
+            .into_iter()
+            .filter(|n| !before.contains(n) && live.is_ownable(n))
+            .collect();
+        dead.push(Rc::from(fresh));
+    }
+    out.reverse();
+    dead.reverse();
+    (Rc::new(out), Rc::new(dead))
 }
 
 fn lower_all(exprs: &[Expr], live: &mut Live) -> Rc<Vec<Code>> {
@@ -562,7 +601,15 @@ fn lower_block(
     }
     let entry = live.snapshot();
 
-    let mut cumulative: Vec<Symbol> = Vec::new();
+    // Seeded with the barrier's parameters, so a parameter can appear in a `Dead` set at all —
+    // ADR 0033 §8.1, which carries the case analysis for why this releases nothing still read.
+    // Parameters only, not every name in `ownable`: that frame holds names from sibling blocks
+    // which are not in scope here.
+    let mut cumulative: Vec<Symbol> = if crate::rc::probe_armed() {
+        live.barrier_params().to_vec()
+    } else {
+        Vec::new()
+    };
     let mut out: Vec<Stmt> = Vec::with_capacity(n);
     for i in 0..n {
         for name in &bound[i] {
@@ -786,7 +833,7 @@ mod tests {
     #[test]
     fn a_record_keeps_its_fields_in_source_order() {
         let e = record(vec![("b", int(2)), ("a", int(1))]);
-        let NodeKind::Record { fields } = &lower(&e).kind else {
+        let NodeKind::Record { fields, .. } = &lower(&e).kind else {
             panic!("expected a record");
         };
         let names: Vec<&str> = fields.iter().map(|(n, _)| n.as_str()).collect();

@@ -83,9 +83,6 @@ impl When {
 }
 
 /// Which search a `simulate` region runs.
-///
-/// Mirrors `ply_eval::SimMode` rather than deriving `ValueEnum` on it, because
-/// `ply-eval` does not depend on `clap` and should not start.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, clap::ValueEnum)]
 #[value(rename_all = "lower")]
 pub enum SimArg {
@@ -160,9 +157,6 @@ pub struct SimOptions {
 impl SimOptions {
     /// The one contradiction `conflicts_with` cannot express, because it is
     /// between a flag and a *value* of another flag.
-    ///
-    /// Refused rather than ignored: a `--sim-budget` that is silently dropped
-    /// reads as a search that was widened and was not.
     pub fn conflict(&self) -> Option<String> {
         (self.sim == SimArg::Random && self.sim_budget.is_some()).then(|| {
             "`--sim-budget` has no meaning under `--sim random`, which runs one \
@@ -174,13 +168,6 @@ impl SimOptions {
 }
 
 /// TLS credential material, configured beside the run and named from it.
-///
-/// The key never enters the program: `net.listen_tls` takes a credential
-/// *name*, so no certificate byte reaches a definition's hash or the
-/// content-addressed store, and a rotation moves nothing. Loaded and validated
-/// at bind time, before anything runs — a server that discovers its certificate
-/// is unusable on the first handshake has already told a client it was
-/// listening.
 #[derive(Args, Clone, Debug, Default)]
 pub struct TlsOptions {
     /// TLS credential: `--tls api=certs/api.pem,certs/api.key`. Repeatable, one
@@ -220,16 +207,6 @@ pub struct FsOptions {
 }
 
 /// What a `SIGINT` or a `SIGTERM` does to a serving run.
-///
-/// Both knobs are the *run's* rather than the program's, which is why they are
-/// flags and `http::Limits` is not: how long a deployment is willing to wait for
-/// its instances differs per deployment, while what a service refuses is what
-/// its tests assert on.
-///
-/// `--drain-ms` should exceed the program's own `body_timeout_ms +
-/// write_timeout_ms`. The run cannot check that — `Limits` is a Ply value it
-/// never sees — so both numbers are printed at start-up, where they can be
-/// compared by eye.
 #[derive(Args, Clone, Debug)]
 pub struct ShutdownOptions {
     /// How long in-flight requests have to finish once the run stops accepting.
@@ -305,6 +282,11 @@ pub struct CheckArgs {
     /// Print the inferred signature and footprint of every definition.
     #[arg(long)]
     pub types: bool,
+
+    /// Print, for every `push`, whether it grows its list in place or copies
+    /// it, and what would remove the copy.
+    #[arg(long)]
+    pub costs: bool,
 
     /// Emit one JSON object on stdout and nothing else.
     #[arg(long)]
@@ -497,11 +479,6 @@ pub struct ProveArgs {
     pub std: bool,
 
     /// Bind the real host handlers, so that a `law/host` is attempted.
-    ///
-    /// Off by default, which is the point: under a hermetic run a `law/host` is
-    /// reported `W0604 unattempted` with the reason, never green. A law about a
-    /// database that never ran a database, reported as passing, is exactly the
-    /// green result over unexplored space this command exists to prevent.
     #[arg(long)]
     pub host: bool,
 
@@ -581,10 +558,6 @@ pub struct RunArgs {
     pub json: bool,
 
     /// The interleaving a `simulate` region takes: `7`, or `7:3.0.2`.
-    ///
-    /// `ply run` explores exactly one interleaving whatever this says —
-    /// exploration is a test-time activity — so this chooses which one rather
-    /// than how many.
     #[arg(long, value_name = "SEED", value_parser = parse_seed)]
     pub seed: Option<Seed>,
 
@@ -632,10 +605,6 @@ pub struct BuildArgs {
 
     /// Ship the closure of this `--config-schema` function too, so the deployed
     /// artifact can be run with the same flag and keeps `E0441 CONFIG_MISSING`.
-    ///
-    /// A schema is a nullary function nothing in the entry point's closure
-    /// calls, so without this it is not in the artifact and the deployed form
-    /// loses the start-up refusal §3.4 exists for.
     #[arg(long = "config-schema", value_name = "MODULE.FN")]
     pub config_schema: Option<String>,
 
@@ -647,11 +616,6 @@ pub struct BuildArgs {
 
     /// Embed the project's source text, so a diagnostic raised in production
     /// carries a line number.
-    ///
-    /// Off, and a flag, because it is a disclosure decision: it puts the
-    /// program's source in whatever receives the artifact. It changes the
-    /// digest, so "was this built with sources" is answerable from the digest
-    /// alone.
     #[arg(long)]
     pub sources: bool,
 

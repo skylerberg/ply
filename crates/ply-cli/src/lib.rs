@@ -4,6 +4,7 @@ pub mod artifact;
 pub mod cli;
 pub mod commands;
 pub mod config;
+pub mod costs;
 pub mod db;
 pub mod driver;
 pub mod engine;
