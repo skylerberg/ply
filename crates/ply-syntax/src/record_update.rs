@@ -39,7 +39,7 @@
 //! written. Both halves are load-bearing and neither is taste:
 //!
 //! - *Sorted, not declaration order*, because `reordering_the_fields_of_a
-//!   _record_type_is_free` (`crates/ply-hash/tests/audit.rs`) is an invariant the
+//!   _record_type_is_free` (`crates/ply-hash/tests/suite/audit.rs`) is an invariant the
 //!   suite asserts. Expanding in the type's declaration order would make
 //!   reordering a `type` move the hash of every update against it.
 //! - *Written fields last*, because `spikes/ply-lexer/GAPS.md` §1 measures a

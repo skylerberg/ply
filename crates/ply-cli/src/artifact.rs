@@ -1247,7 +1247,7 @@ mod tests {
     /// Bodies that are not decodable definitions, deliberately: everything below
     /// is about the *container*, and `decode` checks a body against its key and
     /// nothing more. What a body means is `reconstruct`'s question and is asked
-    /// in `tests/artifact.rs` against a real program.
+    /// in `tests/suite/artifact.rs` against a real program.
     fn sample() -> Artifact {
         let mut bodies = BTreeMap::new();
         let mut names = Vec::new();

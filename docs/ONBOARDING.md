@@ -467,7 +467,7 @@ somewhere:
 2. A test result is keyed by the test's hash. So if no hash moved, every cached
    result is still valid and selection is empty.
 3. It is an asserted invariant, not an observation:
-   **`crates/ply-cli/tests/cli.rs:145 renaming_a_definition_re_runs_nothing`**
+   **`crates/ply-cli/tests/suite/cli.rs:145 renaming_a_definition_re_runs_nothing`**
    writes a two-line project, renames `width` to `breadth`, and asserts the
    output contains `selected 0 of 1 (1 cached)` with the failure message *"a
    rename rebuilt something"*.

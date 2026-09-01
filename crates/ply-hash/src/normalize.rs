@@ -1118,7 +1118,7 @@ fn pattern_binders(p: &Pattern, out: &mut FxHashSet<Symbol>) -> usize {
 // implementation whether an expression may be reordered rather than two that can
 // drift apart — they are the same question, and a drift would mean
 // normalization reordering something `?` refused to, or the reverse. Nothing
-// else about it changed: `crates/ply-hash/tests/map.rs`'s pinned digest is the
+// else about it changed: `crates/ply-hash/tests/suite/map.rs`'s pinned digest is the
 // guard on the move being free.
 
 /// Deliberately blind to scope: any occurrence of the name counts, even one that

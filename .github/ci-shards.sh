@@ -105,7 +105,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # shard that builds `ply-cli` now pays anyway, because `ply-cli` depends on it.
 # It is in the same shard as `ply-cli` on purpose rather than by balance: the
 # tests that decide whether a code generator is policeable are
-# `crates/ply-cli/tests/backend.rs`, and a partition that could run one without
+# `crates/ply-cli/tests/suite/backend.rs`, and a partition that could run one without
 # the other would let half of ADR 0026 §4.5's condition go green alone.
 #
 # **This table's own gate caught the omission.** Adding the crate without
@@ -141,9 +141,9 @@ POSTGRES_SHARD=postgres
 #
 # The reproduction was done on 2026-08-28 and the condition came back NOT
 # satisfied, so the entry is narrowed rather than deleted. Seven of the eight
-# configurations moved: five into crates/ply-eval/tests/differential_corpus.rs
+# configurations moved: five into crates/ply-eval/tests/suite/differential_corpus.rs
 # over ply_eval::backend::Reference at corpus scale, exceeds-budget=4 through
-# `ply test --backend` in crates/ply-cli/tests/backend.rs, and answers= on the
+# `ply test --backend` in crates/ply-cli/tests/suite/backend.rs, and answers= on the
 # offer count of zero that is its whole point. The eighth does not move, for a
 # structural reason: the spike's backend is native code on a fixed stack, so
 # ignoring the budget entirely CRASHES and run_guarded reports it from outside;
@@ -158,7 +158,7 @@ POSTGRES_SHARD=postgres
 # and only hangs under a tree-walker, and a run that never comes back cannot be
 # reported from inside it". The workspace now has a backend with native frames:
 # `ply test --backend cranelift:wrong:exceeds-budget` over a recursion with no
-# base case aborts, exit 134, in 0.02s, and `ply-cli/tests/backend.rs` has
+# base case aborts, exit 134, in 0.02s, and `ply-cli/tests/suite/backend.rs` has
 # always run `ply` as a child so the reporter was never the problem. Eight of
 # eight, under `cargo test --workspace`.
 #
@@ -193,7 +193,7 @@ declare -a KNOWN_OUTSIDE=(
 #     that grep could not see. Re-surveying `crates/*/src` took the list to 12.
 #   * The cli-eval shard then failed on
 #     `routing_a_path_of_escapes_costs_its_length_and_not_its_square`
-#     (`crates/ply-cli/tests/w3_http_audit.rs:714`) — *"four times the escapes
+#     (`crates/ply-cli/tests/suite/w3_http_audit.rs:714`) — *"four times the escapes
 #     cost 1655.9ms against 143.6ms for k, which is 11.5x"*, against
 #     `four <= one * 9.0`. The second survey missed it too: the test reads no
 #     Rust clock at all, it parses milliseconds out of `ply test`'s own output
@@ -205,17 +205,17 @@ declare -a KNOWN_OUTSIDE=(
 DEFERRED=(
   "ply-eval:region_arena_cost:snapshot_cost_as_a_function_of_region_size"
   "ply-eval:fixture_open_cost:a_seeded_fixture_opens_per_test_in_microseconds"
-  "ply-eval:simulation:a_long_sleep_is_a_jump"
-  "ply-test:region_fixture_cost:a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
-  "ply-test:region_fixture_cost:discarding_a_tests_own_cells_costs_nothing"
-  "ply-test:region_fixture_cost:a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"
-  "ply-test:region_fixture_cost:a_group_with_no_fixture_opens_and_closes_in_constant_time"
+  "ply-eval:suite:simulation::a_long_sleep_is_a_jump"
+  "ply-test:suite:region_fixture_cost::a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
+  "ply-test:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"
+  "ply-test:suite:region_fixture_cost::a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"
+  "ply-test:suite:region_fixture_cost::a_group_with_no_fixture_opens_and_closes_in_constant_time"
   "ply-corpus:lib:measure::tests::every_resumption_costs_about_what_the_first_one_did"
   "ply-corpus:lib:measure::tests::capture_and_resume_are_flat_in_the_frames_they_move"
   "ply-corpus:lib:measure::tests::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real"
   "ply-store:lib:tests::opening_a_ten_thousand_definition_cache_is_under_the_budget"
   "ply-store:lib:tests::a_baseline_for_every_test_does_not_slow_the_open"
-  "ply-cli:w3_http_audit:routing_a_path_of_escapes_costs_its_length_and_not_its_square"
+  "ply-cli:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
 )
 
 # Tests that fail on a property of the *tree* rather than of a run, as
@@ -317,6 +317,25 @@ cmd_skips() {
     printf -- '--skip %s ' "$test"
   done < <(cmd_deferred)
   printf '\n'
+}
+
+# Where a named test's `fn` is defined. A target is either a single
+# `tests/<target>.rs` or a directory target rooted at `tests/<target>/main.rs`;
+# in the directory form the test name carries the module path to the file that
+# defines it, so `suite:simulation::a_long_sleep_is_a_jump` resolves to
+# `tests/suite/simulation.rs`. Resolving the module rather than grepping the
+# whole directory keeps the check as sharp as it was against one file per test.
+test_source_file() {
+  local package=$1 target=$2 test=$3 dir modpath
+  dir="$root/crates/$package/tests"
+  if [[ -f "$dir/$target.rs" ]]; then
+    printf '%s\n' "$dir/$target.rs"
+  elif [[ $test == *::* ]]; then
+    modpath=${test%::*}
+    printf '%s\n' "$dir/$target/${modpath//::/\/}.rs"
+  else
+    printf '%s\n' "$dir/$target/main.rs"
+  fi
 }
 
 # One `package target test` line per entry. Split on the first two colons only:
@@ -450,12 +469,13 @@ cmd_verify() {
         failures=$((failures + 1))
       fi
     else
-      file="$root/crates/$package/tests/$target.rs"
+      file=$(test_source_file "$package" "$target" "$test")
+      leaf=${test##*::}
       if [[ ! -f $file ]]; then
         echo "FAIL: deferred test '$test' names $file, which does not exist" >&2
         failures=$((failures + 1))
-      elif ! grep -q "fn $test(" "$file"; then
-        echo "FAIL: $file has no 'fn $test(' — the shards skip a name nothing defines" >&2
+      elif ! grep -q "fn $leaf(" "$file"; then
+        echo "FAIL: $file has no 'fn $leaf(' — the shards skip a name nothing defines" >&2
         failures=$((failures + 1))
       fi
     fi
@@ -475,12 +495,13 @@ cmd_verify() {
   # a deferred test that vanishes only stops being skipped, while a tree check
   # that vanishes stops being checked and says nothing.
   while read -r package target test; do
-    file="$root/crates/$package/tests/$target.rs"
+    file=$(test_source_file "$package" "$target" "$test")
+    leaf=${test##*::}
     if [[ ! -f $file ]]; then
       echo "FAIL: tree check '$test' names $file, which does not exist" >&2
       failures=$((failures + 1))
-    elif ! grep -q "fn $test(" "$file"; then
-      echo "FAIL: $file has no 'fn $test(' — CI asserts a check nothing defines" >&2
+    elif ! grep -q "fn $leaf(" "$file"; then
+      echo "FAIL: $file has no 'fn $leaf(' — CI asserts a check nothing defines" >&2
       failures=$((failures + 1))
     fi
     id=""

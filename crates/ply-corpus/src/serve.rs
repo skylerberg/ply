@@ -76,7 +76,7 @@ fn micros(d: Duration) -> f64 {
 /// W1 wrote them — a `fold` over `range` that boxes an `Int` per byte, calls a
 /// closure per byte, and cannot stop once it has the answer.
 ///
-/// `crates/ply-corpus/tests/w1_baseline.rs` runs the example's own sixteen
+/// `crates/ply-corpus/tests/suite/w1_baseline.rs` runs the example's own sixteen
 /// tests against the reconstruction, which is what makes it a twin rather than
 /// a guess: if the two parsers disagreed on any head the example tests, the
 /// comparison below would be between two different programs.

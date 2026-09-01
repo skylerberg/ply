@@ -93,7 +93,7 @@ settled by a clock, not by a review.
 
 ### How narrow it actually is
 
-`crates/ply-codegen/tests/parser_census.rs`, added by this change, runs the
+`crates/ply-codegen/tests/suite/parser_census.rs`, added by this change, runs the
 fixpoint over `spikes/ply-parser`:
 
 ```
@@ -243,7 +243,7 @@ unclaimed and this ADR narrows why.
    default, read once per process, on `PLY_BACKEND_ONLY`'s model — because the
    arm it enables is the one that produced §4, and a knob that took a finding is
    worth keeping to re-take it.
-3. **`crates/ply-codegen/tests/parser_census.rs` ships**, with a floor of 20 on
+3. **`crates/ply-codegen/tests/suite/parser_census.rs` ships**, with a floor of 20 on
    the enterable set, set below the 22 it measures over that corpus. (W1 reads 6
    through the shipping command; the corpora differ by `probe.ply`, which changes
    what is reachable. The two numbers are not in conflict and the test asserts on

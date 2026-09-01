@@ -472,8 +472,8 @@ gets *zero offers*.** A corruption aimed at a named lexer definition can no
 longer even be presented, because `lexer.at` is inside `items.parse` now. A
 workload that enters one call per file cannot police a corruption of a scalar
 answer, and the corpus that can is `examples/` and `tests/fixtures/` — which is
-why `crates/ply-eval/tests/differential_corpus.rs` and
-`crates/ply-cli/tests/backend.rs` run there and not here.
+why `crates/ply-eval/tests/suite/differential_corpus.rs` and
+`crates/ply-cli/tests/suite/backend.rs` run there and not here.
 
 The other half of the same coin, and it is `Bfo`'s: under the callback-free
 registry W1 recovers all three (ADR 0030 §10.3 measured `off-by-one` at 17,599
@@ -534,7 +534,7 @@ whenever a W1 result is quoted as evidence.
 3. **W1 is retired as a policing workload and kept as a timing workload.** It
    cannot fire three of the nine corruptions (§6). Every claim about whether the
    seam is policed belongs to `differential_corpus.rs` and
-   `crates/ply-cli/tests/backend.rs` over `examples/` and `tests/fixtures/`, and
+   `crates/ply-cli/tests/suite/backend.rs` over `examples/` and `tests/fixtures/`, and
    this ADR's §6 table is the evidence for the split rather than an aside in it.
 4. **The floor arm joins the two-binary method as a standing instrument.** It is
    a `--filter` that selects nothing — no code, no flag, nothing to maintain —

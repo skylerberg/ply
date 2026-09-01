@@ -1,7 +1,7 @@
 //! ADR 0015 §2 at the evaluator: what a credential renders as, what comparing
 //! two of them does, and what happens when one reaches the host boundary.
 //!
-//! `ply-core/tests/secrets.rs` covers the routes the type checker closes. These
+//! `ply-core/tests/suite/secrets.rs` covers the routes the type checker closes. These
 //! are the two that no type can close, because they take *any* value —
 //! `Value::render` and `values_equal` — plus the one that leaves the language
 //! entirely.

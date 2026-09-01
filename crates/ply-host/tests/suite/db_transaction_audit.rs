@@ -17,8 +17,7 @@
 //! `db_driver.rs` gives: `#[test]`s in a binary run in parallel threads of one
 //! process, and a server shared between them would have no owner.
 
-mod support;
-
+use crate::support::cluster::{self, Cluster};
 use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
@@ -33,7 +32,6 @@ use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use support::cluster::{self, Cluster};
 
 /// One entry point that never spawned. The owner every scope in this file
 /// belongs to unless a phase says otherwise.

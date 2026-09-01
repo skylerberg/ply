@@ -3,7 +3,7 @@
 Status: accepted — implemented in W4.
 Date: 2026-08-30
 Closes: the `assert`/`range` divergence recorded in
-`crates/ply-cli/tests/failure_classification_audit.rs`, which documented half of
+`crates/ply-cli/tests/suite/failure_classification_audit.rs`, which documented half of
 it in a comment and resolved neither half.
 Constrained by: ADR 0001 (a definition's identity is its normalized structure),
 ADR 0002 (the driver hashes before it infers, and gate 1 skips a file on its

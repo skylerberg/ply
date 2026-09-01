@@ -1812,7 +1812,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[(
      was handed. It is the only route a shipping command has, and `ply test` arms the \
      cache rule on it twice: `cache_bypassed` reads `args.backend` so nothing is read, \
      and `run_with` records `Record::Backend` so nothing is written. \
-     crates/ply-cli/tests/backend.rs holds both, each seen to fail.",
+     crates/ply-cli/tests/suite/backend.rs holds both, each seen to fail.",
 )];
 
 /// A backend installed by a route the cache rule does not know about.
@@ -1832,7 +1832,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[(
 ///
 /// What it does **not** prove is that the rule works, only that whoever adds a
 /// route is told about it. The rule working is
-/// `crates/ply-cli/tests/backend.rs`'s `a_backend_run_reads_no_cached_pass` and
+/// `crates/ply-cli/tests/suite/backend.rs`'s `a_backend_run_reads_no_cached_pass` and
 /// `a_backend_run_writes_no_pass`, which are behavioural and are the ones that
 /// go red if the enforcement is wrong rather than merely absent.
 #[test]

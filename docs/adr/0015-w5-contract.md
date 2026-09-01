@@ -1531,7 +1531,7 @@ The ones whose absence would let W5 ship broken rather than merely incomplete.
     increasing positions shows no monotone step count.
     **The harness was never written; the property is argued from the source
     instead.** What exists is `the_comparison_is_over_the_whole_of_both_operands`
-    (`crates/ply-eval/tests/secrets.rs:177`), and it asserts seven *answers* —
+    (`crates/ply-eval/tests/suite/secrets.rs:177`), and it asserts seven *answers* —
     that `constant_time_eq` returns the right `bool` for equal inputs, for a
     mismatch at the last byte, for a mismatch at the first byte, for a length
     difference, and for the empty/NUL pair. It measures nothing and counts
@@ -1577,7 +1577,7 @@ The ones whose absence would let W5 ship broken rather than merely incomplete.
     asserted against `pg_stat_activity` and against the table's contents, not
     against the driver's bookkeeping.
     *Enforced by `an_open_transaction_at_shutdown_is_rolled_back`
-    (`crates/ply-host/tests/w5_shutdown.rs:159`), which does assert exactly
+    (`crates/ply-host/tests/suite/w5_shutdown.rs:159`), which does assert exactly
     that, through `idle_in_transaction()` reading `pg_stat_activity` and
     `rows()` reading the `ledger` table. It runs only behind ADR 0014 §13.1's
     gate A: its enclosing `#[test]` at `w5_shutdown.rs:132` prints a skip line
@@ -1669,7 +1669,7 @@ requests" — and their enforcement is the most machine-dependent in the
 milestone.
 
 **Gate C — `#![cfg(unix)]`, and it is silent.**
-`crates/ply-cli/tests/w5_shutdown.rs:18` puts the whole file behind
+`crates/ply-cli/tests/suite/w5_shutdown.rs:18` puts the whole file behind
 `#![cfg(unix)]`, so on a non-Unix host it is not compiled, not counted, and
 **not mentioned** — unlike gates A and B, which at least print a line. Eight
 `#[test]`s are in it, and they are the only ones that drive the real `ply`
@@ -1690,8 +1690,8 @@ so nowhere.
 
 **Gate A — `cluster::available()`**, documented in ADR 0014 §13.1. Required
 tests **28**, **29** and **31**'s live half run through
-`crates/ply-host/tests/w5_shutdown.rs:132` and
-`crates/ply-host/tests/w5_drain_audit.rs:180`, both of which print a skip line
+`crates/ply-host/tests/suite/w5_shutdown.rs:132` and
+`crates/ply-host/tests/suite/w5_drain_audit.rs:180`, both of which print a skip line
 and return when the machine has no `initdb`/`postgres`.
 
 **Gate B — `PLY_PG_URL`**, also ADR 0014 §13.1. Not load-bearing for this
