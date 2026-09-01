@@ -7,7 +7,7 @@ use crate::property::{
     HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
 };
 use ply_core::{Type, prelude};
-use ply_eval::{Decimal, Value, Vector};
+use ply_eval::{Decimal, List, Value};
 use ply_span::{Diagnostic, Symbol};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -467,28 +467,23 @@ fn string_candidates(s: &str) -> Vec<Value> {
 }
 
 /// `[]`, the two halves, each single element removed, then each element shrunk in place.
-fn list_candidates(
-    items: &Vector<Value>,
-    elem: &Type,
-    world: &TypeWorld,
-    depth: u32,
-) -> Vec<Value> {
+fn list_candidates(items: &List, elem: &Type, world: &TypeWorld, depth: u32) -> Vec<Value> {
     if items.is_empty() {
         return Vec::new();
     }
     let mut out = vec![Value::list(Vec::new())];
     if items.len() >= 2 {
         let mid = items.len() / 2;
-        out.push(Value::list(items[..mid].to_vec()));
-        out.push(Value::list(items[mid..].to_vec()));
+        out.push(Value::list(items.iter().take(mid).cloned().collect()));
+        out.push(Value::list(items.iter().skip(mid).cloned().collect()));
     }
     for i in 0..items.len() {
         let mut next = items.to_vec();
         next.remove(i);
         out.push(Value::list(next));
     }
-    for i in 0..items.len() {
-        for candidate in candidates_at(&items[i], elem, world, depth + 1) {
+    for (i, item) in items.iter().enumerate() {
+        for candidate in candidates_at(item, elem, world, depth + 1) {
             let mut next = items.to_vec();
             next[i] = candidate;
             out.push(Value::list(next));

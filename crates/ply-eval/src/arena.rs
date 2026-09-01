@@ -818,7 +818,13 @@ mod tests {
     /// it or is still holding it.
     fn payload(n: i64) -> (Arc<Vec<Value>>, Value) {
         let items = Arc::new(vec![Value::Int(n)]);
-        (Arc::clone(&items), Value::List(items))
+        (
+            Arc::clone(&items),
+            Value::Ctor {
+                name: "Box".into(),
+                args: items,
+            },
+        )
     }
 
     fn int_of(arena: &Arena, slot: Slot) -> i64 {

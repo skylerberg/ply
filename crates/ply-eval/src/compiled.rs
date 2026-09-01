@@ -2033,7 +2033,7 @@ mod tests {
             gate(
                 &c,
                 &poly,
-                &[Value::List(Arc::new(vec![Value::Int(1)])), Value::Int(2)]
+                &[Value::list(vec![Value::Int(1)]), Value::Int(2)]
             ),
             Err(Gate::ArgumentType),
             "a container crossed under a `Type::Var`, which can be a closure"
@@ -2041,11 +2041,7 @@ mod tests {
         // And the same container under a declared `List<Int>` does cross, so the refusal above is
         // the variable's and not the list's.
         assert_eq!(
-            gate(
-                &c,
-                &named(&c, "ints"),
-                &[Value::List(Arc::new(vec![Value::Int(1)]))]
-            ),
+            gate(&c, &named(&c, "ints"), &[Value::list(vec![Value::Int(1)])]),
             Ok(("ints".to_string(), DEFAULT_MAX_CALLS))
         );
     }
@@ -2054,11 +2050,11 @@ mod tests {
     #[test]
     fn a_value_whose_kind_is_not_its_declared_types_is_refused() {
         let c = checked_source("fn twice(x: Int) -> Int = x * 2\n");
-        let holding = Value::List(Arc::new(vec![Value::Closure(Arc::new(code_closure(
+        let holding = Value::list(vec![Value::Closure(Arc::new(code_closure(
             None,
             &["y"],
             var("y"),
-        )))]));
+        )))]);
         assert_eq!(
             gate(&c, &named(&c, "twice"), &[holding]),
             Err(Gate::ArgumentType),
@@ -2327,11 +2323,11 @@ mod tests {
             "type Scan = { at: Int, tok: Bytes }\n\
              fn scan(i: Int) -> Scan = { at: i, tok: b\"x\" }\n",
         );
-        let holding = Value::List(Arc::new(vec![Value::Closure(Arc::new(code_closure(
+        let holding = Value::list(vec![Value::Closure(Arc::new(code_closure(
             None,
             &["y"],
             var("y"),
-        )))]));
+        )))]);
         let types = c.types();
         let scan = Symbol::new("scan");
         assert!(
