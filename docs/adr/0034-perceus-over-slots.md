@@ -514,18 +514,22 @@ small lists, and G2 is measured there. That number needs the change to exist, so
 | **S4′** | §4's probe — P1 at the `App` and `Record` carry sites | done — four of five pairs to 0.000; §4 has the narrowed claim |
 | **S4″** | both of ADR 0025's fallback primitives for P1, priced | done — both roughly double request-path allocations; §4 has the table |
 | **S6′** | §6's flat record representation, which the fifth pair needs | **next**, and ahead of S4 rather than behind it |
-| **S4** | §4, slot frames and flat closure conversion | gated on **G1**, then **G2** |
+| **S4a** | §4's flat closure conversion — a lambda captures its free variables, not the scope | done; +0.6 points of reuse, +2.6 allocations, both marginal |
+| **S4** | §4, slot frames | gated on **G1**, then **G2** |
 | **S5** | §5, the chunked vector — `imbl::Vector`; `rpds` refused on allocations | gated on **G2**, which §10.1 shows binds harder than G3 |
 | **S6** | §6, reuse | G2 does not regress |
 | **S7** | §7, `fip` | — |
 
-**S3 fails G2, which is the second time a milestone of this shape has moved that number the wrong
-way.** Landed by default it takes `/health` from 773 allocations per request to 815.27, +5.2%, and
-bytes with it. The cause is the one ADR 0025 §What would make this wrong item 1 predicted for P1 and
+**S3 fails G2, and what it buys is larger than the record first said.** Landed by default it costs
+`/health` about 35 allocations a request, +4.6%. What that buys, on `examples/` and the `std`
+modules they import, is in-place appends going from **66.7% to 91.1%** — 10,461 list copies that do
+not happen. The cost and the benefit are measured on *different corpora*, and that is the whole
+tension: `/health` pays the release without pushing the lists that would repay it, while the corpus
+that does push them gains a quarter of its appends. The cause is the one ADR 0025 §What would make this wrong item 1 predicted for P1 and
 which applies to P2 for the same reason: `Env::release` rebuilds every link above the binding it
 releases, and a *parameter* is the deepest binding in its barrier's chain, so releasing one rebuilds
-the whole scope. The benefit is real and the corpus rates reproduce — but they are the standard
-library's test suites, and `/health` pays the release without pushing the lists that would repay it.
+the whole scope. Whether that trade is worth taking is not something G2 alone answers, and it is recorded here with
+both numbers rather than only the one that fails.
 
 So S3 sits behind `PLY_ADR0034_PROBE=1` with S4's probe, and the flag now arms both. The case
 analysis (§8.1), the adversarial cases and the G1 pair all stand; what does not stand is landing it
