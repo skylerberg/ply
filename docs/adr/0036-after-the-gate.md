@@ -27,7 +27,9 @@ target's (`docs/BOOTSTRAP-PATH.md` step 10) and not this record's.
 > entry, so an entry's memory is bounded by what it holds; and that the seam
 > remembers a pure root's answer as compiled code does and takes it back in
 > as the word, so a phase's tree crosses the seam once rather than at every
-> root it is handed to.
+> root it is handed to; and that the map is an ordered tree, so no map
+> operation's cost grows with the map's size on a property the source does
+> not show, which ADR 0034 asks of every core operation.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -123,6 +125,23 @@ functions, so the two arms of the front-end row do the same work now, and the
 census says what still crosses: the answers of roots that take arguments the
 memo does not hold, which is what a driver written in Ply, entered once, would
 never convert at all.
+
+## Decision 6 — the map is an ordered tree
+
+ADR 0034's representation gate, asked of the compiled map as it was asked of
+the list, refused the sorted array: a shared insert copied the whole map, so
+its cost per operation grew with the size, and at a few thousand keys the
+compiled map was slower than the interpreter's tree. The front end's maps are
+exactly that case — in the check row most inserts are into a shared map of
+hundreds to thousands of entries, and the hash row's index build moves
+kilobytes per insert. The map is now an ordered B-tree over words
+(`crates/ply-codegen/src/map.rs`): leaves of sorted key–value pairs, branches
+of up to thirty-two children beside each child's greatest key, an insert or a
+removal walking one path — in place along what is held once, one node copied
+per level where it is not — a probe walking the same path with a binary
+search at each node, and iteration in key order, which is the interpreter's.
+A small map is a map object and one leaf; a map built from sorted entries at
+the seam fills its leaves left to right with no path walked.
 
 ## Priced and rejected
 
