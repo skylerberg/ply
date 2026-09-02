@@ -1,6 +1,7 @@
 # ADR 0035 — A compiled value model: layouts from types, counts without atomics, reuse
 
-**Decided; sequence steps 1 to 5 are landed, and the gate is not yet met.**
+**Decided; sequence steps 1 to 5 and the strings half of 6 are landed, and the
+gate is not yet met.**
 `benches/value-model/PRE-REGISTERED.md` is the gate's protocol and the bar is
 in `benches/value-model/analyze.py`, where a number cannot set it after the
 fact; `baseline.txt` there is the series before anything was built,
@@ -17,18 +18,29 @@ first read; a remembered constant is copied into memory that outlives the
 entry; a binding is released at its scope's end unless a move emptied it, and
 every branch, arm and block answers a value it owns; a small pure callee is
 inlined at its call before the body is lowered, and a record that is built
-and only ever read by field inside one body is never built at all. What the
-fifth series says: the integer kernel moved by a large factor and is still
-over the bar, the record kernel moved by a fifth and is a few times Rust, and
-the front end's check row moved by about a sixth. Where the integer kernel's
-remaining distance is: the sixteen-word state records built per round and per
-permutation, which the inliner leaves because their functions are over its
-budget; the chunk loop, which is a callback through the runtime; and the
-bytes builtins, which read through the bridge. Where the record kernel's is:
-its map keys and its bytes are bridged values, so every key compare and every
-concatenation is the interpreter's — sequence step 6. `docs/BOOTSTRAP-PATH.md`
-step 9 carries this record's place in the path and step 10 what is built on
-it if the gate clears.
+and only ever read by field inside one body is never built at all; a string
+or a bytes value is its bytes after the header with room to grow, so
+appending to one nobody else holds copies the piece alone, two of them
+compare by bytes, and the builtins the front end leans on answer over the
+payloads. What the fifth series says: the integer kernel moved by a large
+factor and is still over the bar, the record kernel moved by a fifth and is a
+few times Rust, and the front end's check row moved by about a sixth. Where
+the integer kernel's remaining distance is: the sixteen-word state records
+built per round and per permutation, which the inliner leaves because their
+functions are over its budget, and the chunk loop, which is a callback
+through the runtime. What the strings did, read on the rows rather than a
+series: the record kernel moved by a further quarter and every front-end row
+but the tables moved down, once every string builtin the lexer hands the
+whole source to answered natively — one that does not copies its argument
+into an interpreter value per call, and two such rows doubled before that
+was seen. What ADR 0034's representation gate says of the list, asked of
+compiled code for the first time: the cost per element of a `[x, ..rest]`
+recursion and of a shared push both grow with the length on the array, and
+under a bump allocator that frees nothing before the entry's end the growth
+is memory as well as time; the interpreter's trie is flat on both. The array
+is refused, and the trie with typed leaves is the other half of step 6.
+`docs/BOOTSTRAP-PATH.md` step 9 carries this record's place in the path and
+step 10 what is built on it if the gate clears.
 
 > **What this decides.** That the representation compiled Ply code runs on today
 > is an interpreter's, that no exception carved out for a hot function changes
@@ -264,8 +276,17 @@ a baseline the change is read against and the kernels are known to run.
    is small and fixed; the integer kernel's remaining records are in functions
    over it, and a budget that admits them is a compile-time trade the front
    end's own codegen row prices.
-6. Native strings and bytes; the list's array candidate priced under ADR 0034's
-   gates, or the trie with typed leaves if it is refused.
+6. **Landed, the strings half.** A string or a bytes value is its bytes after
+   the header with a capacity beside its length; `++`, `bytes_concat` and
+   `string_concat` append in place when the left operand is held by nobody
+   else and has the room, and copy once into a value with room to grow again
+   otherwise; equality and order over two native values are a byte compare;
+   and the builtins the front end leans on answer over the payloads, leaving
+   every diagnostic to the interpreter by answering nothing first. **The
+   list's array candidate was priced under ADR 0034's representation gate and
+   refused**: a `[x, ..rest]` recursion and a shared push both cost more per
+   element as the list grows, while the interpreter's trie is flat on both.
+   The trie with typed leaves is what follows.
 7. The seam's conversion and its census (Decision 6).
 8. Both kernels and the front-end row re-taken, and the decision rule applied.
 
