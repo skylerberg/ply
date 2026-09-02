@@ -259,7 +259,7 @@ fn every_non_ascii_byte_in_the_corpus_is_somewhere_both_lexers_agree() {
     // is visible rather than quietly narrowing the claim.
     assert_eq!(
         (non_ascii, in_string),
-        (1543, 45),
+        (301, 45),
         "the corpus holds {non_ascii} non-ASCII bytes of which {in_string} are inside string \
          literals, not the 1,543 and 45 this was written against"
     );

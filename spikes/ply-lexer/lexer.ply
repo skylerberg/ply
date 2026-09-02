@@ -262,7 +262,37 @@ type Num = {
 // scan over eleven bytes and the separators come out with two more calls.
 fn strip_us(b: Bytes) -> Bytes = bytes_concat_all(bytes_split(b, b"_"))
 
-fn number(src: Bytes, s: Scan, start: Int) -> Scan = {
+// `0xFF`, `0xdead_beef`: ADR 0033's hex spelling of an `Int`, bounded as a 64-bit pattern the
+// way `lexer.rs`'s `hex` bounds it, so sixteen `f`s are -1. No digits and a digit string too
+// long for the pattern are `E0001` over the literal and answer 0; a suffix is `E0001` over the
+// digits and the suffix lexes on as a name, which is what the reference does.
+fn number(src: Bytes, s: Scan, start: Int) -> Scan =
+  if at(src, start) == 48 && (at(src, start + 1) == 120 || at(src, start + 1) == 88) {
+    hex_literal(src, s, start)
+  } else {
+    decimal_number(src, s, start)
+  }
+
+fn hex_literal(src: Bytes, s: Scan, start: Int) -> Scan = {
+  let fin = scan(src, start + 2, b"0123456789abcdefABCDEF_");
+  let digits = strip_us(bytes_slice(src, start + 2, fin));
+  if bytes_len(digits) == 0 {
+    emit(err(s, start, fin, unexpected()), start, fin, TInt(0))
+  } else {
+    let s1 = if is_ident_start(at(src, fin)) { err(s, start, fin, unexpected()) } else { s };
+    let d = strip_zeros(digits);
+    if bytes_len(d) > 16 {
+      emit(err(s1, start, fin, unexpected()), start, fin, TInt(0))
+    } else {
+      emit(s1, start, fin, TInt(hex_of_digits(d)))
+    }
+  }
+}
+
+fn hex_of_digits(d: Bytes) -> Int =
+  fold(range(0, bytes_len(d)), 0, |a: Int, i: Int| wrap_add(wrap_mul(a, 16), hex_digit(bytes_at(d, i))))
+
+fn decimal_number(src: Bytes, s: Scan, start: Int) -> Scan = {
   let we = scan(src, start, digit_chars());
   let whole = strip_us(bytes_slice(src, start, we));
   // `..` is the range separator and `.` alone cannot open a field name, so a
@@ -534,13 +564,13 @@ fn punct(src: Bytes, s: Scan, start: Int, c: Int) -> Scan =
   else if c == 47 { emit(s, start, start + 1, TPunct(b"slash")) }
   else if c == 37 { emit(s, start, start + 1, TPunct(b"percent")) }
   else if c == 124 { pair(s, src, start, 124, b"pipepipe", b"pipe") }
-  else if c == 38 {
-    if at(src, start + 1) == 38 {
-      emit(s, start, start + 2, TPunct(b"ampamp"))
-    } else {
-      err(seek(s, start + 1), start, start + 1, unexpected())
-    }
-  } else {
+  // ADR 0033's bit operators and ADR 0028's `?`: `&` alone is a token now, and `^`, `~` and
+  // `?` were reached only to be rejected before.
+  else if c == 38 { pair(s, src, start, 38, b"ampamp", b"amp") }
+  else if c == 94 { emit(s, start, start + 1, TPunct(b"caret")) }
+  else if c == 126 { emit(s, start, start + 1, TPunct(b"tilde")) }
+  else if c == 63 { emit(s, start, start + 1, TPunct(b"question")) }
+  else {
     err(seek(s, start + 1), start, start + 1, unexpected())
   }
 
@@ -655,8 +685,15 @@ test "operators use maximal munch" {
             ++ "30:32:p:ampamp;33:35:p:pipepipe;36:37:p:pipe;38:40:p:dotdot;41:42:p:dot;42:42:e;")
 }
 
-test "a lone ampersand is reported and skipped" {
-  assert_eq(dump(b"a & b"), "0:1:i:a;4:5:i:b;5:5:e;2:3:!:E0001;")
+test "a hex literal is an Int bounded as a 64-bit pattern" {
+  assert_eq(dump(b"0x10 0xff"), "0:4:n:16;5:9:n:255;9:9:e;");
+  assert_eq(dump(b"0xFFFF_FFFF_FFFF_FFFF"), "0:21:n:-1;21:21:e;")
+}
+
+test "the bit operators and the try operator are tokens of their own" {
+  assert_eq(dump(b"a & b"), "0:1:i:a;2:3:p:amp;4:5:i:b;5:5:e;");
+  assert_eq(dump(b"a && b"), "0:1:i:a;2:4:p:ampamp;5:6:i:b;6:6:e;");
+  assert_eq(dump(b"^ ~ ?"), "0:1:p:caret;2:3:p:tilde;4:5:p:question;5:5:e;")
 }
 
 test "a comment runs to the end of its line" {
