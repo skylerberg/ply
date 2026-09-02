@@ -1002,8 +1002,9 @@ honest price and it is item 5's job to keep saying so.
 > `E0118`/`E0119` (`?`), every one on a mined input written to raise it, and
 > the pinned map in `agreement.rs` is the current list. The tree half found
 > one thing this section had stated too strongly — *no rewrite removes a
-> node* — a refused `?` is unwrapped, which is one node fewer, so the count is
-> signed and the invariant holds where nothing was refused.
+> node* — twice over: a refused `?` is unwrapped, one node fewer, and an
+> update that writes every field drops its base, since nothing is copied from
+> it. So the count is signed, and it is a count rather than an invariant.
 
 **One cost is not free and must be stated: the reference crate has to grow an
 entry point.** `lib.rs` declares `mod effect_set; mod record_update; mod try_op;`
@@ -2007,3 +2008,44 @@ the change would have to be re-taken.
 **What the comparison cannot see.** Only what the parser's cannot (§11): the
 prose of a diagnostic. The trees it compares are the post-defaults,
 pre-rewrite trees, which is the phase both sides run.
+
+---
+
+## §16 The three rewrites, ported: the checker reads what `Parser::run` writes
+
+§11R.D decided to compare **pre-expansion** trees and priced the three rewrites
+`Parser::run` applies after the grammar — `effect_set::expand`,
+`record_update::expand`, `try_op::expand` — as the reference-crate cost of that
+decision, left in Rust. The next phase re-opens the question from the other
+side: `crates/ply-core` reads the **expanded** tree, and unreachable arms in its
+inferrer say so (`ExprKind::RecordUpdate` and `ExprKind::Try` "expanded away by
+`parse_module`"). A checker written in Ply therefore needs the rewritten tree
+first, and `rewrite.ply` is the port of all three.
+
+**What was ported.** The effect-set table with its duplicate, cross-module and
+unknown-set refusals, the cycle search with its one-per-hit report, the
+post-order expansion with `canonicalize`'s sort-and-dedup, the write-back into
+each set's own item, and the row walk that appends every alias's expansion —
+including the reference's own omission, which is that a lambda's written return
+type is not walked. The record-update expansion with its scope of written types,
+the alias chase, the sorted copies over the base's span, and `E0116`/`E0117`.
+And the try operator whole: the mode read off the written return type through
+aliases, the constructor-shadowing refusal, the evaluation-order scan that lifts
+the first reachable `?` to a fresh binder, the block split at a statement, the
+return-position walk through `if` and `match`, the `wrap` with its failure arm
+first, and the sweep that refuses what is left with `E0118` and `E0119`. The
+binders are numbered per item, as the reference's are.
+
+**What agrees.** `harness/tests/rewrite.rs`: `dump_expanded` against
+`parse_recovering`'s dump over every example, the standard library, the
+hand-written fixtures and the reference's own inputs — which carry every
+diagnostic the three passes raise (§11R.D's re-take counted them). All four
+agreed on the port's first run; `arm-rewrite.sh` arms them.
+
+**Two things the port found.** The immutable tree is where the rewrites' cost
+lives, and it is the same cost §15 met: every node the walk rebuilds spells
+every field, so a pass the reference writes as a `&mut` walk is here a fold that
+answers the node again. And the rewrites are not independent of the *order*
+`Parser::run` gives them — a `?` inside a written field of an update meets the
+record-update pass first, and the try pass then scans the record literal it
+became; the port keeps that order and the differential is what says it matters.

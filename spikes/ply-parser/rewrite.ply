@@ -1,0 +1,1285 @@
+// rewrite.ply — the three rewrites `Parser::run` applies after the grammar, ported:
+// `effect_set::expand`, `record_update::expand` and `try_op::expand`. The parser
+// port stopped at the grammar (`GAPS.md` §11R.D) and compared pre-expansion trees;
+// the checker reads post-expansion trees, so the next phase needs these.
+// `expand` takes a parsed module and answers the tree `parse_recovering` would,
+// with the diagnostics appended in the order the reference appends them; the
+// third differential (`harness/tests/rewrite.rs`) compares the two.
+
+import spine (Span, Ident, QName, PDiag, span_to, dummy_span, bare, diag1, diag2, dump_diags)
+import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet,
+              FnDef, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause,
+              EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef,
+              TestDef, LawDef, parse, dump_module)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
+              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
+              EWithCell, EWithRegion, ESimulate, EBad, Stmt, SLet, SExpr, Param,
+              NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LUnit)
+
+// --- Shared ---------------------------------------------------------------------
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the rewrite does not hold") }
+
+fn set_at<a>(xs: List<a>, i: Int, v: a) -> List<a> =
+  map(range(0, len(xs)), |j: Int| if j == i { v } else { at(xs, j) })
+
+fn take<a>(xs: List<a>, n: Int) -> List<a> = map(range(0, n), |i: Int| at(xs, i))
+
+fn drop<a>(xs: List<a>, n: Int) -> List<a> = map(range(n, len(xs)), |i: Int| at(xs, i))
+
+fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(_) -> false }
+
+fn max_alias_depth() -> Int = 16
+
+// This module's own `type` items, by simple name, first declaration winning.
+fn collect_types(m: Module) -> List<TypeDef> =
+  fold(m.items, [], |acc: List<TypeDef>, it: Item|
+    match it {
+      IType(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> push(acc, d) },
+      _ -> acc,
+    })
+
+fn find_type(ts: List<TypeDef>, name: Bytes) -> Option<TypeDef> =
+  fold(ts, None, |acc: Option<TypeDef>, t: TypeDef|
+    match acc { Some(_) -> acc, None -> if t.name.name == name { Some(t) } else { None } })
+
+// `ast::is_pure`: evaluates without calling or performing anything.
+pub fn is_pure(e: Expr) -> Bool =
+  match e {
+    EApp(_) -> false,
+    EPerform(_) -> false,
+    EHandle(_) -> false,
+    EWithCell(_) -> false,
+    EWithRegion(_) -> false,
+    ESimulate(_) -> false,
+    ETry(_) -> false,
+    ELit(_) -> true,
+    EVar(_) -> true,
+    EBad(_) -> true,
+    EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
+    EUnary(u) -> is_pure(u.operand),
+    ELambda(l) -> is_pure(l.body),
+    EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
+    EMatch(m) -> is_pure(m.scrutinee)
+                 && fold(m.arms, true, |acc: Bool, arm: MatchArm|
+                      acc && is_pure(arm.body) && (match arm.guard { None -> true, Some(g) -> is_pure(g) })),
+    EBlock(b) -> fold(b.stmts, true, |acc: Bool, s: Stmt|
+                   acc && (match s { SLet(l) -> is_pure(l.value), SExpr(x) -> is_pure(x) }))
+                 && (match b.tail { None -> true, Some(t) -> is_pure(t) }),
+    ERecord(r) -> fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    ERecordUpdate(r) -> is_pure(r.base) && fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    EField(f) -> is_pure(f.base),
+    EList(l) -> fold(l.items, true, |acc: Bool, x: Expr| acc && is_pure(x)),
+  }
+
+// --- Effect sets ----------------------------------------------------------------------
+
+type SetEntry = { name: Bytes, at: Int }
+type Sets = { defs: List<EffectSetDef>, by_name: List<SetEntry>, edges: List<List<Option<Int>>>,
+              cyclic: List<Bool>, effect_names: List<Bytes>, diags: List<PDiag> }
+
+fn set_index(s: Sets, name: Bytes) -> Option<Int> =
+  fold(s.by_name, None, |acc: Option<Int>, e: SetEntry|
+    match acc { Some(_) -> acc, None -> if e.name == name { Some(e.at) } else { None } })
+
+fn sets_collect(m: Module, diags: List<PDiag>) -> Sets =
+  fold(m.items, { defs: [], by_name: [], edges: [], cyclic: [], effect_names: [], diags: diags },
+    |s: Sets, it: Item|
+      match it {
+        IEffect(e) -> {..s, effect_names: push(s.effect_names, e.name.name)},
+        IEffectSet(d) ->
+          match set_index(s, d.name.name) {
+            Some(first) ->
+              {..s, diags: push(s.diags, diag2(b"E0105", d.name.span, at(s.defs, first).name.span, 1))},
+            None -> {..s, by_name: push(s.by_name, { name: d.name.name, at: len(s.defs) }),
+                          defs: push(s.defs, d), edges: push(s.edges, []), cyclic: push(s.cyclic, false)},
+          },
+        _ -> s,
+      })
+
+// `Sets::lookup`: a set named from this module, or one of two `E0114`s.
+fn set_lookup(s: Sets, q: QName) -> { s: Sets, at: Option<Int> } =
+  if !is_bare(q) {
+    { s: {..s, diags: push(s.diags, diag1(b"E0114", q.span, 2))}, at: None }
+  } else {
+    match set_index(s, q.name.name) {
+      Some(i) -> if at(s.cyclic, i) { { s: s, at: None } } else { { s: s, at: Some(i) } },
+      None -> {
+        let is_effect = fold(s.effect_names, false, |acc: Bool, n: Bytes| acc || n == q.name.name);
+        let notes = if is_effect { 3 } else { 1 };
+        { s: {..s, diags: push(s.diags, diag1(b"E0114", q.span, notes))}, at: None }
+      },
+    }
+  }
+
+fn sets_resolve_includes(s: Sets) -> Sets =
+  fold(range(0, len(s.defs)), s, |acc: Sets, i: Int| {
+    let walked: { s: Sets, es: List<Option<Int>> } = fold(at(acc.defs, i).includes, { s: acc, es: [] }, |w: { s: Sets, es: List<Option<Int>> }, q: QName| {
+      let r = set_lookup(w.s, q);
+      { s: r.s, es: push(w.es, r.at) }
+    });
+    {..walked.s, edges: set_at(walked.s.edges, i, walked.es)}
+  })
+
+type SetDfs = { color: List<Int>, path: List<Int>, work: List<{ node: Int, next: Int }>, s: Sets }
+
+fn sets_find_cycles(s: Sets) -> Sets = {
+  let n = len(s.defs);
+  let steps = fold(s.edges, 0, |acc: Int, es: List<Option<Int>>| acc + len(es));
+  let start = { color: map(range(0, n), |i: Int| 0), path: [], work: [], s: s };
+  let done = fold(range(0, n), start, |d: SetDfs, root: Int|
+    if at(d.color, root) != 0 { d } else {
+      let opened: SetDfs = {..d, color: set_at(d.color, root, 1), path: push(d.path, root), work: [{ node: root, next: 0 }]};
+      iterate(opened, 2 * (n + steps) + 4, |x: SetDfs|
+        if len(x.work) == 0 { Stop(x) } else { Continue(sets_dfs_step(x)) })
+    });
+  done.s
+}
+
+fn sets_dfs_step(d: SetDfs) -> SetDfs = {
+  let top = at(d.work, len(d.work) - 1);
+  let rest = take(d.work, len(d.work) - 1);
+  let out = at(d.s.edges, top.node);
+  if top.next >= len(out) {
+    {..d, color: set_at(d.color, top.node, 2), work: rest, path: take(d.path, len(d.path) - 1)}
+  } else {
+    let advanced = push(rest, { node: top.node, next: top.next + 1 });
+    match at(out, top.next) {
+      None -> {..d, work: advanced},
+      Some(target) -> {
+        let c = at(d.color, target);
+        if c == 0 {
+          {..d, work: push(advanced, { node: target, next: 0 }), color: set_at(d.color, target, 1), path: push(d.path, target)}
+        } else if c == 1 {
+          let st = match position(d.path, target) { Some(p) -> p, None -> 0 };
+          let cycle = drop(d.path, st);
+          let s2 = {..d.s, diags: push(d.s.diags, cycle_report(d.s, cycle)),
+                          cyclic: fold(cycle, d.s.cyclic, |cy: List<Bool>, node: Int| set_at(cy, node, true))};
+          {..d, work: advanced, s: s2}
+        } else { {..d, work: advanced} }
+      },
+    }
+  }
+}
+
+fn position(xs: List<Int>, v: Int) -> Option<Int> =
+  fold(range(0, len(xs)), None, |acc: Option<Int>, i: Int|
+    match acc { Some(_) -> acc, None -> if at(xs, i) == v { Some(i) } else { None } })
+
+// `E0115`: primary at the head's name, a secondary on every other set on the cycle, two notes.
+fn cycle_report(s: Sets, cycle: List<Int>) -> PDiag = {
+  let head = at(s.defs, at(cycle, 0));
+  let others = drop(cycle, 1);
+  { code: b"E0115", notes: 2,
+    labels: fold(others, [{ start: head.name.span.start, end: head.name.span.end, primary: true }],
+                 |ls: List<{ start: Int, end: Int, primary: Bool }>, n: Int| {
+                   let d = at(s.defs, n);
+                   push(ls, { start: d.name.span.start, end: d.name.span.end, primary: false })
+                 }) }
+}
+
+fn mode_key(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
+
+// `canonicalize`'s key: (effect's module, effect's name, mode, resource), `None` before `Some`.
+fn atom_before(a: AtomExpr, b: AtomExpr) -> Bool = {
+  let am = match a.eff.module { None -> b"", Some(m) -> bytes_concat(b"1", m.name) };
+  let bm = match b.eff.module { None -> b"", Some(m) -> bytes_concat(b"1", m.name) };
+  let ar = match a.resource { None -> b"", Some(r) -> bytes_concat(b"1", r.name) };
+  let br = match b.resource { None -> b"", Some(r) -> bytes_concat(b"1", r.name) };
+  bytes_lt(am, bm) || (am == bm && (bytes_lt(a.eff.name.name, b.eff.name.name)
+    || (a.eff.name.name == b.eff.name.name && (bytes_lt(mode_key(a.mode), mode_key(b.mode))
+    || (mode_key(a.mode) == mode_key(b.mode) && bytes_lt(ar, br))))))
+}
+
+fn atom_same(a: AtomExpr, b: AtomExpr) -> Bool = !atom_before(a, b) && !atom_before(b, a)
+
+fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare(a, b) { Less -> true, _ -> false }
+
+// A stable insertion sort, then adjacent duplicates dropped — `sort_by_key` is stable too.
+fn canonicalize(atoms: List<AtomExpr>) -> List<AtomExpr> = {
+  let sorted = fold(atoms, [], |acc: List<AtomExpr>, x: AtomExpr| insert_atom(acc, x));
+  fold(sorted, [], |acc: List<AtomExpr>, x: AtomExpr|
+    if len(acc) > 0 && atom_same(at(acc, len(acc) - 1), x) { acc } else { push(acc, x) })
+}
+
+fn insert_atom(sorted: List<AtomExpr>, x: AtomExpr) -> List<AtomExpr> = {
+  let i = fold(range(0, len(sorted)), len(sorted), |acc: Int, j: Int|
+    if acc < len(sorted) { acc } else if atom_before(x, at(sorted, j)) { j } else { acc });
+  append(push(take(sorted, i), x), drop(sorted, i))
+}
+
+type Expanding = { s: Sets, done: List<Bool>, work: List<{ node: Int, visited: Bool }> }
+
+fn sets_expand_all(s: Sets) -> Sets = {
+  let n = len(s.defs);
+  let start = { s: s, done: map(range(0, n), |i: Int| false), work: [] };
+  let steps = fold(s.edges, 0, |acc: Int, es: List<Option<Int>>| acc + len(es));
+  let finished = fold(range(0, n), start, |x: Expanding, root: Int|
+    if at(x.done, root) || at(x.s.cyclic, root) { x } else {
+      let opened: Expanding = {..x, work: [{ node: root, visited: false }]};
+      iterate(opened, 4 * (n + steps) + 4, |y: Expanding|
+        if len(y.work) == 0 { Stop(y) } else { Continue(expand_step(y)) })
+    });
+  finished.s
+}
+
+fn expand_step(x: Expanding) -> Expanding = {
+  let top = at(x.work, len(x.work) - 1);
+  let rest = take(x.work, len(x.work) - 1);
+  if at(x.done, top.node) || at(x.s.cyclic, top.node) { {..x, work: rest} }
+  else if !top.visited {
+    let pushed = fold(at(x.s.edges, top.node), push(rest, { node: top.node, visited: true }),
+      |w: List<{ node: Int, visited: Bool }>, e: Option<Int>|
+        match e {
+          Some(edge) -> if !at(x.done, edge) && !at(x.s.cyclic, edge) { push(w, { node: edge, visited: false }) } else { w },
+          None -> w,
+        });
+    {..x, work: pushed}
+  } else {
+    let own = at(x.s.defs, top.node);
+    let out = fold(at(x.s.edges, top.node), own.atoms, |acc: List<AtomExpr>, e: Option<Int>|
+      match e { Some(edge) -> append(acc, at(x.s.defs, edge).expansion), None -> acc });
+    let d = { name: own.name, atoms: own.atoms, includes: own.includes, expansion: canonicalize(out), span: own.span };
+    {..x, work: rest, done: set_at(x.done, top.node, true), s: {..x.s, defs: set_at(x.s.defs, top.node, d)}}
+  }
+}
+
+fn sets_write_back(s: Sets, m: Module) -> Module = {
+  let walked = fold(m.items, { seen: [], items: [] }, |acc: { seen: List<Bytes>, items: List<Item> }, it: Item|
+    match it {
+      IEffectSet(d) ->
+        match set_index(s, d.name.name) {
+          None -> {..acc, items: push(acc.items, it)},
+          Some(i) ->
+            if fold(acc.seen, false, |b: Bool, n: Bytes| b || n == d.name.name) { {..acc, items: push(acc.items, it)} }
+            else {
+              { seen: push(acc.seen, d.name.name),
+                items: push(acc.items, IEffectSet({ name: d.name, atoms: d.atoms, includes: d.includes,
+                                                    expansion: at(s.defs, i).expansion, span: d.span })) }
+            },
+        },
+      _ -> {..acc, items: push(acc.items, it)},
+    });
+  { imports: m.imports, items: walked.items }
+}
+
+// The row walk: every alias in a row is looked up, and its expansion appended to the atoms.
+fn row_expand(s: Sets, r: RowExpr) -> { s: Sets, r: RowExpr } = {
+  let looked = fold(r.aliases, { s: s, atoms: [] }, |acc: { s: Sets, atoms: List<AtomExpr> }, alias: QName| {
+    let hit = set_lookup(acc.s, alias);
+    match hit.at {
+      Some(i) -> { s: hit.s, atoms: append(acc.atoms, at(hit.s.defs, i).expansion) },
+      None -> { s: hit.s, atoms: acc.atoms },
+    }
+  });
+  { s: looked.s, r: { atoms: append(r.atoms, looked.atoms), aliases: r.aliases, tail: r.tail, span: r.span } }
+}
+
+fn opt_row(s: Sets, r: Option<RowExpr>) -> { s: Sets, r: Option<RowExpr> } =
+  match r { None -> { s: s, r: None }, Some(x) -> { let o = row_expand(s, x); { s: o.s, r: Some(o.r) } } }
+
+fn walk_ty(s: Sets, t: TypeExpr) -> { s: Sets, t: TypeExpr } =
+  match t {
+    TCon(c) -> { let o = walk_tys(s, c.args); { s: o.s, t: TCon({ span: c.span, name: c.name, args: o.ts }) } },
+    TFn(f) -> {
+      let ps = walk_tys(s, f.params);
+      let r = walk_ty(ps.s, f.ret);
+      let e = opt_row(r.s, f.effects);
+      { s: e.s, t: TFn({ span: f.span, params: ps.ts, ret: r.t, effects: e.r }) }
+    },
+    TRecord(r) -> {
+      let fs = fold(r.fields, { s: s, fs: [] }, |acc: { s: Sets, fs: List<{ name: Ident, ty: TypeExpr }> }, f: { name: Ident, ty: TypeExpr }| {
+        let o = walk_ty(acc.s, f.ty);
+        { s: o.s, fs: push(acc.fs, { name: f.name, ty: o.t }) }
+      });
+      { s: fs.s, t: TRecord({ span: r.span, fields: fs.fs }) }
+    },
+    _ -> { s: s, t: t },
+  }
+
+fn walk_tys(s: Sets, ts: List<TypeExpr>) -> { s: Sets, ts: List<TypeExpr> } =
+  fold(ts, { s: s, ts: [] }, |acc: { s: Sets, ts: List<TypeExpr> }, t: TypeExpr| {
+    let o = walk_ty(acc.s, t);
+    { s: o.s, ts: push(acc.ts, o.t) }
+  })
+
+fn opt_ty(s: Sets, t: Option<TypeExpr>) -> { s: Sets, t: Option<TypeExpr> } =
+  match t { None -> { s: s, t: None }, Some(x) -> { let o = walk_ty(s, x); { s: o.s, t: Some(o.t) } } }
+
+fn walk_params(s: Sets, ps: List<Param>) -> { s: Sets, ps: List<Param> } =
+  fold(ps, { s: s, ps: [] }, |acc: { s: Sets, ps: List<Param> }, p: Param| {
+    let o = opt_ty(acc.s, p.ty);
+    { s: o.s, ps: push(acc.ps, { name: p.name, ty: o.t, default: p.default, span: p.span }) }
+  })
+
+fn walk_exprs(s: Sets, xs: List<Expr>) -> { s: Sets, xs: List<Expr> } =
+  fold(xs, { s: s, xs: [] }, |acc: { s: Sets, xs: List<Expr> }, x: Expr| {
+    let o = walk_expr(acc.s, x);
+    { s: o.s, xs: push(acc.xs, o.e) }
+  })
+
+fn walk_fields(s: Sets, fs: List<RecField>) -> { s: Sets, fs: List<RecField> } =
+  fold(fs, { s: s, fs: [] }, |acc: { s: Sets, fs: List<RecField> }, f: RecField| {
+    let o = walk_expr(acc.s, f.value);
+    { s: o.s, fs: push(acc.fs, { name: f.name, value: o.e }) }
+  })
+
+fn opt_expr(s: Sets, e: Option<Expr>) -> { s: Sets, e: Option<Expr> } =
+  match e { None -> { s: s, e: None }, Some(x) -> { let o = walk_expr(s, x); { s: o.s, e: Some(o.e) } } }
+
+// `walk_expr`: the rows inside an expression are the ones on lambda parameters' types and on
+// `let` annotations — a lambda's written return type is not walked, as the reference does not.
+fn walk_expr(s: Sets, e: Expr) -> { s: Sets, e: Expr } =
+  match e {
+    EBinary(b) -> {
+      let l = walk_expr(s, b.lhs);
+      let r = walk_expr(l.s, b.rhs);
+      { s: r.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+    },
+    EUnary(u) -> { let o = walk_expr(s, u.operand); { s: o.s, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
+    ELambda(l) -> {
+      let ps = walk_params(s, l.params);
+      let b = walk_expr(ps.s, l.body);
+      { s: b.s, e: ELambda({ span: l.span, body: b.e, params: ps.ps, ret: l.ret }) }
+    },
+    EApp(a) -> {
+      let f = walk_expr(s, a.func);
+      let args = walk_exprs(f.s, a.args);
+      let named = fold(a.named, { s: args.s, ns: [] }, |acc: { s: Sets, ns: List<NamedArg> }, n: NamedArg| {
+        let o = walk_expr(acc.s, n.value);
+        { s: o.s, ns: push(acc.ns, { name: n.name, value: o.e, span: n.span }) }
+      });
+      { s: named.s, e: EApp({ span: a.span, func: f.e, named: named.ns, args: args.xs }) }
+    },
+    EIf(i) -> {
+      let c = walk_expr(s, i.cond);
+      let t = walk_expr(c.s, i.then_branch);
+      let el = walk_expr(t.s, i.else_branch);
+      { s: el.s, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+    },
+    EMatch(m) -> {
+      let sc = walk_expr(s, m.scrutinee);
+      let arms = fold(m.arms, { s: sc.s, arms: [] }, |acc: { s: Sets, arms: List<MatchArm> }, arm: MatchArm| {
+        let g = opt_expr(acc.s, arm.guard);
+        let b = walk_expr(g.s, arm.body);
+        { s: b.s, arms: push(acc.arms, { pat: arm.pat, guard: g.e, body: b.e, span: arm.span }) }
+      });
+      { s: arms.s, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
+    },
+    EBlock(b) -> {
+      let stmts = fold(b.stmts, { s: s, ss: [] }, |acc: { s: Sets, ss: List<Stmt> }, st: Stmt|
+        match st {
+          SLet(l) -> {
+            let t = opt_ty(acc.s, l.ty);
+            let v = walk_expr(t.s, l.value);
+            { s: v.s, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: t.t, value: v.e })) }
+          },
+          SExpr(x) -> { let o = walk_expr(acc.s, x); { s: o.s, ss: push(acc.ss, SExpr(o.e)) } },
+        });
+      let tl = opt_expr(stmts.s, b.tail);
+      { s: tl.s, e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
+    },
+    ERecord(r) -> { let o = walk_fields(s, r.fields); { s: o.s, e: ERecord({ span: r.span, fields: o.fs }) } },
+    ERecordUpdate(r) -> {
+      let b = walk_expr(s, r.base);
+      let o = walk_fields(b.s, r.fields);
+      { s: o.s, e: ERecordUpdate({ span: r.span, base: b.e, fields: o.fs }) }
+    },
+    EField(f) -> { let o = walk_expr(s, f.base); { s: o.s, e: EField({ span: f.span, base: o.e, field: f.field }) } },
+    ETry(t) -> { let o = walk_expr(s, t.operand); { s: o.s, e: ETry({ span: t.span, operand: o.e }) } },
+    EList(l) -> { let o = walk_exprs(s, l.items); { s: o.s, e: EList({ span: l.span, items: o.xs }) } },
+    EPerform(p) -> { let o = walk_exprs(s, p.args); { s: o.s, e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }) } },
+    EHandle(h) -> {
+      let b = walk_expr(s, h.body);
+      let cs = fold(h.clauses, { s: b.s, cs: [] }, |acc: { s: Sets, cs: List<HandleClause> }, c: HandleClause| {
+        let o = walk_expr(acc.s, c.body);
+        { s: o.s, cs: push(acc.cs, { eff: c.eff, op: c.op, resource: c.resource, resume: c.resume, body: o.e, span: c.span, params: c.params }) }
+      });
+      let r = match h.ret {
+        None -> { s: cs.s, r: None },
+        Some(rc) -> { let o = walk_expr(cs.s, rc.body); { s: o.s, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) } },
+      };
+      { s: r.s, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
+    },
+    EWithCell(c) -> {
+      let i = walk_expr(s, c.init);
+      let b = walk_expr(i.s, c.body);
+      { s: b.s, e: EWithCell({ span: c.span, resource: c.resource, init: i.e, binder: c.binder, body: b.e }) }
+    },
+    EWithRegion(w) -> { let o = walk_expr(s, w.body); { s: o.s, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
+    ESimulate(x) -> { let o = walk_expr(s, x.body); { s: o.s, e: ESimulate({ span: x.span, body: o.e }) } },
+    _ -> { s: s, e: e },
+  }
+
+fn walk_item_rows(s: Sets, it: Item) -> { s: Sets, it: Item } =
+  match it {
+    IFn(d) -> {
+      let ps = walk_params(s, d.params);
+      let r = opt_ty(ps.s, d.ret);
+      let ef = opt_row(r.s, d.effects);
+      let spec = fold(d.spec, { s: ef.s, xs: [] }, |acc: { s: Sets, xs: List<SpecClause> }, c: SpecClause| {
+        let o = walk_expr(acc.s, c.expr);
+        { s: o.s, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
+      });
+      let b = walk_expr(spec.s, d.body);
+      { s: b.s, it: IFn({ vis: d.vis, name: d.name, generics: d.generics, params: ps.ps, ret: r.t, effects: ef.r,
+                          constraints: d.constraints, spec: spec.xs, reuse: d.reuse, body: b.e, span: d.span }) }
+    },
+    IType(d) ->
+      match d.body {
+        TDAlias(t) -> { let o = walk_ty(s, t); { s: o.s, it: IType({ vis: d.vis, name: d.name, params: d.params, body: TDAlias(o.t), span: d.span }) } },
+        TDSum(vs) -> {
+          let out = fold(vs, { s: s, vs: [] }, |acc: { s: Sets, vs: List<VariantDef> }, v: VariantDef| {
+            let o = walk_tys(acc.s, v.fields);
+            { s: o.s, vs: push(acc.vs, { name: v.name, fields: o.ts, span: v.span }) }
+          });
+          { s: out.s, it: IType({ vis: d.vis, name: d.name, params: d.params, body: TDSum(out.vs), span: d.span }) }
+        },
+      },
+    IEffect(d) -> {
+      let ops = fold(d.ops, { s: s, ops: [] }, |acc: { s: Sets, ops: List<OpDef> }, op: OpDef| {
+        let ps = walk_tys(acc.s, op.params);
+        let r = walk_ty(ps.s, op.ret);
+        { s: r.s, ops: push(acc.ops, { name: op.name, mode: op.mode, resource_param: op.resource_param, params: ps.ts, ret: r.t, span: op.span }) }
+      });
+      { s: ops.s, it: IEffect({ vis: d.vis, name: d.name, is_nondet: d.is_nondet, ops: ops.ops, span: d.span }) }
+    },
+    ITest(d) -> { let o = walk_expr(s, d.body); { s: o.s, it: ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: o.e, span: d.span }) } },
+    ILaw(d) -> {
+      let bs = fold(d.binders, { s: s, bs: [] }, |acc: { s: Sets, bs: List<Binder> }, b: Binder| {
+        let o = walk_ty(acc.s, b.ty);
+        { s: o.s, bs: push(acc.bs, { name: b.name, ty: o.t, span: b.span }) }
+      });
+      let g = opt_expr(bs.s, d.guard);
+      let b = walk_expr(g.s, d.body);
+      { s: b.s, it: ILaw({ name: d.name, name_span: d.name_span, host: d.host, binders: bs.bs, guard: g.e, body: b.e, span: d.span }) }
+    },
+    _ -> { s: s, it: it },
+  }
+
+// `effect_set::expand`.
+pub fn expand_effect_sets(m: Module, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } = {
+  let s0 = sets_collect(m, diags);
+  let s1 = sets_resolve_includes(s0);
+  let s2 = sets_find_cycles(s1);
+  let s3 = sets_expand_all(s2);
+  let written = sets_write_back(s3, m);
+  let walked = fold(written.items, { s: s3, items: [] }, |acc: { s: Sets, items: List<Item> }, it: Item| {
+    let o = walk_item_rows(acc.s, it);
+    { s: o.s, items: push(acc.items, o.it) }
+  });
+  { module: { imports: written.imports, items: walked.items }, diags: walked.s.diags }
+}
+
+// --- Record update -----------------------------------------------------------------------
+
+type Bound = { name: Bytes, ty: Option<TypeExpr> }
+type RuCx = { types: List<TypeDef>, scope: List<Bound>, diags: List<PDiag> }
+type RuOut = { cx: RuCx, e: Expr }
+
+type Shape = | Fields(List<{ name: Ident, ty: TypeExpr }>) | NoShape
+
+fn ru_lookup(cx: RuCx, name: Bytes) -> Option<Option<TypeExpr>> =
+  fold(cx.scope, None, |acc: Option<Option<TypeExpr>>, b: Bound|
+    if b.name == name { Some(b.ty) } else { acc })
+
+// `type_of_path`: the written type of a base that is a local, or a field path from one.
+fn type_of_path(cx: RuCx, e: Expr) -> Option<TypeExpr> =
+  match e {
+    EVar(v) -> if !is_bare(v.name) { None } else {
+      match ru_lookup(cx, v.name.name.name) { Some(Some(t)) -> Some(t), _ -> None }
+    },
+    EField(f) ->
+      match type_of_path(cx, f.base) {
+        None -> None,
+        Some(outer) ->
+          match record_of(cx, outer, 0) {
+            NoShape -> None,
+            Fields(fs) -> fold(fs, None, |acc: Option<TypeExpr>, x: { name: Ident, ty: TypeExpr }|
+                            match acc { Some(_) -> acc, None -> if x.name.name == f.field.name { Some(x.ty) } else { None } }),
+          },
+      },
+    _ -> None,
+  }
+
+fn record_of(cx: RuCx, t: TypeExpr, depth: Int) -> Shape =
+  if depth > max_alias_depth() { NoShape } else {
+    match t {
+      TRecord(r) -> Fields(r.fields),
+      TCon(c) ->
+        if !is_bare(c.name) || len(c.args) > 0 { NoShape } else {
+          match find_type(cx.types, c.name.name.name) {
+            None -> NoShape,
+            Some(d) -> if len(d.params) > 0 { NoShape } else {
+              match d.body { TDSum(_) -> NoShape, TDAlias(inner) -> record_of(cx, inner, depth + 1) }
+            },
+          }
+        },
+      _ -> NoShape,
+    }
+  }
+
+fn ru_bind(cx: RuCx, name: Ident, ty: Option<TypeExpr>) -> RuCx =
+  {..cx, scope: push(cx.scope, { name: name.name, ty: ty })}
+
+fn ru_bind_pattern(cx: RuCx, p: Pattern) -> RuCx =
+  match p {
+    PVar(v) -> ru_bind(cx, v.name, None),
+    PCtor(c) -> fold(c.args, cx, |acc: RuCx, a: Pattern| ru_bind_pattern(acc, a)),
+    PRecord(r) -> fold(r.fields, cx, |acc: RuCx, f: { name: Ident, pat: Pattern }| ru_bind_pattern(acc, f.pat)),
+    PList(l) -> {
+      let items = fold(l.items, cx, |acc: RuCx, x: Pattern| ru_bind_pattern(acc, x));
+      match l.rest { None -> items, Some(r) -> ru_bind_pattern(items, r) }
+    },
+    _ -> cx,
+  }
+
+fn ru_truncate(cx: RuCx, mark: Int) -> RuCx = {..cx, scope: take(cx.scope, mark)}
+
+// `expand_update`: the literal an update stands for, or the written fields alone with a diagnostic.
+fn expand_update(cx: RuCx, span: Span, base: Expr, written: List<RecField>) -> RuOut = {
+  let base_span = expr_span(base);
+  let shape = match type_of_path(cx, base) { None -> NoShape, Some(t) -> record_of(cx, t, 0) };
+  match shape {
+    NoShape ->
+      { cx: {..cx, diags: push(cx.diags, diag1(b"E0116", base_span, 1))}, e: ERecord({ span: span, fields: written }) },
+    Fields(fs) -> {
+      let bad = fold(written, { cx: cx, bad: false }, |acc: { cx: RuCx, bad: Bool }, w: RecField|
+        if fold(fs, false, |b: Bool, f: { name: Ident, ty: TypeExpr }| b || f.name.name == w.name.name) { acc }
+        else { { cx: {..acc.cx, diags: push(acc.cx.diags, diag2(b"E0117", w.name.span, base_span, 1))}, bad: true } });
+      if bad.bad { { cx: bad.cx, e: ERecord({ span: span, fields: written }) } } else {
+        let copies = filter(map(fs, |f: { name: Ident, ty: TypeExpr }| f.name.name), |n: Bytes|
+          !fold(written, false, |b: Bool, w: RecField| b || w.name.name == n));
+        let sorted = fold(copies, [], |acc: List<Bytes>, n: Bytes| insert_bytes(acc, n));
+        let copied = map(sorted, |n: Bytes| {
+          let field = { name: n, span: base_span };
+          { name: field, value: EField({ span: base_span, base: base, field: field }) }
+        });
+        { cx: bad.cx, e: ERecord({ span: span, fields: append(copied, written) }) }
+      }
+    },
+  }
+}
+
+fn insert_bytes(sorted: List<Bytes>, x: Bytes) -> List<Bytes> = {
+  let i = fold(range(0, len(sorted)), len(sorted), |acc: Int, j: Int|
+    if acc < len(sorted) { acc } else if bytes_lt(x, at(sorted, j)) { j } else { acc });
+  append(push(take(sorted, i), x), drop(sorted, i))
+}
+
+fn ru_exprs(cx: RuCx, xs: List<Expr>) -> { cx: RuCx, xs: List<Expr> } =
+  fold(xs, { cx: cx, xs: [] }, |acc: { cx: RuCx, xs: List<Expr> }, x: Expr| {
+    let o = ru_expr(acc.cx, x);
+    { cx: o.cx, xs: push(acc.xs, o.e) }
+  })
+
+fn ru_fields(cx: RuCx, fs: List<RecField>) -> { cx: RuCx, fs: List<RecField> } =
+  fold(fs, { cx: cx, fs: [] }, |acc: { cx: RuCx, fs: List<RecField> }, f: RecField| {
+    let o = ru_expr(acc.cx, f.value);
+    { cx: o.cx, fs: push(acc.fs, { name: f.name, value: o.e }) }
+  })
+
+fn ru_opt(cx: RuCx, e: Option<Expr>) -> { cx: RuCx, e: Option<Expr> } =
+  match e { None -> { cx: cx, e: None }, Some(x) -> { let o = ru_expr(cx, x); { cx: o.cx, e: Some(o.e) } } }
+
+// Children first, then this node: a nested update inside a written field expands before its owner.
+fn ru_expr(cx: RuCx, e: Expr) -> RuOut =
+  match e {
+    EBinary(b) -> {
+      let l = ru_expr(cx, b.lhs);
+      let r = ru_expr(l.cx, b.rhs);
+      { cx: r.cx, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+    },
+    EUnary(u) -> { let o = ru_expr(cx, u.operand); { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
+    ELambda(l) -> {
+      let mark = len(cx.scope);
+      let inner = fold(l.params, cx, |acc: RuCx, p: Param| ru_bind(acc, p.name, p.ty));
+      let o = ru_expr(inner, l.body);
+      { cx: ru_truncate(o.cx, mark), e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
+    },
+    EApp(a) -> {
+      let f = ru_expr(cx, a.func);
+      let args = ru_exprs(f.cx, a.args);
+      let named = fold(a.named, { cx: args.cx, ns: [] }, |acc: { cx: RuCx, ns: List<NamedArg> }, n: NamedArg| {
+        let o = ru_expr(acc.cx, n.value);
+        { cx: o.cx, ns: push(acc.ns, { name: n.name, value: o.e, span: n.span }) }
+      });
+      { cx: named.cx, e: EApp({ span: a.span, func: f.e, named: named.ns, args: args.xs }) }
+    },
+    EIf(i) -> {
+      let c = ru_expr(cx, i.cond);
+      let t = ru_expr(c.cx, i.then_branch);
+      let el = ru_expr(t.cx, i.else_branch);
+      { cx: el.cx, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+    },
+    EMatch(m) -> {
+      let sc = ru_expr(cx, m.scrutinee);
+      let arms = fold(m.arms, { cx: sc.cx, arms: [] }, |acc: { cx: RuCx, arms: List<MatchArm> }, arm: MatchArm| {
+        let mark = len(acc.cx.scope);
+        let inner = ru_bind_pattern(acc.cx, arm.pat);
+        let g = ru_opt(inner, arm.guard);
+        let b = ru_expr(g.cx, arm.body);
+        { cx: ru_truncate(b.cx, mark), arms: push(acc.arms, { pat: arm.pat, guard: g.e, body: b.e, span: arm.span }) }
+      });
+      { cx: arms.cx, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
+    },
+    EBlock(b) -> {
+      let mark = len(cx.scope);
+      let stmts = fold(b.stmts, { cx: cx, ss: [] }, |acc: { cx: RuCx, ss: List<Stmt> }, st: Stmt|
+        match st {
+          SLet(l) -> {
+            let v = ru_expr(acc.cx, l.value);
+            let bound = match l.pat {
+              PVar(n) -> match l.ty { Some(t) -> ru_bind(v.cx, n.name, Some(t)), None -> ru_bind_pattern(v.cx, l.pat) },
+              _ -> ru_bind_pattern(v.cx, l.pat),
+            };
+            { cx: bound, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: v.e })) }
+          },
+          SExpr(x) -> { let o = ru_expr(acc.cx, x); { cx: o.cx, ss: push(acc.ss, SExpr(o.e)) } },
+        });
+      let tl = ru_opt(stmts.cx, b.tail);
+      { cx: ru_truncate(tl.cx, mark), e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
+    },
+    ERecord(r) -> { let o = ru_fields(cx, r.fields); { cx: o.cx, e: ERecord({ span: r.span, fields: o.fs }) } },
+    ERecordUpdate(r) -> {
+      let b = ru_expr(cx, r.base);
+      let fs = ru_fields(b.cx, r.fields);
+      expand_update(fs.cx, r.span, b.e, fs.fs)
+    },
+    EField(f) -> { let o = ru_expr(cx, f.base); { cx: o.cx, e: EField({ span: f.span, base: o.e, field: f.field }) } },
+    ETry(t) -> { let o = ru_expr(cx, t.operand); { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) } },
+    EList(l) -> { let o = ru_exprs(cx, l.items); { cx: o.cx, e: EList({ span: l.span, items: o.xs }) } },
+    EPerform(p) -> { let o = ru_exprs(cx, p.args); { cx: o.cx, e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }) } },
+    EHandle(h) -> {
+      let b = ru_expr(cx, h.body);
+      let cs = fold(h.clauses, { cx: b.cx, cs: [] }, |acc: { cx: RuCx, cs: List<HandleClause> }, c: HandleClause| {
+        let mark = len(acc.cx.scope);
+        let with_params = fold(c.params, acc.cx, |x: RuCx, p: Ident| ru_bind(x, p, None));
+        let with_resume = match c.resume { None -> with_params, Some(k) -> ru_bind(with_params, k, None) };
+        let o = ru_expr(with_resume, c.body);
+        { cx: ru_truncate(o.cx, mark), cs: push(acc.cs, { eff: c.eff, op: c.op, resource: c.resource, resume: c.resume, body: o.e, span: c.span, params: c.params }) }
+      });
+      let r = match h.ret {
+        None -> { cx: cs.cx, r: None },
+        Some(rc) -> {
+          let mark = len(cs.cx.scope);
+          let o = ru_expr(ru_bind(cs.cx, rc.binder, None), rc.body);
+          { cx: ru_truncate(o.cx, mark), r: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
+        },
+      };
+      { cx: r.cx, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
+    },
+    EWithCell(c) -> {
+      let i = ru_expr(cx, c.init);
+      let mark = len(i.cx.scope);
+      let o = ru_expr(ru_bind(i.cx, c.binder, None), c.body);
+      { cx: ru_truncate(o.cx, mark), e: EWithCell({ span: c.span, resource: c.resource, init: i.e, binder: c.binder, body: o.e }) }
+    },
+    EWithRegion(w) -> { let o = ru_expr(cx, w.body); { cx: o.cx, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
+    ESimulate(x) -> { let o = ru_expr(cx, x.body); { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) } },
+    _ -> { cx: cx, e: e },
+  }
+
+fn ru_item(cx: RuCx, it: Item) -> { cx: RuCx, it: Item } =
+  match it {
+    IFn(d) -> {
+      let mark = len(cx.scope);
+      let inner = fold(d.params, cx, |acc: RuCx, p: Param| ru_bind(acc, p.name, p.ty));
+      let spec = fold(d.spec, { cx: inner, xs: [] }, |acc: { cx: RuCx, xs: List<SpecClause> }, c: SpecClause| {
+        let o = ru_expr(acc.cx, c.expr);
+        { cx: o.cx, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
+      });
+      let b = ru_expr(spec.cx, d.body);
+      { cx: ru_truncate(b.cx, mark), it: IFn({ vis: d.vis, name: d.name, generics: d.generics, params: d.params, ret: d.ret, effects: d.effects,
+                                               constraints: d.constraints, spec: spec.xs, reuse: d.reuse, body: b.e, span: d.span }) }
+    },
+    ITest(d) -> { let o = ru_expr(cx, d.body); { cx: o.cx, it: ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: o.e, span: d.span }) } },
+    ILaw(d) -> {
+      let mark = len(cx.scope);
+      let inner = fold(d.binders, cx, |acc: RuCx, b: Binder| ru_bind(acc, b.name, Some(b.ty)));
+      let g = ru_opt(inner, d.guard);
+      let b = ru_expr(g.cx, d.body);
+      { cx: ru_truncate(b.cx, mark), it: ILaw({ name: d.name, name_span: d.name_span, host: d.host, binders: d.binders, guard: g.e, body: b.e, span: d.span }) }
+    },
+    _ -> { cx: cx, it: it },
+  }
+
+// `record_update::expand`.
+pub fn expand_record_updates(m: Module, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } = {
+  let start = { types: collect_types(m), scope: [], diags: diags };
+  let walked = fold(m.items, { cx: start, items: [] }, |acc: { cx: RuCx, items: List<Item> }, it: Item| {
+    let o = ru_item(acc.cx, it);
+    { cx: o.cx, items: push(acc.items, o.it) }
+  });
+  { module: { imports: m.imports, items: walked.items }, diags: walked.cx.diags }
+}
+
+// --- The try operator ------------------------------------------------------------------------
+
+type TryMode = | MResult | MOption
+
+// Why a `?` has no meaning where it is written; only the count of notes reaches the comparison,
+// and every reason carries one.
+type Why = | WNone
+
+type TryCx = { types: List<TypeDef>, shadowed: Bool, diags: List<PDiag>, mode: Option<TryMode>, fresh: Int }
+
+type Lift = { operand: Expr, binder: Ident, at: Span }
+type Scan = | SFound(Lift) | SPure | SImpure
+type Scanned = { cx: TryCx, s: Scan, e: Expr }
+type TryOut = { cx: TryCx, e: Expr }
+
+fn is_expansion_name(name: Bytes) -> Bool =
+  name == b"Ok" || name == b"Err" || name == b"Some" || name == b"None"
+
+fn shadowing_ctor(m: Module) -> Bool = {
+  let imported = fold(m.imports, false, |acc: Bool, d: ImportDecl|
+    acc || (match d.kind { INames(ns) -> fold(ns, false, |b: Bool, n: Ident| b || is_expansion_name(n.name)), _ -> false }));
+  imported || fold(m.items, false, |acc: Bool, it: Item|
+    acc || (match it {
+      IType(d) -> match d.body { TDSum(vs) -> fold(vs, false, |b: Bool, v: VariantDef| b || is_expansion_name(v.name.name)), _ -> false },
+      _ -> false,
+    }))
+}
+
+fn mode_of(cx: TryCx, t: TypeExpr, depth: Int) -> Option<TryMode> =
+  if depth > max_alias_depth() { None } else {
+    match t {
+      TCon(c) ->
+        if !is_bare(c.name) { None }
+        else if c.name.name.name == b"Result" { Some(MResult) }
+        else if c.name.name.name == b"Option" { Some(MOption) }
+        else {
+          match find_type(cx.types, c.name.name.name) {
+            None -> None,
+            Some(d) -> if len(d.params) > 0 { None } else {
+              match d.body { TDSum(_) -> None, TDAlias(inner) -> mode_of(cx, inner, depth + 1) }
+            },
+          }
+        },
+      _ -> None,
+    }
+  }
+
+fn fresh_binder(cx: TryCx, span: Span) -> { cx: TryCx, b: Ident } =
+  { cx: {..cx, fresh: cx.fresh + 1}, b: { name: bytes_concat(b"?", bytes_of_string(int_to_string(cx.fresh))), span: span } }
+
+fn var_of(name: Ident) -> Expr = EVar({ span: name.span, name: bare(name) })
+
+fn var_pattern(name: Ident) -> Pattern = PVar({ span: name.span, name: name })
+
+fn ctor_pattern(name: Bytes, args: List<Pattern>, span: Span) -> Pattern =
+  PCtor({ span: span, name: bare({ name: name, span: span }), args: args })
+
+fn unwrap_try(e: Expr) -> Expr = match e { ETry(t) -> t.operand, _ -> e }
+
+// `match operand { <failure>, <success>(pat) -> body }`, failure arm first.
+fn wrap(cx: TryCx, operand: Expr, at_: Span, pat: Pattern, body: Expr) -> TryOut = {
+  let mode = match cx.mode { Some(m) -> m, None -> panic("a mode is established before any lift") };
+  match mode {
+    MResult -> {
+      let fb = fresh_binder(cx, at_);
+      let fail_pat = ctor_pattern(b"Err", [var_pattern(fb.b)], at_);
+      let fail_body = EApp({ span: at_, func: var_of({ name: b"Err", span: at_ }), args: [var_of(fb.b)], named: [] });
+      { cx: fb.cx,
+        e: EMatch({ span: at_, scrutinee: operand,
+                    arms: [{ pat: fail_pat, guard: None, body: fail_body, span: at_ },
+                           { pat: ctor_pattern(b"Ok", [pat], at_), guard: None, body: body, span: at_ }] }) }
+    },
+    MOption -> {
+      let fail_pat = ctor_pattern(b"None", [], at_);
+      let fail_body = var_of({ name: b"None", span: at_ });
+      { cx: cx,
+        e: EMatch({ span: at_, scrutinee: operand,
+                    arms: [{ pat: fail_pat, guard: None, body: fail_body, span: at_ },
+                           { pat: ctor_pattern(b"Some", [pat], at_), guard: None, body: body, span: at_ }] }) }
+    },
+  }
+}
+
+fn purity(pure: Bool) -> Scan = if pure { SPure } else { SImpure }
+
+// Sub-expressions left to right, stopping at the first `?` and at the first impure one.
+fn sequence(cx: TryCx, parts: List<Expr>) -> { cx: TryCx, s: Scan, xs: List<Expr> } =
+  fold(parts, { cx: cx, s: SPure, xs: [] }, |acc: { cx: TryCx, s: Scan, xs: List<Expr> }, p: Expr|
+    match acc.s {
+      SPure -> { let o = scan(acc.cx, p); { cx: o.cx, s: o.s, xs: push(acc.xs, o.e) } },
+      _ -> {..acc, xs: push(acc.xs, p)},
+    })
+
+// `scan`: the first `?` reachable in evaluation order, lifted out and replaced by its binder.
+fn scan(cx: TryCx, e: Expr) -> Scanned =
+  match e {
+    ELit(_) -> { cx: cx, s: SPure, e: e },
+    EVar(_) -> { cx: cx, s: SPure, e: e },
+    EBad(_) -> { cx: cx, s: SPure, e: e },
+    ETry(t) -> {
+      let inner = scan(cx, t.operand);
+      match inner.s {
+        SFound(_) -> { cx: inner.cx, s: inner.s, e: ETry({ span: t.span, operand: inner.e }) },
+        _ -> {
+          let fb = fresh_binder(inner.cx, t.span);
+          { cx: fb.cx, s: SFound({ operand: inner.e, binder: fb.b, at: t.span }), e: var_of(fb.b) }
+        },
+      }
+    },
+    EBinary(b) -> {
+      let short = b.op == b"and" || b.op == b"or";
+      let l = scan(cx, b.lhs);
+      match l.s {
+        SFound(_) -> { cx: l.cx, s: l.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: b.rhs }) },
+        SImpure -> { cx: l.cx, s: SImpure, e: e },
+        SPure ->
+          if short { { cx: l.cx, s: purity(is_pure(b.rhs)), e: e } } else {
+            let r = scan(l.cx, b.rhs);
+            { cx: r.cx, s: r.s, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+          },
+      }
+    },
+    EUnary(u) -> { let o = scan(cx, u.operand); { cx: o.cx, s: o.s, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
+    EApp(a) -> {
+      let o = sequence(cx, append(append([a.func], a.args), map(a.named, |n: NamedArg| n.value)));
+      let func = at(o.xs, 0);
+      let args = take(drop(o.xs, 1), len(a.args));
+      let nvals = drop(o.xs, 1 + len(a.args));
+      let named = map(range(0, len(a.named)), |i: Int| { let n = at(a.named, i); { name: n.name, value: at(nvals, i), span: n.span } });
+      let rebuilt = EApp({ span: a.span, func: func, named: named, args: args });
+      match o.s { SFound(_) -> { cx: o.cx, s: o.s, e: rebuilt }, _ -> { cx: o.cx, s: SImpure, e: rebuilt } }
+    },
+    EPerform(p) -> {
+      let o = sequence(cx, p.args);
+      let rebuilt = EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs });
+      match o.s { SFound(_) -> { cx: o.cx, s: o.s, e: rebuilt }, _ -> { cx: o.cx, s: SImpure, e: rebuilt } }
+    },
+    ERecord(r) -> {
+      let o = sequence(cx, map(r.fields, |f: RecField| f.value));
+      { cx: o.cx, s: o.s, e: ERecord({ span: r.span, fields: map(range(0, len(r.fields)), |i: Int| { name: at(r.fields, i).name, value: at(o.xs, i) }) }) }
+    },
+    EList(l) -> { let o = sequence(cx, l.items); { cx: o.cx, s: o.s, e: EList({ span: l.span, items: o.xs }) } },
+    EField(f) -> { let o = scan(cx, f.base); { cx: o.cx, s: o.s, e: EField({ span: f.span, base: o.e, field: f.field }) } },
+    ERecordUpdate(r) -> {
+      let o = sequence(cx, append([r.base], map(r.fields, |f: RecField| f.value)));
+      { cx: o.cx, s: o.s, e: ERecordUpdate({ span: r.span, base: at(o.xs, 0),
+                                            fields: map(range(0, len(r.fields)), |i: Int| { name: at(r.fields, i).name, value: at(o.xs, i + 1) }) }) }
+    },
+    EIf(i) -> {
+      let c = scan(cx, i.cond);
+      let rebuilt = EIf({ span: i.span, cond: c.e, then_branch: i.then_branch, else_branch: i.else_branch });
+      match c.s {
+        SFound(_) -> { cx: c.cx, s: c.s, e: rebuilt },
+        SImpure -> { cx: c.cx, s: SImpure, e: rebuilt },
+        SPure -> { cx: c.cx, s: purity(is_pure(i.then_branch) && is_pure(i.else_branch)), e: rebuilt },
+      }
+    },
+    EMatch(m) -> {
+      let sc = scan(cx, m.scrutinee);
+      let rebuilt = EMatch({ span: m.span, scrutinee: sc.e, arms: m.arms });
+      match sc.s {
+        SFound(_) -> { cx: sc.cx, s: sc.s, e: rebuilt },
+        SImpure -> { cx: sc.cx, s: SImpure, e: rebuilt },
+        SPure -> { cx: sc.cx, s: purity(fold(m.arms, true, |acc: Bool, arm: MatchArm|
+                     acc && is_pure(arm.body) && (match arm.guard { None -> true, Some(g) -> is_pure(g) }))), e: rebuilt },
+      }
+    },
+    // A nested block is not entered, and a lambda, a handler, a cell, a region and a `simulate`
+    // are barriers a `?` may not cross.
+    _ -> { cx: cx, s: purity(is_pure(e)), e: e },
+  }
+
+// `region`: lifts every `?` `find` reaches out of `e`, one `match` per lift, the rewritten `e`
+// as the success arm's body.
+fn region_cond(cx: TryCx, e: Expr) -> TryOut = {
+  let found = scan_head(cx, e);
+  match found.s {
+    SFound(l) -> {
+      let w = wrap(found.cx, l.operand, l.at, var_pattern(l.binder), found.e);
+      match w.e {
+        EMatch(m) -> {
+          let success = at(m.arms, 1);
+          let inner = region_cond(w.cx, success.body);
+          { cx: inner.cx, e: EMatch({ span: m.span, scrutinee: m.scrutinee,
+                                      arms: [at(m.arms, 0), { pat: success.pat, guard: None, body: inner.e, span: success.span }] }) }
+        },
+        _ -> w,
+      }
+    },
+    _ -> { cx: found.cx, e: found.e },
+  }
+}
+
+// What `ret` scans at each shape: an `if`'s condition, a `match`'s scrutinee, anything else whole.
+fn scan_head(cx: TryCx, e: Expr) -> Scanned =
+  match e {
+    EIf(i) -> {
+      let c = scan(cx, i.cond);
+      { cx: c.cx, s: c.s, e: EIf({ span: i.span, cond: c.e, then_branch: i.then_branch, else_branch: i.else_branch }) }
+    },
+    EMatch(m) -> {
+      let sc = scan(cx, m.scrutinee);
+      { cx: sc.cx, s: sc.s, e: EMatch({ span: m.span, scrutinee: sc.e, arms: m.arms }) }
+    },
+    _ -> scan(cx, e),
+  }
+
+// `ret`: an expression in return position.
+fn ret(cx: TryCx, e: Expr) -> TryOut =
+  match e {
+    EBlock(_) -> block(cx, e),
+    EIf(i) -> {
+      let t = ret(cx, i.then_branch);
+      let el = ret(t.cx, i.else_branch);
+      region_cond(el.cx, EIf({ span: i.span, cond: i.cond, then_branch: t.e, else_branch: el.e }))
+    },
+    EMatch(m) -> {
+      let arms = fold(m.arms, { cx: cx, arms: [] }, |acc: { cx: TryCx, arms: List<MatchArm> }, arm: MatchArm| {
+        let b = ret(acc.cx, arm.body);
+        { cx: b.cx, arms: push(acc.arms, { pat: arm.pat, guard: arm.guard, body: b.e, span: arm.span }) }
+      });
+      region_cond(arms.cx, EMatch({ span: m.span, scrutinee: m.scrutinee, arms: arms.arms }))
+    },
+    _ -> region_cond(cx, e),
+  }
+
+// A block in return position: split at the first statement a `?` can be lifted from.
+fn block(cx: TryCx, e: Expr) -> TryOut =
+  match e {
+    EBlock(b) -> {
+      let split = fold(range(0, len(b.stmts)), { cx: cx, stmts: b.stmts, tail: b.tail, done: false },
+        |acc: { cx: TryCx, stmts: List<Stmt>, tail: Option<Expr>, done: Bool }, i: Int|
+          if acc.done { acc } else {
+            let o = split_at(acc.cx, acc.stmts, acc.tail, i);
+            match o.split {
+              None -> { cx: o.cx, stmts: o.stmts, tail: acc.tail, done: false },
+              Some(t) -> { cx: o.cx, stmts: take(o.stmts, i), tail: Some(t), done: true },
+            }
+          });
+      if split.done { { cx: split.cx, e: EBlock({ span: b.span, tail: split.tail, stmts: split.stmts }) } }
+      else {
+        match split.tail {
+          None -> { cx: split.cx, e: EBlock({ span: b.span, tail: None, stmts: split.stmts }) },
+          Some(t) -> { let o = ret(split.cx, t); { cx: o.cx, e: EBlock({ span: b.span, tail: Some(o.e), stmts: split.stmts }) } },
+        }
+      }
+    },
+    _ -> panic("only called on a block"),
+  }
+
+type Taken = { cx: TryCx, stmt: Stmt, take: Option<{ operand: Expr, at: Span, pat: Pattern, consumes: Bool }> }
+
+// `split_at`: tries to split the block at statement `i`; answers the rewritten statement list and
+// the new tail when it did.
+fn split_at(cx: TryCx, stmts: List<Stmt>, tail: Option<Expr>, i: Int) -> { cx: TryCx, stmts: List<Stmt>, split: Option<Expr> } = {
+  let st = at(stmts, i);
+  let taken = take_stmt(cx, st);
+  match taken.take {
+    None -> { cx: taken.cx, stmts: set_at(stmts, i, taken.stmt), split: None },
+    Some(t) -> {
+      let kept = set_at(stmts, i, taken.stmt);
+      let rest = drop(kept, if t.consumes { i + 1 } else { i });
+      // `consumes`: the `?` was the whole statement, so its binder moved onto the success arm
+      // and the statement itself goes; otherwise the rewritten statement leads the rest.
+      let body0 = EBlock({ span: t.at, tail: tail, stmts: rest });
+      let body = block(taken.cx, body0);
+      let w = wrap(body.cx, t.operand, t.at, t.pat, body.e);
+      { cx: w.cx, stmts: kept, split: Some(w.e) }
+    },
+  }
+}
+
+fn take_stmt(cx: TryCx, st: Stmt) -> Taken =
+  match st {
+    SLet(l) ->
+      match l.value {
+        ETry(t) ->
+          match l.ty {
+            // `let x: T = e?;` has no `let` left to carry `T` on after the split.
+            Some(_) -> {
+              let d = diag2(b"E0119", t.span, l.span, 1);
+              { cx: {..cx, diags: push(cx.diags, d)}, stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: t.operand }), take: None }
+            },
+            None -> {
+              let o = take_try(cx, t.operand, t.span, l.pat);
+              { cx: o.cx, stmt: SLet({ span: l.span, pat: l.pat, ty: None, value: ETry({ span: t.span, operand: o.operand_left }) }), take: Some(o.take) }
+            },
+          },
+        _ -> {
+          let o = scan(cx, l.value);
+          match o.s {
+            SFound(lift) -> { cx: o.cx, stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e }),
+                              take: Some({ operand: lift.operand, at: lift.at, pat: var_pattern(lift.binder), consumes: false }) },
+            _ -> { cx: o.cx, stmt: st, take: None },
+          }
+        },
+      },
+    SExpr(v) ->
+      match v {
+        ETry(t) -> {
+          let o = take_try(cx, t.operand, t.span, PWild({ span: v_span(v) }));
+          { cx: o.cx, stmt: SExpr(ETry({ span: t.span, operand: o.operand_left })), take: Some(o.take) }
+        },
+        _ -> {
+          let o = scan(cx, v);
+          match o.s {
+            SFound(lift) -> { cx: o.cx, stmt: SExpr(o.e),
+                              take: Some({ operand: lift.operand, at: lift.at, pat: var_pattern(lift.binder), consumes: false }) },
+            _ -> { cx: o.cx, stmt: st, take: None },
+          }
+        },
+      },
+  }
+
+fn v_span(e: Expr) -> Span = expr_span(e)
+
+type TryTaken = { cx: TryCx, operand_left: Expr, take: { operand: Expr, at: Span, pat: Pattern, consumes: Bool } }
+
+// A statement whose whole value is a `?`: an inner `?` in the operand is lifted first (and the
+// statement stays, its operand rewritten); otherwise the operand is taken and the statement goes.
+fn take_try(cx: TryCx, operand: Expr, span: Span, pat: Pattern) -> TryTaken = {
+  let o = scan(cx, operand);
+  match o.s {
+    SFound(lift) -> { cx: o.cx, operand_left: o.e, take: { operand: lift.operand, at: lift.at, pat: var_pattern(lift.binder), consumes: false } },
+    _ -> { cx: o.cx, operand_left: ELit({ span: span, lit: LUnit }), take: { operand: o.e, at: span, pat: pat, consumes: true } },
+  }
+}
+
+// `sweep`: refuses every `?` left in `e` and unwraps it. `scope` is `true` when the enclosing
+// function gives `?` no meaning, `barrier` when a lambda, handler, cell, region or `simulate` sits
+// between; both are `E0118`, and a `?` neither reason excuses is `E0119`.
+fn sweep(cx: TryCx, e: Expr, scope: Bool, barrier: Bool) -> TryOut = {
+  let refused = match e {
+    ETry(t) -> {
+      let code = if scope || barrier { b"E0118" } else { b"E0119" };
+      { cx: {..cx, diags: push(cx.diags, diag1(code, t.span, 1))}, e: t.operand }
+    },
+    _ -> { cx: cx, e: e },
+  };
+  sweep_inner(refused.cx, refused.e, scope, barrier)
+}
+
+fn sweep_inner(cx: TryCx, e: Expr, scope: Bool, barrier: Bool) -> TryOut =
+  match e {
+    ETry(t) -> { let o = sweep(cx, t.operand, scope, barrier); { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) } },
+    EBinary(b) -> {
+      let l = sweep(cx, b.lhs, scope, barrier);
+      let r = sweep(l.cx, b.rhs, scope, barrier);
+      { cx: r.cx, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: r.e }) }
+    },
+    EUnary(u) -> { let o = sweep(cx, u.operand, scope, barrier); { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
+    ELambda(l) ->
+      match l.ret {
+        None -> { let o = sweep(cx, l.body, scope, true); { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: None }) } },
+        Some(ty) -> {
+          let mode = if cx.shadowed { None } else { mode_of(cx, ty, 0) };
+          match mode {
+            None -> { let o = sweep(cx, l.body, true, false); { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: Some(ty) }) } },
+            Some(m) -> {
+              let saved = cx.mode;
+              let r = ret({..cx, mode: Some(m)}, l.body);
+              let s: TryOut = sweep(r.cx, r.e, false, false);
+              { cx: {..s.cx, mode: saved}, e: ELambda({ span: l.span, body: s.e, params: l.params, ret: Some(ty) }) }
+            },
+          }
+        },
+      },
+    EApp(a) -> {
+      let f = sweep(cx, a.func, scope, barrier);
+      let args = sweep_all(f.cx, a.args, scope, barrier);
+      let named = fold(a.named, { cx: args.cx, ns: [] }, |acc: { cx: TryCx, ns: List<NamedArg> }, n: NamedArg| {
+        let o = sweep(acc.cx, n.value, scope, barrier);
+        { cx: o.cx, ns: push(acc.ns, { name: n.name, value: o.e, span: n.span }) }
+      });
+      { cx: named.cx, e: EApp({ span: a.span, func: f.e, named: named.ns, args: args.xs }) }
+    },
+    EIf(i) -> {
+      let c = sweep(cx, i.cond, scope, barrier);
+      let t = sweep(c.cx, i.then_branch, scope, barrier);
+      let el = sweep(t.cx, i.else_branch, scope, barrier);
+      { cx: el.cx, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+    },
+    EMatch(m) -> {
+      let sc = sweep(cx, m.scrutinee, scope, barrier);
+      let arms = fold(m.arms, { cx: sc.cx, arms: [] }, |acc: { cx: TryCx, arms: List<MatchArm> }, arm: MatchArm| {
+        let g = match arm.guard { None -> { cx: acc.cx, e: None }, Some(x) -> { let o = sweep(acc.cx, x, scope, barrier); { cx: o.cx, e: Some(o.e) } } };
+        let b = sweep(g.cx, arm.body, scope, barrier);
+        { cx: b.cx, arms: push(acc.arms, { pat: arm.pat, guard: g.e, body: b.e, span: arm.span }) }
+      });
+      { cx: arms.cx, e: EMatch({ span: m.span, scrutinee: sc.e, arms: arms.arms }) }
+    },
+    EBlock(b) -> {
+      let stmts = fold(b.stmts, { cx: cx, ss: [] }, |acc: { cx: TryCx, ss: List<Stmt> }, st: Stmt|
+        match st {
+          SLet(l) -> { let o = sweep(acc.cx, l.value, scope, barrier); { cx: o.cx, ss: push(acc.ss, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })) } },
+          SExpr(x) -> { let o = sweep(acc.cx, x, scope, barrier); { cx: o.cx, ss: push(acc.ss, SExpr(o.e)) } },
+        });
+      let tl = match b.tail { None -> { cx: stmts.cx, e: None }, Some(t) -> { let o = sweep(stmts.cx, t, scope, barrier); { cx: o.cx, e: Some(o.e) } } };
+      { cx: tl.cx, e: EBlock({ span: b.span, tail: tl.e, stmts: stmts.ss }) }
+    },
+    ERecord(r) -> { let o = sweep_fields(cx, r.fields, scope, barrier); { cx: o.cx, e: ERecord({ span: r.span, fields: o.fs }) } },
+    ERecordUpdate(r) -> {
+      let b = sweep(cx, r.base, scope, barrier);
+      let o = sweep_fields(b.cx, r.fields, scope, barrier);
+      { cx: o.cx, e: ERecordUpdate({ span: r.span, base: b.e, fields: o.fs }) }
+    },
+    EField(f) -> { let o = sweep(cx, f.base, scope, barrier); { cx: o.cx, e: EField({ span: f.span, base: o.e, field: f.field }) } },
+    EList(l) -> { let o = sweep_all(cx, l.items, scope, barrier); { cx: o.cx, e: EList({ span: l.span, items: o.xs }) } },
+    EPerform(p) -> { let o = sweep_all(cx, p.args, scope, barrier); { cx: o.cx, e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }) } },
+    EHandle(h) -> {
+      let b = sweep(cx, h.body, scope, true);
+      let cs = fold(h.clauses, { cx: b.cx, cs: [] }, |acc: { cx: TryCx, cs: List<HandleClause> }, c: HandleClause| {
+        let o = sweep(acc.cx, c.body, scope, true);
+        { cx: o.cx, cs: push(acc.cs, { eff: c.eff, op: c.op, resource: c.resource, resume: c.resume, body: o.e, span: c.span, params: c.params }) }
+      });
+      let r = match h.ret { None -> { cx: cs.cx, r: None }, Some(rc) -> { let o = sweep(cs.cx, rc.body, scope, true); { cx: o.cx, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) } } };
+      { cx: r.cx, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
+    },
+    EWithCell(c) -> {
+      let i = sweep(cx, c.init, scope, barrier);
+      let b = sweep(i.cx, c.body, scope, true);
+      { cx: b.cx, e: EWithCell({ span: c.span, resource: c.resource, init: i.e, binder: c.binder, body: b.e }) }
+    },
+    EWithRegion(w) -> { let o = sweep(cx, w.body, scope, true); { cx: o.cx, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
+    ESimulate(x) -> { let o = sweep(cx, x.body, scope, true); { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) } },
+    _ -> { cx: cx, e: e },
+  }
+
+fn sweep_all(cx: TryCx, xs: List<Expr>, scope: Bool, barrier: Bool) -> { cx: TryCx, xs: List<Expr> } =
+  fold(xs, { cx: cx, xs: [] }, |acc: { cx: TryCx, xs: List<Expr> }, x: Expr| {
+    let o = sweep(acc.cx, x, scope, barrier);
+    { cx: o.cx, xs: push(acc.xs, o.e) }
+  })
+
+fn sweep_fields(cx: TryCx, fs: List<RecField>, scope: Bool, barrier: Bool) -> { cx: TryCx, fs: List<RecField> } =
+  fold(fs, { cx: cx, fs: [] }, |acc: { cx: TryCx, fs: List<RecField> }, f: RecField| {
+    let o = sweep(acc.cx, f.value, scope, barrier);
+    { cx: o.cx, fs: push(acc.fs, { name: f.name, value: o.e }) }
+  })
+
+fn try_item(cx0: TryCx, it: Item) -> { cx: TryCx, it: Item } = {
+  let cx = {..cx0, fresh: 0, mode: None};
+  match it {
+    IFn(d) -> {
+      let spec: { cx: TryCx, xs: List<SpecClause> } = fold(d.spec, { cx: cx, xs: [] }, |acc: { cx: TryCx, xs: List<SpecClause> }, c: SpecClause| {
+        let o = sweep(acc.cx, c.expr, true, false);
+        { cx: o.cx, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
+      });
+      let mode = if cx.shadowed { None } else { match d.ret { None -> None, Some(ty) -> mode_of(cx, ty, 0) } };
+      let body = match mode {
+        None -> sweep(spec.cx, d.body, true, false),
+        Some(m) -> {
+          let r = ret({..spec.cx, mode: Some(m)}, d.body);
+          let s: TryOut = sweep(r.cx, r.e, false, false);
+          { cx: {..s.cx, mode: None}, e: s.e }
+        },
+      };
+      { cx: body.cx, it: IFn({ vis: d.vis, name: d.name, generics: d.generics, params: d.params, ret: d.ret, effects: d.effects,
+                               constraints: d.constraints, spec: spec.xs, reuse: d.reuse, body: body.e, span: d.span }) }
+    },
+    ITest(d) -> { let o = sweep(cx, d.body, true, false); { cx: o.cx, it: ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: o.e, span: d.span }) } },
+    ILaw(d) -> {
+      let g = match d.guard { None -> { cx: cx, e: None }, Some(x) -> { let o = sweep(cx, x, true, false); { cx: o.cx, e: Some(o.e) } } };
+      let b = sweep(g.cx, d.body, true, false);
+      { cx: b.cx, it: ILaw({ name: d.name, name_span: d.name_span, host: d.host, binders: d.binders, guard: g.e, body: b.e, span: d.span }) }
+    },
+    _ -> { cx: cx, it: it },
+  }
+}
+
+// `try_op::expand`.
+pub fn expand_try(m: Module, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } = {
+  let start = { types: collect_types(m), shadowed: shadowing_ctor(m), diags: diags, mode: None, fresh: 0 };
+  let walked = fold(m.items, { cx: start, items: [] }, |acc: { cx: TryCx, items: List<Item> }, it: Item| {
+    let o = try_item(acc.cx, it);
+    { cx: o.cx, items: push(acc.items, o.it) }
+  });
+  { module: { imports: m.imports, items: walked.items }, diags: walked.cx.diags }
+}
+
+// --- `Parser::run`'s tail --------------------------------------------------------------------
+
+// Whether the tree still holds a node only a rewrite removes.
+fn has_update(m: Module) -> Bool = any_expr(m, |e: Expr| match e { ERecordUpdate(_) -> true, _ -> false })
+fn has_try(m: Module) -> Bool = any_expr(m, |e: Expr| match e { ETry(_) -> true, _ -> false })
+
+fn any_expr(m: Module, p: (Expr) -> Bool) -> Bool =
+  fold(m.items, false, |acc: Bool, it: Item| acc || (match it {
+    IFn(d) -> any_in(d.body, p) || fold(d.spec, false, |b: Bool, c: SpecClause| b || any_in(c.expr, p))
+              || fold(d.params, false, |b: Bool, x: Param| b || (match x.default { None -> false, Some(v) -> any_in(v, p) })),
+    ITest(d) -> any_in(d.body, p),
+    ILaw(d) -> any_in(d.body, p) || (match d.guard { None -> false, Some(g) -> any_in(g, p) }),
+    _ -> false,
+  }))
+
+fn any_in(e: Expr, p: (Expr) -> Bool) -> Bool =
+  p(e) || (match e {
+    EBinary(b) -> any_in(b.lhs, p) || any_in(b.rhs, p),
+    EUnary(u) -> any_in(u.operand, p),
+    ELambda(l) -> any_in(l.body, p) || fold(l.params, false, |b: Bool, x: Param| b || (match x.default { None -> false, Some(v) -> any_in(v, p) })),
+    EApp(a) -> any_in(a.func, p) || fold(a.args, false, |b: Bool, x: Expr| b || any_in(x, p))
+               || fold(a.named, false, |b: Bool, n: NamedArg| b || any_in(n.value, p)),
+    EIf(i) -> any_in(i.cond, p) || any_in(i.then_branch, p) || any_in(i.else_branch, p),
+    EMatch(m) -> any_in(m.scrutinee, p) || fold(m.arms, false, |b: Bool, arm: MatchArm|
+                   b || any_in(arm.body, p) || (match arm.guard { None -> false, Some(g) -> any_in(g, p) })),
+    EBlock(b) -> fold(b.stmts, false, |acc: Bool, s: Stmt| acc || (match s { SLet(l) -> any_in(l.value, p), SExpr(x) -> any_in(x, p) }))
+                 || (match b.tail { None -> false, Some(t) -> any_in(t, p) }),
+    ERecord(r) -> fold(r.fields, false, |b: Bool, f: RecField| b || any_in(f.value, p)),
+    ERecordUpdate(r) -> any_in(r.base, p) || fold(r.fields, false, |b: Bool, f: RecField| b || any_in(f.value, p)),
+    ETry(t) -> any_in(t.operand, p),
+    EField(f) -> any_in(f.base, p),
+    EList(l) -> fold(l.items, false, |b: Bool, x: Expr| b || any_in(x, p)),
+    EPerform(x) -> fold(x.args, false, |b: Bool, y: Expr| b || any_in(y, p)),
+    EHandle(h) -> any_in(h.body, p) || fold(h.clauses, false, |b: Bool, c: HandleClause| b || any_in(c.body, p))
+                  || (match h.ret { None -> false, Some(rc) -> any_in(rc.body, p) }),
+    EWithCell(c) -> any_in(c.init, p) || any_in(c.body, p),
+    EWithRegion(w) -> any_in(w.body, p),
+    ESimulate(x) -> any_in(x.body, p),
+    _ -> false,
+  })
+
+// The three rewrites in `Parser::run`'s order, each only when the grammar met what it rewrites.
+pub fn expand(m: Module, uses_sets: Bool, diags: List<PDiag>) -> { module: Module, diags: List<PDiag> } = {
+  let a = if uses_sets { expand_effect_sets(m, diags) } else { { module: m, diags: diags } };
+  let b = if has_update(a.module) { expand_record_updates(a.module, a.diags) } else { a };
+  if has_try(b.module) { expand_try(b.module, b.diags) } else { b }
+}
+
+// `items.dump`, after the rewrites: what `parse_recovering` would answer for the same bytes.
+pub fn dump_expanded(src: Bytes) -> String = {
+  let r = parse(src);
+  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  string_of_bytes(bytes_concat(dump_module(x.module), dump_diags(x.diags)))
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// The differential (`harness/tests/rewrite.rs`) is the instrument; each dump
+// below is `refdump --expanded`'s for the same bytes.
+
+test "a `?` on a `let` splits the block at that statement, failure arm first" {
+  assert_eq(dump_expanded(b"fn f(n: Int) -> Result<Int, Bytes> = { let x = g(n)?; Ok(x + 1) }"),
+            "#0;#1;0:65:fn;%priv;?0;3:4:ident;@66;%gen;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?1;16:34:tcon;16:22:qname;?0;16:22:ident;@526573756c74;#2;23:26:tcon;23:26:qname;?0;23:26:ident;@496e74;#0;28:33:tcon;28:33:qname;?0;28:33:ident;@4279746573;#0;?0;#0;#0;37:65:eblk;#0;?1;47:52:emat;47:51:eapp;47:48:evar;47:48:qname;?0;47:48:ident;@67;#1;49:50:evar;49:50:qname;?0;49:50:ident;@6e;#0;#2;47:52:arm;47:52:pctr;47:52:qname;?0;47:52:ident;@457272;#1;47:52:pvar;47:52:ident;@3f30;?0;47:52:eapp;47:52:evar;47:52:qname;?0;47:52:ident;@457272;#1;47:52:evar;47:52:qname;?0;47:52:ident;@3f30;#0;47:52:arm;47:52:pctr;47:52:qname;?0;47:52:ident;@4f6b;#1;43:44:pvar;43:44:ident;@78;?0;47:52:eblk;#0;?1;54:63:eapp;54:56:evar;54:56:qname;?0;54:56:ident;@4f6b;#1;57:62:ebin;%add;57:58:evar;57:58:qname;?0;57:58:ident;@78;61:62:elit;%int;@31;#0;#0;")
+}
+
+test "a `?` inside a return-position expression lifts to its head, and an `Option` names `None`" {
+  assert_eq(dump_expanded(b"fn f(n: Int) -> Option<Int> = Some(g(n)? + 1)"),
+            "#0;#1;0:45:fn;%priv;?0;3:4:ident;@66;%gen;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?1;16:27:tcon;16:22:qname;?0;16:22:ident;@4f7074696f6e;#1;23:26:tcon;23:26:qname;?0;23:26:ident;@496e74;#0;?0;#0;#0;35:40:emat;35:39:eapp;35:36:evar;35:36:qname;?0;35:36:ident;@67;#1;37:38:evar;37:38:qname;?0;37:38:ident;@6e;#0;#2;35:40:arm;35:40:pctr;35:40:qname;?0;35:40:ident;@4e6f6e65;#0;?0;35:40:evar;35:40:qname;?0;35:40:ident;@4e6f6e65;35:40:arm;35:40:pctr;35:40:qname;?0;35:40:ident;@536f6d65;#1;35:40:pvar;35:40:ident;@3f30;?0;30:45:eapp;30:34:evar;30:34:qname;?0;30:34:ident;@536f6d65;#1;35:44:ebin;%add;35:40:evar;35:40:qname;?0;35:40:ident;@3f30;43:44:elit;%int;@31;#0;#0;")
+}
+
+test "a `?` in a function with no written return type is refused and unwrapped" {
+  assert_eq(dump_expanded(b"fn f(n: Int) = g(n)?"),
+            "#0;#1;0:20:fn;%priv;?0;3:4:ident;@66;%gen;#0;#0;#1;5:11:prm;5:6:ident;@6e;?1;8:11:tcon;8:11:qname;?0;8:11:ident;@496e74;#0;?0;?0;?0;#0;#0;15:19:eapp;15:16:evar;15:16:qname;?0;15:16:ident;@67;#1;17:18:evar;17:18:qname;?0;17:18:ident;@6e;#0;#1;!E0118:15:20:1:1;=15:20:1;")
+}
+
+test "a record update copies the base's other fields, sorted, over the base's span" {
+  assert_eq(dump_expanded(b"type P = { a: Int, b: Int }\nfn f(p: P) -> P = {..p, b: 2}"),
+            "#0;#2;0:27:ty;%priv;5:6:ident;@50;#0;%alias;9:27:trec;#2;11:12:ident;@61;14:17:tcon;14:17:qname;?0;14:17:ident;@496e74;#0;19:20:ident;@62;22:25:tcon;22:25:qname;?0;22:25:ident;@496e74;#0;28:57:fn;%priv;?0;31:32:ident;@66;%gen;#0;#0;#1;33:37:prm;33:34:ident;@70;?1;36:37:tcon;36:37:qname;?0;36:37:ident;@50;#0;?0;?1;42:43:tcon;42:43:qname;?0;42:43:ident;@50;#0;?0;#0;#0;46:57:erec;#2;49:50:ident;@61;49:50:efld;49:50:evar;49:50:qname;?0;49:50:ident;@70;49:50:ident;@61;52:53:ident;@62;55:56:elit;%int;@32;#0;")
+}
+
+test "an effect set expands into every row that names it, and into its own item" {
+  assert_eq(dump_expanded(b"effect set io = { db.read[users] }\nfn f() -> Int / { io } = 1"),
+            "#0;#2;0:34:set;11:13:ident;@696f;#1;18:32:atm;18:20:qname;?0;18:20:ident;@6462;%read;?1;26:31:ident;@7573657273;#0;#1;18:32:atm;18:20:qname;?0;18:20:ident;@6462;%read;?1;26:31:ident;@7573657273;35:61:fn;%priv;?0;38:39:ident;@66;%gen;#0;#0;#0;?1;45:48:tcon;45:48:qname;?0;45:48:ident;@496e74;#0;?1;51:57:row;#1;18:32:atm;18:20:qname;?0;18:20:ident;@6462;%read;?1;26:31:ident;@7573657273;#1;53:55:qname;?0;53:55:ident;@696f;?0;#0;#0;60:61:elit;%int;@31;#0;")
+}
