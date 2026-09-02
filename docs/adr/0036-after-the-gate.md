@@ -9,14 +9,14 @@ representation ADR 0035 decided: the words, the layouts, the counts, the
 strings, the list and the seam all stand. `benches/value-model/after-tokens.txt`
 is the series after it and `benches/front-end-whole/observation-5.txt` the
 front-end row, both under their own pre-registrations. What they say: the
-record kernel sits at the bar's edge, within its resolution of it; the
-integer kernel is outside it by a smaller factor than at the re-take — its
-round is straight-line arithmetic over one record rebuilt in place since
-Decision 8, and what remains is that arithmetic, every add checked and every
-word masked as the source writes it, and the records the source keeps alive by
-shape; and the whole front end under the backend is under a second of wall
-time where it was several before ADR 0035 and tens interpreted, every phase
-entered whole, and every test entered whole since Decision 7.
+record kernel is inside the bar since Decision 9; the integer kernel is
+outside it by a smaller factor than at the re-take — its round is
+straight-line arithmetic over one record rebuilt in place since Decision 8,
+and what remains is that arithmetic, every add checked and every word masked
+as the source writes it, and the records the source keeps alive by shape; and
+the whole front end under the backend is under a second of wall time where it
+was several before ADR 0035 and tens interpreted, every phase entered whole,
+and every test entered whole since Decision 7.
 
 > **What this decides.** That a builtin the checker can type is a load in a
 > register rather than a call; that a callback over a range or a list is a loop
@@ -29,8 +29,9 @@ entered whole, and every test entered whole since Decision 7.
 > root it is handed to; that the map is an ordered tree, so no map
 > operation's cost grows with the map's size on a property the source does
 > not show, which ADR 0034 asks of every core operation; that a test is a
-> root the backend enters whole; and that a record dying in a body that
-> builds another of its width is that record's memory.
+> root the backend enters whole; that a record dying in a body that builds
+> another of its width is that record's memory; and that a lookup a match
+> unwraps at once answers the value, with no constructor between.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -188,10 +189,33 @@ released at the exit when nothing took it. A record whose fields are all
 scalars is kept with no call at all; one holding words lets them go first.
 A fully written literal no longer reads its base: a base at its last use is
 released into its width's token and one still held is left alone, and the
-update helper serves only a literal that copies fields. The integer kernel
-moved by more than half on this, and what remains of it is the compiled
-arithmetic itself and the records the source keeps alive by shape — a
-chaining value copied out of a state that stays for its last block.
+update helper serves only a literal that copies fields. A `match` over a
+temporary lets the shell go once the arms have taken its fields — it was
+never released before, and an entry that matched on the answer of a call
+per step grew by one shell per step, against Decision 4's own bound — and a
+record shell goes into its width's token like any dying record. The integer
+kernel moved by more than half on this, and what remains of it is the
+compiled arithmetic itself and the records the source keeps alive by shape —
+a chaining value copied out of a state that stays for its last block.
+
+Constructor shells were tried as tokens too, for their arity, and applications
+of constructors built in them: nothing measured moved, because a body rarely
+both consumes and builds a constructor of one arity, and the shells a
+checker matches are locals released at their scope's end. Not kept.
+
+## Decision 9 — a lookup asked by a match answers the value
+
+`map_get` answered `Some(v)` or `None` as a constructor the calling `match`
+unwrapped at once, one allocation and one release per lookup, in the record
+kernel's step and throughout a checker's environments. A `match` over
+`map_get` whose arms only ask whether the key was found — `Some(p)`, `None`,
+a wildcard — is now one runtime lookup answering the value held once more or
+nothing, and the arms test that word directly; a map or a key the native path
+does not serve is answered through the interpreter's `map_get` and unwrapped
+the same way. With it: a constructor test and an argument read are loads,
+as a field read already was, and two strings or two byte strings compare as
+bytes before the ranking of kinds is asked of them, which is most of a map
+probe. The record kernel sits inside the bar on these.
 
 ## Priced and rejected
 
