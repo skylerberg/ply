@@ -106,13 +106,14 @@ reach rather than to the program.
 
 ## Emitted C inside the loop: priced, and the cost is not where the argument put it
 
-The argument this record was written to carry was that a compiler invocation is
-a process and a program is a link, so a loop built on emitted C has an
-O(project) floor by construction. `benches/c-floor/` takes that on this machine,
-on units shaped like a compiled Ply body over the runtime ABI, with the criteria
-in its `PRE-REGISTERED.md` and the series in `observation-2.txt`. Both halves of
-the argument are wrong about where the cost is, and the row found a third cost
-neither half named.
+The argument against C in a loop is that a compiler invocation is a process and
+a program is a link, so a C loop has an O(project) floor by construction. It is
+the argument anyone reaches for, it is why this record's question exists, and
+`benches/c-floor/` takes it on this machine — on units shaped like a compiled
+Ply body over the runtime ABI, criteria in `PRE-REGISTERED.md` and the series in
+`observation-2.txt`. **Both halves are wrong about where the cost is, and the
+row found a third cost neither half names.** Written down so that the argument
+is not made again from the appeal of its first half.
 
 - **A process per changed definition is real and is a constant.** At `-O0` the
   spawn and the header are most of it and the code generation is the smaller
@@ -134,12 +135,12 @@ neither half named.
   the largest per-image size measured, a warm load of one image per definition
   costs seconds where the same definitions in one library cost a fraction of a
   millisecond. That is a property of the loader, not of C, and it is the real
-  floor under a "compile each definition to its own object and load what you
-  reach" design — the design the first version of this record priced and
-  rejected for the wrong reason.
+  floor under the design the first half of the argument makes attractive:
+  compile each definition to its own image and load what you reach. **That
+  design is refused, on this reading rather than on the link.**
 
-**So the C shape that could sit in a loop is the opposite of the one that was
-rejected.** An object cached per definition and compiled only when its hash
+**So the C shape that could sit in a loop is the opposite of the attractive
+one.** An object cached per definition and compiled only when its hash
 moves; one link over the objects the run reaches; one image loaded. Its floor is
 a constant per run — a link and a load, each about a tenth of a second at the
 largest size measured — plus the compile of what actually changed. Constants,
