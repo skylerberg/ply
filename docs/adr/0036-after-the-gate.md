@@ -325,6 +325,20 @@ loads the bound cannot see — and nothing on the rows, a checked add's branch
 being predicted. Not kept; with the wide budget above, which it was meant to
 enable, the kernel was slower still.
 
+The overflow of a checked `+`, `-` or negation kept in a flag rather than
+branched on at each — the flag and the first operation to set it carried as
+variables, raised at the next helper, call or exit, where the interpreter's
+order could first show it — so that a straight line of arithmetic stays one
+block for the register allocator. Landed and measured: the integer kernel
+slower by a sixteenth, consistently. The branch a checked add takes is
+predicted and costs less than the three operations that replace it, and the
+blocks it splits the round into were never what the allocator did badly by.
+Not kept. What separates the integer kernel from Rust now is the state a
+round loads and stores where Rust keeps it in registers, which is a matter of
+inlining the seven rounds under a register allocator that can carry sixteen
+words through them — the C target's (`docs/BOOTSTRAP-PATH.md` step 10), and
+not Cranelift's over the body the inliner would have to make.
+
 ## What would make this wrong
 
 - **A step that is neither a compiled function nor a literal.** A callback
