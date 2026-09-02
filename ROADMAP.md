@@ -1354,4 +1354,5 @@ one goal none of them reached is ADR 0021's: a front end whose cost is
 O(change), written in Ply. That file records what is no longer in the way
 after ADR 0034, what is — throughput, and the code generator's shape — the
 order to take the rest in, and the measurement each step is gated on. Its
-first step is a row nobody has taken, not a build.
+first step is the code generator's roots, because ADR 0030's row already says
+leaf entry loses.
