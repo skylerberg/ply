@@ -105,6 +105,8 @@ fn let_tuple(n: Int) -> Int = { let (a, b) = (n, n + 1); a * b }
 
 fn let_nested(n: Int) -> Int = { let {left: {value, ..}, right: (r, _)} = {left: step(n), right: (n, n)}; value + r }
 
+fn projected(n: Int) -> Int = { let r = { v: { let s = step(n); s.value + 1 }, w: n }; match r { {v, w} -> v + w } }
+
 fn aliased(n: Int) -> Int = {
   let s = step(n);
   let t: Step = if n > 0 { s } else { step(0) };
@@ -230,6 +232,9 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ("m.let_rest", vec![Value::Int(7)], Value::Int(7)),
         ("m.let_tuple", vec![Value::Int(4)], Value::Int(20)),
         ("m.let_nested", vec![Value::Int(4)], Value::Int(8)),
+        // A written field's own block projects a record it binds; that record is not the
+        // literal's update base.
+        ("m.projected", vec![Value::Int(4)], Value::Int(9)),
         // A branch answering a local must not alias it at one count: the update through the
         // alias would otherwise write into the original.
         ("m.aliased", vec![Value::Int(4)], Value::Int(103)),
