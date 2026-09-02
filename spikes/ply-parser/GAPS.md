@@ -626,8 +626,12 @@ them needs a rename table, and a reviewer diffing the two files sees a differenc
 that is not a difference. Four of the fifteen keywords — `type`, `test`, `with`,
 `effect` — are ordinary nouns a domain model will want.
 
-This is the cheapest entry to fix and the most surprising: the error is at the
-declaration, so it is cheap to hit, and `{ nondet: Bool }` has no other reading.
+**Closed in the reference.** `parser.rs` accepts a keyword wherever a field is
+named — a type, a literal, a pattern, after `.`, an update — and refuses only the
+punned forms, which bind a variable too (`docs/GUIDE.md` §3.3). This port still
+writes `eff` and `is_nondet`, because its own field parser has not followed and
+the differential runs over a corpus both must read: renaming here waits on the
+spike's `record_field`, and the corpus carries no keyword field until then.
 
 ---
 
