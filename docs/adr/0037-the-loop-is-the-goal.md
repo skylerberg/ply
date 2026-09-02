@@ -55,14 +55,21 @@ The compiled loop does not have it, and every stage of a backend run is
 O(project), for three reasons that read in `crates/ply-cli/src/commands/test.rs`
 and `crates/ply-codegen/src/backend.rs`:
 
-- **The caches are bypassed.** `cache_bypassed` is true whenever `--backend` is
-  given, so the run opens a scratch store: the front end is loaded whole rather
-  than incrementally, every test is selected, and nothing is recorded. This is
-  deliberate — `backend_escapes` reports a pass written under a backend as a
-  defect, because a cached `Pass` is a claim about the evaluator's own answer
-  and a backend is a second execution strategy. It is a decision about what a
-  pass means, and it comes first, because a backend run cannot be O(change) at
-  any stage until it can select.
+- **The caches are bypassed — both of them, for one cache's reason.**
+  `cache_bypassed` is true whenever `--backend` is given, so the run opens a
+  scratch store. Its doc comment gives the reason, and the reason is about
+  results only: a stored `Pass` is a claim about what the authoritative engine
+  did, so a run on another engine may neither believe one nor leave one behind,
+  which `backend_escapes` also polices. But one store holds both caches, and
+  the same flag clears `incremental`, so a backend run also re-parses,
+  re-resolves and re-checks the whole program — and the front end is the same
+  work whichever engine executes afterwards. **The result half is a decision;
+  the front-end half has no stated reason and reads as collateral from one flag
+  serving two caches.** So this item splits: reading the front-end cache under
+  a backend costs nothing to justify, and what a cached `Pass` claims when a
+  backend answered is a design question. Both come before anything below,
+  because a backend run cannot be O(change) at any stage until it can skip
+  work.
 - **The unit is whole and compiled per worker.** `Cranelift::over` closes the
   unit over every function the fragment compiles and builds it once as a
   pre-flight; `Provider::attach` builds it again for every worker. A run
@@ -230,8 +237,10 @@ slope for neither tier.
 
 ## The order
 
-1. Decide what a cached `Pass` claims when a backend answered, and key the
-   store on it. Nothing below matters until a backend run selects.
+1. Read the front-end cache under a backend: the front end does not depend on
+   which engine executes, and only the result half of the bypass has a reason.
+   Then decide what a cached `Pass` claims when a backend answered, and key the
+   store on it. Nothing below matters until a backend run can skip work.
 2. Take the row above with its backend arm. It says which of the next two pays
    first.
 3. A `DefHash -> code` cache, which needs per-definition units and an object

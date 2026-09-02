@@ -367,14 +367,16 @@ several sizes.
 
 What the compiled loop does not have, in the order to take them:
 
-- **A cached `Pass` under a backend.** `ply test --backend` bypasses the store
-  (`crates/ply-cli/src/commands/test.rs cache_bypassed`): the run opens a
-  scratch cache, so the front end loads whole and every test runs, and a pass
-  written under a backend is reported as an escape (`backend_escapes`), for a
-  stated reason — a cached `Pass` is a claim about the evaluator's own answer,
-  and a backend is a second execution strategy. That is a decision and not a
-  hole, and it comes first because nothing below it matters until a backend run
-  can select. What the decision needs is a key that names what answered.
+- **Both caches, bypassed for one cache's reason.** `ply test --backend`
+  bypasses the store (`crates/ply-cli/src/commands/test.rs cache_bypassed`):
+  the run opens a scratch cache, so the front end loads whole *and* every test
+  runs. The stated reason covers only the second — a cached `Pass` is a claim
+  about the evaluator's own answer, and a backend is a second execution
+  strategy, which `backend_escapes` polices. The front end is the same work
+  whichever engine runs afterwards, so its half of the bypass is collateral
+  from one flag serving two caches. Reading the front-end cache under a backend
+  is the cheap half; what a cached `Pass` claims when a backend answered is the
+  design half. Both come before anything below.
 - **A compiled-code cache.** `crates/ply-codegen` persists nothing across runs:
   no `DefHash -> code`, and `cranelift-jit` rather than `cranelift-object`, so
   there is no object output for a cache to hold. `Cranelift::over` closes the
@@ -393,7 +395,7 @@ What the compiled loop does not have, in the order to take them:
   in-process. ADR 0037 registers the arm and the fit with the criteria fixed
   first. What the row will say under the backend is already legible from the
   code above — every stage is O(project) — and what it prices is the
-  constants, which order the three items above against each other.
+  constants, which order the items above against each other.
 
 Take the decision and the row before re-ordering anything above them. A lever's
 share of a whole-project run says nothing about its share of one edit, and every
