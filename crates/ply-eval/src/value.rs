@@ -494,6 +494,23 @@ impl Value {
                 out.push('}');
             }
             Value::Record(fields) => {
+                // A tuple is the record `{_0: a, _1: b}` (GUIDE §5.3) and renders as it was written.
+                let tuple = fields.len() >= 2
+                    && (0..fields.len())
+                        .all(|i| fields.get(&Symbol::new(format!("_{i}"))).is_some());
+                if tuple {
+                    out.push('(');
+                    for i in 0..fields.len() {
+                        if i > 0 {
+                            out.push_str(", ");
+                        }
+                        if let Some(v) = fields.get(&Symbol::new(format!("_{i}"))) {
+                            v.write(out, depth + 1);
+                        }
+                    }
+                    out.push(')');
+                    return;
+                }
                 out.push('{');
                 for (i, (k, v)) in fields.iter().enumerate() {
                     if i > 0 {
