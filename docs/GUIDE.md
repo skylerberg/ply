@@ -2670,14 +2670,15 @@ definition *is* is a definition you can read. It is also the demonstration that
 §3.5's operators and §13.10's builtins are enough to write real bit-level code:
 before ADR 0033 this module could not have existed.
 
-**It is an interpreted hash and it is slower than the compiler's own by orders
-of magnitude**, which is a property of where it runs rather than of the code:
-seven rounds of eight mixing functions per 64-byte block, each round an ordinary
-Ply call. Reach for it when a hash is what you need and the input is small. `ply`
-itself hashes in Rust, and ADR 0033 §3 carries the measurement and the bar it
-was taken against.
+**It is slower than the compiler's own hash by orders of magnitude when
+interpreted, and by a large factor under `--backend`**, which is a property of
+where it runs rather than of the code: seven rounds of eight mixing functions per
+64-byte block, each round an ordinary Ply call. Reach for it when a hash is what
+you need and the input is small. `ply` itself hashes in Rust; ADR 0033 carries
+the measurement and the bar it was taken against, and ADR 0035 is what closes
+the gap, using this module as one of its kernels.
 
-What holds it to the truth is `crates/ply-eval-tests/tests/blake3_differential.rs`,
+What holds it to the truth is `crates/ply-eval-tests/tests/suite/blake3_differential.rs`,
 which hashes the same input with this module and with the `blake3` crate the
 compiler links, at every structural boundary the algorithm has — the block, the
 chunk, and the tree above it. Zero disagreements, or the suite is red.
