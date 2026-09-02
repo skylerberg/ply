@@ -6,6 +6,11 @@
 //! that says where it is: the tracing allocator and the site attribution are
 //! `w6_alloc_sites`'s, over the parser spike parsing one example file. Allocation counts are
 //! deterministic, so this runs anywhere and is not a timing.
+//!
+//! It also pins the parity step 4 reached: compiled code takes and moves what the interpreter
+//! takes and moves (`rt.rs`), remembers pure nullary definitions the way the machine's memo does
+//! (`rt_constant`), and builds the same constructor payloads. What is left is under one percent,
+//! most of it the arena's teardown (`Ctx::end`) dropping the last parser state iteratively.
 
 use ply_eval::{Machine, Provider};
 use ply_syntax::ast::{ModuleName, Program};
@@ -231,5 +236,12 @@ fn the_parses_allocation_sites_are_ranked_under_both_engines() {
         "\n  compiled arm: {:.2} of the interpreter's allocations, {:.2} of its bytes",
         native.total as f64 / interpreted.total as f64,
         native.bytes as f64 / interpreted.bytes as f64
+    );
+    assert!(
+        native.total * 100 <= interpreted.total * 101,
+        "compiled code allocated {} times for the interpreter's {}: more than one percent over, \
+         so something compiled code builds, the interpreter moves — read the tables above",
+        native.total,
+        interpreted.total
     );
 }
