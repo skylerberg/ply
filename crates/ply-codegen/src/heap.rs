@@ -745,15 +745,17 @@ impl Heap {
 
     /// The interpreter value a word denotes: deep, and a borrow — the word keeps its count.
     pub fn to_value(layouts: &Layouts, w: Word) -> Value {
-        Heap::to_value_counted(layouts, w, &mut 0)
+        Heap::to_value_counted(layouts, w, &mut Walked::default())
     }
 
-    /// [`Heap::to_value`], counting the objects it reads on the way: the seam's census.
-    pub fn to_value_counted(layouts: &Layouts, w: Word, read: &mut u64) -> Value {
+    /// [`Heap::to_value`], noting what it read on the way: the objects, for the seam's census,
+    /// and whether any was a handle — a closure, or a bridged value holding one — which the
+    /// seam refuses to carry out, so it need not walk the answer a second time to ask.
+    pub fn to_value_counted(layouts: &Layouts, w: Word, walked: &mut Walked) -> Value {
         if is_imm(w) {
             return Value::Int(imm_value(w));
         }
-        *read += 1;
+        walked.read += 1;
         let o = obj(w);
         unsafe {
             match (*o).kind {
@@ -770,7 +772,7 @@ impl Heap {
                         .map(|(i, name)| {
                             (
                                 name.clone(),
-                                Heap::to_value_counted(layouts, word_at(o, i), read),
+                                Heap::to_value_counted(layouts, word_at(o, i), walked),
                             )
                         })
                         .collect();
@@ -779,25 +781,26 @@ impl Heap {
                 KIND_CTOR => {
                     let name = layouts.ctors[(*o).layout as usize].0.clone();
                     let args = (0..(*o).len as usize)
-                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), read))
+                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), walked))
                         .collect();
                     Value::ctor(name, args)
                 }
                 KIND_LIST => Value::list(
                     list::to_vec(o)
                         .into_iter()
-                        .map(|x| Heap::to_value_counted(layouts, x, read))
+                        .map(|x| Heap::to_value_counted(layouts, x, walked))
                         .collect(),
                 ),
                 KIND_MAP => Value::map(map::to_vec(o).into_iter().map(|(k, v)| {
                     (
-                        Heap::to_value_counted(layouts, k, read),
-                        Heap::to_value_counted(layouts, v, read),
+                        Heap::to_value_counted(layouts, k, walked),
+                        Heap::to_value_counted(layouts, v, walked),
                     )
                 })),
                 KIND_CLOSURE => {
+                    walked.handle = true;
                     let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
-                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), read))
+                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), walked))
                         .collect();
                     Value::Closure(Arc::new(Closure {
                         name: None,
@@ -808,11 +811,24 @@ impl Heap {
                         },
                     }))
                 }
-                KIND_BRIDGE => bridged(o).clone(),
+                KIND_BRIDGE => {
+                    let v = bridged(o).clone();
+                    if crate::rt::holds_a_handle(&v).is_some() {
+                        walked.handle = true;
+                    }
+                    v
+                }
                 other => panic!("a word of kind {other} was read after its object died"),
             }
         }
     }
+}
+
+/// What a conversion out of the heap read: how many objects, and whether one was a handle.
+#[derive(Default)]
+pub struct Walked {
+    pub read: u64,
+    pub handle: bool,
 }
 
 impl Drop for Heap {

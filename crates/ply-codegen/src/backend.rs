@@ -391,8 +391,8 @@ impl Bodies {
         // value it is converted to once is kept beside the word: the next entry through this
         // root answers that value without running, and the next entry handed that value passes
         // the word back in without converting it.
-        let mut outward = 0;
-        let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut outward);
+        let mut walked = crate::heap::Walked::default();
+        let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut walked);
         let kept = match admitted.constant {
             Some(index) if crate::heap::world_independent(out) => Some(tables.memoize(index, out)),
             None if all_memo && crate::heap::world_independent(out) => {
@@ -402,13 +402,13 @@ impl Bodies {
         };
         ctx.end();
         drop(ctx);
-        if crate::rt::holds_a_handle(&value).is_some() {
+        if walked.handle {
             return self.decline(|d| d.answer += 1);
         }
         if let Some(kept) = kept {
             tables.remember(kept, &value);
         }
-        self.unit.counters.note_converted(inward, outward);
+        self.unit.counters.note_converted(inward, walked.read);
         self.entered.set(self.entered.get() + 1);
         Some(value)
     }
