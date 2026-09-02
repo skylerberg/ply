@@ -212,14 +212,13 @@ measurement is confounded until the earlier one has moved.
    agree over the standard library, every example, every bundle and the
    hasher's own mined inputs, with BLAKE3 from `std.hash` over the same bytes;
    `arm-hash.sh` arms it. The one surface it needed, `bits_of_float`, landed
-   first. Every phase step 6 names is now behind a differential.
-   Hashing is next after those. `std.hash` exists (ADR 0033) and its throughput is not measured. The
-   syntax the parser spike predated is ported first, so its own differential is
-   green before anything is built on it: the bit operators (with the shift join
-   and the lambda-parameter pipe guard) and keyword fields are in, the corpus
-   is re-mined from the reference's tests, and the agreement tests pass over
-   all of it. Re-mine whenever the reference grows syntax; the harness's
-   diagnostics pin moves with the corpus and says so.
+   first. Every phase step 6 names is now behind a differential. The syntax
+   the parser spike predated went in before any of them, so the parser's own
+   differential was green before anything was built on it: the bit operators
+   (with the shift join and the lambda-parameter pipe guard) and keyword
+   fields are in, the corpus is re-mined from the reference's tests, and the
+   agreement tests pass over all of it. Re-mine whenever the reference grows
+   syntax; the harness's diagnostics pin moves with the corpus and says so.
 7. **The driver.** Incremental caching, the content-addressed store and the
    gates are Rust, and ADR 0020 notes a self-hosted front end would be cached by
    machinery it does not own. Whether the front end lives behind the Rust driver
@@ -229,11 +228,25 @@ measurement is confounded until the earlier one has moved.
    `Known` interface is checked from on both sides, and every hash the store is
    keyed by is reproduced bit for bit — so a Rust driver can drive a Ply front
    end through the interfaces it already has, with no cache format moving. What
-   is not established is the cost: the ported front end has been compared, not
-   timed, and the row that decides whether the driver is worth porting is the
-   whole front end — parse, resolve, check, hash — over the examples, under the
-   backend and without it, taken with step 3's protocol. That row is the next
-   measurement, and the decision waits on it rather than on more porting.
+   was not established was the cost, and the row that decides is the whole
+   front end — parse, expansion, resolve, check, hash — over the standard
+   library and an example, under the backend and without it, with step 3's
+   protocol (`benches/front-end-whole/PRE-REGISTERED.md`, its observation
+   beside it). **The row is taken, and the decision is: the driver stays
+   Rust.** Under the interpreter hashing is the largest phase and checking the
+   next, together most of the whole; parsing is a distant third and the
+   resolver, with derive expansion, is small. Under the backend the parser and
+   the hasher each fall by several times and the checker barely moves — the
+   prediction registered for it held: its state is carried, but the bodies
+   that walk it re-enter through the seam on every `map_fold`, `iterate` and
+   lambda — so the whole front end takes several times less CPU, and is still
+   two orders of magnitude from the Rust front end over the same files. That
+   is not the small factor the rule asked for, so the next lever is the phase
+   the breakdown names and not the driver: the checker under the backend,
+   which is the seam's remaining kinds (step 3), and after it the hasher, most
+   of whose cost is BLAKE3 in Ply. The series is an observation and not a
+   figure by ADR 0030's gate: quiet before, the load lifted past four after by
+   the series' own four workers, as the pre-registration said it would.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not
    compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
    neither them nor hex literals; both are repaired, the differential is green

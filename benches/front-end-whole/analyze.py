@@ -37,16 +37,20 @@ for arm in ("none", "null", "wide"):
 if floor:
     print(f"{'floor':>8} {floor[0]:>9.2f} {floor[1]:>9.2f}")
 print(f"resolution (|none - null|): {resolution:.2f}s user")
-order = ["parse", "expand", "tables", "resolve", "check", "hash"]
+# Each row re-runs the rows its phase depends on; `hash` reads the resolved tree, not the
+# checked one, so its phase is its distance from `resolve` and the whole is `check` plus that.
+parent = {"parse": None, "expand": "parse", "tables": "expand", "resolve": "tables",
+          "check": "resolve", "hash": "resolve"}
 for arm, p in phases.items():
     try:
-        cumulative = [float(p[name]) / 1000.0 for name in order]
+        row = {name: float(p[name]) / 1000.0 for name in parent}
     except (KeyError, ValueError):
         print(f"{arm}: phases unread ({p})")
         continue
-    steps = [cumulative[0]] + [b - a for a, b in zip(cumulative, cumulative[1:])]
-    print(f"{arm}: " + "  ".join(f"{name} {s:.2f}s" for name, s in zip(order, steps)) +
-          f"  (whole {cumulative[-1]:.2f}s wall, one worker each)")
+    steps = {name: row[name] - (row[above] if above else 0.0) for name, above in parent.items()}
+    whole = row["check"] + steps["hash"]
+    print(f"{arm}: " + "  ".join(f"{name} {s:.2f}s" for name, s in steps.items()) +
+          f"  (whole {whole:.2f}s wall, one worker each)")
 for arm, c in counts.items():
     print(f"{arm}: " + " ".join(f"{k}={v}" for k, v in c.items()))
 gate = ""
