@@ -30,7 +30,8 @@ run_suite() {
 mutate() {
   restore
   perl -0pi -e "s/\Q$1\E/$2/" "$work/resolve.ply" || return 1
-  grep -qF -- "$2" "$work/resolve.ply"
+  # The file must actually differ: the replacement text may already occur elsewhere.
+  ! cmp -s "$work/resolve.orig" "$work/resolve.ply"
 }
 
 arm() {
@@ -66,9 +67,9 @@ arm "a later declaration of the same name wins" \
 arm "a sum type's constructors are declared with the type's privacy inverted" \
   'TDSum(vs) -> fold(vs, d2, |acc: Decls, v: VariantDef| declare(acc, NValue, m.name, v.name, t.vis)),' \
   'TDSum(vs) -> fold(vs, d2, |acc: Decls, v: VariantDef| declare(acc, NValue, m.name, v.name, VPub)),'
-arm "a selective import binds the module name too" \
-  '          fold(names, b3, |acc: Builder, n: Ident| bind_name(w, i, acc, t, n))' \
-  '          fold(names, bind_module(w, i, b3, d, t), |acc: Builder, n: Ident| bind_name(w, i, acc, t, n))'
+arm "a selective import is recorded at the whole import rather than its path" \
+  '            None -> push(b2.scope.selective, { binder: key, target: t, span: path_span(d) }),' \
+  '            None -> push(b2.scope.selective, { binder: key, target: t, span: d.span }),'
 arm "a private name is imported anyway" \
   '    if len(public) == 0 {' \
   '    if false {'
@@ -84,9 +85,9 @@ echo "==> the order"
 arm "a module is ordered before what it imports" \
   '          path: take(d.path, len(d.path) - 1), order: push(d.order, top.v)}' \
   '          path: take(d.path, len(d.path) - 1), order: fold(d.order, [top.v], |acc: List<Int>, x: Int| push(acc, x))}'
-arm "a cycle is reported twice, once per root that reaches it" \
-  '      if contains_key(d.found, key) { {..d, stack: again} } else {' \
-  '      if false { {..d, stack: again} } else {'
+arm "a module importing itself is reported as a longer cycle" \
+  '  if len(c.nodes) == 1 { diag1(b"E0109", c.closing.from, c.closing.span, 1) }' \
+  '  if len(c.nodes) == 0 { diag1(b"E0109", c.closing.from, c.closing.span, 1) }'
 
 echo
 echo "==> defaults"
@@ -96,16 +97,14 @@ arm "a call in a default is admissible" \
                && all_default(a.args),' \
   '    EApp(a) -> len(a.named) == 0 && all_default(a.args),'
 arm "a spliced default is not qualified against the module that wrote it" \
-  '                e: EVar({ span: v.span,
-                          name: { module: Some({ name: module, span: v.name.span }),
-                                  name: v.name.name, span: v.name.span } }) }' \
-  '                e: e }'
+  'name: { module: Some({ name: module, span: v.name.span }),' \
+  'name: { module: None,'
 arm "a named argument fills the first empty slot rather than its own" \
   '          None -> {..acc, slots: set_at(acc.slots, i, Some(n.value))},' \
   '          None -> {..acc, slots: set_at(acc.slots, 0, Some(n.value))},'
-arm "a call that leaves a parameter unfilled keeps its named arguments" \
-  '    { cx: cx2, e: EApp({..a, named: []}) }' \
-  '    { cx: cx2, e: EApp(a) }'
+arm "a call that leaves a parameter unfilled is reported without its note" \
+  'diag1(b"E0125", cx.module, a.span, 1)' \
+  'diag1(b"E0125", cx.module, a.span, 0)'
 arm "a local binder no longer shadows a function with defaults" \
   '      else if is_bare(v.name) && contains_bytes(cx.scope, v.name.name.name) { None }' \
   '      else if false { None }'
