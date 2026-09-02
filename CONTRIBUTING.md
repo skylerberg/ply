@@ -767,34 +767,6 @@ original ones and the gaps are where closures used to be.
     `SliceBuilder` and `CausalSlice` themselves are **not enforced**. Nothing in
     `ply-test` was changed.
 
-16. **`spikes/ply-lexer/run.sh` reaches no test at all: its harness does not
-    compile.** Found 2026-08-30 while repairing the same defect one directory
-    over.
-
-    ```
-    $ ./spikes/ply-lexer/run.sh
-    error[E0004]: non-exhaustive patterns:
-      `&ply_syntax::lexer::TokenKind::Question` not covered
-      --> src/lib.rs:66:11
-    ```
-
-    `TokenKind::Question` arrived with ADR 0028 and that harness has a `match`
-    with no `_` arm — which is the design working, not failing: the build stops
-    rather than the comparison going quietly green. What failed is that
-    **nothing ran the build**. That spike is in no CI job, and the figures ADR
-    0020, ADR 0021 and ADR 0022 quote from it — the lexer's throughput, and the
-    whole basis of its multiplier — cannot be re-taken until it is fixed.
-    Its `lexer.ply` also still has no arm for byte 63, so `?` lexes as an
-    error there.
-
-    **Not fixed here**, and the reason is scope rather than difficulty: it is a
-    second spike with its own corpus and its own measurement obligations, and
-    fixing it under another change's cover would produce exactly the undated,
-    unmeasured figures this file's §"The one rule" is about. It is registered
-    where CI is configured — `.github/ci-shards.sh`'s `SPIKES_OUTSIDE_CI` — so
-    `plan` prints the reason on every run, and moving it to `SPIKE_JOBS` is the
-    one-line change that turns the repair into a required check.
-
 18. **`crates/ply-codegen-spike`'s agreement corpus is red, and
     `cargo test --release` does not say so.** From inside the crate,
     `./target/release/mcts --dir ../../benches/kernel --only agreement` exits 1
@@ -820,6 +792,7 @@ made them.
 5. `examples/serve.sh` misdescribed what `--db-schema` refuses.
 6. `PLY_PG_URL` was set by nothing, so the live postgres tests passed without running. CI sets it.
 7. No `LICENSE`/`LICENSE-APACHE` file existed although the manifest declared `MIT OR Apache-2.0`.
+16. `spikes/ply-lexer/run.sh` reached no test because its harness did not compile past the tokens ADR 0028 and ADR 0033 added. It runs now, its lexer lexes them, and CI has a job for it (`lexer-spike`).
 9. The compiled-entry seam carried one of the machine's two resource bounds, so a backend answered where the machine raises.
 10. The two engines disagreed on the recursion bound for deeply pending bodies, with no backend involved.
 11. A definition that discharged its own effects published an empty row, so the seam's purity gate cleared it.

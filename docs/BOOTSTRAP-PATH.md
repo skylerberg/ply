@@ -131,11 +131,14 @@ measurement is confounded until the earlier one has moved.
    machinery it does not own. Whether the front end lives behind the Rust driver
    or the driver is ported too is a decision for when phases exist to drive; it
    is listed so it is not discovered late.
-8. **Repair the oracles as they are needed.** `CONTRIBUTING.md` §"Things known
-   to be broken" items 16 and 18: the lexer spike's harness does not compile, and
-   the codegen spike's agreement corpus is red while its own tests stay green.
-   A bootstrap is verified with exactly these instruments, and a green result over
-   an instrument that runs nothing is the defect class this project names as its
+8. **Repair the oracles as they are needed.** The lexer spike's harness did not
+   compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
+   neither them nor hex literals; both are repaired, the differential is green
+   over the corpus and the standard library, and CI runs it (`lexer-spike`).
+   `CONTRIBUTING.md` §"Things known to be broken" item 18 remains: the codegen
+   spike's agreement corpus is red while its own tests stay green. A bootstrap
+   is verified with exactly these instruments, and a green result over an
+   instrument that runs nothing is the defect class this project names as its
    most expensive.
 
 ## What would make this plan wrong
