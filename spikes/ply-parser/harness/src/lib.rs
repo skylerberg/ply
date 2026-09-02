@@ -40,6 +40,13 @@ fn dump_of(text: &str, module: &Module, diags: &[Diagnostic]) -> String {
     d.out
 }
 
+/// The reference dump of `text` **after** the three rewrites — `parse_recovering`'s tree — for
+/// the third differential, against `rewrite.ply`.
+pub fn reference_dump_expanded(text: &str) -> String {
+    let (module, diags) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
+    dump_of(text, &module, &diags)
+}
+
 /// **The tree half of the same cost: how many nodes the three rewrites add.** Negative only
 /// where `try_op` refused a `?` and unwrapped it — one node fewer, and a diagnostic the other
 /// half counts — since no rewrite removes a node it accepted.
