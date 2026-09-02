@@ -387,11 +387,16 @@ What the compiled loop does not have, in the order to take them:
   proportional to the project — hashing every definition to establish that none
   moved, restoring every interface, writing them back — and under the backend
   the compile is about half of that again.
-- **A warm process**, which is what the row chose. There is no `watch`, no
-  daemon and no server in `Command`: an invocation starts knowing nothing, reads
-  what it can from disk, and exits. A warm process holds interfaces, hashes,
-  selection and compiled code in memory, which removes the front end's fixed
-  cost and the compile together.
+- **A warm process**, which is what the row chose — `ply test --watch`, started
+  and not finished. It holds the store, the checked front end and the compiled
+  unit across iterations, so an iteration where nothing moved pays a stat per
+  file. An iteration where something moved still pays the whole front end,
+  because the driver is one-shot. The phase report says there is no single term
+  to fix: hashing is about a quarter of a warm run that rechecks nothing,
+  writing back a fifth, and parsing, restoring, resolving, checking, assembling
+  and reading divide the rest, each proportional to the project. So the work is
+  to hold the front end and update it rather than to make one phase incremental.
+  ADR 0037 carries it.
 - **A compiled-code cache**, which the row demoted. `crates/ply-codegen`
   persists nothing across runs: no `DefHash -> code`, and `cranelift-jit` rather
   than `cranelift-object`, so there is no object output for a cache to hold, and
