@@ -110,7 +110,8 @@ fn the_readme_still_describes_this_request_path() {
         let drift = (claimed - measured).abs() / measured;
         assert!(
             drift <= 0.01,
-            "`README.md:387` says one /health request makes {claimed:.0} {what} and this tree \
+            "`README.md` §\"Where this is not competitive\" says one /health request makes \
+             {claimed:.0} {what} and this tree \
              makes {measured:.2} — {:.1}% apart. That sentence is present tense about this tree \
              and it has gone stale twice, the second time inside the block correcting the first. \
              Re-take it: `./target/release/w6-alloc --repo . --requests 200`.",

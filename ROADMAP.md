@@ -1357,8 +1357,10 @@ is, and the measurement each step is gated on.
 
 **What is next inside it is the loop rather than the path.** ADR 0037 splits the
 goal that file carried in one piece — the loop's cost, and a dependency line
-drawn where Rust's is — and refuses emitted C inside the loop, because a spawn
-and a link are O(project) and the loop's whole claim is that it is not. The
-first thing to take is the row nothing under `benches/` takes: what one edit
-costs, at two project sizes, fitted. Every row the path is ordered on measures a
-whole project, and none of them measures the quantity the thesis is about.
+drawn where Rust's is — and finds the compiled tier O(project) at every stage:
+a backend run bypasses the front-end cache and the result cache, so the front
+end loads whole and every test runs, and the unit is compiled again per worker.
+The first thing to take is a decision rather than a row — what a cached `Pass`
+means when a backend answered — and then the row `ply-corpus sweep` already
+half-holds: its edit scenarios across the size ladder, fitted, with the
+`--backend` arm it does not have.

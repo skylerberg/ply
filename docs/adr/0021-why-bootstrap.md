@@ -137,11 +137,13 @@ interpreter and that decision stands. **This records why the goal exists, so
 that the next person to read a rejection knows what was being rejected and what
 would change the answer.**
 
-**And it is not a measurement.** The claim at the top is stated as an exponent
-and has never been taken as one. Both pieces are in the tree and nothing
-composes them: `ply-corpus sweep` varies the size of a generated project and
-benchmarks whole-project phases over it, and `ply-corpus w5` times a rebuild
-after a one-leaf edit at a single size on the deploy path. **No row applies an
-edit across two sizes**, which is the only shape that separates an exponent from
-a constant. ADR 0037 registers that row, with its criteria fixed before the
-reading, and orders it ahead of the path this record motivates.
+**And it is measured for one tier of the loop and not the other.** The claim at
+the top is stated as an exponent. `ply-corpus bench` applies a rename, a leaf
+edit and a hub edit to a generated project and times nine phases of the run
+after each; `ply-corpus sweep` takes that at each of several sizes, and
+`README.md` §"The loop" is one size of it. That is the interpreter's loop.
+Nothing fits the slope across the sizes, and nothing takes the row under
+`--backend`, where a run bypasses the front-end cache and the result cache and
+compiles its unit again per worker. ADR 0037 registers the fit and the backend
+arm, with the criteria fixed before the reading, and orders them ahead of the
+path this record motivates.
