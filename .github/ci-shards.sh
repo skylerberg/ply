@@ -266,16 +266,16 @@ TREE_CHECKS=(
 # job is not a green tick.
 declare -a SPIKE_JOBS=(
   "ply-parser:parser-spike"
+  "ply-lexer:lexer-spike"
 )
 
 # Spikes deliberately in no CI job, with the reason, in `KNOWN_OUTSIDE`'s shape.
 #
-# **This list is a finding, not a decision that closes anything.** Three of the
-# four are `.ply` files and a `bench.sh` with no harness and no differential:
-# there is nothing for a job to assert, and a benchmark whose output is a number
-# is not a check. `spikes/ply-lexer` is different and its entry says so.
+# **This list is a finding, not a decision that closes anything.** All three are
+# `.ply` files and a `bench.sh` with no harness and no differential: there is
+# nothing for a job to assert, and a benchmark whose output is a number is not a
+# check. `spikes/ply-lexer` itself has both and is in SPIKE_JOBS.
 declare -a SPIKES_OUTSIDE_CI=(
-  "ply-lexer:it HAS a differential and a run.sh and it is BROKEN -- as of 2026-08-30 \`spikes/ply-lexer/run.sh\` does not reach a single test because its harness does not compile: \`non-exhaustive patterns: &ply_syntax::lexer::TokenKind::Question not covered\` at src/lib.rs:66, the identical bit-rot the parser spike one directory over was just repaired for. It is cited by the self-hosting spike, the bootstrap goal and the call-ceiling decision for throughput figures that cannot currently be re-taken. Adding a job here would only report a red that is already known; the entry exists so that the red is written down where CI is configured rather than only in a session transcript. Fix the spike, then move it to SPIKE_JOBS"
   "ply-lexer-nesting:three files -- main.ply, nesting.ply, bench.sh -- and no harness, no fixtures and no differential. It measures how deep a fold nests; its output is a number for the call-ceiling decision, not a pass or a fail"
   "ply-lexer-rc:same shape -- main.ply, fieldorder.ply, bench.sh. It measures what building a container anywhere but last in a record literal costs, which is spikes/ply-lexer/GAPS.md 1's measurement. A number, not a check"
   "ply-lexer-throughput:same shape -- main.ply, lexer.ply, bench.sh. It measures tokens per second for the self-hosting spike. A number, not a check"
