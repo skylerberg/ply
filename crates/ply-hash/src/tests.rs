@@ -68,6 +68,7 @@ fn lambda(params: &[&str], body: Expr) -> Expr {
     e(ExprKind::Lambda {
         params: params.iter().map(|p| param(p)).collect(),
         body: Box::new(body),
+        ret: None,
     })
 }
 

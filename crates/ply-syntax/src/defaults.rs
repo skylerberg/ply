@@ -191,7 +191,7 @@ fn mentions(e: &Expr, params: &[&Symbol], out: &mut Vec<Symbol>) {
                         out.push(q.symbol().clone());
                     }
                 }
-                ExprKind::Lambda { params, body } => {
+                ExprKind::Lambda { params, body, .. } => {
                     let mark = self.bound.len();
                     for p in params {
                         self.bound.push(p.name.name.clone());
@@ -357,7 +357,7 @@ impl Qualify<'_> {
                 }
                 q.module = Some(Ident::new(binder, q.span));
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 let mark = self.bound.len();
                 for p in params.iter() {
                     self.bound.push(p.name.name.clone());
@@ -513,7 +513,7 @@ impl Cx<'_> {
                     self.expr(rhs);
                 }
                 ExprKind::Unary { operand, .. } => self.expr(operand),
-                ExprKind::Lambda { params, body } => {
+                ExprKind::Lambda { params, body, .. } => {
                     let mark = self.scope.len();
                     for p in params.iter() {
                         self.scope.push(p.name.name.clone());

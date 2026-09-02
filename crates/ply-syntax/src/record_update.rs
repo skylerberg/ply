@@ -324,7 +324,7 @@ impl Cx<'_> {
                     self.expr(rhs);
                 }
                 ExprKind::Unary { operand, .. } => self.expr(operand),
-                ExprKind::Lambda { params, body } => {
+                ExprKind::Lambda { params, body, .. } => {
                     let mark = self.scope.len();
                     for p in params.iter() {
                         let ty = p.ty.clone();

@@ -1103,6 +1103,39 @@ fn derive_is_contextual_and_a_function_may_still_be_named_derive() {
 }
 
 #[test]
+fn a_lambda_may_write_its_return_type_and_then_takes_a_block_body() {
+    let d = dump("fn f() = |x: Int| -> Int { x + 1 }");
+    assert!(d.contains("-> Int"), "{d}");
+    assert_eq!(dump("fn f() = |x| x"), "(fn f () (lam ((x _)) x))");
+    let d = errs("fn f() = |x| -> Int x + 1");
+    assert_eq!(d[0].code, codes::UNEXPECTED_TOKEN);
+    assert!(
+        d[0].message.contains("`{` to open the body"),
+        "{}",
+        d[0].message
+    );
+}
+
+#[test]
+fn a_try_inside_a_lambda_reads_the_lambda_s_written_return_type() {
+    let with = "fn f(r: Result<Int, String>) -> Result<Int, String> = {\n\
+                \x20 let g = |x: Result<Int, String>| -> Result<Int, String> { Ok(x? + 1) };\n\
+                \x20 g(r)\n\
+                }";
+    ok(with);
+    let without = "fn f(r: Result<Int, String>) -> Result<Int, String> = {\n\
+                   \x20 let g = |x: Result<Int, String>| Ok(x? + 1);\n\
+                   \x20 g(r)\n\
+                   }";
+    let d = errs(without);
+    assert_eq!(d[0].code, codes::TRY_SCOPE, "{d:#?}");
+    // The mode is read off the written head, as it is for a `fn`; the type checker is what
+    // refuses the `Result` operand under an `Option` lambda.
+    let option = dump("fn f() = |x: Result<Int, String>| -> Option<Int> { Some(x? + 1) }");
+    assert!(option.contains("None"), "{option}");
+}
+
+#[test]
 fn a_reuse_fn_parses_before_and_after_pub_and_keeps_its_marker() {
     assert_eq!(dump("reuse fn f(xs) = xs"), "(reuse fn f ((xs _)) xs)");
     assert_eq!(
@@ -1419,8 +1452,12 @@ fn dump_expr(e: &Expr) -> String {
             };
             format!("({n} {})", dump_expr(operand))
         }
-        ExprKind::Lambda { params, body } => {
-            format!("(lam ({}) {})", dump_params(params), dump_expr(body))
+        ExprKind::Lambda { params, body, ret } => {
+            let ret = match ret {
+                Some(t) => format!(" -> {}", dump_ty(t)),
+                None => String::new(),
+            };
+            format!("(lam ({}){ret} {})", dump_params(params), dump_expr(body))
         }
         ExprKind::App { func, args, .. } => {
             let mut s = format!("(call {}", dump_expr(func));

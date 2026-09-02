@@ -808,6 +808,9 @@ pub enum ExprKind {
     Lambda {
         params: Vec<Param>,
         body: Box<Expr>,
+        /// `|x| -> T { .. }`: a written return type, which is what gives a `?` inside the body
+        /// its meaning. Erased by normalization, as a spec is: it constrains, it does not denote.
+        ret: Option<TypeExpr>,
     },
     App {
         func: Box<Expr>,

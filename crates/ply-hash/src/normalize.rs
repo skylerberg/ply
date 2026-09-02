@@ -660,7 +660,7 @@ impl<'a, 't> Normalizer<'a, 't> {
                 self.out.push(unop_byte(*op));
                 self.expr(operand);
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 self.tag(tag::E_LAMBDA);
                 self.len(params.len());
                 for p in params {
@@ -1017,7 +1017,7 @@ fn mentions(e: &Expr, names: &FxHashSet<Symbol>) -> bool {
         ExprKind::Var(name) => name.is_bare() && names.contains(&name.name.name),
         ExprKind::Binary { lhs, rhs, .. } => mentions(lhs, names) || mentions(rhs, names),
         ExprKind::Unary { operand, .. } => mentions(operand, names),
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             params.iter().any(|p| names.contains(&p.name.name)) || mentions(body, names)
         }
         ExprKind::App { func, args, .. } => {

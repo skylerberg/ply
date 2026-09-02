@@ -231,7 +231,7 @@ impl Walker<'_> {
                     self.out.of_var.insert(addr_expr(e), found);
                 }
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 let params: Vec<Symbol> = params.iter().map(|p| p.name.name.clone()).collect();
                 let _ = self.barrier(&params, body);
             }
