@@ -99,6 +99,9 @@ struct Helpers {
     iterate_bad: FuncId,
     bad_range: FuncId,
     bytes_join: FuncId,
+    list_get: FuncId,
+    list_push: FuncId,
+    not_a_list: FuncId,
     shift_count: FuncId,
     dup: FuncId,
     dec: FuncId,
@@ -541,6 +544,9 @@ impl Jit {
             iterate_bad: declare(&mut module, "rt_iterate_bad", 3, false)?,
             bad_range: declare(&mut module, "rt_bad_range", 3, false)?,
             bytes_join: declare(&mut module, "rt_bytes_join", 3, true)?,
+            list_get: declare(&mut module, "rt_list_get", 3, true)?,
+            list_push: declare(&mut module, "rt_list_push", 3, true)?,
+            not_a_list: declare(&mut module, "rt_not_a_list", 3, false)?,
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
             dup: declare(&mut module, "rt_dup", 2, true)?,
             dec: declare(&mut module, "rt_dec", 2, false)?,
@@ -897,6 +903,18 @@ enum Step {
     Lambda {
         id: FuncId,
         env: Vec<cranelift_codegen::ir::Value>,
+    },
+}
+
+/// What a fused loop walks.
+enum Walk {
+    Range {
+        lo: cranelift_codegen::ir::Value,
+        hi: cranelift_codegen::ir::Value,
+    },
+    List {
+        list: cranelift_codegen::ir::Value,
+        len: cranelift_codegen::ir::Value,
     },
 }
 
@@ -2251,6 +2269,22 @@ impl Fx<'_, '_> {
         }
     }
 
+    /// Whether `step_of` will answer for this argument, decided before anything is evaluated so
+    /// the generic path can still take the call whole.
+    fn fusable_step(&mut self, code: &Code, arity: usize, scope: &mut Scope) -> Result<bool> {
+        Ok(match &code.kind {
+            NodeKind::Var { name: q, .. } => matches!(
+                self.denotation(q, scope)?,
+                Denotes::Compiled(f)
+                    if f.arity == arity
+                        && f.sig.params.iter().all(|k| *k != Kind::Bool)
+                        && f.sig.ret != Kind::Bool
+            ),
+            NodeKind::Lambda { params, .. } => params.len() == arity,
+            _ => false,
+        })
+    }
+
     /// The callback a fused loop calls directly, when the argument is one it can: a compiled
     /// function of the right arity, or a lambda literal of it, which is compiled as its own
     /// function and called through its entry with the captured values as leading arguments —
@@ -2357,6 +2391,66 @@ impl Fx<'_, '_> {
         }
     }
 
+    /// What a fused loop walks: a `range(lo, hi)` as the integers themselves, checked against
+    /// the interpreter's limit, or any other expression as the list it must be — checked to be
+    /// one, with its length read — walked by index.
+    fn source_of(&mut self, code: &Code, scope: &mut Scope) -> Result<Walk> {
+        if let NodeKind::App { func, args } = &code.kind
+            && let NodeKind::Var { name: q, .. } = &func.kind
+            && args.len() == 2
+            && matches!(self.denotation(q, scope)?, Denotes::Builtin(i) if self.jit.builtins[i] == Builtin::Range)
+        {
+            let lo = self.consumed(&args[0], scope)?;
+            let lo = self.as_int(lo);
+            let hi = self.consumed(&args[1], scope)?;
+            let hi = self.as_int(hi);
+            let span = self.builder.ins().isub(hi, lo);
+            let too_big =
+                self.builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedGreaterThan, span, rt::RANGE_LIMIT);
+            let refuse = self.builder.create_block();
+            let fine = self.builder.create_block();
+            self.builder.ins().brif(too_big, refuse, &[], fine, &[]);
+            self.builder.switch_to_block(refuse);
+            self.builder.seal_block(refuse);
+            self.helper_void(self.jit.helpers.bad_range, &[lo, hi]);
+            self.check();
+            self.builder.ins().jump(fine, &[]);
+            self.builder.switch_to_block(fine);
+            self.builder.seal_block(fine);
+            return Ok(Walk::Range { lo, hi });
+        }
+        let list = self.consumed(code, scope)?;
+        let list = self.boxed(list);
+        let pointer = self.builder.create_block();
+        let bad = self.builder.create_block();
+        let fine = self.builder.create_block();
+        let tagged = self.builder.ins().band_imm(list, 1);
+        self.builder.ins().brif(tagged, bad, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let kind = self
+            .builder
+            .ins()
+            .uload8(types::I32, MemFlags::trusted(), list, 4);
+        let is = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(KIND_LIST));
+        self.builder.ins().brif(is, fine, &[], bad, &[]);
+        self.builder.switch_to_block(bad);
+        self.builder.seal_block(bad);
+        let which = self.builder.ins().iconst(types::I64, 0);
+        self.helper_void(self.jit.helpers.not_a_list, &[which, list]);
+        self.check();
+        self.builder.ins().jump(fine, &[]);
+        self.builder.switch_to_block(fine);
+        self.builder.seal_block(fine);
+        let len = self.builder.ins().uload32(MemFlags::trusted(), list, 8);
+        Ok(Walk::List { list, len })
+    }
+
     /// What a fused loop held for its step, let go once the loop is done.
     fn release_step(&mut self, step: Step) {
         if let Step::Lambda { env, .. } = step {
@@ -2394,73 +2488,56 @@ impl Fx<'_, '_> {
                     home: 0,
                 }))
             }
-            Builtin::Fold if args.len() == 3 => {
-                let NodeKind::App {
-                    func: range,
-                    args: bounds,
-                } = &args[0].kind
-                else {
-                    return Ok(None);
-                };
-                let NodeKind::Var { name: q, .. } = &range.kind else {
-                    return Ok(None);
-                };
-                if bounds.len() != 2
-                    || !matches!(self.denotation(q, scope)?, Denotes::Builtin(i) if self.jit.builtins[i] == Builtin::Range)
-                    || !matches!(
-                        &args[2].kind,
-                        NodeKind::Var { .. } | NodeKind::Lambda { .. }
-                    )
-                {
+            Builtin::Fold | Builtin::Map | Builtin::Filter
+                if args.len() == if b == Builtin::Fold { 3 } else { 2 } =>
+            {
+                let step_at = args.len() - 1;
+                let arity = if b == Builtin::Fold { 2 } else { 1 };
+                if !self.fusable_step(&args[step_at], arity, scope)? {
                     return Ok(None);
                 }
-                // Left to right, as the interpreter evaluates them: the bounds, the seed, then
+                // Left to right, as the interpreter evaluates them: the source, the seed, then
                 // the step — whose captures are read when the lambda is.
-                let lo = self.consumed(&bounds[0], scope)?;
-                let lo = self.as_int(lo);
-                let hi = self.consumed(&bounds[1], scope)?;
-                let hi = self.as_int(hi);
-                let init = self.consumed(&args[1], scope)?;
-                let Some(step) = self.step_of(&args[2], 2, scope)? else {
-                    // Nothing is emitted for a step this cannot call; the bounds and the seed are
-                    // already evaluated, so the generic path must not evaluate them again.
-                    return self.refuse(
-                        "a `fold` over a range whose step is not a call this body can make",
-                    );
+                let walk = self.source_of(&args[0], scope)?;
+                let init = if b == Builtin::Fold {
+                    Some(self.consumed(&args[1], scope)?)
+                } else {
+                    None
                 };
-                let acc_kind = match &step {
-                    Step::Typed(f) => f.sig.params[0],
-                    Step::Lambda { .. } => Kind::Boxed,
+                let Some(step) = self.step_of(&args[step_at], arity, scope)? else {
+                    // The source and the seed are already evaluated, so the generic path must
+                    // not evaluate them again.
+                    return self.refuse(format!(
+                        "a `{}` whose step is not a call this body can make",
+                        b.name()
+                    ));
                 };
-                let acc = self.coerce(init, acc_kind);
+                let acc_kind = match (&step, b) {
+                    (Step::Typed(f), Builtin::Fold) => f.sig.params[0],
+                    _ => Kind::Boxed,
+                };
+                let acc = match init {
+                    Some(init) => self.coerce(init, acc_kind),
+                    None => {
+                        let ptr = self.spill(&[]);
+                        let zero = self.builder.ins().iconst(types::I64, 0);
+                        self.helper(self.jit.helpers.list, &[ptr, zero])
+                    }
+                };
+                let (lo, hi) = match &walk {
+                    Walk::Range { lo, hi } => (*lo, *hi),
+                    Walk::List { len, .. } => (self.builder.ins().iconst(types::I64, 0), *len),
+                };
 
-                let span = self.builder.ins().isub(hi, lo);
-                let too_big =
-                    self.builder
-                        .ins()
-                        .icmp_imm(IntCC::SignedGreaterThan, span, rt::RANGE_LIMIT);
-                let refuse = self.builder.create_block();
                 let header = self.builder.create_block();
-                self.builder.ins().brif(
-                    too_big,
-                    refuse,
-                    &[],
-                    header,
-                    &[BlockArg::Value(lo), BlockArg::Value(acc)],
-                );
-                self.builder.switch_to_block(refuse);
-                self.builder.seal_block(refuse);
-                self.helper_void(self.jit.helpers.bad_range, &[lo, hi]);
-                self.check();
-                self.builder
-                    .ins()
-                    .jump(header, &[BlockArg::Value(lo), BlockArg::Value(acc)]);
-
                 self.builder.append_block_param(header, types::I64);
                 self.builder.append_block_param(header, types::I64);
                 let body = self.builder.create_block();
                 let exit = self.builder.create_block();
                 self.builder.append_block_param(exit, types::I64);
+                self.builder
+                    .ins()
+                    .jump(header, &[BlockArg::Value(lo), BlockArg::Value(acc)]);
                 self.builder.switch_to_block(header);
                 let i = self.builder.block_params(header)[0];
                 let acc = self.builder.block_params(header)[1];
@@ -2470,20 +2547,72 @@ impl Fx<'_, '_> {
                     .brif(more, body, &[], exit, &[BlockArg::Value(acc)]);
                 self.builder.switch_to_block(body);
                 self.builder.seal_block(body);
+                let x = match &walk {
+                    Walk::Range { .. } => Val {
+                        kind: Kind::Int,
+                        v: i,
+                        ty: 0,
+                        home: 0,
+                    },
+                    Walk::List { list, .. } => {
+                        let w = self.helper(self.jit.helpers.list_get, &[*list, i]);
+                        Val {
+                            kind: Kind::Boxed,
+                            v: w,
+                            ty: 0,
+                            home: 0,
+                        }
+                    }
+                };
                 let acc_val = Val {
                     kind: acc_kind,
                     v: acc,
                     ty: 0,
                     home: 0,
                 };
-                let x = Val {
-                    kind: Kind::Int,
-                    v: i,
-                    ty: 0,
-                    home: 0,
+                let next = match b {
+                    Builtin::Fold => {
+                        let next = self.call_step(&step, &[acc_val, x]);
+                        self.coerce(next, acc_kind)
+                    }
+                    Builtin::Map => {
+                        let r = self.call_step(&step, &[x]);
+                        let r = self.boxed(r);
+                        self.helper(self.jit.helpers.list_push, &[acc, r])
+                    }
+                    _ => {
+                        // The element is held once for the predicate, which takes it, and once
+                        // for the answer, which keeps it or lets it go.
+                        let xw = self.boxed(x);
+                        self.inc_inline(xw);
+                        let r = self.call_step(
+                            &step,
+                            &[Val {
+                                kind: Kind::Boxed,
+                                v: xw,
+                                ty: 0,
+                                home: 0,
+                            }],
+                        );
+                        let keep = self.as_bool(r);
+                        let kept = self.builder.create_block();
+                        let dropped = self.builder.create_block();
+                        let joined = self.builder.create_block();
+                        self.builder.append_block_param(joined, types::I64);
+                        self.builder.ins().brif(keep, kept, &[], dropped, &[]);
+                        self.builder.switch_to_block(kept);
+                        self.builder.seal_block(kept);
+                        let pushed = self.helper(self.jit.helpers.list_push, &[acc, xw]);
+                        self.builder.ins().jump(joined, &[BlockArg::Value(pushed)]);
+                        self.builder.switch_to_block(dropped);
+                        self.builder.seal_block(dropped);
+                        self.dec_inline(xw);
+                        self.builder.ins().jump(joined, &[BlockArg::Value(acc)]);
+                        self.builder.switch_to_block(joined);
+                        self.builder.seal_block(joined);
+                        self.builder.block_params(joined)[0]
+                    }
                 };
-                let next = self.call_step(&step, &[acc_val, x]);
-                let next = self.coerce(next, acc_kind);
                 let i1 = self.builder.ins().iadd_imm(i, 1);
                 self.builder
                     .ins()
@@ -2492,6 +2621,9 @@ impl Fx<'_, '_> {
                 self.builder.switch_to_block(exit);
                 self.builder.seal_block(exit);
                 let v = self.builder.block_params(exit)[0];
+                if let Walk::List { list, .. } = &walk {
+                    self.dec_inline(*list);
+                }
                 self.release_step(step);
                 Ok(Some(Val {
                     kind: acc_kind,
@@ -2504,10 +2636,7 @@ impl Fx<'_, '_> {
                 let (Some(stop), Some(go)) = (self.jit.layouts.stop, self.jit.layouts.go) else {
                     return Ok(None);
                 };
-                if !matches!(
-                    &args[2].kind,
-                    NodeKind::Var { .. } | NodeKind::Lambda { .. }
-                ) {
+                if !self.fusable_step(&args[2], 1, scope)? {
                     return Ok(None);
                 }
                 let seed = self.consumed(&args[0], scope)?;

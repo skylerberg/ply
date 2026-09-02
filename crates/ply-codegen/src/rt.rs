@@ -1375,6 +1375,37 @@ pub unsafe extern "C" fn rt_bad_range(ctx: *mut Ctx, lo: i64, hi: i64) {
 /// The most elements the interpreter's `range` builds, which a fused loop holds to as well.
 pub const RANGE_LIMIT: i64 = 10_000_000;
 
+/// The element at `i` of a list a fused loop walks by index, held once more. Reads the list;
+/// the loop checked the kind and the bound.
+pub unsafe extern "C" fn rt_list_get(_ctx: *mut Ctx, list: i64, i: i64) -> i64 {
+    let w = list::get(obj(list), i as usize);
+    heap::inc(w);
+    w
+}
+
+/// `xs` with `x` appended, for a fused `map` or `filter` building its answer. Takes both.
+pub unsafe extern "C" fn rt_list_push(ctx: *mut Ctx, xs: i64, x: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    ctx.heap.list_push(xs, x)
+}
+
+/// A fused loop was handed something other than a list, which the runtime's loop refuses the
+/// same way.
+pub unsafe extern "C" fn rt_not_a_list(ctx: *mut Ctx, which: i64, value: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let what = match which {
+        0 => "fold",
+        1 => "map",
+        _ => "filter",
+    };
+    let d = error(format!(
+        "`{what}` needs a List, and this is {}",
+        ctx.type_name(value)
+    ));
+    heap::dec(value);
+    ctx.fail(d);
+}
+
 /// A shift count outside `0..64`, which the interpreter refuses too.
 pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64) {
     let ctx = unsafe { &mut *ctx };
@@ -1683,6 +1714,9 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_iterate", rt_iterate as *const u8),
         ("rt_iterate_bad", rt_iterate_bad as *const u8),
         ("rt_bytes_join", rt_bytes_join as *const u8),
+        ("rt_list_get", rt_list_get as *const u8),
+        ("rt_list_push", rt_list_push as *const u8),
+        ("rt_not_a_list", rt_not_a_list as *const u8),
         ("rt_bad_range", rt_bad_range as *const u8),
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),
