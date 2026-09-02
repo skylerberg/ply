@@ -76,7 +76,6 @@ struct Helpers {
     record_fits: FuncId,
     record_has: FuncId,
     builtin: FuncId,
-    ctor: FuncId,
     list: FuncId,
     list_fits: FuncId,
     list_at: FuncId,
@@ -95,7 +94,6 @@ struct Helpers {
     bytes_scan_until: FuncId,
     bytes_slice: FuncId,
     bytes_concat: FuncId,
-    record: FuncId,
     record_update: FuncId,
     field: FuncId,
     no_fuel: FuncId,
@@ -118,6 +116,7 @@ struct Helpers {
     dup: FuncId,
     dec: FuncId,
     reset: FuncId,
+    alloc: FuncId,
     constant: FuncId,
 }
 
@@ -143,6 +142,11 @@ struct Sig {
     ret: Kind,
     param_tys: Vec<u32>,
     ret_ty: u32,
+    /// Per parameter, whether the body only reads it — every mention the base of a field read,
+    /// and no literal of its width that would take its memory — so the caller keeps its hold and
+    /// the callee neither counts it nor lets it go: no increment and release around the call,
+    /// and a record that dies in the caller dies where the caller's tokens are.
+    borrowed: Vec<bool>,
 }
 
 /// What the code generator knows of a value's type at compile time: enough to read a record's
@@ -154,6 +158,17 @@ enum Ty {
     Int,
     Bool,
     Record(Vec<(Symbol, u32)>),
+}
+
+/// A fused `iterate` loop's blocks and values, for the step's answer to continue or leave it.
+#[derive(Clone, Copy)]
+struct Loop {
+    go: u32,
+    stop: u32,
+    header: Block,
+    exit: Block,
+    left: cranelift_codegen::ir::Value,
+    state: cranelift_codegen::ir::Value,
 }
 
 /// A compiled top-level function: the typed body other compiled code calls directly, and the
@@ -186,6 +201,7 @@ fn sig_of(jit: &mut Jit, loaded: &Source, name: &str, arity: usize) -> Sig {
         ret: Kind::Boxed,
         param_tys: vec![0; arity],
         ret_ty: 0,
+        borrowed: vec![false; arity],
     };
     let Some(def) = loaded.check.defs.get(&Symbol::new(name)) else {
         return boxed;
@@ -196,12 +212,14 @@ fn sig_of(jit: &mut Jit, loaded: &Source, name: &str, arity: usize) -> Sig {
             ret: kind_of_type(ret),
             param_tys: params.iter().map(|p| jit.ty_of_type(p)).collect(),
             ret_ty: jit.ty_of_type(ret),
+            borrowed: vec![false; arity],
         },
         ty if arity == 0 => Sig {
             params: Vec::new(),
             ret: kind_of_type(ty),
             param_tys: Vec::new(),
             ret_ty: jit.ty_of_type(ty),
+            borrowed: Vec::new(),
         },
         _ => boxed,
     }
@@ -401,6 +419,36 @@ impl Jit {
         })
     }
 
+    /// Which of `name`'s handle parameters its body only reads: every mention the base of a
+    /// field read, none captured by a lambda, and no record literal of the parameter's width
+    /// in the body, which would rather take a parameter that dies there.
+    fn borrowed_params(&self, name: &str, params: &[Symbol], code: &Code) -> Vec<bool> {
+        let Some(func) = self.funcs.get(name) else {
+            return vec![false; params.len()];
+        };
+        let mut widths = BTreeSet::new();
+        record_widths(code, &mut widths);
+        params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if func.sig.params[i] != Kind::Boxed {
+                    return false;
+                }
+                let width = match &self.tys[func.sig.param_tys[i] as usize] {
+                    Ty::Record(fields) => Some(fields.len()),
+                    _ => None,
+                };
+                if width.is_some_and(|w| widths.contains(&w)) {
+                    return false;
+                }
+                let mut only_read = true;
+                read_only(code, p, &mut only_read);
+                only_read
+            })
+            .collect()
+    }
+
     /// The values a body builds without allocating: every nullary constructor, the empty list
     /// and the empty map, each made once and immortal.
     fn make_singletons(&mut self) {
@@ -589,7 +637,6 @@ impl Jit {
             record_fits: declare(&mut module, "rt_record_fits", 4, true)?,
             record_has: declare(&mut module, "rt_record_has", 3, true)?,
             builtin: declare(&mut module, "rt_builtin", 4, true)?,
-            ctor: declare(&mut module, "rt_ctor", 4, true)?,
             list: declare(&mut module, "rt_list", 3, true)?,
             list_fits: declare(&mut module, "rt_list_fits", 4, true)?,
             list_at: declare(&mut module, "rt_list_at", 3, true)?,
@@ -608,7 +655,6 @@ impl Jit {
             bytes_scan_until: declare(&mut module, "rt_bytes_scan_until", 5, true)?,
             bytes_slice: declare(&mut module, "rt_bytes_slice", 4, true)?,
             bytes_concat: declare(&mut module, "rt_bytes_concat", 3, true)?,
-            record: declare(&mut module, "rt_record", 4, true)?,
             record_update: declare(&mut module, "rt_record_update", 6, true)?,
             field: declare(&mut module, "rt_field", 4, true)?,
             no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
@@ -631,6 +677,7 @@ impl Jit {
             dup: declare(&mut module, "rt_dup", 2, true)?,
             dec: declare(&mut module, "rt_dec", 2, false)?,
             reset: declare(&mut module, "rt_reset", 2, true)?,
+            alloc: declare(&mut module, "rt_alloc", 5, true)?,
             constant: declare(&mut module, "rt_constant", 2, true)?,
         };
 
@@ -695,6 +742,10 @@ impl Jit {
             // captures it rather than reading a global that does not exist.
             let body = crate::opt::optimize(loaded, module_index, def);
             let code = lower_fn(&params, &body).code;
+            let borrowed = jit.borrowed_params(name, &params, &code);
+            if let Some(func) = jit.funcs.get_mut(*name) {
+                func.sig.borrowed = borrowed;
+            }
             bodies.push(((*name).to_string(), params, code, module_index));
         }
         Ok((jit, bodies, started))
@@ -732,6 +783,7 @@ impl Jit {
             module_index,
             homes: Vec::new(),
             tokens: Vec::new(),
+            pinned: Vec::new(),
             kinds: HashMap::new(),
         };
         fx.arm_tokens(body);
@@ -758,12 +810,19 @@ impl Jit {
             // A typed body: each parameter is the register it arrived in, of its own kind.
             Some(sig) => {
                 for (i, (p, kind)) in params.iter().zip(&sig.params).enumerate() {
-                    let v = fx.home(Val {
+                    let val = Val {
                         kind: *kind,
                         v: block_params[i + 1],
                         ty: sig.param_tys[i],
                         home: 0,
-                    });
+                    };
+                    // A borrowed parameter is the caller's: read here, never moved or let go.
+                    let v = if sig.borrowed[i] {
+                        fx.pinned.push(p.clone());
+                        val
+                    } else {
+                        fx.home(val)
+                    };
                     scope.push((p.clone(), v));
                 }
             }
@@ -834,14 +893,20 @@ impl Jit {
             module_index: func.module_index,
             homes: Vec::new(),
             tokens: Vec::new(),
+            pinned: Vec::new(),
             kinds: HashMap::new(),
         };
         let mut args = vec![fx.ctx];
+        let mut lent = Vec::new();
         for (i, kind) in func.sig.params.iter().enumerate() {
             let handle =
                 fx.builder
                     .ins()
                     .load(types::I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
+            // The entry owns every handle it is given; one the body borrows is let go here.
+            if func.sig.borrowed[i] {
+                lent.push(handle);
+            }
             let v = fx.coerce(
                 Val {
                     kind: Kind::Boxed,
@@ -860,6 +925,9 @@ impl Jit {
         let call = fx.builder.ins().call(callee, &args);
         let r = fx.builder.inst_results(call)[0];
         fx.check();
+        for w in lent {
+            fx.dec_inline(w);
+        }
         let handle = fx.boxed(Val {
             kind: func.sig.ret,
             v: r,
@@ -985,7 +1053,11 @@ fn record_widths(code: &Code, out: &mut BTreeSet<usize>) {
             out.insert(fields.len());
             fields.iter().for_each(|(_, e)| record_widths(e, out));
         }
-        NodeKind::RecordUpdate { base, sets, .. } => {
+        NodeKind::RecordUpdate { base, copies, sets } => {
+            // A fully written literal is built as one, in the token of its width.
+            if copies.is_empty() {
+                out.insert(sets.len());
+            }
             record_widths(base, out);
             sets.iter().for_each(|(_, e)| record_widths(e, out));
         }
@@ -998,6 +1070,166 @@ fn record_widths(code: &Code, out: &mut BTreeSet<usize>) {
         NodeKind::WithCell { init, body, .. } => {
             record_widths(init, out);
             record_widths(body, out);
+        }
+    }
+}
+
+/// Whether evaluating `code` can move the local `name` out of its binding: a read marked its
+/// last use, or a lambda capturing it.
+fn moves(code: &Code, name: &Symbol) -> bool {
+    let mut hit = false;
+    let mut check = |c: &Code| {
+        if moves(c, name) {
+            hit = true;
+        }
+    };
+    match &code.kind {
+        NodeKind::Var { name: q, .. } => {
+            return q.is_bare() && q.symbol() == name && code.own == Own::Owned;
+        }
+        NodeKind::Lambda { captures, .. } => return captures.names.contains(name),
+        NodeKind::Lit(..) => return false,
+        NodeKind::Field { base, .. } => {
+            // A field read at the record's last use takes the record with it.
+            if let NodeKind::Var { name: q, .. } = &base.kind {
+                return q.is_bare() && q.symbol() == name && base.own == Own::Owned;
+            }
+            check(base);
+        }
+        NodeKind::Unary { operand, .. } => check(operand),
+        NodeKind::Binary { lhs, rhs, .. } => {
+            check(lhs);
+            check(rhs);
+        }
+        NodeKind::App { func, args, .. } => {
+            check(func);
+            args.iter().for_each(&mut check);
+        }
+        NodeKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            check(cond);
+            check(then_branch);
+            check(else_branch);
+        }
+        NodeKind::Match { scrutinee, arms } => {
+            check(scrutinee);
+            for arm in arms.iter() {
+                check(&arm.body);
+                if let Some(g) = &arm.guard {
+                    check(g);
+                }
+            }
+        }
+        NodeKind::Block { stmts, tail } => {
+            for s in stmts.iter() {
+                match s {
+                    Stmt::Let { value, .. } => check(value),
+                    Stmt::Expr { code, .. } => check(code),
+                }
+            }
+            if let Some(t) = tail {
+                check(t);
+            }
+        }
+        NodeKind::Record { fields, .. } => fields.iter().for_each(|(_, e)| check(e)),
+        NodeKind::RecordUpdate { base, sets, .. } => {
+            check(base);
+            sets.iter().for_each(|(_, e)| check(e));
+        }
+        NodeKind::List { items } => items.iter().for_each(&mut check),
+        NodeKind::Perform { args, .. } => args.iter().for_each(&mut check),
+        NodeKind::Handle { body, .. }
+        | NodeKind::Simulate { body, .. }
+        | NodeKind::WithRegion { body } => check(body),
+        NodeKind::WithCell { init, body, .. } => {
+            check(init);
+            check(body);
+        }
+    }
+    hit
+}
+
+/// Clears `ok` where `code` mentions `name` other than as the base of a field read — as a value,
+/// an update's base, a scrutinee or a lambda's capture.
+fn read_only(code: &Code, name: &Symbol, ok: &mut bool) {
+    if !*ok {
+        return;
+    }
+    let mut go = |c: &Code| read_only(c, name, ok);
+    match &code.kind {
+        NodeKind::Lit(..) => {}
+        NodeKind::Var { name: q, .. } => {
+            if q.is_bare() && q.symbol() == name {
+                *ok = false;
+            }
+        }
+        NodeKind::Field { base, .. } => {
+            if !matches!(&base.kind, NodeKind::Var { name: q, .. } if q.is_bare() && q.symbol() == name)
+            {
+                go(base);
+            }
+        }
+        NodeKind::Lambda { captures, body, .. } => {
+            if captures.names.contains(name) {
+                *ok = false;
+            } else {
+                go(body);
+            }
+        }
+        NodeKind::Unary { operand, .. } => go(operand),
+        NodeKind::Binary { lhs, rhs, .. } => {
+            go(lhs);
+            go(rhs);
+        }
+        NodeKind::App { func, args, .. } => {
+            go(func);
+            args.iter().for_each(go);
+        }
+        NodeKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            go(cond);
+            go(then_branch);
+            go(else_branch);
+        }
+        NodeKind::Match { scrutinee, arms } => {
+            go(scrutinee);
+            for arm in arms.iter() {
+                go(&arm.body);
+                if let Some(g) = &arm.guard {
+                    go(g);
+                }
+            }
+        }
+        NodeKind::Block { stmts, tail } => {
+            for s in stmts.iter() {
+                match s {
+                    Stmt::Let { value, .. } => go(value),
+                    Stmt::Expr { code, .. } => go(code),
+                }
+            }
+            if let Some(t) = tail {
+                go(t);
+            }
+        }
+        NodeKind::Record { fields, .. } => fields.iter().for_each(|(_, e)| go(e)),
+        NodeKind::RecordUpdate { base, sets, .. } => {
+            go(base);
+            sets.iter().for_each(|(_, e)| go(e));
+        }
+        NodeKind::List { items } => items.iter().for_each(go),
+        NodeKind::Perform { args, .. } => args.iter().for_each(go),
+        NodeKind::Handle { body, .. }
+        | NodeKind::Simulate { body, .. }
+        | NodeKind::WithRegion { body } => go(body),
+        NodeKind::WithCell { init, body, .. } => {
+            go(init);
+            go(body);
         }
     }
 }
@@ -1017,7 +1249,17 @@ fn inline_builtin_answers(b: Builtin, arity: usize) -> bool {
     matches!(
         (b, arity),
         (Builtin::BytesAt, 2) | (Builtin::BytesLen, 1) | (Builtin::Len, 1)
-    )
+    ) || scalar_builtin_answers(b, arity)
+}
+
+/// The builtins over two `Int`s that are one instruction each: the wrapping arithmetic and the
+/// rotate of the low word.
+fn scalar_builtin_answers(b: Builtin, arity: usize) -> bool {
+    arity == 2
+        && matches!(
+            b,
+            Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul | Builtin::Rotr32
+        )
 }
 
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
@@ -1052,9 +1294,12 @@ fn lowered_callback(b: Builtin) -> bool {
 /// lambda literal through its own entry, with the words it captured as its leading arguments.
 enum Step {
     Typed(Func),
-    Lambda {
-        id: FuncId,
-        env: Vec<cranelift_codegen::ir::Value>,
+    /// A lambda literal, lowered in the loop's own body: its parameters bound to the loop's
+    /// values and its captures read as the loop's locals.
+    Inline {
+        params: Vec<Symbol>,
+        body: Code,
+        captures: Vec<Symbol>,
     },
 }
 
@@ -1095,6 +1340,9 @@ struct Fx<'a, 'b> {
     /// record of that width that died at its last use in this body — its memory the next such
     /// literal's — or `0`. Whatever is left in one at the exit is released there.
     tokens: Vec<(usize, cranelift_codegen::ir::StackSlot)>,
+    /// The locals an inlined step reads as captures: never moved out by a mark computed for
+    /// the lambda's own frame, since the loop still holds them.
+    pinned: Vec<Symbol>,
     /// `kind_of`'s answer per node: a branch is asked about before it is compiled and again at
     /// every join above it, and the answer is fixed by the node's place in the tree.
     kinds: HashMap<*const ply_eval::code::Node, Kind>,
@@ -1481,6 +1729,52 @@ impl Fx<'_, '_> {
         }
     }
 
+    /// The same releases, emitted on a path that leaves the scope by a jump, with the bindings
+    /// kept for the paths still to be emitted.
+    fn release_homes_since(&mut self, mark: usize) {
+        for i in mark..self.homes.len() {
+            let slot = self.homes[i];
+            let w = self.builder.ins().stack_load(types::I64, slot, 0);
+            self.dec_inline(w);
+        }
+    }
+
+    /// A block's statements: each `let` bound into `inner` as a home, each bare expression's
+    /// answer released.
+    fn block_stmts(&mut self, stmts: &[Stmt], inner: &mut Scope) -> Result<()> {
+        for s in stmts.iter() {
+            match s {
+                Stmt::Let { pat, value, .. } => {
+                    let v = self.consumed(value, inner)?;
+                    match pat {
+                        Pat::Var { name, .. } => {
+                            let v = self.home(v);
+                            inner.push((name.name.clone(), v));
+                        }
+                        Pat::Wildcard => {}
+                        other if self.binds_without_test(other) => {
+                            self.bind_pattern(other, v, true, inner)?;
+                        }
+                        other => {
+                            return self.refuse(format!(
+                                "a `let` binding a refutable {} pattern",
+                                pattern_name(other)
+                            ));
+                        }
+                    }
+                }
+                Stmt::Expr { code, .. } => {
+                    // An answer nobody binds is released here unless it is a local's.
+                    let v = self.expr(code, inner)?;
+                    if v.kind == Kind::Boxed && !self.is_local(code, inner) {
+                        self.dec_inline(v.v);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One token slot per width of record literal in `body`, empty on entry.
     fn arm_tokens(&mut self, body: &Code) {
         let mut widths = BTreeSet::new();
@@ -1625,10 +1919,15 @@ impl Fx<'_, '_> {
         let flags = MemFlags::trusted();
         let one = self.builder.ins().iconst(types::I32, 1);
         self.builder.ins().store(flags, one, held, 0);
+        // The kind, and beside it the flat flag when every field is an immediate.
+        let flat = self.flat_over(ordered);
+        let flat = self.builder.ins().ishl_imm(flat, 8);
         let kind = self
             .builder
             .ins()
-            .iconst(types::I32, i64::from(KIND_RECORD));
+            .iconst(types::I64, i64::from(KIND_RECORD));
+        let kind = self.builder.ins().bor(kind, flat);
+        let kind = self.builder.ins().ireduce(types::I32, kind);
         self.builder.ins().store(flags, kind, held, 4);
         let len = self.builder.ins().iconst(types::I32, ordered.len() as i64);
         self.builder.ins().store(flags, len, held, 8);
@@ -1654,10 +1953,43 @@ impl Fx<'_, '_> {
         shape: u32,
         ordered: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        let ptr = self.spill(ordered);
-        let shape = self.builder.ins().iconst(types::I64, i64::from(shape));
-        let n = self.builder.ins().iconst(types::I64, ordered.len() as i64);
-        self.helper(self.jit.helpers.record, &[shape, ptr, n])
+        self.built_fresh(KIND_RECORD, shape, ordered)
+    }
+
+    /// A fresh object with its header written by the runtime and its fields stored here, with
+    /// no argument array between.
+    fn built_fresh(
+        &mut self,
+        kind: u8,
+        layout: u32,
+        ordered: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let flat = self.flat_over(ordered);
+        let kind = self.builder.ins().iconst(types::I64, i64::from(kind));
+        let len = self.builder.ins().iconst(types::I64, ordered.len() as i64);
+        let layout = self.builder.ins().iconst(types::I64, i64::from(layout));
+        let p = self.helper(self.jit.helpers.alloc, &[kind, len, layout, flat]);
+        let flags = MemFlags::trusted();
+        for (i, h) in ordered.iter().enumerate() {
+            self.builder
+                .ins()
+                .store(flags, *h, p, (HEADER + 8 * i) as i32);
+        }
+        p
+    }
+
+    /// `1` when every word is an immediate, `0` otherwise: the flat flag of an object built over
+    /// them.
+    fn flat_over(
+        &mut self,
+        words: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let mut flat = self.builder.ins().iconst(types::I64, 1);
+        for w in words {
+            let tag = self.builder.ins().band_imm(*w, 1);
+            flat = self.builder.ins().band(flat, tag);
+        }
+        flat
     }
 
     fn is_local(&self, code: &Code, scope: &Scope) -> bool {
@@ -1666,12 +1998,19 @@ impl Fx<'_, '_> {
     }
 
     fn is_borrowed_local(&self, code: &Code, scope: &Scope) -> bool {
-        code.own != Own::Owned && self.is_local(code, scope)
+        (code.own != Own::Owned || self.is_pinned(code)) && self.is_local(code, scope)
+    }
+
+    /// Whether `code` reads a local an inlined step captured, which its marks may not move.
+    fn is_pinned(&self, code: &Code) -> bool {
+        matches!(&code.kind, NodeKind::Var { name: q, .. }
+            if q.is_bare() && self.pinned.contains(q.symbol()))
     }
 
     /// Whether `arg` is a local whose read here is the binding's last.
     fn last_use_of_local(&self, arg: &Code, scope: &Scope) -> bool {
         arg.own == Own::Owned
+            && !self.is_pinned(arg)
             && matches!(&arg.kind, NodeKind::Var { name: q, .. }
                 if q.is_bare() && scope.iter().any(|(s, _)| s == q.symbol()))
     }
@@ -2031,36 +2370,7 @@ impl Fx<'_, '_> {
             NodeKind::Block { stmts, tail } => {
                 let mut inner = scope.clone();
                 let mark = self.homes.len();
-                for s in stmts.iter() {
-                    match s {
-                        Stmt::Let { pat, value, .. } => {
-                            let v = self.consumed(value, &mut inner)?;
-                            match pat {
-                                Pat::Var { name, .. } => {
-                                    let v = self.home(v);
-                                    inner.push((name.name.clone(), v));
-                                }
-                                Pat::Wildcard => {}
-                                other if self.binds_without_test(other) => {
-                                    self.bind_pattern(other, v, true, &mut inner)?;
-                                }
-                                other => {
-                                    return self.refuse(format!(
-                                        "a `let` binding a refutable {} pattern",
-                                        pattern_name(other)
-                                    ));
-                                }
-                            }
-                        }
-                        Stmt::Expr { code, .. } => {
-                            // An answer nobody binds is released here unless it is a local's.
-                            let v = self.expr(code, &mut inner)?;
-                            if v.kind == Kind::Boxed && !self.is_local(code, &inner) {
-                                self.dec_inline(v.v);
-                            }
-                        }
-                    }
-                }
+                self.block_stmts(stmts, &mut inner)?;
                 let answer = match tail {
                     Some(t) => self.consumed(t, &mut inner)?,
                     None => {
@@ -2235,7 +2545,12 @@ impl Fx<'_, '_> {
                             "a lambda capturing `{name}`, which is not a local of its body"
                         ));
                     };
-                    let val = self.captured(*own, *val);
+                    let own = if self.pinned.contains(name) {
+                        Own::Borrowed
+                    } else {
+                        *own
+                    };
+                    let val = self.captured(own, *val);
                     let handle = self.boxed(val);
                     env.push(handle);
                 }
@@ -2275,7 +2590,10 @@ impl Fx<'_, '_> {
                 // is a temporary, taken so it pins nothing.
                 let own = if self.last_use_of_local(b, scope) {
                     1
-                } else if code.own == Own::OwnedField && self.is_local(b, scope) {
+                } else if code.own == Own::OwnedField
+                    && self.is_local(b, scope)
+                    && !self.is_pinned(b)
+                {
                     2
                 } else if self.is_local(b, scope) {
                     0
@@ -2688,47 +3006,52 @@ impl Fx<'_, '_> {
                 captures,
                 ..
             } if params.len() == arity => {
-                let mut env = Vec::with_capacity(captures.len());
-                for (name, own) in captures.names.iter().zip(&captures.owns) {
-                    let Some((_, val)) = scope.iter().rev().find(|(s, _)| s == name) else {
+                for name in &captures.names {
+                    if !scope.iter().any(|(s, _)| s == name) {
                         return self.refuse(format!(
                             "a lambda capturing `{name}`, which is not a local of its body"
                         ));
-                    };
-                    let val = self.captured(*own, *val);
-                    let handle = self.boxed(val);
-                    env.push(handle);
+                    }
                 }
-                let index = self.jit.functions.len();
-                let sig = self.jit.entry_signature();
-                let id = self.jit.module.declare_function(
-                    &mangle(&format!("{}$lambda{index}", self.function)),
-                    Linkage::Local,
-                    &sig,
-                )?;
-                self.jit.functions.push(id);
-                let mut full: Vec<Symbol> = captures.names.clone();
-                full.extend(params.iter().cloned());
-                self.jit.pending.push(Pending {
-                    owner: self.function.clone(),
-                    id,
-                    params: full,
+                Ok(Some(Step::Inline {
+                    params: params.to_vec(),
                     body: body.clone(),
-                    module_index: self.module_index,
-                });
-                Ok(Some(Step::Lambda { id, env }))
+                    captures: captures.names.clone(),
+                }))
             }
             _ => Ok(None),
         }
     }
 
     /// One call of a fused loop's step, which owns its arguments and answers an owned value.
-    fn call_step(&mut self, step: &Step, args: &[Val]) -> Val {
+    fn call_step(&mut self, step: &Step, args: &[Val], scope: &Scope) -> Result<Val> {
         match step {
+            Step::Inline {
+                params,
+                body,
+                captures,
+            } => {
+                let mark = self.homes.len();
+                let pin = self.pinned.len();
+                self.pinned.extend(captures.iter().cloned());
+                let mut inner = scope.clone();
+                for (p, a) in params.iter().zip(args) {
+                    let v = self.home(*a);
+                    inner.push((p.clone(), v));
+                }
+                let r = self.consumed(body, &mut inner)?;
+                self.release_homes_from(mark);
+                self.pinned.truncate(pin);
+                Ok(r)
+            }
             Step::Typed(f) => {
                 let mut vals = Vec::with_capacity(args.len() + 1);
                 vals.push(self.ctx);
-                for (a, kind) in args.iter().zip(&f.sig.params) {
+                let mut lent = Vec::new();
+                for (i, (a, kind)) in args.iter().zip(&f.sig.params).enumerate() {
+                    if f.sig.borrowed[i] && a.kind == Kind::Boxed {
+                        lent.push(a.v);
+                    }
                     let v = self.coerce(*a, *kind);
                     vals.push(v);
                 }
@@ -2739,34 +3062,15 @@ impl Fx<'_, '_> {
                 let call = self.builder.ins().call(callee, &vals);
                 let v = self.builder.inst_results(call)[0];
                 self.check();
-                Val {
+                for w in lent {
+                    self.dec_inline(w);
+                }
+                Ok(Val {
                     kind: f.sig.ret,
                     v,
                     ty: f.sig.ret_ty,
                     home: 0,
-                }
-            }
-            Step::Lambda { id, env } => {
-                let mut handles = Vec::with_capacity(env.len() + args.len());
-                for w in env {
-                    self.inc_inline(*w);
-                    handles.push(*w);
-                }
-                for a in args {
-                    let h = self.boxed(*a);
-                    handles.push(h);
-                }
-                let ptr = self.spill(&handles);
-                let callee = self.jit.module.declare_func_in_func(*id, self.builder.func);
-                let call = self.builder.ins().call(callee, &[self.ctx, ptr]);
-                let v = self.builder.inst_results(call)[0];
-                self.check();
-                Val {
-                    kind: Kind::Boxed,
-                    v,
-                    ty: 0,
-                    home: 0,
-                }
+                })
             }
         }
     }
@@ -2829,15 +3133,6 @@ impl Fx<'_, '_> {
         self.builder.seal_block(fine);
         let len = self.builder.ins().uload32(MemFlags::trusted(), list, 8);
         Ok(Walk::List { list, len })
-    }
-
-    /// What a fused loop held for its step, let go once the loop is done.
-    fn release_step(&mut self, step: Step) {
-        if let Step::Lambda { env, .. } = step {
-            for w in env {
-                self.dec_inline(w);
-            }
-        }
     }
 
     /// `fold` over a `range` and `iterate`, as loops in this body calling their step directly
@@ -2952,11 +3247,11 @@ impl Fx<'_, '_> {
                 };
                 let next = match b {
                     Builtin::Fold => {
-                        let next = self.call_step(&step, &[acc_val, x]);
+                        let next = self.call_step(&step, &[acc_val, x], scope)?;
                         self.coerce(next, acc_kind)
                     }
                     Builtin::Map => {
-                        let r = self.call_step(&step, &[x]);
+                        let r = self.call_step(&step, &[x], scope)?;
                         let r = self.boxed(r);
                         self.helper(self.jit.helpers.list_push, &[acc, r])
                     }
@@ -2973,7 +3268,8 @@ impl Fx<'_, '_> {
                                 ty: 0,
                                 home: 0,
                             }],
-                        );
+                            scope,
+                        )?;
                         let keep = self.as_bool(r);
                         let kept = self.builder.create_block();
                         let dropped = self.builder.create_block();
@@ -3004,7 +3300,6 @@ impl Fx<'_, '_> {
                 if let Walk::List { list, .. } = &walk {
                     self.dec_inline(*list);
                 }
-                self.release_step(step);
                 Ok(Some(Val {
                     kind: acc_kind,
                     v,
@@ -3020,6 +3315,7 @@ impl Fx<'_, '_> {
                     return Ok(None);
                 }
                 let seed = self.consumed(&args[0], scope)?;
+                let seed_ty = seed.ty;
                 let seed = self.boxed(seed);
                 let budget = self.consumed(&args[1], scope)?;
                 let budget = self.as_int(budget);
@@ -3070,6 +3366,47 @@ impl Fx<'_, '_> {
 
                 self.builder.switch_to_block(body);
                 self.builder.seal_block(body);
+                if let Step::Inline {
+                    params,
+                    body: step_body,
+                    captures,
+                } = &step
+                {
+                    // The step's body in the loop, its `Continue` and `Stop` as jumps: no
+                    // constructor is built and no call is made per step.
+                    let mark = self.homes.len();
+                    let pin = self.pinned.len();
+                    self.pinned.extend(captures.iter().cloned());
+                    let mut inner = scope.clone();
+                    let v = self.home(Val {
+                        kind: Kind::Boxed,
+                        v: state,
+                        ty: seed_ty,
+                        home: 0,
+                    });
+                    inner.push((params[0].clone(), v));
+                    let loop_ = Loop {
+                        go,
+                        stop,
+                        header,
+                        exit,
+                        left,
+                        state,
+                    };
+                    self.iterate_tail(step_body, &mut inner, mark, &loop_)?;
+                    self.homes.truncate(mark);
+                    self.pinned.truncate(pin);
+                    self.builder.seal_block(header);
+                    self.builder.switch_to_block(exit);
+                    self.builder.seal_block(exit);
+                    let v = self.builder.block_params(exit)[0];
+                    return Ok(Some(Val {
+                        kind: Kind::Boxed,
+                        v,
+                        ty: 0,
+                        home: 0,
+                    }));
+                }
                 let r = self.call_step(
                     &step,
                     &[Val {
@@ -3078,70 +3415,22 @@ impl Fx<'_, '_> {
                         ty: 0,
                         home: 0,
                     }],
-                );
+                    scope,
+                )?;
                 let r = self.boxed(r);
-                // `Continue(x)` or `Stop(x)`, unwrapped in place: the payload is held once more
-                // and the constructor let go.
-                let unwrap = self.builder.create_block();
-                let check_ctor = self.builder.create_block();
-                let bad = self.builder.create_block();
-                let tagged = self.builder.ins().band_imm(r, 1);
-                self.builder.ins().brif(tagged, bad, &[], check_ctor, &[]);
-                self.builder.switch_to_block(check_ctor);
-                self.builder.seal_block(check_ctor);
-                let kind = self
-                    .builder
-                    .ins()
-                    .uload8(types::I32, MemFlags::trusted(), r, 4);
-                let is_ctor = self.builder.ins().icmp_imm(
-                    IntCC::Equal,
-                    kind,
-                    i64::from(crate::heap::KIND_CTOR),
-                );
-                let len = self.builder.ins().uload32(MemFlags::trusted(), r, 8);
-                let one_field = self.builder.ins().icmp_imm(IntCC::Equal, len, 1);
-                let index = self.builder.ins().uload32(MemFlags::trusted(), r, 12);
-                let is_stop = self
-                    .builder
-                    .ins()
-                    .icmp_imm(IntCC::Equal, index, i64::from(stop));
-                let is_go = self
-                    .builder
-                    .ins()
-                    .icmp_imm(IntCC::Equal, index, i64::from(go));
-                let named = self.builder.ins().bor(is_stop, is_go);
-                let shaped = self.builder.ins().band(is_ctor, one_field);
-                let ok = self.builder.ins().band(shaped, named);
-                self.builder.ins().brif(ok, unwrap, &[], bad, &[]);
-                self.builder.switch_to_block(bad);
-                self.builder.seal_block(bad);
-                let two = self.builder.ins().iconst(types::I64, 2);
-                self.helper_void(self.jit.helpers.iterate_bad, &[two, r]);
-                self.check();
-                self.builder.ins().jump(exit, &[BlockArg::Value(state)]);
-                self.builder.switch_to_block(unwrap);
-                self.builder.seal_block(unwrap);
-                let payload =
-                    self.builder
-                        .ins()
-                        .load(types::I64, MemFlags::trusted(), r, HEADER as i32);
-                self.inc_inline(payload);
-                self.dec_inline(r);
-                let again = self.builder.create_block();
-                self.builder
-                    .ins()
-                    .brif(is_stop, exit, &[BlockArg::Value(payload)], again, &[]);
-                self.builder.switch_to_block(again);
-                self.builder.seal_block(again);
-                let left1 = self.builder.ins().iadd_imm(left, -1);
-                self.builder
-                    .ins()
-                    .jump(header, &[BlockArg::Value(left1), BlockArg::Value(payload)]);
+                let loop_ = Loop {
+                    go,
+                    stop,
+                    header,
+                    exit,
+                    left,
+                    state,
+                };
+                self.unwrap_step(r, &loop_);
                 self.builder.seal_block(header);
                 self.builder.switch_to_block(exit);
                 self.builder.seal_block(exit);
                 let v = self.builder.block_params(exit)[0];
-                self.release_step(step);
                 Ok(Some(Val {
                     kind: Kind::Boxed,
                     v,
@@ -3150,6 +3439,153 @@ impl Fx<'_, '_> {
                 }))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// `r`, a step's answer — `Continue(x)` or `Stop(x)` — unwrapped in place: the payload is
+    /// held once more, the constructor let go, and the loop continued or left.
+    fn unwrap_step(&mut self, r: cranelift_codegen::ir::Value, loop_: &Loop) {
+        let Loop {
+            go,
+            stop,
+            header,
+            exit,
+            left,
+            state,
+        } = *loop_;
+        let unwrap = self.builder.create_block();
+        let check_ctor = self.builder.create_block();
+        let bad = self.builder.create_block();
+        let tagged = self.builder.ins().band_imm(r, 1);
+        self.builder.ins().brif(tagged, bad, &[], check_ctor, &[]);
+        self.builder.switch_to_block(check_ctor);
+        self.builder.seal_block(check_ctor);
+        let kind = self
+            .builder
+            .ins()
+            .uload8(types::I32, MemFlags::trusted(), r, 4);
+        let is_ctor =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::heap::KIND_CTOR));
+        let len = self.builder.ins().uload32(MemFlags::trusted(), r, 8);
+        let one_field = self.builder.ins().icmp_imm(IntCC::Equal, len, 1);
+        let index = self.builder.ins().uload32(MemFlags::trusted(), r, 12);
+        let is_stop = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, index, i64::from(stop));
+        let is_go = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, index, i64::from(go));
+        let named = self.builder.ins().bor(is_stop, is_go);
+        let shaped = self.builder.ins().band(is_ctor, one_field);
+        let ok = self.builder.ins().band(shaped, named);
+        self.builder.ins().brif(ok, unwrap, &[], bad, &[]);
+        self.builder.switch_to_block(bad);
+        self.builder.seal_block(bad);
+        let two = self.builder.ins().iconst(types::I64, 2);
+        self.helper_void(self.jit.helpers.iterate_bad, &[two, r]);
+        self.check();
+        self.builder.ins().jump(exit, &[BlockArg::Value(state)]);
+        self.builder.switch_to_block(unwrap);
+        self.builder.seal_block(unwrap);
+        let payload = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), r, HEADER as i32);
+        self.inc_inline(payload);
+        self.dec_inline(r);
+        let again = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_stop, exit, &[BlockArg::Value(payload)], again, &[]);
+        self.builder.switch_to_block(again);
+        self.builder.seal_block(again);
+        let left1 = self.builder.ins().iadd_imm(left, -1);
+        self.builder
+            .ins()
+            .jump(header, &[BlockArg::Value(left1), BlockArg::Value(payload)]);
+    }
+
+    /// An inlined `iterate` step's body in tail position: `Continue(x)` jumps to the loop's
+    /// header with `x` as the next state and `Stop(x)` to its exit, through an `if` or a block;
+    /// anything else is evaluated and unwrapped as a called step's answer is. The step's own
+    /// bindings are released on every path out.
+    fn iterate_tail(
+        &mut self,
+        code: &Code,
+        scope: &mut Scope,
+        base: usize,
+        loop_: &Loop,
+    ) -> Result<()> {
+        let answered = match &code.kind {
+            NodeKind::App { func, args } if args.len() == 1 => match &func.kind {
+                NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
+                    Denotes::Ctor(index, 1)
+                        if index as u32 == loop_.go || index as u32 == loop_.stop =>
+                    {
+                        Some((index as u32, &args[0]))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((index, arg)) = answered {
+            let v = self.consumed(arg, scope)?;
+            let w = self.boxed(v);
+            self.release_homes_since(base);
+            if index == loop_.go {
+                let left1 = self.builder.ins().iadd_imm(loop_.left, -1);
+                self.builder
+                    .ins()
+                    .jump(loop_.header, &[BlockArg::Value(left1), BlockArg::Value(w)]);
+            } else {
+                self.builder.ins().jump(loop_.exit, &[BlockArg::Value(w)]);
+            }
+            return Ok(());
+        }
+        match &code.kind {
+            NodeKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let c = self.expr(cond, scope)?;
+                let c = self.as_bool(c);
+                let then_block = self.builder.create_block();
+                let else_block = self.builder.create_block();
+                self.builder.ins().brif(c, then_block, &[], else_block, &[]);
+                self.builder.switch_to_block(then_block);
+                self.builder.seal_block(then_block);
+                let mut inner = scope.clone();
+                self.iterate_tail(then_branch, &mut inner, base, loop_)?;
+                self.builder.switch_to_block(else_block);
+                self.builder.seal_block(else_block);
+                let mut inner = scope.clone();
+                self.iterate_tail(else_branch, &mut inner, base, loop_)
+            }
+            NodeKind::Block {
+                stmts,
+                tail: Some(t),
+            } => {
+                let mut inner = scope.clone();
+                let mark = self.homes.len();
+                self.block_stmts(stmts, &mut inner)?;
+                self.iterate_tail(t, &mut inner, base, loop_)?;
+                self.homes.truncate(mark);
+                Ok(())
+            }
+            _ => {
+                let r = self.consumed(code, scope)?;
+                let r = self.boxed(r);
+                self.release_homes_since(base);
+                self.unwrap_step(r, loop_);
+                Ok(())
+            }
         }
     }
 
@@ -3162,6 +3598,28 @@ impl Fx<'_, '_> {
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
             vals.push(self.consumed(a, scope)?);
+        }
+        if scalar_builtin_answers(b, args.len()) {
+            let a = self.as_int(vals[0]);
+            let n = self.as_int(vals[1]);
+            let v = match b {
+                Builtin::WrapAdd => self.builder.ins().iadd(a, n),
+                Builtin::WrapSub => self.builder.ins().isub(a, n),
+                Builtin::WrapMul => self.builder.ins().imul(a, n),
+                _ => {
+                    let word = self.builder.ins().ireduce(types::I32, a);
+                    let count = self.builder.ins().band_imm(n, 31);
+                    let count = self.builder.ins().ireduce(types::I32, count);
+                    let turned = self.builder.ins().rotr(word, count);
+                    self.builder.ins().uextend(types::I64, turned)
+                }
+            };
+            return Ok(Val {
+                kind: Kind::Int,
+                v,
+                ty: 0,
+                home: 0,
+            });
         }
         let target = self.boxed(vals[0]);
         let at = (b == Builtin::BytesAt).then(|| self.as_int(vals[1]));
@@ -3263,7 +3721,12 @@ impl Fx<'_, '_> {
         };
         let denotes = self.denotation(q, scope)?;
         if let Denotes::Local(v) = denotes {
-            let callee = self.captured(func.own, v);
+            let own = if self.is_pinned(func) {
+                Own::Borrowed
+            } else {
+                func.own
+            };
+            let callee = self.captured(own, v);
             let callee = self.boxed(callee);
             return self.call_value(callee, args, scope);
         }
@@ -3295,8 +3758,23 @@ impl Fx<'_, '_> {
             // by the read rule — and takes each at its own last use.
             let mut vals = Vec::with_capacity(args.len() + 1);
             vals.push(self.ctx);
-            for (a, kind) in args.iter().zip(&f.sig.params) {
-                let v = self.consumed(a, scope)?;
+            // A borrowed parameter takes a local as it is, the caller's hold outliving the
+            // call, and a temporary with the hold this body has on it, let go afterwards.
+            let mut lent = Vec::new();
+            for (i, (a, kind)) in args.iter().zip(&f.sig.params).enumerate() {
+                // A local passed as it is must outlive the call: a later argument that moves
+                // it out — its last use — would free it first, so that case holds it.
+                let moved_later = matches!(&a.kind, NodeKind::Var { name: q, .. }
+                    if args[i + 1..].iter().any(|later| moves(later, q.symbol())));
+                let v = if f.sig.borrowed[i] && self.is_local(a, scope) && !moved_later {
+                    self.expr(a, scope)?
+                } else {
+                    let v = self.consumed(a, scope)?;
+                    if f.sig.borrowed[i] && v.kind == Kind::Boxed {
+                        lent.push(v.v);
+                    }
+                    v
+                };
                 let v = self.coerce(v, *kind);
                 vals.push(v);
             }
@@ -3307,6 +3785,9 @@ impl Fx<'_, '_> {
             let call = self.builder.ins().call(callee, &vals);
             let v = self.builder.inst_results(call)[0];
             self.check();
+            for w in lent {
+                self.dec_inline(w);
+            }
             return Ok(Val {
                 kind: f.sig.ret,
                 v,
@@ -3446,9 +3927,7 @@ impl Fx<'_, '_> {
                         .ins()
                         .iconst(types::I64, self.jit.nullaries[index])
                 } else {
-                    let ptr = self.spill(&handles);
-                    let index = self.builder.ins().iconst(types::I64, index as i64);
-                    self.helper(self.jit.helpers.ctor, &[index, ptr, n])
+                    self.built_fresh(crate::heap::KIND_CTOR, index as u32, &handles)
                 }
             }
             Denotes::Local(_) => unreachable!("a local callee is called through `call_value`"),
