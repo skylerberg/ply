@@ -2332,6 +2332,7 @@ credential from a wrong one.
 wrap_add(a: Int, b: Int) -> Int
 wrap_sub(a: Int, b: Int) -> Int
 wrap_mul(a: Int, b: Int) -> Int
+rotr32(x: Int, n: Int) -> Int
 ```
 
 Two's complement, modulo 2^64, and the only arithmetic in the language that
@@ -2340,10 +2341,16 @@ spelling is the safe one, and a step that is *defined* to wrap — a 64-bit mixi
 function, a linear congruential generator — says so in the name it calls rather
 than in a comment beside an operator that means something else.
 
+`rotr32` answers the low thirty-two bits of `x` rotated right by `n` modulo
+thirty-two, as the non-negative `Int` a masked word is, whatever `x` held above
+that word and whatever the sign of `n`. It is the rotate a hash written over
+masked words turns on every quarter-round, which spelled with shifts is two
+counts checked, a subtraction and a mask; under the compiled backend it is one
+instruction, as the three above are.
+
 You will reach for these less often than you expect. Arithmetic on values masked
-to 32 bits cannot overflow an `Int` at all, so `std.hash`'s BLAKE3 — the one
-thing in this tree written to need them — uses none: it masks with `& 0xFFFF_FFFF`
-and adds with `+`.
+to 32 bits cannot overflow an `Int` at all, so `std.hash`'s BLAKE3 masks with
+`& 0xFFFF_FFFF`, adds with `+`, and of the four calls only `rotr32`.
 
 ---
 
@@ -2363,7 +2370,7 @@ $ ply std
    std.config  15           5      4810
    std.db      292          34     110073
    std.fs      25           9      12652
-   std.hash    32           5      8970
+   std.hash    32           5      8917
    std.http    166          53     102957
    std.json    137          38     55912
    std.net     7            3      3720
@@ -2373,7 +2380,7 @@ $ ply std
 
    `import std.<name>` to use one; `ply std --show <name>` prints its source
 
-   digest: b3:2b15c1c16074
+   digest: b3:46eb0b21deb3
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`

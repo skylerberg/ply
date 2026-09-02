@@ -10,8 +10,8 @@
 use crate::source::Source;
 use ply_span::Symbol;
 use ply_syntax::ast::{
-    Expr, ExprKind, FnDef, HandleClause, Ident, Item, MatchArm, Module, Pattern, PatternKind,
-    QName, ReturnClause, Stmt,
+    BinOp, Expr, ExprKind, FnDef, HandleClause, Ident, Item, Lit, MatchArm, Module, Pattern,
+    PatternKind, QName, ReturnClause, Stmt,
 };
 use std::collections::HashSet;
 
@@ -849,7 +849,7 @@ fn walk_children<'a>(e: &'a Expr, f: &mut dyn FnMut(&'a Expr)) {
 /// replaced by their fields.
 fn scalarize(e: Expr) -> Expr {
     let span = e.span;
-    let kind = match e.kind {
+    match e.kind {
         ExprKind::Block { stmts, tail } => {
             let mut flat: Vec<Stmt> = Vec::with_capacity(stmts.len());
             for s in stmts {
@@ -896,15 +896,114 @@ fn scalarize(e: Expr) -> Expr {
                 }
             }
             let tail = tail.map(|t| Box::new(scalarize(*t)));
-            replace_records(flat, tail)
+            let mut e = Expr {
+                kind: replace_records(flat, tail),
+                span,
+            };
+            fold_literals(&mut e);
+            e
         }
         other => {
             let mut e = Expr { kind: other, span };
             map_children(&mut e, scalarize);
-            return e;
+            fold_literals(&mut e);
+            e
         }
+    }
+}
+
+/// Every operator over two `Int` literals folded to its answer, where the answer is what the
+/// operator would give at evaluation: an overflow or a shift count outside `0..64` is left for
+/// the evaluator to raise.
+fn fold_literals(e: &mut Expr) {
+    map_children_mut(e, &mut fold_literals);
+    let folded = match &e.kind {
+        ExprKind::Binary { op, lhs, rhs } => match (&lhs.kind, &rhs.kind) {
+            (ExprKind::Lit(Lit::Int(a)), ExprKind::Lit(Lit::Int(b))) => match op {
+                BinOp::Add => a.checked_add(*b),
+                BinOp::Sub => a.checked_sub(*b),
+                BinOp::Mul => a.checked_mul(*b),
+                BinOp::BitAnd => Some(a & b),
+                BinOp::BitOr => Some(a | b),
+                BinOp::BitXor => Some(a ^ b),
+                BinOp::Shl if (0..64).contains(b) => Some(a << b),
+                BinOp::Shr if (0..64).contains(b) => Some(a >> b),
+                BinOp::Ushr if (0..64).contains(b) => Some(((*a as u64) >> b) as i64),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
     };
-    Expr { kind, span }
+    if let Some(n) = folded {
+        e.kind = ExprKind::Lit(Lit::Int(n));
+    }
+}
+
+/// Whether anything in what follows binds `name` again — a `let`, a lambda parameter or a
+/// pattern — under which a read would mean the new binding.
+fn rebinds(name: &Symbol, rest: &[Stmt], tail: Option<&Expr>) -> bool {
+    fn binds(e: &Expr, name: &Symbol) -> bool {
+        let mut hit = false;
+        walk(e, &mut |x| match &x.kind {
+            ExprKind::Lambda { params, .. } if params.iter().any(|p| p.name.name == *name) => {
+                hit = true;
+            }
+            ExprKind::Match { arms, .. } => {
+                for arm in arms {
+                    let mut b = Vec::new();
+                    binders(&arm.pat, &mut b);
+                    if b.contains(name) {
+                        hit = true;
+                    }
+                }
+            }
+            ExprKind::Block { stmts, .. } => {
+                for s in stmts {
+                    if let Stmt::Let { pat, .. } = s {
+                        let mut b = Vec::new();
+                        binders(pat, &mut b);
+                        if b.contains(name) {
+                            hit = true;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        });
+        hit
+    }
+    rest.iter().any(|s| match s {
+        Stmt::Let { pat, value, .. } => {
+            let mut b = Vec::new();
+            binders(pat, &mut b);
+            b.contains(name) || binds(value, name)
+        }
+        Stmt::Expr(x) => binds(x, name),
+    }) || tail.is_some_and(|t| binds(t, name))
+}
+
+/// Every bare read of `name` in what follows becomes `with`.
+fn substitute_var(name: &Symbol, with: &Expr, rest: &mut [Stmt], tail: Option<&mut Expr>) {
+    fn go(e: &mut Expr, name: &Symbol, with: &Expr) {
+        if let ExprKind::Var(q) = &e.kind
+            && q.is_bare()
+            && q.name.name == *name
+        {
+            e.kind = with.kind.clone();
+            return;
+        }
+        map_children_mut(e, &mut |c| go(c, name, with));
+    }
+    for s in rest.iter_mut() {
+        match s {
+            Stmt::Let { value, .. } => go(value, name, with),
+            Stmt::Expr(x) => go(x, name, with),
+        }
+    }
+    if let Some(t) = tail {
+        go(t, name, with);
+    }
 }
 
 /// A block's statements with every `let x = {f: .., ..}` whose `x` is only ever read as `x.f`
@@ -929,6 +1028,15 @@ fn replace_records(stmts: Vec<Stmt>, tail: Option<Box<Expr>>) -> ExprKind {
                     PatternKind::Var(id) => Some(id.name.clone()),
                     _ => None,
                 };
+                // A `let` of a scalar literal is the literal at every read, so a count a callee
+                // named is a constant where it is used — and a shift by one needs no check.
+                if let Some(name) = &name
+                    && matches!(&value.kind, ExprKind::Lit(Lit::Int(_) | Lit::Bool(_)))
+                    && !rebinds(name, &rest, tail.as_deref())
+                {
+                    substitute_var(name, &value, &mut rest, tail.as_deref_mut());
+                    continue;
+                }
                 // An alias of a split record reads through it.
                 if let Some(name) = &name
                     && let ExprKind::Var(q) = &value.kind
@@ -1235,5 +1343,22 @@ mod tests {
             !text.contains("g("),
             "the callee was left as a call:\n{text}"
         );
+    }
+
+    /// A count a callee named is the literal where it is used, and an operator over two
+    /// literals is its answer: a shift by `32 - n` with `n` known is a shift by a literal.
+    #[test]
+    fn a_literal_let_is_propagated_and_folded() {
+        let text = optimized(
+            "fn turn(x: Int, n: Int) -> Int = ((x >>> n) | (x << (32 - n))) & 255\n\
+             fn twice(x: Int) -> Int = turn(turn(x, 7), 12)\n",
+            "twice",
+        );
+        assert!(!text.contains("Sub"), "`32 - n` was not folded:\n{text}");
+        assert!(
+            text.contains("Shl Int(25)") && text.contains("Shl Int(20)"),
+            "{text}"
+        );
+        assert!(!text.contains("let n"), "a literal let survived:\n{text}");
     }
 }

@@ -76,7 +76,6 @@ struct Helpers {
     record_fits: FuncId,
     record_has: FuncId,
     builtin: FuncId,
-    ctor: FuncId,
     list: FuncId,
     list_fits: FuncId,
     list_at: FuncId,
@@ -95,7 +94,6 @@ struct Helpers {
     bytes_scan_until: FuncId,
     bytes_slice: FuncId,
     bytes_concat: FuncId,
-    record: FuncId,
     record_update: FuncId,
     field: FuncId,
     no_fuel: FuncId,
@@ -118,6 +116,7 @@ struct Helpers {
     dup: FuncId,
     dec: FuncId,
     reset: FuncId,
+    alloc: FuncId,
     constant: FuncId,
 }
 
@@ -600,7 +599,6 @@ impl Jit {
             record_fits: declare(&mut module, "rt_record_fits", 4, true)?,
             record_has: declare(&mut module, "rt_record_has", 3, true)?,
             builtin: declare(&mut module, "rt_builtin", 4, true)?,
-            ctor: declare(&mut module, "rt_ctor", 4, true)?,
             list: declare(&mut module, "rt_list", 3, true)?,
             list_fits: declare(&mut module, "rt_list_fits", 4, true)?,
             list_at: declare(&mut module, "rt_list_at", 3, true)?,
@@ -619,7 +617,6 @@ impl Jit {
             bytes_scan_until: declare(&mut module, "rt_bytes_scan_until", 5, true)?,
             bytes_slice: declare(&mut module, "rt_bytes_slice", 4, true)?,
             bytes_concat: declare(&mut module, "rt_bytes_concat", 3, true)?,
-            record: declare(&mut module, "rt_record", 4, true)?,
             record_update: declare(&mut module, "rt_record_update", 6, true)?,
             field: declare(&mut module, "rt_field", 4, true)?,
             no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
@@ -642,6 +639,7 @@ impl Jit {
             dup: declare(&mut module, "rt_dup", 2, true)?,
             dec: declare(&mut module, "rt_dec", 2, false)?,
             reset: declare(&mut module, "rt_reset", 2, true)?,
+            alloc: declare(&mut module, "rt_alloc", 5, true)?,
             constant: declare(&mut module, "rt_constant", 2, true)?,
         };
 
@@ -1030,7 +1028,17 @@ fn inline_builtin_answers(b: Builtin, arity: usize) -> bool {
     matches!(
         (b, arity),
         (Builtin::BytesAt, 2) | (Builtin::BytesLen, 1) | (Builtin::Len, 1)
-    )
+    ) || scalar_builtin_answers(b, arity)
+}
+
+/// The builtins over two `Int`s that are one instruction each: the wrapping arithmetic and the
+/// rotate of the low word.
+fn scalar_builtin_answers(b: Builtin, arity: usize) -> bool {
+    arity == 2
+        && matches!(
+            b,
+            Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul | Builtin::Rotr32
+        )
 }
 
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
@@ -1690,10 +1698,15 @@ impl Fx<'_, '_> {
         let flags = MemFlags::trusted();
         let one = self.builder.ins().iconst(types::I32, 1);
         self.builder.ins().store(flags, one, held, 0);
+        // The kind, and beside it the flat flag when every field is an immediate.
+        let flat = self.flat_over(ordered);
+        let flat = self.builder.ins().ishl_imm(flat, 8);
         let kind = self
             .builder
             .ins()
-            .iconst(types::I32, i64::from(KIND_RECORD));
+            .iconst(types::I64, i64::from(KIND_RECORD));
+        let kind = self.builder.ins().bor(kind, flat);
+        let kind = self.builder.ins().ireduce(types::I32, kind);
         self.builder.ins().store(flags, kind, held, 4);
         let len = self.builder.ins().iconst(types::I32, ordered.len() as i64);
         self.builder.ins().store(flags, len, held, 8);
@@ -1719,10 +1732,43 @@ impl Fx<'_, '_> {
         shape: u32,
         ordered: &[cranelift_codegen::ir::Value],
     ) -> cranelift_codegen::ir::Value {
-        let ptr = self.spill(ordered);
-        let shape = self.builder.ins().iconst(types::I64, i64::from(shape));
-        let n = self.builder.ins().iconst(types::I64, ordered.len() as i64);
-        self.helper(self.jit.helpers.record, &[shape, ptr, n])
+        self.built_fresh(KIND_RECORD, shape, ordered)
+    }
+
+    /// A fresh object with its header written by the runtime and its fields stored here, with
+    /// no argument array between.
+    fn built_fresh(
+        &mut self,
+        kind: u8,
+        layout: u32,
+        ordered: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let flat = self.flat_over(ordered);
+        let kind = self.builder.ins().iconst(types::I64, i64::from(kind));
+        let len = self.builder.ins().iconst(types::I64, ordered.len() as i64);
+        let layout = self.builder.ins().iconst(types::I64, i64::from(layout));
+        let p = self.helper(self.jit.helpers.alloc, &[kind, len, layout, flat]);
+        let flags = MemFlags::trusted();
+        for (i, h) in ordered.iter().enumerate() {
+            self.builder
+                .ins()
+                .store(flags, *h, p, (HEADER + 8 * i) as i32);
+        }
+        p
+    }
+
+    /// `1` when every word is an immediate, `0` otherwise: the flat flag of an object built over
+    /// them.
+    fn flat_over(
+        &mut self,
+        words: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let mut flat = self.builder.ins().iconst(types::I64, 1);
+        for w in words {
+            let tag = self.builder.ins().band_imm(*w, 1);
+            flat = self.builder.ins().band(flat, tag);
+        }
+        flat
     }
 
     fn is_local(&self, code: &Code, scope: &Scope) -> bool {
@@ -3325,6 +3371,28 @@ impl Fx<'_, '_> {
         for a in args {
             vals.push(self.consumed(a, scope)?);
         }
+        if scalar_builtin_answers(b, args.len()) {
+            let a = self.as_int(vals[0]);
+            let n = self.as_int(vals[1]);
+            let v = match b {
+                Builtin::WrapAdd => self.builder.ins().iadd(a, n),
+                Builtin::WrapSub => self.builder.ins().isub(a, n),
+                Builtin::WrapMul => self.builder.ins().imul(a, n),
+                _ => {
+                    let word = self.builder.ins().ireduce(types::I32, a);
+                    let count = self.builder.ins().band_imm(n, 31);
+                    let count = self.builder.ins().ireduce(types::I32, count);
+                    let turned = self.builder.ins().rotr(word, count);
+                    self.builder.ins().uextend(types::I64, turned)
+                }
+            };
+            return Ok(Val {
+                kind: Kind::Int,
+                v,
+                ty: 0,
+                home: 0,
+            });
+        }
         let target = self.boxed(vals[0]);
         let at = (b == Builtin::BytesAt).then(|| self.as_int(vals[1]));
         let want = if b == Builtin::Len {
@@ -3613,9 +3681,7 @@ impl Fx<'_, '_> {
                         .ins()
                         .iconst(types::I64, self.jit.nullaries[index])
                 } else {
-                    let ptr = self.spill(&handles);
-                    let index = self.builder.ins().iconst(types::I64, index as i64);
-                    self.helper(self.jit.helpers.ctor, &[index, ptr, n])
+                    self.built_fresh(crate::heap::KIND_CTOR, index as u32, &handles)
                 }
             }
             Denotes::Local(_) => unreachable!("a local callee is called through `call_value`"),
