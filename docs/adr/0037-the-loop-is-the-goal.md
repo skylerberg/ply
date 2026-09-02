@@ -30,10 +30,12 @@ and the loop has the property today in one tier and not in the other.
 > edit and loads what a run's selected tests reach, at a per-definition
 > constant the loop affords — and not, once such a cache exists, whatever
 > compiles fastest. That emitted C inside the loop is a constant-factor
-> question and not an exponent one, priced by `benches/c-floor/` and left
-> open. And that the row which orders all of it is `ply-corpus bench`'s edit
-> scenarios across the size ladder, fitted, with the backend arm it lacks,
-> whose criteria are registered below before the reading.
+> question rather than an exponent one, measured by `benches/c-floor/`, which
+> refuses one C shape — an image per definition, whose load cost grows faster
+> than the reach — and leaves the other open. And that the row which orders
+> all of it is `ply-corpus bench`'s edit scenarios across the size ladder,
+> fitted, with the backend arm it lacks, whose criteria are registered below
+> before the reading.
 >
 > **What it does not decide.** That C is the release target — ADR 0021's path
 > already carries that as a direction and this record does not re-take it. Nor
@@ -189,9 +191,9 @@ the dependency smaller than the one it replaces.
 six sizes. What is missing: a `--backend` option on `bench`, which calls
 `ply_test::run` in-process and installs no backend, though
 `ply_cli::commands::common::build_backend` is public and is the seam the
-command itself uses; a fit across the sizes,
-since `sweep` prints one report per size and nothing reads the slope; and the
-process start `bench` does not pay. The criteria, written before the arm
+command itself uses; a fit across the sizes, since `sweep` prints one report
+per size and nothing reads the slope; and the process start `bench` does not
+pay, since it runs the phases in-process. The criteria, written before the arm
 exists:
 
 **Question.** What does one edit cost, and does it grow with the size of the
