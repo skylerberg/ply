@@ -124,7 +124,9 @@ short list — carry the words they came from. The interpreter memoizes the same
 functions, so the two arms of the front-end row do the same work now, and the
 census says what still crosses: the answers of roots that take arguments the
 memo does not hold, which is what a driver written in Ply, entered once, would
-never convert at all.
+never convert at all. What does cross is walked once: the conversion notes on
+the way whether it read a handle, which the seam refuses to carry out, rather
+than walking the answer again to ask.
 
 ## Decision 6 — the map is an ordered tree
 
