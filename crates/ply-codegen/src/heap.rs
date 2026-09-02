@@ -3,11 +3,12 @@
 //!
 //! A word with its low bit set is an `Int` in its upper sixty-three bits; a word with it clear is
 //! the address of an [`Obj`]. `Unit`, `true` and `false` are three immortal objects, so a `Bool`
-//! is a pointer compare and never an allocation. A record, a constructor, a list and a native
-//! closure are laid out as words after a sixteen-byte header; anything the model does not lay
-//! out natively yet — strings, bytes, maps, floats, decimals, secrets, the interpreter's own
-//! closures — is carried whole as a [`Value`] behind a `Bridge` object, cheap to hand back to a
-//! builtin because the value's own buffer is shared rather than copied.
+//! is a pointer compare and never an allocation. A record, a constructor, a list, a map and a
+//! native closure are laid out as words after a sixteen-byte header, and a string or a bytes
+//! value as its bytes after the same header, with room to grow so that appending to one nobody
+//! else holds is a copy of the appended piece alone; anything the model does not lay out
+//! natively yet — floats, decimals, secrets, the interpreter's own closures — is carried whole as
+//! a [`Value`] behind a `Bridge` object.
 //!
 //! Every object an entry allocates is logged, and [`Heap::end`] releases the log: a count that
 //! reaches zero dismantles its object then and there — its children let go, a bridged value
@@ -36,6 +37,10 @@ pub const KIND_CLOSURE: u8 = 6;
 pub const KIND_BRIDGE: u8 = 7;
 /// A sorted array of key and value words, `len` entries of two words with room for `layout`.
 pub const KIND_MAP: u8 = 8;
+/// `len` bytes of UTF-8 with room for `layout`.
+pub const KIND_STR: u8 = 9;
+/// `len` bytes with room for `layout`.
+pub const KIND_BYTES: u8 = 10;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -44,8 +49,9 @@ pub const IMMORTAL: u32 = u32::MAX;
 pub const HEADER: usize = 16;
 
 /// The header every object starts with. `len` is the payload's word count for a record, a
-/// constructor, a list or a closure; `layout` is a record's shape, a constructor's index, a
-/// list's capacity or a closure's arity.
+/// constructor, a list or a closure and its byte count for a string or a bytes value; `layout`
+/// is a record's shape, a constructor's index, a list's or a string's capacity or a closure's
+/// arity.
 #[repr(C, align(8))]
 pub struct Obj {
     pub rc: u32,
@@ -146,6 +152,21 @@ pub unsafe fn bridged_mut<'a>(o: *mut Obj) -> &'a mut Value {
     unsafe { &mut *bridge_slot(o) }
 }
 
+/// Where a string's or a bytes value's payload starts.
+pub unsafe fn bytes_ptr(o: *mut Obj) -> *mut u8 {
+    unsafe { (o as *mut u8).add(HEADER) }
+}
+
+/// The bytes a string or a bytes value holds, borrowed.
+pub unsafe fn bytes_of<'a>(o: *mut Obj) -> &'a [u8] {
+    unsafe { std::slice::from_raw_parts(bytes_ptr(o), (*o).len as usize) }
+}
+
+/// A string's payload as the text it is: a native string never holds anything but UTF-8.
+pub unsafe fn str_of<'a>(o: *mut Obj) -> &'a str {
+    unsafe { std::str::from_utf8_unchecked(bytes_of(o)) }
+}
+
 /// The shapes records are laid out by: a shape is its sorted field names, and a field's offset
 /// is its position in them.
 #[derive(Default)]
@@ -179,6 +200,9 @@ pub struct Layouts {
     pub none: Option<u32>,
     pub stop: Option<u32>,
     pub go: Option<u32>,
+    pub less: Option<u32>,
+    pub equal: Option<u32>,
+    pub greater: Option<u32>,
     /// Per shape, the offset of each field name the compiled unit reads by index, filled on the
     /// shape's first such read so a lookup is a load rather than a search over symbols.
     offsets: RefCell<Vec<Option<Box<[u16]>>>>,
@@ -198,6 +222,7 @@ impl Layouts {
             .collect();
         let by = |name: &str| ctor_ids.get(&Symbol::new(name)).copied();
         let (some, none, stop, go) = (by("Some"), by("None"), by("Stop"), by("Continue"));
+        let (less, equal, greater) = (by("Less"), by("Equal"), by("Greater"));
         let mut shapes = Shapes::default();
         let entry_shape = shapes.intern(vec![Symbol::new("key"), Symbol::new("value")]);
         Layouts {
@@ -208,6 +233,9 @@ impl Layouts {
             none,
             stop,
             go,
+            less,
+            equal,
+            greater,
             offsets: RefCell::new(Vec::new()),
             entry_shape,
         }
@@ -388,6 +416,52 @@ impl Heap {
         self.raw_alloc(KIND_MAP, 0, 0, cap, cap as usize * 16)
     }
 
+    /// A fresh string or bytes value with room for `cap` bytes and none in use yet.
+    pub fn alloc_bytes(&mut self, kind: u8, cap: u32) -> *mut Obj {
+        self.raw_alloc(kind, 0, 0, cap, cap as usize)
+    }
+
+    /// A string or bytes value of `kind` holding `a` then `b`, with at least `room` bytes of
+    /// capacity.
+    fn joined(&mut self, kind: u8, a: &[u8], b: &[u8], room: usize) -> *mut Obj {
+        let len = a.len() + b.len();
+        let o = self.alloc_bytes(kind, room.max(len) as u32);
+        unsafe {
+            std::ptr::copy_nonoverlapping(a.as_ptr(), bytes_ptr(o), a.len());
+            std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(o).add(a.len()), b.len());
+            (*o).len = len as u32;
+        }
+        o
+    }
+
+    pub fn str(&mut self, s: &str) -> Word {
+        self.joined(KIND_STR, s.as_bytes(), &[], 0) as Word
+    }
+
+    pub fn bytes(&mut self, b: &[u8]) -> Word {
+        self.joined(KIND_BYTES, b, &[], 0) as Word
+    }
+
+    /// `a` with `b` appended, of `a`'s kind. Takes `a`: when nobody else holds it and it has the
+    /// room, the bytes are written after its own and it is answered; otherwise a fresh value with
+    /// room to grow again is answered and `a` released. A value built by appending to it in a
+    /// loop therefore copies each piece once.
+    pub fn append(&mut self, a: Word, b: &[u8]) -> Word {
+        let o = obj(a);
+        let (len, cap) = unsafe { ((*o).len as usize, (*o).layout as usize) };
+        if is_unique(a) && len + b.len() <= cap {
+            unsafe {
+                std::ptr::copy_nonoverlapping(b.as_ptr(), bytes_ptr(o).add(len), b.len());
+                (*o).len = (len + b.len()) as u32;
+            }
+            return a;
+        }
+        let kind = unsafe { (*o).kind };
+        let out = self.joined(kind, unsafe { bytes_of(o) }, b, (len + b.len()) * 2);
+        dec(a);
+        out as Word
+    }
+
     pub fn boxed_int(&mut self, v: i64) -> Word {
         if fits_imm(v) {
             return imm(v);
@@ -445,6 +519,7 @@ impl Heap {
             let out = match (*o).kind {
                 KIND_UNIT | KIND_BOOL => return w,
                 KIND_INT => self.boxed_int(word_at(o, 0)),
+                KIND_STR | KIND_BYTES => self.joined((*o).kind, bytes_of(o), &[], 0) as Word,
                 KIND_BRIDGE => self.bridge(bridged(o).clone()),
                 KIND_LIST => {
                     let n = (*o).len;
@@ -517,6 +592,8 @@ impl Heap {
             Value::Int(n) => self.boxed_int(*n),
             Value::Bool(b) => bool(*b),
             Value::Unit => unit(),
+            Value::Str(s) if u32::try_from(s.len()).is_ok() => self.str(s),
+            Value::Bytes(b) if u32::try_from(b.len()).is_ok() => self.bytes(b),
             Value::Record(fields) => {
                 let shape = layouts.shape(fields.keys().cloned().collect::<Vec<Symbol>>());
                 let n = fields.len() as u32;
@@ -600,6 +677,8 @@ impl Heap {
                 KIND_UNIT => Value::Unit,
                 KIND_BOOL => Value::Bool((*o).flags != 0),
                 KIND_INT => Value::Int(word_at(o, 0)),
+                KIND_STR => Value::Str(Arc::from(str_of(o))),
+                KIND_BYTES => Value::Bytes(Arc::from(bytes_of(o))),
                 KIND_RECORD => {
                     let names = layouts.shape_names((*o).layout);
                     let fields: Vec<(Symbol, Value)> = names
@@ -880,6 +959,8 @@ fn rank(w: Word) -> u8 {
             KIND_UNIT => 0,
             KIND_BOOL => 1,
             KIND_INT => 2,
+            KIND_STR => 5,
+            KIND_BYTES => 6,
             KIND_LIST => 7,
             KIND_MAP => 8,
             KIND_RECORD => 9,
@@ -931,6 +1012,8 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
         match ka {
             KIND_UNIT => Ordering::Equal,
             KIND_BOOL => (*obj(a)).flags.cmp(&(*obj(b)).flags),
+            // Byte order, which is the order `str` and `[u8]` have.
+            KIND_STR | KIND_BYTES => bytes_of(obj(a)).cmp(bytes_of(obj(b))),
             KIND_BRIDGE => bridged(obj(a)).cmp(bridged(obj(b))),
             KIND_LIST => {
                 let (x, y) = (obj(a), obj(b));
@@ -1003,7 +1086,7 @@ pub fn native_key(w: Word) -> bool {
     let o = obj(w);
     unsafe {
         match (*o).kind {
-            KIND_UNIT | KIND_BOOL | KIND_INT => true,
+            KIND_UNIT | KIND_BOOL | KIND_INT | KIND_STR | KIND_BYTES => true,
             KIND_BRIDGE => matches!(bridged(o), Value::Str(_) | Value::Bytes(_)),
             KIND_RECORD | KIND_CTOR | KIND_LIST => {
                 (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
@@ -1230,10 +1313,40 @@ mod tests {
             (*parent).len = 1;
         }
         dec(parent as Word);
-        assert_eq!(kind(child), KIND_BRIDGE);
+        assert_eq!(kind(child), KIND_STR);
         assert_eq!(Heap::to_value(&l, child), Value::str("kept"));
         dec(child);
         assert_eq!(kind(child), KIND_DEAD);
+        h.end();
+    }
+
+    #[test]
+    fn appending_to_a_string_nobody_else_holds_writes_in_place_and_to_a_shared_one_copies() {
+        let mut h = Heap::new();
+        let l = layouts();
+        let mut s = h.str("ab");
+        let first = s;
+        s = h.append(s, b"cd");
+        assert_ne!(
+            s, first,
+            "an exact-sized value has no room, so the first append copies"
+        );
+        assert_eq!(kind(first), KIND_DEAD);
+        let grown = s;
+        s = h.append(s, b"e");
+        assert_eq!(
+            s, grown,
+            "the copy left room, so the next append is in place"
+        );
+        assert_eq!(Heap::to_value(&l, s), Value::str("abcde"));
+        inc(s);
+        let other = h.append(s, b"f");
+        assert_ne!(other, s, "a value held twice is not written into");
+        assert_eq!(Heap::to_value(&l, s), Value::str("abcde"));
+        assert_eq!(Heap::to_value(&l, other), Value::str("abcdef"));
+        let raw = h.bytes(b"\xff\x00");
+        assert_eq!(Heap::to_value(&l, raw), Value::bytes(b"\xff\x00"));
+        assert_eq!(kind(raw), KIND_BYTES);
         h.end();
     }
 
