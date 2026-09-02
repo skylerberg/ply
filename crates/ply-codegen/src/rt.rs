@@ -7,8 +7,9 @@
 //! Nothing here recurses over a value: a count reaching zero dismantles with a worklist.
 
 use crate::heap::{
-    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_BRIDGE, KIND_CLOSURE, KIND_CTOR, KIND_LIST,
-    KIND_MAP, KIND_RECORD, Layouts, Word, bridged, is_unique, obj, set_word, word_at,
+    self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_BRIDGE, KIND_BYTES, KIND_CLOSURE, KIND_CTOR,
+    KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Word, bridged, bytes_of, is_unique, obj,
+    set_word, str_of, word_at,
 };
 use crate::jit::Entry;
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
@@ -311,6 +312,12 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     if heap::is_imm(a) && heap::is_imm(b) {
         return i64::from(a == b);
     }
+    if !heap::is_imm(a) && !heap::is_imm(b) {
+        let (ka, kb) = (heap::kind(a), heap::kind(b));
+        if ka == kb && (ka == KIND_STR || ka == KIND_BYTES) {
+            return i64::from(unsafe { bytes_of(obj(a)) == bytes_of(obj(b)) });
+        }
+    }
     let ctx = unsafe { &mut *ctx };
     let (l, r) = (ctx.value(a), ctx.value(b));
     match values_equal(&l, &r, Span::DUMMY) {
@@ -319,11 +326,20 @@ pub unsafe extern "C" fn rt_equal(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     }
 }
 
-/// `++`, which is `String` concatenation only, built from the same two `Value::as_str` calls
-/// `interp::strict_binary` uses so a non-`Str` operand raises the identical error. Reads both.
+/// `++`, which is `String` concatenation only. Takes both: two native strings append, in place
+/// when the left one is held by nobody else and has the room; anything else goes through the
+/// same two `Value::as_str` calls `interp::strict_binary` uses, so a non-`Str` operand raises
+/// the identical error.
 pub unsafe extern "C" fn rt_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
+    if heap::kind(a) == KIND_STR && heap::kind(b) == KIND_STR {
+        let out = ctx.heap.append(a, unsafe { bytes_of(obj(b)) });
+        heap::dec(b);
+        return out;
+    }
     let (l, r) = (ctx.value(a), ctx.value(b));
+    heap::dec(a);
+    heap::dec(b);
     let joined = match (l.as_str(Span::DUMMY, "`++`"), r.as_str(Span::DUMMY, "`++`")) {
         (Ok(x), Ok(y)) => format!("{x}{y}"),
         (Err(d), _) | (_, Err(d)) => return ctx.fail(d),
@@ -361,8 +377,8 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
 
 /// The builtins answered over words, when their arguments have the native kinds; `None` hands the
 /// call to the interpreter's implementation.
-fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
-    match (b, args) {
+fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
+    match (which, args) {
         (Builtin::Len, [xs]) if heap::kind(*xs) == KIND_LIST => {
             let n = unsafe { (*obj(*xs)).len } as i64;
             heap::dec(*xs);
@@ -425,70 +441,279 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
             }
             Some(out as Word)
         }
-        // A bridged `Bytes` is read in place: its buffer is shared, so nothing is copied.
-        (Builtin::BytesLen, [b]) if heap::kind(*b) == KIND_BRIDGE => {
-            let Value::Bytes(bytes) = (unsafe { bridged(obj(*b)) }) else {
-                return None;
-            };
-            let n = bytes.len() as i64;
+        // Strings and bytes over their own payloads. Anything out of range, not a byte, not
+        // UTF-8 or not the kind the builtin wants is the interpreter's diagnostic to raise, so
+        // those answer `None` before touching a count.
+        (Builtin::BytesLen, [b]) if heap::kind(*b) == KIND_BYTES => {
+            let n = unsafe { (*obj(*b)).len } as i64;
             heap::dec(*b);
             Some(heap::imm(n))
         }
-        (Builtin::BytesAt, [b, i]) if heap::kind(*b) == KIND_BRIDGE => {
-            let Value::Bytes(bytes) = (unsafe { bridged(obj(*b)) }) else {
-                return None;
-            };
-            let index = heap::as_int(*i)?;
-            // Out of range is the interpreter's diagnostic to raise.
-            let byte = *bytes.get(usize::try_from(index).ok()?)?;
+        (Builtin::BytesAt, [b, i]) if heap::kind(*b) == KIND_BYTES => {
+            let index = usize::try_from(heap::as_int(*i)?).ok()?;
+            let byte = *unsafe { bytes_of(obj(*b)) }.get(index)?;
             heap::dec(*b);
             Some(heap::imm(i64::from(byte)))
         }
-        // Concatenation over bridged buffers, in one allocation; a piece that is not bytes is
-        // the interpreter's diagnostic to raise.
-        (Builtin::BytesConcat, [a, b])
-            if heap::kind(*a) == KIND_BRIDGE && heap::kind(*b) == KIND_BRIDGE =>
-        {
-            let (Value::Bytes(x), Value::Bytes(y)) =
-                (unsafe { bridged(obj(*a)) }, unsafe { bridged(obj(*b)) })
-            else {
-                return None;
-            };
-            let mut out = Vec::with_capacity(x.len() + y.len());
-            out.extend_from_slice(x);
-            out.extend_from_slice(y);
-            heap::dec(*a);
+        (Builtin::BytesSlice, [b, s, e]) if heap::kind(*b) == KIND_BYTES => {
+            let bytes = unsafe { bytes_of(obj(*b)) };
+            let (start, end) = slice_range(*s, *e, bytes.len())?;
+            let out = ctx.heap.bytes(&bytes[start..end]);
             heap::dec(*b);
-            Some(ctx.heap.bridge(Value::bytes(out)))
+            Some(out)
+        }
+        (Builtin::BytesConcat, [a, b])
+            if heap::kind(*a) == KIND_BYTES && heap::kind(*b) == KIND_BYTES =>
+        {
+            let out = ctx.heap.append(*a, unsafe { bytes_of(obj(*b)) });
+            heap::dec(*b);
+            Some(out)
         }
         (Builtin::BytesConcatAll, [xs]) if heap::kind(*xs) == KIND_LIST => {
-            let o = obj(*xs);
-            let n = unsafe { (*o).len } as usize;
+            let items = unsafe { heap::list_items(obj(*xs)) };
             let mut total = 0;
-            for i in 0..n {
-                let w = unsafe { word_at(o, i) };
-                if heap::kind(w) != KIND_BRIDGE {
+            for w in items {
+                if heap::kind(*w) != KIND_BYTES {
                     return None;
                 }
-                let Value::Bytes(piece) = (unsafe { bridged(obj(w)) }) else {
-                    return None;
-                };
-                total += piece.len();
+                total += unsafe { (*obj(*w)).len } as usize;
             }
-            let mut out = Vec::with_capacity(total);
-            for i in 0..n {
-                let w = unsafe { word_at(o, i) };
-                if let Value::Bytes(piece) = unsafe { bridged(obj(w)) } {
-                    out.extend_from_slice(piece);
+            let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
+            let mut at = 0;
+            for w in items {
+                let piece = unsafe { bytes_of(obj(*w)) };
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        piece.as_ptr(),
+                        heap::bytes_ptr(out).add(at),
+                        piece.len(),
+                    );
                 }
+                at += piece.len();
             }
+            unsafe { (*out).len = total as u32 };
             heap::dec(*xs);
-            Some(ctx.heap.bridge(Value::bytes(out)))
+            Some(out as Word)
         }
         (Builtin::ByteOfInt, [n]) => {
-            let v = heap::as_int(*n)?;
-            let byte = u8::try_from(v).ok()?;
-            Some(ctx.heap.bridge(Value::bytes([byte])))
+            let byte = u8::try_from(heap::as_int(*n)?).ok()?;
+            Some(ctx.heap.bytes(&[byte]))
+        }
+        (Builtin::BytesOfString, [s]) if heap::kind(*s) == KIND_STR => {
+            let out = ctx.heap.bytes(unsafe { bytes_of(obj(*s)) });
+            heap::dec(*s);
+            Some(out)
+        }
+        (Builtin::StringOfBytes, [b]) if heap::kind(*b) == KIND_BYTES => {
+            let text = std::str::from_utf8(unsafe { bytes_of(obj(*b)) }).ok()?;
+            let out = ctx.heap.str(text);
+            heap::dec(*b);
+            Some(out)
+        }
+        (Builtin::BytesIndexOf, [hay, needle])
+            if heap::kind(*hay) == KIND_BYTES && heap::kind(*needle) == KIND_BYTES =>
+        {
+            let at = find_bytes(
+                unsafe { bytes_of(obj(*hay)) },
+                unsafe { bytes_of(obj(*needle)) },
+                0,
+            );
+            let out = position(ctx, at)?;
+            heap::dec(*hay);
+            heap::dec(*needle);
+            Some(out)
+        }
+        (Builtin::BytesIndexOfFrom, [hay, needle, from])
+            if heap::kind(*hay) == KIND_BYTES && heap::kind(*needle) == KIND_BYTES =>
+        {
+            let h = unsafe { bytes_of(obj(*hay)) };
+            let from = usize::try_from(heap::as_int(*from)?).ok()?;
+            if from > h.len() {
+                return None;
+            }
+            let at = find_bytes(h, unsafe { bytes_of(obj(*needle)) }, from);
+            let out = position(ctx, at)?;
+            heap::dec(*hay);
+            heap::dec(*needle);
+            Some(out)
+        }
+        (Builtin::BytesIndexOfByte, [hay, byte]) if heap::kind(*hay) == KIND_BYTES => {
+            let byte = u8::try_from(heap::as_int(*byte)?).ok()?;
+            let at = memchr::memchr(byte, unsafe { bytes_of(obj(*hay)) });
+            let out = position(ctx, at)?;
+            heap::dec(*hay);
+            Some(out)
+        }
+        (Builtin::BytesStartsWith | Builtin::BytesEndsWith, [a, b])
+            if heap::kind(*a) == KIND_BYTES && heap::kind(*b) == KIND_BYTES =>
+        {
+            let (x, y) = unsafe { (bytes_of(obj(*a)), bytes_of(obj(*b))) };
+            let answer = if which == Builtin::BytesStartsWith {
+                x.starts_with(y)
+            } else {
+                x.ends_with(y)
+            };
+            heap::dec(*a);
+            heap::dec(*b);
+            Some(heap::bool(answer))
+        }
+        (Builtin::StringConcat, [a, b])
+            if heap::kind(*a) == KIND_STR && heap::kind(*b) == KIND_STR =>
+        {
+            let out = ctx.heap.append(*a, unsafe { bytes_of(obj(*b)) });
+            heap::dec(*b);
+            Some(out)
+        }
+        (Builtin::StringLen, [s]) if heap::kind(*s) == KIND_STR => {
+            let n = unsafe { str_of(obj(*s)) }.chars().count() as i64;
+            heap::dec(*s);
+            Some(heap::imm(n))
+        }
+        (Builtin::IntToString, [n]) => {
+            let text = heap::as_int(*n)?.to_string();
+            Some(ctx.heap.str(&text))
+        }
+        (Builtin::StringStartsWith | Builtin::StringEndsWith | Builtin::StringContains, [a, b])
+            if heap::kind(*a) == KIND_STR && heap::kind(*b) == KIND_STR =>
+        {
+            let (x, y) = unsafe { (str_of(obj(*a)), str_of(obj(*b))) };
+            let answer = match which {
+                Builtin::StringStartsWith => x.starts_with(y),
+                Builtin::StringEndsWith => x.ends_with(y),
+                _ => x.contains(y),
+            };
+            heap::dec(*a);
+            heap::dec(*b);
+            Some(heap::bool(answer))
+        }
+        (Builtin::Len, [s]) if heap::kind(*s) == KIND_STR => {
+            let n = unsafe { str_of(obj(*s)) }.chars().count() as i64;
+            heap::dec(*s);
+            Some(heap::imm(n))
+        }
+        // The bounded scans, as `scan` answers them: a window of at most `max` bytes from `from`,
+        // the position of the first byte in the class (or off it), or the window's end.
+        (Builtin::BytesScan | Builtin::BytesScanUntil, [hay, from, members, max])
+            if heap::kind(*hay) == KIND_BYTES && heap::kind(*members) == KIND_BYTES =>
+        {
+            let h = unsafe { bytes_of(obj(*hay)) };
+            let from = usize::try_from(heap::as_int(*from)?).ok()?;
+            if from > h.len() {
+                return None;
+            }
+            let max = usize::try_from(heap::as_int(*max)?).ok()?;
+            let window = &h[from..h.len().min(from.saturating_add(max))];
+            let want = which == Builtin::BytesScanUntil;
+            let found = match (want, unsafe { bytes_of(obj(*members)) }) {
+                (true, []) => None,
+                (true, [a]) => memchr::memchr(*a, window),
+                (true, [a, b]) => memchr::memchr2(*a, *b, window),
+                (true, [a, b, c]) => memchr::memchr3(*a, *b, *c, window),
+                (_, set) => {
+                    let mut bits = [0u64; 4];
+                    for &b in set {
+                        bits[usize::from(b >> 6)] |= 1 << (b & 63);
+                    }
+                    window
+                        .iter()
+                        .position(|&b| (bits[usize::from(b >> 6)] >> (b & 63) & 1 == 1) == want)
+                }
+            };
+            let at = match found {
+                Some(at) => from + at,
+                None => from + window.len(),
+            };
+            heap::dec(*hay);
+            heap::dec(*members);
+            Some(heap::imm(at as i64))
+        }
+        (Builtin::BytesIsUtf8, [b]) if heap::kind(*b) == KIND_BYTES => {
+            let ok = std::str::from_utf8(unsafe { bytes_of(obj(*b)) }).is_ok();
+            heap::dec(*b);
+            Some(heap::bool(ok))
+        }
+        (Builtin::StringOfBytesLossy, [b]) if heap::kind(*b) == KIND_BYTES => {
+            let text = String::from_utf8_lossy(unsafe { bytes_of(obj(*b)) });
+            let out = ctx.heap.str(&text);
+            heap::dec(*b);
+            Some(out)
+        }
+        (Builtin::BytesSplit, [b, sep])
+            if heap::kind(*b) == KIND_BYTES && heap::kind(*sep) == KIND_BYTES =>
+        {
+            let (x, y) = unsafe { (bytes_of(obj(*b)), bytes_of(obj(*sep))) };
+            if y.is_empty() {
+                return None;
+            }
+            let mut pieces = Vec::new();
+            let mut at = 0;
+            for found in memchr::memmem::find_iter(x, y) {
+                pieces.push(ctx.heap.bytes(&x[at..found]));
+                at = found + y.len();
+            }
+            pieces.push(ctx.heap.bytes(&x[at..]));
+            let out = list_of(ctx, &pieces);
+            heap::dec(*b);
+            heap::dec(*sep);
+            Some(out)
+        }
+        (Builtin::StringSlice, [s, start, end]) if heap::kind(*s) == KIND_STR => {
+            let text = unsafe { str_of(obj(*s)) };
+            let chars = text.chars().count();
+            let (from, to) = slice_range(*start, *end, chars)?;
+            let (from, to) = (char_offset(text, from), char_offset(text, to));
+            let out = ctx.heap.str(&text[from..to]);
+            heap::dec(*s);
+            Some(out)
+        }
+        (Builtin::StringSplit, [s, sep])
+            if heap::kind(*s) == KIND_STR && heap::kind(*sep) == KIND_STR =>
+        {
+            let (x, y) = unsafe { (str_of(obj(*s)), str_of(obj(*sep))) };
+            if y.is_empty() {
+                return None;
+            }
+            let pieces: Vec<Word> = x.split(y).map(|piece| ctx.heap.str(piece)).collect();
+            let out = list_of(ctx, &pieces);
+            heap::dec(*s);
+            heap::dec(*sep);
+            Some(out)
+        }
+        (Builtin::StringTrim | Builtin::StringLower | Builtin::StringUpper, [s])
+            if heap::kind(*s) == KIND_STR =>
+        {
+            let text = unsafe { str_of(obj(*s)) };
+            let out = match which {
+                Builtin::StringTrim => ctx.heap.str(text.trim()),
+                Builtin::StringLower => ctx.heap.str(&text.to_lowercase()),
+                _ => ctx.heap.str(&text.to_uppercase()),
+            };
+            heap::dec(*s);
+            Some(out)
+        }
+        (Builtin::StringFind, [s, needle])
+            if heap::kind(*s) == KIND_STR && heap::kind(*needle) == KIND_STR =>
+        {
+            let (x, y) = unsafe { (str_of(obj(*s)), str_of(obj(*needle))) };
+            // Absent is the interpreter's diagnostic to raise.
+            let at = x.find(y)?;
+            let n = x[..at].chars().count() as i64;
+            heap::dec(*s);
+            heap::dec(*needle);
+            Some(heap::imm(n))
+        }
+        (Builtin::Compare | Builtin::CompareValues, [a, b])
+            if heap::native_key(*a) && heap::native_key(*b) =>
+        {
+            let layouts = &ctx.tables.layouts;
+            let index = match heap::cmp_words(layouts, *a, *b) {
+                std::cmp::Ordering::Less => layouts.less?,
+                std::cmp::Ordering::Equal => layouts.equal?,
+                std::cmp::Ordering::Greater => layouts.greater?,
+            };
+            heap::dec(*a);
+            heap::dec(*b);
+            Some(ctx.heap.alloc(KIND_CTOR, 0, 0, index) as Word)
         }
         (Builtin::MapNew, []) => Some(ctx.heap.alloc_map(4) as Word),
         (Builtin::MapInsert, [m, k, v]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
@@ -534,7 +759,7 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
             let o = obj(*m);
             let n = unsafe { (*o).len };
             let out = ctx.heap.alloc_list(n.max(4));
-            let at = if b == Builtin::MapKeys { 0 } else { 1 };
+            let at = if which == Builtin::MapKeys { 0 } else { 1 };
             unsafe {
                 for i in 0..n as usize {
                     let w = word_at(o, 2 * i + at);
@@ -619,6 +844,60 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
         }
         _ => None,
     }
+}
+
+/// The half-open range a slicing builtin was given over `len` bytes, as `range_args` admits it:
+/// never clamped, so anything outside is `None` and the interpreter's to refuse.
+fn slice_range(start: Word, end: Word, len: usize) -> Option<(usize, usize)> {
+    let (start, end) = (heap::as_int(start)?, heap::as_int(end)?);
+    if start < 0 || end < start || !usize::try_from(end).is_ok_and(|e| e <= len) {
+        return None;
+    }
+    Some((start as usize, end as usize))
+}
+
+/// Where `needle` first occurs in `hay` at or after `from`: an empty needle occurs at `from`,
+/// as the interpreter's `find` answers.
+fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(from);
+    }
+    memchr::memmem::find(&hay[from..], needle).map(|at| from + at)
+}
+
+/// The byte offset of the `n`-th character boundary, as the interpreter's `char_offset` finds it.
+fn char_offset(s: &str, n: usize) -> usize {
+    s.char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(s.len()))
+        .nth(n)
+        .unwrap_or(s.len())
+}
+
+/// A list of `items`, which it takes.
+fn list_of(ctx: &mut Ctx, items: &[Word]) -> Word {
+    let out = ctx.heap.alloc_list((items.len() as u32).max(4));
+    unsafe {
+        for (i, w) in items.iter().enumerate() {
+            set_word(out, i, *w);
+        }
+        (*out).len = items.len() as u32;
+    }
+    out as Word
+}
+
+/// `Some(at)` or `None` as the prelude's constructors, when the unit knows them.
+fn position(ctx: &mut Ctx, at: Option<usize>) -> Option<Word> {
+    let some = ctx.tables.layouts.some?;
+    let none = ctx.tables.layouts.none?;
+    Some(match at {
+        Some(i) => {
+            let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
+            unsafe { set_word(c, 0, heap::imm(i as i64)) };
+            c as Word
+        }
+        None => ctx.heap.alloc(KIND_CTOR, 0, 0, none) as Word,
+    })
 }
 
 /// A closure over `env`: the compiled function `index` names, entered with the captured values
