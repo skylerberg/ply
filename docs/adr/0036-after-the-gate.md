@@ -6,18 +6,17 @@ Decisions 2 and 5 for the integer kernel, Decisions 1 and 4 for the record
 kernel. This record is the first pass over those four, taken as what the
 profiles pointed at rather than as a redesign, and it changes no
 representation ADR 0035 decided: the words, the layouts, the counts, the
-strings, the list and the seam all stand. `benches/value-model/after-loops.txt`
-is the series after it and `benches/front-end-whole/observation-4.txt` the
+strings, the list and the seam all stand. `benches/value-model/after-tokens.txt`
+is the series after it and `benches/front-end-whole/observation-5.txt` the
 front-end row, both under their own pre-registrations. What they say: the
 record kernel sits at the bar's edge, within its resolution of it; the
-integer kernel is nearer than at the re-take and still an order of magnitude
-out, for the reason the budget's pricing below gives; and the whole front end
-under the backend is under a second of wall time where it was several before
-ADR 0035 and tens interpreted, every phase entered whole. What remains of the
-integer kernel's distance is the round's own records and count-downs, which
-neither the inliner nor a helper reaches: the lever there is a register
-allocation over a body the inliner does not have to flatten, which is the C
-target's (`docs/BOOTSTRAP-PATH.md` step 10) and not this record's.
+integer kernel is outside it by a smaller factor than at the re-take — its
+round is straight-line arithmetic over one record rebuilt in place since
+Decision 8, and what remains is that arithmetic, every add checked and every
+word masked as the source writes it, and the records the source keeps alive by
+shape; and the whole front end under the backend is under a second of wall
+time where it was several before ADR 0035 and tens interpreted, every phase
+entered whole, and every test entered whole since Decision 7.
 
 > **What this decides.** That a builtin the checker can type is a load in a
 > register rather than a call; that a callback over a range or a list is a loop
@@ -27,9 +26,11 @@ target's (`docs/BOOTSTRAP-PATH.md` step 10) and not this record's.
 > entry, so an entry's memory is bounded by what it holds; and that the seam
 > remembers a pure root's answer as compiled code does and takes it back in
 > as the word, so a phase's tree crosses the seam once rather than at every
-> root it is handed to; and that the map is an ordered tree, so no map
+> root it is handed to; that the map is an ordered tree, so no map
 > operation's cost grows with the map's size on a property the source does
-> not show, which ADR 0034 asks of every core operation.
+> not show, which ADR 0034 asks of every core operation; that a test is a
+> root the backend enters whole; and that a record dying in a body that
+> builds another of its width is that record's memory.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -165,6 +166,33 @@ the seam, and a test entered whole hands it none. This is the shape a
 program's entry point takes: the whole test runs compiled and nothing crosses
 the seam but a unit.
 
+## Decision 8 — a dying record is the next one's memory
+
+The integer kernel's profile after Decision 7 was nine tenths runtime helpers,
+and the largest was the release of a sixteen-word record that the next round
+allocated again at once: every round's state died at its last field read,
+was walked and recycled, and was re-allocated for the round's answer. Two
+things stood behind that. The inliner had opened an inlined call's parameter
+block into the caller but not the callee's own block under it, so the callee's
+answer stayed a record bound to a block and the scalar replacement never saw
+it; and a record literal written entirely from a dying record of another
+shape was lowered as an update of it, which the runtime's copy path served.
+Now: the flattening opens every block the inliner made, so a small callee's
+answer is scalars in the caller; a callee too small to be anything but a
+mask or a shift is inlined at any depth, since the budget's depth ran out
+exactly on those; and the compiled body keeps Perceus's reuse tokens — one
+slot per width of record literal the body builds, filled by a record of that
+width at its last use when nothing else holds it, taken by the next literal
+of that width, which rewrites the header and the fields in place, and
+released at the exit when nothing took it. A record whose fields are all
+scalars is kept with no call at all; one holding words lets them go first.
+A fully written literal no longer reads its base: a base at its last use is
+released into its width's token and one still held is left alone, and the
+update helper serves only a literal that copies fields. The integer kernel
+moved by more than half on this, and what remains of it is the compiled
+arithmetic itself and the records the source keeps alive by shape — a
+chaining value copied out of a state that stays for its last block.
+
 ## Priced and rejected
 
 A wider inlining budget. ADR 0035's integer kernel keeps its state in records
@@ -172,6 +200,11 @@ the inliner leaves because the round is over its budget, so the budget was
 widened enough to admit the round. The integer kernel got *slower* — a body
 seven rounds deep is more than the register allocator does well by — and code
 generation over the examples took several times longer. The budget stays.
+Widened by half with one more level of depth, after Decision 8, it bought the
+integer kernel a fifth for a code generation nearly twice as long over the
+examples and the suites; the register allocator's time over the larger bodies
+is the whole of that cost. The budget stays at that reading too, and the
+tiny-leaf rule takes the part of the depth that mattered.
 
 ## What would make this wrong
 

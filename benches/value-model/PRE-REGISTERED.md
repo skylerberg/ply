@@ -166,3 +166,18 @@ opening too. The seam's census over the front-end probe answered Decision 6's
 question on the way: a row that keeps its tree inside compiled code costs
 what a row that converts it out does, so conversion is not where any row's
 time is.
+
+## After the tokens
+
+`after-tokens.txt`, under the gate on both sides, with the inliner's blocks
+opened all the way down so a small callee's record answer is scalars in the
+caller, the smallest leaves inlined at any depth, and a record dying in a body
+that builds another of its width kept as that record's memory (ADR 0036,
+Decision 8). The integer kernel moved by more than half, since its round is
+now straight-line arithmetic over one record it rebuilds in place; the record
+kernel did not move, because its step is an update that already wrote in
+place. The bar stands as registered and the integer kernel is still outside
+it, by a smaller factor. What the reading says now: what remains of the
+integer kernel is the compiled arithmetic itself — every add checked, every
+word masked, as the source writes it — and the records the source keeps alive
+by shape.

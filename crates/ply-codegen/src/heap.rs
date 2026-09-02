@@ -887,6 +887,30 @@ pub fn dec(w: Word) {
     }
 }
 
+/// Perceus's `reset`: `w`, a record held once, lets its fields go and keeps its memory for the
+/// next record of the same width — its length zeroed, so a release before that walks nothing.
+/// Answers the word kept, or `0` — the object released — for anything that is not such a record.
+pub fn reset(w: Word) -> Word {
+    if is_imm(w) || w == 0 {
+        return 0;
+    }
+    let o = obj(w);
+    unsafe {
+        if (*o).kind != KIND_RECORD || (*o).rc != 1 {
+            dec(w);
+            return 0;
+        }
+        for i in 0..(*o).len as usize {
+            let c = word_at(o, i);
+            if !is_imm(c) && c != 0 {
+                dec(c);
+            }
+        }
+        (*o).len = 0;
+    }
+    w
+}
+
 /// How deep a dying object's dying children are dismantled on the stack before the rest are
 /// deferred to a heap list: a record of scalars, the common case, allocates nothing.
 const DISMANTLE_DEPTH: usize = 32;
@@ -1227,6 +1251,43 @@ mod tests {
 
     fn layouts() -> Layouts {
         Layouts::new(vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)])
+    }
+
+    /// Perceus's reset keeps a record held once with its fields let go, and releases anything
+    /// else.
+    #[test]
+    fn a_reset_record_keeps_its_memory_and_lets_its_fields_go() {
+        let mut h = Heap::new();
+        let child = h.alloc(KIND_RECORD, 0, 1, 0);
+        unsafe { set_word(child, 0, imm(1)) };
+        let o = h.alloc(KIND_RECORD, 0, 2, 0);
+        unsafe {
+            set_word(o, 0, child as Word);
+            set_word(o, 1, imm(7));
+        }
+        inc(child as Word);
+        assert_eq!(reset(o as Word), o as Word);
+        unsafe {
+            assert_eq!((*o).len, 0);
+            assert_eq!((*o).rc, 1);
+            assert_eq!((*o).kind, KIND_RECORD);
+            assert_eq!((*child).rc, 1, "the field was let go once");
+        }
+        dec(o as Word);
+        unsafe { assert_eq!((*o).kind, KIND_DEAD) };
+
+        let shared = h.alloc(KIND_RECORD, 0, 1, 0);
+        unsafe { set_word(shared, 0, imm(1)) };
+        inc(shared as Word);
+        assert_eq!(
+            reset(shared as Word),
+            0,
+            "a record held twice is released, not kept"
+        );
+        unsafe { assert_eq!((*shared).rc, 1) };
+        assert_eq!(reset(imm(3)), 0);
+        dec(child as Word);
+        dec(shared as Word);
     }
 
     #[test]
