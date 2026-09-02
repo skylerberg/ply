@@ -8,7 +8,7 @@
 
 use crate::heap::{
     self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, KIND_BRIDGE, KIND_CLOSURE, KIND_CTOR, KIND_LIST,
-    KIND_RECORD, Layouts, Word, bridged, is_unique, obj, set_word, word_at,
+    KIND_MAP, KIND_RECORD, Layouts, Word, bridged, is_unique, obj, set_word, word_at,
 };
 use crate::jit::Entry;
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
@@ -126,10 +126,12 @@ impl Ctx {
         }
     }
 
-    /// The other end of [`Ctx::begin`]: the entry gives back what it used.
+    /// The other end of [`Ctx::begin`]: the entry gives back what it used, and what it made
+    /// immortal for the memo goes to the tables, which outlive it.
     pub fn end(&mut self) {
         self.last_entry = self.heap.allocated();
-        self.heap.end();
+        let tables = Rc::clone(&self.tables);
+        self.heap.end_into(&mut tables.immortals.borrow_mut());
     }
 
     /// How many objects the entry that just finished allocated.
@@ -373,7 +375,8 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
                 }
                 return Some(*xs);
             }
-            let out = ctx.heap.alloc_list((len * 2).max(4));
+            let room = if len < cap { cap } else { (len * 2).max(4) };
+            let out = ctx.heap.alloc_list(room);
             unsafe {
                 for i in 0..len as usize {
                     let w = word_at(o, i);
@@ -418,6 +421,136 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
                 (*out).len = n as u32;
             }
             Some(out as Word)
+        }
+        (Builtin::MapNew, []) => Some(ctx.heap.alloc_map(4) as Word),
+        (Builtin::MapInsert, [m, k, v]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+            let tables = Rc::clone(&ctx.tables);
+            Some(ctx.heap.map_insert(&tables.layouts, *m, *k, *v))
+        }
+        (Builtin::MapGet, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+            let some = ctx.tables.layouts.ctor_index(&Symbol::new("Some"))?;
+            let none = ctx.tables.layouts.ctor_index(&Symbol::new("None"))?;
+            let o = obj(*m);
+            let answer = match heap::map_find(&ctx.tables.layouts, o, *k) {
+                Ok(i) => {
+                    let v = unsafe { heap::map_value(o, i) };
+                    heap::inc(v);
+                    let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
+                    unsafe { set_word(c, 0, v) };
+                    c as Word
+                }
+                Err(_) => ctx.heap.alloc(KIND_CTOR, 0, 0, none) as Word,
+            };
+            heap::dec(*m);
+            heap::dec(*k);
+            Some(answer)
+        }
+        (Builtin::MapContains, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+            let found = heap::map_find(&ctx.tables.layouts, obj(*m), *k).is_ok();
+            heap::dec(*m);
+            heap::dec(*k);
+            Some(heap::bool(found))
+        }
+        (Builtin::MapRemove, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
+            let tables = Rc::clone(&ctx.tables);
+            let out = ctx.heap.map_remove(&tables.layouts, *m, *k);
+            heap::dec(*k);
+            Some(out)
+        }
+        (Builtin::MapLen, [m]) if heap::kind(*m) == KIND_MAP => {
+            let n = unsafe { (*obj(*m)).len } as i64;
+            heap::dec(*m);
+            Some(heap::imm(n))
+        }
+        (Builtin::MapKeys | Builtin::MapValues, [m]) if heap::kind(*m) == KIND_MAP => {
+            let o = obj(*m);
+            let n = unsafe { (*o).len };
+            let out = ctx.heap.alloc_list(n.max(4));
+            let at = if b == Builtin::MapKeys { 0 } else { 1 };
+            unsafe {
+                for i in 0..n as usize {
+                    let w = word_at(o, 2 * i + at);
+                    heap::inc(w);
+                    set_word(out, i, w);
+                }
+                (*out).len = n;
+            }
+            heap::dec(*m);
+            Some(out as Word)
+        }
+        (Builtin::MapEntries, [m]) if heap::kind(*m) == KIND_MAP => {
+            let o = obj(*m);
+            let n = unsafe { (*o).len };
+            let shape = ctx
+                .tables
+                .layouts
+                .shape(vec![Symbol::new("key"), Symbol::new("value")]);
+            let out = ctx.heap.alloc_list(n.max(4));
+            unsafe {
+                for i in 0..n as usize {
+                    let (k, v) = (heap::map_key(o, i), heap::map_value(o, i));
+                    heap::inc(k);
+                    heap::inc(v);
+                    let e = ctx.heap.alloc(KIND_RECORD, 0, 2, shape);
+                    set_word(e, 0, k);
+                    set_word(e, 1, v);
+                    set_word(out, i, e as Word);
+                }
+                (*out).len = n;
+            }
+            heap::dec(*m);
+            Some(out as Word)
+        }
+        (Builtin::MapOfEntries, [xs]) if heap::kind(*xs) == KIND_LIST => {
+            let tables = Rc::clone(&ctx.tables);
+            let o = obj(*xs);
+            let n = unsafe { (*o).len } as usize;
+            let (key, value) = (Symbol::new("key"), Symbol::new("value"));
+            // Every entry must be a record with both fields and a key the map can order, or the
+            // interpreter's implementation raises the right diagnostic instead.
+            let mut pairs = Vec::with_capacity(n);
+            for i in 0..n {
+                let e = unsafe { word_at(o, i) };
+                if heap::kind(e) != KIND_RECORD {
+                    return None;
+                }
+                let shape = unsafe { (*obj(e)).layout };
+                let (Some(ka), Some(va)) = (
+                    tables.layouts.offset(shape, &key),
+                    tables.layouts.offset(shape, &value),
+                ) else {
+                    return None;
+                };
+                let (k, v) = unsafe { (word_at(obj(e), ka), word_at(obj(e), va)) };
+                if !heap::native_key(k) {
+                    return None;
+                }
+                pairs.push((k, v));
+            }
+            let mut m = ctx.heap.alloc_map((n as u32).max(4)) as Word;
+            for (k, v) in pairs {
+                heap::inc(k);
+                heap::inc(v);
+                m = ctx.heap.map_insert(&tables.layouts, m, k, v);
+            }
+            heap::dec(*xs);
+            Some(m)
+        }
+        (Builtin::MapMerge, [a, bm])
+            if heap::kind(*a) == KIND_MAP && heap::kind(*bm) == KIND_MAP =>
+        {
+            let tables = Rc::clone(&ctx.tables);
+            let o = obj(*bm);
+            let n = unsafe { (*o).len } as usize;
+            let mut m = *a;
+            for i in 0..n {
+                let (k, v) = unsafe { (heap::map_key(o, i), heap::map_value(o, i)) };
+                heap::inc(k);
+                heap::inc(v);
+                m = ctx.heap.map_insert(&tables.layouts, m, k, v);
+            }
+            heap::dec(*bm);
+            Some(m)
         }
         _ => None,
     }
@@ -483,22 +616,19 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     if c.failed != 0 {
         return 0;
     }
-    let value = c.value(w);
-    if !ply_eval::memo::world_independent(&value) {
+    // Remembered where it lies: the word is marked immortal, and the entry's end hands its
+    // objects to the tables rather than releasing them.
+    if !heap::world_independent(w) {
         return w;
     }
-    let kept = tables
-        .immortals
-        .borrow_mut()
-        .immortal(&tables.layouts, &value);
+    heap::mark_immortal(w);
     let mut memo = tables.memo.borrow_mut();
     let index = index as usize;
     if memo.len() <= index {
         memo.resize(index + 1, None);
     }
-    memo[index] = Some(kept);
-    heap::dec(w);
-    kept
+    memo[index] = Some(w);
+    w
 }
 
 /// A call through a value: a local binding, a callee that is an expression, or a callback. Takes
@@ -733,6 +863,23 @@ pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) ->
 /// entries as the interpreter's loop takes one. Takes all three.
 pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64) -> i64 {
     let c = unsafe { &mut *ctx };
+    if heap::kind(map) == KIND_MAP {
+        let o = obj(map);
+        let n = unsafe { (*o).len } as usize;
+        let mut acc = init;
+        for i in 0..n {
+            let (k, v) = unsafe { (heap::map_key(o, i), heap::map_value(o, i)) };
+            heap::inc(k);
+            heap::inc(v);
+            acc = call_value(ctx, f, &[acc, k, v]);
+            if unsafe { &*ctx }.failed != 0 {
+                return 0;
+            }
+        }
+        heap::dec(map);
+        heap::dec(f);
+        return acc;
+    }
     let value = c.value(map);
     let Value::Map(entries) = &value else {
         let d = error(format!(

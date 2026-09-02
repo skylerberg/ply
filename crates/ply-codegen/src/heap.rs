@@ -19,6 +19,7 @@ use ply_eval::{Closure, ClosureKind, Fields, Value};
 use ply_span::Symbol;
 use std::alloc::{Layout, alloc, dealloc};
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -33,6 +34,8 @@ pub const KIND_CTOR: u8 = 4;
 pub const KIND_LIST: u8 = 5;
 pub const KIND_CLOSURE: u8 = 6;
 pub const KIND_BRIDGE: u8 = 7;
+/// A sorted array of key and value words, `len` entries of two words with room for `layout`.
+pub const KIND_MAP: u8 = 8;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -258,6 +261,13 @@ impl Heap {
         p
     }
 
+    /// A fresh map with room for `cap` entries and none in use yet.
+    pub fn alloc_map(&mut self, cap: u32) -> *mut Obj {
+        let p = Heap::raw_alloc(KIND_MAP, 0, 0, cap, cap as usize * 16);
+        self.log.push(p);
+        p
+    }
+
     pub fn boxed_int(&mut self, v: i64) -> Word {
         if fits_imm(v) {
             return imm(v);
@@ -304,6 +314,11 @@ impl Heap {
                             pending.push(word_at(o, i));
                         }
                     }
+                    KIND_MAP => {
+                        for i in 0..2 * (*o).len as usize {
+                            pending.push(word_at(o, i));
+                        }
+                    }
                     KIND_CLOSURE => {
                         for i in CLOSURE_CAPTURES..(*o).len as usize {
                             pending.push(word_at(o, i));
@@ -317,9 +332,32 @@ impl Heap {
 
     /// Releases everything the entry allocated. A live count is no obstacle: the entry's answer
     /// has already been copied out as a [`Value`], so nothing outside the entry can hold a word.
+    /// What the entry marked immortal is kept, in this heap's own immortal list.
     pub fn end(&mut self) {
+        let mut kept = Vec::new();
         for o in self.log.drain(..) {
-            unsafe { release(o) };
+            unsafe {
+                if (*o).rc == IMMORTAL {
+                    kept.push(o);
+                } else {
+                    release(o);
+                }
+            }
+        }
+        self.immortal.extend(kept);
+    }
+
+    /// [`Heap::end`], with what the entry marked immortal handed to `sink` to own: the memo's
+    /// words outlive the context that made them, so the tables keep them.
+    pub fn end_into(&mut self, sink: &mut Heap) {
+        for o in self.log.drain(..) {
+            unsafe {
+                if (*o).rc == IMMORTAL {
+                    sink.immortal.push(o);
+                } else {
+                    release(o);
+                }
+            }
         }
     }
 
@@ -359,6 +397,21 @@ impl Heap {
                 for (i, item) in items.iter().enumerate() {
                     let w = self.to_word(layouts, item);
                     unsafe { set_word(o, i, w) };
+                }
+                unsafe { (*o).len = n };
+                o as Word
+            }
+            // The interpreter iterates in key order, which is the layout's order too.
+            Value::Map(entries) => {
+                let n = entries.size() as u32;
+                let o = self.alloc_map(n.max(4));
+                for (i, (k, v)) in entries.iter().enumerate() {
+                    let kw = self.to_word(layouts, k);
+                    let vw = self.to_word(layouts, v);
+                    unsafe {
+                        set_word(o, 2 * i, kw);
+                        set_word(o, 2 * i + 1, vw);
+                    }
                 }
                 unsafe { (*o).len = n };
                 o as Word
@@ -420,6 +473,12 @@ impl Heap {
                         .map(|i| Heap::to_value(layouts, word_at(o, i)))
                         .collect(),
                 ),
+                KIND_MAP => Value::map((0..(*o).len as usize).map(|i| {
+                    (
+                        Heap::to_value(layouts, word_at(o, 2 * i)),
+                        Heap::to_value(layouts, word_at(o, 2 * i + 1)),
+                    )
+                })),
                 KIND_CLOSURE => {
                     let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
                         .map(|i| Heap::to_value(layouts, word_at(o, i)))
@@ -469,6 +528,7 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
         match (*o).kind {
             KIND_BRIDGE => std::mem::size_of::<Value>(),
             KIND_LIST => (*o).layout as usize * 8,
+            KIND_MAP => (*o).layout as usize * 16,
             KIND_DEAD => (*o).len as usize,
             _ => (*o).len as usize * 8,
         }
@@ -517,6 +577,11 @@ pub fn dec(w: Word) {
                         pending.push(word_at(o, i));
                     }
                 }
+                KIND_MAP => {
+                    for i in 0..2 * (*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
                 KIND_CLOSURE => {
                     for i in CLOSURE_CAPTURES..(*o).len as usize {
                         pending.push(word_at(o, i));
@@ -532,6 +597,80 @@ pub fn dec(w: Word) {
             (*o).len = bytes as u32;
         }
     }
+}
+
+/// Marks everything under `w` immortal where it lies: no count is touched through it again, and
+/// the entry's end hands it to whoever keeps the memo rather than releasing it.
+pub fn mark_immortal(w: Word) {
+    let mut pending = vec![w];
+    while let Some(w) = pending.pop() {
+        if is_imm(w) {
+            continue;
+        }
+        let o = obj(w);
+        unsafe {
+            if (*o).rc == IMMORTAL {
+                continue;
+            }
+            (*o).rc = IMMORTAL;
+            match (*o).kind {
+                KIND_RECORD | KIND_CTOR | KIND_LIST => {
+                    for i in 0..(*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                KIND_MAP => {
+                    for i in 0..2 * (*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                KIND_CLOSURE => {
+                    for i in CLOSURE_CAPTURES..(*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// `ply_eval::memo::world_independent` over a word: whether what it denotes means the same thing
+/// in a world it was not produced in, which is what a remembered constant must.
+pub fn world_independent(w: Word) -> bool {
+    let mut pending = vec![w];
+    while let Some(w) = pending.pop() {
+        if is_imm(w) {
+            continue;
+        }
+        let o = obj(w);
+        unsafe {
+            match (*o).kind {
+                KIND_RECORD | KIND_CTOR | KIND_LIST => {
+                    for i in 0..(*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                KIND_MAP => {
+                    for i in 0..2 * (*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                KIND_CLOSURE => {
+                    for i in CLOSURE_CAPTURES..(*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                KIND_BRIDGE => {
+                    if !ply_eval::memo::world_independent(bridged(o)) {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 /// Whether one holder alone has `w`: what lets an update write in place.
@@ -579,6 +718,269 @@ pub fn as_bool(w: Word) -> Option<bool> {
 /// A list's items, borrowed.
 pub unsafe fn list_items<'a>(o: *mut Obj) -> &'a [Word] {
     unsafe { std::slice::from_raw_parts(words(o), (*o).len as usize) }
+}
+
+// --- Order -------------------------------------------------------------------------------------
+
+/// The interpreter's rank of a value's variant, which orders values of different kinds.
+fn rank(w: Word) -> u8 {
+    if is_imm(w) {
+        return 2;
+    }
+    let o = obj(w);
+    unsafe {
+        match (*o).kind {
+            KIND_UNIT => 0,
+            KIND_BOOL => 1,
+            KIND_INT => 2,
+            KIND_LIST => 7,
+            KIND_MAP => 8,
+            KIND_RECORD => 9,
+            KIND_CTOR => 10,
+            KIND_CLOSURE => 11,
+            KIND_BRIDGE => match bridged(o) {
+                Value::Unit => 0,
+                Value::Bool(_) => 1,
+                Value::Int(_) => 2,
+                Value::Float(_) => 3,
+                Value::Decimal(_) => 4,
+                Value::Str(_) => 5,
+                Value::Bytes(_) => 6,
+                Value::List(_) => 7,
+                Value::Map(_) => 8,
+                Value::Record(_) => 9,
+                Value::Ctor { .. } => 10,
+                Value::Closure(_) => 11,
+                Value::Cell(_) => 12,
+                Value::Task(_) => 13,
+                Value::Continuation(_) => 14,
+                Value::Secret(_) => 15,
+            },
+            other => panic!("a word of kind {other} was ordered after its object died"),
+        }
+    }
+}
+
+/// `Value::cmp` over words: structural, total and deterministic, the order a map's keys are held
+/// in — and the same order, so a map crosses the seam with its entries where the interpreter
+/// would put them. Two words of one native kind compare in place; anything else compares as the
+/// values it denotes.
+pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
+    if a == b {
+        return Ordering::Equal;
+    }
+    let (ra, rb) = (rank(a), rank(b));
+    if ra != rb {
+        return ra.cmp(&rb);
+    }
+    if let (Some(x), Some(y)) = (as_int(a), as_int(b)) {
+        return x.cmp(&y);
+    }
+    let (ka, kb) = (kind(a), kind(b));
+    if ka != kb {
+        return Heap::to_value(layouts, a).cmp(&Heap::to_value(layouts, b));
+    }
+    unsafe {
+        match ka {
+            KIND_UNIT => Ordering::Equal,
+            KIND_BOOL => (*obj(a)).flags.cmp(&(*obj(b)).flags),
+            KIND_BRIDGE => bridged(obj(a)).cmp(bridged(obj(b))),
+            KIND_LIST => {
+                let (x, y) = (obj(a), obj(b));
+                let (n, m) = ((*x).len as usize, (*y).len as usize);
+                for i in 0..n.min(m) {
+                    let c = cmp_words(layouts, word_at(x, i), word_at(y, i));
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                }
+                n.cmp(&m)
+            }
+            KIND_MAP => {
+                let (x, y) = (obj(a), obj(b));
+                let (n, m) = ((*x).len as usize, (*y).len as usize);
+                for i in 0..2 * n.min(m) {
+                    let c = cmp_words(layouts, word_at(x, i), word_at(y, i));
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                }
+                n.cmp(&m)
+            }
+            KIND_RECORD => {
+                let (x, y) = (obj(a), obj(b));
+                let (names_a, names_b) = (
+                    layouts.shape_names((*x).layout),
+                    layouts.shape_names((*y).layout),
+                );
+                let (n, m) = (names_a.len(), names_b.len());
+                for i in 0..n.min(m) {
+                    let c = names_a[i]
+                        .cmp(&names_b[i])
+                        .then_with(|| cmp_words(layouts, word_at(x, i), word_at(y, i)));
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                }
+                n.cmp(&m)
+            }
+            KIND_CTOR => {
+                let (x, y) = (obj(a), obj(b));
+                let by_name = layouts.ctors[(*x).layout as usize]
+                    .0
+                    .cmp(&layouts.ctors[(*y).layout as usize].0);
+                if by_name != Ordering::Equal {
+                    return by_name;
+                }
+                let (n, m) = ((*x).len as usize, (*y).len as usize);
+                for i in 0..n.min(m) {
+                    let c = cmp_words(layouts, word_at(x, i), word_at(y, i));
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                }
+                n.cmp(&m)
+            }
+            KIND_CLOSURE => Ordering::Equal,
+            _ => Heap::to_value(layouts, a).cmp(&Heap::to_value(layouts, b)),
+        }
+    }
+}
+
+/// Whether a word can be a native map's key: ordered in place, and already canonical — a
+/// `Decimal` is neither, a `Secret` has no order, and both are the interpreter's to refuse.
+pub fn native_key(w: Word) -> bool {
+    if is_imm(w) {
+        return true;
+    }
+    let o = obj(w);
+    unsafe {
+        match (*o).kind {
+            KIND_UNIT | KIND_BOOL | KIND_INT => true,
+            KIND_BRIDGE => matches!(bridged(o), Value::Str(_) | Value::Bytes(_)),
+            KIND_RECORD | KIND_CTOR | KIND_LIST => {
+                (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
+            }
+            KIND_MAP => (0..2 * (*o).len as usize).all(|i| native_key(word_at(o, i))),
+            _ => false,
+        }
+    }
+}
+
+// --- Maps --------------------------------------------------------------------------------------
+
+pub unsafe fn map_key(o: *mut Obj, i: usize) -> Word {
+    unsafe { word_at(o, 2 * i) }
+}
+
+pub unsafe fn map_value(o: *mut Obj, i: usize) -> Word {
+    unsafe { word_at(o, 2 * i + 1) }
+}
+
+/// Where `k` is in the map, or where it would go.
+pub fn map_find(layouts: &Layouts, o: *mut Obj, k: Word) -> Result<usize, usize> {
+    let n = unsafe { (*o).len } as usize;
+    let (mut lo, mut hi) = (0usize, n);
+    while lo < hi {
+        let mid = (lo + hi) / 2;
+        match cmp_words(layouts, unsafe { map_key(o, mid) }, k) {
+            Ordering::Less => lo = mid + 1,
+            Ordering::Greater => hi = mid,
+            Ordering::Equal => return Ok(mid),
+        }
+    }
+    Err(lo)
+}
+
+impl Heap {
+    /// A map with the same entries, each held once more, and room for `cap` of them.
+    unsafe fn map_copy(&mut self, o: *mut Obj, cap: u32) -> *mut Obj {
+        let n = unsafe { (*o).len };
+        let out = self.alloc_map(cap.max(n).max(4));
+        unsafe {
+            for i in 0..2 * n as usize {
+                let w = word_at(o, i);
+                inc(w);
+                set_word(out, i, w);
+            }
+            (*out).len = n;
+        }
+        out
+    }
+
+    /// `map_insert`: the entry replaced, key and value both, when the key is present, and put
+    /// in order when it is not — in place when nothing else holds the map. Takes all three.
+    pub fn map_insert(&mut self, layouts: &Layouts, m: Word, k: Word, v: Word) -> Word {
+        let o = obj(m);
+        let (len, cap) = unsafe { ((*o).len, (*o).layout) };
+        match map_find(layouts, o, k) {
+            Ok(i) => {
+                let target = if is_unique(m) {
+                    o
+                } else {
+                    let copy = unsafe { self.map_copy(o, cap) };
+                    dec(m);
+                    copy
+                };
+                unsafe {
+                    dec(map_key(target, i));
+                    dec(map_value(target, i));
+                    set_word(target, 2 * i, k);
+                    set_word(target, 2 * i + 1, v);
+                }
+                target as Word
+            }
+            Err(i) => {
+                let target = if is_unique(m) && len < cap {
+                    o
+                } else {
+                    // Room doubles only when there is none: a shared map copied on every insert
+                    // must not grow on every copy.
+                    let room = if len < cap { cap } else { (cap * 2).max(4) };
+                    let copy = unsafe { self.map_copy(o, room) };
+                    dec(m);
+                    copy
+                };
+                unsafe {
+                    let base = words(target);
+                    std::ptr::copy(base.add(2 * i), base.add(2 * i + 2), 2 * (len as usize - i));
+                    set_word(target, 2 * i, k);
+                    set_word(target, 2 * i + 1, v);
+                    (*target).len = len + 1;
+                }
+                target as Word
+            }
+        }
+    }
+
+    /// `map_remove`: the map without the key, and the map itself when the key was absent. Takes
+    /// the map and reads the key.
+    pub fn map_remove(&mut self, layouts: &Layouts, m: Word, k: Word) -> Word {
+        let o = obj(m);
+        let Ok(i) = map_find(layouts, o, k) else {
+            return m;
+        };
+        let len = unsafe { (*o).len };
+        let target = if is_unique(m) {
+            o
+        } else {
+            let copy = unsafe { self.map_copy(o, (*o).layout) };
+            dec(m);
+            copy
+        };
+        unsafe {
+            dec(map_key(target, i));
+            dec(map_value(target, i));
+            let base = words(target);
+            std::ptr::copy(
+                base.add(2 * i + 2),
+                base.add(2 * i),
+                2 * (len as usize - i - 1),
+            );
+            (*target).len = len - 1;
+        }
+        target as Word
+    }
 }
 
 #[cfg(test)]
@@ -685,6 +1087,105 @@ mod tests {
         assert_eq!(Heap::to_value(&l, child), Value::str("kept"));
         dec(child);
         assert_eq!(kind(child), KIND_DEAD);
+        h.end();
+    }
+
+    #[test]
+    fn words_order_exactly_as_the_values_they_denote() {
+        let mut h = Heap::new();
+        let l = layouts();
+        let record = |a: i64, b: &str| {
+            Value::Record(Arc::new(Fields::from_unsorted(vec![
+                (Symbol::new("n"), Value::Int(a)),
+                (Symbol::new("s"), Value::str(b)),
+            ])))
+        };
+        let values = vec![
+            Value::Unit,
+            Value::Bool(false),
+            Value::Bool(true),
+            Value::Int(-3),
+            Value::Int(7),
+            Value::Int(i64::MAX),
+            Value::str("a"),
+            Value::str("b"),
+            Value::bytes(b"a"),
+            Value::list(vec![]),
+            Value::list(vec![Value::Int(1)]),
+            Value::list(vec![Value::Int(1), Value::Int(0)]),
+            Value::map(vec![(Value::Int(1), Value::str("x"))]),
+            record(1, "z"),
+            record(2, "a"),
+            Value::ctor("None", vec![]),
+            Value::ctor("Some", vec![Value::Int(1)]),
+            Value::ctor("Some", vec![Value::Int(2)]),
+        ];
+        let words: Vec<Word> = values.iter().map(|v| h.to_word(&l, v)).collect();
+        for (i, a) in values.iter().enumerate() {
+            for (j, b) in values.iter().enumerate() {
+                assert_eq!(
+                    cmp_words(&l, words[i], words[j]),
+                    a.cmp(b),
+                    "{a:?} vs {b:?}"
+                );
+            }
+        }
+        h.end();
+    }
+
+    #[test]
+    fn a_native_map_holds_its_entries_in_the_interpreters_order_and_round_trips() {
+        let mut h = Heap::new();
+        let l = layouts();
+        let mut m = h.alloc_map(1) as Word;
+        for (k, v) in [
+            (5, "five"),
+            (1, "one"),
+            (3, "three"),
+            (1, "uno"),
+            (4, "four"),
+        ] {
+            let kw = h.to_word(&l, &Value::Int(k));
+            let vw = h.to_word(&l, &Value::str(v));
+            m = h.map_insert(&l, m, kw, vw);
+        }
+        assert_eq!(
+            Heap::to_value(&l, m),
+            Value::map(vec![
+                (Value::Int(1), Value::str("uno")),
+                (Value::Int(3), Value::str("three")),
+                (Value::Int(4), Value::str("four")),
+                (Value::Int(5), Value::str("five")),
+            ])
+        );
+        assert!(map_find(&l, obj(m), imm(3)).is_ok());
+        assert!(map_find(&l, obj(m), imm(2)).is_err());
+        let m = h.map_remove(&l, m, imm(3));
+        let m = h.map_remove(&l, m, imm(99));
+        assert_eq!(unsafe { (*obj(m)).len }, 3);
+        // A shared map is copied by an insert and the original keeps its entries.
+        inc(m);
+        let kw = h.to_word(&l, &Value::Int(2));
+        let m2 = h.map_insert(&l, m, kw, imm(0));
+        assert_ne!(m, m2);
+        assert_eq!(unsafe { (*obj(m)).len }, 3);
+        assert_eq!(unsafe { (*obj(m2)).len }, 4);
+        h.end();
+    }
+
+    #[test]
+    fn a_shared_map_inserted_into_many_times_keeps_its_room_bounded() {
+        let mut h = Heap::new();
+        let l = layouts();
+        let mut m = h.alloc_map(4) as Word;
+        for i in 0..200 {
+            // Held elsewhere too, so every insert copies.
+            inc(m);
+            m = h.map_insert(&l, m, imm(i), imm(i));
+        }
+        let (len, cap) = unsafe { ((*obj(m)).len, (*obj(m)).layout) };
+        assert_eq!(len, 200);
+        assert!(cap < 1024, "the room grew to {cap}");
         h.end();
     }
 
