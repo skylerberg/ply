@@ -1212,16 +1212,15 @@ impl Parser {
                 if params.len() == 1 {
                     return Ok(params.into_iter().next().expect("length checked"));
                 }
-                let span = open.to(close);
-                self.push(
-                    Diagnostic::error(
-                        codes::UNEXPECTED_TOKEN,
-                        "expected `->` after a parenthesized parameter list",
-                    )
-                    .primary(span, "this is a function parameter list")
-                    .note("Ply has no tuple type; write a record `{a: A, b: B}` instead"),
-                );
-                Err(Bail)
+                // Two or more make a tuple: the record `{_0: A, _1: B}` (GUIDE §5.3).
+                Ok(TypeExpr::Record {
+                    fields: params
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, t)| (Ident::new(format!("_{i}"), t.span()), t))
+                        .collect(),
+                    span: open.to(close),
+                })
             }
             TokenKind::LBrace => {
                 let open = self.advance();
@@ -1664,6 +1663,32 @@ impl Parser {
                     })
                 } else {
                     self.expr().and_then(|mut inner| {
+                        // Two or more make a tuple: the record `{_0: a, _1: b}` (GUIDE §5.3).
+                        if self.at(&TokenKind::Comma) {
+                            self.advance();
+                            let mut items = vec![inner];
+                            items.extend(self.comma_list(&TokenKind::RParen, Self::expr)?);
+                            let close = self.expect_close(
+                                &TokenKind::RParen,
+                                open,
+                                "`)` to close the tuple",
+                            )?;
+                            if items.len() == 1 {
+                                let mut only = items.pop().expect("one element");
+                                only.span = open.to(close);
+                                return Ok(only);
+                            }
+                            return Ok(Expr {
+                                kind: ExprKind::Record {
+                                    fields: items
+                                        .into_iter()
+                                        .enumerate()
+                                        .map(|(i, e)| (Ident::new(format!("_{i}"), e.span), e))
+                                        .collect(),
+                                },
+                                span: open.to(close),
+                            });
+                        }
                         let close =
                             self.expect_close(&TokenKind::RParen, open, "`)` to close the group")?;
                         inner.span = open.to(close);
@@ -2252,6 +2277,30 @@ impl Parser {
                     });
                 }
                 let mut inner = self.pattern()?;
+                // Two or more make a tuple pattern: the exact record pattern `{_0: p, _1: q}`.
+                if self.at(&TokenKind::Comma) {
+                    self.advance();
+                    let mut items = vec![inner];
+                    items.extend(self.comma_list(&TokenKind::RParen, Self::pattern)?);
+                    let close =
+                        self.expect_close(&TokenKind::RParen, open, "`)` to close the tuple")?;
+                    if items.len() == 1 {
+                        let mut only = items.pop().expect("one element");
+                        only.span = open.to(close);
+                        return Ok(only);
+                    }
+                    return Ok(Pattern {
+                        kind: PatternKind::Record {
+                            fields: items
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, p)| (Ident::new(format!("_{i}"), p.span), p))
+                                .collect(),
+                            rest: false,
+                        },
+                        span: open.to(close),
+                    });
+                }
                 let close = self.expect_close(&TokenKind::RParen, open, "`)`")?;
                 inner.span = open.to(close);
                 Ok(inner)

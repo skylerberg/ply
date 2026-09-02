@@ -621,8 +621,28 @@ fn point(x: Int, y: Int) -> {x: Int, y: Int} = {x, y}
 Field access is `r.field`. There is no field update in place — see §6.6 for the
 record-update form.
 
-There are **no tuples**. A parenthesized type list is a function parameter list,
-and the diagnostic for `(A, B)` says so and tells you to write a record.
+**A tuple is a record with positional fields.** `(A, B)` is the type
+`{_0: A, _1: B}`, `(a, b)` the value `{_0: a, _1: b}`, and `(p, q)` the pattern
+`{_0: p, _1: q}` — the same mechanism in every position, so a tuple hashes,
+derives and unifies as the record it is. Two or more elements make one: `(A)`
+still groups, `()` is still `Unit`, and `(A, B) -> C` is still a function
+type. Field access is `t._0`. A type or a value whose fields are
+exactly `_0..` prints as the tuple it was written as, in `ply check --types`
+and in a failing assertion alike:
+
+```ply
+fn divmod(a: Int, b: Int) -> (Int, Int) = (a / b, a % b)
+
+fn half(p: (Int, Int)) -> Int = match p { (q, _) -> q }
+
+test "quotient and remainder" {
+  let (q, r) = divmod(17, 5);
+  assert_eq((q, r), (3, 2))
+}
+```
+
+Name the fields when the pair is worth a name; a tuple is for the pair that
+is not.
 
 ### 5.4 Lists and maps
 
@@ -816,8 +836,9 @@ A block is `{ statements... tail }`. Its value is the tail expression. The rules
 `let` shadowing is allowed. There is no mutable binding: `let` binds once.
 
 **"Any pattern" includes a record, and that is how a function returns several
-things.** Ply has no tuples and does not need them here: a function answers with
-a record, and the caller takes it apart in the `let` that receives it.
+things.** A function answers with a record — or a tuple, which is a record with
+positional fields (§5.3) — and the caller takes it apart in the `let` that
+receives it.
 
 ```ply
 type Step = { value: Int, next: Int }
@@ -887,6 +908,7 @@ Pattern forms:
 | `42`, `-1`, `1.5`, `1.50m`, `"s"`, `b"s"`, `true`, `()` | a literal (a leading `-` on a numeric literal is part of the pattern) |
 | `[]`, `[a, b]`, `[a, ..]`, `[a, ..rest]` | a list of exact length, or a prefix with a rest binder |
 | `{a, b}`, `{a: p, b: q}`, `{a, ..}` | a record; `..` allows unlisted fields |
+| `(p, q)` | a tuple: the exact record pattern `{_0: p, _1: q}` (§5.3) |
 
 `match` is checked for **exhaustiveness** (`E0205`), and the diagnostic names the
 constructor you missed:
@@ -3114,8 +3136,9 @@ rather than left to be discovered.
   `order_json` and module B calling `order_json_v2`, both type-checking, one type
   serializing two ways. The orphan rule is the coherence there is, and it is a
   local property.
-* **No tuples.** Use a record. Destructure one with a record pattern —
-  `let {p, node} = f(x);` — which is what a tuple would have been for.
+* **A tuple is a record** with positional fields (§5.3): `(a, b)` is
+  `{_0: a, _1: b}` everywhere, so there is no second kind of value to derive,
+  hash or match on.
 * **No loops and no `break`.**
 
   > **This bullet read "No loops, no `break`, no early `return`", and the third

@@ -44,6 +44,7 @@ mod simulation;
 mod slot_resolution;
 mod stdlib_accumulator_cost;
 mod transaction_scope_audit;
+mod tuples;
 mod use_after_free_audit;
 mod value_semantics_audit;
 mod vertical_slice;
