@@ -75,6 +75,12 @@ fn the_census_over_the_parser_spike() {
     for (construct, count) in &ranked {
         println!("  {count:5}  {construct}");
     }
+    let mut by_name: Vec<(String, String)> = unit.refusals().to_vec();
+    by_name.sort();
+    println!("refused, by function:");
+    for (name, construct) in &by_name {
+        println!("  {name}: {construct}");
+    }
     // ADR 0030's ranked roots, kept lowered: a construct here that is refused again is a
     // regression in the fragment, not a fact about the spike.
     let lowered = [
@@ -84,6 +90,7 @@ fn the_census_over_the_parser_spike() {
         "a call whose callee is an expression",
         "is used as a value rather than called",
         "a bitwise operator or shift",
+        "a `let` binding a record pattern",
     ];
     let regressed: Vec<&(&str, usize)> = ranked
         .iter()

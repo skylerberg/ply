@@ -99,9 +99,12 @@ measurement is confounded until the earlier one has moved.
    that call the callback back; and the bitwise operators are lowered with the interpreter's
    shift-count refusal. A trampoline for an uncompiled callee was not needed:
    the cascade was the callbacks' blast radius, and the parser spike's census
-   now refuses only effects, `Decimal` and `Float` literals, a `handle` and
-   `secret_of_string` (`parser_census::the_census_over_the_parser_spike` pins
-   that no lambda, callback or value-call is refused). With every carried
+   now refuses only effects, `Decimal` and `Float` literals, a `handle`,
+   `secret_of_string` and a refutable `let` pattern
+   (`parser_census::the_census_over_the_parser_spike` pins that no lambda,
+   callback, value-call or `let` over a record is refused — the last was what
+   kept the whole checker out of the unit, through two functions that bind a
+   tuple). With every carried
    signature registered, the examples and the spike's own tests agree with the
    backend attached under `--audit-backend`. What remains is the gate, and it
    cannot move until step 3: the narrow registry enters the same leaves it
@@ -212,14 +215,13 @@ measurement is confounded until the earlier one has moved.
    agree over the standard library, every example, every bundle and the
    hasher's own mined inputs, with BLAKE3 from `std.hash` over the same bytes;
    `arm-hash.sh` arms it. The one surface it needed, `bits_of_float`, landed
-   first. Every phase step 6 names is now behind a differential.
-   Hashing is next after those. `std.hash` exists (ADR 0033) and its throughput is not measured. The
-   syntax the parser spike predated is ported first, so its own differential is
-   green before anything is built on it: the bit operators (with the shift join
-   and the lambda-parameter pipe guard) and keyword fields are in, the corpus
-   is re-mined from the reference's tests, and the agreement tests pass over
-   all of it. Re-mine whenever the reference grows syntax; the harness's
-   diagnostics pin moves with the corpus and says so.
+   first. Every phase step 6 names is now behind a differential. The syntax
+   the parser spike predated went in before any of them, so the parser's own
+   differential was green before anything was built on it: the bit operators
+   (with the shift join and the lambda-parameter pipe guard) and keyword
+   fields are in, the corpus is re-mined from the reference's tests, and the
+   agreement tests pass over all of it. Re-mine whenever the reference grows
+   syntax; the harness's diagnostics pin moves with the corpus and says so.
 7. **The driver.** Incremental caching, the content-addressed store and the
    gates are Rust, and ADR 0020 notes a self-hosted front end would be cached by
    machinery it does not own. Whether the front end lives behind the Rust driver
@@ -229,11 +231,33 @@ measurement is confounded until the earlier one has moved.
    `Known` interface is checked from on both sides, and every hash the store is
    keyed by is reproduced bit for bit — so a Rust driver can drive a Ply front
    end through the interfaces it already has, with no cache format moving. What
-   is not established is the cost: the ported front end has been compared, not
-   timed, and the row that decides whether the driver is worth porting is the
-   whole front end — parse, resolve, check, hash — over the examples, under the
-   backend and without it, taken with step 3's protocol. That row is the next
-   measurement, and the decision waits on it rather than on more porting.
+   was not established was the cost, and the row that decides is the whole
+   front end — parse, expansion, resolve, check, hash — over the standard
+   library and an example, under the backend and without it, with step 3's
+   protocol (`benches/front-end-whole/PRE-REGISTERED.md`, its observation
+   beside it). **The row is taken, and the decision is: the driver stays
+   Rust.** Under the interpreter hashing is the largest phase and checking the
+   next, together most of the whole; parsing is a distant third and the
+   resolver, with derive expansion, is small. Under the backend every phase
+   falls by several times and each row's root call is entered whole, nothing
+   declined — the checker included, once the fragment lowered the `let` over
+   a tuple that had kept its roots out of the unit (the first series saw the
+   checker barely move, and the pre-registration records why that confirmed
+   its prediction for the wrong reason). The whole front end is still well
+   over an order of magnitude from the Rust front end over the same files,
+   which is not the small factor the rule asked for, so the driver is not the
+   lever. What is: the runtime's cost per value on the callback path. A
+   profile of the compiled check row
+   (`benches/front-end-whole/profile-check-wide.txt`) puts its time under the
+   runtime's callback loops — `fold`, `map`, `iterate` calling the compiled
+   step back — and the larger part of that in the value traffic each step
+   causes: dropping and draining the values a step gives up, allocating,
+   the argument pool, cloning, field reads; the compiled frames themselves
+   are the minority. So the lever is that path — what a callback step pays
+   to receive, update and release a carried state — and after it the hasher,
+   most of whose cost is BLAKE3 in Ply. The series is an observation and not a figure by ADR 0030's
+   gate: quiet before, the load lifted past four after by the series' own
+   four workers, as the pre-registration said it would.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not
    compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
    neither them nor hex literals; both are repaired, the differential is green

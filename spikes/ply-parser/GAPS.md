@@ -2203,3 +2203,46 @@ hundreds of names unioned once per edge. As a `Map` — the language's ordered
 map, whose keys come back in the byte order a `BTreeSet` iterates in — the same
 run takes seconds. The lesson §5 recorded for the lexer holds for every port: a
 set written as a list is a quadratic waiting for the first real input.
+
+## §20 The whole front end, timed
+
+`benches/front-end-whole` is step 3's protocol over every phase at once: one
+project holding the twelve modules and, as byte literals, the standard library
+with an example, and a test per phase that re-runs the phases its own depends
+on. `PRE-REGISTERED.md` there fixes the arms, the statistic and the decision
+rule; `observation-2.txt` is the series it reads, `observation-1.txt` the one
+before it; `docs/BOOTSTRAP-PATH.md` step 7 carries what it decided. The shape:
+under the interpreter hashing is the largest phase and checking the next,
+parsing a distant third and the resolver small; under the backend every phase
+falls by several times, with each row entered whole and nothing declined. A
+profile of the compiled check row (`profile-check-wide.txt` beside the series)
+puts its time under the runtime's callback loops and, within them, in the value
+traffic of each step — drops, drains, allocation, the argument pool — rather
+than in the compiled frames; the compiled checker is a callback-shaped program,
+and what a callback step pays to receive, update and release its carried state
+is the next thing to move.
+
+**What the first series found, which was not the seam.** The checker barely
+moved under the backend in the first series, exactly as the pre-registration
+predicted — and the prediction's reason was wrong. The census over the spike,
+extended to name each refused function, showed the fragment refusing a `let`
+binding a record pattern in two of the checker's functions (`let (span,
+direct) = ...`, a tuple), and a refused callee refuses every caller, so the
+whole checker sat outside the compiled unit and ran interpreted while its
+leaves were never even offered. The fragment lowers a `let` over any
+irrefutable pattern now, through the binder a `match` arm already used. The
+lesson: a prediction confirmed is not a mechanism confirmed; read the
+instrument that names the mechanism before believing the number.
+
+**What the dry run found, which was not the resolver.** The first probe read
+the resolver's tables at many times the parse, and the resolver's name lookups
+were moved from lists onto maps before the cause was found — they stay, since a
+lookup that scans a module's names on every reference is the same quadratic
+§19 names. The cause was the probe: it called its `parsed()` constant once per
+module inside the later rows, and the memo (`ply_eval::memo`) walked a value a
+fixed depth before refusing to remember it, so a constant holding a parsed
+program was re-evaluated on every call. The walk is now iterative and
+unbounded, with a test that a constant is judged by its leaves however deep
+they lie. The lesson for every measurement of a Ply front end: a nullary
+constant is free on the second call only if the memo kept it, and until this
+change nothing said whether it had.

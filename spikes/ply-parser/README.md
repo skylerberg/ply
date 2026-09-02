@@ -70,6 +70,7 @@ either.
 ./spikes/ply-parser/run.sh --arm              # and then the sixteen mutations
 ./spikes/ply-parser/measure-front-end.sh      # GAPS.md §13's series, re-taken
 ./spikes/ply-parser/measure-multiplier.sh     # GAPS-harness.md §H5's series
+./benches/front-end-whole/run.sh              # GAPS.md §20's series: every phase, under the backend and without
 ```
 
 Per-area scripts (`test-*.sh`, `arm-*.sh`) each build a temp project holding
