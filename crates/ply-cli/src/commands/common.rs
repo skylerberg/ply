@@ -1,12 +1,50 @@
 use crate::load::LoadError;
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
-use ply_span::{Diagnostic, Severity, SourceMap, Span};
+use ply_span::{Diagnostic, Severity, SourceMap, Span, codes};
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
 /// The gutter the specified output shape is indented by.
 pub const IND: &str = "   ";
+
+/// `--backend`'s value as a spec, or the diagnostic that refuses it.
+pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpec>, Diagnostic> {
+    let Some(spec) = flag else {
+        return Ok(None);
+    };
+    ply_eval::backend::parse(spec).map(Some).map_err(|message| {
+        Diagnostic::error(codes::BACKEND_UNAVAILABLE, message).note(
+            "a wrong backend is a self-test: it exists so that a green run with a backend \
+             attached can be read as evidence",
+        )
+    })
+}
+
+/// The run's backend, built once over a checked program, or the diagnostic that refuses it.
+pub fn build_backend(
+    spec: &ply_eval::BackendSpec,
+    program: &ply_syntax::ast::Program,
+    resolved: &ply_syntax::resolve::Resolved,
+    check: &ply_core::CheckOutput,
+) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+    match spec.kind {
+        ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(program, resolved, check)),
+        ply_eval::BackendKind::Cranelift => ply_codegen::Cranelift::over(program, resolved, check)
+            .map(|unit| unit as &'static dyn ply_eval::Provider)
+            .map_err(|error| {
+                Diagnostic::error(
+                    codes::BACKEND_UNAVAILABLE,
+                    format!("the cranelift backend could not be built: {error:#}"),
+                )
+                .note(
+                    "a backend that failed to build would decline every call, so the run is \
+                     refused rather than reported green over a seam nothing reached",
+                )
+                .note("`--backend reference` needs no code generator and runs anywhere")
+            }),
+    }
+}
 
 pub fn diagnostic_json(diagnostic: &Diagnostic, sources: &SourceMap) -> Value {
     serde_json::to_value(ply_span::render::to_json(diagnostic, sources))

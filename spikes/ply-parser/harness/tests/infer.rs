@@ -114,6 +114,7 @@ impl Project {
         let _ = std::fs::remove_dir_all(self.0.join(".ply-cache"));
         let out = Command::new(ply_binary())
             .args(["run", "--json"])
+            .args(backend_args())
             .arg(&self.0)
             .output()
             .expect("run ply");
@@ -402,4 +403,14 @@ fn the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs() {
         .collect();
     assert!(!inputs.is_empty(), "the mined bundle holds no input");
     compare("reference checks", &inputs);
+}
+
+/// `--backend` for every `ply` the differential runs: `cranelift` unless `PLY_BACKEND` names
+/// another, or `none` for the interpreter alone.
+fn backend_args() -> Vec<String> {
+    match std::env::var("PLY_BACKEND").as_deref() {
+        Ok("none") => Vec::new(),
+        Ok(other) => vec!["--backend".to_string(), other.to_string()],
+        Err(_) => vec!["--backend".to_string(), "cranelift".to_string()],
+    }
 }
