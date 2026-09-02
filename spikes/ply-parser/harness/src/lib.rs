@@ -47,19 +47,15 @@ pub fn reference_dump_expanded(text: &str) -> String {
     dump_of(text, &module, &diags)
 }
 
-/// **The tree half of the same cost: how many nodes the three rewrites add.** Negative only
-/// where `try_op` refused a `?` and unwrapped it — one node fewer, and a diagnostic the other
-/// half counts — since no rewrite removes a node it accepted.
+/// **The tree half of the same cost: how many nodes the three rewrites add.** Signed, because
+/// two rewrites remove nodes: `try_op` unwraps a `?` it refused (one node fewer, and a
+/// diagnostic the other half counts), and `record_update` drops the base of an update that
+/// writes every field, since nothing is left to copy from it.
 pub fn nodes_the_rewrites_add(text: &str) -> isize {
     let (before, bd) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
     let (after, ad) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
     let b = node_count(&dump_of(text, &before, &bd));
     let a = node_count(&dump_of(text, &after, &ad));
-    assert!(
-        a >= b || ad.len() > bd.len(),
-        "the rewrites removed {} node(s) without refusing anything, which none of them can do",
-        b - a
-    );
     a as isize - b as isize
 }
 

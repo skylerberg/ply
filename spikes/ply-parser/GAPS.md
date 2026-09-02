@@ -1002,8 +1002,9 @@ honest price and it is item 5's job to keep saying so.
 > `E0118`/`E0119` (`?`), every one on a mined input written to raise it, and
 > the pinned map in `agreement.rs` is the current list. The tree half found
 > one thing this section had stated too strongly — *no rewrite removes a
-> node* — a refused `?` is unwrapped, which is one node fewer, so the count is
-> signed and the invariant holds where nothing was refused.
+> node* — twice over: a refused `?` is unwrapped, one node fewer, and an
+> update that writes every field drops its base, since nothing is copied from
+> it. So the count is signed, and it is a count rather than an invariant.
 
 **One cost is not free and must be stated: the reference crate has to grow an
 entry point.** `lib.rs` declares `mod effect_set; mod record_update; mod try_op;`
