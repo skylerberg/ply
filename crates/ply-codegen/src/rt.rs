@@ -1348,26 +1348,43 @@ pub unsafe extern "C" fn rt_record_update(
         }
         return base;
     }
+    // A fresh record: the written fields at their offsets, and the rest copied out of the base
+    // by offset when it has the shape, or by name when the lowering's guess at a base was a
+    // record of another shape — which is only ever a value that dies here, so nothing is read
+    // from it unless the literal left a field unwritten.
     let tables = Rc::clone(&ctx.tables);
-    let names = tables.layouts.shape_names(shape);
-    let out = ctx.heap.alloc(KIND_RECORD, 0, names.len() as u32, shape);
-    let base_shape = unsafe { (*o).layout };
-    for (i, name) in names.iter().enumerate() {
-        let w = match offsets.iter().position(|at| *at as usize == i) {
-            Some(k) => written[k],
-            None => match tables.layouts.offset(base_shape, name) {
-                Some(at) => {
-                    let w = unsafe { word_at(o, at) };
+    let width = tables.layouts.shape_width(shape);
+    let out = ctx.heap.alloc(KIND_RECORD, 0, width as u32, shape);
+    let mut filled = vec![false; width];
+    for (w, at) in written.iter().zip(offsets) {
+        unsafe { set_word(out, *at as usize, *w) };
+        filled[*at as usize] = true;
+    }
+    if written.len() < width {
+        let base_shape = unsafe { (*o).layout };
+        if base_shape == shape {
+            for (i, done) in filled.iter().enumerate() {
+                if !done {
+                    let w = unsafe { word_at(o, i) };
                     heap::inc(w);
-                    w
+                    unsafe { set_word(out, i, w) };
                 }
-                None => {
-                    let d = error(format!("this record has no field `{name}`"));
+            }
+        } else {
+            let names = tables.layouts.shape_names(shape);
+            for (i, done) in filled.iter().enumerate() {
+                if *done {
+                    continue;
+                }
+                let Some(at) = tables.layouts.offset(base_shape, &names[i]) else {
+                    let d = error(format!("this record has no field `{}`", names[i]));
                     return ctx.fail(d);
-                }
-            },
-        };
-        unsafe { set_word(out, i, w) };
+                };
+                let w = unsafe { word_at(o, at) };
+                heap::inc(w);
+                unsafe { set_word(out, i, w) };
+            }
+        }
     }
     heap::dec(base);
     out as Word
