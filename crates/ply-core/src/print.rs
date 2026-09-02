@@ -86,6 +86,12 @@ impl Printer {
                 s
             }
             Type::Record(fields) => {
+                if let Some(n) = crate::ty::tuple_arity(fields.len(), |k| fields.contains_key(k)) {
+                    let ts: Vec<String> = (0..n)
+                        .map(|i| self.ty(&fields[&ply_span::Symbol::new(format!("_{i}"))]))
+                        .collect();
+                    return format!("({})", ts.join(", "));
+                }
                 let fs: Vec<String> = fields
                     .iter()
                     .map(|(k, v)| {
