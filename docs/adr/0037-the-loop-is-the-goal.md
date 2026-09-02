@@ -1,14 +1,15 @@
 # ADR 0037 — The loop is the goal; the dependency line is a second one
 
-**Accepted as a direction and an ordering. It decides one refusal and registers
-one measurement; it builds nothing.**
+**Accepted as a split and an ordering. It decides that two goals were carried
+as one and which comes first, registers the row that orders the work under it,
+and takes one row it needed — `benches/c-floor/`, which prices what a C
+toolchain charges per definition on this machine. It refuses nothing.**
 
 `docs/BOOTSTRAP-PATH.md` carried one goal with two halves fused: a verification
 loop whose cost is O(the change), and a dependency line drawn where Rust's is —
 a C compiler and libc, with everything that has language content above it. They
-were written as one path ending in one place, and the fusion hid a conflict.
-**They are two goals, they are served by different work, and in the place the
-fusion put it one of them is hostile to the other.**
+were written as one path ending in one place, and they are served by different
+work.
 
 - **The loop.** ADR 0021's claim: Ply's verification loop is O(the change) and
   every toolchain it competes with is O(the project). That is the thesis, and it
@@ -19,156 +20,228 @@ fusion put it one of them is hostile to the other.**
   above Rust's: the evaluator, the code generator through Cranelift, the runtime
   helpers, the driver and the host effects are all Rust.
 
-**The loop is the goal. The line is a property the goal does not require.**
+**The loop is the goal. The line is a property the goal does not require** —
+and the loop has the property today in one tier and not in the other.
 
-> **What this decides.** That the loop's compiler tier is in-process and stays
-> in-process; that emitting C is **refused inside the loop** and kept for
-> release, portability and the bootstrap chain; that the end state is therefore
-> two tiers rather than one, both eventually hostable without Rust; and that
-> what orders any of it is the marginal cost of one edit, whose criteria are
-> registered below before the row is taken.
+> **What this decides.** That the compiled loop is O(project) at every stage a
+> backend run makes, by three mechanisms named below, and that the first of
+> them is a decision about what a cached pass claims rather than a cache to
+> build. That the loop's tier is whatever compiles O(change) definitions per
+> edit and loads what a run's selected tests reach, at a per-definition
+> constant the loop affords — and not, once such a cache exists, whatever
+> compiles fastest. That emitted C inside the loop is a constant-factor
+> question and not an exponent one, priced by `benches/c-floor/` and left
+> open. And that the row which orders all of it is `ply-corpus bench`'s edit
+> scenarios across the size ladder, fitted, with the backend arm it lacks,
+> whose criteria are registered below before the reading.
 >
 > **What it does not decide.** That C is the release target — ADR 0021's path
 > already carries that as a direction and this record does not re-take it. Nor
-> which loop tier replaces Cranelift: the candidate is named with its trade and
-> listed rather than chosen.
+> which loop tier replaces Cranelift: the candidates are listed with the trade
+> each makes, and what would choose among them is named.
 
-## Why C is refused in the loop
+## The loop today, checked
 
-A C compiler is a process, and a program is a link. Neither cost is marginal:
+The interpreter's loop has the property. The front end is cached by content
+(`crates/ply-store/src/frontend.rs`), a test is selected against the definition
+set it last passed under (`ply_store::PassRecord`), and `ply-corpus bench`
+prices an edit — `cold`, `warm`, `rename`, `edit-leaf` and `edit-hub`, nine
+phases each — at every size `ply-corpus sweep` is given. `README.md` §"The
+loop" is one size of that row.
 
-- **Per invocation**, a process spawn and a parse of every header the unit
-  includes, paid whether or not the definition changed. Caching an object by
-  content removes the compile and not the spawn.
-- **Per program**, the link is whole-program. Incremental linking is weak
-  everywhere it exists, and nothing makes a link proportional to an edit.
+The compiled loop does not have it, and every stage of a backend run is
+O(project), for three reasons that read in `crates/ply-cli/src/commands/test.rs`
+and `crates/ply-codegen/src/backend.rs`:
 
-A loop built on emitted C therefore has a floor that is O(project) by
-construction, and ADR 0021's whole claim is that the loop is not. **Both cannot
-be true of the same tier.**
+- **The caches are bypassed.** `cache_bypassed` is true whenever `--backend` is
+  given, so the run opens a scratch store: the front end is loaded whole rather
+  than incrementally, every test is selected, and nothing is recorded. This is
+  deliberate — `backend_escapes` reports a pass written under a backend as a
+  defect, because a cached `Pass` is a claim about the evaluator's own answer
+  and a backend is a second execution strategy. It is a decision about what a
+  pass means, and it comes first, because a backend run cannot be O(change) at
+  any stage until it can select.
+- **The unit is whole and compiled per worker.** `Cranelift::over` closes the
+  unit over every function the fragment compiles and builds it once as a
+  pre-flight; `Provider::attach` builds it again for every worker. A run
+  compiles the whole unit once more than it has workers.
+- **Nothing persists and every process is cold.** `crates/ply-codegen` depends
+  on `cranelift-jit` and not `cranelift-object`, so there is no object output a
+  cache could hold and no `DefHash -> code` exists; there is no `watch`, daemon
+  or server in `Command`, so every invocation starts from disk.
 
-This is not only a prediction. **Lean 4 is the instance**: reference counting
-with reuse from the same lineage as ADR 0034, self-hosted, emitting C, and used
-at a scale that settles whether the approach works — with compile times as the
-standing complaint against it. What Lean pays is what a C loop costs, paid by a
-project that wanted several of the same things this one does.
+So the compiled loop's exponent is not a question the row needs to answer; the
+code answers it. What the row prices is the constants — how much of an edit
+under the backend is the front end, how much is tests re-run, how much is
+compile — which decides whether the pass decision, the per-definition cache or
+the warm process pays first.
 
-### Priced and rejected
+## What the loop's tier must be
 
-**A translation unit per definition, with an object cached by content.** The
-compile becomes marginal and nothing else does: the spawn is paid per changed
-definition and the link stays whole-program. Recorded so that it is not
-re-derived from the appeal of the first half.
+The requirement is on the edit, not on the compiler. An edit must compile the
+definitions whose hash moved, and a run must load the code its selected tests
+reach; both are O(change) in ADR 0021's sense, because selection already bounds
+the reach. Once a cache keyed by `DefHash` holds compiled code, the compiler's
+latency is paid per changed definition and its code quality is paid on every
+test that runs — so a tier that compiles in microseconds and runs the suite
+several times slower loses to one that compiles in milliseconds and runs it
+fast, as soon as the suite runs longer than the compile. Compile latency near
+zero is the requirement only while every run compiles everything, which is the
+state this record exists to end.
 
-**LLVM IR in place of C, for the line rather than the loop.** Two forms, both
-losing. Linking LLVM trades a Rust dependency for a larger C++ one that is
-harder to build and to bind, which is the dependency this goal exists to
-shrink. Emitting textual IR trades a stable interface for one that is
-explicitly not stable — it moves with the release, and the opaque-pointer
-transition broke the out-of-tree text emitters that existed — and it still
-shells out to a binary, at which point `cc` is the simpler shell-out. **The
-serious LLVM consumers link the library in process; emitting its text is rare
-and is rarer the more the emitter is maintained.** C is the only one of the
-three that makes the dependency smaller than the one it replaces.
+Two consequences. The tier's compile speed matters up to the budget and not past
+it; past it, its code quality decides. And loading by reach is itself a link —
+`cranelift-jit` is an in-process linker, as every JIT is — so "no link" is not a
+property any tier can have. What a tier can have is a link proportional to the
+reach rather than to the program.
 
-## The two tiers
+## Emitted C inside the loop: priced, and the cost is not where the argument put it
 
-| tier | what it serves | what it must be |
-| --- | --- | --- |
-| the loop | `ply check`, `ply test`, `ply run` over an edit | in process; no spawn, no link; compile latency near zero; fast enough that the interpreter is not the fallback |
-| release | `ply build`, distribution, the bootstrap chain | emitted C over libc, portable, debuggable, and buildable from source with a C compiler alone |
+The argument this record was written to carry was that a compiler invocation is
+a process and a program is a link, so a loop built on emitted C has an
+O(project) floor by construction. `benches/c-floor/` takes that on this machine,
+on units shaped like a compiled Ply body over the runtime ABI, with the criteria
+in its `PRE-REGISTERED.md` and the series in `observation-2.txt`. Both halves of
+the argument are wrong about where the cost is, and the row found a third cost
+neither half named.
 
-Cranelift is the loop tier today and it is a Rust library, so the line's goal
-eventually takes it away. **What replaces it is not decided here.** The
-candidate worth naming, because it collapses most of the work, is
-**copy-and-patch**: stencils compiled by a C compiler at build time, and a
-run-time code generator that is a copy and a relocation patch. It puts the C
-dependency at build time and out of the loop, needs no register allocator, and
-trades code quality down to about what an unoptimising compiler emits. Listed,
-not chosen — what would decide it is the row below together with how long the
-loop's tests actually run, and neither reading exists.
+- **A process per changed definition is real and is a constant.** At `-O0` the
+  spawn and the header are most of it and the code generation is the smaller
+  part; optimising adds a fraction. It is tens of milliseconds per changed
+  definition, and it does not grow with the project.
+- **The whole-program link is not the exponent.** Over sixteen times the
+  objects, the link costs under twice the time: it is dominated by a fixed cost
+  and its marginal cost per object is microseconds. A link over everything a
+  run reaches, at the largest size measured, is about a tenth of a second.
+  "The link is whole-program, therefore O(project)" is true as asymptotics and
+  false as a description of the loop's budget at the sizes this project
+  measures.
+- **Loading is per image, not per definition.** One library's first load costs
+  the same whether it holds a few hundred definitions or a few thousand, and a
+  later load of the same file is a fraction of a millisecond.
+- **And the cost the argument missed: images.** Loading one image per definition
+  costs *more* than N times loading one, superlinearly in N, and it holds
+  whether each image binds its runtime symbols two-level or by flat lookup. At
+  the largest per-image size measured, a warm load of one image per definition
+  costs seconds where the same definitions in one library cost a fraction of a
+  millisecond. That is a property of the loader, not of C, and it is the real
+  floor under a "compile each definition to its own object and load what you
+  reach" design — the design the first version of this record priced and
+  rejected for the wrong reason.
 
-## The loop's own gaps
+**So the C shape that could sit in a loop is the opposite of the one that was
+rejected.** An object cached per definition and compiled only when its hash
+moves; one link over the objects the run reaches; one image loaded. Its floor is
+a constant per run — a link and a load, each about a tenth of a second at the
+largest size measured — plus the compile of what actually changed. Constants,
+measured, not an exponent.
 
-Three. The first two are holes rather than slow paths, and none of them is
-mentioned by the path this record reorders.
+Whether that constant fits inside the loop is not this row's to say, because the
+budget is not written down. The marginal-change row below is what sets it, and
+what it must compare the constant against is what the same edit costs with no
+process at all — which is what an in-process tier gives and what nothing has
+measured for Cranelift, since the unit is compiled whole.
 
-- **Compiled code does not persist.** The front end is cached by content —
-  `DefHash -> interface`, `crates/ply-store/src/frontend.rs` — and a test is
-  selected against the definition set it last passed under, which
-  `ply_store::PassRecord` holds as the test's own hash plus every function and
-  declaration in its closure by hash. Both are already O(change).
-  `crates/ply-codegen` persists nothing: no `DefHash -> code`, and it depends on
-  `cranelift-jit` and not `cranelift-object`, so there is no object output for a
-  cache to hold. **Every `--backend` run compiles the whole reachable program
-  again**, and a `.plyx` carries definitions rather than code, so a built
-  artifact does not change that. The backend is the one stage of the loop still
-  O(project) on every invocation, and it is the stage the loop now depends on
-  for its speed.
-- **Every invocation is cold.** There is no `watch`, no daemon and no server in
-  `Command`; a run starts a process, reads the caches from disk and exits. A
-  warm process holds interfaces, compiled code and selection in memory and
-  sidesteps serialising compiled code at all, which is the harder half of the
-  gap above.
-- **Nothing measures an edit in the loop.** Every row under `benches/`
-  measures work proportional to the project — parse the standard library, check
-  everything, hash everything — and where those pre-registrations say "warm"
-  they mean *the cache was warmed so that it would not vary*. `ply-corpus w5`
-  times one edit, on the deploy path and at one size. **No row prices the
-  marginal change in the loop**, which is the only quantity ADR 0021's claim is
-  about.
+**Lean 4 is the precedent for the split, not evidence against C.** Checked
+against Lake's source (`LeanLibConfig.lean` and `Facets.lean`, read
+2026-09-02): a bare `lake build` of a library builds its `leanArts` facet — the
+`.olean`, `.ilean` and emitted `.c` — and does not compile that C;
+`precompileModules` defaults to false, and objects are built for an executable
+or for a module the elaborator is asked to load natively. Lean's editing loop is
+elaboration over its own artifacts, and its C is a release tier, which is the
+shape this record proposes. The one Lean loop that does pass through C is the
+compiler's own, rebuilt through the stage chain — the analogue of ADR 0021's
+instance, Ply's own loop being a Rust loop, and not evidence about C in a user's
+loop.
+
+## Candidates for the loop's tier, listed and not chosen
+
+| tier | depends on | per changed definition | per run | code quality | what it costs the tree |
+| --- | --- | --- | --- | --- | --- |
+| Cranelift over a `DefHash -> code` cache | a Rust library, until the line's goal removes it | a Cranelift compile, unmeasured per definition | none; the code is already in the process | Cranelift's | a per-definition unit and a way to hold code across runs; keeps Rust |
+| emitted C, an object per definition, linked and loaded once per run | a C compiler at run time | a process and a compile | a link and a load — `benches/c-floor/` | the C compiler's, at the level chosen | one code generator serving both tiers |
+| emitted C, an image per definition, loaded by reach | a C compiler at run time | a process, a compile and a link | superlinear in the images loaded — **the row above refuses this shape** | the C compiler's | one code generator, and a loader cost that grows faster than the reach |
+| a C compiler linked in process (libtcc is the instance) | a C library at run time | a compile, no process | unmeasured | unoptimised | one code generator; a second C toolchain to bind |
+| copy-and-patch | clang at build time — the stencils need a calling convention that passes every register through, and CPython's JIT builds with a pinned LLVM for that reason | a copy and a relocation patch | none | about an unoptimising compiler's | a second code generator in Ply, with its own differential |
+
+What would choose: the per-run and per-definition constants against the loop's
+budget, which `benches/c-floor/` has half of and the marginal-change row sets;
+the code quality against how long the suite runs, which the marginal-change row
+separates only if test length is varied; and one code generator against two,
+since the release tier is C either way and every code generator in Ply is a
+differential to maintain. The C row that survives its own measurement is the
+second, and what is missing to compare it with the first is Cranelift's own
+per-definition cost, which nothing has read because the unit is compiled whole.
+
+**LLVM in place of C, for the line rather than the loop — priced and rejected.**
+Two forms, both losing. Linking LLVM trades a Rust dependency for a larger C++
+one that is harder to build and to bind, which is the dependency this goal
+exists to shrink. Emitting textual IR trades a stable interface for one that
+moves with the release — the opaque-pointer transition broke the out-of-tree
+text emitters that existed — and it still shells out to a binary, at which
+point `cc` is the simpler shell-out. C is the only one of the three that makes
+the dependency smaller than the one it replaces.
 
 ## The row, registered before it is taken
 
-**Not built, but not from nothing.** The reading does not exist and the harness
-is a composition of two that do: `ply-corpus sweep` generates a project at each
-of several sizes and benchmarks whole-project phases over it, and `ply-corpus
-w5` times a rebuild after a one-leaf edit at one size on the deploy path.
-Neither applies an edit across two sizes, and neither runs under `--backend`.
-This section is the criteria, written first so that a number cannot set the bar
-it is about to clear.
+**Half built.** `ply-corpus bench` applies the edits and times the phases,
+`ply-corpus sweep` takes it at each size, and `benches/run.sh` is a ladder of
+six sizes. What is missing: a `--backend` option on `bench`, which calls
+`ply_test::run` in-process and installs no backend, though
+`ply_cli::commands::common::build_backend` is public and is the seam the
+command itself uses; a fit across the sizes,
+since `sweep` prints one report per size and nothing reads the slope; and the
+process start `bench` does not pay. The criteria, written before the arm
+exists:
 
-**Question.** What does one edit cost, end to end, and does that cost grow with
-the size of the project?
+**Question.** What does one edit cost, and does it grow with the size of the
+project — under the interpreter, and under the backend?
 
-**Arms.** Each is an edit applied to a checked-out tree, followed by `ply test`
-to green:
+**Arms.** `bench`'s five scenarios, each under no backend and under
+`--backend cranelift`: `warm` is the run's fixed cost, `cold` the O(project)
+bound on the same project, `rename` the edit that moves no hash, `edit-leaf`
+and `edit-hub` the two reaches.
 
-| arm | the edit |
-| --- | --- |
-| `leaf` | a body-only change to a definition nothing else depends on |
-| `hub` | a body-only change to a definition much of the suite reaches |
-| `rename` | a rename, which changes no hash |
-| `signature` | a change to a declared type, which moves every dependent hash |
-| `cold` | the same tree with the caches discarded — the O(project) bound |
+**Sizes.** Three from the ladder in a ratio of four, so a slope is told from a
+constant; two points fit any line.
 
-Against the control the thesis is actually about: **the same five edits made to
-the Rust tree**, `cargo nextest` to green, which is the O(project) toolchain
-ADR 0021 names as the competitor.
+**Statistic.** `bench`'s own — minimum total over repeats, phases beside it —
+under ADR 0030's gate: load read before and after, the binary checked current,
+no series spanning a rebuild.
 
-**Statistic.** Minimum user CPU to green over blocks, under ADR 0030's protocol
-— counterbalanced arms, a null control, the load gate read before and after, the
-binary checked current on both sides, no series spanning a rebuild.
+**Control.** `cold` on the same project. The Rust tree is one program at one
+size and cannot be fitted, so it is not in the row.
 
-**Decision rule, and it is a slope rather than a threshold.** The claim is about
-an exponent, so no single project size can test it: **take every arm at two
-project sizes and fit.** `leaf` and `rename` must be flat in project size;
-`cold` must not be. If `leaf` grows with the project then the loop is O(project)
-whatever its constant, and whatever causes that growth — today, the backend's
-missing cache — is what to fix before anything else in the path is worth
-ordering. `hub` and `signature` are read for where the knee falls, not against a
-bar.
+**Decision rule.** Under the interpreter, `rename` and `edit-leaf` move less
+across the sizes than `warm` does, and `cold` moves in proportion to the size.
+Under the backend the same test, and it is expected to fail on every arm — the
+code above says so — and the row's reading is *which phase* carries the growth,
+front end, execute or compile, because that is what orders the pass decision,
+the per-definition cache and the warm process. Growth mostly in execute means
+the pass decision is the whole of the first step; mostly in compile, the cache;
+a fixed cost that dominates both, the warm process.
 
 That rule is CONTRIBUTING §"Measure an ADR's motivating claim before accepting
-the ADR" applied to the claim this whole project rests on. Note what skipping it
-has cost so far: ADR 0021's claim has been load-bearing for every bootstrap
-decision in the tree and **has never been measured as a slope.**
+the ADR" applied to the claim this whole project rests on, which has been
+load-bearing for every bootstrap decision in the tree and has been read as a
+slope for neither tier.
+
+## The order
+
+1. Decide what a cached `Pass` claims when a backend answered, and key the
+   store on it. Nothing below matters until a backend run selects.
+2. Take the row above with its backend arm. It says which of the next two pays
+   first.
+3. A `DefHash -> code` cache, which needs per-definition units and an object
+   format, or a warm process, which needs neither.
+4. Re-take `benches/c-floor/` against Cranelift's per-definition constant once
+   the unit is per-definition, and choose the loop's tier from the table above.
 
 ## What would make this wrong
 
-- **If `leaf` is already flat and already small.** Then the loop is what it
-  claims, the two holes above are theoretical, and the ordering this record
-  changes should go back to the one it found.
+- **If the row finds an edit under the backend flat in project size.** Then the
+  code reading above is wrong somewhere, and the ordering should go back to
+  what it found once the row says where.
 - **If a warm process removes the backend's cost by itself.** Then persisting
   compiled code is never needed and the daemon is the whole of that work rather
   than half of it.
@@ -178,8 +251,13 @@ decision in the tree and **has never been measured as a slope.**
   enough; which regime the loop is in is a property of the suite, not of the
   compiler. The row above does not separate the two, and a row that varied test
   length would.
-- **If C's floor is smaller than this record assumes.** The spawn and the link
-  are asserted here from how C toolchains work and are **not measured on this
-  tree**: one timing of `cc` over a generated unit, and one link of the whole
-  program, would settle it. Per CONTRIBUTING §"Say how it was checked, or say it
-  was not": not checked.
+- **If the C floor is different where the loop runs than here.**
+  `benches/c-floor/` is one machine, one loader and one toolchain, and the cost
+  that decided the shape — many images being superlinear to load — is the
+  loader's. Another platform is a re-take, not an inference, and a loader
+  without that property would put the per-definition-image shape back on the
+  table.
+- **If a cached pass under a backend cannot be given a meaning the evaluator's
+  cache can share.** Then the compiled tier keeps a cache with its own key, and
+  O(change) holds per tier rather than across them — still the property, at the
+  cost of a cold first run per tier.

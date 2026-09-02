@@ -332,62 +332,70 @@ measurement is confounded until the earlier one has moved.
    value, and the hottest builtins as direct calls over values made once; its
    series are `benches/value-model/after-direct.txt` and
    `benches/front-end-whole/observation-6.txt`.
-10. **Emit C, for release and not for the loop.** Where the path ends, decided
-    as a direction and gated on step 9: the eventual host is a C compiler and
-    libc, with the compiler and its runtime written in Ply, which is the line
-    Rust itself holds above LLVM and libc. Two reasons it is a direction and not
-    a step to start, and ADR 0037 added the second. Emitting C onto today's
-    representation would move a slow model to a different host, and step 9 is
-    what decides whether the model competes. And **C is refused inside the
-    loop**: a compiler invocation is a process and a program is a link, so a
-    loop built on emitted C has an O(project) floor by construction, which is
-    the exponent ADR 0021 exists to avoid. C is the release tier and the loop
-    keeps a tier of its own. §"Where this ends" below is the order once step 9
-    clears.
+10. **Emit C, for release; inside the loop it is priced and not chosen.** Where
+    the path ends, decided as a direction and gated on step 9: the eventual host
+    is a C compiler and libc, with the compiler and its runtime written in Ply,
+    which is the line Rust itself holds above LLVM and libc. It is a direction
+    and not a step to start because emitting C onto today's representation
+    would move a slow model to a different host, and step 9 is what decides
+    whether the model competes. Whether the loop's tier is the same C over
+    smaller units or a second code generator is ADR 0037's question, and it
+    turns on a constant per changed definition that `benches/c-floor/` prices
+    rather than on an exponent. §"Where this ends" below is the order once
+    step 9 clears.
 
 ## The loop, which is what the path is for
 
-ADR 0037 records the split and the refusal; this is what it means for the order
-of work. **The loop's gaps are not steps on the path above.** They are not gated
-on the bootstrap, they pay off before any of it lands, and the path is worth
-ordering only if the loop it serves is the thing ADR 0021 claims.
+ADR 0037 records the split; this is what it means for the order of work. **The
+loop's gaps are not steps on the path above.** They are not gated on the
+bootstrap, they pay off before any of it lands, and the path is worth ordering
+only if the loop it serves is the thing ADR 0021 claims.
 
-What the loop already has. The front end is cached by content —
+What the interpreter's loop has. The front end is cached by content —
 `DefHash -> interface`, `crates/ply-store/src/frontend.rs` — and a test is
 selected against the definition set it last passed under, which
 `ply_store::PassRecord` holds as the test's own hash together with every
 function and declaration in its closure, so a test re-runs only when something
 it reaches moved. Selecting nothing after a rename is an invariant the suite
 asserts rather than a heuristic:
-`crates/ply-cli/tests/suite/cli.rs renaming_a_definition_re_runs_nothing`.
+`crates/ply-cli/tests/suite/cli.rs renaming_a_definition_re_runs_nothing`. And
+it is measured: `ply-corpus bench` applies a rename, a leaf edit and a hub edit
+and times nine phases after each, and `ply-corpus sweep` takes that at each of
+several sizes.
 
-What it does not have:
+What the compiled loop does not have, in the order to take them:
 
+- **A cached `Pass` under a backend.** `ply test --backend` bypasses the store
+  (`crates/ply-cli/src/commands/test.rs cache_bypassed`): the run opens a
+  scratch cache, so the front end loads whole and every test runs, and a pass
+  written under a backend is reported as an escape (`backend_escapes`), for a
+  stated reason — a cached `Pass` is a claim about the evaluator's own answer,
+  and a backend is a second execution strategy. That is a decision and not a
+  hole, and it comes first because nothing below it matters until a backend run
+  can select. What the decision needs is a key that names what answered.
 - **A compiled-code cache.** `crates/ply-codegen` persists nothing across runs:
   no `DefHash -> code`, and `cranelift-jit` rather than `cranelift-object`, so
-  there is no object output for a cache to hold. Every `--backend` run compiles
-  the whole reachable program again, and a `.plyx` carries definitions rather
-  than code, so building one does not change it. The front end got its
-  content-addressed cache and the backend never did, which leaves the backend
-  the one stage of the loop still O(project) per invocation — now that the loop
-  depends on it for speed.
+  there is no object output for a cache to hold. `Cranelift::over` closes the
+  unit over every function the fragment compiles, builds it once as a
+  pre-flight, and builds it again for every worker that attaches, so a run
+  compiles the whole unit once more than it has workers. A `.plyx` carries
+  definitions rather than code, so building one changes nothing here.
 - **A warm process.** No `watch`, no daemon and no server in `Command`: an
-  invocation starts cold, reads the caches from disk and exits. A warm process
-  holds interfaces, compiled code and selection in memory, and sidesteps
-  serialising compiled code at all, which is the harder half of the gap above.
-- **A row that measures an edit.** Every row under `benches/` measures work
-  proportional to the project, and "warm" in those pre-registrations means the
-  cache was warmed so that it would not vary. ADR 0037 registers the missing
-  one — five edits, the same five against the Rust tree as the control, every
-  arm taken at two project sizes and fitted, because a claim about an exponent
-  cannot be tested at one size. **Not built**, though not from nothing:
-  `ply-corpus sweep` already varies a generated project's size and
-  `ply-corpus w5` already times a rebuild after a one-leaf edit, and what is
-  missing is a row that does both at once and does it under `--backend`.
+  invocation starts cold, reads what caches it reads from disk, and exits. A
+  warm process holds interfaces, compiled code and selection in memory, and
+  sidesteps serialising compiled code at all, which is the harder half of the
+  gap above.
+- **The row under `--backend`, fitted.** `ply-corpus bench` has the scenarios
+  and `sweep` has the sizes; what is missing is a backend arm, a fit across the
+  sizes, and the process start `bench` does not pay because it runs the phases
+  in-process. ADR 0037 registers the arm and the fit with the criteria fixed
+  first. What the row will say under the backend is already legible from the
+  code above — every stage is O(project) — and what it prices is the
+  constants, which order the three items above against each other.
 
-Take that row before re-ordering anything above it. A lever's share of a
-whole-project run says nothing about its share of one edit, and every row the
-path above is ordered on measures the former.
+Take the decision and the row before re-ordering anything above them. A lever's
+share of a whole-project run says nothing about its share of one edit, and every
+row the path above is ordered on measures the former.
 
 ## Where this ends: two tiers, over a C compiler and libc
 
@@ -400,14 +408,15 @@ when that line is where Rust's is: a Ply compiler, written in Ply, emitting C
 whose only external dependencies are a C compiler and the C library, over a
 runtime written in Ply or a thin C shim.
 
-**It ends in two tiers rather than one** (ADR 0037). Emitted C is the release
-tier: `ply build`, distribution, and a bootstrap chain anyone can follow with a
-C compiler alone. The loop keeps a tier of its own, in process, because a spawn
-and a link are not marginal costs and the loop's entire claim is that its costs
-are. Cranelift is that tier today and is a Rust library, so this goal takes it
-away eventually; what replaces it is undecided, and ADR 0037 names
-copy-and-patch as the candidate that would put a C compiler at build time and
-out of the loop.
+**It ends in two tiers, and whether they share a code generator is open**
+(ADR 0037). Emitted C is the release tier: `ply build`, distribution, and a
+bootstrap chain anyone can follow with a C compiler alone. The loop's tier is
+whatever makes an edit compile O(change) definitions and a run load what its
+selected tests reach, at a per-definition constant the loop affords. Cranelift
+is that tier today and is a Rust library, so this goal takes it away
+eventually; ADR 0037 lists what could replace it — the same C over
+per-definition objects, a C compiler linked in process, copy-and-patch — with
+the trade each makes, and chooses none until the rows it registers are read.
 
 The route is visible already, which is why it can be written down before it is
 started. The runtime surface compiled code depends on is an enumerated table —
@@ -427,8 +436,9 @@ port in this tree has been:
    answers the same, over the differential corpus. C rather than machine code
    because a C compiler is portable, debuggable and the route most self-hosted
    languages took at this stage; Cranelift is a Rust library, so a Ply backend
-   over it would still link Rust. **This is the release tier.** The loop's tier
-   is a separate build and ADR 0037 says why it cannot be this one.
+   over it would still link Rust. **This is the release tier.** Whether the
+   loop's tier is the same generator over smaller units or a second one is
+   ADR 0037's open question.
 4. **A runtime over libc** behind the same ABI: values as step 9 laid them out,
    counts, reuse, strings, the ordered map, and the host effects over the C
    library. The open design question is effects with captured continuations —
@@ -460,9 +470,10 @@ regression.
 - **If step 9's kernels clear and the front-end row does not move.** Then the
   cost is at the seam or in dispatch rather than in the values, and ADR 0035's
   census is what says which; the C target waits either way.
-- **If the marginal-change row finds the loop already flat and already small.**
-  Then the gaps §"The loop, which is what the path is for" names are
-  theoretical, and ADR 0037's re-ordering should be given back.
+- **If the row under `--backend` finds an edit flat in project size.** Then
+  the reading of the code in §"The loop, which is what the path is for" is
+  wrong somewhere, and ADR 0037's re-ordering should be given back once the
+  row says where.
 - **If no loop tier can be built without Rust at a latency the loop affords.**
   Then the two goals are one after all, the release tier is the only tier, and
   what gives is either the sub-second claim or the dependency line — ADR 0037
