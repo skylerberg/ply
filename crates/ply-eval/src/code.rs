@@ -744,13 +744,24 @@ fn lower_record_update(fields: &[(Ident, Expr)], cx: &mut Cx) -> Option<NodeKind
     })
 }
 
-/// The first slot variable projected anywhere inside `e`, without crossing into a barrier of
-/// its own (a lambda's projections read its own window).
+/// The first slot variable projected anywhere inside `e` that is in scope around `e`, without
+/// crossing into a barrier of its own (a lambda's projections read its own window). A variable
+/// `e` binds itself is dead by the time the base is read, so it is never the base.
 fn projected_slot_var<'e>(e: &'e Expr, cx: &Cx) -> Option<(&'e Expr, &'e QName, (u32, u32))> {
+    let mut inner = Vec::new();
+    projected_outer_var(e, cx, &mut inner)
+}
+
+fn projected_outer_var<'e>(
+    e: &'e Expr,
+    cx: &Cx,
+    inner: &mut Vec<Symbol>,
+) -> Option<(&'e Expr, &'e QName, (u32, u32))> {
     crate::limit::grow(|| {
         if let ExprKind::Field { base, .. } = &e.kind
             && let ExprKind::Var(q) = &base.kind
             && q.is_bare()
+            && !inner.contains(q.symbol())
             && let Some(slot) = cx.table.var(base)
         {
             return Some((&**base, q, slot));
@@ -768,14 +779,25 @@ fn projected_slot_var<'e>(e: &'e Expr, cx: &Cx) -> Option<(&'e Expr, &'e QName, 
                 else_branch,
             } => vec![cond, then_branch, else_branch],
             ExprKind::Match { scrutinee, .. } => vec![scrutinee],
-            ExprKind::Block { stmts, tail } => stmts
-                .iter()
-                .map(|s| match s {
-                    AstStmt::Let { value, .. } => &**value,
-                    AstStmt::Expr(e) => e,
-                })
-                .chain(tail.iter().map(|t| &**t))
-                .collect(),
+            ExprKind::Block { stmts, tail } => {
+                let mark = inner.len();
+                let found = stmts
+                    .iter()
+                    .find_map(|s| match s {
+                        AstStmt::Let { pat, value, .. } => {
+                            let found = projected_outer_var(value, cx, inner);
+                            pattern_binders(pat, inner);
+                            found
+                        }
+                        AstStmt::Expr(e) => projected_outer_var(e, cx, inner),
+                    })
+                    .or_else(|| {
+                        tail.as_ref()
+                            .and_then(|t| projected_outer_var(t, cx, inner))
+                    });
+                inner.truncate(mark);
+                return found;
+            }
             ExprKind::Record { fields } => fields.iter().map(|(_, v)| v).collect(),
             ExprKind::RecordUpdate { base, fields } => std::iter::once(&**base)
                 .chain(fields.iter().map(|(_, v)| v))
@@ -785,11 +807,24 @@ fn projected_slot_var<'e>(e: &'e Expr, cx: &Cx) -> Option<(&'e Expr, &'e QName, 
             ExprKind::List { items } => items.iter().collect(),
             ExprKind::Perform { args, .. } => args.iter().collect(),
             ExprKind::Handle { body, .. } => vec![body],
-            ExprKind::WithCell { init, body, .. } => vec![init, body],
+            ExprKind::WithCell {
+                init, binder, body, ..
+            } => {
+                let found = projected_outer_var(init, cx, inner);
+                if found.is_some() {
+                    return found;
+                }
+                inner.push(binder.name.clone());
+                let found = projected_outer_var(body, cx, inner);
+                inner.pop();
+                return found;
+            }
             ExprKind::WithRegion { body, .. } => vec![body],
             ExprKind::Simulate { .. } => Vec::new(),
         };
-        children.into_iter().find_map(|c| projected_slot_var(c, cx))
+        children
+            .into_iter()
+            .find_map(|c| projected_outer_var(c, cx, inner))
     })
 }
 

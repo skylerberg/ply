@@ -124,3 +124,18 @@ what moved it — its key is built per step — not the drops, whose in-place
 updates the last-use moves had already secured on this kernel. The drops
 found something else: a branch answering a local aliased it at one count,
 which the fragment's cases now pin. Neither kernel clears.
+
+## After the inlining
+
+`after-inline.txt`, under the gate on both sides, with small callees inlined
+before lowering, field-only records split into their fields, every field of a
+fixed shape read inline — a scalar into a register — and the count-down
+allocating nothing. The integer kernel moved by a large factor, and the
+profile before this step said why in advance: half its samples were the
+by-name field read the ownership marks had been routing around the static
+path, and a third the work list the count-down allocated per dying record.
+The record kernel moved by a fifth. Neither kernel clears. What the reading
+says now: the integer kernel's records that remain are the sixteen-word
+states of functions over the inliner's budget, and the record kernel's time
+is in bridged keys and bytes — string compares and concatenations done by the
+interpreter — which is the next step's, not this one's.

@@ -481,6 +481,16 @@ impl Jit {
         flags.set("use_colocated_libcalls", "false")?;
         flags.set("is_pic", "false")?;
         flags.set("opt_level", "speed")?;
+        // The verifier checks the IR this generator emits, which the test suites run in debug
+        // builds; a release binary compiles a unit for its speed.
+        flags.set(
+            "enable_verifier",
+            if cfg!(debug_assertions) {
+                "true"
+            } else {
+                "false"
+            },
+        )?;
         let isa = cranelift_native::builder()
             .map_err(|e| anyhow!("this host has no Cranelift backend: {e}"))?
             .finish(settings::Flags::new(flags))?;
@@ -585,7 +595,8 @@ impl Jit {
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
             // With the parameters as the window's leading slots, so a lambda that reads one
             // captures it rather than reading a global that does not exist.
-            let code = lower_fn(&params, &def.body).code;
+            let body = crate::opt::optimize(loaded, module_index, def);
+            let code = lower_fn(&params, &body).code;
             bodies.push(((*name).to_string(), params, code, module_index));
         }
         Ok((jit, bodies, started))
@@ -622,6 +633,7 @@ impl Jit {
             function: name.to_string(),
             module_index,
             homes: Vec::new(),
+            kinds: HashMap::new(),
         };
 
         // The prologue `ply_eval::limit` needs and the fragment's gaps item 6 records as missing: one
@@ -720,6 +732,7 @@ impl Jit {
             function: String::new(),
             module_index: func.module_index,
             homes: Vec::new(),
+            kinds: HashMap::new(),
         };
         let mut args = vec![fx.ctx];
         for (i, kind) in func.sig.params.iter().enumerate() {
@@ -880,6 +893,9 @@ struct Fx<'a, 'b> {
     /// The stack slot of every binding whose value is a word, released at the function's exit
     /// unless a move emptied it first.
     homes: Vec<cranelift_codegen::ir::StackSlot>,
+    /// `kind_of`'s answer per node: a branch is asked about before it is compiled and again at
+    /// every join above it, and the answer is fixed by the node's place in the tree.
+    kinds: HashMap<*const ply_eval::code::Node, Kind>,
 }
 
 type Scope = Vec<(Symbol, Val)>;
@@ -957,6 +973,39 @@ impl Fx<'_, '_> {
         self.builder.seal_block(bump);
         let bumped = self.builder.ins().iadd_imm(rc, 1);
         self.builder.ins().store(MemFlags::trusted(), bumped, w, 0);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+    }
+
+    /// The field `w` at offset `at` of the record `base` leaves it: the slot is emptied when the
+    /// record has one holder, so the field keeps its count and the record's end lets nothing go;
+    /// otherwise the field is held once more. What `rt_field` does for a taken field, inline.
+    fn take_field_inline(
+        &mut self,
+        base: cranelift_codegen::ir::Value,
+        at: usize,
+        w: cranelift_codegen::ir::Value,
+    ) {
+        let rc = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlags::trusted(), base, 0);
+        let unique = self.builder.ins().icmp_imm(IntCC::Equal, rc, 1);
+        let take = self.builder.create_block();
+        let share = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.ins().brif(unique, take, &[], share, &[]);
+        self.builder.switch_to_block(take);
+        self.builder.seal_block(take);
+        let unit = self.builder.ins().iconst(types::I64, crate::heap::unit());
+        self.builder
+            .ins()
+            .store(MemFlags::trusted(), unit, base, (HEADER + 8 * at) as i32);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(share);
+        self.builder.seal_block(share);
+        self.inc_inline(w);
         self.builder.ins().jump(done, &[]);
         self.builder.switch_to_block(done);
         self.builder.seal_block(done);
@@ -1332,6 +1381,16 @@ impl Fx<'_, '_> {
     /// The representation an expression will produce, decided before its branches are compiled so a
     /// join can be given a block parameter.
     fn kind_of(&mut self, code: &Code, scope: &Scope) -> Result<Kind> {
+        let key = std::rc::Rc::as_ptr(code);
+        if let Some(kind) = self.kinds.get(&key) {
+            return Ok(*kind);
+        }
+        let kind = self.kind_of_uncached(code, scope)?;
+        self.kinds.insert(key, kind);
+        Ok(kind)
+    }
+
+    fn kind_of_uncached(&mut self, code: &Code, scope: &Scope) -> Result<Kind> {
         Ok(match &code.kind {
             NodeKind::Lit(Lit::Int(_), _) => Kind::Int,
             NodeKind::Lit(Lit::Bool(_), _) => Kind::Bool,
@@ -1344,6 +1403,22 @@ impl Fx<'_, '_> {
             NodeKind::App { func, args } => match &func.kind {
                 NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                     Denotes::Compiled(f) if f.arity == args.len() => f.sig.ret,
+                    _ => Kind::Boxed,
+                },
+                _ => Kind::Boxed,
+            },
+            // A scalar field of a local whose record type the checker fixed, as the field arm
+            // of `expr` answers it.
+            NodeKind::Field { base, field } => match &base.kind {
+                NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
+                    Denotes::Local(v) => match self.static_field(v.ty, &field.name) {
+                        Some((_, ty)) => match self.jit.tys[ty as usize] {
+                            Ty::Int => Kind::Int,
+                            Ty::Bool => Kind::Bool,
+                            _ => Kind::Boxed,
+                        },
+                        None => Kind::Boxed,
+                    },
                     _ => Kind::Boxed,
                 },
                 _ => Kind::Boxed,
@@ -1795,20 +1870,47 @@ impl Fx<'_, '_> {
                 }
                 let base = self.boxed(base);
                 // A read of a record whose shape the checker fixed is a load at the field's
-                // offset, held once more; anything else, and any read that takes the base or the
-                // field, goes by name through the runtime.
-                if own == 0
-                    && let Some((at, ty)) = known
-                {
-                    let v = self.builder.ins().load(
+                // offset. A scalar field answers in a register whatever the mark, since moving
+                // a scalar out of a dying record is the same as reading it; any other field is
+                // held once more when the record stays, and taken out of the record — its slot
+                // emptied when nobody else holds the record, held once more otherwise — when
+                // the mark says the field or the record is at its last use.
+                if let Some((at, ty)) = known {
+                    let kind = match self.jit.tys[ty as usize] {
+                        Ty::Int => Kind::Int,
+                        Ty::Bool => Kind::Bool,
+                        _ => Kind::Boxed,
+                    };
+                    let w = self.builder.ins().load(
                         types::I64,
                         MemFlags::trusted(),
                         base,
                         (HEADER + 8 * at) as i32,
                     );
-                    self.inc_inline(v);
+                    let v = match kind {
+                        Kind::Boxed if own == 0 => {
+                            self.inc_inline(w);
+                            w
+                        }
+                        Kind::Boxed => {
+                            self.take_field_inline(base, at, w);
+                            w
+                        }
+                        _ => self.coerce(
+                            Val {
+                                kind: Kind::Boxed,
+                                v: w,
+                                ty,
+                                home: 0,
+                            },
+                            kind,
+                        ),
+                    };
+                    if own == 1 || own == 3 {
+                        self.dec_inline(base);
+                    }
                     return Ok(Val {
-                        kind: Kind::Boxed,
+                        kind,
                         v,
                         ty,
                         home: 0,
