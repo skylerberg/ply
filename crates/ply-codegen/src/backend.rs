@@ -19,6 +19,9 @@ const MAX_ARITY: usize = 16;
 struct Admitted {
     entry: Entry,
     arity: usize,
+    /// The memo index of a pure nullary root, whose answer the seam remembers as compiled
+    /// code does.
+    constant: Option<usize>,
 }
 
 /// Why an offered call was not taken.
@@ -270,7 +273,15 @@ impl Bodies {
                      every call and no reason recorded against it"
                 );
             }
-            admitted.insert(name.clone(), Admitted { entry, arity });
+            let constant = code.constant_index(name.as_str());
+            admitted.insert(
+                name.clone(),
+                Admitted {
+                    entry,
+                    arity,
+                    constant,
+                },
+            );
         }
         let ctx = RefCell::new(code.context());
         Ok(Bodies {
@@ -311,14 +322,43 @@ impl Bodies {
             return self.decline(|d| d.reentered += 1);
         };
 
+        let tables = Rc::clone(&ctx.tables);
+        // A pure nullary root already remembered is answered without running: the memo's word
+        // as the value it was converted to once.
+        if let Some(index) = admitted.constant
+            && let Some(kept) = tables.memoized(index)
+            && let Some(value) = tables.memo_value(kept)
+        {
+            drop(ctx);
+            self.unit.counters.note_converted(0, 0);
+            self.entered.set(self.entered.get() + 1);
+            return Some(value);
+        }
         ctx.begin(i64::try_from(fuel).unwrap_or(i64::MAX));
         // The arguments cross into the entry's own words, deep, and the answer crosses back the
         // same way below: nothing outside the entry ever holds a word.
-        let tables = Rc::clone(&ctx.tables);
         let mut handles = [0i64; MAX_ARITY];
         let before = ctx.heap.allocated();
+        // A value this unit answered from its memo goes back in as the word it came from; a
+        // call whose arguments are all such words is a pure function of remembered inputs, and
+        // is remembered in turn.
+        let mut all_memo = !args.is_empty();
         for (slot, value) in handles.iter_mut().zip(args) {
-            *slot = ctx.heap.to_word(&tables.layouts, value);
+            *slot = match tables.memo_word(value) {
+                Some(w) => w,
+                None => {
+                    all_memo = false;
+                    ctx.heap.to_word(&tables.layouts, value)
+                }
+            };
+        }
+        let words = &handles[..args.len()];
+        if all_memo && let Some(value) = tables.memo_call(name, words) {
+            ctx.end();
+            drop(ctx);
+            self.unit.counters.note_converted(0, 0);
+            self.entered.set(self.entered.get() + 1);
+            return Some(value);
         }
         let inward = (ctx.heap.allocated() - before) as u64;
         // SAFETY: `admitted.entry` is a pointer into `self._code`'s finalized executable pages,
@@ -347,12 +387,26 @@ impl Bodies {
             drop(ctx);
             return self.decline(|d| d.touched_cells += 1);
         }
+        // A pure nullary root's answer is remembered as compiled code remembers it, and the
+        // value it is converted to once is kept beside the word: the next entry through this
+        // root answers that value without running, and the next entry handed that value passes
+        // the word back in without converting it.
         let mut outward = 0;
         let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut outward);
+        let kept = match admitted.constant {
+            Some(index) if crate::heap::world_independent(out) => Some(tables.memoize(index, out)),
+            None if all_memo && crate::heap::world_independent(out) => {
+                tables.memoize_call(name, words, out)
+            }
+            _ => None,
+        };
         ctx.end();
         drop(ctx);
         if crate::rt::holds_a_handle(&value).is_some() {
             return self.decline(|d| d.answer += 1);
+        }
+        if let Some(kept) = kept {
+            tables.remember(kept, &value);
         }
         self.unit.counters.note_converted(inward, outward);
         self.entered.set(self.entered.get() + 1);

@@ -198,6 +198,9 @@ fn sig_of(jit: &mut Jit, loaded: &Source, name: &str, arity: usize) -> Sig {
 pub struct Unit {
     module: JITModule,
     entries: HashMap<String, (FuncId, usize)>,
+    /// The pure nullary roots, by the index the runtime's memo is keyed on, so the seam can
+    /// remember their answers as compiled code does.
+    constants: HashMap<String, usize>,
     tables: Rc<Tables>,
     pub nodes: HashMap<String, usize>,
     /// Nanoseconds spent in `cranelift`, from the first declaration to `finalize_definitions`.
@@ -209,6 +212,11 @@ impl Unit {
         let (id, _) = self.entries.get(name)?;
         let ptr = self.module.get_finalized_function(*id);
         Some(unsafe { std::mem::transmute::<*const u8, Entry>(ptr) })
+    }
+
+    /// The memo index of a pure nullary root, if `name` is one.
+    pub fn constant_index(&self, name: &str) -> Option<usize> {
+        self.constants.get(name).copied()
     }
 
     pub fn arity(&self, name: &str) -> Option<usize> {
@@ -340,9 +348,19 @@ impl Jit {
             .iter()
             .map(|(name, f)| (name.clone(), (f.entry, f.arity)))
             .collect();
+        let constants = jit
+            .funcs
+            .iter()
+            .filter(|(_, f)| jit.constants.contains(&f.typed))
+            .filter_map(|(name, f)| {
+                let index = jit.functions.iter().position(|id| *id == f.entry)?;
+                Some((name.clone(), index))
+            })
+            .collect();
         Ok(Unit {
             module: jit.module,
             entries,
+            constants,
             tables: Rc::new(Tables {
                 consts: jit.consts,
                 const_words: jit.const_words,
@@ -353,6 +371,9 @@ impl Jit {
                 memo: RefCell::new(Vec::new()),
                 immortals: RefCell::new(jit.immortals),
                 bytes: RefCell::new([0; 256]),
+                memo_values: RefCell::new(HashMap::new()),
+                memo_words: RefCell::new(HashMap::new()),
+                calls: RefCell::new(HashMap::new()),
             }),
             nodes: jit.nodes,
             compile_nanos,
