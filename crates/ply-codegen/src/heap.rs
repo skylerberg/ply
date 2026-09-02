@@ -287,6 +287,11 @@ impl Layouts {
         self.shapes.borrow().names[shape as usize].clone()
     }
 
+    /// How many fields a shape has.
+    pub fn shape_width(&self, shape: u32) -> usize {
+        self.shapes.borrow().names[shape as usize].len()
+    }
+
     pub fn offset(&self, shape: u32, name: &Symbol) -> Option<usize> {
         self.shapes.borrow().names[shape as usize]
             .binary_search(name)
