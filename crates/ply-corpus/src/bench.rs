@@ -353,13 +353,16 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
 
     // Timed apart from the run, because it is the phase an edit does not shrink: the unit closes
     // over every function the fragment compiles whatever moved, and nothing holds it across runs.
+    // Skipped when the selection is empty, exactly as `ply test` skips it: a unit compiled to enter
+    // nothing would put the whole project's compile into a scenario that runs no test, and the row
+    // would report a cost the command does not pay.
     let started = Instant::now();
     let provider = match &spec {
-        None => None,
-        Some(spec) => Some(
+        Some(spec) if !selection.to_run.is_empty() => Some(
             ply_cli::commands::common::build_backend(spec, &program, &resolved, &check)
                 .map_err(|d| anyhow::anyhow!("building the backend: {}", d.message))?,
         ),
+        _ => None,
     };
     timings.record(Phase::Compile, started.elapsed());
 

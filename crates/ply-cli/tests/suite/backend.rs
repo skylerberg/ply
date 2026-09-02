@@ -387,6 +387,44 @@ fn a_backend_run_writes_no_pass_the_evaluator_will_read() {
     assert_eq!(u64_at(&plain, &["summary", "passed"]), 9, "{plain}");
 }
 
+/// A unit compiled to enter nothing is the whole project's compile spent on an empty selection,
+/// and `benches/marginal-change/` prices that at about half of a backed run. A run that selected no
+/// test builds none.
+#[test]
+fn a_backed_run_that_selects_nothing_compiles_nothing() {
+    let dir = project(CORPUS);
+    let report = run(dir.path(), Some("cranelift"));
+    assert!(
+        u64_at(&report, &["backend", "fragment"]) > 0,
+        "the control did not compile a fragment, so the next assertion proves nothing: {}",
+        report["backend"]
+    );
+
+    let out = ply(dir.path())
+        .arg("test")
+        .arg("--backend")
+        .arg("cranelift")
+        .arg("--filter")
+        .arg("nothing-matches-this")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["ok"], Value::Bool(true), "{report}");
+    assert_eq!(
+        u64_at(&report, &["backend", "fragment"]),
+        0,
+        "a run that selected no test compiled a fragment anyway: {}",
+        report["backend"]
+    );
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .is_some_and(|d| d.is_empty()),
+        "a run that built no backend reported a disagreement about which engine it was: {report}"
+    );
+}
+
 // --- The flag itself --------------------------------------------------------
 
 /// A flag that is accepted and does nothing is `CONTRIBUTING.md` §"The one rule"'s defect shape, so
