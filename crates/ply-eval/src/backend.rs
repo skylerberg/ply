@@ -637,6 +637,12 @@ impl Compiled for Mutant {
         self.inner.describes(program)
     }
 
+    /// A corruption is a wrong answer at the seam, and a test entered whole hands the seam
+    /// nothing to corrupt: a mutant leaves every test to the machine, where each call crosses.
+    fn enter_test(&self, _name: &Symbol, _budget: usize) -> crate::compiled::Entered {
+        crate::compiled::Entered::Declined
+    }
+
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
         let counters = self.inner.counters();
         counters.note_offer(args);

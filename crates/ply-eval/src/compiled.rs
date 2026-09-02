@@ -3,7 +3,7 @@
 use crate::value::{Closure, ClosureKind, Value};
 use ply_core::CheckOutput;
 use ply_core::ty::{SECRET, TyVar, Type};
-use ply_span::Symbol;
+use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::Program;
 use rustc_hash::FxHashMap;
 
@@ -14,6 +14,24 @@ pub trait Compiled {
 
     /// Runs `name`'s body over `args`, or declines for any reason at all.
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value>;
+
+    /// Runs a test's body whole, through the nullary root the backend synthesized for it, and
+    /// says whether the body ran and raised — which `enter` folds into a decline — because a
+    /// test the backend fails and the machine passes is a disagreement, not a decline.
+    fn enter_test(&self, _name: &Symbol, _budget: usize) -> Entered {
+        Entered::Declined
+    }
+}
+
+/// How a test root's entry ended.
+#[derive(Debug)]
+pub enum Entered {
+    /// The body ran to its answer.
+    Answered(Value),
+    /// The body ran and raised this.
+    Raised(Diagnostic),
+    /// The backend did not run the body.
+    Declined,
 }
 
 /// What may cross this boundary, in either direction: the two unboxed scalars, the two byte
@@ -421,7 +439,7 @@ mod tests {
     use crate::value::Fields;
     use crate::value::{Closure, ClosureKind};
     use ply_core::{CheckOutput, check_program};
-    use ply_span::Diagnostic;
+    use ply_span::{Diagnostic, codes};
     use ply_syntax::ast::{BinOp, Expr, ExprKind, Item, Program};
     use ply_syntax::resolve::Resolved;
     use std::cell::RefCell;
@@ -2576,6 +2594,91 @@ mod tests {
 
     /// A record `Value` from a list of fields, which no helper in [`crate::build`] answers because
     /// that module builds `Expr`s.
+    /// A backend that holds only test roots, and ends every entry the one way it is told to.
+    struct Roots {
+        /// Never dereferenced.
+        program: *const Program,
+        entered: Box<dyn Fn() -> Entered>,
+    }
+
+    impl Compiled for Roots {
+        fn describes(&self, program: &Program) -> bool {
+            std::ptr::eq(self.program, std::ptr::from_ref(program))
+        }
+
+        fn enter(&self, _: &Symbol, _: &[Value], _: usize) -> Option<Value> {
+            None
+        }
+
+        fn enter_test(&self, _: &Symbol, _: usize) -> Entered {
+            (self.entered)()
+        }
+    }
+
+    fn first_test_under(
+        c: &Checked,
+        entered: impl Fn() -> Entered + 'static,
+    ) -> (Result<(), Diagnostic>, (u64, u64)) {
+        let mut machine = c.machine();
+        machine.set_compiled(Rc::new(Roots {
+            program: &c.program,
+            entered: Box::new(entered),
+        }));
+        let outcome = machine.eval_test_in(c.program.modules[0].name.as_symbol(), 0);
+        (outcome, machine.compiled_counts())
+    }
+
+    fn double_doubles(expected: i64) -> Vec<Item> {
+        vec![
+            double_def(),
+            test_def(
+                "double doubles",
+                callv(
+                    "assert_eq",
+                    vec![callv("double", vec![int(21)]), int(expected)],
+                ),
+            ),
+        ]
+    }
+
+    fn assertion_raised() -> Entered {
+        Entered::Raised(Diagnostic::error(codes::RUNTIME_ERROR, "assertion failed"))
+    }
+
+    /// A root the backend ran and raised in is not a decline: nothing crossed the seam to be
+    /// checked, so the machine runs the body, and a pass there is the backend's disagreement.
+    #[test]
+    fn a_test_root_the_backend_raised_in_fails_as_a_disagreement_when_the_machine_passes() {
+        let c = checked(double_doubles(42));
+        let (outcome, counts) = first_test_under(&c, || Entered::Answered(Value::Unit));
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(counts, (1, 0), "an answered root is an entry");
+
+        // The root's decline, and then the machine's own run offering `double`, declined too.
+        let (outcome, counts) = first_test_under(&c, || Entered::Declined);
+        assert!(outcome.is_ok(), "{outcome:?}");
+        assert_eq!(counts, (0, 2), "a declined root is the machine's run");
+
+        let (outcome, counts) = first_test_under(&c, assertion_raised);
+        let d = outcome.expect_err("the backend raised where the machine passes");
+        assert_eq!(d.code, codes::ENGINE_DIVERGENCE, "{}", d.message);
+        assert!(
+            d.notes.iter().any(|n| n.contains("assertion failed")),
+            "the note names what the backend raised: {:?}",
+            d.notes
+        );
+        assert_eq!(counts, (0, 2));
+    }
+
+    /// The same raise where the machine raises too is the machine's diagnostic, as before.
+    #[test]
+    fn a_test_root_the_backend_raised_in_keeps_the_machines_diagnostic_when_it_raises_too() {
+        let c = checked(double_doubles(43));
+        let (outcome, _) = first_test_under(&c, assertion_raised);
+        let d = outcome.expect_err("the assertion fails in the machine");
+        assert_ne!(d.code, codes::ENGINE_DIVERGENCE, "{}", d.message);
+    }
+
     fn record_value(fields: &[(&str, Value)]) -> Value {
         let mut map = BTreeMap::new();
         for (name, value) in fields {

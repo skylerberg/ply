@@ -52,7 +52,7 @@ pub use backend::{
 };
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use code::{Captures, Code, Lowered, Lowering, Node, NodeKind, Pat, lower};
-pub use compiled::Compiled;
+pub use compiled::{Compiled, Entered};
 pub use cont::{
     Continuation, Delimiter, Extent, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
 };
