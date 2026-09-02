@@ -13,6 +13,7 @@ use crate::heap::{
 };
 use crate::jit::Entry;
 use crate::list;
+use crate::map;
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::cell::RefCell;
@@ -872,7 +873,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*b);
             Some(ctx.heap.alloc(KIND_CTOR, 0, 0, index) as Word)
         }
-        (Builtin::MapNew, []) => Some(ctx.heap.alloc_map(4) as Word),
+        (Builtin::MapNew, []) => Some(ctx.heap.map_new()),
         (Builtin::MapInsert, [m, k, v]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
             let tables = Rc::clone(&ctx.tables);
             Some(ctx.heap.map_insert(&tables.layouts, *m, *k, *v))
@@ -881,22 +882,21 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let some = ctx.tables.layouts.some?;
             let none = ctx.tables.layouts.none?;
             let o = obj(*m);
-            let answer = match heap::map_find(&ctx.tables.layouts, o, *k) {
-                Ok(i) => {
-                    let v = unsafe { heap::map_value(o, i) };
+            let answer = match map::get(&ctx.tables.layouts, o, *k) {
+                Some(v) => {
                     heap::inc(v);
                     let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
                     unsafe { set_word(c, 0, v) };
                     c as Word
                 }
-                Err(_) => ctx.heap.alloc(KIND_CTOR, 0, 0, none) as Word,
+                None => ctx.heap.alloc(KIND_CTOR, 0, 0, none) as Word,
             };
             heap::dec(*m);
             heap::dec(*k);
             Some(answer)
         }
         (Builtin::MapContains, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
-            let found = heap::map_find(&ctx.tables.layouts, obj(*m), *k).is_ok();
+            let found = map::get(&ctx.tables.layouts, obj(*m), *k).is_some();
             heap::dec(*m);
             heap::dec(*k);
             Some(heap::bool(found))
@@ -914,11 +914,11 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::MapKeys | Builtin::MapValues, [m]) if heap::kind(*m) == KIND_MAP => {
             let o = obj(*m);
-            let n = unsafe { (*o).len } as usize;
-            let at = if which == Builtin::MapKeys { 0 } else { 1 };
-            let items: Vec<Word> = (0..n)
-                .map(|i| {
-                    let w = unsafe { word_at(o, 2 * i + at) };
+            let keys = which == Builtin::MapKeys;
+            let items: Vec<Word> = map::to_vec(o)
+                .into_iter()
+                .map(|(k, v)| {
+                    let w = if keys { k } else { v };
                     heap::inc(w);
                     w
                 })
@@ -929,11 +929,9 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::MapEntries, [m]) if heap::kind(*m) == KIND_MAP => {
             let o = obj(*m);
-            let n = unsafe { (*o).len } as usize;
             let shape = ctx.tables.layouts.entry_shape();
-            let mut items = Vec::with_capacity(n);
-            for i in 0..n {
-                let (k, v) = unsafe { (heap::map_key(o, i), heap::map_value(o, i)) };
+            let mut items = Vec::with_capacity(map::len(o));
+            for (k, v) in map::to_vec(o) {
                 heap::inc(k);
                 heap::inc(v);
                 let e = ctx.heap.alloc(KIND_RECORD, 0, 2, shape);
@@ -972,7 +970,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 }
                 pairs.push((k, v));
             }
-            let mut m = ctx.heap.alloc_map((n as u32).max(4)) as Word;
+            let mut m = ctx.heap.map_new();
             for (k, v) in pairs {
                 heap::inc(k);
                 heap::inc(v);
@@ -986,10 +984,8 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         {
             let tables = Rc::clone(&ctx.tables);
             let o = obj(*bm);
-            let n = unsafe { (*o).len } as usize;
             let mut m = *a;
-            for i in 0..n {
-                let (k, v) = unsafe { (heap::map_key(o, i), heap::map_value(o, i)) };
+            for (k, v) in map::to_vec(o) {
                 heap::inc(k);
                 heap::inc(v);
                 m = ctx.heap.map_insert(&tables.layouts, m, k, v);
@@ -1347,10 +1343,8 @@ pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64)
     let c = unsafe { &mut *ctx };
     if heap::kind(map) == KIND_MAP {
         let o = obj(map);
-        let n = unsafe { (*o).len } as usize;
         let mut acc = init;
-        for i in 0..n {
-            let (k, v) = unsafe { (heap::map_key(o, i), heap::map_value(o, i)) };
+        for (k, v) in map::to_vec(o) {
             heap::inc(k);
             heap::inc(v);
             acc = call_value(ctx, f, &[acc, k, v]);
