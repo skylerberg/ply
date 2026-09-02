@@ -124,14 +124,24 @@ measurement is confounded until the earlier one has moved.
    also says: the compiled parse is a fifth faster than the interpreted one,
    not five times, so the next lever is what compiled code does with values
    (step 4), not what it lowers.
-4. **The container machinery.** Map insert and lookup, record field access, list
-   push and index are outside the fragment however many functions compile (ADR
-   0021). Measure the share first with the executed-work census
-   (`w6_alloc_sites` and ADR 0026's coverage criterion), then make the operations
-   native to compiled code or specialise their representations. Gate: the share
-   falls under the census, not a micro-benchmark.
+4. **What compiled code does with values — measured, and it is ownership.**
+   `front_end_alloc_sites` (in `ply-codegen-tests`) attributes one parse's
+   allocations by site under both engines, the way `w6_alloc_sites` attributes
+   a request's. The compiled parse allocates several times *more* than the
+   interpreted one, and the table says why: the arena hands every value to a
+   helper as a shared handle, so a record update rebuilds the record, a `push`
+   copies the list, and every builtin, constructor and callback clones its
+   arguments — none of the last-use ownership ADR 0034 gave the machine reaches
+   compiled code, and the machine's own copies of the same parse are a
+   fraction of it. So the lever is not native container operations; it is the
+   lowering's `Own` marks, which the code generator already has on every
+   variable use and ignores: a last use moves the value out of its slot, so an
+   update writes in place, a push reuses, and an argument is handed over rather
+   than cloned. Gate: the census reads the compiled arm at or below the
+   interpreter's allocations, pinned there.
 5. **The language tax the spike priced.** In `spikes/ply-parser/GAPS.md`'s
-   order: tuples (§3), `const` (§5 — the value of a nullary pure definition is
+   order: tuples (§3 — **landed** as sugar over positional records, `(a, b)` is
+   `{_0: a, _1: b}` in a type, a value and a pattern), `const` (§5 — the value of a nullary pure definition is
    already memoised at run time by `ply-eval::memo`, so what remains is the
    spelling), `?` inside lambdas (§2, `E0118` — **landed**: a lambda may write
    `-> T` before a block body and `?` reads it; an `iterate` step answers `Iter`

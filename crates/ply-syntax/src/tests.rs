@@ -915,16 +915,6 @@ fn an_operation_without_a_mode_says_read_or_write() {
 }
 
 #[test]
-fn a_tuple_type_is_rejected_with_a_note() {
-    let ds = errs("fn f(x: (Int, Bool)) = x");
-    assert!(
-        ds[0].notes.iter().any(|n| n.contains("record")),
-        "{:#?}",
-        ds[0]
-    );
-}
-
-#[test]
 fn a_duplicate_return_clause_is_reported_once() {
     let ds = errs("fn f() = handle g() with { return x -> x, return y -> y }");
     assert_eq!(ds.len(), 1);
@@ -1100,6 +1090,27 @@ fn derive_item_parses() {
 #[test]
 fn derive_is_contextual_and_a_function_may_still_be_named_derive() {
     assert_eq!(dump("fn derive(x) = x"), "(fn derive ((x _)) x)");
+}
+
+/// A comma inside parentheses makes a tuple, which is the record `{_0: a, _1: b}` in every
+/// position; without one the parentheses group, and `()` stays `Unit`.
+#[test]
+fn a_tuple_is_a_positional_record_in_types_expressions_and_patterns() {
+    let d = dump("fn f(p: (Int, Bool)) -> Int = match p { (x, true) -> x, (_, false) -> 0 }");
+    assert!(
+        d.contains("{_0: Int, _1: Bool}") || d.contains("(rec"),
+        "{d}"
+    );
+    assert_eq!(expr("(1, true)"), expr("{_0: 1, _1: true}"));
+    assert_eq!(expr("(1)"), expr("1"));
+    assert_eq!(expr("(1,)"), expr("1"));
+    assert_eq!(dump("fn f(x: (Int)) = x"), dump("fn f(x: Int) = x"));
+    assert_eq!(
+        dump("fn f(x: (Int, Int) -> Int) = x"),
+        dump("fn f(x: (Int, Int) -> Int) = x")
+    );
+    let d = errs("fn f() = (1, ");
+    assert_eq!(d[0].code, codes::UNEXPECTED_TOKEN);
 }
 
 #[test]
