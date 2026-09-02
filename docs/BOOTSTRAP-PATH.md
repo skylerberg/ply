@@ -161,7 +161,9 @@ measurement is confounded until the earlier one has moved.
    its corpus carries none), an expression-position `unreachable` (§8 — the
    expression exists: `panic` is typed `String -> a`, and what the spike wanted
    beyond it was a placeholder *visible in the differential*, which is the
-   spike's choice rather than a gap), and §9's small pieces. Float construction is ADR 0020's
+   spike's choice rather than a gap), and §9's small pieces (`min` and `max`
+   **landed** as integer builtins; `saturating_sub` is `max(a - b, 0)`; the rest
+   of §9 is spelling the language does not owe). Float construction is ADR 0020's
    one absolute hole. Each is an ordinary language
    change under ADR 0001's rule that no existing hash may move, and each moves
    `docs/GUIDE.md` in the same change.
