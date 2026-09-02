@@ -196,7 +196,10 @@ fn report(name: &str, window: &Window) {
             100.0 * *count as f64 / window.total as f64
         );
     }
-    assert!(window.total > 0, "`{name}` allocated nothing, so nothing was ranked");
+    assert!(
+        window.total > 0,
+        "`{name}` allocated nothing, so nothing was ranked"
+    );
 }
 
 /// The census this file exists for, printed under `--no-capture`: both arms, ranked by site, and
