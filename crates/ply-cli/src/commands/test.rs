@@ -247,8 +247,14 @@ fn iterate(
     let runtime = hosts.runtime_factory();
     // One per run, not one per worker: a backend may not borrow the program (`Machine`'s `compiled`
     // field says why), so building one costs a copy of the AST and the workers share it.
+    // A unit compiled to run nothing is the whole project's compile spent on an empty selection,
+    // and `benches/marginal-change/` prices it at about half of a backed run. A run that selected
+    // no test has nothing to enter, so it builds nothing — which is what makes a warm loop under a
+    // backend cost the edit rather than the project.
+    let nothing_to_run = plan.selection.to_run.is_empty();
     let provider = match backend
         .as_ref()
+        .filter(|_| !nothing_to_run)
         .map(|spec| build_backend(spec, &loaded.program, &loaded.resolved, &loaded.check))
     {
         None => None,
@@ -437,6 +443,18 @@ impl BackendView {
 /// a claim about a third execution strategy.
 fn backend_escapes(report: &RunReport, selected_under: &ply_test::Engine) -> Vec<Diagnostic> {
     if &report.engine == selected_under {
+        return Vec::new();
+    }
+    // The invariant is about what was written, so a run that wrote nothing cannot have broken it.
+    // This is the case where the two legitimately differ: a run that selected no test builds no
+    // backend, because a unit compiled to enter nothing is the whole project's compile spent on an
+    // empty selection — so the runner sees no provider and names the evaluator, over a run that
+    // recorded no pass under either engine.
+    if !report
+        .results
+        .iter()
+        .any(|r| r.recorded.as_ref().is_some_and(Record::is_written))
+    {
         return Vec::new();
     }
     vec![
@@ -2802,6 +2820,55 @@ test \"stuck\" {
             true,
         )
         .expect("the fixture binds")
+    }
+
+    fn recorded_result(recorded: Option<Record>) -> TestResult {
+        TestResult {
+            index: 0,
+            name: "a".into(),
+            hash: None,
+            group: 0,
+            duration: Duration::ZERO,
+            status: Status::Passed,
+            failure: None,
+            simulation: None,
+            recorded,
+            audited: None,
+            backend: None,
+        }
+    }
+
+    /// The check can fire, which is the whole of its value: the command names the engine before it
+    /// builds a provider and the run names it from the provider it built, so the two are separate
+    /// readings of one fact and nothing else compares them.
+    #[test]
+    fn recording_under_an_engine_the_run_did_not_select_against_is_an_escape() {
+        let mut report = report_over(vec![recorded_result(Some(Record::Under(vec![])))]);
+        report.engine = ply_test::Engine::backend("cranelift:wide");
+        let escapes = backend_escapes(&report, &ply_test::Engine::Evaluator);
+        assert_eq!(escapes.len(), 1, "the disagreement was not reported");
+        assert!(
+            escapes[0].message.contains("evaluator"),
+            "{}",
+            escapes[0].message
+        );
+        assert!(
+            escapes[0].message.contains("cranelift:wide"),
+            "{}",
+            escapes[0].message
+        );
+    }
+
+    /// And the one case where they legitimately differ: a run that selected nothing builds no
+    /// backend, so the runner names the evaluator over a run that recorded no pass at all.
+    #[test]
+    fn a_run_that_recorded_nothing_cannot_have_escaped() {
+        let mut report = report_over(vec![recorded_result(None)]);
+        report.engine = ply_test::Engine::Evaluator;
+        assert!(
+            backend_escapes(&report, &ply_test::Engine::backend("cranelift:wide")).is_empty(),
+            "a run that wrote nothing was reported as writing in the wrong namespace"
+        );
     }
 
     fn report_over(results: Vec<TestResult>) -> RunReport {
