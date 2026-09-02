@@ -358,6 +358,12 @@ pub unsafe extern "C" fn rt_dec(_ctx: *mut Ctx, w: i64) {
     heap::dec(w);
 }
 
+/// Perceus's `reset`: a record held once, at its last use in a body that builds another of its
+/// width, keeps its memory for that one. Answers the word kept, or `0` once released.
+pub unsafe extern "C" fn rt_reset(_ctx: *mut Ctx, w: i64) -> i64 {
+    heap::reset(w)
+}
+
 pub unsafe extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     ctx.heap.boxed_int(v)
@@ -1833,6 +1839,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),
         ("rt_dec", rt_dec as *const u8),
+        ("rt_reset", rt_reset as *const u8),
         ("rt_constant", rt_constant as *const u8),
     ]
 }
