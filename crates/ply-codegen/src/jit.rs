@@ -1224,11 +1224,10 @@ impl Fx<'_, '_> {
     /// Perceus's drop at the scope's end, for a block's `let`s at the block's end, an arm's
     /// pattern at the arm's, and the parameters at the function's.
     fn release_homes_from(&mut self, mark: usize) {
-        for slot in self.homes[mark..].to_vec() {
+        for slot in self.homes.split_off(mark) {
             let w = self.builder.ins().stack_load(types::I64, slot, 0);
             self.dec_inline(w);
         }
-        self.homes.truncate(mark);
     }
 
     fn is_local(&self, code: &Code, scope: &Scope) -> bool {
@@ -1543,6 +1542,8 @@ impl Fx<'_, '_> {
                 self.builder.switch_to_block(then_block);
                 self.builder.seal_block(then_block);
                 let mut inner = scope.clone();
+                // A branch's answer is owned: a local returned here is duplicated unless the
+                // read is its last, so the join never aliases a binding at one count.
                 let t = self.consumed(then_branch, &mut inner)?;
                 let t_ty = t.ty;
                 let t = self.coerce(t, kind);
