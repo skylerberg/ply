@@ -38,6 +38,10 @@ pub struct Declines {
     /// A builtin allocated in the fragment's private arena, which means the compile-time refusal of
     /// `cell_get`/`cell_set` has a hole in it.
     pub touched_cells: u64,
+    /// The body answered a value holding a closure, a cell, a task, a continuation or a secret —
+    /// nothing this boundary carries out. The machine would refuse it too; the backend refuses
+    /// it first, so no registry width can leak one.
+    pub answer: u64,
 }
 
 impl Declines {
@@ -48,6 +52,7 @@ impl Declines {
             + self.out_of_fuel
             + self.reentered
             + self.touched_cells
+            + self.answer
     }
 }
 
@@ -340,6 +345,9 @@ impl Bodies {
         let value = ctx.read(out).clone();
         ctx.end();
         drop(ctx);
+        if crate::rt::holds_a_handle(&value).is_some() {
+            return self.decline(|d| d.answer += 1);
+        }
         self.entered.set(self.entered.get() + 1);
         Some(value)
     }
@@ -378,11 +386,16 @@ impl Policed for Bodies {
 ///
 /// Read once per process, so a test cannot set it and expect it to take now that the crate's tests
 /// share one binary; measure this arm through the command.
+/// Every function the fragment compiled is registered, and the seam admits each call by its
+/// carried types. ADR 0030 shipped the scalar-signature registry instead, because registering
+/// more only added leaf islands while the callback family was refused; with that family lowered
+/// the wide registry enters at the parse root and beats no backend on the front-end row
+/// (`benches/front-end`). `PLY_CODEGEN_REGISTER=narrow` keeps the arm that record measured.
 fn registers(source: &Source, name: &str) -> bool {
-    static ALL: OnceLock<bool> = OnceLock::new();
-    let all =
-        *ALL.get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "all"));
-    all || scalar_signature(source, name)
+    static NARROW: OnceLock<bool> = OnceLock::new();
+    let narrow = *NARROW
+        .get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "narrow"));
+    !narrow || scalar_signature(source, name)
 }
 
 /// Whether every parameter and the return type are written `Int` or `Bool`.

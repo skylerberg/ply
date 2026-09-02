@@ -62,11 +62,10 @@ fn the_whole_kernel_is_inside_the_fragment() {
         44,
         "the kernel changed size; update this number deliberately rather than loosening it"
     );
-    // Enterable is the subset whose whole signature is `Int` or `Bool`: the machine can never be
-    // offered a call whose answer the seam cannot carry, so a definition returning `Tree` is
-    // compiled — because a native body reaching it is what makes the set closed — and never
-    // registered.
-    assert_eq!(unit.len(), 25, "enterable definitions");
+    // Every compiled definition is registered; the seam admits each call by its carried types,
+    // so a definition returning `Tree` is entered when `Tree` carries and declined at the answer
+    // when it does not.
+    assert_eq!(unit.len(), 44, "enterable definitions");
 }
 
 /// The search itself answers natively, and the answer is the one the kernel's own oracle expects.

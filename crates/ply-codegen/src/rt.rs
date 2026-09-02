@@ -48,7 +48,7 @@ impl Tables {
 }
 
 /// The same question of one value, to its leaves.
-fn holds_a_handle(value: &Value) -> Option<&'static str> {
+pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
     match value {
         Value::Secret(_) => Some("a Secret"),
         Value::Cell(_) => Some("a Cell"),
