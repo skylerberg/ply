@@ -1685,6 +1685,9 @@ and the replay command.
 twice — once with it and once without — and fails the run on any disagreement
 (`E0503`). It is off by default because it doubles what a run costs, and a run
 with a backend attached neither reads nor writes the result cache either way.
+Every function the fragment compiles is entered when a call's arguments and
+answer are carried; `PLY_CODEGEN_REGISTER=narrow` limits entry to scalar
+signatures, the measurement arm ADR 0030 shipped.
 
 ---
 

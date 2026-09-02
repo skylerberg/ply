@@ -22,6 +22,10 @@ fn pair(x: Int) -> List<Int> = [x, x]
 
 fn label(x: Int) -> String = "n"
 
+// Outside the fragment — a `Float` literal has no path in it — so its name is one the registry
+// lacks however wide the registry is, which is what `wrong:unoffered` answers for.
+fn refused(x: Int) -> Int = if 1.5 > 0.5 { x + 1 } else { x }
+
 fn measured(n: Int) -> Int / {tally.read[log], tally.write[log]} = {
   let b = tally.base[log]();
   tally.note[log](n + 1);
@@ -44,6 +48,7 @@ test "even is even" { assert(even(4)) }
 test "triple triples" { assert_eq(triple(5), 15) }
 test "a pair has two" { assert_eq(len(pair(7)), 2) }
 test "a pair holds its number" { assert_eq(pair(7), [7, 7]) }
+test "a refused body adds one" { assert_eq(refused(2), 3) }
 test "a label is a word" { assert_eq(label(7), "n") }
 test "a self handled effect still answers" { assert_eq(handled(1), 10) }
 "#;
@@ -349,7 +354,7 @@ fn a_backend_run_writes_no_pass() {
     );
     // Seven: `CORPUS` gained `label` and a second test on `pair` on 2026-08-31 (see [`CORPUS`]'s
     // note).
-    assert_eq!(u64_at(&plain, &["summary", "passed"]), 7, "{plain}");
+    assert_eq!(u64_at(&plain, &["summary", "passed"]), 8, "{plain}");
 }
 
 // --- The flag itself --------------------------------------------------------
@@ -460,13 +465,14 @@ fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
     );
 }
 
-/// The registry-miss path, over a backend whose registry is much smaller than `reference`'s.
+/// The registry-miss path: every compiled definition is registered, so the name the mutation
+/// answers for is one the fragment refused.
 #[test]
 fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
     let dir = project(CORPUS);
     let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:unoffered");
     assert!(
-        caught.contains(&"m.a pair has two".to_string()),
+        caught.contains(&"m.a refused body adds one".to_string()),
         "{caught:?}"
     );
 }
