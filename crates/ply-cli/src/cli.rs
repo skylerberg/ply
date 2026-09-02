@@ -584,6 +584,12 @@ pub struct RunArgs {
 
     #[command(flatten)]
     pub shutdown: ShutdownOptions,
+
+    /// Attach a compiled backend to the machine, as `ply test --backend` does:
+    /// `cranelift`, `reference`, or a `wrong:` corruption. A `.plyx` runs under
+    /// it the same way.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
 }
 
 #[derive(Args, Debug)]

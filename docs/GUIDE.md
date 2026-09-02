@@ -2930,8 +2930,13 @@ is `E0127` with exit code 2 (§6.7).
 
 `--host`, `--seed`, the TLS/db/config flags, `--fs NAME=PATH` (§15.7,
 repeatable, refused without `--host`), `--trace`, `--drain-ms`,
-`--drain-lead-ms`, `--json`. A `.plyx` path is run out of its own
-verified definitions rather than out of a source tree it may not be next to.
+`--drain-lead-ms`, `--backend BACKEND`, `--json`. A `.plyx` path is run out
+of its own verified definitions rather than out of a source tree it may not be
+next to. `--backend` attaches a compiled backend exactly as `ply test`'s flag
+does (§9.7), to a source tree or to an artifact: `main` runs with the machine
+dropping into compiled code at the leaves, and the value printed is what it
+produced. There is no audit under `ply run`; a program whose answer must be
+checked against the interpreter's is a test.
 
 `ply run` explores exactly one interleaving whatever `--seed` says — exploration
 is a test-time activity — so the flag chooses which one rather than how many.

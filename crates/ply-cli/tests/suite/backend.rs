@@ -737,6 +737,44 @@ fn a_code_generator_run_writes_no_pass() {
     assert_eq!(u64_at(&plain, &["summary", "passed"]), in_corpus, "{plain}");
 }
 
+/// `ply run --backend` attaches the backend to the program's `main` as `ply test` does to a test,
+/// and a spec the grammar refuses is the same diagnostic there.
+#[test]
+fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
+    let dir = project(
+        "fn double(x: Int) -> Int = x * 2\nfn main() -> Int = fold(range(0, 10), 0, |acc: Int, i: Int| acc + double(i))\n",
+    );
+    for backend in ["cranelift", "reference"] {
+        let out = ply(dir.path())
+            .arg("run")
+            .arg("--json")
+            .arg("--backend")
+            .arg(backend)
+            .output()
+            .unwrap();
+        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+        assert_eq!(
+            report["value"],
+            Value::String("90".into()),
+            "{backend}: {report}"
+        );
+        assert!(out.status.success(), "{backend}: {report}");
+    }
+    let out = ply(dir.path())
+        .arg("run")
+        .arg("--json")
+        .arg("--backend")
+        .arg("nonsense")
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(ply_span::codes::BACKEND_UNAVAILABLE),
+        "{text}"
+    );
+}
+
 // --- The grammar -------------------------------------------------------------
 
 /// A corruption may name the backend it wraps, and a bare `wrong:` still means `reference`.
