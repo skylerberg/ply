@@ -1,6 +1,6 @@
 //! The fragment of the spike's fragment, compiled with Cranelift.
 
-use crate::heap::{HEADER, Heap, KIND_BYTES, KIND_LIST, Layouts, Word};
+use crate::heap::{HEADER, Heap, KIND_BYTES, KIND_LIST, KIND_RECORD, Layouts, Word};
 use crate::rt::{self, Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, anyhow};
@@ -21,7 +21,7 @@ use ply_span::Symbol;
 use ply_syntax::ast::{BinOp, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::rc::Rc;
 
 /// A compiled function: `extern "C" fn(ctx, args) -> handle`.
@@ -81,8 +81,8 @@ struct Helpers {
     list_fits: FuncId,
     list_at: FuncId,
     list_rest: FuncId,
-    ctor_is: FuncId,
     ctor_arg: FuncId,
+    map_lookup: FuncId,
     record: FuncId,
     record_update: FuncId,
     field: FuncId,
@@ -105,6 +105,7 @@ struct Helpers {
     shift_count: FuncId,
     dup: FuncId,
     dec: FuncId,
+    reset: FuncId,
     constant: FuncId,
 }
 
@@ -547,8 +548,8 @@ impl Jit {
             list_fits: declare(&mut module, "rt_list_fits", 4, true)?,
             list_at: declare(&mut module, "rt_list_at", 3, true)?,
             list_rest: declare(&mut module, "rt_list_rest", 3, true)?,
-            ctor_is: declare(&mut module, "rt_ctor_is", 3, true)?,
             ctor_arg: declare(&mut module, "rt_ctor_arg", 4, true)?,
+            map_lookup: declare(&mut module, "rt_map_lookup", 3, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
             record_update: declare(&mut module, "rt_record_update", 6, true)?,
             field: declare(&mut module, "rt_field", 4, true)?,
@@ -571,6 +572,7 @@ impl Jit {
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
             dup: declare(&mut module, "rt_dup", 2, true)?,
             dec: declare(&mut module, "rt_dec", 2, false)?,
+            reset: declare(&mut module, "rt_reset", 2, true)?,
             constant: declare(&mut module, "rt_constant", 2, true)?,
         };
 
@@ -667,8 +669,10 @@ impl Jit {
             function: name.to_string(),
             module_index,
             homes: Vec::new(),
+            tokens: Vec::new(),
             kinds: HashMap::new(),
         };
+        fx.arm_tokens(body);
 
         // The prologue `ply_eval::limit` needs and the fragment's gaps item 6 records as missing: one
         // nested call is spent here and given back on the normal return, so a compiled recursion is
@@ -724,6 +728,7 @@ impl Jit {
 
         let result = fx.consumed(body, &mut scope)?;
         let answer = fx.coerce(result, sig.map_or(Kind::Boxed, |s| s.ret));
+        fx.release_tokens();
         fx.release_homes_from(0);
         // The only path that gives the nested call back.
         let left = fx.load_fuel();
@@ -766,6 +771,7 @@ impl Jit {
             function: String::new(),
             module_index: func.module_index,
             homes: Vec::new(),
+            tokens: Vec::new(),
             kinds: HashMap::new(),
         };
         let mut args = vec![fx.ctx];
@@ -871,6 +877,69 @@ fn count_nodes(code: &Code) -> usize {
     n
 }
 
+/// The widths of the record literals a body builds itself — a lambda's are its own function's.
+fn record_widths(code: &Code, out: &mut BTreeSet<usize>) {
+    match &code.kind {
+        NodeKind::Lit(..) | NodeKind::Var { .. } | NodeKind::Lambda { .. } => {}
+        NodeKind::Unary { operand, .. } => record_widths(operand, out),
+        NodeKind::Binary { lhs, rhs, .. } => {
+            record_widths(lhs, out);
+            record_widths(rhs, out);
+        }
+        NodeKind::App { func, args, .. } => {
+            record_widths(func, out);
+            args.iter().for_each(|a| record_widths(a, out));
+        }
+        NodeKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            record_widths(cond, out);
+            record_widths(then_branch, out);
+            record_widths(else_branch, out);
+        }
+        NodeKind::Match { scrutinee, arms } => {
+            record_widths(scrutinee, out);
+            for arm in arms.iter() {
+                record_widths(&arm.body, out);
+                if let Some(g) = &arm.guard {
+                    record_widths(g, out);
+                }
+            }
+        }
+        NodeKind::Block { stmts, tail } => {
+            for s in stmts.iter() {
+                match s {
+                    Stmt::Let { value, .. } => record_widths(value, out),
+                    Stmt::Expr { code, .. } => record_widths(code, out),
+                }
+            }
+            if let Some(t) = tail {
+                record_widths(t, out);
+            }
+        }
+        NodeKind::Record { fields, .. } => {
+            out.insert(fields.len());
+            fields.iter().for_each(|(_, e)| record_widths(e, out));
+        }
+        NodeKind::RecordUpdate { base, sets, .. } => {
+            record_widths(base, out);
+            sets.iter().for_each(|(_, e)| record_widths(e, out));
+        }
+        NodeKind::Field { base, .. } => record_widths(base, out),
+        NodeKind::List { items } => items.iter().for_each(|i| record_widths(i, out)),
+        NodeKind::Perform { args, .. } => args.iter().for_each(|a| record_widths(a, out)),
+        NodeKind::Handle { body, .. }
+        | NodeKind::Simulate { body, .. }
+        | NodeKind::WithRegion { body } => record_widths(body, out),
+        NodeKind::WithCell { init, body, .. } => {
+            record_widths(init, out);
+            record_widths(body, out);
+        }
+    }
+}
+
 /// Where compiled code finds `Ctx::failed`, taken from the type rather than written down:
 /// `#[repr(C)]` fixes the layout and `offset_of!` reads it, so the two cannot drift when a field is
 /// added.
@@ -960,6 +1029,10 @@ struct Fx<'a, 'b> {
     /// The stack slot of every binding whose value is a word, released at the function's exit
     /// unless a move emptied it first.
     homes: Vec<cranelift_codegen::ir::StackSlot>,
+    /// Perceus's reuse tokens: per width of record literal the body builds, a slot holding a
+    /// record of that width that died at its last use in this body — its memory the next such
+    /// literal's — or `0`. Whatever is left in one at the exit is released there.
+    tokens: Vec<(usize, cranelift_codegen::ir::StackSlot)>,
     /// `kind_of`'s answer per node: a branch is asked about before it is compiled and again at
     /// every join above it, and the answer is fixed by the node's place in the tree.
     kinds: HashMap<*const ply_eval::code::Node, Kind>,
@@ -1344,6 +1417,185 @@ impl Fx<'_, '_> {
             let w = self.builder.ins().stack_load(types::I64, slot, 0);
             self.dec_inline(w);
         }
+    }
+
+    /// One token slot per width of record literal in `body`, empty on entry.
+    fn arm_tokens(&mut self, body: &Code) {
+        let mut widths = BTreeSet::new();
+        record_widths(body, &mut widths);
+        for width in widths {
+            let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+                StackSlotKind::ExplicitSlot,
+                8,
+                3,
+            ));
+            let zero = self.builder.ins().iconst(types::I64, 0);
+            self.builder.ins().stack_store(zero, slot, 0);
+            self.tokens.push((width, slot));
+        }
+    }
+
+    fn token_for(&self, width: usize) -> Option<cranelift_codegen::ir::StackSlot> {
+        self.tokens
+            .iter()
+            .find(|(w, _)| *w == width)
+            .map(|(_, slot)| *slot)
+    }
+
+    /// The token slot a dying value of compile-time type `ty` can fill — a record of a width this
+    /// body builds — and whether every field of it is a scalar, so that keeping it lets nothing go.
+    fn token_of(&self, ty: u32) -> Option<(cranelift_codegen::ir::StackSlot, bool)> {
+        match &self.jit.tys[ty as usize] {
+            Ty::Record(fields) => {
+                let flat = fields
+                    .iter()
+                    .all(|(_, t)| matches!(self.jit.tys[*t as usize], Ty::Int | Ty::Bool));
+                self.token_for(fields.len()).map(|slot| (slot, flat))
+            }
+            _ => None,
+        }
+    }
+
+    /// A dying record's word released into its width's token when it has one, and let go
+    /// otherwise.
+    fn release_record(&mut self, w: cranelift_codegen::ir::Value, ty: u32) {
+        match self.token_of(ty) {
+            Some((slot, flat)) => self.reset_inline(w, slot, flat),
+            None => self.dec_inline(w),
+        }
+    }
+
+    /// Whatever a token still holds at the exit is released: its fields already let go and its
+    /// length zero, the release walks nothing.
+    fn release_tokens(&mut self) {
+        for (_, slot) in std::mem::take(&mut self.tokens) {
+            let w = self.builder.ins().stack_load(types::I64, slot, 0);
+            self.dec_inline(w);
+        }
+    }
+
+    /// [`Fx::dec_inline`] for a record at its last use in a body that builds another of its width:
+    /// the last holder resets it into `slot` when the slot is empty — with no call at all when
+    /// the record is `flat`, its fields all scalars with nothing to let go — and dismantles it
+    /// otherwise.
+    fn reset_inline(
+        &mut self,
+        w: cranelift_codegen::ir::Value,
+        slot: cranelift_codegen::ir::StackSlot,
+        flat: bool,
+    ) {
+        let done = self.builder.create_block();
+        let pointer = self.builder.create_block();
+        let counted = self.builder.create_block();
+        let shared = self.builder.create_block();
+        let last = self.builder.create_block();
+        let free = self.builder.create_block();
+        let keep = self.builder.create_block();
+        let tagged = self.builder.ins().band_imm(w, 1);
+        let tagged = self.builder.ins().icmp_imm(IntCC::NotEqual, tagged, 0);
+        let empty = self.builder.ins().icmp_imm(IntCC::Equal, w, 0);
+        let skip = self.builder.ins().bor(empty, tagged);
+        self.builder.ins().brif(skip, done, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let rc = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlags::trusted(), w, 0);
+        let immortal = self.builder.ins().icmp_imm(IntCC::Equal, rc, -1);
+        self.builder.ins().brif(immortal, done, &[], counted, &[]);
+        self.builder.switch_to_block(counted);
+        self.builder.seal_block(counted);
+        let more = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, rc, 1);
+        self.builder.ins().brif(more, shared, &[], last, &[]);
+        self.builder.switch_to_block(shared);
+        self.builder.seal_block(shared);
+        let fewer = self.builder.ins().iadd_imm(rc, -1);
+        self.builder.ins().store(MemFlags::trusted(), fewer, w, 0);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(last);
+        self.builder.seal_block(last);
+        let held = self.builder.ins().stack_load(types::I64, slot, 0);
+        let occupied = self.builder.ins().icmp_imm(IntCC::NotEqual, held, 0);
+        self.builder.ins().brif(occupied, free, &[], keep, &[]);
+        self.builder.switch_to_block(free);
+        self.builder.seal_block(free);
+        self.helper_void(self.jit.helpers.dec, &[w]);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(keep);
+        self.builder.seal_block(keep);
+        let kept = if flat {
+            w
+        } else {
+            self.helper(self.jit.helpers.reset, &[w])
+        };
+        self.builder.ins().stack_store(kept, slot, 0);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+    }
+
+    /// A fresh record of `shape` over `ordered`, built in the token a dying record of this width
+    /// left when there is one — the header rewritten, the fields stored — and by the runtime
+    /// otherwise.
+    fn record_of(
+        &mut self,
+        shape: u32,
+        ordered: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let Some(slot) = self.token_for(ordered.len()) else {
+            return self.record_fresh(shape, ordered);
+        };
+        let reuse = self.builder.create_block();
+        let fresh = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, types::I64);
+        let held = self.builder.ins().stack_load(types::I64, slot, 0);
+        let have = self.builder.ins().icmp_imm(IntCC::NotEqual, held, 0);
+        self.builder.ins().brif(have, reuse, &[], fresh, &[]);
+        self.builder.switch_to_block(reuse);
+        self.builder.seal_block(reuse);
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().stack_store(zero, slot, 0);
+        let flags = MemFlags::trusted();
+        let one = self.builder.ins().iconst(types::I32, 1);
+        self.builder.ins().store(flags, one, held, 0);
+        let kind = self
+            .builder
+            .ins()
+            .iconst(types::I32, i64::from(KIND_RECORD));
+        self.builder.ins().store(flags, kind, held, 4);
+        let len = self.builder.ins().iconst(types::I32, ordered.len() as i64);
+        self.builder.ins().store(flags, len, held, 8);
+        let layout = self.builder.ins().iconst(types::I32, i64::from(shape));
+        self.builder.ins().store(flags, layout, held, 12);
+        for (i, h) in ordered.iter().enumerate() {
+            self.builder
+                .ins()
+                .store(flags, *h, held, (HEADER + 8 * i) as i32);
+        }
+        self.builder.ins().jump(done, &[BlockArg::Value(held)]);
+        self.builder.switch_to_block(fresh);
+        self.builder.seal_block(fresh);
+        let v = self.record_fresh(shape, ordered);
+        self.builder.ins().jump(done, &[BlockArg::Value(v)]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        self.builder.block_params(done)[0]
+    }
+
+    fn record_fresh(
+        &mut self,
+        shape: u32,
+        ordered: &[cranelift_codegen::ir::Value],
+    ) -> cranelift_codegen::ir::Value {
+        let ptr = self.spill(ordered);
+        let shape = self.builder.ins().iconst(types::I64, i64::from(shape));
+        let n = self.builder.ins().iconst(types::I64, ordered.len() as i64);
+        self.helper(self.jit.helpers.record, &[shape, ptr, n])
     }
 
     fn is_local(&self, code: &Code, scope: &Scope) -> bool {
@@ -1771,6 +2023,42 @@ impl Fx<'_, '_> {
                     let h = self.boxed(v);
                     handles.push(h);
                 }
+                // A fully written literal copies nothing out of its base: the base is a hint that
+                // a record dies here, released into its width's token when it does — and left
+                // alone when it is still held elsewhere — and the literal is built as one, in the
+                // token of its own width when there is one.
+                if copies.is_empty() {
+                    if self.last_use_of_local(base, scope) {
+                        let dying = self.expr(base, scope)?;
+                        self.moved(dying);
+                        let w = self.boxed(dying);
+                        self.release_record(w, dying.ty);
+                    }
+                    let mut names: Vec<Symbol> = sets.iter().map(|(n, _)| n.clone()).collect();
+                    names.sort();
+                    let shape = self.jit.layouts.shape(names);
+                    let sorted = self.jit.layouts.shape_names(shape);
+                    let at_of = |name: &Symbol| {
+                        sets.iter()
+                            .position(|(n, _)| n == name)
+                            .expect("every field of the shape was written")
+                    };
+                    let ordered: Vec<cranelift_codegen::ir::Value> =
+                        sorted.iter().map(|name| handles[at_of(name)]).collect();
+                    let ty = self.jit.ty_id(Ty::Record(
+                        sorted
+                            .iter()
+                            .map(|name| (name.clone(), set_tys[at_of(name)]))
+                            .collect(),
+                    ));
+                    let v = self.record_of(shape, &ordered);
+                    return Ok(Val {
+                        kind: Kind::Boxed,
+                        v,
+                        ty,
+                        home: 0,
+                    });
+                }
                 let base = self.consumed(base, scope)?;
                 // The result's type is the base's with the written fields' types replaced, when
                 // the base's is known and names exactly these fields.
@@ -1861,10 +2149,7 @@ impl Fx<'_, '_> {
                         .map(|(name, at)| (name.clone(), tys[*at]))
                         .collect(),
                 ));
-                let ptr = self.spill(&ordered);
-                let shape = self.builder.ins().iconst(types::I64, i64::from(shape));
-                let n = self.builder.ins().iconst(types::I64, ordered.len() as i64);
-                let v = self.helper(self.jit.helpers.record, &[shape, ptr, n]);
+                let v = self.record_of(shape, &ordered);
                 Ok(Val {
                     kind: Kind::Boxed,
                     v,
@@ -1936,6 +2221,7 @@ impl Fx<'_, '_> {
                     3
                 };
                 let base = self.expr(b, scope)?;
+                let base_ty = base.ty;
                 let known = self.static_field(base.ty, &field.name);
                 if own == 1 {
                     self.moved(base);
@@ -1978,8 +2264,10 @@ impl Fx<'_, '_> {
                             kind,
                         ),
                     };
+                    // A record dying here whose width this body rebuilds is the next such
+                    // literal's memory rather than the allocator's.
                     if own == 1 || own == 3 {
-                        self.dec_inline(base);
+                        self.release_record(base, base_ty);
                     }
                     return Ok(Val {
                         kind,
@@ -3175,7 +3463,7 @@ impl Fx<'_, '_> {
                 self.builder.ins().jump(hit, &[]);
             }
             Pat::Var { name: id, .. } => match self.ctor_of(&QName::bare(id.clone())) {
-                Some((index, 0)) => self.test_ctor(value, index, hit, miss),
+                Some((index, 0)) => self.test_ctor(value, index, 0, hit, miss),
                 _ => {
                     self.builder.ins().jump(hit, &[]);
                 }
@@ -3276,17 +3564,14 @@ impl Fx<'_, '_> {
                     home: 0,
                 };
                 let mut cur = self.builder.create_block();
-                self.test_ctor(boxed, index, cur, miss);
+                self.test_ctor(boxed, index, arity, cur, miss);
                 for (i, arg) in args.iter().enumerate() {
                     if self.irrefutable(arg) {
                         continue;
                     }
                     self.builder.switch_to_block(cur);
                     self.builder.seal_block(cur);
-                    let at = self.builder.ins().iconst(types::I64, i as i64);
-                    let read = self.builder.ins().iconst(types::I64, 0);
-                    let sub = self.helper(self.jit.helpers.ctor_arg, &[base, at, read]);
-                    self.check();
+                    let sub = self.ctor_arg_inline(base, i, false);
                     let next = self.builder.create_block();
                     self.test_pattern(
                         arg,
@@ -3360,12 +3645,92 @@ impl Fx<'_, '_> {
         Ok(())
     }
 
-    fn test_ctor(&mut self, value: Val, index: usize, hit: Block, miss: Block) {
+    /// Whether `value` is the constructor at `index` with `arity` arguments: a pointer whose
+    /// header says so, read inline.
+    fn test_ctor(&mut self, value: Val, index: usize, arity: usize, hit: Block, miss: Block) {
         let v = self.boxed(value);
-        let index = self.builder.ins().iconst(types::I64, index as i64);
-        let is = self.helper(self.jit.helpers.ctor_is, &[v, index]);
-        let is = self.builder.ins().icmp_imm(IntCC::NotEqual, is, 0);
+        let pointer = self.builder.create_block();
+        let tagged = self.builder.ins().band_imm(v, 1);
+        let tagged = self.builder.ins().icmp_imm(IntCC::NotEqual, tagged, 0);
+        let empty = self.builder.ins().icmp_imm(IntCC::Equal, v, 0);
+        let skip = self.builder.ins().bor(empty, tagged);
+        self.builder.ins().brif(skip, miss, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let flags = MemFlags::trusted();
+        let kind = self.builder.ins().uload8(types::I32, flags, v, 4);
+        let is_ctor =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::heap::KIND_CTOR));
+        let len = self.builder.ins().load(types::I32, flags, v, 8);
+        let has_arity = self.builder.ins().icmp_imm(IntCC::Equal, len, arity as i64);
+        let layout = self.builder.ins().load(types::I32, flags, v, 12);
+        let is_index = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, layout, index as i64);
+        let is = self.builder.ins().band(is_ctor, has_arity);
+        let is = self.builder.ins().band(is, is_index);
         self.builder.ins().brif(is, hit, &[], miss, &[]);
+    }
+
+    /// Argument `i` of a constructor value: a load, taken out of a constructor nothing else
+    /// holds when `take` is set and held once more otherwise. A value whose header says it is
+    /// not a constructor with that argument enters the runtime's path, which raises.
+    fn ctor_arg_inline(
+        &mut self,
+        base: cranelift_codegen::ir::Value,
+        i: usize,
+        take: bool,
+    ) -> cranelift_codegen::ir::Value {
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, types::I64);
+        let flags = MemFlags::trusted();
+        let tagged = self.builder.ins().band_imm(base, 1);
+        let tagged = self.builder.ins().icmp_imm(IntCC::NotEqual, tagged, 0);
+        let empty = self.builder.ins().icmp_imm(IntCC::Equal, base, 0);
+        let bad = self.builder.ins().bor(empty, tagged);
+        let check = self.builder.create_block();
+        self.builder.ins().brif(bad, slow, &[], check, &[]);
+        self.builder.switch_to_block(check);
+        self.builder.seal_block(check);
+        let kind = self.builder.ins().uload8(types::I32, flags, base, 4);
+        let is_ctor =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::heap::KIND_CTOR));
+        let len = self.builder.ins().load(types::I32, flags, base, 8);
+        let in_range = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, len, i as i64);
+        let ok = self.builder.ins().band(is_ctor, in_range);
+        self.builder.ins().brif(ok, fast, &[], slow, &[]);
+        self.builder.switch_to_block(fast);
+        self.builder.seal_block(fast);
+        let w = self
+            .builder
+            .ins()
+            .load(types::I64, flags, base, (HEADER + 8 * i) as i32);
+        if take {
+            self.take_field_inline(base, i, w);
+        } else {
+            self.inc_inline(w);
+        }
+        self.builder.ins().jump(done, &[BlockArg::Value(w)]);
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        let at = self.builder.ins().iconst(types::I64, i as i64);
+        let taking = self.builder.ins().iconst(types::I64, i64::from(take));
+        let v = self.helper(self.jit.helpers.ctor_arg, &[base, at, taking]);
+        self.check();
+        self.builder.ins().jump(done, &[BlockArg::Value(v)]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        self.builder.block_params(done)[0]
     }
 
     /// The bindings a pattern makes, emitted in the block that has already committed to the arm.
@@ -3446,10 +3811,7 @@ impl Fx<'_, '_> {
                         continue;
                     }
                     let ty = payload_tys.get(i).copied().unwrap_or(0);
-                    let i = self.builder.ins().iconst(types::I64, i as i64);
-                    let take = self.builder.ins().iconst(types::I64, i64::from(moving));
-                    let v = self.helper(self.jit.helpers.ctor_arg, &[base, i, take]);
-                    self.check();
+                    let v = self.ctor_arg_inline(base, i, moving);
                     self.bind_pattern(
                         arg,
                         Val {
@@ -3500,7 +3862,151 @@ impl Fx<'_, '_> {
         Ok(())
     }
 
+    /// A `match` over `map_get` whose arms only ask whether the key was found — `Some(p)`,
+    /// `None`, `_` — is a lookup answering the value or nothing, and no constructor is built:
+    /// the arms test that word directly.
+    fn lookup_match(
+        &mut self,
+        scrutinee: &Code,
+        arms: &[Arm],
+        scope: &mut Scope,
+    ) -> Result<Option<Val>> {
+        let NodeKind::App { func, args, .. } = &scrutinee.kind else {
+            return Ok(None);
+        };
+        let NodeKind::Var { name: q, .. } = &func.kind else {
+            return Ok(None);
+        };
+        if args.len() != 2 || !q.is_bare() || scope.iter().any(|(s, _)| s == q.symbol()) {
+            return Ok(None);
+        }
+        let Denotes::Builtin(index) = self.denotation(q, scope)? else {
+            return Ok(None);
+        };
+        if self.jit.builtins[index] != Builtin::MapGet {
+            return Ok(None);
+        }
+        let (Some(some), Some(none)) = (self.jit.layouts.some, self.jit.layouts.none) else {
+            return Ok(None);
+        };
+        // Which arms this shape serves: `Some(p)`, `None`, a wildcard, no guards.
+        enum Shape<'a> {
+            Found(&'a Pat),
+            Missing,
+            Any,
+        }
+        let mut shapes = Vec::with_capacity(arms.len());
+        for arm in arms {
+            if arm.guard.is_some() {
+                return Ok(None);
+            }
+            let shape = match &arm.pat {
+                Pat::Wildcard => Shape::Any,
+                Pat::Ctor { name, args } => match self.ctor_of(name) {
+                    Some((i, 1)) if i as u32 == some && args.len() == 1 => Shape::Found(&args[0]),
+                    Some((i, 0)) if i as u32 == none && args.is_empty() => Shape::Missing,
+                    _ => return Ok(None),
+                },
+                Pat::Var { name: id, .. } => match self.ctor_of(&QName::bare(id.clone())) {
+                    Some((i, 0)) if i as u32 == none => Shape::Missing,
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            shapes.push(shape);
+        }
+        let mut handles = Vec::with_capacity(2);
+        for a in args.iter() {
+            let v = self.consumed(a, scope)?;
+            let h = self.boxed(v);
+            handles.push(h);
+        }
+        let found = self.helper(self.jit.helpers.map_lookup, &[handles[0], handles[1]]);
+        self.check();
+        let present = self.builder.ins().icmp_imm(IntCC::NotEqual, found, 0);
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        let mut next = self.builder.create_block();
+        self.builder.ins().jump(next, &[]);
+        let mut ty: Option<u32> = None;
+        for (arm, shape) in arms.iter().zip(&shapes) {
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+            let body_block = self.builder.create_block();
+            let after = self.builder.create_block();
+            let value = Val {
+                kind: Kind::Boxed,
+                v: found,
+                ty: 0,
+                home: 0,
+            };
+            match shape {
+                Shape::Found(p) => {
+                    let inner_test = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(present, inner_test, &[], after, &[]);
+                    self.builder.switch_to_block(inner_test);
+                    self.builder.seal_block(inner_test);
+                    self.test_pattern(p, value, body_block, after)?;
+                }
+                Shape::Missing => {
+                    self.builder
+                        .ins()
+                        .brif(present, after, &[], body_block, &[]);
+                }
+                Shape::Any => {
+                    self.builder.ins().jump(body_block, &[]);
+                }
+            }
+            self.builder.switch_to_block(body_block);
+            self.builder.seal_block(body_block);
+            let mut inner = scope.clone();
+            let mark = self.homes.len();
+            // The value found is held once by this match; a pattern binding the whole of it
+            // takes that hold, and any other pattern leaves it to be let go here.
+            match shape {
+                Shape::Found(p) => {
+                    self.bind_pattern(p, value, true, &mut inner)?;
+                    let binds_whole = matches!(p, Pat::Var { name: id, .. }
+                        if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))));
+                    if !binds_whole {
+                        self.dec_inline(found);
+                    }
+                }
+                Shape::Any => self.dec_inline(found),
+                Shape::Missing => {}
+            }
+            let body = self.consumed(&arm.body, &mut inner)?;
+            self.release_homes_from(mark);
+            ty = match ty {
+                None => Some(body.ty),
+                Some(t) if t == body.ty => Some(t),
+                Some(_) => Some(0),
+            };
+            let body = self.boxed(body);
+            self.builder.ins().jump(join, &[BlockArg::Value(body)]);
+            next = after;
+        }
+        self.builder.switch_to_block(next);
+        self.builder.seal_block(next);
+        self.dec_inline(found);
+        self.helper_void(self.jit.helpers.no_match, &[]);
+        self.builder.ins().jump(self.failure, &[]);
+        self.builder.switch_to_block(join);
+        self.builder.seal_block(join);
+        Ok(Some(Val {
+            kind: Kind::Boxed,
+            v: self.builder.block_params(join)[0],
+            ty: ty.unwrap_or(0),
+            home: 0,
+        }))
+    }
+
     fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], scope: &mut Scope) -> Result<Val> {
+        if let Some(v) = self.lookup_match(scrutinee, arms, scope)? {
+            return Ok(v);
+        }
         let value = self.expr(scrutinee, scope)?;
         let join = self.builder.create_block();
         self.builder.append_block_param(join, types::I64);
@@ -3524,6 +4030,18 @@ impl Fx<'_, '_> {
             let moving = !self.is_borrowed_local(scrutinee, scope);
             let mark = self.homes.len();
             self.bind_pattern(&arm.pat, value, moving, &mut inner)?;
+            // A temporary scrutinee is held once by this match: a pattern binding the whole
+            // of it took that hold into the binding, and any other pattern leaves the shell —
+            // its fields taken — to be let go here, before the body runs.
+            let binds_whole = matches!(&arm.pat, Pat::Var { name: id, .. }
+                if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))));
+            if !self.is_local(scrutinee, scope) && !binds_whole && value.kind == Kind::Boxed {
+                // A record shell of a width this body builds is the next one's memory.
+                match self.token_of(value.ty) {
+                    Some((slot, _)) => self.reset_inline(value.v, slot, false),
+                    None => self.dec_inline(value.v),
+                }
+            }
             let body = self.consumed(&arm.body, &mut inner)?;
             self.release_homes_from(mark);
             // The arms' type, when every arm agrees.

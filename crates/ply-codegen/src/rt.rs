@@ -358,6 +358,12 @@ pub unsafe extern "C" fn rt_dec(_ctx: *mut Ctx, w: i64) {
     heap::dec(w);
 }
 
+/// Perceus's `reset`: a record held once, at its last use in a body that builds another of its
+/// width, keeps its memory for that one. Answers the word kept, or `0` once released.
+pub unsafe extern "C" fn rt_reset(_ctx: *mut Ctx, w: i64) -> i64 {
+    heap::reset(w)
+}
+
 pub unsafe extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     ctx.heap.boxed_int(v)
@@ -1754,18 +1760,7 @@ pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i
     ctx.heap.list_skip(value, from.max(0) as usize)
 }
 
-/// Whether a value is the constructor at `index`, name and arity both. Reads.
-pub unsafe extern "C" fn rt_ctor_is(ctx: *mut Ctx, value: i64, index: i64) -> i64 {
-    let ctx = unsafe { &mut *ctx };
-    if heap::kind(value) != KIND_CTOR {
-        return 0;
-    }
-    let arity = ctx.tables.layouts.ctors[index as usize].1;
-    let o = obj(value);
-    i64::from(unsafe { (*o).layout } as i64 == index && unsafe { (*o).len } as usize == arity)
-}
-
-/// One argument of a constructor value, once [`rt_ctor_is`] has said it is that constructor:
+/// One argument of a constructor value, once the compiled test has said it is that constructor:
 /// moved out when `take` is set and nothing else holds the constructor, held once more otherwise.
 /// Reads the constructor.
 pub unsafe extern "C" fn rt_ctor_arg(ctx: *mut Ctx, value: i64, i: i64, take: i64) -> i64 {
@@ -1786,6 +1781,39 @@ pub unsafe extern "C" fn rt_ctor_arg(ctx: *mut Ctx, value: i64, i: i64, take: i6
         heap::inc(w);
     }
     w
+}
+
+/// `map_get` for a `match` that unwraps its answer at once: the value held once more, or `0`
+/// for a key the map does not hold, with no constructor built between. Takes the map and the
+/// key; a map or a key the native path does not serve is answered through the interpreter's
+/// `map_get` and unwrapped here.
+pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+        let found = map::get(&ctx.tables.layouts, obj(m), k);
+        if let Some(v) = found {
+            heap::inc(v);
+        }
+        heap::dec(m);
+        heap::dec(k);
+        return found.unwrap_or(0);
+    }
+    let answer = builtin_over_values(ctx, Builtin::MapGet, &[m, k]);
+    if ctx.failed != 0 {
+        return 0;
+    }
+    let o = obj(answer);
+    let some = ctx.tables.layouts.some;
+    let held = unsafe { (*o).len == 1 && some == Some((*o).layout) };
+    let v = if held {
+        let v = unsafe { word_at(o, 0) };
+        heap::inc(v);
+        v
+    } else {
+        0
+    };
+    heap::dec(answer);
+    v
 }
 
 /// Every symbol the JIT registers, in one place so the compiler and the linker cannot drift.
@@ -1809,8 +1837,8 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_list_fits", rt_list_fits as *const u8),
         ("rt_list_at", rt_list_at as *const u8),
         ("rt_list_rest", rt_list_rest as *const u8),
-        ("rt_ctor_is", rt_ctor_is as *const u8),
         ("rt_ctor_arg", rt_ctor_arg as *const u8),
+        ("rt_map_lookup", rt_map_lookup as *const u8),
         ("rt_record", rt_record as *const u8),
         ("rt_record_update", rt_record_update as *const u8),
         ("rt_field", rt_field as *const u8),
@@ -1833,6 +1861,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),
         ("rt_dec", rt_dec as *const u8),
+        ("rt_reset", rt_reset as *const u8),
         ("rt_constant", rt_constant as *const u8),
     ]
 }
