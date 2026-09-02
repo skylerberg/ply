@@ -58,6 +58,11 @@ pub const IMMORTAL: u32 = u32::MAX;
 
 pub const HEADER: usize = 16;
 
+/// A record or constructor none of whose fields holds a count — each an immediate or an
+/// immortal — so releasing it walks nothing. Set where one is built from such fields, kept where
+/// an update in place writes only such fields, and never set otherwise.
+pub const FLAT: u8 = 1;
+
 /// The header every object starts with. `len` is the payload's word count for a record, a
 /// constructor, a trie node or a closure, its byte count for a string or a bytes value, and a
 /// list's length; `layout` is a record's shape, a constructor's index, a node's or a string's
@@ -369,8 +374,7 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
 /// A dead object goes back to the current heap's free list for its class. A bridged one does
 /// not: its slot is on the heap's drop log, and a second bridged value in the same slot would
 /// be dropped twice at the entry's end.
-unsafe fn recycle(o: *mut Obj) {
-    let heap = CURRENT.with(|c| c.get());
+unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
     if heap.is_null() {
         return;
     }
@@ -507,6 +511,17 @@ impl Heap {
     /// A fresh object with `len` payload words.
     pub fn alloc(&mut self, kind: u8, flags: u8, len: u32, layout: u32) -> *mut Obj {
         self.raw_alloc(kind, flags, len, layout, len as usize * 8)
+    }
+
+    /// [`dec`] for a word compiled code has already found held once and mortal: released into
+    /// this heap's free lists without asking a thread-local which heap that is.
+    pub fn release_last(&mut self, w: Word) {
+        debug_assert!(!is_imm(w) && w != 0);
+        let o = obj(w);
+        unsafe {
+            debug_assert!((*o).rc == 1 && (*o).kind != KIND_DEAD);
+            release(o, self);
+        }
     }
 
     /// A fresh string or bytes value with room for `cap` bytes and none in use yet.
@@ -878,11 +893,17 @@ pub fn dec(w: Word) {
             return;
         }
     }
+    let heap = CURRENT.with(|c| c.get());
+    unsafe { release(o, heap) }
+}
+
+/// `o`, held once, released with its children, into `heap`'s free lists when it has them.
+unsafe fn release(o: *mut Obj, heap: *mut Heap) {
     let mut deferred = Vec::new();
     unsafe {
-        dismantle(o, 0, &mut deferred);
+        dismantle(o, 0, &mut deferred, heap);
         while let Some(o) = deferred.pop() {
-            dismantle(o, 0, &mut deferred);
+            dismantle(o, 0, &mut deferred, heap);
         }
     }
 }
@@ -900,10 +921,12 @@ pub fn reset(w: Word) -> Word {
             dec(w);
             return 0;
         }
-        for i in 0..(*o).len as usize {
-            let c = word_at(o, i);
-            if !is_imm(c) && c != 0 {
-                dec(c);
+        if (*o).flags & FLAT == 0 {
+            for i in 0..(*o).len as usize {
+                let c = word_at(o, i);
+                if !is_imm(c) && c != 0 {
+                    dec(c);
+                }
             }
         }
         (*o).len = 0;
@@ -934,11 +957,12 @@ const DISMANTLE_DEPTH: usize = 32;
 /// `o`, held once, dies: each child is let go, a child it was the last holder of dismantled in
 /// turn, and its header marked dead — read as such by anything still holding a stale word,
 /// dropped by nothing twice, and its memory recycled with the entry.
-unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>) {
+unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>, heap: *mut Heap) {
     unsafe {
         debug_assert!((*o).rc == 1 && (*o).kind != KIND_DEAD);
         (*o).rc = 0;
         let ranges: [(usize, usize); 2] = match (*o).kind {
+            KIND_RECORD | KIND_CTOR if (*o).flags & FLAT != 0 => [(0, 0), (0, 0)],
             KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => [(0, (*o).len as usize), (0, 0)],
             KIND_MLEAF => [(0, 2 * (*o).len as usize), (0, 0)],
             // The root when there is one, then the tail.
@@ -970,13 +994,13 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>) {
             if (*co).rc > 1 {
                 (*co).rc -= 1;
             } else if depth < DISMANTLE_DEPTH {
-                dismantle(co, depth + 1, deferred);
+                dismantle(co, depth + 1, deferred, heap);
             } else {
                 deferred.push(co);
             }
         }
         // The class is read off the header before it is marked dead.
-        recycle(o);
+        recycle(o, heap);
         (*o).kind = KIND_DEAD;
     }
 }
@@ -1308,6 +1332,36 @@ mod tests {
             Heap::to_value(&l, s).cmp(&Heap::to_value(&l, b)),
             "a string against bytes takes the general path"
         );
+    }
+
+    /// A flat record's release walks nothing and still recycles it; a field written in place
+    /// that holds a count takes the flag with it.
+    #[test]
+    fn a_flat_record_is_released_without_a_walk_and_loses_the_flag_when_it_gains_a_count() {
+        let mut h = Heap::new();
+        h.set_reuse(true);
+        let o = h.alloc(KIND_RECORD, FLAT, 2, 0);
+        unsafe {
+            set_word(o, 0, imm(1));
+            set_word(o, 1, imm(2));
+        }
+        crate::heap::enter(&mut h);
+        dec(o as Word);
+        crate::heap::leave();
+        unsafe { assert_eq!((*o).kind, KIND_DEAD) };
+        let again = h.alloc(KIND_RECORD, 0, 2, 0);
+        assert_eq!(again, o, "a flat record's memory was not recycled");
+        let child = h.alloc(KIND_RECORD, 0, 1, 0);
+        unsafe {
+            set_word(child, 0, imm(1));
+            set_word(again, 0, child as Word);
+            set_word(again, 1, imm(2));
+            (*again).flags = 0;
+        }
+        crate::heap::enter(&mut h);
+        dec(again as Word);
+        crate::heap::leave();
+        unsafe { assert_eq!((*child).kind, KIND_DEAD, "a counted field was not let go") };
     }
 
     /// Perceus's reset keeps a record held once with its fields let go, and releases anything

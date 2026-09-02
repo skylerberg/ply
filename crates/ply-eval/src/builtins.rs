@@ -35,6 +35,9 @@ pub enum Builtin {
     WrapAdd,
     WrapSub,
     WrapMul,
+    /// The low thirty-two bits rotated right, the one step a hash written over masked words
+    /// spells as two shifts, a subtraction and a mask otherwise.
+    Rotr32,
     /// The smaller and the larger of two integers.
     Min,
     Max,
@@ -129,6 +132,7 @@ impl Builtin {
             "max" => Builtin::Max,
             "wrap_sub" => Builtin::WrapSub,
             "wrap_mul" => Builtin::WrapMul,
+            "rotr32" => Builtin::Rotr32,
             "byte_of_int" => Builtin::ByteOfInt,
             "int_to_string" => Builtin::IntToString,
             "string_concat" => Builtin::StringConcat,
@@ -214,6 +218,7 @@ impl Builtin {
             Builtin::Max => "max",
             Builtin::WrapSub => "wrap_sub",
             Builtin::WrapMul => "wrap_mul",
+            Builtin::Rotr32 => "rotr32",
             Builtin::ByteOfInt => "byte_of_int",
             Builtin::IntToString => "int_to_string",
             Builtin::StringConcat => "string_concat",
@@ -349,6 +354,7 @@ impl Builtin {
             | Builtin::Max
             | Builtin::WrapSub
             | Builtin::WrapMul
+            | Builtin::Rotr32
             | Builtin::Range => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
@@ -395,6 +401,7 @@ impl Builtin {
             Builtin::WrapAdd,
             Builtin::WrapSub,
             Builtin::WrapMul,
+            Builtin::Rotr32,
             Builtin::Min,
             Builtin::Max,
             Builtin::ByteOfInt,
@@ -613,6 +620,16 @@ fn call_with(
             } else {
                 x.max(y)
             })))
+        }
+
+        // The low thirty-two bits of `x` rotated right by `n` modulo thirty-two, answered as the
+        // non-negative `Int` a masked word is.
+        Builtin::Rotr32 => {
+            let x = args[0].as_int(span, "`rotr32`")?;
+            let n = args[1].as_int(span, "`rotr32`")?;
+            Ok(Step::Done(Value::Int(i64::from(
+                (x as u32).rotate_right((n & 31) as u32),
+            ))))
         }
 
         Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul => {
@@ -2937,6 +2954,7 @@ mod tests {
                 "panic",
                 "push",
                 "range",
+                "rotr32",
                 "secret_is_empty",
                 "secret_of_string",
                 "secret_verify",
@@ -2960,6 +2978,29 @@ mod tests {
             "a builtin was added to or removed from the enum without `Builtin::all()` being \
              updated — every table driven by `all()` silently skips it until this list agrees"
         );
+    }
+
+    /// The low word rotated: bits leaving the right come back on the left of a thirty-two-bit
+    /// word, whatever the `Int` above that word held and whatever the count's sign.
+    #[test]
+    fn rotr32_turns_the_low_word_and_answers_it_non_negative() {
+        let cases: &[(i64, i64, i64)] = &[
+            (1, 1, 0x8000_0000),
+            (0x8000_0000, 31, 1),
+            (0x1234_5678, 0, 0x1234_5678),
+            (0x1234_5678, 32, 0x1234_5678),
+            (0x1234_5678, 4, 0x8123_4567),
+            (0x1_0000_0001, 1, 0x8000_0000),
+            (-1, 7, 0xFFFF_FFFF),
+            (2, -1, 4),
+        ];
+        for &(x, n, want) in cases {
+            assert_eq!(
+                done(Builtin::Rotr32, vec![Value::Int(x), Value::Int(n)]).unwrap(),
+                Value::Int(want),
+                "rotr32({x}, {n})"
+            );
+        }
     }
 
     /// The three that answer where `+`, `-` and `*` raise, at the boundaries

@@ -6,8 +6,8 @@ Decisions 2 and 5 for the integer kernel, Decisions 1 and 4 for the record
 kernel. This record is the first pass over those four, taken as what the
 profiles pointed at rather than as a redesign, and it changes no
 representation ADR 0035 decided: the words, the layouts, the counts, the
-strings, the list and the seam all stand. `benches/value-model/after-direct.txt`
-is the series after it and `benches/front-end-whole/observation-6.txt` the
+strings, the list and the seam all stand. `benches/value-model/after-rounds.txt`
+is the series after it and `benches/front-end-whole/observation-7.txt` the
 front-end row, both under their own pre-registrations. What they say: the
 record kernel is inside the bar since Decision 9; the integer kernel is
 outside it by a smaller factor than at the re-take — its round is
@@ -33,7 +33,9 @@ and every test entered whole since Decision 7.
 > another of its width is that record's memory; that a lookup a match
 > unwraps at once answers the value, with no constructor between; and that
 > the builtins a body calls most are direct calls, and the empty list, the
-> empty map and every nullary constructor are made once.
+> empty map and every nullary constructor are made once; and that a literal
+> step is the loop's own body, a flat record's release walks nothing, and the
+> low word's rotate is one instruction.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -238,6 +240,40 @@ append into a singleton copies, as it does into anything held more than
 once; and the lookup match of Decision 9 covers `list_at`. The check row moved
 by a quarter and the hash row by almost a third on this, the parse row by a
 tenth.
+
+## Decision 11 — the loop's step in the loop, and the round's arithmetic as it is written
+
+Three things the integer kernel's profile named once the runtime paths were out
+of the way, each landed and read against the rows too. A lambda literal passed
+to `fold`, `map`, `filter` or `iterate` was compiled as its own function and
+called through its entry per iteration, the captured values spilled into an
+argument array each time and the `Continue` it answered allocated and released
+by the loop that unwrapped it; the step is now lowered in the loop's body, its
+parameters the loop's values and its captures the loop's locals, pinned so no
+mark computed for the lambda's frame moves one out of the scope that still holds
+it, and an `iterate` step's `Continue` and `Stop` in tail position are jumps.
+That is a language-level result as much as a kernel one: `iterate` is the
+loop, and the front end's rows moved by a sixth and a fifth on it.
+
+A record whose fields hold no count — every one an immediate — carries a flat
+flag from where it is built, kept by an update in place that writes only such
+fields, so its release walks nothing; the release takes the heap from the
+context that owns it rather than from a thread-local per object; and a record
+or constructor a body builds is allocated as a header by the runtime and its
+fields stored by the body, with no argument array between.
+
+The round itself spelled its rotate as two shifts with their counts checked,
+a checked subtraction for the second count and a mask, and each quarter-round
+turns four times. `rotr32` is a builtin now — the low word rotated right, total
+by construction, one instruction under the backend beside the three wrapping
+builtins it joins — and `std.hash` turns on it. Behind that, the optimizer
+propagates a `let` of a scalar literal to its reads and folds an operator over
+two literals, so a count a callee named is a literal where the shift happens
+and needs no check.
+
+What remains of the integer kernel is the compiled arithmetic with each add
+checked, the state records loaded and stored once per round where Rust holds
+them in registers, and the records the source keeps alive by shape.
 
 ## Priced and rejected
 

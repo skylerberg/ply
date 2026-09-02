@@ -197,3 +197,17 @@ series': the record kernel inside, the integer kernel outside by the same
 factor. What the reading says now is unchanged for the kernels; it is the
 front end's rows that moved on this step, and `observation-6.txt` is where
 they are read.
+
+## After the rounds
+
+`after-rounds.txt`, under the gate on both sides, with a fused loop's literal
+step lowered in the loop and its `Continue` and `Stop` as jumps, a flat
+record's release walking nothing and its allocation storing fields in place,
+and the round's rotate as the `rotr32` builtin over literal counts the
+optimizer folds (ADR 0036, Decision 11). The integer kernel moved by about a
+quarter on the runtime paths and again on the arithmetic; the record kernel a
+little, on the step it no longer calls. The bar stands as registered and the
+verdict is the last series': the record kernel inside, the integer kernel
+outside by a smaller factor. What the reading says now: what remains of the
+integer kernel is the arithmetic with each add checked and the state loaded
+and stored per round, and the records the source keeps alive by shape.
