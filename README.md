@@ -88,6 +88,15 @@ Opening a content-addressed store of ten thousand definitions costs single-digit
 milliseconds, which is what lets the cache sit in the inner loop rather than be a
 build artifact.
 
+> **This loop is the interpreter's, and the compiled one does not have it.**
+> What makes it O(change) is the front-end cache keyed by content and a test
+> selected against the definition set it last passed under. `--backend cranelift`
+> switches both off: a backend run opens a scratch store, so the front end is
+> loaded whole and every test runs, and the compiled unit is built again for
+> every worker; nothing persists between runs and every invocation starts cold.
+> ADR 0037 carries what that costs, the row that prices it, and the order to
+> close it in.
+
 ## Three ideas
 
 **Effects are in the type, at resource granularity.** Not `IO`, and not even

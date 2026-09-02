@@ -28,6 +28,14 @@ Rust — it is measured as slower by more than an order of magnitude, **and that
 is a floor.** It is that compiler work done *in Ply* would verify in time
 proportional to the edit, **and compiler work done in Rust never will.**
 
+**That is a claim about this repository before it is a claim about anyone
+else's.** Ply's own loop is a Rust loop: the unit of rebuild is the crate, a
+release build gates every measurement in the tree, and every improvement Ply
+makes to definition-level incrementality reaches every project except the one
+building Ply. The bootstrap is what puts the language's own development inside
+the language's own thesis, and that compounding is the payoff this record has no
+other route to.
+
 ## Why today's measurement is the wrong instrument
 
 The obvious way to price this is to measure what fraction of an agent's wall
@@ -128,3 +136,14 @@ Ply program, and each is a precondition.
 interpreter and that decision stands. **This records why the goal exists, so
 that the next person to read a rejection knows what was being rejected and what
 would change the answer.**
+
+**And it is measured for one tier of the loop and not the other.** The claim at
+the top is stated as an exponent. `ply-corpus bench` applies a rename, a leaf
+edit and a hub edit to a generated project and times nine phases of the run
+after each; `ply-corpus sweep` takes that at each of several sizes, and
+`README.md` §"The loop" is one size of it. That is the interpreter's loop.
+Nothing fits the slope across the sizes, and nothing takes the row under
+`--backend`, where a run bypasses the front-end cache and the result cache and
+compiles its unit again per worker. ADR 0037 registers the fit and the backend
+arm, with the criteria fixed before the reading, and orders them ahead of the
+path this record motivates.
