@@ -12,7 +12,7 @@ ply="${PLY_BIN:-$root/target/release/ply}"
 [ -x "$ply" ] || ply="$root/target/debug/ply"
 [ -x "$ply" ] || { echo "no ply binary; run cargo build -p ply-cli --bin ply"; exit 2; }
 work="$(mktemp -d)"
-cp "$here"/{lexer,spine,types,patterns,exprs,items,rewrite,resolve,tycore,infer}.ply "$work/"
+cp "$here"/{lexer,spine,types,patterns,exprs,items,rewrite,resolve,derive,tycore,infer}.ply "$work/"
 cp "$work/infer.ply" "$work/infer.orig"
 cp "$work/tycore.ply" "$work/tycore.orig"
 restore() { cp "$work/infer.orig" "$work/infer.ply"; cp "$work/tycore.orig" "$work/tycore.ply"; }
@@ -44,7 +44,7 @@ arm() {
   out=$(run_suite)
   if [[ "$out" == *"test result: ok"* ]]; then
     echo "NOT ARMED: $name -- the differential stayed green"; fails=$((fails + 1))
-  elif [[ "$out" == *"disagree"*]]; then
+  elif [[ "$out" == *"disagree"* ]]; then
     echo "armed:    $name"
   else
     echo "INVALID:  $name -- the mutant did not run:"; printf '%s\n' "$out" | grep -E '^error|panicked at' | head -3

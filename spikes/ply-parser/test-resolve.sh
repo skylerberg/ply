@@ -16,7 +16,7 @@ work="$(mktemp -d)"
 [ "$keep" -eq 1 ] || trap 'rm -rf "$work"' EXIT
 cp "$here"/lexer.ply "$here"/spine.ply "$here"/types.ply "$here"/patterns.ply \
    "$here"/exprs.ply "$here"/items.ply "$here"/resolve.ply "$here"/rewrite.ply \
-   "$here"/tycore.ply "$here"/infer.ply "$work/"
+   "$here"/derive.ply "$here"/tycore.ply "$here"/infer.ply "$work/"
 "$ply" test "$work" --no-cache "$@"
 [ "$keep" -eq 1 ] && echo "project kept at $work"
 exit 0

@@ -189,10 +189,13 @@ measurement is confounded until the earlier one has moved.
    ported** (`tycore.ply`, `infer.ply`, `GAPS.md` §17): the checker's published
    output — every scheme, footprint, constraint set, test, law, effect and
    constructor, or its diagnostics — agrees with `check_program` over the
-   standard library, every example without a `derive`, a hand-written bundle
-   and every one of the reference checker's own test inputs; `arm-infer.sh`
-   arms it. Still outside: the derive expansion (and the two checker passes
-   that read what it produces), and the incremental `Known` interface.
+   standard library, every example, a hand-written bundle and every one of the
+   reference checker's own test inputs; `arm-infer.sh` arms it. **The deriver
+   is ported** (`derive.ply`, `GAPS.md` §18): the source every derivation
+   generates agrees byte for byte with `ply-derive` over a hand-written bundle,
+   every example and the standard library, the checker expands before it
+   resolves, and `arm-derive.sh` arms it. Still outside: the incremental
+   `Known` interface.
    Hashing is next after those. `std.hash` exists (ADR 0033) and its throughput is not measured. The
    syntax the parser spike predated is ported first, so its own differential is
    green before anything is built on it: the bit operators (with the shift join
