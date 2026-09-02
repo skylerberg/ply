@@ -44,6 +44,11 @@ pub struct Tables {
     /// The two hundred and fifty-six one-byte values, each made immortal the first time it is
     /// asked for, so `byte_of_int` allocates nothing.
     pub bytes: RefCell<[Word; 256]>,
+    /// Per constructor index, the immortal singleton a nullary one is, or `0`; and the empty
+    /// list and the empty map, made once — no body allocates any of these.
+    pub nullaries: Vec<Word>,
+    pub empty_list: Word,
+    pub empty_map: Word,
     /// The memo's words as the values the seam converted them to, once each, and those values'
     /// identities back to the words: what lets a phase's tree cross the seam and come back
     /// without being rebuilt either way.
@@ -297,6 +302,11 @@ impl Ctx {
     pub fn touched_cells(&self) -> bool {
         let stats = self.cells.arena().stats();
         (stats.allocations, stats.regions_opened) != self.cells_baseline
+    }
+
+    /// The singleton a nullary constructor is.
+    pub fn nullary(&self, index: u32) -> Word {
+        self.tables.nullaries[index as usize]
     }
 
     fn fail(&mut self, d: Diagnostic) -> i64 {
@@ -591,7 +601,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                 unsafe { set_word(c, 0, item) };
                 c as Word
             } else {
-                ctx.heap.alloc(KIND_CTOR, 0, 0, none) as Word
+                ctx.nullary(none)
             };
             heap::dec(*xs);
             Some(answer)
@@ -881,9 +891,9 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             };
             heap::dec(*a);
             heap::dec(*b);
-            Some(ctx.heap.alloc(KIND_CTOR, 0, 0, index) as Word)
+            Some(ctx.nullary(index))
         }
-        (Builtin::MapNew, []) => Some(ctx.heap.map_new()),
+        (Builtin::MapNew, []) => Some(ctx.tables.empty_map),
         (Builtin::MapInsert, [m, k, v]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
             let tables = Rc::clone(&ctx.tables);
             Some(ctx.heap.map_insert(&tables.layouts, *m, *k, *v))
@@ -899,7 +909,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                     unsafe { set_word(c, 0, v) };
                     c as Word
                 }
-                None => ctx.heap.alloc(KIND_CTOR, 0, 0, none) as Word,
+                None => ctx.nullary(none),
             };
             heap::dec(*m);
             heap::dec(*k);
@@ -1050,7 +1060,7 @@ fn position(ctx: &mut Ctx, at: Option<usize>) -> Option<Word> {
             unsafe { set_word(c, 0, heap::imm(i as i64)) };
             c as Word
         }
-        None => ctx.heap.alloc(KIND_CTOR, 0, 0, none) as Word,
+        None => ctx.nullary(none),
     })
 }
 
@@ -1540,6 +1550,9 @@ pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64) {
 /// An applied constructor. Takes the arguments.
 pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
+    if n == 0 {
+        return ctx.nullary(index as u32);
+    }
     let args = args_of(args, n);
     let o = ctx.heap.alloc(KIND_CTOR, 0, n as u32, index as u32);
     for (i, w) in args.iter().enumerate() {
@@ -1803,12 +1816,26 @@ pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
         return found.unwrap_or(0);
     }
     let answer = builtin_over_values(ctx, Builtin::MapGet, &[m, k]);
+    unwrapped(ctx, answer)
+}
+
+/// A builtin called directly by compiled code, with no dispatch on its index and no argument
+/// array: the native path, or the interpreter's over the values. Takes the arguments.
+fn direct(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
+    ctx.builtin_calls += 1;
+    match native_builtin(ctx, b, args) {
+        Some(w) => w,
+        None => builtin_over_values(ctx, b, args),
+    }
+}
+
+/// The value inside an `Option` answer, held once more, or `0` for `None`; the answer is let go.
+fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
     if ctx.failed != 0 {
         return 0;
     }
     let o = obj(answer);
-    let some = ctx.tables.layouts.some;
-    let held = unsafe { (*o).len == 1 && some == Some((*o).layout) };
+    let held = unsafe { (*o).len == 1 && ctx.tables.layouts.some == Some((*o).layout) };
     let v = if held {
         let v = unsafe { word_at(o, 0) };
         heap::inc(v);
@@ -1818,6 +1845,118 @@ pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     };
     heap::dec(answer);
     v
+}
+
+pub unsafe extern "C" fn rt_list_index(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
+    direct(unsafe { &mut *ctx }, Builtin::ListAt, &[xs, i])
+}
+
+/// `list_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].
+pub unsafe extern "C" fn rt_list_lookup(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    if heap::kind(xs) == KIND_LIST
+        && let Some(index) = heap::as_int(i)
+    {
+        ctx.builtin_calls += 1;
+        let o = obj(xs);
+        let w = if index >= 0 && (index as usize) < list::len(o) {
+            let item = list::get(o, index as usize);
+            heap::inc(item);
+            item
+        } else {
+            0
+        };
+        heap::dec(xs);
+        return w;
+    }
+    let answer = builtin_over_values(ctx, Builtin::ListAt, &[xs, i]);
+    unwrapped(ctx, answer)
+}
+
+pub unsafe extern "C" fn rt_push(ctx: *mut Ctx, xs: i64, x: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    if heap::kind(xs) == KIND_LIST {
+        ctx.builtin_calls += 1;
+        return ctx.heap.list_push(xs, x);
+    }
+    direct(ctx, Builtin::Push, &[xs, x])
+}
+
+pub unsafe extern "C" fn rt_map_insert(ctx: *mut Ctx, m: i64, k: i64, v: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+        ctx.builtin_calls += 1;
+        let tables = Rc::clone(&ctx.tables);
+        return ctx.heap.map_insert(&tables.layouts, m, k, v);
+    }
+    direct(ctx, Builtin::MapInsert, &[m, k, v])
+}
+
+pub unsafe extern "C" fn rt_map_contains(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    if heap::kind(m) == KIND_MAP && heap::native_key(k) {
+        ctx.builtin_calls += 1;
+        let found = map::get(&ctx.tables.layouts, obj(m), k).is_some();
+        heap::dec(m);
+        heap::dec(k);
+        return heap::bool(found);
+    }
+    direct(ctx, Builtin::MapContains, &[m, k])
+}
+
+pub unsafe extern "C" fn rt_map_get(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
+    direct(unsafe { &mut *ctx }, Builtin::MapGet, &[m, k])
+}
+
+pub unsafe extern "C" fn rt_compare(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
+    direct(unsafe { &mut *ctx }, Builtin::Compare, &[a, b])
+}
+
+pub unsafe extern "C" fn rt_byte_of_int(ctx: *mut Ctx, n: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    match heap::as_int(n).and_then(|v| u8::try_from(v).ok()) {
+        Some(b) => {
+            ctx.builtin_calls += 1;
+            ctx.tables.byte(b)
+        }
+        None => direct(ctx, Builtin::ByteOfInt, &[n]),
+    }
+}
+
+pub unsafe extern "C" fn rt_bytes_scan(
+    ctx: *mut Ctx,
+    hay: i64,
+    from: i64,
+    members: i64,
+    max: i64,
+) -> i64 {
+    direct(
+        unsafe { &mut *ctx },
+        Builtin::BytesScan,
+        &[hay, from, members, max],
+    )
+}
+
+pub unsafe extern "C" fn rt_bytes_scan_until(
+    ctx: *mut Ctx,
+    hay: i64,
+    from: i64,
+    members: i64,
+    max: i64,
+) -> i64 {
+    direct(
+        unsafe { &mut *ctx },
+        Builtin::BytesScanUntil,
+        &[hay, from, members, max],
+    )
+}
+
+pub unsafe extern "C" fn rt_bytes_slice(ctx: *mut Ctx, b: i64, s: i64, e: i64) -> i64 {
+    direct(unsafe { &mut *ctx }, Builtin::BytesSlice, &[b, s, e])
+}
+
+pub unsafe extern "C" fn rt_bytes_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
+    direct(unsafe { &mut *ctx }, Builtin::BytesConcat, &[a, b])
 }
 
 /// Every symbol the JIT registers, in one place so the compiler and the linker cannot drift.
@@ -1843,6 +1982,18 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_list_rest", rt_list_rest as *const u8),
         ("rt_ctor_arg", rt_ctor_arg as *const u8),
         ("rt_map_lookup", rt_map_lookup as *const u8),
+        ("rt_list_index", rt_list_index as *const u8),
+        ("rt_list_lookup", rt_list_lookup as *const u8),
+        ("rt_push", rt_push as *const u8),
+        ("rt_map_insert", rt_map_insert as *const u8),
+        ("rt_map_contains", rt_map_contains as *const u8),
+        ("rt_map_get", rt_map_get as *const u8),
+        ("rt_compare", rt_compare as *const u8),
+        ("rt_byte_of_int", rt_byte_of_int as *const u8),
+        ("rt_bytes_scan", rt_bytes_scan as *const u8),
+        ("rt_bytes_scan_until", rt_bytes_scan_until as *const u8),
+        ("rt_bytes_slice", rt_bytes_slice as *const u8),
+        ("rt_bytes_concat", rt_bytes_concat as *const u8),
         ("rt_record", rt_record as *const u8),
         ("rt_record_update", rt_record_update as *const u8),
         ("rt_field", rt_field as *const u8),
