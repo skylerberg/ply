@@ -350,6 +350,40 @@ fn decimal_of_float_is_the_shortest_round_tripping_decimal() {
 }
 
 #[test]
+fn the_float_bit_pattern_round_trips_every_value_including_nan() {
+    assert_eq!(
+        ok(callv("bits_of_float", vec![float(1.5)])),
+        Value::Int(0x3FF8_0000_0000_0000)
+    );
+    assert_eq!(
+        ok(callv("bits_of_float", vec![float(-0.0)])),
+        Value::Int(i64::MIN),
+        "the sign of a negative zero is a bit like any other"
+    );
+    assert_eq!(
+        ok_float(callv("float_of_bits", vec![int(0x3FF8_0000_0000_0000)])),
+        1.5
+    );
+    for f in [0.0, -1.0, 1e300, f64::INFINITY, f64::MIN_POSITIVE] {
+        let back = callv(
+            "float_of_bits",
+            vec![callv("bits_of_float", vec![float(f)])],
+        );
+        assert_eq!(ok_float(back), f, "{f}");
+    }
+    let nan = callv("bits_of_float", vec![float(f64::NAN)]);
+    let through = callv(
+        "bits_of_float",
+        vec![callv("float_of_bits", vec![nan.clone()])],
+    );
+    assert_eq!(
+        ok(through),
+        ok(nan),
+        "a NaN keeps its payload through both directions"
+    );
+}
+
+#[test]
 fn the_int_and_float_conversions_are_total_where_they_claim_to_be() {
     assert_eq!(ok_decimal(callv("decimal_of_int", vec![int(-7)])), d(-7, 0));
     assert_eq!(ok_float(callv("float_of_decimal", vec![dec(15, 1)])), 1.5);

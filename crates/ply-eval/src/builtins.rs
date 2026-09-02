@@ -93,6 +93,9 @@ pub enum Builtin {
     DecimalOfFloat,
     DecimalOfString,
     DecimalToString,
+    /// The IEEE 754 bit pattern, as the signed 64-bit `Int` it fits in.
+    BitsOfFloat,
+    FloatOfBits,
     Compare,
     /// The same order as [`Builtin::Compare`], under a name a module may not declare.
     CompareValues,
@@ -181,6 +184,8 @@ impl Builtin {
             "decimal_of_float" => Builtin::DecimalOfFloat,
             "decimal_of_string" => Builtin::DecimalOfString,
             "decimal_to_string" => Builtin::DecimalToString,
+            "bits_of_float" => Builtin::BitsOfFloat,
+            "float_of_bits" => Builtin::FloatOfBits,
             "cell_get" => Builtin::CellGet,
             "cell_set" => Builtin::CellSet,
             "cell_update" => Builtin::CellUpdate,
@@ -263,6 +268,8 @@ impl Builtin {
             Builtin::DecimalOfFloat => "decimal_of_float",
             Builtin::DecimalOfString => "decimal_of_string",
             Builtin::DecimalToString => "decimal_to_string",
+            Builtin::BitsOfFloat => "bits_of_float",
+            Builtin::FloatOfBits => "float_of_bits",
             Builtin::CellGet => "cell_get",
             Builtin::CellSet => "cell_set",
             Builtin::CellUpdate => "cell_update",
@@ -304,6 +311,8 @@ impl Builtin {
             | Builtin::DecimalOfFloat
             | Builtin::DecimalOfString
             | Builtin::DecimalToString
+            | Builtin::BitsOfFloat
+            | Builtin::FloatOfBits
             | Builtin::SecretOfString
             | Builtin::SecretIsEmpty => (1, 1),
             Builtin::AssertEq
@@ -440,6 +449,8 @@ impl Builtin {
             Builtin::DecimalOfFloat,
             Builtin::DecimalOfString,
             Builtin::DecimalToString,
+            Builtin::BitsOfFloat,
+            Builtin::FloatOfBits,
             Builtin::Compare,
             Builtin::CompareValues,
             Builtin::CellGet,
@@ -1027,6 +1038,18 @@ fn call_with(
         Builtin::DecimalToString => {
             let d = args[0].as_decimal(span, "`decimal_to_string`")?;
             Ok(Step::Done(Value::str(d.to_string())))
+        }
+
+        // Total both ways: every bit pattern is a `Float`, NaNs included, and the pattern is what
+        // content addressing hashes a literal by.
+        Builtin::BitsOfFloat => {
+            let f = args[0].as_float(span, "`bits_of_float`")?;
+            Ok(Step::Done(Value::Int(f.to_bits() as i64)))
+        }
+
+        Builtin::FloatOfBits => {
+            let n = args[0].as_int(span, "`float_of_bits`")?;
+            Ok(Step::Done(Value::Float(f64::from_bits(n as u64))))
         }
 
         Builtin::Panic => {
@@ -2857,6 +2880,7 @@ mod tests {
             [
                 "assert",
                 "assert_eq",
+                "bits_of_float",
                 "byte_of_int",
                 "bytes_at",
                 "bytes_concat",
@@ -2886,6 +2910,7 @@ mod tests {
                 "decimal_round",
                 "decimal_to_string",
                 "filter",
+                "float_of_bits",
                 "float_of_decimal",
                 "fold",
                 "int_of_decimal",

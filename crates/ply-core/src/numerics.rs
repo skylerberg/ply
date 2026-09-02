@@ -313,6 +313,8 @@ fn the_decimal_builtins_have_the_signatures_the_contract_names() {
         ("decimal_of_float", "(Float) -> Option<Decimal>"),
         ("decimal_of_string", "(String) -> Option<Decimal>"),
         ("decimal_to_string", "(Decimal) -> String"),
+        ("bits_of_float", "(Float) -> Int"),
+        ("float_of_bits", "(Int) -> Float"),
     ] {
         // Checking through a definition that names it is what proves the builtin is reachable *and*
         // has the type, in one step.
