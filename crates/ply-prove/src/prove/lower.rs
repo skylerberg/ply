@@ -57,6 +57,9 @@ const TOTAL_BUILTINS: &[&str] = &[
     "float_of_decimal",
     "decimal_of_float",
     "int_of_decimal",
+    // The IEEE 754 bit pattern both ways, total by construction.
+    "bits_of_float",
+    "float_of_bits",
     // The wrapping arithmetic (the shift semantics). Total by construction: they
     // exist because `+`, `-` and `*` raise on overflow and a mixing step needs
     // an answer there, so there is no input any of them declines. Uninterpreted
