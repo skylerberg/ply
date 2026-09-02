@@ -430,6 +430,21 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
         "{}",
         report["backend"]
     );
+    // The seam's census counted what the entries converted: this corpus hands in only `Int`s,
+    // which are immediates and build nothing, and answers a list and a string, which are read
+    // back out.
+    assert_eq!(
+        u64_at(&report, &["backend", "converted_in"]),
+        0,
+        "an immediate argument built an object at the seam: {}",
+        report["backend"]
+    );
+    assert!(
+        u64_at(&report, &["backend", "converted_out"]) > 0,
+        "the seam read nothing back out of a corpus that answers lists and strings, so the \
+         census is not counting: {}",
+        report["backend"]
+    );
     // A code generator compiled something, and the report says how much it cost.
     assert!(
         u64_at(&report, &["backend", "units"]) > 0,

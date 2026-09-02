@@ -1,6 +1,6 @@
 # ADR 0035 — A compiled value model: layouts from types, counts without atomics, reuse
 
-**Decided; sequence steps 1 to 6 are landed, and the gate is not yet met.**
+**Decided; sequence steps 1 to 7 are landed, and the gate is not yet met.**
 `benches/value-model/PRE-REGISTERED.md` is the gate's protocol and the bar is
 in `benches/value-model/analyze.py`, where a number cannot set it after the
 fact; `baseline.txt` there is the series before anything was built,
@@ -182,8 +182,10 @@ Entry converts the arguments from the interpreter's values to the compiled
 layout; exit converts the answer back. The conversion is deep and paid once per
 root entry, which is what the front end's entry pattern is now — every phase's
 root is entered whole and nothing under it declines (`benches/front-end-whole`).
-The seam census counts the words converted, so an outcome where conversion
-dominates is visible rather than inferred.
+The seam census counts the objects converted — built from the arguments on
+the way in, read back out of the answer on the way out — and the run's report
+carries the sums, so an outcome where conversion dominates is visible rather
+than inferred.
 
 ## Decision 7 — no builtin stands in for a slow kernel
 
@@ -300,7 +302,12 @@ a baseline the change is read against and the kernels are known to run.
    per level otherwise; a `rest` moves the offset and shares the trie. Every
    helper over lists builds through one constructor and walks through one
    iterator, and `fold` walks the leaves in place.
-7. The seam's conversion and its census (Decision 6).
+7. **Landed.** The seam's census (Decision 6): every entry counts the objects
+   it builds from its arguments and the objects it reads back out of its
+   answer, and the run's report carries the sums as `backend.converted_in`
+   and `backend.converted_out`, so a run whose conversion dominates is
+   visible rather than inferred. The conversion itself was already at the
+   root (ADR 0030) and is unchanged.
 8. Both kernels and the front-end row re-taken, and the decision rule applied.
 
 Each step is behind the differential corpus and the fragment's own cases, as

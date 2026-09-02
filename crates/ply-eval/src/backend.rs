@@ -39,6 +39,8 @@ pub struct Counters {
     str_in: AtomicU64,
     str_out: AtomicU64,
     containers_out: AtomicU64,
+    converted_in: AtomicU64,
+    converted_out: AtomicU64,
 }
 
 impl Counters {
@@ -83,7 +85,16 @@ impl Counters {
             str_in: self.str_in.load(Ordering::Relaxed),
             str_out: self.str_out.load(Ordering::Relaxed),
             containers_out: self.containers_out.load(Ordering::Relaxed),
+            converted_in: self.converted_in.load(Ordering::Relaxed),
+            converted_out: self.converted_out.load(Ordering::Relaxed),
         }
+    }
+
+    /// The seam's census (ADR 0035 Decision 6): the objects one entry built from its arguments
+    /// and the objects it read back out of its answer.
+    pub fn note_converted(&self, inward: u64, outward: u64) {
+        self.converted_in.fetch_add(inward, Ordering::Relaxed);
+        self.converted_out.fetch_add(outward, Ordering::Relaxed);
     }
 
     /// One answer that carried a container out.
@@ -114,6 +125,11 @@ pub struct Offers {
     /// Entered calls that answered a `List`, `Map`, `Record` or `Ctor`, counted before any mutation
     /// touches the answer.
     pub containers_out: u64,
+    /// Objects the entries built from their arguments — every value converted at the root that
+    /// was not an immediate — and objects read back out of their answers: the seam's census,
+    /// so a run whose conversion dominates is visible rather than inferred.
+    pub converted_in: u64,
+    pub converted_out: u64,
 }
 
 impl Fragment {
