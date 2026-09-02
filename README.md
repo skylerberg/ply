@@ -88,6 +88,16 @@ Opening a content-addressed store of ten thousand definitions costs single-digit
 milliseconds, which is what lets the cache sit in the inner loop rather than be a
 build artifact.
 
+> **This loop is the interpreter's, and the compiled one is not yet its equal.**
+> What makes it O(change) is the front-end cache keyed by content and a test
+> selected against the definition set it last passed under. Under
+> `--backend cranelift` the selection still holds and the compilation does not:
+> `crates/ply-codegen` persists nothing between runs, so a backed run compiles
+> the whole reachable program again, and every invocation of every command
+> starts cold — there is no `watch`, no daemon and no server. ADR 0037 carries
+> what that costs, the row that would price it, and why emitted C is refused
+> inside the loop.
+
 ## Three ideas
 
 **Effects are in the type, at resource granularity.** Not `IO`, and not even

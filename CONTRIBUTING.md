@@ -508,7 +508,7 @@ W1's footprint check, the paragraph above still stands on its own.
 A reader cannot tell an asserted invariant from an observation. Say which:
 
 > Selecting zero deterministic tests after a rename is an invariant the suite
-> asserts — `crates/ply-cli/tests/suite/cli.rs:145
+> asserts — `crates/ply-cli/tests/suite/cli.rs:198
 > renaming_a_definition_re_runs_nothing` — not a heuristic.
 
 That sentence is checkable in one grep. "The rename path is safe" is not.
