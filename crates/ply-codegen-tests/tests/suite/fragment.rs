@@ -139,6 +139,16 @@ fn looked_up_nested(n: Int) -> Int = match map_get(counted(n), 2) { Some(5) -> 5
 fn looked_up_twice(n: Int) -> Int = { let m = counted(n); match map_get(m, 0) { Some(a) -> match map_get(m, 1) { Some(b) -> a + b, None -> a }, None -> 0 } }
 
 fn looked_up_by_list(n: Int) -> Int = { let m = map_insert(map_new(), [n, n + 1], n); match map_get(m, [n, n + 1]) { Some(v) -> v, None -> 0 - 1 } }
+
+fn indexed(n: Int) -> Int = { let xs = map(range(0, n), |x: Int| x + 1); match list_at(xs, 2) { Some(v) -> v * 10, None -> 0 - 1 } }
+
+fn indexed_past(n: Int) -> Int = match list_at(map(range(0, n), |x: Int| x + 1), n + 5) { Some(_) -> 1, None -> 0 - 1 }
+
+fn ordered(a: Int, b: Int) -> Int = match compare(a, b) { Less -> 0 - 1, Equal -> 0, Greater -> 1 }
+
+fn grown_apart(n: Int) -> Int = { let a = push([], n); let b = push([], n + 1); let c = push(push([], n + 2), n + 3); len(a) * 100 + len(b) * 10 + len(c) + fold(a, 0, |acc: Int, x: Int| acc + x) + fold(b, 0, |acc: Int, x: Int| acc + x) }
+
+fn maps_apart(n: Int) -> Int = { let a = map_insert(map_new(), n, 1); let b = map_insert(map_new(), n + 1, 2); let e = map_new(); map_len(a) * 100 + map_len(b) * 10 + map_len(e) + (match map_get(a, n + 1) { Some(_) -> 1000, None -> 0 }) }
 "#;
 
 fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
@@ -331,6 +341,28 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ("m.looked_up_nested", vec![Value::Int(2)], Value::Int(-1)),
         ("m.looked_up_twice", vec![Value::Int(6)], Value::Int(7)),
         ("m.looked_up_by_list", vec![Value::Int(4)], Value::Int(4)),
+        // The same shape over `list_at`; a three-way compare answering singletons; and the empty
+        // list and the empty map made once, grown apart.
+        ("m.indexed", vec![Value::Int(5)], Value::Int(30)),
+        ("m.indexed", vec![Value::Int(2)], Value::Int(-1)),
+        ("m.indexed_past", vec![Value::Int(3)], Value::Int(-1)),
+        (
+            "m.ordered",
+            vec![Value::Int(1), Value::Int(2)],
+            Value::Int(-1),
+        ),
+        (
+            "m.ordered",
+            vec![Value::Int(2), Value::Int(2)],
+            Value::Int(0),
+        ),
+        (
+            "m.ordered",
+            vec![Value::Int(3), Value::Int(2)],
+            Value::Int(1),
+        ),
+        ("m.grown_apart", vec![Value::Int(4)], Value::Int(121)),
+        ("m.maps_apart", vec![Value::Int(7)], Value::Int(110)),
     ];
     for (name, args, want) in cases {
         assert_eq!(
