@@ -1355,27 +1355,40 @@ pub unsafe extern "C" fn rt_record_update(
     let tables = Rc::clone(&ctx.tables);
     let width = tables.layouts.shape_width(shape);
     let out = ctx.heap.alloc(KIND_RECORD, 0, width as u32, shape);
-    let mut filled = vec![false; width];
-    for (w, at) in written.iter().zip(offsets) {
-        unsafe { set_word(out, *at as usize, *w) };
-        filled[*at as usize] = true;
+    // Which offsets the literal wrote: a bit each for a shape a word of bits covers, which is
+    // every shape a front end has, and a list for a wider one.
+    let mut mask = 0u128;
+    let mut wide = Vec::new();
+    if width > 128 {
+        wide = vec![false; width];
     }
+    for (w, at) in written.iter().zip(offsets) {
+        let at = *at as usize;
+        unsafe { set_word(out, at, *w) };
+        if width > 128 {
+            wide[at] = true;
+        } else {
+            mask |= 1 << at;
+        }
+    }
+    let filled = |i: usize| {
+        if width > 128 {
+            wide[i]
+        } else {
+            mask >> i & 1 == 1
+        }
+    };
     if written.len() < width {
         let base_shape = unsafe { (*o).layout };
         if base_shape == shape {
-            for (i, done) in filled.iter().enumerate() {
-                if !done {
-                    let w = unsafe { word_at(o, i) };
-                    heap::inc(w);
-                    unsafe { set_word(out, i, w) };
-                }
+            for i in (0..width).filter(|i| !filled(*i)) {
+                let w = unsafe { word_at(o, i) };
+                heap::inc(w);
+                unsafe { set_word(out, i, w) };
             }
         } else {
             let names = tables.layouts.shape_names(shape);
-            for (i, done) in filled.iter().enumerate() {
-                if *done {
-                    continue;
-                }
+            for i in (0..width).filter(|i| !filled(*i)) {
                 let Some(at) = tables.layouts.offset(base_shape, &names[i]) else {
                     let d = error(format!("this record has no field `{}`", names[i]));
                     return ctx.fail(d);
