@@ -1346,3 +1346,13 @@ item is ordered on an assumption only that measurement can test.
 Available today, and it is the design working rather than a concession: the kernel
 in Rust behind a host handler with a declared footprint, the strategy and
 experiment harness in Ply. The boundary costs 0.5 us per crossing, measured.
+
+## What is next
+
+`docs/BOOTSTRAP-PATH.md`. Every track above ended on a measurement, and the
+one goal none of them reached is ADR 0021's: a front end whose cost is
+O(change), written in Ply. That file records what is no longer in the way
+after ADR 0034, what is — throughput, and the code generator's shape — the
+order to take the rest in, and the measurement each step is gated on. Its
+first step is the code generator's roots, because ADR 0030's row already says
+leaf entry loses.
