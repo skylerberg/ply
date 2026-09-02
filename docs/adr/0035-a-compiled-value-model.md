@@ -296,9 +296,11 @@ a baseline the change is read against and the kernels are known to run.
    the stack rather than through a work list it allocated. The pass is
    syntactic and the interpreter never sees its output, so the differential
    corpus and the fragment's cases are what hold it to the source. Its budget
-   is small and fixed; the integer kernel's remaining records are in functions
-   over it, and a budget that admits them is a compile-time trade the front
-   end's own codegen row prices.
+   is small and fixed, and priced: a budget wide enough to admit the hash's
+   round made the integer kernel *slower* — a body seven rounds deep is more
+   than the register allocator does well by — and code generation over the
+   examples several times longer, so the budget stays and the round's records
+   are not the inliner's to remove.
 6. **Landed.** A string or a bytes value is its bytes after
    the header with a capacity beside its length; `++`, `bytes_concat` and
    `string_concat` append in place when the left operand is held by nobody
