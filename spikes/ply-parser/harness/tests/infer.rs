@@ -306,12 +306,27 @@ fn the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs()
     compare("hand-written programs", &inputs);
 }
 
-/// The reference checker's own test inputs, each as a one-module program named `m`, the way
-/// `crates/ply-core/src/tests.rs` checks them. Most are error paths, and the stage this port is
-/// at does not raise every one the reference raises — so this reports the residue rather than
-/// requiring agreement, and pins its size so it can only shrink.
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs_up_to_the_pinned_residue() {
+fn the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs() {
+    let text = std::fs::read_to_string(spike_dir().join("fixtures/check-programs.corpus"))
+        .expect("the hand-written checker programs");
+    let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
+        .into_iter()
+        .enumerate()
+        .map(|(i, p)| (format!("check-programs.corpus#{i}"), p))
+        .collect();
+    assert!(
+        !inputs.is_empty(),
+        "the hand-written checker bundle holds no program"
+    );
+    compare("hand-written checker programs", &inputs);
+}
+
+/// The reference checker's own test inputs, each as a one-module program named `m`, the way
+/// `crates/ply-core/src/tests.rs` checks them. Most are error paths: this is where the port's
+/// diagnostics are compared, code by code and label by label.
+#[test]
+fn the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs() {
     let text = std::fs::read_to_string(spike_dir().join("fixtures/reference-checks.corpus"))
         .expect("the mined checker inputs; run mine-checks.py");
     let inputs: Vec<(String, Vec<(String, String)>)> = ply_parser_spike_harness::bundle(&text)
@@ -324,41 +339,6 @@ fn the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs_up_to_the_p
             )
         })
         .collect();
-    assert!(!inputs.is_empty());
-    let project = Project::new();
-    let programs: Vec<Vec<(String, String)>> = inputs.iter().map(|(_, p)| p.clone()).collect();
-    let got = project.dumps(&programs);
-    let mut disagree: Vec<String> = Vec::new();
-    for ((name, program), actual) in inputs.iter().zip(&got) {
-        let reference = reference_check_dump(program);
-        if first_difference(&reference, actual).is_some() {
-            let code = reference
-                .split(';')
-                .find(|r| r.starts_with('!'))
-                .map(|r| {
-                    r.split(':')
-                        .next()
-                        .unwrap_or(r)
-                        .trim_start_matches('!')
-                        .to_string()
-                })
-                .unwrap_or_else(|| "ok".to_string());
-            disagree.push(format!("{name} ({code})"));
-        }
-    }
-    println!(
-        "  reference checks: {} of {} inputs agree; the residue: {:?}",
-        inputs.len() - disagree.len(),
-        inputs.len(),
-        disagree
-    );
-    assert!(
-        disagree.len() <= RESIDUE,
-        "the residue grew to {} past the pinned {RESIDUE}: {disagree:?}",
-        disagree.len()
-    );
+    assert!(!inputs.is_empty(), "the mined bundle holds no input");
+    compare("reference checks", &inputs);
 }
-
-/// The inputs above the port does not yet agree on, pinned so that a port of one more pass
-/// lowers it and a regression raises it.
-const RESIDUE: usize = 13;

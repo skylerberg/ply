@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # The checker differential, armed: each mutation below is applied to a copy of
 # `infer.ply` or `tycore.ply` and the fast half of `harness/tests/infer.rs` (the
-# resolver's programs and the standard library) must go red.
+# hand-written programs, the resolver's programs, the standard library and the
+# reference checker's own inputs) must go red.
 #
 #   ./spikes/ply-parser/arm-infer.sh
 set -uo pipefail
@@ -23,9 +24,10 @@ run_suite() {
     && PLY_BIN="$ply" PLY_PARSER_SRC="$work" \
        cargo test --offline --test infer -- --test-threads=2 \
          the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs \
+         the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs \
          the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs \
          the_ply_checker_agrees_with_ply_core_on_the_standard_library \
-         the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs_up_to_the_pinned_residue 2>&1 )
+         the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs 2>&1 )
 }
 
 mutate() {
@@ -42,7 +44,7 @@ arm() {
   out=$(run_suite)
   if [[ "$out" == *"test result: ok"* ]]; then
     echo "NOT ARMED: $name -- the differential stayed green"; fails=$((fails + 1))
-  elif [[ "$out" == *"disagree"* || "$out" == *"residue grew"* ]]; then
+  elif [[ "$out" == *"disagree"*]]; then
     echo "armed:    $name"
   else
     echo "INVALID:  $name -- the mutant did not run:"; printf '%s\n' "$out" | grep -E '^error|panicked at' | head -3
@@ -61,19 +63,15 @@ echo "==> unification and generalization"
 arm "a rigid type variable binds like any other" tycore \
   '        _ -> if !is_rigid_ty(s, x) { bind_ty(s, f, x, b) } else { failed(s, f, Mismatch({ expected: a, found: b })) },' \
   '        _ -> bind_ty(s, f, x, b),'
-arm "generalization quantifies what the environment still reaches" tycore \
+arm "generalization leaves row variables monomorphic" tycore \
   '  { e: env.e, sc: { ty_vars: ints_difference(fv.tys, env.free.tys), row_vars: ints_difference(fv.rows, env.free.rows), ty: ty } }' \
-  '  { e: env.e, sc: { ty_vars: fv.tys, row_vars: fv.rows, ty: ty } }'
+  '  { e: env.e, sc: { ty_vars: ints_difference(fv.tys, env.free.tys), row_vars: [], ty: ty } }'
 arm "a closed row absorbs an atom it lacks" tycore \
   '        None -> if len(only_a) == 0 && len(only_b) == 0 { ok(s, f) } else { failed(s, f, bad) },' \
   '        None -> ok(s, f),'
-arm "the printer names the variables of a scheme from its head rather than its body" tycore \
-  '  let body = print_ty(p, sc.ty);
-  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { body } else {' \
-  '  let body0 = print_ty(p, sc.ty);
-  let body = print_ty(fold(sc.ty_vars, p, |q: Printer, v: Int| ty_name(q, v).p), sc.ty);
-  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { body } else {'
-
+arm "the printer gives every type variable the first letter" tycore \
+  '      let name = letter_name(ty_letters(), map_len(p.ty_names));' \
+  '      let name = letter_name(ty_letters(), 0);'
 echo
 echo "==> the checker"
 arm "the row of a call is not joined into the row of the caller" infer \
