@@ -729,7 +729,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
     fn application(&mut self, func: &Expr, args: &[Expr]) -> TermId {
         let lowered: Vec<TermId> = args.iter().map(|a| self.lower(a)).collect();
 
-        if let ExprKind::Lambda { params, body } = &func.kind
+        if let ExprKind::Lambda { params, body, .. } = &func.kind
             && params.len() == lowered.len()
         {
             return self.with_frame(params_frame(params, &lowered), |this| this.lower(body));

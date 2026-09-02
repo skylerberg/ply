@@ -1881,8 +1881,23 @@ impl Parser {
             self.expect(&TokenKind::Pipe, "`|` to close the lambda parameters")?;
             params
         };
+        let ret = if self.eat(&TokenKind::Arrow) {
+            Some(self.ty()?)
+        } else {
+            None
+        };
         let saved = std::mem::replace(&mut self.no_pipe, false);
-        let body = self.expr();
+        // With a return type written the body is a block, as a `fn`'s is after its `->`: the
+        // type's end and the body's start are then unambiguous.
+        let body = if ret.is_some() {
+            if self.at(&TokenKind::LBrace) {
+                self.block_expr()
+            } else {
+                Err(self.error_here("`{` to open the body of a lambda with a written return type"))
+            }
+        } else {
+            self.expr()
+        };
         self.no_pipe = saved;
         let body = body?;
         let span = start.to(body.span);
@@ -1890,6 +1905,7 @@ impl Parser {
             kind: ExprKind::Lambda {
                 params,
                 body: Box::new(body),
+                ret,
             },
             span,
         })

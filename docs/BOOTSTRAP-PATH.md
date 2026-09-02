@@ -123,11 +123,14 @@ measurement is confounded until the earlier one has moved.
    native to compiled code or specialise their representations. Gate: the share
    falls under the census, not a micro-benchmark.
 5. **The language tax the spike priced.** In `spikes/ply-parser/GAPS.md`'s
-   order: tuples (§3), `const` (§5, an interpreter call per nullary function at
-   the parser's innermost operation), `?` inside lambdas and `iterate` steps (§2,
-   `E0118`/`E0119`), keywords reserved in the field namespace (§6), an
-   expression-position `unreachable` (§8), and §9's small pieces. Float
-   construction is ADR 0020's one absolute hole. Each is an ordinary language
+   order: tuples (§3), `const` (§5 — the value of a nullary pure definition is
+   already memoised at run time by `ply-eval::memo`, so what remains is the
+   spelling), `?` inside lambdas (§2, `E0118` — **landed**: a lambda may write
+   `-> T` before a block body and `?` reads it; an `iterate` step answers `Iter`
+   and can never carry one), `?` as a `let`'s value inside a branch (`E0119`),
+   keywords reserved in the field namespace (§6), an expression-position
+   `unreachable` (§8), and §9's small pieces. Float construction is ADR 0020's
+   one absolute hole. Each is an ordinary language
    change under ADR 0001's rule that no existing hash may move, and each moves
    `docs/GUIDE.md` in the same change.
 6. **The other four phases, behind the differential.** Resolve, inference,
