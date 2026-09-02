@@ -251,6 +251,35 @@ impl Parser {
         }
     }
 
+    /// A field name: an identifier, or a keyword, since a field position has no other reading.
+    /// `keyword` says which it was, for the punned forms that need a variable too.
+    fn expect_field_name(&mut self, what: &str) -> PResult<(Ident, bool)> {
+        if let TokenKind::Kw(k) = self.kind() {
+            let name = k.as_str();
+            let span = self.advance();
+            return Ok((Ident::new(name, span), true));
+        }
+        self.expect_ident(what).map(|name| (name, false))
+    }
+
+    fn keyword_pun_refusal(&mut self, name: &Ident) -> Bail {
+        self.push(
+            Diagnostic::error(
+                codes::UNEXPECTED_TOKEN,
+                format!(
+                    "`{}` names a field here, and a bare field also names a variable",
+                    name.name
+                ),
+            )
+            .primary(name.span, "a keyword cannot name a variable")
+            .note(format!(
+                "write `{0}: {0}_` with a name of your own on the right",
+                name.name
+            )),
+        );
+        Bail
+    }
+
     /// `>=` immediately after a type parameter list is really `>` then `=`, as in `type Pair<a>=
     /// ..`
     fn expect_gt(&mut self, what: &str) -> PResult<Span> {
@@ -1276,7 +1305,7 @@ impl Parser {
     }
 
     fn ty_field(&mut self) -> PResult<(Ident, TypeExpr)> {
-        let name = self.expect_ident("a field name")?;
+        let (name, _) = self.expect_field_name("a field name")?;
         self.expect(&TokenKind::Colon, "`:` after the field name")?;
         Ok((name, self.ty()?))
     }
@@ -1454,7 +1483,7 @@ impl Parser {
                     };
                     self.advance();
                     let Some(effect) = effect else {
-                        let field = self.expect_ident("a field name after `.`")?;
+                        let (field, _) = self.expect_field_name("a field name after `.`")?;
                         let span = e.span.to(field.span);
                         e = Expr {
                             kind: ExprKind::Field {
@@ -1729,12 +1758,13 @@ impl Parser {
         }
     }
 
-    /// `{x: e}` and `{x, y}` are records; `{x}` is a block whose value is `x`.
+    /// `{x: e}` and `{x, y}` are records; `{x}` is a block whose value is `x`. A keyword in the
+    /// name's place reads the same way, since no block starts with a keyword and `:` or `,`.
     fn at_record_literal(&self) -> bool {
         if matches!(self.kind_at(1), TokenKind::DotDot) {
             return true;
         }
-        matches!(self.kind_at(1), TokenKind::Ident(_))
+        matches!(self.kind_at(1), TokenKind::Ident(_) | TokenKind::Kw(_))
             && matches!(self.kind_at(2), TokenKind::Colon | TokenKind::Comma)
     }
 
@@ -1795,7 +1825,7 @@ impl Parser {
         };
         while self.at(&TokenKind::Dot) {
             self.advance();
-            let field = self.expect_ident("a field name")?;
+            let (field, _) = self.expect_field_name("a field name")?;
             expr = Expr {
                 span: expr.span.to(field.span),
                 kind: ExprKind::Field {
@@ -1820,10 +1850,13 @@ impl Parser {
             );
             return Err(Bail);
         }
-        let name = self.expect_ident("a field name")?;
+        let (name, keyword) = self.expect_field_name("a field name")?;
         if self.eat(&TokenKind::Colon) {
             let value = self.expr()?;
             return Ok((name, value));
+        }
+        if keyword {
+            return Err(self.keyword_pun_refusal(&name));
         }
         let span = name.span;
         Ok((
@@ -2388,10 +2421,13 @@ impl Parser {
                 self.eat(&TokenKind::Comma);
                 break;
             }
-            let name = self.expect_ident("a field name")?;
+            let (name, keyword) = self.expect_field_name("a field name")?;
             let pat = if self.eat(&TokenKind::Colon) {
                 self.pattern()?
             } else {
+                if keyword {
+                    return Err(self.keyword_pun_refusal(&name));
+                }
                 let span = name.span;
                 Pattern {
                     kind: PatternKind::Var(name.clone()),
