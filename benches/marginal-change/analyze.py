@@ -160,6 +160,23 @@ if process:
         print("  Nothing was rechecked at any size, so this is the cost of establishing that,")
         print("  paid again by every invocation. It is what a warm process would not pay.")
 
+backed = [r for r in process if r.get("backend")]
+if backed:
+    print("\n=== what the code generator charges, per definition it compiles")
+    for r in backed:
+        b = r["backend"]
+        units, fragment = b.get("units", 0), b.get("fragment", 0)
+        codegen_ms = b.get("codegen_nanos", 0) / 1e6
+        per_build = codegen_ms / units if units else 0.0
+        per_def = per_build * 1e3 / fragment if fragment else 0.0
+        print(f"  {definitions(r['size']):>6} defs: fragment {fragment:>5}"
+              f"   {units:>3} build(s) of it, {codegen_ms:8.1f}ms in all"
+              f"   {per_build:7.1f}ms each   {per_def:6.0f} us per definition"
+              f"   deciding what to compile {b.get('analysis_nanos', 0) / 1e6:.1f}ms")
+    print("  The unit is built once as a pre-flight and again per worker, so `builds` is the")
+    print("  worker count plus one and the total is that many whole-project compiles.")
+    print("  `benches/c-floor/` holds what a C toolchain charges for the same unit of work.")
+
 after = raw.get("load_after")
 print(f"\nload before {raw.get('load_before')} after {after}"
       + ("  -- above the gate; an observation, not a figure"

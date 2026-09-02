@@ -32,9 +32,16 @@ for size in "${sizes[@]}"; do
     --depth "$(( m < 6 ? m : 6 ))" >/dev/null
 done
 
-l=$(load1)
+# The build and the corpora above are this script's own load, so the gate is read after them and
+# waited on rather than refused at once: a series that refuses because of its own setup tells you
+# nothing about the machine it would have measured on.
+for _ in $(seq 60); do
+  l=$(load1)
+  awk -v l="$l" 'BEGIN{exit !(l < 4.0)}' && break
+  sleep 15
+done
 echo "==> load before: $(uptime)"
-awk -v l="$l" 'BEGIN{exit !(l < 4.0)}' || { echo "load $l is above the gate of 4; not measuring" >&2; exit 3; }
+awk -v l="$l" 'BEGIN{exit !(l < 4.0)}' || { echo "load $l stayed above the gate of 4; not measuring" >&2; exit 3; }
 
 echo "{" > "$raw"
 echo "  \"load_before\": $l," >> "$raw"
@@ -66,9 +73,12 @@ for size in "${sizes[@]}"; do
     awk -v a="$s" -v b="$best" 'BEGIN{exit !(a < b)}' && best=$s
   done
   front=$("$ply" test "$dir" --json 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["front_end"]))')
+  # What the code generator charges per definition, which is the number ADR 0037's table of loop
+  # tiers compares against `benches/c-floor/`'s and which the whole-unit compile otherwise hides.
+  back=$("$ply" test "$dir" --backend cranelift --json 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["backend"]))')
   echo "    ," >> "$raw"
-  printf '    {"size": "%s", "engine": "process", "warm_wall_seconds": %s, "warm_front_end": %s}\n' \
-    "$size" "$best" "$front" >> "$raw"
+  printf '    {"size": "%s", "engine": "process", "warm_wall_seconds": %s, "warm_front_end": %s, "backend": %s}\n' \
+    "$size" "$best" "$front" "$back" >> "$raw"
 done
 echo "  ]," >> "$raw"
 echo "  \"load_after\": $(load1)" >> "$raw"

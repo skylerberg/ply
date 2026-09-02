@@ -168,20 +168,34 @@ loop.
 
 | tier | depends on | per changed definition | per run | code quality | what it costs the tree |
 | --- | --- | --- | --- | --- | --- |
-| Cranelift over a `DefHash -> code` cache | a Rust library, until the line's goal removes it | a Cranelift compile, unmeasured per definition | none; the code is already in the process | Cranelift's | a per-definition unit and a way to hold code across runs; keeps Rust |
+| Cranelift over a `DefHash -> code` cache | a Rust library, until the line's goal removes it | a Cranelift compile — hundreds of microseconds, `benches/marginal-change/` | none; the code is already in the process | Cranelift's | a per-definition unit and a way to hold code across runs; keeps Rust |
 | emitted C, an object per definition, linked and loaded once per run | a C compiler at run time | a process and a compile | a link and a load — `benches/c-floor/` | the C compiler's, at the level chosen | one code generator serving both tiers |
 | emitted C, an image per definition, loaded by reach | a C compiler at run time | a process, a compile and a link | superlinear in the images loaded — **the row above refuses this shape** | the C compiler's | one code generator, and a loader cost that grows faster than the reach |
 | a C compiler linked in process (libtcc is the instance) | a C library at run time | a compile, no process | unmeasured | unoptimised | one code generator; a second C toolchain to bind |
 | copy-and-patch | clang at build time — the stencils need a calling convention that passes every register through, and CPython's JIT builds with a pinned LLVM for that reason | a copy and a relocation patch | none | about an unoptimising compiler's | a second code generator in Ply, with its own differential |
 
 What would choose: the per-run and per-definition constants against the loop's
-budget, which `benches/c-floor/` has half of and the marginal-change row sets;
-the code quality against how long the suite runs, which the marginal-change row
-separates only if test length is varied; and one code generator against two,
-since the release tier is C either way and every code generator in Ply is a
-differential to maintain. The C row that survives its own measurement is the
-second, and what is missing to compare it with the first is Cranelift's own
-per-definition cost, which nothing has read because the unit is compiled whole.
+budget; the code quality against how long the suite runs, which the
+marginal-change row separates only if test length is varied; and one code
+generator against two, since the release tier is C either way and every code
+generator in Ply is a differential to maintain.
+
+**Both constants are now read, and they are two orders of magnitude apart.**
+`benches/marginal-change/` reports what Cranelift charges per definition it
+compiles, at three project sizes; `benches/c-floor/` reports what a C toolchain
+charges for one changed definition, dominated by the process rather than by the
+compiling. Cranelift is the cheaper by roughly sixty times, and neither reading
+is an estimate. That does not settle the table on its own — an in-process tier
+still has to be hostable without Rust, which is the whole of the line's goal —
+but it does say that a C tier inside the loop buys its single code generator at
+a price the loop can feel, and that the shape which pays it least is the one
+`benches/c-floor/` already picked out: an object cached per definition, one link
+over the reach, one image loaded.
+
+The same row says the unit is compiled once per worker plus a pre-flight, so a
+run pays that per-definition cost as many times as it has workers and one more.
+Sharing one compiled unit across workers is the next bounded win under a
+backend, and it is blocked on `Unit` holding an `Rc`; nothing has attempted it.
 
 **LLVM in place of C, for the line rather than the loop — priced and rejected.**
 Two forms, both losing. Linking LLVM trades a Rust dependency for a larger C++
@@ -261,11 +275,15 @@ slope for neither tier.
    each against the store. None of that is I/O and none of it is checking; the
    run rechecks nothing. Making the driver resumable is what remains, and it is
    the last O(project) term in a warm loop.
-4. Re-take `benches/c-floor/` against Cranelift's per-definition constant once
-   the unit is per-definition, and choose the loop's tier from the table above.
-   **Its premise is now conditional on item 3**: a warm process holds compiled
-   code in memory and never serialises it, so a per-definition unit is only
-   needed if the warm process turns out not to be enough.
+4. Choose the loop's tier from the table above. **The comparison it was waiting
+   on is taken**: `benches/marginal-change/` reads Cranelift's per-definition
+   cost and `benches/c-floor/` reads C's, and they are two orders of magnitude
+   apart. What is still open is not a number but the line's goal — whether an
+   in-process tier can be hosted without Rust — and that is a design question
+   rather than a measurement. The re-take against a *per-definition* unit is
+   conditional on item 3: a warm process holds compiled code in memory and never
+   serialises it, so a per-definition unit is only needed if the warm process
+   turns out not to be enough.
 
 ## What the row said
 
