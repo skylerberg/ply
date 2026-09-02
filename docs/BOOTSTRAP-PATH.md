@@ -261,7 +261,13 @@ measurement is confounded until the earlier one has moved.
    same lever seen on an integer kernel, not a separate one: step 9 is the
    decision that moves it. The series is an observation and not a figure by
    ADR 0030's gate: quiet before, the load lifted past four after by the
-   series' own four workers, as the pre-registration said it would.
+   series' own four workers, as the pre-registration said it would. **Re-taken
+   with ADR 0035's sequence landed** (`observation-3.txt`, the same gate
+   reading): every phase under the backend fell by several times again —
+   hashing by an order of magnitude, parsing and checking by several — the
+   whole front end under the backend is a small fraction of what it was, and
+   the interpreted row did not move, as it should not have. The decision
+   stands: the driver stays Rust.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not
    compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
    neither them nor hex literals; both are repaired, the differential is green
@@ -302,8 +308,14 @@ measurement is confounded until the earlier one has moved.
    and the list is a trie with typed leaves after ADR 0034's representation
    gate refused the array (`benches/value-model/after-strings-and-lists.txt`
    is the series after both), and the seam's census is in the run's report.
-   What comes next is the record's last step: both kernels and the front-end
-   row re-taken, and the decision rule applied.
+   **The sequence is complete and the gate is not met**
+   (`benches/value-model/retake.txt`): both kernels are over the bar, the
+   integer one by an order of magnitude and the record one by a little, and
+   ADR 0035's own rule says the model as designed is refuted. What it names
+   to revisit — builtins and callbacks that stay calls, a map copied per
+   insert, an update that does not reuse the cell it releases — is where the
+   next record starts, and the front-end row re-taken on the same binary
+   (step 7) is the outcome it is read against.
 10. **Emit C.** Where the path ends, decided as a direction and gated on step 9:
     the eventual host is a C compiler and libc, with the compiler and its
     runtime written in Ply, which is the line Rust itself holds above LLVM and
