@@ -71,6 +71,7 @@ fn lambda(params: &[&str], body: Expr) -> Expr {
             })
             .collect(),
         body: Box::new(body),
+        ret: None,
     })
 }
 

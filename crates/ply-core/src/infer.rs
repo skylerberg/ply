@@ -3024,7 +3024,11 @@ impl<'a> Checker<'a> {
 
             ExprKind::Binary { op, lhs, rhs } => self.infer_binary(e, *op, lhs, rhs),
 
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda {
+                params,
+                body,
+                ret: written,
+            } => {
                 self.env.push();
                 let mut ptys = Vec::new();
                 for p in params {
@@ -3036,6 +3040,10 @@ impl<'a> Checker<'a> {
                     ptys.push(t);
                 }
                 let (ret, row) = self.infer(body);
+                if let Some(written) = written {
+                    let t = self.conv_type(written);
+                    self.expect(body.span, &t, &ret, "the lambda's written return type");
+                }
                 self.env.pop();
                 (
                     Type::Fn {

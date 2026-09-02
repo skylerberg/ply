@@ -111,7 +111,7 @@ fn expr(e: &mut Expr, span: Span) {
             expr(rhs, span);
         }
         ExprKind::Unary { operand, .. } => expr(operand, span),
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             for p in params {
                 p.span = span;
                 p.name.span = span;

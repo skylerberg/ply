@@ -117,6 +117,7 @@ pub fn lam(params: &[&str], body: Expr) -> Expr {
     ex(ExprKind::Lambda {
         params: params.iter().map(|p| param(p)).collect(),
         body: Box::new(body),
+        ret: None,
     })
 }
 

@@ -442,7 +442,7 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
             let lhs = lower_in(lhs, cx);
             NodeKind::Binary { op: *op, lhs, rhs }
         }
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             let params: Vec<Symbol> = params.iter().map(|p| p.name.name.clone()).collect();
             let (body, size, captures) = lower_barrier(&params, body, cx, true);
             NodeKind::Lambda {

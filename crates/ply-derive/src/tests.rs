@@ -239,7 +239,7 @@ fn collect_spans(e: &ply_syntax::ast::Expr, out: &mut Vec<Span>) {
     use ply_syntax::ast::ExprKind;
     out.push(e.span);
     match &e.kind {
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             for p in params {
                 out.push(p.span);
             }

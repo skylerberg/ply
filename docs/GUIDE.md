@@ -905,11 +905,19 @@ constructor you missed:
 |x: Int| x + 1
 |acc, a: Account| acc + a.balance
 || do_something()                     // no parameters
+|r: Result<Int, E>| -> Result<Int, E> { Ok(r? + 1) }   // a written return type
 ```
 
 Parameter annotations are optional and are usually needed only where inference
 has nothing else to go on — in practice, on the element parameter of a `fold` or
 `map` over a record type. A lambda closes over its environment by value.
+
+A lambda may write its return type after the parameters, `|x| -> T { .. }`, and
+then takes a **block** body, as a `fn` does after its `->` — the type's end and
+the body's start are otherwise ambiguous. The body must fit the type, and the
+written type is what gives a `?` inside the lambda its meaning (§6.10). It is
+not part of the lambda's identity: normalization erases it, as it erases a
+`requires`, so writing one moves no hash.
 
 A lambda's row is inferred and flows into the enclosing function's row, which is
 what makes `map`, `filter`, `fold` and `iterate` usable with effectful
@@ -1214,14 +1222,19 @@ Err(e) -> Err(in_index(index, e))     // `?` cannot express this; leave it
 
 **It is not a `return`.** §19.2 still holds: there is no `return` statement and
 no `break`. `?` exits the expression it is written in and nothing more. It
-cannot leave a lambda, a `handle` clause or body, a `with_cell`, a `with_region`
-or a `simulate` — every one of those is `E0118`, because none of them has a
-written return type to read the constructors off:
+cannot leave a `handle` clause or body, a `with_cell`, a `with_region` or a
+`simulate` — every one of those is `E0118`, because none of them has a written
+return type to read the constructors off — and it cannot leave a lambda unless
+the lambda writes one (§6.4), in which case `?` reads the lambda's type and
+exits the lambda:
 
 ```ply
 fn decode_all(js: List<Json>, c: JsonCodec<a>) -> Result<List<a>, DecodeError> =
-  map(js, |j: Json| (c.decode)(j)?)   // E0118: a lambda has no written return
-                                      // type; `?` needs one. Name a function.
+  map(js, |j: Json| (c.decode)(j)?)   // E0118: this lambda has no written return
+                                      // type; `?` needs one
+
+fn decode_each(js: List<Json>, c: JsonCodec<a>) -> List<Result<a, DecodeError>> =
+  map(js, |j: Json| -> Result<a, DecodeError> { Ok(inspect((c.decode)(j)?)) })
 ```
 
 **It will not move work across a branch.** `?` lifts what it unwraps to the head
@@ -2951,7 +2964,7 @@ program.
 | `E0115` | an `effect set` cycle |
 | `E0116` | a record update whose base has no record shape this file can name |
 | `E0117` | a record update naming a field the base does not have |
-| `E0118` | a `?` whose enclosing function has no return type this file can read as `Result` or `Option` |
+| `E0118` | a `?` whose enclosing function or lambda has no written return type this file can read as `Result` or `Option` |
 | `E0119` | a `?` written where its early exit would change what runs, or would discard a written annotation |
 | `E0120` | a parameter default written where no call could fill it in — on a lambda, an operation or a handler clause |
 | `E0121` | a parameter default that is not a pure, closed expression, or that names another parameter of the same signature |
@@ -3164,9 +3177,9 @@ rather than left to be discovered.
   time failure rather than a compile error.
 * `{..b, f: e}` needs the base's shape to be readable from the same file, so a
   base whose type is declared in another module is `E0116`.
-* `?` refuses a lambda body (`E0118`), so a codec's `decode:` field cannot use
-  one — and neither can a `fold` accumulator that threads a `Result`, which is
-  where `examples/desk.ply` still writes the `match` out by hand.
+* `?` inside a lambda needs the lambda's written return type (`|x| -> T { .. }`,
+  §6.4); a lambda without one is `E0118`. An `iterate` step answers `Iter`, so
+  it can never carry a `?`.
 * `?` in a call argument refuses if anything impure is evaluated to its left
   (`E0119`); the fix is a `let`.
 * `?` on a `let` with a written type is `E0119`. Drop the annotation, or put it
