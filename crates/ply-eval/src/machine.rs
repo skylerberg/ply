@@ -6,6 +6,7 @@ use crate::builtins::{self, Builtin, Step};
 use crate::code::{
     self, Captures, ClosureCode, Code, Lowered, Lowering, NodeKind, Pat, Stmt as CodeStmt, lower,
 };
+use crate::compiled::Entered;
 use crate::cont::{Continuation, Delimiter, Extent, Frame, Next, Prompt, SimId, Stack};
 use crate::handler::{self, Answered, Request, Scheduled, Transition};
 use crate::host::{
@@ -460,8 +461,8 @@ impl<'a> Machine<'a> {
             .iter()
             .filter(|t| program.modules[t.module].name.as_symbol() == module)
             .nth(ordinal)
-            .map(|slot| (slot.module, slot.body));
-        let Some((owner, source)) = found else {
+            .map(|slot| (slot.module, slot.body, slot.name));
+        let Some((owner, source, label)) = found else {
             return Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
                 format!("module `{module}` has no test at position {ordinal}"),
@@ -469,8 +470,54 @@ impl<'a> Machine<'a> {
             .primary(Span::DUMMY, "this test's module was not parsed")
             .note("run `ply cache clear`, or pass `--no-incremental`"));
         };
+        // A backend that compiled the test enters it whole, and its answer is the pass; one that
+        // declines — a body the fragment refused — leaves the test to the machine, which raises
+        // the diagnostic. One that ran the body and raised is answered by the machine's own run:
+        // the same raise, or a pass, which is the disagreement `--backend` exists to surface.
+        let raised = if self.compiled.is_some() && self.max_frames.is_none() {
+            let root = program.modules[owner]
+                .name
+                .qualify(&Symbol::new(format!("test#{ordinal}")));
+            self.reset();
+            let entered = self
+                .compiled
+                .as_ref()
+                .map(|backend| backend.enter_test(&root, self.max_calls));
+            match entered {
+                // A test's body answers the unit; anything else is a backend answering wrongly,
+                // which the machine's own run of the body catches as it catches every wrong call.
+                Some(Entered::Answered(Value::Unit)) => {
+                    self.compiled_entries.set(self.compiled_entries.get() + 1);
+                    self.end_entry_point();
+                    return Ok(());
+                }
+                Some(Entered::Answered(_)) => {
+                    self.compiled_refusals.set(self.compiled_refusals.get() + 1);
+                    self.compiled_declines.set(self.compiled_declines.get() + 1);
+                    None
+                }
+                Some(Entered::Raised(raised)) => {
+                    self.compiled_declines.set(self.compiled_declines.get() + 1);
+                    Some(raised)
+                }
+                Some(Entered::Declined) | None => {
+                    self.compiled_declines.set(self.compiled_declines.get() + 1);
+                    None
+                }
+            }
+        } else {
+            None
+        };
         let body = self.lowering.body(source);
-        self.drive(body, owner).map(|_| ())
+        let outcome = self.drive(body, owner).map(|_| ());
+        match raised {
+            Some(raised) if outcome.is_ok() => Err(err_backend_raised(
+                &format!("{}.{label}", program.modules[owner].name),
+                source.span,
+                &raised,
+            )),
+            _ => outcome,
+        }
     }
 
     /// An expression of unknown provenance, lowered afresh.
@@ -2783,6 +2830,21 @@ fn err_unenumerated_atom(span: Span, operation: &str, path: &'static str) -> Dia
     .note(format!("`{path}` is registered for this operation, but binding resolved no atom for it against the program's declared footprints"))
     .note("a footprint that does not contain an atom the program performs is a footprint that under-reports, and scheduling and isolation are decided from it")
     .note("this is Ply's fault: report it with the program that produced it")
+}
+
+/// The backend raised in a test's body that the machine passes: a disagreement, blamed on the
+/// backend as every disagreement is, since the machine hands it no route back in.
+fn err_backend_raised(label: &str, span: Span, raised: &Diagnostic) -> Diagnostic {
+    Diagnostic::error(
+        codes::ENGINE_DIVERGENCE,
+        format!("the compiled backend and `machine` disagree on `{label}`"),
+    )
+    .primary(
+        span,
+        "the backend raised in this test's body, and the machine passes it",
+    )
+    .note(format!("the backend raised: {}", raised.message))
+    .note("re-run without `--backend` to confirm the program passes without one")
 }
 
 /// `E0427` — a host handler answered an atom outside the entry point's row.

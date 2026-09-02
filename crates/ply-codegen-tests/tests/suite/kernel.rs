@@ -57,15 +57,16 @@ fn the_whole_kernel_is_inside_the_fragment() {
         "the fragment refused part of the kernel: {:?}",
         unit.refusals()
     );
+    // Forty-four definitions and the kernel's eight tests, each a root (ADR 0036, Decision 7).
     assert_eq!(
         unit.compiled().len(),
-        44,
+        52,
         "the kernel changed size; update this number deliberately rather than loosening it"
     );
     // Every compiled definition is registered; the seam admits each call by its carried types,
     // so a definition returning `Tree` is entered when `Tree` carries and declined at the answer
     // when it does not.
-    assert_eq!(unit.len(), 44, "enterable definitions");
+    assert_eq!(unit.len(), 52, "enterable definitions");
 }
 
 /// The search itself answers natively, and the answer is the one the kernel's own oracle expects.
