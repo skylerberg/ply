@@ -193,6 +193,10 @@ struct BenchArgs {
     /// Repeats per scenario; the fastest run is reported.
     #[arg(long, default_value_t = 3)]
     repeats: usize,
+    /// Attach a compiled backend, as `ply test --backend` spells it. Every scenario is measured
+    /// under it, and a `compile` phase appears beside the others: one row is one engine.
+    #[arg(long, value_name = "BACKEND")]
+    backend: Option<String>,
     #[arg(long)]
     json: bool,
 }
@@ -205,6 +209,9 @@ struct SweepArgs {
     /// Sizes to sweep, each `modules,defs_per_module,tests`.
     #[arg(long, value_name = "M,D,T", num_args = 1.., value_delimiter = ' ')]
     sizes: Vec<String>,
+    /// Attach a compiled backend to every size, as `ply test --backend` spells it.
+    #[arg(long, value_name = "BACKEND")]
+    backend: Option<String>,
     #[arg(long, default_value_t = 1)]
     seed: u64,
     #[arg(long, default_value_t = 3)]
@@ -1239,6 +1246,7 @@ fn run() -> Result<()> {
                 &args.corpus,
                 &bench::Options {
                     repeats: args.repeats,
+                    backend: args.backend.clone(),
                 },
             )?;
             emit_report(&report, args.json)
@@ -1390,6 +1398,7 @@ fn sweep(args: SweepArgs) -> Result<()> {
             &root,
             &bench::Options {
                 repeats: args.repeats,
+                backend: args.backend.clone(),
             },
         )?);
     }

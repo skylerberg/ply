@@ -19,6 +19,10 @@ pub enum Phase {
     Hash,
     CacheOpen,
     Select,
+    /// Building the run's compiled unit, which is nothing at all without a backend. Its own phase
+    /// because it is the one an edit does not shrink: the unit is closed over every function the
+    /// fragment compiles, whatever changed.
+    Compile,
     Execute,
 }
 
@@ -31,13 +35,14 @@ impl Phase {
             Phase::Resolve => "resolve",
             Phase::Typecheck => "typecheck",
             Phase::Hash => "hash",
+            Phase::Compile => "compile",
             Phase::CacheOpen => "cache open",
             Phase::Select => "select",
             Phase::Execute => "execute",
         }
     }
 
-    pub fn all() -> [Phase; 9] {
+    pub fn all() -> [Phase; 10] {
         [
             Phase::Discover,
             Phase::Read,
@@ -47,6 +52,7 @@ impl Phase {
             Phase::Hash,
             Phase::CacheOpen,
             Phase::Select,
+            Phase::Compile,
             Phase::Execute,
         ]
     }

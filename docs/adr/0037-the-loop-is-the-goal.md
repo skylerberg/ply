@@ -245,12 +245,47 @@ slope for neither tier.
    `a_second_backed_run_selects_nothing` in `crates/ply-cli/tests/suite/cli.rs`
    hold the two halves, and `armed.rs` fails if a new route to a backend
    forgets either.
-2. Take the row above with its backend arm. It says which of the next two pays
-   first.
-3. A `DefHash -> code` cache, which needs per-definition units and an object
-   format, or a warm process, which needs neither.
+2. **Done, and it decided item 3.** `benches/marginal-change/` is the row:
+   `ply-corpus bench --backend`, five edits at three sizes, fitted step by step.
+   What it says is in its `observation-1.txt`, and the short form is below.
+3. **A warm process**, which the row chose over the `DefHash -> code` cache: the
+   cost that dominates a small edit is not the compile alone but the whole fixed
+   cost of an invocation, and a warm process removes both while a code cache
+   removes one.
 4. Re-take `benches/c-floor/` against Cranelift's per-definition constant once
    the unit is per-definition, and choose the loop's tier from the table above.
+   **Its premise is now conditional on item 3**: a warm process holds compiled
+   code in memory and never serialises it, so a per-definition unit is only
+   needed if the warm process turns out not to be enough.
+
+## What the row said
+
+`benches/marginal-change/observation-1.txt`, taken above the load gate at the
+end and therefore an observation. The counts in it are deterministic and carry
+most of the argument.
+
+- **A rename costs nothing, under either engine.** Its marginal cost never rises
+  above the measurement's own resolution at any size. That is ADR 0021's claim
+  holding where it is sharpest, and under the compiled backend it holds only
+  because item 1 landed.
+- **A leaf edit is flat under the interpreter** across a project sixteen times
+  larger, and `cold` is proportional. The two arms that had to separate, did.
+- **And the cost that dominates a small edit is neither of those. It is the
+  invocation.** A warm `ply test` that rechecks *nothing* — the report says
+  `rechecked 0` at every size — still pays a front end proportional to the
+  project: over the step where the reading is above the noise floor, four times
+  the project costs four times the time. It goes on hashing every definition to
+  establish that none moved, restoring every interface, and writing them back.
+- **Under the backend, compile is about half of that warm run** and does not
+  shrink with the edit, because the unit closes over every function the fragment
+  compiles and nothing holds it across runs.
+
+So the ordering the row decides is: **the warm process, not the code cache.**
+The code cache removes the compile and leaves the front end's fixed cost; the
+warm process removes both, because what makes an invocation cost the project is
+that it starts knowing nothing. This record's own falsifier — *if a warm process
+removes the backend's cost by itself, persisting compiled code is never needed* —
+is the live hypothesis rather than a hedge.
 
 ## What would make this wrong
 
