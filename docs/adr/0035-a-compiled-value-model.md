@@ -1,14 +1,29 @@
 # ADR 0035 — A compiled value model: layouts from types, counts without atomics, reuse
 
-**Decided; sequence steps 1 to 7 are landed, and the gate is not yet met.**
+**Decided, every sequence step landed, and the gate not met: by this record's
+own rule, both kernels outside the bar refute the model as designed.**
 `benches/value-model/PRE-REGISTERED.md` is the gate's protocol and the bar is
 in `benches/value-model/analyze.py`, where a number cannot set it after the
 fact; `baseline.txt` there is the series before anything was built,
 `after-words.txt` the series after the words landed, `after-layouts.txt` the
 series after the layouts did, `after-drops.txt` the series after the drops,
-`after-inline.txt` the series after the inlining and
-`after-strings-and-lists.txt` the series after the strings and the list. What
-landed: calls
+`after-inline.txt` the series after the inlining,
+`after-strings-and-lists.txt` the series after the strings and the list, and
+`retake.txt` the re-take with everything landed. What the re-take says: the
+integer kernel is tens of times Rust and the record kernel a little over the
+bar, so the rule names what to revisit — Decisions 2 and 5 for the integer
+kernel, because its remaining cost is a builtin call per byte read and a
+callback per block through the runtime's loop, neither a register nor a
+direct call; Decisions 1 and 4 for the record kernel, because its remaining
+cost is a map probed by compare and copied per insert, and a record update
+that allocates rather than reusing the cell it releases. What refuted is the
+design as written — a model in which a builtin and a callback stay calls —
+and not the direction: the front-end row re-taken on the same binary
+(`benches/front-end-whole/observation-3.txt`) puts the whole front end under
+the backend at several times below where this record started it and far
+below the interpreter, every phase entered whole, and the seam's census puts
+conversion nowhere in it. The next record starts from those four decisions.
+What landed: calls
 between compiled functions are direct and typed; a compiled value is one word,
 with records, constructors, lists, maps and native closures laid out as
 counted objects allocated by bumping a pointer over memory the entry recycles,
@@ -308,7 +323,13 @@ a baseline the change is read against and the kernels are known to run.
    and `backend.converted_out`, so a run whose conversion dominates is
    visible rather than inferred. The conversion itself was already at the
    root (ADR 0030) and is unchanged.
-8. Both kernels and the front-end row re-taken, and the decision rule applied.
+8. **Landed.** Both kernels re-taken (`retake.txt`) and the front-end row
+   (`benches/front-end-whole/observation-3.txt`), and the decision rule
+   applied: both kernels are over the bar, so the model as designed is
+   refuted and the opening says so; the row says the backend pays, by its
+   own rule, and by more than it did before this record. The record kernel
+   is within the bar's resolution of a factor above it and the integer kernel
+   is not; what each names is in the opening.
 
 Each step is behind the differential corpus and the fragment's own cases, as
 every backend change has been.
