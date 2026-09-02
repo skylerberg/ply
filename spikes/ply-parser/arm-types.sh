@@ -132,8 +132,8 @@ arm "an atom ends at the current token rather than the previous one" types \
   'span: span_to(ef.span, cur_span(c, p))'
 
 arm "a parenthesised pattern keeps the inner node's span" patterns \
-  'Ok({ p: cl.p, node: set_pat_span(inner.node, span_to(o.node, cl.node)) })' \
-  'Ok({ p: cl.p, node: inner.node })'
+  'Ok({ p: close.p, node: set_pat_span(inner.node, span_to(o.node, close.node)) })' \
+  'Ok({ p: close.p, node: inner.node })'
 
 arm "a negative integer pattern is not negated" patterns \
   'TInt(v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) }),' \
@@ -154,9 +154,9 @@ arm "a \`..\` with a name binds a wildcard instead" patterns \
 echo
 echo "== the diagnostics =="
 
-arm "the no-tuple-type diagnostic loses its note" types \
-  'diag1(unexpected(), span_to(o.node, cl.node), 1)' \
-  'diag1(unexpected(), span_to(o.node, cl.node), 0)'
+arm "a tuple type's positional field takes the opener's span, not its element's" types \
+  'Some(t) -> { name: positional(i, ty_span(t)), ty: t },' \
+  'Some(t) -> { name: positional(i, o.node), ty: t },'
 
 arm "an unclosed record type loses the label on its opening brace" types \
   'let {p, node: cl} = expect_close(c, p, t_rbrace(), o.node, b"`}`")?;' \

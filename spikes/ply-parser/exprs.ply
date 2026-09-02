@@ -43,13 +43,14 @@ import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, S
               default_not_allowed, unknown_argument_name, argument_order,
               kind, kind_at, cur_span, prev_span, at, at_eof, at_ident_text,
               advance, bump, eat, expect, expect_close, expect_ident,
+              expect_field_name, keyword_pun_refusal,
               with_no_brace, deeper, shallower, start, qname, comma_list,
               t_lparen, t_rparen, t_lbrace, t_rbrace, t_lbracket, t_rbracket,
               t_comma, t_semi, t_colon, t_dot, t_dotdot, t_arrow, t_eq,
               t_pipe, t_pipepipe, t_question,
               k_let, k_if, k_else, k_with,
               rec, nlist, opt, word, dump_list, dump_opt, dump_ident, dump_qname,
-              dump_diags)
+              dump_diags, with_no_pipe, advance_n, tok_at, t_gt, t_lt)
 import lexer (Tok, TIdent, TInt, TFloat, TDec, TStr, TBytes, TKw, TPunct, TEof)
 import types (TypeExpr, ty, ty_span, dump_ty)
 import patterns (Pattern, Lit, LInt, LBool, LStr, LBytes, LFloat, LDec, LUnit,
@@ -233,30 +234,52 @@ pub fn is_block_like(e: Expr) -> Bool =
 // --- The precedence table ---------------------------------------------------
 //
 // `parser.rs:2096 bin_op`, which is `Option<(BinOp, u8)>` there and a two-field
-// record here — no tuples. Fourteen operators over six binding powers; the six
-// is what bounds the recursion on the right operand.
-type Op = { op: Bytes, bp: Int }
+// record here — no tuples. Twenty operators over ten binding powers, `parser.rs`
+// `bin_op`'s numbers; the ten is what bounds the recursion on the right operand.
+// `width` is how many tokens the operator spans: a shift is two or three
+// touching `<`s or `>`s, because `>>` is not lexed.
+type Op = { op: Bytes, bp: Int, width: Int }
 
 fn bin_op(k: Tok) -> Option<Op> =
   match k {
     TPunct(s) ->
-      if s == b"pipepipe" { Some({op: b"or", bp: 1}) }
-      else if s == b"ampamp" { Some({op: b"and", bp: 2}) }
-      else if s == b"eqeq" { Some({op: b"eq", bp: 3}) }
-      else if s == b"bangeq" { Some({op: b"ne", bp: 3}) }
-      else if s == b"lt" { Some({op: b"lt", bp: 3}) }
-      else if s == b"le" { Some({op: b"le", bp: 3}) }
-      else if s == b"gt" { Some({op: b"gt", bp: 3}) }
-      else if s == b"ge" { Some({op: b"ge", bp: 3}) }
-      else if s == b"plusplus" { Some({op: b"concat", bp: 4}) }
-      else if s == b"plus" { Some({op: b"add", bp: 5}) }
-      else if s == b"minus" { Some({op: b"sub", bp: 5}) }
-      else if s == b"star" { Some({op: b"mul", bp: 6}) }
-      else if s == b"slash" { Some({op: b"div", bp: 6}) }
-      else if s == b"percent" { Some({op: b"rem", bp: 6}) }
+      if s == b"pipepipe" { Some({op: b"or", bp: 1, width: 1}) }
+      else if s == b"ampamp" { Some({op: b"and", bp: 2, width: 1}) }
+      else if s == b"eqeq" { Some({op: b"eq", bp: 3, width: 1}) }
+      else if s == b"bangeq" { Some({op: b"ne", bp: 3, width: 1}) }
+      else if s == b"lt" { Some({op: b"lt", bp: 3, width: 1}) }
+      else if s == b"le" { Some({op: b"le", bp: 3, width: 1}) }
+      else if s == b"gt" { Some({op: b"gt", bp: 3, width: 1}) }
+      else if s == b"ge" { Some({op: b"ge", bp: 3, width: 1}) }
+      else if s == b"pipe" { Some({op: b"bitor", bp: 4, width: 1}) }
+      else if s == b"caret" { Some({op: b"bitxor", bp: 5, width: 1}) }
+      else if s == b"amp" { Some({op: b"bitand", bp: 6, width: 1}) }
+      else if s == b"plusplus" { Some({op: b"concat", bp: 8, width: 1}) }
+      else if s == b"plus" { Some({op: b"add", bp: 9, width: 1}) }
+      else if s == b"minus" { Some({op: b"sub", bp: 9, width: 1}) }
+      else if s == b"star" { Some({op: b"mul", bp: 10, width: 1}) }
+      else if s == b"slash" { Some({op: b"div", bp: 10, width: 1}) }
+      else if s == b"percent" { Some({op: b"rem", bp: 10, width: 1}) }
       else { None },
     _ -> None,
   }
+
+// Token `i` is the same kind as the one under the cursor and touches the one before it.
+fn touching(c: Ctx, p: P, i: Int) -> Bool =
+  kind_at(c, p, i) == kind(c, p) && tok_at(c, p, i).start == tok_at(c, p, i - 1).end
+
+// `Parser::joined`: the next `n` tokens are the cursor's kind and touch it.
+fn joined(c: Ctx, p: P, n: Int) -> Bool =
+  if n == 1 { touching(c, p, 1) } else { touching(c, p, 1) && touching(c, p, 2) }
+
+// `Parser::peek_bin_op`: a lambda's parameter list ends in a `|`, so inside one a
+// `|` is never bit-or; and a shift is touching `<`s or `>`s, `>>>` before `>>`.
+fn peek_bin_op(c: Ctx, p: P) -> Option<Op> =
+  if p.no_pipe && at(c, p, t_pipe()) { None }
+  else if at(c, p, t_gt()) && joined(c, p, 2) { Some({op: b"ushr", bp: 7, width: 3}) }
+  else if at(c, p, t_gt()) && joined(c, p, 1) { Some({op: b"shr", bp: 7, width: 2}) }
+  else if at(c, p, t_lt()) && joined(c, p, 1) { Some({op: b"shl", bp: 7, width: 2}) }
+  else { bin_op(kind(c, p)) }
 
 fn src_over(c: Ctx, s: Span) -> Bytes = bytes_slice(c.src, s.start, s.end)
 
@@ -285,12 +308,12 @@ fn bin_expr(c: Ctx, p: P, min_bp: Int) -> Result<R<Expr>, P> = {
   // Not destructured: `lhs` is the `iterate` seed *whole*, not just its state.
   let lhs = unary_expr(c, p)?;
   iterate(lhs, c.ntok - lhs.p.pos + 1, |s: R<Expr>|
-    match bin_op(kind(c, s.p)) {
+    match peek_bin_op(c, s.p) {
       None -> Stop(Ok(s)),
       Some(o) ->
         if o.bp < min_bp { Stop(Ok(s)) } else {
-          let a = advance(c, s.p);
-          match bin_expr(c, a.p, o.bp + 1) {
+          let a = advance_n(c, s.p, o.width);
+          match bin_expr(c, a, o.bp + 1) {
             Err(q) -> Stop(Err(q)),
             Ok(rhs) ->
               Continue({p: rhs.p,
@@ -313,7 +336,8 @@ fn unary_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
 
 fn unary_body(c: Ctx, p: P) -> Result<R<Expr>, P> = {
   let op = match kind(c, p) {
-    TPunct(s) -> if s == b"minus" { b"neg" } else if s == b"bang" { b"not" } else { b"" },
+    TPunct(s) -> if s == b"minus" { b"neg" } else if s == b"bang" { b"not" }
+                 else if s == b"tilde" { b"bitnot" } else { b"" },
     _ -> b"",
   };
   if op == b"" { postfix_expr(c, p) } else {
@@ -373,10 +397,10 @@ fn postfix_dot(c: Ctx, s: R<Expr>) -> Result<R<Expr>, P> = {
   };
   let dot = advance(c, s.p);
   if !is_perform {
-    let {p, node: field} = expect_ident(c, dot.p, b"a field name after `.`")?;
+    let {p, node: f} = expect_field_name(c, dot.p, b"a field name after `.`")?;
     Ok({ p: p,
-         node: EField({ span: span_to(expr_span(s.node), field.span),
-                        base: s.node, field: field }) })
+         node: EField({ span: span_to(expr_span(s.node), f.name.span),
+                        base: s.node, field: f.name }) })
   } else {
     let eff = match s.node { EVar(v) -> v.name, _ -> bare(no_ident()) };
     let {p, node: op} = expect_ident(c, dot.p, b"an operation name")?;
@@ -572,8 +596,8 @@ fn primary_paren_inner(c: Ctx, p: P) -> Result<R<Expr>, P> = {
                            }) }) })
       }
     } else {
-      let cl = expect_close(c, inner.p, t_rparen(), o.node, b"`)` to close the group")?;
-      Ok({ p: cl.p, node: set_span(inner.node, span_to(o.node, cl.node)) })
+      let close = expect_close(c, inner.p, t_rparen(), o.node, b"`)` to close the group")?;
+      Ok({ p: close.p, node: set_span(inner.node, span_to(o.node, close.node)) })
     }
   }
 }
@@ -600,6 +624,7 @@ fn at_record_literal(c: Ctx, p: P) -> Bool =
   if kind_at(c, p, 1) == t_dotdot() { true } else {
     match kind_at(c, p, 1) {
       TIdent(n) -> kind_at(c, p, 2) == t_colon() || kind_at(c, p, 2) == t_comma(),
+      TKw(k) -> kind_at(c, p, 2) == t_colon() || kind_at(c, p, 2) == t_comma(),
       _ -> false,
     }
   }
@@ -657,12 +682,12 @@ fn record_update_base(c: Ctx, p: P) -> Result<R<Expr>, P> = {
             c.ntok - p.pos + 1, |s: R<Expr>|
       if !at(c, s.p, t_dot()) { Stop(Ok(s)) } else {
         let d = advance(c, s.p);
-        match expect_ident(c, d.p, b"a field name") {
+        match expect_field_name(c, d.p, b"a field name") {
           Err(q) -> Stop(Err(q)),
           Ok(f) ->
             Continue({ p: f.p,
-                       node: EField({ span: span_to(expr_span(s.node), f.node.span),
-                                      base: s.node, field: f.node }) }),
+                       node: EField({ span: span_to(expr_span(s.node), f.node.name.span),
+                                      base: s.node, field: f.node.name }) }),
         }
       })
   }
@@ -676,11 +701,15 @@ fn record_field(c: Ctx, p: P) -> Result<R<RecField>, P> =
   } else { record_field_named(c, p) }
 
 fn record_field_named(c: Ctx, p: P) -> Result<R<RecField>, P> = {
-  let {p, node: name} = expect_ident(c, p, b"a field name")?;
+  let {p, node: f} = expect_field_name(c, p, b"a field name")?;
+  let name = f.name;
   let colon = eat(c, p, t_colon());
   if colon.ok {
     let {p, node: v} = expr(c, colon.p)?;
     Ok({ p: p, node: {name: name, value: v} })
+  } else if f.keyword {
+    // The shorthand binds a variable too, and a keyword cannot name one.
+    Err(keyword_pun_refusal(colon.p, name))
   } else {
     // `{x, y}` is `{x: x, y: y}`, and the shorthand's value takes the
     // field's own span.
@@ -833,7 +862,12 @@ fn lambda_params(c: Ctx, p: P) -> Result<R<List<Param>>, P> = {
   let empty = eat(c, p, t_pipepipe());
   if empty.ok { Ok({ p: empty.p, node: [] }) } else {
     let bar = advance(c, empty.p);
-    let {p, node: ps} = comma_list(c, bar.p, t_pipe(), param)?;
+    // Inside the list a `|` closes it and is never bit-or; restored on both paths.
+    let saved = bar.p.no_pipe;
+    let {p, node: ps} = match comma_list(c, with_no_pipe(bar.p, true), t_pipe(), param) {
+      Err(q) -> Err(with_no_pipe(q, saved)),
+      Ok(r) -> Ok({ p: with_no_pipe(r.p, saved), node: r.node }),
+    }?;
     let {p, ..} = expect(c, p, t_pipe(), b"`|` to close the lambda parameters")?;
     Ok({ p: p, node: ps })
   }
@@ -849,16 +883,26 @@ fn lambda_expr(c: Ctx, p: P) -> Result<R<Expr>, P> = {
     if !at(c, p, t_lbrace()) {
       Err(error_here(c, p, b"`{` to open the body of a lambda with a written return type"))
     } else {
-      let {p, node: body} = block_expr(c, p)?;
+      let {p, node: body} = lambda_body(c, p, true)?;
       Ok({ p: p,
            node: ELambda({ span: span_to(st, expr_span(body)),
                            body: body, params: params, ret: Some(ret) }) })
     }
   } else {
-    let {p, node: body} = expr(c, p)?;
+    let {p, node: body} = lambda_body(c, p, false)?;
     Ok({ p: p,
          node: ELambda({ span: span_to(st, expr_span(body)),
                          body: body, params: params, ret: None }) })
+  }
+}
+
+// The body reads `|` as bit-or again whatever list encloses the lambda; restored on both paths.
+fn lambda_body(c: Ctx, p: P, braced: Bool) -> Result<R<Expr>, P> = {
+  let saved = p.no_pipe;
+  let inner = with_no_pipe(p, false);
+  match (if braced { block_expr(c, inner) } else { expr(c, inner) }) {
+    Err(q) -> Err(with_no_pipe(q, saved)),
+    Ok(r) -> Ok({ p: with_no_pipe(r.p, saved), node: r.node }),
   }
 }
 
@@ -1288,6 +1332,38 @@ pub fn parse_pos(src: Bytes) -> Int = {
 // taken. Every expectation below was derived from the reference's control flow
 // and the dump grammar before it was run, the way the rest of this file was;
 // the whole-file agreement over 766 inputs is the independent check.
+
+test "the bit operators sit between the comparisons and the concatenation, loosest first" {
+  assert_eq(dump_expr_of(b"a | b ^ c & d"),
+            "0:13:ebin;%bitor;0:1:evar;0:1:qname;?0;0:1:ident;@61;4:13:ebin;%bitxor;4"
+            ++ ":5:evar;4:5:qname;?0;4:5:ident;@62;8:13:ebin;%bitand;8:9:evar;8:9:qname;"
+            ++ "?0;8:9:ident;@63;12:13:evar;12:13:qname;?0;12:13:ident;@64;#0;")
+}
+
+test "a shift is touching `<`s or `>`s, and `>>>` is read before `>>`" {
+  assert_eq(dump_expr_of(b"a << b >> c >>> d"),
+            "0:17:ebin;%ushr;0:11:ebin;%shr;0:6:ebin;%shl;0:1:evar;0:1:qname;?0;0:1:i"
+            ++ "dent;@61;5:6:evar;5:6:qname;?0;5:6:ident;@62;10:11:evar;10:11:qname;?0;1"
+            ++ "0:11:ident;@63;16:17:evar;16:17:qname;?0;16:17:ident;@64;#0;")
+}
+
+test "`~` is a unary operator, tighter than any binary" {
+  assert_eq(dump_expr_of(b"~a + b"), "0:6:ebin;%add;0:2:eun;%bitnot;1:2:evar;1:2:qname;?0;1:2:ident;@61;5:6:ev"
+            ++ "ar;5:6:qname;?0;5:6:ident;@62;#0;")
+}
+
+test "inside a lambda's parameter list a `|` closes the list; in its body it is bit-or again" {
+  // `x = 1|` is the parameter's default, refused as `E0120` where the reference refuses it.
+  assert_eq(dump_expr_of(b"|x = 1| x | 2"),
+            "0:13:elam;#1;1:2:prm;1:2:ident;@78;?0;?0;?0;8:13:ebin;%bitor;8:9:evar;8:"
+            ++ "9:qname;?0;8:9:ident;@78;12:13:elit;%int;@32;#1;!E0120:3:6:1:1;=3:6:1;")
+}
+
+test "a keyword names a field in a literal and after `.`" {
+  assert_eq(dump_expr_of(b"{effect: 1, type: 2}.type"),
+            "0:25:efld;0:20:erec;#2;1:7:ident;@656666656374;9:10:elit;%int;@31;12:16:"
+            ++ "ident;@74797065;18:19:elit;%int;@32;21:25:ident;@74797065;#0;")
+}
 
 test "the try operator is a node of its own and takes the `?` into its span" {
   assert_eq(dump_expr_of(b"x?"),

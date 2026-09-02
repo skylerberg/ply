@@ -626,12 +626,13 @@ them needs a rename table, and a reviewer diffing the two files sees a differenc
 that is not a difference. Four of the fifteen keywords — `type`, `test`, `with`,
 `effect` — are ordinary nouns a domain model will want.
 
-**Closed in the reference.** `parser.rs` accepts a keyword wherever a field is
+**Closed, on both sides.** `parser.rs` accepts a keyword wherever a field is
 named — a type, a literal, a pattern, after `.`, an update — and refuses only the
-punned forms, which bind a variable too (`docs/GUIDE.md` §3.3). This port still
-writes `eff` and `is_nondet`, because its own field parser has not followed and
-the differential runs over a corpus both must read: renaming here waits on the
-spike's `record_field`, and the corpus carries no keyword field until then.
+punned forms, which bind a variable too (`docs/GUIDE.md` §3.3); this port's
+`expect_field_name` does the same at its five sites, and the re-mined corpus
+carries the reference's tests for it. The port still writes `eff` and
+`is_nondet`: renaming them is a change to its own AST, not to what it parses,
+and is left for whoever next touches those records.
 
 ---
 
@@ -993,6 +994,16 @@ honest price and it is item 5's job to keep saying so.
 > over the corpus — `db.ply` 2,137, `desk.ply` 1,028, `http.ply` 279, `json.ply`
 > 119, `router.ply` 11, `config.ply` 11 — which is the tree the comparison does
 > not look at, as a number.
+>
+> **Re-taken 2026-09-01, on re-mining the corpus.** The reference's test file
+> had grown the bit operators, tuples, lambda return types, keyword fields and
+> the `?` refusals since the corpus was mined, so the pin moved with it: the
+> give-up set now also carries `E0116`/`E0117` (record update) and
+> `E0118`/`E0119` (`?`), every one on a mined input written to raise it, and
+> the pinned map in `agreement.rs` is the current list. The tree half found
+> one thing this section had stated too strongly — *no rewrite removes a
+> node* — a refused `?` is unwrapped, which is one node fewer, so the count is
+> signed and the invariant holds where nothing was refused.
 
 **One cost is not free and must be stated: the reference crate has to grow an
 entry point.** `lib.rs` declares `mod effect_set; mod record_update; mod try_op;`
