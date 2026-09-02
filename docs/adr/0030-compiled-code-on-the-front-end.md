@@ -423,7 +423,11 @@ arm became two-thirds slower than no backend at all.**
    through a local binding. **The top two are not the callback problem and are
    plain missing lowerings — the cheap half of the distance between the front
    end's loss and the kernel's win — and nothing in the evaluator has to move for
-   them.**
+   them.** *Since taken, all of it: the two lowerings, then the callback family
+   as one piece — a native closure kind, callbacks as runtime loops, values as
+   closures, calls through values — after which the parser spike's fixpoint
+   keeps every function that performs no effect and writes no `Decimal` or
+   `Float` (`docs/BOOTSTRAP-PATH.md` step 2).*
 3. **The narrow registry stays the default**, because the front end is the
    bootstrap workload and the pre-registered bar for changing it was not met. The
    widening knob ships as measurement scaffolding, **because the arm it enables

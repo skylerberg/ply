@@ -207,6 +207,15 @@ pub enum ClosureKind {
         arity: usize,
     },
     Builtin(Builtin),
+    /// A closure a code generator built inside a compiled body: `code` is the address of a
+    /// compiled function taking `captured` as its leading arguments. It lives only inside the
+    /// entry that made it — the seam carries no function either way — so the machine never
+    /// enters one.
+    Native {
+        code: usize,
+        arity: usize,
+        captured: Vec<Value>,
+    },
 }
 
 impl Closure {
@@ -216,6 +225,7 @@ impl Closure {
             ClosureKind::Code { params, .. } => params.len(),
             ClosureKind::Ctor { arity, .. } => *arity,
             ClosureKind::Builtin(b) => b.arity().0,
+            ClosureKind::Native { arity, .. } => *arity,
         }
     }
 
@@ -227,6 +237,7 @@ impl Closure {
             (None, ClosureKind::Fn { .. } | ClosureKind::Code { .. }) => {
                 "an anonymous function".to_string()
             }
+            (None, ClosureKind::Native { .. }) => "a compiled function".to_string(),
         }
     }
 }
