@@ -597,7 +597,9 @@ pins it.
 
 Conversions are explicit: `decimal_of_int`, `int_of_decimal` (takes a rounding
 mode, answers `Option`), `float_of_decimal`, `decimal_of_float` (`Option`),
-`decimal_of_string` (`Option`), `decimal_to_string`, `int_to_string`.
+`decimal_of_string` (`Option`), `decimal_to_string`, `int_to_string`, and the
+IEEE 754 bit pattern both ways, `bits_of_float` and `float_of_bits`, which are
+total: every pattern is a `Float`, NaNs included.
 
 ### 5.3 Records
 
@@ -2275,10 +2277,14 @@ float_of_decimal(d) -> Float
 decimal_of_float(f) -> Option<Decimal>
 decimal_of_string(s) -> Option<Decimal>
 decimal_to_string(d) -> String
+bits_of_float(f) -> Int
+float_of_bits(n) -> Float
 ```
 
 The scale and the rounding mode are arguments because `/` on `Decimal` is
-`E0209`: naming the rounding is the whole point.
+`E0209`: naming the rounding is the whole point. `bits_of_float` is the IEEE 754
+pattern as the signed 64-bit `Int` it fits in, and `float_of_bits` is its
+inverse; both are total, so a NaN round-trips bit for bit.
 
 ### 13.8 Cells
 
