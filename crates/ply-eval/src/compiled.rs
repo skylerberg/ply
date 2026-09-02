@@ -16,9 +16,13 @@ pub trait Compiled {
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value>;
 }
 
-/// What may cross this boundary, in either direction: the two unboxed scalars and [`Value::Bytes`].
+/// What may cross this boundary, in either direction: the two unboxed scalars, the two byte
+/// carriers and unit — every leaf kind that holds no handle.
 pub(crate) fn crossable(value: &Value) -> bool {
-    matches!(value, Value::Int(_) | Value::Bool(_) | Value::Bytes(_))
+    matches!(
+        value,
+        Value::Int(_) | Value::Bool(_) | Value::Bytes(_) | Value::Str(_) | Value::Unit
+    )
 }
 
 /// The `Value` kinds a *carried type* can denote, which is what an argument's discriminant is
@@ -29,6 +33,8 @@ pub(crate) fn crossable_argument_kind(value: &Value) -> bool {
         Value::Int(_)
             | Value::Bool(_)
             | Value::Bytes(_)
+            | Value::Str(_)
+            | Value::Unit
             | Value::List(_)
             | Value::Map(_)
             | Value::Record(_)
@@ -69,6 +75,8 @@ enum Denotes {
     Int,
     Bool,
     Bytes,
+    Str,
+    Unit,
     List,
     Map,
     Record,
@@ -81,6 +89,8 @@ impl Denotes {
             Denotes::Int => matches!(value, Value::Int(_)),
             Denotes::Bool => matches!(value, Value::Bool(_)),
             Denotes::Bytes => matches!(value, Value::Bytes(_)),
+            Denotes::Str => matches!(value, Value::Str(_)),
+            Denotes::Unit => matches!(value, Value::Unit),
             Denotes::List => matches!(value, Value::List(_)),
             Denotes::Map => matches!(value, Value::Map(_)),
             Denotes::Record => matches!(value, Value::Record(_)),
@@ -162,6 +172,8 @@ impl CarriedTypes {
                 "Int" => Denotes::Int,
                 "Bool" => Denotes::Bool,
                 "Bytes" => Denotes::Bytes,
+                "String" => Denotes::Str,
+                "Unit" => Denotes::Unit,
                 "List" => Denotes::List,
                 "Map" => Denotes::Map,
                 // `carries` cleared it and it is none of the builtin heads, so it is a declared sum
@@ -182,12 +194,12 @@ impl CarriedTypes {
             Type::Fn { .. } => false,
             Type::Record(fields) => fields.values().all(|t| self.carries(t, decl_vars)),
             Type::Con(name, args) => match name.as_str() {
-                "Int" | "Bool" | "Bytes" => args.is_empty(),
+                // The leaf set is `crossable`'s exactly, so it is the same list in both directions.
+                "Int" | "Bool" | "Bytes" | "String" | "Unit" => args.is_empty(),
                 "List" | "Map" => args.iter().all(|t| self.carries(t, decl_vars)),
-                // the fragment's gaps item 4's three, and the leaf set is deliberately `crossable`'s
-                // exactly rather than one kind wider — `Unit` included, which holds nothing and is
-                // refused anyway so that the leaf set is the same list in both directions.
-                "Float" | "Decimal" | "String" | "Unit" => false,
+                // The fragment has no path for either literal, so a body over them is refused
+                // before this table is asked; keeping them out here keeps the leaf set honest.
+                "Float" | "Decimal" => false,
                 // A world handle and a credential are `Type::Con`s like any other.
                 "Cell" | ply_core::prelude::TASK_TYPE | SECRET => false,
                 _ => match self.decls.get(name) {
@@ -252,12 +264,10 @@ impl CarriedTypes {
             Type::Fn { .. } => Some("Fn"),
             Type::Record(fields) => fields.values().find_map(|t| self.blocker(t, decl_vars)),
             Type::Con(name, args) => match name.as_str() {
-                "Int" | "Bool" | "Bytes" => None,
+                "Int" | "Bool" | "Bytes" | "String" | "Unit" => None,
                 "List" | "Map" => args.iter().find_map(|t| self.blocker(t, decl_vars)),
                 "Float" => Some("Float"),
                 "Decimal" => Some("Decimal"),
-                "String" => Some("String"),
-                "Unit" => Some("Unit"),
                 "Cell" => Some("Cell"),
                 ply_core::prelude::TASK_TYPE => Some("Task"),
                 SECRET => Some("Secret"),
@@ -724,14 +734,14 @@ mod tests {
         assert_eq!(backend.names(), vec!["twice"]);
     }
 
-    /// The boundary checks the *kind* of what comes back, in every profile.
+    /// The boundary checks the *kind* of what comes back, in every profile: a kind it does not
+    /// carry, or a container where the declared type denotes another kind.
     #[test]
     fn an_answer_this_boundary_refuses_is_declined_and_the_body_is_evaluated() {
         let c = checked(vec![double_def()]);
         for refused in [
-            Value::str("a string"),
             Value::Float(1.0),
-            Value::Unit,
+            Value::Decimal(Default::default()),
             Value::List(Default::default()),
         ] {
             let backend = Double::answering(&c.program, "double", refused.clone());
@@ -940,23 +950,29 @@ mod tests {
     fn an_argument_this_boundary_does_not_carry_is_refused_by_the_shape_gate() {
         let c = checked(vec![double_def()]);
         let subject = double_closure();
-        for refused in [
-            Value::Float(1.0),
-            Value::str("21"),
-            Value::Unit,
-            Value::Secret(Arc::new(Value::Int(21))),
-        ] {
+        for refused in [Value::Float(1.0), Value::Secret(Arc::new(Value::Int(21)))] {
             assert_eq!(
                 gate(&c, &subject, std::slice::from_ref(&refused)),
                 Err(Gate::ArgumentShape),
                 "{refused:?} was carried across the boundary"
             );
         }
+        // A container where the declared type denotes another kind: past the shape gate, refused
+        // by the type gate.
         assert_eq!(
             gate(&c, &subject, &[Value::List(Default::default())]),
             Err(Gate::ArgumentType),
             "a `List` where `Int` is declared crossed the boundary"
         );
+        // A leaf that holds no handle crosses whatever is declared, as a `Bool` does where an
+        // `Int` belongs: the seam checks for a handle, and the other engine catches a wrong kind.
+        for leaf in [Value::str("21"), Value::Unit, Value::Bool(true)] {
+            assert_eq!(
+                gate(&c, &subject, std::slice::from_ref(&leaf)),
+                admitted(),
+                "{leaf:?} is a leaf and was refused"
+            );
+        }
         assert_eq!(gate(&c, &subject, &[Value::Int(21)]), admitted());
         assert_eq!(gate(&c, &subject, &[Value::Bool(true)]), admitted());
         assert_eq!(
@@ -1135,13 +1151,13 @@ mod tests {
         let c = checked(vec![double_def()]);
         let unknown = code_closure(Some("never.declared"), &["x"], var("x"));
         assert_eq!(
-            gate(&c, &unknown, &[Value::str("21")]),
+            gate(&c, &unknown, &[Value::Float(21.0)]),
             Err(Gate::ArgumentShape),
             "the row was looked up for a call the argument shape had already refused"
         );
         let anonymous = code_closure(None, &["x"], var("x"));
         assert_eq!(
-            gate(&c, &anonymous, &[Value::str("21")]),
+            gate(&c, &anonymous, &[Value::Float(21.0)]),
             Err(Gate::ArgumentShape)
         );
         // Re-taken for the type gate (the fragment census registered this debt): a `Record` argument is
@@ -1487,13 +1503,8 @@ mod tests {
                 tcon("Int"),
                 callv("len", vec![var("xs")]),
             ),
-            fn_def_poly(
-                "width",
-                &["a"],
-                &[("s", tapp("List", vec![tvar("a")]))],
-                tcon("Int"),
-                callv("len", vec![var("s")]),
-            ),
+            // A `Float` is the leaf kind the shape gate still refuses.
+            fn_def_poly("size", &[], &[("f", tcon("Float"))], tcon("Int"), int(4)),
         ]);
         let backend = Double::declining(&c.program);
         let mut machine = c.machine();
@@ -1502,8 +1513,12 @@ mod tests {
             ok(machine.eval_expr_for_test(&callv("head", vec![list(vec![int(1), int(2)])]))),
             Value::Int(2)
         );
+        let two = ply_syntax::ast::Expr {
+            kind: ply_syntax::ast::ExprKind::Lit(ply_syntax::ast::Lit::Float(2.0)),
+            span: ply_span::Span::DUMMY,
+        };
         assert_eq!(
-            ok(machine.eval_expr_for_test(&callv("width", vec![string("abcd")]))),
+            ok(machine.eval_expr_for_test(&callv("size", vec![two]))),
             Value::Int(4)
         );
         assert!(
@@ -1863,7 +1878,7 @@ mod tests {
     }
 
     #[test]
-    fn crossable_admits_the_two_scalars_and_bytes_and_nothing_else() {
+    fn crossable_admits_every_leaf_kind_that_holds_no_handle_and_nothing_else() {
         assert!(crossable(&Value::Int(0)));
         assert!(crossable(&Value::Bool(false)));
         assert!(crossable(&Value::bytes(b"GET /orders HTTP/1.1")));
@@ -1871,10 +1886,15 @@ mod tests {
             crossable(&Value::bytes(b"")),
             "an empty `Bytes` is a `Bytes`"
         );
+        assert!(crossable(&Value::str("s")));
+        assert!(
+            crossable(&Value::str("")),
+            "an empty `String` is a `String`"
+        );
+        assert!(crossable(&Value::Unit));
         for refused in [
             Value::Float(0.0),
-            Value::str("s"),
-            Value::Unit,
+            Value::Decimal(Default::default()),
             Value::List(Default::default()),
             Value::Secret(Arc::new(Value::Int(1))),
             Value::Secret(Arc::new(Value::bytes(b"hunter2"))),
