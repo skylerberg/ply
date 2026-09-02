@@ -251,7 +251,16 @@ slope for neither tier.
 3. **A warm process**, which the row chose over the `DefHash -> code` cache: the
    cost that dominates a small edit is not the compile alone but the whole fixed
    cost of an invocation, and a warm process removes both while a code cache
-   removes one.
+   removes one. **Started, not finished.** `ply test --watch` is a process that
+   stays: it holds the store, the checked front end and the compiled unit across
+   iterations, and an iteration where nothing moved pays a stat per file instead
+   of a front end. An iteration where something *did* move still pays the front
+   end in full, and the reason is specific — `crates/ply-cli/src/driver.rs`
+   builds its tables over the whole program whatever changed: it hashes every
+   definition, assembles every export, interface and fingerprint, and compares
+   each against the store. None of that is I/O and none of it is checking; the
+   run rechecks nothing. Making the driver resumable is what remains, and it is
+   the last O(project) term in a warm loop.
 4. Re-take `benches/c-floor/` against Cranelift's per-definition constant once
    the unit is per-definition, and choose the loop's tier from the table above.
    **Its premise is now conditional on item 3**: a warm process holds compiled
@@ -294,7 +303,10 @@ is the live hypothesis rather than a hedge.
   what it found once the row says where.
 - **If a warm process removes the backend's cost by itself.** Then persisting
   compiled code is never needed and the daemon is the whole of that work rather
-  than half of it.
+  than half of it. This is the live hypothesis rather than a hedge, and what
+  would settle it is the resumable driver: until an iteration stops rebuilding
+  the whole program's tables, a warm process cannot be read as evidence about
+  what holding compiled code is worth.
 - **If the loop tier's code quality decides the loop rather than its latency.**
   A tier that compiles instantly and runs the tests several times slower loses
   to one that compiles slowly and runs them fast, once the tests run long

@@ -268,6 +268,55 @@ fn a_corrupt_backend_neither_reads_nor_writes_the_cache() {
     );
 }
 
+/// The warm process, end to end: one invocation, two runs, and the second one does not pay a front
+/// end at all because the tree it holds is the tree on disk.
+#[test]
+fn watch_runs_again_when_the_tree_moves_and_holds_what_did_not() {
+    let dir = project(GREEN);
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ply"))
+        .current_dir(dir.path())
+        .args(["--color", "never", "test", "--watch", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut text = String::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_string(&mut text);
+        let _ = tx.send(text);
+    });
+
+    // Let the first iteration land, touch the module without changing what it says, and give the
+    // second one room. The waits are budgets rather than measurements: nothing here asserts on
+    // elapsed time, only on how many iterations happened and what each of them said.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::fs::write(dir.path().join("m.ply"), format!("{GREEN}\n// nudged\n")).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+    let mut reports = Vec::new();
+    // One JSON object per iteration, concatenated; `into_iter` over the stream splits them.
+    for report in serde_json::Deserializer::from_str(&text).into_iter::<Value>() {
+        match report {
+            Ok(v) => reports.push(v),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        reports.len() >= 2,
+        "`--watch` did not run again when the tree moved; it emitted {} report(s):\n{text}",
+        reports.len()
+    );
+    for (i, report) in reports.iter().enumerate() {
+        assert_eq!(report["ok"], Value::Bool(true), "iteration {i}: {report}");
+    }
+}
+
 #[test]
 fn renaming_a_definition_re_runs_nothing() {
     let dir = project("fn width() -> Int = 3\ntest \"width is three\" { assert_eq(width(), 3) }\n");
