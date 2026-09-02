@@ -1,7 +1,7 @@
 use super::common::{
-    IND, build_pool, describe_schema, diagnostic_json, diagnostics_json, emit_json, exit_code,
-    location, millis, once_each, phases_json, plural, print_diagnostics, print_phases,
-    print_warnings, report_bind_error, report_load_error,
+    IND, backend_spec, build_backend, build_pool, describe_schema, diagnostic_json,
+    diagnostics_json, emit_json, exit_code, location, millis, once_each, phases_json, plural,
+    print_diagnostics, print_phases, print_warnings, report_bind_error, report_load_error,
 };
 use crate::EXIT_COMPILE_ERROR;
 use crate::cli::{TestArgs, When};
@@ -25,7 +25,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
     // Before the store is opened, because a misspelled `--backend` must not leave a cache directory
     // behind for a run that is about to refuse.
-    let backend = match backend_spec(args) {
+    let backend = match backend_spec(args.backend.as_ref()) {
         Ok(spec) => spec,
         Err(diagnostic) => {
             if args.json {
@@ -180,7 +180,10 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let runtime = hosts.runtime_factory();
     // One per run, not one per worker: a backend may not borrow the program (`Machine`'s `compiled`
     // field says why), so building one costs a copy of the AST and the workers share it.
-    let provider = match backend.as_ref().map(|spec| build_backend(spec, &loaded)) {
+    let provider = match backend
+        .as_ref()
+        .map(|spec| build_backend(spec, &loaded.program, &loaded.resolved, &loaded.check))
+    {
         None => None,
         Some(Ok(provider)) => Some(provider),
         Some(Err(diagnostic)) => {
@@ -474,47 +477,6 @@ fn cache_bypassed(args: &TestArgs) -> bool {
 }
 
 /// What `--backend` asked for, or the diagnostic that refuses it.
-fn backend_spec(args: &TestArgs) -> Result<Option<ply_eval::BackendSpec>, Diagnostic> {
-    let Some(spec) = &args.backend else {
-        return Ok(None);
-    };
-    ply_eval::backend::parse(spec).map(Some).map_err(|message| {
-        Diagnostic::error(codes::BACKEND_UNAVAILABLE, message).note(
-            "a wrong backend is a self-test: it exists so that a green run with a backend \
-                 attached can be read as evidence",
-        )
-    })
-}
-
-/// The run's backend, built once, or the diagnostic that refuses it.
-fn build_backend(
-    spec: &ply_eval::BackendSpec,
-    loaded: &Loaded,
-) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
-    match spec.kind {
-        ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(
-            &loaded.program,
-            &loaded.resolved,
-            &loaded.check,
-        )),
-        ply_eval::BackendKind::Cranelift => {
-            ply_codegen::Cranelift::over(&loaded.program, &loaded.resolved, &loaded.check)
-                .map(|unit| unit as &'static dyn ply_eval::Provider)
-                .map_err(|error| {
-                    Diagnostic::error(
-                        codes::BACKEND_UNAVAILABLE,
-                        format!("the cranelift backend could not be built: {error:#}"),
-                    )
-                    .note(
-                        "a backend that failed to build would decline every call, so the run is \
-                         refused rather than reported green over a seam nothing reached",
-                    )
-                    .note("`--backend reference` needs no code generator and runs anywhere")
-                })
-        }
-    }
-}
-
 /// `--bisect never` goes *through* the diagnosis rather than around it, so that the artifact has
 /// one shape: a consumer branches on `verdict` and never on whether a field is present.
 fn diagnosis_options(args: &TestArgs) -> ply_test::Options {

@@ -917,7 +917,14 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         .map(|d| d.span)
         .unwrap_or(Span::DUMMY);
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let answer = evaluate(&opened, span, &plan, &hosts, declared.as_ref());
+    let answer = evaluate(
+        &opened,
+        span,
+        &plan,
+        &hosts,
+        declared.as_ref(),
+        args.backend.as_ref(),
+    );
 
     // the teardown order's pinned order, on the machine's own thread and never from a signal handler:
     // roll every open transaction back, close every open span, flush the sink, close the pool.
@@ -997,11 +1004,21 @@ fn evaluate(
     plan: &ply_eval::Plan,
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_core::ty::Footprint>,
+    backend: Option<&String>,
 ) -> Result<ply_eval::Value, Diagnostic> {
     use ply_eval::Machine;
 
     let name = opened.entry.as_str();
     let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+    if let Some(spec) = crate::commands::common::backend_spec(backend)? {
+        let provider = crate::commands::common::build_backend(
+            &spec,
+            &opened.program,
+            &opened.resolved,
+            &opened.check,
+        )?;
+        machine.set_compiled(provider.attach(&spec));
+    }
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);

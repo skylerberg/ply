@@ -110,6 +110,7 @@ impl Project {
 
         let out = Command::new(ply_binary())
             .arg("run")
+            .args(backend_args())
             .arg(&self.0)
             .arg("--json")
             .output()
@@ -673,3 +674,13 @@ const EMITTABLE: [&str; 101] = [
     "%ushr",
     "%write",
 ];
+
+/// `--backend` for every `ply` the differential runs: `cranelift` unless `PLY_BACKEND` names
+/// another, or `none` for the interpreter alone.
+fn backend_args() -> Vec<String> {
+    match std::env::var("PLY_BACKEND").as_deref() {
+        Ok("none") => Vec::new(),
+        Ok(other) => vec!["--backend".to_string(), other.to_string()],
+        Err(_) => vec!["--backend".to_string(), "cranelift".to_string()],
+    }
+}
