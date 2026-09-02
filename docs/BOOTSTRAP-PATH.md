@@ -154,11 +154,14 @@ measurement is confounded until the earlier one has moved.
    already memoised at run time by `ply-eval::memo`, so what remains is the
    spelling), `?` inside lambdas (§2, `E0118` — **landed**: a lambda may write
    `-> T` before a block body and `?` reads it; an `iterate` step answers `Iter`
-   and can never carry one), `?` as a `let`'s value inside a branch (`E0119`),
-   keywords reserved in the field namespace (§6 — **landed**: a keyword names
-   a field wherever a field is named, and only the punned forms, which bind a
-   variable too, are refused; the spike's own parser has not followed yet, so
-   its corpus carries none), an expression-position `unreachable` (§8 — the
+   and can never carry one), `?` as a `let`'s value inside a branch (`E0119` —
+   **stays**: lifting the conditional whole with its success wrapped would keep
+   what runs unchanged, but it is a second expansion shape, and ADR 0028 §4
+   chose refusal over hoisting for exactly that reason; re-take that decision
+   before building it, and the spike converted every guard without it),
+   keywords reserved in the field namespace (§6 — **landed** on both sides: a
+   keyword names a field wherever a field is named, and only the punned forms,
+   which bind a variable too, are refused), an expression-position `unreachable` (§8 — the
    expression exists: `panic` is typed `String -> a`, and what the spike wanted
    beyond it was a placeholder *visible in the differential*, which is the
    spike's choice rather than a gap), and §9's small pieces (`min` and `max`
@@ -171,9 +174,13 @@ measurement is confounded until the earlier one has moved.
    effect inference and hashing, each ported the way the parser was: a reference
    dumper on the Rust side, a corpus, and mutations that prove the comparison
    can go red (`spikes/ply-parser/arm-*.sh`). Inference with rows is the hard
-   one. `std.hash` exists (ADR 0033) and its throughput is not measured. Port the
-   syntax the parser predates first, so the spike's own differential is green
-   before anything is built on it.
+   one. `std.hash` exists (ADR 0033) and its throughput is not measured. The
+   syntax the parser spike predated is ported first, so its own differential is
+   green before anything is built on it: the bit operators (with the shift join
+   and the lambda-parameter pipe guard) and keyword fields are in, the corpus
+   is re-mined from the reference's tests, and the agreement tests pass over
+   all of it. Re-mine whenever the reference grows syntax; the harness's
+   diagnostics pin moves with the corpus and says so.
 7. **The driver.** Incremental caching, the content-addressed store and the
    gates are Rust, and ADR 0020 notes a self-hosted front end would be cached by
    machinery it does not own. Whether the front end lives behind the Rust driver

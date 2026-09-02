@@ -40,18 +40,20 @@ fn dump_of(text: &str, module: &Module, diags: &[Diagnostic]) -> String {
     d.out
 }
 
-/// **The tree half of the same cost: how many nodes the three rewrites add.**
-pub fn nodes_the_rewrites_add(text: &str) -> usize {
+/// **The tree half of the same cost: how many nodes the three rewrites add.** Negative only
+/// where `try_op` refused a `?` and unwrapped it — one node fewer, and a diagnostic the other
+/// half counts — since no rewrite removes a node it accepted.
+pub fn nodes_the_rewrites_add(text: &str) -> isize {
     let (before, bd) = parse_unexpanded(SourceId(0), ModuleName::anonymous(), text);
     let (after, ad) = ply_syntax::parse_recovering(SourceId(0), ModuleName::anonymous(), text);
     let b = node_count(&dump_of(text, &before, &bd));
     let a = node_count(&dump_of(text, &after, &ad));
     assert!(
-        a >= b,
-        "the rewrites removed {} node(s), which none of them can do",
+        a >= b || ad.len() > bd.len(),
+        "the rewrites removed {} node(s) without refusing anything, which none of them can do",
         b - a
     );
-    a - b
+    a as isize - b as isize
 }
 
 // > **WITHDRAWN 2026-08-30 — the projection is gone, not merely unused.**
