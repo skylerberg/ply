@@ -6,6 +6,11 @@
 #   ./benches/c-floor/run.sh
 #
 # Builds its fixtures, waits for the load gate, and refuses if it is never met (exit 3).
+#
+# macOS only as written: `-undefined dynamic_lookup`, `-bundle -bundle_loader` and
+# `-Wl,-export_dynamic` are this linker's spellings, and the cost that decided the
+# reading is dyld's. A Linux re-take wants `-rdynamic` and plain `-shared`, and is a
+# re-take rather than a port: the loader is the subject.
 set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
