@@ -2114,12 +2114,42 @@ size of the standard library needs the lookup to be logarithmic; everything the
 reference keeps in an `IndexMap` for its order is a list here, and the order is
 what the dump compares.
 
-**Not here yet.** The derive expansion runs before the checker and is not ported,
-so the two examples that `derive` are compared by neither side, and the two
-passes that read what expansion produced (`check_derives`, `attribute_generated`)
-have nothing to walk; and the incremental `Known` interface the driver hands in.
-Each is a bounded port with the same instrument waiting for it. One thing the
-port asked of the code generator rather than of the language: `map_fold` is the
-one callback builtin the checker uses that the fragment did not lower, and
+**Not here yet.** The incremental `Known` interface the driver hands in: a
+bounded port with the same instrument waiting for it. The derive expansion, and
+the two checker passes that read what it produced, are §18. One thing the port
+asked of the code generator rather than of the language: `map_fold` is the one
+callback builtin the checker uses that the fragment did not lower, and
 `parser_census::the_census_over_the_parser_spike` pins that no callback is
 refused, so the runtime gained the loop.
+
+## §18 The deriver, ported: `ply-derive` behind a fifth differential
+
+`derive.ply` is `crates/ply-derive` — `rules.rs`, `walk.rs`, `emit.rs`,
+`retarget.rs` and `lib.rs`: the table that says what a type constructor means to
+a derivation, the syntactic walk that refuses a field before anything is
+generated, the emitter that writes a dictionary as Ply source, the parse of that
+source back through the same parser, the retargeting of every span in it to the
+`derive` item's, and the expander with its orphan, collision, missing-runtime and
+internal-error diagnostics. `harness/tests/derive.rs` compares `derive_dump` —
+each module expanded on its own, its generated sources byte for byte and its
+diagnostics — with `reference_derive_dump`, over a hand-written bundle of every
+shape the reference's own tests exercise (`fixtures/derive-programs.corpus`),
+every example and every standard-library module; `arm-derive.sh` arms it. The
+checker's pipeline now expands before it resolves, the two examples that
+`derive` join the fourth differential, and `check_derives` and
+`attribute_generated` — the passes that read what expansion produced — are in
+`infer.ply`, keyed on the `derived` list `resolve.ply`'s `Mod` carries beside
+the module, since `FnDef::derived` is not a field the port's parser writes.
+
+**What agreed first time.** The golden pin the reference keeps of its own output
+matched byte for byte before the differential ran: an emitter is string
+concatenation, and string concatenation ports. The retargeting walk is where the
+language charged: a generated tree's spans cannot be stamped at the tokens,
+because the parser reads literal text through node spans, so the walk rebuilds
+every node kind of the AST with every field spelled — the same record-update tax
+§15 met, paid once more, over forty record shapes.
+
+**One table.** `con_shape` now lives in `derive.ply` and `infer.ply` imports it,
+as `derivable.rs` reads `ply_derive::rules::shape`: the type the deriver can
+encode and the type the checker admits are decided in one place, which is the
+only way they cannot disagree.
