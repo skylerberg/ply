@@ -51,25 +51,25 @@ prices an edit — `cold`, `warm`, `rename`, `edit-leaf` and `edit-hub`, nine
 phases each — at every size `ply-corpus sweep` is given. `README.md` §"The
 loop" is one size of that row.
 
-The compiled loop does not have it, and every stage of a backend run is
+The compiled loop did not have it, and every stage of a backend run was
 O(project), for three reasons that read in `crates/ply-cli/src/commands/test.rs`
-and `crates/ply-codegen/src/backend.rs`:
+and `crates/ply-codegen/src/backend.rs`. The first is fixed; the other two
+stand:
 
-- **The caches are bypassed — both of them, for one cache's reason.**
-  `cache_bypassed` is true whenever `--backend` is given, so the run opens a
-  scratch store. Its doc comment gives the reason, and the reason is about
-  results only: a stored `Pass` is a claim about what the authoritative engine
-  did, so a run on another engine may neither believe one nor leave one behind,
-  which `backend_escapes` also polices. But one store holds both caches, and
-  the same flag clears `incremental`, so a backend run also re-parses,
-  re-resolves and re-checks the whole program — and the front end is the same
-  work whichever engine executes afterwards. **The result half is a decision;
-  the front-end half has no stated reason and reads as collateral from one flag
-  serving two caches.** So this item splits: reading the front-end cache under
-  a backend costs nothing to justify, and what a cached `Pass` claims when a
-  backend answered is a design question. Both come before anything below,
-  because a backend run cannot be O(change) at any stage until it can skip
-  work.
+- **The caches were bypassed — both of them, for one cache's reason. Fixed.**
+  `cache_bypassed` was true whenever `--backend` was given, so the run opened a
+  scratch store, and the runner refused to record a test that entered compiled
+  code. The reason given was about results only: a stored `Pass` is a claim
+  about what the authoritative engine did. But one store holds both caches, so
+  the same flag also cleared `incremental`, and a backed run re-parsed,
+  re-resolved and re-checked the whole program — work that is the same whichever
+  engine executes afterwards. Both halves are decided rather than fused now: a
+  result names the engine that earned it (`ply_test::Engine`), so a backed run
+  selects against what backed runs proved and neither engine reads the other's;
+  and the front-end cache is read whatever executes. What still gets no store at
+  all is a backend that is **wrong on purpose**, since a run that skipped a test
+  is not evidence. The cost is a cold first run per engine, which this record's
+  own falsifier named as the acceptable outcome.
 - **The unit is whole and compiled per worker.** `Cranelift::over` closes the
   unit over every function the fragment compiles and builds it once as a
   pre-flight; `Provider::attach` builds it again for every worker. A run
@@ -224,12 +224,13 @@ size and cannot be fitted, so it is not in the row.
 
 **Decision rule.** Under the interpreter, `rename` and `edit-leaf` move less
 across the sizes than `warm` does, and `cold` moves in proportion to the size.
-Under the backend the same test, and it is expected to fail on every arm — the
-code above says so — and the row's reading is *which phase* carries the growth,
-front end, execute or compile, because that is what orders the pass decision,
-the per-definition cache and the warm process. Growth mostly in execute means
-the pass decision is the whole of the first step; mostly in compile, the cache;
-a fixed cost that dominates both, the warm process.
+Under the backend the same test, and it is expected to fail — the code above
+says the compile does not shrink with the edit — and the row's reading is
+*which phase* carries the growth, because that is what orders the two items
+left. Growth in compile means the per-definition cache; a fixed cost that
+dominates it means the warm process. The front end and the tests re-run are no
+longer candidates: item 1 took them out, and the row is what shows whether it
+did.
 
 That rule is CONTRIBUTING §"Measure an ADR's motivating claim before accepting
 the ADR" applied to the claim this whole project rests on, which has been
@@ -238,10 +239,12 @@ slope for neither tier.
 
 ## The order
 
-1. Read the front-end cache under a backend: the front end does not depend on
-   which engine executes, and only the result half of the bypass has a reason.
-   Then decide what a cached `Pass` claims when a backend answered, and key the
-   store on it. Nothing below matters until a backend run can skip work.
+1. **Done.** A result names the engine that earned it, the front-end cache is
+   read whatever executes, and a backend that is wrong on purpose still gets no
+   store. `one_engines_pass_is_never_another_engines` and
+   `a_second_backed_run_selects_nothing` in `crates/ply-cli/tests/suite/cli.rs`
+   hold the two halves, and `armed.rs` fails if a new route to a backend
+   forgets either.
 2. Take the row above with its backend arm. It says which of the next two pays
    first.
 3. A `DefHash -> code` cache, which needs per-definition units and an object
@@ -269,7 +272,8 @@ slope for neither tier.
   loader's. Another platform is a re-take, not an inference, and a loader
   without that property would put the per-definition-image shape back on the
   table.
-- **If a cached pass under a backend cannot be given a meaning the evaluator's
-  cache can share.** Then the compiled tier keeps a cache with its own key, and
-  O(change) holds per tier rather than across them — still the property, at the
-  cost of a cold first run per tier.
+- ~~**If a cached pass under a backend cannot be given a meaning the
+  evaluator's cache can share.**~~ **This fired.** It could not, and the
+  outcome this named is the one taken: each engine keeps its own namespace, so
+  O(change) holds per engine rather than across them, at the cost of a cold
+  first run per engine.

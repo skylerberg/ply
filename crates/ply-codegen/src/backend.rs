@@ -184,6 +184,12 @@ impl Provider for Cranelift {
         "cranelift"
     }
 
+    /// The registry width, because it decides which definitions run natively at all: a pass earned
+    /// under the narrow registry entered fewer of them, and is not the wide registry's pass.
+    fn variant(&self) -> String {
+        registry_width().to_string()
+    }
+
     fn len(&self) -> usize {
         self.members.len()
     }
@@ -487,10 +493,19 @@ impl Policed for Bodies {
 /// the wide registry enters at the parse root and beats no backend on the front-end row
 /// (`benches/front-end`). `PLY_CODEGEN_REGISTER=narrow` keeps the arm that record measured.
 fn registers(source: &Source, name: &str) -> bool {
+    !narrow_registry() || scalar_signature(source, name)
+}
+
+/// Read once per process, and read here rather than at each site so that the knob has one
+/// spelling: it is part of this provider's identity, which a cached result is namespaced by.
+pub fn registry_width() -> &'static str {
+    if narrow_registry() { "narrow" } else { "wide" }
+}
+
+pub fn narrow_registry() -> bool {
     static NARROW: OnceLock<bool> = OnceLock::new();
-    let narrow = *NARROW
-        .get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "narrow"));
-    !narrow || scalar_signature(source, name)
+    *NARROW
+        .get_or_init(|| std::env::var("PLY_CODEGEN_REGISTER").is_ok_and(|v| v.trim() == "narrow"))
 }
 
 /// Whether every parameter and the return type are written `Int` or `Bool`.

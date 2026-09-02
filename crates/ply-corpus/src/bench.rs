@@ -332,7 +332,13 @@ fn once(root: &Path) -> Result<(Timings, Shape)> {
     timings.record(Phase::CacheOpen, started.elapsed());
 
     let started = Instant::now();
-    let selection = ply_test::select(&check, &hashes, &store, &Plan::default());
+    let selection = ply_test::select(
+        &check,
+        &hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     timings.record(Phase::Select, started.elapsed());
 
     let started = Instant::now();

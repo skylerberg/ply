@@ -731,6 +731,7 @@ fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Durati
         &loaded.hashes,
         store,
         &ply_eval::Plan::default(),
+        &ply_test::Engine::Evaluator,
     );
     let plan = ply_cli::commands::test::Plan::new(selection, &loaded.check, None, false);
     let selection = plan.selection;

@@ -36,7 +36,13 @@ fn report(src: &str, audit: bool) -> ply_test::RunReport {
     let compiled = Compiled::anonymous(src);
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = ply_test::select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let fragment = ply_eval::Fragment::over(&compiled.program, &compiled.resolved, &compiled.check);
     let executor =
         ply_test::InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)

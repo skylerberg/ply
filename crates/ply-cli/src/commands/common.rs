@@ -21,6 +21,21 @@ pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpe
     })
 }
 
+/// The engine a run under `spec` selects against and records under, named before a provider
+/// exists — selection is what decides whether building one is worth anything.
+/// `a_commands_engine_is_the_one_the_run_records_under` pins that this agrees with what the
+/// executor answers once the provider is built.
+pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
+    let Some(spec) = spec else {
+        return ply_test::Engine::Evaluator;
+    };
+    let (name, variant) = match spec.kind {
+        ply_eval::BackendKind::Reference => ("reference", ""),
+        ply_eval::BackendKind::Cranelift => ("cranelift", ply_codegen::backend::registry_width()),
+    };
+    ply_test::Engine::of_backend(name, variant, spec)
+}
+
 /// The run's backend, built once over a checked program, or the diagnostic that refuses it.
 pub fn build_backend(
     spec: &ply_eval::BackendSpec,
