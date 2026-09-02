@@ -59,6 +59,8 @@ struct Val {
     v: cranelift_codegen::ir::Value,
     /// What the value is known to be at compile time, by index into `Jit::tys`; `0` is unknown.
     ty: u32,
+    /// The binding this value lives in, as one past its index in `Fx::homes`; `0` for a temporary.
+    home: u32,
 }
 
 struct Helpers {
@@ -96,6 +98,7 @@ struct Helpers {
     iterate: FuncId,
     shift_count: FuncId,
     dup: FuncId,
+    dec: FuncId,
     constant: FuncId,
 }
 
@@ -523,6 +526,7 @@ impl Jit {
             iterate: declare(&mut module, "rt_iterate", 4, true)?,
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
             dup: declare(&mut module, "rt_dup", 2, true)?,
+            dec: declare(&mut module, "rt_dec", 2, false)?,
             constant: declare(&mut module, "rt_constant", 2, true)?,
         };
 
@@ -617,6 +621,7 @@ impl Jit {
             failure,
             function: name.to_string(),
             module_index,
+            homes: Vec::new(),
         };
 
         // The prologue `ply_eval::limit` needs and the fragment's gaps item 6 records as missing: one
@@ -641,14 +646,13 @@ impl Jit {
             // A typed body: each parameter is the register it arrived in, of its own kind.
             Some(sig) => {
                 for (i, (p, kind)) in params.iter().zip(&sig.params).enumerate() {
-                    scope.push((
-                        p.clone(),
-                        Val {
-                            kind: *kind,
-                            v: block_params[i + 1],
-                            ty: sig.param_tys[i],
-                        },
-                    ));
+                    let v = fx.home(Val {
+                        kind: *kind,
+                        v: block_params[i + 1],
+                        ty: sig.param_tys[i],
+                        home: 0,
+                    });
+                    scope.push((p.clone(), v));
                 }
             }
             // A lambda: its captures and parameters arrive as handles through the array.
@@ -661,20 +665,20 @@ impl Jit {
                         args_ptr,
                         (i * 8) as i32,
                     );
-                    scope.push((
-                        p.clone(),
-                        Val {
-                            kind: Kind::Boxed,
-                            v: handle,
-                            ty: 0,
-                        },
-                    ));
+                    let v = fx.home(Val {
+                        kind: Kind::Boxed,
+                        v: handle,
+                        ty: 0,
+                        home: 0,
+                    });
+                    scope.push((p.clone(), v));
                 }
             }
         }
 
-        let result = fx.expr(body, &mut scope)?;
+        let result = fx.consumed(body, &mut scope)?;
         let answer = fx.coerce(result, sig.map_or(Kind::Boxed, |s| s.ret));
+        fx.release_homes_from(0);
         // The only path that gives the nested call back.
         let left = fx.load_fuel();
         let restored = fx.builder.ins().iadd_imm(left, 1);
@@ -715,6 +719,7 @@ impl Jit {
             failure,
             function: String::new(),
             module_index: func.module_index,
+            homes: Vec::new(),
         };
         let mut args = vec![fx.ctx];
         for (i, kind) in func.sig.params.iter().enumerate() {
@@ -727,6 +732,7 @@ impl Jit {
                     kind: Kind::Boxed,
                     v: handle,
                     ty: 0,
+                    home: 0,
                 },
                 *kind,
             );
@@ -743,6 +749,7 @@ impl Jit {
             kind: func.sig.ret,
             v: r,
             ty: 0,
+            home: 0,
         });
         fx.builder.ins().return_(&[handle]);
 
@@ -870,6 +877,9 @@ struct Fx<'a, 'b> {
     failure: cranelift_codegen::ir::Block,
     function: String,
     module_index: usize,
+    /// The stack slot of every binding whose value is a word, released at the function's exit
+    /// unless a move emptied it first.
+    homes: Vec<cranelift_codegen::ir::StackSlot>,
 }
 
 type Scope = Vec<(Symbol, Val)>;
@@ -1099,27 +1109,124 @@ impl Fx<'_, '_> {
     /// ended and cost every later update its reuse.
     fn consumed(&mut self, code: &Code, scope: &mut Scope) -> Result<Val> {
         let val = self.expr(code, scope)?;
-        if self.is_borrowed_local(code, scope) && val.kind == Kind::Boxed {
-            let v = self.helper(self.jit.helpers.dup, &[val.v]);
+        if val.kind != Kind::Boxed {
+            return Ok(val);
+        }
+        if self.is_borrowed_local(code, scope) {
+            self.inc_inline(val.v);
+            let v = val.v;
             return Ok(Val {
                 kind: Kind::Boxed,
                 v,
-                ty: 0,
+                ty: val.ty,
+                home: 0,
             });
         }
-        Ok(val)
+        // A local at its last use leaves its binding: the binding's slot is emptied, so the
+        // exit releases nothing for it and whoever now holds the word is its only holder.
+        if self.last_use_of_local(code, scope) {
+            self.moved(val);
+        }
+        Ok(Val { home: 0, ..val })
     }
 
     /// A captured value, by the capture's own mark.
     fn captured(&mut self, own: Own, val: Val) -> Val {
-        if own == Own::Owned || val.kind != Kind::Boxed {
+        if val.kind != Kind::Boxed {
             return val;
+        }
+        if own == Own::Owned {
+            self.moved(val);
+            return Val { home: 0, ..val };
         }
         let v = self.helper(self.jit.helpers.dup, &[val.v]);
         Val {
             kind: Kind::Boxed,
             v,
-            ty: 0,
+            ty: val.ty,
+            home: 0,
+        }
+    }
+
+    /// A binding's value, given a stack slot its scope releases at its end unless a move empties
+    /// it first; a register value has no count and needs none. The slot is written here, on
+    /// every path through the scope that reads it, so it needs no clearing.
+    fn home(&mut self, val: Val) -> Val {
+        if val.kind != Kind::Boxed {
+            return val;
+        }
+        let slot = self.builder.create_sized_stack_slot(StackSlotData::new(
+            StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
+        self.builder.ins().stack_store(val.v, slot, 0);
+        self.homes.push(slot);
+        Val {
+            home: self.homes.len() as u32,
+            ..val
+        }
+    }
+
+    /// A binding's value has left it: the slot is emptied so the exit does not release it.
+    fn moved(&mut self, val: Val) {
+        if val.home == 0 {
+            return;
+        }
+        let slot = self.homes[val.home as usize - 1];
+        let zero = self.builder.ins().iconst(types::I64, 0);
+        self.builder.ins().stack_store(zero, slot, 0);
+    }
+
+    /// One holder fewer of a word, in place: nothing for an empty slot, an immediate or an
+    /// immortal object, a decrement for an object others still hold, and the runtime's
+    /// dismantling only for the last holder.
+    fn dec_inline(&mut self, w: cranelift_codegen::ir::Value) {
+        let done = self.builder.create_block();
+        let pointer = self.builder.create_block();
+        let counted = self.builder.create_block();
+        let shared = self.builder.create_block();
+        let last = self.builder.create_block();
+        let tagged = self.builder.ins().band_imm(w, 1);
+        let tagged = self.builder.ins().icmp_imm(IntCC::NotEqual, tagged, 0);
+        let empty = self.builder.ins().icmp_imm(IntCC::Equal, w, 0);
+        let skip = self.builder.ins().bor(empty, tagged);
+        self.builder.ins().brif(skip, done, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let rc = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlags::trusted(), w, 0);
+        let immortal = self.builder.ins().icmp_imm(IntCC::Equal, rc, -1);
+        self.builder.ins().brif(immortal, done, &[], counted, &[]);
+        self.builder.switch_to_block(counted);
+        self.builder.seal_block(counted);
+        let more = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, rc, 1);
+        self.builder.ins().brif(more, shared, &[], last, &[]);
+        self.builder.switch_to_block(shared);
+        self.builder.seal_block(shared);
+        let fewer = self.builder.ins().iadd_imm(rc, -1);
+        self.builder.ins().store(MemFlags::trusted(), fewer, w, 0);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(last);
+        self.builder.seal_block(last);
+        self.helper_void(self.jit.helpers.dec, &[w]);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+    }
+
+    /// Every binding made since `mark` and still holding a word is released, and forgotten:
+    /// Perceus's drop at the scope's end, for a block's `let`s at the block's end, an arm's
+    /// pattern at the arm's, and the parameters at the function's.
+    fn release_homes_from(&mut self, mark: usize) {
+        for slot in self.homes.split_off(mark) {
+            let w = self.builder.ins().stack_load(types::I64, slot, 0);
+            self.dec_inline(w);
         }
     }
 
@@ -1294,6 +1401,7 @@ impl Fx<'_, '_> {
                                 kind,
                                 v: cranelift_codegen::ir::Value::from_u32(0),
                                 ty: 0,
+                                home: 0,
                             },
                         ));
                     }
@@ -1332,6 +1440,7 @@ impl Fx<'_, '_> {
                         kind: Kind::Boxed,
                         v,
                         ty: 0,
+                        home: 0,
                     })
                 }
                 Denotes::Builtin(index) => {
@@ -1341,6 +1450,7 @@ impl Fx<'_, '_> {
                         kind: Kind::Boxed,
                         v,
                         ty: 0,
+                        home: 0,
                     })
                 }
                 Denotes::Ctor(index, _) => {
@@ -1350,6 +1460,7 @@ impl Fx<'_, '_> {
                         kind: Kind::Boxed,
                         v,
                         ty: 0,
+                        home: 0,
                     })
                 }
                 Denotes::Uncompiled(target) => self.refuse(format!(
@@ -1367,6 +1478,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Int,
                             v,
                             ty: 0,
+                            home: 0,
                         })
                     }
                     UnOp::Not => {
@@ -1377,6 +1489,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Bool,
                             v,
                             ty: 0,
+                            home: 0,
                         })
                     }
                     // `Int` like the rest of the fragment: `as_int` refuses a `Float` or `Decimal`
@@ -1400,6 +1513,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Int,
                             v,
                             ty: 0,
+                            home: 0,
                         })
                     }
                 }
@@ -1449,17 +1563,22 @@ impl Fx<'_, '_> {
                     kind,
                     v: self.builder.block_params(join)[0],
                     ty: if t_ty == e_ty { t_ty } else { 0 },
+                    home: 0,
                 })
             }
 
             NodeKind::Block { stmts, tail } => {
                 let mut inner = scope.clone();
+                let mark = self.homes.len();
                 for s in stmts.iter() {
                     match s {
                         Stmt::Let { pat, value, .. } => {
                             let v = self.consumed(value, &mut inner)?;
                             match pat {
-                                Pat::Var { name, .. } => inner.push((name.name.clone(), v)),
+                                Pat::Var { name, .. } => {
+                                    let v = self.home(v);
+                                    inner.push((name.name.clone(), v));
+                                }
                                 Pat::Wildcard => {}
                                 other if self.binds_without_test(other) => {
                                     self.bind_pattern(other, v, true, &mut inner)?;
@@ -1473,17 +1592,23 @@ impl Fx<'_, '_> {
                             }
                         }
                         Stmt::Expr { code, .. } => {
-                            self.expr(code, &mut inner)?;
+                            // An answer nobody binds is released here unless it is a local's.
+                            let v = self.expr(code, &mut inner)?;
+                            if v.kind == Kind::Boxed && !self.is_local(code, &inner) {
+                                self.dec_inline(v.v);
+                            }
                         }
                     }
                 }
-                match tail {
-                    Some(t) => self.consumed(t, &mut inner),
+                let answer = match tail {
+                    Some(t) => self.consumed(t, &mut inner)?,
                     None => {
                         let handle = self.intern(Value::Unit);
-                        Ok(self.constant(handle))
+                        self.constant(handle)
                     }
-                }
+                };
+                self.release_homes_from(mark);
+                Ok(answer)
             }
 
             NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, scope),
@@ -1551,6 +1676,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v,
                     ty,
+                    home: 0,
                 })
             }
 
@@ -1596,6 +1722,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v,
                     ty,
+                    home: 0,
                 })
             }
 
@@ -1644,6 +1771,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
 
@@ -1662,6 +1790,9 @@ impl Fx<'_, '_> {
                 };
                 let base = self.expr(b, scope)?;
                 let known = self.static_field(base.ty, &field.name);
+                if own == 1 {
+                    self.moved(base);
+                }
                 let base = self.boxed(base);
                 // A read of a record whose shape the checker fixed is a load at the field's
                 // offset, held once more; anything else, and any read that takes the base or the
@@ -1680,6 +1811,7 @@ impl Fx<'_, '_> {
                         kind: Kind::Boxed,
                         v,
                         ty,
+                        home: 0,
                     });
                 }
                 let index = self.field_index(&field.name);
@@ -1691,6 +1823,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v,
                     ty: known.map_or(0, |(_, ty)| ty),
+                    home: 0,
                 })
             }
 
@@ -1708,6 +1841,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             NodeKind::Perform { effect, op, .. } => {
@@ -1732,6 +1866,7 @@ impl Fx<'_, '_> {
                 kind: Kind::Boxed,
                 v,
                 ty: 0,
+                home: 0,
             };
         }
         let index = self.builder.ins().iconst(types::I64, index as i64);
@@ -1740,6 +1875,7 @@ impl Fx<'_, '_> {
             kind: Kind::Boxed,
             v,
             ty: 0,
+            home: 0,
         }
     }
 
@@ -1750,11 +1886,13 @@ impl Fx<'_, '_> {
                 kind: Kind::Int,
                 v: self.builder.ins().iconst(types::I64, *i),
                 ty: 0,
+                home: 0,
             }),
             Lit::Bool(b) => Ok(Val {
                 kind: Kind::Bool,
                 v: self.builder.ins().iconst(types::I64, i64::from(*b)),
                 ty: 0,
+                home: 0,
             }),
             Lit::Float(_) => self.refuse("a `Float` literal, which the fragment has no path for"),
             Lit::Decimal { .. } => {
@@ -1804,6 +1942,7 @@ impl Fx<'_, '_> {
                 kind: Kind::Bool,
                 v: self.builder.block_params(join)[0],
                 ty: 0,
+                home: 0,
             });
         }
 
@@ -1822,6 +1961,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Int,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
@@ -1850,6 +1990,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Int,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             BinOp::Add | BinOp::Sub => {
@@ -1877,6 +2018,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Int,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             BinOp::Mul | BinOp::Div | BinOp::Rem => {
@@ -1894,6 +2036,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Int,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -1911,6 +2054,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Bool,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             BinOp::Eq | BinOp::Ne => {
@@ -1950,6 +2094,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Bool,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             BinOp::Concat => {
@@ -1961,6 +2106,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v,
                     ty: 0,
+                    home: 0,
                 })
             }
             BinOp::And | BinOp::Or => unreachable!("short-circuit handled above"),
@@ -2000,6 +2146,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v,
                     ty: 0,
+                    home: 0,
                 });
             }
             // A direct call: each argument in the register kind the callee's signature names. A
@@ -2023,6 +2170,7 @@ impl Fx<'_, '_> {
                 kind: f.sig.ret,
                 v,
                 ty: f.sig.ret_ty,
+                home: 0,
             });
         }
         let mut handles = Vec::with_capacity(args.len());
@@ -2099,6 +2247,7 @@ impl Fx<'_, '_> {
             kind: Kind::Boxed,
             v,
             ty: 0,
+            home: 0,
         })
     }
 
@@ -2124,6 +2273,7 @@ impl Fx<'_, '_> {
             kind: Kind::Boxed,
             v,
             ty: 0,
+            home: 0,
         })
     }
 
@@ -2298,6 +2448,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v: sub,
                             ty: 0,
+                            home: 0,
                         },
                         next,
                         miss,
@@ -2330,6 +2481,7 @@ impl Fx<'_, '_> {
                     kind: Kind::Boxed,
                     v: base,
                     ty: 0,
+                    home: 0,
                 };
                 let mut cur = self.builder.create_block();
                 self.test_ctor(boxed, index, cur, miss);
@@ -2350,6 +2502,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v: sub,
                             ty: 0,
+                            home: 0,
                         },
                         next,
                         miss,
@@ -2400,6 +2553,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v: field,
                             ty: 0,
+                            home: 0,
                         },
                         next,
                         miss,
@@ -2438,6 +2592,7 @@ impl Fx<'_, '_> {
             Pat::Wildcard => {}
             Pat::Var { name: id, .. } => {
                 if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))) {
+                    let value = self.home(value);
                     scope.push((id.name.clone(), value));
                 }
             }
@@ -2457,6 +2612,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v,
                             ty: 0,
+                            home: 0,
                         },
                         true,
                         scope,
@@ -2468,14 +2624,13 @@ impl Fx<'_, '_> {
                     let from = self.builder.ins().iconst(types::I64, items.len() as i64);
                     let v = self.helper(self.jit.helpers.list_rest, &[base, from]);
                     self.check();
-                    scope.push((
-                        name,
-                        Val {
-                            kind: Kind::Boxed,
-                            v,
-                            ty: 0,
-                        },
-                    ));
+                    let v = self.home(Val {
+                        kind: Kind::Boxed,
+                        v,
+                        ty: 0,
+                        home: 0,
+                    });
+                    scope.push((name, v));
                 }
             }
             Pat::Ctor { name, args } => {
@@ -2509,6 +2664,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v,
                             ty,
+                            home: 0,
                         },
                         true,
                         scope,
@@ -2541,6 +2697,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v,
                             ty,
+                            home: 0,
                         },
                         true,
                         scope,
@@ -2573,8 +2730,10 @@ impl Fx<'_, '_> {
             // A scrutinee that is a local still read afterwards keeps its fields; anything else
             // — a temporary, or a local at its last use — gives them up.
             let moving = !self.is_borrowed_local(scrutinee, scope);
+            let mark = self.homes.len();
             self.bind_pattern(&arm.pat, value, moving, &mut inner)?;
             let body = self.consumed(&arm.body, &mut inner)?;
+            self.release_homes_from(mark);
             // The arms' type, when every arm agrees.
             ty = match ty {
                 None => Some(body.ty),
@@ -2597,6 +2756,7 @@ impl Fx<'_, '_> {
             kind: Kind::Boxed,
             v: self.builder.block_params(join)[0],
             ty: ty.unwrap_or(0),
+            home: 0,
         })
     }
 }

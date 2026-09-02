@@ -114,3 +114,13 @@ but the string compares the by-name path was paying and the allocation on
 every release. What the reading says now: the integer kernel's distance is
 the record built and torn down per mixing step, which no helper change
 reaches; it needs the step inlined and the record kept in registers.
+
+## After the drops
+
+`after-drops.txt`, under the gate on both sides, with every binding released
+at its scope's end, every tail owned, and byte concatenation native. The
+integer kernel did not move; the record kernel moved, and the concatenation is
+what moved it — its key is built per step — not the drops, whose in-place
+updates the last-use moves had already secured on this kernel. The drops
+found something else: a branch answering a local aliased it at one count,
+which the fragment's cases now pin. Neither kernel clears.
