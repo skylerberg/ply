@@ -368,8 +368,9 @@ pub unsafe extern "C" fn rt_dup(_ctx: *mut Ctx, w: i64) -> i64 {
 }
 
 /// Perceus's `drop`: one holder fewer.
-pub unsafe extern "C" fn rt_dec(_ctx: *mut Ctx, w: i64) {
-    heap::dec(w);
+pub unsafe extern "C" fn rt_dec(ctx: *mut Ctx, w: i64) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.heap.release_last(w);
 }
 
 /// Perceus's `reset`: a record held once, at its last use in a body that builds another of its
@@ -1554,7 +1555,9 @@ pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n:
         return ctx.nullary(index as u32);
     }
     let args = args_of(args, n);
-    let o = ctx.heap.alloc(KIND_CTOR, 0, n as u32, index as u32);
+    let o = ctx
+        .heap
+        .alloc(KIND_CTOR, flat_over(args), n as u32, index as u32);
     for (i, w) in args.iter().enumerate() {
         unsafe { set_word(o, i, *w) };
     }
@@ -1565,7 +1568,9 @@ pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n:
 pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let args = args_of(args, n);
-    let o = ctx.heap.alloc(KIND_RECORD, 0, n as u32, shape as u32);
+    let o = ctx
+        .heap
+        .alloc(KIND_RECORD, flat_over(args), n as u32, shape as u32);
     for (i, w) in args.iter().enumerate() {
         unsafe { set_word(o, i, *w) };
     }
@@ -1602,6 +1607,7 @@ pub unsafe extern "C" fn rt_record_update(
                 set_word(o, *at as usize, *w);
             }
         }
+        unsafe { (*o).flags &= flat_over(written) | !heap::FLAT };
         return base;
     }
     // A fresh record: the written fields at their offsets, and the rest copied out of the base
@@ -1610,7 +1616,8 @@ pub unsafe extern "C" fn rt_record_update(
     // from it unless the literal left a field unwritten.
     let tables = Rc::clone(&ctx.tables);
     let width = tables.layouts.shape_width(shape);
-    let out = ctx.heap.alloc(KIND_RECORD, 0, width as u32, shape);
+    let flat = flat_over(written) & unsafe { (*o).flags };
+    let out = ctx.heap.alloc(KIND_RECORD, flat, width as u32, shape);
     // Which offsets the literal wrote: a bit each for a shape a word of bits covers, which is
     // every shape a front end has, and a list for a wider one.
     let mut mask = 0u128;
@@ -1819,6 +1826,29 @@ pub unsafe extern "C" fn rt_map_lookup(ctx: *mut Ctx, m: i64, k: i64) -> i64 {
     unwrapped(ctx, answer)
 }
 
+/// [`heap::FLAT`] when none of `words` holds a count.
+fn flat_over(words: &[Word]) -> u8 {
+    if words.iter().all(|w| heap::is_imm(*w)) {
+        heap::FLAT
+    } else {
+        0
+    }
+}
+
+/// A fresh object of `kind` with `len` words, its header written and its fields left for the
+/// compiled code that asked, which stores them itself.
+pub unsafe extern "C" fn rt_alloc(
+    ctx: *mut Ctx,
+    kind: i64,
+    len: i64,
+    layout: i64,
+    flags: i64,
+) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    ctx.heap
+        .alloc(kind as u8, flags as u8, len as u32, layout as u32) as Word
+}
+
 /// A builtin called directly by compiled code, with no dispatch on its index and no argument
 /// array: the native path, or the interpreter's over the values. Takes the arguments.
 fn direct(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
@@ -2016,6 +2046,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),
         ("rt_dec", rt_dec as *const u8),
+        ("rt_alloc", rt_alloc as *const u8),
         ("rt_reset", rt_reset as *const u8),
         ("rt_constant", rt_constant as *const u8),
     ]

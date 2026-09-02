@@ -149,6 +149,12 @@ fn ordered(a: Int, b: Int) -> Int = match compare(a, b) { Less -> 0 - 1, Equal -
 fn grown_apart(n: Int) -> Int = { let a = push([], n); let b = push([], n + 1); let c = push(push([], n + 2), n + 3); len(a) * 100 + len(b) * 10 + len(c) + fold(a, 0, |acc: Int, x: Int| acc + x) + fold(b, 0, |acc: Int, x: Int| acc + x) }
 
 fn maps_apart(n: Int) -> Int = { let a = map_insert(map_new(), n, 1); let b = map_insert(map_new(), n + 1, 2); let e = map_new(); map_len(a) * 100 + map_len(b) * 10 + map_len(e) + (match map_get(a, n + 1) { Some(_) -> 1000, None -> 0 }) }
+
+fn turned(x: Int, n: Int) -> Int = rotr32(x, n)
+
+fn wrapping(a: Int, b: Int) -> Int = wrap_add(a, b) + wrap_sub(a, b) + wrap_mul(a, b)
+
+fn turned_by_name(x: Int) -> Int = { let n = 4; let k = 32 - n; rotr32(x, n) + (x << k) }
 "#;
 
 fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
@@ -363,6 +369,43 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ),
         ("m.grown_apart", vec![Value::Int(4)], Value::Int(121)),
         ("m.maps_apart", vec![Value::Int(7)], Value::Int(110)),
+        // The rotate of the low word and the wrapping arithmetic, each one instruction in a
+        // compiled body, answering what the interpreter answers at the edges.
+        (
+            "m.turned",
+            vec![Value::Int(1), Value::Int(1)],
+            Value::Int(0x8000_0000),
+        ),
+        (
+            "m.turned",
+            vec![Value::Int(0x1_0000_0001), Value::Int(1)],
+            Value::Int(0x8000_0000),
+        ),
+        (
+            "m.turned",
+            vec![Value::Int(-1), Value::Int(7)],
+            Value::Int(0xFFFF_FFFF),
+        ),
+        (
+            "m.turned",
+            vec![Value::Int(2), Value::Int(-1)],
+            Value::Int(4),
+        ),
+        (
+            "m.wrapping",
+            vec![Value::Int(i64::MAX), Value::Int(1)],
+            Value::Int(i64::MIN + (i64::MAX - 1) + i64::MAX),
+        ),
+        (
+            "m.wrapping",
+            vec![Value::Int(6), Value::Int(7)],
+            Value::Int(13 - 1 + 42),
+        ),
+        (
+            "m.turned_by_name",
+            vec![Value::Int(1)],
+            Value::Int(0x1000_0000 + (1 << 28)),
+        ),
     ];
     for (name, args, want) in cases {
         assert_eq!(
