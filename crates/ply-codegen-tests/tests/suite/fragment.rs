@@ -69,6 +69,12 @@ fn busy(n: Int) -> Int = {
 
 fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }
 
+fn limit() -> Int = 7
+
+fn odd(n: Int) -> Bool = n % 2 == 1
+
+fn capped(n: Int) -> Int = if odd(n) && n > limit() { limit() } else { n }
+
 fn shaped(x: Int) -> List<Int> = [x, x]
 "#;
 
@@ -186,6 +192,9 @@ fn a_compiled_body_answers_what_the_interpreter_answers() {
         ("m.sign", vec![Value::Int(-9)], Value::Int(-1)),
         ("m.sign", vec![Value::Int(0)], Value::Int(0)),
         ("m.busy", vec![Value::Int(9)], Value::Int(19)),
+        ("m.capped", vec![Value::Int(9)], Value::Int(7)),
+        ("m.capped", vec![Value::Int(8)], Value::Int(8)),
+        ("m.capped", vec![Value::Int(3)], Value::Int(3)),
     ];
     for (name, args, want) in cases {
         let got = call(unit, name, args);

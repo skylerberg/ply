@@ -109,6 +109,60 @@ struct Pending {
     module_index: usize,
 }
 
+/// What a compiled function takes and answers in registers: the kind of each parameter and of
+/// the result, read off the checker's scheme. `Boxed` wherever the type is one the fragment keeps
+/// as a handle, a type variable included.
+#[derive(Clone, Debug)]
+struct Sig {
+    params: Vec<Kind>,
+    ret: Kind,
+}
+
+/// A compiled top-level function: the typed body other compiled code calls directly, and the
+/// entry the seam and a closure reach it through, over the handle ABI.
+#[derive(Clone)]
+struct Func {
+    typed: FuncId,
+    entry: FuncId,
+    arity: usize,
+    module_index: usize,
+    sig: Sig,
+}
+
+fn kind_of_type(t: &ply_core::ty::Type) -> Kind {
+    match t {
+        ply_core::ty::Type::Con(name, args) if args.is_empty() => match name.as_str() {
+            "Int" => Kind::Int,
+            "Bool" => Kind::Bool,
+            _ => Kind::Boxed,
+        },
+        _ => Kind::Boxed,
+    }
+}
+
+/// The signature the checker published for `name`, or all-boxed for one it did not.
+fn sig_of(loaded: &Source, name: &str, arity: usize) -> Sig {
+    use ply_core::ty::Type;
+    let boxed = Sig {
+        params: vec![Kind::Boxed; arity],
+        ret: Kind::Boxed,
+    };
+    let Some(def) = loaded.check.defs.get(&Symbol::new(name)) else {
+        return boxed;
+    };
+    match &def.scheme.ty {
+        Type::Fn { params, ret, .. } if params.len() == arity => Sig {
+            params: params.iter().map(kind_of_type).collect(),
+            ret: kind_of_type(ret),
+        },
+        ty if arity == 0 => Sig {
+            params: Vec::new(),
+            ret: kind_of_type(ty),
+        },
+        _ => boxed,
+    }
+}
+
 /// One compiled program, and the tables its runtime context needs.
 pub struct Unit {
     module: JITModule,
@@ -164,7 +218,7 @@ pub struct Jit {
     shapes: Vec<Vec<Symbol>>,
     fields: Vec<Symbol>,
     builtins: Vec<Builtin>,
-    funcs: HashMap<String, (FuncId, usize, usize)>,
+    funcs: HashMap<String, Func>,
     /// The nullary functions whose published row is pure: called through `rt_constant`, which
     /// remembers their value the way the machine's memo does.
     constants: HashSet<FuncId>,
@@ -203,8 +257,8 @@ impl Jit {
         for (name, params, body, module_index) in &bodies {
             jit.nodes.insert(name.clone(), count_nodes(body));
             clif.clear();
-            let (id, _, _) = jit.funcs[name];
-            clif.func.signature = jit.entry_signature();
+            let func = jit.funcs[name].clone();
+            clif.func.signature = jit.typed_signature(func.arity);
             jit.define(
                 &mut clif,
                 &mut fctx,
@@ -213,8 +267,13 @@ impl Jit {
                 params,
                 body,
                 *module_index,
+                Some(&func.sig),
             )?;
-            jit.module.define_function(id, &mut clif)?;
+            jit.module.define_function(func.typed, &mut clif)?;
+            clif.clear();
+            clif.func.signature = jit.entry_signature();
+            jit.define_entry(&mut clif, &mut fctx, loaded, &func);
+            jit.module.define_function(func.entry, &mut clif)?;
             while let Some(lambda) = jit.pending.pop() {
                 clif.clear();
                 clif.func.signature = jit.entry_signature();
@@ -226,6 +285,7 @@ impl Jit {
                     &lambda.params,
                     &lambda.body,
                     lambda.module_index,
+                    None,
                 )?;
                 jit.module.define_function(lambda.id, &mut clif)?;
             }
@@ -241,7 +301,7 @@ impl Jit {
         let entries = jit
             .funcs
             .iter()
-            .map(|(name, (id, arity, _))| (name.clone(), (*id, *arity)))
+            .map(|(name, f)| (name.clone(), (f.entry, f.arity)))
             .collect();
         Ok(Unit {
             module: jit.module,
@@ -270,7 +330,8 @@ impl Jit {
             // `FunctionBuilderContext` to a reusable state, and a refused body never reaches it.
             let mut clif = ClifContext::new();
             let mut fctx = FunctionBuilderContext::new();
-            clif.func.signature = jit.entry_signature();
+            let func = jit.funcs[name].clone();
+            clif.func.signature = jit.typed_signature(func.arity);
             if let Err(e) = jit.define(
                 &mut clif,
                 &mut fctx,
@@ -279,6 +340,7 @@ impl Jit {
                 params,
                 body,
                 *module_index,
+                Some(&func.sig),
             ) {
                 // A refusal is the answer this is asking for; anything else — a cranelift failure,
                 // a name that does not resolve — is a bug in the spike and must not be read as
@@ -305,6 +367,7 @@ impl Jit {
                     &lambda.params,
                     &lambda.body,
                     lambda.module_index,
+                    None,
                 ) {
                     let Some(refused) = e.downcast_ref::<Refused>() else {
                         return Err(e);
@@ -326,6 +389,17 @@ impl Jit {
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
         sig.params.push(AbiParam::new(types::I64));
+        sig.returns.push(AbiParam::new(types::I64));
+        sig
+    }
+
+    /// `(ctx, p1, .., pn) -> r`: every parameter and the result in a register, each an `Int` or a
+    /// `Bool` as itself or anything else as its handle, which [`Sig`] says per position.
+    fn typed_signature(&self, arity: usize) -> Signature {
+        let mut sig = self.module.make_signature();
+        for _ in 0..=arity {
+            sig.params.push(AbiParam::new(types::I64));
+        }
         sig.returns.push(AbiParam::new(types::I64));
         sig
     }
@@ -412,17 +486,32 @@ impl Jit {
             let (def, module_index) = loaded
                 .definition(name)
                 .ok_or_else(|| anyhow!("no definition named `{name}`"))?;
-            let sig = jit.entry_signature();
-            let id = jit
+            let arity = def.params.len();
+            let typed_sig = jit.typed_signature(arity);
+            let typed = jit
                 .module
-                .declare_function(&mangle(name), Linkage::Export, &sig)?;
-            jit.funcs
-                .insert((*name).to_string(), (id, def.params.len(), module_index));
-            jit.functions.push(id);
-            if def.params.is_empty()
+                .declare_function(&mangle(name), Linkage::Local, &typed_sig)?;
+            let entry_sig = jit.entry_signature();
+            let entry = jit.module.declare_function(
+                &mangle(&format!("{name}$entry")),
+                Linkage::Export,
+                &entry_sig,
+            )?;
+            jit.funcs.insert(
+                (*name).to_string(),
+                Func {
+                    typed,
+                    entry,
+                    arity,
+                    module_index,
+                    sig: sig_of(loaded, name, arity),
+                },
+            );
+            jit.functions.push(entry);
+            if arity == 0
                 && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(name))
             {
-                jit.constants.insert(id);
+                jit.constants.insert(typed);
             }
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
             // With the parameters as the window's leading slots, so a lambda that reads one
@@ -443,14 +532,15 @@ impl Jit {
         params: &[Symbol],
         body: &Code,
         module_index: usize,
+        sig: Option<&Sig>,
     ) -> Result<()> {
         let mut builder = FunctionBuilder::new(&mut clif.func, fctx);
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
         builder.switch_to_block(entry);
         builder.seal_block(entry);
-        let ctx_ptr = builder.block_params(entry)[0];
-        let args_ptr = builder.block_params(entry)[1];
+        let block_params: Vec<cranelift_codegen::ir::Value> = builder.block_params(entry).to_vec();
+        let ctx_ptr = block_params[0];
 
         let failure = builder.create_block();
 
@@ -482,27 +572,47 @@ impl Jit {
         fx.store_fuel(spent);
 
         let mut scope = Vec::new();
-        for (i, p) in params.iter().enumerate() {
-            let handle =
-                fx.builder
-                    .ins()
-                    .load(types::I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
-            scope.push((
-                p.clone(),
-                Val {
-                    kind: Kind::Boxed,
-                    v: handle,
-                },
-            ));
+        match sig {
+            // A typed body: each parameter is the register it arrived in, of its own kind.
+            Some(sig) => {
+                for (i, (p, kind)) in params.iter().zip(&sig.params).enumerate() {
+                    scope.push((
+                        p.clone(),
+                        Val {
+                            kind: *kind,
+                            v: block_params[i + 1],
+                        },
+                    ));
+                }
+            }
+            // A lambda: its captures and parameters arrive as handles through the array.
+            None => {
+                let args_ptr = block_params[1];
+                for (i, p) in params.iter().enumerate() {
+                    let handle = fx.builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        args_ptr,
+                        (i * 8) as i32,
+                    );
+                    scope.push((
+                        p.clone(),
+                        Val {
+                            kind: Kind::Boxed,
+                            v: handle,
+                        },
+                    ));
+                }
+            }
         }
 
         let result = fx.expr(body, &mut scope)?;
-        let handle = fx.boxed(result);
+        let answer = fx.coerce(result, sig.map_or(Kind::Boxed, |s| s.ret));
         // The only path that gives the nested call back.
         let left = fx.load_fuel();
         let restored = fx.builder.ins().iadd_imm(left, 1);
         fx.store_fuel(restored);
-        fx.builder.ins().return_(&[handle]);
+        fx.builder.ins().return_(&[answer]);
 
         fx.builder.switch_to_block(failure);
         let zero = fx.builder.ins().iconst(types::I64, 0);
@@ -511,6 +621,67 @@ impl Jit {
         fx.builder.seal_all_blocks();
         fx.builder.finalize();
         Ok(())
+    }
+
+    /// The handle-ABI entry of a typed function: each parameter unboxed to the register kind the
+    /// body takes, the body called, and its answer boxed for whoever entered.
+    fn define_entry(
+        &mut self,
+        clif: &mut ClifContext,
+        fctx: &mut FunctionBuilderContext,
+        loaded: &'static Source,
+        func: &Func,
+    ) {
+        let mut builder = FunctionBuilder::new(&mut clif.func, fctx);
+        let entry = builder.create_block();
+        builder.append_block_params_for_function_params(entry);
+        builder.switch_to_block(entry);
+        builder.seal_block(entry);
+        let ctx = builder.block_params(entry)[0];
+        let args_ptr = builder.block_params(entry)[1];
+        let failure = builder.create_block();
+        let mut fx = Fx {
+            jit: self,
+            builder,
+            loaded,
+            ctx,
+            failure,
+            function: String::new(),
+            module_index: func.module_index,
+        };
+        let mut args = vec![fx.ctx];
+        for (i, kind) in func.sig.params.iter().enumerate() {
+            let handle =
+                fx.builder
+                    .ins()
+                    .load(types::I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
+            let v = fx.coerce(
+                Val {
+                    kind: Kind::Boxed,
+                    v: handle,
+                },
+                *kind,
+            );
+            args.push(v);
+        }
+        let callee = fx
+            .jit
+            .module
+            .declare_func_in_func(func.typed, fx.builder.func);
+        let call = fx.builder.ins().call(callee, &args);
+        let r = fx.builder.inst_results(call)[0];
+        fx.check();
+        let handle = fx.boxed(Val {
+            kind: func.sig.ret,
+            v: r,
+        });
+        fx.builder.ins().return_(&[handle]);
+
+        fx.builder.switch_to_block(failure);
+        let zero = fx.builder.ins().iconst(types::I64, 0);
+        fx.builder.ins().return_(&[zero]);
+        fx.builder.seal_all_blocks();
+        fx.builder.finalize();
     }
 }
 
@@ -614,7 +785,7 @@ fn lowered_callback(b: Builtin) -> bool {
 /// time.
 enum Denotes {
     Local(Val),
-    Compiled(FuncId, usize),
+    Compiled(Func),
     /// A Ply function this unit did not compile.
     Uncompiled(String),
     Ctor(usize, usize),
@@ -819,9 +990,9 @@ impl Fx<'_, '_> {
                 .map(|b| b.qualified.clone())
         };
         if let Some(name) = &global
-            && let Some((id, arity, _)) = self.jit.funcs.get(name.as_str())
+            && let Some(f) = self.jit.funcs.get(name.as_str())
         {
-            return Ok(Denotes::Compiled(*id, *arity));
+            return Ok(Denotes::Compiled(f.clone()));
         }
         if let Some(name) = &global
             && self.loaded.definition(name.as_str()).is_some()
@@ -875,6 +1046,14 @@ impl Fx<'_, '_> {
             NodeKind::Lit(..) => Kind::Boxed,
             NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                 Denotes::Local(v) => v.kind,
+                _ => Kind::Boxed,
+            },
+            // A direct call answers in the callee's register kind; anything else answers a handle.
+            NodeKind::App { func, args } => match &func.kind {
+                NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
+                    Denotes::Compiled(f) if f.arity == args.len() => f.sig.ret,
+                    _ => Kind::Boxed,
+                },
                 _ => Kind::Boxed,
             },
             NodeKind::Unary { op, .. } => match op {
@@ -954,11 +1133,12 @@ impl Fx<'_, '_> {
             NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                 Denotes::Local(v) => Ok(v),
                 Denotes::Constant(handle) => Ok(self.constant(handle)),
-                // A compiled function used as a value is a closure over nothing.
-                Denotes::Compiled(id, arity) => {
-                    let index = self.function_index(id);
+                // A compiled function used as a value is a closure over nothing, through its
+                // handle-ABI entry.
+                Denotes::Compiled(f) => {
+                    let index = self.function_index(f.entry);
                     let index = self.builder.ins().iconst(types::I64, index as i64);
-                    let arity = self.builder.ins().iconst(types::I64, arity as i64);
+                    let arity = self.builder.ins().iconst(types::I64, f.arity as i64);
                     let ptr = self.spill(&[]);
                     let zero = self.builder.ins().iconst(types::I64, 0);
                     let v = self.helper(self.jit.helpers.closure, &[index, arity, ptr, zero]);
@@ -1483,6 +1663,46 @@ impl Fx<'_, '_> {
             let callee = self.boxed(callee);
             return self.call_value(callee, args, scope);
         }
+        if let Denotes::Compiled(f) = &denotes {
+            if f.arity != args.len() {
+                return self.refuse(format!(
+                    "`{}` is called with {} arguments and takes {}",
+                    q.symbol(),
+                    args.len(),
+                    f.arity
+                ));
+            }
+            // A pure nullary definition whose value is a handle is remembered by the runtime's
+            // memo; one that answers a register is cheaper to call than to look up.
+            if f.arity == 0 && f.sig.ret == Kind::Boxed && self.jit.constants.contains(&f.typed) {
+                let index = self.function_index(f.entry);
+                let index = self.builder.ins().iconst(types::I64, index as i64);
+                let v = self.helper(self.jit.helpers.constant, &[index]);
+                self.check();
+                return Ok(Val {
+                    kind: Kind::Boxed,
+                    v,
+                });
+            }
+            // A direct call: each argument in the register kind the callee's signature names. A
+            // compiled callee owns its handle parameters — each is a last use or a fresh duplicate
+            // by the read rule — and takes each at its own last use.
+            let mut vals = Vec::with_capacity(args.len() + 1);
+            vals.push(self.ctx);
+            for (a, kind) in args.iter().zip(&f.sig.params) {
+                let v = self.consumed(a, scope)?;
+                let v = self.coerce(v, *kind);
+                vals.push(v);
+            }
+            let callee = self
+                .jit
+                .module
+                .declare_func_in_func(f.typed, self.builder.func);
+            let call = self.builder.ins().call(callee, &vals);
+            let v = self.builder.inst_results(call)[0];
+            self.check();
+            return Ok(Val { kind: f.sig.ret, v });
+        }
         let mut handles = Vec::with_capacity(args.len());
         for a in args {
             let v = self.consumed(a, scope)?;
@@ -1491,33 +1711,7 @@ impl Fx<'_, '_> {
         }
         let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
         let v = match denotes {
-            Denotes::Compiled(id, arity) => {
-                if arity != handles.len() {
-                    return self.refuse(format!(
-                        "`{}` is called with {} arguments and takes {arity}",
-                        q.symbol(),
-                        handles.len()
-                    ));
-                }
-                if arity == 0 && self.jit.constants.contains(&id) {
-                    let index = self.function_index(id);
-                    let index = self.builder.ins().iconst(types::I64, index as i64);
-                    let v = self.helper(self.jit.helpers.constant, &[index]);
-                    self.check();
-                    return Ok(Val {
-                        kind: Kind::Boxed,
-                        v,
-                    });
-                }
-                // A compiled callee owns its parameters — each handle is a last use or a fresh
-                // duplicate by the read rule — and takes each at its own last use.
-                let ptr = self.spill(&handles);
-                let callee = self.jit.module.declare_func_in_func(id, self.builder.func);
-                let call = self.builder.ins().call(callee, &[self.ctx, ptr]);
-                let v = self.builder.inst_results(call)[0];
-                self.check();
-                v
-            }
+            Denotes::Compiled(_) => unreachable!("a compiled callee is called directly above"),
             Denotes::Uncompiled(target) => {
                 return self.refuse(format!(
                     "a call to `{target}`, which is not in this compiled unit"
