@@ -780,8 +780,9 @@ Everything here cost this audit real time. In descending order of cost.
    2026-08-31**, when the crate moved to cranelift 0.132.3 and its CI job to
    1.93.1. This item read *"the toolchain wall stands"*. The crate is still
    outside `--workspace`, so it rots silently and has done so twice — and a
-   third way that no toolchain would have caught: its agreement corpus is red
-   and `cargo test` does not run it (`CONTRIBUTING.md` item 18). Its
+   third way that no toolchain would have caught: its agreement corpus went
+   red while `cargo test` said nothing, because no test ran it (closed as
+   `CONTRIBUTING.md` item 18; the suite runs the command now). Its
    `--half` invocation also needs `--bin ply-codegen-spike` now that the crate
    ships two binaries. §1.
 2. ~~**`examples/same-tests.sh` never builds the binary it runs.** Build release
