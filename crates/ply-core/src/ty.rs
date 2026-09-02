@@ -260,6 +260,13 @@ impl Type {
 /// The builtin type constructor the secret containment claim is about.
 pub const SECRET: &str = "Secret";
 
+/// `Some(n)` when a record's `len` fields are exactly `_0` to `_{n-1}` — the record a tuple is
+/// sugar for (GUIDE §5.3) — so it can be shown as the tuple it was written as. Two or more make
+/// a tuple, so a lone `_0` is a record.
+pub fn tuple_arity(len: usize, has: impl Fn(&Symbol) -> bool) -> Option<usize> {
+    (len >= 2 && (0..len).all(|i| has(&Symbol::new(format!("_{i}"))))).then_some(len)
+}
+
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -282,6 +289,12 @@ impl fmt::Display for Type {
                 Ok(())
             }
             Type::Record(fields) => {
+                if let Some(n) = tuple_arity(fields.len(), |k| fields.contains_key(k)) {
+                    let ts: Vec<String> = (0..n)
+                        .map(|i| fields[&Symbol::new(format!("_{i}"))].to_string())
+                        .collect();
+                    return write!(f, "({})", ts.join(", "));
+                }
                 let fs: Vec<String> = fields.iter().map(|(k, v)| format!("{k}: {v}")).collect();
                 write!(f, "{{{}}}", fs.join(", "))
             }
