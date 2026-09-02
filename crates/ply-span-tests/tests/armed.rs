@@ -1651,14 +1651,30 @@ fn a_codes_path_is_recognised_however_it_is_qualified() {
 /// Production files that install a compiled backend, and the reason each is allowed to, in the
 /// shape `UNARMED_CODES` uses and for the same reason: a route that appears without anybody
 /// deciding it should must look different from one that was decided on.
-const BACKEND_INSTALLERS: &[(&str, &str)] = &[(
-    "crates/ply-test/src/lib.rs",
-    "`InterpExecutor::machine_lowering`, installing what `InterpExecutor::with_backend` \
-     was handed. It is the only route a shipping command has, and `ply test` arms the \
-     cache rule on it twice: `cache_bypassed` reads `args.backend` so nothing is read, \
-     and `run_with` records `Record::Backend` so nothing is written. \
-     crates/ply-cli/tests/suite/backend.rs holds both, each seen to fail.",
-)];
+const BACKEND_INSTALLERS: &[(&str, &str)] = &[
+    (
+        "crates/ply-test/src/lib.rs",
+        "`InterpExecutor::machine_lowering`, installing what `InterpExecutor::with_backend` \
+         was handed. It is the route `ply test` has, and it arms the cache rule on it \
+         twice: `cache_bypassed` reads `args.backend` so nothing is read, and `run_with` \
+         records `Record::Backend` so nothing is written. \
+         crates/ply-cli/tests/suite/backend.rs holds both, each seen to fail.",
+    ),
+    (
+        "crates/ply-cli/src/commands/run.rs",
+        "`evaluate`, installing what `ply run --backend` names on the machine that runs \
+         `main`. `ply run` has no result cache: nothing it answers is a `Pass`, nothing is \
+         read before `main` and nothing is recorded after it, so neither half of the rule \
+         has a route to break. `run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse` \
+         in crates/ply-cli/tests/suite/backend.rs runs `main` under both backends and was \
+         seen to fail, on the seam memo walking a scalar answer for parts.",
+    ),
+    (
+        "crates/ply-cli/src/artifact.rs",
+        "`evaluate`, the same flag over a `.plyx`: the artifact's verified definitions run \
+         under the backend, and an artifact run has no result cache either.",
+    ),
+];
 
 /// A backend installed by a route the cache rule does not know about.
 #[test]
