@@ -1665,7 +1665,9 @@ impl Fx<'_, '_> {
     /// list pattern that is only a rest.
     fn binds_without_test(&self, pat: &Pat) -> bool {
         match pat {
-            Pat::Record { fields, .. } => fields.iter().all(|(_, sub)| self.binds_without_test(sub)),
+            Pat::Record { fields, .. } => {
+                fields.iter().all(|(_, sub)| self.binds_without_test(sub))
+            }
             Pat::List { items, rest } => {
                 items.is_empty() && rest.as_ref().is_some_and(|r| self.binds_without_test(r))
             }
