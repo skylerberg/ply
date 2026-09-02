@@ -141,10 +141,12 @@ impl Ctx {
             self.unclosed_entries += 1;
             self.end();
         }
+        heap::enter(&mut self.heap);
     }
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        heap::leave();
         self.last_entry = self.heap.allocated();
         self.heap.end();
     }
