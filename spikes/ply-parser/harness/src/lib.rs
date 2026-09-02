@@ -47,6 +47,120 @@ pub fn reference_dump_expanded(text: &str) -> String {
     dump_of(text, &module, &diags)
 }
 
+/// The reference's check of a program given as `(module name, source)` pairs: the rewrites, the
+/// resolver and `check_program` in the driver's order, dumped for the fourth differential.
+pub fn reference_check_dump(modules: &[(String, String)]) -> String {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (module, _) =
+            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        program.modules.push(module);
+    }
+    let mut out = String::new();
+    out.push_str(&format!("K;{};", modules.len()));
+    let resolved = match ply_syntax::resolve::resolve(&mut program) {
+        Ok(r) => r,
+        Err(diags) => {
+            out.push_str("X;");
+            resolve_diags(&mut out, &diags);
+            return out;
+        }
+    };
+    match ply_core::check_program(&program, &resolved) {
+        Ok(check) => {
+            for (name, def) in &check.defs {
+                out.push_str(&format!(
+                    "F;{name};{};{};{};{};{};",
+                    ply_core::print_scheme(&def.scheme),
+                    footprint_text(&def.footprint),
+                    footprint_text(&def.performed),
+                    def.constraints
+                        .iter()
+                        .map(|c| format!("{}{}", c.deriver, c.param))
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    if def.internally_effectful { 1 } else { 0 }
+                ));
+            }
+            for t in &check.tests {
+                out.push_str(&format!(
+                    "T;{};{};{};",
+                    t.key,
+                    if t.nondet { 1 } else { 0 },
+                    footprint_text(&t.footprint)
+                ));
+            }
+            for l in &check.laws {
+                let binders: Vec<String> = l
+                    .binders
+                    .iter()
+                    .map(|b| format!("{}:{}", b.name, ply_core::print_type(&b.ty)))
+                    .collect();
+                out.push_str(&format!(
+                    "L;{};{};{};{};{};",
+                    l.key,
+                    binders.join(","),
+                    if l.has_guard { 1 } else { 0 },
+                    if l.host { 1 } else { 0 },
+                    footprint_text(&l.footprint)
+                ));
+            }
+            for (name, e) in &check.effects {
+                if e.module.is_anonymous() {
+                    continue;
+                }
+                let ops: Vec<String> = e
+                    .ops
+                    .values()
+                    .map(|o| {
+                        let params: Vec<String> =
+                            o.params.iter().map(ply_core::print_type).collect();
+                        format!(
+                            "{}:{}:{}:{}:{}",
+                            o.name,
+                            o.mode.as_str(),
+                            if o.resource_param { 1 } else { 0 },
+                            params.join("+"),
+                            ply_core::print_type(&o.ret)
+                        )
+                    })
+                    .collect();
+                out.push_str(&format!(
+                    "E;{name};{};{};",
+                    if e.nondet { 1 } else { 0 },
+                    ops.join(",")
+                ));
+            }
+            for (name, c) in &check.ctors {
+                if c.module.is_anonymous() {
+                    continue;
+                }
+                out.push_str(&format!(
+                    "C;{name};{};{};{};{};",
+                    c.type_name,
+                    c.index,
+                    c.arity,
+                    ply_core::print_scheme(&c.scheme)
+                ));
+            }
+        }
+        Err(diags) => {
+            out.push_str("X;");
+            resolve_diags(&mut out, &diags);
+        }
+    }
+    out
+}
+
+fn footprint_text(f: &ply_core::Footprint) -> String {
+    f.atoms()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// **The tree half of the same cost: how many nodes the three rewrites add.** Signed, because
 /// two rewrites remove nodes: `try_op` unwraps a `?` it refused (one node fewer, and a
 /// diagnostic the other half counts), and `record_update` drops the base of an update that

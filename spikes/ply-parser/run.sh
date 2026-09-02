@@ -78,6 +78,15 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-rewrite.log || {
   exit 1
 }
 
+echo
+echo "==> the fourth differential: infer.ply against crates/ply-core's checker"
+PLY_BIN="$root/target/release/ply" cargo test --test infer -- --nocapture --test-threads=2 |
+  tee /tmp/ply-parser-infer.log
+grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-infer.log || {
+  echo "the checker differential ran no tests at all -- see the note above" >&2
+  exit 1
+}
+
 if [ "${1:-}" = "--arm" ]; then
   echo
   echo "==> arming it: twenty-two corruptions of the Ply parser, each seen to go red"

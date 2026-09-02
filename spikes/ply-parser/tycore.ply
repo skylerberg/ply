@@ -1,0 +1,638 @@
+// tycore.ply — `crates/ply-core`'s `ty.rs`, `unify.rs`, `env.rs` and `print.rs`,
+// ported: the type language, the substitution and unification over it, the
+// type environment with instantiation and generalization, and the printer the
+// reference publishes schemes with. `infer.ply` is the checker over these.
+//
+// A `BTreeSet` of atoms is a sorted list here, a `BTreeMap` of fields a list
+// sorted by name, and the substitution's maps are `Map`s, which a program the
+// size of the standard library needs to be logarithmic.
+
+import types (Mode, MRead, MWrite, MBad)
+
+// --- Atoms and rows ---------------------------------------------------------------
+
+pub type Resource = | RNamed(Bytes) | RSingleton
+
+pub type Atom = { effect: Bytes, resource: Resource, mode: Mode }
+
+// Sorted by (effect, resource, mode), `Named` before `Singleton`, `Read` before
+// `Write`: the order the reference's `BTreeSet<EffectAtom>` keeps.
+pub type Row = { atoms: List<Atom>, tail: Option<Int> }
+
+pub fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare(a, b) { Less -> true, _ -> false }
+
+fn resource_lt(a: Resource, b: Resource) -> Bool =
+  match a {
+    RNamed(x) -> match b { RNamed(y) -> bytes_lt(x, y), RSingleton -> true },
+    RSingleton -> false,
+  }
+
+fn mode_rank(m: Mode) -> Int = match m { MRead -> 0, MWrite -> 1, MBad -> 2 }
+
+pub fn atom_lt(a: Atom, b: Atom) -> Bool =
+  bytes_lt(a.effect, b.effect)
+  || (a.effect == b.effect && (resource_lt(a.resource, b.resource)
+     || (a.resource == b.resource && mode_rank(a.mode) < mode_rank(b.mode))))
+
+pub fn atom_conflicts(a: Atom, b: Atom) -> Bool =
+  a.effect == b.effect && a.resource == b.resource
+  && (mode_rank(a.mode) == 1 || mode_rank(b.mode) == 1)
+
+// A sorted, duplicate-free list with `x` in its place.
+pub fn atoms_insert(xs: List<Atom>, x: Atom) -> List<Atom> = {
+  let n = len(xs);
+  let i = fold(range(0, n), n, |acc: Int, j: Int|
+    if acc < n { acc } else if atom_lt(x, at(xs, j)) || at(xs, j) == x { j } else { acc });
+  if i < n && at(xs, i) == x { xs } else { append(push(take(xs, i), x), drop(xs, i)) }
+}
+
+pub fn atoms_union(a: List<Atom>, b: List<Atom>) -> List<Atom> =
+  fold(b, a, |acc: List<Atom>, x: Atom| atoms_insert(acc, x))
+
+pub fn atoms_contains(xs: List<Atom>, x: Atom) -> Bool =
+  fold(xs, false, |acc: Bool, y: Atom| acc || y == x)
+
+pub fn atoms_difference(a: List<Atom>, b: List<Atom>) -> List<Atom> =
+  filter(a, |x: Atom| !atoms_contains(b, x))
+
+pub fn row_empty() -> Row = { atoms: [], tail: None }
+pub fn row_open(v: Int) -> Row = { atoms: [], tail: Some(v) }
+pub fn row_closed(atoms: List<Atom>) -> Row = { atoms: fold(atoms, [], |acc: List<Atom>, x: Atom| atoms_insert(acc, x)), tail: None }
+pub fn row_singleton(a: Atom) -> Row = { atoms: [a], tail: None }
+pub fn row_is_pure(r: Row) -> Bool = len(r.atoms) == 0 && (match r.tail { None -> true, Some(_) -> false })
+
+pub fn row_union(a: Row, b: Row) -> Row =
+  { atoms: atoms_union(a.atoms, b.atoms), tail: match a.tail { Some(_) -> a.tail, None -> b.tail } }
+
+pub fn row_without(r: Row, removed: List<Atom>) -> Row =
+  { atoms: atoms_difference(r.atoms, removed), tail: r.tail }
+
+// --- Types -------------------------------------------------------------------------
+
+pub type Field = { name: Bytes, ty: Type }
+
+pub type Type =
+  | TyVar(Int)
+  | TyCon({ name: Bytes, args: List<Type> })
+  | TyFn({ params: List<Type>, ret: Type, effects: Row })
+  // Sorted by field name: the reference's `BTreeMap`.
+  | TyRecord(List<Field>)
+
+pub type Scheme = { ty_vars: List<Int>, row_vars: List<Int>, ty: Type }
+
+pub fn con(name: Bytes) -> Type = TyCon({ name: name, args: [] })
+pub fn con1(name: Bytes, a: Type) -> Type = TyCon({ name: name, args: [a] })
+pub fn t_int() -> Type = con(b"Int")
+pub fn t_bool() -> Type = con(b"Bool")
+pub fn t_string() -> Type = con(b"String")
+pub fn t_bytes() -> Type = con(b"Bytes")
+pub fn t_float() -> Type = con(b"Float")
+pub fn t_decimal() -> Type = con(b"Decimal")
+pub fn t_unit() -> Type = con(b"Unit")
+pub fn t_list(a: Type) -> Type = con1(b"List", a)
+pub fn t_option(a: Type) -> Type = con1(b"Option", a)
+pub fn t_map(k: Type, v: Type) -> Type = TyCon({ name: b"Map", args: [k, v] })
+pub fn t_iter(s: Type, r: Type) -> Type = TyCon({ name: b"Iter", args: [s, r] })
+pub fn t_secret(a: Type) -> Type = con1(b"Secret", a)
+pub fn t_fn(params: List<Type>, ret: Type, effects: Row) -> Type = TyFn({ params: params, ret: ret, effects: effects })
+pub fn mono(t: Type) -> Scheme = { ty_vars: [], row_vars: [], ty: t }
+
+pub fn fields_sorted(fs: List<Field>) -> List<Field> =
+  fold(fs, [], |acc: List<Field>, f: Field| field_insert(acc, f))
+
+// Later entries win, as a `BTreeMap` built by insertion does.
+fn field_insert(sorted: List<Field>, f: Field) -> List<Field> = {
+  let n = len(sorted);
+  let i = fold(range(0, n), n, |acc: Int, j: Int|
+    if acc < n { acc } else if !bytes_lt(at(sorted, j).name, f.name) { j } else { acc });
+  if i < n && at(sorted, i).name == f.name { set_at(sorted, i, f) } else { append(push(take(sorted, i), f), drop(sorted, i)) }
+}
+
+pub fn field_get(fs: List<Field>, name: Bytes) -> Option<Type> =
+  fold(fs, None, |acc: Option<Type>, f: Field| match acc { Some(_) -> acc, None -> if f.name == name { Some(f.ty) } else { None } })
+
+pub fn mentions_secret(t: Type) -> Bool =
+  match t {
+    TyCon(c) -> c.name == b"Secret" || fold(c.args, false, |acc: Bool, a: Type| acc || mentions_secret(a)),
+    TyFn(f) -> fold(f.params, false, |acc: Bool, p: Type| acc || mentions_secret(p)) || mentions_secret(f.ret),
+    TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || mentions_secret(f.ty)),
+    TyVar(_) -> false,
+  }
+
+// `tuple_arity`: two or more fields named `_0`, `_1`, ... in full.
+pub fn tuple_arity(fs: List<Field>) -> Option<Int> = {
+  let n = len(fs);
+  if n < 2 { None } else {
+    let all = fold(range(0, n), true, |acc: Bool, i: Int|
+      acc && (match field_get(fs, bytes_concat(b"_", bytes_of_string(int_to_string(i)))) { Some(_) -> true, None -> false }));
+    if all { Some(n) } else { None }
+  }
+}
+
+// --- Small list helpers ---------------------------------------------------------------
+
+pub fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the checker does not hold") }
+
+pub fn set_at<a>(xs: List<a>, i: Int, v: a) -> List<a> =
+  map(range(0, len(xs)), |j: Int| if j == i { v } else { at(xs, j) })
+
+pub fn take<a>(xs: List<a>, n: Int) -> List<a> = map(range(0, n), |i: Int| at(xs, i))
+
+pub fn drop<a>(xs: List<a>, n: Int) -> List<a> = map(range(n, len(xs)), |i: Int| at(xs, i))
+
+pub fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+pub fn contains_int(xs: List<Int>, v: Int) -> Bool = fold(xs, false, |acc: Bool, x: Int| acc || x == v)
+
+pub fn contains_bytes(xs: List<Bytes>, v: Bytes) -> Bool = fold(xs, false, |acc: Bool, x: Bytes| acc || x == v)
+
+// A sorted, duplicate-free list of ints: the reference's `BTreeSet<TyVar>`.
+pub fn ints_insert(xs: List<Int>, v: Int) -> List<Int> = {
+  let n = len(xs);
+  let i = fold(range(0, n), n, |acc: Int, j: Int| if acc < n { acc } else if at(xs, j) >= v { j } else { acc });
+  if i < n && at(xs, i) == v { xs } else { append(push(take(xs, i), v), drop(xs, i)) }
+}
+
+pub fn ints_union(a: List<Int>, b: List<Int>) -> List<Int> = fold(b, a, |acc: List<Int>, v: Int| ints_insert(acc, v))
+
+pub fn ints_difference(a: List<Int>, b: List<Int>) -> List<Int> = filter(a, |v: Int| !contains_int(b, v))
+
+// --- Fresh variables and the substitution -----------------------------------------------
+
+pub type Fresh = { next_ty: Int, next_row: Int }
+
+pub fn fresh_new() -> Fresh = { next_ty: 0, next_row: 0 }
+
+pub fn fresh_ty_var(f: Fresh) -> { f: Fresh, v: Int } = { f: { next_ty: f.next_ty + 1, next_row: f.next_row }, v: f.next_ty }
+pub fn fresh_ty(f: Fresh) -> { f: Fresh, t: Type } = { let o = fresh_ty_var(f); { f: o.f, t: TyVar(o.v) } }
+pub fn fresh_row_var(f: Fresh) -> { f: Fresh, v: Int } = { f: { next_ty: f.next_ty, next_row: f.next_row + 1 }, v: f.next_row }
+pub fn fresh_row(f: Fresh) -> { f: Fresh, r: Row } = { let o = fresh_row_var(f); { f: o.f, r: row_open(o.v) } }
+
+pub type Subst = { ty: Map<Int, Type>, row: Map<Int, Row>, rigid_ty: Map<Int, Bool>, rigid_row: Map<Int, Bool> }
+
+pub fn subst_new() -> Subst = { ty: map_new(), row: map_new(), rigid_ty: map_new(), rigid_row: map_new() }
+
+pub fn mark_rigid_ty(s: Subst, v: Int) -> Subst = { ty: s.ty, row: s.row, rigid_ty: map_insert(s.rigid_ty, v, true), rigid_row: s.rigid_row }
+pub fn mark_rigid_row(s: Subst, v: Int) -> Subst = { ty: s.ty, row: s.row, rigid_ty: s.rigid_ty, rigid_row: map_insert(s.rigid_row, v, true) }
+pub fn is_rigid_ty(s: Subst, v: Int) -> Bool = map_contains(s.rigid_ty, v)
+pub fn is_rigid_row(s: Subst, v: Int) -> Bool = map_contains(s.rigid_row, v)
+
+// The variable chain followed to its end; a bound is followed at most as many times as there are
+// bindings, since a binding never makes a cycle.
+pub fn shallow(s: Subst, t: Type) -> Type =
+  iterate(t, map_len(s.ty) + 2, |cur: Type|
+    match cur {
+      TyVar(v) -> match map_get(s.ty, v) { Some(next) -> Continue(next), None -> Stop(cur) },
+      _ -> Stop(cur),
+    })
+
+pub fn resolve_ty(s: Subst, t: Type) -> Type =
+  match shallow(s, t) {
+    TyVar(v) -> TyVar(v),
+    TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| resolve_ty(s, a)) }),
+    TyFn(f) -> TyFn({ params: map(f.params, |p: Type| resolve_ty(s, p)), ret: resolve_ty(s, f.ret), effects: resolve_row(s, f.effects) }),
+    TyRecord(fs) -> TyRecord(map(fs, |f: Field| { name: f.name, ty: resolve_ty(s, f.ty) })),
+  }
+
+pub fn resolved_tail(s: Subst, r: Row) -> Option<Int> = {
+  let bound = map_len(s.row);
+  iterate({ tail: r.tail, hops: 0 }, bound + 2, |st: { tail: Option<Int>, hops: Int }|
+    match st.tail {
+      None -> Stop(None),
+      Some(v) ->
+        match map_get(s.row, v) {
+          Some(next) ->
+            if next.tail == Some(v) { Stop(Some(v)) }
+            else if st.hops + 1 > bound { Stop(next.tail) }
+            else { Continue({ tail: next.tail, hops: st.hops + 1 }) },
+          None -> Stop(Some(v)),
+        },
+    })
+}
+
+pub fn resolve_row(s: Subst, r: Row) -> Row = {
+  let bound = map_len(s.row);
+  iterate({ atoms: r.atoms, tail: r.tail, seen: [] }, bound + 2, |st: { atoms: List<Atom>, tail: Option<Int>, seen: List<Int> }|
+    match st.tail {
+      None -> Stop({ atoms: st.atoms, tail: None }),
+      Some(v) ->
+        if contains_int(st.seen, v) { Stop({ atoms: st.atoms, tail: st.tail }) } else {
+          match map_get(s.row, v) {
+            Some(next) -> Continue({ atoms: atoms_union(st.atoms, next.atoms), tail: next.tail, seen: push(st.seen, v) }),
+            None -> Stop({ atoms: st.atoms, tail: st.tail }),
+          }
+        },
+    })
+}
+
+pub fn occurs_ty(v: Int, t: Type) -> Bool =
+  match t {
+    TyVar(w) -> w == v,
+    TyCon(c) -> fold(c.args, false, |acc: Bool, a: Type| acc || occurs_ty(v, a)),
+    TyFn(f) -> fold(f.params, false, |acc: Bool, p: Type| acc || occurs_ty(v, p)) || occurs_ty(v, f.ret),
+    TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || occurs_ty(v, f.ty)),
+  }
+
+pub type UnifyError =
+  | Mismatch({ expected: Type, found: Type })
+  | Arity({ expected: Int, found: Int })
+  | OccursTy({ v: Int, ty: Type })
+  | OccursRow({ v: Int, row: Row })
+  | RowMismatch({ expected: Row, found: Row })
+
+pub type Unified = { s: Subst, f: Fresh, err: Option<UnifyError> }
+
+fn ok(s: Subst, f: Fresh) -> Unified = { s: s, f: f, err: None }
+fn failed(s: Subst, f: Fresh, e: UnifyError) -> Unified = { s: s, f: f, err: Some(e) }
+
+fn bind_ty(s: Subst, f: Fresh, v: Int, t: Type) -> Unified = {
+  let r = resolve_ty(s, t);
+  if r == TyVar(v) { ok(s, f) }
+  else if occurs_ty(v, r) { failed(s, f, OccursTy({ v: v, ty: r })) }
+  else { ok({ ty: map_insert(s.ty, v, r), row: s.row, rigid_ty: s.rigid_ty, rigid_row: s.rigid_row }, f) }
+}
+
+fn bind_row(s: Subst, f: Fresh, v: Int, r: Row) -> Unified =
+  if len(r.atoms) == 0 && r.tail == Some(v) { ok(s, f) }
+  else if r.tail == Some(v) { failed(s, f, OccursRow({ v: v, row: r })) }
+  else { ok({ ty: s.ty, row: map_insert(s.row, v, r), rigid_ty: s.rigid_ty, rigid_row: s.rigid_row }, f) }
+
+pub fn solve_continuation_row(s: Subst, v: Int, row: Row) -> Subst =
+  if map_contains(s.row, v) { s } else {
+    let solved = resolve_row(s, row);
+    let closed = if solved.tail == Some(v) { { atoms: solved.atoms, tail: None } } else { solved };
+    { ty: s.ty, row: map_insert(s.row, v, closed), rigid_ty: s.rigid_ty, rigid_row: s.rigid_row }
+  }
+
+pub type Free = { tys: List<Int>, rows: List<Int> }
+
+pub fn free_vars(s: Subst, t: Type, acc: Free) -> Free =
+  match shallow(s, t) {
+    TyVar(v) -> { tys: ints_insert(acc.tys, v), rows: acc.rows },
+    TyCon(c) -> fold(c.args, acc, |a: Free, x: Type| free_vars(s, x, a)),
+    TyFn(fn_) -> {
+      let ps = fold(fn_.params, acc, |a: Free, x: Type| free_vars(s, x, a));
+      let r = free_vars(s, fn_.ret, ps);
+      match resolved_tail(s, fn_.effects) { Some(v) -> { tys: r.tys, rows: ints_insert(r.rows, v) }, None -> r }
+    },
+    TyRecord(fs) -> fold(fs, acc, |a: Free, f: Field| free_vars(s, f.ty, a)),
+  }
+
+// `unify`, with the pair the mismatch names taken before either side moved.
+pub fn unify(s: Subst, f: Fresh, expected: Type, found: Type) -> Unified = {
+  let a = shallow(s, expected);
+  let b = shallow(s, found);
+  match a {
+    TyVar(x) ->
+      match b {
+        TyVar(y) -> if x == y { ok(s, f) } else if !is_rigid_ty(s, x) { bind_ty(s, f, x, b) }
+                    else if !is_rigid_ty(s, y) { bind_ty(s, f, y, a) } else { failed(s, f, Mismatch({ expected: a, found: b })) },
+        _ -> if !is_rigid_ty(s, x) { bind_ty(s, f, x, b) } else { failed(s, f, Mismatch({ expected: a, found: b })) },
+      },
+    _ ->
+      match b {
+        TyVar(y) -> if !is_rigid_ty(s, y) { bind_ty(s, f, y, a) } else { failed(s, f, Mismatch({ expected: a, found: b })) },
+        _ -> unify_structural(s, f, a, b),
+      },
+  }
+}
+
+fn unify_structural(s: Subst, f: Fresh, a: Type, b: Type) -> Unified =
+  match a {
+    TyCon(c1) ->
+      match b {
+        TyCon(c2) ->
+          if c1.name != c2.name || len(c1.args) != len(c2.args) { failed(s, f, Mismatch({ expected: a, found: b })) }
+          else { unify_all(s, f, c1.args, c2.args) },
+        _ -> failed(s, f, Mismatch({ expected: a, found: b })),
+      },
+    TyFn(f1) ->
+      match b {
+        TyFn(f2) ->
+          if len(f1.params) != len(f2.params) { failed(s, f, Arity({ expected: len(f1.params), found: len(f2.params) })) }
+          else {
+            let ps = unify_all(s, f, f1.params, f2.params);
+            match ps.err {
+              Some(_) -> ps,
+              None -> {
+                let r = unify(ps.s, ps.f, f1.ret, f2.ret);
+                match r.err { Some(_) -> r, None -> unify_row(r.s, r.f, f1.effects, f2.effects) }
+              },
+            }
+          },
+        _ -> failed(s, f, Mismatch({ expected: a, found: b })),
+      },
+    TyRecord(fs1) ->
+      match b {
+        TyRecord(fs2) ->
+          if len(fs1) != len(fs2) || map(fs1, |x: Field| x.name) != map(fs2, |x: Field| x.name) { failed(s, f, Mismatch({ expected: a, found: b })) }
+          else { unify_all(s, f, map(fs1, |x: Field| x.ty), map(fs2, |x: Field| x.ty)) },
+        _ -> failed(s, f, Mismatch({ expected: a, found: b })),
+      },
+    TyVar(_) -> failed(s, f, Mismatch({ expected: a, found: b })),
+  }
+
+fn unify_all(s: Subst, f: Fresh, xs: List<Type>, ys: List<Type>) -> Unified =
+  fold(range(0, len(xs)), ok(s, f), |acc: Unified, i: Int|
+    match acc.err { Some(_) -> acc, None -> unify(acc.s, acc.f, at(xs, i), at(ys, i)) })
+
+pub fn unify_row(s: Subst, f: Fresh, expected: Row, found: Row) -> Unified = {
+  let a = resolve_row(s, expected);
+  let b = resolve_row(s, found);
+  let only_a = atoms_difference(a.atoms, b.atoms);
+  let only_b = atoms_difference(b.atoms, a.atoms);
+  let bad = RowMismatch({ expected: a, found: b });
+  match a.tail {
+    None ->
+      match b.tail {
+        None -> if len(only_a) == 0 && len(only_b) == 0 { ok(s, f) } else { failed(s, f, bad) },
+        Some(v) -> if len(only_b) > 0 || is_rigid_row(s, v) { failed(s, f, bad) } else { bind_row(s, f, v, row_closed(only_a)) },
+      },
+    Some(v1) ->
+      match b.tail {
+        None -> if len(only_a) > 0 || is_rigid_row(s, v1) { failed(s, f, bad) } else { bind_row(s, f, v1, row_closed(only_b)) },
+        Some(v2) ->
+          if v1 == v2 {
+            if len(only_a) == 0 && len(only_b) == 0 { ok(s, f) }
+            else if is_rigid_row(s, v1) { failed(s, f, bad) }
+            else {
+              let nv = fresh_row_var(f);
+              bind_row(s, nv.f, v1, { atoms: atoms_union(only_a, only_b), tail: Some(nv.v) })
+            }
+          } else {
+            let r1 = is_rigid_row(s, v1);
+            let r2 = is_rigid_row(s, v2);
+            if r1 && r2 { failed(s, f, bad) }
+            else if r1 { if len(only_b) > 0 { failed(s, f, bad) } else { bind_row(s, f, v2, { atoms: only_a, tail: Some(v1) }) } }
+            else if r2 { if len(only_a) > 0 { failed(s, f, bad) } else { bind_row(s, f, v1, { atoms: only_b, tail: Some(v2) }) } }
+            else {
+              let nv = fresh_row_var(f);
+              let first = bind_row(s, nv.f, v1, { atoms: only_b, tail: Some(nv.v) });
+              match first.err { Some(_) -> first, None -> bind_row(first.s, first.f, v2, { atoms: only_a, tail: Some(nv.v) }) }
+            }
+          },
+      },
+  }
+}
+
+// --- The environment ----------------------------------------------------------------------
+
+pub type Scope = { schemes: Map<Bytes, Scheme>, open: List<Bytes> }
+pub type TypeEnv = { scopes: List<Scope> }
+
+pub fn env_new() -> TypeEnv = { scopes: [{ schemes: map_new(), open: [] }] }
+pub fn env_push(e: TypeEnv) -> TypeEnv = { scopes: push(e.scopes, { schemes: map_new(), open: [] }) }
+pub fn env_pop(e: TypeEnv) -> TypeEnv = if len(e.scopes) > 1 { { scopes: take(e.scopes, len(e.scopes) - 1) } } else { e }
+
+pub fn env_bind(e: TypeEnv, name: Bytes, sc: Scheme) -> TypeEnv = {
+  let last = len(e.scopes) - 1;
+  let s = at(e.scopes, last);
+  { scopes: set_at(e.scopes, last, { schemes: map_insert(s.schemes, name, sc), open: push(s.open, name) }) }
+}
+
+pub fn env_bind_global(e: TypeEnv, name: Bytes, sc: Scheme) -> TypeEnv = {
+  let s = at(e.scopes, 0);
+  { scopes: set_at(e.scopes, 0, { schemes: map_insert(s.schemes, name, sc), open: push(s.open, name) }) }
+}
+
+pub fn env_remove_global(e: TypeEnv, name: Bytes) -> TypeEnv = {
+  let s = at(e.scopes, 0);
+  { scopes: set_at(e.scopes, 0, { schemes: map_remove(s.schemes, name), open: filter(s.open, |n: Bytes| n != name) }) }
+}
+
+pub fn env_lookup(e: TypeEnv, name: Bytes) -> Option<Scheme> =
+  fold(e.scopes, None, |acc: Option<Scheme>, s: Scope| match map_get(s.schemes, name) { Some(x) -> Some(x), None -> acc })
+
+// The innermost scope holding `name`, as a depth; `0` is the globals.
+pub fn env_depth_of(e: TypeEnv, name: Bytes) -> Option<Int> =
+  fold(range(0, len(e.scopes)), None, |acc: Option<Int>, i: Int|
+    if map_contains(at(e.scopes, i).schemes, name) { Some(i) } else { acc })
+
+pub fn env_locals(e: TypeEnv) -> List<{ name: Bytes, sc: Scheme }> =
+  fold(drop(e.scopes, 1), [], |acc: List<{ name: Bytes, sc: Scheme }>, s: Scope|
+    map_fold(s.schemes, acc, |a: List<{ name: Bytes, sc: Scheme }>, k: Bytes, v: Scheme| push(a, { name: k, sc: v })))
+
+fn scheme_free(s: Subst, sc: Scheme) -> Free = {
+  let fv = free_vars(s, sc.ty, { tys: [], rows: [] });
+  { tys: ints_difference(fv.tys, sc.ty_vars), rows: ints_difference(fv.rows, sc.row_vars) }
+}
+
+// `TypeEnv::free_vars`: the variables still reachable from the environment, and the environment
+// with every binding that reaches none closed.
+pub fn env_free_vars(s: Subst, e: TypeEnv) -> { e: TypeEnv, free: Free } = {
+  let walked = fold(e.scopes, { scopes: [], free: { tys: [], rows: [] } }, |acc: { scopes: List<Scope>, free: Free }, sc: Scope| {
+    let kept = fold(sc.open, { open: [], free: acc.free }, |a: { open: List<Bytes>, free: Free }, name: Bytes|
+      match map_get(sc.schemes, name) {
+        None -> a,
+        Some(scheme) -> {
+          let fv = scheme_free(s, scheme);
+          if len(fv.tys) == 0 && len(fv.rows) == 0 { a }
+          else { { open: push(a.open, name), free: { tys: ints_union(a.free.tys, fv.tys), rows: ints_union(a.free.rows, fv.rows) } } }
+        },
+      });
+    { scopes: push(acc.scopes, { schemes: sc.schemes, open: kept.open }), free: kept.free }
+  });
+  { e: { scopes: walked.scopes }, free: walked.free }
+}
+
+fn rename(t: Type, tys: Map<Int, Type>, rows: Map<Int, Int>) -> Type =
+  match t {
+    TyVar(v) -> match map_get(tys, v) { Some(x) -> x, None -> t },
+    TyCon(c) -> TyCon({ name: c.name, args: map(c.args, |a: Type| rename(a, tys, rows)) }),
+    TyFn(f) -> TyFn({ params: map(f.params, |p: Type| rename(p, tys, rows)), ret: rename(f.ret, tys, rows),
+                      effects: { atoms: f.effects.atoms, tail: match f.effects.tail { None -> None, Some(v) -> Some(match map_get(rows, v) { Some(w) -> w, None -> v }) } } }),
+    TyRecord(fs) -> TyRecord(map(fs, |x: Field| { name: x.name, ty: rename(x.ty, tys, rows) })),
+  }
+
+pub type Instantiated = { f: Fresh, ty: Type, args: List<Type> }
+
+pub fn instantiate_with(sc: Scheme, f: Fresh) -> Instantiated =
+  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { { f: f, ty: sc.ty, args: [] } } else {
+    let tys = fold(sc.ty_vars, { f: f, m: map_new(), args: [] }, |acc: { f: Fresh, m: Map<Int, Type>, args: List<Type> }, v: Int| {
+      let o = fresh_ty(acc.f);
+      { f: o.f, m: map_insert(acc.m, v, o.t), args: push(acc.args, o.t) }
+    });
+    let rows = fold(sc.row_vars, { f: tys.f, m: map_new() }, |acc: { f: Fresh, m: Map<Int, Int> }, v: Int| {
+      let o = fresh_row_var(acc.f);
+      { f: o.f, m: map_insert(acc.m, v, o.v) }
+    });
+    { f: rows.f, ty: rename(sc.ty, tys.m, rows.m), args: tys.args }
+  }
+
+pub fn instantiate(sc: Scheme, f: Fresh) -> { f: Fresh, ty: Type } = { let o = instantiate_with(sc, f); { f: o.f, ty: o.ty } }
+
+pub fn rename_scheme(sc: Scheme, ty_vars: List<Int>, row_vars: List<Int>) -> Type = {
+  let tys = fold(range(0, len(sc.ty_vars)), map_new(), |m: Map<Int, Type>, i: Int| map_insert(m, at(sc.ty_vars, i), TyVar(at(ty_vars, i))));
+  let rows = fold(range(0, len(sc.row_vars)), map_new(), |m: Map<Int, Int>, i: Int| map_insert(m, at(sc.row_vars, i), at(row_vars, i)));
+  rename(sc.ty, tys, rows)
+}
+
+pub fn generalize(s: Subst, e: TypeEnv, t: Type) -> { e: TypeEnv, sc: Scheme } = {
+  let ty = resolve_ty(s, t);
+  let env = env_free_vars(s, e);
+  let fv = free_vars(s, ty, { tys: [], rows: [] });
+  { e: env.e, sc: { ty_vars: ints_difference(fv.tys, env.free.tys), row_vars: ints_difference(fv.rows, env.free.rows), ty: ty } }
+}
+
+// --- The printer --------------------------------------------------------------------------
+
+pub type Printer = { ty_names: Map<Int, Bytes>, row_names: Map<Int, Bytes> }
+
+pub fn printer_new() -> Printer = { ty_names: map_new(), row_names: map_new() }
+
+fn ty_letters() -> Bytes = b"abcdghijklmnopqrsuvwxyz"
+fn row_letters() -> Bytes = b"eft"
+
+// `letter_name`: the `i`th name over an alphabet — a letter, then the letter with a number.
+fn letter_name(letters: Bytes, i: Int) -> Bytes = {
+  let n = bytes_len(letters);
+  let letter = bytes_slice(letters, i % n, i % n + 1);
+  if i < n { letter } else { bytes_concat(letter, bytes_of_string(int_to_string(i / n))) }
+}
+
+fn ty_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
+  match map_get(p.ty_names, v) {
+    Some(n) -> { p: p, name: n },
+    None -> {
+      let name = letter_name(ty_letters(), map_len(p.ty_names));
+      { p: { ty_names: map_insert(p.ty_names, v, name), row_names: p.row_names }, name: name }
+    },
+  }
+
+fn row_name(p: Printer, v: Int) -> { p: Printer, name: Bytes } =
+  match map_get(p.row_names, v) {
+    Some(n) -> { p: p, name: n },
+    None -> {
+      let name = letter_name(row_letters(), map_len(p.row_names));
+      { p: { ty_names: p.ty_names, row_names: map_insert(p.row_names, v, name) }, name: name }
+    },
+  }
+
+pub fn region_prefix() -> Bytes = b"#region:"
+
+pub fn region_of(t: Type) -> Option<Bytes> =
+  match t {
+    TyCon(c) -> if len(c.args) == 0 && bytes_starts_with(c.name, region_prefix()) { Some(bytes_slice(c.name, bytes_len(region_prefix()), bytes_len(c.name))) } else { None },
+    _ -> None,
+  }
+
+pub fn resource_text(r: Resource) -> Bytes = match r { RNamed(s) -> bytes_concat_all([b"[", s, b"]"]), RSingleton -> b"" }
+
+pub fn atom_text(a: Atom) -> Bytes =
+  bytes_concat_all([a.effect, b".", match a.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }, resource_text(a.resource)])
+
+fn join_bytes(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
+
+pub fn print_ty(p: Printer, t: Type) -> { p: Printer, s: Bytes } =
+  match t {
+    TyVar(v) -> { let o = ty_name(p, v); { p: o.p, s: o.name } },
+    TyCon(c) ->
+      if c.name == b"Cell" && len(c.args) == 2 {
+        let elem = print_ty(p, at(c.args, 1));
+        match region_of(at(c.args, 0)) {
+          Some(r) -> { p: elem.p, s: bytes_concat_all([b"Cell[", r, b"]<", elem.s, b">"]) },
+          None -> { p: elem.p, s: bytes_concat_all([b"Cell<", elem.s, b">"]) },
+        }
+      } else if len(c.args) == 0 { { p: p, s: c.name } }
+      else {
+        let args = print_tys(p, c.args);
+        { p: args.p, s: bytes_concat_all([c.name, b"<", join_bytes(args.ss, b", "), b">"]) }
+      },
+    TyFn(f) -> {
+      let ps = print_tys(p, f.params);
+      let r = print_ty(ps.p, f.ret);
+      let head = bytes_concat_all([b"(", join_bytes(ps.ss, b", "), b") -> ", r.s]);
+      if row_is_pure(f.effects) { { p: r.p, s: head } }
+      else { let row = print_row(r.p, f.effects); { p: row.p, s: bytes_concat_all([head, b" / ", row.s]) } }
+    },
+    TyRecord(fs) ->
+      match tuple_arity(fs) {
+        Some(n) -> {
+          let ts = print_tys(p, map(range(0, n), |i: Int|
+            match field_get(fs, bytes_concat(b"_", bytes_of_string(int_to_string(i)))) { Some(x) -> x, None -> panic("a tuple field") }));
+          { p: ts.p, s: bytes_concat_all([b"(", join_bytes(ts.ss, b", "), b")"]) }
+        },
+        None -> {
+          let out = fold(fs, { p: p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, f: Field| {
+            let v = print_ty(acc.p, f.ty);
+            { p: v.p, ss: push(acc.ss, bytes_concat_all([f.name, b": ", v.s])) }
+          });
+          { p: out.p, s: bytes_concat_all([b"{", join_bytes(out.ss, b", "), b"}"]) }
+        },
+      },
+  }
+
+fn print_tys(p: Printer, ts: List<Type>) -> { p: Printer, ss: List<Bytes> } =
+  fold(ts, { p: p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, t: Type| {
+    let o = print_ty(acc.p, t);
+    { p: o.p, ss: push(acc.ss, o.s) }
+  })
+
+pub fn print_row(p: Printer, r: Row) -> { p: Printer, s: Bytes } = {
+  let atoms = join_bytes(map(r.atoms, atom_text), b", ");
+  match r.tail {
+    None -> { p: p, s: bytes_concat_all([b"{", atoms, b"}"]) },
+    Some(v) -> {
+      let n = row_name(p, v);
+      if len(r.atoms) == 0 { { p: n.p, s: n.name } }
+      else { { p: n.p, s: bytes_concat_all([b"{", atoms, b" | ", n.name, b"}"]) } }
+    },
+  }
+}
+
+pub fn print_scheme(p: Printer, sc: Scheme) -> { p: Printer, s: Bytes } = {
+  let body = print_ty(p, sc.ty);
+  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { body } else {
+    let tys = fold(sc.ty_vars, { p: body.p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, v: Int| {
+      let o = ty_name(acc.p, v); { p: o.p, ss: push(acc.ss, o.name) } });
+    let rows = fold(sc.row_vars, { p: tys.p, ss: [] }, |acc: { p: Printer, ss: List<Bytes> }, v: Int| {
+      let o = row_name(acc.p, v); { p: o.p, ss: push(acc.ss, o.name) } });
+    let head = if len(tys.ss) > 0 && len(rows.ss) > 0 { bytes_concat_all([b"<", join_bytes(tys.ss, b", "), b" | ", join_bytes(rows.ss, b", "), b">"]) }
+               else if len(tys.ss) > 0 { bytes_concat_all([b"<", join_bytes(tys.ss, b", "), b">"]) }
+               else { bytes_concat_all([b"<| ", join_bytes(rows.ss, b", "), b">"]) };
+    { p: rows.p, s: bytes_concat(head, body.s) }
+  }
+}
+
+// `print_scheme` as the reference publishes it: a fresh printer per scheme.
+pub fn scheme_text(sc: Scheme) -> Bytes = print_scheme(printer_new(), sc).s
+pub fn type_text(t: Type) -> Bytes = print_ty(printer_new(), t).s
+pub fn row_text(r: Row) -> Bytes = print_row(printer_new(), r).s
+
+// --- Tests ------------------------------------------------------------------
+
+test "unification binds a variable once and refuses the occurs case" {
+  let f0 = fresh_new();
+  let a = fresh_ty(f0);
+  let u = unify(subst_new(), a.f, a.t, t_list(t_int()));
+  assert_eq(type_text(resolve_ty(u.s, a.t)), b"List<Int>");
+  let bad = unify(u.s, u.f, a.t, t_list(a.t));
+  assert_eq(match bad.err { Some(Mismatch(_)) -> 1, Some(_) -> 2, None -> 0 }, 1)
+}
+
+test "a row unifies atom-wise and a closed row refuses what it lacks" {
+  let db = { effect: b"db", resource: RNamed(b"users"), mode: MRead };
+  let f0 = fresh_new();
+  let e = fresh_row(f0);
+  let u = unify_row(subst_new(), e.f, e.r, row_singleton(db));
+  assert_eq(row_text(resolve_row(u.s, e.r)), b"{db.read[users]}");
+  let bad = unify_row(u.s, u.f, row_empty(), row_singleton(db));
+  assert(match bad.err { Some(RowMismatch(_)) -> true, _ -> false })
+}
+
+test "the printer names variables in the order it meets them, rows apart" {
+  let sc = { ty_vars: [7, 3], row_vars: [2], ty: t_fn([TyVar(3), TyVar(7)], t_list(TyVar(3)), row_open(2)) };
+  assert_eq(scheme_text(sc), b"<b, a | e>(a, b) -> List<a> / e");
+  assert_eq(type_text(TyRecord(fields_sorted([{ name: b"_1", ty: t_int() }, { name: b"_0", ty: t_bool() }]))), b"(Bool, Int)")
+}
+
+test "generalization skips what the environment still reaches" {
+  let f0 = fresh_new();
+  let a = fresh_ty(f0);
+  let b = fresh_ty(a.f);
+  let env = env_bind_global(env_new(), b"outer", mono(a.t));
+  let g = generalize(subst_new(), env, t_fn([a.t], b.t, row_empty()));
+  assert_eq(len(g.sc.ty_vars), 1)
+}

@@ -2049,3 +2049,51 @@ answers the node again. And the rewrites are not independent of the *order*
 `Parser::run` gives them — a `?` inside a written field of an update meets the
 record-update pass first, and the try pass then scans the record literal it
 became; the port keeps that order and the differential is what says it matters.
+
+---
+
+## §17 The checker, ported: `infer.rs` behind a fourth differential, and what its residue names
+
+`docs/BOOTSTRAP-PATH.md` step 6 called inference with rows "the hard one". This is
+its first stage: `tycore.ply` (`ty.rs`, `unify.rs`, `env.rs`, `print.rs` — the
+type language, the substitution and unification over it, the environment with
+instantiation and generalization, and the printer schemes are published with) and
+`infer.ply` (`infer.rs`: the prelude, the declarations, the signatures, the
+component-wise check of definitions with Tarjan's order, every expression form
+including `perform`, `handle`, cells, regions and `simulate`, numeric settling,
+the written-signature requirement, tests, laws, and the internal-effect marking).
+`check_dump` writes what `check_program` publishes — every definition's scheme,
+footprint, performed row, constraints and internal-effect flag; every test's and
+law's footprint; every effect and constructor — and `harness/tests/infer.rs`
+compares it with `reference_check_dump`.
+
+**What agrees.** The standard library as one program, and every example without a
+`derive` checked together with it, agreed on the port's first substantive run;
+the resolver's programs agree too. The one thing that stood between the first
+run and agreement was not the checker: a test label with a backslash crosses two
+escaping layers on its way out of `ply run --json`, and the harness's extractor
+had undone one. `arm-infer.sh` arms the comparison.
+
+**What the residue names.** `mine-checks.py` mines `crates/ply-core/src/tests.rs`
+the way `mine-fixtures.py` mines the parser's, and the port agrees with the
+reference on all but a pinned handful of those inputs — the count is in the test,
+and it can only shrink. Every one of them is a pass this stage leaves out, and
+the codes say which: the purity of spec clauses and law bodies, the
+quantifiability of a law's binders, a region escape, and the comparison of
+functions for equality. Those are passes over sites the walk already records,
+which is why they can follow separately.
+
+**What the language charged this time.** The same tax §15 and §16 met, and one
+more: a threaded state with thirty fields is written back in full at every step,
+so every `let` that is later updated needs its type written — which a checker,
+whose every step answers a state, does a few hundred times. The port did not need
+`Map` for anything but the substitution and the environment, where a program the
+size of the standard library needs the lookup to be logarithmic; everything the
+reference keeps in an `IndexMap` for its order is a list here, and the order is
+what the dump compares.
+
+**Not here yet.** The derive expansion runs before the checker and is not ported,
+so the two examples that `derive` are compared by neither side; the region escape
+checks, derivability and map-key checks, spec clauses, and the incremental
+`Known` interface the driver hands in. Each is a bounded port with the same
+instrument waiting for it.

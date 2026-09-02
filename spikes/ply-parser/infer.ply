@@ -1,0 +1,1968 @@
+// infer.ply — `crates/ply-core`'s `infer.rs`, ported: the checker over `tycore.ply`.
+//
+// The first stage. It reads the trees `rewrite.ply` and `resolve.ply` produce, as
+// the reference reads `parse_recovering`'s and `resolve`'s, and publishes what
+// `check_program` publishes: every definition's scheme, footprint and constraints,
+// every test's and law's footprint, every effect and constructor. `check_dump`
+// writes those in the encoding `harness/src/lib.rs`'s `reference_check_dump`
+// writes, and `harness/tests/infer.rs` compares the two.
+//
+// Not yet here: the region escape checks, the derivability and map-key checks,
+// spec clauses, and the comparison-of-functions check. Each is a pass over
+// sites the walk below records, and each reports only on a program that is
+// wrong; the corpus this stage is compared over is the tree's own programs.
+
+import spine (Span, Ident, QName, span_to, dummy_span, num)
+import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad, ty_span)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
+              TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
+              Constraint, Deriver, DJson, DEq, DOrd, parse)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithRegion,
+              ESimulate, EBad, Stmt, SLet, SExpr, Param, NamedArg, MatchArm, HandleClause,
+              ReturnClause, RecField, expr_span)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LBool, LStr,
+                 LBytes, LFloat, LDec, LUnit, pat_span)
+import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord, Field,
+               Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity, OccursTy, OccursRow,
+               RowMismatch, Unified, atom_lt, atoms_insert, atoms_union, atoms_contains,
+               atoms_difference, row_empty, row_open, row_closed, row_singleton, row_is_pure,
+               row_union, row_without, con, con1, t_int, t_bool, t_string, t_bytes, t_float,
+               t_decimal, t_unit, t_list, t_option, t_map, t_iter, t_secret, t_fn, mono,
+               fields_sorted, field_get, mentions_secret, at, set_at, take, drop, append,
+               contains_int, contains_bytes, ints_insert, ints_union, ints_difference, fresh_new,
+               fresh_ty_var, fresh_ty, fresh_row_var, fresh_row, subst_new, mark_rigid_ty,
+               mark_rigid_row, is_rigid_ty, is_rigid_row, shallow, resolve_ty, resolved_tail,
+               resolve_row, occurs_ty, solve_continuation_row, free_vars, unify, unify_row,
+               env_new, env_push, env_pop, env_bind, env_bind_global, env_remove_global,
+               env_lookup, env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme,
+               generalize, region_prefix, region_of, atom_text, scheme_text, type_text, row_text)
+import resolve (Mod, Source, Resolved, Scope, Binding, Diag, Label, Ns, NValue, NType, NEffect,
+                resolve_modules, Resolved_, Failed, Expanded, find, find_binding, find_declared,
+                bspace, space, qualify, default_binder, dump_diags, diag1, diag2, lab, is_bare,
+                is_ctor_name)
+import rewrite (expand)
+
+// --- What the checker keeps ----------------------------------------------------------
+
+type Loc = { module: Int, span: Span }
+type TypeDecl = { params: List<Bytes>, alias: Option<TypeExpr>, owner: Int, span: Span }
+type OpInfo = { name: Bytes, mode: Mode, resource_param: Bool, params: List<Type>, ret: Type,
+                at: Loc, scheme: Option<Scheme> }
+type EffectInfo = { name: Bytes, module: Bytes, simple_name: Bytes, nondet: Bool, ops: List<OpInfo>, at: Loc }
+type CtorInfo = { name: Bytes, module: Bytes, simple_name: Bytes, type_name: Bytes, index: Int,
+                  arity: Int, fields: List<Type>, scheme: Scheme, at: Loc }
+type DefConstraint = { deriver: Deriver, param: Int }
+type DefInfo = { name: Bytes, module: Bytes, simple_name: Bytes, scheme: Scheme, footprint: List<Atom>,
+                 performed: List<Atom>, constraints: List<DefConstraint>, internally_effectful: Bool, at: Loc }
+type TestInfo = { key: Bytes, nondet: Bool, footprint: List<Atom> }
+type LawBinder = { name: Bytes, ty: Type }
+type LawInfo = { key: Bytes, binders: List<LawBinder>, has_guard: Bool, host: Bool, footprint: List<Atom> }
+type PerformSite = { atom: Atom, module: Int, span: Span, direct: Bool }
+type Numeric = { span: Span, op: Bytes, ty: Type }
+type Sig = { ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, fn_ty: Type, params: List<Type>,
+             ret: Type, declared: Option<Row>, published_row: Row, scope: Int }
+type Assumed = { deriver: Deriver, vars: List<Int> }
+
+type Cx = {
+  r: Resolved,
+  mods: List<Mod>,
+  module: Int,
+  subst: Subst,
+  fresh: Fresh,
+  env: TypeEnv,
+  diags: List<Diag>,
+  types: Map<Bytes, TypeDecl>,
+  effects: List<EffectInfo>,
+  effect_index: Map<Bytes, Int>,
+  ctors: List<CtorInfo>,
+  ctor_index: Map<Bytes, Int>,
+  defs: List<DefInfo>,
+  def_index: Map<Bytes, Int>,
+  tests: List<TestInfo>,
+  laws: List<LawInfo>,
+  ty_params: Map<Bytes, Type>,
+  row_params: Map<Bytes, Int>,
+  auto_ty_params: Bool,
+  alias_stack: List<Bytes>,
+  refused_atoms: List<Span>,
+  performs: List<PerformSite>,
+  comparisons: List<{ span: Span, ty: Type }>,
+  scope: Int,
+  constraints: Map<Bytes, List<DefConstraint>>,
+  numerics: List<Numeric>,
+  simulate_depth: Int,
+  open_regions: List<Bytes>,
+  assumed: List<Assumed>,
+}
+
+type Inferred = { cx: Cx, ty: Type, row: Row }
+type WithTy = { cx: Cx, t: Type }
+type WithVar = { cx: Cx, v: Int }
+type WithRow = { cx: Cx, r: Row }
+type WithName = { cx: Cx, name: Option<Bytes> }
+type Expected = { cx: Cx, ok: Bool }
+type WithTys = { cx: Cx, ts: List<Type> }
+type WithSig = { cx: Cx, sig: Sig }
+type WithAtom = { cx: Cx, atom: Option<Atom> }
+type WithOptVar = { cx: Cx, v: Option<Int> }
+type WithKey = { cx: Cx, key: Option<ValueKey> }
+type WithHit = { cx: Cx, hit: Option<{ info: EffectInfo, op: OpInfo }> }
+type WithRes = { cx: Cx, res: Option<Resource> }
+type WithBodyRow = { cx: Cx, row: Row }
+type Generalized = { e: TypeEnv, sc: Scheme }
+
+fn cell() -> Bytes = b"cell"
+fn compare_values_name() -> Bytes = b"compare_values"
+fn result_name() -> Bytes = b"result"
+
+fn here(cx: Cx, s: Span) -> Loc = { module: cx.module, span: s }
+
+fn module_name(cx: Cx, i: Int) -> Bytes = at(cx.mods, i).name
+
+fn qualify_here(cx: Cx, name: Bytes) -> Bytes = qualify(module_name(cx, cx.module), name)
+
+fn scope_of(cx: Cx) -> Scope = at(cx.r.scopes, cx.module)
+
+fn report(cx: Cx, d: Diag) -> Cx = {..cx, diags: push(cx.diags, d)}
+
+fn err1(cx: Cx, code: Bytes, s: Span, notes: Int) -> Cx = report(cx, diag1(code, cx.module, s, notes))
+
+fn err2(cx: Cx, code: Bytes, s: Span, also: Loc, notes: Int) -> Cx =
+  report(cx, diag2(code, cx.module, s, also.module, also.span, notes))
+
+fn err_labels(cx: Cx, code: Bytes, labels: List<Label>, notes: Int) -> Cx =
+  report(cx, { code: code, notes: notes, labels: labels })
+
+fn deriver_tag(d: Deriver) -> Int = match d { DJson -> 0, DEq -> 1, DOrd -> 2 }
+
+fn same_deriver(a: Deriver, b: Deriver) -> Bool = deriver_tag(a) == deriver_tag(b)
+
+fn deriver_text(d: Deriver) -> Bytes = match d { DJson -> b"json", DEq -> b"eq", DOrd -> b"ord" }
+
+// --- Fresh variables, threaded ---------------------------------------------------------
+
+fn new_ty(cx: Cx) -> { cx: Cx, t: Type } = { let o = fresh_ty(cx.fresh); { cx: {..cx, fresh: o.f}, t: o.t } }
+fn new_ty_var(cx: Cx) -> { cx: Cx, v: Int } = { let o = fresh_ty_var(cx.fresh); { cx: {..cx, fresh: o.f}, v: o.v } }
+fn new_row(cx: Cx) -> { cx: Cx, r: Row } = { let o = fresh_row(cx.fresh); { cx: {..cx, fresh: o.f}, r: o.r } }
+fn new_row_var(cx: Cx) -> { cx: Cx, v: Int } = { let o = fresh_row_var(cx.fresh); { cx: {..cx, fresh: o.f}, v: o.v } }
+
+fn resolve(cx: Cx, t: Type) -> Type = resolve_ty(cx.subst, t)
+fn resolve_r(cx: Cx, r: Row) -> Row = resolve_row(cx.subst, r)
+
+fn with_unified(cx: Cx, u: Unified) -> Cx = {..cx, subst: u.s, fresh: u.f}
+
+// --- The prelude ----------------------------------------------------------------------
+
+fn prelude_effect_names() -> List<Bytes> = [b"task", b"clock", b"random", b"sim"]
+fn is_prelude_effect(name: Bytes) -> Bool = contains_bytes(prelude_effect_names(), name)
+fn simulated_names() -> List<Bytes> = [b"task", b"clock", b"random"]
+
+fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead }
+
+fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
+  [{ name: b"Int", arity: 0 }, { name: b"Bool", arity: 0 }, { name: b"String", arity: 0 }, { name: b"Bytes", arity: 0 },
+   { name: b"Float", arity: 0 }, { name: b"Decimal", arity: 0 }, { name: b"Unit", arity: 0 }, { name: b"List", arity: 1 },
+   { name: b"Map", arity: 2 }, { name: b"Cell", arity: 1 }, { name: b"Secret", arity: 1 }, { name: b"Task", arity: 1 },
+   { name: b"Option", arity: 1 }, { name: b"Result", arity: 2 }, { name: b"Ordering", arity: 0 }, { name: b"Rounding", arity: 0 },
+   { name: b"Iter", arity: 2 }]
+
+fn builtin_type_arity(name: Bytes) -> Option<Int> =
+  fold(builtin_type_arities(), None, |acc: Option<Int>, x: { name: Bytes, arity: Int }|
+    match acc { Some(_) -> acc, None -> if x.name == name { Some(x.arity) } else { None } })
+
+type Adt = { name: Bytes, params: List<Bytes>, variants: List<{ name: Bytes, fields: List<Bytes> }> }
+
+fn prelude_adts() -> List<Adt> =
+  [{ name: b"Option", params: [b"a"], variants: [{ name: b"None", fields: [] }, { name: b"Some", fields: [b"a"] }] },
+   { name: b"Result", params: [b"a", b"e"], variants: [{ name: b"Ok", fields: [b"a"] }, { name: b"Err", fields: [b"e"] }] },
+   { name: b"Ordering", params: [], variants: [{ name: b"Less", fields: [] }, { name: b"Equal", fields: [] }, { name: b"Greater", fields: [] }] },
+   { name: b"Rounding", params: [], variants: [{ name: b"HalfEven", fields: [] }, { name: b"HalfUp", fields: [] }, { name: b"Down", fields: [] },
+                                               { name: b"Up", fields: [] }, { name: b"Ceiling", fields: [] }, { name: b"Floor", fields: [] }] },
+   { name: b"Iter", params: [b"s", b"r"], variants: [{ name: b"Continue", fields: [b"s"] }, { name: b"Stop", fields: [b"r"] }] }]
+
+fn position_bytes(xs: List<Bytes>, v: Bytes) -> Int =
+  fold(range(0, len(xs)), 0 - 1, |acc: Int, i: Int| if acc >= 0 { acc } else if at(xs, i) == v { i } else { acc })
+
+fn install_prelude_adts(cx: Cx) -> Cx =
+  fold(prelude_adts(), cx, |c: Cx, adt: Adt| {
+    let vars = range(0, len(adt.params));
+    let result = TyCon({ name: adt.name, args: map(vars, |v: Int| TyVar(v)) });
+    fold(range(0, len(adt.variants)), c, |c2: Cx, index: Int| {
+      let v = at(adt.variants, index);
+      let fields = map(v.fields, |p: Bytes| TyVar(position_bytes(adt.params, p)));
+      let ty = if len(fields) == 0 { result } else { t_fn(fields, result, row_empty()) };
+      let sc = { ty_vars: vars, row_vars: [], ty: ty };
+      add_ctor({..c2, env: env_bind_global(c2.env, v.name, sc)},
+               { name: v.name, module: b"", simple_name: v.name, type_name: adt.name, index: index,
+                 arity: len(fields), fields: fields, scheme: sc, at: { module: 0, span: dummy_span() } })
+    })
+  })
+
+fn add_ctor(cx: Cx, info: CtorInfo) -> Cx =
+  {..cx, ctors: push(cx.ctors, info), ctor_index: map_insert(cx.ctor_index, info.name, len(cx.ctors))}
+
+fn ctor_of(cx: Cx, name: Bytes) -> Option<CtorInfo> =
+  match map_get(cx.ctor_index, name) { Some(i) -> Some(at(cx.ctors, i)), None -> None }
+
+fn add_effect(cx: Cx, info: EffectInfo) -> Cx =
+  {..cx, effects: push(cx.effects, info), effect_index: map_insert(cx.effect_index, info.name, len(cx.effects))}
+
+fn effect_of(cx: Cx, name: Bytes) -> Option<EffectInfo> =
+  match map_get(cx.effect_index, name) { Some(i) -> Some(at(cx.effects, i)), None -> None }
+
+fn def_of(cx: Cx, name: Bytes) -> Option<DefInfo> =
+  match map_get(cx.def_index, name) { Some(i) -> Some(at(cx.defs, i)), None -> None }
+
+fn set_def(cx: Cx, info: DefInfo) -> Cx =
+  match map_get(cx.def_index, info.name) {
+    Some(i) -> {..cx, defs: set_at(cx.defs, i, info)},
+    None -> {..cx, defs: push(cx.defs, info), def_index: map_insert(cx.def_index, info.name, len(cx.defs))},
+  }
+
+fn prelude_op(name: Bytes, mode: Mode, ty_vars: List<Int>, row_vars: List<Int>, params: List<Type>, ret: Type, row: Row) -> OpInfo =
+  { name: name, mode: mode, resource_param: false, params: params, ret: ret, at: { module: 0, span: dummy_span() },
+    scheme: Some({ ty_vars: ty_vars, row_vars: row_vars, ty: t_fn(params, ret, row) }) }
+
+fn prelude_effects() -> List<EffectInfo> = {
+  let ta = TyVar(0);
+  let body = t_fn([], ta, row_open(0));
+  let task = con1(b"Task", ta);
+  let none = { module: 0, span: dummy_span() };
+  [{ name: b"task", module: b"", simple_name: b"task", nondet: true, at: none,
+     ops: [prelude_op(b"spawn", MWrite, [0], [0], [body], task, row_open(0)),
+           prelude_op(b"join", MWrite, [0], [], [task], ta, row_empty()),
+           prelude_op(b"yield", MWrite, [], [], [], t_unit(), row_empty())] },
+   { name: b"clock", module: b"", simple_name: b"clock", nondet: true, at: none,
+     ops: [prelude_op(b"now", MRead, [], [], [], t_int(), row_empty()),
+           prelude_op(b"sleep", MWrite, [], [], [t_int()], t_unit(), row_empty())] },
+   { name: b"random", module: b"", simple_name: b"random", nondet: true, at: none,
+     ops: [prelude_op(b"next", MWrite, [], [], [], t_int(), row_empty()),
+           prelude_op(b"below", MWrite, [], [], [t_int()], t_int(), row_empty())] },
+   { name: b"sim", module: b"", simple_name: b"sim", nondet: false, at: none,
+     ops: [prelude_op(b"seed", MRead, [], [], [], t_int(), row_empty())] }]
+}
+
+fn simulated_atoms() -> List<Atom> =
+  fold(prelude_effects(), [], |acc: List<Atom>, e: EffectInfo|
+    if contains_bytes(simulated_names(), e.name) {
+      fold(e.ops, acc, |a: List<Atom>, op: OpInfo| atoms_insert(a, { effect: e.name, resource: RSingleton, mode: op.mode }))
+    } else { acc })
+
+fn mono_fn(params: List<Type>, ret: Type) -> Scheme = mono(t_fn(params, ret, row_empty()))
+fn poly_fn(tys: List<Int>, rows: List<Int>, params: List<Type>, ret: Type, eff: Row) -> Scheme =
+  { ty_vars: tys, row_vars: rows, ty: t_fn(params, ret, eff) }
+
+// `install_prelude`: the builtin signatures, on the first three type variables and the first row
+// variable — which is why `fresh` starts past them.
+fn install_prelude(cx0: Cx) -> Cx = {
+  let cx = install_prelude_adts(cx0);
+  let a: WithVar = new_ty_var(cx);
+  let b: WithVar = new_ty_var(a.cx);
+  let c: WithVar = new_ty_var(b.cx);
+  let e: WithVar = new_row_var(c.cx);
+  let ta = TyVar(a.v);
+  let tb = TyVar(b.v);
+  let tc = TyVar(c.v);
+  let re = row_open(e.v);
+  let map_ty = t_map(ta, tb);
+  let entry_ty = TyRecord(fields_sorted([{ name: b"key", ty: ta }, { name: b"value", ty: tb }]));
+  let ordering = con(b"Ordering");
+  let rounding = con(b"Rounding");
+  let entries = [
+    { name: b"assert", sc: mono_fn([t_bool(), t_option(t_string())], t_unit()) },
+    { name: b"assert_eq", sc: poly_fn([a.v], [], [ta, ta], t_unit(), row_empty()) },
+    { name: b"len", sc: poly_fn([a.v], [], [t_list(ta)], t_int(), row_empty()) },
+    { name: b"push", sc: poly_fn([a.v], [], [t_list(ta), ta], t_list(ta), row_empty()) },
+    { name: b"list_at", sc: poly_fn([a.v], [], [t_list(ta), t_int()], t_option(ta), row_empty()) },
+    { name: b"map", sc: poly_fn([a.v, b.v], [e.v], [t_list(ta), t_fn([ta], tb, re)], t_list(tb), re) },
+    { name: b"filter", sc: poly_fn([a.v], [e.v], [t_list(ta), t_fn([ta], t_bool(), re)], t_list(ta), re) },
+    { name: b"fold", sc: poly_fn([a.v, b.v], [e.v], [t_list(ta), tb, t_fn([tb, ta], tb, re)], tb, re) },
+    { name: b"iterate", sc: poly_fn([a.v, b.v], [e.v], [ta, t_int(), t_fn([ta], t_iter(ta, tb), re)], tb, re) },
+    { name: b"range", sc: mono_fn([t_int(), t_int()], t_list(t_int())) },
+    { name: b"wrap_add", sc: mono_fn([t_int(), t_int()], t_int()) },
+    { name: b"wrap_sub", sc: mono_fn([t_int(), t_int()], t_int()) },
+    { name: b"wrap_mul", sc: mono_fn([t_int(), t_int()], t_int()) },
+    { name: b"min", sc: mono_fn([t_int(), t_int()], t_int()) },
+    { name: b"max", sc: mono_fn([t_int(), t_int()], t_int()) },
+    { name: b"byte_of_int", sc: mono_fn([t_int()], t_bytes()) },
+    { name: b"int_to_string", sc: mono_fn([t_int()], t_string()) },
+    { name: b"string_concat", sc: mono_fn([t_string(), t_string()], t_string()) },
+    { name: b"bytes_len", sc: mono_fn([t_bytes()], t_int()) },
+    { name: b"bytes_at", sc: mono_fn([t_bytes(), t_int()], t_int()) },
+    { name: b"bytes_slice", sc: mono_fn([t_bytes(), t_int(), t_int()], t_bytes()) },
+    { name: b"bytes_concat", sc: mono_fn([t_bytes(), t_bytes()], t_bytes()) },
+    { name: b"bytes_concat_all", sc: mono_fn([t_list(t_bytes())], t_bytes()) },
+    { name: b"bytes_of_string", sc: mono_fn([t_string()], t_bytes()) },
+    { name: b"bytes_is_utf8", sc: mono_fn([t_bytes()], t_bool()) },
+    { name: b"bytes_index_of", sc: mono_fn([t_bytes(), t_bytes()], t_option(t_int())) },
+    { name: b"bytes_index_of_from", sc: mono_fn([t_bytes(), t_bytes(), t_int()], t_option(t_int())) },
+    { name: b"bytes_index_of_byte", sc: mono_fn([t_bytes(), t_int()], t_option(t_int())) },
+    { name: b"bytes_starts_with", sc: mono_fn([t_bytes(), t_bytes()], t_bool()) },
+    { name: b"bytes_ends_with", sc: mono_fn([t_bytes(), t_bytes()], t_bool()) },
+    { name: b"bytes_split", sc: mono_fn([t_bytes(), t_bytes()], t_list(t_bytes())) },
+    { name: b"bytes_scan", sc: mono_fn([t_bytes(), t_int(), t_bytes(), t_int()], t_int()) },
+    { name: b"bytes_scan_until", sc: mono_fn([t_bytes(), t_int(), t_bytes(), t_int()], t_int()) },
+    { name: b"bytes_position", sc: poly_fn([], [e.v], [t_bytes(), t_int(), t_fn([t_int()], t_bool(), re)], t_option(t_int()), re) },
+    { name: b"string_of_bytes", sc: mono_fn([t_bytes()], t_string()) },
+    { name: b"string_of_bytes_lossy", sc: mono_fn([t_bytes()], t_string()) },
+    { name: b"string_len", sc: mono_fn([t_string()], t_int()) },
+    { name: b"string_slice", sc: mono_fn([t_string(), t_int(), t_int()], t_string()) },
+    { name: b"string_split", sc: mono_fn([t_string(), t_string()], t_list(t_string())) },
+    { name: b"string_trim", sc: mono_fn([t_string()], t_string()) },
+    { name: b"string_lower", sc: mono_fn([t_string()], t_string()) },
+    { name: b"string_upper", sc: mono_fn([t_string()], t_string()) },
+    { name: b"string_starts_with", sc: mono_fn([t_string(), t_string()], t_bool()) },
+    { name: b"string_ends_with", sc: mono_fn([t_string(), t_string()], t_bool()) },
+    { name: b"string_contains", sc: mono_fn([t_string(), t_string()], t_bool()) },
+    { name: b"string_find", sc: mono_fn([t_string(), t_string()], t_int()) },
+    { name: b"compare", sc: poly_fn([a.v], [], [ta, ta], ordering, row_empty()) },
+    { name: b"compare_values", sc: poly_fn([a.v], [], [ta, ta], ordering, row_empty()) },
+    { name: b"map_new", sc: poly_fn([a.v, b.v], [], [], map_ty, row_empty()) },
+    { name: b"map_insert", sc: poly_fn([a.v, b.v], [], [map_ty, ta, tb], map_ty, row_empty()) },
+    { name: b"map_update", sc: poly_fn([a.v, b.v], [e.v], [map_ty, ta, t_fn([tb], tb, re)], map_ty, re) },
+    { name: b"map_get", sc: poly_fn([a.v, b.v], [], [map_ty, ta], t_option(tb), row_empty()) },
+    { name: b"map_contains", sc: poly_fn([a.v, b.v], [], [map_ty, ta], t_bool(), row_empty()) },
+    { name: b"map_remove", sc: poly_fn([a.v, b.v], [], [map_ty, ta], map_ty, row_empty()) },
+    { name: b"map_len", sc: poly_fn([a.v, b.v], [], [map_ty], t_int(), row_empty()) },
+    { name: b"map_keys", sc: poly_fn([a.v, b.v], [], [map_ty], t_list(ta), row_empty()) },
+    { name: b"map_values", sc: poly_fn([a.v, b.v], [], [map_ty], t_list(tb), row_empty()) },
+    { name: b"map_entries", sc: poly_fn([a.v, b.v], [], [map_ty], t_list(entry_ty), row_empty()) },
+    { name: b"map_of_entries", sc: poly_fn([a.v, b.v], [], [t_list(entry_ty)], map_ty, row_empty()) },
+    { name: b"map_merge", sc: poly_fn([a.v, b.v], [], [map_ty, map_ty], map_ty, row_empty()) },
+    { name: b"map_fold", sc: poly_fn([a.v, b.v, c.v], [e.v], [map_ty, tc, t_fn([tc, ta, tb], tc, re)], tc, re) },
+    { name: b"decimal_div", sc: mono_fn([t_decimal(), t_decimal(), t_int(), rounding], t_decimal()) },
+    { name: b"decimal_round", sc: mono_fn([t_decimal(), t_int(), rounding], t_decimal()) },
+    { name: b"decimal_of_int", sc: mono_fn([t_int()], t_decimal()) },
+    { name: b"int_of_decimal", sc: mono_fn([t_decimal(), rounding], t_option(t_int())) },
+    { name: b"float_of_decimal", sc: mono_fn([t_decimal()], t_float()) },
+    { name: b"decimal_of_float", sc: mono_fn([t_float()], t_option(t_decimal())) },
+    { name: b"decimal_of_string", sc: mono_fn([t_string()], t_option(t_decimal())) },
+    { name: b"decimal_to_string", sc: mono_fn([t_decimal()], t_string()) },
+    { name: b"panic", sc: poly_fn([a.v], [], [t_string()], ta, row_empty()) },
+    { name: b"secret_of_string", sc: mono_fn([t_string()], t_secret(t_string())) },
+    { name: b"secret_verify", sc: mono_fn([t_secret(t_string()), t_string()], t_bool()) },
+    { name: b"secret_is_empty", sc: poly_fn([a.v], [], [t_secret(ta)], t_bool(), row_empty()) },
+  ];
+  let bound: Cx = fold(entries, e.cx, |c2: Cx, x: { name: Bytes, sc: Scheme }| {..c2, env: env_bind_global(c2.env, x.name, x.sc)});
+  let ord = [{ deriver: DOrd, param: 0 }];
+  let constrained: Cx = {..bound, constraints: map_insert(map_insert(bound.constraints, b"compare", ord), b"compare_values", ord)};
+  let cell_ty = TyCon({ name: b"Cell", args: [tb, ta] });
+  let with_cells: Cx = fold([
+    { name: b"cell_get", sc: poly_fn([a.v, b.v], [], [cell_ty], ta, row_empty()) },
+    { name: b"cell_set", sc: poly_fn([a.v, b.v], [], [cell_ty, ta], t_unit(), row_empty()) },
+    { name: b"cell_update", sc: poly_fn([a.v, b.v], [e.v], [cell_ty, t_fn([ta], ta, re)], t_unit(), row_empty()) },
+  ], constrained, |c2: Cx, x: { name: Bytes, sc: Scheme }| {..c2, env: env_bind_global(c2.env, x.name, x.sc)});
+  fold(prelude_effects(), with_cells, |c2: Cx, ef: EffectInfo| add_effect(c2, ef))
+}
+
+// --- Names ------------------------------------------------------------------------------
+
+type ValueKey = { name: Bytes, prelude: Bool }
+
+// `global`: a bare name through this module's scope, a qualified one through the resolver.
+fn global(cx: Cx, ns: Ns, q: QName) -> { cx: Cx, name: Option<Bytes> } =
+  if is_bare(q) {
+    match find_binding(bspace(scope_of(cx).bound, ns), q.name.name) {
+      Some(b) -> { cx: cx, name: Some(b.qualified) },
+      None -> { cx: cx, name: None },
+    }
+  } else {
+    match find(cx.r, cx.module, ns, q) {
+      Some(b) -> { cx: cx, name: Some(b.qualified) },
+      None -> { cx: lookup_failure(cx, ns, q), name: None },
+    }
+  }
+
+// `Resolved::lookup`'s diagnostics for a qualified name that does not resolve.
+fn lookup_failure(cx: Cx, ns: Ns, q: QName) -> Cx =
+  match q.module {
+    None -> cx,
+    Some(binder) -> {
+      let scope = scope_of(cx);
+      match fold(scope.modules, None, |acc: Option<Int>, mb: { binder: Bytes, target: Int, span: Span }|
+                 match acc { Some(_) -> acc, None -> if mb.binder == binder.name { Some(mb.target) } else { None } }) {
+        // `unknown_module`: one note either way, plus a secondary when a selective import bound it.
+        None -> {
+          let selective = fold(scope.selective, None, |acc: Option<{ binder: Bytes, target: Int, span: Span }>, mb: { binder: Bytes, target: Int, span: Span }|
+            match acc { Some(_) -> acc, None -> if mb.binder == binder.name { Some(mb) } else { None } });
+          match selective {
+            Some(sel) -> err_labels(cx, b"E0106", [lab(cx.module, binder.span, true), lab(cx.module, sel.span, false)], 1),
+            None -> err1(cx, b"E0106", binder.span, 1),
+          }
+        },
+        Some(owner) ->
+          match find_declared(space(at(cx.r.declarations, owner), ns), q.name.name) {
+            None -> err1(cx, b"E0101", q.span, 1),
+            Some(d) -> if !d.public { err2(cx, b"E0107", q.span, { module: owner, span: d.span }, 2) } else { cx },
+          },
+      }
+    },
+  }
+
+fn value_key(cx: Cx, q: QName) -> { cx: Cx, key: Option<ValueKey> } =
+  if !is_bare(q) {
+    let g: WithName = global(cx, NValue, q);
+    match g.name { Some(n) -> { cx: g.cx, key: Some({ name: n, prelude: false }) }, None -> { cx: g.cx, key: None } }
+  } else {
+    let name = q.name.name;
+    match env_depth_of(cx.env, name) {
+      Some(depth) -> if depth > 0 { { cx: cx, key: Some({ name: name, prelude: false }) } } else { value_key_global(cx, q) },
+      None -> value_key_global(cx, q),
+    }
+  }
+
+fn value_key_global(cx: Cx, q: QName) -> { cx: Cx, key: Option<ValueKey> } = {
+  let name = q.name.name;
+  match find_binding(scope_of(cx).bound.values, name) {
+    Some(b) -> { cx: cx, key: Some({ name: b.qualified, prelude: false }) },
+    None ->
+      match env_depth_of(cx.env, name) {
+        Some(0) -> { cx: cx, key: Some({ name: name, prelude: true }) },
+        _ -> { cx: unknown_name(cx, q), key: None },
+      },
+  }
+}
+
+fn is_cell_builtin(name: Bytes) -> Bool = name == b"cell_get" || name == b"cell_set" || name == b"cell_update"
+
+type CellForm = | CGet | CSet | CUpdate
+
+fn cell_form(cx: Cx, q: QName) -> Option<CellForm> =
+  if !is_bare(q) { None }
+  else if env_depth_of(cx.env, q.name.name) != Some(0) { None }
+  else {
+    match find_binding(scope_of(cx).bound.values, q.name.name) {
+      Some(_) -> None,
+      None -> if q.name.name == b"cell_get" { Some(CGet) } else if q.name.name == b"cell_set" { Some(CSet) }
+              else if q.name.name == b"cell_update" { Some(CUpdate) } else { None },
+    }
+  }
+
+fn declared_value(cx: Cx, q: QName) -> Option<Bytes> =
+  if is_bare(q) {
+    match find_binding(scope_of(cx).bound.values, q.name.name) { Some(b) -> Some(b.qualified), None -> None }
+  } else {
+    match find(cx.r, cx.module, NValue, q) { Some(b) -> Some(b.qualified), None -> None }
+  }
+
+fn prelude_ctor(cx: Cx, q: QName) -> Option<Bytes> =
+  if is_bare(q) { match ctor_of(cx, q.name.name) { Some(_) -> Some(q.name.name), None -> None } } else { None }
+
+fn ctor_name(cx: Cx, q: QName) -> { cx: Cx, name: Option<Bytes> } = {
+  let g: WithName = global(cx, NValue, q);
+  match g.name { Some(n) -> g, None -> { cx: g.cx, name: prelude_ctor(g.cx, q) } }
+}
+
+fn covered_ctor(cx: Cx, q: QName) -> Option<Bytes> =
+  match declared_value(cx, q) { Some(n) -> Some(n), None -> prelude_ctor(cx, q) }
+
+// `exporter`: another module that declares `name` publicly in `ns`.
+fn exporter(cx: Cx, ns: Ns, name: Bytes) -> Option<Int> =
+  fold(range(0, len(cx.r.declarations)), None, |acc: Option<Int>, i: Int|
+    match acc {
+      Some(_) -> acc,
+      None -> if i == cx.module { None } else {
+        match find_declared(space(at(cx.r.declarations, i), ns), name) { Some(d) -> if d.public { Some(i) } else { None }, None -> None }
+      },
+    })
+
+fn nearest_name(cx: Cx, name: Bytes) -> Option<Bytes> = {
+  let n = bytes_len(name);
+  let best = fold(scope_of(cx).bound.values, None, |acc: Option<{ d: Int, name: Bytes }>, b: Binding| {
+    let d = edit_distance(name, b.name);
+    if d > 0 && d * 3 <= max(n, 1) && (match acc { None -> true, Some(x) -> d < x.d }) { Some({ d: d, name: b.name }) } else { acc }
+  });
+  match best { Some(x) -> Some(x.name), None -> None }
+}
+
+fn edit_distance(a: Bytes, b: Bytes) -> Int = {
+  let n = bytes_len(a);
+  let m = bytes_len(b);
+  let first = range(0, m + 1);
+  let final = fold(range(0, n), first, |prev: List<Int>, i: Int|
+    fold(range(0, m), [i + 1], |cur: List<Int>, j: Int| {
+      let cost = if bytes_at(a, i) == bytes_at(b, j) { 0 } else { 1 };
+      let v = min(min(at(prev, j + 1) + 1, at(cur, j) + 1), at(prev, j) + cost);
+      push(cur, v)
+    }));
+  at(final, m)
+}
+
+fn unknown_name(cx: Cx, q: QName) -> Cx = {
+  let near = match nearest_name(cx, q.name.name) { Some(_) -> 1, None -> 0 };
+  let exported = if is_bare(q) { match exporter(cx, NValue, q.name.name) { Some(_) -> 1, None -> 0 } } else { 0 };
+  err1(cx, b"E0101", q.span, near + exported)
+}
+
+// --- Types from type expressions ----------------------------------------------------------
+
+fn type_param(cx: Cx, id: Ident) -> { cx: Cx, t: Type } =
+  match map_get(cx.ty_params, id.name) {
+    Some(t) -> { cx: cx, t: t },
+    None ->
+      if cx.auto_ty_params {
+        let o: WithTy = new_ty(cx);
+        { cx: {..o.cx, ty_params: map_insert(o.cx.ty_params, id.name, o.t)}, t: o.t }
+      } else {
+        let o: WithTy = new_ty(err1(cx, b"E0102", id.span, 1));
+        o
+      },
+  }
+
+fn conv_type(cx: Cx, te: TypeExpr) -> { cx: Cx, t: Type } =
+  match te {
+    TVar(id) -> type_param(cx, id),
+    TUnit(_) -> { cx: cx, t: t_unit() },
+    TBad(_) -> new_ty(cx),
+    TRecord(r) -> {
+      let fs = fold(r.fields, { cx: cx, fs: [] }, |acc: { cx: Cx, fs: List<Field> }, f: { name: Ident, ty: TypeExpr }| {
+        let o: WithTy = conv_type(acc.cx, f.ty);
+        { cx: o.cx, fs: push(acc.fs, { name: f.name.name, ty: o.t }) }
+      });
+      { cx: fs.cx, t: TyRecord(fields_sorted(fs.fs)) }
+    },
+    TFn(f) -> {
+      let ps: WithTys = conv_types(cx, f.params);
+      let r: WithTy = conv_type(ps.cx, f.ret);
+      let eff = match f.effects { Some(row) -> conv_row(r.cx, row), None -> { cx: r.cx, r: row_empty() } };
+      { cx: eff.cx, t: t_fn(ps.ts, r.t, eff.r) }
+    },
+    TCon(c) -> conv_con(cx, c.name, c.args, c.span),
+  }
+
+fn conv_types(cx: Cx, ts: List<TypeExpr>) -> { cx: Cx, ts: List<Type> } =
+  fold(ts, { cx: cx, ts: [] }, |acc: { cx: Cx, ts: List<Type> }, t: TypeExpr| {
+    let o: WithTy = conv_type(acc.cx, t);
+    { cx: o.cx, ts: push(acc.ts, o.t) }
+  })
+
+fn arity_error(cx: Cx, span: Span) -> Cx = err1(cx, b"E0202", span, 0)
+
+fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, t: Type } =
+  if is_bare(name) && len(args) == 0 && map_contains(cx.ty_params, name.name.name) {
+    { cx: cx, t: match map_get(cx.ty_params, name.name.name) { Some(t) -> t, None -> t_unit() } }
+  } else {
+    let converted: WithTys = conv_types(cx, args);
+    let cx1: Cx = converted.cx;
+    match (if is_bare(name) { builtin_type_arity(name.name.name) } else { None }) {
+      Some(arity) ->
+        if len(converted.ts) != arity { new_ty(arity_error(cx1, span)) }
+        else if name.name.name == b"Cell" {
+          let region: WithTy = new_ty(cx1);
+          { cx: region.cx, t: TyCon({ name: b"Cell", args: [region.t, at(converted.ts, 0)] }) }
+        } else { { cx: cx1, t: TyCon({ name: name.name.name, args: converted.ts }) } },
+      None -> {
+        let g: WithName = global(cx1, NType, name);
+        match g.name {
+          None ->
+            if is_bare(name) {
+              if len(args) == 0 && g.cx.auto_ty_params { type_param(g.cx, name.name) }
+              else { new_ty(unknown_type(g.cx, name)) }
+            } else { new_ty(g.cx) },
+          Some(qualified) ->
+            match map_get(g.cx.types, qualified) {
+              None -> new_ty(g.cx),
+              Some(decl) ->
+                if len(converted.ts) != len(decl.params) { new_ty(arity_error(g.cx, span)) }
+                else {
+                  match decl.alias {
+                    None -> { cx: g.cx, t: TyCon({ name: qualified, args: converted.ts }) },
+                    Some(alias) ->
+                      if contains_bytes(g.cx.alias_stack, qualified) { new_ty(err1(g.cx, b"E0102", name.span, 1)) }
+                      else {
+                        let saved = g.cx.ty_params;
+                        let bound: Map<Bytes, Type> = fold(range(0, len(decl.params)), map_new(), |m: Map<Bytes, Type>, i: Int| map_insert(m, at(decl.params, i), at(converted.ts, i)));
+                        let inner: Cx = {..g.cx, ty_params: bound, alias_stack: push(g.cx.alias_stack, qualified), module: decl.owner};
+                        let o: WithTy = conv_type(inner, alias);
+                        { cx: {..o.cx, ty_params: saved, alias_stack: take(o.cx.alias_stack, len(o.cx.alias_stack) - 1), module: g.cx.module}, t: o.t }
+                      },
+                  }
+                },
+            },
+        }
+      },
+    }
+  }
+
+fn unknown_type(cx: Cx, q: QName) -> Cx = {
+  let exported = if is_bare(q) { match exporter(cx, NType, q.name.name) { Some(_) -> 1, None -> 0 } } else { 0 };
+  err1(cx, b"E0102", q.span, 1 + exported)
+}
+
+fn row_param(cx: Cx, id: Ident) -> { cx: Cx, v: Option<Int> } =
+  match map_get(cx.row_params, id.name) {
+    Some(v) -> { cx: cx, v: Some(v) },
+    None -> { cx: err1(cx, b"E0301", id.span, 1), v: None },
+  }
+
+fn conv_row(cx: Cx, row: RowExpr) -> { cx: Cx, r: Row } = {
+  let atoms = fold(row.atoms, { cx: cx, atoms: [] }, |acc: { cx: Cx, atoms: List<Atom> }, a: AtomExpr| {
+    let o: WithAtom = conv_atom(acc.cx, a);
+    match o.atom { Some(x) -> { cx: o.cx, atoms: atoms_insert(acc.atoms, x) }, None -> { cx: o.cx, atoms: acc.atoms } }
+  });
+  let tail = match row.tail { Some(t) -> row_param(atoms.cx, t), None -> { cx: atoms.cx, v: None } };
+  { cx: tail.cx, r: { atoms: atoms.atoms, tail: tail.v } }
+}
+
+fn refused(cx: Cx, s: Span) -> Bool = fold(cx.refused_atoms, false, |acc: Bool, x: Span| acc || x == s)
+
+fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
+  if refused(cx, a.span) { { cx: cx, atom: None } } else {
+    let e: WithName = effect_name(cx, a.eff);
+    match e.name {
+      None -> { cx: {..e.cx, refused_atoms: push(e.cx.refused_atoms, a.span)}, atom: None },
+      Some(eff) -> {
+        let resource = match a.resource { Some(r) -> RNamed(r.name), None -> RSingleton };
+        let declares_mode = match effect_of(e.cx, eff) {
+          Some(info) -> fold(info.ops, false, |acc: Bool, op: OpInfo| acc || mode_eq(op.mode, a.mode)),
+          None -> true,
+        };
+        if !declares_mode {
+          let reported: Cx = err1(e.cx, b"E0104", a.span, 1);
+          { cx: {..reported, refused_atoms: push(reported.refused_atoms, a.span)}, atom: None }
+        } else { { cx: e.cx, atom: Some({ effect: eff, resource: resource, mode: a.mode }) } }
+      },
+    }
+  }
+
+fn mode_eq(a: Mode, b: Mode) -> Bool = match a { MRead -> (match b { MRead -> true, _ -> false }), MWrite -> (match b { MWrite -> true, _ -> false }), MBad -> false }
+
+fn effect_name(cx: Cx, q: QName) -> { cx: Cx, name: Option<Bytes> } =
+  if is_bare(q) && q.name.name == cell() { { cx: cx, name: Some(cell()) } } else {
+    let g: WithName = global(cx, NEffect, q);
+    match g.name {
+      Some(n) -> match effect_of(g.cx, n) { Some(_) -> { cx: g.cx, name: Some(n) }, None -> { cx: g.cx, name: None } },
+      None ->
+        if is_bare(q) && is_prelude_effect(q.name.name) { { cx: g.cx, name: Some(q.name.name) } }
+        else if is_bare(q) { { cx: unknown_effect(g.cx, q), name: None } }
+        else { { cx: g.cx, name: None } },
+    }
+  }
+
+fn unknown_effect(cx: Cx, q: QName) -> Cx =
+  if is_bare(q) && (match env_depth_of(cx.env, q.name.name) { Some(_) -> true, None -> false }) { err1(cx, b"E0103", q.span, 2) }
+  else {
+    let exported = match exporter(cx, NEffect, q.name.name) { Some(_) -> 1, None -> 0 };
+    err1(cx, b"E0103", q.span, 1 + exported)
+  }
+
+// --- Declarations ------------------------------------------------------------------------
+
+fn duplicate(cx: Cx, name: Ident, prev: Loc) -> Cx = err2(cx, b"E0105", name.span, prev, 1)
+
+fn record_type(cx: Cx, m: Mod, def: TypeDef) -> Cx = {
+  let name = qualify(m.name, def.name.name);
+  match map_get(cx.types, name) {
+    Some(prev) -> duplicate(cx, def.name, { module: prev.owner, span: prev.span }),
+    None ->
+      match builtin_type_arity(def.name.name) {
+        Some(_) -> err1(cx, b"E0105", def.name.span, 1),
+        None -> {
+          let alias = match def.body { TDAlias(t) -> Some(t), TDSum(_) -> None };
+          {..cx, types: map_insert(cx.types, name, { params: map(def.params, |p: Ident| p.name), alias: alias, owner: cx.module, span: def.span })}
+        },
+      },
+  }
+}
+
+fn collect_types(cx: Cx, m: Mod) -> Cx =
+  fold(m.module.items, cx, |c: Cx, it: Item| match it { IType(d) -> record_type(c, m, d), _ -> c })
+
+fn mentions_cell(t: Type) -> Bool =
+  match t {
+    TyCon(c) -> c.name == b"Cell" || fold(c.args, false, |acc: Bool, a: Type| acc || mentions_cell(a)),
+    TyFn(f) -> fold(f.params, false, |acc: Bool, p: Type| acc || mentions_cell(p)) || mentions_cell(f.ret),
+    TyRecord(fs) -> fold(fs, false, |acc: Bool, f: Field| acc || mentions_cell(f.ty)),
+    TyVar(_) -> false,
+  }
+
+fn ty_expr_span(t: TypeExpr) -> Span = ty_span(t)
+
+fn reject_declared_cell(cx: Cx, t: Type, span: Span) -> Cx =
+  if mentions_cell(t) { err1(cx, b"E0446", span, 2) } else { cx }
+
+fn collect_effects(cx: Cx, m: Mod) -> Cx =
+  fold(m.module.items, cx, |c: Cx, it: Item|
+    match it {
+      IEffect(def) -> {
+        let name = qualify(m.name, def.name.name);
+        if def.name.name == cell() { err1(c, b"E0105", def.name.span, 1) }
+        else if is_prelude_effect(name) { err1(c, b"E0105", def.name.span, 2) }
+        else {
+          match effect_of(c, name) {
+            Some(prev) -> duplicate(c, def.name, prev.at),
+            None -> {
+              let ops = fold(def.ops, { cx: c, ops: [] }, |acc: { cx: Cx, ops: List<OpInfo> }, op: OpDef|
+                if fold(acc.ops, false, |b: Bool, o: OpInfo| b || o.name == op.name.name) {
+                  let prev = fold(acc.ops, dummy_span(), |s: Span, o: OpInfo| if o.name == op.name.name { o.at.span } else { s });
+                  { cx: duplicate(acc.cx, op.name, { module: acc.cx.module, span: prev }), ops: acc.ops }
+                } else {
+                  let c1: Cx = {..acc.cx, ty_params: map_new(), auto_ty_params: true};
+                  let ps: WithTys = conv_types(c1, op.params);
+                  let r: WithTy = conv_type(ps.cx, op.ret);
+                  let c2: Cx = {..r.cx, auto_ty_params: false, ty_params: map_new()};
+                  let c3: Cx = fold(range(0, len(ps.ts)), c2, |cc: Cx, i: Int| reject_declared_cell(cc, at(ps.ts, i), ty_expr_span(at(op.params, i))));
+                  let c4 = reject_declared_cell(c3, r.t, ty_expr_span(op.ret));
+                  { cx: c4, ops: push(acc.ops, { name: op.name.name, mode: op.mode, resource_param: op.resource_param, params: ps.ts, ret: r.t, at: here(c4, op.span), scheme: None }) }
+                });
+              add_effect(ops.cx, { name: name, module: m.name, simple_name: def.name.name, nondet: def.is_nondet, ops: ops.ops, at: here(ops.cx, def.span) })
+            },
+          }
+        }
+      },
+      _ -> c,
+    })
+
+fn collect_ctors(cx: Cx, m: Mod) -> Cx =
+  fold(m.module.items, cx, |c: Cx, it: Item|
+    match it {
+      IType(def) ->
+        match def.body {
+          TDAlias(_) -> c,
+          TDSum(variants) -> {
+            let type_name = qualify(m.name, def.name.name);
+            match map_get(c.types, type_name) {
+              None -> c,
+              Some(decl) -> {
+                let vars: { cx: Cx, vars: List<Int>, params: Map<Bytes, Type> } = fold(decl.params, { cx: c, vars: [], params: map_new() }, |acc: { cx: Cx, vars: List<Int>, params: Map<Bytes, Type> }, p: Bytes| {
+                  let o: WithVar = new_ty_var(acc.cx);
+                  { cx: o.cx, vars: push(acc.vars, o.v), params: map_insert(acc.params, p, TyVar(o.v)) }
+                });
+                let c1: Cx = {..vars.cx, ty_params: vars.params};
+                let result = TyCon({ name: type_name, args: map(vars.vars, |v: Int| TyVar(v)) });
+                let walked: Cx = fold(range(0, len(variants)), c1, |cc: Cx, index: Int| {
+                  let variant = at(variants, index);
+                  let ctor = qualify(m.name, variant.name.name);
+                  match ctor_of(cc, ctor) {
+                    Some(prev) -> duplicate(cc, variant.name, prev.at),
+                    None -> {
+                      let fs: WithTys = conv_types(cc, variant.fields);
+                      let checked: Cx = fold(range(0, len(fs.ts)), fs.cx, |c3: Cx, i: Int| reject_declared_cell(c3, at(fs.ts, i), ty_expr_span(at(variant.fields, i))));
+                      let ty = if len(fs.ts) == 0 { result } else { t_fn(fs.ts, result, row_empty()) };
+                      let sc = { ty_vars: vars.vars, row_vars: [], ty: ty };
+                      add_ctor({..checked, env: env_bind_global(checked.env, ctor, sc)},
+                               { name: ctor, module: m.name, simple_name: variant.name.name, type_name: type_name, index: index,
+                                 arity: len(fs.ts), fields: fs.ts, scheme: sc, at: here(checked, variant.span) })
+                    },
+                  }
+                });
+                {..walked, ty_params: map_new()}
+              },
+            }
+          },
+        },
+      _ -> c,
+    })
+
+// `check_value_namespace`: a function and a constructor of one name in one module.
+fn check_value_namespace(cx: Cx, m: Mod) -> Cx = {
+  let walked = fold(m.module.items, { cx: cx, seen: [] }, |acc: { cx: Cx, seen: List<{ name: Bytes, span: Span, is_fn: Bool }> }, it: Item| {
+    let declared = match it {
+      IFn(d) -> [{ name: d.name, is_fn: true }],
+      IType(d) -> match d.body { TDSum(vs) -> map(vs, |v: VariantDef| { name: v.name, is_fn: false }), TDAlias(_) -> [] },
+      _ -> [],
+    };
+    fold(declared, acc, |a: { cx: Cx, seen: List<{ name: Bytes, span: Span, is_fn: Bool }> }, x: { name: Ident, is_fn: Bool }| {
+      let prev = fold(a.seen, None, |p: Option<{ name: Bytes, span: Span, is_fn: Bool }>, s: { name: Bytes, span: Span, is_fn: Bool }|
+        match p { Some(_) -> p, None -> if s.name == x.name.name { Some(s) } else { None } });
+      match prev {
+        None -> {..a, seen: push(a.seen, { name: x.name.name, span: x.name.span, is_fn: x.is_fn })},
+        Some(first) -> if first.is_fn == x.is_fn { a } else { {..a, cx: err2(a.cx, b"E0105", x.name.span, { module: a.cx.module, span: first.span }, 2)} },
+      }
+    })
+  });
+  walked.cx
+}
+
+// --- Signatures ---------------------------------------------------------------------------
+
+fn constraints_in_force(cx: Cx, cs: List<Constraint>) -> List<Assumed> =
+  fold(cs, [], |acc: List<Assumed>, c: Constraint|
+    match map_get(cx.ty_params, c.param.name) {
+      Some(TyVar(v)) -> assume(acc, c.deriver, v),
+      _ -> acc,
+    })
+
+fn assume(xs: List<Assumed>, d: Deriver, v: Int) -> List<Assumed> = {
+  let hit = fold(range(0, len(xs)), None, |acc: Option<Int>, i: Int| match acc { Some(_) -> acc, None -> if same_deriver(at(xs, i).deriver, d) { Some(i) } else { None } });
+  match hit {
+    Some(i) -> { let x = at(xs, i); set_at(xs, i, { deriver: x.deriver, vars: ints_insert(x.vars, v) }) },
+    None -> push(xs, { deriver: d, vars: [v] }),
+  }
+}
+
+fn check_where(cx: Cx, def: FnDef) -> Cx =
+  fold(def.constraints, cx, |c: Cx, k: Constraint|
+    if map_contains(c.ty_params, k.param.name) { c } else { err1(c, b"E0102", k.param.span, 1) })
+
+fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
+  let cx: Cx = {..cx0, scope: cx0.scope + 1, ty_params: map_new(), row_params: map_new()};
+  let tys: Cx = fold(def.generics.types, cx, |c: Cx, p: Ident| {
+    let o: WithVar = new_ty_var(c);
+    {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v), ty_params: map_insert(o.cx.ty_params, p.name, TyVar(o.v))}
+  });
+  let rows: Cx = fold(def.generics.effects, tys, |c: Cx, p: Ident| {
+    let o: WithVar = new_row_var(c);
+    {..o.cx, subst: mark_rigid_row(o.cx.subst, o.v), row_params: map_insert(o.cx.row_params, p.name, o.v)}
+  });
+  let assumed: Cx = {..rows, assumed: constraints_in_force(rows, def.constraints)};
+  let checked: Cx = check_where(assumed, def);
+  let params = fold(def.params, { cx: checked, ts: [] }, |acc: { cx: Cx, ts: List<Type> }, p: Param|
+    match p.ty {
+      Some(t) -> { let o: WithTy = conv_type(acc.cx, t); { cx: o.cx, ts: push(acc.ts, o.t) } },
+      None -> { let o: WithTy = new_ty(acc.cx); { cx: o.cx, ts: push(acc.ts, o.t) } },
+    });
+  let ret = match def.ret { Some(t) -> conv_type(params.cx, t), None -> new_ty(params.cx) };
+  let declared: { cx: Cx, r: Option<Row> } = match def.effects { Some(r) -> { let o: WithRow = conv_row(ret.cx, r); { cx: o.cx, r: Some(o.r) } }, None -> { cx: ret.cx, r: None } };
+  let row: WithRow = match declared.r { Some(r) -> { cx: declared.cx, r: r }, None -> new_row(declared.cx) };
+  let c: Cx = row.cx;
+  { cx: {..c, ty_params: map_new(), row_params: map_new()},
+    sig: { ty_params: c.ty_params, row_params: c.row_params, fn_ty: t_fn(params.ts, ret.t, row.r), params: params.ts,
+           ret: ret.t, declared: declared.r, published_row: row.r, scope: c.scope } }
+}
+
+// --- Expressions ------------------------------------------------------------------------------
+
+fn lit_type(l: Lit) -> Type =
+  match l { LInt(_) -> t_int(), LBool(_) -> t_bool(), LStr(_) -> t_string(), LBytes(_) -> t_bytes(), LFloat(_) -> t_float(), LDec(_) -> t_decimal(), _ -> t_unit() }
+
+fn record_site(cx: Cx, atom: Atom, span: Span, direct: Bool) -> Cx =
+  if span.start == 0 && span.end == 0 { cx } else { {..cx, performs: push(cx.performs, { atom: atom, module: cx.module, span: span, direct: direct })} }
+
+fn discharge(cx: Cx, mark: Int, handled: List<Atom>) -> Cx = {
+  let before = take(cx.performs, mark);
+  let kept = filter(drop(cx.performs, mark), |s: PerformSite| !atoms_contains(handled, s.atom));
+  {..cx, performs: append(before, kept)}
+}
+
+fn site_for(cx: Cx, atom: Atom) -> Option<PerformSite> =
+  fold(cx.performs, None, |acc: Option<PerformSite>, s: PerformSite| match acc { Some(_) -> acc, None -> if s.atom == atom { Some(s) } else { None } })
+
+// `join`: two rows combined, their tails unified.
+fn join(cx: Cx, span: Span, a: Row, b: Row) -> { cx: Cx, r: Row } =
+  match a.tail {
+    Some(x) ->
+      match b.tail {
+        Some(y) ->
+          if x != y {
+            let u = unify_row(cx.subst, cx.fresh, row_open(x), row_open(y));
+            let c = with_unified(cx, u);
+            match u.err { Some(e) -> { cx: report_unify(c, e, span), r: row_union(a, b) }, None -> { cx: c, r: row_union(a, b) } }
+          } else { { cx: cx, r: row_union(a, b) } },
+        None -> { cx: cx, r: row_union(a, b) },
+      },
+    None -> { cx: cx, r: row_union(a, b) },
+  }
+
+fn report_unify(cx: Cx, e: UnifyError, span: Span) -> Cx =
+  match e {
+    Mismatch(_) -> err1(cx, b"E0201", span, 0),
+    Arity(_) -> err1(cx, b"E0202", span, 0),
+    OccursTy(_) -> err1(cx, b"E0203", span, 1),
+    OccursRow(_) -> err1(cx, b"E0203", span, 1),
+    RowMismatch(m) -> {
+      let expected = resolve_r(cx, m.expected);
+      let found = resolve_r(cx, m.found);
+      let extra = atoms_difference(found.atoms, expected.atoms);
+      err1(cx, b"E0302", span, if len(extra) > 0 { 1 } else { 0 })
+    },
+  }
+
+fn expect(cx: Cx, span: Span, expected: Type, found: Type) -> { cx: Cx, ok: Bool } = {
+  let u = unify(cx.subst, cx.fresh, expected, found);
+  let c = with_unified(cx, u);
+  match u.err { Some(e) -> { cx: report_unify(c, e, span), ok: false }, None -> { cx: c, ok: true } }
+}
+
+fn expect_bits(cx: Cx, span: Span, found: Type) -> Cx = {
+  let o: Expected = expect(cx, span, t_int(), found);
+  if o.ok { o.cx } else {
+    // A `Bool` operand earns one more note on the mismatch just reported.
+    let is_bool = match resolve(o.cx, found) { TyCon(c) -> len(c.args) == 0 && c.name == b"Bool", _ -> false };
+    if is_bool { add_note_to_last(o.cx) } else { o.cx }
+  }
+}
+
+fn add_note_to_last(cx: Cx) -> Cx = {
+  let n = len(cx.diags);
+  if n == 0 { cx } else {
+    let last = at(cx.diags, n - 1);
+    {..cx, diags: set_at(cx.diags, n - 1, { code: last.code, notes: last.notes + 1, labels: last.labels })}
+  }
+}
+
+fn bind_all(cx: Cx, bindings: List<{ name: Bytes, ty: Type }>) -> Cx =
+  fold(bindings, cx, |c: Cx, b: { name: Bytes, ty: Type }| {..c, env: env_bind(c.env, b.name, mono(b.ty))})
+
+fn infer_all(cx: Cx, xs: List<Expr>, span: Span) -> { cx: Cx, tys: List<Type>, row: Row } =
+  fold(xs, { cx: cx, tys: [], row: row_empty() }, |acc: { cx: Cx, tys: List<Type>, row: Row }, x: Expr| {
+    let o: Inferred = infer(acc.cx, x);
+    let j: WithRow = join(o.cx, span, acc.row, o.row);
+    { cx: j.cx, tys: push(acc.tys, o.ty), row: j.r }
+  })
+
+fn infer(cx: Cx, e: Expr) -> Inferred =
+  match e {
+    ELit(l) -> { cx: cx, ty: lit_type(l.lit), row: row_empty() },
+    EBad(_) -> { let o: WithTy = new_ty(cx); { cx: o.cx, ty: o.t, row: row_empty() } },
+    EVar(v) -> infer_var(cx, v.name),
+    EUnary(u) -> {
+      let o: Inferred = infer(cx, u.operand);
+      if u.op == b"neg" { { cx: {..o.cx, numerics: push(o.cx.numerics, { span: u.span, op: b"sub", ty: o.ty })}, ty: o.ty, row: o.row } }
+      else if u.op == b"bitnot" { { cx: expect_bits(o.cx, expr_span(u.operand), o.ty), ty: t_int(), row: o.row } }
+      else { let x: Expected = expect(o.cx, expr_span(u.operand), t_bool(), o.ty); { cx: x.cx, ty: t_bool(), row: o.row } }
+    },
+    EBinary(b) -> infer_binary(cx, b.span, b.op, b.lhs, b.rhs),
+    ELambda(l) -> {
+      let pushed: Cx = {..cx, env: env_push(cx.env)};
+      let ps = fold(l.params, { cx: pushed, ts: [] }, |acc: { cx: Cx, ts: List<Type> }, p: Param| {
+        let t: WithTy = match p.ty { Some(te) -> conv_type(acc.cx, te), None -> new_ty(acc.cx) };
+        { cx: {..t.cx, env: env_bind(t.cx.env, p.name.name, mono(t.t))}, ts: push(acc.ts, t.t) }
+      });
+      let body: Inferred = infer(ps.cx, l.body);
+      let checked: Cx = match l.ret {
+        Some(written) -> { let w: WithTy = conv_type(body.cx, written); expect(w.cx, expr_span(l.body), w.t, body.ty).cx },
+        None -> body.cx,
+      };
+      { cx: {..checked, env: env_pop(checked.env)}, ty: t_fn(ps.ts, body.ty, body.row), row: row_empty() }
+    },
+    EApp(a) -> infer_app(cx, a.span, a.func, a.args),
+    EIf(i) -> {
+      let c: Inferred = infer(cx, i.cond);
+      let cc: Cx = expect(c.cx, expr_span(i.cond), t_bool(), c.ty).cx;
+      let t: Inferred = infer(cc, i.then_branch);
+      let el: Inferred = infer(t.cx, i.else_branch);
+      let agreed: Cx = expect(el.cx, expr_span(i.else_branch), t.ty, el.ty).cx;
+      let j1: WithRow = join(agreed, i.span, c.row, t.row);
+      let j2: WithRow = join(j1.cx, i.span, j1.r, el.row);
+      { cx: j2.cx, ty: t.ty, row: j2.r }
+    },
+    EMatch(m) -> infer_match(cx, m.span, m.scrutinee, m.arms),
+    EBlock(b) -> {
+      let pushed: Cx = {..cx, env: env_push(cx.env)};
+      let stmts: WithBodyRow = fold(b.stmts, { cx: pushed, row: row_empty() }, |acc: { cx: Cx, row: Row }, s: Stmt| {
+        let o: WithBodyRow = infer_stmt(acc.cx, s);
+        let j: WithRow = join(o.cx, b.span, acc.row, o.row);
+        { cx: j.cx, row: j.r }
+      });
+      let tail: Inferred = match b.tail {
+        Some(t) -> { let o: Inferred = infer(stmts.cx, t); let j: WithRow = join(o.cx, b.span, stmts.row, o.row); { cx: j.cx, ty: o.ty, row: j.r } },
+        None -> { cx: stmts.cx, ty: t_unit(), row: stmts.row },
+      };
+      { cx: {..tail.cx, env: env_pop(tail.cx.env)}, ty: tail.ty, row: tail.row }
+    },
+    ERecord(r) -> {
+      let fs = fold(r.fields, { cx: cx, fs: [], row: row_empty() }, |acc: { cx: Cx, fs: List<Field>, row: Row }, f: RecField| {
+        let o: Inferred = infer(acc.cx, f.value);
+        let j: WithRow = join(o.cx, r.span, acc.row, o.row);
+        { cx: j.cx, fs: push(acc.fs, { name: f.name.name, ty: o.ty }), row: j.r }
+      });
+      { cx: fs.cx, ty: TyRecord(fields_sorted(fs.fs)), row: fs.row }
+    },
+    ERecordUpdate(r) -> panic("`{..b, f: e}` is expanded away before the checker runs"),
+    ETry(_) -> panic("`e?` is expanded away before the checker runs"),
+    EField(f) -> {
+      let b: Inferred = infer(cx, f.base);
+      match resolve(b.cx, b.ty) {
+        TyRecord(fs) ->
+          match field_get(fs, f.field.name) {
+            Some(t) -> { cx: b.cx, ty: t, row: b.row },
+            None -> { let o: WithTy = new_ty(err1(b.cx, b"E0101", f.field.span, 1)); { cx: o.cx, ty: o.t, row: b.row } },
+          },
+        _ -> { let o: WithTy = new_ty(err1(b.cx, b"E0201", expr_span(f.base), 1)); { cx: o.cx, ty: o.t, row: b.row } },
+      }
+    },
+    EList(l) -> {
+      let elem: WithTy = new_ty(cx);
+      let items = fold(l.items, { cx: elem.cx, row: row_empty() }, |acc: { cx: Cx, row: Row }, x: Expr| {
+        let o: Inferred = infer(acc.cx, x);
+        let j: WithRow = join(o.cx, l.span, acc.row, o.row);
+        { cx: expect(j.cx, expr_span(x), elem.t, o.ty).cx, row: j.r }
+      });
+      { cx: items.cx, ty: t_list(elem.t), row: items.row }
+    },
+    EPerform(p) -> infer_perform(cx, p.span, p.eff, p.op, p.resource, p.args),
+    EHandle(h) -> infer_handle(cx, h.span, h.body, h.clauses, h.ret),
+    EWithCell(c) -> infer_with_cell(cx, c.span, c.resource, c.init, c.binder, c.body),
+    EWithRegion(w) -> infer_with_region(cx, w.region, w.body),
+    ESimulate(s) -> infer_simulate(cx, s.span, s.body),
+  }
+
+fn infer_var(cx: Cx, q: QName) -> Inferred = {
+  let k: WithKey = value_key(cx, q);
+  match k.key {
+    None -> { let o: WithTy = new_ty(k.cx); { cx: o.cx, ty: o.t, row: row_empty() } },
+    Some(key) ->
+      if key.prelude && is_cell_builtin(key.name) {
+        let o: WithTy = new_ty(err1(k.cx, b"E0304", q.span, 1));
+        { cx: o.cx, ty: o.t, row: row_empty() }
+      } else {
+        match env_lookup(k.cx.env, key.name) {
+          Some(sc) -> {
+            let inst = instantiate_with(sc, k.cx.fresh);
+            let c: Cx = {..k.cx, fresh: inst.f};
+            { cx: c, ty: inst.ty, row: row_empty() }
+          },
+          None -> { let o: WithTy = new_ty(unknown_name(k.cx, q)); { cx: o.cx, ty: o.t, row: row_empty() } },
+        }
+      },
+  }
+}
+
+fn is_arithmetic(op: Bytes) -> Bool = op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+fn is_ordered(op: Bytes) -> Bool = op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
+fn is_bits(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor" || op == b"shl" || op == b"shr" || op == b"ushr"
+
+fn infer_binary(cx: Cx, span: Span, op: Bytes, lhs: Expr, rhs: Expr) -> Inferred = {
+  let l: Inferred = infer(cx, lhs);
+  let r: Inferred = infer(l.cx, rhs);
+  let j: WithRow = join(r.cx, span, l.row, r.row);
+  let c: Cx = j.cx;
+  if is_arithmetic(op) || is_ordered(op) {
+    let x: Expected = expect(c, expr_span(rhs), l.ty, r.ty);
+    let noted: Cx = if x.ok { {..x.cx, numerics: push(x.cx.numerics, { span: span, op: op, ty: l.ty })} } else { x.cx };
+    { cx: noted, ty: if is_arithmetic(op) { l.ty } else { t_bool() }, row: j.r }
+  } else if is_bits(op) {
+    let c1: Cx = expect_bits(c, expr_span(lhs), l.ty);
+    let c2: Cx = expect_bits(c1, expr_span(rhs), r.ty);
+    { cx: c2, ty: t_int(), row: j.r }
+  } else if op == b"and" || op == b"or" {
+    let c1: Cx = expect(c, expr_span(lhs), t_bool(), l.ty).cx;
+    let c2: Cx = expect(c1, expr_span(rhs), t_bool(), r.ty).cx;
+    { cx: c2, ty: t_bool(), row: j.r }
+  } else if op == b"concat" {
+    let c1: Cx = expect(c, expr_span(lhs), t_string(), l.ty).cx;
+    let c2: Cx = expect(c1, expr_span(rhs), t_string(), r.ty).cx;
+    { cx: c2, ty: t_string(), row: j.r }
+  } else {
+    let c1: Cx = expect(c, expr_span(rhs), l.ty, r.ty).cx;
+    { cx: {..c1, comparisons: push(c1.comparisons, { span: span, ty: l.ty })}, ty: t_bool(), row: j.r }
+  }
+}
+
+fn infer_stmt(cx: Cx, s: Stmt) -> { cx: Cx, row: Row } =
+  match s {
+    SExpr(e) -> { let o: Inferred = infer(cx, e); { cx: o.cx, row: o.row } },
+    SLet(l) -> {
+      let v: Inferred = infer(cx, l.value);
+      let annotated: { cx: Cx, ty: Type } = match l.ty {
+        Some(te) -> { let w: WithTy = conv_type(v.cx, te); let x: Expected = expect(w.cx, expr_span(l.value), w.t, v.ty); { cx: x.cx, ty: w.t } },
+        None -> { cx: v.cx, ty: v.ty },
+      };
+      let b: Bound = bind_pattern(annotated.cx, l.pat, annotated.ty, []);
+      { cx: bind_all(b.cx, b.out), row: v.row }
+    },
+  }
+
+fn supplied_note(n: Int) -> Int = 0
+
+fn infer_app(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferred =
+  match func {
+    EVar(v) ->
+      match cell_form(cx, v.name) {
+        Some(form) -> infer_cell_op(cx, span, args, form),
+        None -> infer_app_general(cx, span, func, args),
+      },
+    _ -> infer_app_general(cx, span, func, args),
+  }
+
+fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferred = {
+  let f: Inferred = infer(cx, func);
+  let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_all(f.cx, args, span);
+  let j0: WithRow = join(as_.cx, span, f.row, as_.row);
+  let c: Cx = j0.cx;
+  match resolve(c, f.ty) {
+    TyFn(fn_) ->
+      if len(fn_.params) != len(args) {
+        let reported: Cx = err_labels(c, b"E0202", [lab(c.module, span, true), lab(c.module, expr_span(func), false)], 0);
+        let j: WithRow = join(reported, span, j0.r, fn_.effects);
+        { cx: j.cx, ty: fn_.ret, row: j.r }
+      } else {
+        let checked: Cx = fold(range(0, len(args)), c, |cc: Cx, i: Int| expect(cc, expr_span(at(args, i)), at(fn_.params, i), at(as_.tys, i)).cx);
+        let effects = resolve_r(checked, fn_.effects);
+        let recorded: Cx = fold(effects.atoms, checked, |cc: Cx, a: Atom| record_site(cc, a, span, false));
+        let j: WithRow = join(recorded, span, j0.r, effects);
+        { cx: j.cx, ty: fn_.ret, row: j.r }
+      },
+    TyVar(_) -> {
+      let ret: WithTy = new_ty(c);
+      let eff: WithRow = new_row(ret.cx);
+      let want = t_fn(as_.tys, ret.t, eff.r);
+      let x: Expected = expect(eff.cx, expr_span(func), want, f.ty);
+      let j: WithRow = join(x.cx, span, j0.r, eff.r);
+      { cx: j.cx, ty: ret.t, row: j.r }
+    },
+    _ -> { let o: WithTy = new_ty(err1(c, b"E0204", expr_span(func), 1)); { cx: o.cx, ty: o.t, row: j0.r } },
+  }
+}
+
+fn infer_cell_op(cx: Cx, span: Span, args: List<Expr>, form: CellForm) -> Inferred = {
+  let expected = match form { CGet -> 1, CSet -> 2, CUpdate -> 2 };
+  let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_all(cx, args, span);
+  if len(args) != expected { let o: WithTy = new_ty(arity_error(as_.cx, span)); { cx: o.cx, ty: o.t, row: as_.row } } else {
+    let region: WithTy = new_ty(as_.cx);
+    let elem: WithTy = new_ty(region.cx);
+    let cell_ty = TyCon({ name: b"Cell", args: [region.t, elem.t] });
+    let c0: Cx = expect(elem.cx, expr_span(at(args, 0)), cell_ty, at(as_.tys, 0)).cx;
+    let after = match form {
+      CGet -> { cx: c0, row: as_.row },
+      CSet -> { cx: expect(c0, expr_span(at(args, 1)), elem.t, at(as_.tys, 1)).cx, row: as_.row },
+      CUpdate -> {
+        let eff: WithRow = new_row(c0);
+        let f = t_fn([elem.t], elem.t, eff.r);
+        let x: Cx = expect(eff.cx, expr_span(at(args, 1)), f, at(as_.tys, 1)).cx;
+        let j: WithRow = join(x, span, as_.row, eff.r);
+        { cx: j.cx, row: j.r }
+      },
+    };
+    let ret = match form { CGet -> elem.t, _ -> t_unit() };
+    match region_of(resolve(after.cx, region.t)) {
+      None -> { cx: err1(after.cx, b"E0304", expr_span(at(args, 0)), 1), ty: ret, row: after.row },
+      Some(resource) -> {
+        let modes = match form { CGet -> [MRead], CSet -> [MWrite], CUpdate -> [MRead, MWrite] };
+        let out = fold(modes, { cx: after.cx, row: after.row }, |acc: { cx: Cx, row: Row }, m: Mode| {
+          let atom = { effect: cell(), resource: RNamed(resource), mode: m };
+          let j: WithRow = join(record_site(acc.cx, atom, span, true), span, acc.row, row_singleton(atom));
+          { cx: j.cx, row: j.r }
+        });
+        { cx: out.cx, ty: ret, row: out.row }
+      },
+    }
+  }
+}
+
+// --- Patterns and matches -----------------------------------------------------------------------
+
+type Bound = { cx: Cx, out: List<{ name: Bytes, ty: Type }> }
+
+fn bind_pattern(cx: Cx, p: Pattern, scrutinee: Type, out: List<{ name: Bytes, ty: Type }>) -> Bound =
+  match p {
+    PWild(_) -> { cx: cx, out: out },
+    PBad(_) -> { cx: cx, out: out },
+    PVar(v) -> { cx: cx, out: push(out, { name: v.name.name, ty: scrutinee }) },
+    PLit(l) -> { cx: expect(cx, l.span, scrutinee, lit_type(l.lit)).cx, out: out },
+    PCtor(c) -> {
+      let n: WithName = ctor_name(cx, c.name);
+      let info = match n.name { Some(q) -> ctor_of(n.cx, q), None -> None };
+      match info {
+        None ->
+          if is_bare(c.name) || (match declared_value(n.cx, c.name) { Some(_) -> true, None -> false }) {
+            let builtin = match builtin_type_arity(c.name.name.name) { Some(_) -> if c.name.name.name == b"Secret" { 3 } else { 1 }, None -> 0 };
+            { cx: err1(n.cx, b"E0101", c.name.span, 1 + builtin), out: out }
+          } else { { cx: n.cx, out: out } },
+        Some(ci) -> {
+          let inst = instantiate(ci.scheme, n.cx.fresh);
+          let c1: Cx = {..n.cx, fresh: inst.f};
+          let shape = match inst.ty { TyFn(f) -> { fields: f.params, result: f.ret }, other -> { fields: [], result: other } };
+          let c2: Cx = expect(c1, c.span, scrutinee, shape.result).cx;
+          if len(shape.fields) != len(c.args) { { cx: err2(c2, b"E0202", c.span, ci.at, 0), out: out } }
+          else {
+            fold(range(0, len(c.args)), { cx: c2, out: out }, |acc: Bound, i: Int| bind_pattern(acc.cx, at(c.args, i), at(shape.fields, i), acc.out))
+          }
+        },
+      }
+    },
+    PList(l) -> {
+      let elem: WithTy = new_ty(cx);
+      let c1: Cx = expect(elem.cx, l.span, scrutinee, t_list(elem.t)).cx;
+      let items = fold(l.items, { cx: c1, out: out }, |acc: Bound, x: Pattern| bind_pattern(acc.cx, x, elem.t, acc.out));
+      match l.rest { Some(r) -> bind_pattern(items.cx, r, t_list(elem.t), items.out), None -> items }
+    },
+    PRecord(r) ->
+      match resolve(cx, scrutinee) {
+        TyRecord(known) -> {
+          let bound: Bound = fold(r.fields, { cx: cx, out: out }, |acc: Bound, f: { name: Ident, pat: Pattern }|
+            match field_get(known, f.name.name) {
+              Some(t) -> bind_pattern(acc.cx, f.pat, t, acc.out),
+              None -> { cx: err1(acc.cx, b"E0101", f.name.span, 0), out: acc.out },
+            });
+          if r.rest { bound } else {
+            let named = map(r.fields, |f: { name: Ident, pat: Pattern }| f.name.name);
+            let omitted = filter(known, |k: Field| !contains_bytes(named, k.name));
+            if len(omitted) > 0 { { cx: err1(bound.cx, b"E0201", r.span, 1), out: bound.out } } else { bound }
+          }
+        },
+        _ ->
+          if r.rest { { cx: err1(cx, b"E0201", r.span, 1), out: out } } else {
+            let fs = fold(r.fields, { cx: cx, fs: [], out: out }, |acc: { cx: Cx, fs: List<Field>, out: List<{ name: Bytes, ty: Type }> }, f: { name: Ident, pat: Pattern }| {
+              let t: WithTy = new_ty(acc.cx);
+              let b: Bound = bind_pattern(t.cx, f.pat, t.t, acc.out);
+              { cx: b.cx, fs: push(acc.fs, { name: f.name.name, ty: t.t }), out: b.out }
+            });
+            { cx: expect(fs.cx, r.span, scrutinee, TyRecord(fields_sorted(fs.fs))).cx, out: fs.out }
+          },
+      },
+  }
+
+fn infer_match(cx: Cx, span: Span, scrutinee: Expr, arms: List<MatchArm>) -> Inferred = {
+  let s: Inferred = infer(cx, scrutinee);
+  let result: WithTy = new_ty(s.cx);
+  let walked: WithBodyRow = fold(arms, { cx: result.cx, row: s.row }, |acc: { cx: Cx, row: Row }, arm: MatchArm| {
+    let pushed: Cx = {..acc.cx, env: env_push(acc.cx.env)};
+    let b: Bound = bind_pattern(pushed, arm.pat, s.ty, []);
+    let bound: Cx = bind_all(b.cx, b.out);
+    let guarded: WithBodyRow = match arm.guard {
+      Some(g) -> {
+        let o: Inferred = infer(bound, g);
+        let c: Cx = expect(o.cx, expr_span(g), t_bool(), o.ty).cx;
+        let j: WithRow = join(c, span, acc.row, o.row);
+        { cx: j.cx, row: j.r }
+      },
+      None -> { cx: bound, row: acc.row },
+    };
+    let body: Inferred = infer(guarded.cx, arm.body);
+    let j: WithRow = join(body.cx, span, guarded.row, body.row);
+    let popped: Cx = {..j.cx, env: env_pop(j.cx.env)};
+    { cx: expect(popped, expr_span(arm.body), result.t, body.ty).cx, row: j.r }
+  });
+  { cx: check_exhaustive(walked.cx, span, s.ty, arms), ty: result.t, row: walked.row }
+}
+
+fn is_irrefutable(p: Pattern) -> Bool =
+  match p {
+    PWild(_) -> true,
+    PVar(_) -> true,
+    PRecord(r) -> fold(r.fields, true, |acc: Bool, f: { name: Ident, pat: Pattern }| acc && is_irrefutable(f.pat)),
+    _ -> false,
+  }
+
+fn check_exhaustive(cx: Cx, span: Span, scrutinee: Type, arms: List<MatchArm>) -> Cx = {
+  let unguarded = filter(arms, |a: MatchArm| match a.guard { None -> true, Some(_) -> false });
+  if fold(unguarded, false, |acc: Bool, a: MatchArm| acc || is_irrefutable(a.pat)) { cx } else {
+    let missing = match resolve(cx, scrutinee) {
+      TyCon(c) ->
+        if c.name == b"List" { missing_list_lengths(unguarded) }
+        else if c.name == b"Bool" {
+          let covered = map(filter(unguarded, |a: MatchArm| match a.pat { PLit(l) -> (match l.lit { LBool(_) -> true, _ -> false }), _ -> false }),
+                            |a: MatchArm| match a.pat { PLit(l) -> (match l.lit { LBool(b) -> b, _ -> false }), _ -> false });
+          filter([true, false], |b: Bool| !fold(covered, false, |acc: Bool, x: Bool| acc || x == b))
+        } else {
+          let variants = filter(cx.ctors, |k: CtorInfo| k.type_name == c.name);
+          if len(variants) == 0 { [true] } else {
+            let covered = fold(unguarded, [], |acc: List<Bytes>, a: MatchArm|
+              match a.pat {
+                PCtor(pc) -> if fold(pc.args, true, |b: Bool, x: Pattern| b && is_irrefutable(x)) {
+                               match covered_ctor(cx, pc.name) { Some(n) -> push(acc, n), None -> acc } } else { acc },
+                _ -> acc,
+              });
+            map(filter(variants, |k: CtorInfo| !contains_bytes(covered, k.name)), |k: CtorInfo| true)
+          }
+        },
+      _ -> [true],
+    };
+    if len(missing) == 0 { cx } else { err1(cx, b"E0205", span, 1) }
+  }
+}
+
+// `missing_list_lengths`: the lengths the arms leave uncovered, as a list of flags — only its
+// emptiness reaches the diagnostic.
+fn missing_list_lengths(arms: List<MatchArm>) -> List<Bool> = {
+  let shapes = fold(arms, { exact: [], rest_from: 0 - 1 }, |acc: { exact: List<Int>, rest_from: Int }, a: MatchArm|
+    match a.pat {
+      PList(l) ->
+        if fold(l.items, true, |b: Bool, x: Pattern| b && is_irrefutable(x)) {
+          match l.rest {
+            Some(r) -> if is_irrefutable(r) { { exact: acc.exact, rest_from: if acc.rest_from < 0 { len(l.items) } else { min(acc.rest_from, len(l.items)) } } } else { acc },
+            None -> { exact: push(acc.exact, len(l.items)), rest_from: acc.rest_from },
+          }
+        } else { acc },
+      _ -> acc,
+    });
+  if shapes.rest_from < 0 { [true] } else {
+    lengths_to_flags(filter(range(0, shapes.rest_from), |n: Int| !contains_int(shapes.exact, n)))
+  }
+}
+
+fn lengths_to_flags(xs: List<Int>) -> List<Bool> = map(xs, |x: Int| true)
+
+// --- Effects ----------------------------------------------------------------------------------
+
+fn resolve_op(cx: Cx, eff: QName, op: Ident) -> { cx: Cx, hit: Option<{ info: EffectInfo, op: OpInfo }> } = {
+  let e: WithName = effect_name(cx, eff);
+  match e.name {
+    None -> { cx: e.cx, hit: None },
+    Some(name) ->
+      match effect_of(e.cx, name) {
+        None -> if name == cell() { { cx: err1(e.cx, b"E0103", eff.span, 1), hit: None } } else { { cx: e.cx, hit: None } },
+        Some(info) ->
+          match fold(info.ops, None, |acc: Option<OpInfo>, o: OpInfo| match acc { Some(_) -> acc, None -> if o.name == op.name { Some(o) } else { None } }) {
+            Some(o) -> { cx: e.cx, hit: Some({ info: info, op: o }) },
+            None -> { cx: err2(e.cx, b"E0104", op.span, info.at, 1), hit: None },
+          },
+      },
+  }
+}
+
+fn resource_for(cx: Cx, info: EffectInfo, op: OpInfo, resource: Option<Ident>, span: Span) -> { cx: Cx, res: Option<Resource> } =
+  match resource {
+    Some(r) -> if op.resource_param { { cx: cx, res: Some(RNamed(r.name)) } } else { { cx: err2(cx, b"E0304", r.span, op.at, 1), res: None } },
+    None -> if op.resource_param { { cx: err2(cx, b"E0304", span, op.at, 1), res: None } } else { { cx: cx, res: Some(RSingleton) } },
+  }
+
+fn op_free_vars(op: OpInfo) -> List<Int> = {
+  let fv = fold(op.params, { tys: [], rows: [] }, |acc: Free, p: Type| free_vars(subst_new(), p, acc));
+  free_vars(subst_new(), op.ret, fv).tys
+}
+
+fn op_scheme(op: OpInfo) -> Scheme =
+  match op.scheme { Some(sc) -> sc, None -> { ty_vars: op_free_vars(op), row_vars: [], ty: t_fn(op.params, op.ret, row_empty()) } }
+
+type OpShape = { cx: Cx, params: List<Type>, ret: Type, row: Row }
+
+fn instantiate_op(cx: Cx, op: OpInfo) -> OpShape = {
+  let inst = instantiate(op_scheme(op), cx.fresh);
+  let c: Cx = {..cx, fresh: inst.f};
+  match inst.ty { TyFn(f) -> { cx: c, params: f.params, ret: f.ret, row: f.effects }, _ -> panic("operation schemes are function types") }
+}
+
+fn instantiate_op_for_clause(cx: Cx, op: OpInfo) -> OpShape = {
+  let sc = op_scheme(op);
+  let tys: { cx: Cx, vs: List<Int> } = fold(sc.ty_vars, { cx: cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_ty_var(acc.cx); { cx: {..o.cx, subst: mark_rigid_ty(o.cx.subst, o.v)}, vs: push(acc.vs, o.v) } });
+  let rows: { cx: Cx, vs: List<Int> } = fold(sc.row_vars, { cx: tys.cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_row_var(acc.cx); { cx: {..o.cx, subst: mark_rigid_row(o.cx.subst, o.v)}, vs: push(acc.vs, o.v) } });
+  match rename_scheme(sc, tys.vs, rows.vs) { TyFn(f) -> { cx: rows.cx, params: f.params, ret: f.ret, row: f.effects }, _ -> panic("operation schemes are function types") }
+}
+
+fn infer_perform(cx: Cx, span: Span, eff: QName, op: Ident, resource: Option<Ident>, args: List<Expr>) -> Inferred = {
+  let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_all(cx, args, span);
+  let r: WithHit = resolve_op(as_.cx, eff, op);
+  match r.hit {
+    None -> { let o: WithTy = new_ty(r.cx); { cx: o.cx, ty: o.t, row: as_.row } },
+    Some(hit) -> {
+      let res: WithRes = resource_for(r.cx, hit.info, hit.op, resource, span);
+      match res.res {
+        None -> { let o: WithTy = new_ty(res.cx); { cx: o.cx, ty: o.t, row: as_.row } },
+        Some(resource_) -> {
+          let shape: OpShape = instantiate_op(res.cx, hit.op);
+          if len(shape.params) != len(args) {
+            { cx: err2(shape.cx, b"E0202", span, hit.op.at, 0), ty: shape.ret, row: as_.row }
+          } else {
+            let checked: Cx = fold(range(0, len(args)), shape.cx, |c: Cx, i: Int| expect(c, expr_span(at(args, i)), at(shape.params, i), at(as_.tys, i)).cx);
+            let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
+            let c1: Cx = record_site(checked, atom, span, true);
+            let op_row = resolve_r(c1, shape.row);
+            let c2: Cx = fold(op_row.atoms, c1, |c: Cx, a: Atom| record_site(c, a, span, false));
+            let j1: WithRow = join(c2, span, as_.row, op_row);
+            let j2: WithRow = join(j1.cx, span, j1.r, row_singleton(atom));
+            { cx: j2.cx, ty: shape.ret, row: j2.r }
+          }
+        },
+      }
+    },
+  }
+}
+
+type HandleAcc = { cx: Cx, handled: List<Atom>, selected: List<{ effect: Bytes, op: Bytes, res: Resource }>, clause_rows: Row }
+
+fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret: Option<ReturnClause>) -> Inferred = {
+  let mark = len(cx.performs);
+  let b: Inferred = infer(cx, body);
+  let general = fold(clauses, false, |acc: Bool, c: HandleClause| acc || (match c.resume { Some(_) -> true, None -> false }));
+  let cont: { cx: Cx, v: Option<Int> } = if general { let o: WithVar = new_row_var(b.cx); { cx: o.cx, v: Some(o.v) } } else { { cx: b.cx, v: None } };
+  let result_var: { cx: Cx, t: Option<Type> } = if general { let o: WithTy = new_ty(cont.cx); { cx: o.cx, t: Some(o.t) } } else { { cx: cont.cx, t: None } };
+  let walked: HandleAcc = fold(clauses, { cx: result_var.cx, handled: [], selected: [], clause_rows: row_empty() }, |acc: HandleAcc, clause: HandleClause| {
+    let r: WithHit = resolve_op(acc.cx, clause.eff, clause.op);
+    match r.hit {
+      None -> {..acc, cx: r.cx},
+      Some(hit) -> {
+        let res: WithRes = resource_for(r.cx, hit.info, hit.op, clause.resource, clause.span);
+        match res.res {
+          None -> {..acc, cx: res.cx},
+          Some(resource_) -> {
+            let shape: OpShape = instantiate_op_for_clause(res.cx, hit.op);
+            if len(shape.params) != len(clause.params) { {..acc, cx: err2(shape.cx, b"E0202", clause.span, hit.op.at, 0)} } else {
+              let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
+              let key = { effect: hit.info.name, op: hit.op.name, res: resource_ };
+              let dup = fold(acc.selected, false, |d: Bool, k: { effect: Bytes, op: Bytes, res: Resource }| d || k == key);
+              let c0: Cx = if dup { err1(shape.cx, b"E0105", clause.span, 1) } else { shape.cx };
+              let pushed: Cx = {..c0, env: env_push(c0.env)};
+              let bound: Cx = fold(range(0, len(clause.params)), pushed, |c: Cx, i: Int| {..c, env: env_bind(c.env, at(clause.params, i).name, mono(at(shape.params, i)))});
+              let with_resume: Cx = match clause.resume {
+                Some(k) -> {
+                  let result = match result_var.t { Some(t) -> t, None -> panic("a general clause is present") };
+                  let row = match cont.v { Some(v) -> v, None -> panic("a general clause is present") };
+                  {..bound, env: env_bind(bound.env, k.name, mono(t_fn([shape.ret], result, row_open(row))))}
+                },
+                None -> bound,
+              };
+              let body_: Inferred = infer(with_resume, clause.body);
+              let popped: Cx = {..body_.cx, env: env_pop(body_.cx.env)};
+              let checked: Cx = match clause.resume {
+                Some(_) -> expect(popped, expr_span(clause.body), match result_var.t { Some(t) -> t, None -> shape.ret }, body_.ty).cx,
+                None -> {
+                  let x: Expected = expect(popped, expr_span(clause.body), shape.ret, body_.ty);
+                  if !x.ok && len(op_free_vars(hit.op)) > 0 { note_universal_clause(x.cx, hit.op) } else { x.cx }
+                },
+              };
+              let j: WithRow = join(checked, span, acc.clause_rows, body_.row);
+              { cx: j.cx, handled: atoms_insert(acc.handled, atom), selected: push(acc.selected, key), clause_rows: j.r }
+            }
+          },
+        }
+      },
+    }
+  });
+  let discharged: Cx = discharge(walked.cx, mark, walked.handled);
+  let returned = match ret {
+    Some(rc) -> {
+      let pushed: Cx = {..discharged, env: env_push(discharged.env)};
+      let bound: Cx = {..pushed, env: env_bind(pushed.env, rc.binder.name, mono(b.ty))};
+      let o: Inferred = infer(bound, rc.body);
+      { cx: {..o.cx, env: env_pop(o.cx.env)}, ty: o.ty, row: o.row }
+    },
+    None -> { cx: discharged, ty: b.ty, row: row_empty() },
+  };
+  let agreed: Cx = match result_var.t { Some(t) -> expect(returned.cx, span, t, returned.ty).cx, None -> returned.cx };
+  let remaining = row_without(b.row, walked.handled);
+  let j1: WithRow = join(agreed, span, remaining, walked.clause_rows);
+  let j2: WithRow = join(j1.cx, span, j1.r, returned.row);
+  let solved = match cont.v { Some(v) -> {..j2.cx, subst: solve_continuation_row(j2.cx.subst, v, j2.r)}, None -> j2.cx };
+  { cx: solved, ty: returned.ty, row: j2.r }
+}
+
+// The mismatch just reported gains a secondary at the declaration and two notes.
+fn note_universal_clause(cx: Cx, op: OpInfo) -> Cx = {
+  let n = len(cx.diags);
+  if n == 0 { cx } else {
+    let last = at(cx.diags, n - 1);
+    {..cx, diags: set_at(cx.diags, n - 1, { code: last.code, notes: last.notes + 3, labels: push(last.labels, lab(op.at.module, op.at.span, false)) })}
+  }
+}
+
+fn region_type(name: Bytes) -> Type = con(bytes_concat(region_prefix(), name))
+
+fn cell_atoms(resource: Bytes) -> List<Atom> =
+  [{ effect: cell(), resource: RNamed(resource), mode: MRead }, { effect: cell(), resource: RNamed(resource), mode: MWrite }]
+
+fn region_is_open(cx: Cx, name: Bytes) -> Bool = contains_bytes(cx.open_regions, name)
+
+fn infer_with_cell(cx: Cx, span: Span, resource: Ident, init: Expr, binder: Ident, body: Expr) -> Inferred = {
+  let i: Inferred = infer(cx, init);
+  let cell_ty = TyCon({ name: b"Cell", args: [region_type(resource.name), i.ty] });
+  if region_is_open(i.cx, resource.name) {
+    let pushed: Cx = {..i.cx, env: env_bind(env_push(i.cx.env), binder.name, mono(cell_ty))};
+    let b: Inferred = infer(pushed, body);
+    let j: WithRow = join({..b.cx, env: env_pop(b.cx.env)}, span, i.row, b.row);
+    { cx: j.cx, ty: b.ty, row: j.r }
+  } else {
+    let opened: Cx = {..i.cx, open_regions: push(i.cx.open_regions, resource.name)};
+    let mark = len(opened.performs);
+    let pushed: Cx = {..opened, env: env_bind(env_push(opened.env), binder.name, mono(cell_ty))};
+    let b: Inferred = infer(pushed, body);
+    let closed: Cx = {..b.cx, env: env_pop(b.cx.env), open_regions: take(b.cx.open_regions, len(b.cx.open_regions) - 1)};
+    let handled = cell_atoms(resource.name);
+    let discharged: Cx = discharge(closed, mark, handled);
+    let j: WithRow = join(discharged, span, i.row, row_without(b.row, handled));
+    { cx: j.cx, ty: b.ty, row: j.r }
+  }
+}
+
+fn infer_with_region(cx: Cx, region: Ident, body: Expr) -> Inferred = {
+  let c0: Cx = if region_is_open(cx, region.name) { err1(cx, b"E0447", region.span, 2) } else { cx };
+  let opened: Cx = {..c0, open_regions: push(c0.open_regions, region.name)};
+  let mark = len(opened.performs);
+  let b: Inferred = infer(opened, body);
+  let closed: Cx = {..b.cx, open_regions: take(b.cx.open_regions, len(b.cx.open_regions) - 1)};
+  let handled = cell_atoms(region.name);
+  let discharged: Cx = discharge(closed, mark, handled);
+  { cx: discharged, ty: b.ty, row: row_without(resolve_r(discharged, b.row), handled) }
+}
+
+fn infer_simulate(cx: Cx, span: Span, body: Expr) -> Inferred = {
+  let mark = len(cx.performs);
+  let b: Inferred = infer({..cx, simulate_depth: cx.simulate_depth + 1}, body);
+  let c: Cx = {..b.cx, simulate_depth: b.cx.simulate_depth - 1};
+  let handled = simulated_atoms();
+  let discharged: Cx = discharge(c, mark, handled);
+  let seed = seed_atom();
+  let recorded: Cx = record_site(discharged, seed, span, true);
+  let j: WithRow = join(recorded, span, row_without(resolve_r(recorded, b.row), handled), row_singleton(seed));
+  { cx: j.cx, ty: b.ty, row: j.r }
+}
+
+// --- Definitions ----------------------------------------------------------------------------------
+
+type Refs = { names: List<QName>, effects: Bool }
+
+fn refs_of(e: Expr) -> Refs = collect_refs(e, { names: [], effects: false })
+
+fn collect_refs(e: Expr, out: Refs) -> Refs =
+  match e {
+    ELit(_) -> out,
+    EBad(_) -> out,
+    EVar(v) -> {..out, names: push(out.names, v.name)},
+    EBinary(b) -> collect_refs(b.rhs, collect_refs(b.lhs, out)),
+    EUnary(u) -> collect_refs(u.operand, out),
+    ELambda(l) -> collect_refs(l.body, out),
+    EApp(a) -> fold(a.args, collect_refs(a.func, out), |acc: Refs, x: Expr| collect_refs(x, acc)),
+    EIf(i) -> collect_refs(i.else_branch, collect_refs(i.then_branch, collect_refs(i.cond, out))),
+    EMatch(m) -> fold(m.arms, collect_refs(m.scrutinee, out), |acc: Refs, arm: MatchArm|
+                   collect_refs(arm.body, match arm.guard { Some(g) -> collect_refs(g, acc), None -> acc })),
+    EBlock(b) -> {
+      let ss = fold(b.stmts, out, |acc: Refs, s: Stmt| match s { SExpr(x) -> collect_refs(x, acc), SLet(l) -> collect_refs(l.value, acc) });
+      match b.tail { Some(t) -> collect_refs(t, ss), None -> ss }
+    },
+    ERecord(r) -> fold(r.fields, out, |acc: Refs, f: RecField| collect_refs(f.value, acc)),
+    ERecordUpdate(r) -> fold(r.fields, collect_refs(r.base, out), |acc: Refs, f: RecField| collect_refs(f.value, acc)),
+    EField(f) -> collect_refs(f.base, out),
+    ETry(t) -> collect_refs(t.operand, out),
+    EList(l) -> fold(l.items, out, |acc: Refs, x: Expr| collect_refs(x, acc)),
+    EPerform(p) -> fold(p.args, {..out, effects: true}, |acc: Refs, x: Expr| collect_refs(x, acc)),
+    EHandle(h) -> {
+      let b = collect_refs(h.body, {..out, effects: true});
+      let cs = fold(h.clauses, b, |acc: Refs, c: HandleClause| collect_refs(c.body, acc));
+      match h.ret { Some(rc) -> collect_refs(rc.body, cs), None -> cs }
+    },
+    EWithCell(c) -> collect_refs(c.body, collect_refs(c.init, out)),
+    EWithRegion(w) -> collect_refs(w.body, out),
+    ESimulate(s) -> collect_refs(s.body, out),
+  }
+
+// Tarjan's components, ported edge for edge so the components come out in the reference's order.
+type Tarjan = { index: List<Int>, low: List<Int>, on_stack: List<Bool>, stack: List<Int>,
+                call: List<{ v: Int, edge: Int }>, out: List<List<Int>>, next: Int }
+
+fn sccs(n: Int, adj: List<List<Int>>) -> List<List<Int>> = {
+  let unvisited = 0 - 1;
+  let start = { index: map(range(0, n), |i: Int| unvisited), low: map(range(0, n), |i: Int| 0), on_stack: map(range(0, n), |i: Int| false),
+                stack: [], call: [], out: [], next: 0 };
+  let edges = fold(adj, 0, |acc: Int, es: List<Int>| acc + len(es));
+  let done = fold(range(0, n), start, |t: Tarjan, root: Int|
+    if at(t.index, root) != unvisited { t } else {
+      let opened: Tarjan = {..t, index: set_at(t.index, root, t.next), low: set_at(t.low, root, t.next), next: t.next + 1,
+                            stack: push(t.stack, root), on_stack: set_at(t.on_stack, root, true), call: [{ v: root, edge: 0 }]};
+      iterate(opened, 2 * (n + edges) + 4, |x: Tarjan| if len(x.call) == 0 { Stop(x) } else { Continue(tarjan_step(adj, x)) })
+    });
+  done.out
+}
+
+fn tarjan_step(adj: List<List<Int>>, t: Tarjan) -> Tarjan = {
+  let top = at(t.call, len(t.call) - 1);
+  let rest = take(t.call, len(t.call) - 1);
+  let out = at(adj, top.v);
+  if top.edge < len(out) {
+    let again = push(rest, { v: top.v, edge: top.edge + 1 });
+    let w = at(out, top.edge);
+    if at(t.index, w) == 0 - 1 {
+      {..t, index: set_at(t.index, w, t.next), low: set_at(t.low, w, t.next), next: t.next + 1,
+            stack: push(t.stack, w), on_stack: set_at(t.on_stack, w, true), call: push(again, { v: w, edge: 0 })}
+    } else if at(t.on_stack, w) {
+      {..t, low: set_at(t.low, top.v, min(at(t.low, top.v), at(t.index, w))), call: again}
+    } else { {..t, call: again} }
+  } else {
+    let popped: Tarjan = if at(t.low, top.v) == at(t.index, top.v) {
+      let split = iterate({ stack: t.stack, on: t.on_stack, comp: [] }, len(t.stack) + 1, |s: { stack: List<Int>, on: List<Bool>, comp: List<Int> }| {
+        let w = at(s.stack, len(s.stack) - 1);
+        let next = { stack: take(s.stack, len(s.stack) - 1), on: set_at(s.on, w, false), comp: push(s.comp, w) };
+        if w == top.v { Stop(next) } else { Continue(next) }
+      });
+      {..t, stack: split.stack, on_stack: split.on, out: push(t.out, reverse_ints(split.comp))}
+    } else { t };
+    let lowered: Tarjan = if len(rest) > 0 {
+      let parent = at(rest, len(rest) - 1).v;
+      {..popped, low: set_at(popped.low, parent, min(at(popped.low, parent), at(popped.low, top.v)))}
+    } else { popped };
+    {..lowered, call: rest}
+  }
+}
+
+fn reverse_ints(xs: List<Int>) -> List<Int> = map(range(0, len(xs)), |i: Int| at(xs, len(xs) - 1 - i))
+
+fn reverse_types(xs: List<Type>) -> List<Type> = map(range(0, len(xs)), |i: Int| at(xs, len(xs) - 1 - i))
+
+fn check_fns(cx: Cx, m: Mod) -> Cx = {
+  let collected = fold(m.module.items, { cx: cx, fns: [], names: [] }, |acc: { cx: Cx, fns: List<FnDef>, names: List<Bytes> }, it: Item|
+    match it {
+      IFn(def) ->
+        if contains_bytes(acc.names, def.name.name) {
+          let prev = fold(acc.fns, dummy_span(), |s: Span, f: FnDef| if f.name.name == def.name.name { f.name.span } else { s });
+          {..acc, cx: duplicate(acc.cx, def.name, { module: acc.cx.module, span: prev })}
+        } else if is_cell_builtin(def.name.name) { {..acc, cx: err1(acc.cx, b"E0105", def.name.span, 1)} }
+        else if def.name.name == compare_values_name() { {..acc, cx: err1(acc.cx, b"E0105", def.name.span, 2)} }
+        else { { cx: acc.cx, fns: push(acc.fns, def), names: push(acc.names, def.name.name) } },
+      _ -> acc,
+    });
+  let fns = collected.fns;
+  let names = collected.names;
+  let adj = map(fns, |d: FnDef| {
+    let refs = refs_of(d.body);
+    fold(refs.names, [], |acc: List<Int>, q: QName|
+      if !is_bare(q) { acc } else {
+        let i = position_bytes(names, q.name.name);
+        if i < 0 || contains_int(acc, i) { acc } else { push(acc, i) }
+      })
+  });
+  fold(sccs(len(fns), adj), collected.cx, |c: Cx, comp: List<Int>| check_component(c, m, fns, comp))
+}
+
+fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
+  let qualified = map(comp, |i: Int| qualify(m.name, at(fns, i).name.name));
+  let sigs = fold(range(0, len(comp)), { cx: cx, sigs: [] }, |acc: { cx: Cx, sigs: List<Sig> }, slot: Int| {
+    let s: WithSig = signature(acc.cx, at(fns, at(comp, slot)));
+    { cx: {..s.cx, env: env_bind_global(s.cx.env, at(qualified, slot), mono(s.sig.fn_ty))}, sigs: push(acc.sigs, s.sig) }
+  });
+  let bodies = fold(range(0, len(comp)), { cx: sigs.cx, rows: [] }, |acc: { cx: Cx, rows: List<Row> }, slot: Int| {
+    let o: WithBodyRow = check_fn_body(acc.cx, at(fns, at(comp, slot)), at(sigs.sigs, slot));
+    { cx: o.cx, rows: push(acc.rows, o.row) }
+  });
+  let settled: Cx = settle_numerics(bodies.cx);
+  let required: Cx = fold(range(0, len(comp)), settled, |c: Cx, slot: Int| require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
+  let closed: Cx = fold(sigs.sigs, required, |c: Cx, s: Sig| close_unreachable_row(c, s));
+  let removed: Cx = fold(qualified, closed, |c: Cx, name: Bytes| {..c, env: env_remove_global(c.env, name)});
+  fold(range(0, len(comp)), removed, |c: Cx, slot: Int| {
+    let def = at(fns, at(comp, slot));
+    let sig = at(sigs.sigs, slot);
+    let g: Generalized = generalize(c.subst, c.env, sig.fn_ty);
+    let row = resolve_r(c, sig.published_row);
+    let bound: Cx = {..c, env: env_bind_global(g.e, at(qualified, slot), g.sc), ty_params: sig.ty_params};
+    let constraints = published_constraints(bound, def, g.sc);
+    let performed = resolve_r(bound, at(bodies.rows, slot));
+    set_def({..bound, ty_params: map_new(), constraints: map_insert(bound.constraints, at(qualified, slot), constraints)},
+            { name: at(qualified, slot), module: m.name, simple_name: def.name.name, scheme: g.sc, footprint: row.atoms,
+              performed: performed.atoms, constraints: constraints, internally_effectful: true, at: here(bound, def.span) })
+  })
+}
+
+fn published_constraints(cx: Cx, def: FnDef, sc: Scheme) -> List<DefConstraint> = {
+  let found = fold(def.constraints, [], |acc: List<DefConstraint>, c: Constraint|
+    match map_get(cx.ty_params, c.param.name) {
+      Some(TyVar(v)) -> {
+        let param = fold(range(0, len(sc.ty_vars)), 0 - 1, |p: Int, i: Int| if p >= 0 { p } else if at(sc.ty_vars, i) == v { i } else { p });
+        if param < 0 { acc } else { push(acc, { deriver: c.deriver, param: param }) }
+      },
+      _ -> acc,
+    });
+  dedup_constraints(fold(found, [], |acc: List<DefConstraint>, c: DefConstraint| insert_constraint(acc, c)))
+}
+
+fn constraint_lt(a: DefConstraint, b: DefConstraint) -> Bool =
+  a.param < b.param || (a.param == b.param && deriver_tag(a.deriver) < deriver_tag(b.deriver))
+
+fn insert_constraint(sorted: List<DefConstraint>, c: DefConstraint) -> List<DefConstraint> = {
+  let n = len(sorted);
+  let i = fold(range(0, n), n, |acc: Int, j: Int| if acc < n { acc } else if constraint_lt(c, at(sorted, j)) { j } else { acc });
+  append(push(take(sorted, i), c), drop(sorted, i))
+}
+
+fn dedup_constraints(xs: List<DefConstraint>) -> List<DefConstraint> =
+  fold(xs, [], |acc: List<DefConstraint>, c: DefConstraint|
+    if len(acc) > 0 && at(acc, len(acc) - 1).param == c.param && same_deriver(at(acc, len(acc) - 1).deriver, c.deriver) { acc } else { push(acc, c) })
+
+fn check_fn_body(cx0: Cx, def: FnDef, sig: Sig) -> { cx: Cx, row: Row } = {
+  let cx: Cx = {..cx0, scope: sig.scope, ty_params: sig.ty_params, row_params: sig.row_params, performs: []};
+  let assumed: Cx = {..cx, assumed: constraints_in_force(cx, def.constraints)};
+  let defaults: Cx = fold(range(0, len(def.params)), assumed, |c: Cx, i: Int|
+    match at(def.params, i).default {
+      None -> c,
+      Some(d) -> { let o: Inferred = infer(c, d); expect(o.cx, expr_span(d), at(sig.params, i), o.ty).cx },
+    });
+  let pushed: Cx = {..defaults, env: env_push(defaults.env)};
+  let bound: Cx = fold(range(0, len(def.params)), pushed, |c: Cx, i: Int| {..c, env: env_bind(c.env, at(def.params, i).name.name, mono(at(sig.params, i)))});
+  let body: Inferred = infer(bound, def.body);
+  let checked: Cx = expect(body.cx, expr_span(def.body), sig.ret, body.ty).cx;
+  let popped: Cx = {..checked, env: env_pop(checked.env)};
+  let rowed: Cx = match sig.declared {
+    Some(declared) -> check_upper_bound(popped, def, declared, body.row),
+    None -> {
+      let u = unify_row(popped.subst, popped.fresh, sig.published_row, body.row);
+      let c = with_unified(popped, u);
+      match u.err { Some(e) -> report_unify(c, e, expr_span(def.body)), None -> c }
+    },
+  };
+  { cx: {..rowed, ty_params: map_new(), row_params: map_new(), assumed: []}, row: body.row }
+}
+
+fn check_upper_bound(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx = {
+  let ann_span = match def.effects { Some(r) -> r.span, None -> def.span };
+  let inf = resolve_r(cx, inferred);
+  let dec = resolve_r(cx, declared);
+  let extra = atoms_difference(inf.atoms, dec.atoms);
+  let c1: Cx = if len(extra) == 0 { cx } else {
+    let sites = fold(extra, [], |acc: List<Label>, a: Atom| match site_for(cx, a) { Some(s) -> push(acc, lab(s.module, s.span, true)), None -> acc });
+    let primaries = if len(sites) == 0 { [lab(cx.module, expr_span(def.body), true)] } else { sites };
+    err_labels(cx, b"E0302", push(primaries, lab(cx.module, ann_span, false)), 1)
+  };
+  match inf.tail {
+    None -> c1,
+    Some(v) ->
+      if dec.tail == Some(v) { c1 } else {
+        let u = unify_row(c1.subst, c1.fresh, { atoms: [], tail: dec.tail }, row_open(v));
+        let c2: Cx = with_unified(c1, u);
+        match u.err {
+          Some(_) -> err_labels(c2, b"E0302", [lab(c2.module, expr_span(def.body), true), lab(c2.module, ann_span, false)], 1),
+          None -> c2,
+        }
+      },
+  }
+}
+
+fn settle_numerics(cx: Cx) -> Cx = {
+  let entries = cx.numerics;
+  fold(entries, {..cx, numerics: []}, |c: Cx, entry: Numeric| {
+    let ty = resolve(c, entry.ty);
+    match ty {
+      TyVar(_) -> err1(c, b"E0210", entry.span, 2),
+      TyCon(k) ->
+        if len(k.args) != 0 { err1(c, b"E0201", entry.span, 1) }
+        else if k.name == b"Int" || k.name == b"Float" { c }
+        else if k.name == b"Decimal" { if entry.op == b"div" { err1(c, b"E0209", entry.span, 2) } else { c } }
+        else { err1(c, b"E0201", entry.span, 1) },
+      _ -> err1(c, b"E0201", entry.span, 1),
+    }
+  })
+}
+
+fn require_written_signature(cx: Cx, def: FnDef, sig: Sig) -> Cx = {
+  let params = fold(def.params, cx, |c: Cx, p: Param| match p.ty { Some(_) -> c, None -> err1(c, b"E0126", p.span, 1) });
+  match def.ret { Some(_) -> params, None -> err1(params, b"E0126", def.name.span, 1) }
+}
+
+fn close_unreachable_row(cx: Cx, sig: Sig) -> Cx =
+  match resolve(cx, sig.fn_ty) {
+    TyFn(f) ->
+      match f.effects.tail {
+        None -> cx,
+        Some(tail) ->
+          if is_rigid_row(cx.subst, tail) { cx } else {
+            let fv = fold(f.params, { tys: [], rows: [] }, |acc: Free, p: Type| free_vars(cx.subst, p, acc));
+            let all = free_vars(cx.subst, f.ret, fv);
+            if contains_int(all.rows, tail) { cx } else {
+              let u = unify_row(cx.subst, cx.fresh, row_empty(), row_open(tail));
+              with_unified(cx, u)
+            }
+          },
+      },
+    _ -> cx,
+  }
+
+// --- Tests and laws --------------------------------------------------------------------------------
+
+fn check_tests(cx: Cx, m: Mod) -> Cx =
+  fold(m.module.items, cx, |c: Cx, it: Item|
+    match it {
+      ITest(def) -> {
+        let c1: Cx = {..c, scope: c.scope + 1, ty_params: map_new(), row_params: map_new(), performs: []};
+        let pushed: Cx = {..c1, env: env_push(c1.env)};
+        let o: Inferred = infer(pushed, def.body);
+        let popped: Cx = {..o.cx, env: env_pop(o.cx.env)};
+        let row = resolve_r(popped, o.row);
+        let checked: Cx = if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) };
+        {..checked, tests: push(checked.tests, { key: qualify(m.name, def.name), nondet: def.is_nondet, footprint: row.atoms })}
+      },
+      _ -> c,
+    })
+
+fn check_determinism(cx: Cx, def: TestDef, footprint: List<Atom>) -> Cx =
+  fold(footprint, cx, |c: Cx, atom: Atom|
+    match effect_of(c, atom.effect) {
+      None -> c,
+      Some(info) ->
+        if !info.nondet { c } else {
+          let site = site_for(c, atom);
+          let (span, direct) = match site { Some(s) -> (s.span, s.direct), None -> (expr_span(def.body), false) };
+          let notes = if direct { 2 } else { 3 };
+          err_labels(c, b"E0412", [lab(c.module, span, true), lab(c.module, def.name_span, false)], notes)
+        },
+    })
+
+fn check_laws(cx: Cx, m: Mod) -> Cx = {
+  let walked = fold(m.module.items, { cx: cx, labels: [] }, |acc: { cx: Cx, labels: List<{ name: Bytes, span: Span }> }, it: Item|
+    match it {
+      ILaw(def) -> {
+        let c: Cx = {..acc.cx, scope: acc.cx.scope + 1};
+        match fold(acc.labels, None, |p: Option<Span>, l: { name: Bytes, span: Span }| match p { Some(_) -> p, None -> if l.name == def.name { Some(l.span) } else { None } }) {
+          Some(first) -> {..acc, cx: err2(c, b"E0105", def.name_span, { module: c.module, span: first }, 1)},
+          None -> { cx: check_law(c, m, def), labels: push(acc.labels, { name: def.name, span: def.name_span }) },
+        }
+      },
+      _ -> acc,
+    });
+  walked.cx
+}
+
+fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
+  let cx: Cx = {..cx0, ty_params: map_new(), row_params: map_new(), performs: [], auto_ty_params: true};
+  let types: WithTys = fold(def.binders, { cx: cx, ts: [] }, |acc: { cx: Cx, ts: List<Type> }, b: Binder| {
+    let o: WithTy = law_binder(acc.cx, b);
+    { cx: o.cx, ts: push(acc.ts, o.t) }
+  });
+  let c1: Cx = {..types.cx, auto_ty_params: false};
+  let sorts = map_fold(c1.ty_params, [], |acc: List<Int>, k: Bytes, t: Type| match t { TyVar(v) -> push(acc, v), _ -> acc });
+  let rigid: Cx = fold(sorts, c1, |c: Cx, v: Int| {..c, subst: mark_rigid_ty(c.subst, v)});
+  let pushed: Cx = {..rigid, env: env_push(rigid.env)};
+  let bound: Cx = fold(range(0, len(def.binders)), pushed, |c: Cx, i: Int| {..c, env: env_bind(c.env, at(def.binders, i).name.name, mono(at(types.ts, i)))});
+  let guarded: Cx = match def.guard {
+    Some(g) -> {
+      let o: Inferred = infer({..bound, performs: []}, g);
+      let c: Cx = expect(o.cx, expr_span(g), t_bool(), o.ty).cx;
+      check_spec_purity(c, [], expr_span(g), resolve_r(c, o.row))
+    },
+    None -> bound,
+  };
+  let body: Inferred = infer({..guarded, performs: []}, def.body);
+  let c2: Cx = expect(body.cx, expr_span(def.body), t_bool(), body.ty).cx;
+  let row = resolve_r(c2, body.row);
+  let c3: Cx = if def.host { c2 } else { check_spec_purity(c2, [seed_atom()], expr_span(def.body), row) };
+  let popped: Cx = {..c3, env: env_pop(c3.env)};
+  let binders = map(range(0, len(def.binders)), |i: Int| { name: at(def.binders, i).name.name, ty: resolve(popped, at(types.ts, i)) });
+  {..popped, ty_params: map_new(), row_params: map_new(),
+    laws: push(popped.laws, { key: qualify(m.name, def.name), binders: binders, has_guard: match def.guard { Some(_) -> true, None -> false },
+                              host: def.host, footprint: row.atoms })}
+}
+
+fn law_binder(cx: Cx, b: Binder) -> { cx: Cx, t: Type } = conv_type(cx, b.ty)
+
+// `check_spec_purity`: every atom past the allowed set is `E0305`, and an open row too.
+fn check_spec_purity(cx: Cx, allowed: List<Atom>, at_: Span, row: Row) -> Cx = {
+  let c1: Cx = fold(atoms_difference(row.atoms, allowed), cx, |c: Cx, atom: Atom| {
+    let site = site_for(c, atom);
+    let (span, direct) = match site { Some(s) -> (s.span, s.direct), None -> (at_, false) };
+    err_labels(c, b"E0417", [lab(c.module, span, true), lab(c.module, at_, false)], 3 + len(allowed))
+  });
+  match row.tail { Some(_) -> err1(c1, b"E0417", at_, 1), None -> c1 }
+}
+
+// --- Internal effects ---------------------------------------------------------------------------------
+
+fn mark_internal_effects(cx: Cx) -> Cx = {
+  let names = fold(range(0, len(cx.mods)), [], |acc: List<Bytes>, mi: Int|
+    fold(at(cx.mods, mi).module.items, acc, |a: List<Bytes>, it: Item|
+      match it { IFn(def) -> { let n = qualify(module_name(cx, mi), def.name.name); if contains_bytes(a, n) { a } else { push(a, n) } }, _ -> a }));
+  let n = len(names);
+  let seeded = fold(range(0, len(cx.mods)), { cx: cx, effects: map(range(0, n), |i: Int| false), callers: map(range(0, n), |i: Int| []) },
+    |acc: { cx: Cx, effects: List<Bool>, callers: List<List<Int>> }, mi: Int| {
+      let c: Cx = {..acc.cx, module: mi};
+      fold(at(c.mods, mi).module.items, {..acc, cx: c}, |a: { cx: Cx, effects: List<Bool>, callers: List<List<Int>> }, it: Item|
+        match it {
+          IFn(def) -> {
+            let at_ = position_bytes(names, qualify(module_name(a.cx, mi), def.name.name));
+            if at_ < 0 { a } else {
+              let refs = refs_of(def.body);
+              let flagged = if refs.effects { set_at(a.effects, at_, true) } else { a.effects };
+              let params = map(def.params, |p: Param| p.name.name);
+              let callers = fold(refs.names, a.callers, |cs: List<List<Int>>, q: QName|
+                if is_bare(q) && contains_bytes(params, q.name.name) { cs } else {
+                  match declared_value(a.cx, q) {
+                    None -> cs,
+                    Some(callee) -> { let to = position_bytes(names, callee); if to < 0 { cs } else { set_at(cs, to, push(at(cs, to), at_)) } },
+                  }
+                });
+              { cx: a.cx, effects: flagged, callers: callers }
+            }
+          },
+          _ -> a,
+        })
+    });
+  let propagated = iterate({ effects: seeded.effects, pending: filter(range(0, n), |i: Int| at(seeded.effects, i)) }, n * n + n + 2,
+    |st: { effects: List<Bool>, pending: List<Int> }|
+      if len(st.pending) == 0 { Stop(st.effects) } else {
+        let node = at(st.pending, len(st.pending) - 1);
+        let rest = take(st.pending, len(st.pending) - 1);
+        let out = fold(at(seeded.callers, node), { effects: st.effects, pending: rest }, |a: { effects: List<Bool>, pending: List<Int> }, caller: Int|
+          if at(a.effects, caller) { a } else { { effects: set_at(a.effects, caller, true), pending: push(a.pending, caller) } });
+        Continue(out)
+      });
+  let c: Cx = seeded.cx;
+  fold(range(0, n), c, |cc: Cx, i: Int|
+    match def_of(cc, at(names, i)) {
+      Some(d) -> set_def(cc, { name: d.name, module: d.module, simple_name: d.simple_name, scheme: d.scheme, footprint: d.footprint,
+                                performed: d.performed, constraints: d.constraints, internally_effectful: at(propagated, i), at: d.at }),
+      None -> cc,
+    })
+}
+
+// --- `check_program` --------------------------------------------------------------------------------------
+
+fn fresh_cx(r: Resolved, mods: List<Mod>) -> Cx =
+  install_prelude({ r: r, mods: mods, module: 0, subst: subst_new(), fresh: fresh_new(), env: env_new(), diags: [],
+                    types: map_new(), effects: [], effect_index: map_new(), ctors: [], ctor_index: map_new(),
+                    defs: [], def_index: map_new(), tests: [], laws: [], ty_params: map_new(), row_params: map_new(),
+                    auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], comparisons: [], scope: 0,
+                    constraints: map_new(), numerics: [], simulate_depth: 0, open_regions: [], assumed: [] })
+
+type Checked = { cx: Cx, ok: Bool }
+
+pub fn check_program(r: Resolved, mods: List<Mod>) -> Checked = {
+  let c0 = fresh_cx(r, mods);
+  let declared: Cx = fold(r.order, c0, |c: Cx, i: Int| {
+    let m = at(mods, i);
+    let c1: Cx = {..c, module: i};
+    check_value_namespace(collect_ctors(collect_effects(collect_types(c1, m), m), m), m)
+  });
+  let checked: Cx = fold(r.order, declared, |c: Cx, i: Int| check_fns({..c, module: i}, at(mods, i)));
+  let tested: Cx = fold(range(0, len(mods)), checked, |c: Cx, i: Int| check_laws(check_tests({..c, module: i}, at(mods, i)), at(mods, i)));
+  let settled: Cx = settle_numerics(tested);
+  let marked: Cx = mark_internal_effects(settled);
+  { cx: marked, ok: len(marked.diags) == 0 }
+}
+
+// --- The dump -----------------------------------------------------------------------------------------------
+
+fn n(v: Int) -> Bytes = num(v)
+
+fn footprint_text(atoms: List<Atom>) -> Bytes =
+  fold(range(0, len(atoms)), b"", |acc: Bytes, i: Int| if i == 0 { atom_text(at(atoms, i)) } else { bytes_concat_all([acc, b",", atom_text(at(atoms, i))]) })
+
+fn join_with(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
+
+fn flag(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
+
+fn dump_def(d: DefInfo) -> Bytes =
+  bytes_concat_all([b"F;", d.name, b";", scheme_text(d.scheme), b";", footprint_text(d.footprint), b";", footprint_text(d.performed), b";",
+                    join_with(map(d.constraints, |c: DefConstraint| bytes_concat(deriver_text(c.deriver), n(c.param))), b","), b";",
+                    flag(d.internally_effectful), b";"])
+
+fn dump_op(o: OpInfo) -> Bytes =
+  bytes_concat_all([o.name, b":", match o.mode { MRead -> b"read", MWrite -> b"write", MBad -> b"" }, b":", flag(o.resource_param), b":",
+                    join_with(map(o.params, type_text), b"+"), b":", type_text(o.ret)])
+
+fn dump_checked(c: Cx) -> Bytes =
+  bytes_concat_all([
+    bytes_concat_all(map(c.defs, dump_def)),
+    bytes_concat_all(map(c.tests, |t: TestInfo| bytes_concat_all([b"T;", t.key, b";", flag(t.nondet), b";", footprint_text(t.footprint), b";"]))),
+    bytes_concat_all(map(c.laws, |l: LawInfo| bytes_concat_all([b"L;", l.key, b";",
+      join_with(map(l.binders, |b: LawBinder| bytes_concat_all([b.name, b":", type_text(b.ty)])), b","), b";",
+      flag(l.has_guard), b";", flag(l.host), b";", footprint_text(l.footprint), b";"]))),
+    bytes_concat_all(map(filter(c.effects, |e: EffectInfo| bytes_len(e.module) > 0), |e: EffectInfo|
+      bytes_concat_all([b"E;", e.name, b";", flag(e.nondet), b";", join_with(map(e.ops, dump_op), b","), b";"]))),
+    bytes_concat_all(map(filter(c.ctors, |k: CtorInfo| bytes_len(k.module) > 0), |k: CtorInfo|
+      bytes_concat_all([b"C;", k.name, b";", k.type_name, b";", n(k.index), b";", n(k.arity), b";", scheme_text(k.scheme), b";"]))),
+  ])
+
+// `deduplicated`: diagnostics that would render alike are one; here, alike is the same code,
+// labels and note count.
+fn dedup_diags(ds: List<Diag>) -> List<Diag> =
+  fold(ds, [], |acc: List<Diag>, d: Diag| if fold(acc, false, |b: Bool, x: Diag| b || x == d) { acc } else { push(acc, d) })
+
+pub fn check_dump(sources: List<Source>) -> String = {
+  let mods = map(sources, |s: Source| {
+    let r = parse(s.src);
+    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    { name: s.name, module: x.module }
+  });
+  let head = bytes_concat_all([b"K;", n(len(sources)), b";"]);
+  let body = match resolve_modules(mods) {
+    Failed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
+    Resolved_(x) -> {
+      let out = check_program(x.r, x.mods);
+      if out.ok { dump_checked(out.cx) } else { bytes_concat(b"X;", dump_diags(dedup_diags(out.cx.diags))) }
+    },
+  };
+  string_of_bytes(bytes_concat(head, body))
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// The differential (`harness/tests/infer.rs`) is the instrument; these pin the
+// port's own shape on programs small enough to read.
+
+test "a definition's scheme is generalized and its footprint inferred" {
+  let dump = check_dump([{ name: b"m", src: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)" }]);
+  assert_eq(dump, "K;1;F;m.id;<a>(a) -> a;;;;0;F;m.two;() -> Int;;;;0;F;m.say;(Bytes) -> Unit / {m.log.write};m.log.write;m.log.write;;1;E;m.log;0;emit:write:0:Bytes:Unit;")
+}
+
+test "a body that performs more than its signature permits is refused" {
+  let dump = check_dump([{ name: b"m", src: b"effect log { write emit(Bytes) -> Unit }\nfn quiet() -> Unit / {} = log.emit(b\"x\")" }]);
+  assert_eq(dump, "K;1;X;D;1;!E0302:0:67:81:2:1;=0:67:81:1;=0:62:64:0;")
+}
