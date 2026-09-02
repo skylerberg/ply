@@ -1116,6 +1116,8 @@ impl<'a> Checker<'a> {
                 "decimal_to_string",
                 mono(vec![Type::decimal()], Type::string()),
             ),
+            ("bits_of_float", mono(vec![Type::float()], Type::int())),
+            ("float_of_bits", mono(vec![Type::int()], Type::float())),
             (
                 "panic",
                 poly(
