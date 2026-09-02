@@ -184,3 +184,16 @@ outside, by a smaller factor. What the reading says now: what remains of the
 integer kernel is the compiled arithmetic itself — every add checked, every
 word masked, as the source writes it — and the records the source keeps alive
 by shape.
+
+## After the direct builtins
+
+`after-direct.txt`, under the gate on both sides, with the builtins the rows
+call most as direct calls from compiled code and the empty list, the empty
+map and every nullary constructor made once (ADR 0036, Decision 10). The
+record kernel moved by a little, on the inserts and the byte singletons its
+step no longer dispatches; the integer kernel did not move, since its round
+calls no builtin. The bar stands as registered and the verdict is the last
+series': the record kernel inside, the integer kernel outside by the same
+factor. What the reading says now is unchanged for the kernels; it is the
+front end's rows that moved on this step, and `observation-6.txt` is where
+they are read.
