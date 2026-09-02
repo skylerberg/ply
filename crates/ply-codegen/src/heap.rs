@@ -678,12 +678,11 @@ pub fn inc(w: Word) {
     }
 }
 
-/// One holder fewer; the last one dismantles the object, children and all, without recursing.
+/// One holder fewer; the last one dismantles the object, children and all.
 pub fn dec(w: Word) {
     if is_imm(w) {
         return;
     }
-    // The common case allocates nothing: a holder that is not the last just counts down.
     let o = obj(w);
     unsafe {
         if (*o).rc == IMMORTAL {
@@ -694,46 +693,56 @@ pub fn dec(w: Word) {
             (*o).rc -= 1;
             return;
         }
-        (*o).rc = 1;
     }
-    let mut pending = vec![w];
-    while let Some(w) = pending.pop() {
-        if is_imm(w) {
-            continue;
+    let mut deferred = Vec::new();
+    unsafe {
+        dismantle(o, 0, &mut deferred);
+        while let Some(o) = deferred.pop() {
+            dismantle(o, 0, &mut deferred);
         }
-        let o = obj(w);
-        unsafe {
-            if (*o).rc == IMMORTAL {
+    }
+}
+
+/// How deep a dying object's dying children are dismantled on the stack before the rest are
+/// deferred to a heap list: a record of scalars, the common case, allocates nothing.
+const DISMANTLE_DEPTH: usize = 32;
+
+/// `o`, held once, dies: each child is let go, a child it was the last holder of dismantled in
+/// turn, and its header marked dead — read as such by anything still holding a stale word,
+/// dropped by nothing twice, and its memory recycled with the entry.
+unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>) {
+    unsafe {
+        debug_assert!((*o).rc == 1 && (*o).kind != KIND_DEAD);
+        (*o).rc = 0;
+        let (first, last) = match (*o).kind {
+            KIND_RECORD | KIND_CTOR | KIND_LIST => (0, (*o).len as usize),
+            KIND_MAP => (0, 2 * (*o).len as usize),
+            KIND_CLOSURE => (CLOSURE_CAPTURES, (*o).len as usize),
+            KIND_BRIDGE => {
+                std::ptr::drop_in_place(bridge_slot(o));
+                (0, 0)
+            }
+            _ => (0, 0),
+        };
+        for i in first..last {
+            let c = word_at(o, i);
+            if is_imm(c) {
                 continue;
             }
-            debug_assert!((*o).kind != KIND_DEAD, "a dead object was released again");
-            (*o).rc -= 1;
-            if (*o).rc != 0 {
+            let co = obj(c);
+            if (*co).rc == IMMORTAL {
                 continue;
             }
-            match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LIST => {
-                    for i in 0..(*o).len as usize {
-                        pending.push(word_at(o, i));
-                    }
-                }
-                KIND_MAP => {
-                    for i in 0..2 * (*o).len as usize {
-                        pending.push(word_at(o, i));
-                    }
-                }
-                KIND_CLOSURE => {
-                    for i in CLOSURE_CAPTURES..(*o).len as usize {
-                        pending.push(word_at(o, i));
-                    }
-                }
-                KIND_BRIDGE => std::ptr::drop_in_place(bridge_slot(o)),
-                _ => {}
+            debug_assert!((*co).kind != KIND_DEAD, "a dead object was released again");
+            if (*co).rc > 1 {
+                (*co).rc -= 1;
+            } else if depth < DISMANTLE_DEPTH {
+                dismantle(co, depth + 1, deferred);
+            } else {
+                deferred.push(co);
             }
-            // Dead: read as such by anything still holding a stale word, dropped by nothing
-            // twice, and its memory recycled with the entry.
-            (*o).kind = KIND_DEAD;
         }
+        (*o).kind = KIND_DEAD;
     }
 }
 
