@@ -91,3 +91,26 @@ words built and torn down per `g`, and a field read through the runtime for
 each of its words — is where the model is furthest from Rust, and the record
 kernel's distance is mostly the ordered map and the list, which sequence step 5
 reaches last. Prediction 3's order stands.
+
+## After sequence steps 2 and 3
+
+`after-words.txt`, under the gate on both sides. Neither kernel clears, so
+prediction 3 is not yet decided; its order held in direction — the integer
+kernel halved and the record kernel moved by a fraction — with the calls typed
+and the values laid out as words but every field still read by name through the
+runtime. What the reading says: the integer kernel's remaining distance is the
+record path inside it — a `Quad` built and read per mixing step — and not the
+arithmetic, so the static half of ADR 0035's Decision 1 comes before anything
+else.
+
+## After the layouts
+
+`after-layouts.txt`, under the gate on both sides, with field reads at known
+offsets, a per-shape offset table for the rest, a bump allocator and the memo
+copied out. Neither kernel clears yet. The integer kernel moved by more than
+the record kernel again, so prediction 3's order still holds in direction, and
+what moved it was not the field loads — those changed little on their own —
+but the string compares the by-name path was paying and the allocation on
+every release. What the reading says now: the integer kernel's distance is
+the record built and torn down per mixing step, which no helper change
+reaches; it needs the step inlined and the record kept in registers.
