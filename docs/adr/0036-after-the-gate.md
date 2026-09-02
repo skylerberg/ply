@@ -23,8 +23,11 @@ target's (`docs/BOOTSTRAP-PATH.md` step 10) and not this record's.
 > register rather than a call; that a callback over a range or a list is a loop
 > in the body that calls its step directly rather than a closure the runtime
 > calls back; that a record update copies by offset, never by name, when it
-> cannot write in place; and that an entry's dead memory is reused within the
-> entry, so an entry's memory is bounded by what it holds.
+> cannot write in place; that an entry's dead memory is reused within the
+> entry, so an entry's memory is bounded by what it holds; and that the seam
+> remembers a pure root's answer as compiled code does and takes it back in
+> as the word, so a phase's tree crosses the seam once rather than at every
+> root it is handed to.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -103,6 +106,24 @@ under the audit, the kernels and the front-end row run the reuse. A
 five-million-step churn of one record holds its memory flat where it grew by
 the step before.
 
+## Decision 5 — the seam remembers what compiled code remembers
+
+A pure nullary root entered from the interpreter was run and its answer
+converted every time, while the same function called from compiled code was
+answered from the memo; and the tree a phase answers was converted out and, at
+the next phase's entry, converted back in. The seam now memoizes a pure nullary
+root as compiled code does — the answer copied into the tables' own heap, the
+value it is converted to kept beside the word — and takes that value back in
+as its word when a body hands it to the next root; a call whose arguments are
+all such words is a pure function of remembered inputs and is remembered in
+turn, up to a bound, and the parts of a remembered answer one level down —
+the fields a body pulls out of a record or a constructor, the elements of a
+short list — carry the words they came from. The interpreter memoizes the same
+functions, so the two arms of the front-end row do the same work now, and the
+census says what still crosses: the answers of roots that take arguments the
+memo does not hold, which is what a driver written in Ply, entered once, would
+never convert at all.
+
 ## Priced and rejected
 
 A wider inlining budget. ADR 0035's integer kernel keeps its state in records
@@ -118,8 +139,10 @@ generation over the examples took several times longer. The budget stays.
   the front end's own code takes that shape rarely, and the census of steps is
   what would say if that changed.
 - **The seam's share of the front-end row.** It is the probe's shape, not the
-  model's, and the only thing that removes it is a driver entered once — which
-  is `docs/BOOTSTRAP-PATH.md` step 10's, not this record's.
+  model's: three roots entered from the interpreter per row. Decision 5 takes
+  most of it — what a remembered root answered goes back in as the word — and
+  what remains is the answers of roots over arguments the memo does not hold,
+  which only a driver entered once removes (`docs/BOOTSTRAP-PATH.md` step 10).
 
 ## Provenance
 
