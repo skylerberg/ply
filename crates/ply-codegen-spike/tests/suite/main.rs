@@ -8,6 +8,7 @@
 //! one. Every fixture path comes from `env!("CARGO_MANIFEST_DIR")`, so the
 //! move down a directory changes none of them.
 
+mod agreement;
 mod entry_cost;
 mod hazards;
 mod mcts_kernel;

@@ -547,6 +547,8 @@ fn sweep(spec: BackendSpec, selection: Selection) -> Sweep {
         out.offers.fired += seen.fired;
         out.offers.bytes_in += seen.bytes_in;
         out.offers.bytes_out += seen.bytes_out;
+        out.offers.str_in += seen.str_in;
+        out.offers.str_out += seen.str_out;
         out.offers.containers_out += seen.containers_out;
     }
     out
@@ -646,15 +648,31 @@ fn honest(selection: Selection) {
              the container widening of `Machine::compiled_answer` is inert on this corpus",
             sweep.compared
         );
+        // The `String` widening, asserted the same way: a kind admitted at the seam that nothing
+        // on disk carries across it would leave every wrong backend saying nothing about it.
+        assert!(
+            sweep.offers.str_in > 0,
+            "no call carrying a `String` argument was offered over {} tests, so the `String` \
+             widening of `compiled::crossable` is inert on this corpus",
+            sweep.compared
+        );
+        assert!(
+            sweep.offers.str_out > 0,
+            "{} calls carried a `String` in and not one answered a `String`",
+            sweep.offers.str_in
+        );
     }
     println!(
         "honest backend over {selection}: {} entered of {} offered, over {} tests · {} offers \
-         carried a `Bytes` argument · {} answered a `Bytes` · {} answered a container",
+         carried a `Bytes` argument · {} answered a `Bytes` · {} carried a `String` · {} answered \
+         a `String` · {} answered a container",
         sweep.entered,
         sweep.offers.offered,
         sweep.compared,
         sweep.offers.bytes_in,
         sweep.offers.bytes_out,
+        sweep.offers.str_in,
+        sweep.offers.str_out,
         sweep.offers.containers_out
     );
 }
