@@ -210,6 +210,11 @@ pub unsafe extern "C" fn rt_dup(_ctx: *mut Ctx, w: i64) -> i64 {
     w
 }
 
+/// Perceus's `drop`: one holder fewer.
+pub unsafe extern "C" fn rt_dec(_ctx: *mut Ctx, w: i64) {
+    heap::dec(w);
+}
+
 pub unsafe extern "C" fn rt_box_int(ctx: *mut Ctx, v: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     ctx.heap.boxed_int(v)
@@ -438,6 +443,47 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
             let byte = *bytes.get(usize::try_from(index).ok()?)?;
             heap::dec(*b);
             Some(heap::imm(i64::from(byte)))
+        }
+        // Concatenation over bridged buffers, in one allocation; a piece that is not bytes is
+        // the interpreter's diagnostic to raise.
+        (Builtin::BytesConcat, [a, b])
+            if heap::kind(*a) == KIND_BRIDGE && heap::kind(*b) == KIND_BRIDGE =>
+        {
+            let (Value::Bytes(x), Value::Bytes(y)) =
+                (unsafe { bridged(obj(*a)) }, unsafe { bridged(obj(*b)) })
+            else {
+                return None;
+            };
+            let mut out = Vec::with_capacity(x.len() + y.len());
+            out.extend_from_slice(x);
+            out.extend_from_slice(y);
+            heap::dec(*a);
+            heap::dec(*b);
+            Some(ctx.heap.bridge(Value::bytes(out)))
+        }
+        (Builtin::BytesConcatAll, [xs]) if heap::kind(*xs) == KIND_LIST => {
+            let o = obj(*xs);
+            let n = unsafe { (*o).len } as usize;
+            let mut total = 0;
+            for i in 0..n {
+                let w = unsafe { word_at(o, i) };
+                if heap::kind(w) != KIND_BRIDGE {
+                    return None;
+                }
+                let Value::Bytes(piece) = (unsafe { bridged(obj(w)) }) else {
+                    return None;
+                };
+                total += piece.len();
+            }
+            let mut out = Vec::with_capacity(total);
+            for i in 0..n {
+                let w = unsafe { word_at(o, i) };
+                if let Value::Bytes(piece) = unsafe { bridged(obj(w)) } {
+                    out.extend_from_slice(piece);
+                }
+            }
+            heap::dec(*xs);
+            Some(ctx.heap.bridge(Value::bytes(out)))
         }
         (Builtin::ByteOfInt, [n]) => {
             let v = heap::as_int(*n)?;
@@ -1291,6 +1337,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_iterate", rt_iterate as *const u8),
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),
+        ("rt_dec", rt_dec as *const u8),
         ("rt_constant", rt_constant as *const u8),
     ]
 }
