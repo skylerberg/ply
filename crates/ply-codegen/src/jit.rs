@@ -1617,6 +1617,8 @@ impl Fx<'_, '_> {
                 self.builder.switch_to_block(then_block);
                 self.builder.seal_block(then_block);
                 let mut inner = scope.clone();
+                // A branch's answer is owned: a local returned here is duplicated unless the
+                // read is its last, so the join never aliases a binding at one count.
                 let t = self.consumed(then_branch, &mut inner)?;
                 let t_ty = t.ty;
                 let t = self.coerce(t, kind);
