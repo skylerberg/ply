@@ -2048,6 +2048,21 @@ impl Fx<'_, '_> {
             });
         }
 
+        // `++` takes both operands, so a string built by appending to it grows in place.
+        if matches!(op, BinOp::Concat) {
+            let l = self.consumed(lhs, scope)?;
+            let r = self.consumed(rhs, scope)?;
+            let a = self.boxed(l);
+            let b = self.boxed(r);
+            let v = self.helper(self.jit.helpers.concat, &[a, b]);
+            self.check();
+            return Ok(Val {
+                kind: Kind::Boxed,
+                v,
+                ty: 0,
+                home: 0,
+            });
+        }
         let l = self.expr(lhs, scope)?;
         let r = self.expr(rhs, scope)?;
         match op {
@@ -2199,19 +2214,7 @@ impl Fx<'_, '_> {
                     home: 0,
                 })
             }
-            BinOp::Concat => {
-                let a = self.boxed(l);
-                let b = self.boxed(r);
-                let v = self.helper(self.jit.helpers.concat, &[a, b]);
-                self.check();
-                Ok(Val {
-                    kind: Kind::Boxed,
-                    v,
-                    ty: 0,
-                    home: 0,
-                })
-            }
-            BinOp::And | BinOp::Or => unreachable!("short-circuit handled above"),
+            BinOp::Concat | BinOp::And | BinOp::Or => unreachable!("handled above"),
         }
     }
 
