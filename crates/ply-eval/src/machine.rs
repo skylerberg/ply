@@ -1918,7 +1918,10 @@ impl<'a> Machine<'a> {
                 if *arity != args.len() {
                     return Err(arity_error(span, &format!("`{name}`"), *arity, args.len()));
                 }
-                self.go_return(Value::ctor_pooled(name.clone(), args));
+                self.go_return(Value::Ctor {
+                    name: name.clone(),
+                    args: Arc::new(args),
+                });
                 Ok(())
             }
             ClosureKind::Builtin(b) => {
