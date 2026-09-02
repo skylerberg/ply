@@ -35,6 +35,9 @@ pub enum Builtin {
     WrapAdd,
     WrapSub,
     WrapMul,
+    /// The smaller and the larger of two integers.
+    Min,
+    Max,
     /// One byte, from the number naming it: the inverse of `bytes_at`, which had none.
     ByteOfInt,
     IntToString,
@@ -119,6 +122,8 @@ impl Builtin {
             "fold" => Builtin::Fold,
             "range" => Builtin::Range,
             "wrap_add" => Builtin::WrapAdd,
+            "min" => Builtin::Min,
+            "max" => Builtin::Max,
             "wrap_sub" => Builtin::WrapSub,
             "wrap_mul" => Builtin::WrapMul,
             "byte_of_int" => Builtin::ByteOfInt,
@@ -200,6 +205,8 @@ impl Builtin {
             Builtin::Iterate => "iterate",
             Builtin::Range => "range",
             Builtin::WrapAdd => "wrap_add",
+            Builtin::Min => "min",
+            Builtin::Max => "max",
             Builtin::WrapSub => "wrap_sub",
             Builtin::WrapMul => "wrap_mul",
             Builtin::ByteOfInt => "byte_of_int",
@@ -329,6 +336,8 @@ impl Builtin {
             | Builtin::SecretVerify
             | Builtin::Assert
             | Builtin::WrapAdd
+            | Builtin::Min
+            | Builtin::Max
             | Builtin::WrapSub
             | Builtin::WrapMul
             | Builtin::Range => (2, 2),
@@ -377,6 +386,8 @@ impl Builtin {
             Builtin::WrapAdd,
             Builtin::WrapSub,
             Builtin::WrapMul,
+            Builtin::Min,
+            Builtin::Max,
             Builtin::ByteOfInt,
             Builtin::IntToString,
             Builtin::StringConcat,
@@ -583,6 +594,16 @@ fn call_with(
         }
 
         // Two's complement, modulo 2^64: the only arithmetic in the language that cannot raise.
+        Builtin::Min | Builtin::Max => {
+            let x = args[0].as_int(span, &format!("`{}`", b.name()))?;
+            let y = args[1].as_int(span, &format!("`{}`", b.name()))?;
+            Ok(Step::Done(Value::Int(if b == Builtin::Min {
+                x.min(y)
+            } else {
+                x.max(y)
+            })))
+        }
+
         Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul => {
             let what = b.name();
             let x = args[0].as_int(span, &format!("`{what}`"))?;
@@ -2886,6 +2907,8 @@ mod tests {
                 "map_remove",
                 "map_update",
                 "map_values",
+                "max",
+                "min",
                 "panic",
                 "push",
                 "range",

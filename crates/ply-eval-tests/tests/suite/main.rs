@@ -20,6 +20,7 @@ mod lambda_return;
 mod list_builtins;
 mod map_builtins;
 mod map_order;
+mod min_max;
 mod ownership_checker_armed;
 mod ownership_checker_oracle;
 mod position_invariance_g1;
