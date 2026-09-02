@@ -1719,8 +1719,15 @@ twice — once with it and once without — and fails the run on any disagreemen
 (`E0503`). It is off by default because it doubles what a run costs, and a run
 with a backend attached neither reads nor writes the result cache either way.
 Every function the fragment compiles is entered when a call's arguments and
-answer are carried; `PLY_CODEGEN_REGISTER=narrow` limits entry to scalar
-signatures, the measurement arm ADR 0030 shipped.
+answer are carried, and a test whose body the fragment compiles is entered
+whole, the backend's answer being the pass. A test the fragment refused is
+left to the machine, which raises the diagnostic as it always did; one the
+backend ran and raised in — an assertion included — is run by the machine
+too, and a pass there fails the test with `E0503`, since a backend that fails
+a test the machine passes is the disagreement `--backend` exists to surface.
+A `wrong:` corruption (§17) leaves every test to the machine, where each call
+crosses the seam it corrupts. `PLY_CODEGEN_REGISTER=narrow` limits entry to
+scalar signatures, the measurement arm ADR 0030 shipped.
 
 ---
 
