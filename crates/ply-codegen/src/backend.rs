@@ -316,9 +316,11 @@ impl Bodies {
         // same way below: nothing outside the entry ever holds a word.
         let tables = Rc::clone(&ctx.tables);
         let mut handles = [0i64; MAX_ARITY];
+        let before = ctx.heap.allocated();
         for (slot, value) in handles.iter_mut().zip(args) {
             *slot = ctx.heap.to_word(&tables.layouts, value);
         }
+        let inward = (ctx.heap.allocated() - before) as u64;
         // SAFETY: `admitted.entry` is a pointer into `self._code`'s finalized executable pages,
         // which this struct owns and outlives the call; `ctx` is the context that unit's own
         // `Ctx::new` built, borrowed uniquely here; and `handles` is `MAX_ARITY` wide against an
@@ -345,12 +347,14 @@ impl Bodies {
             drop(ctx);
             return self.decline(|d| d.touched_cells += 1);
         }
-        let value = crate::heap::Heap::to_value(&tables.layouts, out);
+        let mut outward = 0;
+        let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut outward);
         ctx.end();
         drop(ctx);
         if crate::rt::holds_a_handle(&value).is_some() {
             return self.decline(|d| d.answer += 1);
         }
+        self.unit.counters.note_converted(inward, outward);
         self.entered.set(self.entered.get() + 1);
         Some(value)
     }
