@@ -2210,12 +2210,23 @@ set written as a list is a quadratic waiting for the first real input.
 project holding the twelve modules and, as byte literals, the standard library
 with an example, and a test per phase that re-runs the phases its own depends
 on. `PRE-REGISTERED.md` there fixes the arms, the statistic and the decision
-rule; `observation-1.txt` is the series; `docs/BOOTSTRAP-PATH.md` step 7
-carries what it decided. The shape: under the interpreter hashing is the
-largest phase and checking the next, parsing a distant third and the resolver
-small; under the backend the parser and the hasher fall by several times and
-the checker barely moves, because its bodies re-enter through the seam on every
-`map_fold`, `iterate` and lambda over the carried state.
+rule; `observation-2.txt` is the series it reads, `observation-1.txt` the one
+before it; `docs/BOOTSTRAP-PATH.md` step 7 carries what it decided. The shape:
+under the interpreter hashing is the largest phase and checking the next,
+parsing a distant third and the resolver small; under the backend every phase
+falls by several times, with each row entered whole and nothing declined.
+
+**What the first series found, which was not the seam.** The checker barely
+moved under the backend in the first series, exactly as the pre-registration
+predicted — and the prediction's reason was wrong. The census over the spike,
+extended to name each refused function, showed the fragment refusing a `let`
+binding a record pattern in two of the checker's functions (`let (span,
+direct) = ...`, a tuple), and a refused callee refuses every caller, so the
+whole checker sat outside the compiled unit and ran interpreted while its
+leaves were never even offered. The fragment lowers a `let` over any
+irrefutable pattern now, through the binder a `match` arm already used. The
+lesson: a prediction confirmed is not a mechanism confirmed; read the
+instrument that names the mechanism before believing the number.
 
 **What the dry run found, which was not the resolver.** The first probe read
 the resolver's tables at many times the parse, and the resolver's name lookups
