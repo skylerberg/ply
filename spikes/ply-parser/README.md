@@ -36,6 +36,7 @@ diagnostic for diagnostic** over every `.ply` file in the tree.
 | `patterns.ply` | Pattern forms and literals. |
 | `exprs.ply` | Expressions, precedence, blocks, `handle`. |
 | `items.ply` | `fn`/`type`/`effect`/`test`/`law`/`derive`/`effect set`, imports, and `run`. |
+| `rewrite.ply` | The three rewrites `Parser::run` applies after the grammar — `effect_set`, `record_update` and `try_op` — which §11R.D left in Rust and the checker's input needs. `GAPS.md` §16. |
 | `resolve.ply` | The second phase: `resolve.rs` and `defaults.rs` ported — the module index, declarations, scopes, the dependency order, and the defaults pass — over the trees the modules above produce. `GAPS.md` §15. |
 | `harness/` | A separate cargo project: the reference-side dumper, the differential, `refdump`. It enters `ply_syntax` at `parse_unexpanded`, so the two sides are the same phase; `GAPS.md` §11R.D. `tests/resolve.rs` is the second differential, over whole programs. |
 | `fixtures/` | Hand-written `.ply` files plus `reference-tests.corpus`, every string literal in the reference's own test file, re-mined by `mine-fixtures.py` whenever the reference grows syntax; the agreement test prints the count. For the resolve differential: `reference-programs.corpus`, every multi-module program `resolve.rs`'s tests build, mined by `mine-programs.py`, and `resolve-programs.corpus`, hand-written programs for the error paths. |

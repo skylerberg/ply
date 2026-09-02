@@ -181,8 +181,12 @@ measurement is confounded until the earlier one has moved.
    `arm-resolve.sh` arms it. The one tax it met is worth knowing before the
    next port: record update needs the base's field list declared in the same
    file (ADR 0029's parse-time expansion), so a rewrite of an imported AST node
-   spells every field. Inference with rows is the hard
-   one. `std.hash` exists (ADR 0033) and its throughput is not measured. The
+   spells every field. **The three parse-time rewrites are ported too**
+   (`rewrite.ply`, `GAPS.md` §16): the checker reads the expanded tree, so the
+   effect-set, record-update and try-operator passes that §11R.D left in Rust
+   now run in Ply and agree with `parse_recovering` over everything the parser
+   differential reads; `arm-rewrite.sh` arms them. Inference with rows is the
+   hard one, and it is next. `std.hash` exists (ADR 0033) and its throughput is not measured. The
    syntax the parser spike predated is ported first, so its own differential is
    green before anything is built on it: the bit operators (with the shift join
    and the lambda-parameter pipe guard) and keyword fields are in, the corpus
