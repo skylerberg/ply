@@ -1349,10 +1349,18 @@ experiment harness in Ply. The boundary costs 0.5 us per crossing, measured.
 
 ## What is next
 
-`docs/BOOTSTRAP-PATH.md`. Every track above ended on a measurement, and the
-one goal none of them reached is ADR 0021's: a front end whose cost is
-O(change), written in Ply. That file records what is no longer in the way
-after ADR 0034, what is — throughput, and the code generator's shape — the
-order to take the rest in, and the measurement each step is gated on. Its
-first step is the code generator's roots, because ADR 0030's row already says
-leaf entry loses.
+`docs/BOOTSTRAP-PATH.md`, and ADR 0037 for the order it is taken in. Every
+track above ended on a measurement, and the one goal none of them reached is
+ADR 0021's: a verification loop whose cost is O(change), with the compiler
+inside it written in Ply. That file records what is no longer in the way, what
+is, and the measurement each step is gated on.
+
+**What is next inside it is the loop rather than the path.** ADR 0037 splits the
+goal that file carried in one piece — the loop's cost, and a dependency line
+drawn where Rust's is — and finds the compiled tier O(project) at every stage:
+a backend run bypasses the front-end cache and the result cache, so the front
+end loads whole and every test runs, and the unit is compiled again per worker.
+The first thing to take is a decision rather than a row — what a cached `Pass`
+means when a backend answered — and then the row `ply-corpus sweep` already
+half-holds: its edit scenarios across the size ladder, fitted, with the
+`--backend` arm it does not have.
