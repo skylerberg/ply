@@ -1428,7 +1428,9 @@ impl Fx<'_, '_> {
                 self.builder.switch_to_block(then_block);
                 self.builder.seal_block(then_block);
                 let mut inner = scope.clone();
-                let t = self.expr(then_branch, &mut inner)?;
+                // A branch's answer is owned: a local returned here is duplicated unless the
+                // read is its last, so the join never aliases a binding at one count.
+                let t = self.consumed(then_branch, &mut inner)?;
                 let t_ty = t.ty;
                 let t = self.coerce(t, kind);
                 self.builder.ins().jump(join, &[BlockArg::Value(t)]);
@@ -1436,7 +1438,7 @@ impl Fx<'_, '_> {
                 self.builder.switch_to_block(else_block);
                 self.builder.seal_block(else_block);
                 let mut inner = scope.clone();
-                let e = self.expr(else_branch, &mut inner)?;
+                let e = self.consumed(else_branch, &mut inner)?;
                 let e_ty = e.ty;
                 let e = self.coerce(e, kind);
                 self.builder.ins().jump(join, &[BlockArg::Value(e)]);
@@ -1476,7 +1478,7 @@ impl Fx<'_, '_> {
                     }
                 }
                 match tail {
-                    Some(t) => self.expr(t, &mut inner),
+                    Some(t) => self.consumed(t, &mut inner),
                     None => {
                         let handle = self.intern(Value::Unit);
                         Ok(self.constant(handle))
@@ -2572,7 +2574,7 @@ impl Fx<'_, '_> {
             // — a temporary, or a local at its last use — gives them up.
             let moving = !self.is_borrowed_local(scrutinee, scope);
             self.bind_pattern(&arm.pat, value, moving, &mut inner)?;
-            let body = self.expr(&arm.body, &mut inner)?;
+            let body = self.consumed(&arm.body, &mut inner)?;
             // The arms' type, when every arm agrees.
             ty = match ty {
                 None => Some(body.ty),
