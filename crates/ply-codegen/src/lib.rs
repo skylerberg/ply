@@ -5,6 +5,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod backend;
+pub mod heap;
 pub mod jit;
 pub mod rt;
 pub mod source;

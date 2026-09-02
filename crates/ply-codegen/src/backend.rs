@@ -312,9 +312,12 @@ impl Bodies {
         };
 
         ctx.begin(i64::try_from(fuel).unwrap_or(i64::MAX));
+        // The arguments cross into the entry's own words, deep, and the answer crosses back the
+        // same way below: nothing outside the entry ever holds a word.
+        let tables = Rc::clone(&ctx.tables);
         let mut handles = [0i64; MAX_ARITY];
         for (slot, value) in handles.iter_mut().zip(args) {
-            *slot = ctx.push(value.clone());
+            *slot = ctx.heap.to_word(&tables.layouts, value);
         }
         // SAFETY: `admitted.entry` is a pointer into `self._code`'s finalized executable pages,
         // which this struct owns and outlives the call; `ctx` is the context that unit's own
@@ -342,7 +345,7 @@ impl Bodies {
             drop(ctx);
             return self.decline(|d| d.touched_cells += 1);
         }
-        let value = ctx.read(out).clone();
+        let value = crate::heap::Heap::to_value(&tables.layouts, out);
         ctx.end();
         drop(ctx);
         if crate::rt::holds_a_handle(&value).is_some() {
