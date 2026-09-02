@@ -733,8 +733,6 @@ impl Fx<'_, '_> {
         self.builder.ins().call(func, &all);
     }
 
-    /// The argument array a call is handed: one stack slot, one store per argument, and every value
-    /// boxed at the boundary.
     /// A value about to be consumed — handed to a helper that takes its arguments, bound by a
     /// `let`, captured by a closure. A local read at the binding's last use (`Own::Owned`, the
     /// lowering's mark) is the slot's own handle and is taken; a local read anywhere else is
@@ -783,6 +781,8 @@ impl Fx<'_, '_> {
                 if q.is_bare() && scope.iter().any(|(s, _)| s == q.symbol()))
     }
 
+    /// The argument array a call is handed: one stack slot, one store per argument, and every value
+    /// boxed at the boundary.
     fn spill(&mut self, handles: &[cranelift_codegen::ir::Value]) -> cranelift_codegen::ir::Value {
         let bytes = (handles.len().max(1) * 8) as u32;
         let slot = self.builder.create_sized_stack_slot(StackSlotData::new(

@@ -732,8 +732,8 @@ pub unsafe extern "C" fn rt_record(ctx: *mut Ctx, shape: i64, args: *const i64, 
     ctx.push(Value::Record(Arc::new(Fields::from_unsorted(fields))))
 }
 
-/// A record update, built as written: the base's copied fields and the written ones. In-place
-/// reuse is the machine's, keyed on a uniqueness the fragment's handles never have.
+/// A record update: written in place when the literal names exactly the base's fields and
+/// nothing else holds the base, built as written otherwise.
 pub unsafe extern "C" fn rt_record_update(
     ctx: *mut Ctx,
     shape: i64,
