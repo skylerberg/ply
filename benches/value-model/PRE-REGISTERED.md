@@ -25,12 +25,17 @@ and not "is it as fast as a vectorised library", which is not the question.
 | K2, records | a fold over a fixed list that threads one record — counters, a list, an ordered map, bytes — and updates some fields each step | the same loop over a struct updated in place, with a `Vec` and a `BTreeMap` |
 
 Both kernels' inputs are built inside the program, so the two arms hash and fold
-identical data and no file is read. The Rust kernels live in
-`benches/value-model/rust`, a release binary that runs each kernel the same
-number of times and prints its user time, so the bar is taken on the same
-machine in the same sitting as the Ply arm and never against a figure written
-down elsewhere. The transliteration rule for K1 is the one a reviewer holds it
-to: a Rust that is faster because it is a different algorithm is a broken bar.
+identical data and no file is read: `run.sh` writes the K1 input beside
+`kernels.ply` as a byte literal, with the digest the Rust bar printed, so the
+Ply test asserts the digest and a transliteration that drifts fails a test
+rather than skewing a comparison. The Rust kernels live in
+`benches/value-model/rust`, a release binary with no dependencies that repeats
+each kernel and prints its minimum time, so the bar is taken on the same machine
+in the same sitting as the Ply arm and never against a figure written down
+elsewhere; the Ply arm's time is each test's own duration from `--json`, one
+worker, and its minimum is over the blocks. The transliteration rule for K1 is
+the one a reviewer holds it to: a Rust that is faster because it is a different
+algorithm is a broken bar.
 
 ## Arms
 
@@ -74,3 +79,15 @@ run them on.
 3. After ADR 0035's sequence steps 2 and 3, K1 clears first and K2 second, in
    that order, because typed calls and unboxed locals are the whole of K1 and
    only half of K2.
+
+## The baseline, taken
+
+`baseline.txt`, under the gate on both sides. Prediction 1 held, by more than it
+said: K1 is nearly three orders of magnitude over the bar. Prediction 2 did not:
+K2 is the *closer* kernel by far, within a factor the record path's name search
+and counts alone do not explain. What that says, before anything is built: the
+integer path — a boxed call for every `mask32` and `rotr`, a record of four
+words built and torn down per `g`, and a field read through the runtime for
+each of its words — is where the model is furthest from Rust, and the record
+kernel's distance is mostly the ordered map and the list, which sequence step 5
+reaches last. Prediction 3's order stands.
