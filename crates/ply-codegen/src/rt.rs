@@ -126,12 +126,10 @@ impl Ctx {
         }
     }
 
-    /// The other end of [`Ctx::begin`]: the entry gives back what it used, and what it made
-    /// immortal for the memo goes to the tables, which outlive it.
+    /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
         self.last_entry = self.heap.allocated();
-        let tables = Rc::clone(&self.tables);
-        self.heap.end_into(&mut tables.immortals.borrow_mut());
+        self.heap.end();
     }
 
     /// How many objects the entry that just finished allocated.
@@ -637,18 +635,18 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     if c.failed != 0 {
         return 0;
     }
-    // Remembered where it lies: the word is marked immortal, and the entry's end hands its
-    // objects to the tables rather than releasing them.
+    // Remembered as a copy in the tables' own heap, which outlives the entry's memory; the
+    // entry keeps using its own word.
     if !heap::world_independent(w) {
         return w;
     }
-    heap::mark_immortal(w);
+    let kept = tables.immortals.borrow_mut().adopt(w);
     let mut memo = tables.memo.borrow_mut();
     let index = index as usize;
     if memo.len() <= index {
         memo.resize(index + 1, None);
     }
-    memo[index] = Some(w);
+    memo[index] = Some(kept);
     w
 }
 

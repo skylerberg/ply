@@ -261,30 +261,104 @@ impl Layouts {
     }
 }
 
-/// What an entry allocated, and what was made immortal through it.
-#[derive(Default)]
+/// What an entry allocates from: a bump pointer over chunks that are recycled at the entry's
+/// end, since the entry's answer is copied out before then and nothing outside it can hold a
+/// word. A persistent heap — the constant pool, the memo — never recycles.
+#[repr(C)]
 pub struct Heap {
-    log: Vec<*mut Obj>,
-    immortal: Vec<*mut Obj>,
+    /// The next free byte and the end of the current chunk, first so that compiled code can
+    /// bump them at fixed offsets from the context.
+    cur: *mut u8,
+    end: *mut u8,
+    chunks: Vec<(*mut u8, usize)>,
+    /// Which chunk `cur` is in.
+    chunk: usize,
+    /// Bridged values allocated since the last reset, whose interpreter value must be dropped.
+    bridges: Vec<*mut Obj>,
+    persistent: bool,
+    /// Objects allocated since the last reset.
+    count: usize,
 }
+
+impl Default for Heap {
+    fn default() -> Heap {
+        Heap::new()
+    }
+}
+
+const FIRST_CHUNK: usize = 1 << 20;
+const LARGEST_CHUNK: usize = 64 << 20;
+
+/// The byte offset of the bump pointer and of the chunk's end within a [`Heap`].
+pub const HEAP_CUR: usize = 0;
+pub const HEAP_END: usize = 8;
 
 impl Heap {
     pub fn new() -> Heap {
         Heap {
-            log: Vec::with_capacity(1024),
-            immortal: Vec::new(),
+            cur: std::ptr::null_mut(),
+            end: std::ptr::null_mut(),
+            chunks: Vec::new(),
+            chunk: 0,
+            bridges: Vec::new(),
+            persistent: false,
+            count: 0,
         }
     }
 
-    /// How many objects the entry has allocated so far.
-    pub fn allocated(&self) -> usize {
-        self.log.len()
+    /// A heap whose entries never end: what outlives every entry lives here.
+    pub fn persistent() -> Heap {
+        let mut h = Heap::new();
+        h.persistent = true;
+        h
     }
 
-    fn raw_alloc(kind: u8, flags: u8, len: u32, layout: u32, payload_bytes: usize) -> *mut Obj {
-        let l = Layout::from_size_align(HEADER + payload_bytes.max(8), 8).expect("a small layout");
-        let p = unsafe { alloc(l) } as *mut Obj;
+    /// How many objects have been allocated since the last reset.
+    pub fn allocated(&self) -> usize {
+        self.count
+    }
+
+    /// Moves to a chunk with `need` bytes free: the next one already on hand that fits, or a
+    /// new one, each larger than the last up to a bound.
+    fn grow(&mut self, need: usize) {
+        while self.chunk + 1 < self.chunks.len() {
+            self.chunk += 1;
+            let (p, cap) = self.chunks[self.chunk];
+            if cap >= need {
+                self.cur = p;
+                self.end = unsafe { p.add(cap) };
+                return;
+            }
+        }
+        let last = self.chunks.last().map_or(0, |c| c.1);
+        let cap = need.max(FIRST_CHUNK).max((last * 2).min(LARGEST_CHUNK));
+        let p = unsafe { alloc(Layout::from_size_align(cap, 16).expect("a chunk layout")) };
         assert!(!p.is_null(), "the heap is out of memory");
+        self.chunks.push((p, cap));
+        self.chunk = self.chunks.len() - 1;
+        self.cur = p;
+        self.end = unsafe { p.add(cap) };
+    }
+
+    /// The bytes an object with this payload takes, header included and rounded to a word.
+    pub fn object_size(payload_bytes: usize) -> usize {
+        (HEADER + payload_bytes.max(8) + 7) & !7
+    }
+
+    fn raw_alloc(
+        &mut self,
+        kind: u8,
+        flags: u8,
+        len: u32,
+        layout: u32,
+        payload_bytes: usize,
+    ) -> *mut Obj {
+        let size = Heap::object_size(payload_bytes);
+        if (self.end as usize).wrapping_sub(self.cur as usize) < size || self.cur.is_null() {
+            self.grow(size);
+        }
+        let p = self.cur as *mut Obj;
+        self.cur = unsafe { self.cur.add(size) };
         unsafe {
             p.write(Obj {
                 rc: 1,
@@ -295,28 +369,23 @@ impl Heap {
                 layout,
             });
         }
+        self.count += 1;
         p
     }
 
-    /// A fresh object with `len` payload words, logged to the entry.
+    /// A fresh object with `len` payload words.
     pub fn alloc(&mut self, kind: u8, flags: u8, len: u32, layout: u32) -> *mut Obj {
-        let p = Heap::raw_alloc(kind, flags, len, layout, len as usize * 8);
-        self.log.push(p);
-        p
+        self.raw_alloc(kind, flags, len, layout, len as usize * 8)
     }
 
     /// A fresh list with room for `cap` words and none of them in use yet.
     pub fn alloc_list(&mut self, cap: u32) -> *mut Obj {
-        let p = Heap::raw_alloc(KIND_LIST, 0, 0, cap, cap as usize * 8);
-        self.log.push(p);
-        p
+        self.raw_alloc(KIND_LIST, 0, 0, cap, cap as usize * 8)
     }
 
     /// A fresh map with room for `cap` entries and none in use yet.
     pub fn alloc_map(&mut self, cap: u32) -> *mut Obj {
-        let p = Heap::raw_alloc(KIND_MAP, 0, 0, cap, cap as usize * 16);
-        self.log.push(p);
-        p
+        self.raw_alloc(KIND_MAP, 0, 0, cap, cap as usize * 16)
     }
 
     pub fn boxed_int(&mut self, v: i64) -> Word {
@@ -329,87 +398,115 @@ impl Heap {
     }
 
     pub fn bridge(&mut self, v: Value) -> Word {
-        let o = Heap::raw_alloc(KIND_BRIDGE, 0, 0, 0, std::mem::size_of::<Value>());
+        let o = self.raw_alloc(KIND_BRIDGE, 0, 0, 0, std::mem::size_of::<Value>());
         unsafe { bridge_slot(o).write(v) };
-        self.log.push(o);
+        self.bridges.push(o);
         o as Word
     }
 
-    /// A word that lives as long as this heap does, past every entry: the constant pool and the
-    /// memo. Every object under it is immortal too, so no count is touched through a constant.
+    /// A word that lives as long as this persistent heap does: the constant pool. Every object
+    /// under it is immortal too, so no count is touched through a constant.
     pub fn immortal(&mut self, layouts: &Layouts, v: &Value) -> Word {
+        debug_assert!(
+            self.persistent,
+            "an immortal word needs a heap that never resets"
+        );
         let w = self.to_word(layouts, v);
-        self.freeze(w);
+        mark_immortal(w);
         w
     }
 
-    fn freeze(&mut self, w: Word) {
-        let mut pending = vec![w];
-        while let Some(w) = pending.pop() {
-            if is_imm(w) {
-                continue;
+    /// A copy of everything under `w` into this persistent heap, immortal: what the memo keeps
+    /// of an entry's word, since the entry's own memory is recycled. An object already immortal
+    /// is shared rather than copied.
+    pub fn adopt(&mut self, w: Word) -> Word {
+        debug_assert!(
+            self.persistent,
+            "an adopted word needs a heap that never resets"
+        );
+        let mut copies: HashMap<usize, Word> = HashMap::new();
+        let out = self.copy(w, &mut copies);
+        mark_immortal(out);
+        out
+    }
+
+    fn copy(&mut self, w: Word, copies: &mut HashMap<usize, Word>) -> Word {
+        if is_imm(w) {
+            return w;
+        }
+        let o = obj(w);
+        unsafe {
+            if (*o).rc == IMMORTAL {
+                return w;
             }
-            let o = obj(w);
-            unsafe {
-                if (*o).rc == IMMORTAL {
-                    continue;
-                }
-                (*o).rc = IMMORTAL;
-                if let Some(i) = self.log.iter().rposition(|p| *p == o) {
-                    self.log.swap_remove(i);
-                }
-                self.immortal.push(o);
-                match (*o).kind {
-                    KIND_RECORD | KIND_CTOR | KIND_LIST => {
-                        for i in 0..(*o).len as usize {
-                            pending.push(word_at(o, i));
-                        }
-                    }
-                    KIND_MAP => {
-                        for i in 0..2 * (*o).len as usize {
-                            pending.push(word_at(o, i));
-                        }
-                    }
-                    KIND_CLOSURE => {
-                        for i in CLOSURE_CAPTURES..(*o).len as usize {
-                            pending.push(word_at(o, i));
-                        }
-                    }
-                    _ => {}
-                }
+            if let Some(c) = copies.get(&(w as usize)) {
+                return *c;
             }
+            let out = match (*o).kind {
+                KIND_UNIT | KIND_BOOL => return w,
+                KIND_INT => self.boxed_int(word_at(o, 0)),
+                KIND_BRIDGE => self.bridge(bridged(o).clone()),
+                KIND_LIST => {
+                    let n = (*o).len;
+                    let c = self.alloc_list(n.max(1));
+                    (*c).len = n;
+                    for i in 0..n as usize {
+                        let x = self.copy(word_at(o, i), copies);
+                        set_word(c, i, x);
+                    }
+                    c as Word
+                }
+                KIND_MAP => {
+                    let n = (*o).len;
+                    let c = self.alloc_map(n.max(1));
+                    (*c).len = n;
+                    for i in 0..2 * n as usize {
+                        let x = self.copy(word_at(o, i), copies);
+                        set_word(c, i, x);
+                    }
+                    c as Word
+                }
+                kind => {
+                    let (len, layout, flags) = ((*o).len, (*o).layout, (*o).flags);
+                    let c = self.alloc(kind, flags, len, layout);
+                    let first = if kind == KIND_CLOSURE {
+                        set_word(c, CLOSURE_CODE, word_at(o, CLOSURE_CODE));
+                        CLOSURE_CAPTURES
+                    } else {
+                        0
+                    };
+                    for i in first..len as usize {
+                        let x = self.copy(word_at(o, i), copies);
+                        set_word(c, i, x);
+                    }
+                    c as Word
+                }
+            };
+            copies.insert(w as usize, out);
+            out
         }
     }
 
-    /// Releases everything the entry allocated. A live count is no obstacle: the entry's answer
-    /// has already been copied out as a [`Value`], so nothing outside the entry can hold a word.
-    /// What the entry marked immortal is kept, in this heap's own immortal list.
+    /// Resets the entry's memory: every bridged value still alive is dropped, and the chunks
+    /// are kept for the next entry. A live count is no obstacle: the entry's answer has already
+    /// been copied out as a [`Value`], so nothing outside the entry can hold a word.
     pub fn end(&mut self) {
-        let mut kept = Vec::new();
-        for o in self.log.drain(..) {
+        if self.persistent {
+            return;
+        }
+        for o in self.bridges.drain(..) {
             unsafe {
-                if (*o).rc == IMMORTAL {
-                    kept.push(o);
-                } else {
-                    release(o);
+                if (*o).kind == KIND_BRIDGE {
+                    std::ptr::drop_in_place(bridge_slot(o));
                 }
             }
         }
-        self.immortal.extend(kept);
-    }
-
-    /// [`Heap::end`], with what the entry marked immortal handed to `sink` to own: the memo's
-    /// words outlive the context that made them, so the tables keep them.
-    pub fn end_into(&mut self, sink: &mut Heap) {
-        for o in self.log.drain(..) {
-            unsafe {
-                if (*o).rc == IMMORTAL {
-                    sink.immortal.push(o);
-                } else {
-                    release(o);
-                }
-            }
+        if let Some((p, cap)) = self.chunks.first() {
+            self.cur = *p;
+            self.end = unsafe { p.add(*cap) };
         }
+        self.chunk = 0;
+        self.count = 0;
     }
 
     // --- Conversions ------------------------------------------------------------------------
@@ -552,36 +649,15 @@ impl Heap {
 
 impl Drop for Heap {
     fn drop(&mut self) {
-        self.end();
-        for o in self.immortal.drain(..) {
-            unsafe { release(o) };
+        for o in self.bridges.drain(..) {
+            unsafe {
+                if (*o).kind == KIND_BRIDGE {
+                    std::ptr::drop_in_place(bridge_slot(o));
+                }
+            }
         }
-    }
-}
-
-/// Hands an object's memory back, dropping a still-live bridged value on the way.
-unsafe fn release(o: *mut Obj) {
-    unsafe {
-        if (*o).kind == KIND_BRIDGE {
-            std::ptr::drop_in_place(bridge_slot(o));
-        }
-        let bytes = payload_bytes(o);
-        dealloc(
-            o as *mut u8,
-            Layout::from_size_align(HEADER + bytes.max(8), 8).expect("a small layout"),
-        );
-    }
-}
-
-/// The payload size an object was allocated with, read back off its header.
-unsafe fn payload_bytes(o: *mut Obj) -> usize {
-    unsafe {
-        match (*o).kind {
-            KIND_BRIDGE => std::mem::size_of::<Value>(),
-            KIND_LIST => (*o).layout as usize * 8,
-            KIND_MAP => (*o).layout as usize * 16,
-            KIND_DEAD => (*o).len as usize,
-            _ => (*o).len as usize * 8,
+        for (p, cap) in self.chunks.drain(..) {
+            unsafe { dealloc(p, Layout::from_size_align(cap, 16).expect("a chunk layout")) };
         }
     }
 }
@@ -654,11 +730,9 @@ pub fn dec(w: Word) {
                 KIND_BRIDGE => std::ptr::drop_in_place(bridge_slot(o)),
                 _ => {}
             }
-            // Dead, with the byte size the memory was allocated with kept in `len`, so that
-            // `Heap::end` frees exactly what was taken and drops no bridged value twice.
-            let bytes = payload_bytes(o);
+            // Dead: read as such by anything still holding a stale word, dropped by nothing
+            // twice, and its memory recycled with the entry.
             (*o).kind = KIND_DEAD;
-            (*o).len = bytes as u32;
         }
     }
 }
@@ -1254,8 +1328,35 @@ mod tests {
     }
 
     #[test]
+    fn an_adopted_word_is_a_copy_that_outlives_the_entry_and_shares_what_was_already_immortal() {
+        let l = layouts();
+        let mut entry = Heap::new();
+        let mut kept = Heap::persistent();
+        let shared = kept.immortal(&l, &Value::str("shared"));
+        let record = Value::Record(Arc::new(Fields::from_unsorted(vec![
+            (Symbol::new("n"), Value::Int(1)),
+            (Symbol::new("s"), Value::str("own")),
+        ])));
+        let w = entry.to_word(&l, &record);
+        let list = entry.alloc_list(2);
+        unsafe {
+            set_word(list, 0, w);
+            set_word(list, 1, shared);
+            (*list).len = 2;
+        }
+        let copy = kept.adopt(list as Word);
+        assert_ne!(copy, list as Word);
+        assert_eq!(unsafe { word_at(obj(copy), 1) }, shared);
+        entry.end();
+        assert_eq!(
+            Heap::to_value(&l, copy),
+            Value::list(vec![record, Value::str("shared")])
+        );
+    }
+
+    #[test]
     fn an_immortal_word_survives_the_end_of_every_entry_and_counts_nothing() {
-        let mut h = Heap::new();
+        let mut h = Heap::persistent();
         let l = layouts();
         let w = h.immortal(&l, &Value::list(vec![Value::str("a"), Value::Int(1)]));
         h.end();
