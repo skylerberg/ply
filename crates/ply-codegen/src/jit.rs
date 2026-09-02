@@ -1,6 +1,6 @@
 //! The fragment of the spike's fragment, compiled with Cranelift.
 
-use crate::heap::{HEADER, Heap, Layouts, Word};
+use crate::heap::{HEADER, Heap, KIND_BYTES, KIND_LIST, Layouts, Word};
 use crate::rt::{self, Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, anyhow};
@@ -844,6 +844,17 @@ const FAILED_OFFSET: i32 = std::mem::offset_of!(Ctx, failed) as i32;
 const FUEL_OFFSET: i32 = std::mem::offset_of!(Ctx, fuel) as i32;
 
 /// Whether a compiled body may call this builtin, and what to say when it may not.
+/// Whether a call of `b` with `arity` arguments is answered inline, in an `Int` register: a
+/// length or a byte read is a load once the argument's kind is checked, and the runtime is
+/// entered only for anything else — another kind, an index out of range — which it refuses as
+/// the interpreter would.
+fn inline_builtin_answers(b: Builtin, arity: usize) -> bool {
+    matches!(
+        (b, arity),
+        (Builtin::BytesAt, 2) | (Builtin::BytesLen, 1) | (Builtin::Len, 1)
+    )
+}
+
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
     if b.higher_order() && !lowered_callback(b) {
         return Err(format!("`{}`, a builtin that calls user code", b.name()));
@@ -1403,6 +1414,11 @@ impl Fx<'_, '_> {
             NodeKind::App { func, args } => match &func.kind {
                 NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                     Denotes::Compiled(f) if f.arity == args.len() => f.sig.ret,
+                    Denotes::Builtin(index)
+                        if inline_builtin_answers(self.jit.builtins[index], args.len()) =>
+                    {
+                        Kind::Int
+                    }
                     _ => Kind::Boxed,
                 },
                 _ => Kind::Boxed,
@@ -2218,6 +2234,107 @@ impl Fx<'_, '_> {
         }
     }
 
+    /// A builtin `inline_builtin_answers` admits, in a register: the argument's kind is checked
+    /// inline and its length or byte loaded; any other kind, or an index out of range, goes
+    /// through the runtime's own path so the diagnostic is the interpreter's. Takes the
+    /// arguments as the runtime would.
+    fn inline_builtin(&mut self, index: usize, args: &[Code], scope: &mut Scope) -> Result<Val> {
+        let b = self.jit.builtins[index];
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(self.consumed(a, scope)?);
+        }
+        let target = self.boxed(vals[0]);
+        let at = (b == Builtin::BytesAt).then(|| self.as_int(vals[1]));
+        let want = if b == Builtin::Len {
+            KIND_LIST
+        } else {
+            KIND_BYTES
+        };
+
+        let pointer = self.builder.create_block();
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        let tagged = self.builder.ins().band_imm(target, 1);
+        self.builder.ins().brif(tagged, slow, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let kind = self
+            .builder
+            .ins()
+            .uload8(types::I32, MemFlags::trusted(), target, 4);
+        let is = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(want));
+        let len = self.builder.ins().uload32(MemFlags::trusted(), target, 8);
+        match at {
+            Some(i) => {
+                // A negative index is a huge one unsigned, so one compare covers both bounds.
+                let bounds = self.builder.create_block();
+                self.builder.ins().brif(is, bounds, &[], slow, &[]);
+                self.builder.switch_to_block(bounds);
+                self.builder.seal_block(bounds);
+                let inside = self.builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
+                self.builder.ins().brif(inside, fast, &[], slow, &[]);
+            }
+            None => {
+                self.builder.ins().brif(is, fast, &[], slow, &[]);
+            }
+        }
+
+        self.builder.switch_to_block(fast);
+        self.builder.seal_block(fast);
+        let answer = match at {
+            Some(i) => {
+                let base = self.builder.ins().iadd_imm(target, HEADER as i64);
+                let addr = self.builder.ins().iadd(base, i);
+                self.builder
+                    .ins()
+                    .uload8(types::I64, MemFlags::trusted(), addr, 0)
+            }
+            None => len,
+        };
+        self.dec_inline(target);
+        self.builder.ins().jump(join, &[BlockArg::Value(answer)]);
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        let mut handles = vec![target];
+        if let Some(i) = at {
+            handles.push(self.boxed(Val {
+                kind: Kind::Int,
+                v: i,
+                ty: 0,
+                home: 0,
+            }));
+        }
+        let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+        let ptr = self.spill(&handles);
+        let which = self.builder.ins().iconst(types::I64, index as i64);
+        let v = self.helper(self.jit.helpers.builtin, &[which, ptr, n]);
+        self.check();
+        let v = self.as_int(Val {
+            kind: Kind::Boxed,
+            v,
+            ty: 0,
+            home: 0,
+        });
+        self.builder.ins().jump(join, &[BlockArg::Value(v)]);
+
+        self.builder.switch_to_block(join);
+        self.builder.seal_block(join);
+        Ok(Val {
+            kind: Kind::Int,
+            v: self.builder.block_params(join)[0],
+            ty: 0,
+            home: 0,
+        })
+    }
+
     fn app(&mut self, func: &Code, args: &[Code], scope: &mut Scope) -> Result<Val> {
         let NodeKind::Var { name: q, .. } = &func.kind else {
             // The callee is a value: evaluate it, then the arguments, then call through it.
@@ -2277,6 +2394,11 @@ impl Fx<'_, '_> {
                 ty: f.sig.ret_ty,
                 home: 0,
             });
+        }
+        if let Denotes::Builtin(index) = &denotes
+            && inline_builtin_answers(self.jit.builtins[*index], args.len())
+        {
+            return self.inline_builtin(*index, args, scope);
         }
         let mut handles = Vec::with_capacity(args.len());
         for a in args {
