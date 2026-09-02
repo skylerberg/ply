@@ -969,13 +969,14 @@ fn why(dir: &std::path::Path, which: &str, repeats: u32) -> Result<()> {
             println!(
                 "      over {repeats} hybrid call(s): {} entries, {} declines by the machine; \
                  fragment declines: {} out of fuel, {} body failed, {} not compiled, {} arity, \
-                 {} re-entered, {} touched a cell",
+                 {} kind, {} re-entered, {} touched a cell",
                 e1.0 - e0.0,
                 e1.1 - e0.1,
                 d.out_of_fuel,
                 d.failed,
                 d.not_compiled,
                 d.arity,
+                d.kind,
                 d.reentered,
                 d.touched_cells
             );
@@ -1347,10 +1348,11 @@ fn main() -> Result<()> {
     );
     let declines = harness.bodies.declines();
     println!(
-        "   declines: {} not compiled, {} arity, {} the body failed, {} out of fuel, {} re-entered, \
-         {} touched a cell",
+        "   declines: {} not compiled, {} arity, {} kind, {} the body failed, {} out of fuel, \
+         {} re-entered, {} touched a cell",
         declines.not_compiled,
         declines.arity,
+        declines.kind,
         declines.failed,
         declines.out_of_fuel,
         declines.reentered,

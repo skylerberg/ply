@@ -223,17 +223,28 @@ measurement is confounded until the earlier one has moved.
 7. **The driver.** Incremental caching, the content-addressed store and the
    gates are Rust, and ADR 0020 notes a self-hosted front end would be cached by
    machinery it does not own. Whether the front end lives behind the Rust driver
-   or the driver is ported too is a decision for when phases exist to drive; it
-   is listed so it is not discovered late.
+   or the driver is ported too is a decision for when phases exist to drive.
+   They exist now, and what step 6 established bears on the decision: the
+   ported phases publish exactly what the driver caches on — the restored
+   `Known` interface is checked from on both sides, and every hash the store is
+   keyed by is reproduced bit for bit — so a Rust driver can drive a Ply front
+   end through the interfaces it already has, with no cache format moving. What
+   is not established is the cost: the ported front end has been compared, not
+   timed, and the row that decides whether the driver is worth porting is the
+   whole front end — parse, resolve, check, hash — over the examples, under the
+   backend and without it, taken with step 3's protocol. That row is the next
+   measurement, and the decision waits on it rather than on more porting.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not
    compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
    neither them nor hex literals; both are repaired, the differential is green
    over the corpus and the standard library, and CI runs it (`lexer-spike`).
-   `CONTRIBUTING.md` §"Things known to be broken" item 18 remains: the codegen
-   spike's agreement corpus is red while its own tests stay green. A bootstrap
-   is verified with exactly these instruments, and a green result over an
-   instrument that runs nothing is the defect class this project names as its
-   most expensive.
+   `CONTRIBUTING.md` item 18 is closed: the codegen spike's agreement corpus
+   was red because its boundary handed the leaf kinds the machine's seam
+   admits to bodies compiled over `Int` and `Bool`, and green under `cargo
+   test` because no test ran the command; the boundary checks the kind and the
+   suite runs the command. A bootstrap is verified with exactly these
+   instruments, and a green result over an instrument that runs nothing is the
+   defect class this project names as its most expensive.
 
 ## What would make this plan wrong
 

@@ -28,6 +28,11 @@ pub struct Declines {
     pub not_compiled: u64,
     /// It compiled the name and the call had the wrong number of arguments.
     pub arity: u64,
+    /// An argument of a kind this boundary's bodies were not compiled to take. The machine's seam
+    /// admits every handle-free leaf — `Bytes`, `String` and `Unit` among them — and these bodies
+    /// were compiled over `Int` and `Bool` signatures, so the kind is checked again here rather
+    /// than handed to a body that would unbox it as an `Int`.
+    pub kind: u64,
     /// The body ran and failed — an overflow, a division by zero, a `match` with no arm, a type the
     /// fragment's `Int` lowering could not unbox.
     pub failed: u64,
@@ -44,6 +49,7 @@ impl Declines {
     pub fn total(&self) -> u64 {
         self.not_compiled
             + self.arity
+            + self.kind
             + self.failed
             + self.out_of_fuel
             + self.reentered
@@ -243,6 +249,12 @@ impl ply_eval::Compiled for SpikeBodies {
         };
         if admitted.arity != args.len() {
             return self.decline(|d| d.arity += 1);
+        }
+        if args
+            .iter()
+            .any(|a| !matches!(a, Value::Int(_) | Value::Bool(_)))
+        {
+            return self.decline(|d| d.kind += 1);
         }
         let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
             return self.decline(|d| d.reentered += 1);
