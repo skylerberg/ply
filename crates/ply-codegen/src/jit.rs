@@ -1,5 +1,6 @@
 //! The fragment of the spike's fragment, compiled with Cranelift.
 
+use crate::heap::{Heap, Layouts, Word};
 use crate::rt::{self, Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, anyhow};
@@ -214,8 +215,11 @@ pub struct Jit {
     module: JITModule,
     opts: Opts,
     consts: Vec<Value>,
-    ctors: Vec<(Symbol, usize)>,
-    shapes: Vec<Vec<Symbol>>,
+    /// The constants as immortal words, one per entry of `consts`, built as they are met.
+    const_words: Vec<Word>,
+    layouts: Layouts,
+    /// Owns the constant pool's objects until the tables take it over.
+    immortals: Heap,
     fields: Vec<Symbol>,
     builtins: Vec<Builtin>,
     funcs: HashMap<String, Func>,
@@ -308,12 +312,13 @@ impl Jit {
             entries,
             tables: Rc::new(Tables {
                 consts: jit.consts,
-                ctors: jit.ctors,
-                shapes: jit.shapes,
+                const_words: jit.const_words,
+                layouts: jit.layouts,
                 fields: jit.fields,
                 builtins: jit.builtins,
                 functions,
                 memo: RefCell::new(Vec::new()),
+                immortals: RefCell::new(jit.immortals),
             }),
             nodes: jit.nodes,
             compile_nanos,
@@ -448,7 +453,7 @@ impl Jit {
             ctor_is: declare(&mut module, "rt_ctor_is", 3, true)?,
             ctor_arg: declare(&mut module, "rt_ctor_arg", 4, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
-            record_update: declare(&mut module, "rt_record_update", 5, true)?,
+            record_update: declare(&mut module, "rt_record_update", 6, true)?,
             field: declare(&mut module, "rt_field", 4, true)?,
             no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
             closure: declare(&mut module, "rt_closure", 5, true)?,
@@ -469,8 +474,9 @@ impl Jit {
             module,
             opts,
             consts: Vec::new(),
-            ctors: loaded.ctors(),
-            shapes: Vec::new(),
+            const_words: Vec::new(),
+            layouts: Layouts::new(loaded.ctors()),
+            immortals: Heap::new(),
             fields: Vec::new(),
             builtins: Vec::new(),
             funcs: HashMap::new(),
@@ -790,7 +796,7 @@ enum Denotes {
     Uncompiled(String),
     Ctor(usize, usize),
     Builtin(usize),
-    Constant(i64),
+    Constant(usize),
 }
 
 struct Fx<'a, 'b> {
@@ -823,9 +829,12 @@ impl Fx<'_, '_> {
         (self.jit.fields.len() - 1) as i64
     }
 
-    fn intern(&mut self, value: Value) -> i64 {
+    /// A constant's index in the pool, its word built immortal on the way in.
+    fn intern(&mut self, value: Value) -> usize {
+        let w = self.jit.immortals.immortal(&self.jit.layouts, &value);
         self.jit.consts.push(value);
-        -(self.jit.consts.len() as i64)
+        self.jit.const_words.push(w);
+        self.jit.consts.len() - 1
     }
 
     fn load_fuel(&mut self) -> cranelift_codegen::ir::Value {
@@ -1000,16 +1009,16 @@ impl Fx<'_, '_> {
             return Ok(Denotes::Uncompiled(name.to_string()));
         }
         let ctor = global.clone().or_else(|| {
-            if q.is_bare() && self.jit.ctors.iter().any(|(n, _)| n == q.symbol()) {
+            if q.is_bare() && self.jit.layouts.ctors.iter().any(|(n, _)| n == q.symbol()) {
                 Some(q.symbol().clone())
             } else {
                 None
             }
         });
         if let Some(name) = ctor
-            && let Some(index) = self.jit.ctors.iter().position(|(n, _)| *n == name)
+            && let Some(index) = self.jit.layouts.ctors.iter().position(|(n, _)| *n == name)
         {
-            let arity = self.jit.ctors[index].1;
+            let arity = self.jit.layouts.ctors[index].1;
             if arity == 0 {
                 let handle = self.intern(Value::ctor(name, Vec::new()));
                 return Ok(Denotes::Constant(handle));
@@ -1286,23 +1295,38 @@ impl Fx<'_, '_> {
             NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, scope),
 
             NodeKind::RecordUpdate { base, copies, sets } => {
-                let mut names = Vec::with_capacity(copies.len() + sets.len());
+                // The written fields in source order, then the base at its last use; the result's
+                // shape is the whole field set, and each written field goes to its offset in it.
                 let mut handles = Vec::with_capacity(sets.len());
-                for (name, value) in sets.iter() {
+                for (_, value) in sets.iter() {
                     let v = self.consumed(value, scope)?;
                     let h = self.boxed(v);
-                    names.push(name.clone());
                     handles.push(h);
                 }
-                names.extend(copies.iter().map(|c| c.name.clone()));
                 let base = self.consumed(base, scope)?;
                 let base = self.boxed(base);
-                let shape = self.jit.shapes.len();
-                self.jit.shapes.push(names);
+                let mut all: Vec<Symbol> = sets.iter().map(|(n, _)| n.clone()).collect();
+                all.extend(copies.iter().map(|c| c.name.clone()));
+                let shape = self.jit.layouts.shape(all);
+                let offsets: Vec<cranelift_codegen::ir::Value> = sets
+                    .iter()
+                    .map(|(name, _)| {
+                        let at = self
+                            .jit
+                            .layouts
+                            .offset(shape, name)
+                            .expect("a written field is in the shape it was interned into");
+                        self.builder.ins().iconst(types::I64, at as i64)
+                    })
+                    .collect();
                 let ptr = self.spill(&handles);
-                let shape = self.builder.ins().iconst(types::I64, shape as i64);
+                let offsets = self.spill(&offsets);
+                let shape = self.builder.ins().iconst(types::I64, i64::from(shape));
                 let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
-                let v = self.helper(self.jit.helpers.record_update, &[shape, base, ptr, n]);
+                let v = self.helper(
+                    self.jit.helpers.record_update,
+                    &[shape, base, ptr, offsets, n],
+                );
                 self.check();
                 Ok(Val {
                     kind: Kind::Boxed,
@@ -1313,6 +1337,7 @@ impl Fx<'_, '_> {
             NodeKind::App { func, args, .. } => self.app(func, args, scope),
 
             NodeKind::Record { fields, .. } => {
+                // Evaluated in source order, laid out in the shape's sorted order.
                 let mut names = Vec::with_capacity(fields.len());
                 let mut handles = Vec::with_capacity(fields.len());
                 for (name, value) in fields.iter() {
@@ -1321,11 +1346,21 @@ impl Fx<'_, '_> {
                     names.push(name.clone());
                     handles.push(h);
                 }
-                let shape = self.jit.shapes.len();
-                self.jit.shapes.push(names);
-                let ptr = self.spill(&handles);
-                let shape = self.builder.ins().iconst(types::I64, shape as i64);
-                let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+                let shape = self.jit.layouts.shape(names.clone());
+                let sorted = self.jit.layouts.shape_names(shape);
+                let ordered: Vec<cranelift_codegen::ir::Value> = sorted
+                    .iter()
+                    .map(|name| {
+                        let at = names
+                            .iter()
+                            .position(|n| n == name)
+                            .expect("every field of the shape was written");
+                        handles[at]
+                    })
+                    .collect();
+                let ptr = self.spill(&ordered);
+                let shape = self.builder.ins().iconst(types::I64, i64::from(shape));
+                let n = self.builder.ins().iconst(types::I64, ordered.len() as i64);
                 let v = self.helper(self.jit.helpers.record, &[shape, ptr, n]);
                 Ok(Val {
                     kind: Kind::Boxed,
@@ -1431,17 +1466,21 @@ impl Fx<'_, '_> {
         }
     }
 
-    /// A constant handle, as an immediate when folding is on and as a rebuilt allocation when it is
-    /// off.
-    fn constant(&mut self, handle: i64) -> Val {
-        let v = self.builder.ins().iconst(types::I64, handle);
+    /// A constant: its immortal word as an immediate when folding is on, and a rebuilt allocation
+    /// when it is off.
+    fn constant(&mut self, index: usize) -> Val {
         if self.jit.opts.fold_literals {
+            let v = self
+                .builder
+                .ins()
+                .iconst(types::I64, self.jit.const_words[index]);
             return Val {
                 kind: Kind::Boxed,
                 v,
             };
         }
-        let v = self.helper(self.jit.helpers.lit, &[v]);
+        let index = self.builder.ins().iconst(types::I64, index as i64);
+        let v = self.helper(self.jit.helpers.lit, &[index]);
         Val {
             kind: Kind::Boxed,
             v,
@@ -1833,14 +1872,19 @@ impl Fx<'_, '_> {
                 .map(|b| b.qualified.clone())
         };
         let name = global.or_else(|| {
-            if q.is_bare() && self.jit.ctors.iter().any(|(n, _)| n == q.symbol()) {
+            if q.is_bare() && self.jit.layouts.ctors.iter().any(|(n, _)| n == q.symbol()) {
                 Some(q.symbol().clone())
             } else {
                 None
             }
         })?;
-        let index = self.jit.ctors.iter().position(|(n, _)| *n == name)?;
-        Some((index, self.jit.ctors[index].1))
+        let index = self
+            .jit
+            .layouts
+            .ctors
+            .iter()
+            .position(|(n, _)| *n == name)?;
+        Some((index, self.jit.layouts.ctors[index].1))
     }
 
     /// Whether a sub-pattern binds without being able to fail.
