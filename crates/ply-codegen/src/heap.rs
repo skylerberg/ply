@@ -16,6 +16,7 @@
 //! `DEAD` header rather than someone else's object. Reuse of that memory within an entry is
 //! ADR 0035's sequence step 4, not this file's.
 
+use crate::list;
 use ply_eval::{Closure, ClosureKind, Fields, Value};
 use ply_span::Symbol;
 use std::alloc::{Layout, alloc, dealloc};
@@ -41,6 +42,9 @@ pub const KIND_MAP: u8 = 8;
 pub const KIND_STR: u8 = 9;
 /// `len` bytes with room for `layout`.
 pub const KIND_BYTES: u8 = 10;
+/// A list's trie nodes (`list.rs`): `len` elements or children of `layout` slots.
+pub const KIND_LEAF: u8 = 11;
+pub const KIND_BRANCH: u8 = 12;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -49,15 +53,16 @@ pub const IMMORTAL: u32 = u32::MAX;
 pub const HEADER: usize = 16;
 
 /// The header every object starts with. `len` is the payload's word count for a record, a
-/// constructor, a list or a closure and its byte count for a string or a bytes value; `layout`
-/// is a record's shape, a constructor's index, a list's or a string's capacity or a closure's
-/// arity.
+/// constructor, a trie node or a closure, its byte count for a string or a bytes value, and a
+/// list's length; `layout` is a record's shape, a constructor's index, a node's or a string's
+/// capacity, a closure's arity or the prefix a list dropped; `flags` and `aux` are a `Bool`'s
+/// value and a list's tail length and tail capacity (`list.rs`).
 #[repr(C, align(8))]
 pub struct Obj {
     pub rc: u32,
     pub kind: u8,
     pub flags: u8,
-    _pad: u16,
+    pub aux: u16,
     pub len: u32,
     pub layout: u32,
 }
@@ -66,7 +71,7 @@ static UNIT_OBJ: Obj = Obj {
     rc: IMMORTAL,
     kind: KIND_UNIT,
     flags: 0,
-    _pad: 0,
+    aux: 0,
     len: 0,
     layout: 0,
 };
@@ -74,7 +79,7 @@ static TRUE_OBJ: Obj = Obj {
     rc: IMMORTAL,
     kind: KIND_BOOL,
     flags: 1,
-    _pad: 0,
+    aux: 0,
     len: 0,
     layout: 0,
 };
@@ -82,7 +87,7 @@ static FALSE_OBJ: Obj = Obj {
     rc: IMMORTAL,
     kind: KIND_BOOL,
     flags: 0,
-    _pad: 0,
+    aux: 0,
     len: 0,
     layout: 0,
 };
@@ -373,7 +378,7 @@ impl Heap {
         (HEADER + payload_bytes.max(8) + 7) & !7
     }
 
-    fn raw_alloc(
+    pub(crate) fn raw_alloc(
         &mut self,
         kind: u8,
         flags: u8,
@@ -392,7 +397,7 @@ impl Heap {
                 rc: 1,
                 kind,
                 flags,
-                _pad: 0,
+                aux: 0,
                 len,
                 layout,
             });
@@ -404,11 +409,6 @@ impl Heap {
     /// A fresh object with `len` payload words.
     pub fn alloc(&mut self, kind: u8, flags: u8, len: u32, layout: u32) -> *mut Obj {
         self.raw_alloc(kind, flags, len, layout, len as usize * 8)
-    }
-
-    /// A fresh list with room for `cap` words and none of them in use yet.
-    pub fn alloc_list(&mut self, cap: u32) -> *mut Obj {
-        self.raw_alloc(KIND_LIST, 0, 0, cap, cap as usize * 8)
     }
 
     /// A fresh map with room for `cap` entries and none in use yet.
@@ -522,14 +522,11 @@ impl Heap {
                 KIND_STR | KIND_BYTES => self.joined((*o).kind, bytes_of(o), &[], 0) as Word,
                 KIND_BRIDGE => self.bridge(bridged(o).clone()),
                 KIND_LIST => {
-                    let n = (*o).len;
-                    let c = self.alloc_list(n.max(1));
-                    (*c).len = n;
-                    for i in 0..n as usize {
-                        let x = self.copy(word_at(o, i), copies);
-                        set_word(c, i, x);
-                    }
-                    c as Word
+                    let items: Vec<Word> = list::to_vec(o)
+                        .into_iter()
+                        .map(|x| self.copy(x, copies))
+                        .collect();
+                    self.list_from(&items)
                 }
                 KIND_MAP => {
                     let n = (*o).len;
@@ -617,14 +614,8 @@ impl Heap {
                 None => self.bridge(v.clone()),
             },
             Value::List(items) => {
-                let n = items.len() as u32;
-                let o = self.alloc_list(n.max(4));
-                for (i, item) in items.iter().enumerate() {
-                    let w = self.to_word(layouts, item);
-                    unsafe { set_word(o, i, w) };
-                }
-                unsafe { (*o).len = n };
-                o as Word
+                let words: Vec<Word> = items.iter().map(|x| self.to_word(layouts, x)).collect();
+                self.list_from(&words)
             }
             // The interpreter iterates in key order, which is the layout's order too.
             Value::Map(entries) => {
@@ -696,8 +687,9 @@ impl Heap {
                     Value::ctor(name, args)
                 }
                 KIND_LIST => Value::list(
-                    (0..(*o).len as usize)
-                        .map(|i| Heap::to_value(layouts, word_at(o, i)))
+                    list::to_vec(o)
+                        .into_iter()
+                        .map(|x| Heap::to_value(layouts, x))
                         .collect(),
                 ),
                 KIND_MAP => Value::map((0..(*o).len as usize).map(|i| {
@@ -794,7 +786,9 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>) {
         debug_assert!((*o).rc == 1 && (*o).kind != KIND_DEAD);
         (*o).rc = 0;
         let (first, last) = match (*o).kind {
-            KIND_RECORD | KIND_CTOR | KIND_LIST => (0, (*o).len as usize),
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => (0, (*o).len as usize),
+            // The root when there is one, two immediates the walk skips, then the tail.
+            KIND_LIST => (0, list::TAIL + list::tail_len(o)),
             KIND_MAP => (0, 2 * (*o).len as usize),
             KIND_CLOSURE => (CLOSURE_CAPTURES, (*o).len as usize),
             KIND_BRIDGE => {
@@ -805,7 +799,7 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>) {
         };
         for i in first..last {
             let c = word_at(o, i);
-            if is_imm(c) {
+            if is_imm(c) || c == 0 {
                 continue;
             }
             let co = obj(c);
@@ -840,11 +834,12 @@ pub fn mark_immortal(w: Word) {
             }
             (*o).rc = IMMORTAL;
             match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LIST => {
+                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
                     for i in 0..(*o).len as usize {
                         pending.push(word_at(o, i));
                     }
                 }
+                KIND_LIST => pending.extend(list::children(o)),
                 KIND_MAP => {
                     for i in 0..2 * (*o).len as usize {
                         pending.push(word_at(o, i));
@@ -872,11 +867,12 @@ pub fn world_independent(w: Word) -> bool {
         let o = obj(w);
         unsafe {
             match (*o).kind {
-                KIND_RECORD | KIND_CTOR | KIND_LIST => {
+                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
                     for i in 0..(*o).len as usize {
                         pending.push(word_at(o, i));
                     }
                 }
+                KIND_LIST => pending.extend(list::children(o)),
                 KIND_MAP => {
                     for i in 0..2 * (*o).len as usize {
                         pending.push(word_at(o, i));
@@ -939,11 +935,6 @@ pub fn as_bool(w: Word) -> Option<bool> {
             None
         }
     }
-}
-
-/// A list's items, borrowed.
-pub unsafe fn list_items<'a>(o: *mut Obj) -> &'a [Word] {
-    unsafe { std::slice::from_raw_parts(words(o), (*o).len as usize) }
 }
 
 // --- Order -------------------------------------------------------------------------------------
@@ -1016,15 +1007,14 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
             KIND_STR | KIND_BYTES => bytes_of(obj(a)).cmp(bytes_of(obj(b))),
             KIND_BRIDGE => bridged(obj(a)).cmp(bridged(obj(b))),
             KIND_LIST => {
-                let (x, y) = (obj(a), obj(b));
-                let (n, m) = ((*x).len as usize, (*y).len as usize);
-                for i in 0..n.min(m) {
-                    let c = cmp_words(layouts, word_at(x, i), word_at(y, i));
+                let (xs, ys) = (list::to_vec(obj(a)), list::to_vec(obj(b)));
+                for (x, y) in xs.iter().zip(&ys) {
+                    let c = cmp_words(layouts, *x, *y);
                     if c != Ordering::Equal {
                         return c;
                     }
                 }
-                n.cmp(&m)
+                xs.len().cmp(&ys.len())
             }
             KIND_MAP => {
                 let (x, y) = (obj(a), obj(b));
@@ -1088,9 +1078,10 @@ pub fn native_key(w: Word) -> bool {
         match (*o).kind {
             KIND_UNIT | KIND_BOOL | KIND_INT | KIND_STR | KIND_BYTES => true,
             KIND_BRIDGE => matches!(bridged(o), Value::Str(_) | Value::Bytes(_)),
-            KIND_RECORD | KIND_CTOR | KIND_LIST => {
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
                 (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
             }
+            KIND_LIST => list::children(o).all(native_key),
             KIND_MAP => (0..2 * (*o).len as usize).all(|i| native_key(word_at(o, i))),
             _ => false,
         }
@@ -1307,12 +1298,8 @@ mod tests {
         let l = layouts();
         let child = h.to_word(&l, &Value::str("kept"));
         inc(child);
-        let parent = h.alloc_list(1);
-        unsafe {
-            set_word(parent, 0, child);
-            (*parent).len = 1;
-        }
-        dec(parent as Word);
+        let parent = h.list_from(&[child]);
+        dec(parent);
         assert_eq!(kind(child), KIND_STR);
         assert_eq!(Heap::to_value(&l, child), Value::str("kept"));
         dec(child);
@@ -1460,15 +1447,10 @@ mod tests {
             (Symbol::new("s"), Value::str("own")),
         ])));
         let w = entry.to_word(&l, &record);
-        let list = entry.alloc_list(2);
-        unsafe {
-            set_word(list, 0, w);
-            set_word(list, 1, shared);
-            (*list).len = 2;
-        }
-        let copy = kept.adopt(list as Word);
-        assert_ne!(copy, list as Word);
-        assert_eq!(unsafe { word_at(obj(copy), 1) }, shared);
+        let list = entry.list_from(&[w, shared]);
+        let copy = kept.adopt(list);
+        assert_ne!(copy, list);
+        assert_eq!(list::get(obj(copy), 1), shared);
         entry.end();
         assert_eq!(
             Heap::to_value(&l, copy),

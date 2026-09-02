@@ -12,6 +12,7 @@ use crate::heap::{
     set_word, str_of, word_at,
 };
 use crate::jit::Entry;
+use crate::list;
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::cell::RefCell;
@@ -385,37 +386,16 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(heap::imm(n))
         }
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
-            let o = obj(*xs);
-            let (len, cap) = unsafe { ((*o).len, (*o).layout) };
-            if is_unique(*xs) && len < cap {
-                unsafe {
-                    set_word(o, len as usize, *x);
-                    (*o).len = len + 1;
-                }
-                return Some(*xs);
-            }
-            let room = if len < cap { cap } else { (len * 2).max(4) };
-            let out = ctx.heap.alloc_list(room);
-            unsafe {
-                for i in 0..len as usize {
-                    let w = word_at(o, i);
-                    heap::inc(w);
-                    set_word(out, i, w);
-                }
-                set_word(out, len as usize, *x);
-                (*out).len = len + 1;
-            }
-            heap::dec(*xs);
-            Some(out as Word)
+            Some(ctx.heap.list_push(*xs, *x))
         }
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
             let o = obj(*xs);
             let index = heap::as_int(*i)?;
-            let len = unsafe { (*o).len } as i64;
+            let len = list::len(o) as i64;
             let some = ctx.tables.layouts.some?;
             let none = ctx.tables.layouts.none?;
             let answer = if (0..len).contains(&index) {
-                let item = unsafe { word_at(o, index as usize) };
+                let item = list::get(o, index as usize);
                 heap::inc(item);
                 let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
                 unsafe { set_word(c, 0, item) };
@@ -428,18 +408,11 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::Range, [lo, hi]) => {
             let (a, b) = (heap::as_int(*lo)?, heap::as_int(*hi)?);
-            let n = b.saturating_sub(a).clamp(0, 1 << 20);
             if b - a > (1 << 20) {
                 return None;
             }
-            let out = ctx.heap.alloc_list((n as u32).max(4));
-            unsafe {
-                for (i, v) in (a..b).enumerate() {
-                    set_word(out, i, heap::imm(v));
-                }
-                (*out).len = n as u32;
-            }
-            Some(out as Word)
+            let items: Vec<Word> = (a..b).map(heap::imm).collect();
+            Some(ctx.heap.list_from(&items))
         }
         // Strings and bytes over their own payloads. Anything out of range, not a byte, not
         // UTF-8 or not the kind the builtin wants is the interpreter's diagnostic to raise, so
@@ -470,18 +443,23 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             Some(out)
         }
         (Builtin::BytesConcatAll, [xs]) if heap::kind(*xs) == KIND_LIST => {
-            let items = unsafe { heap::list_items(obj(*xs)) };
+            let o = obj(*xs);
             let mut total = 0;
-            for w in items {
-                if heap::kind(*w) != KIND_BYTES {
-                    return None;
+            let mut all_bytes = true;
+            list::for_each(o, &mut |w| {
+                if heap::kind(w) != KIND_BYTES {
+                    all_bytes = false;
+                } else {
+                    total += unsafe { (*obj(w)).len } as usize;
                 }
-                total += unsafe { (*obj(*w)).len } as usize;
+            });
+            if !all_bytes {
+                return None;
             }
             let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
             let mut at = 0;
-            for w in items {
-                let piece = unsafe { bytes_of(obj(*w)) };
+            list::for_each(o, &mut |w| {
+                let piece = unsafe { bytes_of(obj(w)) };
                 unsafe {
                     std::ptr::copy_nonoverlapping(
                         piece.as_ptr(),
@@ -490,7 +468,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                     );
                 }
                 at += piece.len();
-            }
+            });
             unsafe { (*out).len = total as u32 };
             heap::dec(*xs);
             Some(out as Word)
@@ -757,50 +735,48 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::MapKeys | Builtin::MapValues, [m]) if heap::kind(*m) == KIND_MAP => {
             let o = obj(*m);
-            let n = unsafe { (*o).len };
-            let out = ctx.heap.alloc_list(n.max(4));
+            let n = unsafe { (*o).len } as usize;
             let at = if which == Builtin::MapKeys { 0 } else { 1 };
-            unsafe {
-                for i in 0..n as usize {
-                    let w = word_at(o, 2 * i + at);
+            let items: Vec<Word> = (0..n)
+                .map(|i| {
+                    let w = unsafe { word_at(o, 2 * i + at) };
                     heap::inc(w);
-                    set_word(out, i, w);
-                }
-                (*out).len = n;
-            }
+                    w
+                })
+                .collect();
+            let out = ctx.heap.list_from(&items);
             heap::dec(*m);
-            Some(out as Word)
+            Some(out)
         }
         (Builtin::MapEntries, [m]) if heap::kind(*m) == KIND_MAP => {
             let o = obj(*m);
-            let n = unsafe { (*o).len };
+            let n = unsafe { (*o).len } as usize;
             let shape = ctx.tables.layouts.entry_shape();
-            let out = ctx.heap.alloc_list(n.max(4));
-            unsafe {
-                for i in 0..n as usize {
-                    let (k, v) = (heap::map_key(o, i), heap::map_value(o, i));
-                    heap::inc(k);
-                    heap::inc(v);
-                    let e = ctx.heap.alloc(KIND_RECORD, 0, 2, shape);
+            let mut items = Vec::with_capacity(n);
+            for i in 0..n {
+                let (k, v) = unsafe { (heap::map_key(o, i), heap::map_value(o, i)) };
+                heap::inc(k);
+                heap::inc(v);
+                let e = ctx.heap.alloc(KIND_RECORD, 0, 2, shape);
+                unsafe {
                     set_word(e, 0, k);
                     set_word(e, 1, v);
-                    set_word(out, i, e as Word);
                 }
-                (*out).len = n;
+                items.push(e as Word);
             }
+            let out = ctx.heap.list_from(&items);
             heap::dec(*m);
-            Some(out as Word)
+            Some(out)
         }
         (Builtin::MapOfEntries, [xs]) if heap::kind(*xs) == KIND_LIST => {
             let tables = Rc::clone(&ctx.tables);
-            let o = obj(*xs);
-            let n = unsafe { (*o).len } as usize;
+            let entries = list::to_vec(obj(*xs));
+            let n = entries.len();
             let (key, value) = (Symbol::new("key"), Symbol::new("value"));
             // Every entry must be a record with both fields and a key the map can order, or the
             // interpreter's implementation raises the right diagnostic instead.
             let mut pairs = Vec::with_capacity(n);
-            for i in 0..n {
-                let e = unsafe { word_at(o, i) };
+            for e in entries {
                 if heap::kind(e) != KIND_RECORD {
                     return None;
                 }
@@ -876,14 +852,7 @@ fn char_offset(s: &str, n: usize) -> usize {
 
 /// A list of `items`, which it takes.
 fn list_of(ctx: &mut Ctx, items: &[Word]) -> Word {
-    let out = ctx.heap.alloc_list((items.len() as u32).max(4));
-    unsafe {
-        for (i, w) in items.iter().enumerate() {
-            set_word(out, i, *w);
-        }
-        (*out).len = items.len() as u32;
-    }
-    out as Word
+    ctx.heap.list_from(items)
 }
 
 /// `Some(at)` or `None` as the prelude's constructors, when the unit knows them.
@@ -1120,24 +1089,22 @@ pub unsafe extern "C" fn rt_map(ctx: *mut Ctx, list: i64, f: i64) -> i64 {
     let Some(items) = native_list(c, list, "map") else {
         return 0;
     };
-    let n = unsafe { (*items).len };
-    let out = c.heap.alloc_list(n.max(4));
-    for i in 0..n as usize {
-        let x = unsafe { word_at(items, i) };
+    let items = list::to_vec(items);
+    let mut out = Vec::with_capacity(items.len());
+    for x in items {
         heap::inc(x);
         let r = call_value(ctx, f, &[x]);
         let c = unsafe { &mut *ctx };
         if c.failed != 0 {
             return 0;
         }
-        unsafe {
-            set_word(out, i, r);
-            (*out).len = i as u32 + 1;
-        }
+        out.push(r);
     }
+    let c = unsafe { &mut *ctx };
+    let out = c.heap.list_from(&out);
     heap::dec(list);
     heap::dec(f);
-    out as Word
+    out
 }
 
 /// `filter(xs, p)`: the elements `p` answers `true` for. Takes the list and the predicate.
@@ -1146,11 +1113,9 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
     let Some(items) = native_list(c, list, "filter") else {
         return 0;
     };
-    let n = unsafe { (*items).len };
-    let out = c.heap.alloc_list(n.max(4));
-    let mut kept = 0u32;
-    for i in 0..n as usize {
-        let x = unsafe { word_at(items, i) };
+    let items = list::to_vec(items);
+    let mut kept = Vec::new();
+    for x in items {
         heap::inc(x);
         let r = call_value(ctx, p, &[x]);
         let c = unsafe { &mut *ctx };
@@ -1160,11 +1125,7 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
         match heap::as_bool(r) {
             Some(true) => {
                 heap::inc(x);
-                unsafe {
-                    set_word(out, kept as usize, x);
-                    (*out).len = kept + 1;
-                }
-                kept += 1;
+                kept.push(x);
             }
             Some(false) => {}
             None => {
@@ -1176,9 +1137,11 @@ pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
             }
         }
     }
+    let c = unsafe { &mut *ctx };
+    let out = c.heap.list_from(&kept);
     heap::dec(list);
     heap::dec(p);
-    out as Word
+    out
 }
 
 /// `fold(xs, init, f)`. Takes all three.
@@ -1187,16 +1150,19 @@ pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) ->
     let Some(items) = native_list(c, list, "fold") else {
         return 0;
     };
-    let n = unsafe { (*items).len };
+    // The list is held until the walk ends, so `f` may run whatever it likes over it.
     let mut acc = init;
-    for i in 0..n as usize {
-        let x = unsafe { word_at(items, i) };
+    let mut failed = false;
+    list::for_each(items, &mut |x| {
+        if failed {
+            return;
+        }
         heap::inc(x);
         acc = call_value(ctx, f, &[acc, x]);
-        let c = unsafe { &mut *ctx };
-        if c.failed != 0 {
-            return 0;
-        }
+        failed = unsafe { (*ctx).failed } != 0;
+    });
+    if failed {
+        return 0;
     }
     heap::dec(list);
     heap::dec(f);
@@ -1459,13 +1425,7 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
 /// A list literal. Takes the items.
 pub unsafe extern "C" fn rt_list(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    let args = args_of(args, n);
-    let o = ctx.heap.alloc_list((n as u32).max(4));
-    for (i, w) in args.iter().enumerate() {
-        unsafe { set_word(o, i, *w) };
-    }
-    unsafe { (*o).len = n as u32 };
-    o as Word
+    ctx.heap.list_from(args_of(args, n))
 }
 
 /// Whether a value is a record whose field count a pattern admits: `exact` demands the count,
@@ -1511,37 +1471,24 @@ pub unsafe extern "C" fn rt_list_at(ctx: *mut Ctx, value: i64, i: i64) -> i64 {
         return ctx.fail(d);
     }
     let o = obj(value);
-    if i < 0 || i >= unsafe { (*o).len } as i64 {
+    if i < 0 || i >= list::len(o) as i64 {
         let d = error("a list pattern read past the end of the list");
         return ctx.fail(d);
     }
-    let w = unsafe { word_at(o, i as usize) };
+    let w = list::get(o, i as usize);
     heap::inc(w);
     w
 }
 
-/// What a `..rest` binds: a fresh list of everything from `from` on, which is the copy `ply_eval`
-/// makes at the same point rather than a shared tail. Reads.
+/// What a `..rest` binds: the list from `from` on, sharing the trie and copying at most a
+/// tail, as `ply_eval`'s `skip` does at the same point. Reads.
 pub unsafe extern "C" fn rt_list_rest(ctx: *mut Ctx, value: i64, from: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     if heap::kind(value) != KIND_LIST {
         let d = error("a list pattern bound a value that is not a list");
         return ctx.fail(d);
     }
-    let o = obj(value);
-    let len = unsafe { (*o).len } as i64;
-    let from = from.clamp(0, len) as usize;
-    let n = len as usize - from;
-    let out = ctx.heap.alloc_list((n as u32).max(4));
-    unsafe {
-        for i in 0..n {
-            let w = word_at(o, from + i);
-            heap::inc(w);
-            set_word(out, i, w);
-        }
-        (*out).len = n as u32;
-    }
-    out as Word
+    ctx.heap.list_skip(value, from.max(0) as usize)
 }
 
 /// Whether a value is the constructor at `index`, name and arity both. Reads.
