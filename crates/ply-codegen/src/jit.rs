@@ -532,7 +532,7 @@ impl Jit {
             consts: Vec::new(),
             const_words: Vec::new(),
             layouts: Layouts::new(loaded.ctors()),
-            immortals: Heap::new(),
+            immortals: Heap::persistent(),
             tys: vec![Ty::Unknown],
             ty_ids: HashMap::from([(Ty::Unknown, 0)]),
             fields: Vec::new(),
