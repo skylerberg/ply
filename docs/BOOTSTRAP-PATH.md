@@ -96,8 +96,8 @@ measurement is confounded until the earlier one has moved.
    inside the entry that made it (the seam carries no function); a named
    function, a constructor and a builtin used as values are closures over
    nothing; a call through a local or through an expression is `rt_call`;
-   `map`, `filter`, `fold` and `iterate` are loops in the runtime that call the
-   callback back; and the bitwise operators are lowered with the interpreter's
+   `map`, `filter`, `fold`, `map_fold` and `iterate` are loops in the runtime
+   that call the callback back; and the bitwise operators are lowered with the interpreter's
    shift-count refusal. A trampoline for an uncompiled callee was not needed:
    the cascade was the callbacks' blast radius, and the parser spike's census
    now refuses only effects, `Decimal` and `Float` literals, a `handle` and
@@ -185,8 +185,15 @@ measurement is confounded until the earlier one has moved.
    (`rewrite.ply`, `GAPS.md` §16): the checker reads the expanded tree, so the
    effect-set, record-update and try-operator passes that §11R.D left in Rust
    now run in Ply and agree with `parse_recovering` over everything the parser
-   differential reads; `arm-rewrite.sh` arms them. Inference with rows is the
-   hard one, and it is next. `std.hash` exists (ADR 0033) and its throughput is not measured. The
+   differential reads; `arm-rewrite.sh` arms them. **Inference with rows is
+   ported** (`tycore.ply`, `infer.ply`, `GAPS.md` §17): the checker's published
+   output — every scheme, footprint, constraint set, test, law, effect and
+   constructor, or its diagnostics — agrees with `check_program` over the
+   standard library, every example without a `derive`, a hand-written bundle
+   and every one of the reference checker's own test inputs; `arm-infer.sh`
+   arms it. Still outside: the derive expansion (and the two checker passes
+   that read what it produces), and the incremental `Known` interface.
+   Hashing is next after those. `std.hash` exists (ADR 0033) and its throughput is not measured. The
    syntax the parser spike predated is ported first, so its own differential is
    green before anything is built on it: the bit operators (with the shift join
    and the lambda-parameter pipe guard) and keyword fields are in, the corpus

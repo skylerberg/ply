@@ -90,6 +90,7 @@ struct Helpers {
     map: FuncId,
     filter: FuncId,
     fold: FuncId,
+    map_fold: FuncId,
     iterate: FuncId,
     shift_count: FuncId,
     dup: FuncId,
@@ -383,6 +384,7 @@ impl Jit {
             map: declare(&mut module, "rt_map", 3, true)?,
             filter: declare(&mut module, "rt_filter", 3, true)?,
             fold: declare(&mut module, "rt_fold", 4, true)?,
+            map_fold: declare(&mut module, "rt_map_fold", 4, true)?,
             iterate: declare(&mut module, "rt_iterate", 4, true)?,
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
             dup: declare(&mut module, "rt_dup", 2, true)?,
@@ -604,7 +606,7 @@ fn admissible_builtin(b: Builtin) -> Result<(), String> {
 fn lowered_callback(b: Builtin) -> bool {
     matches!(
         b,
-        Builtin::Map | Builtin::Filter | Builtin::Fold | Builtin::Iterate
+        Builtin::Map | Builtin::Filter | Builtin::Fold | Builtin::MapFold | Builtin::Iterate
     )
 }
 
@@ -1522,7 +1524,7 @@ impl Fx<'_, '_> {
                 let b = self.jit.builtins[index];
                 let want = match b {
                     Builtin::Map | Builtin::Filter => 2,
-                    Builtin::Fold | Builtin::Iterate => 3,
+                    Builtin::Fold | Builtin::MapFold | Builtin::Iterate => 3,
                     _ => handles.len(),
                 };
                 if handles.len() != want {
@@ -1540,6 +1542,10 @@ impl Fx<'_, '_> {
                     Builtin::Fold => {
                         self.helper(self.jit.helpers.fold, &[handles[0], handles[1], handles[2]])
                     }
+                    Builtin::MapFold => self.helper(
+                        self.jit.helpers.map_fold,
+                        &[handles[0], handles[1], handles[2]],
+                    ),
                     Builtin::Iterate => self.helper(
                         self.jit.helpers.iterate,
                         &[handles[0], handles[1], handles[2]],
