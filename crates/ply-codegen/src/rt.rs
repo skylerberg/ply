@@ -393,8 +393,8 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
             let o = obj(*xs);
             let index = heap::as_int(*i)?;
             let len = unsafe { (*o).len } as i64;
-            let some = ctx.tables.layouts.ctor_index(&Symbol::new("Some"))?;
-            let none = ctx.tables.layouts.ctor_index(&Symbol::new("None"))?;
+            let some = ctx.tables.layouts.some?;
+            let none = ctx.tables.layouts.none?;
             let answer = if (0..len).contains(&index) {
                 let item = unsafe { word_at(o, index as usize) };
                 heap::inc(item);
@@ -452,8 +452,8 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
             Some(ctx.heap.map_insert(&tables.layouts, *m, *k, *v))
         }
         (Builtin::MapGet, [m, k]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
-            let some = ctx.tables.layouts.ctor_index(&Symbol::new("Some"))?;
-            let none = ctx.tables.layouts.ctor_index(&Symbol::new("None"))?;
+            let some = ctx.tables.layouts.some?;
+            let none = ctx.tables.layouts.none?;
             let o = obj(*m);
             let answer = match heap::map_find(&ctx.tables.layouts, o, *k) {
                 Ok(i) => {
@@ -505,10 +505,7 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
         (Builtin::MapEntries, [m]) if heap::kind(*m) == KIND_MAP => {
             let o = obj(*m);
             let n = unsafe { (*o).len };
-            let shape = ctx
-                .tables
-                .layouts
-                .shape(vec![Symbol::new("key"), Symbol::new("value")]);
+            let shape = ctx.tables.layouts.entry_shape();
             let out = ctx.heap.alloc_list(n.max(4));
             unsafe {
                 for i in 0..n as usize {
@@ -952,8 +949,8 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
             return c.fail(d);
         }
     };
-    let stop = c.tables.layouts.ctor_index(&Symbol::new("Stop"));
-    let go = c.tables.layouts.ctor_index(&Symbol::new("Continue"));
+    let stop = c.tables.layouts.stop;
+    let go = c.tables.layouts.go;
     let mut state = seed;
     let mut left = budget;
     loop {
@@ -1094,7 +1091,6 @@ pub unsafe extern "C" fn rt_record_update(
 /// and 3 a base that is a temporary, both of which take the base and release it.
 pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    let name = ctx.tables.fields[index as usize].clone();
     if heap::kind(base) != KIND_RECORD {
         let d = error(format!(
             "a field access needs a record, and this is {}",
@@ -1103,8 +1099,16 @@ pub unsafe extern "C" fn rt_field(ctx: *mut Ctx, base: i64, index: i64, own: i64
         return ctx.fail(d);
     }
     let o = obj(base);
-    let Some(at) = ctx.tables.layouts.offset(unsafe { (*o).layout }, &name) else {
-        let d = error(format!("this record has no field `{name}`"));
+    let shape = unsafe { (*o).layout };
+    let Some(at) = ctx
+        .tables
+        .layouts
+        .offset_by_index(shape, index as usize, &ctx.tables.fields)
+    else {
+        let d = error(format!(
+            "this record has no field `{}`",
+            ctx.tables.fields[index as usize]
+        ));
         return ctx.fail(d);
     };
     let w = unsafe { word_at(o, at) };
@@ -1157,9 +1161,13 @@ pub unsafe extern "C" fn rt_record_has(ctx: *mut Ctx, value: i64, index: i64) ->
     if heap::kind(value) != KIND_RECORD {
         return 0;
     }
-    let name = &ctx.tables.fields[index as usize];
     let shape = unsafe { (*obj(value)).layout };
-    i64::from(ctx.tables.layouts.offset(shape, name).is_some())
+    i64::from(
+        ctx.tables
+            .layouts
+            .offset_by_index(shape, index as usize, &ctx.tables.fields)
+            .is_some(),
+    )
 }
 
 /// Whether a value is a list long enough for a pattern: `exact` demands the length, and otherwise
