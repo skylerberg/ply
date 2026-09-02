@@ -29,11 +29,12 @@ labelled `row: <phase>`:
 | `row: tables` | the above and the resolver's tables — the index, declarations, scopes and order — without the defaults pass |
 | `row: resolve` | the above and the defaults pass: `resolve_modules` whole |
 | `row: check` | the above and `check_program` |
-| `row: hash` | the above and `hash_index` |
+| `row: hash` | everything through `resolve`, then `hash_index` — hashing reads the resolved tree, not the checked one |
 
-Each test re-runs the phases before its own, so a phase's cost is the
-difference between consecutive tests, and the `hash` test is the whole front
-end. Selected with `--filter "row:"` so the spike's own unit tests are excluded;
+Each test re-runs the phases its own depends on, so a phase's cost is its
+test's distance from the test it builds on, and the whole front end is the
+`check` test plus the `hash` phase. Selected with `--filter "row:"` so the
+spike's own unit tests are excluded;
 `--no-cache`, because a backend run never reads the result cache and the arms
 must not differ in what they read. The front-end cache is warmed once before the
 series and left warm; the floor arm measures the fixed cost.

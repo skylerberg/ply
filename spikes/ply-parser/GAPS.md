@@ -2203,3 +2203,29 @@ hundreds of names unioned once per edge. As a `Map` — the language's ordered
 map, whose keys come back in the byte order a `BTreeSet` iterates in — the same
 run takes seconds. The lesson §5 recorded for the lexer holds for every port: a
 set written as a list is a quadratic waiting for the first real input.
+
+## §20 The whole front end, timed
+
+`benches/front-end-whole` is step 3's protocol over every phase at once: one
+project holding the twelve modules and, as byte literals, the standard library
+with an example, and a test per phase that re-runs the phases its own depends
+on. `PRE-REGISTERED.md` there fixes the arms, the statistic and the decision
+rule; `observation-1.txt` is the series; `docs/BOOTSTRAP-PATH.md` step 7
+carries what it decided. The shape: under the interpreter hashing is the
+largest phase and checking the next, parsing a distant third and the resolver
+small; under the backend the parser and the hasher fall by several times and
+the checker barely moves, because its bodies re-enter through the seam on every
+`map_fold`, `iterate` and lambda over the carried state.
+
+**What the dry run found, which was not the resolver.** The first probe read
+the resolver's tables at many times the parse, and the resolver's name lookups
+were moved from lists onto maps before the cause was found — they stay, since a
+lookup that scans a module's names on every reference is the same quadratic
+§19 names. The cause was the probe: it called its `parsed()` constant once per
+module inside the later rows, and the memo (`ply_eval::memo`) walked a value a
+fixed depth before refusing to remember it, so a constant holding a parsed
+program was re-evaluated on every call. The walk is now iterative and
+unbounded, with a test that a constant is judged by its leaves however deep
+they lie. The lesson for every measurement of a Ply front end: a nullary
+constant is free on the second call only if the memo kept it, and until this
+change nothing said whether it had.
