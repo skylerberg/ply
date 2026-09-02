@@ -18,6 +18,7 @@
 //! someone else's object, which is the net the suites run under.
 
 use crate::list;
+use crate::map;
 use ply_eval::{Closure, ClosureKind, Fields, Value};
 use ply_span::Symbol;
 use std::alloc::{Layout, alloc, dealloc};
@@ -46,6 +47,10 @@ pub const KIND_BYTES: u8 = 10;
 /// A list's trie nodes (`list.rs`): `len` elements or children of `layout` slots.
 pub const KIND_LEAF: u8 = 11;
 pub const KIND_BRANCH: u8 = 12;
+/// A map's tree nodes (`map.rs`): a leaf of `len` sorted pairs, a branch of `len` children
+/// with their greatest keys beside them.
+pub const KIND_MLEAF: u8 = 13;
+pub const KIND_MBRANCH: u8 = 14;
 pub const KIND_DEAD: u8 = 255;
 
 /// A count no increment or decrement touches: the singletons, the constant pool, the memo.
@@ -352,7 +357,9 @@ unsafe fn payload_bytes(o: *mut Obj) -> usize {
             KIND_RECORD | KIND_CTOR | KIND_CLOSURE | KIND_INT => (*o).len as usize * 8,
             KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
             KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
-            KIND_MAP => (*o).layout as usize * 16,
+            KIND_MAP => 8,
+            KIND_MLEAF => (*o).layout as usize * 16,
+            KIND_MBRANCH => 2 * map::KEYS * 8,
             KIND_STR | KIND_BYTES => (*o).layout as usize,
             _ => usize::MAX,
         }
@@ -502,11 +509,6 @@ impl Heap {
         self.raw_alloc(kind, flags, len, layout, len as usize * 8)
     }
 
-    /// A fresh map with room for `cap` entries and none in use yet.
-    pub fn alloc_map(&mut self, cap: u32) -> *mut Obj {
-        self.raw_alloc(KIND_MAP, 0, 0, cap, cap as usize * 16)
-    }
-
     /// A fresh string or bytes value with room for `cap` bytes and none in use yet.
     pub fn alloc_bytes(&mut self, kind: u8, cap: u32) -> *mut Obj {
         self.raw_alloc(kind, 0, 0, cap, cap as usize)
@@ -620,14 +622,11 @@ impl Heap {
                     self.list_from(&items)
                 }
                 KIND_MAP => {
-                    let n = (*o).len;
-                    let c = self.alloc_map(n.max(1));
-                    (*c).len = n;
-                    for i in 0..2 * n as usize {
-                        let x = self.copy(word_at(o, i), copies);
-                        set_word(c, i, x);
-                    }
-                    c as Word
+                    let entries: Vec<(Word, Word)> = map::to_vec(o)
+                        .into_iter()
+                        .map(|(k, v)| (self.copy(k, copies), self.copy(v, copies)))
+                        .collect();
+                    self.map_from_sorted(&entries)
                 }
                 kind => {
                     let (len, layout, flags) = ((*o).len, (*o).layout, (*o).flags);
@@ -711,20 +710,13 @@ impl Heap {
                 let words: Vec<Word> = items.iter().map(|x| self.to_word(layouts, x)).collect();
                 self.list_from(&words)
             }
-            // The interpreter iterates in key order, which is the layout's order too.
+            // The interpreter iterates in key order, which is the tree's order too.
             Value::Map(entries) => {
-                let n = entries.size() as u32;
-                let o = self.alloc_map(n.max(4));
-                for (i, (k, v)) in entries.iter().enumerate() {
-                    let kw = self.to_word(layouts, k);
-                    let vw = self.to_word(layouts, v);
-                    unsafe {
-                        set_word(o, 2 * i, kw);
-                        set_word(o, 2 * i + 1, vw);
-                    }
-                }
-                unsafe { (*o).len = n };
-                o as Word
+                let words: Vec<(Word, Word)> = entries
+                    .iter()
+                    .map(|(k, v)| (self.to_word(layouts, k), self.to_word(layouts, v)))
+                    .collect();
+                self.map_from_sorted(&words)
             }
             Value::Closure(c) => match &c.kind {
                 ClosureKind::Native {
@@ -797,10 +789,10 @@ impl Heap {
                         .map(|x| Heap::to_value_counted(layouts, x, read))
                         .collect(),
                 ),
-                KIND_MAP => Value::map((0..(*o).len as usize).map(|i| {
+                KIND_MAP => Value::map(map::to_vec(o).into_iter().map(|(k, v)| {
                     (
-                        Heap::to_value_counted(layouts, word_at(o, 2 * i), read),
-                        Heap::to_value_counted(layouts, word_at(o, 2 * i + 1), read),
+                        Heap::to_value_counted(layouts, k, read),
+                        Heap::to_value_counted(layouts, v, read),
                     )
                 })),
                 KIND_CLOSURE => {
@@ -890,19 +882,26 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>) {
     unsafe {
         debug_assert!((*o).rc == 1 && (*o).kind != KIND_DEAD);
         (*o).rc = 0;
-        let (first, last) = match (*o).kind {
-            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => (0, (*o).len as usize),
-            // The root when there is one, two immediates the walk skips, then the tail.
-            KIND_LIST => (0, list::TAIL + list::tail_len(o)),
-            KIND_MAP => (0, 2 * (*o).len as usize),
-            KIND_CLOSURE => (CLOSURE_CAPTURES, (*o).len as usize),
+        let ranges: [(usize, usize); 2] = match (*o).kind {
+            KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => [(0, (*o).len as usize), (0, 0)],
+            KIND_MLEAF => [(0, 2 * (*o).len as usize), (0, 0)],
+            // The root when there is one, then the tail.
+            KIND_LIST => [(0, list::TAIL + list::tail_len(o)), (0, 0)],
+            // The root when there is one.
+            KIND_MAP => [(0, 1), (0, 0)],
+            // The children, then their greatest keys.
+            KIND_MBRANCH => [
+                (0, (*o).len as usize),
+                (map::KEYS, map::KEYS + (*o).len as usize),
+            ],
+            KIND_CLOSURE => [(CLOSURE_CAPTURES, (*o).len as usize), (0, 0)],
             KIND_BRIDGE => {
                 std::ptr::drop_in_place(bridge_slot(o));
-                (0, 0)
+                [(0, 0), (0, 0)]
             }
-            _ => (0, 0),
+            _ => [(0, 0), (0, 0)],
         };
-        for i in first..last {
+        for i in ranges.iter().flat_map(|(first, last)| *first..*last) {
             let c = word_at(o, i);
             if is_imm(c) || c == 0 {
                 continue;
@@ -948,9 +947,13 @@ pub fn mark_immortal(w: Word) {
                 }
                 KIND_LIST => pending.extend(list::children(o)),
                 KIND_MAP => {
-                    for i in 0..2 * (*o).len as usize {
-                        pending.push(word_at(o, i));
+                    let r = word_at(o, 0);
+                    if r != 0 {
+                        pending.push(r);
                     }
+                }
+                KIND_MLEAF | KIND_MBRANCH => {
+                    pending.extend(map::child_words(o).map(|i| word_at(o, i)));
                 }
                 KIND_CLOSURE => {
                     for i in CLOSURE_CAPTURES..(*o).len as usize {
@@ -981,9 +984,13 @@ pub fn world_independent(w: Word) -> bool {
                 }
                 KIND_LIST => pending.extend(list::children(o)),
                 KIND_MAP => {
-                    for i in 0..2 * (*o).len as usize {
-                        pending.push(word_at(o, i));
+                    let r = word_at(o, 0);
+                    if r != 0 {
+                        pending.push(r);
                     }
+                }
+                KIND_MLEAF | KIND_MBRANCH => {
+                    pending.extend(map::child_words(o).map(|i| word_at(o, i)));
                 }
                 KIND_CLOSURE => {
                     for i in CLOSURE_CAPTURES..(*o).len as usize {
@@ -1124,15 +1131,14 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
                 xs.len().cmp(&ys.len())
             }
             KIND_MAP => {
-                let (x, y) = (obj(a), obj(b));
-                let (n, m) = ((*x).len as usize, (*y).len as usize);
-                for i in 0..2 * n.min(m) {
-                    let c = cmp_words(layouts, word_at(x, i), word_at(y, i));
+                let (xs, ys) = (map::to_vec(obj(a)), map::to_vec(obj(b)));
+                for ((xk, xv), (yk, yv)) in xs.iter().zip(&ys) {
+                    let c = cmp_words(layouts, *xk, *yk).then_with(|| cmp_words(layouts, *xv, *yv));
                     if c != Ordering::Equal {
                         return c;
                     }
                 }
-                n.cmp(&m)
+                xs.len().cmp(&ys.len())
             }
             KIND_RECORD => {
                 let (x, y) = (obj(a), obj(b));
@@ -1189,125 +1195,13 @@ pub fn native_key(w: Word) -> bool {
                 (0..(*o).len as usize).all(|i| native_key(word_at(o, i)))
             }
             KIND_LIST => list::children(o).all(native_key),
-            KIND_MAP => (0..2 * (*o).len as usize).all(|i| native_key(word_at(o, i))),
+            KIND_MAP => {
+                let mut fine = true;
+                map::for_each(o, |k, v| fine = fine && native_key(k) && native_key(v));
+                fine
+            }
             _ => false,
         }
-    }
-}
-
-// --- Maps --------------------------------------------------------------------------------------
-
-pub unsafe fn map_key(o: *mut Obj, i: usize) -> Word {
-    unsafe { word_at(o, 2 * i) }
-}
-
-pub unsafe fn map_value(o: *mut Obj, i: usize) -> Word {
-    unsafe { word_at(o, 2 * i + 1) }
-}
-
-/// Where `k` is in the map, or where it would go.
-pub fn map_find(layouts: &Layouts, o: *mut Obj, k: Word) -> Result<usize, usize> {
-    let n = unsafe { (*o).len } as usize;
-    let (mut lo, mut hi) = (0usize, n);
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        match cmp_words(layouts, unsafe { map_key(o, mid) }, k) {
-            Ordering::Less => lo = mid + 1,
-            Ordering::Greater => hi = mid,
-            Ordering::Equal => return Ok(mid),
-        }
-    }
-    Err(lo)
-}
-
-impl Heap {
-    /// A map with the same entries, each held once more, and room for `cap` of them.
-    unsafe fn map_copy(&mut self, o: *mut Obj, cap: u32) -> *mut Obj {
-        let n = unsafe { (*o).len };
-        let out = self.alloc_map(cap.max(n).max(4));
-        unsafe {
-            for i in 0..2 * n as usize {
-                let w = word_at(o, i);
-                inc(w);
-                set_word(out, i, w);
-            }
-            (*out).len = n;
-        }
-        out
-    }
-
-    /// `map_insert`: the entry replaced, key and value both, when the key is present, and put
-    /// in order when it is not — in place when nothing else holds the map. Takes all three.
-    pub fn map_insert(&mut self, layouts: &Layouts, m: Word, k: Word, v: Word) -> Word {
-        let o = obj(m);
-        let (len, cap) = unsafe { ((*o).len, (*o).layout) };
-        match map_find(layouts, o, k) {
-            Ok(i) => {
-                let target = if is_unique(m) {
-                    o
-                } else {
-                    let copy = unsafe { self.map_copy(o, cap) };
-                    dec(m);
-                    copy
-                };
-                unsafe {
-                    dec(map_key(target, i));
-                    dec(map_value(target, i));
-                    set_word(target, 2 * i, k);
-                    set_word(target, 2 * i + 1, v);
-                }
-                target as Word
-            }
-            Err(i) => {
-                let target = if is_unique(m) && len < cap {
-                    o
-                } else {
-                    // Room doubles only when there is none: a shared map copied on every insert
-                    // must not grow on every copy.
-                    let room = if len < cap { cap } else { (cap * 2).max(4) };
-                    let copy = unsafe { self.map_copy(o, room) };
-                    dec(m);
-                    copy
-                };
-                unsafe {
-                    let base = words(target);
-                    std::ptr::copy(base.add(2 * i), base.add(2 * i + 2), 2 * (len as usize - i));
-                    set_word(target, 2 * i, k);
-                    set_word(target, 2 * i + 1, v);
-                    (*target).len = len + 1;
-                }
-                target as Word
-            }
-        }
-    }
-
-    /// `map_remove`: the map without the key, and the map itself when the key was absent. Takes
-    /// the map and reads the key.
-    pub fn map_remove(&mut self, layouts: &Layouts, m: Word, k: Word) -> Word {
-        let o = obj(m);
-        let Ok(i) = map_find(layouts, o, k) else {
-            return m;
-        };
-        let len = unsafe { (*o).len };
-        let target = if is_unique(m) {
-            o
-        } else {
-            let copy = unsafe { self.map_copy(o, (*o).layout) };
-            dec(m);
-            copy
-        };
-        unsafe {
-            dec(map_key(target, i));
-            dec(map_value(target, i));
-            let base = words(target);
-            std::ptr::copy(
-                base.add(2 * i + 2),
-                base.add(2 * i),
-                2 * (len as usize - i - 1),
-            );
-            (*target).len = len - 1;
-        }
-        target as Word
     }
 }
 
@@ -1526,7 +1420,7 @@ mod tests {
     fn a_native_map_holds_its_entries_in_the_interpreters_order_and_round_trips() {
         let mut h = Heap::new();
         let l = layouts();
-        let mut m = h.alloc_map(1) as Word;
+        let mut m = h.map_new();
         for (k, v) in [
             (5, "five"),
             (1, "one"),
@@ -1547,8 +1441,8 @@ mod tests {
                 (Value::Int(5), Value::str("five")),
             ])
         );
-        assert!(map_find(&l, obj(m), imm(3)).is_ok());
-        assert!(map_find(&l, obj(m), imm(2)).is_err());
+        assert!(map::get(&l, obj(m), imm(3)).is_some());
+        assert!(map::get(&l, obj(m), imm(2)).is_none());
         let m = h.map_remove(&l, m, imm(3));
         let m = h.map_remove(&l, m, imm(99));
         assert_eq!(unsafe { (*obj(m)).len }, 3);
@@ -1559,22 +1453,6 @@ mod tests {
         assert_ne!(m, m2);
         assert_eq!(unsafe { (*obj(m)).len }, 3);
         assert_eq!(unsafe { (*obj(m2)).len }, 4);
-        h.end();
-    }
-
-    #[test]
-    fn a_shared_map_inserted_into_many_times_keeps_its_room_bounded() {
-        let mut h = Heap::new();
-        let l = layouts();
-        let mut m = h.alloc_map(4) as Word;
-        for i in 0..200 {
-            // Held elsewhere too, so every insert copies.
-            inc(m);
-            m = h.map_insert(&l, m, imm(i), imm(i));
-        }
-        let (len, cap) = unsafe { ((*obj(m)).len, (*obj(m)).layout) };
-        assert_eq!(len, 200);
-        assert!(cap < 1024, "the room grew to {cap}");
         h.end();
     }
 

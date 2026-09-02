@@ -12,6 +12,7 @@ pub mod backend;
 pub mod heap;
 pub mod jit;
 pub mod list;
+pub mod map;
 pub mod opt;
 pub mod rt;
 pub mod source;
