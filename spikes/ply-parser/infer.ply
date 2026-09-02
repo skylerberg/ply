@@ -15,7 +15,7 @@ import spine (Span, Ident, QName, span_to, dummy_span, num)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad, ty_span)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
               TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
-              Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause, parse)
+              Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause, Derived, DeriveDef, parse)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithRegion,
               ESimulate, EBad, Stmt, SLet, SExpr, Param, NamedArg, MatchArm, HandleClause,
@@ -42,6 +42,8 @@ import resolve (Mod, Source, Resolved, Scope, Binding, Diag, Label, Ns, NValue, 
                 bspace, space, qualify, default_binder, dump_diags, diag1, diag2, lab, is_bare,
                 is_ctor_name)
 import rewrite (expand)
+import derive (Why, WFunction, WHandle, WFloatIsNotOrdered, WUnconstrained, WNullInsideOption, WSecret,
+               ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name, Expansion, expand_derives)
 
 // --- What the checker keeps ----------------------------------------------------------
 
@@ -108,6 +110,8 @@ type Cx = {
   constrained_uses: List<ConstraintSite>,
   spec_kind: Option<SpecKind>,
   spec_envs: List<SpecEnv>,
+  // The `derive` that generated the definition being walked, if any.
+  derived: Option<Derived>,
   assumed: List<Assumed>,
 }
 
@@ -385,9 +389,13 @@ fn global(cx: Cx, ns: Ns, q: QName) -> { cx: Cx, name: Option<Bytes> } =
   } else {
     match find(cx.r, cx.module, ns, q) {
       Some(b) -> { cx: cx, name: Some(b.qualified) },
-      None -> { cx: lookup_failure(cx, ns, q), name: None },
+      None -> { cx: match cx.derived { Some(_) -> unresolved_in_derived(cx, q), None -> lookup_failure(cx, ns, q) }, name: None },
     }
   }
+
+// A name a generated body cannot see is the field type's missing `derive`, not a bug in the
+// user's code: `E0206` at the name, with the two notes that say so.
+fn unresolved_in_derived(cx: Cx, q: QName) -> Cx = err1(cx, b"E0206", q.span, 2)
 
 // `Resolved::lookup`'s diagnostics for a qualified name that does not resolve.
 fn lookup_failure(cx: Cx, ns: Ns, q: QName) -> Cx =
@@ -504,7 +512,10 @@ fn edit_distance(a: Bytes, b: Bytes) -> Int = {
   at(final, m)
 }
 
-fn unknown_name(cx: Cx, q: QName) -> Cx = {
+fn unknown_name(cx: Cx, q: QName) -> Cx =
+  match cx.derived { Some(_) -> unresolved_in_derived(cx, q), None -> unknown_name_here(cx, q) }
+
+fn unknown_name_here(cx: Cx, q: QName) -> Cx = {
   let near = match nearest_name(cx, q.name.name) { Some(_) -> 1, None -> 0 };
   let exported = if is_bare(q) { match exporter(cx, NValue, q.name.name) { Some(_) -> 1, None -> 0 } } else { 0 };
   let in_requires = match cx.spec_kind { Some(SRequires) -> true, _ -> false };
@@ -605,10 +616,14 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
     }
   }
 
-fn unknown_type(cx: Cx, q: QName) -> Cx = {
-  let exported = if is_bare(q) { match exporter(cx, NType, q.name.name) { Some(_) -> 1, None -> 0 } } else { 0 };
-  err1(cx, b"E0102", q.span, 1 + exported)
-}
+fn unknown_type(cx: Cx, q: QName) -> Cx =
+  match cx.derived {
+    Some(_) -> unresolved_in_derived(cx, q),
+    None -> {
+      let exported = if is_bare(q) { match exporter(cx, NType, q.name.name) { Some(_) -> 1, None -> 0 } } else { 0 };
+      err1(cx, b"E0102", q.span, 1 + exported)
+    },
+  }
 
 fn row_param(cx: Cx, id: Ident) -> { cx: Cx, v: Option<Int> } =
   match map_get(cx.row_params, id.name) {
@@ -1728,14 +1743,16 @@ fn check_fns(cx: Cx, m: Mod) -> Cx = {
 fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
   let qualified = map(comp, |i: Int| qualify(m.name, at(fns, i).name.name));
   let sigs = fold(range(0, len(comp)), { cx: cx, sigs: [] }, |acc: { cx: Cx, sigs: List<Sig> }, slot: Int| {
-    let s: WithSig = signature(acc.cx, at(fns, at(comp, slot)));
-    { cx: {..s.cx, env: env_bind_global(s.cx.env, at(qualified, slot), mono(s.sig.fn_ty))}, sigs: push(acc.sigs, s.sig) }
+    let def = at(fns, at(comp, slot));
+    let s: WithSig = signature({..acc.cx, derived: derived_of(m, def)}, def);
+    { cx: {..s.cx, derived: None, env: env_bind_global(s.cx.env, at(qualified, slot), mono(s.sig.fn_ty))}, sigs: push(acc.sigs, s.sig) }
   });
   let bodies = fold(range(0, len(comp)), { cx: sigs.cx, rows: [] }, |acc: { cx: Cx, rows: List<Row> }, slot: Int| {
     let def = at(fns, at(comp, slot));
     let sig = at(sigs.sigs, slot);
-    let o: WithBodyRow = check_fn_body(acc.cx, def, sig);
-    { cx: record_spec_env(o.cx, def, at(qualified, slot), sig), rows: push(acc.rows, o.row) }
+    let o: WithBodyRow = check_fn_body({..acc.cx, derived: derived_of(m, def)}, def, sig);
+    let walked: Cx = {..o.cx, derived: None};
+    { cx: record_spec_env(walked, def, at(qualified, slot), sig), rows: push(acc.rows, o.row) }
   });
   let settled: Cx = settle_numerics(bodies.cx);
   let required: Cx = fold(range(0, len(comp)), settled, |c: Cx, slot: Int| require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
@@ -1754,6 +1771,10 @@ fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
               performed: performed.atoms, constraints: constraints, internally_effectful: true, at: here(bound, def.span) })
   })
 }
+
+// A generated definition carries its `derive` item's span and nothing hand-written does.
+fn derived_of(m: Mod, def: FnDef) -> Option<Derived> =
+  fold(m.derived, None, |acc: Option<Derived>, d: Derived| match acc { Some(_) -> acc, None -> if d.span == def.span { Some(d) } else { None } })
 
 fn published_constraints(cx: Cx, def: FnDef, sc: Scheme) -> List<DefConstraint> = {
   let found = fold(def.constraints, [], |acc: List<DefConstraint>, c: Constraint|
@@ -2075,21 +2096,11 @@ fn check_result_shadow(cx: Cx, def: FnDef) -> Cx =
 
 // --- Derivability ------------------------------------------------------------------------------
 //
-// `derivable.rs` with `ply_derive::rules::shape` folded in: the one predicate a `where`
-// clause, a `Map` key type and (once expansion is ported) a `derive` ask.
+// `derivable.rs`, over `derive.ply`'s `con_shape`: the one predicate a `where` clause, a
+// `Map` key type and a `derive` ask.
 
-type Why = | WFunction | WHandle | WFloatIsNotOrdered | WUnconstrained(Int) | WNullInsideOption | WSecret
 type Blocked = { ty: Type, why: Why }
 type AdtShape = { name: Bytes, params: List<Int>, fields: List<Type> }
-type ConShape = | Leaf | Structural | Refused(Why) | Nominal
-
-fn con_shape(d: Deriver, name: Bytes) -> ConShape =
-  if name == b"Int" || name == b"Bool" || name == b"String" || name == b"Bytes" || name == b"Unit" || name == b"Decimal" { Leaf }
-  else if name == b"Float" { match d { DOrd -> Refused(WFloatIsNotOrdered), _ -> Leaf } }
-  else if name == b"List" || name == b"Option" || name == b"Map" || name == b"Result" || name == b"Ordering" || name == b"Rounding" { Structural }
-  else if name == b"Cell" || name == b"Task" { Refused(WHandle) }
-  else if name == b"Secret" { match d { DEq -> Leaf, _ -> Refused(WSecret) } }
-  else { Nominal }
 
 // Every sum type this run declared, flattened: its parameters and every field of every variant.
 fn adt_shapes(cx: Cx) -> List<AdtShape> =
@@ -2113,7 +2124,7 @@ fn substitute_ty(t: Type, params: List<Int>, args: List<Type>) -> Type =
     TyRecord(fs) -> TyRecord(map(fs, |f: Field| { name: f.name, ty: substitute_ty(f.ty, params, args) })),
   }
 
-fn json_null_encoded(t: Type) -> Bool = match t { TyCon(c) -> c.name == b"Unit" || c.name == b"Option", _ -> false }
+fn json_null_encoded(t: Type) -> Bool = match t { TyCon(c) -> null_encoded_name(c.name), _ -> false }
 
 fn first_blocked(d: Deriver, tys: List<Type>, adts: List<AdtShape>, assumed: List<Int>, visiting: List<Bytes>) -> Option<Blocked> =
   fold(tys, None, |acc: Option<Blocked>, t: Type| match acc { Some(_) -> acc, None -> derivable(d, t, adts, assumed, visiting) })
@@ -2227,6 +2238,75 @@ fn check_constraints(cx: Cx) -> Cx = {
       }
     });
   walked.cx
+}
+
+// --- The two passes that read what expansion produced --------------------------------------------
+
+fn expanded_here(m: Mod, def: DeriveDef) -> Bool =
+  fold(m.derived, false, |acc: Bool, d: Derived| acc || (same_deriver(d.deriver, def.deriver) && d.target == def.target.name))
+
+// The `derive` target as a solved type, for a target with no parameters; an alias is expanded
+// with whatever it reports discarded, since its own declaration reported it already.
+fn derive_target(cx: Cx, m: Mod, target: Bytes) -> Option<WithTy> = {
+  let qualified = qualify(m.name, target);
+  match map_get(cx.types, qualified) {
+    None -> None,
+    Some(decl) ->
+      if len(decl.params) > 0 { None } else {
+        match decl.alias {
+          None -> Some({ cx: cx, t: TyCon({ name: qualified, args: [] }) }),
+          Some(alias) -> {
+            let mark = len(cx.diags);
+            let inner: Cx = {..cx, ty_params: map_new(), alias_stack: push(cx.alias_stack, qualified), module: decl.owner};
+            let o: WithTy = conv_type(inner, alias);
+            Some({ cx: {..o.cx, ty_params: cx.ty_params, alias_stack: cx.alias_stack, module: cx.module, diags: take(o.cx.diags, mark)}, t: o.t })
+          },
+        }
+      },
+  }
+}
+
+fn why_notes_for_derive(w: Why) -> Int =
+  match w { WNullInsideOption -> 2, WFloatIsNotOrdered -> 1, WFunction -> 1, WHandle -> 1, WSecret -> 2, WUnconstrained(_) -> 0 }
+
+// `derivable(D, T)` over each `derive`'s target as a **solved** type.
+fn check_derives(cx: Cx) -> Cx = {
+  let adts = adt_shapes(cx);
+  fold(range(0, len(cx.mods)), cx, |c: Cx, i: Int| {
+    let m = at(c.mods, i);
+    fold(m.module.items, c, |cc: Cx, it: Item|
+      match it {
+        IDerive(def) ->
+          if !expanded_here(m, def) { cc } else {
+            match derive_target({..cc, module: i}, m, def.target.name) {
+              None -> cc,
+              Some(o) ->
+                match derivable(def.deriver, o.t, adts, [], []) {
+                  None -> o.cx,
+                  Some(blocked) ->
+                    match blocked.why {
+                      WUnconstrained(_) -> o.cx,
+                      _ -> report(o.cx, diag1(b"E0206", i, def.span, why_notes_for_derive(blocked.why) + 1)),
+                    },
+                }
+            }
+          },
+        _ -> cc,
+      })
+  })
+}
+
+// Anything a generated definition failed on, other than a name it could not see, is Ply's fault.
+fn attribute_generated(cx: Cx) -> Cx = {
+  let spans = fold(range(0, len(cx.mods)), [], |acc: List<Label>, i: Int|
+    fold(at(cx.mods, i).derived, acc, |a: List<Label>, d: Derived| push(a, lab(i, d.span, true))));
+  if len(spans) == 0 { cx } else {
+    {..cx, diags: map(cx.diags, |d: Diag| {
+      let primary = fold(d.labels, None, |acc: Option<Label>, l: Label| match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } });
+      let generated = match primary { Some(p) -> fold(spans, false, |b: Bool, s: Label| b || (s.module == p.module && s.start == p.start && s.end == p.end)), None -> false };
+      if d.code == b"E0206" || !generated { d } else { { code: b"E0505", notes: d.notes + 2, labels: d.labels, text: d.text } }
+    })}
+  }
 }
 
 // --- Comparisons, simulations and regions, once the module is solved ------------------------------
@@ -2388,7 +2468,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>) -> Cx =
                     defs: [], def_index: map_new(), tests: [], laws: [], ty_params: map_new(), row_params: map_new(),
                     auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], comparisons: [], scope: 0,
                     constraints: map_new(), numerics: [], simulate_depth: 0, open_regions: [], regions: [], simulations: [],
-                    map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], assumed: [] })
+                    map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], derived: None, assumed: [] })
 
 type Checked = { cx: Cx, ok: Bool }
 
@@ -2403,7 +2483,8 @@ pub fn check_program(r: Resolved, mods: List<Mod>) -> Checked = {
   let tested: Cx = fold(range(0, len(mods)), checked, |c: Cx, i: Int| check_laws(check_tests({..c, module: i}, at(mods, i)), at(mods, i)));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
   let settled: Cx = settle_numerics(tested);
-  let solved: Cx = check_regions(check_simulations(check_constraints(check_map_keys(check_comparisons(settled)))));
+  let constrained: Cx = check_constraints(check_map_keys(check_comparisons(settled)));
+  let solved: Cx = check_regions(check_simulations(attribute_generated(check_derives(constrained))));
   let marked: Cx = mark_internal_effects(solved);
   { cx: marked, ok: len(marked.diags) == 0 }
 }
@@ -2447,19 +2528,29 @@ fn dump_checked(c: Cx) -> Bytes =
 fn dedup_diags(ds: List<Diag>) -> List<Diag> =
   fold(ds, [], |acc: List<Diag>, d: Diag| if fold(acc, false, |b: Bool, x: Diag| b || x == d) { acc } else { push(acc, d) })
 
+type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
+
+// The driver's order: parse with the rewrites, expand every `derive`, resolve, check. An
+// expansion that reports stops the pipeline there, as `check_module` stops.
 pub fn check_dump(sources: List<Source>) -> String = {
-  let mods = map(sources, |s: Source| {
+  let parsed = map(range(0, len(sources)), |i: Int| {
+    let s = at(sources, i);
     let r = parse(s.src);
     let x = expand(r.node, r.p.uses_sets, r.p.diags);
-    { name: s.name, module: x.module }
+    let d: Expansion = expand_derives(i, x.module);
+    { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
   });
+  let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
   let head = bytes_concat_all([b"K;", n(len(sources)), b";"]);
-  let body = match resolve_modules(mods) {
-    Failed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
-    Resolved_(x) -> {
-      let out = check_program(x.r, x.mods);
-      if out.ok { dump_checked(out.cx) } else { bytes_concat(b"X;", dump_diags(dedup_diags(out.cx.diags))) }
-    },
+  let body = if len(expansion) > 0 { bytes_concat(b"X;", dump_diags(expansion)) } else {
+    match resolve_modules(mods) {
+      Failed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
+      Resolved_(x) -> {
+        let out = check_program(x.r, x.mods);
+        if out.ok { dump_checked(out.cx) } else { bytes_concat(b"X;", dump_diags(dedup_diags(out.cx.diags))) }
+      },
+    }
   };
   string_of_bytes(bytes_concat(head, body))
 }

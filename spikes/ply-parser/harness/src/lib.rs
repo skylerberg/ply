@@ -47,8 +47,27 @@ pub fn reference_dump_expanded(text: &str) -> String {
     dump_of(text, &module, &diags)
 }
 
+/// The reference's derive expansion of each module on its own, for the fifth differential: the
+/// source every derivation generates, byte for byte, and the diagnostics expansion raises.
+pub fn reference_derive_dump(modules: &[(String, String)]) -> String {
+    let mut out = String::new();
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (mut module, _) =
+            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        let sources = ply_derive::preview(&module);
+        let diags = ply_derive::expand_module(&mut module);
+        out.push_str(&format!("M;{};", sources.len()));
+        for s in &sources {
+            out.push_str(&format!("S;{};{s}", s.len()));
+        }
+        resolve_diags(&mut out, &diags);
+    }
+    out
+}
+
 /// The reference's check of a program given as `(module name, source)` pairs: the rewrites, the
-/// resolver and `check_program` in the driver's order, dumped for the fourth differential.
+/// derive expansion, the resolver and `check_program` in the driver's order, dumped for the
+/// fourth differential.
 pub fn reference_check_dump(modules: &[(String, String)]) -> String {
     let mut program = Program {
         modules: Vec::new(),
@@ -60,6 +79,14 @@ pub fn reference_check_dump(modules: &[(String, String)]) -> String {
     }
     let mut out = String::new();
     out.push_str(&format!("K;{};", modules.len()));
+    // Before anything is resolved, as the driver and `check_module` expand: what resolution
+    // and inference see is ordinary definitions.
+    let expansion = ply_derive::expand_program(&mut program);
+    if !expansion.is_empty() {
+        out.push_str("X;");
+        resolve_diags(&mut out, &expansion);
+        return out;
+    }
     let resolved = match ply_syntax::resolve::resolve(&mut program) {
         Ok(r) => r,
         Err(diags) => {
