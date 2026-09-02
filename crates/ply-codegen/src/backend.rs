@@ -3,8 +3,8 @@
 use crate::jit::{Entry, Jit, Opts, Unit};
 use crate::source::Source;
 use anyhow::{Context, Result, anyhow, bail};
-use ply_eval::{Compilation, Counters, Policed, Provider, Value};
-use ply_span::Symbol;
+use ply_eval::{Compilation, Counters, Entered, Policed, Provider, Value};
+use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::{Program, TypeExpr};
 use std::cell::{Cell, RefCell};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -303,15 +303,15 @@ impl Bodies {
         self.declines.get()
     }
 
-    fn decline(&self, mut f: impl FnMut(&mut Declines)) -> Option<Value> {
+    fn decline(&self, mut f: impl FnMut(&mut Declines)) -> Run {
         let mut d = self.declines.get();
         f(&mut d);
         self.declines.set(d);
-        None
+        Run::Declined
     }
 
     /// One entry, on whatever fuel the caller names.
-    fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
+    fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Run {
         let Some(admitted) = self.admitted.get(name) else {
             return self.decline(|d| d.not_compiled += 1);
         };
@@ -332,7 +332,7 @@ impl Bodies {
             drop(ctx);
             self.unit.counters.note_converted(0, 0);
             self.entered.set(self.entered.get() + 1);
-            return Some(value);
+            return Run::Answered(value);
         }
         ctx.begin(i64::try_from(fuel).unwrap_or(i64::MAX));
         // The arguments cross into the entry's own words, deep, and the answer crosses back the
@@ -358,7 +358,7 @@ impl Bodies {
             drop(ctx);
             self.unit.counters.note_converted(0, 0);
             self.entered.set(self.entered.get() + 1);
-            return Some(value);
+            return Run::Answered(value);
         }
         let inward = (ctx.heap.allocated() - before) as u64;
         // SAFETY: `admitted.entry` is a pointer into `self._code`'s finalized executable pages,
@@ -368,19 +368,28 @@ impl Bodies {
         let out = unsafe { (admitted.entry)(&mut *ctx as *mut crate::rt::Ctx, handles.as_ptr()) };
 
         if ctx.failed != 0 {
-            // The fragment's own diagnostic is deliberately dropped on the floor: it is
-            // `RUNTIME_ERROR` at `Span::DUMMY`, and the machine is about to evaluate the same
-            // definition and raise the real one.
+            // The fragment's diagnostic is `RUNTIME_ERROR` at `Span::DUMMY`; the machine is about
+            // to evaluate the same definition and raise the real one, and a test root carries
+            // this one only to name what raised when the machine then passes.
             let out_of_fuel = ctx.failed == crate::rt::FAILED_OUT_OF_FUEL;
+            let raised = if out_of_fuel {
+                None
+            } else {
+                ctx.diagnostic.take()
+            };
             ctx.end();
             drop(ctx);
-            return self.decline(|d| {
+            self.decline(|d| {
                 if out_of_fuel {
                     d.out_of_fuel += 1;
                 } else {
                     d.failed += 1;
                 }
             });
+            return match raised {
+                Some(raised) => Run::Raised(raised),
+                None => Run::Declined,
+            };
         }
         if ctx.touched_cells() {
             ctx.end();
@@ -410,7 +419,23 @@ impl Bodies {
         }
         self.unit.counters.note_converted(inward, walked.read);
         self.entered.set(self.entered.get() + 1);
-        Some(value)
+        Run::Answered(value)
+    }
+}
+
+/// How one entry ended.
+enum Run {
+    Answered(Value),
+    Raised(Diagnostic),
+    Declined,
+}
+
+impl Run {
+    fn answer(self) -> Option<Value> {
+        match self {
+            Run::Answered(value) => Some(value),
+            Run::Raised(_) | Run::Declined => None,
+        }
     }
 }
 
@@ -421,7 +446,16 @@ impl ply_eval::Compiled for Bodies {
 
     fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
         self.unit.counters.note_offer(args);
-        self.run(name, args, budget)
+        self.run(name, args, budget).answer()
+    }
+
+    fn enter_test(&self, name: &Symbol, budget: usize) -> Entered {
+        self.unit.counters.note_offer(&[]);
+        match self.run(name, &[], budget) {
+            Run::Answered(value) => Entered::Answered(value),
+            Run::Raised(raised) => Entered::Raised(raised),
+            Run::Declined => Entered::Declined,
+        }
     }
 }
 
@@ -435,11 +469,11 @@ impl Policed for Bodies {
     }
 
     fn answer(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        self.run(name, args, budget)
+        self.run(name, args, budget).answer()
     }
 
     fn run_with_fuel(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
-        self.run(name, args, fuel)
+        self.run(name, args, fuel).answer()
     }
 }
 

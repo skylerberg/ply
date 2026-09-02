@@ -145,6 +145,26 @@ search at each node, and iteration in key order, which is the interpreter's.
 A small map is a map object and one leaf; a map built from sorted entries at
 the seam fills its leaves left to right with no path walked.
 
+## Decision 7 — a test is a root
+
+The front-end row's shape — three roots entered from an interpreted test body
+per row, each phase's tree converted out and back in — was the seam's share
+of every row, and Decision 5 removed only the part the memo could hold. A
+test body is now a root: the seam synthesizes a nullary definition of it,
+named by the test's place among its module's tests, the fragment compiles it
+like any other function, and the test runner offers that root to the backend
+before interpreting, taking the backend's answer as the pass. A backend that
+declines — a body the fragment refused — leaves the test to the machine, which
+raises the diagnostic as before. One that ran the body and raised, an
+assertion included, is not folded into a decline: the machine runs the body
+too, and where it passes the test fails as a disagreement, because a body
+entered whole is the one place a wrong compiled answer never crosses the seam
+and the rerun would otherwise hide it. A corruption wrapper leaves every test
+to the machine for the same reason from the other side: it corrupts answers at
+the seam, and a test entered whole hands it none. This is the shape a
+program's entry point takes: the whole test runs compiled and nothing crosses
+the seam but a unit.
+
 ## Priced and rejected
 
 A wider inlining budget. ADR 0035's integer kernel keeps its state in records

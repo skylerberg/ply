@@ -771,3 +771,30 @@ fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
         );
     }
 }
+
+/// A test body is a root the code generator enters whole, and a failing one is still a failure:
+/// the backend declines it and the machine raises the diagnostic.
+#[test]
+fn a_test_body_is_entered_whole_and_a_failing_one_still_fails() {
+    let dir = project(
+        r#"
+fn double(x: Int) -> Int = x * 2
+
+test "doubles" { assert_eq(double(21), 42) }
+
+test "wrong" { assert_eq(double(21), 41) }
+"#,
+    );
+    let report = run(dir.path(), Some("cranelift"));
+    assert_eq!(u64_at(&report, &["summary", "failed"]), 1, "{report}");
+    assert!(
+        u64_at(&report, &["backend", "entered"]) > 0,
+        "the passing test's body was not entered: {}",
+        report["backend"]
+    );
+    assert!(
+        u64_at(&report, &["backend", "declined"]) > 0,
+        "the failing test's body was not declined back to the machine: {}",
+        report["backend"]
+    );
+}
