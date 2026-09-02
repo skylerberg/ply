@@ -131,7 +131,8 @@ measurement is confounded until the earlier one has moved.
    native to compiled code or specialise their representations. Gate: the share
    falls under the census, not a micro-benchmark.
 5. **The language tax the spike priced.** In `spikes/ply-parser/GAPS.md`'s
-   order: tuples (§3), `const` (§5 — the value of a nullary pure definition is
+   order: tuples (§3 — **landed** as sugar over positional records, `(a, b)` is
+   `{_0: a, _1: b}` in a type, a value and a pattern), `const` (§5 — the value of a nullary pure definition is
    already memoised at run time by `ply-eval::memo`, so what remains is the
    spelling), `?` inside lambdas (§2, `E0118` — **landed**: a lambda may write
    `-> T` before a block body and `?` reads it; an `iterate` step answers `Iter`
