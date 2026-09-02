@@ -870,7 +870,13 @@ fn probe_recursion(dir: &std::path::Path, compiled: bool) -> Result<()> {
         "mcts.next_seed",
         "mcts.below",
     ];
-    let mut h = Harness::over(loaded, &names, Opts::default(), Some(ENTRY))?;
+    let mut h = Harness::bounded(
+        loaded,
+        &names,
+        Opts::default(),
+        Some(ENTRY),
+        ply_eval::DEFAULT_MAX_CALLS,
+    )?;
     // A terminal position, so every playout is instant and what the recursion measures is the
     // nesting rather than the game.
     let args = vec![Value::Int(0), Value::Int(1), Value::Int(5_000_000)];
