@@ -1023,7 +1023,8 @@ fn resolve_diags(out: &mut String, ds: &[Diagnostic]) {
 /// line holding exactly `%%`, and each module's first line its dotted name.
 pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
     let mut out = Vec::new();
-    for chunk in text.split("\n%%%\n") {
+    // Everything before the first separator is the bundle's header, not a program.
+    for chunk in text.split("\n%%%\n").skip(1) {
         let chunk = chunk.trim_start_matches('\n');
         if chunk.trim().is_empty() {
             continue;
