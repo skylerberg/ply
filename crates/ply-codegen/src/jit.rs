@@ -156,6 +156,17 @@ enum Ty {
     Record(Vec<(Symbol, u32)>),
 }
 
+/// A fused `iterate` loop's blocks and values, for the step's answer to continue or leave it.
+#[derive(Clone, Copy)]
+struct Loop {
+    go: u32,
+    stop: u32,
+    header: Block,
+    exit: Block,
+    left: cranelift_codegen::ir::Value,
+    state: cranelift_codegen::ir::Value,
+}
+
 /// A compiled top-level function: the typed body other compiled code calls directly, and the
 /// entry the seam and a closure reach it through, over the handle ABI.
 #[derive(Clone)]
@@ -732,6 +743,7 @@ impl Jit {
             module_index,
             homes: Vec::new(),
             tokens: Vec::new(),
+            pinned: Vec::new(),
             kinds: HashMap::new(),
         };
         fx.arm_tokens(body);
@@ -834,6 +846,7 @@ impl Jit {
             module_index: func.module_index,
             homes: Vec::new(),
             tokens: Vec::new(),
+            pinned: Vec::new(),
             kinds: HashMap::new(),
         };
         let mut args = vec![fx.ctx];
@@ -1052,9 +1065,12 @@ fn lowered_callback(b: Builtin) -> bool {
 /// lambda literal through its own entry, with the words it captured as its leading arguments.
 enum Step {
     Typed(Func),
-    Lambda {
-        id: FuncId,
-        env: Vec<cranelift_codegen::ir::Value>,
+    /// A lambda literal, lowered in the loop's own body: its parameters bound to the loop's
+    /// values and its captures read as the loop's locals.
+    Inline {
+        params: Vec<Symbol>,
+        body: Code,
+        captures: Vec<Symbol>,
     },
 }
 
@@ -1095,6 +1111,9 @@ struct Fx<'a, 'b> {
     /// record of that width that died at its last use in this body — its memory the next such
     /// literal's — or `0`. Whatever is left in one at the exit is released there.
     tokens: Vec<(usize, cranelift_codegen::ir::StackSlot)>,
+    /// The locals an inlined step reads as captures: never moved out by a mark computed for
+    /// the lambda's own frame, since the loop still holds them.
+    pinned: Vec<Symbol>,
     /// `kind_of`'s answer per node: a branch is asked about before it is compiled and again at
     /// every join above it, and the answer is fixed by the node's place in the tree.
     kinds: HashMap<*const ply_eval::code::Node, Kind>,
@@ -1481,6 +1500,52 @@ impl Fx<'_, '_> {
         }
     }
 
+    /// The same releases, emitted on a path that leaves the scope by a jump, with the bindings
+    /// kept for the paths still to be emitted.
+    fn release_homes_since(&mut self, mark: usize) {
+        for i in mark..self.homes.len() {
+            let slot = self.homes[i];
+            let w = self.builder.ins().stack_load(types::I64, slot, 0);
+            self.dec_inline(w);
+        }
+    }
+
+    /// A block's statements: each `let` bound into `inner` as a home, each bare expression's
+    /// answer released.
+    fn block_stmts(&mut self, stmts: &[Stmt], inner: &mut Scope) -> Result<()> {
+        for s in stmts.iter() {
+            match s {
+                Stmt::Let { pat, value, .. } => {
+                    let v = self.consumed(value, inner)?;
+                    match pat {
+                        Pat::Var { name, .. } => {
+                            let v = self.home(v);
+                            inner.push((name.name.clone(), v));
+                        }
+                        Pat::Wildcard => {}
+                        other if self.binds_without_test(other) => {
+                            self.bind_pattern(other, v, true, inner)?;
+                        }
+                        other => {
+                            return self.refuse(format!(
+                                "a `let` binding a refutable {} pattern",
+                                pattern_name(other)
+                            ));
+                        }
+                    }
+                }
+                Stmt::Expr { code, .. } => {
+                    // An answer nobody binds is released here unless it is a local's.
+                    let v = self.expr(code, inner)?;
+                    if v.kind == Kind::Boxed && !self.is_local(code, inner) {
+                        self.dec_inline(v.v);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// One token slot per width of record literal in `body`, empty on entry.
     fn arm_tokens(&mut self, body: &Code) {
         let mut widths = BTreeSet::new();
@@ -1666,12 +1731,19 @@ impl Fx<'_, '_> {
     }
 
     fn is_borrowed_local(&self, code: &Code, scope: &Scope) -> bool {
-        code.own != Own::Owned && self.is_local(code, scope)
+        (code.own != Own::Owned || self.is_pinned(code)) && self.is_local(code, scope)
+    }
+
+    /// Whether `code` reads a local an inlined step captured, which its marks may not move.
+    fn is_pinned(&self, code: &Code) -> bool {
+        matches!(&code.kind, NodeKind::Var { name: q, .. }
+            if q.is_bare() && self.pinned.contains(q.symbol()))
     }
 
     /// Whether `arg` is a local whose read here is the binding's last.
     fn last_use_of_local(&self, arg: &Code, scope: &Scope) -> bool {
         arg.own == Own::Owned
+            && !self.is_pinned(arg)
             && matches!(&arg.kind, NodeKind::Var { name: q, .. }
                 if q.is_bare() && scope.iter().any(|(s, _)| s == q.symbol()))
     }
@@ -2031,36 +2103,7 @@ impl Fx<'_, '_> {
             NodeKind::Block { stmts, tail } => {
                 let mut inner = scope.clone();
                 let mark = self.homes.len();
-                for s in stmts.iter() {
-                    match s {
-                        Stmt::Let { pat, value, .. } => {
-                            let v = self.consumed(value, &mut inner)?;
-                            match pat {
-                                Pat::Var { name, .. } => {
-                                    let v = self.home(v);
-                                    inner.push((name.name.clone(), v));
-                                }
-                                Pat::Wildcard => {}
-                                other if self.binds_without_test(other) => {
-                                    self.bind_pattern(other, v, true, &mut inner)?;
-                                }
-                                other => {
-                                    return self.refuse(format!(
-                                        "a `let` binding a refutable {} pattern",
-                                        pattern_name(other)
-                                    ));
-                                }
-                            }
-                        }
-                        Stmt::Expr { code, .. } => {
-                            // An answer nobody binds is released here unless it is a local's.
-                            let v = self.expr(code, &mut inner)?;
-                            if v.kind == Kind::Boxed && !self.is_local(code, &inner) {
-                                self.dec_inline(v.v);
-                            }
-                        }
-                    }
-                }
+                self.block_stmts(stmts, &mut inner)?;
                 let answer = match tail {
                     Some(t) => self.consumed(t, &mut inner)?,
                     None => {
@@ -2235,7 +2278,12 @@ impl Fx<'_, '_> {
                             "a lambda capturing `{name}`, which is not a local of its body"
                         ));
                     };
-                    let val = self.captured(*own, *val);
+                    let own = if self.pinned.contains(name) {
+                        Own::Borrowed
+                    } else {
+                        *own
+                    };
+                    let val = self.captured(own, *val);
                     let handle = self.boxed(val);
                     env.push(handle);
                 }
@@ -2275,7 +2323,10 @@ impl Fx<'_, '_> {
                 // is a temporary, taken so it pins nothing.
                 let own = if self.last_use_of_local(b, scope) {
                     1
-                } else if code.own == Own::OwnedField && self.is_local(b, scope) {
+                } else if code.own == Own::OwnedField
+                    && self.is_local(b, scope)
+                    && !self.is_pinned(b)
+                {
                     2
                 } else if self.is_local(b, scope) {
                     0
@@ -2688,43 +2739,44 @@ impl Fx<'_, '_> {
                 captures,
                 ..
             } if params.len() == arity => {
-                let mut env = Vec::with_capacity(captures.len());
-                for (name, own) in captures.names.iter().zip(&captures.owns) {
-                    let Some((_, val)) = scope.iter().rev().find(|(s, _)| s == name) else {
+                for name in &captures.names {
+                    if !scope.iter().any(|(s, _)| s == name) {
                         return self.refuse(format!(
                             "a lambda capturing `{name}`, which is not a local of its body"
                         ));
-                    };
-                    let val = self.captured(*own, *val);
-                    let handle = self.boxed(val);
-                    env.push(handle);
+                    }
                 }
-                let index = self.jit.functions.len();
-                let sig = self.jit.entry_signature();
-                let id = self.jit.module.declare_function(
-                    &mangle(&format!("{}$lambda{index}", self.function)),
-                    Linkage::Local,
-                    &sig,
-                )?;
-                self.jit.functions.push(id);
-                let mut full: Vec<Symbol> = captures.names.clone();
-                full.extend(params.iter().cloned());
-                self.jit.pending.push(Pending {
-                    owner: self.function.clone(),
-                    id,
-                    params: full,
+                Ok(Some(Step::Inline {
+                    params: params.to_vec(),
                     body: body.clone(),
-                    module_index: self.module_index,
-                });
-                Ok(Some(Step::Lambda { id, env }))
+                    captures: captures.names.clone(),
+                }))
             }
             _ => Ok(None),
         }
     }
 
     /// One call of a fused loop's step, which owns its arguments and answers an owned value.
-    fn call_step(&mut self, step: &Step, args: &[Val]) -> Val {
+    fn call_step(&mut self, step: &Step, args: &[Val], scope: &Scope) -> Result<Val> {
         match step {
+            Step::Inline {
+                params,
+                body,
+                captures,
+            } => {
+                let mark = self.homes.len();
+                let pin = self.pinned.len();
+                self.pinned.extend(captures.iter().cloned());
+                let mut inner = scope.clone();
+                for (p, a) in params.iter().zip(args) {
+                    let v = self.home(*a);
+                    inner.push((p.clone(), v));
+                }
+                let r = self.consumed(body, &mut inner)?;
+                self.release_homes_from(mark);
+                self.pinned.truncate(pin);
+                Ok(r)
+            }
             Step::Typed(f) => {
                 let mut vals = Vec::with_capacity(args.len() + 1);
                 vals.push(self.ctx);
@@ -2739,34 +2791,12 @@ impl Fx<'_, '_> {
                 let call = self.builder.ins().call(callee, &vals);
                 let v = self.builder.inst_results(call)[0];
                 self.check();
-                Val {
+                Ok(Val {
                     kind: f.sig.ret,
                     v,
                     ty: f.sig.ret_ty,
                     home: 0,
-                }
-            }
-            Step::Lambda { id, env } => {
-                let mut handles = Vec::with_capacity(env.len() + args.len());
-                for w in env {
-                    self.inc_inline(*w);
-                    handles.push(*w);
-                }
-                for a in args {
-                    let h = self.boxed(*a);
-                    handles.push(h);
-                }
-                let ptr = self.spill(&handles);
-                let callee = self.jit.module.declare_func_in_func(*id, self.builder.func);
-                let call = self.builder.ins().call(callee, &[self.ctx, ptr]);
-                let v = self.builder.inst_results(call)[0];
-                self.check();
-                Val {
-                    kind: Kind::Boxed,
-                    v,
-                    ty: 0,
-                    home: 0,
-                }
+                })
             }
         }
     }
@@ -2829,15 +2859,6 @@ impl Fx<'_, '_> {
         self.builder.seal_block(fine);
         let len = self.builder.ins().uload32(MemFlags::trusted(), list, 8);
         Ok(Walk::List { list, len })
-    }
-
-    /// What a fused loop held for its step, let go once the loop is done.
-    fn release_step(&mut self, step: Step) {
-        if let Step::Lambda { env, .. } = step {
-            for w in env {
-                self.dec_inline(w);
-            }
-        }
     }
 
     /// `fold` over a `range` and `iterate`, as loops in this body calling their step directly
@@ -2952,11 +2973,11 @@ impl Fx<'_, '_> {
                 };
                 let next = match b {
                     Builtin::Fold => {
-                        let next = self.call_step(&step, &[acc_val, x]);
+                        let next = self.call_step(&step, &[acc_val, x], scope)?;
                         self.coerce(next, acc_kind)
                     }
                     Builtin::Map => {
-                        let r = self.call_step(&step, &[x]);
+                        let r = self.call_step(&step, &[x], scope)?;
                         let r = self.boxed(r);
                         self.helper(self.jit.helpers.list_push, &[acc, r])
                     }
@@ -2973,7 +2994,8 @@ impl Fx<'_, '_> {
                                 ty: 0,
                                 home: 0,
                             }],
-                        );
+                            scope,
+                        )?;
                         let keep = self.as_bool(r);
                         let kept = self.builder.create_block();
                         let dropped = self.builder.create_block();
@@ -3004,7 +3026,6 @@ impl Fx<'_, '_> {
                 if let Walk::List { list, .. } = &walk {
                     self.dec_inline(*list);
                 }
-                self.release_step(step);
                 Ok(Some(Val {
                     kind: acc_kind,
                     v,
@@ -3020,6 +3041,7 @@ impl Fx<'_, '_> {
                     return Ok(None);
                 }
                 let seed = self.consumed(&args[0], scope)?;
+                let seed_ty = seed.ty;
                 let seed = self.boxed(seed);
                 let budget = self.consumed(&args[1], scope)?;
                 let budget = self.as_int(budget);
@@ -3070,6 +3092,47 @@ impl Fx<'_, '_> {
 
                 self.builder.switch_to_block(body);
                 self.builder.seal_block(body);
+                if let Step::Inline {
+                    params,
+                    body: step_body,
+                    captures,
+                } = &step
+                {
+                    // The step's body in the loop, its `Continue` and `Stop` as jumps: no
+                    // constructor is built and no call is made per step.
+                    let mark = self.homes.len();
+                    let pin = self.pinned.len();
+                    self.pinned.extend(captures.iter().cloned());
+                    let mut inner = scope.clone();
+                    let v = self.home(Val {
+                        kind: Kind::Boxed,
+                        v: state,
+                        ty: seed_ty,
+                        home: 0,
+                    });
+                    inner.push((params[0].clone(), v));
+                    let loop_ = Loop {
+                        go,
+                        stop,
+                        header,
+                        exit,
+                        left,
+                        state,
+                    };
+                    self.iterate_tail(step_body, &mut inner, mark, &loop_)?;
+                    self.homes.truncate(mark);
+                    self.pinned.truncate(pin);
+                    self.builder.seal_block(header);
+                    self.builder.switch_to_block(exit);
+                    self.builder.seal_block(exit);
+                    let v = self.builder.block_params(exit)[0];
+                    return Ok(Some(Val {
+                        kind: Kind::Boxed,
+                        v,
+                        ty: 0,
+                        home: 0,
+                    }));
+                }
                 let r = self.call_step(
                     &step,
                     &[Val {
@@ -3078,70 +3141,22 @@ impl Fx<'_, '_> {
                         ty: 0,
                         home: 0,
                     }],
-                );
+                    scope,
+                )?;
                 let r = self.boxed(r);
-                // `Continue(x)` or `Stop(x)`, unwrapped in place: the payload is held once more
-                // and the constructor let go.
-                let unwrap = self.builder.create_block();
-                let check_ctor = self.builder.create_block();
-                let bad = self.builder.create_block();
-                let tagged = self.builder.ins().band_imm(r, 1);
-                self.builder.ins().brif(tagged, bad, &[], check_ctor, &[]);
-                self.builder.switch_to_block(check_ctor);
-                self.builder.seal_block(check_ctor);
-                let kind = self
-                    .builder
-                    .ins()
-                    .uload8(types::I32, MemFlags::trusted(), r, 4);
-                let is_ctor = self.builder.ins().icmp_imm(
-                    IntCC::Equal,
-                    kind,
-                    i64::from(crate::heap::KIND_CTOR),
-                );
-                let len = self.builder.ins().uload32(MemFlags::trusted(), r, 8);
-                let one_field = self.builder.ins().icmp_imm(IntCC::Equal, len, 1);
-                let index = self.builder.ins().uload32(MemFlags::trusted(), r, 12);
-                let is_stop = self
-                    .builder
-                    .ins()
-                    .icmp_imm(IntCC::Equal, index, i64::from(stop));
-                let is_go = self
-                    .builder
-                    .ins()
-                    .icmp_imm(IntCC::Equal, index, i64::from(go));
-                let named = self.builder.ins().bor(is_stop, is_go);
-                let shaped = self.builder.ins().band(is_ctor, one_field);
-                let ok = self.builder.ins().band(shaped, named);
-                self.builder.ins().brif(ok, unwrap, &[], bad, &[]);
-                self.builder.switch_to_block(bad);
-                self.builder.seal_block(bad);
-                let two = self.builder.ins().iconst(types::I64, 2);
-                self.helper_void(self.jit.helpers.iterate_bad, &[two, r]);
-                self.check();
-                self.builder.ins().jump(exit, &[BlockArg::Value(state)]);
-                self.builder.switch_to_block(unwrap);
-                self.builder.seal_block(unwrap);
-                let payload =
-                    self.builder
-                        .ins()
-                        .load(types::I64, MemFlags::trusted(), r, HEADER as i32);
-                self.inc_inline(payload);
-                self.dec_inline(r);
-                let again = self.builder.create_block();
-                self.builder
-                    .ins()
-                    .brif(is_stop, exit, &[BlockArg::Value(payload)], again, &[]);
-                self.builder.switch_to_block(again);
-                self.builder.seal_block(again);
-                let left1 = self.builder.ins().iadd_imm(left, -1);
-                self.builder
-                    .ins()
-                    .jump(header, &[BlockArg::Value(left1), BlockArg::Value(payload)]);
+                let loop_ = Loop {
+                    go,
+                    stop,
+                    header,
+                    exit,
+                    left,
+                    state,
+                };
+                self.unwrap_step(r, &loop_);
                 self.builder.seal_block(header);
                 self.builder.switch_to_block(exit);
                 self.builder.seal_block(exit);
                 let v = self.builder.block_params(exit)[0];
-                self.release_step(step);
                 Ok(Some(Val {
                     kind: Kind::Boxed,
                     v,
@@ -3150,6 +3165,153 @@ impl Fx<'_, '_> {
                 }))
             }
             _ => Ok(None),
+        }
+    }
+
+    /// `r`, a step's answer — `Continue(x)` or `Stop(x)` — unwrapped in place: the payload is
+    /// held once more, the constructor let go, and the loop continued or left.
+    fn unwrap_step(&mut self, r: cranelift_codegen::ir::Value, loop_: &Loop) {
+        let Loop {
+            go,
+            stop,
+            header,
+            exit,
+            left,
+            state,
+        } = *loop_;
+        let unwrap = self.builder.create_block();
+        let check_ctor = self.builder.create_block();
+        let bad = self.builder.create_block();
+        let tagged = self.builder.ins().band_imm(r, 1);
+        self.builder.ins().brif(tagged, bad, &[], check_ctor, &[]);
+        self.builder.switch_to_block(check_ctor);
+        self.builder.seal_block(check_ctor);
+        let kind = self
+            .builder
+            .ins()
+            .uload8(types::I32, MemFlags::trusted(), r, 4);
+        let is_ctor =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::heap::KIND_CTOR));
+        let len = self.builder.ins().uload32(MemFlags::trusted(), r, 8);
+        let one_field = self.builder.ins().icmp_imm(IntCC::Equal, len, 1);
+        let index = self.builder.ins().uload32(MemFlags::trusted(), r, 12);
+        let is_stop = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, index, i64::from(stop));
+        let is_go = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, index, i64::from(go));
+        let named = self.builder.ins().bor(is_stop, is_go);
+        let shaped = self.builder.ins().band(is_ctor, one_field);
+        let ok = self.builder.ins().band(shaped, named);
+        self.builder.ins().brif(ok, unwrap, &[], bad, &[]);
+        self.builder.switch_to_block(bad);
+        self.builder.seal_block(bad);
+        let two = self.builder.ins().iconst(types::I64, 2);
+        self.helper_void(self.jit.helpers.iterate_bad, &[two, r]);
+        self.check();
+        self.builder.ins().jump(exit, &[BlockArg::Value(state)]);
+        self.builder.switch_to_block(unwrap);
+        self.builder.seal_block(unwrap);
+        let payload = self
+            .builder
+            .ins()
+            .load(types::I64, MemFlags::trusted(), r, HEADER as i32);
+        self.inc_inline(payload);
+        self.dec_inline(r);
+        let again = self.builder.create_block();
+        self.builder
+            .ins()
+            .brif(is_stop, exit, &[BlockArg::Value(payload)], again, &[]);
+        self.builder.switch_to_block(again);
+        self.builder.seal_block(again);
+        let left1 = self.builder.ins().iadd_imm(left, -1);
+        self.builder
+            .ins()
+            .jump(header, &[BlockArg::Value(left1), BlockArg::Value(payload)]);
+    }
+
+    /// An inlined `iterate` step's body in tail position: `Continue(x)` jumps to the loop's
+    /// header with `x` as the next state and `Stop(x)` to its exit, through an `if` or a block;
+    /// anything else is evaluated and unwrapped as a called step's answer is. The step's own
+    /// bindings are released on every path out.
+    fn iterate_tail(
+        &mut self,
+        code: &Code,
+        scope: &mut Scope,
+        base: usize,
+        loop_: &Loop,
+    ) -> Result<()> {
+        let answered = match &code.kind {
+            NodeKind::App { func, args } if args.len() == 1 => match &func.kind {
+                NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
+                    Denotes::Ctor(index, 1)
+                        if index as u32 == loop_.go || index as u32 == loop_.stop =>
+                    {
+                        Some((index as u32, &args[0]))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            },
+            _ => None,
+        };
+        if let Some((index, arg)) = answered {
+            let v = self.consumed(arg, scope)?;
+            let w = self.boxed(v);
+            self.release_homes_since(base);
+            if index == loop_.go {
+                let left1 = self.builder.ins().iadd_imm(loop_.left, -1);
+                self.builder
+                    .ins()
+                    .jump(loop_.header, &[BlockArg::Value(left1), BlockArg::Value(w)]);
+            } else {
+                self.builder.ins().jump(loop_.exit, &[BlockArg::Value(w)]);
+            }
+            return Ok(());
+        }
+        match &code.kind {
+            NodeKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let c = self.expr(cond, scope)?;
+                let c = self.as_bool(c);
+                let then_block = self.builder.create_block();
+                let else_block = self.builder.create_block();
+                self.builder.ins().brif(c, then_block, &[], else_block, &[]);
+                self.builder.switch_to_block(then_block);
+                self.builder.seal_block(then_block);
+                let mut inner = scope.clone();
+                self.iterate_tail(then_branch, &mut inner, base, loop_)?;
+                self.builder.switch_to_block(else_block);
+                self.builder.seal_block(else_block);
+                let mut inner = scope.clone();
+                self.iterate_tail(else_branch, &mut inner, base, loop_)
+            }
+            NodeKind::Block {
+                stmts,
+                tail: Some(t),
+            } => {
+                let mut inner = scope.clone();
+                let mark = self.homes.len();
+                self.block_stmts(stmts, &mut inner)?;
+                self.iterate_tail(t, &mut inner, base, loop_)?;
+                self.homes.truncate(mark);
+                Ok(())
+            }
+            _ => {
+                let r = self.consumed(code, scope)?;
+                let r = self.boxed(r);
+                self.release_homes_since(base);
+                self.unwrap_step(r, loop_);
+                Ok(())
+            }
         }
     }
 
@@ -3263,7 +3425,12 @@ impl Fx<'_, '_> {
         };
         let denotes = self.denotation(q, scope)?;
         if let Denotes::Local(v) = denotes {
-            let callee = self.captured(func.own, v);
+            let own = if self.is_pinned(func) {
+                Own::Borrowed
+            } else {
+                func.own
+            };
+            let callee = self.captured(own, v);
             let callee = self.boxed(callee);
             return self.call_value(callee, args, scope);
         }
