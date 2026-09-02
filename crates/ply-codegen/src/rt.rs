@@ -628,6 +628,36 @@ pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) ->
     unsafe { &mut *ctx }.push(acc)
 }
 
+/// `map_fold(m, init, f)`: `f` on every entry in ascending key order, over a snapshot of the
+/// entries as the interpreter's loop takes one.
+pub unsafe extern "C" fn rt_map_fold(ctx: *mut Ctx, map: i64, init: i64, f: i64) -> i64 {
+    let (entries, f, mut acc) = {
+        let c = unsafe { &mut *ctx };
+        let value = take_or_clone(c, map, true);
+        let entries: Vec<(Value, Value)> = match &value {
+            Value::Map(m) => m.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+            other => {
+                let d = error(format!(
+                    "`map_fold` needs a Map, and this is {}",
+                    other.type_name()
+                ));
+                return c.fail(d);
+            }
+        };
+        let acc = take_or_clone(c, init, true);
+        (entries, take_or_clone(c, f, true), acc)
+    };
+    for (k, v) in entries {
+        let r = call_value(ctx, &f, ply_eval::argv::of([acc, k, v]));
+        let c = unsafe { &mut *ctx };
+        if c.failed != 0 {
+            return 0;
+        }
+        acc = take_or_clone(c, r, true);
+    }
+    unsafe { &mut *ctx }.push(acc)
+}
+
 /// `iterate(seed, budget, f)`: `f` until it answers `Stop`, or the budget runs out and the call
 /// fails the way the interpreter's raises.
 pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i64) -> i64 {
@@ -995,6 +1025,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_map", rt_map as *const u8),
         ("rt_filter", rt_filter as *const u8),
         ("rt_fold", rt_fold as *const u8),
+        ("rt_map_fold", rt_map_fold as *const u8),
         ("rt_iterate", rt_iterate as *const u8),
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_record", rt_record as *const u8),

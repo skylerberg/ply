@@ -2052,36 +2052,58 @@ became; the port keeps that order and the differential is what says it matters.
 
 ---
 
-## §17 The checker, ported: `infer.rs` behind a fourth differential, and what its residue names
+## §17 The checker, ported: `infer.rs` behind a fourth differential
 
-`docs/BOOTSTRAP-PATH.md` step 6 called inference with rows "the hard one". This is
-its first stage: `tycore.ply` (`ty.rs`, `unify.rs`, `env.rs`, `print.rs` — the
-type language, the substitution and unification over it, the environment with
-instantiation and generalization, and the printer schemes are published with) and
-`infer.ply` (`infer.rs`: the prelude, the declarations, the signatures, the
+`docs/BOOTSTRAP-PATH.md` step 6 called inference with rows "the hard one".
+`tycore.ply` is `ty.rs`, `unify.rs`, `env.rs` and `print.rs` — the type
+language, the substitution and unification over it, the environment with
+instantiation and generalization, and the printer schemes are published with.
+`infer.ply` is `infer.rs`: the prelude, the declarations, the signatures, the
 component-wise check of definitions with Tarjan's order, every expression form
 including `perform`, `handle`, cells, regions and `simulate`, numeric settling,
-the written-signature requirement, tests, laws, and the internal-effect marking).
-`check_dump` writes what `check_program` publishes — every definition's scheme,
-footprint, performed row, constraints and internal-effect flag; every test's and
-law's footprint; every effect and constructor — and `harness/tests/infer.rs`
-compares it with `reference_check_dump`.
+the written-signature requirement, spec clauses, tests, laws with the
+quantifiability of their binders, the derivability predicate behind `where`
+clauses and `Map` keys, the comparison-of-functions check, the `simulate` and
+region escape checks, and the internal-effect marking. `check_dump` writes what
+`check_program` publishes — every definition's scheme, footprint, performed row,
+constraints and internal-effect flag; every test's and law's footprint; every
+effect and constructor — or the diagnostics, deduplicated as the reference
+deduplicates them, and `harness/tests/infer.rs` compares it with
+`reference_check_dump`.
 
-**What agrees.** The standard library as one program, and every example without a
-`derive` checked together with it, agreed on the port's first substantive run;
-the resolver's programs agree too. The one thing that stood between the first
-run and agreement was not the checker: a test label with a backslash crosses two
-escaping layers on its way out of `ply run --json`, and the harness's extractor
-had undone one. `arm-infer.sh` arms the comparison.
+**What agrees.** The standard library as one program, every example without a
+`derive` checked together with it, the resolver's programs, a hand-written
+bundle for the checker (`fixtures/check-programs.corpus`), and every input
+`mine-checks.py` mines from `crates/ply-core/src/tests.rs` the way
+`mine-fixtures.py` mines the parser's — most of those are error paths, so that
+is where the diagnostics are compared code by code and label by label. The one
+thing that stood between the first run and agreement over the green programs
+was not the checker: a test label with a backslash crosses two escaping layers
+on its way out of `ply run --json`, and the harness's extractor had undone one.
+`arm-infer.sh` arms the comparison.
 
-**What the residue names.** `mine-checks.py` mines `crates/ply-core/src/tests.rs`
-the way `mine-fixtures.py` mines the parser's, and the port agrees with the
-reference on all but a pinned handful of those inputs — the count is in the test,
-and it can only shrink. Every one of them is a pass this stage leaves out, and
-the codes say which: the purity of spec clauses and law bodies, the
-quantifiability of a law's binders, a region escape, and the comparison of
-functions for equality. Those are passes over sites the walk already records,
-which is why they can follow separately.
+**What the last disagreement taught.** The reference's `deduplicated` keeps two
+diagnostics apart by their *message* and their label texts, not only by code,
+spans and note count: a parameter default of the wrong type is reported once as
+"parameter default" and once per call site the defaults pass copied it into as
+"argument type", at the same span, and both survive. The port's diagnostic
+carried none of that, so its dedup was coarser and one of the mined inputs
+disagreed by a count of one. `Diag` now carries a `text` — the unification
+context and the two printed sides — that the dump does not print and the dedup
+compares; every `expect` site names the reference's context string. The cheap
+key looked right for a long time, because nothing in the tree reports the same
+code twice at one span.
+
+**What the arm taught.** Four mutations were caught by nothing — a body that
+performs more than it declares, a numeric operand left unsettled, a test
+footprint dropped, a closed row absorbing an atom — because every corpus the
+fast half ran was a program that checks, and the mined inputs happen to hold
+none of those shapes; two more were equivalent mutations (generalization over
+the environment's variables, which is always empty at top level, and naming
+scheme variables head-first, which is body order for a generalized scheme).
+The hand-written checker bundle exists to hold the first four, and the two were
+re-aimed. A mutation that stays green is a corpus gap or an equivalent mutant,
+and the run says which only after the corpus is read.
 
 **What the language charged this time.** The same tax §15 and §16 met, and one
 more: a threaded state with thirty fields is written back in full at every step,
@@ -2093,7 +2115,11 @@ reference keeps in an `IndexMap` for its order is a list here, and the order is
 what the dump compares.
 
 **Not here yet.** The derive expansion runs before the checker and is not ported,
-so the two examples that `derive` are compared by neither side; the region escape
-checks, derivability and map-key checks, spec clauses, and the incremental
-`Known` interface the driver hands in. Each is a bounded port with the same
-instrument waiting for it.
+so the two examples that `derive` are compared by neither side, and the two
+passes that read what expansion produced (`check_derives`, `attribute_generated`)
+have nothing to walk; and the incremental `Known` interface the driver hands in.
+Each is a bounded port with the same instrument waiting for it. One thing the
+port asked of the code generator rather than of the language: `map_fold` is the
+one callback builtin the checker uses that the fragment did not lower, and
+`parser_census::the_census_over_the_parser_spike` pins that no callback is
+refused, so the runtime gained the loop.
