@@ -299,9 +299,10 @@ measurement is confounded until the earlier one has moved.
    still over the bar — the integer one much closer than it was, the record
    one a few times Rust — and the front end under the backend at roughly a
    fifth of its cost before the record. Strings and bytes are native since,
-   and the list's array was priced under ADR 0034's representation gate and
-   refused. What comes next is the record's: the list as a trie with typed
-   leaves, then the seam's census and the re-take.
+   and the list is a trie with typed leaves after ADR 0034's representation
+   gate refused the array (`benches/value-model/after-strings-and-lists.txt`
+   is the series after both). What comes next is the record's: the seam's
+   census, then the re-take and the decision rule.
 10. **Emit C.** Where the path ends, decided as a direction and gated on step 9:
     the eventual host is a C compiler and libc, with the compiler and its
     runtime written in Ply, which is the line Rust itself holds above LLVM and

@@ -1,13 +1,14 @@
 # ADR 0035 — A compiled value model: layouts from types, counts without atomics, reuse
 
-**Decided; sequence steps 1 to 5 and the strings half of 6 are landed, and the
-gate is not yet met.**
+**Decided; sequence steps 1 to 6 are landed, and the gate is not yet met.**
 `benches/value-model/PRE-REGISTERED.md` is the gate's protocol and the bar is
 in `benches/value-model/analyze.py`, where a number cannot set it after the
 fact; `baseline.txt` there is the series before anything was built,
 `after-words.txt` the series after the words landed, `after-layouts.txt` the
-series after the layouts did, `after-drops.txt` the series after the drops
-and `after-inline.txt` the series after the inlining. What landed: calls
+series after the layouts did, `after-drops.txt` the series after the drops,
+`after-inline.txt` the series after the inlining and
+`after-strings-and-lists.txt` the series after the strings and the list. What
+landed: calls
 between compiled functions are direct and typed; a compiled value is one word,
 with records, constructors, lists, maps and native closures laid out as
 counted objects allocated by bumping a pointer over memory the entry recycles,
@@ -38,9 +39,14 @@ compiled code for the first time: the cost per element of a `[x, ..rest]`
 recursion and of a shared push both grow with the length on the array, and
 under a bump allocator that frees nothing before the entry's end the growth
 is memory as well as time; the interpreter's trie is flat on both. The array
-is refused, and the trie with typed leaves is the other half of step 6.
-`docs/BOOTSTRAP-PATH.md` step 9 carries this record's place in the path and
-step 10 what is built on it if the gate clears.
+was refused, and the list is now that trie over words, its newest elements
+inline in the list object so a list no longer than a leaf is one object: on
+the trie the gate's rows are flat and an order of magnitude lower at the
+probe's largest size, at the price of a few percent on the rows a short
+list's bookkeeping shows in. What the sixth series says is in
+`after-strings-and-lists.txt` and `PRE-REGISTERED.md`. `docs/BOOTSTRAP-PATH.md`
+step 9 carries this record's place in the path and step 10 what is built on
+it if the gate clears.
 
 > **What this decides.** That the representation compiled Ply code runs on today
 > is an interpreter's, that no exception carved out for a hot function changes
@@ -276,7 +282,7 @@ a baseline the change is read against and the kernels are known to run.
    is small and fixed; the integer kernel's remaining records are in functions
    over it, and a budget that admits them is a compile-time trade the front
    end's own codegen row prices.
-6. **Landed, the strings half.** A string or a bytes value is its bytes after
+6. **Landed.** A string or a bytes value is its bytes after
    the header with a capacity beside its length; `++`, `bytes_concat` and
    `string_concat` append in place when the left operand is held by nobody
    else and has the room, and copy once into a value with room to grow again
@@ -286,7 +292,14 @@ a baseline the change is read against and the kernels are known to run.
    list's array candidate was priced under ADR 0034's representation gate and
    refused**: a `[x, ..rest]` recursion and a shared push both cost more per
    element as the list grows, while the interpreter's trie is flat on both.
-   The trie with typed leaves is what follows.
+   **The list is that trie over words** (`crates/ply-codegen/src/list.rs`):
+   a list object holds its newest elements inline as a tail after the trie's
+   root, with the dropped prefix, the tail's length and its capacity in the
+   header, so a list no longer than a leaf is one object; a push down a
+   uniquely held path writes in place and copies at most a leaf and a branch
+   per level otherwise; a `rest` moves the offset and shares the trie. Every
+   helper over lists builds through one constructor and walks through one
+   iterator, and `fold` walks the leaves in place.
 7. The seam's conversion and its census (Decision 6).
 8. Both kernels and the front-end row re-taken, and the decision rule applied.
 
