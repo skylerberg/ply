@@ -44,7 +44,7 @@ pub use bisect::{
 };
 pub use diagnose::{Evidence, Options, diagnose};
 pub use hybrid::{BodyHybrid, Mixture, Signature};
-pub use key::{result_key, seed_key, sim_key, writes_seed_keys};
+pub use key::{Engine, result_key, seed_key, sim_key, writes_seed_keys};
 pub use region::GroupRegion;
 pub use schedule::{
     AMBIENT, Isolation, Parallelism, REGION_SCOPED, SIM_EFFECT, SIMULATED, contends,
@@ -363,6 +363,11 @@ pub struct RunReport {
     pub simulation: SimSummary,
     /// How much of this run the differential oracle actually covered.
     pub audit: Option<AuditSummary>,
+    /// Which engine answered, and therefore whose namespace this run's passes went into. A caller
+    /// that selected against an engine of its own compares the two: the selection and the run
+    /// name the engine in different places, and a disagreement would mean a run skipped what one
+    /// engine proved and recorded it as another's.
+    pub engine: Engine,
 }
 
 /// What `--audit-backend` compared, and what it could not.
@@ -405,6 +410,12 @@ pub trait Executor: Sync {
     fn worker(&self) -> Self::Worker;
 
     fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic>;
+
+    /// Which engine answers, and therefore whose claim a `Pass` this run records is. The
+    /// evaluator unless something else was installed.
+    fn engine(&self) -> Engine {
+        Engine::Evaluator
+    }
 
     /// What the search the last [`Executor::execute`] performed did, read off the worker that
     /// performed it.
@@ -839,6 +850,18 @@ impl<'a> InterpExecutor<'a> {
 impl<'a> Executor for InterpExecutor<'a> {
     type Worker = Worker<'a>;
 
+    /// A run with a backend installed records in that backend's namespace, auditing or not. Under
+    /// `--audit-backend` a plain test runs on both engines and they must agree, so its pass is
+    /// true of the backend as well; a *searched* test under audit runs on machines the backend is
+    /// installed on and never on the pair, so its pass is true of the backend alone. The backend's
+    /// namespace is the one claim that holds in every case.
+    fn engine(&self) -> Engine {
+        let Some((provider, spec)) = &self.backend else {
+            return Engine::Evaluator;
+        };
+        Engine::of_backend(provider.name(), &provider.variant(), spec)
+    }
+
     fn worker(&self) -> Worker<'a> {
         let backend = self.backend();
         let mut worker = Worker::in_region(
@@ -987,7 +1010,15 @@ fn test_hash(hashes: &HashOutput, index: usize) -> Option<DefHash> {
 
 /// `plan` is what a seeded test's cache entry is keyed on, so a selection made against one plan
 /// says nothing about another.
-pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Plan) -> Selection {
+/// What this run must execute, read against `engine`'s own history: a `Pass` another engine
+/// recorded is a claim about that engine and is not read here.
+pub fn select(
+    check: &CheckOutput,
+    hashes: &HashOutput,
+    store: &Store,
+    plan: &Plan,
+    engine: &Engine,
+) -> Selection {
     let plan = plan.clone().normalized();
     let total = check.tests.len();
     let mut reasons = Vec::with_capacity(total);
@@ -998,7 +1029,7 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
     for (index, test) in check.tests.iter().enumerate() {
         let seeded = is_seeded(&test.footprint);
         let hash = test_hash(hashes, index);
-        let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan)));
+        let stored = hash.map(|hash| store.get(result_key(hash, seeded, &plan, engine)));
 
         // A `random` plan decomposes into one standalone claim per root, so a widened root set owes
         // only the roots nothing has answered for.
@@ -1009,7 +1040,7 @@ pub fn select(check: &CheckOutput, hashes: &HashOutput, store: &Store, plan: &Pl
                 .copied()
                 .filter(|&root| {
                     !matches!(
-                        store.get(seed_key(hash, &Seed::root(root))),
+                        store.get(seed_key(hash, &Seed::root(root), engine)),
                         Some(Outcome::Pass)
                     )
                 })
@@ -1259,6 +1290,7 @@ pub fn run_with<E: Executor>(
 ) -> RunReport {
     let started = Instant::now();
     let mut warnings = Vec::new();
+    let engine = executor.engine();
 
     let changed = changed_definitions(hashes, store);
 
@@ -1330,12 +1362,6 @@ pub fn run_with<E: Executor>(
                     seed: exploration.as_ref().and_then(|e| e.failure.clone()),
                     race: exploration.as_ref().and_then(|e| e.race.clone()),
                 });
-            } else if executed.backend.is_some_and(|b| b.entries > 0) {
-                // A backend is a third execution strategy: this test's green verdict is a claim
-                // about what a native body answered, and a stored `Pass` is a claim about what the
-                // authoritative engine did.
-                passed += 1;
-                recorded = Some(Record::Backend);
             } else if executed.host.is_some() {
                 // The runtime is authoritative: this run reached a socket, so its green verdict is
                 // a statement about that socket at that moment and about nothing the next run will
@@ -1353,6 +1379,7 @@ pub fn run_with<E: Executor>(
                         &selection.plan,
                         selection.plan_for(index),
                         exploration.as_ref(),
+                        &engine,
                     );
                     if record == Record::Unobserved {
                         warnings.push(unobserved_search(&test.key));
@@ -1360,7 +1387,12 @@ pub fn run_with<E: Executor>(
                     for key in record.keys() {
                         store.put(*key, Outcome::Pass);
                     }
-                    if record.is_written() {
+                    // The baseline a later failure is bisected against, and it is written only
+                    // by the evaluator: it is keyed by the test's name rather than by a key an
+                    // engine can qualify, and `diagnose_failures` re-runs every hybrid on the
+                    // evaluator, so a baseline another engine earned would be a claim this record
+                    // does not make.
+                    if record.is_written() && engine.is_evaluator() {
                         let (closure, decls) = closure_hashes(hashes, &test.key);
                         store.put_pass_record(
                             test.key.clone(),
@@ -1417,6 +1449,7 @@ pub fn run_with<E: Executor>(
         warnings,
         simulation,
         audit,
+        engine,
     }
 }
 

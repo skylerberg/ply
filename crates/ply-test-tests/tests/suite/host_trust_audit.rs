@@ -98,7 +98,13 @@ fn run_with(
     binding: Option<&Arc<HostBinding>>,
     audit_backend: bool,
 ) -> RunReport {
-    let selection = select(&compiled.check, &compiled.hashes, store, &Plan::default());
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let hosting = match binding {
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),

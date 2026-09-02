@@ -207,6 +207,14 @@ pub trait Provider: Send + Sync {
     /// What `--backend` calls this, for a report a user reads.
     fn name(&self) -> &'static str;
 
+    /// What decides this provider's answers beyond its name: anything that would make a result it
+    /// earned untrue of another run under the same name. Empty when the name is the whole
+    /// identity. A cached result is namespaced by it, so a knob that changes which definitions run
+    /// natively belongs here.
+    fn variant(&self) -> String {
+        String::new()
+    }
+
     /// How many definitions this provider has a body for.
     fn len(&self) -> usize;
 

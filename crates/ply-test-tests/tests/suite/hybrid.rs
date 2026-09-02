@@ -374,6 +374,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
 
     let index = after.test_index("m.doubles");
     let mut report = ply_test::RunReport {
+        engine: ply_test::Engine::Evaluator,
         passed: 0,
         failed: 1,
         cached: 0,

@@ -194,6 +194,80 @@ fn a_second_run_selects_nothing_because_the_cache_is_exact() {
     assert!(text.contains("0 failed, 0 passed, 2 cached"));
 }
 
+/// The compiled loop's whole point, and what it could not do before engines were told apart: a
+/// backed run reads the passes backed runs earned, so a second one selects nothing.
+#[test]
+fn a_second_backed_run_selects_nothing() {
+    let dir = project(GREEN);
+    ply(dir.path())
+        .args(["test", "--backend", "cranelift"])
+        .assert()
+        .success();
+
+    let out = ply(dir.path())
+        .args(["test", "--backend", "cranelift"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout_of(&out);
+    assert!(text.contains("selected 0 of 2 (2 cached)"), "got:\n{text}");
+}
+
+/// And the reason it may: a `Pass` names the engine that earned it. Neither run may read the
+/// other's, so the first run on each engine executes whatever the other already passed.
+#[test]
+fn one_engines_pass_is_never_another_engines() {
+    let dir = project(GREEN);
+    ply(dir.path()).arg("test").assert().success();
+
+    let out = ply(dir.path())
+        .args(["test", "--backend", "cranelift"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 2 of 2 (0 cached)"),
+        "a backed run read the evaluator's passes:\n{text}"
+    );
+
+    // And back the other way, over a cache the backed run has now written to.
+    let out = ply(dir.path()).arg("test").output().unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 0 of 2 (2 cached)"),
+        "the evaluator lost its own passes:\n{text}"
+    );
+}
+
+/// A backend that is wrong on purpose exists so that a green run can be read as evidence, and a
+/// run that skipped the test is not evidence. It gets no store in either direction.
+#[test]
+fn a_corrupt_backend_neither_reads_nor_writes_the_cache() {
+    let dir = project(GREEN);
+    ply(dir.path()).arg("test").assert().success();
+
+    let out = ply(dir.path())
+        .args(["test", "--backend", "wrong:off-by-one"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 2 of 2 (0 cached)"),
+        "a corrupt backend skipped a test:\n{text}"
+    );
+
+    // Nothing it did is readable afterwards, by it or by anything else.
+    let out = ply(dir.path())
+        .args(["test", "--backend", "wrong:off-by-one"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 2 of 2 (0 cached)"),
+        "a corrupt backend left a cache behind:\n{text}"
+    );
+}
+
 #[test]
 fn renaming_a_definition_re_runs_nothing() {
     let dir = project("fn width() -> Int = 3\ntest \"width is three\" { assert_eq(width(), 3) }\n");

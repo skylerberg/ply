@@ -48,7 +48,13 @@ pub fn verify(root: &Path) -> Result<Verified> {
     let mut store = Store::open(root)?;
     store.clear()?;
 
-    let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+    let selection = ply_test::select(
+        &front.check,
+        &front.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let report = ply_test::run(
         &selection,
         &front.program,
@@ -361,7 +367,13 @@ mod tests {
 
         let front = pipeline::front(&root).unwrap();
         let store = Store::open(&root).unwrap();
-        let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+        let selection = ply_test::select(
+            &front.check,
+            &front.hashes,
+            &store,
+            &Plan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
         assert_eq!(
             selection.to_run.len(),
@@ -446,7 +458,13 @@ mod tests {
 
         let front = pipeline::front(&root).unwrap();
         let store = Store::open(&root).unwrap();
-        let selection = ply_test::select(&front.check, &front.hashes, &store, &Plan::default());
+        let selection = ply_test::select(
+            &front.check,
+            &front.hashes,
+            &store,
+            &Plan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let nondet = front.check.tests.iter().filter(|t| t.nondet).count();
         assert_eq!(
             selection.to_run.len(),

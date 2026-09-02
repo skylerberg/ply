@@ -292,7 +292,7 @@ fn a_backend_is_never_offered_a_definition_that_performs() {
 
 /// The cache rule, both stages, on the path where neither is an accident.
 #[test]
-fn a_backend_run_reads_no_cached_pass() {
+fn a_backend_run_reads_no_pass_the_evaluator_earned() {
     let dir = project(CORPUS);
     // Warm the cache with an ordinary run, so there is something to believe.
     let warm = ply(dir.path()).arg("test").arg("--json").output().unwrap();
@@ -317,7 +317,9 @@ fn a_backend_run_reads_no_cached_pass() {
         .output()
         .unwrap();
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["no_cache"], Value::Bool(true), "{report}");
+    // The store is open — the front end is the same work whichever engine executes — and the
+    // results in it are the evaluator's, which this engine may not read.
+    assert_eq!(report["no_cache"], Value::Bool(false), "{report}");
     assert_eq!(
         u64_at(&report, &["summary", "cached"]),
         0,
@@ -328,10 +330,26 @@ fn a_backend_run_reads_no_cached_pass() {
         "a backend run that entered nothing proves nothing about whether it read the cache: {}",
         report["backend"]
     );
+
+    // And the other half, which is the whole point of telling engines apart: it believes its own.
+    let again = ply(dir.path())
+        .arg("test")
+        .arg("--backend")
+        .arg("reference")
+        .arg("-j")
+        .arg("1")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
+    assert!(
+        u64_at(&again, &["summary", "cached"]) > 0,
+        "a backend run re-ran what a backend run had already passed: {again}"
+    );
 }
 
 #[test]
-fn a_backend_run_writes_no_pass() {
+fn a_backend_run_writes_no_pass_the_evaluator_will_read() {
     let dir = project(CORPUS);
     let out = ply(dir.path())
         .arg("test")
@@ -356,8 +374,8 @@ fn a_backend_run_writes_no_pass() {
         "{report}"
     );
 
-    // And the fact the diagnostic is a check *on*: a later run with no backend has to run every
-    // test again, because the backend run left nothing behind.
+    // The fact that matters: a later run with no backend has to run every test again, because
+    // what the backend run left behind is in the backend's namespace and not the evaluator's.
     let plain = ply(dir.path()).arg("test").arg("--json").output().unwrap();
     let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
     assert_eq!(
@@ -655,7 +673,7 @@ test "a runaway" { assert_eq(spin(0), 0) }
 
 /// The cache rule again, on the backend that arrived after it was written.
 #[test]
-fn a_code_generator_run_reads_no_cached_pass() {
+fn a_code_generator_run_reads_no_pass_the_evaluator_earned() {
     let dir = project(CORPUS);
     let warm = ply(dir.path()).arg("test").arg("--json").output().unwrap();
     let warm: Value = serde_json::from_slice(&warm.stdout).unwrap();
@@ -681,7 +699,7 @@ fn a_code_generator_run_reads_no_cached_pass() {
         .output()
         .unwrap();
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["no_cache"], Value::Bool(true), "{report}");
+    assert_eq!(report["no_cache"], Value::Bool(false), "{report}");
     assert_eq!(
         u64_at(&report, &["summary", "cached"]),
         0,
