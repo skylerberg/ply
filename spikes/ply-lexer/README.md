@@ -160,10 +160,12 @@ cover fails rather than quietly narrowing it.
 
 `crates/ply-codegen-spike` does the same thing and `CONTRIBUTING.md` §"Things
 known to be broken" item 1 records what it cost: `cargo build --workspace` does
-not reach it, so it bit-rotted twice with nothing to say so. **This will rot the
-same way**, and the same sentence applies: the next change to
-`ply_syntax::lexer::TokenKind` will break `harness/src/lib.rs` and no workspace
-command will notice.
+not reach it, so it bit-rotted twice with nothing to say so. **This rotted the
+same way** — closed item 16 there: `TokenKind` gained four variants and a hex
+literal and nothing built this harness for a month — which is why CI now runs
+`run.sh` as the required `lexer-spike` job. A change to
+`ply_syntax::lexer::TokenKind` still breaks `harness/src/lib.rs`, and that job
+is what says so.
 
 It is taken anyway because the alternative is worse for a spike: adding a
 fourteenth workspace member moves the test-target counts that `README.md`,

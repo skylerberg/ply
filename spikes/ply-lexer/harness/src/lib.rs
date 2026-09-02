@@ -71,6 +71,10 @@ fn punct_name(kind: &TokenKind) -> &'static str {
         TokenKind::AmpAmp => "ampamp",
         TokenKind::Pipe => "pipe",
         TokenKind::PipePipe => "pipepipe",
+        TokenKind::Amp => "amp",
+        TokenKind::Caret => "caret",
+        TokenKind::Tilde => "tilde",
+        TokenKind::Question => "question",
         // Unreachable: `body` routes every payload-carrying kind above.
         TokenKind::Ident(_)
         | TokenKind::Int(_)
