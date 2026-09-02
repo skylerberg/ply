@@ -4,6 +4,7 @@ use ply_codegen_spike::entry::{admissible, enterable, refusals_over, scalar_sign
 use ply_codegen_spike::jit::Opts;
 use ply_codegen_spike::measure::Harness;
 use ply_codegen_spike::program::Loaded;
+use ply_eval::DEFAULT_MAX_CALLS;
 use ply_eval::{Machine, Value, compare_answers};
 use ply_span::Span;
 use std::path::PathBuf;
@@ -33,7 +34,8 @@ fn pure_harness(loaded: &'static Loaded) -> Harness {
         refusals_over(loaded, &all).expect("it classifies")
     );
     let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
-    Harness::over(loaded, &names, Opts::default(), None).expect("`pure` compiles")
+    Harness::bounded(loaded, &names, Opts::default(), None, DEFAULT_MAX_CALLS)
+        .expect("`pure` compiles")
 }
 
 /// The same, over a named module, without insisting the fragment accept it.
@@ -44,7 +46,8 @@ fn harness_over(loaded: &'static Loaded, modules: &[&str]) -> Harness {
     }
     let accepted = admissible(loaded, &all).expect("the modules classify");
     let names: Vec<&str> = accepted.iter().map(|s| s.as_str()).collect();
-    Harness::over(loaded, &names, Opts::default(), None).expect("the accepted set compiles")
+    Harness::bounded(loaded, &names, Opts::default(), None, DEFAULT_MAX_CALLS)
+        .expect("the accepted set compiles")
 }
 
 fn refusal(loaded: &'static Loaded, module: &str, name: &str) -> Option<String> {
