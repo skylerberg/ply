@@ -330,12 +330,18 @@ constructors, and lowercase for effects and resource labels.
 
 ### 3.3 Keywords
 
-Reserved everywhere:
+Reserved everywhere a name is bound or referenced:
 
 ```
 pub  import  fn  type  effect  nondet  test  let  if  else  match  handle  with
 true  false
 ```
+
+A **field name** is the one exception: a keyword names a record field in a
+type, a literal, a pattern, after `.` and in an update, because a field position
+has no other reading — `{nondet: Bool}` and `d.nondet` are fine. The punned
+forms `{nondet}` and `{nondet, ..}` are not, since they also bind a *variable*
+of that name; write `nondet: n`.
 
 The following are **contextual**: they are keywords only in the one position
 where nothing else is grammatical, and are ordinary identifiers everywhere else.
@@ -617,6 +623,9 @@ Construction is `{field: value, ...}`. A field written bare is shorthand for
 ```ply
 fn point(x: Int, y: Int) -> {x: Int, y: Int} = {x, y}
 ```
+
+A field may be named with a keyword (`{type: 1, nondet: false}`); only the bare
+shorthand needs an ordinary name, since it binds a variable too (§3.3).
 
 Field access is `r.field`. There is no field update in place — see §6.6 for the
 record-update form.

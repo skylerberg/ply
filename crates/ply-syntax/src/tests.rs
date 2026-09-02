@@ -3673,3 +3673,47 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
          These files name it: {offenders:?}"
     );
 }
+
+/// A field position has no other reading, so a keyword names a field in a type, a literal, a
+/// pattern, after `.` and in an update — `{ nondet: Bool }` is the AST this compiler's own
+/// parser is a port of (`spikes/ply-parser/GAPS-items.md` §P3).
+#[test]
+fn a_keyword_names_a_field_wherever_a_field_is_named() {
+    assert_eq!(
+        dump("type EffectDef = {effect: Int, nondet: Bool}"),
+        "(type EffectDef = {effect: Int, nondet: Bool})"
+    );
+    assert_eq!(
+        expr("{effect: 1, type: true}"),
+        "(rec (effect 1) (type true))"
+    );
+    assert_eq!(expr("d.nondet"), "(field d nondet)");
+    ok(
+        "fn f(d: {effect: Int, nondet: Bool}) -> Bool = match d { {effect: 1, nondet: n} -> n, _ -> false }",
+    );
+    ok("fn g(d: {effect: Int, nondet: Bool}) -> {effect: Int, nondet: Bool} = {..d, nondet: true}");
+    for kw in [
+        "pub", "import", "fn", "type", "effect", "nondet", "test", "let", "if", "else", "match",
+        "handle", "with", "true", "false",
+    ] {
+        ok(&format!("type T = {{{kw}: Int}}"));
+        ok(&format!("fn f(r: T) -> Int = r.{kw}"));
+    }
+}
+
+/// The punned forms bind a variable of the field's name, and a keyword cannot be one.
+#[test]
+fn a_keyword_field_cannot_be_punned() {
+    for src in [
+        "fn f(x: Int) = {effect, x}",
+        "fn f(d: {effect: Int}) -> Int = match d { {effect} -> 1 }",
+    ] {
+        let d = errs(src);
+        assert_eq!(d[0].code, codes::UNEXPECTED_TOKEN, "{src}");
+        assert!(
+            d[0].message.contains("a bare field also names a variable"),
+            "{src}: {}",
+            d[0].message
+        );
+    }
+}
