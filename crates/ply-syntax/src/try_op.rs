@@ -612,7 +612,26 @@ impl Cx<'_> {
                     self.sweep(rhs, scope, barrier);
                 }
                 ExprKind::Unary { operand, .. } => self.sweep(operand, scope, barrier),
-                ExprKind::Lambda { body, .. } => self.sweep(body, scope, under("a lambda")),
+                // A lambda with a written return type gives `?` inside it a meaning of its own,
+                // read the way a `fn`'s is; without one it stays the barrier it was.
+                ExprKind::Lambda { body, ret, .. } => match ret {
+                    None => self.sweep(body, scope, under("a lambda")),
+                    Some(ty) => {
+                        let mode = match &self.shadowed {
+                            Some(why) => Err(why.clone()),
+                            None => self.mode_of(ty, 0),
+                        };
+                        match mode {
+                            Err(why) => self.sweep(body, Some(&why), None),
+                            Ok(m) => {
+                                let saved = self.mode.replace(m);
+                                self.ret(body);
+                                self.sweep(body, None, None);
+                                self.mode = saved;
+                            }
+                        }
+                    }
+                },
                 ExprKind::App { func, args, named } => {
                     self.sweep(func, scope, barrier);
                     for a in args {

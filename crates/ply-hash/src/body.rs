@@ -1215,7 +1215,11 @@ impl Decoder<'_> {
                     .collect();
                 let body = Box::new(self.expr()?);
                 self.values = mark;
-                ExprKind::Lambda { params, body }
+                ExprKind::Lambda {
+                    params,
+                    body,
+                    ret: None,
+                }
             }
             tag::E_APP => {
                 let func = Box::new(self.expr()?);

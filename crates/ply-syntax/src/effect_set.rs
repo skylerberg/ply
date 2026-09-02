@@ -401,7 +401,7 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
             walk_expr(rhs, f);
         }
         ExprKind::Unary { operand, .. } => walk_expr(operand, f),
-        ExprKind::Lambda { params, body } => {
+        ExprKind::Lambda { params, body, .. } => {
             for p in params {
                 if let Some(t) = &mut p.ty {
                     walk_type(t, f);

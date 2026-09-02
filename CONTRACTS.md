@@ -8219,7 +8219,7 @@ longhand. There is no row rule for `?` because there is no `?` after the parser
 
 | code | constant | when | whose fault |
 | --- | --- | --- | --- |
-| E0118 | `TRY_SCOPE` | the enclosing `fn` has no return type this file can read as `Result` or `Option`: no `->`, another head, a type parameter, a generic alias, a cross-module name, a `test`/`law`/spec, a lambda, a `handle` clause or body, a `with_cell`/`with_region`/`simulate`, or a module that declares — or imports unqualified — its own `Ok`/`Err`/`Some`/`None` | the program's |
+| E0118 | `TRY_SCOPE` | the enclosing `fn` — or lambda, which may write `-> T` before a block body — has no return type this file can read as `Result` or `Option`: no `->`, another head, a type parameter, a generic alias, a cross-module name, a `test`/`law`/spec, a lambda without one, a `handle` clause or body, a `with_cell`/`with_region`/`simulate`, or a module that declares — or imports unqualified — its own `Ok`/`Err`/`Some`/`None` | the program's |
 | E0119 | `TRY_POSITION` | the `?`'s early exit would change what runs — something conditional between it and the region root, or something impure evaluated before it — or would discard a written `let` annotation | the program's |
 
 **No third code and no typing rule.** By the time inference runs, `e?` *is* the
@@ -8252,7 +8252,8 @@ two arms emitted in the other order the same conversion moves **392 of 1,211**
 entries in `crates/ply-std/ply/`.
 
 **One site refused and was reverted.** `examples/desk.ply`'s `decoded` writes the
-canonical shape *inside a `fold` lambda*, and `?` refuses a lambda (`E0118`). The
+canonical shape *inside a `fold` lambda*, and `?` refused a lambda (`E0118`) until
+lambdas could write a return type. The
 design phase recorded "0 of the 129 sites sit under a lambda"; it is **1**, and
 that is a measured cost of the restriction rather than a hole in it.
 

@@ -358,9 +358,10 @@ impl<'a> Dumper<'a> {
                 self.word(un_op_name(*op));
                 self.expr(operand);
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, ret } => {
                 self.rec(e.span, "elam");
                 self.list(params, Self::param);
+                self.opt(ret.as_ref(), Self::ty);
                 self.expr(body);
             }
             // Every `name: value` argument, with its own span, its name and its value — and the

@@ -455,7 +455,7 @@ impl<'a> Analysis<'a> {
             ExprKind::App { func, args, .. } => {
                 self.walk_call(e.span, func, args, ctx, out);
             }
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 let bound = params.iter().map(|p| p.name.name.clone()).collect();
                 self.scoped(bound, |a| a.walk(body, ctx, out));
             }
@@ -611,7 +611,7 @@ impl<'a> Analysis<'a> {
             ExprKind::Var(_) => out.indirect_at(span, Cause::Indirect),
             // Written at the call site: the callee is known, and its body has already been walked
             // as an argument-free subexpression.
-            ExprKind::Lambda { params, body } => {
+            ExprKind::Lambda { params, body, .. } => {
                 let bound = params.iter().map(|p| p.name.name.clone()).collect();
                 self.scoped(bound, |a| a.walk(body, ctx, out));
             }
