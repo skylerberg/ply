@@ -13,8 +13,8 @@ use cranelift_codegen::settings::{self, Configurable};
 use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
-use ply_eval::code::{Arm, Pat, Stmt};
-use ply_eval::{Builtin, Code, NodeKind, Value, lower};
+use ply_eval::code::{Arm, Pat, Stmt, lower_fn};
+use ply_eval::{Builtin, Code, NodeKind, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{BinOp, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
@@ -23,10 +23,6 @@ use std::rc::Rc;
 
 /// A compiled function: `extern "C" fn(ctx, args) -> handle`.
 pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
-
-/// Refused rather than lowered: `<<` discards where the other arithmetic raises, and a shift
-/// count outside `0..=63` raises where Cranelift's `ishl` masks it.
-const BIT_OPERATORS: &str = "a bitwise operator or shift, which the fragment does not lower";
 
 /// What the fragment refused, and where.
 #[derive(Debug)]
@@ -85,6 +81,27 @@ struct Helpers {
     record_update: FuncId,
     field: FuncId,
     no_fuel: FuncId,
+    closure: FuncId,
+    builtin_value: FuncId,
+    ctor_value: FuncId,
+    call: FuncId,
+    map: FuncId,
+    filter: FuncId,
+    fold: FuncId,
+    iterate: FuncId,
+    shift_count: FuncId,
+}
+
+/// A lambda met while lowering a body: declared where it was met, so the closure that names it
+/// can be built, and defined after its owner so one `FunctionBuilder` is live at a time.
+struct Pending {
+    /// The top-level function the lambda is inside, which a refusal in its body is charged to.
+    owner: String,
+    id: FuncId,
+    /// The captured names first, then the lambda's own parameters.
+    params: Vec<Symbol>,
+    body: Code,
+    module_index: usize,
 }
 
 /// One compiled program, and the tables its runtime context needs.
@@ -145,6 +162,9 @@ pub struct Jit {
     funcs: HashMap<String, (FuncId, usize, usize)>,
     helpers: Helpers,
     nodes: HashMap<String, usize>,
+    /// Every function a closure may name, by the index `rt_closure` is handed.
+    functions: Vec<FuncId>,
+    pending: Vec<Pending>,
 }
 
 fn helper_sig(module: &JITModule, params: usize, returns: bool) -> Signature {
@@ -187,9 +207,28 @@ impl Jit {
                 *module_index,
             )?;
             jit.module.define_function(id, &mut clif)?;
+            while let Some(lambda) = jit.pending.pop() {
+                clif.clear();
+                clif.func.signature = jit.entry_signature();
+                jit.define(
+                    &mut clif,
+                    &mut fctx,
+                    loaded,
+                    &lambda.owner,
+                    &lambda.params,
+                    &lambda.body,
+                    lambda.module_index,
+                )?;
+                jit.module.define_function(lambda.id, &mut clif)?;
+            }
         }
         jit.module.finalize_definitions()?;
         let compile_nanos = started.elapsed().as_nanos();
+        let functions = jit
+            .functions
+            .iter()
+            .map(|id| jit.module.get_finalized_function(*id) as usize)
+            .collect();
 
         let entries = jit
             .funcs
@@ -205,6 +244,7 @@ impl Jit {
                 shapes: jit.shapes,
                 fields: jit.fields,
                 builtins: jit.builtins,
+                functions,
             }),
             nodes: jit.nodes,
             compile_nanos,
@@ -241,6 +281,32 @@ impl Jit {
                     function: refused.function.clone(),
                     construct: refused.construct.clone(),
                 });
+                jit.pending.clear();
+                continue;
+            }
+            while let Some(lambda) = jit.pending.pop() {
+                let mut clif = ClifContext::new();
+                let mut fctx = FunctionBuilderContext::new();
+                clif.func.signature = jit.entry_signature();
+                if let Err(e) = jit.define(
+                    &mut clif,
+                    &mut fctx,
+                    loaded,
+                    &lambda.owner,
+                    &lambda.params,
+                    &lambda.body,
+                    lambda.module_index,
+                ) {
+                    let Some(refused) = e.downcast_ref::<Refused>() else {
+                        return Err(e);
+                    };
+                    out.push(Refused {
+                        function: refused.function.clone(),
+                        construct: refused.construct.clone(),
+                    });
+                    jit.pending.clear();
+                    break;
+                }
             }
         }
         Ok(out)
@@ -302,6 +368,15 @@ impl Jit {
             record_update: declare(&mut module, "rt_record_update", 5, true)?,
             field: declare(&mut module, "rt_field", 3, true)?,
             no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
+            closure: declare(&mut module, "rt_closure", 5, true)?,
+            builtin_value: declare(&mut module, "rt_builtin_value", 2, true)?,
+            ctor_value: declare(&mut module, "rt_ctor_value", 2, true)?,
+            call: declare(&mut module, "rt_call", 4, true)?,
+            map: declare(&mut module, "rt_map", 3, true)?,
+            filter: declare(&mut module, "rt_filter", 3, true)?,
+            fold: declare(&mut module, "rt_fold", 4, true)?,
+            iterate: declare(&mut module, "rt_iterate", 4, true)?,
+            shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
         };
 
         let mut jit = Jit {
@@ -315,6 +390,8 @@ impl Jit {
             funcs: HashMap::new(),
             helpers,
             nodes: HashMap::new(),
+            functions: Vec::new(),
+            pending: Vec::new(),
         };
 
         let mut bodies = Vec::new();
@@ -328,13 +405,12 @@ impl Jit {
                 .declare_function(&mangle(name), Linkage::Export, &sig)?;
             jit.funcs
                 .insert((*name).to_string(), (id, def.params.len(), module_index));
+            jit.functions.push(id);
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
-            bodies.push((
-                (*name).to_string(),
-                params,
-                lower(&def.body).code,
-                module_index,
-            ));
+            // With the parameters as the window's leading slots, so a lambda that reads one
+            // captures it rather than reading a global that does not exist.
+            let code = lower_fn(&params, &def.body).code;
+            bodies.push(((*name).to_string(), params, code, module_index));
         }
         Ok((jit, bodies, started))
     }
@@ -491,7 +567,7 @@ const FUEL_OFFSET: i32 = std::mem::offset_of!(Ctx, fuel) as i32;
 
 /// Whether a compiled body may call this builtin, and what to say when it may not.
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
-    if b.higher_order() {
+    if b.higher_order() && !lowered_callback(b) {
         return Err(format!("`{}`, a builtin that calls user code", b.name()));
     }
     match b {
@@ -505,6 +581,15 @@ fn admissible_builtin(b: Builtin) -> Result<(), String> {
         )),
         _ => Ok(()),
     }
+}
+
+/// The callback builtins compiled code runs as a loop of its own, calling the callback through
+/// `rt_call`; the others that call user code stay outside the fragment.
+fn lowered_callback(b: Builtin) -> bool {
+    matches!(
+        b,
+        Builtin::Map | Builtin::Filter | Builtin::Fold | Builtin::Iterate
+    )
 }
 
 /// What a name denotes, decided at compile time in the order `Machine::lookup` decides it at run
@@ -728,8 +813,7 @@ impl Fx<'_, '_> {
             },
             NodeKind::Unary { op, .. } => match op {
                 UnOp::Not => Kind::Bool,
-                UnOp::Neg => Kind::Int,
-                UnOp::BitNot => return self.refuse(BIT_OPERATORS),
+                UnOp::Neg | UnOp::BitNot => Kind::Int,
             },
             NodeKind::Binary { op, .. } => match op {
                 BinOp::BitAnd
@@ -737,8 +821,12 @@ impl Fx<'_, '_> {
                 | BinOp::BitXor
                 | BinOp::Shl
                 | BinOp::Shr
-                | BinOp::Ushr => return self.refuse(BIT_OPERATORS),
-                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Rem => Kind::Int,
+                | BinOp::Ushr
+                | BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem => Kind::Int,
                 BinOp::Eq
                 | BinOp::Ne
                 | BinOp::Lt
@@ -800,22 +888,48 @@ impl Fx<'_, '_> {
             NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                 Denotes::Local(v) => Ok(v),
                 Denotes::Constant(handle) => Ok(self.constant(handle)),
-                _ => self.refuse(format!(
-                    "`{}` is used as a value rather than called",
-                    q.symbol()
+                // A compiled function used as a value is a closure over nothing.
+                Denotes::Compiled(id, arity) => {
+                    let index = self.function_index(id);
+                    let index = self.builder.ins().iconst(types::I64, index as i64);
+                    let arity = self.builder.ins().iconst(types::I64, arity as i64);
+                    let ptr = self.spill(&[]);
+                    let zero = self.builder.ins().iconst(types::I64, 0);
+                    let v = self.helper(self.jit.helpers.closure, &[index, arity, ptr, zero]);
+                    Ok(Val {
+                        kind: Kind::Boxed,
+                        v,
+                    })
+                }
+                Denotes::Builtin(index) => {
+                    let index = self.builder.ins().iconst(types::I64, index as i64);
+                    let v = self.helper(self.jit.helpers.builtin_value, &[index]);
+                    Ok(Val {
+                        kind: Kind::Boxed,
+                        v,
+                    })
+                }
+                Denotes::Ctor(index, _) => {
+                    let index = self.builder.ins().iconst(types::I64, index as i64);
+                    let v = self.helper(self.jit.helpers.ctor_value, &[index]);
+                    Ok(Val {
+                        kind: Kind::Boxed,
+                        v,
+                    })
+                }
+                Denotes::Uncompiled(target) => self.refuse(format!(
+                    "`{target}` is used as a value, and it is not in this compiled unit"
                 )),
             },
 
             NodeKind::Unary { op, operand } => {
-                if matches!(op, UnOp::BitNot) {
-                    return self.refuse(BIT_OPERATORS);
-                }
                 let value = self.expr(operand, scope)?;
                 match op {
-                    // Unreachable past the guard above, and an arm rather than
-                    // a wildcard so that a *new* `UnOp` fails to compile here
-                    // instead of being refused by accident.
-                    UnOp::BitNot => self.refuse(BIT_OPERATORS),
+                    UnOp::BitNot => {
+                        let a = self.as_int(value);
+                        let v = self.builder.ins().bnot(a);
+                        Ok(Val { kind: Kind::Int, v })
+                    }
                     UnOp::Not => {
                         let b = self.as_bool(value);
                         let one = self.builder.ins().iconst(types::I64, 1);
@@ -970,7 +1084,51 @@ impl Fx<'_, '_> {
                 })
             }
 
-            NodeKind::Lambda { .. } => self.refuse("a lambda"),
+            NodeKind::Lambda {
+                params,
+                body,
+                captures,
+                ..
+            } => {
+                // The captured values are the closure's environment and the body's leading
+                // parameters, in the order the lowering named them.
+                let mut env = Vec::with_capacity(captures.len());
+                for name in &captures.names {
+                    let Some((_, val)) = scope.iter().rev().find(|(s, _)| s == name) else {
+                        return self.refuse(format!(
+                            "a lambda capturing `{name}`, which is not a local of its body"
+                        ));
+                    };
+                    let handle = self.boxed(*val);
+                    env.push(handle);
+                }
+                let index = self.jit.functions.len();
+                let sig = self.jit.entry_signature();
+                let id = self.jit.module.declare_function(
+                    &mangle(&format!("{}$lambda{index}", self.function)),
+                    Linkage::Local,
+                    &sig,
+                )?;
+                self.jit.functions.push(id);
+                let mut full: Vec<Symbol> = captures.names.clone();
+                full.extend(params.iter().cloned());
+                self.jit.pending.push(Pending {
+                    owner: self.function.clone(),
+                    id,
+                    params: full,
+                    body: body.clone(),
+                    module_index: self.module_index,
+                });
+                let ptr = self.spill(&env);
+                let index = self.builder.ins().iconst(types::I64, index as i64);
+                let arity = self.builder.ins().iconst(types::I64, params.len() as i64);
+                let n = self.builder.ins().iconst(types::I64, env.len() as i64);
+                let v = self.helper(self.jit.helpers.closure, &[index, arity, ptr, n]);
+                Ok(Val {
+                    kind: Kind::Boxed,
+                    v,
+                })
+            }
 
             NodeKind::Field { base, field } => {
                 let base = self.expr(base, scope)?;
@@ -1091,12 +1249,40 @@ impl Fx<'_, '_> {
         let l = self.expr(lhs, scope)?;
         let r = self.expr(rhs, scope)?;
         match op {
-            BinOp::BitAnd
-            | BinOp::BitOr
-            | BinOp::BitXor
-            | BinOp::Shl
-            | BinOp::Shr
-            | BinOp::Ushr => self.refuse(BIT_OPERATORS),
+            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                let a = self.as_int(l);
+                let b = self.as_int(r);
+                let v = match op {
+                    BinOp::BitAnd => self.builder.ins().band(a, b),
+                    BinOp::BitOr => self.builder.ins().bor(a, b),
+                    _ => self.builder.ins().bxor(a, b),
+                };
+                Ok(Val { kind: Kind::Int, v })
+            }
+            BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
+                let a = self.as_int(l);
+                let n = self.as_int(r);
+                // The interpreter refuses a count outside `0..64` rather than masking it.
+                let bad = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, n, 64);
+                let refused = self.builder.create_block();
+                let ok = self.builder.create_block();
+                self.builder.ins().brif(bad, refused, &[], ok, &[]);
+                self.builder.switch_to_block(refused);
+                self.builder.seal_block(refused);
+                self.helper_void(self.jit.helpers.shift_count, &[n]);
+                self.builder.ins().jump(self.failure, &[]);
+                self.builder.switch_to_block(ok);
+                self.builder.seal_block(ok);
+                let v = match op {
+                    BinOp::Shl => self.builder.ins().ishl(a, n),
+                    BinOp::Shr => self.builder.ins().sshr(a, n),
+                    _ => self.builder.ins().ushr(a, n),
+                };
+                Ok(Val { kind: Kind::Int, v })
+            }
             BinOp::Add | BinOp::Sub => {
                 let a = self.as_int(l);
                 let b = self.as_int(r);
@@ -1203,9 +1389,16 @@ impl Fx<'_, '_> {
 
     fn app(&mut self, func: &Code, args: &[Code], scope: &mut Scope) -> Result<Val> {
         let NodeKind::Var { name: q, .. } = &func.kind else {
-            return self.refuse("a call whose callee is an expression");
+            // The callee is a value: evaluate it, then the arguments, then call through it.
+            let callee = self.expr(func, scope)?;
+            let callee = self.boxed(callee);
+            return self.call_value(callee, args, scope);
         };
         let denotes = self.denotation(q, scope)?;
+        if let Denotes::Local(v) = denotes {
+            let callee = self.boxed(v);
+            return self.call_value(callee, args, scope);
+        }
         let mut handles = Vec::with_capacity(args.len());
         for a in args {
             let v = self.expr(a, scope)?;
@@ -1235,9 +1428,37 @@ impl Fx<'_, '_> {
                 ));
             }
             Denotes::Builtin(index) => {
-                let ptr = self.spill(&handles);
-                let index = self.builder.ins().iconst(types::I64, index as i64);
-                let v = self.helper(self.jit.helpers.builtin, &[index, ptr, n]);
+                let b = self.jit.builtins[index];
+                let want = match b {
+                    Builtin::Map | Builtin::Filter => 2,
+                    Builtin::Fold | Builtin::Iterate => 3,
+                    _ => handles.len(),
+                };
+                if handles.len() != want {
+                    return self.refuse(format!(
+                        "`{}` is called with {} arguments and takes {want}",
+                        b.name(),
+                        handles.len()
+                    ));
+                }
+                let v = match b {
+                    Builtin::Map => self.helper(self.jit.helpers.map, &[handles[0], handles[1]]),
+                    Builtin::Filter => {
+                        self.helper(self.jit.helpers.filter, &[handles[0], handles[1]])
+                    }
+                    Builtin::Fold => {
+                        self.helper(self.jit.helpers.fold, &[handles[0], handles[1], handles[2]])
+                    }
+                    Builtin::Iterate => self.helper(
+                        self.jit.helpers.iterate,
+                        &[handles[0], handles[1], handles[2]],
+                    ),
+                    _ => {
+                        let ptr = self.spill(&handles);
+                        let index = self.builder.ins().iconst(types::I64, index as i64);
+                        self.helper(self.jit.helpers.builtin, &[index, ptr, n])
+                    }
+                };
                 self.check();
                 v
             }
@@ -1253,7 +1474,7 @@ impl Fx<'_, '_> {
                 let index = self.builder.ins().iconst(types::I64, index as i64);
                 self.helper(self.jit.helpers.ctor, &[index, ptr, n])
             }
-            Denotes::Local(_) => return self.refuse("a call through a local binding"),
+            Denotes::Local(_) => unreachable!("a local callee is called through `call_value`"),
             Denotes::Constant(_) => {
                 return self.refuse(format!("`{}` is not a function", q.symbol()));
             }
@@ -1262,6 +1483,41 @@ impl Fx<'_, '_> {
             kind: Kind::Boxed,
             v,
         })
+    }
+
+    /// A call through a closure handle: the arguments, then `rt_call`, which enters a native
+    /// closure directly and answers a builtin or a constructor the way the interpreter would.
+    fn call_value(
+        &mut self,
+        callee: cranelift_codegen::ir::Value,
+        args: &[Code],
+        scope: &mut Scope,
+    ) -> Result<Val> {
+        let mut handles = Vec::with_capacity(args.len());
+        for a in args {
+            let v = self.expr(a, scope)?;
+            let h = self.boxed(v);
+            handles.push(h);
+        }
+        let ptr = self.spill(&handles);
+        let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+        let v = self.helper(self.jit.helpers.call, &[callee, ptr, n]);
+        self.check();
+        Ok(Val {
+            kind: Kind::Boxed,
+            v,
+        })
+    }
+
+    /// The index `rt_closure` names a compiled function by.
+    fn function_index(&mut self, id: FuncId) -> usize {
+        match self.jit.functions.iter().position(|f| *f == id) {
+            Some(i) => i,
+            None => {
+                self.jit.functions.push(id);
+                self.jit.functions.len() - 1
+            }
+        }
     }
 
     /// The constructor a name in *pattern* position denotes, resolved the way

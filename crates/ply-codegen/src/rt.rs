@@ -14,7 +14,8 @@
 // hands their addresses to the JIT, not because they are an API.
 #![allow(clippy::missing_safety_doc)]
 
-use ply_eval::{Builtin, Step, Value, values_equal};
+use crate::jit::Entry;
+use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -32,6 +33,10 @@ pub struct Tables {
     pub fields: Vec<Symbol>,
     /// Every builtin a compiled body may call.
     pub builtins: Vec<Builtin>,
+    /// Every compiled function by index, as its finalized address: what a native closure's
+    /// `code` is read from when the closure is built, since no address exists until the module
+    /// is finalized and every closure is built after that.
+    pub functions: Vec<usize>,
 }
 
 impl Tables {
@@ -336,6 +341,283 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
     }
 }
 
+/// A closure over `env`: the compiled function `index` names, entered with the captured values
+/// as its leading arguments.
+pub unsafe extern "C" fn rt_closure(
+    ctx: *mut Ctx,
+    index: i64,
+    arity: i64,
+    env: *const i64,
+    n: i64,
+) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let code = ctx.tables.functions[index as usize];
+    let captured = args_of(ctx, env, n);
+    ctx.push(Value::Closure(Arc::new(Closure {
+        name: None,
+        kind: ClosureKind::Native {
+            code,
+            arity: arity as usize,
+            captured,
+        },
+    })))
+}
+
+/// A builtin used as a value: the interpreter's own closure kind for it.
+pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let b = ctx.tables.builtins[index as usize];
+    ctx.push(Value::builtin(b))
+}
+
+/// A constructor used as a value, likewise.
+pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let (name, arity) = ctx.tables.ctors[index as usize].clone();
+    ctx.push(Value::Closure(Arc::new(Closure {
+        name: Some(name.clone()),
+        kind: ClosureKind::Ctor { name, arity },
+    })))
+}
+
+/// A call through a value: a local binding, a callee that is an expression, or a callback.
+pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n: i64) -> i64 {
+    let (callee, args) = {
+        let c = unsafe { &*ctx };
+        (c.read(callee).clone(), args_of(c, args, n))
+    };
+    call_value(ctx, &callee, args)
+}
+
+/// Applies `callee` to `args` and answers the handle of the result, or 0 with the context failed.
+/// A native closure is entered directly; a builtin or a constructor is the interpreter's own; an
+/// interpreted closure cannot be here, because the seam carries no function.
+fn call_value(ctx: *mut Ctx, callee: &Value, args: Vec<Value>) -> i64 {
+    let Value::Closure(closure) = callee else {
+        let c = unsafe { &mut *ctx };
+        let d = error(format!(
+            "a call needs a function, and this is {}",
+            callee.type_name()
+        ));
+        return c.fail(d);
+    };
+    match &closure.kind {
+        ClosureKind::Native {
+            code,
+            arity,
+            captured,
+        } => {
+            if args.len() != *arity {
+                let c = unsafe { &mut *ctx };
+                let d = error(format!(
+                    "a compiled function takes {arity} arguments and was given {}",
+                    args.len()
+                ));
+                return c.fail(d);
+            }
+            let mut handles = Vec::with_capacity(captured.len() + args.len());
+            {
+                let c = unsafe { &mut *ctx };
+                for v in captured {
+                    handles.push(c.push(v.clone()));
+                }
+                for v in args {
+                    handles.push(c.push(v));
+                }
+            }
+            // SAFETY: `code` came out of `Tables::functions`, the finalized addresses of this
+            // unit's own functions, which `Bodies` keeps alive for as long as this context
+            // exists; the signature is the one every compiled function has.
+            let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(*code) };
+            unsafe { f(ctx, handles.as_ptr()) }
+        }
+        ClosureKind::Builtin(b) => {
+            let c = unsafe { &mut *ctx };
+            c.builtin_calls += 1;
+            match ply_eval::builtins::call(*b, args, c.cells.arena_mut(), Span::DUMMY) {
+                Ok(Step::Done(v)) => c.push(v),
+                Ok(_) => {
+                    let d = error(format!(
+                        "`{}` suspended, which the fragment excludes",
+                        b.name()
+                    ));
+                    c.fail(d)
+                }
+                Err(d) => c.fail(d),
+            }
+        }
+        ClosureKind::Ctor { name, arity } => {
+            let c = unsafe { &mut *ctx };
+            if args.len() != *arity {
+                let d = error(format!(
+                    "the constructor `{name}` takes {arity} fields and was given {}",
+                    args.len()
+                ));
+                return c.fail(d);
+            }
+            c.push(Value::Ctor {
+                name: name.clone(),
+                args: Arc::new(args),
+            })
+        }
+        ClosureKind::Fn { .. } | ClosureKind::Code { .. } => {
+            let c = unsafe { &mut *ctx };
+            let d = error(
+                "an interpreted closure reached compiled code, which has no machine to run it on",
+            );
+            c.fail(d)
+        }
+    }
+}
+
+/// The list a callback builtin walks, or a failure.
+fn list_of(ctx: *mut Ctx, handle: i64, what: &str) -> Option<Vec<Value>> {
+    let c = unsafe { &mut *ctx };
+    match c.read(handle) {
+        Value::List(xs) => Some(xs.to_vec()),
+        other => {
+            let d = error(format!(
+                "`{what}` needs a List, and this is {}",
+                other.type_name()
+            ));
+            c.fail(d);
+            None
+        }
+    }
+}
+
+/// `map(xs, f)`: `f` on every element, in order.
+pub unsafe extern "C" fn rt_map(ctx: *mut Ctx, list: i64, f: i64) -> i64 {
+    let Some(items) = list_of(ctx, list, "map") else {
+        return 0;
+    };
+    let f = unsafe { &*ctx }.read(f).clone();
+    let mut out = Vec::with_capacity(items.len());
+    for x in items {
+        let r = call_value(ctx, &f, vec![x]);
+        let c = unsafe { &mut *ctx };
+        if c.failed != 0 {
+            return 0;
+        }
+        out.push(c.read(r).clone());
+    }
+    unsafe { &mut *ctx }.push(Value::list(out))
+}
+
+/// `filter(xs, p)`: the elements `p` answers `true` for.
+pub unsafe extern "C" fn rt_filter(ctx: *mut Ctx, list: i64, p: i64) -> i64 {
+    let Some(items) = list_of(ctx, list, "filter") else {
+        return 0;
+    };
+    let p = unsafe { &*ctx }.read(p).clone();
+    let mut out = Vec::new();
+    for x in items {
+        let r = call_value(ctx, &p, vec![x.clone()]);
+        let c = unsafe { &mut *ctx };
+        if c.failed != 0 {
+            return 0;
+        }
+        match c.read(r) {
+            Value::Bool(true) => out.push(x),
+            Value::Bool(false) => {}
+            other => {
+                let d = error(format!(
+                    "the predicate given to `filter` answered {}, not a Bool",
+                    other.type_name()
+                ));
+                return c.fail(d);
+            }
+        }
+    }
+    unsafe { &mut *ctx }.push(Value::list(out))
+}
+
+/// `fold(xs, init, f)`.
+pub unsafe extern "C" fn rt_fold(ctx: *mut Ctx, list: i64, init: i64, f: i64) -> i64 {
+    let Some(items) = list_of(ctx, list, "fold") else {
+        return 0;
+    };
+    let (f, mut acc) = {
+        let c = unsafe { &*ctx };
+        (c.read(f).clone(), c.read(init).clone())
+    };
+    for x in items {
+        let r = call_value(ctx, &f, vec![acc, x]);
+        let c = unsafe { &mut *ctx };
+        if c.failed != 0 {
+            return 0;
+        }
+        acc = c.read(r).clone();
+    }
+    unsafe { &mut *ctx }.push(acc)
+}
+
+/// `iterate(seed, budget, f)`: `f` until it answers `Stop`, or the budget runs out and the call
+/// fails the way the interpreter's raises.
+pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i64) -> i64 {
+    let (f, mut state, budget) = {
+        let c = unsafe { &mut *ctx };
+        let budget = match c.read(budget) {
+            Value::Int(n) if *n >= 1 => *n,
+            Value::Int(n) => {
+                let d = error(format!(
+                    "`iterate` needs a budget of at least 1, and this is {n}"
+                ));
+                return c.fail(d);
+            }
+            other => {
+                let d = error(format!(
+                    "`iterate` needs an Int budget, and this is {}",
+                    other.type_name()
+                ));
+                return c.fail(d);
+            }
+        };
+        (c.read(f).clone(), c.read(seed).clone(), budget)
+    };
+    let mut left = budget;
+    loop {
+        if left <= 0 {
+            let c = unsafe { &mut *ctx };
+            let d = error(format!(
+                "`iterate` did not stop within its budget of {budget}"
+            ));
+            return c.fail(d);
+        }
+        left -= 1;
+        let r = call_value(ctx, &f, vec![state]);
+        let c = unsafe { &mut *ctx };
+        if c.failed != 0 {
+            return 0;
+        }
+        match c.read(r) {
+            Value::Ctor { name, args } if args.len() == 1 && name.as_str() == "Continue" => {
+                state = args[0].clone();
+            }
+            Value::Ctor { name, args } if args.len() == 1 && name.as_str() == "Stop" => {
+                let v = args[0].clone();
+                return c.push(v);
+            }
+            other => {
+                let d = error(format!(
+                    "the step given to `iterate` answered {}, not `Continue` or `Stop`",
+                    other.type_name()
+                ));
+                return c.fail(d);
+            }
+        }
+    }
+}
+
+/// A shift count outside `0..64`, which the interpreter refuses too.
+pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let d = error(format!(
+        "a shift count must be between 0 and 63, and this is {n}"
+    ));
+    ctx.fail(d);
+}
+
 pub unsafe extern "C" fn rt_ctor(ctx: *mut Ctx, index: i64, args: *const i64, n: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let name = ctx.tables.ctors[index as usize].0.clone();
@@ -548,6 +830,15 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_concat", rt_concat as *const u8),
         ("rt_builtin", rt_builtin as *const u8),
         ("rt_ctor", rt_ctor as *const u8),
+        ("rt_closure", rt_closure as *const u8),
+        ("rt_builtin_value", rt_builtin_value as *const u8),
+        ("rt_ctor_value", rt_ctor_value as *const u8),
+        ("rt_call", rt_call as *const u8),
+        ("rt_map", rt_map as *const u8),
+        ("rt_filter", rt_filter as *const u8),
+        ("rt_fold", rt_fold as *const u8),
+        ("rt_iterate", rt_iterate as *const u8),
+        ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_record", rt_record as *const u8),
         ("rt_record_update", rt_record_update as *const u8),
         ("rt_field", rt_field as *const u8),

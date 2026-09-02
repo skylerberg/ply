@@ -75,6 +75,24 @@ fn the_census_over_the_parser_spike() {
     for (construct, count) in &ranked {
         println!("  {count:5}  {construct}");
     }
+    // ADR 0030's ranked roots, kept lowered: a construct here that is refused again is a
+    // regression in the fragment, not a fact about the spike.
+    let lowered = [
+        "a lambda",
+        "a builtin that calls user code",
+        "a call through a local binding",
+        "a call whose callee is an expression",
+        "is used as a value rather than called",
+        "a bitwise operator or shift",
+    ];
+    let regressed: Vec<&(&str, usize)> = ranked
+        .iter()
+        .filter(|(construct, _)| lowered.iter().any(|l| construct.contains(l)))
+        .collect();
+    assert!(
+        regressed.is_empty(),
+        "the fragment refuses a construct it lowers: {regressed:?}"
+    );
     // `compiled()` is the fixpoint's survivors; `len()` is how many of those are registered.
     println!(
         "survived the fixpoint ({}): {:?}",
