@@ -659,9 +659,15 @@ impl Heap {
 
     /// The interpreter value a word denotes: deep, and a borrow — the word keeps its count.
     pub fn to_value(layouts: &Layouts, w: Word) -> Value {
+        Heap::to_value_counted(layouts, w, &mut 0)
+    }
+
+    /// [`Heap::to_value`], counting the objects it reads on the way: the seam's census.
+    pub fn to_value_counted(layouts: &Layouts, w: Word, read: &mut u64) -> Value {
         if is_imm(w) {
             return Value::Int(imm_value(w));
         }
+        *read += 1;
         let o = obj(w);
         unsafe {
             match (*o).kind {
@@ -675,32 +681,37 @@ impl Heap {
                     let fields: Vec<(Symbol, Value)> = names
                         .iter()
                         .enumerate()
-                        .map(|(i, name)| (name.clone(), Heap::to_value(layouts, word_at(o, i))))
+                        .map(|(i, name)| {
+                            (
+                                name.clone(),
+                                Heap::to_value_counted(layouts, word_at(o, i), read),
+                            )
+                        })
                         .collect();
                     Value::Record(Arc::new(Fields::from_unsorted(fields)))
                 }
                 KIND_CTOR => {
                     let name = layouts.ctors[(*o).layout as usize].0.clone();
                     let args = (0..(*o).len as usize)
-                        .map(|i| Heap::to_value(layouts, word_at(o, i)))
+                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), read))
                         .collect();
                     Value::ctor(name, args)
                 }
                 KIND_LIST => Value::list(
                     list::to_vec(o)
                         .into_iter()
-                        .map(|x| Heap::to_value(layouts, x))
+                        .map(|x| Heap::to_value_counted(layouts, x, read))
                         .collect(),
                 ),
                 KIND_MAP => Value::map((0..(*o).len as usize).map(|i| {
                     (
-                        Heap::to_value(layouts, word_at(o, 2 * i)),
-                        Heap::to_value(layouts, word_at(o, 2 * i + 1)),
+                        Heap::to_value_counted(layouts, word_at(o, 2 * i), read),
+                        Heap::to_value_counted(layouts, word_at(o, 2 * i + 1), read),
                     )
                 })),
                 KIND_CLOSURE => {
                     let captured: Vec<Value> = (CLOSURE_CAPTURES..(*o).len as usize)
-                        .map(|i| Heap::to_value(layouts, word_at(o, i)))
+                        .map(|i| Heap::to_value_counted(layouts, word_at(o, i), read))
                         .collect();
                     Value::Closure(Arc::new(Closure {
                         name: None,
