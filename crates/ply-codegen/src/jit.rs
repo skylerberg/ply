@@ -83,6 +83,18 @@ struct Helpers {
     list_rest: FuncId,
     ctor_arg: FuncId,
     map_lookup: FuncId,
+    list_index: FuncId,
+    list_lookup: FuncId,
+    push: FuncId,
+    map_insert: FuncId,
+    map_contains: FuncId,
+    map_get: FuncId,
+    compare: FuncId,
+    byte_of_int: FuncId,
+    bytes_scan: FuncId,
+    bytes_scan_until: FuncId,
+    bytes_slice: FuncId,
+    bytes_concat: FuncId,
     record: FuncId,
     record_update: FuncId,
     field: FuncId,
@@ -259,6 +271,11 @@ pub struct Jit {
     layouts: Layouts,
     /// Owns the constant pool's objects until the tables take it over.
     immortals: Heap,
+    /// Per constructor index, the immortal singleton a nullary one is, or `0`; and the empty
+    /// list and map, each made once — none of these is ever allocated by a body.
+    nullaries: Vec<Word>,
+    empty_list: Word,
+    empty_map: Word,
     /// Every compile-time type a value has been given, interned; index `0` is unknown.
     tys: Vec<Ty>,
     ty_ids: HashMap<Ty, u32>,
@@ -372,6 +389,9 @@ impl Jit {
                 memo: RefCell::new(Vec::new()),
                 immortals: RefCell::new(jit.immortals),
                 bytes: RefCell::new([0; 256]),
+                nullaries: jit.nullaries,
+                empty_list: jit.empty_list,
+                empty_map: jit.empty_map,
                 memo_values: RefCell::new(HashMap::new()),
                 memo_words: RefCell::new(HashMap::new()),
                 calls: RefCell::new(HashMap::new()),
@@ -379,6 +399,32 @@ impl Jit {
             nodes: jit.nodes,
             compile_nanos,
         })
+    }
+
+    /// The values a body builds without allocating: every nullary constructor, the empty list
+    /// and the empty map, each made once and immortal.
+    fn make_singletons(&mut self) {
+        let mut nullaries = Vec::with_capacity(self.layouts.ctors.len());
+        for (index, (_, arity)) in self.layouts.ctors.iter().enumerate() {
+            let w = if *arity == 0 {
+                let w = self
+                    .immortals
+                    .alloc(crate::heap::KIND_CTOR, 0, 0, index as u32)
+                    as Word;
+                crate::heap::mark_immortal(w);
+                w
+            } else {
+                0
+            };
+            nullaries.push(w);
+        }
+        self.nullaries = nullaries;
+        let list = self.immortals.list_from(&[]);
+        crate::heap::mark_immortal(list);
+        self.empty_list = list;
+        let map = self.immortals.map_new();
+        crate::heap::mark_immortal(map);
+        self.empty_map = map;
     }
 
     /// Every refusal `names` produces when they are offered **as one unit**, rather than the first
@@ -550,6 +596,18 @@ impl Jit {
             list_rest: declare(&mut module, "rt_list_rest", 3, true)?,
             ctor_arg: declare(&mut module, "rt_ctor_arg", 4, true)?,
             map_lookup: declare(&mut module, "rt_map_lookup", 3, true)?,
+            list_index: declare(&mut module, "rt_list_index", 3, true)?,
+            list_lookup: declare(&mut module, "rt_list_lookup", 3, true)?,
+            push: declare(&mut module, "rt_push", 3, true)?,
+            map_insert: declare(&mut module, "rt_map_insert", 4, true)?,
+            map_contains: declare(&mut module, "rt_map_contains", 3, true)?,
+            map_get: declare(&mut module, "rt_map_get", 3, true)?,
+            compare: declare(&mut module, "rt_compare", 3, true)?,
+            byte_of_int: declare(&mut module, "rt_byte_of_int", 2, true)?,
+            bytes_scan: declare(&mut module, "rt_bytes_scan", 5, true)?,
+            bytes_scan_until: declare(&mut module, "rt_bytes_scan_until", 5, true)?,
+            bytes_slice: declare(&mut module, "rt_bytes_slice", 4, true)?,
+            bytes_concat: declare(&mut module, "rt_bytes_concat", 3, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
             record_update: declare(&mut module, "rt_record_update", 6, true)?,
             field: declare(&mut module, "rt_field", 4, true)?,
@@ -583,6 +641,9 @@ impl Jit {
             const_words: Vec::new(),
             layouts: Layouts::new(loaded.ctors()),
             immortals: Heap::persistent(),
+            nullaries: Vec::new(),
+            empty_list: 0,
+            empty_map: 0,
             tys: vec![Ty::Unknown],
             ty_ids: HashMap::from([(Ty::Unknown, 0)]),
             fields: Vec::new(),
@@ -594,6 +655,7 @@ impl Jit {
             functions: Vec::new(),
             pending: Vec::new(),
         };
+        jit.make_singletons();
 
         let mut bodies = Vec::new();
         for name in names {
@@ -2290,6 +2352,15 @@ impl Fx<'_, '_> {
             }
 
             NodeKind::List { items } => {
+                if items.is_empty() {
+                    let v = self.builder.ins().iconst(types::I64, self.jit.empty_list);
+                    return Ok(Val {
+                        kind: Kind::Boxed,
+                        v,
+                        ty: 0,
+                        home: 0,
+                    });
+                }
                 let mut handles = Vec::with_capacity(items.len());
                 for item in items.iter() {
                     let v = self.consumed(item, scope)?;
@@ -3281,7 +3352,63 @@ impl Fx<'_, '_> {
                         handles.len()
                     ));
                 }
+                let h = &self.jit.helpers;
+                let (list_at, push, map_insert, map_contains, map_get, compare, byte_of_int) = (
+                    h.list_index,
+                    h.push,
+                    h.map_insert,
+                    h.map_contains,
+                    h.map_get,
+                    h.compare,
+                    h.byte_of_int,
+                );
+                let (bytes_scan, bytes_scan_until, bytes_slice, bytes_concat) = (
+                    h.bytes_scan,
+                    h.bytes_scan_until,
+                    h.bytes_slice,
+                    h.bytes_concat,
+                );
                 let v = match b {
+                    // The values no body allocates, and the builtins called directly: no
+                    // dispatch on the index, no argument array.
+                    Builtin::MapNew if handles.is_empty() => {
+                        self.builder.ins().iconst(types::I64, self.jit.empty_map)
+                    }
+                    Builtin::ListAt if handles.len() == 2 => {
+                        self.helper(list_at, &[handles[0], handles[1]])
+                    }
+                    Builtin::Push if handles.len() == 2 => {
+                        self.helper(push, &[handles[0], handles[1]])
+                    }
+                    Builtin::MapInsert if handles.len() == 3 => {
+                        self.helper(map_insert, &[handles[0], handles[1], handles[2]])
+                    }
+                    Builtin::MapContains if handles.len() == 2 => {
+                        self.helper(map_contains, &[handles[0], handles[1]])
+                    }
+                    Builtin::MapGet if handles.len() == 2 => {
+                        self.helper(map_get, &[handles[0], handles[1]])
+                    }
+                    Builtin::Compare if handles.len() == 2 => {
+                        self.helper(compare, &[handles[0], handles[1]])
+                    }
+                    Builtin::ByteOfInt if handles.len() == 1 => {
+                        self.helper(byte_of_int, &[handles[0]])
+                    }
+                    Builtin::BytesScan if handles.len() == 4 => self.helper(
+                        bytes_scan,
+                        &[handles[0], handles[1], handles[2], handles[3]],
+                    ),
+                    Builtin::BytesScanUntil if handles.len() == 4 => self.helper(
+                        bytes_scan_until,
+                        &[handles[0], handles[1], handles[2], handles[3]],
+                    ),
+                    Builtin::BytesSlice if handles.len() == 3 => {
+                        self.helper(bytes_slice, &[handles[0], handles[1], handles[2]])
+                    }
+                    Builtin::BytesConcat if handles.len() == 2 => {
+                        self.helper(bytes_concat, &[handles[0], handles[1]])
+                    }
                     Builtin::Map => self.helper(self.jit.helpers.map, &[handles[0], handles[1]]),
                     Builtin::Filter => {
                         self.helper(self.jit.helpers.filter, &[handles[0], handles[1]])
@@ -3314,9 +3441,15 @@ impl Fx<'_, '_> {
                         handles.len()
                     ));
                 }
-                let ptr = self.spill(&handles);
-                let index = self.builder.ins().iconst(types::I64, index as i64);
-                self.helper(self.jit.helpers.ctor, &[index, ptr, n])
+                if arity == 0 {
+                    self.builder
+                        .ins()
+                        .iconst(types::I64, self.jit.nullaries[index])
+                } else {
+                    let ptr = self.spill(&handles);
+                    let index = self.builder.ins().iconst(types::I64, index as i64);
+                    self.helper(self.jit.helpers.ctor, &[index, ptr, n])
+                }
             }
             Denotes::Local(_) => unreachable!("a local callee is called through `call_value`"),
             Denotes::Constant(_) => {
@@ -3862,9 +3995,9 @@ impl Fx<'_, '_> {
         Ok(())
     }
 
-    /// A `match` over `map_get` whose arms only ask whether the key was found — `Some(p)`,
-    /// `None`, `_` — is a lookup answering the value or nothing, and no constructor is built:
-    /// the arms test that word directly.
+    /// A `match` over `map_get` or `list_at` whose arms only ask whether something was found —
+    /// `Some(p)`, `None`, `_` — is a lookup answering the value or nothing, and no constructor
+    /// is built: the arms test that word directly.
     fn lookup_match(
         &mut self,
         scrutinee: &Code,
@@ -3883,9 +4016,11 @@ impl Fx<'_, '_> {
         let Denotes::Builtin(index) = self.denotation(q, scope)? else {
             return Ok(None);
         };
-        if self.jit.builtins[index] != Builtin::MapGet {
-            return Ok(None);
-        }
+        let lookup = match self.jit.builtins[index] {
+            Builtin::MapGet => self.jit.helpers.map_lookup,
+            Builtin::ListAt => self.jit.helpers.list_lookup,
+            _ => return Ok(None),
+        };
         let (Some(some), Some(none)) = (self.jit.layouts.some, self.jit.layouts.none) else {
             return Ok(None);
         };
@@ -3921,7 +4056,7 @@ impl Fx<'_, '_> {
             let h = self.boxed(v);
             handles.push(h);
         }
-        let found = self.helper(self.jit.helpers.map_lookup, &[handles[0], handles[1]]);
+        let found = self.helper(lookup, &[handles[0], handles[1]]);
         self.check();
         let present = self.builder.ins().icmp_imm(IntCC::NotEqual, found, 0);
         let join = self.builder.create_block();

@@ -6,8 +6,8 @@ Decisions 2 and 5 for the integer kernel, Decisions 1 and 4 for the record
 kernel. This record is the first pass over those four, taken as what the
 profiles pointed at rather than as a redesign, and it changes no
 representation ADR 0035 decided: the words, the layouts, the counts, the
-strings, the list and the seam all stand. `benches/value-model/after-tokens.txt`
-is the series after it and `benches/front-end-whole/observation-5.txt` the
+strings, the list and the seam all stand. `benches/value-model/after-direct.txt`
+is the series after it and `benches/front-end-whole/observation-6.txt` the
 front-end row, both under their own pre-registrations. What they say: the
 record kernel is inside the bar since Decision 9; the integer kernel is
 outside it by a smaller factor than at the re-take — its round is
@@ -30,8 +30,10 @@ and every test entered whole since Decision 7.
 > operation's cost grows with the map's size on a property the source does
 > not show, which ADR 0034 asks of every core operation; that a test is a
 > root the backend enters whole; that a record dying in a body that builds
-> another of its width is that record's memory; and that a lookup a match
-> unwraps at once answers the value, with no constructor between.
+> another of its width is that record's memory; that a lookup a match
+> unwraps at once answers the value, with no constructor between; and that
+> the builtins a body calls most are direct calls, and the empty list, the
+> empty map and every nullary constructor are made once.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -216,6 +218,26 @@ the same way. With it: a constructor test and an argument read are loads,
 as a field read already was, and two strings or two byte strings compare as
 bytes before the ranking of kinds is asked of them, which is most of a map
 probe. The record kernel sits inside the bar on these.
+
+## Decision 10 — the builtins a body calls most are calls, and the values it builds most are made once
+
+A count of what the front end's rows and the record kernel call through the
+runtime's dispatcher — an index into the builtin table, an argument array on
+the stack, a match over the builtin and the kinds — put list indexing and
+appending first by a wide margin in the parse row, byte singletons and map
+membership first in the hash row, map probes and inserts and the three-way
+compare first in the check row, and the empty map thousands of times in each,
+allocated fresh every time beside a nullary constructor allocated for every
+`None` and every `Less`. Now: the builtins at the top of that count are
+direct calls from compiled code, each to a helper of its own that takes its
+arguments in registers and answers through the native path or the
+interpreter's as before; the empty list, the empty map and every nullary
+constructor are immortal singletons the unit makes once, which a body reads
+as a constant and the runtime hands out where it built one — an insert or an
+append into a singleton copies, as it does into anything held more than
+once; and the lookup match of Decision 9 covers `list_at`. The check row moved
+by a quarter and the hash row by almost a third on this, the parse row by a
+tenth.
 
 ## Priced and rejected
 
