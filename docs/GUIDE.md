@@ -2209,6 +2209,7 @@ answers a clone the map still holds.
 | --- | --- |
 | `compare<a>(x: a, y: a) -> Ordering` | the canonical total order over values; requires `derivable(ord, a)` |
 | `compare_values<a>(x: a, y: a) -> Ordering` | the same order under a name a module may not declare; what `derive ord` emits |
+| `min(a: Int, b: Int) -> Int`, `max(a: Int, b: Int) -> Int` | the smaller and the larger of two integers; a module may declare its own `min` and it wins inside that module |
 
 ### 13.5 Strings
 

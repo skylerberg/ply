@@ -19,6 +19,8 @@ const TOTAL_BUILTINS: &[&str] = &[
     // The list index.
     "list_at",
     "int_to_string",
+    "min",
+    "max",
     "string_concat",
     "bytes_len",
     "bytes_concat",
