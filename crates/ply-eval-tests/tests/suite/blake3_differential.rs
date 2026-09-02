@@ -107,9 +107,9 @@ fn the_ply_blake3_agrees_with_the_crate_at_every_structural_boundary() {
         disagreed.is_empty(),
         "the hash written in Ply's threshold T1 is zero disagreements, and this is {} of them.\n\
          A disagreement here refutes the decision to write the hash in Ply \
-         rather than the code that failed: the follow-up it names in advance is a \
-         `bytes_blake3` builtin, with this module kept as the readable definition \
-         and this test kept as what holds the two together.\n\n{}",
+         rather than the code that failed: the reversal is a builtin, with this \
+         module kept as the readable definition and this test kept as what holds \
+         the two together.\n\n{}",
         disagreed.len(),
         disagreed.join("\n\n"),
     );

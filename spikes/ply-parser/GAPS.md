@@ -2220,7 +2220,10 @@ puts its time under the runtime's callback loops and, within them, in the value
 traffic of each step — drops, drains, allocation, the argument pool — rather
 than in the compiled frames; the compiled checker is a callback-shaped program,
 and what a callback step pays to receive, update and release its carried state
-is the next thing to move.
+is the next thing to move. ADR 0035 is the decision that moves it — a value
+model for compiled code with layouts from types, unboxed scalars, counts without
+atomics and reuse — and `benches/value-model` is its gate, two kernels against
+Rust: the hash for integers and a threaded state record for the checker's shape.
 
 **What the first series found, which was not the seam.** The checker barely
 moved under the backend in the first series, exactly as the pre-registration
