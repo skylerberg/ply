@@ -39,9 +39,24 @@ pub struct Tables {
     pub memo: RefCell<Vec<Option<Word>>>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
     pub immortals: RefCell<Heap>,
+    /// The two hundred and fifty-six one-byte values, each made immortal the first time it is
+    /// asked for, so `byte_of_int` allocates nothing.
+    pub bytes: RefCell<[Word; 256]>,
 }
 
 impl Tables {
+    /// The immortal `Bytes` holding just `b`.
+    pub fn byte(&self, b: u8) -> Word {
+        let cached = self.bytes.borrow()[b as usize];
+        if cached != 0 {
+            return cached;
+        }
+        let w = self.immortals.borrow_mut().bytes(&[b]);
+        heap::mark_immortal(w);
+        self.bytes.borrow_mut()[b as usize] = w;
+        w
+    }
+
     /// Whether the constant pool holds a value that must never sit in a table outliving the call
     /// that made it.
     pub fn retains_a_handle(&self) -> Option<&'static str> {
@@ -359,6 +374,12 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
     if let Some(w) = native_builtin(ctx, b, args) {
         return w;
     }
+    builtin_over_values(ctx, b, args)
+}
+
+/// The interpreter's own implementation of `b` over the values the words denote: what answers
+/// when no native path does. Takes the arguments.
+fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
     match ply_eval::builtins::call(b, values, ctx.cells.arena_mut(), Span::DUMMY) {
         Ok(Step::Done(v)) => ctx.word(&v),
@@ -374,6 +395,39 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
         }
         Err(d) => ctx.fail(d),
     }
+}
+
+/// `bytes_concat_all` over the pieces of a list literal, without the list: one value holding
+/// them all, or the interpreter's answer over the list when a piece is not bytes. Takes the
+/// pieces.
+pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let pieces = args_of(args, n);
+    ctx.builtin_calls += 1;
+    if pieces.iter().any(|w| heap::kind(*w) != KIND_BYTES) {
+        let xs = ctx.heap.list_from(pieces);
+        return builtin_over_values(ctx, Builtin::BytesConcatAll, &[xs]);
+    }
+    let total: usize = pieces
+        .iter()
+        .map(|w| unsafe { (*obj(*w)).len } as usize)
+        .sum();
+    let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
+    let mut at = 0;
+    for w in pieces {
+        let piece = unsafe { bytes_of(obj(*w)) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                piece.as_ptr(),
+                heap::bytes_ptr(out).add(at),
+                piece.len(),
+            );
+        }
+        at += piece.len();
+        heap::dec(*w);
+    }
+    unsafe { (*out).len = total as u32 };
+    out as Word
 }
 
 /// The builtins answered over words, when their arguments have the native kinds; `None` hands the
@@ -475,7 +529,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::ByteOfInt, [n]) => {
             let byte = u8::try_from(heap::as_int(*n)?).ok()?;
-            Some(ctx.heap.bytes(&[byte]))
+            Some(ctx.tables.byte(byte))
         }
         (Builtin::BytesOfString, [s]) if heap::kind(*s) == KIND_STR => {
             let out = ctx.heap.bytes(unsafe { bytes_of(obj(*s)) });
@@ -1285,6 +1339,42 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
     }
 }
 
+/// What a fused `iterate` loop raises: `what` 0 for a budget under one (`n` the budget), 1 for
+/// a budget run out (`n` the budget), 2 for a step that answered neither `Continue` nor `Stop`
+/// (`n` the answer). Takes the answer in the last case.
+pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let d = match what {
+        0 => error(format!(
+            "`iterate` needs a budget of at least 1, and this is {n}"
+        )),
+        1 => error(format!("`iterate` did not stop within its budget of {n}")),
+        _ => {
+            let d = error(format!(
+                "the step given to `iterate` answered {}, not `Continue` or `Stop`",
+                ctx.type_name(n)
+            ));
+            heap::dec(n);
+            d
+        }
+    };
+    ctx.fail(d);
+}
+
+/// A range longer than the interpreter's `range` admits, raised where a fused loop would have
+/// walked it.
+pub unsafe extern "C" fn rt_bad_range(ctx: *mut Ctx, lo: i64, hi: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let d = error(format!(
+        "`range` of {} elements exceeds the limit of {RANGE_LIMIT}",
+        hi.saturating_sub(lo)
+    ));
+    ctx.fail(d);
+}
+
+/// The most elements the interpreter's `range` builds, which a fused loop holds to as well.
+pub const RANGE_LIMIT: i64 = 10_000_000;
+
 /// A shift count outside `0..64`, which the interpreter refuses too.
 pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64) {
     let ctx = unsafe { &mut *ctx };
@@ -1348,26 +1438,56 @@ pub unsafe extern "C" fn rt_record_update(
         }
         return base;
     }
+    // A fresh record: the written fields at their offsets, and the rest copied out of the base
+    // by offset when it has the shape, or by name when the lowering's guess at a base was a
+    // record of another shape — which is only ever a value that dies here, so nothing is read
+    // from it unless the literal left a field unwritten.
     let tables = Rc::clone(&ctx.tables);
-    let names = tables.layouts.shape_names(shape);
-    let out = ctx.heap.alloc(KIND_RECORD, 0, names.len() as u32, shape);
-    let base_shape = unsafe { (*o).layout };
-    for (i, name) in names.iter().enumerate() {
-        let w = match offsets.iter().position(|at| *at as usize == i) {
-            Some(k) => written[k],
-            None => match tables.layouts.offset(base_shape, name) {
-                Some(at) => {
-                    let w = unsafe { word_at(o, at) };
-                    heap::inc(w);
-                    w
-                }
-                None => {
-                    let d = error(format!("this record has no field `{name}`"));
+    let width = tables.layouts.shape_width(shape);
+    let out = ctx.heap.alloc(KIND_RECORD, 0, width as u32, shape);
+    // Which offsets the literal wrote: a bit each for a shape a word of bits covers, which is
+    // every shape a front end has, and a list for a wider one.
+    let mut mask = 0u128;
+    let mut wide = Vec::new();
+    if width > 128 {
+        wide = vec![false; width];
+    }
+    for (w, at) in written.iter().zip(offsets) {
+        let at = *at as usize;
+        unsafe { set_word(out, at, *w) };
+        if width > 128 {
+            wide[at] = true;
+        } else {
+            mask |= 1 << at;
+        }
+    }
+    let filled = |i: usize| {
+        if width > 128 {
+            wide[i]
+        } else {
+            mask >> i & 1 == 1
+        }
+    };
+    if written.len() < width {
+        let base_shape = unsafe { (*o).layout };
+        if base_shape == shape {
+            for i in (0..width).filter(|i| !filled(*i)) {
+                let w = unsafe { word_at(o, i) };
+                heap::inc(w);
+                unsafe { set_word(out, i, w) };
+            }
+        } else {
+            let names = tables.layouts.shape_names(shape);
+            for i in (0..width).filter(|i| !filled(*i)) {
+                let Some(at) = tables.layouts.offset(base_shape, &names[i]) else {
+                    let d = error(format!("this record has no field `{}`", names[i]));
                     return ctx.fail(d);
-                }
-            },
-        };
-        unsafe { set_word(out, i, w) };
+                };
+                let w = unsafe { word_at(o, at) };
+                heap::inc(w);
+                unsafe { set_word(out, i, w) };
+            }
+        }
     }
     heap::dec(base);
     out as Word
@@ -1561,6 +1681,9 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_fold", rt_fold as *const u8),
         ("rt_map_fold", rt_map_fold as *const u8),
         ("rt_iterate", rt_iterate as *const u8),
+        ("rt_iterate_bad", rt_iterate_bad as *const u8),
+        ("rt_bytes_join", rt_bytes_join as *const u8),
+        ("rt_bad_range", rt_bad_range as *const u8),
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),
         ("rt_dec", rt_dec as *const u8),

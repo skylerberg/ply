@@ -1,6 +1,6 @@
 //! The fragment of the spike's fragment, compiled with Cranelift.
 
-use crate::heap::{HEADER, Heap, Layouts, Word};
+use crate::heap::{HEADER, Heap, KIND_BYTES, KIND_LIST, Layouts, Word};
 use crate::rt::{self, Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, anyhow};
@@ -96,6 +96,9 @@ struct Helpers {
     fold: FuncId,
     map_fold: FuncId,
     iterate: FuncId,
+    iterate_bad: FuncId,
+    bad_range: FuncId,
+    bytes_join: FuncId,
     shift_count: FuncId,
     dup: FuncId,
     dec: FuncId,
@@ -346,6 +349,7 @@ impl Jit {
                 functions,
                 memo: RefCell::new(Vec::new()),
                 immortals: RefCell::new(jit.immortals),
+                bytes: RefCell::new([0; 256]),
             }),
             nodes: jit.nodes,
             compile_nanos,
@@ -534,6 +538,9 @@ impl Jit {
             fold: declare(&mut module, "rt_fold", 4, true)?,
             map_fold: declare(&mut module, "rt_map_fold", 4, true)?,
             iterate: declare(&mut module, "rt_iterate", 4, true)?,
+            iterate_bad: declare(&mut module, "rt_iterate_bad", 3, false)?,
+            bad_range: declare(&mut module, "rt_bad_range", 3, false)?,
+            bytes_join: declare(&mut module, "rt_bytes_join", 3, true)?,
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
             dup: declare(&mut module, "rt_dup", 2, true)?,
             dec: declare(&mut module, "rt_dec", 2, false)?,
@@ -844,6 +851,17 @@ const FAILED_OFFSET: i32 = std::mem::offset_of!(Ctx, failed) as i32;
 const FUEL_OFFSET: i32 = std::mem::offset_of!(Ctx, fuel) as i32;
 
 /// Whether a compiled body may call this builtin, and what to say when it may not.
+/// Whether a call of `b` with `arity` arguments is answered inline, in an `Int` register: a
+/// length or a byte read is a load once the argument's kind is checked, and the runtime is
+/// entered only for anything else — another kind, an index out of range — which it refuses as
+/// the interpreter would.
+fn inline_builtin_answers(b: Builtin, arity: usize) -> bool {
+    matches!(
+        (b, arity),
+        (Builtin::BytesAt, 2) | (Builtin::BytesLen, 1) | (Builtin::Len, 1)
+    )
+}
+
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
     if b.higher_order() && !lowered_callback(b) {
         return Err(format!("`{}`, a builtin that calls user code", b.name()));
@@ -872,6 +890,16 @@ fn lowered_callback(b: Builtin) -> bool {
 
 /// What a name denotes, decided at compile time in the order `Machine::lookup` decides it at run
 /// time.
+/// The step a fused loop calls directly: a compiled function through its typed body, or a
+/// lambda literal through its own entry, with the words it captured as its leading arguments.
+enum Step {
+    Typed(Func),
+    Lambda {
+        id: FuncId,
+        env: Vec<cranelift_codegen::ir::Value>,
+    },
+}
+
 enum Denotes {
     Local(Val),
     Compiled(Func),
@@ -1403,6 +1431,11 @@ impl Fx<'_, '_> {
             NodeKind::App { func, args } => match &func.kind {
                 NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
                     Denotes::Compiled(f) if f.arity == args.len() => f.sig.ret,
+                    Denotes::Builtin(index)
+                        if inline_builtin_answers(self.jit.builtins[index], args.len()) =>
+                    {
+                        Kind::Int
+                    }
                     _ => Kind::Boxed,
                 },
                 _ => Kind::Boxed,
@@ -2218,6 +2251,500 @@ impl Fx<'_, '_> {
         }
     }
 
+    /// The callback a fused loop calls directly, when the argument is one it can: a compiled
+    /// function of the right arity, or a lambda literal of it, which is compiled as its own
+    /// function and called through its entry with the captured values as leading arguments —
+    /// held for the loop's duration and given to the callee once more per call, as a closure
+    /// would hand them over.
+    fn step_of(&mut self, code: &Code, arity: usize, scope: &mut Scope) -> Result<Option<Step>> {
+        match &code.kind {
+            NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
+                Denotes::Compiled(f)
+                    if f.arity == arity
+                        && f.sig.params.iter().all(|k| *k != Kind::Bool)
+                        && f.sig.ret != Kind::Bool =>
+                {
+                    Ok(Some(Step::Typed(f)))
+                }
+                _ => Ok(None),
+            },
+            NodeKind::Lambda {
+                params,
+                body,
+                captures,
+                ..
+            } if params.len() == arity => {
+                let mut env = Vec::with_capacity(captures.len());
+                for (name, own) in captures.names.iter().zip(&captures.owns) {
+                    let Some((_, val)) = scope.iter().rev().find(|(s, _)| s == name) else {
+                        return self.refuse(format!(
+                            "a lambda capturing `{name}`, which is not a local of its body"
+                        ));
+                    };
+                    let val = self.captured(*own, *val);
+                    let handle = self.boxed(val);
+                    env.push(handle);
+                }
+                let index = self.jit.functions.len();
+                let sig = self.jit.entry_signature();
+                let id = self.jit.module.declare_function(
+                    &mangle(&format!("{}$lambda{index}", self.function)),
+                    Linkage::Local,
+                    &sig,
+                )?;
+                self.jit.functions.push(id);
+                let mut full: Vec<Symbol> = captures.names.clone();
+                full.extend(params.iter().cloned());
+                self.jit.pending.push(Pending {
+                    owner: self.function.clone(),
+                    id,
+                    params: full,
+                    body: body.clone(),
+                    module_index: self.module_index,
+                });
+                Ok(Some(Step::Lambda { id, env }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// One call of a fused loop's step, which owns its arguments and answers an owned value.
+    fn call_step(&mut self, step: &Step, args: &[Val]) -> Val {
+        match step {
+            Step::Typed(f) => {
+                let mut vals = Vec::with_capacity(args.len() + 1);
+                vals.push(self.ctx);
+                for (a, kind) in args.iter().zip(&f.sig.params) {
+                    let v = self.coerce(*a, *kind);
+                    vals.push(v);
+                }
+                let callee = self
+                    .jit
+                    .module
+                    .declare_func_in_func(f.typed, self.builder.func);
+                let call = self.builder.ins().call(callee, &vals);
+                let v = self.builder.inst_results(call)[0];
+                self.check();
+                Val {
+                    kind: f.sig.ret,
+                    v,
+                    ty: f.sig.ret_ty,
+                    home: 0,
+                }
+            }
+            Step::Lambda { id, env } => {
+                let mut handles = Vec::with_capacity(env.len() + args.len());
+                for w in env {
+                    self.inc_inline(*w);
+                    handles.push(*w);
+                }
+                for a in args {
+                    let h = self.boxed(*a);
+                    handles.push(h);
+                }
+                let ptr = self.spill(&handles);
+                let callee = self.jit.module.declare_func_in_func(*id, self.builder.func);
+                let call = self.builder.ins().call(callee, &[self.ctx, ptr]);
+                let v = self.builder.inst_results(call)[0];
+                self.check();
+                Val {
+                    kind: Kind::Boxed,
+                    v,
+                    ty: 0,
+                    home: 0,
+                }
+            }
+        }
+    }
+
+    /// What a fused loop held for its step, let go once the loop is done.
+    fn release_step(&mut self, step: Step) {
+        if let Step::Lambda { env, .. } = step {
+            for w in env {
+                self.dec_inline(w);
+            }
+        }
+    }
+
+    /// `fold` over a `range` and `iterate`, as loops in this body calling their step directly
+    /// when `step_of` admits it, rather than a list built and a closure called back through the
+    /// runtime's loop. The interpreter's limits and refusals hold: a range past its limit and
+    /// an `iterate` that runs out or answers the wrong constructor raise, and so decline.
+    fn fused_loop(&mut self, b: Builtin, args: &[Code], scope: &mut Scope) -> Result<Option<Val>> {
+        match b {
+            // The pieces of a list literal are joined without the list.
+            Builtin::BytesConcatAll if args.len() == 1 => {
+                let NodeKind::List { items } = &args[0].kind else {
+                    return Ok(None);
+                };
+                let mut handles = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    let v = self.consumed(item, scope)?;
+                    let h = self.boxed(v);
+                    handles.push(h);
+                }
+                let ptr = self.spill(&handles);
+                let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+                let v = self.helper(self.jit.helpers.bytes_join, &[ptr, n]);
+                self.check();
+                Ok(Some(Val {
+                    kind: Kind::Boxed,
+                    v,
+                    ty: 0,
+                    home: 0,
+                }))
+            }
+            Builtin::Fold if args.len() == 3 => {
+                let NodeKind::App {
+                    func: range,
+                    args: bounds,
+                } = &args[0].kind
+                else {
+                    return Ok(None);
+                };
+                let NodeKind::Var { name: q, .. } = &range.kind else {
+                    return Ok(None);
+                };
+                if bounds.len() != 2
+                    || !matches!(self.denotation(q, scope)?, Denotes::Builtin(i) if self.jit.builtins[i] == Builtin::Range)
+                    || !matches!(
+                        &args[2].kind,
+                        NodeKind::Var { .. } | NodeKind::Lambda { .. }
+                    )
+                {
+                    return Ok(None);
+                }
+                // Left to right, as the interpreter evaluates them: the bounds, the seed, then
+                // the step — whose captures are read when the lambda is.
+                let lo = self.consumed(&bounds[0], scope)?;
+                let lo = self.as_int(lo);
+                let hi = self.consumed(&bounds[1], scope)?;
+                let hi = self.as_int(hi);
+                let init = self.consumed(&args[1], scope)?;
+                let Some(step) = self.step_of(&args[2], 2, scope)? else {
+                    // Nothing is emitted for a step this cannot call; the bounds and the seed are
+                    // already evaluated, so the generic path must not evaluate them again.
+                    return self.refuse(
+                        "a `fold` over a range whose step is not a call this body can make",
+                    );
+                };
+                let acc_kind = match &step {
+                    Step::Typed(f) => f.sig.params[0],
+                    Step::Lambda { .. } => Kind::Boxed,
+                };
+                let acc = self.coerce(init, acc_kind);
+
+                let span = self.builder.ins().isub(hi, lo);
+                let too_big =
+                    self.builder
+                        .ins()
+                        .icmp_imm(IntCC::SignedGreaterThan, span, rt::RANGE_LIMIT);
+                let refuse = self.builder.create_block();
+                let header = self.builder.create_block();
+                self.builder.ins().brif(
+                    too_big,
+                    refuse,
+                    &[],
+                    header,
+                    &[BlockArg::Value(lo), BlockArg::Value(acc)],
+                );
+                self.builder.switch_to_block(refuse);
+                self.builder.seal_block(refuse);
+                self.helper_void(self.jit.helpers.bad_range, &[lo, hi]);
+                self.check();
+                self.builder
+                    .ins()
+                    .jump(header, &[BlockArg::Value(lo), BlockArg::Value(acc)]);
+
+                self.builder.append_block_param(header, types::I64);
+                self.builder.append_block_param(header, types::I64);
+                let body = self.builder.create_block();
+                let exit = self.builder.create_block();
+                self.builder.append_block_param(exit, types::I64);
+                self.builder.switch_to_block(header);
+                let i = self.builder.block_params(header)[0];
+                let acc = self.builder.block_params(header)[1];
+                let more = self.builder.ins().icmp(IntCC::SignedLessThan, i, hi);
+                self.builder
+                    .ins()
+                    .brif(more, body, &[], exit, &[BlockArg::Value(acc)]);
+                self.builder.switch_to_block(body);
+                self.builder.seal_block(body);
+                let acc_val = Val {
+                    kind: acc_kind,
+                    v: acc,
+                    ty: 0,
+                    home: 0,
+                };
+                let x = Val {
+                    kind: Kind::Int,
+                    v: i,
+                    ty: 0,
+                    home: 0,
+                };
+                let next = self.call_step(&step, &[acc_val, x]);
+                let next = self.coerce(next, acc_kind);
+                let i1 = self.builder.ins().iadd_imm(i, 1);
+                self.builder
+                    .ins()
+                    .jump(header, &[BlockArg::Value(i1), BlockArg::Value(next)]);
+                self.builder.seal_block(header);
+                self.builder.switch_to_block(exit);
+                self.builder.seal_block(exit);
+                let v = self.builder.block_params(exit)[0];
+                self.release_step(step);
+                Ok(Some(Val {
+                    kind: acc_kind,
+                    v,
+                    ty: 0,
+                    home: 0,
+                }))
+            }
+            Builtin::Iterate if args.len() == 3 => {
+                let (Some(stop), Some(go)) = (self.jit.layouts.stop, self.jit.layouts.go) else {
+                    return Ok(None);
+                };
+                if !matches!(
+                    &args[2].kind,
+                    NodeKind::Var { .. } | NodeKind::Lambda { .. }
+                ) {
+                    return Ok(None);
+                }
+                let seed = self.consumed(&args[0], scope)?;
+                let seed = self.boxed(seed);
+                let budget = self.consumed(&args[1], scope)?;
+                let budget = self.as_int(budget);
+                let Some(step) = self.step_of(&args[2], 1, scope)? else {
+                    return self.refuse("an `iterate` whose step is not a call this body can make");
+                };
+
+                let header = self.builder.create_block();
+                self.builder.append_block_param(header, types::I64);
+                self.builder.append_block_param(header, types::I64);
+                let exit = self.builder.create_block();
+                self.builder.append_block_param(exit, types::I64);
+                let small = self.builder.create_block();
+                let under = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThan, budget, 1);
+                self.builder.ins().brif(
+                    under,
+                    small,
+                    &[],
+                    header,
+                    &[BlockArg::Value(budget), BlockArg::Value(seed)],
+                );
+                self.builder.switch_to_block(small);
+                self.builder.seal_block(small);
+                let zero = self.builder.ins().iconst(types::I64, 0);
+                self.helper_void(self.jit.helpers.iterate_bad, &[zero, budget]);
+                self.check();
+                self.builder.ins().jump(exit, &[BlockArg::Value(seed)]);
+
+                self.builder.switch_to_block(header);
+                let left = self.builder.block_params(header)[0];
+                let state = self.builder.block_params(header)[1];
+                let spent = self.builder.create_block();
+                let body = self.builder.create_block();
+                let none_left = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::SignedLessThanOrEqual, left, 0);
+                self.builder.ins().brif(none_left, spent, &[], body, &[]);
+                self.builder.switch_to_block(spent);
+                self.builder.seal_block(spent);
+                let one = self.builder.ins().iconst(types::I64, 1);
+                self.helper_void(self.jit.helpers.iterate_bad, &[one, budget]);
+                self.check();
+                self.builder.ins().jump(exit, &[BlockArg::Value(state)]);
+
+                self.builder.switch_to_block(body);
+                self.builder.seal_block(body);
+                let r = self.call_step(
+                    &step,
+                    &[Val {
+                        kind: Kind::Boxed,
+                        v: state,
+                        ty: 0,
+                        home: 0,
+                    }],
+                );
+                let r = self.boxed(r);
+                // `Continue(x)` or `Stop(x)`, unwrapped in place: the payload is held once more
+                // and the constructor let go.
+                let unwrap = self.builder.create_block();
+                let check_ctor = self.builder.create_block();
+                let bad = self.builder.create_block();
+                let tagged = self.builder.ins().band_imm(r, 1);
+                self.builder.ins().brif(tagged, bad, &[], check_ctor, &[]);
+                self.builder.switch_to_block(check_ctor);
+                self.builder.seal_block(check_ctor);
+                let kind = self
+                    .builder
+                    .ins()
+                    .uload8(types::I32, MemFlags::trusted(), r, 4);
+                let is_ctor = self.builder.ins().icmp_imm(
+                    IntCC::Equal,
+                    kind,
+                    i64::from(crate::heap::KIND_CTOR),
+                );
+                let len = self.builder.ins().uload32(MemFlags::trusted(), r, 8);
+                let one_field = self.builder.ins().icmp_imm(IntCC::Equal, len, 1);
+                let index = self.builder.ins().uload32(MemFlags::trusted(), r, 12);
+                let is_stop = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, index, i64::from(stop));
+                let is_go = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, index, i64::from(go));
+                let named = self.builder.ins().bor(is_stop, is_go);
+                let shaped = self.builder.ins().band(is_ctor, one_field);
+                let ok = self.builder.ins().band(shaped, named);
+                self.builder.ins().brif(ok, unwrap, &[], bad, &[]);
+                self.builder.switch_to_block(bad);
+                self.builder.seal_block(bad);
+                let two = self.builder.ins().iconst(types::I64, 2);
+                self.helper_void(self.jit.helpers.iterate_bad, &[two, r]);
+                self.check();
+                self.builder.ins().jump(exit, &[BlockArg::Value(state)]);
+                self.builder.switch_to_block(unwrap);
+                self.builder.seal_block(unwrap);
+                let payload =
+                    self.builder
+                        .ins()
+                        .load(types::I64, MemFlags::trusted(), r, HEADER as i32);
+                self.inc_inline(payload);
+                self.dec_inline(r);
+                let again = self.builder.create_block();
+                self.builder
+                    .ins()
+                    .brif(is_stop, exit, &[BlockArg::Value(payload)], again, &[]);
+                self.builder.switch_to_block(again);
+                self.builder.seal_block(again);
+                let left1 = self.builder.ins().iadd_imm(left, -1);
+                self.builder
+                    .ins()
+                    .jump(header, &[BlockArg::Value(left1), BlockArg::Value(payload)]);
+                self.builder.seal_block(header);
+                self.builder.switch_to_block(exit);
+                self.builder.seal_block(exit);
+                let v = self.builder.block_params(exit)[0];
+                self.release_step(step);
+                Ok(Some(Val {
+                    kind: Kind::Boxed,
+                    v,
+                    ty: 0,
+                    home: 0,
+                }))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// A builtin `inline_builtin_answers` admits, in a register: the argument's kind is checked
+    /// inline and its length or byte loaded; any other kind, or an index out of range, goes
+    /// through the runtime's own path so the diagnostic is the interpreter's. Takes the
+    /// arguments as the runtime would.
+    fn inline_builtin(&mut self, index: usize, args: &[Code], scope: &mut Scope) -> Result<Val> {
+        let b = self.jit.builtins[index];
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(self.consumed(a, scope)?);
+        }
+        let target = self.boxed(vals[0]);
+        let at = (b == Builtin::BytesAt).then(|| self.as_int(vals[1]));
+        let want = if b == Builtin::Len {
+            KIND_LIST
+        } else {
+            KIND_BYTES
+        };
+
+        let pointer = self.builder.create_block();
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+
+        let tagged = self.builder.ins().band_imm(target, 1);
+        self.builder.ins().brif(tagged, slow, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let kind = self
+            .builder
+            .ins()
+            .uload8(types::I32, MemFlags::trusted(), target, 4);
+        let is = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, kind, i64::from(want));
+        let len = self.builder.ins().uload32(MemFlags::trusted(), target, 8);
+        match at {
+            Some(i) => {
+                // A negative index is a huge one unsigned, so one compare covers both bounds.
+                let bounds = self.builder.create_block();
+                self.builder.ins().brif(is, bounds, &[], slow, &[]);
+                self.builder.switch_to_block(bounds);
+                self.builder.seal_block(bounds);
+                let inside = self.builder.ins().icmp(IntCC::UnsignedLessThan, i, len);
+                self.builder.ins().brif(inside, fast, &[], slow, &[]);
+            }
+            None => {
+                self.builder.ins().brif(is, fast, &[], slow, &[]);
+            }
+        }
+
+        self.builder.switch_to_block(fast);
+        self.builder.seal_block(fast);
+        let answer = match at {
+            Some(i) => {
+                let base = self.builder.ins().iadd_imm(target, HEADER as i64);
+                let addr = self.builder.ins().iadd(base, i);
+                self.builder
+                    .ins()
+                    .uload8(types::I64, MemFlags::trusted(), addr, 0)
+            }
+            None => len,
+        };
+        self.dec_inline(target);
+        self.builder.ins().jump(join, &[BlockArg::Value(answer)]);
+
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        let mut handles = vec![target];
+        if let Some(i) = at {
+            handles.push(self.boxed(Val {
+                kind: Kind::Int,
+                v: i,
+                ty: 0,
+                home: 0,
+            }));
+        }
+        let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+        let ptr = self.spill(&handles);
+        let which = self.builder.ins().iconst(types::I64, index as i64);
+        let v = self.helper(self.jit.helpers.builtin, &[which, ptr, n]);
+        self.check();
+        let v = self.as_int(Val {
+            kind: Kind::Boxed,
+            v,
+            ty: 0,
+            home: 0,
+        });
+        self.builder.ins().jump(join, &[BlockArg::Value(v)]);
+
+        self.builder.switch_to_block(join);
+        self.builder.seal_block(join);
+        Ok(Val {
+            kind: Kind::Int,
+            v: self.builder.block_params(join)[0],
+            ty: 0,
+            home: 0,
+        })
+    }
+
     fn app(&mut self, func: &Code, args: &[Code], scope: &mut Scope) -> Result<Val> {
         let NodeKind::Var { name: q, .. } = &func.kind else {
             // The callee is a value: evaluate it, then the arguments, then call through it.
@@ -2277,6 +2804,16 @@ impl Fx<'_, '_> {
                 ty: f.sig.ret_ty,
                 home: 0,
             });
+        }
+        if let Denotes::Builtin(index) = &denotes
+            && let Some(v) = self.fused_loop(self.jit.builtins[*index], args, scope)?
+        {
+            return Ok(v);
+        }
+        if let Denotes::Builtin(index) = &denotes
+            && inline_builtin_answers(self.jit.builtins[*index], args.len())
+        {
+            return self.inline_builtin(*index, args, scope);
         }
         let mut handles = Vec::with_capacity(args.len());
         for a in args {
