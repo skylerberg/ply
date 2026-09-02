@@ -1,0 +1,160 @@
+# The bootstrap path — what still stands between Ply and a compiler written in Ply
+
+A plan, not a decision. ADR 0020 decided against self-hosting the front end on
+today's interpreter and that decision stands; ADR 0021 records why the goal
+exists anyway. This file is the entry for whoever continues toward it: what is
+no longer a blocker, what is, the order to take the rest in, and the measurement
+each step is gated on. Every claim below names the record that holds it. Figures
+stay in those records and in the commands that produce them; none is restated
+here, per `CONTRIBUTING.md` §"Writing a claim down".
+
+The goal it serves is ADR 0021's: a front end whose cost is O(change) rather than
+O(project), fast enough to sit inside the sub-second verification loop the
+project exists to make fast. "Reasonably close to Rust" means that loop, not a
+benchmark.
+
+## Where it stands
+
+**No longer a blocker, and each is checked by something in the tree:**
+
+- **Expressiveness.** A lexer and a recursive-descent parser written in Ply agree
+  with `crates/ply-syntax` on the reference corpus, tree and diagnostics, byte
+  for byte; the inputs they disagree on are the ones written in syntax that
+  postdates the port (`spikes/ply-parser/GAPS.md` §11R). CI runs the differential
+  on every push (`.github/workflows/ci.yml`, job `spikes/ply-parser`).
+- **The call ceiling.** `iterate` gives a parser the reference's own shape —
+  loops for sequences, recursion only for grammar nesting — at depth one (ADR
+  0022). A raisable ceiling is refused there, with the reason.
+- **The positional cost rule.** ADR 0034 is landed entire: a last use moves its
+  value out of its slot (`position_invariance_g1`), a copy is bounded whatever a
+  list's length and a `[x, ..rest]` pattern shares rather than copies
+  (`accumulator_shape`, `list_pattern_rest`), a record update writes into a
+  dying base (`record_update_reuse`), and `reuse fn` turns the cost report into
+  an obligation `ply check` enforces
+  (`check::tests::a_reuse_fn_is_refused_only_for_a_copy_its_own_body_causes`).
+  Position decides nothing; a copy means a genuine second owner.
+- **Four of the parser spike's ranked gaps.** A list index (ADR 0027), record
+  update (ADR 0023), `?` (ADR 0028), and bit operators with a filesystem effect
+  and a hash written in Ply (ADR 0033).
+
+**The blocker is throughput, and it is the only one.** Lexing plus parsing in
+Ply costs more than an order of magnitude what the whole six-phase Rust front
+end costs on identical input in one sitting, and four of the six phases are
+unwritten. `spikes/ply-parser/GAPS.md` §13 and §13R hold the series and
+`spikes/ply-parser/measure-multiplier.sh` re-takes it. ADR 0021 §"The critical
+path" locates the cost: interpreter dispatch dominates builtin bodies by roughly
+twenty to one, so compilation removes the right half — and a fifth of executed
+work is map, record and list machinery that no amount of compiling reaches.
+
+## Why the interpreter path cannot close it
+
+ADR 0030 measured compiled code on the front end itself and the finding is the
+shape of the whole problem. Entering compiled code at the leaves pays the
+boundary on every entry, and at a front end's entry rate **an infinitely fast
+backend at that granularity cannot win**. The entry has to move to the root of a
+subtree, and what keeps it out is the code generator: it refuses a lambda because
+there is no closure representation at all, refuses the builtins that call user
+code, and refuses an *enclosing* function when a callee is uncompiled instead of
+emitting a trampoline — so one lambda under a root refuses the root. ADR 0018
+found the earlier form of the same constraint: the fragment covered most of a
+kernel's work and bought nothing until the interpreter could call compiled code
+(R5).
+
+The seam is wider than it was, and what it still refuses is specific.
+`crates/ply-eval/src/compiled.rs` carries a value whose declared type is built
+from `Int`, `Bool` and `Bytes` — lists, maps, records and declared types of
+those included, since ADR 0030's widening — and a backend answers one value
+with no arena, handler stack or route back in. What cannot cross: a function, a
+type variable, `String`, `Unit`, `Float`, `Decimal`, and the cell, task and
+secret kinds (`CarriedTypes::blocker`). Separately, the *registry* of what the
+machine may enter is narrowed to scalar signatures by default
+(`backend::scalar_signature`), because ADR 0030 measured that registering every
+carried signature adds leaf islands and loses; `PLY_CODEGEN_REGISTER=all` is
+the measurement knob.
+
+## The path, in order
+
+Each step names its gate. Take them in this order because each later step's
+measurement is confounded until the earlier one has moved.
+
+1. **The front-end row exists, and it is the ordering.** ADR 0026 named the
+   bootstrap front end as a workload class with no row; ADR 0030 then took it —
+   the parser spike's modules parsing the example files as byte literals,
+   through `ply test --backend`, against a null control, arms rotated. Every
+   backend arm was slower than no backend, by nearly ten times the control,
+   because the entries are leaf islands and a boundary crossing costs more than
+   the machine's own dispatch. So the first step is not a measurement but the
+   two that follow, and the row is re-taken after each root lands, with ADR
+   0030's protocol and its bar: beat the unbacked arm by more than the null
+   control, on an idle machine, pre-registered (`CONTRIBUTING.md` §"Gate on an
+   idle machine").
+2. **The code generator's roots, in ADR 0030's ranking.** String concatenation
+   and a record pattern nested in a constructor pattern are plain missing
+   lowerings and nothing in the evaluator moves for them. Then the callback
+   problem as one piece: a closure representation, the three callback builtins,
+   a named function used as a value, a call through a local binding, and a
+   trampoline for an uncompiled callee so a refusal stops cascading to the root.
+   Gate: the parser spike's entered-names count moves from leaves to roots, and
+   the delivered speedup against the control is positive rather than projected.
+3. **Widen the registry, then the seam's remaining kinds.** Once root entry
+   pays, register the carried signatures the narrow registry leaves out — the
+   parser's state record is carried and its functions are not registered — and
+   then admit what `CarriedTypes::blocker` still refuses that a front end
+   needs: type variables (the spike's generic `comma_list`), `String` and
+   `Unit`. ADR 0026's contract goes with each widening: a backend must be
+   policeable before it is fast, so every widening arrives with the
+   wrong-backend mutations that catch it through a shipping command. Gate: ADR
+   0030's row re-taken with the wider registry beats the narrow one.
+4. **The container machinery.** Map insert and lookup, record field access, list
+   push and index are outside the fragment however many functions compile (ADR
+   0021). Measure the share first with the executed-work census
+   (`w6_alloc_sites` and ADR 0026's coverage criterion), then make the operations
+   native to compiled code or specialise their representations. Gate: the share
+   falls under the census, not a micro-benchmark.
+5. **The language tax the spike priced.** In `spikes/ply-parser/GAPS.md`'s
+   order: tuples (§3), `const` (§5, an interpreter call per nullary function at
+   the parser's innermost operation), `?` inside lambdas and `iterate` steps (§2,
+   `E0118`/`E0119`), keywords reserved in the field namespace (§6), an
+   expression-position `unreachable` (§8), and §9's small pieces. Float
+   construction is ADR 0020's one absolute hole. Each is an ordinary language
+   change under ADR 0001's rule that no existing hash may move, and each moves
+   `docs/GUIDE.md` in the same change.
+6. **The other four phases, behind the differential.** Resolve, inference,
+   effect inference and hashing, each ported the way the parser was: a reference
+   dumper on the Rust side, a corpus, and mutations that prove the comparison
+   can go red (`spikes/ply-parser/arm-*.sh`). Inference with rows is the hard
+   one. `std.hash` exists (ADR 0033) and its throughput is not measured. Port the
+   syntax the parser predates first, so the spike's own differential is green
+   before anything is built on it.
+7. **The driver.** Incremental caching, the content-addressed store and the
+   gates are Rust, and ADR 0020 notes a self-hosted front end would be cached by
+   machinery it does not own. Whether the front end lives behind the Rust driver
+   or the driver is ported too is a decision for when phases exist to drive; it
+   is listed so it is not discovered late.
+8. **Repair the oracles as they are needed.** `CONTRIBUTING.md` §"Things known
+   to be broken" items 16 and 18: the lexer spike's harness does not compile, and
+   the codegen spike's agreement corpus is red while its own tests stay green.
+   A bootstrap is verified with exactly these instruments, and a green result over
+   an instrument that runs nothing is the defect class this project names as its
+   most expensive.
+
+## What would make this plan wrong
+
+- **If root entry, once reachable, still loses to no backend.** ADR 0030's
+  per-entry cost — a registry lookup, a context, a clone and an arena push per
+  argument, two post-conditions, a clone out — is then the ceiling, and the seam
+  has to change shape before any construct is worth lowering.
+- **If the container share stays the ceiling after steps 2 and 3.** Then step 4
+  is the milestone and the generator's constructs were the cheap half.
+- **If the inference speedup ADR 0021 bets on does not arrive.** Then tooling
+  stays a minority of the loop, O(project) stays affordable, and the bootstrap is
+  over-engineering; ADR 0021 says so in its own falsifiers and the second payoff
+  path — the project simply growing — is slower.
+- **If a Rust-side tool makes the conventional loop O(change).** Nothing has
+  tried, and it would remove the motive entirely.
+
+## What this is not
+
+Not a decision to self-host. ADR 0020's decision stands until a re-take of
+ADR 0030's row clears its bar, and this file should be corrected in place when
+it does: replace the sentence, do not add a block saying the sentence moved.
