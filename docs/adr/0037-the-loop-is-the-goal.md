@@ -285,7 +285,9 @@ slope for neither tier.
    incremental, or by any other single lever, because no single lever is where
    the time is. What it needs is for the front end to be *held* and updated,
    which is what a resumable driver means, and that is the last O(project) term
-   in a warm loop.
+   in a warm loop. **ADR 0038 is that record**: it fixes what correctness means
+   for a resumable front end and what the row must show, before a branch exists
+   to judge.
 4. Choose the loop's tier from the table above. **The comparison it was waiting
    on is taken**: `benches/marginal-change/` reads Cranelift's per-definition
    cost and `benches/c-floor/` reads C's, and they are two orders of magnitude
