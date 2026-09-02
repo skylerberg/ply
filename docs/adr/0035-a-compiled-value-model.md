@@ -1,10 +1,21 @@
 # ADR 0035 — A compiled value model: layouts from types, counts without atomics, reuse
 
-**Decided, and nothing is landed.** The gate below is registered and has not
-been measured; `benches/value-model/PRE-REGISTERED.md` is its protocol and the
-bar is in `benches/value-model/analyze.py`, where a number cannot set it after
-the fact. `docs/BOOTSTRAP-PATH.md` step 9 carries this record's place in the
-path and step 10 what is built on it if the gate clears.
+**Decided; sequence steps 1 to 3 are landed, and the gate is not yet met.**
+`benches/value-model/PRE-REGISTERED.md` is the gate's protocol and the bar is
+in `benches/value-model/analyze.py`, where a number cannot set it after the
+fact; `baseline.txt` there is the series before anything was built and
+`after-words.txt` the series after steps 2 and 3. What landed: calls between
+compiled functions are direct and typed; a compiled value is one word, with
+records, constructors, lists, maps and native closures laid out as counted
+objects and everything else bridged; a remembered constant is kept as its
+word. What the second series says: both kernels are still over the bar, the
+integer one halved and the record one down by a fraction, and the whole front
+end under the backend takes half what it did. What is next, in order: the
+static half of Decision 1 — a field read at a known offset rather than by
+name through the runtime, which is where the integer kernel's remaining
+distance is — then step 4's drops and reuse, then native strings and bytes,
+then the seam's census. `docs/BOOTSTRAP-PATH.md` step 9 carries this record's
+place in the path and step 10 what is built on it if the gate clears.
 
 > **What this decides.** That the representation compiled Ply code runs on today
 > is an interpreter's, that no exception carved out for a hot function changes
@@ -115,11 +126,14 @@ the same point takes that cell; an append to a list whose count is one writes in
 place. Uniqueness is the count at run time, as ADR 0034 chose, so a multi-shot
 resumption degrades to a copy rather than breaking.
 
-**The list's structure is not decided here.** ADR 0034 refused a representation
-whose worst case is unbounded, and an array whose shared append copies the whole
-list is that representation. The first step is the trie with typed leaves, which
-keeps the bound; an array with a uniqueness fast path is a candidate to be priced
-afterwards under ADR 0034's own gates, and this record does not pre-empt them.
+**The list's structure is a candidate, not a decision.** ADR 0034 refused a
+representation whose worst case is unbounded, and an array whose shared append
+copies the whole list is that representation. What landed is that array — an
+append writes in place when nothing else holds the list and copies otherwise —
+because it is the simplest thing the words could carry, and ADR 0034's
+bounded-worst-case gate has not been run against compiled code. Until it is,
+the array is the candidate that record priced and not a decision, and the trie
+with typed leaves is the fallback if the gate refuses it.
 
 ## Decision 5 — calls are direct and typed
 
@@ -206,16 +220,22 @@ a baseline the change is read against and the kernels are known to run.
 
 ## Sequence
 
-1. The kernels and their Rust bars, under `benches/value-model`, and the baseline
-   series on today's fragment.
-2. Typed locals and direct calls (Decisions 2 and 5): `Kind` grows, a compiled
-   callee takes scalars in registers, and a callback is a direct call. K1 is the
-   kernel that moves.
-3. Records and constructors with fixed layouts, unboxed scalar fields, per-object
-   counts and in-place update (Decisions 1, 3 and 4). K2 is the kernel that
-   moves.
-4. Closures with typed captures, and the callback loops as direct calls.
-5. The list with typed leaves; the array candidate priced under ADR 0034's gates.
+1. **Landed.** The kernels and their Rust bars, under `benches/value-model`, and
+   the baseline series on today's fragment.
+2. **Landed, the calling half.** Direct and typed calls (Decision 5), with an
+   `Int` or a `Bool` in a register and everything else as its word; a callback
+   is still a call through the runtime's loop.
+3. **Landed, the representation half.** Words, with records, constructors,
+   lists, maps and native closures as counted objects (Decisions 1, 3 and 4 as
+   far as the layout goes), and a record's fields at the offsets its shape
+   fixes — read by name through the runtime still, which is the static half of
+   Decision 1 and the next step: a field read at a known offset, a literal
+   stored in place, from the types the checker publishes for parameters, calls
+   and constructors.
+4. Drops at a scope's end and reuse of a dying cell, so that uniqueness is the
+   common case a state loop sees rather than the exception.
+5. Native strings and bytes; the list's array candidate priced under ADR 0034's
+   gates, or the trie with typed leaves if it is refused.
 6. The seam's conversion and its census (Decision 6).
 7. Both kernels and the front-end row re-taken, and the decision rule applied.
 
