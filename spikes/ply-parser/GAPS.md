@@ -2162,3 +2162,44 @@ every node kind of the AST with every field spelled — the same record-update t
 as `derivable.rs` reads `ply_derive::rules::shape`: the type the deriver can
 encode and the type the checker admits are decided in one place, which is the
 only way they cannot disagree.
+
+## §19 The hasher, ported: `ply-hash` behind a sixth differential
+
+`hash.ply` is `crates/ply-hash` — `graph.rs`, `normalize.rs` and `lib.rs`: the
+reference graph over every top-level definition with Tarjan's components, the
+byte encoding with every sort that makes a reformatting free (record fields,
+row atoms, commuting `let`s, an effect's operations, a signature's
+constraints), the hash table built dependency-first, a cyclic component hashed
+as a unit under a labelling refined until nothing splits, the tests, laws,
+own-form keys and spec keys under their domain tags, and the reference graph's
+transitive closure. The hash is `std.hash.blake3`, BLAKE3 written in Ply, over
+the same bytes. `harness/tests/hash.rs` compares every hash `hash_program_ast`
+publishes, record by record, with `reference_hash_dump`, over the standard
+library, every example with it, the resolver's programs, both hand-written
+bundles, the checker's mined inputs and the hasher's own (`mine-hashes.py`,
+which yields the minority of that test file's programs written as source
+rather than built as trees); `arm-hash.sh` arms it.
+
+**What the port needed of the language.** A float literal is hashed by its
+IEEE bit pattern, and the parser spike carries a literal's text. The text
+reaches a correctly rounded `Float` through `decimal_of_string` and
+`float_of_decimal`, which read it as the reference's lexer does; what the
+language could not do was read the bits back, so `bits_of_float` and
+`float_of_bits` were added first, on their own. A `Decimal` literal's mantissa
+has up to 96 bits, more than an `Int`, so it is accumulated a byte at a time
+into the sixteen little-endian bytes the reference writes.
+
+**What agreed first time.** Every bundle, on the first run: an encoder is a
+walk that writes bytes, and a walk ports. The one shape worth naming is the
+row: the reference sorts a row's atoms by their encoding and holds their
+mentions back until the order is known, so that the reference graph is a
+function of the sorted row and not of the written one; the port threads a
+`deferred` list through the same walk.
+
+**Where the time went.** The first run over the standard library took minutes,
+and none of it was BLAKE3: the reference graph's transitive closure was a sorted
+list unioned by linear insertion, and a closure over the standard library is
+hundreds of names unioned once per edge. As a `Map` — the language's ordered
+map, whose keys come back in the byte order a `BTreeSet` iterates in — the same
+run takes seconds. The lesson §5 recorded for the lexer holds for every port: a
+set written as a list is a quadratic waiting for the first real input.
