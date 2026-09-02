@@ -68,6 +68,8 @@ const TOTAL_BUILTINS: &[&str] = &[
     "wrap_add",
     "wrap_sub",
     "wrap_mul",
+    // A rotate of the low word, total for the same reason and uninterpreted the same way.
+    "rotr32",
 ];
 
 /// Where lowering left the decidable fragment, for measurement only.
