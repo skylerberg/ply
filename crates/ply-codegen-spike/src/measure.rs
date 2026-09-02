@@ -21,6 +21,12 @@ pub const GROUP: &[&str] = &[
 /// is the cost of arriving.
 pub const ENTRY_FN: &str = "std.http.chunk_budget";
 
+/// The bound on nested calls the corpus's machines run under. A generated case whose arguments
+/// send the kernel into recursion runs until this bound on every evaluator, and the corpus draws
+/// thousands of them; what such a case checks — that every evaluator reaches the bound and says
+/// so — holds at a fraction of the machine's default, for a fraction of the time.
+pub const CORPUS_MAX_CALLS: usize = DEFAULT_MAX_CALLS / 8;
+
 pub struct Input {
     pub name: String,
     pub args: Vec<Value>,
@@ -44,6 +50,8 @@ pub struct Harness {
     pub machine: Machine<'static>,
     /// The same interpreter, with compiled bodies it may enter.
     pub hybrid: Machine<'static>,
+    /// The bound on nested calls both machines run under, and the fuel a direct call is given.
+    pub max_calls: usize,
 }
 
 impl Harness {
@@ -66,6 +74,18 @@ impl Harness {
         opts: Opts,
         entry: Option<&str>,
     ) -> Result<Harness> {
+        Harness::bounded(loaded, names, opts, entry, CORPUS_MAX_CALLS)
+    }
+
+    /// The same, with both machines bounded at `max_calls` nested calls: [`CORPUS_MAX_CALLS`] for
+    /// the corpus, the machine's own default where a fixture is about that default.
+    pub fn bounded(
+        loaded: &'static Loaded,
+        names: &[&str],
+        opts: Opts,
+        entry: Option<&str>,
+        max_calls: usize,
+    ) -> Result<Harness> {
         let mut all: Vec<&str> = names.to_vec();
         if let Some(entry) = entry
             && !all.contains(&entry)
@@ -77,14 +97,17 @@ impl Harness {
         let compiled_names: Vec<String> = all.iter().map(|n| (*n).to_string()).collect();
         let admitted = enterable(loaded, &compiled_names);
         let bodies = Rc::new(SpikeBodies::new(loaded, compiled, &admitted)?);
-        let machine = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check);
-        let mut hybrid = Machine::new(&loaded.ast, &loaded.resolved, &loaded.check);
+        let machine =
+            Machine::new(&loaded.ast, &loaded.resolved, &loaded.check).with_max_calls(max_calls);
+        let mut hybrid =
+            Machine::new(&loaded.ast, &loaded.resolved, &loaded.check).with_max_calls(max_calls);
         hybrid.set_compiled(bodies.clone());
         Ok(Harness {
             loaded,
             bodies,
             machine,
             hybrid,
+            max_calls,
         })
     }
 
@@ -132,8 +155,7 @@ impl Harness {
     /// A direct native call, outside any machine: the performance verdict's original path, and the only one that
     /// can report the fragment's own failure.
     pub fn compiled_call(&mut self, name: &str, args: &[Value]) -> Result<Value> {
-        self.bodies
-            .call_direct(name, args, DEFAULT_MAX_CALLS as i64)
+        self.bodies.call_direct(name, args, self.max_calls as i64)
     }
 }
 
