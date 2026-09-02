@@ -329,9 +329,11 @@ measurement is confounded until the earlier one has moved.
    type as loads, the callbacks as loops in the body, memory reused within an
    entry, the seam's memo, the map as a tree, tests as roots, and a dying
    record as the next one's memory, a lookup a match unwraps answering the
-   value, and the hottest builtins as direct calls over values made once; its
-   series are `benches/value-model/after-direct.txt` and
-   `benches/front-end-whole/observation-6.txt`.
+   value, the hottest builtins as direct calls over values made once, a
+   literal step as the loop's own body, the round's rotate as one
+   instruction, and a parameter a body only reads borrowed for the call; its
+   series are `benches/value-model/after-borrows.txt` and
+   `benches/front-end-whole/observation-8.txt`.
 10. **Emit C, for release; inside the loop it is priced and not chosen.** Where
     the path ends, decided as a direction and gated on step 9: the eventual host
     is a C compiler and libc, with the compiler and its runtime written in Ply,
@@ -339,10 +341,10 @@ measurement is confounded until the earlier one has moved.
     and not a step to start because emitting C onto today's representation
     would move a slow model to a different host, and step 9 is what decides
     whether the model competes. Whether the loop's tier is the same C over
-    smaller units or a second code generator is ADR 0037's question, and it
-    turns on a constant per changed definition that `benches/c-floor/` prices
-    rather than on an exponent. §"Where this ends" below is the order once
-    step 9 clears.
+    smaller units or a second code generator is ADR 0037's question, and
+    `benches/c-floor/` prices what C charges: constants per changed definition
+    and per run, not the exponent that question was first argued from.
+    §"Where this ends" below is the order once step 9 clears.
 
 ## The loop, which is what the path is for
 

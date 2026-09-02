@@ -767,6 +767,7 @@ impl<'a> Checker<'a> {
                 "wrap_mul",
                 mono(vec![Type::int(), Type::int()], Type::int()),
             ),
+            ("rotr32", mono(vec![Type::int(), Type::int()], Type::int())),
             ("min", mono(vec![Type::int(), Type::int()], Type::int())),
             ("max", mono(vec![Type::int(), Type::int()], Type::int())),
             // The inverse of `bytes_at`, which had none.
