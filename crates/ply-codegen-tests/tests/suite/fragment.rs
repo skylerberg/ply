@@ -150,8 +150,8 @@ fn the_fragment_is_neither_empty_nor_everything() {
         total,
         unit.compiled().len()
     );
-    // `shaped` returns a `List<Int>`, so the seam could never carry its answer and it is not
-    // registered — which is the gap `Mutation::Unoffered` lives in.
+    // `adder` answers a function, which the seam never carries, so a call of it declines however
+    // wide the registry — the gap `Mutation::Unoffered` lives in.
     assert!(!unit.compiled().is_empty());
     let members: Vec<&str> = unit.compiled().iter().map(String::as_str).collect();
     assert!(members.contains(&"m.double"), "{members:?}");
@@ -259,8 +259,9 @@ fn a_compiled_body_answers_over_closures_and_callbacks() {
     }
 }
 
-/// A closure never crosses the seam: a definition answering a function is not registered, so a
-/// call of it declines, while the compiled body that calls through the same closure answers.
+/// A closure never crosses the seam: a definition answering a function is registered like any
+/// other, runs, and has its answer refused by the backend itself, while the compiled body that
+/// calls through the same closure answers.
 #[test]
 fn a_native_closure_stays_inside_the_entry_that_made_it() {
     let (_, unit) = unit(CLOSURES);
@@ -288,8 +289,12 @@ fn a_callback_that_raises_declines_rather_than_answering() {
 #[test]
 fn a_definition_the_fragment_has_no_body_for_is_declined() {
     let (_, unit) = unit(ARITHMETIC);
-    assert_eq!(call(unit, "m.shaped", &[Value::Int(1)]), None);
     assert_eq!(call(unit, "m.no_such_function", &[Value::Int(1)]), None);
+    // A carried list answer crosses now that every compiled function is registered.
+    assert_eq!(
+        call(unit, "m.shaped", &[Value::Int(1)]),
+        Some(Value::list(vec![Value::Int(1), Value::Int(1)]))
+    );
 }
 
 /// A call with the wrong number of arguments declines rather than reading past the argument array

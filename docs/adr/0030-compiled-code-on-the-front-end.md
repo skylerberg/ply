@@ -431,7 +431,11 @@ arm became two-thirds slower than no backend at all.**
 3. **The narrow registry stays the default**, because the front end is the
    bootstrap workload and the pre-registered bar for changing it was not met. The
    widening knob ships as measurement scaffolding, **because the arm it enables
-   is the one that produced the sentence above.**
+   is the one that produced the sentence above.** *Flipped since: with
+   the callback family lowered the wide registry enters at the parse root and
+   beats no backend on this record's own row, re-taken under a pre-registered
+   rule (`benches/front-end`); the narrow registry is now the knob,
+   `PLY_CODEGEN_REGISTER=narrow`, kept as the arm this record measured.*
 4. **This workload is retired as a policing workload and kept as a timing
    workload.** Every claim about whether the seam is policed belongs to the
    workspace corpus.
