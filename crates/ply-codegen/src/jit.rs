@@ -81,8 +81,8 @@ struct Helpers {
     list_fits: FuncId,
     list_at: FuncId,
     list_rest: FuncId,
-    ctor_is: FuncId,
     ctor_arg: FuncId,
+    map_lookup: FuncId,
     record: FuncId,
     record_update: FuncId,
     field: FuncId,
@@ -548,8 +548,8 @@ impl Jit {
             list_fits: declare(&mut module, "rt_list_fits", 4, true)?,
             list_at: declare(&mut module, "rt_list_at", 3, true)?,
             list_rest: declare(&mut module, "rt_list_rest", 3, true)?,
-            ctor_is: declare(&mut module, "rt_ctor_is", 3, true)?,
             ctor_arg: declare(&mut module, "rt_ctor_arg", 4, true)?,
+            map_lookup: declare(&mut module, "rt_map_lookup", 3, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
             record_update: declare(&mut module, "rt_record_update", 6, true)?,
             field: declare(&mut module, "rt_field", 4, true)?,
@@ -3463,7 +3463,7 @@ impl Fx<'_, '_> {
                 self.builder.ins().jump(hit, &[]);
             }
             Pat::Var { name: id, .. } => match self.ctor_of(&QName::bare(id.clone())) {
-                Some((index, 0)) => self.test_ctor(value, index, hit, miss),
+                Some((index, 0)) => self.test_ctor(value, index, 0, hit, miss),
                 _ => {
                     self.builder.ins().jump(hit, &[]);
                 }
@@ -3564,17 +3564,14 @@ impl Fx<'_, '_> {
                     home: 0,
                 };
                 let mut cur = self.builder.create_block();
-                self.test_ctor(boxed, index, cur, miss);
+                self.test_ctor(boxed, index, arity, cur, miss);
                 for (i, arg) in args.iter().enumerate() {
                     if self.irrefutable(arg) {
                         continue;
                     }
                     self.builder.switch_to_block(cur);
                     self.builder.seal_block(cur);
-                    let at = self.builder.ins().iconst(types::I64, i as i64);
-                    let read = self.builder.ins().iconst(types::I64, 0);
-                    let sub = self.helper(self.jit.helpers.ctor_arg, &[base, at, read]);
-                    self.check();
+                    let sub = self.ctor_arg_inline(base, i, false);
                     let next = self.builder.create_block();
                     self.test_pattern(
                         arg,
@@ -3648,12 +3645,92 @@ impl Fx<'_, '_> {
         Ok(())
     }
 
-    fn test_ctor(&mut self, value: Val, index: usize, hit: Block, miss: Block) {
+    /// Whether `value` is the constructor at `index` with `arity` arguments: a pointer whose
+    /// header says so, read inline.
+    fn test_ctor(&mut self, value: Val, index: usize, arity: usize, hit: Block, miss: Block) {
         let v = self.boxed(value);
-        let index = self.builder.ins().iconst(types::I64, index as i64);
-        let is = self.helper(self.jit.helpers.ctor_is, &[v, index]);
-        let is = self.builder.ins().icmp_imm(IntCC::NotEqual, is, 0);
+        let pointer = self.builder.create_block();
+        let tagged = self.builder.ins().band_imm(v, 1);
+        let tagged = self.builder.ins().icmp_imm(IntCC::NotEqual, tagged, 0);
+        let empty = self.builder.ins().icmp_imm(IntCC::Equal, v, 0);
+        let skip = self.builder.ins().bor(empty, tagged);
+        self.builder.ins().brif(skip, miss, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let flags = MemFlags::trusted();
+        let kind = self.builder.ins().uload8(types::I32, flags, v, 4);
+        let is_ctor =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::heap::KIND_CTOR));
+        let len = self.builder.ins().load(types::I32, flags, v, 8);
+        let has_arity = self.builder.ins().icmp_imm(IntCC::Equal, len, arity as i64);
+        let layout = self.builder.ins().load(types::I32, flags, v, 12);
+        let is_index = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::Equal, layout, index as i64);
+        let is = self.builder.ins().band(is_ctor, has_arity);
+        let is = self.builder.ins().band(is, is_index);
         self.builder.ins().brif(is, hit, &[], miss, &[]);
+    }
+
+    /// Argument `i` of a constructor value: a load, taken out of a constructor nothing else
+    /// holds when `take` is set and held once more otherwise. A value whose header says it is
+    /// not a constructor with that argument enters the runtime's path, which raises.
+    fn ctor_arg_inline(
+        &mut self,
+        base: cranelift_codegen::ir::Value,
+        i: usize,
+        take: bool,
+    ) -> cranelift_codegen::ir::Value {
+        let fast = self.builder.create_block();
+        let slow = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.append_block_param(done, types::I64);
+        let flags = MemFlags::trusted();
+        let tagged = self.builder.ins().band_imm(base, 1);
+        let tagged = self.builder.ins().icmp_imm(IntCC::NotEqual, tagged, 0);
+        let empty = self.builder.ins().icmp_imm(IntCC::Equal, base, 0);
+        let bad = self.builder.ins().bor(empty, tagged);
+        let check = self.builder.create_block();
+        self.builder.ins().brif(bad, slow, &[], check, &[]);
+        self.builder.switch_to_block(check);
+        self.builder.seal_block(check);
+        let kind = self.builder.ins().uload8(types::I32, flags, base, 4);
+        let is_ctor =
+            self.builder
+                .ins()
+                .icmp_imm(IntCC::Equal, kind, i64::from(crate::heap::KIND_CTOR));
+        let len = self.builder.ins().load(types::I32, flags, base, 8);
+        let in_range = self
+            .builder
+            .ins()
+            .icmp_imm(IntCC::UnsignedGreaterThan, len, i as i64);
+        let ok = self.builder.ins().band(is_ctor, in_range);
+        self.builder.ins().brif(ok, fast, &[], slow, &[]);
+        self.builder.switch_to_block(fast);
+        self.builder.seal_block(fast);
+        let w = self
+            .builder
+            .ins()
+            .load(types::I64, flags, base, (HEADER + 8 * i) as i32);
+        if take {
+            self.take_field_inline(base, i, w);
+        } else {
+            self.inc_inline(w);
+        }
+        self.builder.ins().jump(done, &[BlockArg::Value(w)]);
+        self.builder.switch_to_block(slow);
+        self.builder.seal_block(slow);
+        let at = self.builder.ins().iconst(types::I64, i as i64);
+        let taking = self.builder.ins().iconst(types::I64, i64::from(take));
+        let v = self.helper(self.jit.helpers.ctor_arg, &[base, at, taking]);
+        self.check();
+        self.builder.ins().jump(done, &[BlockArg::Value(v)]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+        self.builder.block_params(done)[0]
     }
 
     /// The bindings a pattern makes, emitted in the block that has already committed to the arm.
@@ -3734,10 +3811,7 @@ impl Fx<'_, '_> {
                         continue;
                     }
                     let ty = payload_tys.get(i).copied().unwrap_or(0);
-                    let i = self.builder.ins().iconst(types::I64, i as i64);
-                    let take = self.builder.ins().iconst(types::I64, i64::from(moving));
-                    let v = self.helper(self.jit.helpers.ctor_arg, &[base, i, take]);
-                    self.check();
+                    let v = self.ctor_arg_inline(base, i, moving);
                     self.bind_pattern(
                         arg,
                         Val {
@@ -3788,7 +3862,151 @@ impl Fx<'_, '_> {
         Ok(())
     }
 
+    /// A `match` over `map_get` whose arms only ask whether the key was found — `Some(p)`,
+    /// `None`, `_` — is a lookup answering the value or nothing, and no constructor is built:
+    /// the arms test that word directly.
+    fn lookup_match(
+        &mut self,
+        scrutinee: &Code,
+        arms: &[Arm],
+        scope: &mut Scope,
+    ) -> Result<Option<Val>> {
+        let NodeKind::App { func, args, .. } = &scrutinee.kind else {
+            return Ok(None);
+        };
+        let NodeKind::Var { name: q, .. } = &func.kind else {
+            return Ok(None);
+        };
+        if args.len() != 2 || !q.is_bare() || scope.iter().any(|(s, _)| s == q.symbol()) {
+            return Ok(None);
+        }
+        let Denotes::Builtin(index) = self.denotation(q, scope)? else {
+            return Ok(None);
+        };
+        if self.jit.builtins[index] != Builtin::MapGet {
+            return Ok(None);
+        }
+        let (Some(some), Some(none)) = (self.jit.layouts.some, self.jit.layouts.none) else {
+            return Ok(None);
+        };
+        // Which arms this shape serves: `Some(p)`, `None`, a wildcard, no guards.
+        enum Shape<'a> {
+            Found(&'a Pat),
+            Missing,
+            Any,
+        }
+        let mut shapes = Vec::with_capacity(arms.len());
+        for arm in arms {
+            if arm.guard.is_some() {
+                return Ok(None);
+            }
+            let shape = match &arm.pat {
+                Pat::Wildcard => Shape::Any,
+                Pat::Ctor { name, args } => match self.ctor_of(name) {
+                    Some((i, 1)) if i as u32 == some && args.len() == 1 => Shape::Found(&args[0]),
+                    Some((i, 0)) if i as u32 == none && args.is_empty() => Shape::Missing,
+                    _ => return Ok(None),
+                },
+                Pat::Var { name: id, .. } => match self.ctor_of(&QName::bare(id.clone())) {
+                    Some((i, 0)) if i as u32 == none => Shape::Missing,
+                    _ => return Ok(None),
+                },
+                _ => return Ok(None),
+            };
+            shapes.push(shape);
+        }
+        let mut handles = Vec::with_capacity(2);
+        for a in args.iter() {
+            let v = self.consumed(a, scope)?;
+            let h = self.boxed(v);
+            handles.push(h);
+        }
+        let found = self.helper(self.jit.helpers.map_lookup, &[handles[0], handles[1]]);
+        self.check();
+        let present = self.builder.ins().icmp_imm(IntCC::NotEqual, found, 0);
+        let join = self.builder.create_block();
+        self.builder.append_block_param(join, types::I64);
+        let mut next = self.builder.create_block();
+        self.builder.ins().jump(next, &[]);
+        let mut ty: Option<u32> = None;
+        for (arm, shape) in arms.iter().zip(&shapes) {
+            self.builder.switch_to_block(next);
+            self.builder.seal_block(next);
+            let body_block = self.builder.create_block();
+            let after = self.builder.create_block();
+            let value = Val {
+                kind: Kind::Boxed,
+                v: found,
+                ty: 0,
+                home: 0,
+            };
+            match shape {
+                Shape::Found(p) => {
+                    let inner_test = self.builder.create_block();
+                    self.builder
+                        .ins()
+                        .brif(present, inner_test, &[], after, &[]);
+                    self.builder.switch_to_block(inner_test);
+                    self.builder.seal_block(inner_test);
+                    self.test_pattern(p, value, body_block, after)?;
+                }
+                Shape::Missing => {
+                    self.builder
+                        .ins()
+                        .brif(present, after, &[], body_block, &[]);
+                }
+                Shape::Any => {
+                    self.builder.ins().jump(body_block, &[]);
+                }
+            }
+            self.builder.switch_to_block(body_block);
+            self.builder.seal_block(body_block);
+            let mut inner = scope.clone();
+            let mark = self.homes.len();
+            // The value found is held once by this match; a pattern binding the whole of it
+            // takes that hold, and any other pattern leaves it to be let go here.
+            match shape {
+                Shape::Found(p) => {
+                    self.bind_pattern(p, value, true, &mut inner)?;
+                    let binds_whole = matches!(p, Pat::Var { name: id, .. }
+                        if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))));
+                    if !binds_whole {
+                        self.dec_inline(found);
+                    }
+                }
+                Shape::Any => self.dec_inline(found),
+                Shape::Missing => {}
+            }
+            let body = self.consumed(&arm.body, &mut inner)?;
+            self.release_homes_from(mark);
+            ty = match ty {
+                None => Some(body.ty),
+                Some(t) if t == body.ty => Some(t),
+                Some(_) => Some(0),
+            };
+            let body = self.boxed(body);
+            self.builder.ins().jump(join, &[BlockArg::Value(body)]);
+            next = after;
+        }
+        self.builder.switch_to_block(next);
+        self.builder.seal_block(next);
+        self.dec_inline(found);
+        self.helper_void(self.jit.helpers.no_match, &[]);
+        self.builder.ins().jump(self.failure, &[]);
+        self.builder.switch_to_block(join);
+        self.builder.seal_block(join);
+        Ok(Some(Val {
+            kind: Kind::Boxed,
+            v: self.builder.block_params(join)[0],
+            ty: ty.unwrap_or(0),
+            home: 0,
+        }))
+    }
+
     fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], scope: &mut Scope) -> Result<Val> {
+        if let Some(v) = self.lookup_match(scrutinee, arms, scope)? {
+            return Ok(v);
+        }
         let value = self.expr(scrutinee, scope)?;
         let join = self.builder.create_block();
         self.builder.append_block_param(join, types::I64);
@@ -3812,6 +4030,14 @@ impl Fx<'_, '_> {
             let moving = !self.is_borrowed_local(scrutinee, scope);
             let mark = self.homes.len();
             self.bind_pattern(&arm.pat, value, moving, &mut inner)?;
+            // A temporary scrutinee is held once by this match: a pattern binding the whole
+            // of it took that hold into the binding, and any other pattern leaves the shell —
+            // its fields taken — to be let go here, before the body runs.
+            let binds_whole = matches!(&arm.pat, Pat::Var { name: id, .. }
+                if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))));
+            if !self.is_local(scrutinee, scope) && !binds_whole && value.kind == Kind::Boxed {
+                self.dec_inline(value.v);
+            }
             let body = self.consumed(&arm.body, &mut inner)?;
             self.release_homes_from(mark);
             // The arms' type, when every arm agrees.
