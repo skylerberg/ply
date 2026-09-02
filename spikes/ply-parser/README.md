@@ -37,7 +37,7 @@ diagnostic for diagnostic** over every `.ply` file in the tree.
 | `exprs.ply` | Expressions, precedence, blocks, `handle`. |
 | `items.ply` | `fn`/`type`/`effect`/`test`/`law`/`derive`/`effect set`, imports, and `run`. |
 | `harness/` | A separate cargo project: the reference-side dumper, the differential, `refdump`. It enters `ply_syntax` at `parse_unexpanded`, so the two sides are the same phase; `GAPS.md` §11R.D. |
-| `fixtures/` | 26 hand-written `.ply` plus `reference-tests.corpus` — 716 inputs mined from the reference's own tests. |
+| `fixtures/` | Hand-written `.ply` files plus `reference-tests.corpus`, every string literal in the reference's own test file, re-mined by `mine-fixtures.py` whenever the reference grows syntax; the agreement test prints the count. |
 | `GAPS.md` | **The point of the spike.** Consolidates the five area files below and takes the multiplier. |
 | `GAPS-{spine,types,exprs,items,harness}.md` | The per-area records, kept: each carries its own measurements and every run of them. |
 

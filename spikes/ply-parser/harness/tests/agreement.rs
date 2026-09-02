@@ -466,6 +466,10 @@ fn the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics() {
             ("E0105".to_string(), 1usize),
             ("E0114".to_string(), 4),
             ("E0115".to_string(), 2),
+            ("E0116".to_string(), 6),
+            ("E0117".to_string(), 1),
+            ("E0118".to_string(), 17),
+            ("E0119".to_string(), 10),
         ]
         .into_iter()
         .collect(),
@@ -477,8 +481,8 @@ fn the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics() {
 
     // The tree half, printed rather than pinned: it moves whenever a `.ply` in the tree gains or
     // loses a `?`, which is not a fact about this spike.
-    let mut added = 0usize;
-    let mut biggest: Vec<(usize, String)> = Vec::new();
+    let mut added = 0isize;
+    let mut biggest: Vec<(isize, String)> = Vec::new();
     for dir in ["examples", "crates/ply-std/ply"] {
         for path in ply_files(&repo_root().join(dir)) {
             let n = ply_parser_spike_harness::nodes_the_rewrites_add(
