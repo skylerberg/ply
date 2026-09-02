@@ -243,6 +243,18 @@ impl List {
     pub fn is_unique(&mut self) -> bool {
         Arc::get_mut(&mut self.tail).is_some() && self.root.as_mut().is_none_or(unique_path)
     }
+
+    /// What identifies this list without walking it: its tail's and root's allocations and the
+    /// window it shows of them. Two lists with one identity hold the same elements, for as long
+    /// as one of them keeps those allocations alive.
+    pub fn identity(&self) -> (usize, usize, usize, usize) {
+        (
+            Arc::as_ptr(&self.tail) as usize,
+            self.root.as_ref().map_or(0, |r| Arc::as_ptr(r) as usize),
+            self.len as usize,
+            self.start as usize,
+        )
+    }
 }
 
 fn drain_node(node: Arc<Node>, out: &mut Vec<Value>) {

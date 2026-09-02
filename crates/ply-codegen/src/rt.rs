@@ -16,6 +16,7 @@ use crate::list;
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -42,9 +43,131 @@ pub struct Tables {
     /// The two hundred and fifty-six one-byte values, each made immortal the first time it is
     /// asked for, so `byte_of_int` allocates nothing.
     pub bytes: RefCell<[Word; 256]>,
+    /// The memo's words as the values the seam converted them to, once each, and those values'
+    /// identities back to the words: what lets a phase's tree cross the seam and come back
+    /// without being rebuilt either way.
+    pub memo_values: RefCell<HashMap<Word, Value>>,
+    pub memo_words: RefCell<HashMap<Identity, Word>>,
+    /// The answers of roots called with nothing but memo words, by the root and the words:
+    /// a pure function of remembered inputs, remembered in turn, up to a bound.
+    pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
+}
+
+/// How many calls of roots over memo words a unit remembers; past it, a call is run and
+/// converted as any other.
+pub const CALL_MEMO_LIMIT: usize = 64;
+
+/// How many of an answer's parts are given identities of their own, one level down: the fields
+/// a body pulls out of a record or a constructor, and the elements of a short list.
+const PARTS_LIMIT: usize = 64;
+
+/// What identifies a value the seam handed out, without walking it: the allocation behind it
+/// and, for a list, the window it shows of that allocation. A value with no allocation of its
+/// own has no identity and is converted like any other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Identity {
+    Record(usize),
+    Str(usize),
+    Bytes(usize),
+    List(usize, usize, usize, usize),
+}
+
+fn identity(v: &Value) -> Option<Identity> {
+    Some(match v {
+        Value::Record(fields) => Identity::Record(Arc::as_ptr(fields) as usize),
+        Value::Str(s) => Identity::Str(Arc::as_ptr(s) as *const u8 as usize),
+        Value::Bytes(b) => Identity::Bytes(Arc::as_ptr(b) as *const u8 as usize),
+        Value::List(items) => {
+            let (tail, root, len, start) = items.identity();
+            Identity::List(tail, root, len, start)
+        }
+        _ => return None,
+    })
 }
 
 impl Tables {
+    /// The memo's word for the pure nullary function at `index`, if it has one.
+    pub fn memoized(&self, index: usize) -> Option<Word> {
+        self.memo.borrow().get(index).copied().flatten()
+    }
+
+    /// Remembers `w`, world-independent, as the answer of the pure nullary function at `index`:
+    /// a copy in the tables' own heap, which outlives every entry, answered from then on.
+    pub fn memoize(&self, index: usize, w: Word) -> Word {
+        let kept = self.immortals.borrow_mut().adopt(w);
+        let mut memo = self.memo.borrow_mut();
+        if memo.len() <= index {
+            memo.resize(index + 1, None);
+        }
+        memo[index] = Some(kept);
+        kept
+    }
+
+    /// The value a memo word was converted to before, if it was.
+    pub fn memo_value(&self, w: Word) -> Option<Value> {
+        self.memo_values.borrow().get(&w).cloned()
+    }
+
+    /// The memo word a value came from, if the seam handed that value out. The values kept in
+    /// `memo_values` hold their allocations, so an identity here cannot be a later value's.
+    pub fn memo_word(&self, v: &Value) -> Option<Word> {
+        let id = identity(v)?;
+        self.memo_words.borrow().get(&id).copied()
+    }
+
+    /// Keeps the value a memo word was just converted to, and gives the value's parts one level
+    /// down — a record's fields, a constructor's arguments, a short list's elements — the words
+    /// they came from, since a body that takes a memo value apart hands those parts back in.
+    pub fn remember(&self, w: Word, v: &Value) {
+        self.memo_values.borrow_mut().insert(w, v.clone());
+        let mut words = self.memo_words.borrow_mut();
+        if let Some(id) = identity(v) {
+            words.insert(id, w);
+        }
+        let o = obj(w);
+        let parts: Vec<(Word, &Value)> = match v {
+            Value::Record(fields) => fields
+                .iter()
+                .enumerate()
+                .map(|(i, (_, part))| (unsafe { word_at(o, i) }, part))
+                .collect(),
+            Value::Ctor { args, .. } => args
+                .iter()
+                .enumerate()
+                .map(|(i, part)| (unsafe { word_at(o, i) }, part))
+                .collect(),
+            Value::List(items) if items.len() <= PARTS_LIMIT => items
+                .iter()
+                .enumerate()
+                .map(|(i, part)| (list::get(o, i), part))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (part_word, part) in parts.into_iter().take(PARTS_LIMIT) {
+            if let Some(id) = identity(part) {
+                words.insert(id, part_word);
+            }
+        }
+    }
+
+    /// The remembered answer of `root` over exactly these memo words, if it has one.
+    pub fn memo_call(&self, root: &Symbol, words: &[Word]) -> Option<Value> {
+        let kept = *self.calls.borrow().get(&(root.clone(), words.to_vec()))?;
+        self.memo_value(kept)
+    }
+
+    /// Remembers `out`, world-independent, as the answer of `root` over these memo words, up to
+    /// the bound; answers the word to keep, or nothing when the bound is reached.
+    pub fn memoize_call(&self, root: &Symbol, words: &[Word], out: Word) -> Option<Word> {
+        let mut calls = self.calls.borrow_mut();
+        if calls.len() >= CALL_MEMO_LIMIT {
+            return None;
+        }
+        let kept = self.immortals.borrow_mut().adopt(out);
+        calls.insert((root.clone(), words.to_vec()), kept);
+        Some(kept)
+    }
+
     /// The immortal `Bytes` holding just `b`.
     pub fn byte(&self, b: u8) -> Word {
         let cached = self.bytes.borrow()[b as usize];
@@ -987,16 +1110,9 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     }
     // Remembered as a copy in the tables' own heap, which outlives the entry's memory; the
     // entry keeps using its own word.
-    if !heap::world_independent(w) {
-        return w;
+    if heap::world_independent(w) {
+        tables.memoize(index as usize, w);
     }
-    let kept = tables.immortals.borrow_mut().adopt(w);
-    let mut memo = tables.memo.borrow_mut();
-    let index = index as usize;
-    if memo.len() <= index {
-        memo.resize(index + 1, None);
-    }
-    memo[index] = Some(kept);
     w
 }
 
