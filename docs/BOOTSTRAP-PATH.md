@@ -13,6 +13,13 @@ O(project), fast enough to sit inside the sub-second verification loop the
 project exists to make fast. "Reasonably close to Rust" means that loop, not a
 benchmark.
 
+**That is one of two goals this file carried as one, and ADR 0037 splits them.**
+The loop is the goal. A dependency line drawn where Rust's is — a C compiler and
+libc — is a second one, which the loop does not require and which
+§"Where this ends" holds as a direction. The split changes what is ordered
+first: the loop's own gaps are not steps on the path below, they are what the
+path is for, and §"The loop, which is what the path is for" carries them.
+
 ## Where it stands
 
 **No longer a blocker, and each is checked by something in the tree:**
@@ -325,15 +332,64 @@ measurement is confounded until the earlier one has moved.
    value, and the hottest builtins as direct calls over values made once; its
    series are `benches/value-model/after-direct.txt` and
    `benches/front-end-whole/observation-6.txt`.
-10. **Emit C.** Where the path ends, decided as a direction and gated on step 9:
-    the eventual host is a C compiler and libc, with the compiler and its
-    runtime written in Ply, which is the line Rust itself holds above LLVM and
-    libc. It is a direction and not a step to start, for one reason: emitting C
-    onto today's representation would move a slow model to a different host,
-    and step 9 is what decides whether the model competes. §"Where this ends"
-    below is the order it is taken in once it does.
+10. **Emit C, for release and not for the loop.** Where the path ends, decided
+    as a direction and gated on step 9: the eventual host is a C compiler and
+    libc, with the compiler and its runtime written in Ply, which is the line
+    Rust itself holds above LLVM and libc. Two reasons it is a direction and not
+    a step to start, and ADR 0037 added the second. Emitting C onto today's
+    representation would move a slow model to a different host, and step 9 is
+    what decides whether the model competes. And **C is refused inside the
+    loop**: a compiler invocation is a process and a program is a link, so a
+    loop built on emitted C has an O(project) floor by construction, which is
+    the exponent ADR 0021 exists to avoid. C is the release tier and the loop
+    keeps a tier of its own. §"Where this ends" below is the order once step 9
+    clears.
 
-## Where this ends: a C compiler and libc
+## The loop, which is what the path is for
+
+ADR 0037 records the split and the refusal; this is what it means for the order
+of work. **The loop's gaps are not steps on the path above.** They are not gated
+on the bootstrap, they pay off before any of it lands, and the path is worth
+ordering only if the loop it serves is the thing ADR 0021 claims.
+
+What the loop already has. The front end is cached by content —
+`DefHash -> interface`, `crates/ply-store/src/frontend.rs` — and a test is
+selected against the definition set it last passed under, which
+`ply_store::PassRecord` holds as the test's own hash together with every
+function and declaration in its closure, so a test re-runs only when something
+it reaches moved. Selecting nothing after a rename is an invariant the suite
+asserts rather than a heuristic:
+`crates/ply-cli/tests/suite/cli.rs renaming_a_definition_re_runs_nothing`.
+
+What it does not have:
+
+- **A compiled-code cache.** `crates/ply-codegen` persists nothing across runs:
+  no `DefHash -> code`, and `cranelift-jit` rather than `cranelift-object`, so
+  there is no object output for a cache to hold. Every `--backend` run compiles
+  the whole reachable program again, and a `.plyx` carries definitions rather
+  than code, so building one does not change it. The front end got its
+  content-addressed cache and the backend never did, which leaves the backend
+  the one stage of the loop still O(project) per invocation — now that the loop
+  depends on it for speed.
+- **A warm process.** No `watch`, no daemon and no server in `Command`: an
+  invocation starts cold, reads the caches from disk and exits. A warm process
+  holds interfaces, compiled code and selection in memory, and sidesteps
+  serialising compiled code at all, which is the harder half of the gap above.
+- **A row that measures an edit.** Every row under `benches/` measures work
+  proportional to the project, and "warm" in those pre-registrations means the
+  cache was warmed so that it would not vary. ADR 0037 registers the missing
+  one — five edits, the same five against the Rust tree as the control, every
+  arm taken at two project sizes and fitted, because a claim about an exponent
+  cannot be tested at one size. **Not built**, though not from nothing:
+  `ply-corpus sweep` already varies a generated project's size and
+  `ply-corpus w5` already times a rebuild after a one-leaf edit, and what is
+  missing is a row that does both at once and does it under `--backend`.
+
+Take that row before re-ordering anything above it. A lever's share of a
+whole-project run says nothing about its share of one edit, and every row the
+path above is ordered on measures the former.
+
+## Where this ends: two tiers, over a C compiler and libc
 
 Every language rests on a host it did not write. Rust's is LLVM, libc and the
 kernel, and everything with language content — the front end, the middle, the
@@ -343,6 +399,15 @@ compiled code calls, the driver and the host effects are all Rust. The path ends
 when that line is where Rust's is: a Ply compiler, written in Ply, emitting C
 whose only external dependencies are a C compiler and the C library, over a
 runtime written in Ply or a thin C shim.
+
+**It ends in two tiers rather than one** (ADR 0037). Emitted C is the release
+tier: `ply build`, distribution, and a bootstrap chain anyone can follow with a
+C compiler alone. The loop keeps a tier of its own, in process, because a spawn
+and a link are not marginal costs and the loop's entire claim is that its costs
+are. Cranelift is that tier today and is a Rust library, so this goal takes it
+away eventually; what replaces it is undecided, and ADR 0037 names
+copy-and-patch as the candidate that would put a C compiler at build time and
+out of the loop.
 
 The route is visible already, which is why it can be written down before it is
 started. The runtime surface compiled code depends on is an enumerated table —
@@ -362,7 +427,8 @@ port in this tree has been:
    answers the same, over the differential corpus. C rather than machine code
    because a C compiler is portable, debuggable and the route most self-hosted
    languages took at this stage; Cranelift is a Rust library, so a Ply backend
-   over it would still link Rust.
+   over it would still link Rust. **This is the release tier.** The loop's tier
+   is a separate build and ADR 0037 says why it cannot be this one.
 4. **A runtime over libc** behind the same ABI: values as step 9 laid them out,
    counts, reuse, strings, the ordered map, and the host effects over the C
    library. The open design question is effects with captured continuations —
@@ -394,6 +460,13 @@ regression.
 - **If step 9's kernels clear and the front-end row does not move.** Then the
   cost is at the seam or in dispatch rather than in the values, and ADR 0035's
   census is what says which; the C target waits either way.
+- **If the marginal-change row finds the loop already flat and already small.**
+  Then the gaps §"The loop, which is what the path is for" names are
+  theoretical, and ADR 0037's re-ordering should be given back.
+- **If no loop tier can be built without Rust at a latency the loop affords.**
+  Then the two goals are one after all, the release tier is the only tier, and
+  what gives is either the sub-second claim or the dependency line — ADR 0037
+  does not say which.
 - **If the compiled model cannot come within its factor of Rust on either
   kernel.** Then the bootstrap's front end cannot sit inside the loop ADR 0021
   exists for, on any host, and what to change is the model's decisions the
@@ -406,3 +479,5 @@ ADR 0030's row clears its bar, and this file should be corrected in place when
 it does: replace the sentence, do not add a block saying the sentence moved.
 And §"Where this ends" is a direction with an order, not a commitment to a
 date: each stage is gated on the one before it, and the first gate is step 9's.
+And it is not a plan for the loop: ADR 0037 carries that, and orders the two
+against each other there rather than here.

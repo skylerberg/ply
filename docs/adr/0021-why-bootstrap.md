@@ -28,6 +28,14 @@ Rust — it is measured as slower by more than an order of magnitude, **and that
 is a floor.** It is that compiler work done *in Ply* would verify in time
 proportional to the edit, **and compiler work done in Rust never will.**
 
+**That is a claim about this repository before it is a claim about anyone
+else's.** Ply's own loop is a Rust loop: the unit of rebuild is the crate, a
+release build gates every measurement in the tree, and every improvement Ply
+makes to definition-level incrementality reaches every project except the one
+building Ply. The bootstrap is what puts the language's own development inside
+the language's own thesis, and that compounding is the payoff this record has no
+other route to.
+
 ## Why today's measurement is the wrong instrument
 
 The obvious way to price this is to measure what fraction of an agent's wall
@@ -128,3 +136,12 @@ Ply program, and each is a precondition.
 interpreter and that decision stands. **This records why the goal exists, so
 that the next person to read a rejection knows what was being rejected and what
 would change the answer.**
+
+**And it is not a measurement.** The claim at the top is stated as an exponent
+and has never been taken as one. Both pieces are in the tree and nothing
+composes them: `ply-corpus sweep` varies the size of a generated project and
+benchmarks whole-project phases over it, and `ply-corpus w5` times a rebuild
+after a one-leaf edit at a single size on the deploy path. **No row applies an
+edit across two sizes**, which is the only shape that separates an exponent from
+a constant. ADR 0037 registers that row, with its criteria fixed before the
+reading, and orders it ahead of the path this record motivates.
