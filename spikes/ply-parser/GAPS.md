@@ -2114,9 +2114,18 @@ size of the standard library needs the lookup to be logarithmic; everything the
 reference keeps in an `IndexMap` for its order is a list here, and the order is
 what the dump compares.
 
-**Not here yet.** The incremental `Known` interface the driver hands in: a
-bounded port with the same instrument waiting for it. The derive expansion, and
-the two checker passes that read what it produced, are §18. One thing the port
+**The restored path.** `Known` — the interfaces the driver hands in for
+definitions whose bodies it need not walk again, and the footprints of tests it
+need not re-infer — is ported with `check_program_with`: a group whose every
+member is known is published from its interfaces, its scheme adopted into this
+run's variables, its constraints recovered by unifying the restored scheme with
+the signature just built, and its clauses still typed. The instrument is the
+checker's own output: `check_dump_known` checks a program, hands back what it
+published, checks again from those interfaces and dumps the second check, and
+the reference does the same through `check_program_with`, so the two restored
+paths are compared over the standard library and every bundle. The derive
+expansion, and the two checker passes that read what it produced, are §18. One
+thing the port
 asked of the code generator rather than of the language: `map_fold` is the one
 callback builtin the checker uses that the fragment did not lower, and
 `parser_census::the_census_over_the_parser_spike` pins that no callback is

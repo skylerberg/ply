@@ -75,6 +75,14 @@ type MapKeySite = { module: Int, span: Span, scope: Int, key: Type, assumed: Lis
 type ConstraintSite = { module: Int, span: Span, deriver: Deriver, ty: Type, callee_at: Loc, assumed: List<Int> }
 type SpecEnv = { name: Bytes, ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, params: List<Type>, ret: Type }
 
+// `Known`: the interfaces the driver hands in for definitions whose bodies it need not walk
+// again, and the footprints of tests it need not re-infer, one slot per `test` in source order.
+pub type KnownDef = { name: Bytes, scheme: Scheme, footprint: List<Atom>, performed: List<Atom> }
+pub type KnownTests = { module: Bytes, slots: List<Option<List<Atom>>> }
+pub type Known = { defs: List<KnownDef>, tests: List<KnownTests> }
+
+pub fn no_known() -> Known = { defs: [], tests: [] }
+
 type Cx = {
   r: Resolved,
   mods: List<Mod>,
@@ -112,6 +120,7 @@ type Cx = {
   spec_envs: List<SpecEnv>,
   // The `derive` that generated the definition being walked, if any.
   derived: Option<Derived>,
+  known: Known,
   assumed: List<Assumed>,
 }
 
@@ -1742,8 +1751,69 @@ fn check_fns(cx: Cx, m: Mod) -> Cx = {
   fold(sccs(len(fns), adj), collected.cx, |c: Cx, comp: List<Int>| check_component(c, m, fns, comp))
 }
 
+fn known_def(cx: Cx, name: Bytes) -> Option<KnownDef> =
+  fold(cx.known.defs, None, |acc: Option<KnownDef>, d: KnownDef| match acc { Some(_) -> acc, None -> if d.name == name { Some(d) } else { None } })
+
+fn known_test(cx: Cx, module: Bytes, position: Int) -> Option<List<Atom>> =
+  fold(cx.known.tests, None, |acc: Option<List<Atom>>, t: KnownTests|
+    match acc {
+      Some(_) -> acc,
+      None -> if t.module != module { None } else { match list_at(t.slots, position) { Some(slot) -> slot, None -> None } },
+    })
+
+// The same scheme with its quantified variables drawn from this run.
+fn adopt(cx: Cx, sc: Scheme) -> { cx: Cx, sc: Scheme } =
+  if len(sc.ty_vars) == 0 && len(sc.row_vars) == 0 { { cx: cx, sc: sc } } else {
+    let tys = fold(sc.ty_vars, { cx: cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_ty_var(acc.cx); { cx: o.cx, vs: push(acc.vs, o.v) } });
+    let rows = fold(sc.row_vars, { cx: tys.cx, vs: [] }, |acc: { cx: Cx, vs: List<Int> }, v: Int| { let o: WithVar = new_row_var(acc.cx); { cx: o.cx, vs: push(acc.vs, o.v) } });
+    { cx: rows.cx, sc: { ty_vars: tys.vs, row_vars: rows.vs, ty: rename_scheme(sc, tys.vs, rows.vs) } }
+  }
+
+// A restored scheme came back with quantified variables of its own; unifying it with the
+// signature just built says which of them each constrained parameter is.
+fn recovered_constraints(cx: Cx, def: FnDef, sig: Sig, args: List<Type>) -> List<DefConstraint> = {
+  let found = fold(def.constraints, [], |acc: List<DefConstraint>, c: Constraint|
+    match map_get(sig.ty_params, c.param.name) {
+      Some(TyVar(v)) -> {
+        let param = fold(range(0, len(args)), 0 - 1, |p: Int, i: Int|
+          if p >= 0 { p } else { match resolve(cx, at(args, i)) { TyVar(w) -> if w == v { i } else { p }, _ -> p } });
+        if param < 0 { acc } else { push(acc, { deriver: c.deriver, param: param }) }
+      },
+      _ -> acc,
+    });
+  dedup_constraints(fold(found, [], |acc: List<DefConstraint>, c: DefConstraint| insert_constraint(acc, c)))
+}
+
+// A mutually recursive group published straight from the interfaces the caller supplied,
+// without walking a single body. A spec is erased from a definition's hash, so a clause is
+// still typed against the restored interface.
+fn publish_known(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qualified: List<Bytes>) -> Cx =
+  fold(range(0, len(comp)), cx, |c: Cx, slot: Int| {
+    let def = at(fns, at(comp, slot));
+    let name = at(qualified, slot);
+    let entry = match known_def(c, name) { Some(e) -> e, None -> panic("every member of the group is known") };
+    let a: { cx: Cx, sc: Scheme } = adopt(c, entry.scheme);
+    let recovered: { cx: Cx, cs: List<DefConstraint> } =
+      if len(def.spec) > 0 || len(def.constraints) > 0 {
+        let s: WithSig = signature(a.cx, def);
+        let inst = instantiate_with(a.sc, s.cx.fresh);
+        let c1: Cx = {..s.cx, fresh: inst.f};
+        let c2: Cx = with_unified(c1, unify(c1.subst, c1.fresh, s.sig.fn_ty, inst.ty));
+        { cx: record_spec_env(c2, def, name, s.sig), cs: recovered_constraints(c2, def, s.sig, inst.args) }
+      } else { { cx: a.cx, cs: [] } };
+    let c3: Cx = recovered.cx;
+    let bound: Cx = {..c3, env: env_bind_global(c3.env, name, a.sc), constraints: map_insert(c3.constraints, name, recovered.cs)};
+    set_def(bound, { name: name, module: m.name, simple_name: def.name.name, scheme: a.sc, footprint: entry.footprint,
+                     performed: entry.performed, constraints: recovered.cs, internally_effectful: true, at: here(bound, def.span) })
+  })
+
 fn check_component(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>) -> Cx = {
   let qualified = map(comp, |i: Int| qualify(m.name, at(fns, i).name.name));
+  let all_known = fold(qualified, true, |acc: Bool, q: Bytes| acc && (match known_def(cx, q) { Some(_) -> true, None -> false }));
+  if all_known { publish_known(cx, m, fns, comp, qualified) } else { check_component_walked(cx, m, fns, comp, qualified) }
+}
+
+fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qualified: List<Bytes>) -> Cx = {
   let sigs = fold(range(0, len(comp)), { cx: cx, sigs: [] }, |acc: { cx: Cx, sigs: List<Sig> }, slot: Int| {
     let def = at(fns, at(comp, slot));
     let s: WithSig = signature({..acc.cx, derived: derived_of(m, def)}, def);
@@ -1892,20 +1962,34 @@ fn close_unreachable_row(cx: Cx, sig: Sig) -> Cx =
 
 // --- Tests and laws --------------------------------------------------------------------------------
 
-fn check_tests(cx: Cx, m: Mod) -> Cx =
-  fold(m.module.items, cx, |c: Cx, it: Item|
+// A cached footprint carries the determinism verdict with it: an effect's `nondet` marker is
+// part of its declaration's hash.
+fn check_tests(cx: Cx, m: Mod) -> Cx = {
+  let walked = fold(m.module.items, { cx: cx, position: 0 }, |acc: { cx: Cx, position: Int }, it: Item|
     match it {
       ITest(def) -> {
-        let c1: Cx = {..c, scope: c.scope + 1, ty_params: map_new(), row_params: map_new(), performs: []};
-        let pushed: Cx = {..c1, env: env_push(c1.env)};
-        let o: Inferred = infer(pushed, def.body);
-        let popped: Cx = {..o.cx, env: env_pop(o.cx.env)};
-        let row = resolve_r(popped, o.row);
-        let checked: Cx = if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) };
-        {..checked, tests: push(checked.tests, { key: qualify(m.name, def.name), nondet: def.is_nondet, footprint: row.atoms })}
+        let c: Cx = {..acc.cx, scope: acc.cx.scope + 1};
+        let footprint: WithAtoms = match known_test(c, m.name, acc.position) {
+          Some(cached) -> { cx: c, atoms: cached },
+          None -> {
+            let c1: Cx = {..c, ty_params: map_new(), row_params: map_new(), performs: []};
+            let pushed: Cx = {..c1, env: env_push(c1.env)};
+            let o: Inferred = infer(pushed, def.body);
+            let popped: Cx = {..o.cx, env: env_pop(o.cx.env)};
+            let row = resolve_r(popped, o.row);
+            { cx: if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) }, atoms: row.atoms }
+          },
+        };
+        let checked: Cx = footprint.cx;
+        { cx: {..checked, tests: push(checked.tests, { key: qualify(m.name, def.name), nondet: def.is_nondet, footprint: footprint.atoms })},
+          position: acc.position + 1 }
       },
-      _ -> c,
-    })
+      _ -> acc,
+    });
+  walked.cx
+}
+
+type WithAtoms = { cx: Cx, atoms: List<Atom> }
 
 fn check_determinism(cx: Cx, def: TestDef, footprint: List<Atom>) -> Cx =
   fold(footprint, cx, |c: Cx, atom: Atom|
@@ -2464,18 +2548,20 @@ fn mark_internal_effects(cx: Cx) -> Cx = {
 
 // --- `check_program` --------------------------------------------------------------------------------------
 
-fn fresh_cx(r: Resolved, mods: List<Mod>) -> Cx =
+fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
   install_prelude({ r: r, mods: mods, module: 0, subst: subst_new(), fresh: fresh_new(), env: env_new(), diags: [],
                     types: map_new(), effects: [], effect_index: map_new(), ctors: [], ctor_index: map_new(),
                     defs: [], def_index: map_new(), tests: [], laws: [], ty_params: map_new(), row_params: map_new(),
                     auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], comparisons: [], scope: 0,
                     constraints: map_new(), numerics: [], simulate_depth: 0, open_regions: [], regions: [], simulations: [],
-                    map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], derived: None, assumed: [] })
+                    map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], derived: None, known: known, assumed: [] })
 
 type Checked = { cx: Cx, ok: Bool }
 
-pub fn check_program(r: Resolved, mods: List<Mod>) -> Checked = {
-  let c0 = fresh_cx(r, mods);
+pub fn check_program(r: Resolved, mods: List<Mod>) -> Checked = check_program_with(r, mods, no_known())
+
+pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked = {
+  let c0 = fresh_cx(r, mods, known);
   let declared: Cx = fold(r.order, c0, |c: Cx, i: Int| {
     let m = at(mods, i);
     let c1: Cx = {..c, module: i};
@@ -2548,9 +2634,48 @@ pub fn check_dump(sources: List<Source>) -> String = {
   let body = if len(expansion) > 0 { bytes_concat(b"X;", dump_diags(expansion)) } else {
     match resolve_modules(mods) {
       Failed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
+      Resolved_(x) -> dump_outcome(check_program(x.r, x.mods)),
+    }
+  };
+  string_of_bytes(bytes_concat(head, body))
+}
+
+fn dump_outcome(out: Checked) -> Bytes =
+  if out.ok { dump_checked(out.cx) } else { bytes_concat(b"X;", dump_diags(dedup_diags(out.cx.diags))) }
+
+// What a checked program publishes, as the interfaces a second check of it would be handed:
+// every definition's, and every test's footprint in its module's slot.
+fn known_of(cx: Cx) -> Known = {
+  let defs = map(cx.defs, |d: DefInfo| { name: d.name, scheme: d.scheme, footprint: d.footprint, performed: d.performed });
+  // `tests` is the modules in load order and source order within each, so the slots are a
+  // walk over the modules that takes the next entry for every `test` item.
+  let walked = fold(cx.mods, { next: 0, tests: [] }, |acc: { next: Int, tests: List<KnownTests> }, m: Mod| {
+    let slots = fold(m.module.items, { next: acc.next, slots: [] }, |a: { next: Int, slots: List<Option<List<Atom>>> }, it: Item|
+      match it { ITest(_) -> { next: a.next + 1, slots: push(a.slots, Some(at(cx.tests, a.next).footprint)) }, _ -> a });
+    { next: slots.next, tests: push(acc.tests, { module: m.name, slots: slots.slots }) }
+  });
+  { defs: defs, tests: walked.tests }
+}
+
+// The same program checked twice, the second time from what the first published — the
+// driver's restored path, over the whole program rather than the skipped part of it.
+pub fn check_dump_known(sources: List<Source>) -> String = {
+  let parsed = map(range(0, len(sources)), |i: Int| {
+    let s = at(sources, i);
+    let r = parse(s.src);
+    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let d: Expansion = expand_derives(i, x.module);
+    { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
+  });
+  let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
+  let head = bytes_concat_all([b"K;", n(len(sources)), b";"]);
+  let body = if len(expansion) > 0 { bytes_concat(b"X;", dump_diags(expansion)) } else {
+    match resolve_modules(mods) {
+      Failed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
       Resolved_(x) -> {
-        let out = check_program(x.r, x.mods);
-        if out.ok { dump_checked(out.cx) } else { bytes_concat(b"X;", dump_diags(dedup_diags(out.cx.diags))) }
+        let first = check_program(x.r, x.mods);
+        if !first.ok { dump_outcome(first) } else { dump_outcome(check_program_with(x.r, x.mods, known_of(first.cx))) }
       },
     }
   };
@@ -2570,6 +2695,11 @@ test "a definition's scheme is generalized and its footprint inferred" {
 test "a body that performs more than its signature permits is refused" {
   let dump = check_dump([{ name: b"m", src: b"effect log { write emit(Bytes) -> Unit }\nfn quiet() -> Unit / {} = log.emit(b\"x\")" }]);
   assert_eq(dump, "K;1;X;D;1;!E0302:0:67:81:2:1;=0:67:81:1;=0:62:64:0;")
+}
+
+test "a program checked from its own published interfaces publishes the same thing" {
+  let src = [{ name: b"m", src: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\nfn show<a>(x: a) -> Int where derivable(eq, a) = 1\ntest \"says\" { say(b\"x\") }" }];
+  assert_eq(check_dump_known(src), check_dump(src))
 }
 
 test "a spec clause that reaches an effect through a call is refused at the call" {
