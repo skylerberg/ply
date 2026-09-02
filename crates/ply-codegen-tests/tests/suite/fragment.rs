@@ -97,6 +97,45 @@ fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
     backend.enter(&Symbol::new(name), args, 10_000)
 }
 
+/// Closures and the callbacks that take them: a lambda capturing a parameter, nested lambdas, a
+/// named function and a constructor and a builtin used as values, a call through a parameter and
+/// through a `let`, `iterate` stopping and running out, and the bitwise operators.
+const CLOSURES: &str = r#"
+fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc, x| acc + x)
+
+fn scaled_sum(n: Int, k: Int) -> Int = fold(map(range(0, n), |x| x * k), 0, |a, b| a + b)
+
+fn even_count(n: Int) -> Int = len(filter(range(0, n), |x| x % 2 == 0))
+
+fn countdown(n: Int) -> Int = iterate(n, 1000, |s| if s <= 0 { Stop(s) } else { Continue(s - 1) })
+
+fn stuck(n: Int) -> Int = iterate(n, 3, |s| Continue(s + 1))
+
+fn twice(f: (Int) -> Int, x: Int) -> Int = f(f(x))
+
+fn inc(x: Int) -> Int = x + 1
+
+fn plus_two(x: Int) -> Int = twice(inc, x)
+
+fn tripled(x: Int) -> Int = { let g = |y| y * 3; g(x) }
+
+fn nested(k: Int, n: Int) -> Int = fold(range(0, n), 0, |acc, x| acc + fold([x, k], 0, |a, b| a + b))
+
+fn bits(n: Int) -> Int = ((n << 2) | (n >> 1)) ^ (n & 3)
+
+fn bad_shift(n: Int) -> Int = 1 << n
+
+fn flipped(n: Int) -> Int = ~n
+
+fn wrapped_count(n: Int) -> Int = len(map(range(0, n), Some))
+
+fn named_count(n: Int) -> Int = len(map(range(0, n), int_to_string))
+
+fn adder(k: Int) -> (Int) -> Int = |x| x + k
+
+fn added(k: Int, x: Int) -> Int = adder(k)(x)
+"#;
+
 /// The control every other test here is read against: the fragment is not empty, and it is not
 /// everything.
 #[test]
@@ -170,6 +209,80 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
             "{name} answered differently through compiled code"
         );
     }
+}
+
+/// Compiled code answers what the interpreter answers over closures, the callback builtins and
+/// the bitwise operators — the constructs the parser census ranked first.
+#[test]
+fn a_compiled_body_answers_over_closures_and_callbacks() {
+    let (_, unit) = unit(CLOSURES);
+    let refused: Vec<String> = unit
+        .refusals()
+        .iter()
+        .filter(|(f, _)| f.starts_with("m."))
+        .map(|(f, c)| format!("{f}: {c}"))
+        .collect();
+    assert!(refused.is_empty(), "{refused:#?}");
+    let cases: &[(&str, Vec<Value>, Value)] = &[
+        ("m.sum_to", vec![Value::Int(10)], Value::Int(45)),
+        (
+            "m.scaled_sum",
+            vec![Value::Int(4), Value::Int(3)],
+            Value::Int(18),
+        ),
+        ("m.even_count", vec![Value::Int(7)], Value::Int(4)),
+        ("m.countdown", vec![Value::Int(5)], Value::Int(0)),
+        ("m.plus_two", vec![Value::Int(5)], Value::Int(7)),
+        ("m.tripled", vec![Value::Int(4)], Value::Int(12)),
+        (
+            "m.nested",
+            vec![Value::Int(10), Value::Int(3)],
+            Value::Int(33),
+        ),
+        ("m.bits", vec![Value::Int(5)], Value::Int(23)),
+        ("m.flipped", vec![Value::Int(5)], Value::Int(-6)),
+        ("m.wrapped_count", vec![Value::Int(3)], Value::Int(3)),
+        ("m.named_count", vec![Value::Int(3)], Value::Int(3)),
+        (
+            "m.added",
+            vec![Value::Int(10), Value::Int(5)],
+            Value::Int(15),
+        ),
+    ];
+    for (name, args, want) in cases {
+        let got = call(unit, name, args);
+        assert_eq!(
+            got.as_ref(),
+            Some(want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
+        );
+    }
+}
+
+/// A closure never crosses the seam: a definition answering a function is not registered, so a
+/// call of it declines, while the compiled body that calls through the same closure answers.
+#[test]
+fn a_native_closure_stays_inside_the_entry_that_made_it() {
+    let (_, unit) = unit(CLOSURES);
+    assert!(unit.compiled().iter().any(|f| f == "m.adder"));
+    assert_eq!(call(unit, "m.adder", &[Value::Int(1)]), None);
+    assert_eq!(
+        call(unit, "m.added", &[Value::Int(1), Value::Int(2)]),
+        Some(Value::Int(3))
+    );
+}
+
+/// What raises in the interpreter declines here: an `iterate` past its budget, and a shift by a
+/// count outside `0..64`.
+#[test]
+fn a_callback_that_raises_declines_rather_than_answering() {
+    let (_, unit) = unit(CLOSURES);
+    assert_eq!(call(unit, "m.stuck", &[Value::Int(0)]), None);
+    assert_eq!(call(unit, "m.bad_shift", &[Value::Int(70)]), None);
+    assert_eq!(
+        call(unit, "m.bad_shift", &[Value::Int(3)]),
+        Some(Value::Int(8))
+    );
 }
 
 #[test]

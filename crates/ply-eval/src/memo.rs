@@ -83,6 +83,9 @@ fn world_independent(value: &Value, depth: u32) -> bool {
         Value::Secret(inner) => world_independent(inner, deeper),
         Value::Closure(closure) => match &closure.kind {
             ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => true,
+            ClosureKind::Native { captured, .. } => {
+                captured.iter().all(|v| world_independent(v, deeper))
+            }
             ClosureKind::Fn { bindings, .. } => {
                 bindings.iter().all(|(_, v)| world_independent(v, deeper))
             }
