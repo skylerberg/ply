@@ -911,6 +911,22 @@ pub fn reset(w: Word) -> Word {
     w
 }
 
+/// Byte order over two slices, by hand for the short keys a map is probed with and by `memcmp`
+/// past that.
+#[inline]
+fn cmp_bytes(x: &[u8], y: &[u8]) -> Ordering {
+    let n = x.len().min(y.len());
+    if n > 16 {
+        return x.cmp(y);
+    }
+    for i in 0..n {
+        if x[i] != y[i] {
+            return x[i].cmp(&y[i]);
+        }
+    }
+    x.len().cmp(&y.len())
+}
+
 /// How deep a dying object's dying children are dismantled on the stack before the rest are
 /// deferred to a heap list: a record of scalars, the common case, allocates nothing.
 const DISMANTLE_DEPTH: usize = 32;
@@ -1142,6 +1158,15 @@ pub fn cmp_words(layouts: &Layouts, a: Word, b: Word) -> Ordering {
     if a == b {
         return Ordering::Equal;
     }
+    // Two strings, or two byte strings — a map's keys, most often — are compared as bytes
+    // before any of the ranking below is asked of them.
+    if !is_imm(a) && !is_imm(b) && a != 0 && b != 0 {
+        let (oa, ob) = (obj(a), obj(b));
+        let (ka, kb) = unsafe { ((*oa).kind, (*ob).kind) };
+        if ka == kb && (ka == KIND_STR || ka == KIND_BYTES) {
+            return unsafe { cmp_bytes(bytes_of(oa), bytes_of(ob)) };
+        }
+    }
     let (ra, rb) = (rank(a), rank(b));
     if ra != rb {
         return ra.cmp(&rb);
@@ -1251,6 +1276,38 @@ mod tests {
 
     fn layouts() -> Layouts {
         Layouts::new(vec![(Symbol::new("Some"), 1), (Symbol::new("None"), 0)])
+    }
+
+    /// Two byte strings compare as bytes on the fast path, and as the interpreter orders them.
+    #[test]
+    fn two_byte_strings_compare_in_byte_order_at_every_length() {
+        let mut h = Heap::new();
+        let l = layouts();
+        let long: Vec<u8> = (0..40u8).collect();
+        let mut longer = long.clone();
+        longer.push(0);
+        let cases: [(&[u8], &[u8]); 6] = [
+            (b"kA", b"kB"),
+            (b"kB", b"kA"),
+            (b"k", b"kA"),
+            (b"kA", b"kA"),
+            (&long, &longer),
+            (&longer, &long),
+        ];
+        for (x, y) in cases {
+            let (a, b) = (h.bytes(x), h.bytes(y));
+            assert_eq!(cmp_words(&l, a, b), x.cmp(y), "{x:?} against {y:?}");
+            assert_eq!(
+                cmp_words(&l, a, b),
+                Heap::to_value(&l, a).cmp(&Heap::to_value(&l, b))
+            );
+        }
+        let (s, b) = (h.str("kA"), h.bytes(b"kA"));
+        assert_eq!(
+            cmp_words(&l, s, b),
+            Heap::to_value(&l, s).cmp(&Heap::to_value(&l, b)),
+            "a string against bytes takes the general path"
+        );
     }
 
     /// Perceus's reset keeps a record held once with its fields let go, and releases anything

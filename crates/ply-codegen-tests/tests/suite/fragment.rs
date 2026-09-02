@@ -127,6 +127,18 @@ fn swapped(n: Int) -> Int = { let p = {x: n, y: 7}; let q = {x: p.y, y: p.x}; le
 fn leftover(p: Pair, b: Bool) -> Int = { let s = p.x + p.y; if b { let q = {x: s, y: 0}; q.x } else { s } }
 
 fn boxed_field(n: Int) -> Int = { let h = {left: step(n), right: n}; let v = h.left.value; let k = {left: step(v), right: h.right}; k.left.value + k.right }
+
+fn counted(n: Int) -> Map<Int, Int> = fold(range(0, n), map_new(), |m: Map<Int, Int>, i: Int| map_insert(m, i % 3, i))
+
+fn looked_up(n: Int) -> Int = match map_get(counted(n), 1) { Some(v) -> v * 10, None -> 0 - 1 }
+
+fn looked_up_any(n: Int) -> Int = match map_get(counted(n), 1) { None -> 0 - 1, _ -> 7 }
+
+fn looked_up_nested(n: Int) -> Int = match map_get(counted(n), 2) { Some(5) -> 55, Some(v) -> v, None -> 0 - 1 }
+
+fn looked_up_twice(n: Int) -> Int = { let m = counted(n); match map_get(m, 0) { Some(a) -> match map_get(m, 1) { Some(b) -> a + b, None -> a }, None -> 0 } }
+
+fn looked_up_by_list(n: Int) -> Int = { let m = map_insert(map_new(), [n, n + 1], n); match map_get(m, [n, n + 1]) { Some(v) -> v, None -> 0 - 1 } }
 "#;
 
 fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
@@ -308,6 +320,17 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
             Value::Int(9),
         ),
         ("m.boxed_field", vec![Value::Int(4)], Value::Int(8)),
+        // A `match` over `map_get` whose arms only ask whether the key was found builds no
+        // constructor: the value found, or nothing, is tested directly.
+        ("m.looked_up", vec![Value::Int(6)], Value::Int(40)),
+        ("m.looked_up", vec![Value::Int(1)], Value::Int(-1)),
+        ("m.looked_up_any", vec![Value::Int(2)], Value::Int(7)),
+        ("m.looked_up_any", vec![Value::Int(1)], Value::Int(-1)),
+        ("m.looked_up_nested", vec![Value::Int(6)], Value::Int(55)),
+        ("m.looked_up_nested", vec![Value::Int(3)], Value::Int(2)),
+        ("m.looked_up_nested", vec![Value::Int(2)], Value::Int(-1)),
+        ("m.looked_up_twice", vec![Value::Int(6)], Value::Int(7)),
+        ("m.looked_up_by_list", vec![Value::Int(4)], Value::Int(4)),
     ];
     for (name, args, want) in cases {
         assert_eq!(
