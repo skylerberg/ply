@@ -127,7 +127,10 @@ measurement is confounded until the earlier one has moved.
    answer holding a closure, cell, task or secret itself, so no registry width
    leaks one. `String` and `Unit` now cross, with the wrong-backend mutations
    that police them and the differential corpus asserting the widening is
-   reached. Still to admit: a type variable (the spike's generic `comma_list`).
+   reached. Still to admit: a type variable (the spike's generic `comma_list`)
+   — listed, not built: with every phase entered at its root (step 7) a
+   generic leaf is reached inside compiled code and never through the seam, so
+   the kind buys nothing for this workload until a program's *root* is generic.
    A value of unknown type can only be admitted by walking it for a handle,
    which is the O(value) cost per call the type gate exists to avoid, so what
    it needs is the instantiation at the call site — a design step with its own
@@ -254,10 +257,11 @@ measurement is confounded until the earlier one has moved.
    causes: dropping and draining the values a step gives up, allocating,
    the argument pool, cloning, field reads; the compiled frames themselves
    are the minority. So the lever is that path — what a callback step pays
-   to receive, update and release a carried state — and after it the hasher,
-   most of whose cost is BLAKE3 in Ply. The series is an observation and not a figure by ADR 0030's
-   gate: quiet before, the load lifted past four after by the series' own
-   four workers, as the pre-registration said it would.
+   to receive, update and release a carried state — and the hasher is the
+   same lever seen on an integer kernel, not a separate one: step 9 is the
+   decision that moves it. The series is an observation and not a figure by
+   ADR 0030's gate: quiet before, the load lifted past four after by the
+   series' own four workers, as the pre-registration said it would.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not
    compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
    neither them nor hex literals; both are repaired, the differential is green
@@ -269,6 +273,74 @@ measurement is confounded until the earlier one has moved.
    suite runs the command. A bootstrap is verified with exactly these
    instruments, and a green result over an instrument that runs nothing is the
    defect class this project names as its most expensive.
+9. **The compiled value model.** ADR 0035 decides it: the representation
+   compiled code runs on is the interpreter's — name-keyed records searched on
+   every read, atomic counts, a radix trie, an arena handle for every argument
+   — and no builtin carved out for a hot function changes that, so ADR 0033's
+   hash builtin is retired and the hash is kept as a kernel instead. The model
+   is a second one for compiled code only, with the interpreter's value kept
+   whole as the oracle and the seam converting at an entry's root: layouts
+   fixed from the checker's types, scalars unboxed wherever the type is known,
+   reference counts without atomics, and reuse where a value is unique, which
+   is the layout ADR 0034 asked for and did not get. **The gate is two kernels
+   against Rust** — BLAKE3 in Ply against a scalar transliteration, and a
+   threaded state record against a struct updated in place — within a factor
+   registered in `benches/value-model/PRE-REGISTERED.md` before either exists,
+   with a baseline taken on today's fragment first; the front-end row re-taken
+   on the model is the outcome measure. Its sequence is in the record: typed
+   locals and direct calls, then records and constructors with fixed layouts,
+   closures, the list's leaves, the seam's conversion, and the re-take.
+10. **Emit C.** Where the path ends, decided as a direction and gated on step 9:
+    the eventual host is a C compiler and libc, with the compiler and its
+    runtime written in Ply, which is the line Rust itself holds above LLVM and
+    libc. It is a direction and not a step to start, for one reason: emitting C
+    onto today's representation would move a slow model to a different host,
+    and step 9 is what decides whether the model competes. §"Where this ends"
+    below is the order it is taken in once it does.
+
+## Where this ends: a C compiler and libc
+
+Every language rests on a host it did not write. Rust's is LLVM, libc and the
+kernel, and everything with language content — the front end, the middle, the
+standard library — sits above that line in Rust. Ply's line today is drawn much
+higher: the evaluator, the code generator through Cranelift, the runtime helpers
+compiled code calls, the driver and the host effects are all Rust. The path ends
+when that line is where Rust's is: a Ply compiler, written in Ply, emitting C
+whose only external dependencies are a C compiler and the C library, over a
+runtime written in Ply or a thin C shim.
+
+The route is visible already, which is why it can be written down before it is
+started. The runtime surface compiled code depends on is an enumerated table —
+the helpers in `crates/ply-codegen/src/rt.rs` a compiled body calls for field
+reads, constructor tests, list operations, callbacks and failure — and that
+table is the host ABI in all but name; the host effects are likewise an explicit
+listing. A switch of host is a re-implementation behind two existing seams, not a
+redesign. The order, each stage held to the Rust one by a differential as every
+port in this tree has been:
+
+1. **The value model competes** (step 9). Nothing below is worth starting until
+   it does, because every later stage inherits the representation.
+2. **The front end is within a small factor of Rust under that model** — the
+   front-end row's own decision rule, re-taken.
+3. **A code generator in Ply that emits C**, over the same runtime ABI, with
+   the Rust code generator as the oracle: the same program compiled both ways
+   answers the same, over the differential corpus. C rather than machine code
+   because a C compiler is portable, debuggable and the route most self-hosted
+   languages took at this stage; Cranelift is a Rust library, so a Ply backend
+   over it would still link Rust.
+4. **A runtime over libc** behind the same ABI: values as step 9 laid them out,
+   counts, reuse, strings, the ordered map, and the host effects over the C
+   library. The open design question is effects with captured continuations —
+   a CPS transform in the code generator or stack switching in the runtime —
+   and the deterministic simulation scheduler must be reproduced exactly; that
+   gets its own record before it is built.
+5. **The driver last.** It needs only host effects the listing already has,
+   and it is the part whose cost the plan has never found to matter.
+
+What stays Rust until each stage lands is stated by the stage; nothing is
+removed from the Rust side until its Ply replacement agrees with it over the
+corpus, which is the rule that let every phase of the front end land without a
+regression.
 
 ## What would make this plan wrong
 
@@ -284,9 +356,18 @@ measurement is confounded until the earlier one has moved.
   path — the project simply growing — is slower.
 - **If a Rust-side tool makes the conventional loop O(change).** Nothing has
   tried, and it would remove the motive entirely.
+- **If step 9's kernels clear and the front-end row does not move.** Then the
+  cost is at the seam or in dispatch rather than in the values, and ADR 0035's
+  census is what says which; the C target waits either way.
+- **If the compiled model cannot come within its factor of Rust on either
+  kernel.** Then the bootstrap's front end cannot sit inside the loop ADR 0021
+  exists for, on any host, and what to change is the model's decisions the
+  record names for that kernel, not the host.
 
 ## What this is not
 
 Not a decision to self-host. ADR 0020's decision stands until a re-take of
 ADR 0030's row clears its bar, and this file should be corrected in place when
 it does: replace the sentence, do not add a block saying the sentence moved.
+And §"Where this ends" is a direction with an order, not a commitment to a
+date: each stage is gated on the one before it, and the first gate is step 9's.
