@@ -142,6 +142,82 @@ pub fn reference_check_dump_known(modules: &[(String, String)]) -> String {
     out
 }
 
+/// The reference's content addressing of a program, for the sixth differential: every hash
+/// `hash_program_ast` publishes, keyed as it keys them, and the reference graph beside them.
+pub fn reference_hash_dump(modules: &[(String, String)]) -> String {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (module, _) =
+            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        program.modules.push(module);
+    }
+    let mut out = String::new();
+    out.push_str(&format!("K;{};", modules.len()));
+    let expansion = ply_derive::expand_program(&mut program);
+    if !expansion.is_empty() {
+        out.push_str("E;");
+        resolve_diags(&mut out, &expansion);
+        return out;
+    }
+    let resolved = match ply_syntax::resolve::resolve(&mut program) {
+        Ok(r) => r,
+        Err(diags) => {
+            out.push_str("E;");
+            resolve_diags(&mut out, &diags);
+            return out;
+        }
+    };
+    let hashes = match ply_hash::hash_program_ast(&program, &resolved) {
+        Ok(h) => h,
+        Err(diags) => {
+            out.push_str("E;");
+            resolve_diags(&mut out, &diags);
+            return out;
+        }
+    };
+    let hexes = |hs: &[ply_hash::DefHash]| {
+        hs.iter()
+            .map(ply_hash::DefHash::to_hex)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    for (name, h) in &hashes.defs {
+        out.push_str(&format!("H;{name};{};", h.to_hex()));
+    }
+    for (name, h) in &hashes.decls {
+        out.push_str(&format!("Y;{name};{};", h.to_hex()));
+    }
+    for h in &hashes.tests {
+        out.push_str(&format!("T;{};", h.to_hex()));
+    }
+    for h in &hashes.laws {
+        out.push_str(&format!("L;{};", h.to_hex()));
+    }
+    for h in &hashes.law_texts {
+        out.push_str(&format!("W;{};", h.to_hex()));
+    }
+    for (name, h) in &hashes.own {
+        out.push_str(&format!("O;{name};{};", h.to_hex()));
+    }
+    for (name, hs) in &hashes.specs {
+        out.push_str(&format!("S;{name};{};", hexes(hs)));
+    }
+    for (name, hs) in &hashes.spec_texts {
+        out.push_str(&format!("X;{name};{};", hexes(hs)));
+    }
+    for (name, deps) in &hashes.deps {
+        let names: Vec<String> = deps.iter().map(|d| d.to_string()).collect();
+        out.push_str(&format!("D;{name};{};", names.join(",")));
+    }
+    for (name, closure) in &hashes.closure {
+        let names: Vec<String> = closure.iter().map(|d| d.to_string()).collect();
+        out.push_str(&format!("C;{name};{};", names.join(",")));
+    }
+    out
+}
+
 /// Every definition's interface and every test's footprint, as the driver would restore them.
 fn known_of(check: &ply_core::CheckOutput) -> ply_core::Known {
     let mut known = ply_core::Known::default();

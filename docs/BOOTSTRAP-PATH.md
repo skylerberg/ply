@@ -198,7 +198,13 @@ measurement is confounded until the earlier one has moved.
    `check_program_with` publishes a known group from its interfaces as the
    driver's cache hands them in, and a program checked from what its own
    first check published publishes the same thing on both sides, over the
-   standard library and every bundle. Of step 6, hashing is what remains.
+   standard library and every bundle. **Hashing is ported** (`hash.ply`,
+   `GAPS.md` §19): every hash `ply-hash` publishes — definitions, declarations,
+   tests, laws, own-form and spec keys — and the reference graph beside them
+   agree over the standard library, every example, every bundle and the
+   hasher's own mined inputs, with BLAKE3 from `std.hash` over the same bytes;
+   `arm-hash.sh` arms it. The one surface it needed, `bits_of_float`, landed
+   first. Every phase step 6 names is now behind a differential.
    Hashing is next after those. `std.hash` exists (ADR 0033) and its throughput is not measured. The
    syntax the parser spike predated is ported first, so its own differential is
    green before anything is built on it: the bit operators (with the shift join
