@@ -422,6 +422,30 @@ fn native_builtin(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Option<Word> {
             }
             Some(out as Word)
         }
+        // A bridged `Bytes` is read in place: its buffer is shared, so nothing is copied.
+        (Builtin::BytesLen, [b]) if heap::kind(*b) == KIND_BRIDGE => {
+            let Value::Bytes(bytes) = (unsafe { bridged(obj(*b)) }) else {
+                return None;
+            };
+            let n = bytes.len() as i64;
+            heap::dec(*b);
+            Some(heap::imm(n))
+        }
+        (Builtin::BytesAt, [b, i]) if heap::kind(*b) == KIND_BRIDGE => {
+            let Value::Bytes(bytes) = (unsafe { bridged(obj(*b)) }) else {
+                return None;
+            };
+            let index = heap::as_int(*i)?;
+            // Out of range is the interpreter's diagnostic to raise.
+            let byte = *bytes.get(usize::try_from(index).ok()?)?;
+            heap::dec(*b);
+            Some(heap::imm(i64::from(byte)))
+        }
+        (Builtin::ByteOfInt, [n]) => {
+            let v = heap::as_int(*n)?;
+            let byte = u8::try_from(v).ok()?;
+            Some(ctx.heap.bridge(Value::bytes([byte])))
+        }
         (Builtin::MapNew, []) => Some(ctx.heap.alloc_map(4) as Word),
         (Builtin::MapInsert, [m, k, v]) if heap::kind(*m) == KIND_MAP && heap::native_key(*k) => {
             let tables = Rc::clone(&ctx.tables);

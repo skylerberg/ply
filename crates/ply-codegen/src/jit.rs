@@ -1,6 +1,6 @@
 //! The fragment of the spike's fragment, compiled with Cranelift.
 
-use crate::heap::{Heap, Layouts, Word};
+use crate::heap::{HEADER, Heap, Layouts, Word};
 use crate::rt::{self, Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, anyhow};
@@ -57,6 +57,8 @@ enum Kind {
 struct Val {
     kind: Kind,
     v: cranelift_codegen::ir::Value,
+    /// What the value is known to be at compile time, by index into `Jit::tys`; `0` is unknown.
+    ty: u32,
 }
 
 struct Helpers {
@@ -111,11 +113,25 @@ struct Pending {
 
 /// What a compiled function takes and answers in registers: the kind of each parameter and of
 /// the result, read off the checker's scheme. `Boxed` wherever the type is one the fragment keeps
-/// as a handle, a type variable included.
+/// as a handle, a type variable included. Beside each kind, what the checker knows of the type,
+/// by index into [`Jit::tys`].
 #[derive(Clone, Debug)]
 struct Sig {
     params: Vec<Kind>,
     ret: Kind,
+    param_tys: Vec<u32>,
+    ret_ty: u32,
+}
+
+/// What the code generator knows of a value's type at compile time: enough to read a record's
+/// field at its offset rather than by name. A record type is its fields sorted, each with its own
+/// type, which is the order the shape lays them out in.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Ty {
+    Unknown,
+    Int,
+    Bool,
+    Record(Vec<(Symbol, u32)>),
 }
 
 /// A compiled top-level function: the typed body other compiled code calls directly, and the
@@ -141,11 +157,13 @@ fn kind_of_type(t: &ply_core::ty::Type) -> Kind {
 }
 
 /// The signature the checker published for `name`, or all-boxed for one it did not.
-fn sig_of(loaded: &Source, name: &str, arity: usize) -> Sig {
+fn sig_of(jit: &mut Jit, loaded: &Source, name: &str, arity: usize) -> Sig {
     use ply_core::ty::Type;
     let boxed = Sig {
         params: vec![Kind::Boxed; arity],
         ret: Kind::Boxed,
+        param_tys: vec![0; arity],
+        ret_ty: 0,
     };
     let Some(def) = loaded.check.defs.get(&Symbol::new(name)) else {
         return boxed;
@@ -154,10 +172,14 @@ fn sig_of(loaded: &Source, name: &str, arity: usize) -> Sig {
         Type::Fn { params, ret, .. } if params.len() == arity => Sig {
             params: params.iter().map(kind_of_type).collect(),
             ret: kind_of_type(ret),
+            param_tys: params.iter().map(|p| jit.ty_of_type(p)).collect(),
+            ret_ty: jit.ty_of_type(ret),
         },
         ty if arity == 0 => Sig {
             params: Vec::new(),
             ret: kind_of_type(ty),
+            param_tys: Vec::new(),
+            ret_ty: jit.ty_of_type(ty),
         },
         _ => boxed,
     }
@@ -219,6 +241,9 @@ pub struct Jit {
     layouts: Layouts,
     /// Owns the constant pool's objects until the tables take it over.
     immortals: Heap,
+    /// Every compile-time type a value has been given, interned; index `0` is unknown.
+    tys: Vec<Ty>,
+    ty_ids: HashMap<Ty, u32>,
     fields: Vec<Symbol>,
     builtins: Vec<Builtin>,
     funcs: HashMap<String, Func>,
@@ -397,6 +422,39 @@ impl Jit {
         sig
     }
 
+    /// The index of a compile-time type, interned.
+    fn ty_id(&mut self, ty: Ty) -> u32 {
+        if let Some(id) = self.ty_ids.get(&ty) {
+            return *id;
+        }
+        let id = self.tys.len() as u32;
+        self.tys.push(ty.clone());
+        self.ty_ids.insert(ty, id);
+        id
+    }
+
+    /// What the code generator keeps of a type the checker published: scalars, and a closed
+    /// record with its fields' types; a type variable, a row or anything else is unknown.
+    fn ty_of_type(&mut self, t: &ply_core::ty::Type) -> u32 {
+        use ply_core::ty::Type;
+        let ty = match t {
+            Type::Con(name, args) if args.is_empty() => match name.as_str() {
+                "Int" => Ty::Int,
+                "Bool" => Ty::Bool,
+                _ => Ty::Unknown,
+            },
+            Type::Record(fields) => {
+                let fields: Vec<(Symbol, u32)> = fields
+                    .iter()
+                    .map(|(name, t)| (name.clone(), self.ty_of_type(t)))
+                    .collect();
+                Ty::Record(fields)
+            }
+            _ => Ty::Unknown,
+        };
+        self.ty_id(ty)
+    }
+
     /// `(ctx, p1, .., pn) -> r`: every parameter and the result in a register, each an `Int` or a
     /// `Bool` as itself or anything else as its handle, which [`Sig`] says per position.
     fn typed_signature(&self, arity: usize) -> Signature {
@@ -475,6 +533,8 @@ impl Jit {
             const_words: Vec::new(),
             layouts: Layouts::new(loaded.ctors()),
             immortals: Heap::new(),
+            tys: vec![Ty::Unknown],
+            ty_ids: HashMap::from([(Ty::Unknown, 0)]),
             fields: Vec::new(),
             builtins: Vec::new(),
             funcs: HashMap::new(),
@@ -501,6 +561,7 @@ impl Jit {
                 Linkage::Export,
                 &entry_sig,
             )?;
+            let sig = sig_of(&mut jit, loaded, name, arity);
             jit.funcs.insert(
                 (*name).to_string(),
                 Func {
@@ -508,7 +569,7 @@ impl Jit {
                     entry,
                     arity,
                     module_index,
-                    sig: sig_of(loaded, name, arity),
+                    sig,
                 },
             );
             jit.functions.push(entry);
@@ -585,6 +646,7 @@ impl Jit {
                         Val {
                             kind: *kind,
                             v: block_params[i + 1],
+                            ty: sig.param_tys[i],
                         },
                     ));
                 }
@@ -604,6 +666,7 @@ impl Jit {
                         Val {
                             kind: Kind::Boxed,
                             v: handle,
+                            ty: 0,
                         },
                     ));
                 }
@@ -663,6 +726,7 @@ impl Jit {
                 Val {
                     kind: Kind::Boxed,
                     v: handle,
+                    ty: 0,
                 },
                 *kind,
             );
@@ -678,6 +742,7 @@ impl Jit {
         let handle = fx.boxed(Val {
             kind: func.sig.ret,
             v: r,
+            ty: 0,
         });
         fx.builder.ins().return_(&[handle]);
 
@@ -862,6 +927,42 @@ impl Fx<'_, '_> {
         self.builder.seal_block(next);
     }
 
+    /// One more holder of a word, in place: nothing for an immediate or an immortal object, a
+    /// bumped count for anything else.
+    fn inc_inline(&mut self, w: cranelift_codegen::ir::Value) {
+        let tagged = self.builder.ins().band_imm(w, 1);
+        let pointer = self.builder.create_block();
+        let bump = self.builder.create_block();
+        let done = self.builder.create_block();
+        self.builder.ins().brif(tagged, done, &[], pointer, &[]);
+        self.builder.switch_to_block(pointer);
+        self.builder.seal_block(pointer);
+        let rc = self
+            .builder
+            .ins()
+            .load(types::I32, MemFlags::trusted(), w, 0);
+        let immortal = self.builder.ins().icmp_imm(IntCC::Equal, rc, -1);
+        self.builder.ins().brif(immortal, done, &[], bump, &[]);
+        self.builder.switch_to_block(bump);
+        self.builder.seal_block(bump);
+        let bumped = self.builder.ins().iadd_imm(rc, 1);
+        self.builder.ins().store(MemFlags::trusted(), bumped, w, 0);
+        self.builder.ins().jump(done, &[]);
+        self.builder.switch_to_block(done);
+        self.builder.seal_block(done);
+    }
+
+    /// The field a value of compile-time type `ty` has at `name`, as its offset and its own type.
+    fn static_field(&self, ty: u32, name: &Symbol) -> Option<(usize, u32)> {
+        match &self.jit.tys[ty as usize] {
+            Ty::Record(fields) => fields
+                .iter()
+                .position(|(n, _)| n == name)
+                .map(|at| (at, fields[at].1)),
+            _ => None,
+        }
+    }
+
     /// A register's value as a word: an `Int` that fits is tagged in place and one that does not
     /// is boxed by the runtime; a `Bool` is one of the two singletons.
     fn boxed(&mut self, val: Val) -> cranelift_codegen::ir::Value {
@@ -1003,6 +1104,7 @@ impl Fx<'_, '_> {
             return Ok(Val {
                 kind: Kind::Boxed,
                 v,
+                ty: 0,
             });
         }
         Ok(val)
@@ -1017,6 +1119,7 @@ impl Fx<'_, '_> {
         Val {
             kind: Kind::Boxed,
             v,
+            ty: 0,
         }
     }
 
@@ -1190,6 +1293,7 @@ impl Fx<'_, '_> {
                             Val {
                                 kind,
                                 v: cranelift_codegen::ir::Value::from_u32(0),
+                                ty: 0,
                             },
                         ));
                     }
@@ -1227,6 +1331,7 @@ impl Fx<'_, '_> {
                     Ok(Val {
                         kind: Kind::Boxed,
                         v,
+                        ty: 0,
                     })
                 }
                 Denotes::Builtin(index) => {
@@ -1235,6 +1340,7 @@ impl Fx<'_, '_> {
                     Ok(Val {
                         kind: Kind::Boxed,
                         v,
+                        ty: 0,
                     })
                 }
                 Denotes::Ctor(index, _) => {
@@ -1243,6 +1349,7 @@ impl Fx<'_, '_> {
                     Ok(Val {
                         kind: Kind::Boxed,
                         v,
+                        ty: 0,
                     })
                 }
                 Denotes::Uncompiled(target) => self.refuse(format!(
@@ -1256,7 +1363,11 @@ impl Fx<'_, '_> {
                     UnOp::BitNot => {
                         let a = self.as_int(value);
                         let v = self.builder.ins().bnot(a);
-                        Ok(Val { kind: Kind::Int, v })
+                        Ok(Val {
+                            kind: Kind::Int,
+                            v,
+                            ty: 0,
+                        })
                     }
                     UnOp::Not => {
                         let b = self.as_bool(value);
@@ -1265,6 +1376,7 @@ impl Fx<'_, '_> {
                         Ok(Val {
                             kind: Kind::Bool,
                             v,
+                            ty: 0,
                         })
                     }
                     // `Int` like the rest of the fragment: `as_int` refuses a `Float` or `Decimal`
@@ -1284,7 +1396,11 @@ impl Fx<'_, '_> {
                         self.builder.switch_to_block(ok);
                         self.builder.seal_block(ok);
                         let v = self.builder.ins().ineg(a);
-                        Ok(Val { kind: Kind::Int, v })
+                        Ok(Val {
+                            kind: Kind::Int,
+                            v,
+                            ty: 0,
+                        })
                     }
                 }
             }
@@ -1313,6 +1429,7 @@ impl Fx<'_, '_> {
                 self.builder.seal_block(then_block);
                 let mut inner = scope.clone();
                 let t = self.expr(then_branch, &mut inner)?;
+                let t_ty = t.ty;
                 let t = self.coerce(t, kind);
                 self.builder.ins().jump(join, &[BlockArg::Value(t)]);
 
@@ -1320,6 +1437,7 @@ impl Fx<'_, '_> {
                 self.builder.seal_block(else_block);
                 let mut inner = scope.clone();
                 let e = self.expr(else_branch, &mut inner)?;
+                let e_ty = e.ty;
                 let e = self.coerce(e, kind);
                 self.builder.ins().jump(join, &[BlockArg::Value(e)]);
 
@@ -1328,6 +1446,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind,
                     v: self.builder.block_params(join)[0],
+                    ty: if t_ty == e_ty { t_ty } else { 0 },
                 })
             }
 
@@ -1371,12 +1490,37 @@ impl Fx<'_, '_> {
                 // The written fields in source order, then the base at its last use; the result's
                 // shape is the whole field set, and each written field goes to its offset in it.
                 let mut handles = Vec::with_capacity(sets.len());
+                let mut set_tys = Vec::with_capacity(sets.len());
                 for (_, value) in sets.iter() {
                     let v = self.consumed(value, scope)?;
+                    set_tys.push(v.ty);
                     let h = self.boxed(v);
                     handles.push(h);
                 }
                 let base = self.consumed(base, scope)?;
+                // The result's type is the base's with the written fields' types replaced, when
+                // the base's is known and names exactly these fields.
+                let ty = match &self.jit.tys[base.ty as usize] {
+                    Ty::Record(fields)
+                        if fields.len() == sets.len() + copies.len()
+                            && sets
+                                .iter()
+                                .map(|(n, _)| n)
+                                .chain(copies.iter().map(|c| &c.name))
+                                .all(|n| fields.iter().any(|(f, _)| f == n)) =>
+                    {
+                        let updated: Vec<(Symbol, u32)> = fields
+                            .iter()
+                            .map(|(f, t)| match sets.iter().position(|(n, _)| n == f) {
+                                Some(i) => (f.clone(), set_tys[i]),
+                                None => (f.clone(), *t),
+                            })
+                            .collect();
+                        Some(Ty::Record(updated))
+                    }
+                    _ => None,
+                };
+                let ty = ty.map_or(0, |t| self.jit.ty_id(t));
                 let base = self.boxed(base);
                 let mut all: Vec<Symbol> = sets.iter().map(|(n, _)| n.clone()).collect();
                 all.extend(copies.iter().map(|c| c.name.clone()));
@@ -1404,6 +1548,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Boxed,
                     v,
+                    ty,
                 })
             }
 
@@ -1413,24 +1558,34 @@ impl Fx<'_, '_> {
                 // Evaluated in source order, laid out in the shape's sorted order.
                 let mut names = Vec::with_capacity(fields.len());
                 let mut handles = Vec::with_capacity(fields.len());
+                let mut tys = Vec::with_capacity(fields.len());
                 for (name, value) in fields.iter() {
                     let v = self.consumed(value, scope)?;
+                    tys.push(v.ty);
                     let h = self.boxed(v);
                     names.push(name.clone());
                     handles.push(h);
                 }
                 let shape = self.jit.layouts.shape(names.clone());
                 let sorted = self.jit.layouts.shape_names(shape);
-                let ordered: Vec<cranelift_codegen::ir::Value> = sorted
+                let positions: Vec<usize> = sorted
                     .iter()
                     .map(|name| {
-                        let at = names
+                        names
                             .iter()
                             .position(|n| n == name)
-                            .expect("every field of the shape was written");
-                        handles[at]
+                            .expect("every field of the shape was written")
                     })
                     .collect();
+                let ordered: Vec<cranelift_codegen::ir::Value> =
+                    positions.iter().map(|at| handles[*at]).collect();
+                let ty = self.jit.ty_id(Ty::Record(
+                    sorted
+                        .iter()
+                        .zip(&positions)
+                        .map(|(name, at)| (name.clone(), tys[*at]))
+                        .collect(),
+                ));
                 let ptr = self.spill(&ordered);
                 let shape = self.builder.ins().iconst(types::I64, i64::from(shape));
                 let n = self.builder.ins().iconst(types::I64, ordered.len() as i64);
@@ -1438,6 +1593,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Boxed,
                     v,
+                    ty,
                 })
             }
 
@@ -1485,6 +1641,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Boxed,
                     v,
+                    ty: 0,
                 })
             }
 
@@ -1502,7 +1659,27 @@ impl Fx<'_, '_> {
                     3
                 };
                 let base = self.expr(b, scope)?;
+                let known = self.static_field(base.ty, &field.name);
                 let base = self.boxed(base);
+                // A read of a record whose shape the checker fixed is a load at the field's
+                // offset, held once more; anything else, and any read that takes the base or the
+                // field, goes by name through the runtime.
+                if own == 0
+                    && let Some((at, ty)) = known
+                {
+                    let v = self.builder.ins().load(
+                        types::I64,
+                        MemFlags::trusted(),
+                        base,
+                        (HEADER + 8 * at) as i32,
+                    );
+                    self.inc_inline(v);
+                    return Ok(Val {
+                        kind: Kind::Boxed,
+                        v,
+                        ty,
+                    });
+                }
                 let index = self.field_index(&field.name);
                 let index = self.builder.ins().iconst(types::I64, index);
                 let own = self.builder.ins().iconst(types::I64, own);
@@ -1511,6 +1688,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Boxed,
                     v,
+                    ty: known.map_or(0, |(_, ty)| ty),
                 })
             }
 
@@ -1527,6 +1705,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Boxed,
                     v,
+                    ty: 0,
                 })
             }
             NodeKind::Perform { effect, op, .. } => {
@@ -1550,6 +1729,7 @@ impl Fx<'_, '_> {
             return Val {
                 kind: Kind::Boxed,
                 v,
+                ty: 0,
             };
         }
         let index = self.builder.ins().iconst(types::I64, index as i64);
@@ -1557,6 +1737,7 @@ impl Fx<'_, '_> {
         Val {
             kind: Kind::Boxed,
             v,
+            ty: 0,
         }
     }
 
@@ -1566,10 +1747,12 @@ impl Fx<'_, '_> {
             Lit::Int(i) => Ok(Val {
                 kind: Kind::Int,
                 v: self.builder.ins().iconst(types::I64, *i),
+                ty: 0,
             }),
             Lit::Bool(b) => Ok(Val {
                 kind: Kind::Bool,
                 v: self.builder.ins().iconst(types::I64, i64::from(*b)),
+                ty: 0,
             }),
             Lit::Float(_) => self.refuse("a `Float` literal, which the fragment has no path for"),
             Lit::Decimal { .. } => {
@@ -1618,6 +1801,7 @@ impl Fx<'_, '_> {
             return Ok(Val {
                 kind: Kind::Bool,
                 v: self.builder.block_params(join)[0],
+                ty: 0,
             });
         }
 
@@ -1632,7 +1816,11 @@ impl Fx<'_, '_> {
                     BinOp::BitOr => self.builder.ins().bor(a, b),
                     _ => self.builder.ins().bxor(a, b),
                 };
-                Ok(Val { kind: Kind::Int, v })
+                Ok(Val {
+                    kind: Kind::Int,
+                    v,
+                    ty: 0,
+                })
             }
             BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
                 let a = self.as_int(l);
@@ -1656,7 +1844,11 @@ impl Fx<'_, '_> {
                     BinOp::Shr => self.builder.ins().sshr(a, n),
                     _ => self.builder.ins().ushr(a, n),
                 };
-                Ok(Val { kind: Kind::Int, v })
+                Ok(Val {
+                    kind: Kind::Int,
+                    v,
+                    ty: 0,
+                })
             }
             BinOp::Add | BinOp::Sub => {
                 let a = self.as_int(l);
@@ -1679,7 +1871,11 @@ impl Fx<'_, '_> {
                 self.builder.ins().jump(self.failure, &[]);
                 self.builder.switch_to_block(ok);
                 self.builder.seal_block(ok);
-                Ok(Val { kind: Kind::Int, v })
+                Ok(Val {
+                    kind: Kind::Int,
+                    v,
+                    ty: 0,
+                })
             }
             BinOp::Mul | BinOp::Div | BinOp::Rem => {
                 let a = self.as_int(l);
@@ -1692,7 +1888,11 @@ impl Fx<'_, '_> {
                 let code = self.builder.ins().iconst(types::I64, code);
                 let v = self.helper(self.jit.helpers.arith, &[code, a, b]);
                 self.check();
-                Ok(Val { kind: Kind::Int, v })
+                Ok(Val {
+                    kind: Kind::Int,
+                    v,
+                    ty: 0,
+                })
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
                 let a = self.as_int(l);
@@ -1708,6 +1908,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Bool,
                     v,
+                    ty: 0,
                 })
             }
             BinOp::Eq | BinOp::Ne => {
@@ -1746,6 +1947,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Bool,
                     v,
+                    ty: 0,
                 })
             }
             BinOp::Concat => {
@@ -1756,6 +1958,7 @@ impl Fx<'_, '_> {
                 Ok(Val {
                     kind: Kind::Boxed,
                     v,
+                    ty: 0,
                 })
             }
             BinOp::And | BinOp::Or => unreachable!("short-circuit handled above"),
@@ -1794,6 +1997,7 @@ impl Fx<'_, '_> {
                 return Ok(Val {
                     kind: Kind::Boxed,
                     v,
+                    ty: 0,
                 });
             }
             // A direct call: each argument in the register kind the callee's signature names. A
@@ -1813,7 +2017,11 @@ impl Fx<'_, '_> {
             let call = self.builder.ins().call(callee, &vals);
             let v = self.builder.inst_results(call)[0];
             self.check();
-            return Ok(Val { kind: f.sig.ret, v });
+            return Ok(Val {
+                kind: f.sig.ret,
+                v,
+                ty: f.sig.ret_ty,
+            });
         }
         let mut handles = Vec::with_capacity(args.len());
         for a in args {
@@ -1888,6 +2096,7 @@ impl Fx<'_, '_> {
         Ok(Val {
             kind: Kind::Boxed,
             v,
+            ty: 0,
         })
     }
 
@@ -1912,6 +2121,7 @@ impl Fx<'_, '_> {
         Ok(Val {
             kind: Kind::Boxed,
             v,
+            ty: 0,
         })
     }
 
@@ -2085,6 +2295,7 @@ impl Fx<'_, '_> {
                         Val {
                             kind: Kind::Boxed,
                             v: sub,
+                            ty: 0,
                         },
                         next,
                         miss,
@@ -2116,6 +2327,7 @@ impl Fx<'_, '_> {
                 let boxed = Val {
                     kind: Kind::Boxed,
                     v: base,
+                    ty: 0,
                 };
                 let mut cur = self.builder.create_block();
                 self.test_ctor(boxed, index, cur, miss);
@@ -2135,6 +2347,7 @@ impl Fx<'_, '_> {
                         Val {
                             kind: Kind::Boxed,
                             v: sub,
+                            ty: 0,
                         },
                         next,
                         miss,
@@ -2184,6 +2397,7 @@ impl Fx<'_, '_> {
                         Val {
                             kind: Kind::Boxed,
                             v: field,
+                            ty: 0,
                         },
                         next,
                         miss,
@@ -2240,6 +2454,7 @@ impl Fx<'_, '_> {
                         Val {
                             kind: Kind::Boxed,
                             v,
+                            ty: 0,
                         },
                         true,
                         scope,
@@ -2256,16 +2471,32 @@ impl Fx<'_, '_> {
                         Val {
                             kind: Kind::Boxed,
                             v,
+                            ty: 0,
                         },
                     ));
                 }
             }
-            Pat::Ctor { args, .. } => {
+            Pat::Ctor { name, args } => {
+                // What the checker says each payload is, where it said anything monomorphic.
+                let payload_tys: Vec<u32> = match self.ctor_of(name) {
+                    Some((index, _)) => {
+                        let qualified = self.jit.layouts.ctors[index].0.clone();
+                        match self.loaded.check.ctors.get(&qualified) {
+                            Some(info) => {
+                                let fields = info.fields.clone();
+                                fields.iter().map(|t| self.jit.ty_of_type(t)).collect()
+                            }
+                            None => Vec::new(),
+                        }
+                    }
+                    None => Vec::new(),
+                };
                 let base = self.boxed(value);
                 for (i, arg) in args.iter().enumerate() {
                     if !self.binds_any(arg) {
                         continue;
                     }
+                    let ty = payload_tys.get(i).copied().unwrap_or(0);
                     let i = self.builder.ins().iconst(types::I64, i as i64);
                     let take = self.builder.ins().iconst(types::I64, i64::from(moving));
                     let v = self.helper(self.jit.helpers.ctor_arg, &[base, i, take]);
@@ -2275,6 +2506,7 @@ impl Fx<'_, '_> {
                         Val {
                             kind: Kind::Boxed,
                             v,
+                            ty,
                         },
                         true,
                         scope,
@@ -2287,6 +2519,9 @@ impl Fx<'_, '_> {
                     if !self.binds_any(sub) {
                         continue;
                     }
+                    let ty = self
+                        .static_field(value.ty, &name.name)
+                        .map_or(0, |(_, ty)| ty);
                     let index = self.field_index(&name.name);
                     let index = self.builder.ins().iconst(types::I64, index);
                     let v = {
@@ -2303,6 +2538,7 @@ impl Fx<'_, '_> {
                         Val {
                             kind: Kind::Boxed,
                             v,
+                            ty,
                         },
                         true,
                         scope,
@@ -2319,6 +2555,7 @@ impl Fx<'_, '_> {
         self.builder.append_block_param(join, types::I64);
         let mut next = self.builder.create_block();
         self.builder.ins().jump(next, &[]);
+        let mut ty: Option<u32> = None;
         for arm in arms {
             if arm.guard.is_some() {
                 return self.refuse("a `match` arm with a guard");
@@ -2336,6 +2573,12 @@ impl Fx<'_, '_> {
             let moving = !self.is_borrowed_local(scrutinee, scope);
             self.bind_pattern(&arm.pat, value, moving, &mut inner)?;
             let body = self.expr(&arm.body, &mut inner)?;
+            // The arms' type, when every arm agrees.
+            ty = match ty {
+                None => Some(body.ty),
+                Some(t) if t == body.ty => Some(t),
+                Some(_) => Some(0),
+            };
             let body = self.boxed(body);
             self.builder.ins().jump(join, &[BlockArg::Value(body)]);
             next = after;
@@ -2351,6 +2594,7 @@ impl Fx<'_, '_> {
         Ok(Val {
             kind: Kind::Boxed,
             v: self.builder.block_params(join)[0],
+            ty: ty.unwrap_or(0),
         })
     }
 }
