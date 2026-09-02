@@ -61,7 +61,6 @@ struct Val {
 
 struct Helpers {
     box_int: FuncId,
-    box_bool: FuncId,
     unbox_int: FuncId,
     unbox_bool: FuncId,
     arith: FuncId,
@@ -433,7 +432,6 @@ impl Jit {
         let started = std::time::Instant::now();
         let helpers = Helpers {
             box_int: declare(&mut module, "rt_box_int", 2, true)?,
-            box_bool: declare(&mut module, "rt_box_bool", 2, true)?,
             unbox_int: declare(&mut module, "rt_unbox_int", 2, true)?,
             unbox_bool: declare(&mut module, "rt_unbox_bool", 2, true)?,
             arith: declare(&mut module, "rt_arith", 4, true)?,
@@ -864,34 +862,109 @@ impl Fx<'_, '_> {
         self.builder.seal_block(next);
     }
 
+    /// A register's value as a word: an `Int` that fits is tagged in place and one that does not
+    /// is boxed by the runtime; a `Bool` is one of the two singletons.
     fn boxed(&mut self, val: Val) -> cranelift_codegen::ir::Value {
         match val.kind {
             Kind::Boxed => val.v,
-            Kind::Int => self.helper(self.jit.helpers.box_int, &[val.v]),
-            Kind::Bool => self.helper(self.jit.helpers.box_bool, &[val.v]),
-        }
-    }
-
-    fn as_int(&mut self, val: Val) -> cranelift_codegen::ir::Value {
-        match val.kind {
-            Kind::Int => val.v,
-            _ => {
-                let handle = self.boxed(val);
-                let v = self.helper(self.jit.helpers.unbox_int, &[handle]);
-                self.check();
-                v
+            Kind::Int => {
+                let shifted = self.builder.ins().ishl_imm(val.v, 1);
+                let back = self.builder.ins().sshr_imm(shifted, 1);
+                let fits = self.builder.ins().icmp(IntCC::Equal, back, val.v);
+                let fast = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+                self.builder.ins().brif(fits, fast, &[], slow, &[]);
+                self.builder.switch_to_block(fast);
+                self.builder.seal_block(fast);
+                let tagged = self.builder.ins().bor_imm(shifted, 1);
+                self.builder.ins().jump(join, &[BlockArg::Value(tagged)]);
+                self.builder.switch_to_block(slow);
+                self.builder.seal_block(slow);
+                let heavy = self.helper(self.jit.helpers.box_int, &[val.v]);
+                self.builder.ins().jump(join, &[BlockArg::Value(heavy)]);
+                self.builder.switch_to_block(join);
+                self.builder.seal_block(join);
+                self.builder.block_params(join)[0]
+            }
+            Kind::Bool => {
+                let t = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, crate::heap::bool(true));
+                let f = self
+                    .builder
+                    .ins()
+                    .iconst(types::I64, crate::heap::bool(false));
+                let c = self.builder.ins().icmp_imm(IntCC::NotEqual, val.v, 0);
+                self.builder.ins().select(c, t, f)
             }
         }
     }
 
+    /// A word as an `Int` register: an immediate is untagged in place, and anything else is the
+    /// runtime's to unbox or refuse.
+    fn as_int(&mut self, val: Val) -> cranelift_codegen::ir::Value {
+        match val.kind {
+            Kind::Int => val.v,
+            _ => {
+                let w = self.boxed(val);
+                let tagged = self.builder.ins().band_imm(w, 1);
+                let fast = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+                self.builder.ins().brif(tagged, fast, &[], slow, &[]);
+                self.builder.switch_to_block(fast);
+                self.builder.seal_block(fast);
+                let v = self.builder.ins().sshr_imm(w, 1);
+                self.builder.ins().jump(join, &[BlockArg::Value(v)]);
+                self.builder.switch_to_block(slow);
+                self.builder.seal_block(slow);
+                let v = self.helper(self.jit.helpers.unbox_int, &[w]);
+                self.check();
+                self.builder.ins().jump(join, &[BlockArg::Value(v)]);
+                self.builder.switch_to_block(join);
+                self.builder.seal_block(join);
+                self.builder.block_params(join)[0]
+            }
+        }
+    }
+
+    /// A word as a `Bool` register: a compare against the two singletons, and the runtime's
+    /// refusal for anything else.
     fn as_bool(&mut self, val: Val) -> cranelift_codegen::ir::Value {
         match val.kind {
             Kind::Bool => val.v,
             _ => {
-                let handle = self.boxed(val);
-                let v = self.helper(self.jit.helpers.unbox_bool, &[handle]);
+                let w = self.boxed(val);
+                let is_true = self
+                    .builder
+                    .ins()
+                    .icmp_imm(IntCC::Equal, w, crate::heap::bool(true));
+                let is_false =
+                    self.builder
+                        .ins()
+                        .icmp_imm(IntCC::Equal, w, crate::heap::bool(false));
+                let known = self.builder.ins().bor(is_true, is_false);
+                let fast = self.builder.create_block();
+                let slow = self.builder.create_block();
+                let join = self.builder.create_block();
+                self.builder.append_block_param(join, types::I64);
+                self.builder.ins().brif(known, fast, &[], slow, &[]);
+                self.builder.switch_to_block(fast);
+                self.builder.seal_block(fast);
+                let v = self.builder.ins().uextend(types::I64, is_true);
+                self.builder.ins().jump(join, &[BlockArg::Value(v)]);
+                self.builder.switch_to_block(slow);
+                self.builder.seal_block(slow);
+                let v = self.helper(self.jit.helpers.unbox_bool, &[w]);
                 self.check();
-                v
+                self.builder.ins().jump(join, &[BlockArg::Value(v)]);
+                self.builder.switch_to_block(join);
+                self.builder.seal_block(join);
+                self.builder.block_params(join)[0]
             }
         }
     }
