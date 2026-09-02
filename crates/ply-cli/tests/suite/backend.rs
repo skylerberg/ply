@@ -22,6 +22,10 @@ fn pair(x: Int) -> List<Int> = [x, x]
 
 fn label(x: Int) -> String = "n"
 
+// A carried argument and an answer the seam does not carry: offered to every backend and declined
+// by the reference one's registry, which is the registry-miss path `wrong:unoffered` corrupts.
+fn grade(x: Int) -> Float = 1.5
+
 // Outside the fragment — a `Float` literal has no path in it — so its name is one the registry
 // lacks however wide the registry is, which is what `wrong:unoffered` answers for.
 fn refused(x: Int) -> Int = if 1.5 > 0.5 { x + 1 } else { x }
@@ -50,6 +54,7 @@ test "a pair has two" { assert_eq(len(pair(7)), 2) }
 test "a pair holds its number" { assert_eq(pair(7), [7, 7]) }
 test "a refused body adds one" { assert_eq(refused(2), 3) }
 test "a label is a word" { assert_eq(label(7), "n") }
+test "a grade is a float" { assert(grade(7) == 1.5) }
 test "a self handled effect still answers" { assert_eq(handled(1), 10) }
 "#;
 
@@ -204,14 +209,22 @@ fn a_bool_where_an_int_belongs_crosses_the_seam_and_is_caught_by_ply_test() {
         caught.contains(&"m.double doubles".to_string()),
         "{caught:?}"
     );
+    // A `String` crosses the seam too, so an `Int` in its place is a caught wrong kind.
+    assert!(
+        caught.contains(&"m.a label is a word".to_string()),
+        "{caught:?}"
+    );
 }
 
+/// `grade` is offered — its argument is carried — and declined by the reference registry, whose
+/// members are the carried *signatures*; an answer for it is an answer for a name the backend has
+/// no body for.
 #[test]
 fn an_answer_for_a_definition_the_backend_has_no_body_for_is_caught_by_ply_test() {
     let dir = project(CORPUS);
     let caught = fires_and_is_caught(dir.path(), "wrong:unoffered");
     assert!(
-        caught.contains(&"m.a label is a word".to_string()),
+        caught.contains(&"m.a grade is a float".to_string()),
         "{caught:?}"
     );
 }
@@ -352,9 +365,8 @@ fn a_backend_run_writes_no_pass() {
         0,
         "a run with no backend believed a pass a backend run recorded: {plain}"
     );
-    // Seven: `CORPUS` gained `label` and a second test on `pair` on 2026-08-31 (see [`CORPUS`]'s
-    // note).
-    assert_eq!(u64_at(&plain, &["summary", "passed"]), 8, "{plain}");
+    // Every test in `CORPUS`, counted so a test that silently stopped running would show here.
+    assert_eq!(u64_at(&plain, &["summary", "passed"]), 9, "{plain}");
 }
 
 // --- The flag itself --------------------------------------------------------
@@ -461,6 +473,10 @@ fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
     let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:wrong-type");
     assert!(
         caught.contains(&"m.double doubles".to_string()),
+        "{caught:?}"
+    );
+    assert!(
+        caught.contains(&"m.a label is a word".to_string()),
         "{caught:?}"
     );
 }

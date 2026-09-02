@@ -93,16 +93,20 @@ pub struct Counts {
 /// The widening ladder, coarsest last.
 pub(crate) const LADDER: [(&str, &[&str], bool); 7] = [
     ("0 Int|Bool (before 2026-08-30)", &["Int", "Bool"], false),
-    ("1 +Bytes (today)", &["Int", "Bool", "Bytes"], false),
-    ("2 +Bytes,Str", &["Int", "Bool", "Bytes", "Str"], false),
+    ("1 +Bytes (2026-08-31)", &["Int", "Bool", "Bytes"], false),
+    (
+        "2 +Bytes,Str,Unit (today)",
+        &["Int", "Bool", "Bytes", "Str", "Unit"],
+        false,
+    ),
     (
         "3 +Record,Ctor  shallow",
-        &["Int", "Bool", "Bytes", "Str", "Record", "Ctor"],
+        &["Int", "Bool", "Bytes", "Str", "Unit", "Record", "Ctor"],
         false,
     ),
     (
         "3d +Record,Ctor  DEEP",
-        &["Int", "Bool", "Bytes", "Str", "Record", "Ctor"],
+        &["Int", "Bool", "Bytes", "Str", "Unit", "Record", "Ctor"],
         true,
     ),
     (

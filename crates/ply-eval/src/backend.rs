@@ -36,21 +36,31 @@ pub struct Counters {
     fired: AtomicU64,
     bytes_in: AtomicU64,
     bytes_out: AtomicU64,
+    str_in: AtomicU64,
+    str_out: AtomicU64,
     containers_out: AtomicU64,
 }
 
 impl Counters {
-    /// One offer, counted, and whether it carried a `Bytes` in.
+    /// One offer, counted, and whether it carried a `Bytes` or a `String` in.
     pub fn note_offer(&self, args: &[Value]) {
         self.offered.fetch_add(1, Ordering::Relaxed);
         if args.iter().any(|a| matches!(a, Value::Bytes(_))) {
             self.bytes_in.fetch_add(1, Ordering::Relaxed);
+        }
+        if args.iter().any(|a| matches!(a, Value::Str(_))) {
+            self.str_in.fetch_add(1, Ordering::Relaxed);
         }
     }
 
     /// An answered [`Value::Bytes`], counted before any mutation touches it.
     pub fn note_bytes_out(&self) {
         self.bytes_out.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// An answered [`Value::Str`], counted before any mutation touches it.
+    pub fn note_str_out(&self) {
+        self.str_out.fetch_add(1, Ordering::Relaxed);
     }
 
     /// An offer naming the one definition a targeted mutation corrupts.
@@ -70,6 +80,8 @@ impl Counters {
             fired: self.fired.load(Ordering::Relaxed),
             bytes_in: self.bytes_in.load(Ordering::Relaxed),
             bytes_out: self.bytes_out.load(Ordering::Relaxed),
+            str_in: self.str_in.load(Ordering::Relaxed),
+            str_out: self.str_out.load(Ordering::Relaxed),
             containers_out: self.containers_out.load(Ordering::Relaxed),
         }
     }
@@ -94,6 +106,11 @@ pub struct Offers {
     /// Entered calls that answered a [`Value::Bytes`], counted before any mutation touches the
     /// answer.
     pub bytes_out: u64,
+    /// Offers carrying at least one [`Value::Str`] argument.
+    pub str_in: u64,
+    /// Entered calls that answered a [`Value::Str`], counted before any mutation touches the
+    /// answer.
+    pub str_out: u64,
     /// Entered calls that answered a `List`, `Map`, `Record` or `Ctor`, counted before any mutation
     /// touches the answer.
     pub containers_out: u64,
@@ -330,6 +347,9 @@ impl Reference {
                 match &value {
                     Value::Bytes(_) => {
                         self.fragment.counters.note_bytes_out();
+                    }
+                    Value::Str(_) => {
+                        self.fragment.counters.note_str_out();
                     }
                     Value::List(_) | Value::Map(_) | Value::Record(_) | Value::Ctor { .. } => {
                         self.fragment.counters.note_container_out();
@@ -630,11 +650,13 @@ impl Compiled for Mutant {
             (Mutation::Inverted, Some(Value::Bool(b))) => self.fire(Value::Bool(!b)),
             (Mutation::WrongType, Some(Value::Int(n))) => self.fire(Value::Bool(n != 0)),
             (Mutation::WrongType, Some(Value::Bool(b))) => self.fire(Value::Int(i64::from(b))),
-            // The third kind the seam carries, and the arm that keeps this mutation's claim true of
-            // it.
+            // The other leaf kinds the seam carries, and the arms that keep this mutation's claim
+            // true of them.
             (Mutation::WrongType, Some(Value::Bytes(ref b))) => {
                 self.fire(Value::Int(b.len() as i64))
             }
+            (Mutation::WrongType, Some(Value::Str(ref s))) => self.fire(Value::Int(s.len() as i64)),
+            (Mutation::WrongType, Some(Value::Unit)) => self.fire(Value::Int(0)),
             (Mutation::Handle, Some(value)) => match forge_handle(&value) {
                 Some(forged) => self.fire(forged),
                 // A scalar answer has nowhere to put one.
