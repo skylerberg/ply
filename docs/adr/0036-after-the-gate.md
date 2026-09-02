@@ -1,20 +1,30 @@
 # ADR 0036 — After the gate: what ADR 0035's rule named, revisited
 
-**Decided and landed in part; the series is what says how far it went.**
-ADR 0035's re-take put both kernels over its bar and its own rule named what
-to revisit: Decisions 2 and 5 for the integer kernel, Decisions 1 and 4 for
-the record kernel. This record is the first pass over those four, taken as
-what the profiles pointed at rather than as a redesign, and it changes no
+**Decided and landed; the series says how far it went.** ADR 0035's re-take
+put both kernels over its bar and its own rule named what to revisit:
+Decisions 2 and 5 for the integer kernel, Decisions 1 and 4 for the record
+kernel. This record is the first pass over those four, taken as what the
+profiles pointed at rather than as a redesign, and it changes no
 representation ADR 0035 decided: the words, the layouts, the counts, the
 strings, the list and the seam all stand. `benches/value-model/after-loops.txt`
 is the series after it and `benches/front-end-whole/observation-4.txt` the
-front-end row, both under their own pre-registrations.
+front-end row, both under their own pre-registrations. What they say: the
+record kernel sits at the bar's edge, within its resolution of it; the
+integer kernel is nearer than at the re-take and still an order of magnitude
+out, for the reason the budget's pricing below gives; and the whole front end
+under the backend is under a second of wall time where it was several before
+ADR 0035 and tens interpreted, every phase entered whole. What remains of the
+integer kernel's distance is the round's own records and count-downs, which
+neither the inliner nor a helper reaches: the lever there is a register
+allocation over a body the inliner does not have to flatten, which is the C
+target's (`docs/BOOTSTRAP-PATH.md` step 10) and not this record's.
 
 > **What this decides.** That a builtin the checker can type is a load in a
 > register rather than a call; that a callback over a range or a list is a loop
 > in the body that calls its step directly rather than a closure the runtime
-> calls back; and that a record update copies by offset, never by name, when it
-> cannot write in place.
+> calls back; that a record update copies by offset, never by name, when it
+> cannot write in place; and that an entry's dead memory is reused within the
+> entry, so an entry's memory is bounded by what it holds.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -74,6 +84,24 @@ out raise, and so decline — and the constructors `iterate` unwraps are checked
 inline. Whether the step can be called is decided from its denotation before
 anything is evaluated, so a step that is a constructor or a builtin takes the
 runtime's path whole.
+
+## Decision 4 — an entry's dead memory is reused within the entry
+
+ADR 0035's allocator bumped a pointer and gave memory back only at the entry's
+end, so an entry's memory was bounded by what it ever allocated rather than by
+what it held: a long entry — a whole compile, a loop of a few million steps
+building a record each — grew without bound, and the list gate's array
+refusal (ADR 0035, step 6) was memory before it was time. A dead object now
+goes back to its heap's free list for its size class, from the header its
+allocation site wrote, and an allocation of that class takes it before the
+bump pointer moves; a bridged object does not, because its slot is on the
+heap's drop log and a second bridged value in the same slot would be dropped
+twice at the entry's end. A release build reuses; a debug build does not, so
+every suite still reads a stale word as a dead header rather than as someone
+else's object — the net the counts are checked under — while the examples
+under the audit, the kernels and the front-end row run the reuse. A
+five-million-step churn of one record holds its memory flat where it grew by
+the step before.
 
 ## Priced and rejected
 
