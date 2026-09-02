@@ -62,15 +62,14 @@ kernel's work and bought nothing until the interpreter could call compiled code
 
 The seam is wider than it was, and what it still refuses is specific.
 `crates/ply-eval/src/compiled.rs` carries a value whose declared type is built
-from `Int`, `Bool` and `Bytes` — lists, maps, records and declared types of
-those included, since ADR 0030's widening — and a backend answers one value
-with no arena, handler stack or route back in. What cannot cross: a function, a
-type variable, `String`, `Unit`, `Float`, `Decimal`, and the cell, task and
+from `Int`, `Bool`, `Bytes`, `String` and `Unit` — lists, maps, records and
+declared types of those included, since ADR 0030's widening — and a backend
+answers one value with no arena, handler stack or route back in. What cannot
+cross: a function, a type variable, `Float`, `Decimal`, and the cell, task and
 secret kinds (`CarriedTypes::blocker`). Separately, the *registry* of what the
-machine may enter is narrowed to scalar signatures by default
-(`backend::scalar_signature`), because ADR 0030 measured that registering every
-carried signature adds leaf islands and loses; `PLY_CODEGEN_REGISTER=all` is
-the measurement knob.
+machine may enter is every compiled function whose signature is carried
+(step 3's row decided it); `PLY_CODEGEN_REGISTER=narrow` keeps ADR 0030's
+scalar-signature arm as the measurement knob.
 
 ## The path, in order
 
@@ -114,13 +113,22 @@ measurement is confounded until the earlier one has moved.
    `benches/front-end/PRE-REGISTERED.md`: with the wide registry the whole
    parse of each example file runs inside one native entry and beats no backend
    by ten times the null control's resolution, while the narrow registry loses
-   as before. Both series (`observation-*.txt`) are recorded as observations
-   rather than figures, because the load rose past the gate during each — a
-   clean re-take is owed and `run.sh` takes it. The backend now refuses an
+   as before. Three series (`observation-*.txt`) say the same, and all three
+   are recorded as observations rather than figures: the protocol's after-load
+   gate reads the one-minute average, and a series of ten-worker test runs
+   lifts that past 4 on an otherwise idle machine before it ends — the third
+   series started at 3.2 and finished at 4.9 with nothing else running. The
+   gate as pre-registered measures the series' own workers, so what stands as
+   the load evidence is the load *before* and the null control's resolution,
+   which is tight in every series. The backend now refuses an
    answer holding a closure, cell, task or secret itself, so no registry width
-   leaks one. Still to admit: what `CarriedTypes::blocker` refuses that a front
-   end needs — type variables (the spike's generic `comma_list`), `String`,
-   `Unit` — each with the wrong-backend mutations that police it. What the row
+   leaks one. `String` and `Unit` now cross, with the wrong-backend mutations
+   that police them and the differential corpus asserting the widening is
+   reached. Still to admit: a type variable (the spike's generic `comma_list`).
+   A value of unknown type can only be admitted by walking it for a handle,
+   which is the O(value) cost per call the type gate exists to avoid, so what
+   it needs is the instantiation at the call site — a design step with its own
+   row rather than a widening of the table. What the row
    also says: the compiled parse is a fifth faster than the interpreted one,
    not five times, so the next lever is what compiled code does with values
    (step 4), not what it lowers.
