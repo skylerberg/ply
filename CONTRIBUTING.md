@@ -767,19 +767,6 @@ original ones and the gaps are where closures used to be.
     `SliceBuilder` and `CausalSlice` themselves are **not enforced**. Nothing in
     `ply-test` was changed.
 
-18. **`crates/ply-codegen-spike`'s agreement corpus is red, and
-    `cargo test --release` does not say so.** From inside the crate,
-    `./target/release/mcts --dir ../../benches/kernel --only agreement` exits 1
-    with dozens of disagreements, all of them one check — the boundary carrying
-    an argument kind it refuses. The crate's own test suite is green throughout,
-    because no test runs that command.
-
-    **This is the shape to notice, not the count.** A green `cargo test` over a
-    harness whose *purpose* is a differential, with the differential itself
-    behind a binary nothing invokes, is a green result over space nothing
-    exercises. Re-run the command rather than trusting the suite, and see
-    `benches/README.md` §"What `mcts` adds".
-
 ### Closed items, kept only so a reference resolves
 
 Comments in the source and notes in other documents cite these by number. One
@@ -798,6 +785,7 @@ made them.
 11. A definition that discharged its own effects published an empty row, so the seam's purity gate cleared it.
 12. Every entry into the spike's backend cost O(the *previous* entry's peak arena).
 17. `spikes/ply-parser` was in no CI job and its differential was red.
+18. `crates/ply-codegen-spike`'s agreement corpus was red and its suite green, because no test ran the command: the spike's boundary handed the leaf kinds the machine's seam admits to bodies compiled over `Int` and `Bool`. The boundary checks the kind now, and the suite runs the command. The shape to notice stands: a green suite over a harness whose purpose is a differential the suite never invokes is a green result over space nothing exercises.
 
 ## Style
 
