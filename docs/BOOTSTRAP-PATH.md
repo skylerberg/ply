@@ -315,7 +315,11 @@ measurement is confounded until the earlier one has moved.
    to revisit — builtins and callbacks that stay calls, a map copied per
    insert, an update that does not reuse the cell it releases — is where the
    next record starts, and the front-end row re-taken on the same binary
-   (step 7) is the outcome it is read against.
+   (step 7) is the outcome it is read against. ADR 0036 is that record's
+   first pass: the update's copy path by offset, the builtins the checker can
+   type as loads, and the callbacks as loops in the body; its series are
+   `benches/value-model/after-loops.txt` and
+   `benches/front-end-whole/observation-4.txt`.
 10. **Emit C.** Where the path ends, decided as a direction and gated on step 9:
     the eventual host is a C compiler and libc, with the compiler and its
     runtime written in Ply, which is the line Rust itself holds above LLVM and

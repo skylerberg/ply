@@ -174,6 +174,12 @@ fn totals(n: Int) -> Int = { let a = fold(range(0, n), {total: 0, count: 0}, bum
 fn walked(n: Int, k: Int) -> Int = iterate({total: 0, count: 0}, n + 1, |a: Acc| if a.count >= n { Stop(a.total) } else { Continue({..a, total: a.total + k, count: a.count + 1}) })
 
 fn huge(n: Int) -> Int = fold(range(0, 20000000 + n), 0, add)
+
+fn listed_sum(n: Int) -> Int = fold(map(range(0, n), inc), 0, add)
+
+fn kept(n: Int) -> Int = len(filter(map(range(0, n), inc), |x: Int| x % 2 == 1))
+
+fn longer(n: Int) -> Int = fold(map(range(0, n), inc), 0, |acc: Int, x: Int| acc + x * 2)
 "#;
 
 /// The control every other test here is read against: the fragment is not empty, and it is not
@@ -306,6 +312,11 @@ fn a_compiled_body_answers_over_closures_and_callbacks() {
         // record, and an `iterate` with a lambda that captures.
         ("m.stepped", vec![Value::Int(10)], Value::Int(45)),
         ("m.totals", vec![Value::Int(4)], Value::Int(10)),
+        // Fused loops over a list built by a fused `map`: a typed step, a filter, a lambda step
+        // over a list of a hundred so the walk crosses a leaf.
+        ("m.listed_sum", vec![Value::Int(10)], Value::Int(55)),
+        ("m.kept", vec![Value::Int(5)], Value::Int(3)),
+        ("m.longer", vec![Value::Int(100)], Value::Int(10100)),
         (
             "m.walked",
             vec![Value::Int(5), Value::Int(3)],
