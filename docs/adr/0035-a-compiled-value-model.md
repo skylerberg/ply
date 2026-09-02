@@ -1,33 +1,34 @@
 # ADR 0035 — A compiled value model: layouts from types, counts without atomics, reuse
 
-**Decided; sequence steps 1 to 3 are landed, and the gate is not yet met.**
+**Decided; sequence steps 1 to 5 are landed, and the gate is not yet met.**
 `benches/value-model/PRE-REGISTERED.md` is the gate's protocol and the bar is
 in `benches/value-model/analyze.py`, where a number cannot set it after the
 fact; `baseline.txt` there is the series before anything was built,
 `after-words.txt` the series after the words landed, `after-layouts.txt` the
-series after the layouts did and `after-drops.txt` the series after the
-drops. What landed: calls between compiled functions are direct and typed; a
-compiled value is one word, with records, constructors, lists, maps and native
-closures laid out as counted objects allocated by bumping a pointer over
-memory the entry recycles, and everything else bridged; a field of a record
-whose type the checker fixed is read at its offset, and one read by name finds
-its offset in a table after the first read; a remembered constant is copied
-into memory that outlives the entry; a binding is released at its scope's end
-unless a move emptied it, and every branch, arm and block answers a value it
-owns. What the fourth series says: both kernels are still over the bar, the
-integer one at a small fraction of its baseline distance and the record one a
-few times Rust, and the whole front end under the backend takes roughly a
-quarter of what it did before this record. What the drops found: not speed —
-the record kernel's last gain was native byte concatenation — but a hole,
-a branch answering a local that the join then aliased at one count, so an
-update through the alias wrote into the original; owning every tail closed it,
-and the front end pays a fraction more where a state really is shared and an
-update now copies. Where the integer kernel's remaining distance is: not in
-any one helper any more but in the record built and torn down per mixing
-step, which only inlining the step and keeping the record's fields in
-registers removes — a compiler pass over the lowered code, sequence step 5.
-`docs/BOOTSTRAP-PATH.md` step 9 carries this record's place in the path and
-step 10 what is built on it if the gate clears.
+series after the layouts did, `after-drops.txt` the series after the drops
+and `after-inline.txt` the series after the inlining. What landed: calls
+between compiled functions are direct and typed; a compiled value is one word,
+with records, constructors, lists, maps and native closures laid out as
+counted objects allocated by bumping a pointer over memory the entry recycles,
+and everything else bridged; a field of a record whose type the checker fixed
+is read at its offset — a scalar one straight into a register, whatever the
+ownership mark — and one read by name finds its offset in a table after the
+first read; a remembered constant is copied into memory that outlives the
+entry; a binding is released at its scope's end unless a move emptied it, and
+every branch, arm and block answers a value it owns; a small pure callee is
+inlined at its call before the body is lowered, and a record that is built
+and only ever read by field inside one body is never built at all. What the
+fifth series says: the integer kernel moved by a large factor and is still
+over the bar, the record kernel moved by a fifth and is a few times Rust, and
+the front end's check row moved by about a sixth. Where the integer kernel's
+remaining distance is: the sixteen-word state records built per round and per
+permutation, which the inliner leaves because their functions are over its
+budget; the chunk loop, which is a callback through the runtime; and the
+bytes builtins, which read through the bridge. Where the record kernel's is:
+its map keys and its bytes are bridged values, so every key compare and every
+concatenation is the interpreter's — sequence step 6. `docs/BOOTSTRAP-PATH.md`
+step 9 carries this record's place in the path and step 10 what is built on
+it if the gate clears.
 
 > **What this decides.** That the representation compiled Ply code runs on today
 > is an interpreter's, that no exception carved out for a hot function changes
@@ -249,9 +250,20 @@ a baseline the change is read against and the kernels are known to run.
    Reuse of a dying cell for a new one of the same shape is not built: the
    allocator is a bump pointer, so the cell would have to be kept on a free
    list, and no kernel has yet shown the allocation itself to be the cost.
-5. Inlining a small pure callee into its caller over the lowered code, and
-   keeping a record that never escapes in registers, which is what removes the
-   record built per mixing step from the integer kernel.
+5. **Landed.** A pass over a definition's syntax before it is lowered
+   (`crates/ply-codegen/src/opt.rs`): a small pure callee in the caller's own
+   module is inlined at its call with every name it binds made fresh, a block
+   a `let` binds opens into the block around it, and a record a `let` binds
+   that is only ever read by field becomes one binding per field. With it, a
+   field of a fixed shape is read inline whatever its ownership mark — a
+   scalar into a register, anything else taken out of a unique record as the
+   runtime did — and the count-down dismantles a dying object's children on
+   the stack rather than through a work list it allocated. The pass is
+   syntactic and the interpreter never sees its output, so the differential
+   corpus and the fragment's cases are what hold it to the source. Its budget
+   is small and fixed; the integer kernel's remaining records are in functions
+   over it, and a budget that admits them is a compile-time trade the front
+   end's own codegen row prices.
 6. Native strings and bytes; the list's array candidate priced under ADR 0034's
    gates, or the trie with typed leaves if it is refused.
 7. The seam's conversion and its census (Decision 6).
