@@ -414,7 +414,7 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     let f: Entry = unsafe { std::mem::transmute::<usize, Entry>(tables.functions[index as usize]) };
     let handle = unsafe { f(ctx, std::ptr::null()) };
     let c = unsafe { &mut *ctx };
-    if c.failed == 0 && ply_eval::memo::world_independent(c.read(handle), 0) {
+    if c.failed == 0 && ply_eval::memo::world_independent(c.read(handle)) {
         let mut memo = tables.memo.borrow_mut();
         let index = index as usize;
         if memo.len() <= index {

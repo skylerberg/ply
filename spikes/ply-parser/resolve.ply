@@ -31,9 +31,13 @@ pub type Mod = { name: Bytes, module: Module, derived: List<Derived> }
 pub type Ns = | NValue | NType | NEffect
 
 pub type Declared = { name: Bytes, qualified: Bytes, public: Bool, span: Span }
-pub type Decls = { values: List<Declared>, types: List<Declared>, effects: List<Declared> }
+// The lists keep the reference's insertion order, which the dump compares; the maps answer a
+// lookup without scanning them. A name entered twice keeps its first entry in both.
+pub type Decls = { values: List<Declared>, types: List<Declared>, effects: List<Declared>,
+                   by_value: Map<Bytes, Declared>, by_type: Map<Bytes, Declared>, by_effect: Map<Bytes, Declared> }
 pub type Binding = { name: Bytes, qualified: Bytes, owner: Int, span: Span }
-pub type Bindings = { values: List<Binding>, types: List<Binding>, effects: List<Binding> }
+pub type Bindings = { values: List<Binding>, types: List<Binding>, effects: List<Binding>,
+                      by_value: Map<Bytes, Binding>, by_type: Map<Bytes, Binding>, by_effect: Map<Bytes, Binding> }
 pub type ModBind = { binder: Bytes, target: Int, span: Span }
 pub type Scope = { module: Bytes, modules: List<ModBind>, selective: List<ModBind>, bound: Bindings }
 pub type Label = { module: Int, start: Int, end: Int, primary: Bool }
@@ -46,38 +50,50 @@ pub type Entry = { name: Bytes, at: Int }
 pub type Resolved = { names: List<Entry>, scopes: List<Scope>, declarations: List<Decls>,
                   declared: List<Bindings>, order: List<Int> }
 
-fn no_decls() -> Decls = { values: [], types: [], effects: [] }
-fn no_bindings() -> Bindings = { values: [], types: [], effects: [] }
+fn no_decls() -> Decls = { values: [], types: [], effects: [], by_value: map_new(), by_type: map_new(), by_effect: map_new() }
+fn no_bindings() -> Bindings = { values: [], types: [], effects: [], by_value: map_new(), by_type: map_new(), by_effect: map_new() }
 
 fn spaces() -> List<Ns> = [NValue, NType, NEffect]
 
 pub fn space(d: Decls, ns: Ns) -> List<Declared> =
   match ns { NValue -> d.values, NType -> d.types, NEffect -> d.effects }
 
-fn with_space(d: Decls, ns: Ns, xs: List<Declared>) -> Decls =
+fn first_declared(m: Map<Bytes, Declared>, x: Declared) -> Map<Bytes, Declared> =
+  if map_contains(m, x.name) { m } else { map_insert(m, x.name, x) }
+
+fn first_binding(m: Map<Bytes, Binding>, x: Binding) -> Map<Bytes, Binding> =
+  if map_contains(m, x.name) { m } else { map_insert(m, x.name, x) }
+
+// One declaration more, in the list and in the map.
+fn dpush(d: Decls, ns: Ns, x: Declared) -> Decls =
   match ns {
-    NValue -> {..d, values: xs},
-    NType -> {..d, types: xs},
-    NEffect -> {..d, effects: xs},
+    NValue -> {..d, values: push(d.values, x), by_value: first_declared(d.by_value, x)},
+    NType -> {..d, types: push(d.types, x), by_type: first_declared(d.by_type, x)},
+    NEffect -> {..d, effects: push(d.effects, x), by_effect: first_declared(d.by_effect, x)},
   }
 
-pub fn bspace(b: Bindings, ns: Ns) -> List<Binding> =
-  match ns { NValue -> b.values, NType -> b.types, NEffect -> b.effects }
+pub fn dlookup(d: Decls, ns: Ns, name: Bytes) -> Option<Declared> =
+  map_get(match ns { NValue -> d.by_value, NType -> d.by_type, NEffect -> d.by_effect }, name)
 
-fn with_bspace(b: Bindings, ns: Ns, xs: List<Binding>) -> Bindings =
+fn with_bspace(b: Bindings, ns: Ns, xs: List<Binding>) -> Bindings = {
+  let by = fold(xs, map_new(), |m: Map<Bytes, Binding>, x: Binding| first_binding(m, x));
   match ns {
-    NValue -> {..b, values: xs},
-    NType -> {..b, types: xs},
-    NEffect -> {..b, effects: xs},
+    NValue -> {..b, values: xs, by_value: by},
+    NType -> {..b, types: xs, by_type: by},
+    NEffect -> {..b, effects: xs, by_effect: by},
+  }
+}
+
+// One binding more, in the list and in the map.
+fn bpush(b: Bindings, ns: Ns, x: Binding) -> Bindings =
+  match ns {
+    NValue -> {..b, values: push(b.values, x), by_value: first_binding(b.by_value, x)},
+    NType -> {..b, types: push(b.types, x), by_type: first_binding(b.by_type, x)},
+    NEffect -> {..b, effects: push(b.effects, x), by_effect: first_binding(b.by_effect, x)},
   }
 
-pub fn find_declared(xs: List<Declared>, name: Bytes) -> Option<Declared> =
-  fold(xs, None, |acc: Option<Declared>, x: Declared|
-    match acc { Some(_) -> acc, None -> if x.name == name { Some(x) } else { None } })
-
-pub fn find_binding(xs: List<Binding>, name: Bytes) -> Option<Binding> =
-  fold(xs, None, |acc: Option<Binding>, x: Binding|
-    match acc { Some(_) -> acc, None -> if x.name == name { Some(x) } else { None } })
+pub fn lookup(b: Bindings, ns: Ns, name: Bytes) -> Option<Binding> =
+  map_get(match ns { NValue -> b.by_value, NType -> b.by_type, NEffect -> b.by_effect }, name)
 
 pub fn find_modbind(xs: List<ModBind>, binder: Bytes) -> Option<ModBind> =
   fold(xs, None, |acc: Option<ModBind>, x: ModBind|
@@ -174,11 +190,10 @@ fn declarations_of(m: Mod) -> Decls =
     })
 
 fn declare(d: Decls, ns: Ns, module: Bytes, name: Ident, vis: Vis) -> Decls =
-  match find_declared(space(d, ns), name.name) {
+  match dlookup(d, ns, name.name) {
     Some(_) -> d,
-    None -> with_space(d, ns, push(space(d, ns),
-              { name: name.name, qualified: qualify(module, name.name),
-                public: is_public(vis), span: name.span })),
+    None -> dpush(d, ns, { name: name.name, qualified: qualify(module, name.name),
+                           public: is_public(vis), span: name.span }),
   }
 
 fn bindings_of(owner: Int, d: Decls) -> Bindings =
@@ -257,14 +272,14 @@ fn bind_module(w: World, i: Int, b: Builder, d: ImportDecl, t: Int) -> Builder =
 
 fn bind_name(w: World, i: Int, b: Builder, t: Int, name: Ident) -> Builder = {
   let decls = at(w.declarations, t);
-  let found = filter(spaces(), |ns: Ns| match find_declared(space(decls, ns), name.name) { Some(_) -> true, None -> false });
+  let found = filter(spaces(), |ns: Ns| match dlookup(decls, ns, name.name) { Some(_) -> true, None -> false });
   if len(found) == 0 {
     {..b, diags: push(b.diags, diag1(b"E0101", i, name.span, 1))}
   } else {
     let public = filter(found, |ns: Ns|
-      match find_declared(space(decls, ns), name.name) { Some(x) -> x.public, None -> false });
+      match dlookup(decls, ns, name.name) { Some(x) -> x.public, None -> false });
     if len(public) == 0 {
-      let declared = match find_declared(space(decls, at(found, 0)), name.name) {
+      let declared = match dlookup(decls, at(found, 0), name.name) {
         Some(x) -> x,
         None -> panic("just found"),
       };
@@ -276,22 +291,20 @@ fn bind_name(w: World, i: Int, b: Builder, t: Int, name: Ident) -> Builder = {
 }
 
 fn bind_one(w: World, i: Int, b: Builder, t: Int, name: Ident, ns: Ns) -> Builder = {
-  let binding = match find_binding(bspace(at(w.declared, t), ns), name.name) {
+  let binding = match lookup(at(w.declared, t), ns, name.name) {
     Some(x) -> x,
     None -> panic("a public declaration always has a binding"),
   };
-  match find_declared(space(b.local, ns), name.name) {
+  match dlookup(b.local, ns, name.name) {
     // Local-wins was rejected deliberately: adding a local beside an import would silently
     // steal every existing call site.
     Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0108", i, name.span, i, prev.span, 2))},
     None ->
-      match find_declared(space(b.imported, ns), name.name) {
+      match dlookup(b.imported, ns, name.name) {
         Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0110", i, name.span, i, prev.span, 1))},
         None -> {
-          let imported = with_space(b.imported, ns, push(space(b.imported, ns),
-            { name: name.name, qualified: binding.qualified, public: true, span: name.span }));
-          let bound = with_bspace(b.scope.bound, ns, push(bspace(b.scope.bound, ns),
-            { name: name.name, qualified: binding.qualified, owner: t, span: name.span }));
+          let imported = dpush(b.imported, ns, { name: name.name, qualified: binding.qualified, public: true, span: name.span });
+          let bound = bpush(b.scope.bound, ns, { name: name.name, qualified: binding.qualified, owner: t, span: name.span });
           {..b, imported: imported, scope: {..b.scope, bound: bound}}
         },
       },
@@ -364,15 +377,15 @@ fn cycle_diag(c: Cycle) -> Diag =
 pub fn find(r: Resolved, module: Int, ns: Ns, q: QName) -> Option<Binding> = {
   let scope = at(r.scopes, module);
   match q.module {
-    None -> find_binding(bspace(scope.bound, ns), q.name.name),
+    None -> lookup(scope.bound, ns, q.name.name),
     Some(binder) ->
       match find_modbind(scope.modules, binder.name) {
         None -> None,
         Some(mb) ->
-          match find_declared(space(at(r.declarations, mb.target), ns), q.name.name) {
+          match dlookup(at(r.declarations, mb.target), ns, q.name.name) {
             None -> None,
             Some(d) -> if !d.public { None }
-                       else { find_binding(bspace(at(r.declared, mb.target), ns), q.name.name) },
+                       else { lookup(at(r.declared, mb.target), ns, q.name.name) },
           },
       },
   }
@@ -592,7 +605,7 @@ fn qfields(r: Resolved, q: Qual, xs: List<RecField>) -> { q: Qual, xs: List<RecF
   })
 
 fn decl_public(r: Resolved, owner: Int, name: Bytes) -> Bool =
-  match find_declared(space(at(r.declarations, owner), NValue), name) { Some(d) -> d.public, None -> false }
+  match dlookup(at(r.declarations, owner), NValue, name) { Some(d) -> d.public, None -> false }
 
 // --- Defaults: the signatures ---------------------------------------------------------------
 
@@ -934,7 +947,13 @@ pub fn resolve(sources: List<Source>) -> Outcome =
   resolve_modules(map(sources, |s: Source| { name: s.name, module: parse(s.src).node, derived: [] }))
 
 // `resolve` over modules already parsed — and, for the checker, already rewritten.
-pub fn resolve_modules(mods: List<Mod>) -> Outcome = {
+pub fn resolve_modules(mods: List<Mod>) -> Outcome = resolve_with(mods, true)
+
+// The tables alone — the index, the declarations, the scopes and the order — with the
+// defaults pass left undone, so a measurement can attribute the resolver's cost between them.
+pub fn resolve_tables(mods: List<Mod>) -> Outcome = resolve_with(mods, false)
+
+fn resolve_with(mods: List<Mod>, defaults: Bool) -> Outcome = {
   let n = len(mods);
   // The index: the first module of each name; a second non-anonymous one is `E0105`.
   let indexed = fold(range(0, n), { names: [], diags: [] }, |acc: { names: List<Entry>, diags: List<Diag> }, i: Int| {
@@ -957,8 +976,10 @@ pub fn resolve_modules(mods: List<Mod>) -> Outcome = {
   // Only with a consistent set of tables: expansion resolves names through them.
   if len(diags2) > 0 { Failed(diags2) } else {
     let r = { names: indexed.names, scopes: scopes, declarations: declarations, declared: declared, order: dfs.order };
-    let x = expand(r, mods, []);
-    if len(x.diags) > 0 { Failed(x.diags) } else { Resolved_(x) }
+    if !defaults { Resolved_({ r: r, mods: mods, diags: [] }) } else {
+      let x = expand(r, mods, []);
+      if len(x.diags) > 0 { Failed(x.diags) } else { Resolved_(x) }
+    }
   }
 }
 
