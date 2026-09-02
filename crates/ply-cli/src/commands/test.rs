@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     // Before the store is opened, because a misspelled `--backend` must not leave a cache directory
     // behind for a run that is about to refuse.
     let backend = match backend_spec(args.backend.as_ref()) {
@@ -61,6 +61,58 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             return EXIT_COMPILE_ERROR;
         }
     };
+    // The store, the front end and the compiled unit outlive one iteration under `--watch`, which
+    // is the whole of what a warm process is: `benches/marginal-change/` reads an invocation that
+    // rechecks nothing and still pays a front end proportional to the project.
+    let mut warm = crate::warm::Warm::default();
+    if !args.watch {
+        return iterate(
+            args, style, &mut cache, &backend, &engine, &mut warm, warnings,
+        );
+    }
+    watch(
+        args, style, &mut cache, &backend, &engine, &mut warm, warnings,
+    )
+}
+
+/// Re-run whenever the tree moves, holding what the last iteration built.
+fn watch(
+    args: &TestArgs,
+    style: Style,
+    cache: &mut Cache,
+    backend: &Option<ply_eval::BackendSpec>,
+    engine: &ply_test::Engine,
+    warm: &mut crate::warm::Warm,
+    warnings: Vec<Diagnostic>,
+) -> i32 {
+    let root = project_root(&args.path);
+    iterate(args, style, cache, backend, engine, warm, warnings);
+    loop {
+        // A poll rather than a filesystem notification: the scan is a stat per file and this
+        // command already owes the tree a walk to discover it, so a watcher would be a dependency
+        // buying latency this loop cannot use.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        if !warm.tree_moved(&root) {
+            continue;
+        }
+        if !args.json {
+            println!();
+        }
+        iterate(args, style, cache, backend, engine, warm, Vec::new());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iterate(
+    args: &TestArgs,
+    style: Style,
+    cache: &mut Cache,
+    backend: &Option<ply_eval::BackendSpec>,
+    engine: &ply_test::Engine,
+    warm: &mut crate::warm::Warm,
+    mut warnings: Vec<Diagnostic>,
+) -> i32 {
+    let no_cache = cache_bypassed(args);
     warnings.append(&mut cache.warnings);
     let opened = cache.store.take_warnings();
     let migration = crate::migrate::notice(&cache.store, &opened);
@@ -68,13 +120,24 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     warnings.extend(migration);
 
     let incremental = !args.no_incremental && !no_cache;
-    let loaded = if incremental {
-        driver::load_incremental(&args.path, &mut cache.store)
-    } else {
-        load(&args.path)
+    // What the last iteration built, if every file is still as it was. The front end is a function
+    // of the sources, so an unmoved tree has the same one — and re-deriving it is the cost that
+    // dominates a small edit.
+    let (held, reuse) = warm.take(&project_root(&args.path));
+    let loaded = match held {
+        Some(loaded) => Ok(loaded),
+        None if incremental => driver::load_incremental(&args.path, &mut cache.store),
+        None => load(&args.path),
     };
     let mut loaded = match loaded {
-        Ok(loaded) => loaded,
+        Ok(mut loaded) => {
+            if reuse == crate::warm::Reuse::Whole {
+                // Nothing was read, parsed, hashed or restored this iteration, and the report says
+                // so rather than repeating what the iteration that did the work spent.
+                loaded.frontend.phases = driver::Phases::default();
+            }
+            loaded
+        }
         Err(err) => return report_load_error("test", &err, args.json, style),
     };
     warnings.extend(cache.store.take_warnings());
@@ -84,7 +147,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // Half of what a simulated test is cached under, so it is decided before selection and never
     // after it.
     let search = crate::simulation::plan(&args.simulation);
-    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, &engine);
+    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
     let mut plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
 
     // Evaluation needs an AST, and gate 1 may have skipped the file a selected test lives in.
@@ -114,7 +177,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
                 loaded = full;
                 hashes = loaded.hashes.clone();
                 let selected =
-                    ply_test::select(&loaded.check, &hashes, &cache.store, &search, &engine);
+                    ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
                 plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
             }
             Err(err) => return report_load_error("test", &err, args.json, style),
@@ -244,7 +307,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let warnings = once_each(warnings);
 
     let view = HostView::of(&hosts, &plan, &loaded.check, &report);
-    let backend_view = BackendView::of(backend.as_ref(), provider, &report, &engine);
+    let backend_view = BackendView::of(backend.as_ref(), provider, &report, engine);
     let ok = report.is_success() && view.escapes.is_empty() && backend_view.escapes.is_empty();
 
     if args.json {
@@ -274,6 +337,9 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             style,
         );
     }
+    // Held for the next iteration, and only now: an iteration that returned early left nothing
+    // behind, so the next one loads rather than trusting a state no run finished with.
+    warm.keep(loaded);
     exit_code(ok)
 }
 
@@ -1847,6 +1913,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
     fn args_for(filter: Option<&str>) -> TestArgs {
         TestArgs {
+            watch: false,
             path: PathBuf::from("."),
             json: true,
             explain: false,

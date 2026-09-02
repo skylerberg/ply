@@ -1738,6 +1738,30 @@ crosses the seam it corrupts. `PLY_CODEGEN_REGISTER=narrow` limits entry to
 scalar signatures, the measurement arm ADR 0030 shipped; it is part of the
 backend's cache namespace, since a pass under it entered fewer definitions.
 
+### 9.8 Staying warm
+
+`ply test --watch` does not exit. It runs, then waits for a `.ply` file under
+the path to change, then runs again — keeping the caches, the checked front end
+and the compiled unit in memory between iterations.
+
+The reason is a measurement rather than a convenience.
+`benches/marginal-change/` prices an edit at three project sizes, and what it
+found is that the cost which dominates a small edit is not the edit: an
+invocation that rechecks **nothing** still pays a front end proportional to the
+project, because it starts knowing nothing and has to hash every definition to
+establish that none moved. A process that already knows does not pay it.
+
+What an iteration costs today:
+
+- **Nothing changed.** A stat of each file, and no front end at all.
+- **Something changed.** The front end again, as a fresh invocation would run
+  it. The driver builds its tables over the whole program whatever moved, so
+  this is the part still to do; ADR 0037 carries it.
+
+Under `--json` each iteration prints one report, so a stream of them is a
+stream of objects. `Ctrl-C` ends the loop; anything the caches learned that has
+not been written is recomputed by the next run rather than lost.
+
 ---
 
 ## 10. Simulation and concurrency
@@ -2927,6 +2951,7 @@ is `E0127` with exit code 2 (§6.7).
 | flag | meaning |
 | --- | --- |
 | `--filter SUBSTRING` | only tests whose `<module>.<label>` contains it |
+| `--watch` | stay running and re-run whenever a `.ply` file under the path changes (§9.8) |
 | `--jobs N`, `-j N` | worker threads (default: one per core) |
 | `--no-cache` | neither read nor write the result cache |
 | `--no-incremental` | neither read nor write the front-end cache |
