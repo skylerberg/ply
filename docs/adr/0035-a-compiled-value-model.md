@@ -4,25 +4,30 @@
 `benches/value-model/PRE-REGISTERED.md` is the gate's protocol and the bar is
 in `benches/value-model/analyze.py`, where a number cannot set it after the
 fact; `baseline.txt` there is the series before anything was built,
-`after-words.txt` the series after the words landed and `after-layouts.txt`
-the series after the layouts did. What landed: calls between compiled
-functions are direct and typed; a compiled value is one word, with records,
-constructors, lists, maps and native closures laid out as counted objects
-allocated by bumping a pointer over memory the entry recycles, and everything
-else bridged; a field of a record whose type the checker fixed is read at its
-offset, and one read by name finds its offset in a table after the first
-read; a remembered constant is copied into memory that outlives the entry.
-What the third series says: both kernels are still over the bar, the integer
-one at a small fraction of its baseline distance and the record one within an
-order of magnitude of Rust, and the whole front end under the backend takes
-roughly a quarter of what it did before this record. Where the integer
-kernel's remaining distance is: not in any one helper any more but in the
-record built and torn down per mixing step, which only inlining the step and
-keeping the record's fields in registers removes — a compiler pass over the
-lowered code, sequence step 5 below. What is next before it: step 4's drops,
-so that a value's holder count says what it should and an update or an append
-writes in place. `docs/BOOTSTRAP-PATH.md` step 9 carries this record's place
-in the path and step 10 what is built on it if the gate clears.
+`after-words.txt` the series after the words landed, `after-layouts.txt` the
+series after the layouts did and `after-drops.txt` the series after the
+drops. What landed: calls between compiled functions are direct and typed; a
+compiled value is one word, with records, constructors, lists, maps and native
+closures laid out as counted objects allocated by bumping a pointer over
+memory the entry recycles, and everything else bridged; a field of a record
+whose type the checker fixed is read at its offset, and one read by name finds
+its offset in a table after the first read; a remembered constant is copied
+into memory that outlives the entry; a binding is released at its scope's end
+unless a move emptied it, and every branch, arm and block answers a value it
+owns. What the fourth series says: both kernels are still over the bar, the
+integer one at a small fraction of its baseline distance and the record one a
+few times Rust, and the whole front end under the backend takes roughly a
+quarter of what it did before this record. What the drops found: not speed —
+the record kernel's last gain was native byte concatenation — but a hole,
+a branch answering a local that the join then aliased at one count, so an
+update through the alias wrote into the original; owning every tail closed it,
+and the front end pays a fraction more where a state really is shared and an
+update now copies. Where the integer kernel's remaining distance is: not in
+any one helper any more but in the record built and torn down per mixing
+step, which only inlining the step and keeping the record's fields in
+registers removes — a compiler pass over the lowered code, sequence step 5.
+`docs/BOOTSTRAP-PATH.md` step 9 carries this record's place in the path and
+step 10 what is built on it if the gate clears.
 
 > **What this decides.** That the representation compiled Ply code runs on today
 > is an interpreter's, that no exception carved out for a hot function changes
@@ -237,8 +242,13 @@ a baseline the change is read against and the kernels are known to run.
    goes) allocated by a bump pointer the entry recycles, and a record's fields
    at the offsets its shape fixes — read at a known offset where the checker
    fixed the type, through a per-shape table otherwise.
-4. Drops at a scope's end and reuse of a dying cell, so that uniqueness is the
-   common case a state loop sees rather than the exception.
+4. **Landed, the drops.** A binding lives in a stack slot its scope releases
+   at its end unless a move emptied it, a branch or arm or block answers an
+   owned value, and an answer nobody binds is released where it falls; the
+   count-down is inline and the runtime is entered only for the last holder.
+   Reuse of a dying cell for a new one of the same shape is not built: the
+   allocator is a bump pointer, so the cell would have to be kept on a free
+   list, and no kernel has yet shown the allocation itself to be the cost.
 5. Inlining a small pure callee into its caller over the lowered code, and
    keeping a record that never escapes in registers, which is what removes the
    record built per mixing step from the integer kernel.
