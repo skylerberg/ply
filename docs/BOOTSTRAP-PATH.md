@@ -60,12 +60,17 @@ found the earlier form of the same constraint: the fragment covered most of a
 kernel's work and bought nothing until the interpreter could call compiled code
 (R5).
 
-The seam itself is narrow by design. `crates/ply-eval/src/compiled.rs`'s
-`crossable` admits `Int`, `Bool` and `Bytes` and nothing else, and a backend
-answers at most one value with no arena, handler stack or route back in. A front
-end produces lists, records and bytes at every step, so today nothing it does can
-cross that seam whole. ADR 0034 gave values a representation a backend could own;
-the generator does not use it yet.
+The seam is wider than it was, and what it still refuses is specific.
+`crates/ply-eval/src/compiled.rs` carries a value whose declared type is built
+from `Int`, `Bool` and `Bytes` — lists, maps, records and declared types of
+those included, since ADR 0030's widening — and a backend answers one value
+with no arena, handler stack or route back in. What cannot cross: a function, a
+type variable, `String`, `Unit`, `Float`, `Decimal`, and the cell, task and
+secret kinds (`CarriedTypes::blocker`). Separately, the *registry* of what the
+machine may enter is narrowed to scalar signatures by default
+(`backend::scalar_signature`), because ADR 0030 measured that registering every
+carried signature adds leaf islands and loses; `PLY_CODEGEN_REGISTER=all` is
+the measurement knob.
 
 ## The path, in order
 
@@ -91,13 +96,15 @@ measurement is confounded until the earlier one has moved.
    trampoline for an uncompiled callee so a refusal stops cascading to the root.
    Gate: the parser spike's entered-names count moves from leaves to roots, and
    the delivered speedup against the control is positive rather than projected.
-3. **Widen the seam to the value representation.** Lists, records and
-   constructors crossing `crossable`, on ADR 0034's slot and trie representation,
-   so a compiled subtree can build what a front end builds. ADR 0026's contract
-   goes with it: a backend must be policeable before it is fast, so every widening
-   arrives with the wrong-backend mutations that catch it through a shipping
-   command. Gate: `crossable` admits the new kinds and the mutation corpus is
-   seen to fail for each.
+3. **Widen the registry, then the seam's remaining kinds.** Once root entry
+   pays, register the carried signatures the narrow registry leaves out — the
+   parser's state record is carried and its functions are not registered — and
+   then admit what `CarriedTypes::blocker` still refuses that a front end
+   needs: type variables (the spike's generic `comma_list`), `String` and
+   `Unit`. ADR 0026's contract goes with each widening: a backend must be
+   policeable before it is fast, so every widening arrives with the
+   wrong-backend mutations that catch it through a shipping command. Gate: ADR
+   0030's row re-taken with the wider registry beats the narrow one.
 4. **The container machinery.** Map insert and lookup, record field access, list
    push and index are outside the fragment however many functions compile (ADR
    0021). Measure the share first with the executed-work census
