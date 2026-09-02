@@ -46,7 +46,7 @@ impl Memo {
 
     pub(crate) fn remember(&mut self, name: &Symbol, value: &Value) {
         if let Some(slot @ Slot::Pending) = self.slots.get_mut(name) {
-            *slot = if world_independent(value, 0) {
+            *slot = if world_independent(value) {
                 Slot::Known(value.clone())
             } else {
                 Slot::Never
@@ -57,44 +57,41 @@ impl Memo {
 
 /// Whether the value means the same thing in a world it was not produced in — what a
 /// remembered constant must be, whichever engine produced it.
-pub fn world_independent(value: &Value, depth: u32) -> bool {
-    /// Deep enough for any value a constant plausibly builds, and finite so a cyclic value
-    /// (`reference_cycles.rs`) terminates rather than recursing.
-    const MAX_DEPTH: u32 = 64;
-
-    if depth >= MAX_DEPTH {
-        return false;
+///
+/// Walked with an explicit stack: a constant that holds a whole program's syntax tree is far
+/// deeper than the Rust stack should be asked to recurse. A cycle can only run through a cell
+/// (`reference_cycles.rs`), which the walk refuses without following, so it terminates.
+pub fn world_independent(value: &Value) -> bool {
+    let mut pending = vec![value];
+    while let Some(value) = pending.pop() {
+        match value {
+            Value::Int(_)
+            | Value::Bool(_)
+            | Value::Float(_)
+            | Value::Decimal(_)
+            | Value::Str(_)
+            | Value::Bytes(_)
+            | Value::Unit => {}
+            Value::Cell(_) | Value::Task(_) | Value::Continuation(_) => return false,
+            Value::List(items) => pending.extend(items.iter()),
+            Value::Map(map) => {
+                for (k, v) in map.iter() {
+                    pending.push(k);
+                    pending.push(v);
+                }
+            }
+            Value::Record(fields) => pending.extend(fields.values()),
+            Value::Ctor { args, .. } => pending.extend(args.iter()),
+            Value::Secret(inner) => pending.push(inner),
+            Value::Closure(closure) => match &closure.kind {
+                ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => {}
+                ClosureKind::Native { captured, .. } => pending.extend(captured.iter()),
+                ClosureKind::Code { captured, .. } => pending.extend(captured.iter()),
+                ClosureKind::Fn { bindings, .. } => pending.extend(bindings.iter().map(|(_, v)| v)),
+            },
+        }
     }
-    let deeper = depth + 1;
-    match value {
-        Value::Int(_)
-        | Value::Bool(_)
-        | Value::Float(_)
-        | Value::Decimal(_)
-        | Value::Str(_)
-        | Value::Bytes(_)
-        | Value::Unit => true,
-        Value::Cell(_) | Value::Task(_) | Value::Continuation(_) => false,
-        Value::List(items) => items.iter().all(|v| world_independent(v, deeper)),
-        Value::Map(map) => map
-            .iter()
-            .all(|(k, v)| world_independent(k, deeper) && world_independent(v, deeper)),
-        Value::Record(fields) => fields.values().all(|v| world_independent(v, deeper)),
-        Value::Ctor { args, .. } => args.iter().all(|v| world_independent(v, deeper)),
-        Value::Secret(inner) => world_independent(inner, deeper),
-        Value::Closure(closure) => match &closure.kind {
-            ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => true,
-            ClosureKind::Native { captured, .. } => {
-                captured.iter().all(|v| world_independent(v, deeper))
-            }
-            ClosureKind::Fn { bindings, .. } => {
-                bindings.iter().all(|(_, v)| world_independent(v, deeper))
-            }
-            ClosureKind::Code { captured, .. } => {
-                captured.iter().all(|v| world_independent(v, deeper))
-            }
-        },
-    }
+    true
 }
 
 /// Whether `name`'s *published* row claims it reads nothing of the world.
@@ -141,5 +138,22 @@ mod tests {
         memo.slots.insert(name(), Slot::Never);
         memo.remember(&name(), &Value::Int(7));
         assert!(matches!(memo.lookup(None, &name()), Lookup::Ignore));
+    }
+
+    fn nested(levels: usize, bottom: Value) -> Value {
+        (0..levels).fold(bottom, |inner, _| Value::Ctor {
+            name: Symbol::new("Node"),
+            args: std::sync::Arc::new(vec![Value::list(vec![inner])]),
+        })
+    }
+
+    /// A parsed program is a constant far deeper than any recursion budget; the walk must
+    /// reach its bottom either way, since what is there decides the answer.
+    #[test]
+    fn a_constant_is_judged_by_its_leaves_however_deep_they_lie() {
+        assert!(world_independent(&nested(2_000, Value::Unit)));
+        let mut regions = crate::TaskRegions::new();
+        let cell = Value::Cell(regions.alloc_cell(Value::Unit));
+        assert!(!world_independent(&nested(2_000, cell)));
     }
 }
