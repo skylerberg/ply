@@ -194,8 +194,11 @@ measurement is confounded until the earlier one has moved.
    is ported** (`derive.ply`, `GAPS.md` §18): the source every derivation
    generates agrees byte for byte with `ply-derive` over a hand-written bundle,
    every example and the standard library, the checker expands before it
-   resolves, and `arm-derive.sh` arms it. Still outside: the incremental
-   `Known` interface.
+   resolves, and `arm-derive.sh` arms it. **The restored path is ported**:
+   `check_program_with` publishes a known group from its interfaces as the
+   driver's cache hands them in, and a program checked from what its own
+   first check published publishes the same thing on both sides, over the
+   standard library and every bundle. Of step 6, hashing is what remains.
    Hashing is next after those. `std.hash` exists (ADR 0033) and its throughput is not measured. The
    syntax the parser spike predated is ported first, so its own differential is
    green before anything is built on it: the bit operators (with the shift join

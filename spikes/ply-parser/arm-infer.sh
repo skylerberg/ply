@@ -27,7 +27,8 @@ run_suite() {
          the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs \
          the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs \
          the_ply_checker_agrees_with_ply_core_on_the_standard_library \
-         the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs 2>&1 )
+         the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs \
+         the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_bundles 2>&1 )
 }
 
 mutate() {
@@ -108,10 +109,22 @@ arm "the numeric operand type defaults to Int" infer \
   '      TyVar(_) -> err1(c, b"E0210", entry.span, 2),' \
   '      TyVar(_) -> c,'
 arm "the footprint of a test drops what its body performs" infer \
-  '        let row = resolve_r(popped, o.row);
-        let checked: Cx = if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) };' \
-  '        let row = row_empty();
-        let checked: Cx = if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) };'
+  '            let row = resolve_r(popped, o.row);
+            { cx: if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) }, atoms: row.atoms }' \
+  '            let row = row_empty();
+            { cx: if def.is_nondet { popped } else { check_determinism(popped, def, row.atoms) }, atoms: row.atoms }'
+
+echo
+echo "==> the restored path"
+arm "a restored definition is published with an empty footprint" infer \
+  '    set_def(bound, { name: name, module: m.name, simple_name: def.name.name, scheme: a.sc, footprint: entry.footprint,' \
+  '    set_def(bound, { name: name, module: m.name, simple_name: def.name.name, scheme: a.sc, footprint: [],'
+arm "a restored definition loses its constraints" infer \
+  '        { cx: record_spec_env(c2, def, name, s.sig), cs: recovered_constraints(c2, def, s.sig, inst.args) }' \
+  '        { cx: record_spec_env(c2, def, name, s.sig), cs: [] }'
+arm "a cached test footprint is dropped" infer \
+  '          Some(cached) -> { cx: c, atoms: cached },' \
+  '          Some(cached) -> { cx: c, atoms: [] },'
 
 echo
 if [ "$fails" -eq 0 ]; then echo "all mutations behaved as declared"; else echo "$fails mutation(s) did not"; exit 1; fi
