@@ -139,3 +139,18 @@ says now: the integer kernel's records that remain are the sixteen-word
 states of functions over the inliner's budget, and the record kernel's time
 is in bridged keys and bytes — string compares and concatenations done by the
 interpreter — which is the next step's, not this one's.
+
+## After the strings and the list
+
+`after-strings-and-lists.txt`, under the gate on both sides, with strings and
+bytes native with room to grow, their builtins answered over the payloads,
+and the list a trie with typed leaves after ADR 0034's representation gate
+refused the array. The record kernel moved by about a quarter on the strings,
+since its keys are bytes it builds and compares every step, and gave a few
+percent back on the list, which is the bookkeeping a short list's tail
+carries; the integer kernel did not move, because nothing in it is a string
+or a list. Neither kernel clears. What the reading says now: the integer
+kernel's distance is its state records and its callback loop, and the record
+kernel's is the map — a sorted array probed by compare — and the record
+update itself; the seam's census (step 7) is what says whether conversion is
+anywhere in the front end's rows before those are re-taken.
