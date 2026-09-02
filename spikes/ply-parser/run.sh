@@ -87,6 +87,15 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-infer.log || {
   exit 1
 }
 
+echo
+echo "==> the fifth differential: derive.ply against crates/ply-derive"
+PLY_BIN="$root/target/release/ply" cargo test --test derive -- --nocapture --test-threads=2 |
+  tee /tmp/ply-parser-derive.log
+grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-derive.log || {
+  echo "the derive differential ran no tests at all -- see the note above" >&2
+  exit 1
+}
+
 if [ "${1:-}" = "--arm" ]; then
   echo
   echo "==> arming it: twenty-two corruptions of the Ply parser, each seen to go red"

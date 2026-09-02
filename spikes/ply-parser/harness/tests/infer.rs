@@ -44,7 +44,7 @@ fn source_dir() -> PathBuf {
     }
 }
 
-const MODULES: [&str; 10] = [
+const MODULES: [&str; 11] = [
     "lexer.ply",
     "spine.ply",
     "types.ply",
@@ -53,6 +53,7 @@ const MODULES: [&str; 10] = [
     "items.ply",
     "rewrite.ply",
     "resolve.ply",
+    "derive.ply",
     "tycore.ply",
     "infer.ply",
 ];
@@ -261,13 +262,10 @@ fn the_ply_checker_agrees_with_ply_core_on_the_standard_library() {
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_every_underived_example_with_the_standard_library() {
+fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library() {
     let std = std_modules();
     let inputs: Vec<(String, Vec<(String, String)>)> = examples()
         .into_iter()
-        // `ply_derive::expand_program` runs before the checker and the port has no deriver yet, so
-        // an example with a `derive` is checked by neither side as the driver would check it.
-        .filter(|(_, text)| !text.lines().any(|l| l.starts_with("derive ")))
         .map(|(name, text)| {
             let mut program = std.clone();
             program.push((name.clone(), text));
