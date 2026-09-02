@@ -63,9 +63,16 @@ echo "ok"
 echo
 echo "==> the precedence table"
 arm "* and + swap binding powers" \
-    'Some({op: b"mul", bp: 6})' 'Some({op: b"mul", bp: 5})'
+    'Some({op: b"mul", bp: 10, width: 1})' 'Some({op: b"mul", bp: 9, width: 1})'
+arm "| and ^ swap binding powers" \
+    'Some({op: b"bitor", bp: 4, width: 1})' 'Some({op: b"bitor", bp: 5, width: 1})'
+arm "a shift is read as two comparisons" \
+    'else if at(c, p, t_lt()) && joined(c, p, 1) { Some({op: b"shl", bp: 7, width: 2}) }' \
+    'else if false { Some({op: b"shl", bp: 7, width: 2}) }'
+arm "inside a lambda's parameter list a | is read as bit-or" \
+    'if p.no_pipe && at(c, p, t_pipe()) { None }' 'if false { None }'
 arm "the right operand is parsed at bp, so the operators right-associate" \
-    'bin_expr(c, a.p, o.bp + 1)' 'bin_expr(c, a.p, o.bp)'
+    'bin_expr(c, a, o.bp + 1)' 'bin_expr(c, a, o.bp)'
 arm "a binding power below the minimum no longer stops the loop" \
     'if o.bp < min_bp { Stop(Ok(s)) } else {' 'if false { Stop(Ok(s)) } else {'
 
@@ -90,7 +97,7 @@ arm "resume stops being a contextual keyword" \
 echo
 echo "==> spans, which a span-blind comparator would not see at all"
 arm "a parenthesized expression keeps its inner span" \
-    'Ok({ p: cl.p, node: set_span(inner.node, span_to(o.node, cl.node)) })' 'Ok({ p: cl.p, node: inner.node })'
+    'Ok({ p: close.p, node: set_span(inner.node, span_to(o.node, close.node)) })' 'Ok({ p: close.p, node: inner.node })'
 arm "the synthesized else takes a dummy span instead of the block end" \
     'node: ELit({ span: {start: end, end: end}, lit: LUnit }) }' 'node: ELit({ span: dummy_span(), lit: LUnit }) }'
 

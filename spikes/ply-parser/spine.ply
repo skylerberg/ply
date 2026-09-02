@@ -227,6 +227,9 @@ pub type Ctx = { ntok: Int, src: Bytes, toks: List<lexer::Token> }
 pub type P = {
   pos: Int,
   no_brace: Bool,
+  // `Parser::no_pipe`: inside a lambda's parameter list a `|` closes the list
+  // and is never bit-or, so a parameter's default cannot swallow the body.
+  no_pipe: Bool,
   depth: Int,
   gt_split: Int,
   uses_sets: Bool,
@@ -258,42 +261,49 @@ pub fn start(src: Bytes) -> Start = {
   let d = map(lx.diags,
     |x: lexer::Diag| diag1(x.code, {start: x.start, end: x.end}, 0));
   { c: { ntok: len(lx.toks), src: src, toks: lx.toks },
-    p: { pos: 0, no_brace: false, depth: 0, gt_split: -1, uses_sets: false,
-         diags: d } }
+    p: { pos: 0, no_brace: false, no_pipe: false, depth: 0, gt_split: -1,
+         uses_sets: false, diags: d } }
 }
 
 // --- Constructing `P` -------------------------------------------------------
 //
-// Ply has no record-update syntax (`spikes/ply-lexer/GAPS.md` §2), so changing
-// one field means writing all six — nine before the list index decision took `last_code` and
-// `last_span` out and the try operator took `bail`. Six fields times ~300 sites is
-// 1,800 chances to put `diags` anywhere but last, so the literal is written
-// here seven times and nowhere else.
+// The spike predates record update (`spikes/ply-lexer/GAPS.md` §2), so changing
+// one field means writing all seven. Seven fields times ~300 sites is over two
+// thousand chances to put `diags` anywhere but last, so the literal is written
+// here eight times and nowhere else.
 
 pub fn at_pos(p: P, pos: Int) -> P =
-  { no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
+  { no_brace: p.no_brace, no_pipe: p.no_pipe, depth: p.depth, gt_split: p.gt_split,
     uses_sets: p.uses_sets, pos: pos, diags: p.diags }
 
 pub fn with_no_brace(p: P, b: Bool) -> P =
-  { pos: p.pos, depth: p.depth, gt_split: p.gt_split, uses_sets: p.uses_sets,
-    no_brace: b, diags: p.diags }
+  { pos: p.pos, no_pipe: p.no_pipe, depth: p.depth, gt_split: p.gt_split,
+    uses_sets: p.uses_sets, no_brace: b, diags: p.diags }
+
+pub fn with_no_pipe(p: P, b: Bool) -> P =
+  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
+    uses_sets: p.uses_sets, no_pipe: b, diags: p.diags }
 
 pub fn with_depth(p: P, d: Int) -> P =
-  { pos: p.pos, no_brace: p.no_brace, gt_split: p.gt_split,
+  { pos: p.pos, no_brace: p.no_brace, no_pipe: p.no_pipe, gt_split: p.gt_split,
     uses_sets: p.uses_sets, depth: d, diags: p.diags }
 
 pub fn with_gt_split(p: P, i: Int) -> P =
-  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, uses_sets: p.uses_sets,
-    gt_split: i, diags: p.diags }
+  { pos: p.pos, no_brace: p.no_brace, no_pipe: p.no_pipe, depth: p.depth,
+    uses_sets: p.uses_sets, gt_split: i, diags: p.diags }
 
 pub fn with_sets(p: P) -> P =
-  { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
-    uses_sets: true, diags: p.diags }
+  { pos: p.pos, no_brace: p.no_brace, no_pipe: p.no_pipe, depth: p.depth,
+    gt_split: p.gt_split, uses_sets: true, diags: p.diags }
 
 // `run`'s loop head: `self.no_brace = false; self.depth = 0;`.
 pub fn fresh_item(p: P) -> P =
-  { pos: p.pos, gt_split: p.gt_split, uses_sets: p.uses_sets,
+  { pos: p.pos, no_pipe: p.no_pipe, gt_split: p.gt_split, uses_sets: p.uses_sets,
     no_brace: false, depth: 0, diags: p.diags }
+
+// `advance`, `n` times: a shift is two or three touching tokens.
+pub fn advance_n(c: Ctx, p: P, n: Int) -> P =
+  if n <= 0 { p } else { advance_n(c, advance(c, p).p, n - 1) }
 
 // `Parser::push` (`parser.rs:207`): a single mistake usually trips several
 // expectations at the same offset, so a diagnostic with the same code and the
@@ -313,8 +323,8 @@ pub fn push_diag(p: P, d: PDiag) -> P = {
     None -> false,
   };
   if dup { p } else {
-    { pos: p.pos, no_brace: p.no_brace, depth: p.depth, gt_split: p.gt_split,
-      uses_sets: p.uses_sets, diags: push(p.diags, d) }
+    { pos: p.pos, no_brace: p.no_brace, no_pipe: p.no_pipe, depth: p.depth,
+      gt_split: p.gt_split, uses_sets: p.uses_sets, diags: push(p.diags, d) }
   }
 }
 
@@ -457,6 +467,26 @@ pub fn expect_ident(c: Ctx, p: P, what: Bytes) -> Result<R<Ident>, P> =
     _ -> Err(error_here(c, p, what)),
   }
 
+// `Parser::expect_field_name`: a field position has no other reading, so a
+// keyword names a field there; `keyword` says which it was, for the punned
+// forms that bind a variable too.
+pub fn expect_field_name(c: Ctx, p: P, what: Bytes) -> Result<R<{ name: Ident, keyword: Bool }>, P> =
+  match kind(c, p) {
+    lexer::TIdent(n) -> {
+      let a = advance(c, p);
+      Ok({ p: a.p, node: { name: {name: n, span: a.node}, keyword: false } })
+    },
+    lexer::TKw(k) -> {
+      let a = advance(c, p);
+      Ok({ p: a.p, node: { name: {name: k, span: a.node}, keyword: true } })
+    },
+    _ -> Err(error_here(c, p, what)),
+  }
+
+// `Parser::keyword_pun_refusal`: `E0001` at the name, one note.
+pub fn keyword_pun_refusal(p: P, name: Ident) -> P =
+  push_diag(p, diag1(unexpected(), name.span, 1))
+
 // `Parser::expect_gt` (`parser.rs:187`). The `Ge` arm answers the first byte as
 // the `>` and leaves `pos` where it is, having rewritten the token under it to
 // `=` over the second byte; here the rewrite is `gt_split` and `tok_index`
@@ -564,6 +594,9 @@ pub fn t_eqeq() -> lexer::Tok = lexer::TPunct(b"eqeq")
 pub fn t_bang() -> lexer::Tok = lexer::TPunct(b"bang")
 pub fn t_bangeq() -> lexer::Tok = lexer::TPunct(b"bangeq")
 pub fn t_lt() -> lexer::Tok = lexer::TPunct(b"lt")
+pub fn t_amp() -> lexer::Tok = lexer::TPunct(b"amp")
+pub fn t_caret() -> lexer::Tok = lexer::TPunct(b"caret")
+pub fn t_tilde() -> lexer::Tok = lexer::TPunct(b"tilde")
 pub fn t_le() -> lexer::Tok = lexer::TPunct(b"le")
 pub fn t_gt() -> lexer::Tok = lexer::TPunct(b"gt")
 pub fn t_ge() -> lexer::Tok = lexer::TPunct(b"ge")
@@ -770,9 +803,9 @@ test "two diagnostics with the same code and primary span collapse to one" {
 
 test "the dedup rule sees the last lexer diagnostic, not only parser ones" {
   // `Parser::new` seeds `self.diags` with the lexer's, so the first parser
-  // diagnostic is deduplicated against a *lexer* one. `&` alone is E0001 over
+  // diagnostic is deduplicated against a *lexer* one. `$` alone is E0001 over
   // 0..1 on both sides.
-  let s = probe(b"&");
+  let s = probe(b"$");
   assert_eq(len(s.p.diags), 1);
   let last = match list_at(s.p.diags, len(s.p.diags) - 1) {
     Some(l) -> l,

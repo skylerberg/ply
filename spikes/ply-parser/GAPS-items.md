@@ -147,10 +147,10 @@ This is cheaper than most entries here and it is the most surprising: Ply
 reserved its keywords in the *field* namespace, where nothing could be
 ambiguous — `{ nondet: Bool }` has no other reading.
 
-**Closed in the reference**, which now accepts every keyword as a field name and
-refuses only the punned forms (`docs/GUIDE.md` §3.3). The renames stay until
-this port's own field parser accepts the same, since the corpus is read by both
-(`GAPS.md` §6).
+**Closed on both sides**: the reference accepts every keyword as a field name and
+refuses only the punned forms (`docs/GUIDE.md` §3.3), and this port's
+`expect_field_name` does the same. The renames stay as a fact about this port's
+own AST (`GAPS.md` §6).
 
 ---
 
