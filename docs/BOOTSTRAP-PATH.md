@@ -289,14 +289,16 @@ measurement is confounded until the earlier one has moved.
    with a baseline taken on today's fragment first; the front-end row re-taken
    on the model is the outcome measure. Its sequence is in the record, and the
    first three steps are landed: the kernels and their baseline; direct and
-   typed calls; and the words themselves, with records, constructors, lists,
-   maps and closures as counted objects and the memo kept in place. The series
-   after them (`benches/value-model/after-words.txt`) reads both kernels still
-   over the bar — the integer one halved, the record one down by a fraction —
-   and the front end under the backend at half its previous cost. What comes
-   next is the record's: field reads at known offsets from the checker's
-   types, then drops and reuse, then native strings and bytes, then the seam's
-   census and the re-take.
+   typed calls; and the words themselves — records, constructors, lists, maps
+   and closures as counted objects over a bump allocator, fields read at the
+   offsets the checker's types fix, the memo copied out. The series after
+   them (`benches/value-model/after-layouts.txt`) reads both kernels still
+   over the bar — the integer one at a small fraction of its baseline
+   distance, the record one within an order of magnitude — and the front end
+   under the backend at roughly a quarter of its cost before the record. What
+   comes next is the record's: drops and reuse, then inlining with records
+   kept in registers, then native strings and bytes, then the seam's census
+   and the re-take.
 10. **Emit C.** Where the path ends, decided as a direction and gated on step 9:
     the eventual host is a C compiler and libc, with the compiler and its
     runtime written in Ply, which is the line Rust itself holds above LLVM and
