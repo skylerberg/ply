@@ -16,6 +16,7 @@ use crate::list;
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -42,9 +43,76 @@ pub struct Tables {
     /// The two hundred and fifty-six one-byte values, each made immortal the first time it is
     /// asked for, so `byte_of_int` allocates nothing.
     pub bytes: RefCell<[Word; 256]>,
+    /// The memo's words as the values the seam converted them to, once each, and those values'
+    /// identities back to the words: what lets a phase's tree cross the seam and come back
+    /// without being rebuilt either way.
+    pub memo_values: RefCell<HashMap<Word, Value>>,
+    pub memo_words: RefCell<HashMap<Identity, Word>>,
+}
+
+/// What identifies a value the seam handed out, without walking it: the allocation behind it
+/// and, for a list, the window it shows of that allocation. A value with no allocation of its
+/// own has no identity and is converted like any other.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Identity {
+    Record(usize),
+    Str(usize),
+    Bytes(usize),
+    List(usize, usize, usize, usize),
+}
+
+fn identity(v: &Value) -> Option<Identity> {
+    Some(match v {
+        Value::Record(fields) => Identity::Record(Arc::as_ptr(fields) as usize),
+        Value::Str(s) => Identity::Str(Arc::as_ptr(s) as *const u8 as usize),
+        Value::Bytes(b) => Identity::Bytes(Arc::as_ptr(b) as *const u8 as usize),
+        Value::List(items) => {
+            let (tail, root, len, start) = items.identity();
+            Identity::List(tail, root, len, start)
+        }
+        _ => return None,
+    })
 }
 
 impl Tables {
+    /// The memo's word for the pure nullary function at `index`, if it has one.
+    pub fn memoized(&self, index: usize) -> Option<Word> {
+        self.memo.borrow().get(index).copied().flatten()
+    }
+
+    /// Remembers `w`, world-independent, as the answer of the pure nullary function at `index`:
+    /// a copy in the tables' own heap, which outlives every entry, answered from then on.
+    pub fn memoize(&self, index: usize, w: Word) -> Word {
+        let kept = self.immortals.borrow_mut().adopt(w);
+        let mut memo = self.memo.borrow_mut();
+        if memo.len() <= index {
+            memo.resize(index + 1, None);
+        }
+        memo[index] = Some(kept);
+        kept
+    }
+
+    /// The value a memo word was converted to before, if it was.
+    pub fn memo_value(&self, w: Word) -> Option<Value> {
+        self.memo_values.borrow().get(&w).cloned()
+    }
+
+    /// The memo word a value came from, if the seam handed that value out. The values kept in
+    /// `memo_values` hold their allocations, so an identity here cannot be a later value's.
+    pub fn memo_word(&self, v: &Value) -> Option<Word> {
+        let id = identity(v)?;
+        self.memo_words.borrow().get(&id).copied()
+    }
+
+    /// Keeps the value a memo word was just converted to.
+    pub fn remember(&self, w: Word, v: &Value) {
+        let Some(id) = identity(v) else {
+            return;
+        };
+        self.memo_values.borrow_mut().insert(w, v.clone());
+        self.memo_words.borrow_mut().insert(id, w);
+    }
+
     /// The immortal `Bytes` holding just `b`.
     pub fn byte(&self, b: u8) -> Word {
         let cached = self.bytes.borrow()[b as usize];
@@ -987,16 +1055,9 @@ pub unsafe extern "C" fn rt_constant(ctx: *mut Ctx, index: i64) -> i64 {
     }
     // Remembered as a copy in the tables' own heap, which outlives the entry's memory; the
     // entry keeps using its own word.
-    if !heap::world_independent(w) {
-        return w;
+    if heap::world_independent(w) {
+        tables.memoize(index as usize, w);
     }
-    let kept = tables.immortals.borrow_mut().adopt(w);
-    let mut memo = tables.memo.borrow_mut();
-    let index = index as usize;
-    if memo.len() <= index {
-        memo.resize(index + 1, None);
-    }
-    memo[index] = Some(kept);
     w
 }
 
