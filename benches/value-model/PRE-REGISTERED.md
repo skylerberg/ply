@@ -154,3 +154,15 @@ kernel's distance is its state records and its callback loop, and the record
 kernel's is the map — a sorted array probed by compare — and the record
 update itself; the seam's census (step 7) is what says whether conversion is
 anywhere in the front end's rows before those are re-taken.
+
+## The re-take
+
+`retake.txt`, under the gate on both sides, on the binary with every sequence
+step landed. Both kernels are over the bar: the integer one by an order of
+magnitude and the record one by a little. **The decision rule as registered
+applies as written: both outside, and the model as designed is refuted,
+which ADR 0035's opening now says.** What the rule names to revisit is in the
+opening too. The seam's census over the front-end probe answered Decision 6's
+question on the way: a row that keeps its tree inside compiled code costs
+what a row that converts it out does, so conversion is not where any row's
+time is.
