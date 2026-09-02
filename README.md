@@ -313,11 +313,14 @@ is argued about:
 `--backend wrong:<mutation>` installs one of eight deliberately wrong backends.
 `cranelift` is a real JIT, compiled into the binary with no feature flag.
 
-**It loses on real programs, and that is the finding.** On a compute loop, which
-is almost entirely inside the fragment, cranelift is several times faster and
-enters nearly every call it is offered. On programs built out of the standard
-library it enters a fraction of a percent of calls, and compiling costs more per
-run than entering them saves. [ADR 0026](docs/adr/0026-a-reachable-backend.md)
+**It wins narrowly on the front end and loses on the request path, and that is
+the finding.** On a compute loop, which is almost entirely inside the fragment,
+cranelift is several times faster and enters nearly every call it is offered.
+The parser spike parsing the examples now runs inside one native entry per file
+and beats the interpreter by a fifth (`benches/front-end`), which says the cost
+left is what compiled code does with values rather than what it lowers. On the
+request path most of the work is a host and a database, and compiling costs
+more per run than entering saves. [ADR 0026](docs/adr/0026-a-reachable-backend.md)
 and [ADR 0030](docs/adr/0030-compiled-code-on-the-front-end.md) carry the series
 and the conditions; do not re-derive the ratios here, and do not read a loss on
 one workload as a bound on the idea.

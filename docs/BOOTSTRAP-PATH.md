@@ -107,15 +107,23 @@ measurement is confounded until the earlier one has moved.
    backend attached under `--audit-backend`. What remains is the gate, and it
    cannot move until step 3: the narrow registry enters the same leaves it
    entered before.
-3. **Widen the registry, then the seam's remaining kinds.** Once root entry
-   pays, register the carried signatures the narrow registry leaves out — the
-   parser's state record is carried and its functions are not registered — and
-   then admit what `CarriedTypes::blocker` still refuses that a front end
-   needs: type variables (the spike's generic `comma_list`), `String` and
-   `Unit`. ADR 0026's contract goes with each widening: a backend must be
-   policeable before it is fast, so every widening arrives with the
-   wrong-backend mutations that catch it through a shipping command. Gate: ADR
-   0030's row re-taken with the wider registry beats the narrow one.
+3. **The registry is wide — landed; the seam's remaining kinds are not.**
+   Every function the fragment compiles is registered and the seam admits each
+   call by its carried types; `PLY_CODEGEN_REGISTER=narrow` keeps ADR 0030's
+   scalar-signature arm. Decided on ADR 0030's row re-taken under
+   `benches/front-end/PRE-REGISTERED.md`: with the wide registry the whole
+   parse of each example file runs inside one native entry and beats no backend
+   by ten times the null control's resolution, while the narrow registry loses
+   as before. Both series (`observation-*.txt`) are recorded as observations
+   rather than figures, because the load rose past the gate during each — a
+   clean re-take is owed and `run.sh` takes it. The backend now refuses an
+   answer holding a closure, cell, task or secret itself, so no registry width
+   leaks one. Still to admit: what `CarriedTypes::blocker` refuses that a front
+   end needs — type variables (the spike's generic `comma_list`), `String`,
+   `Unit` — each with the wrong-backend mutations that police it. What the row
+   also says: the compiled parse is a fifth faster than the interpreted one,
+   not five times, so the next lever is what compiled code does with values
+   (step 4), not what it lowers.
 4. **The container machinery.** Map insert and lookup, record field access, list
    push and index are outside the fragment however many functions compile (ADR
    0021). Measure the share first with the executed-work census
