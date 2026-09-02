@@ -1954,3 +1954,56 @@ checks, that ten functions violated on the first write, and that 63 of 83 guards
 cannot be shown to matter. A self-hosted front end will meet that at every phase,
 and the only instrument that found it was deleting each guard by hand and running
 everything.
+
+---
+
+## §15 The second phase: `resolve.rs` and `defaults.rs`, ported behind a second differential
+
+`docs/BOOTSTRAP-PATH.md` step 6 asks for the other four phases "each ported the
+way the parser was: a reference dumper on the Rust side, a corpus, and mutations
+that prove the comparison can go red." `resolve.ply` is the first of them.
+
+**What was ported.** The module index and its duplicate-module refusal; each
+module's declarations, first declaration winning and a sum type's constructors
+as public as the type; the scope each import builds — module binders, aliases,
+selective imports, and the six diagnostics of `ScopeBuilder`; `traverse`'s
+iterative DFS, with the same postorder and the same once-per-cycle canonical
+rotation; and the whole of `defaults.rs`: the admissibility of a default, its
+qualification against the module that wrote it, the signatures, the call
+filling with its four diagnostics, and the implicit imports a spliced default
+adds to the caller's scope. `harness/src/lib.rs`'s `reference_resolve_dump`
+writes the tables, the load order, the diagnostics with their module index and
+the post-defaults trees in one record encoding; `resolve_dump` writes the same
+from the port.
+
+**What agrees.** `harness/tests/resolve.rs`: the standard library as one
+program, the standard library with each example, every multi-module program
+`resolve.rs`'s own tests build (`mine-programs.py`, `fixtures/reference-programs.corpus`)
+and a hand-written bundle of the error paths the tree never reaches
+(`fixtures/resolve-programs.corpus`). The error-path and reference programs
+agreed on the port's first run; the standard library did not, and the reason was
+not the resolver: this spike's lexer had never learned hex literals, so
+`hash.ply`'s masks parsed as zero — the parser differential had excused the
+module by name (`POSTDATES_THE_PORT`) and this comparison could not. The lexer
+now reads them, the exemption list is empty, and it stays so that the next
+surface to land is named there rather than skipped. `arm-resolve.sh` carries
+mutations across the three parts, each of which the fast half of the comparison
+catches, and prints how many.
+
+**What it cost to write, and the one thing the language charged.** The port is
+short beside the parser's. The tax was not the threading of state — a `fold` over a record
+does what `&mut self` does — and not `IndexMap`, whose insertion order a list
+keeps; it was record update. `{..b, f: v}` expands in the parser (ADR 0029) and
+therefore needs the base's field list *in the same file*: a `let` without a
+written type is refused with `E0116`, and a type declared in another module —
+every AST node the port rewrites — has no field list this file can name at all.
+So each of the ~30 places that rebuild an expression node spell every field of
+that node, and every threaded state is a type declared in `resolve.ply` with
+its binders annotated. It is a real cost and a cheap one to remove: an
+expansion that ran after inference could read the shape from the type; ADR 0029
+chose the parse-time expansion for the hash's sake, and that decision is where
+the change would have to be re-taken.
+
+**What the comparison cannot see.** Only what the parser's cannot (§11): the
+prose of a diagnostic. The trees it compares are the post-defaults,
+pre-rewrite trees, which is the phase both sides run.

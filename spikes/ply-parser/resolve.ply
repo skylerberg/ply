@@ -1,0 +1,1078 @@
+// resolve.ply — `crates/ply-syntax/src/resolve.rs` and `defaults.rs`, ported.
+//
+// The second phase of the front end, over a whole program: the module index,
+// each module's declarations, the scope its imports build, the dependency
+// order, and the defaults pass that fills every call. `resolve_dump` writes the
+// tables, the order, the diagnostics and the post-defaults trees in the one
+// encoding `harness/src/lib.rs`'s `reference_resolve_dump` writes, and
+// `harness/tests/resolve.rs` compares the two.
+//
+// Everything the reference keeps in an `IndexMap` is a list here, in insertion
+// order, because the dump encodes that order and a Ply `Map` sorts its keys.
+
+import spine (Span, Ident, QName, span_to, dummy_span, num)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet,
+              FnDef, TypeDefBody, TDSum, TDAlias, VariantDef, SpecClause, Binder,
+              Vis, VPub, VPriv, ImportDecl, ImportKind, IModule, IAlias, INames,
+              parse, dump_module)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
+              ERecord, ERecordUpdate, ETry, EField, EList, EPerform, EHandle,
+              EWithCell, EWithRegion, ESimulate, EBad, Stmt, SLet, SExpr, Param,
+              NamedArg, MatchArm, HandleClause, ReturnClause, RecField, expr_span)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad)
+
+// --- The tables ---------------------------------------------------------------
+
+pub type Source = { name: Bytes, src: Bytes }
+
+type Mod = { name: Bytes, module: Module }
+
+type Ns = | NValue | NType | NEffect
+
+type Declared = { name: Bytes, qualified: Bytes, public: Bool, span: Span }
+type Decls = { values: List<Declared>, types: List<Declared>, effects: List<Declared> }
+type Binding = { name: Bytes, qualified: Bytes, owner: Int, span: Span }
+type Bindings = { values: List<Binding>, types: List<Binding>, effects: List<Binding> }
+type ModBind = { binder: Bytes, target: Int, span: Span }
+type Scope = { module: Bytes, modules: List<ModBind>, selective: List<ModBind>, bound: Bindings }
+type Label = { module: Int, start: Int, end: Int, primary: Bool }
+type Diag = { code: Bytes, notes: Int, labels: List<Label> }
+type Edge = { from: Int, target: Int, span: Span }
+type Entry = { name: Bytes, at: Int }
+type Resolved = { names: List<Entry>, scopes: List<Scope>, declarations: List<Decls>,
+                  declared: List<Bindings>, order: List<Int> }
+
+fn no_decls() -> Decls = { values: [], types: [], effects: [] }
+fn no_bindings() -> Bindings = { values: [], types: [], effects: [] }
+
+fn spaces() -> List<Ns> = [NValue, NType, NEffect]
+
+fn space(d: Decls, ns: Ns) -> List<Declared> =
+  match ns { NValue -> d.values, NType -> d.types, NEffect -> d.effects }
+
+fn with_space(d: Decls, ns: Ns, xs: List<Declared>) -> Decls =
+  match ns {
+    NValue -> {..d, values: xs},
+    NType -> {..d, types: xs},
+    NEffect -> {..d, effects: xs},
+  }
+
+fn bspace(b: Bindings, ns: Ns) -> List<Binding> =
+  match ns { NValue -> b.values, NType -> b.types, NEffect -> b.effects }
+
+fn with_bspace(b: Bindings, ns: Ns, xs: List<Binding>) -> Bindings =
+  match ns {
+    NValue -> {..b, values: xs},
+    NType -> {..b, types: xs},
+    NEffect -> {..b, effects: xs},
+  }
+
+fn find_declared(xs: List<Declared>, name: Bytes) -> Option<Declared> =
+  fold(xs, None, |acc: Option<Declared>, x: Declared|
+    match acc { Some(_) -> acc, None -> if x.name == name { Some(x) } else { None } })
+
+fn find_binding(xs: List<Binding>, name: Bytes) -> Option<Binding> =
+  fold(xs, None, |acc: Option<Binding>, x: Binding|
+    match acc { Some(_) -> acc, None -> if x.name == name { Some(x) } else { None } })
+
+fn find_modbind(xs: List<ModBind>, binder: Bytes) -> Option<ModBind> =
+  fold(xs, None, |acc: Option<ModBind>, x: ModBind|
+    match acc { Some(_) -> acc, None -> if x.binder == binder { Some(x) } else { None } })
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the tables do not hold") }
+
+fn set_at<a>(xs: List<a>, i: Int, v: a) -> List<a> =
+  map(range(0, len(xs)), |j: Int| if j == i { v } else { at(xs, j) })
+
+fn position(xs: List<Int>, v: Int) -> Option<Int> =
+  fold(range(0, len(xs)), None, |acc: Option<Int>, i: Int|
+    match acc { Some(_) -> acc, None -> if at(xs, i) == v { Some(i) } else { None } })
+
+fn contains_bytes(xs: List<Bytes>, v: Bytes) -> Bool =
+  fold(xs, false, |acc: Bool, x: Bytes| acc || x == v)
+
+fn take(xs: List<Int>, n: Int) -> List<Int> = map(range(0, n), |i: Int| at(xs, i))
+
+fn drop(xs: List<Int>, n: Int) -> List<Int> = map(range(n, len(xs)), |i: Int| at(xs, i))
+
+fn take_bytes(xs: List<Bytes>, n: Int) -> List<Bytes> = map(range(0, n), |i: Int| at(xs, i))
+
+// --- Module names ---------------------------------------------------------------
+
+fn last_dot(name: Bytes) -> Int =
+  fold(range(0, bytes_len(name)), 0 - 1, |acc: Int, i: Int| if bytes_at(name, i) == 46 { i } else { acc })
+
+// `ModuleName::default_binder`: the last dotted segment.
+fn default_binder(name: Bytes) -> Bytes = bytes_slice(name, last_dot(name) + 1, bytes_len(name))
+
+// `ModuleName::qualify`: `store.orders.place`; an anonymous module qualifies nothing.
+fn qualify(module: Bytes, name: Bytes) -> Bytes =
+  if bytes_len(module) == 0 { name } else { bytes_concat_all([module, b".", name]) }
+
+fn is_public(v: Vis) -> Bool = match v { VPub -> true, VPriv -> false }
+
+// `ImportDecl::module_name`: the path's names joined with `.`.
+fn import_module_name(d: ImportDecl) -> Bytes =
+  fold(range(0, len(d.path)), b"", |acc: Bytes, i: Int|
+    if i == 0 { at(d.path, i).name } else { bytes_concat_all([acc, b".", at(d.path, i).name]) })
+
+fn path_span(d: ImportDecl) -> Span =
+  if len(d.path) == 0 { d.span } else { span_to(at(d.path, 0).span, at(d.path, len(d.path) - 1).span) }
+
+fn import_binder(d: ImportDecl) -> Option<Bytes> =
+  match d.kind {
+    IModule -> if len(d.path) == 0 { None } else { Some(at(d.path, len(d.path) - 1).name) },
+    IAlias(a) -> Some(a.name),
+    INames(_) -> None,
+  }
+
+fn binder_span(d: ImportDecl) -> Span =
+  match d.kind {
+    IModule -> if len(d.path) == 0 { d.span } else { at(d.path, len(d.path) - 1).span },
+    IAlias(a) -> a.span,
+    INames(_) -> d.span,
+  }
+
+// --- Diagnostics ---------------------------------------------------------------
+//
+// Codes, label spans (with the module each lies in) and note counts: what the
+// comparison sees. The prose is the reference's alone.
+
+fn lab(m: Int, s: Span, primary: Bool) -> Label =
+  { module: m, start: s.start, end: s.end, primary: primary }
+
+fn diag1(code: Bytes, m: Int, s: Span, notes: Int) -> Diag =
+  { code: code, notes: notes, labels: [lab(m, s, true)] }
+
+fn diag2(code: Bytes, m: Int, s: Span, m2: Int, also: Span, notes: Int) -> Diag =
+  { code: code, notes: notes, labels: [lab(m, s, true), lab(m2, also, false)] }
+
+// --- Declarations ---------------------------------------------------------------
+
+// `declarations_of`: every name an item declares, first declaration winning.
+fn declarations_of(m: Mod) -> Decls =
+  fold(m.module.items, no_decls(), |d: Decls, it: Item|
+    match it {
+      IFn(f) -> declare(d, NValue, m.name, f.name, f.vis),
+      IEffect(e) -> declare(d, NEffect, m.name, e.name, e.vis),
+      IType(t) -> {
+        let d2 = declare(d, NType, m.name, t.name, t.vis);
+        match t.body {
+          // A type you can name but cannot match on is not a useful export, so a
+          // constructor is as public as it is.
+          TDSum(vs) -> fold(vs, d2, |acc: Decls, v: VariantDef| declare(acc, NValue, m.name, v.name, t.vis)),
+          TDAlias(_) -> d2,
+        }
+      },
+      // None declares a name a reference could reach.
+      _ -> d,
+    })
+
+fn declare(d: Decls, ns: Ns, module: Bytes, name: Ident, vis: Vis) -> Decls =
+  match find_declared(space(d, ns), name.name) {
+    Some(_) -> d,
+    None -> with_space(d, ns, push(space(d, ns),
+              { name: name.name, qualified: qualify(module, name.name),
+                public: is_public(vis), span: name.span })),
+  }
+
+fn bindings_of(owner: Int, d: Decls) -> Bindings =
+  fold(spaces(), no_bindings(), |b: Bindings, ns: Ns|
+    with_bspace(b, ns, map(space(d, ns), |x: Declared|
+      { name: x.name, qualified: x.qualified, owner: owner, span: x.span })))
+
+// --- Scopes ---------------------------------------------------------------------
+
+type Builder = { scope: Scope, local: Decls, imported: Decls, edges: List<Edge>, diags: List<Diag> }
+
+type World = { mods: List<Mod>, names: List<Entry>, declarations: List<Decls>, declared: List<Bindings> }
+
+fn index_of(names: List<Entry>, name: Bytes) -> Option<Int> =
+  fold(names, None, |acc: Option<Int>, e: Entry|
+    match acc { Some(_) -> acc, None -> if e.name == name { Some(e.at) } else { None } })
+
+fn build_scope(w: World, i: Int) -> Builder = {
+  let m = at(w.mods, i);
+  let start = { scope: { module: m.name, modules: [], selective: [], bound: at(w.declared, i) },
+                local: at(w.declarations, i), imported: no_decls(), edges: [], diags: [] };
+  fold(m.module.imports, start, |b: Builder, d: ImportDecl| one_import(w, i, b, d))
+}
+
+fn one_import(w: World, i: Int, b: Builder, d: ImportDecl) -> Builder =
+  match target(w, i, b, d) {
+    None -> b,
+    Some(t) -> {
+      let b2: Builder = {..b, edges: push(b.edges, { from: i, target: t, span: path_span(d) })};
+      match d.kind {
+        INames(names) -> {
+          let key = default_binder(import_module_name(d));
+          let sel = match find_modbind(b2.scope.selective, key) {
+            Some(_) -> b2.scope.selective,
+            None -> push(b2.scope.selective, { binder: key, target: t, span: path_span(d) }),
+          };
+          let b3: Builder = {..b2, scope: {..b2.scope, selective: sel}};
+          fold(names, b3, |acc: Builder, n: Ident| bind_name(w, i, acc, t, n))
+        },
+        _ -> bind_module(w, i, b2, d, t),
+      }
+    },
+  }
+
+// `ScopeBuilder::target`: the module an import names, or `E0106` with one note either way.
+fn target(w: World, i: Int, b: Builder, d: ImportDecl) -> Option<Int> = {
+  let name = import_module_name(d);
+  let hit = if bytes_len(name) == 0 { None } else {
+    match index_of(w.names, name) {
+      Some(t) -> if bytes_len(at(w.mods, t).name) == 0 { None } else { Some(t) },
+      None -> None,
+    }
+  };
+  hit
+}
+
+fn target_or_report(w: World, i: Int, b: Builder, d: ImportDecl) -> { b: Builder, t: Option<Int> } =
+  match target(w, i, b, d) {
+    Some(t) -> { b: b, t: Some(t) },
+    None -> { b: {..b, diags: push(b.diags, diag1(b"E0106", i, path_span(d), 1))}, t: None },
+  }
+
+fn bind_module(w: World, i: Int, b: Builder, d: ImportDecl, t: Int) -> Builder =
+  match import_binder(d) {
+    None -> b,
+    Some(binder) -> {
+      let s = binder_span(d);
+      match find_modbind(b.scope.modules, binder) {
+        Some(first) ->
+          {..b, diags: push(b.diags, diag2(b"E0110", i, s, i, first.span, 1))},
+        None ->
+          {..b, scope: {..b.scope, modules: push(b.scope.modules, { binder: binder, target: t, span: s })}},
+      }
+    },
+  }
+
+fn bind_name(w: World, i: Int, b: Builder, t: Int, name: Ident) -> Builder = {
+  let decls = at(w.declarations, t);
+  let found = filter(spaces(), |ns: Ns| match find_declared(space(decls, ns), name.name) { Some(_) -> true, None -> false });
+  if len(found) == 0 {
+    {..b, diags: push(b.diags, diag1(b"E0101", i, name.span, 1))}
+  } else {
+    let public = filter(found, |ns: Ns|
+      match find_declared(space(decls, ns), name.name) { Some(x) -> x.public, None -> false });
+    if len(public) == 0 {
+      let declared = match find_declared(space(decls, at(found, 0)), name.name) {
+        Some(x) -> x,
+        None -> panic("just found"),
+      };
+      {..b, diags: push(b.diags, diag2(b"E0107", i, name.span, t, declared.span, 2))}
+    } else {
+      fold(public, b, |acc: Builder, ns: Ns| bind_one(w, i, acc, t, name, ns))
+    }
+  }
+}
+
+fn bind_one(w: World, i: Int, b: Builder, t: Int, name: Ident, ns: Ns) -> Builder = {
+  let binding = match find_binding(bspace(at(w.declared, t), ns), name.name) {
+    Some(x) -> x,
+    None -> panic("a public declaration always has a binding"),
+  };
+  match find_declared(space(b.local, ns), name.name) {
+    // Local-wins was rejected deliberately: adding a local beside an import would silently
+    // steal every existing call site.
+    Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0108", i, name.span, i, prev.span, 2))},
+    None ->
+      match find_declared(space(b.imported, ns), name.name) {
+        Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0110", i, name.span, i, prev.span, 1))},
+        None -> {
+          let imported = with_space(b.imported, ns, push(space(b.imported, ns),
+            { name: name.name, qualified: binding.qualified, public: true, span: name.span }));
+          let bound = with_bspace(b.scope.bound, ns, push(bspace(b.scope.bound, ns),
+            { name: name.name, qualified: binding.qualified, owner: t, span: name.span }));
+          {..b, imported: imported, scope: {..b.scope, bound: bound}}
+        },
+      },
+  }
+}
+
+// --- The dependency order ---------------------------------------------------------
+
+type Cycle = { nodes: List<Int>, closing: Edge }
+
+type Dfs = { color: List<Int>, order: List<Int>, cycles: List<Cycle>, found: List<List<Int>>,
+             path: List<Int>, stack: List<{ v: Int, edge: Int }> }
+
+// `traverse`: one iterative DFS that finds every cycle and, when there is none, leaves a
+// postorder that is exactly the dependency-first load order.
+fn traverse(edges: List<List<Edge>>) -> Dfs = {
+  let n = len(edges);
+  let steps = fold(edges, 0, |acc: Int, es: List<Edge>| acc + len(es));
+  let start = { color: map(range(0, n), |i: Int| 0), order: [], cycles: [], found: [], path: [], stack: [] };
+  fold(range(0, n), start, |s: Dfs, root: Int|
+    if at(s.color, root) != 0 { s } else {
+      let opened: Dfs = {..s, color: set_at(s.color, root, 1), path: push(s.path, root), stack: [{ v: root, edge: 0 }]};
+      iterate(opened, 2 * (n + steps) + 4, |d: Dfs|
+        if len(d.stack) == 0 { Stop(d) } else { Continue(dfs_step(edges, d)) })
+    })
+}
+
+fn dfs_step(edges: List<List<Edge>>, d: Dfs) -> Dfs = {
+  let top = at(d.stack, len(d.stack) - 1);
+  let popped = map(range(0, len(d.stack) - 1), |i: Int| at(d.stack, i));
+  let out = at(edges, top.v);
+  if top.edge < len(out) {
+    let again = push(popped, { v: top.v, edge: top.edge + 1 });
+    let e = at(out, top.edge);
+    let w = e.target;
+    let c = at(d.color, w);
+    if c == 0 {
+      {..d, stack: push(again, { v: w, edge: 0 }), color: set_at(d.color, w, 1), path: push(d.path, w)}
+    } else if c == 1 {
+      let st = match position(d.path, w) { Some(p) -> p, None -> 0 };
+      let nodes = drop(d.path, st);
+      let key = canonical(nodes);
+      if contains_key(d.found, key) { {..d, stack: again} } else {
+        {..d, stack: again, found: push(d.found, key),
+              cycles: push(d.cycles, { nodes: nodes, closing: e })}
+      }
+    } else { {..d, stack: again} }
+  } else {
+    {..d, stack: popped, color: set_at(d.color, top.v, 2),
+          path: take(d.path, len(d.path) - 1), order: push(d.order, top.v)}
+  }
+}
+
+fn contains_key(keys: List<List<Int>>, key: List<Int>) -> Bool =
+  fold(keys, false, |acc: Bool, k: List<Int>| acc || k == key)
+
+// Rotated so the smallest index leads: the same cycle reached from two roots compares equal.
+fn canonical(nodes: List<Int>) -> List<Int> =
+  if len(nodes) == 0 { [] } else {
+    let least = fold(range(0, len(nodes)), 0, |best: Int, i: Int| if at(nodes, i) < at(nodes, best) { i } else { best });
+    map(range(0, len(nodes)), |i: Int| at(nodes, (least + i) % len(nodes)))
+  }
+
+fn cycle_diag(c: Cycle) -> Diag =
+  if len(c.nodes) == 1 { diag1(b"E0109", c.closing.from, c.closing.span, 1) }
+  else { diag1(b"E0109", c.closing.from, c.closing.span, 2) }
+
+// --- `find`: what a name denotes in a module -----------------------------------------
+
+fn find(r: Resolved, module: Int, ns: Ns, q: QName) -> Option<Binding> = {
+  let scope = at(r.scopes, module);
+  match q.module {
+    None -> find_binding(bspace(scope.bound, ns), q.name.name),
+    Some(binder) ->
+      match find_modbind(scope.modules, binder.name) {
+        None -> None,
+        Some(mb) ->
+          match find_declared(space(at(r.declarations, mb.target), ns), q.name.name) {
+            None -> None,
+            Some(d) -> if !d.public { None }
+                       else { find_binding(bspace(at(r.declared, mb.target), ns), q.name.name) },
+          },
+      },
+  }
+}
+
+fn is_bare(q: QName) -> Bool = match q.module { None -> true, Some(_) -> false }
+
+fn is_ctor_name(name: Bytes) -> Bool =
+  bytes_len(name) > 0 && bytes_at(name, 0) >= 65 && bytes_at(name, 0) <= 90
+
+// --- Defaults: what a default may be -----------------------------------------------------
+
+// `ast::is_default_expr`: a pure, closed expression — a value, not something that runs.
+fn is_default_expr(e: Expr) -> Bool =
+  match e {
+    EApp(a) -> len(a.named) == 0
+               && (match a.func { EVar(v) -> is_ctor_name(v.name.name.name), _ -> false })
+               && all_default(a.args),
+    EPerform(_) -> false,
+    EHandle(_) -> false,
+    EWithCell(_) -> false,
+    EWithRegion(_) -> false,
+    ESimulate(_) -> false,
+    ETry(_) -> false,
+    ELit(_) -> true,
+    EVar(_) -> true,
+    EBinary(b) -> is_default_expr(b.lhs) && is_default_expr(b.rhs),
+    EUnary(u) -> is_default_expr(u.operand),
+    ELambda(l) -> is_default_expr(l.body),
+    EIf(i) -> is_default_expr(i.cond) && is_default_expr(i.then_branch) && is_default_expr(i.else_branch),
+    EMatch(m) -> is_default_expr(m.scrutinee)
+                 && fold(m.arms, true, |acc: Bool, arm: MatchArm|
+                      acc && is_default_expr(arm.body)
+                          && (match arm.guard { None -> true, Some(g) -> is_default_expr(g) })),
+    EBlock(b) -> fold(b.stmts, true, |acc: Bool, s: Stmt|
+                   acc && (match s { SLet(l) -> is_default_expr(l.value), SExpr(x) -> is_default_expr(x) }))
+                 && (match b.tail { None -> true, Some(t) -> is_default_expr(t) }),
+    ERecord(r) -> fold(r.fields, true, |acc: Bool, f: RecField| acc && is_default_expr(f.value)),
+    ERecordUpdate(r) -> is_default_expr(r.base)
+                        && fold(r.fields, true, |acc: Bool, f: RecField| acc && is_default_expr(f.value)),
+    EField(f) -> is_default_expr(f.base),
+    EList(l) -> all_default(l.items),
+    EBad(_) -> true,
+  }
+
+fn all_default(xs: List<Expr>) -> Bool = fold(xs, true, |acc: Bool, x: Expr| acc && is_default_expr(x))
+
+fn pattern_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
+  match p {
+    PVar(v) -> push(out, v.name.name),
+    PCtor(c) -> fold(c.args, out, |acc: List<Bytes>, a: Pattern| pattern_binders(a, acc)),
+    PRecord(r) -> fold(r.fields, out, |acc: List<Bytes>, f: { name: Ident, pat: Pattern }| pattern_binders(f.pat, acc)),
+    PList(l) -> {
+      let items = fold(l.items, out, |acc: List<Bytes>, x: Pattern| pattern_binders(x, acc));
+      match l.rest { None -> items, Some(r) -> pattern_binders(r, items) }
+    },
+    _ -> out,
+  }
+
+// `mentions`: which of `params` the expression names free, in evaluation order.
+fn mentions(e: Expr, params: List<Bytes>, bound: List<Bytes>, out: List<Bytes>) -> List<Bytes> =
+  match e {
+    EVar(v) -> if is_bare(v.name) && !contains_bytes(bound, v.name.name.name)
+                  && contains_bytes(params, v.name.name.name) { push(out, v.name.name.name) } else { out },
+    ELambda(l) -> mentions(l.body, params, fold(l.params, bound, |acc: List<Bytes>, p: Param| push(acc, p.name.name)), out),
+    EApp(a) -> {
+      let o1 = mentions(a.func, params, bound, out);
+      let o2 = fold(a.args, o1, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc));
+      fold(a.named, o2, |acc: List<Bytes>, n: NamedArg| mentions(n.value, params, bound, acc))
+    },
+    EBinary(b) -> mentions(b.rhs, params, bound, mentions(b.lhs, params, bound, out)),
+    EUnary(u) -> mentions(u.operand, params, bound, out),
+    EIf(i) -> mentions(i.else_branch, params, bound,
+                mentions(i.then_branch, params, bound, mentions(i.cond, params, bound, out))),
+    EMatch(m) -> fold(m.arms, mentions(m.scrutinee, params, bound, out), |acc: List<Bytes>, arm: MatchArm| {
+      let inner = pattern_binders(arm.pat, bound);
+      let g = match arm.guard { None -> acc, Some(x) -> mentions(x, params, inner, acc) };
+      mentions(arm.body, params, inner, g)
+    }),
+    EBlock(b) -> {
+      let walked = fold(b.stmts, { bound: bound, out: out }, |acc: { bound: List<Bytes>, out: List<Bytes> }, s: Stmt|
+        match s {
+          SLet(l) -> { bound: pattern_binders(l.pat, acc.bound), out: mentions(l.value, params, acc.bound, acc.out) },
+          SExpr(x) -> {..acc, out: mentions(x, params, acc.bound, acc.out)},
+        });
+      match b.tail { None -> walked.out, Some(t) -> mentions(t, params, walked.bound, walked.out) }
+    },
+    ERecord(r) -> fold(r.fields, out, |acc: List<Bytes>, f: RecField| mentions(f.value, params, bound, acc)),
+    ERecordUpdate(r) -> fold(r.fields, mentions(r.base, params, bound, out), |acc: List<Bytes>, f: RecField| mentions(f.value, params, bound, acc)),
+    EField(f) -> mentions(f.base, params, bound, out),
+    EList(l) -> fold(l.items, out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
+    ETry(t) -> mentions(t.operand, params, bound, out),
+    EPerform(p) -> fold(p.args, out, |acc: List<Bytes>, x: Expr| mentions(x, params, bound, acc)),
+    EHandle(h) -> mentions(h.body, params, bound, out),
+    EWithCell(c) -> mentions(c.body, params, bound, out),
+    EWithRegion(r) -> mentions(r.body, params, bound, out),
+    ESimulate(s) -> mentions(s.body, params, bound, out),
+    ELit(_) -> out,
+    EBad(_) -> out,
+  }
+
+// --- Defaults: qualifying one against the module that wrote it -----------------------------
+
+type Qual = { owner: Int, public: Bool, bound: List<Bytes>, imports: List<ModBind>, diags: List<Diag> }
+type QOut = { q: Qual, e: Expr }
+
+fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut =
+  match e {
+    EVar(v) ->
+      if !is_bare(v.name) || contains_bytes(q.bound, v.name.name.name) { { q: q, e: e } } else {
+        match find(r, q.owner, NValue, v.name) {
+          // A builtin or a prelude constructor: in reach everywhere, so it needs no qualifying.
+          None -> { q: q, e: e },
+          Some(b) ->
+            if b.owner == q.owner && q.public && !decl_public(r, q.owner, v.name.name.name) {
+              { q: {..q, diags: push(q.diags, diag1(b"E0122", q.owner, v.name.span, 1))}, e: e }
+            } else {
+              let module = at(r.scopes, b.owner).module;
+              let imports = match find_modbind(q.imports, module) {
+                Some(_) -> q.imports,
+                None -> push(q.imports, { binder: module, target: b.owner, span: dummy_span() }),
+              };
+              { q: {..q, imports: imports},
+                e: EVar({ span: v.span,
+                          name: { module: Some({ name: module, span: v.name.span }),
+                                  name: v.name.name, span: v.name.span } }) }
+            },
+        }
+      },
+    ELambda(l) -> {
+      let mark = len(q.bound);
+      let inner = fold(l.params, q.bound, |acc: List<Bytes>, p: Param| push(acc, p.name.name));
+      let o: QOut = qexpr(r, {..q, bound: inner}, l.body);
+      { q: {..o.q, bound: take_bytes(o.q.bound, mark)}, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
+    },
+    EApp(a) -> {
+      let f = qexpr(r, q, a.func);
+      let args = qexprs(r, f.q, a.args);
+      let named = fold(a.named, { q: args.q, xs: [] }, |acc: { q: Qual, xs: List<NamedArg> }, n: NamedArg| {
+        let o = qexpr(r, acc.q, n.value);
+        { q: o.q, xs: push(acc.xs, { name: n.name, value: o.e, span: n.span }) }
+      });
+      { q: named.q, e: EApp({ span: a.span, func: f.e, named: named.xs, args: args.xs }) }
+    },
+    EMatch(m) -> {
+      let s: QOut = qexpr(r, q, m.scrutinee);
+      let arms = fold(m.arms, { q: s.q, xs: [] }, |acc: { q: Qual, xs: List<MatchArm> }, arm: MatchArm| {
+        let mark = len(acc.q.bound);
+        let inner = {..acc.q, bound: pattern_binders(arm.pat, acc.q.bound)};
+        let g: { q: Qual, e: Option<Expr> } = match arm.guard {
+          None -> { q: inner, e: None },
+          Some(x) -> { let o: QOut = qexpr(r, inner, x); { q: o.q, e: Some(o.e) } },
+        };
+        let body: QOut = qexpr(r, g.q, arm.body);
+        { q: {..body.q, bound: take_bytes(body.q.bound, mark)}, xs: push(acc.xs, { pat: arm.pat, guard: g.e, body: body.e, span: arm.span }) }
+      });
+      { q: arms.q, e: EMatch({ span: m.span, scrutinee: s.e, arms: arms.xs }) }
+    },
+    EBlock(b) -> {
+      let mark = len(q.bound);
+      let stmts: { q: Qual, xs: List<Stmt> } = fold(b.stmts, { q: q, xs: [] }, |acc: { q: Qual, xs: List<Stmt> }, s: Stmt|
+        match s {
+          SLet(l) -> {
+            let o: QOut = qexpr(r, acc.q, l.value);
+            { q: {..o.q, bound: pattern_binders(l.pat, o.q.bound)}, xs: push(acc.xs, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })) }
+          },
+          SExpr(x) -> { let o: QOut = qexpr(r, acc.q, x); { q: o.q, xs: push(acc.xs, SExpr(o.e)) } },
+        });
+      let tail: { q: Qual, e: Option<Expr> } = match b.tail {
+        None -> { q: stmts.q, e: None },
+        Some(t) -> { let o: QOut = qexpr(r, stmts.q, t); { q: o.q, e: Some(o.e) } },
+      };
+      { q: {..tail.q, bound: take_bytes(tail.q.bound, mark)}, e: EBlock({ span: b.span, tail: tail.e, stmts: stmts.xs }) }
+    },
+    EBinary(b) -> {
+      let l = qexpr(r, q, b.lhs);
+      let rr = qexpr(r, l.q, b.rhs);
+      { q: rr.q, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
+    },
+    EUnary(u) -> { let o: QOut = qexpr(r, q, u.operand); { q: o.q, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
+    EIf(i) -> {
+      let c = qexpr(r, q, i.cond);
+      let t = qexpr(r, c.q, i.then_branch);
+      let el = qexpr(r, t.q, i.else_branch);
+      { q: el.q, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+    },
+    ERecord(rec) -> { let o = qfields(r, q, rec.fields); { q: o.q, e: ERecord({ span: rec.span, fields: o.xs }) } },
+    ERecordUpdate(rec) -> {
+      let b = qexpr(r, q, rec.base);
+      let o = qfields(r, b.q, rec.fields);
+      { q: o.q, e: ERecordUpdate({ span: rec.span, base: b.e, fields: o.xs }) }
+    },
+    EField(f) -> { let o: QOut = qexpr(r, q, f.base); { q: o.q, e: EField({ span: f.span, base: o.e, field: f.field }) } },
+    EList(l) -> { let o = qexprs(r, q, l.items); { q: o.q, e: EList({ span: l.span, items: o.xs }) } },
+    ETry(t) -> { let o: QOut = qexpr(r, q, t.operand); { q: o.q, e: ETry({ span: t.span, operand: o.e }) } },
+    // Refused by `is_default_expr` before this runs, and reached only when the checker has
+    // already reported that.
+    EPerform(p) -> { let o = qexprs(r, q, p.args); { q: o.q, e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }) } },
+    EHandle(h) -> { let o: QOut = qexpr(r, q, h.body); { q: o.q, e: EHandle({ span: h.span, body: o.e, ret: h.ret, clauses: h.clauses }) } },
+    EWithCell(c) -> { let o: QOut = qexpr(r, q, c.body); { q: o.q, e: EWithCell({ span: c.span, resource: c.resource, init: c.init, binder: c.binder, body: o.e }) } },
+    EWithRegion(w) -> { let o: QOut = qexpr(r, q, w.body); { q: o.q, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
+    ESimulate(s) -> { let o: QOut = qexpr(r, q, s.body); { q: o.q, e: ESimulate({ span: s.span, body: o.e }) } },
+    ELit(_) -> { q: q, e: e },
+    EBad(_) -> { q: q, e: e },
+  }
+
+fn qexprs(r: Resolved, q: Qual, xs: List<Expr>) -> { q: Qual, xs: List<Expr> } =
+  fold(xs, { q: q, xs: [] }, |acc: { q: Qual, xs: List<Expr> }, x: Expr| {
+    let o = qexpr(r, acc.q, x);
+    { q: o.q, xs: push(acc.xs, o.e) }
+  })
+
+fn qfields(r: Resolved, q: Qual, xs: List<RecField>) -> { q: Qual, xs: List<RecField> } =
+  fold(xs, { q: q, xs: [] }, |acc: { q: Qual, xs: List<RecField> }, f: RecField| {
+    let o = qexpr(r, acc.q, f.value);
+    { q: o.q, xs: push(acc.xs, { name: f.name, value: o.e }) }
+  })
+
+fn decl_public(r: Resolved, owner: Int, name: Bytes) -> Bool =
+  match find_declared(space(at(r.declarations, owner), NValue), name) { Some(d) -> d.public, None -> false }
+
+// --- Defaults: the signatures ---------------------------------------------------------------
+
+type PInfo = { name: Bytes, default: Option<Expr>, imports: List<ModBind> }
+type Sig = { name: Bytes, params: List<PInfo> }
+type Collected = { sigs: List<Sig>, owner_imports: List<{ module: Int, binder: Bytes, target: Int }>, diags: List<Diag> }
+
+fn collect(r: Resolved, mods: List<Mod>) -> Collected =
+  fold(range(0, len(mods)), { sigs: [], owner_imports: [], diags: [] }, |acc: Collected, m: Int|
+    fold(at(mods, m).module.items, acc, |c: Collected, it: Item|
+      match it {
+        IFn(f) -> collect_fn(r, mods, m, c, f),
+        _ -> c,
+      }))
+
+fn collect_fn(r: Resolved, mods: List<Mod>, m: Int, c: Collected, f: FnDef) -> Collected = {
+  let names = map(f.params, |p: Param| p.name.name);
+  let walked: { c: Collected, params: List<PInfo> } = fold(f.params, { c: c, params: [] }, |acc: { c: Collected, params: List<PInfo> }, p: Param|
+    match p.default {
+      None -> {..acc, params: push(acc.params, { name: p.name.name, default: None, imports: [] })},
+      Some(d) -> {
+        let adm = admissible(m, d, names, acc.c.diags);
+        if !adm.ok {
+          { c: {..acc.c, diags: adm.diags}, params: push(acc.params, { name: p.name.name, default: None, imports: [] }) }
+        } else {
+          let o = qexpr(r, { owner: m, public: is_public(f.vis), bound: [], imports: [], diags: adm.diags }, d);
+          // The writing module needs the binder as much as any caller does.
+          let owner_imports = fold(o.q.imports, acc.c.owner_imports,
+            |oi: List<{ module: Int, binder: Bytes, target: Int }>, mb: ModBind|
+              push(oi, { module: m, binder: mb.binder, target: mb.target }));
+          { c: {..acc.c, diags: o.q.diags, owner_imports: owner_imports},
+            params: push(acc.params, { name: p.name.name, default: Some(o.e), imports: o.q.imports }) }
+        }
+      },
+    });
+  {..walked.c, sigs: push(walked.c.sigs, { name: qualify(at(mods, m).name, f.name.name), params: walked.params })}
+}
+
+fn admissible(m: Int, e: Expr, names: List<Bytes>, diags: List<Diag>) -> { ok: Bool, diags: List<Diag> } =
+  if !is_default_expr(e) {
+    { ok: false, diags: push(diags, diag1(b"E0121", m, expr_span(e), 2)) }
+  } else {
+    let mentioned = mentions(e, names, [], []);
+    if len(mentioned) > 0 { { ok: false, diags: push(diags, diag1(b"E0121", m, expr_span(e), 1)) } }
+    else { { ok: true, diags: diags } }
+  }
+
+// `bind_module` (defaults.rs): the module now reaches `target` under `binder`, with no span.
+fn reach(r: Resolved, module: Int, binder: Bytes, target: Int) -> Resolved = {
+  let scope: Scope = at(r.scopes, module);
+  match find_modbind(scope.modules, binder) {
+    Some(_) -> r,
+    None -> {..r, scopes: set_at(r.scopes, module,
+              {..scope, modules: push(scope.modules, { binder: binder, target: target, span: dummy_span() })})},
+  }
+}
+
+fn find_sig(sigs: List<Sig>, name: Bytes) -> Option<Sig> =
+  fold(sigs, None, |acc: Option<Sig>, s: Sig| match acc { Some(_) -> acc, None -> if s.name == name { Some(s) } else { None } })
+
+// The builtins that carry a default: `assert(cond, message: None)`.
+fn builtin_signature(name: Bytes) -> Option<Sig> =
+  if name == b"assert" {
+    Some({ name: b"assert",
+           params: [{ name: b"cond", default: None, imports: [] },
+                    { name: b"message",
+                      default: Some(EVar({ span: dummy_span(),
+                                           name: { module: None, name: { name: b"None", span: dummy_span() },
+                                                   span: dummy_span() } })),
+                      imports: [] }] })
+  } else { None }
+
+// --- Defaults: filling every call --------------------------------------------------------
+
+type Cx = { module: Int, scope: List<Bytes>, implicit: List<ModBind>, diags: List<Diag> }
+type COut = { cx: Cx, e: Expr }
+type Filling = { r: Resolved, sigs: List<Sig> }
+
+fn cexpr(f: Filling, cx: Cx, e: Expr) -> COut = {
+  // Children first, then this node, so a call nested in another's argument is filled before
+  // the outer one copies it.
+  let o = cchildren(f, cx, e);
+  match o.e {
+    EApp(a) -> fill(f, o.cx, a),
+    _ -> o,
+  }
+}
+
+fn cchildren(f: Filling, cx: Cx, e: Expr) -> COut =
+  match e {
+    ELit(_) -> { cx: cx, e: e },
+    EVar(_) -> { cx: cx, e: e },
+    EBad(_) -> { cx: cx, e: e },
+    EBinary(b) -> {
+      let l = cexpr(f, cx, b.lhs);
+      let rr = cexpr(f, l.cx, b.rhs);
+      { cx: rr.cx, e: EBinary({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
+    },
+    EUnary(u) -> { let o: COut = cexpr(f, cx, u.operand); { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
+    ELambda(l) -> {
+      let mark = len(cx.scope);
+      let inner = {..cx, scope: fold(l.params, cx.scope, |acc: List<Bytes>, p: Param| push(acc, p.name.name))};
+      let o: COut = cexpr(f, inner, l.body);
+      { cx: {..o.cx, scope: take_bytes(o.cx.scope, mark)}, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
+    },
+    EApp(a) -> {
+      let fn_ = cexpr(f, cx, a.func);
+      let args = cexprs(f, fn_.cx, a.args);
+      let named = fold(a.named, { cx: args.cx, xs: [] }, |acc: { cx: Cx, xs: List<NamedArg> }, n: NamedArg| {
+        let o = cexpr(f, acc.cx, n.value);
+        { cx: o.cx, xs: push(acc.xs, { name: n.name, value: o.e, span: n.span }) }
+      });
+      { cx: named.cx, e: EApp({ span: a.span, func: fn_.e, named: named.xs, args: args.xs }) }
+    },
+    EIf(i) -> {
+      let c = cexpr(f, cx, i.cond);
+      let t = cexpr(f, c.cx, i.then_branch);
+      let el = cexpr(f, t.cx, i.else_branch);
+      { cx: el.cx, e: EIf({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
+    },
+    EMatch(m) -> {
+      let s = cexpr(f, cx, m.scrutinee);
+      let arms = fold(m.arms, { cx: s.cx, xs: [] }, |acc: { cx: Cx, xs: List<MatchArm> }, arm: MatchArm| {
+        let mark = len(acc.cx.scope);
+        let inner = {..acc.cx, scope: pattern_binders(arm.pat, acc.cx.scope)};
+        let g: { cx: Cx, e: Option<Expr> } = match arm.guard {
+          None -> { cx: inner, e: None },
+          Some(x) -> { let o: COut = cexpr(f, inner, x); { cx: o.cx, e: Some(o.e) } },
+        };
+        let body: COut = cexpr(f, g.cx, arm.body);
+        { cx: {..body.cx, scope: take_bytes(body.cx.scope, mark)}, xs: push(acc.xs, { pat: arm.pat, guard: g.e, body: body.e, span: arm.span }) }
+      });
+      { cx: arms.cx, e: EMatch({ span: m.span, scrutinee: s.e, arms: arms.xs }) }
+    },
+    EBlock(b) -> {
+      let mark = len(cx.scope);
+      let stmts: { cx: Cx, xs: List<Stmt> } = fold(b.stmts, { cx: cx, xs: [] }, |acc: { cx: Cx, xs: List<Stmt> }, s: Stmt|
+        match s {
+          SLet(l) -> {
+            let o: COut = cexpr(f, acc.cx, l.value);
+            { cx: {..o.cx, scope: pattern_binders(l.pat, o.cx.scope)}, xs: push(acc.xs, SLet({ span: l.span, pat: l.pat, ty: l.ty, value: o.e })) }
+          },
+          SExpr(x) -> { let o: COut = cexpr(f, acc.cx, x); { cx: o.cx, xs: push(acc.xs, SExpr(o.e)) } },
+        });
+      let tail: { cx: Cx, e: Option<Expr> } = match b.tail {
+        None -> { cx: stmts.cx, e: None },
+        Some(t) -> { let o: COut = cexpr(f, stmts.cx, t); { cx: o.cx, e: Some(o.e) } },
+      };
+      { cx: {..tail.cx, scope: take_bytes(tail.cx.scope, mark)}, e: EBlock({ span: b.span, tail: tail.e, stmts: stmts.xs }) }
+    },
+    ERecord(rec) -> { let o = cfields(f, cx, rec.fields); { cx: o.cx, e: ERecord({ span: rec.span, fields: o.xs }) } },
+    ERecordUpdate(rec) -> {
+      let b = cexpr(f, cx, rec.base);
+      let o = cfields(f, b.cx, rec.fields);
+      { cx: o.cx, e: ERecordUpdate({ span: rec.span, base: b.e, fields: o.xs }) }
+    },
+    EField(fl) -> { let o: COut = cexpr(f, cx, fl.base); { cx: o.cx, e: EField({ span: fl.span, base: o.e, field: fl.field }) } },
+    EList(l) -> { let o = cexprs(f, cx, l.items); { cx: o.cx, e: EList({ span: l.span, items: o.xs }) } },
+    ETry(t) -> { let o: COut = cexpr(f, cx, t.operand); { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) } },
+    EPerform(p) -> { let o = cexprs(f, cx, p.args); { cx: o.cx, e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }) } },
+    EHandle(h) -> {
+      let body: COut = cexpr(f, cx, h.body);
+      let clauses: { cx: Cx, xs: List<HandleClause> } = fold(h.clauses, { cx: body.cx, xs: [] }, |acc: { cx: Cx, xs: List<HandleClause> }, c: HandleClause| {
+        let mark = len(acc.cx.scope);
+        let with_params = fold(c.params, acc.cx.scope, |sc: List<Bytes>, p: Ident| push(sc, p.name));
+        let with_resume = match c.resume { None -> with_params, Some(k) -> push(with_params, k.name) };
+        let o: COut = cexpr(f, {..acc.cx, scope: with_resume}, c.body);
+        { cx: {..o.cx, scope: take_bytes(o.cx.scope, mark)}, xs: push(acc.xs, { eff: c.eff, op: c.op, resource: c.resource, resume: c.resume, body: o.e, span: c.span, params: c.params }) }
+      });
+      let ret: { cx: Cx, e: Option<ReturnClause> } = match h.ret {
+        None -> { cx: clauses.cx, e: None },
+        Some(rc) -> {
+          let mark = len(clauses.cx.scope);
+          let o: COut = cexpr(f, {..clauses.cx, scope: push(clauses.cx.scope, rc.binder.name)}, rc.body);
+          { cx: {..o.cx, scope: take_bytes(o.cx.scope, mark)}, e: Some({ binder: rc.binder, body: o.e, span: rc.span }) }
+        },
+      };
+      { cx: ret.cx, e: EHandle({ span: h.span, body: body.e, ret: ret.e, clauses: clauses.xs }) }
+    },
+    EWithCell(c) -> {
+      let init: COut = cexpr(f, cx, c.init);
+      let mark = len(init.cx.scope);
+      let o: COut = cexpr(f, {..init.cx, scope: push(init.cx.scope, c.binder.name)}, c.body);
+      { cx: {..o.cx, scope: take_bytes(o.cx.scope, mark)}, e: EWithCell({ span: c.span, resource: c.resource, init: init.e, binder: c.binder, body: o.e }) }
+    },
+    EWithRegion(w) -> { let o: COut = cexpr(f, cx, w.body); { cx: o.cx, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
+    ESimulate(s) -> { let o: COut = cexpr(f, cx, s.body); { cx: o.cx, e: ESimulate({ span: s.span, body: o.e }) } },
+  }
+
+fn cexprs(f: Filling, cx: Cx, xs: List<Expr>) -> { cx: Cx, xs: List<Expr> } =
+  fold(xs, { cx: cx, xs: [] }, |acc: { cx: Cx, xs: List<Expr> }, x: Expr| {
+    let o = cexpr(f, acc.cx, x);
+    { cx: o.cx, xs: push(acc.xs, o.e) }
+  })
+
+fn cfields(f: Filling, cx: Cx, xs: List<RecField>) -> { cx: Cx, xs: List<RecField> } =
+  fold(xs, { cx: cx, xs: [] }, |acc: { cx: Cx, xs: List<RecField> }, fl: RecField| {
+    let o = cexpr(f, acc.cx, fl.value);
+    { cx: o.cx, xs: push(acc.xs, { name: fl.name, value: o.e }) }
+  })
+
+// The callee's signature, if this call reaches one by name.
+fn signature_of(f: Filling, cx: Cx, func: Expr) -> Option<Sig> =
+  match func {
+    EVar(v) ->
+      // A constructor is exactly applied and carries no defaults; a local binder wins over
+      // everything, so a call through one is a call through a value.
+      if is_bare(v.name) && is_ctor_name(v.name.name.name) { None }
+      else if is_bare(v.name) && contains_bytes(cx.scope, v.name.name.name) { None }
+      else {
+        match find(f.r, cx.module, NValue, v.name) {
+          Some(b) -> find_sig(f.sigs, b.qualified),
+          None -> if is_bare(v.name) { builtin_signature(v.name.name.name) } else { None },
+        }
+      },
+    _ -> None,
+  }
+
+type App = { span: Span, func: Expr, named: List<NamedArg>, args: List<Expr> }
+
+// `Cx::fill`: one call matched against its callee's signature.
+fn fill(f: Filling, cx: Cx, a: App) -> COut =
+  match signature_of(f, cx, a.func) {
+    None -> {
+      // No signature in hand: a call through a value, a constructor, or a name that does not
+      // resolve. A named argument then names no parameter.
+      let diags = fold(a.named, cx.diags, |ds: List<Diag>, n: NamedArg|
+        push(ds, diag1(b"E0123", cx.module, n.name.span, 1)));
+      { cx: {..cx, diags: diags}, e: EApp({..a, named: []}) }
+    },
+    Some(sig) ->
+      // Over-application is `E0202`'s to report, with the callee's own type in hand.
+      if len(a.args) > len(sig.params) { { cx: cx, e: EApp({..a, named: []}) } }
+      else { fill_slots(cx, a, sig) },
+  }
+
+fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut = {
+  let was_named = len(a.named) > 0;
+  let filled_positionally = len(a.args);
+  let start = map(range(0, len(sig.params)), |i: Int| list_at(a.args, i));
+  let placed: { cx: Cx, slots: List<Option<Expr>> } = fold(a.named, { cx: cx, slots: start }, |acc: { cx: Cx, slots: List<Option<Expr>> }, n: NamedArg|
+    match param_index(sig, n.name.name) {
+      None -> {..acc, cx: {..acc.cx, diags: push(acc.cx.diags, diag1(b"E0123", cx.module, n.name.span, 1))}},
+      Some(i) ->
+        match at(acc.slots, i) {
+          Some(_) -> {..acc, cx: {..acc.cx, diags: push(acc.cx.diags, diag1(b"E0123", cx.module, n.name.span, 0))}},
+          None -> {..acc, slots: set_at(acc.slots, i, Some(n.value))},
+        },
+    });
+  let out: { cx: Cx, xs: List<Expr>, missing: Int } = fold(range(0, len(sig.params)), { cx: placed.cx, xs: [], missing: 0 },
+    |acc: { cx: Cx, xs: List<Expr>, missing: Int }, i: Int|
+      match at(placed.slots, i) {
+        Some(written) -> {..acc, xs: push(acc.xs, written)},
+        None -> {
+          let p = at(sig.params, i);
+          match p.default {
+            None -> {..acc, missing: acc.missing + 1},
+            Some(d) -> {
+              // The default may name something in the module that wrote it, and this one may
+              // never have imported that module.
+              let implicit = fold(p.imports, acc.cx.implicit, |im: List<ModBind>, mb: ModBind|
+                match find_modbind(im, mb.binder) { Some(_) -> im, None -> push(im, mb) });
+              {..acc, cx: {..acc.cx, implicit: implicit}, xs: push(acc.xs, d)}
+            },
+          }
+        },
+      });
+  if out.missing > 0 {
+    // A call with no names in it that leaves a hole is under-applied, which is `E0202`'s.
+    let cx2 = if was_named { {..out.cx, diags: push(out.cx.diags, diag1(b"E0125", cx.module, a.span, 1))} } else { out.cx };
+    { cx: cx2, e: EApp({..a, named: []}) }
+  } else {
+    { cx: out.cx, e: EApp({..a, args: out.xs, named: []}) }
+  }
+}
+
+fn param_index(sig: Sig, name: Bytes) -> Option<Int> =
+  fold(range(0, len(sig.params)), None, |acc: Option<Int>, i: Int|
+    match acc { Some(_) -> acc, None -> if at(sig.params, i).name == name { Some(i) } else { None } })
+
+fn citem(f: Filling, cx: Cx, it: Item) -> { cx: Cx, it: Item } =
+  match it {
+    IFn(d) -> {
+      let mark = len(cx.scope);
+      let inner = {..cx, scope: fold(d.params, cx.scope, |acc: List<Bytes>, p: Param| push(acc, p.name.name))};
+      // A default is not walked here: it was qualified against this module in `collect`.
+      let spec: { cx: Cx, xs: List<SpecClause> } = fold(d.spec, { cx: inner, xs: [] },
+        |acc: { cx: Cx, xs: List<SpecClause> }, s: SpecClause| {
+          let o = cexpr(f, acc.cx, s.expr);
+          { cx: o.cx, xs: push(acc.xs, { kind: s.kind, expr: o.e, span: s.span }) }
+        });
+      let body: COut = cexpr(f, spec.cx, d.body);
+      { cx: {..body.cx, scope: take_bytes(body.cx.scope, mark)}, it: IFn({ vis: d.vis, name: d.name, generics: d.generics, params: d.params, ret: d.ret, effects: d.effects, constraints: d.constraints, spec: spec.xs, reuse: d.reuse, body: body.e, span: d.span }) }
+    },
+    ITest(d) -> { let o: COut = cexpr(f, cx, d.body); { cx: o.cx, it: ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: o.e, span: d.span }) } },
+    ILaw(d) -> {
+      let mark = len(cx.scope);
+      let inner = {..cx, scope: fold(d.binders, cx.scope, |acc: List<Bytes>, b: Binder| push(acc, b.name.name))};
+      let g = match d.guard {
+        None -> { cx: inner, e: None },
+        Some(x) -> { let o: COut = cexpr(f, inner, x); { cx: o.cx, e: Some(o.e) } },
+      };
+      let body: COut = cexpr(f, g.cx, d.body);
+      { cx: {..body.cx, scope: take_bytes(body.cx.scope, mark)}, it: ILaw({ name: d.name, name_span: d.name_span, host: d.host, binders: d.binders, guard: g.e, body: body.e, span: d.span }) }
+    },
+    _ -> { cx: cx, it: it },
+  }
+
+type Expanded = { r: Resolved, mods: List<Mod>, diags: List<Diag> }
+
+// `defaults::expand`: the signatures, then every module's calls, then the modules a spliced
+// default made each one reference.
+fn expand(r: Resolved, mods: List<Mod>, diags: List<Diag>) -> Expanded = {
+  let c = collect(r, mods);
+  let r2 = fold(c.owner_imports, r, |acc: Resolved, oi: { module: Int, binder: Bytes, target: Int }|
+    reach(acc, oi.module, oi.binder, oi.target));
+  let f = { r: r2, sigs: c.sigs };
+  let walked = fold(range(0, len(mods)), { r: r2, mods: [], diags: bytes_concat_diags(diags, c.diags) },
+    |acc: Expanded, m: Int| {
+      let mod: Mod = at(mods, m);
+      let items: { cx: Cx, xs: List<Item> } = fold(mod.module.items, { cx: { module: m, scope: [], implicit: [], diags: acc.diags }, xs: [] },
+        |ia: { cx: Cx, xs: List<Item> }, it: Item| {
+          let o = citem(f, ia.cx, it);
+          { cx: o.cx, xs: push(ia.xs, o.it) }
+        });
+      let reached = fold(items.cx.implicit, acc.r, |rr: Resolved, mb: ModBind| reach(rr, m, mb.binder, mb.target));
+      { r: reached, mods: push(acc.mods, { name: mod.name, module: { imports: mod.module.imports, items: items.xs } }), diags: items.cx.diags }
+    });
+  walked
+}
+
+fn bytes_concat_diags(a: List<Diag>, b: List<Diag>) -> List<Diag> = fold(b, a, |acc: List<Diag>, d: Diag| push(acc, d))
+
+// --- `resolve` ---------------------------------------------------------------------------
+
+type Outcome = | Resolved_(Expanded) | Failed(List<Diag>)
+
+pub fn resolve(sources: List<Source>) -> Outcome = {
+  let mods = map(sources, |s: Source| { name: s.name, module: parse(s.src).node });
+  let n = len(mods);
+  // The index: the first module of each name; a second non-anonymous one is `E0105`.
+  let indexed = fold(range(0, n), { names: [], diags: [] }, |acc: { names: List<Entry>, diags: List<Diag> }, i: Int| {
+    let name = at(mods, i).name;
+    match index_of(acc.names, name) {
+      None -> {..acc, names: push(acc.names, { name: name, at: i })},
+      Some(_) -> if bytes_len(name) == 0 { acc }
+                 else { {..acc, diags: push(acc.diags, diag1(b"E0105", i, dummy_span(), 1))} },
+    }
+  });
+  let declarations = map(mods, declarations_of);
+  let declared = map(range(0, n), |i: Int| bindings_of(i, at(declarations, i)));
+  let w = { mods: mods, names: indexed.names, declarations: declarations, declared: declared };
+  let built = map(range(0, n), |i: Int| build_scope_reporting(w, i));
+  let scopes = map(built, |b: Builder| b.scope);
+  let edges = map(built, |b: Builder| b.edges);
+  let diags1 = fold(built, indexed.diags, |acc: List<Diag>, b: Builder| bytes_concat_diags(acc, b.diags));
+  let dfs = traverse(edges);
+  let diags2 = fold(dfs.cycles, diags1, |acc: List<Diag>, c: Cycle| push(acc, cycle_diag(c)));
+  // Only with a consistent set of tables: expansion resolves names through them.
+  if len(diags2) > 0 { Failed(diags2) } else {
+    let r = { names: indexed.names, scopes: scopes, declarations: declarations, declared: declared, order: dfs.order };
+    let x = expand(r, mods, []);
+    if len(x.diags) > 0 { Failed(x.diags) } else { Resolved_(x) }
+  }
+}
+
+// `build_scope`, with the imports that name no module reported as the reference reports them.
+fn build_scope_reporting(w: World, i: Int) -> Builder = {
+  let m = at(w.mods, i);
+  let start = { scope: { module: m.name, modules: [], selective: [], bound: at(w.declared, i) },
+                local: at(w.declarations, i), imported: no_decls(), edges: [], diags: [] };
+  fold(m.module.imports, start, |b: Builder, d: ImportDecl| {
+    let t = target_or_report(w, i, b, d);
+    match t.t {
+      None -> t.b,
+      Some(_) -> one_import(w, i, t.b, d),
+    }
+  })
+}
+
+// --- The dump -------------------------------------------------------------------------------
+
+fn n(v: Int) -> Bytes = num(v)
+
+fn dump_span(s: Span) -> Bytes = bytes_concat_all([n(s.start), b":", n(s.end)])
+
+fn dump_modbind(tag: Bytes, mb: ModBind) -> Bytes =
+  bytes_concat_all([tag, b";", mb.binder, b";", n(mb.target), b";", dump_span(mb.span), b";"])
+
+fn dump_binding(tag: Bytes, b: Binding) -> Bytes =
+  bytes_concat_all([tag, b";", b.name, b";", b.qualified, b";", n(b.owner), b";", dump_span(b.span), b";"])
+
+fn dump_scope(i: Int, s: Scope) -> Bytes =
+  bytes_concat_all([
+    b"M;", n(i), b";", s.module, b";",
+    bytes_concat_all(map(s.modules, |mb: ModBind| dump_modbind(b"B", mb))),
+    bytes_concat_all(map(s.selective, |mb: ModBind| dump_modbind(b"S", mb))),
+    bytes_concat_all(map(s.bound.values, |b: Binding| dump_binding(b"V", b))),
+    bytes_concat_all(map(s.bound.types, |b: Binding| dump_binding(b"T", b))),
+    bytes_concat_all(map(s.bound.effects, |b: Binding| dump_binding(b"E", b))),
+  ])
+
+fn dump_order(order: List<Int>) -> Bytes =
+  bytes_concat_all([b"O;",
+    fold(range(0, len(order)), b"", |acc: Bytes, i: Int|
+      if i == 0 { n(at(order, i)) } else { bytes_concat_all([acc, b",", n(at(order, i))]) }),
+    b";"])
+
+fn dump_label(l: Label) -> Bytes =
+  bytes_concat_all([b"=", n(l.module), b":", n(l.start), b":", n(l.end), b":", if l.primary { b"1" } else { b"0" }, b";"])
+
+fn dump_diag(d: Diag) -> Bytes = {
+  let primary = fold(d.labels, None, |acc: Option<Label>, l: Label|
+    match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } });
+  let head = match primary {
+    Some(l) -> bytes_concat_all([n(l.module), b":", n(l.start), b":", n(l.end)]),
+    None -> b"0:0:0",
+  };
+  bytes_concat_all([b"!", d.code, b":", head, b":", n(len(d.labels)), b":", n(d.notes), b";",
+                    bytes_concat_all(map(d.labels, dump_label))])
+}
+
+fn dump_diags(ds: List<Diag>) -> Bytes =
+  bytes_concat_all([b"D;", n(len(ds)), b";", bytes_concat_all(map(ds, dump_diag))])
+
+pub fn resolve_dump(sources: List<Source>) -> String = {
+  let head = bytes_concat_all([b"R;", n(len(sources)), b";"]);
+  let body = match resolve(sources) {
+    Failed(ds) -> bytes_concat(b"X;", dump_diags(ds)),
+    Resolved_(x) -> bytes_concat_all([
+      bytes_concat_all(map(range(0, len(x.r.scopes)), |i: Int| dump_scope(i, at(x.r.scopes, i)))),
+      dump_order(x.r.order),
+      dump_diags([]),
+      bytes_concat_all(map(range(0, len(x.mods)), |i: Int|
+        bytes_concat_all([b"P;", n(i), b";", dump_module(at(x.mods, i).module), b"#0;"]))),
+    ]),
+  };
+  string_of_bytes(bytes_concat(head, body))
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// The differential (`harness/tests/resolve.rs`) is the instrument; these pin
+// the helpers it cannot see through, in the shape the other areas use.
+
+test "a module name qualifies its declarations and binds its last segment" {
+  assert_eq(default_binder(b"std.db"), b"db");
+  assert_eq(default_binder(b"app"), b"app");
+  assert_eq(qualify(b"store.orders", b"place"), b"store.orders.place");
+  assert_eq(qualify(b"", b"place"), b"place")
+}
+
+test "a cycle is rotated so the smallest index leads, whichever root reached it" {
+  assert_eq(canonical([2, 0, 1]), [0, 1, 2]);
+  assert_eq(canonical([1, 2]), [1, 2]);
+  assert_eq(canonical([]), [])
+}
+
+test "the traversal leaves a dependency-first order and names each cycle once" {
+  let e: Edge = { from: 0, target: 0, span: dummy_span() };
+  // 0 -> 1 -> 2, and 3 alone: 2 before 1 before 0, then 3.
+  let acyclic = traverse([[{..e, from: 0, target: 1}], [{..e, from: 1, target: 2}], [], []]);
+  assert_eq(acyclic.order, [2, 1, 0, 3]);
+  assert_eq(len(acyclic.cycles), 0);
+  // 0 -> 1 -> 0 is one cycle, closed by 1's import, however it is entered.
+  let ring = traverse([[{..e, from: 0, target: 1}], [{..e, from: 1, target: 0}]]);
+  assert_eq(len(ring.cycles), 1);
+  assert_eq(at(ring.cycles, 0).closing.from, 1)
+}
+
+test "a default is a value, and may not name a parameter of its own signature" {
+  let src = b"fn f(a: Int = 1, b: Int = g(1), c: Int = a) -> Int = 0";
+  let m = parse(src).node;
+  let f = match at(m.items, 0) { IFn(d) -> d, _ -> panic("a fn") };
+  let names = map(f.params, |p: Param| p.name.name);
+  let d = |i: Int| match at(f.params, i).default { Some(x) -> x, None -> panic("a default") };
+  assert(is_default_expr(d(0)));
+  assert(!is_default_expr(d(1)));
+  assert_eq(mentions(d(2), names, [], []), [b"a"])
+}
+
+test "two modules resolve to the tables the reference builds" {
+  let dump = resolve_dump([
+    { name: b"base", src: b"pub fn one() -> Int = 1" },
+    { name: b"app", src: b"import base (one)\nfn two() -> Int = one() + one()" }]);
+  assert(string_starts_with(dump, "R;2;M;0;base;V;one;base.one;0;7:10;M;1;app;S;base;0;7:11;V;two;app.two;1;21:24;V;one;base.one;0;13:16;O;0,1;D;0;"))
+}

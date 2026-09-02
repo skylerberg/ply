@@ -289,13 +289,11 @@ fn the_ply_parser_agrees_with_ply_syntax_on_every_example() {
 
 /// Modules this port cannot read, because their syntax postdates it.
 ///
-/// The fifth feature to land after the spike was frozen, and the first the
-/// pre-expansion comparison cannot absorb: `?` and `{..b, f: e}` desugar into
-/// nodes the port already has, while `&`, `^`, `~`, the shifts and `0x` are
-/// tokens its lexer never learned. Porting them is a language surface, not a
-/// fix, so the file is named here instead — and both assertions below exist so
-/// the naming cannot rot into a permanent exemption.
-const POSTDATES_THE_PORT: &[&str] = &["hash.ply"];
+/// Empty since the port learned the bit operators and hex literals; `hash.ply`
+/// stood here while it had not. The list stays, with both assertions below, so
+/// that the next surface to land is named here rather than quietly skipped —
+/// and so that the naming cannot rot into a permanent exemption.
+const POSTDATES_THE_PORT: &[&str] = &[];
 
 #[test]
 fn the_ply_parser_agrees_with_ply_syntax_on_the_shipped_standard_library() {
