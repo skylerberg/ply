@@ -99,9 +99,12 @@ measurement is confounded until the earlier one has moved.
    that call the callback back; and the bitwise operators are lowered with the interpreter's
    shift-count refusal. A trampoline for an uncompiled callee was not needed:
    the cascade was the callbacks' blast radius, and the parser spike's census
-   now refuses only effects, `Decimal` and `Float` literals, a `handle` and
-   `secret_of_string` (`parser_census::the_census_over_the_parser_spike` pins
-   that no lambda, callback or value-call is refused). With every carried
+   now refuses only effects, `Decimal` and `Float` literals, a `handle`,
+   `secret_of_string` and a refutable `let` pattern
+   (`parser_census::the_census_over_the_parser_spike` pins that no lambda,
+   callback, value-call or `let` over a record is refused — the last was what
+   kept the whole checker out of the unit, through two functions that bind a
+   tuple). With every carried
    signature registered, the examples and the spike's own tests agree with the
    backend attached under `--audit-backend`. What remains is the gate, and it
    cannot move until step 3: the narrow registry enters the same leaves it
@@ -235,18 +238,21 @@ measurement is confounded until the earlier one has moved.
    beside it). **The row is taken, and the decision is: the driver stays
    Rust.** Under the interpreter hashing is the largest phase and checking the
    next, together most of the whole; parsing is a distant third and the
-   resolver, with derive expansion, is small. Under the backend the parser and
-   the hasher each fall by several times and the checker barely moves — the
-   prediction registered for it held: its state is carried, but the bodies
-   that walk it re-enter through the seam on every `map_fold`, `iterate` and
-   lambda — so the whole front end takes several times less CPU, and is still
-   two orders of magnitude from the Rust front end over the same files. That
-   is not the small factor the rule asked for, so the next lever is the phase
-   the breakdown names and not the driver: the checker under the backend,
-   which is the seam's remaining kinds (step 3), and after it the hasher, most
-   of whose cost is BLAKE3 in Ply. The series is an observation and not a
-   figure by ADR 0030's gate: quiet before, the load lifted past four after by
-   the series' own four workers, as the pre-registration said it would.
+   resolver, with derive expansion, is small. Under the backend every phase
+   falls by several times and each row's root call is entered whole, nothing
+   declined — the checker included, once the fragment lowered the `let` over
+   a tuple that had kept its roots out of the unit (the first series saw the
+   checker barely move, and the pre-registration records why that confirmed
+   its prediction for the wrong reason). The whole front end is still well
+   over an order of magnitude from the Rust front end over the same files,
+   which is not the small factor the rule asked for, so the driver is not the
+   lever. What is: the compiled code's own cost per value — every field read,
+   bind and update is a runtime helper over a boxed value — which no row has
+   yet attributed within a phase, so a profile of the entered bodies is the
+   measurement before any change; and the hasher, most of whose cost is
+   BLAKE3 in Ply. The series is an observation and not a figure by ADR 0030's
+   gate: quiet before, the load lifted past four after by the series' own
+   four workers, as the pre-registration said it would.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not
    compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
    neither them nor hex literals; both are repaired, the differential is green

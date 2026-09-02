@@ -1078,9 +1078,12 @@ impl Fx<'_, '_> {
                             match pat {
                                 Pat::Var { name, .. } => inner.push((name.name.clone(), v)),
                                 Pat::Wildcard => {}
+                                other if self.binds_without_test(other) => {
+                                    self.bind_pattern(other, v, true, &mut inner)?;
+                                }
                                 other => {
                                     return self.refuse(format!(
-                                        "a `let` binding a {} pattern",
+                                        "a `let` binding a refutable {} pattern",
                                         pattern_name(other)
                                     ));
                                 }
@@ -1654,6 +1657,19 @@ impl Fx<'_, '_> {
                 .ctor_of(&QName::bare(id.clone()))
                 .is_none_or(|(_, arity)| arity != 0),
             _ => false,
+        }
+    }
+
+    /// Whether a pattern can be bound with no test at all — what a `let` may carry, since the
+    /// checker has already matched the value's shape to it: a product of such patterns, or a
+    /// list pattern that is only a rest.
+    fn binds_without_test(&self, pat: &Pat) -> bool {
+        match pat {
+            Pat::Record { fields, .. } => fields.iter().all(|(_, sub)| self.binds_without_test(sub)),
+            Pat::List { items, rest } => {
+                items.is_empty() && rest.as_ref().is_some_and(|r| self.binds_without_test(r))
+            }
+            _ => self.irrefutable(pat),
         }
     }
 

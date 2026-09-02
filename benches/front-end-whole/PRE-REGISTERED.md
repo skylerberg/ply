@@ -80,18 +80,28 @@ the backend is within a small factor of the Rust front end's known cost the
 driver stays Rust and drives a Ply front end; if it is not, the next lever is
 the phase the breakdown names, not the driver.
 
-## Before the series
+## Between the series
 
-A dry run of the probe, one worker, preceded the series and changed two things,
-both recorded here so the series is read against the tree it ran in. The probe
-first called its `parsed()` constant once per module inside the later rows, and
-the interpreter re-parsed the standard library on every call: the memo gave up
-on a value past a fixed depth, and a parsed module tree is deeper, so the tables
-row read at many times the parse row. The walk is now iterative and unbounded
+Recorded so each series is read against the tree it ran in. A dry run of the
+probe, one worker, came first and changed two things. The probe called its
+`parsed()` constant once per module inside the later rows, and the interpreter
+re-parsed the standard library on every call: the memo gave up on a value past
+a fixed depth, and a parsed module tree is deeper, so the tables row read at
+many times the parse row. The walk is now iterative and unbounded
 (`ply_eval::memo::world_independent`), and the probe binds the constant once
-regardless. The resolver's name lookups were also
-moved from per-module lists onto maps before the cause was found; the dry run
-after both changes reads the tables as a small fraction of the parse.
+regardless. The resolver's name lookups were also moved from per-module lists
+onto maps before the cause was found; after both changes the tables are a small
+fraction of the parse.
+
+`observation-1.txt` is the first series. It confirmed prediction 3 — the
+checker barely moved under the backend — for a reason the prediction did not
+give: the fragment refused a `let` binding a record pattern, two of the
+checker's functions bind a tuple that way, and a refused callee refuses every
+caller, so the whole checker was outside the compiled unit and ran interpreted
+(`parser_census::the_census_over_the_parser_spike` names each refused function
+now, which is how this was found). The fragment lowers a `let` over any
+irrefutable pattern since, the checker's roots are in the unit, and
+`observation-2.txt` is the series over that tree — the one step 7 reads.
 
 ## Predictions, registered
 
