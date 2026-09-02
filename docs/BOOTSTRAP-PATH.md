@@ -72,14 +72,17 @@ the generator does not use it yet.
 Each step names its gate. Take them in this order because each later step's
 measurement is confounded until the earlier one has moved.
 
-1. **Take the front-end row.** ADR 0026 names the bootstrap front end as a
-   workload class and deliberately offers no row for it; ADR 0020 ranks the
-   fragment's cost at one entry per token as the measurement that would most
-   change its decision. It is now takeable: `ply test --backend` attaches the
-   shipping backend, `--audit-backend` polices it, and the parser spike is the
-   workload. Report entries counted against a zero-entry control, on an idle
-   machine, pre-registered (`CONTRIBUTING.md` §"Gate on an idle machine"). This
-   step decides whether the rest of the order is right and costs a sitting.
+1. **The front-end row exists, and it is the ordering.** ADR 0026 named the
+   bootstrap front end as a workload class with no row; ADR 0030 then took it —
+   the parser spike's modules parsing the example files as byte literals,
+   through `ply test --backend`, against a null control, arms rotated. Every
+   backend arm was slower than no backend, by nearly ten times the control,
+   because the entries are leaf islands and a boundary crossing costs more than
+   the machine's own dispatch. So the first step is not a measurement but the
+   two that follow, and the row is re-taken after each root lands, with ADR
+   0030's protocol and its bar: beat the unbacked arm by more than the null
+   control, on an idle machine, pre-registered (`CONTRIBUTING.md` §"Gate on an
+   idle machine").
 2. **The code generator's roots, in ADR 0030's ranking.** String concatenation
    and a record pattern nested in a constructor pattern are plain missing
    lowerings and nothing in the evaluator moves for them. Then the callback
@@ -130,9 +133,10 @@ measurement is confounded until the earlier one has moved.
 
 ## What would make this plan wrong
 
-- **If step 1 reads that entering compiled code per token costs more than
-  interpreting the token.** Then only root entry can pay, steps 2 and 3 become
-  the whole path, and nothing in step 5 matters until they land.
+- **If root entry, once reachable, still loses to no backend.** ADR 0030's
+  per-entry cost — a registry lookup, a context, a clone and an arena push per
+  argument, two post-conditions, a clone out — is then the ceiling, and the seam
+  has to change shape before any construct is worth lowering.
 - **If the container share stays the ceiling after steps 2 and 3.** Then step 4
   is the milestone and the generator's constructs were the cheap half.
 - **If the inference speedup ADR 0021 bets on does not arrive.** Then tooling
@@ -144,6 +148,6 @@ measurement is confounded until the earlier one has moved.
 
 ## What this is not
 
-Not a decision to self-host. ADR 0020's decision stands until step 1's row
-exists, and this file should be corrected in place when it does: replace the
-sentence, do not add a block saying the sentence moved.
+Not a decision to self-host. ADR 0020's decision stands until a re-take of
+ADR 0030's row clears its bar, and this file should be corrected in place when
+it does: replace the sentence, do not add a block saying the sentence moved.
