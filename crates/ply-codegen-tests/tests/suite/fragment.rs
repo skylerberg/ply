@@ -90,6 +90,14 @@ fn nested(n: Int) -> Int = match wrapped(n) { Ok({value, next}) -> value + next,
 fn listed(n: Int) -> Int = match [Ok(n), Err(2)] { [Ok(a), Err(b)] -> a + b, _ -> 0 }
 
 fn joined(n: Int) -> Int = if "ab" ++ "cd" == "abcd" { n } else { 0 - n }
+
+fn let_taken(n: Int) -> Int = { let {value, next} = step(n); value + next }
+
+fn let_rest(n: Int) -> Int = { let {value: v, ..} = step(n); v }
+
+fn let_tuple(n: Int) -> Int = { let (a, b) = (n, n + 1); a * b }
+
+fn let_nested(n: Int) -> Int = { let {left: {value, ..}, right: (r, _)} = {left: step(n), right: (n, n)}; value + r }
 "#;
 
 fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
@@ -202,6 +210,10 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ("m.ignored", vec![Value::Int(7)], Value::Int(7)),
         ("m.nested", vec![Value::Int(4)], Value::Int(9)),
         ("m.nested", vec![Value::Int(-3)], Value::Int(3)),
+        ("m.let_taken", vec![Value::Int(4)], Value::Int(9)),
+        ("m.let_rest", vec![Value::Int(7)], Value::Int(7)),
+        ("m.let_tuple", vec![Value::Int(4)], Value::Int(20)),
+        ("m.let_nested", vec![Value::Int(4)], Value::Int(8)),
         ("m.listed", vec![Value::Int(5)], Value::Int(7)),
         ("m.joined", vec![Value::Int(11)], Value::Int(11)),
     ];
