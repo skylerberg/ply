@@ -154,27 +154,23 @@ the published vectors holding independently, **so the two implementations are no
 wrong together.**
 
 **Throughput.** The bar is that hashing must not be worse than the phase already
-known to be worst — the Ply lexer's measured rate. **Not decided, and the bar is
-not moved.** The best observed figure is well short of it, **and neither series
-is gate-compliant**: the machine never went below twice the load gate. **The bias
-has a known direction — contention only makes a wall clock larger — so each
-figure is a lower bound**, which is why the series taken while load was climbing
-reads *worse* rather than confirming the first. **That is not a pass and it is
-not a fail.** The run that settles it is the same series under the gate, and
-until that exists this record carries a threshold it did not meet and did not
-clear — **which is the state the pre-registration was written to make visible
-instead of letting a number be interpreted after the fact.**
-
-**The follow-up is named in advance and is contingent on a number rather than on
-the argument being re-made**: a hash builtin, with the Ply definition kept as the
-readable one and the differential kept as what holds the two together. That is
-the shape ADR 0027 used, and it is the shape a *measured* reversal takes.
+known to be worst — the Ply lexer's measured rate. **Decided, under the gate**
+(`benches/hash-throughput/observation-1.txt`, and `run.sh` beside it re-takes
+it): interpreted, the hash runs at roughly half the interpreted lexer's rate,
+below the bar as the arithmetic below predicted; under the backend, which did not
+exist when the bar was set, it runs several times above it. **The follow-up this
+record named in advance — a hash builtin, with the Ply definition kept as the
+readable one and the differential kept as what holds the two together — is not
+taken, and ADR 0035 says why**: the shortfall is the compiled value model's cost
+on every integer kernel, not a property of hashing, and the hash is kept as the
+integer kernel that model is measured on. A builtin stays available as a measured
+reversal there, under a reason that record would have to state.
 
 **Failure was expected, which is why it is written down.** One compression is
 seven rounds of eight mixing functions, so a kibibyte of input is on the order of
-ten thousand interpreted operations against a lexer's handful per byte. **If the
-idle run lands below the bar — as the arithmetic predicts — this record does not
-get to call the result acceptable after seeing it.**
+ten thousand interpreted operations against a lexer's handful per byte. The idle
+run landed where that arithmetic put it, and this record does not call the
+interpreted result acceptable after seeing it — it calls it the interpreter's.
 
 ## A rooted filesystem effect
 
