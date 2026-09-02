@@ -55,8 +55,9 @@ impl Memo {
     }
 }
 
-/// Whether the value means the same thing in a world it was not produced in.
-fn world_independent(value: &Value, depth: u32) -> bool {
+/// Whether the value means the same thing in a world it was not produced in — what a
+/// remembered constant must be, whichever engine produced it.
+pub fn world_independent(value: &Value, depth: u32) -> bool {
     /// Deep enough for any value a constant plausibly builds, and finite so a cyclic value
     /// (`reference_cycles.rs`) terminates rather than recursing.
     const MAX_DEPTH: u32 = 64;
@@ -97,7 +98,7 @@ fn world_independent(value: &Value, depth: u32) -> bool {
 }
 
 /// Whether `name`'s *published* row claims it reads nothing of the world.
-pub(crate) fn pure_by_published_row(check: Option<&CheckOutput>, name: &Symbol) -> bool {
+pub fn pure_by_published_row(check: Option<&CheckOutput>, name: &Symbol) -> bool {
     check
         .and_then(|check| check.defs.get(name))
         .is_some_and(|def| def.footprint.is_empty() && def.constraints.is_empty())

@@ -9,6 +9,11 @@ use ply_syntax::ast::{Expr, render_float};
 use rpds::RedBlackTreeMap;
 pub use rust_decimal::Decimal;
 use std::cell::RefCell;
+
+thread_local! {
+    /// Every nullary constructor's payload, built once per thread.
+    static NO_ARGS: Arc<Vec<Value>> = Arc::new(Vec::new());
+}
 use std::cmp::Ordering;
 use std::fmt;
 use std::fmt::Write as _;
@@ -102,7 +107,7 @@ impl Fields {
     /// The fields in any order, sorted in place: a literal's frame hands over the vector it
     /// collected the values into, and that vector is the record's storage — no second one.
     /// Later entries win, which is what collecting into a `BTreeMap` did.
-    pub(crate) fn from_unsorted(mut v: Vec<(Symbol, Value)>) -> Fields {
+    pub fn from_unsorted(mut v: Vec<(Symbol, Value)>) -> Fields {
         v.sort_by(|(a, _), (b, _)| a.cmp(b));
         v.dedup_by(|later, earlier| {
             if later.0 == earlier.0 {
@@ -275,12 +280,29 @@ impl Value {
         Value::Map(m)
     }
 
+    /// A constructor over the vector its arguments were collected into — that vector is the
+    /// payload. A nullary constructor's payload is the thread's one shared empty vector.
     #[inline(never)]
     pub fn ctor(name: impl Into<Symbol>, args: Vec<Value>) -> Value {
+        let args = if args.is_empty() {
+            NO_ARGS.with(Arc::clone)
+        } else {
+            Arc::new(args)
+        };
         Value::Ctor {
             name: name.into(),
-            args: Arc::new(args),
+            args,
         }
+    }
+
+    /// `ctor` for arguments that arrived in a pooled buffer: the payload is an exact vector of its
+    /// own and the buffer goes back to the pool, so a constructor call does not drain the pool
+    /// the next call's arguments would have come from.
+    pub fn ctor_pooled(name: impl Into<Symbol>, mut args: Vec<Value>) -> Value {
+        let mut payload = Vec::with_capacity(args.len());
+        payload.append(&mut args);
+        crate::argv::give(args);
+        Value::ctor(name, payload)
     }
 
     /// One `Value` per builtin per thread, built on first reference.
