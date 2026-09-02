@@ -148,7 +148,12 @@ fn extract_value(stdout: &str) -> String {
     );
     let rest = &after[quote.len()..];
     let end = rest.find(quote).expect("the rendered `String` is closed");
-    rest[..end].to_string()
+    // The rendered string is JSON-escaped twice over: a backslash in a test label arrives as
+    // `\\\\`, a quote as `\\\"`.
+    rest[..end]
+        .replace("\\\\\\\\", "\u{0}")
+        .replace("\\\\\\\"", "\"")
+        .replace('\u{0}', "\\")
 }
 
 fn first_difference(reference: &str, actual: &str) -> Option<String> {

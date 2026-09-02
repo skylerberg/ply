@@ -99,9 +99,12 @@ fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
 
 /// Closures and the callbacks that take them: a lambda capturing a parameter, nested lambdas, a
 /// named function and a constructor and a builtin used as values, a call through a parameter and
-/// through a `let`, `iterate` stopping and running out, and the bitwise operators.
+/// through a `let`, `iterate` stopping and running out, `map_fold` over a map built in place, and
+/// the bitwise operators.
 const CLOSURES: &str = r#"
 fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc, x| acc + x)
+
+fn keyed_sum(n: Int) -> Int = map_fold(fold(range(0, n), map_new(), |m, i| map_insert(m, n - i, i)), 0, |acc, k, v| acc * 10 + k + v)
 
 fn scaled_sum(n: Int, k: Int) -> Int = fold(map(range(0, n), |x| x * k), 0, |a, b| a + b)
 
@@ -231,6 +234,7 @@ fn a_compiled_body_answers_over_closures_and_callbacks() {
             Value::Int(18),
         ),
         ("m.even_count", vec![Value::Int(7)], Value::Int(4)),
+        ("m.keyed_sum", vec![Value::Int(3)], Value::Int(333)),
         ("m.countdown", vec![Value::Int(5)], Value::Int(0)),
         ("m.plus_two", vec![Value::Int(5)], Value::Int(7)),
         ("m.tripled", vec![Value::Int(4)], Value::Int(12)),
