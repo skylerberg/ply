@@ -12,9 +12,10 @@
 //!
 //! Every object an entry allocates is logged, and [`Heap::end`] releases the log: a count that
 //! reaches zero dismantles its object then and there — its children let go, a bridged value
-//! dropped — but the memory itself waits for the end of the entry, so a stale reference reads a
-//! `DEAD` header rather than someone else's object. Reuse of that memory within an entry is
-//! ADR 0035's sequence step 4, not this file's.
+//! dropped — and in a release build its memory goes back to the entry's free list for its size
+//! class, so an entry's memory is bounded by what it holds; in a debug build the memory waits
+//! for the end of the entry instead, so a stale reference reads a `DEAD` header rather than
+//! someone else's object, which is the net the suites run under.
 
 use crate::list;
 use ply_eval::{Closure, ClosureKind, Fields, Value};
@@ -316,6 +317,74 @@ pub struct Heap {
     persistent: bool,
     /// Objects allocated since the last reset.
     count: usize,
+    /// Dead objects by size class, for an allocation of that class to take before the bump
+    /// pointer moves: what keeps an entry's memory bounded by what it holds rather than by what
+    /// it ever held. Filled only while `reuse` is set, which a release build does and a debug
+    /// build does not, so the tests keep reading a stale word as a dead header.
+    free: Vec<Vec<*mut Obj>>,
+    reuse: bool,
+}
+
+/// The size classes a dead object is kept in, in words; anything larger goes back only at the
+/// entry's end.
+const REUSE_CLASSES: usize = 64;
+
+thread_local! {
+    /// The heap of the entry running on this thread, which a dying object goes back to. Entries
+    /// never nest on a thread (a re-entry is declined), so one is enough.
+    static CURRENT: std::cell::Cell<*mut Heap> = const { std::cell::Cell::new(std::ptr::null_mut()) };
+}
+
+/// The entry beginning on this thread allocates from `heap`; its dead objects go back to it.
+pub fn enter(heap: *mut Heap) {
+    CURRENT.with(|c| c.set(heap));
+}
+
+pub fn leave() {
+    CURRENT.with(|c| c.set(std::ptr::null_mut()));
+}
+
+/// The payload an object was allocated with, from its header: what its allocation site asked
+/// for, kind by kind, so a dead object goes back to the class it came from.
+unsafe fn payload_bytes(o: *mut Obj) -> usize {
+    unsafe {
+        match (*o).kind {
+            KIND_RECORD | KIND_CTOR | KIND_CLOSURE | KIND_INT => (*o).len as usize * 8,
+            KIND_LEAF | KIND_BRANCH => (*o).layout as usize * 8,
+            KIND_LIST => (list::TAIL + (*o).aux as usize) * 8,
+            KIND_MAP => (*o).layout as usize * 16,
+            KIND_STR | KIND_BYTES => (*o).layout as usize,
+            _ => usize::MAX,
+        }
+    }
+}
+
+/// A dead object goes back to the current heap's free list for its class. A bridged one does
+/// not: its slot is on the heap's drop log, and a second bridged value in the same slot would
+/// be dropped twice at the entry's end.
+unsafe fn recycle(o: *mut Obj) {
+    let heap = CURRENT.with(|c| c.get());
+    if heap.is_null() {
+        return;
+    }
+    unsafe {
+        if !(*heap).reuse || (*o).kind == KIND_BRIDGE {
+            return;
+        }
+        let size = payload_bytes(o);
+        if size == usize::MAX {
+            return;
+        }
+        let class = Heap::object_size(size) / 8;
+        if class >= REUSE_CLASSES {
+            return;
+        }
+        let free = &mut (*heap).free;
+        if free.len() <= class {
+            free.resize_with(class + 1, Vec::new);
+        }
+        free[class].push(o);
+    }
 }
 
 impl Default for Heap {
@@ -341,7 +410,15 @@ impl Heap {
             bridges: Vec::new(),
             persistent: false,
             count: 0,
+            free: Vec::new(),
+            reuse: !cfg!(debug_assertions),
         }
+    }
+
+    /// Whether dead objects are reused within an entry: on in a release build, off in a debug
+    /// one, and set here by a test that exercises the reuse itself.
+    pub fn set_reuse(&mut self, reuse: bool) {
+        self.reuse = reuse;
     }
 
     /// A heap whose entries never end: what outlives every entry lives here.
@@ -392,11 +469,20 @@ impl Heap {
         payload_bytes: usize,
     ) -> *mut Obj {
         let size = Heap::object_size(payload_bytes);
-        if (self.end as usize).wrapping_sub(self.cur as usize) < size || self.cur.is_null() {
-            self.grow(size);
-        }
-        let p = self.cur as *mut Obj;
-        self.cur = unsafe { self.cur.add(size) };
+        // A dead object of this class, if the entry has one, before the bump pointer moves.
+        let recycled = self.free.get_mut(size / 8).and_then(Vec::pop);
+        let p = match recycled {
+            Some(p) => p,
+            None => {
+                if (self.end as usize).wrapping_sub(self.cur as usize) < size || self.cur.is_null()
+                {
+                    self.grow(size);
+                }
+                let p = self.cur as *mut Obj;
+                self.cur = unsafe { self.cur.add(size) };
+                p
+            }
+        };
         unsafe {
             p.write(Obj {
                 rc: 1,
@@ -584,6 +670,9 @@ impl Heap {
         }
         self.chunk = 0;
         self.count = 0;
+        for class in &mut self.free {
+            class.clear();
+        }
     }
 
     // --- Conversions ------------------------------------------------------------------------
@@ -831,6 +920,8 @@ unsafe fn dismantle(o: *mut Obj, depth: usize, deferred: &mut Vec<*mut Obj>) {
                 deferred.push(co);
             }
         }
+        // The class is read off the header before it is marked dead.
+        recycle(o);
         (*o).kind = KIND_DEAD;
     }
 }
@@ -1305,6 +1396,41 @@ mod tests {
         dec(w);
         assert_eq!(kind(w), KIND_DEAD);
         assert_eq!(kind(child), KIND_DEAD);
+        h.end();
+    }
+
+    #[test]
+    fn a_dead_object_is_reused_by_the_next_of_its_class_within_an_entry() {
+        let mut h = Heap::new();
+        h.set_reuse(true);
+        enter(&mut h);
+        let l = layouts();
+        let first = h.to_word(&l, &Value::list(vec![Value::Int(1), Value::Int(2)]));
+        let record = h.to_word(
+            &l,
+            &Value::Record(Arc::new(Fields::from_unsorted(vec![
+                (Symbol::new("a"), Value::Int(1)),
+                (Symbol::new("b"), Value::Int(2)),
+            ]))),
+        );
+        dec(first);
+        let again = h.to_word(&l, &Value::list(vec![Value::Int(3), Value::Int(4)]));
+        assert_eq!(
+            again, first,
+            "a list of the same class took the dead list's slot"
+        );
+        assert_eq!(
+            Heap::to_value(&l, again),
+            Value::list(vec![Value::Int(3), Value::Int(4)])
+        );
+        dec(record);
+        let other = h.to_word(&l, &Value::str("ab"));
+        assert_ne!(other, record, "a string is not a record's class");
+        let bridged = h.bridge(Value::Float(1.5));
+        dec(bridged);
+        let bridged_again = h.bridge(Value::Float(2.5));
+        assert_ne!(bridged_again, bridged, "a bridged slot is never reused");
+        leave();
         h.end();
     }
 
