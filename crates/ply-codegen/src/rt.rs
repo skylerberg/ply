@@ -1285,6 +1285,42 @@ pub unsafe extern "C" fn rt_iterate(ctx: *mut Ctx, seed: i64, budget: i64, f: i6
     }
 }
 
+/// What a fused `iterate` loop raises: `what` 0 for a budget under one (`n` the budget), 1 for
+/// a budget run out (`n` the budget), 2 for a step that answered neither `Continue` nor `Stop`
+/// (`n` the answer). Takes the answer in the last case.
+pub unsafe extern "C" fn rt_iterate_bad(ctx: *mut Ctx, what: i64, n: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let d = match what {
+        0 => error(format!(
+            "`iterate` needs a budget of at least 1, and this is {n}"
+        )),
+        1 => error(format!("`iterate` did not stop within its budget of {n}")),
+        _ => {
+            let d = error(format!(
+                "the step given to `iterate` answered {}, not `Continue` or `Stop`",
+                ctx.type_name(n)
+            ));
+            heap::dec(n);
+            d
+        }
+    };
+    ctx.fail(d);
+}
+
+/// A range longer than the interpreter's `range` admits, raised where a fused loop would have
+/// walked it.
+pub unsafe extern "C" fn rt_bad_range(ctx: *mut Ctx, lo: i64, hi: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let d = error(format!(
+        "`range` of {} elements exceeds the limit of {RANGE_LIMIT}",
+        hi.saturating_sub(lo)
+    ));
+    ctx.fail(d);
+}
+
+/// The most elements the interpreter's `range` builds, which a fused loop holds to as well.
+pub const RANGE_LIMIT: i64 = 10_000_000;
+
 /// A shift count outside `0..64`, which the interpreter refuses too.
 pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64) {
     let ctx = unsafe { &mut *ctx };
@@ -1591,6 +1627,8 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_fold", rt_fold as *const u8),
         ("rt_map_fold", rt_map_fold as *const u8),
         ("rt_iterate", rt_iterate as *const u8),
+        ("rt_iterate_bad", rt_iterate_bad as *const u8),
+        ("rt_bad_range", rt_bad_range as *const u8),
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),
         ("rt_dec", rt_dec as *const u8),

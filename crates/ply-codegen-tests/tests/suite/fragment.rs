@@ -160,6 +160,20 @@ fn named_count(n: Int) -> Int = len(map(range(0, n), int_to_string))
 fn adder(k: Int) -> (Int) -> Int = |x| x + k
 
 fn added(k: Int, x: Int) -> Int = adder(k)(x)
+
+fn add(a: Int, b: Int) -> Int = a + b
+
+fn stepped(n: Int) -> Int = fold(range(0, n), 0, add)
+
+type Acc = { total: Int, count: Int }
+
+fn bump(a: Acc, x: Int) -> Acc = {..a, total: a.total + x, count: a.count + 1}
+
+fn totals(n: Int) -> Int = { let a = fold(range(0, n), {total: 0, count: 0}, bump); a.total + a.count }
+
+fn walked(n: Int, k: Int) -> Int = iterate({total: 0, count: 0}, n + 1, |a: Acc| if a.count >= n { Stop(a.total) } else { Continue({..a, total: a.total + k, count: a.count + 1}) })
+
+fn huge(n: Int) -> Int = fold(range(0, 20000000 + n), 0, add)
 "#;
 
 /// The control every other test here is read against: the fragment is not empty, and it is not
@@ -288,6 +302,15 @@ fn a_compiled_body_answers_over_closures_and_callbacks() {
             vec![Value::Int(10), Value::Int(5)],
             Value::Int(15),
         ),
+        // Fused loops: a `fold` over a range with a compiled step, over an `Int` and over a
+        // record, and an `iterate` with a lambda that captures.
+        ("m.stepped", vec![Value::Int(10)], Value::Int(45)),
+        ("m.totals", vec![Value::Int(4)], Value::Int(10)),
+        (
+            "m.walked",
+            vec![Value::Int(5), Value::Int(3)],
+            Value::Int(15),
+        ),
     ];
     for (name, args, want) in cases {
         let got = call(unit, name, args);
@@ -319,6 +342,8 @@ fn a_native_closure_stays_inside_the_entry_that_made_it() {
 fn a_callback_that_raises_declines_rather_than_answering() {
     let (_, unit) = unit(CLOSURES);
     assert_eq!(call(unit, "m.stuck", &[Value::Int(0)]), None);
+    // A fused loop declines where the runtime's would: a range past the interpreter's limit.
+    assert_eq!(call(unit, "m.huge", &[Value::Int(1)]), None);
     assert_eq!(call(unit, "m.bad_shift", &[Value::Int(70)]), None);
     assert_eq!(
         call(unit, "m.bad_shift", &[Value::Int(3)]),
