@@ -246,11 +246,16 @@ measurement is confounded until the earlier one has moved.
    its prediction for the wrong reason). The whole front end is still well
    over an order of magnitude from the Rust front end over the same files,
    which is not the small factor the rule asked for, so the driver is not the
-   lever. What is: the compiled code's own cost per value — every field read,
-   bind and update is a runtime helper over a boxed value — which no row has
-   yet attributed within a phase, so a profile of the entered bodies is the
-   measurement before any change; and the hasher, most of whose cost is
-   BLAKE3 in Ply. The series is an observation and not a figure by ADR 0030's
+   lever. What is: the runtime's cost per value on the callback path. A
+   profile of the compiled check row
+   (`benches/front-end-whole/profile-check-wide.txt`) puts its time under the
+   runtime's callback loops — `fold`, `map`, `iterate` calling the compiled
+   step back — and the larger part of that in the value traffic each step
+   causes: dropping and draining the values a step gives up, allocating,
+   the argument pool, cloning, field reads; the compiled frames themselves
+   are the minority. So the lever is that path — what a callback step pays
+   to receive, update and release a carried state — and after it the hasher,
+   most of whose cost is BLAKE3 in Ply. The series is an observation and not a figure by ADR 0030's
    gate: quiet before, the load lifted past four after by the series' own
    four workers, as the pre-registration said it would.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not

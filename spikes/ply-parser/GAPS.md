@@ -2214,7 +2214,13 @@ rule; `observation-2.txt` is the series it reads, `observation-1.txt` the one
 before it; `docs/BOOTSTRAP-PATH.md` step 7 carries what it decided. The shape:
 under the interpreter hashing is the largest phase and checking the next,
 parsing a distant third and the resolver small; under the backend every phase
-falls by several times, with each row entered whole and nothing declined.
+falls by several times, with each row entered whole and nothing declined. A
+profile of the compiled check row (`profile-check-wide.txt` beside the series)
+puts its time under the runtime's callback loops and, within them, in the value
+traffic of each step — drops, drains, allocation, the argument pool — rather
+than in the compiled frames; the compiled checker is a callback-shaped program,
+and what a callback step pays to receive, update and release its carried state
+is the next thing to move.
 
 **What the first series found, which was not the seam.** The checker barely
 moved under the backend in the first series, exactly as the pre-registration
