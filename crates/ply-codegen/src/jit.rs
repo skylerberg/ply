@@ -142,6 +142,11 @@ struct Sig {
     ret: Kind,
     param_tys: Vec<u32>,
     ret_ty: u32,
+    /// Per parameter, whether the body only reads it — every mention the base of a field read,
+    /// and no literal of its width that would take its memory — so the caller keeps its hold and
+    /// the callee neither counts it nor lets it go: no increment and release around the call,
+    /// and a record that dies in the caller dies where the caller's tokens are.
+    borrowed: Vec<bool>,
 }
 
 /// What the code generator knows of a value's type at compile time: enough to read a record's
@@ -196,6 +201,7 @@ fn sig_of(jit: &mut Jit, loaded: &Source, name: &str, arity: usize) -> Sig {
         ret: Kind::Boxed,
         param_tys: vec![0; arity],
         ret_ty: 0,
+        borrowed: vec![false; arity],
     };
     let Some(def) = loaded.check.defs.get(&Symbol::new(name)) else {
         return boxed;
@@ -206,12 +212,14 @@ fn sig_of(jit: &mut Jit, loaded: &Source, name: &str, arity: usize) -> Sig {
             ret: kind_of_type(ret),
             param_tys: params.iter().map(|p| jit.ty_of_type(p)).collect(),
             ret_ty: jit.ty_of_type(ret),
+            borrowed: vec![false; arity],
         },
         ty if arity == 0 => Sig {
             params: Vec::new(),
             ret: kind_of_type(ty),
             param_tys: Vec::new(),
             ret_ty: jit.ty_of_type(ty),
+            borrowed: Vec::new(),
         },
         _ => boxed,
     }
@@ -409,6 +417,36 @@ impl Jit {
             nodes: jit.nodes,
             compile_nanos,
         })
+    }
+
+    /// Which of `name`'s handle parameters its body only reads: every mention the base of a
+    /// field read, none captured by a lambda, and no record literal of the parameter's width
+    /// in the body, which would rather take a parameter that dies there.
+    fn borrowed_params(&self, name: &str, params: &[Symbol], code: &Code) -> Vec<bool> {
+        let Some(func) = self.funcs.get(name) else {
+            return vec![false; params.len()];
+        };
+        let mut widths = BTreeSet::new();
+        record_widths(code, &mut widths);
+        params
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                if func.sig.params[i] != Kind::Boxed {
+                    return false;
+                }
+                let width = match &self.tys[func.sig.param_tys[i] as usize] {
+                    Ty::Record(fields) => Some(fields.len()),
+                    _ => None,
+                };
+                if width.is_some_and(|w| widths.contains(&w)) {
+                    return false;
+                }
+                let mut only_read = true;
+                read_only(code, p, &mut only_read);
+                only_read
+            })
+            .collect()
     }
 
     /// The values a body builds without allocating: every nullary constructor, the empty list
@@ -704,6 +742,10 @@ impl Jit {
             // captures it rather than reading a global that does not exist.
             let body = crate::opt::optimize(loaded, module_index, def);
             let code = lower_fn(&params, &body).code;
+            let borrowed = jit.borrowed_params(name, &params, &code);
+            if let Some(func) = jit.funcs.get_mut(*name) {
+                func.sig.borrowed = borrowed;
+            }
             bodies.push(((*name).to_string(), params, code, module_index));
         }
         Ok((jit, bodies, started))
@@ -768,12 +810,19 @@ impl Jit {
             // A typed body: each parameter is the register it arrived in, of its own kind.
             Some(sig) => {
                 for (i, (p, kind)) in params.iter().zip(&sig.params).enumerate() {
-                    let v = fx.home(Val {
+                    let val = Val {
                         kind: *kind,
                         v: block_params[i + 1],
                         ty: sig.param_tys[i],
                         home: 0,
-                    });
+                    };
+                    // A borrowed parameter is the caller's: read here, never moved or let go.
+                    let v = if sig.borrowed[i] {
+                        fx.pinned.push(p.clone());
+                        val
+                    } else {
+                        fx.home(val)
+                    };
                     scope.push((p.clone(), v));
                 }
             }
@@ -848,11 +897,16 @@ impl Jit {
             kinds: HashMap::new(),
         };
         let mut args = vec![fx.ctx];
+        let mut lent = Vec::new();
         for (i, kind) in func.sig.params.iter().enumerate() {
             let handle =
                 fx.builder
                     .ins()
                     .load(types::I64, MemFlags::trusted(), args_ptr, (i * 8) as i32);
+            // The entry owns every handle it is given; one the body borrows is let go here.
+            if func.sig.borrowed[i] {
+                lent.push(handle);
+            }
             let v = fx.coerce(
                 Val {
                     kind: Kind::Boxed,
@@ -871,6 +925,9 @@ impl Jit {
         let call = fx.builder.ins().call(callee, &args);
         let r = fx.builder.inst_results(call)[0];
         fx.check();
+        for w in lent {
+            fx.dec_inline(w);
+        }
         let handle = fx.boxed(Val {
             kind: func.sig.ret,
             v: r,
@@ -996,7 +1053,11 @@ fn record_widths(code: &Code, out: &mut BTreeSet<usize>) {
             out.insert(fields.len());
             fields.iter().for_each(|(_, e)| record_widths(e, out));
         }
-        NodeKind::RecordUpdate { base, sets, .. } => {
+        NodeKind::RecordUpdate { base, copies, sets } => {
+            // A fully written literal is built as one, in the token of its width.
+            if copies.is_empty() {
+                out.insert(sets.len());
+            }
             record_widths(base, out);
             sets.iter().for_each(|(_, e)| record_widths(e, out));
         }
@@ -1009,6 +1070,166 @@ fn record_widths(code: &Code, out: &mut BTreeSet<usize>) {
         NodeKind::WithCell { init, body, .. } => {
             record_widths(init, out);
             record_widths(body, out);
+        }
+    }
+}
+
+/// Whether evaluating `code` can move the local `name` out of its binding: a read marked its
+/// last use, or a lambda capturing it.
+fn moves(code: &Code, name: &Symbol) -> bool {
+    let mut hit = false;
+    let mut check = |c: &Code| {
+        if moves(c, name) {
+            hit = true;
+        }
+    };
+    match &code.kind {
+        NodeKind::Var { name: q, .. } => {
+            return q.is_bare() && q.symbol() == name && code.own == Own::Owned;
+        }
+        NodeKind::Lambda { captures, .. } => return captures.names.contains(name),
+        NodeKind::Lit(..) => return false,
+        NodeKind::Field { base, .. } => {
+            // A field read at the record's last use takes the record with it.
+            if let NodeKind::Var { name: q, .. } = &base.kind {
+                return q.is_bare() && q.symbol() == name && base.own == Own::Owned;
+            }
+            check(base);
+        }
+        NodeKind::Unary { operand, .. } => check(operand),
+        NodeKind::Binary { lhs, rhs, .. } => {
+            check(lhs);
+            check(rhs);
+        }
+        NodeKind::App { func, args, .. } => {
+            check(func);
+            args.iter().for_each(&mut check);
+        }
+        NodeKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            check(cond);
+            check(then_branch);
+            check(else_branch);
+        }
+        NodeKind::Match { scrutinee, arms } => {
+            check(scrutinee);
+            for arm in arms.iter() {
+                check(&arm.body);
+                if let Some(g) = &arm.guard {
+                    check(g);
+                }
+            }
+        }
+        NodeKind::Block { stmts, tail } => {
+            for s in stmts.iter() {
+                match s {
+                    Stmt::Let { value, .. } => check(value),
+                    Stmt::Expr { code, .. } => check(code),
+                }
+            }
+            if let Some(t) = tail {
+                check(t);
+            }
+        }
+        NodeKind::Record { fields, .. } => fields.iter().for_each(|(_, e)| check(e)),
+        NodeKind::RecordUpdate { base, sets, .. } => {
+            check(base);
+            sets.iter().for_each(|(_, e)| check(e));
+        }
+        NodeKind::List { items } => items.iter().for_each(&mut check),
+        NodeKind::Perform { args, .. } => args.iter().for_each(&mut check),
+        NodeKind::Handle { body, .. }
+        | NodeKind::Simulate { body, .. }
+        | NodeKind::WithRegion { body } => check(body),
+        NodeKind::WithCell { init, body, .. } => {
+            check(init);
+            check(body);
+        }
+    }
+    hit
+}
+
+/// Clears `ok` where `code` mentions `name` other than as the base of a field read — as a value,
+/// an update's base, a scrutinee or a lambda's capture.
+fn read_only(code: &Code, name: &Symbol, ok: &mut bool) {
+    if !*ok {
+        return;
+    }
+    let mut go = |c: &Code| read_only(c, name, ok);
+    match &code.kind {
+        NodeKind::Lit(..) => {}
+        NodeKind::Var { name: q, .. } => {
+            if q.is_bare() && q.symbol() == name {
+                *ok = false;
+            }
+        }
+        NodeKind::Field { base, .. } => {
+            if !matches!(&base.kind, NodeKind::Var { name: q, .. } if q.is_bare() && q.symbol() == name)
+            {
+                go(base);
+            }
+        }
+        NodeKind::Lambda { captures, body, .. } => {
+            if captures.names.contains(name) {
+                *ok = false;
+            } else {
+                go(body);
+            }
+        }
+        NodeKind::Unary { operand, .. } => go(operand),
+        NodeKind::Binary { lhs, rhs, .. } => {
+            go(lhs);
+            go(rhs);
+        }
+        NodeKind::App { func, args, .. } => {
+            go(func);
+            args.iter().for_each(go);
+        }
+        NodeKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            go(cond);
+            go(then_branch);
+            go(else_branch);
+        }
+        NodeKind::Match { scrutinee, arms } => {
+            go(scrutinee);
+            for arm in arms.iter() {
+                go(&arm.body);
+                if let Some(g) = &arm.guard {
+                    go(g);
+                }
+            }
+        }
+        NodeKind::Block { stmts, tail } => {
+            for s in stmts.iter() {
+                match s {
+                    Stmt::Let { value, .. } => go(value),
+                    Stmt::Expr { code, .. } => go(code),
+                }
+            }
+            if let Some(t) = tail {
+                go(t);
+            }
+        }
+        NodeKind::Record { fields, .. } => fields.iter().for_each(|(_, e)| go(e)),
+        NodeKind::RecordUpdate { base, sets, .. } => {
+            go(base);
+            sets.iter().for_each(|(_, e)| go(e));
+        }
+        NodeKind::List { items } => items.iter().for_each(go),
+        NodeKind::Perform { args, .. } => args.iter().for_each(go),
+        NodeKind::Handle { body, .. }
+        | NodeKind::Simulate { body, .. }
+        | NodeKind::WithRegion { body } => go(body),
+        NodeKind::WithCell { init, body, .. } => {
+            go(init);
+            go(body);
         }
     }
 }
@@ -2826,7 +3047,11 @@ impl Fx<'_, '_> {
             Step::Typed(f) => {
                 let mut vals = Vec::with_capacity(args.len() + 1);
                 vals.push(self.ctx);
-                for (a, kind) in args.iter().zip(&f.sig.params) {
+                let mut lent = Vec::new();
+                for (i, (a, kind)) in args.iter().zip(&f.sig.params).enumerate() {
+                    if f.sig.borrowed[i] && a.kind == Kind::Boxed {
+                        lent.push(a.v);
+                    }
                     let v = self.coerce(*a, *kind);
                     vals.push(v);
                 }
@@ -2837,6 +3062,9 @@ impl Fx<'_, '_> {
                 let call = self.builder.ins().call(callee, &vals);
                 let v = self.builder.inst_results(call)[0];
                 self.check();
+                for w in lent {
+                    self.dec_inline(w);
+                }
                 Ok(Val {
                     kind: f.sig.ret,
                     v,
@@ -3530,8 +3758,23 @@ impl Fx<'_, '_> {
             // by the read rule — and takes each at its own last use.
             let mut vals = Vec::with_capacity(args.len() + 1);
             vals.push(self.ctx);
-            for (a, kind) in args.iter().zip(&f.sig.params) {
-                let v = self.consumed(a, scope)?;
+            // A borrowed parameter takes a local as it is, the caller's hold outliving the
+            // call, and a temporary with the hold this body has on it, let go afterwards.
+            let mut lent = Vec::new();
+            for (i, (a, kind)) in args.iter().zip(&f.sig.params).enumerate() {
+                // A local passed as it is must outlive the call: a later argument that moves
+                // it out — its last use — would free it first, so that case holds it.
+                let moved_later = matches!(&a.kind, NodeKind::Var { name: q, .. }
+                    if args[i + 1..].iter().any(|later| moves(later, q.symbol())));
+                let v = if f.sig.borrowed[i] && self.is_local(a, scope) && !moved_later {
+                    self.expr(a, scope)?
+                } else {
+                    let v = self.consumed(a, scope)?;
+                    if f.sig.borrowed[i] && v.kind == Kind::Boxed {
+                        lent.push(v.v);
+                    }
+                    v
+                };
                 let v = self.coerce(v, *kind);
                 vals.push(v);
             }
@@ -3542,6 +3785,9 @@ impl Fx<'_, '_> {
             let call = self.builder.ins().call(callee, &vals);
             let v = self.builder.inst_results(call)[0];
             self.check();
+            for w in lent {
+                self.dec_inline(w);
+            }
             return Ok(Val {
                 kind: f.sig.ret,
                 v,

@@ -323,9 +323,10 @@ measurement is confounded until the earlier one has moved.
    entry, the seam's memo, the map as a tree, tests as roots, and a dying
    record as the next one's memory, a lookup a match unwraps answering the
    value, the hottest builtins as direct calls over values made once, a
-   literal step as the loop's own body, and the round's rotate as one
-   instruction; its series are `benches/value-model/after-rounds.txt` and
-   `benches/front-end-whole/observation-7.txt`.
+   literal step as the loop's own body, the round's rotate as one
+   instruction, and a parameter a body only reads borrowed for the call; its
+   series are `benches/value-model/after-borrows.txt` and
+   `benches/front-end-whole/observation-8.txt`.
 10. **Emit C.** Where the path ends, decided as a direction and gated on step 9:
     the eventual host is a C compiler and libc, with the compiler and its
     runtime written in Ply, which is the line Rust itself holds above LLVM and

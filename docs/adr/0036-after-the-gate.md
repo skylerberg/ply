@@ -6,8 +6,8 @@ Decisions 2 and 5 for the integer kernel, Decisions 1 and 4 for the record
 kernel. This record is the first pass over those four, taken as what the
 profiles pointed at rather than as a redesign, and it changes no
 representation ADR 0035 decided: the words, the layouts, the counts, the
-strings, the list and the seam all stand. `benches/value-model/after-rounds.txt`
-is the series after it and `benches/front-end-whole/observation-7.txt` the
+strings, the list and the seam all stand. `benches/value-model/after-borrows.txt`
+is the series after it and `benches/front-end-whole/observation-8.txt` the
 front-end row, both under their own pre-registrations. What they say: the
 record kernel is inside the bar since Decision 9; the integer kernel is
 outside it by a smaller factor than at the re-take — its round is
@@ -33,9 +33,10 @@ and every test entered whole since Decision 7.
 > another of its width is that record's memory; that a lookup a match
 > unwraps at once answers the value, with no constructor between; and that
 > the builtins a body calls most are direct calls, and the empty list, the
-> empty map and every nullary constructor are made once; and that a literal
+> empty map and every nullary constructor are made once; that a literal
 > step is the loop's own body, a flat record's release walks nothing, and the
-> low word's rotate is one instruction.
+> low word's rotate is one instruction; and that a parameter a body only
+> reads is the caller's, borrowed for the call.
 >
 > **What it does not decide.** A new bar. ADR 0035's stands, and the series
 > here is read against it.
@@ -275,6 +276,29 @@ What remains of the integer kernel is the compiled arithmetic with each add
 checked, the state records loaded and stored once per round where Rust holds
 them in registers, and the records the source keeps alive by shape.
 
+## Decision 12 — a parameter the body only reads is borrowed
+
+Every handle a compiled body was handed it owned: the caller held the value
+once more for the call, or moved it in at its last use, and the callee let it
+go at its exit. For a callee that only reads its parameter's fields that is an
+increment and a release around every call, and, worse for the integer kernel,
+a value the caller needs again dies inside the callee — the chaining value
+`compress` reads dies there, and the loop that needs a fresh one allocates it
+— where dying in the caller would have put it in the caller's token. A
+parameter is now borrowed when the body mentions it only as the base of a
+field read, never as a value, an update's base, a scrutinee or a capture, and
+builds no record literal of its width, which would rather take a parameter
+that dies there. The typed body reads such a parameter as the caller's and
+neither counts it nor lets it go; a direct call passes a local as it is, and
+a temporary with the hold the caller has on it, released afterwards; the entry
+that closures and the seam reach a body through owns every handle it is
+given, and lets a borrowed one go once the body answers; and a fused loop's
+typed step is called the same way. One hold stays where it is needed: a local
+passed as it is must outlive the call, and a later argument of the same call
+that is the local's last use would move it into a callee that frees it first,
+so that argument order holds the local for the call. The integer kernel moved
+by a seventh.
+
 ## Priced and rejected
 
 A wider inlining budget. ADR 0035's integer kernel keeps its state in records
@@ -286,7 +310,20 @@ Widened by half with one more level of depth, after Decision 8, it bought the
 integer kernel a fifth for a code generation nearly twice as long over the
 examples and the suites; the register allocator's time over the larger bodies
 is the whole of that cost. The budget stays at that reading too, and the
-tiny-leaf rule takes the part of the depth that mattered.
+tiny-leaf rule takes the part of the depth that mattered. Widened to admit
+the whole round into the compress after Decision 11, when the flattening
+that the first pricing lacked was in place, the integer kernel was slower by
+three quarters: a body of seven rounds is what the register allocator does
+badly by, whatever the records become.
+
+A bit-width bound on compiled values — a literal, a mask, a rotate, a byte
+and a literal shift each bounding what they answer, and an add or a
+multiplication of two bounded values emitted without its overflow check.
+Landed and measured: about a hundredth of the integer kernel, since only a
+third of a round's adds have both operands bounded — the state's fields are
+loads the bound cannot see — and nothing on the rows, a checked add's branch
+being predicted. Not kept; with the wide budget above, which it was meant to
+enable, the kernel was slower still.
 
 ## What would make this wrong
 

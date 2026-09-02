@@ -211,3 +211,16 @@ verdict is the last series': the record kernel inside, the integer kernel
 outside by a smaller factor. What the reading says now: what remains of the
 integer kernel is the arithmetic with each add checked and the state loaded
 and stored per round, and the records the source keeps alive by shape.
+
+## After the borrows
+
+`after-borrows.txt`, under the gate on both sides, with a parameter a body
+only reads borrowed for the call: the caller keeps its hold, the callee
+neither counts nor releases it, and a value the caller needs again dies where
+the caller's tokens are (ADR 0036, Decision 12). The integer kernel moved by
+about a seventh, on the chaining value its chunk loop no longer allocates per
+block and the holds its rounds no longer take on the message; the record
+kernel a little. The bar stands as registered and the verdict is the last
+series': the record kernel inside, the integer kernel outside by a smaller
+factor. What the reading says now: what remains of the integer kernel is the
+arithmetic with each add checked and the state loaded and stored per round.
