@@ -2675,8 +2675,9 @@ interpreted, and by a large factor under `--backend`**, which is a property of
 where it runs rather than of the code: seven rounds of eight mixing functions per
 64-byte block, each round an ordinary Ply call. Reach for it when a hash is what
 you need and the input is small. `ply` itself hashes in Rust; ADR 0033 carries
-the measurement and the bar it was taken against, and ADR 0035 is what closes
-the gap, using this module as one of its kernels.
+the measurement and the bar it was taken against, and ADR 0035 narrowed the
+gap under `--backend` by an order of magnitude, using this module as one of
+its kernels, and records what remains of it and why.
 
 What holds it to the truth is `crates/ply-eval-tests/tests/suite/blake3_differential.rs`,
 which hashes the same input with this module and with the `blake3` crate the
