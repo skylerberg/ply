@@ -6,7 +6,7 @@ fn main() {
         [p] => ("dump", p.clone()),
         [flag, p] if flag.starts_with("--") => (&flag[2..], p.clone()),
         _ => {
-            eprintln!("usage: refdump [--nodes|--tags] <file.ply>");
+            eprintln!("usage: refdump [--nodes|--tags|--expanded] <file.ply>");
             std::process::exit(2);
         }
     };
@@ -31,6 +31,10 @@ fn main() {
     let dump = ply_parser_spike_harness::reference_dump(&text);
     match mode {
         "dump" => println!("{dump}"),
+        "expanded" => println!(
+            "{}",
+            ply_parser_spike_harness::reference_dump_expanded(&text)
+        ),
         "nodes" => println!("{}", ply_parser_spike_harness::node_count(&dump)),
         "tags" => {
             for t in ply_parser_spike_harness::tags(&dump) {
