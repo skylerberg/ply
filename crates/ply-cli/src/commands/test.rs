@@ -1587,6 +1587,10 @@ fn report_json(
             "units": backend.compiled.map(|c| c.units),
             "entered": backend.entries,
             "declined": backend.declines,
+            // The seam's census: objects built from the arguments at every entry, and objects
+            // read back out of every answer.
+            "converted_in": backend.offers.converted_in,
+            "converted_out": backend.offers.converted_out,
         })),
         "selection": {
             "total": selection.total,
