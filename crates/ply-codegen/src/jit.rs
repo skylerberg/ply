@@ -4036,7 +4036,11 @@ impl Fx<'_, '_> {
             let binds_whole = matches!(&arm.pat, Pat::Var { name: id, .. }
                 if !matches!(self.ctor_of(&QName::bare(id.clone())), Some((_, 0))));
             if !self.is_local(scrutinee, scope) && !binds_whole && value.kind == Kind::Boxed {
-                self.dec_inline(value.v);
+                // A record shell of a width this body builds is the next one's memory.
+                match self.token_of(value.ty) {
+                    Some((slot, _)) => self.reset_inline(value.v, slot, false),
+                    None => self.dec_inline(value.v),
+                }
             }
             let body = self.consumed(&arm.body, &mut inner)?;
             self.release_homes_from(mark);
