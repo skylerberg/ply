@@ -373,6 +373,7 @@ impl Jit {
                 bytes: RefCell::new([0; 256]),
                 memo_values: RefCell::new(HashMap::new()),
                 memo_words: RefCell::new(HashMap::new()),
+                calls: RefCell::new(HashMap::new()),
             }),
             nodes: jit.nodes,
             compile_nanos,

@@ -48,7 +48,18 @@ pub struct Tables {
     /// without being rebuilt either way.
     pub memo_values: RefCell<HashMap<Word, Value>>,
     pub memo_words: RefCell<HashMap<Identity, Word>>,
+    /// The answers of roots called with nothing but memo words, by the root and the words:
+    /// a pure function of remembered inputs, remembered in turn, up to a bound.
+    pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
 }
+
+/// How many calls of roots over memo words a unit remembers; past it, a call is run and
+/// converted as any other.
+pub const CALL_MEMO_LIMIT: usize = 64;
+
+/// How many of an answer's parts are given identities of their own, one level down: the fields
+/// a body pulls out of a record or a constructor, and the elements of a short list.
+const PARTS_LIMIT: usize = 64;
 
 /// What identifies a value the seam handed out, without walking it: the allocation behind it
 /// and, for a list, the window it shows of that allocation. A value with no allocation of its
@@ -104,13 +115,57 @@ impl Tables {
         self.memo_words.borrow().get(&id).copied()
     }
 
-    /// Keeps the value a memo word was just converted to.
+    /// Keeps the value a memo word was just converted to, and gives the value's parts one level
+    /// down — a record's fields, a constructor's arguments, a short list's elements — the words
+    /// they came from, since a body that takes a memo value apart hands those parts back in.
     pub fn remember(&self, w: Word, v: &Value) {
-        let Some(id) = identity(v) else {
-            return;
-        };
         self.memo_values.borrow_mut().insert(w, v.clone());
-        self.memo_words.borrow_mut().insert(id, w);
+        let mut words = self.memo_words.borrow_mut();
+        if let Some(id) = identity(v) {
+            words.insert(id, w);
+        }
+        let o = obj(w);
+        let parts: Vec<(Word, &Value)> = match v {
+            Value::Record(fields) => fields
+                .iter()
+                .enumerate()
+                .map(|(i, (_, part))| (unsafe { word_at(o, i) }, part))
+                .collect(),
+            Value::Ctor { args, .. } => args
+                .iter()
+                .enumerate()
+                .map(|(i, part)| (unsafe { word_at(o, i) }, part))
+                .collect(),
+            Value::List(items) if items.len() <= PARTS_LIMIT => items
+                .iter()
+                .enumerate()
+                .map(|(i, part)| (list::get(o, i), part))
+                .collect(),
+            _ => Vec::new(),
+        };
+        for (part_word, part) in parts.into_iter().take(PARTS_LIMIT) {
+            if let Some(id) = identity(part) {
+                words.insert(id, part_word);
+            }
+        }
+    }
+
+    /// The remembered answer of `root` over exactly these memo words, if it has one.
+    pub fn memo_call(&self, root: &Symbol, words: &[Word]) -> Option<Value> {
+        let kept = *self.calls.borrow().get(&(root.clone(), words.to_vec()))?;
+        self.memo_value(kept)
+    }
+
+    /// Remembers `out`, world-independent, as the answer of `root` over these memo words, up to
+    /// the bound; answers the word to keep, or nothing when the bound is reached.
+    pub fn memoize_call(&self, root: &Symbol, words: &[Word], out: Word) -> Option<Word> {
+        let mut calls = self.calls.borrow_mut();
+        if calls.len() >= CALL_MEMO_LIMIT {
+            return None;
+        }
+        let kept = self.immortals.borrow_mut().adopt(out);
+        calls.insert((root.clone(), words.to_vec()), kept);
+        Some(kept)
     }
 
     /// The immortal `Bytes` holding just `b`.

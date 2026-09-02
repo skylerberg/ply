@@ -339,12 +339,26 @@ impl Bodies {
         // same way below: nothing outside the entry ever holds a word.
         let mut handles = [0i64; MAX_ARITY];
         let before = ctx.heap.allocated();
+        // A value this unit answered from its memo goes back in as the word it came from; a
+        // call whose arguments are all such words is a pure function of remembered inputs, and
+        // is remembered in turn.
+        let mut all_memo = !args.is_empty();
         for (slot, value) in handles.iter_mut().zip(args) {
-            // A value this unit answered from its memo goes back in as the word it came from.
             *slot = match tables.memo_word(value) {
                 Some(w) => w,
-                None => ctx.heap.to_word(&tables.layouts, value),
+                None => {
+                    all_memo = false;
+                    ctx.heap.to_word(&tables.layouts, value)
+                }
             };
+        }
+        let words = &handles[..args.len()];
+        if all_memo && let Some(value) = tables.memo_call(name, words) {
+            ctx.end();
+            drop(ctx);
+            self.unit.counters.note_converted(0, 0);
+            self.entered.set(self.entered.get() + 1);
+            return Some(value);
         }
         let inward = (ctx.heap.allocated() - before) as u64;
         // SAFETY: `admitted.entry` is a pointer into `self._code`'s finalized executable pages,
@@ -380,10 +394,12 @@ impl Bodies {
         let mut outward = 0;
         let value = crate::heap::Heap::to_value_counted(&tables.layouts, out, &mut outward);
         let kept = match admitted.constant {
-            Some(index) if crate::heap::world_independent(out) => Some((index, out)),
+            Some(index) if crate::heap::world_independent(out) => Some(tables.memoize(index, out)),
+            None if all_memo && crate::heap::world_independent(out) => {
+                tables.memoize_call(name, words, out)
+            }
             _ => None,
-        }
-        .map(|(index, out)| tables.memoize(index, out));
+        };
         ctx.end();
         drop(ctx);
         if crate::rt::holds_a_handle(&value).is_some() {
