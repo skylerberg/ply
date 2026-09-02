@@ -39,9 +39,24 @@ pub struct Tables {
     pub memo: RefCell<Vec<Option<Word>>>,
     /// Owns the constant pool's and the memo's objects for as long as the unit lives.
     pub immortals: RefCell<Heap>,
+    /// The two hundred and fifty-six one-byte values, each made immortal the first time it is
+    /// asked for, so `byte_of_int` allocates nothing.
+    pub bytes: RefCell<[Word; 256]>,
 }
 
 impl Tables {
+    /// The immortal `Bytes` holding just `b`.
+    pub fn byte(&self, b: u8) -> Word {
+        let cached = self.bytes.borrow()[b as usize];
+        if cached != 0 {
+            return cached;
+        }
+        let w = self.immortals.borrow_mut().bytes(&[b]);
+        heap::mark_immortal(w);
+        self.bytes.borrow_mut()[b as usize] = w;
+        w
+    }
+
     /// Whether the constant pool holds a value that must never sit in a table outliving the call
     /// that made it.
     pub fn retains_a_handle(&self) -> Option<&'static str> {
@@ -359,6 +374,12 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
     if let Some(w) = native_builtin(ctx, b, args) {
         return w;
     }
+    builtin_over_values(ctx, b, args)
+}
+
+/// The interpreter's own implementation of `b` over the values the words denote: what answers
+/// when no native path does. Takes the arguments.
+fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
     match ply_eval::builtins::call(b, values, ctx.cells.arena_mut(), Span::DUMMY) {
         Ok(Step::Done(v)) => ctx.word(&v),
@@ -374,6 +395,39 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
         }
         Err(d) => ctx.fail(d),
     }
+}
+
+/// `bytes_concat_all` over the pieces of a list literal, without the list: one value holding
+/// them all, or the interpreter's answer over the list when a piece is not bytes. Takes the
+/// pieces.
+pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let pieces = args_of(args, n);
+    ctx.builtin_calls += 1;
+    if pieces.iter().any(|w| heap::kind(*w) != KIND_BYTES) {
+        let xs = ctx.heap.list_from(pieces);
+        return builtin_over_values(ctx, Builtin::BytesConcatAll, &[xs]);
+    }
+    let total: usize = pieces
+        .iter()
+        .map(|w| unsafe { (*obj(*w)).len } as usize)
+        .sum();
+    let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
+    let mut at = 0;
+    for w in pieces {
+        let piece = unsafe { bytes_of(obj(*w)) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                piece.as_ptr(),
+                heap::bytes_ptr(out).add(at),
+                piece.len(),
+            );
+        }
+        at += piece.len();
+        heap::dec(*w);
+    }
+    unsafe { (*out).len = total as u32 };
+    out as Word
 }
 
 /// The builtins answered over words, when their arguments have the native kinds; `None` hands the
@@ -475,7 +529,7 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::ByteOfInt, [n]) => {
             let byte = u8::try_from(heap::as_int(*n)?).ok()?;
-            Some(ctx.heap.bytes(&[byte]))
+            Some(ctx.tables.byte(byte))
         }
         (Builtin::BytesOfString, [s]) if heap::kind(*s) == KIND_STR => {
             let out = ctx.heap.bytes(unsafe { bytes_of(obj(*s)) });
@@ -1628,6 +1682,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_map_fold", rt_map_fold as *const u8),
         ("rt_iterate", rt_iterate as *const u8),
         ("rt_iterate_bad", rt_iterate_bad as *const u8),
+        ("rt_bytes_join", rt_bytes_join as *const u8),
         ("rt_bad_range", rt_bad_range as *const u8),
         ("rt_shift_count", rt_shift_count as *const u8),
         ("rt_dup", rt_dup as *const u8),

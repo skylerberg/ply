@@ -98,6 +98,7 @@ struct Helpers {
     iterate: FuncId,
     iterate_bad: FuncId,
     bad_range: FuncId,
+    bytes_join: FuncId,
     shift_count: FuncId,
     dup: FuncId,
     dec: FuncId,
@@ -348,6 +349,7 @@ impl Jit {
                 functions,
                 memo: RefCell::new(Vec::new()),
                 immortals: RefCell::new(jit.immortals),
+                bytes: RefCell::new([0; 256]),
             }),
             nodes: jit.nodes,
             compile_nanos,
@@ -538,6 +540,7 @@ impl Jit {
             iterate: declare(&mut module, "rt_iterate", 4, true)?,
             iterate_bad: declare(&mut module, "rt_iterate_bad", 3, false)?,
             bad_range: declare(&mut module, "rt_bad_range", 3, false)?,
+            bytes_join: declare(&mut module, "rt_bytes_join", 3, true)?,
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
             dup: declare(&mut module, "rt_dup", 2, true)?,
             dec: declare(&mut module, "rt_dec", 2, false)?,
@@ -2369,6 +2372,28 @@ impl Fx<'_, '_> {
     /// an `iterate` that runs out or answers the wrong constructor raise, and so decline.
     fn fused_loop(&mut self, b: Builtin, args: &[Code], scope: &mut Scope) -> Result<Option<Val>> {
         match b {
+            // The pieces of a list literal are joined without the list.
+            Builtin::BytesConcatAll if args.len() == 1 => {
+                let NodeKind::List { items } = &args[0].kind else {
+                    return Ok(None);
+                };
+                let mut handles = Vec::with_capacity(items.len());
+                for item in items.iter() {
+                    let v = self.consumed(item, scope)?;
+                    let h = self.boxed(v);
+                    handles.push(h);
+                }
+                let ptr = self.spill(&handles);
+                let n = self.builder.ins().iconst(types::I64, handles.len() as i64);
+                let v = self.helper(self.jit.helpers.bytes_join, &[ptr, n]);
+                self.check();
+                Ok(Some(Val {
+                    kind: Kind::Boxed,
+                    v,
+                    ty: 0,
+                    home: 0,
+                }))
+            }
             Builtin::Fold if args.len() == 3 => {
                 let NodeKind::App {
                     func: range,
