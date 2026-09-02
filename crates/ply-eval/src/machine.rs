@@ -1935,6 +1935,11 @@ impl<'a> Machine<'a> {
                 }
                 self.call_builtin(b, args, span)
             }
+            ClosureKind::Native { .. } => Err(Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "a compiled closure reached the interpreter, which has no code to run it",
+            )
+            .primary(span, "this call")),
         }
     }
 

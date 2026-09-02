@@ -88,14 +88,25 @@ measurement is confounded until the earlier one has moved.
    0030's protocol and its bar: beat the unbacked arm by more than the null
    control, on an idle machine, pre-registered (`CONTRIBUTING.md` §"Gate on an
    idle machine").
-2. **The code generator's roots, in ADR 0030's ranking.** String concatenation
-   and a record pattern nested in a constructor pattern are plain missing
-   lowerings and nothing in the evaluator moves for them. Then the callback
-   problem as one piece: a closure representation, the three callback builtins,
-   a named function used as a value, a call through a local binding, and a
-   trampoline for an uncompiled callee so a refusal stops cascading to the root.
-   Gate: the parser spike's entered-names count moves from leaves to roots, and
-   the delivered speedup against the control is positive rather than projected.
+2. **The code generator's roots — landed, except the gate.** String
+   concatenation and nested patterns were already lowered when this was
+   re-censused; the callback family was the whole of the rest, and it is
+   lowered as one piece: a lambda is a compiled function taking its captures as
+   leading arguments, built into a `ClosureKind::Native` value that lives only
+   inside the entry that made it (the seam carries no function); a named
+   function, a constructor and a builtin used as values are closures over
+   nothing; a call through a local or through an expression is `rt_call`;
+   `map`, `filter`, `fold` and `iterate` are loops in the runtime that call the
+   callback back; and the bitwise operators are lowered with the interpreter's
+   shift-count refusal. A trampoline for an uncompiled callee was not needed:
+   the cascade was the callbacks' blast radius, and the parser spike's census
+   now refuses only effects, `Decimal` and `Float` literals, a `handle` and
+   `secret_of_string` (`parser_census::the_census_over_the_parser_spike` pins
+   that no lambda, callback or value-call is refused). With every carried
+   signature registered, the examples and the spike's own tests agree with the
+   backend attached under `--audit-backend`. What remains is the gate, and it
+   cannot move until step 3: the narrow registry enters the same leaves it
+   entered before.
 3. **Widen the registry, then the seam's remaining kinds.** Once root entry
    pays, register the carried signatures the narrow registry leaves out — the
    parser's state record is carried and its functions are not registered — and

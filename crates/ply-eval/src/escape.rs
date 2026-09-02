@@ -280,6 +280,9 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
             };
             match &closure.kind {
                 ClosureKind::Ctor { .. } | ClosureKind::Builtin(_) => None,
+                ClosureKind::Native { captured, .. } => {
+                    captured.iter().find_map(|v| find(v, route))
+                }
                 ClosureKind::Fn { bindings, .. } => bindings.iter().find_map(|(bound, v)| {
                     let handle = find(v, route)?;
                     named(bound, route, handle)
