@@ -269,12 +269,23 @@ slope for neither tier.
    stays: it holds the store, the checked front end and the compiled unit across
    iterations, and an iteration where nothing moved pays a stat per file instead
    of a front end. An iteration where something *did* move still pays the front
-   end in full, and the reason is specific — `crates/ply-cli/src/driver.rs`
-   builds its tables over the whole program whatever changed: it hashes every
-   definition, assembles every export, interface and fingerprint, and compares
-   each against the store. None of that is I/O and none of it is checking; the
-   run rechecks nothing. Making the driver resumable is what remains, and it is
-   the last O(project) term in a warm loop.
+   end in full, because `crates/ply-cli/src/driver.rs` is one-shot: it works over
+   the whole program whatever changed.
+
+   **And the phase report says there is no single term to fix.** On a warm run
+   that rechecks nothing, hashing is about a quarter, writing back a fifth, and
+   parsing, restoring, resolving, checking, assembling the modules and reading
+   the files divide the rest — every one of them proportional to the project.
+   Assembling was in no phase at all until this record's branch gave it one: gate
+   1 runs to a fixed point and copies every parsed module each round, so a cost
+   proportional to the program was invisible in a report that accounted for
+   everything else.
+
+   That shape is the finding. A loop cannot be made O(change) by making hashing
+   incremental, or by any other single lever, because no single lever is where
+   the time is. What it needs is for the front end to be *held* and updated,
+   which is what a resumable driver means, and that is the last O(project) term
+   in a warm loop.
 4. Choose the loop's tier from the table above. **The comparison it was waiting
    on is taken**: `benches/marginal-change/` reads Cranelift's per-definition
    cost and `benches/c-floor/` reads C's, and they are two orders of magnitude
