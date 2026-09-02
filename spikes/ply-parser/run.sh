@@ -32,6 +32,10 @@ echo "==> the parser's own tests, in Ply (spine, types, patterns, exprs, items)"
 "$here/test-items.sh"
 
 echo
+echo "==> the resolve phase, in Ply, over the whole parser"
+"$here/test-resolve.sh"
+
+echo
 echo "==> the reference dumper's own tests, in Rust"
 cd "$here/harness"
 cargo fmt --all --check
@@ -53,6 +57,15 @@ PLY_BIN="$root/target/release/ply" cargo test --test agreement -- --nocapture --
   tee /tmp/ply-parser-agreement.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-agreement.log || {
   echo "the differential ran no tests at all -- see the note above this check" >&2
+  exit 1
+}
+
+echo
+echo "==> the second differential: resolve.ply against crates/ply-syntax's resolve"
+PLY_BIN="$root/target/release/ply" cargo test --test resolve -- --nocapture --test-threads=2 |
+  tee /tmp/ply-parser-resolve.log
+grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-resolve.log || {
+  echo "the resolve differential ran no tests at all -- see the note above" >&2
   exit 1
 }
 

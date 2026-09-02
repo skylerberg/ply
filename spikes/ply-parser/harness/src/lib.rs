@@ -935,6 +935,110 @@ pub fn byte_literal(bytes: &[u8]) -> String {
     out
 }
 
+// --- The resolve phase -------------------------------------------------------
+//
+// The second phase under comparison: `ply_syntax::resolve` over a whole program, and the
+// `defaults` pass it ends with. One record-based dump of the resolved tables, the load order, the
+// diagnostics with their module index, and the post-defaults trees — the same encoding the Ply
+// port's `resolve.ply` writes.
+
+/// The reference's resolution of a program given as `(module name, source)` pairs, in the same
+/// order and with the same `SourceId`s the harness hands the Ply side.
+pub fn reference_resolve_dump(modules: &[(String, String)]) -> String {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (module, _) = parse_unexpanded(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        program.modules.push(module);
+    }
+    let mut out = String::new();
+    out.push_str(&format!("R;{};", modules.len()));
+    match ply_syntax::resolve::resolve(&mut program) {
+        Ok(resolved) => {
+            for (i, scope) in resolved.scopes.iter().enumerate() {
+                out.push_str(&format!("M;{i};{};", scope.module));
+                for (binder, (target, span)) in &scope.modules {
+                    out.push_str(&format!("B;{binder};{target};{}:{};", span.start, span.end));
+                }
+                for (binder, (target, span)) in &scope.selective {
+                    out.push_str(&format!("S;{binder};{target};{}:{};", span.start, span.end));
+                }
+                for (tag, space) in [
+                    ("V", &scope.values),
+                    ("T", &scope.types),
+                    ("E", &scope.effects),
+                ] {
+                    for (name, b) in space {
+                        out.push_str(&format!(
+                            "{tag};{name};{};{};{}:{};",
+                            b.qualified, b.owner, b.span.start, b.span.end
+                        ));
+                    }
+                }
+            }
+            let order: Vec<String> = resolved.order.iter().map(|i| i.to_string()).collect();
+            out.push_str(&format!("O;{};", order.join(",")));
+            resolve_diags(&mut out, &[]);
+            for (i, module) in program.modules.iter().enumerate() {
+                out.push_str(&format!("P;{i};"));
+                out.push_str(&dump_of(&modules[i].1, module, &[]));
+            }
+        }
+        Err(diags) => {
+            out.push_str("X;");
+            resolve_diags(&mut out, &diags);
+        }
+    }
+    out
+}
+
+/// `Dumper::diags` with each label's module in front of its span, since a program has many.
+fn resolve_diags(out: &mut String, ds: &[Diagnostic]) {
+    out.push_str(&format!("D;{};", ds.len()));
+    for d in ds {
+        let s = d.primary_span().unwrap_or(Span::DUMMY);
+        out.push_str(&format!(
+            "!{}:{}:{}:{}:{}:{};",
+            d.code,
+            s.source.0,
+            s.start,
+            s.end,
+            d.labels.len(),
+            d.notes.len()
+        ));
+        for l in &d.labels {
+            out.push_str(&format!(
+                "={}:{}:{}:{};",
+                l.span.source.0,
+                l.span.start,
+                l.span.end,
+                if l.primary { 1 } else { 0 }
+            ));
+        }
+    }
+}
+
+/// A program bundle: programs separated by a line holding exactly `%%%`, modules within one by a
+/// line holding exactly `%%`, and each module's first line its dotted name.
+pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    // Everything before the first separator is the bundle's header, not a program.
+    for chunk in text.split("\n%%%\n").skip(1) {
+        let chunk = chunk.trim_start_matches('\n');
+        if chunk.trim().is_empty() {
+            continue;
+        }
+        let mut modules = Vec::new();
+        for m in chunk.split("\n%%\n") {
+            let (name, src) = m.split_once('\n').unwrap_or((m, ""));
+            modules.push((name.trim().to_string(), src.to_string()));
+        }
+        out.push(modules);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

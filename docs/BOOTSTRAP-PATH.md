@@ -173,7 +173,15 @@ measurement is confounded until the earlier one has moved.
 6. **The other four phases, behind the differential.** Resolve, inference,
    effect inference and hashing, each ported the way the parser was: a reference
    dumper on the Rust side, a corpus, and mutations that prove the comparison
-   can go red (`spikes/ply-parser/arm-*.sh`). Inference with rows is the hard
+   can go red (`spikes/ply-parser/arm-*.sh`). **Resolve is ported**
+   (`spikes/ply-parser/resolve.ply`, `GAPS.md` §15): the tables, the load
+   order, the diagnostics and the whole defaults pass agree with the reference
+   over the standard library, every example with it, every program the
+   reference's own tests build and a hand-written bundle of the error paths;
+   `arm-resolve.sh` arms it. The one tax it met is worth knowing before the
+   next port: record update needs the base's field list declared in the same
+   file (ADR 0029's parse-time expansion), so a rewrite of an imported AST node
+   spells every field. Inference with rows is the hard
    one. `std.hash` exists (ADR 0033) and its throughput is not measured. The
    syntax the parser spike predated is ported first, so its own differential is
    green before anything is built on it: the bit operators (with the shift join
