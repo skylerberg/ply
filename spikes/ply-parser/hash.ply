@@ -1,0 +1,1196 @@
+// hash.ply — `crates/ply-hash`, ported: content addressing. A definition's identity is its
+// normalized structure, so a name is never part of it and renaming rebuilds nothing.
+//
+// `graph.rs` (the reference graph and Tarjan's components), `normalize.rs` (the byte
+// encoding, with every sort that makes a reformatting free), and `lib.rs` (the hash table
+// built dependency-first, a cyclic component hashed as a unit under a refined labelling, the
+// tests, laws, own-form keys and spec keys, and the reference graph's closure). The hash is
+// `std.hash.blake3`, BLAKE3 written in Ply, over the same bytes the reference writes.
+//
+// A float literal is hashed by its IEEE bit pattern: the parser carries the literal's text,
+// `decimal_of_string` and `float_of_decimal` read it as the correctly rounded `Float` the
+// reference's lexer reads, and `bits_of_float` is the pattern.
+
+import spine (Span, Ident, QName, num)
+import lexer (byte_of)
+import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock, ERecord,
+              ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithRegion,
+              ESimulate, EBad, Stmt, SLet, SExpr, Param, MatchArm, HandleClause, ReturnClause, RecField)
+import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet, FnDef, TypeDef,
+              TypeDefBody, TDAlias, TDSum, VariantDef, EffectDef, OpDef, TestDef, LawDef, Binder,
+              Constraint, Deriver, DJson, DEq, DOrd, SpecKind, SRequires, SEnsures, SpecClause, Derived, parse)
+import rewrite (expand)
+import resolve (Mod, Source, Resolved, Scope, Binding, Bindings, ModBind, Diag, Outcome,
+                Resolved_, Failed, resolve_modules, diag2, is_bare, dump_diags, qualify)
+import derive (Expansion, expand_derives, deriver_tag)
+import std.hash (blake3)
+
+// --- Bytes ------------------------------------------------------------------------------------
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the hasher does not hold") }
+
+fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+fn contains_int(xs: List<Int>, v: Int) -> Bool = fold(xs, false, |acc: Bool, x: Int| acc || x == v)
+
+fn contains_bytes(xs: List<Bytes>, v: Bytes) -> Bool = fold(xs, false, |acc: Bool, x: Bytes| acc || x == v)
+
+// The position of `v` in `xs`, searching from the end: a binder's de Bruijn level.
+fn rposition(xs: List<Bytes>, v: Bytes) -> Option<Int> =
+  fold(range(0, len(xs)), None, |acc: Option<Int>, i: Int| if at(xs, i) == v { Some(i) } else { acc })
+
+fn u32_le(v: Int) -> Bytes =
+  bytes_concat_all([byte_of(v & 0xFF), byte_of((v >>> 8) & 0xFF), byte_of((v >>> 16) & 0xFF), byte_of((v >>> 24) & 0xFF)])
+
+fn i64_le(v: Int) -> Bytes =
+  bytes_concat_all(map(range(0, 8), |i: Int| byte_of((v >>> (8 * i)) & 0xFF)))
+
+fn hex_digit(v: Int) -> Bytes = if v < 10 { byte_of(48 + v) } else { byte_of(87 + v) }
+
+pub fn hex(b: Bytes) -> Bytes =
+  bytes_concat_all(map(range(0, bytes_len(b)), |i: Int| { let v = bytes_at(b, i); bytes_concat(hex_digit(v >>> 4), hex_digit(v & 15)) }))
+
+// Sixteen little-endian bytes holding the decimal digits' value: a `Decimal` literal's mantissa
+// has up to 96 bits, which is more than an `Int`, so it is accumulated a byte at a time.
+fn i128_le_of_digits(digits: Bytes) -> Bytes = {
+  let limbs = fold(range(0, bytes_len(digits)), map(range(0, 16), |i: Int| 0), |acc: List<Int>, i: Int| {
+    let d = bytes_at(digits, i) - 48;
+    let carried = fold(range(0, 16), { limbs: [], carry: d }, |s: { limbs: List<Int>, carry: Int }, k: Int| {
+      let v = at(acc, k) * 10 + s.carry;
+      { limbs: push(s.limbs, v & 0xFF), carry: v >>> 8 }
+    });
+    carried.limbs
+  });
+  bytes_concat_all(map(limbs, |v: Int| byte_of(v)))
+}
+
+fn is_digit_byte(c: Int) -> Bool = c >= 48 && c <= 57
+
+// `1.5`, `1e9`, `2.5e-3`: the digits before and after the point, and the exponent, exactly as
+// the reference lexer assembled the text it parsed.
+type FloatText = { whole: Bytes, fraction: Bytes, exponent: Int }
+
+fn float_text(text: Bytes) -> FloatText = {
+  let n = bytes_len(text);
+  let split = fold(range(0, n), { whole: b"", fraction: b"", exponent: b"", part: 0 }, |s: { whole: Bytes, fraction: Bytes, exponent: Bytes, part: Int }, i: Int| {
+    let c = bytes_at(text, i);
+    if c == 46 { {..s, part: 1} }
+    else if c == 101 || c == 69 { {..s, part: 2} }
+    else if c == 95 { s }
+    else if s.part == 0 { {..s, whole: bytes_concat(s.whole, byte_of(c))} }
+    else if s.part == 1 { {..s, fraction: bytes_concat(s.fraction, byte_of(c))} }
+    else { {..s, exponent: bytes_concat(s.exponent, byte_of(c))} }
+  });
+  let e = split.exponent;
+  let exponent = if bytes_len(e) == 0 { 0 } else {
+    let negative = bytes_at(e, 0) == 45;
+    let start = if negative || bytes_at(e, 0) == 43 { 1 } else { 0 };
+    let magnitude = fold(range(start, bytes_len(e)), 0, |acc: Int, i: Int| acc * 10 + (bytes_at(e, i) - 48));
+    if negative { 0 - magnitude } else { magnitude }
+  };
+  { whole: split.whole, fraction: split.fraction, exponent: exponent }
+}
+
+fn zeros(n: Int) -> Bytes = bytes_concat_all(map(range(0, n), |i: Int| b"0"))
+
+// The literal's value as a `Decimal` spelled without an exponent, which `decimal_of_string`
+// reads: the point moved by the exponent.
+fn float_as_decimal_text(f: FloatText) -> Bytes = {
+  let digits = bytes_concat(f.whole, f.fraction);
+  let point = bytes_len(f.whole) + f.exponent;
+  if point <= 0 { bytes_concat_all([b"0.", zeros(0 - point), digits]) }
+  else if point >= bytes_len(digits) { bytes_concat(digits, zeros(point - bytes_len(digits))) }
+  else { bytes_concat_all([bytes_slice(digits, 0, point), b".", bytes_slice(digits, point, bytes_len(digits))]) }
+}
+
+fn float_bits(text: Bytes) -> Int =
+  match decimal_of_string(string_of_bytes(float_as_decimal_text(float_text(text)))) {
+    Some(d) -> bits_of_float(float_of_decimal(d)),
+    None -> panic("a float literal the hasher cannot read"),
+  }
+
+// A `Decimal` literal's `(mantissa, scale)`: the digits with the point removed, and how many
+// followed it.
+fn decimal_parts(text: Bytes) -> { mantissa: Bytes, scale: Int } = {
+  let body = bytes_slice(text, 0, bytes_len(text) - 1);
+  let split = fold(range(0, bytes_len(body)), { digits: b"", scale: 0, after: false }, |s: { digits: Bytes, scale: Int, after: Bool }, i: Int| {
+    let c = bytes_at(body, i);
+    if c == 46 { {..s, after: true} }
+    else if !is_digit_byte(c) { s }
+    else { { digits: bytes_concat(s.digits, byte_of(c)), scale: if s.after { s.scale + 1 } else { s.scale }, after: s.after } }
+  });
+  { mantissa: i128_le_of_digits(split.digits), scale: split.scale }
+}
+
+// --- `graph.rs`: the reference graph over every top-level definition ------------------------------
+
+pub type NodeBody = | NFn(FnDef) | NType(TypeDef) | NEffect(EffectDef)
+pub type Node = { name: Bytes, simple: Bytes, module: Int, body: NodeBody }
+pub type TestNode = { key: Bytes, module: Int, def: TestDef }
+pub type LawNode = { key: Bytes, module: Int, def: LawDef }
+pub type Entry = | EDef(Int) | ETest(Int) | ELaw(Int)
+type Target = { owner: Int, name: Bytes }
+pub type ValueTarget = | VFn(Int) | VCtor({ owner: Int, name: Bytes })
+type ModuleItems = { fns: Map<Bytes, Int>, types: Map<Bytes, Int>, effects: Map<Bytes, Int>, ctors: Map<Bytes, Int> }
+type ScopeIndex = { values: Map<Bytes, Target>, types: Map<Bytes, Target>, effects: Map<Bytes, Target>, modules: Map<Bytes, Int> }
+
+pub type Index = { mods: List<Mod>, nodes: List<Node>, tests: List<TestNode>, laws: List<LawNode>, order: List<Entry>,
+                   items: List<ModuleItems>, scopes: List<ScopeIndex>, effect_sketches: Map<Int, Bytes> }
+
+fn qualifier(q: QName) -> Option<Bytes> = match q.module { Some(m) -> Some(m.name), None -> None }
+
+// The name `qualified` has inside the module that declares it.
+fn simple_of(qualified: Bytes, owner: Bytes) -> Bytes = {
+  let prefix = bytes_concat(owner, b".");
+  if bytes_len(owner) > 0 && bytes_starts_with(qualified, prefix) { bytes_slice(qualified, bytes_len(prefix), bytes_len(qualified)) } else { qualified }
+}
+
+type Building = { nodes: List<Node>, tests: List<TestNode>, laws: List<LawNode>, order: List<Entry>, items: List<ModuleItems>, diags: List<Diag> }
+type Declaring = { map: Map<Bytes, Int>, spans: Map<Bytes, Span>, diags: List<Diag> }
+
+fn declare(d: Declaring, m: Int, name: Ident, id: Int) -> Declaring =
+  match map_get(d.spans, name.name) {
+    Some(first) -> {..d, diags: push(d.diags, diag2(b"E0105", m, name.span, m, first, 1))},
+    None -> { map: map_insert(d.map, name.name, id), spans: map_insert(d.spans, name.name, name.span), diags: d.diags },
+  }
+
+fn no_declaring(diags: List<Diag>) -> Declaring = { map: map_new(), spans: map_new(), diags: diags }
+
+pub fn build_index(mods: List<Mod>, r: Resolved) -> { index: Index, diags: List<Diag> } = {
+  let built = fold(range(0, len(mods)), { nodes: [], tests: [], laws: [], order: [], items: [], diags: [] }, |b: Building, m: Int| {
+    let module = at(mods, m);
+    let walked = fold(module.module.items, { b: b, fns: no_declaring([]), types: no_declaring([]), effects: no_declaring([]), ctors: no_declaring([]) },
+      |s: { b: Building, fns: Declaring, types: Declaring, effects: Declaring, ctors: Declaring }, it: Item| {
+        let bb: Building = s.b;
+        match it {
+          IFn(d) -> {
+            let id = len(bb.nodes);
+            let pushed: Building = {..bb, nodes: push(bb.nodes, { name: qualify(module.name, d.name.name), simple: d.name.name, module: m, body: NFn(d) }), order: push(bb.order, EDef(id))};
+            let fns: Declaring = declare({..s.fns, diags: []}, m, d.name, id);
+            {..s, b: {..pushed, diags: append(pushed.diags, fns.diags)}, fns: {..fns, diags: []}}
+          },
+          IType(d) -> {
+            let id = len(bb.nodes);
+            let pushed: Building = {..bb, nodes: push(bb.nodes, { name: qualify(module.name, d.name.name), simple: d.name.name, module: m, body: NType(d) }), order: push(bb.order, EDef(id))};
+            let types: Declaring = declare({..s.types, diags: []}, m, d.name, id);
+            let ctors: Declaring = match d.body {
+              TDSum(variants) -> fold(variants, {..s.ctors, diags: []}, |c: Declaring, v: VariantDef| declare(c, m, v.name, id)),
+              _ -> {..s.ctors, diags: []},
+            };
+            {..s, b: {..pushed, diags: append(append(pushed.diags, types.diags), ctors.diags)}, types: {..types, diags: []}, ctors: {..ctors, diags: []}}
+          },
+          IEffect(d) -> {
+            let id = len(bb.nodes);
+            let pushed: Building = {..bb, nodes: push(bb.nodes, { name: qualify(module.name, d.name.name), simple: d.name.name, module: m, body: NEffect(d) }), order: push(bb.order, EDef(id))};
+            let effects: Declaring = declare({..s.effects, diags: []}, m, d.name, id);
+            {..s, b: {..pushed, diags: append(pushed.diags, effects.diags)}, effects: {..effects, diags: []}}
+          },
+          ITest(d) -> {..s, b: {..bb, order: push(bb.order, ETest(len(bb.tests))), tests: push(bb.tests, { key: qualify(module.name, d.name), module: m, def: d })}},
+          ILaw(d) -> {..s, b: {..bb, order: push(bb.order, ELaw(len(bb.laws))), laws: push(bb.laws, { key: qualify(module.name, d.name), module: m, def: d })}},
+          _ -> s,
+        }
+      });
+    let wb: Building = walked.b;
+    {..wb, items: push(wb.items, { fns: walked.fns.map, types: walked.types.map, effects: walked.effects.map, ctors: walked.ctors.map })}
+  });
+  let scopes = map(range(0, len(mods)), |m: Int| {
+    let scope = at(r.scopes, m);
+    let project = |bs: List<Binding>| fold(bs, map_new(), |acc: Map<Bytes, Target>, b: Binding|
+      map_insert(acc, b.name, { owner: b.owner, name: simple_of(b.qualified, at(mods, b.owner).name) }));
+    { values: project(scope.bound.values), types: project(scope.bound.types), effects: project(scope.bound.effects),
+      modules: fold(scope.modules, map_new(), |acc: Map<Bytes, Int>, mb: ModBind| map_insert(acc, mb.binder, mb.target)) }
+  });
+  let index: Index = { mods: mods, nodes: built.nodes, tests: built.tests, laws: built.laws, order: built.order, items: built.items, scopes: scopes, effect_sketches: map_new() };
+  { index: {..index, effect_sketches: sketch_effects(index)}, diags: built.diags }
+}
+
+// Each effect declaration's own normalized bytes, against empty tables.
+fn sketch_effects(index: Index) -> Map<Int, Bytes> =
+  fold(range(0, len(index.nodes)), map_new(), |acc: Map<Int, Bytes>, v: Int| {
+    let node = at(index.nodes, v);
+    match node.body {
+      NEffect(_) -> map_insert(acc, v, finish(normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body)).bytes),
+      _ -> acc,
+    }
+  })
+
+fn is_effect(index: Index, v: Int) -> Bool = match at(index.nodes, v).body { NEffect(_) -> true, _ -> false }
+
+// A qualified name consults only the named module's declarations; a bare one only the scope.
+fn target(index: Index, module: Int, ns: Int, qual: Option<Bytes>, name: Bytes) -> Option<Target> = {
+  let scope = at(index.scopes, module);
+  match qual {
+    Some(binder) -> match map_get(scope.modules, binder) { Some(owner) -> Some({ owner: owner, name: name }), None -> None },
+    None -> map_get(if ns == 0 { scope.values } else if ns == 1 { scope.types } else { scope.effects }, name),
+  }
+}
+
+fn value_target(index: Index, module: Int, q: QName) -> Option<ValueTarget> =
+  match target(index, module, 0, qualifier(q), q.name.name) {
+    None -> None,
+    Some(t) -> {
+      let items = at(index.items, t.owner);
+      match map_get(items.fns, t.name) {
+        Some(node) -> Some(VFn(node)),
+        None -> match map_get(items.ctors, t.name) { Some(owner) -> Some(VCtor({ owner: owner, name: t.name })), None -> None },
+      }
+    },
+  }
+
+fn ctor_target(index: Index, module: Int, q: QName) -> Option<ValueTarget> =
+  match target(index, module, 0, qualifier(q), q.name.name) {
+    None -> None,
+    Some(t) -> match map_get(at(index.items, t.owner).ctors, t.name) { Some(owner) -> Some(VCtor({ owner: owner, name: t.name })), None -> None },
+  }
+
+fn type_target(index: Index, module: Int, qual: Option<Bytes>, name: Bytes) -> Option<Int> =
+  match target(index, module, 1, qual, name) { None -> None, Some(t) -> map_get(at(index.items, t.owner).types, t.name) }
+
+fn effect_target(index: Index, module: Int, q: QName) -> Option<Int> =
+  match target(index, module, 2, qualifier(q), q.name.name) { None -> None, Some(t) -> map_get(at(index.items, t.owner).effects, t.name) }
+
+// Tarjan's components, iterative, in the reference's order: completion order, each component's
+// members as they left the stack.
+type Tarjan = { index: List<Int>, low: List<Int>, on_stack: List<Bool>, stack: List<Int>, call: List<{ v: Int, edge: Int }>, out: List<List<Int>>, next: Int }
+
+pub fn tarjan(n: Int, edges: List<List<Int>>) -> List<List<Int>> = {
+  let unvisited = 0 - 1;
+  let start = { index: map(range(0, n), |i: Int| unvisited), low: map(range(0, n), |i: Int| 0), on_stack: map(range(0, n), |i: Int| false),
+                stack: [], call: [], out: [], next: 0 };
+  let total = fold(edges, 0, |acc: Int, es: List<Int>| acc + len(es));
+  let done = fold(range(0, n), start, |t: Tarjan, root: Int|
+    if at(t.index, root) != unvisited { t } else {
+      let opened: Tarjan = {..t, index: set_at(t.index, root, t.next), low: set_at(t.low, root, t.next), next: t.next + 1,
+                            stack: push(t.stack, root), on_stack: set_at(t.on_stack, root, true), call: [{ v: root, edge: 0 }]};
+      iterate(opened, 2 * (n + total) + 4, |x: Tarjan| if len(x.call) == 0 { Stop(x) } else { Continue(tarjan_step(n, edges, x)) })
+    });
+  done.out
+}
+
+fn set_at<a>(xs: List<a>, i: Int, v: a) -> List<a> = map(range(0, len(xs)), |j: Int| if j == i { v } else { at(xs, j) })
+
+fn tarjan_step(n: Int, edges: List<List<Int>>, t: Tarjan) -> Tarjan = {
+  let top = at(t.call, len(t.call) - 1);
+  let rest = take(t.call, len(t.call) - 1);
+  let out = at(edges, top.v);
+  if top.edge < len(out) {
+    let again = push(rest, { v: top.v, edge: top.edge + 1 });
+    let w = at(out, top.edge);
+    if w >= n { {..t, call: again} }
+    else if at(t.index, w) == 0 - 1 {
+      {..t, index: set_at(t.index, w, t.next), low: set_at(t.low, w, t.next), next: t.next + 1,
+            stack: push(t.stack, w), on_stack: set_at(t.on_stack, w, true), call: push(again, { v: w, edge: 0 })}
+    } else if at(t.on_stack, w) {
+      {..t, low: set_at(t.low, top.v, min(at(t.low, top.v), at(t.index, w))), call: again}
+    } else { {..t, call: again} }
+  } else {
+    let lowered: Tarjan = if len(rest) > 0 {
+      let parent = at(rest, len(rest) - 1).v;
+      {..t, low: set_at(t.low, parent, min(at(t.low, parent), at(t.low, top.v)))}
+    } else { t };
+    let popped: Tarjan = if at(lowered.low, top.v) == at(lowered.index, top.v) {
+      let split = iterate({ stack: lowered.stack, on: lowered.on_stack, comp: [] }, len(lowered.stack) + 1, |s: { stack: List<Int>, on: List<Bool>, comp: List<Int> }| {
+        let w = at(s.stack, len(s.stack) - 1);
+        let next = { stack: take(s.stack, len(s.stack) - 1), on: set_at(s.on, w, false), comp: push(s.comp, w) };
+        if w == top.v { Stop(next) } else { Continue(next) }
+      });
+      {..lowered, stack: split.stack, on_stack: split.on, out: push(lowered.out, split.comp)}
+    } else { lowered };
+    {..popped, call: rest}
+  }
+}
+
+fn take<a>(xs: List<a>, n: Int) -> List<a> = map(range(0, n), |i: Int| at(xs, i))
+
+fn is_cyclic(component: List<Int>, edges: List<List<Int>>) -> Bool =
+  if len(component) != 1 { true } else { let only = at(component, 0); contains_int(at(edges, only), only) }
+
+// --- `normalize.rs`: the byte encoding ----------------------------------------------------------------
+
+fn t_local() -> Int = 1
+fn t_ref_hash() -> Int = 2
+fn t_ref_self() -> Int = 3
+fn t_ref_index() -> Int = 4
+fn t_free() -> Int = 5
+fn t_ctor() -> Int = 6
+fn t_ty_param() -> Int = 7
+fn t_row_param() -> Int = 8
+fn t_free_qualified() -> Int = 9
+fn t_none() -> Int = 10
+fn t_some() -> Int = 11
+fn t_ref_name() -> Int = 12
+fn t_param_default() -> Int = 13
+fn t_fn() -> Int = 20
+fn t_type_alias() -> Int = 21
+fn t_type_sum() -> Int = 22
+fn t_effect() -> Int = 23
+fn t_test() -> Int = 24
+fn t_variant() -> Int = 25
+fn t_op() -> Int = 26
+fn t_type() -> Int = 27
+fn t_law() -> Int = 28
+fn t_spec() -> Int = 29
+fn t_ty_con() -> Int = 30
+fn t_ty_fn() -> Int = 31
+fn t_ty_record() -> Int = 32
+fn t_ty_unit() -> Int = 33
+fn t_lit_int() -> Int = 40
+fn t_lit_bool() -> Int = 41
+fn t_lit_str() -> Int = 42
+fn t_lit_unit() -> Int = 43
+fn t_lit_bytes() -> Int = 44
+fn t_lit_float() -> Int = 45
+fn t_lit_decimal() -> Int = 46
+fn t_e_lit() -> Int = 50
+fn t_e_var() -> Int = 51
+fn t_e_binary() -> Int = 52
+fn t_e_unary() -> Int = 53
+fn t_e_lambda() -> Int = 54
+fn t_e_app() -> Int = 55
+fn t_e_if() -> Int = 56
+fn t_e_match() -> Int = 57
+fn t_e_block() -> Int = 58
+fn t_e_record() -> Int = 59
+fn t_e_field() -> Int = 60
+fn t_e_list() -> Int = 61
+fn t_e_perform() -> Int = 62
+fn t_e_handle() -> Int = 63
+fn t_e_with_cell() -> Int = 64
+fn t_e_simulate() -> Int = 65
+fn t_e_with_region() -> Int = 66
+fn t_s_let() -> Int = 70
+fn t_s_expr() -> Int = 71
+fn t_p_wildcard() -> Int = 80
+fn t_p_var() -> Int = 81
+fn t_p_lit() -> Int = 82
+fn t_p_ctor() -> Int = 83
+fn t_p_record() -> Int = 84
+fn t_p_list() -> Int = 85
+fn t_row() -> Int = 90
+fn t_atom() -> Int = 91
+fn t_arm() -> Int = 92
+fn t_clause() -> Int = 93
+fn t_return_clause() -> Int = 94
+fn t_constraint() -> Int = 95
+
+// An explicit table: renumbering a row invalidates every cached result in every store.
+fn binop_byte(op: Bytes) -> Int =
+  if op == b"add" { 1 } else if op == b"sub" { 2 } else if op == b"mul" { 3 } else if op == b"div" { 4 } else if op == b"rem" { 5 }
+  else if op == b"eq" { 6 } else if op == b"ne" { 7 } else if op == b"lt" { 8 } else if op == b"le" { 9 } else if op == b"gt" { 10 } else if op == b"ge" { 11 }
+  else if op == b"and" { 12 } else if op == b"or" { 13 } else if op == b"concat" { 14 }
+  else if op == b"bitand" { 15 } else if op == b"bitor" { 16 } else if op == b"bitxor" { 17 } else if op == b"shl" { 18 } else if op == b"shr" { 19 } else { 20 }
+
+fn unop_byte(op: Bytes) -> Int = if op == b"neg" { 1 } else if op == b"not" { 2 } else { 3 }
+
+fn mode_byte(m: Mode) -> Int = match m { MRead -> 0, MWrite -> 1, MBad -> 0 }
+
+fn spec_tag(k: SpecKind) -> Int = match k { SRequires -> 1, SEnsures -> 2 }
+
+// `Deriver::tag`: json 1, eq 2, ord 3.
+fn deriver_byte(d: Deriver) -> Int = deriver_tag(d) + 1
+
+// The threaded normalizer. `out` is the encoding as chunks, concatenated once at the end;
+// `refs` the definitions it references in first-mention order; `values`, `ty_params` and
+// `row_params` the binders in scope as de Bruijn levels.
+type Nz = { index: Index, module: Int, hashes: Map<Int, Bytes>, component: Map<Int, Int>, effects: Map<Int, Int>,
+            out: List<Bytes>, refs: List<Int>, seen: Map<Int, Bool>, values: List<Bytes>, ty_params: List<Bytes>, row_params: List<Bytes>,
+            by_name: Bool, deferred: Option<List<Int>> }
+
+type Finished = { bytes: Bytes, refs: List<Int> }
+
+fn new_nz(index: Index, module: Int, hashes: Map<Int, Bytes>, component: Map<Int, Int>, effects: Map<Int, Int>) -> Nz =
+  { index: index, module: module, hashes: hashes, component: component, effects: effects, out: [], refs: [], seen: map_new(),
+    values: [], ty_params: [], row_params: [], by_name: false, deferred: None }
+
+fn finish(z: Nz) -> Finished = { bytes: bytes_concat_all(z.out), refs: z.refs }
+
+fn emit(z: Nz, b: Bytes) -> Nz = {..z, out: push(z.out, b)}
+fn tag(z: Nz, t: Int) -> Nz = emit(z, byte_of(t))
+fn u32v(z: Nz, v: Int) -> Nz = emit(z, u32_le(v))
+fn boolv(z: Nz, b: Bool) -> Nz = emit(z, byte_of(if b { 1 } else { 0 }))
+fn strv(z: Nz, s: Bytes) -> Nz = emit(u32v(z, bytes_len(s)), s)
+
+type Captured = { z: Nz, bytes: Bytes }
+
+// The bytes `f` writes, kept apart from the encoding so far.
+fn capture(z: Nz, f: (Nz) -> Nz) -> Captured = {
+  let inner: Nz = f({..z, out: []});
+  { z: {..inner, out: z.out}, bytes: bytes_concat_all(inner.out) }
+}
+
+fn normalize_node(z: Nz, body: NodeBody) -> Nz =
+  match body { NFn(d) -> fn_def(z, d), NType(d) -> type_def(z, d), NEffect(d) -> effect_def(z, d) }
+
+// A reference in first-mention order, unless a row is holding its mentions back.
+fn mention(z: Nz, node: Int) -> Nz =
+  match z.deferred {
+    Some(held) -> {..z, deferred: Some(push(held, node))},
+    None -> if map_contains(z.seen, node) { z } else { {..z, seen: map_insert(z.seen, node, true), refs: push(z.refs, node)} },
+  }
+
+fn node_ref(z: Nz, node: Int) -> Nz = {
+  let m: Nz = mention(z, node);
+  if m.by_name { strv(tag(m, t_ref_name()), at(m.index.nodes, node).name) }
+  else {
+    match map_get(m.component, node) {
+      Some(ix) -> u32v(tag(m, t_ref_index()), ix),
+      None -> match map_get(m.hashes, node) { Some(h) -> emit(tag(m, t_ref_hash()), h), None -> tag(m, t_ref_self()) },
+    }
+  }
+}
+
+fn free_ref(z: Nz, qual: Option<Bytes>, name: Bytes) -> Nz =
+  match qual { None -> strv(tag(z, t_free()), name), Some(m) -> strv(strv(tag(z, t_free_qualified()), m), name) }
+
+fn ctor_bytes(z: Nz, owner: Int, name: Bytes) -> Nz = strv(node_ref(tag(z, t_ctor()), owner), name)
+
+// A local binder wins over everything, and only a bare name can be one.
+fn value_ref(z: Nz, q: QName) -> Nz = {
+  let local = if is_bare(q) { rposition(z.values, q.name.name) } else { None };
+  match local {
+    Some(level) -> u32v(tag(z, t_local()), level),
+    None -> match value_target(z.index, z.module, q) {
+      Some(t) -> match t { VFn(node) -> node_ref(z, node), VCtor(c) -> ctor_bytes(z, c.owner, c.name) },
+      None -> free_ref(z, qualifier(q), q.name.name),
+    },
+  }
+}
+
+fn type_ref(z: Nz, qual: Option<Bytes>, name: Bytes) -> Nz = {
+  let param = match qual { None -> rposition(z.ty_params, name), Some(_) -> None };
+  match param {
+    Some(level) -> u32v(tag(z, t_ty_param()), level),
+    None -> match type_target(z.index, z.module, qual, name) { Some(node) -> node_ref(z, node), None -> free_ref(z, qual, name) },
+  }
+}
+
+// Effects are nominal: the reference, then the slot the component's enumeration gave it.
+fn effect_ref(z: Nz, q: QName) -> Nz =
+  match effect_target(z.index, z.module, q) {
+    Some(node) -> u32v(node_ref(z, node), match map_get(z.effects, node) { Some(s) -> s, None -> 0 }),
+    None -> free_ref(z, qualifier(q), q.name.name),
+  }
+
+fn ctor_ref(z: Nz, q: QName) -> Nz =
+  match ctor_target(z.index, z.module, q) { Some(VCtor(c)) -> ctor_bytes(z, c.owner, c.name), _ -> free_ref(z, qualifier(q), q.name.name) }
+
+fn opt_type(z: Nz, t: Option<TypeExpr>) -> Nz = match t { None -> tag(z, t_none()), Some(te) -> type_expr(tag(z, t_some()), te) }
+fn opt_row(z: Nz, r: Option<RowExpr>) -> Nz = match r { None -> tag(z, t_none()), Some(row) -> row_expr(tag(z, t_some()), row) }
+fn opt_expr(z: Nz, e: Option<Expr>) -> Nz = match e { None -> tag(z, t_none()), Some(x) -> expr(tag(z, t_some()), x) }
+fn opt_name(z: Nz, i: Option<Ident>) -> Nz = match i { None -> tag(z, t_none()), Some(x) -> strv(tag(z, t_some()), x.name) }
+
+fn push_generics(z: Nz, def: FnDef) -> Nz =
+  {..z, ty_params: append(z.ty_params, map(def.generics.types, |g: Ident| g.name)), row_params: append(z.row_params, map(def.generics.effects, |g: Ident| g.name))}
+
+fn fn_def(z: Nz, d: FnDef) -> Nz = {
+  let z1: Nz = push_generics(u32v(u32v(tag(z, t_fn()), len(d.generics.types)), len(d.generics.effects)), d);
+  // Before the parameter names reach `values`: a default is closed.
+  let z2: Nz = fold(d.params, u32v(z1, len(d.params)), |acc: Nz, p: Param|
+    match p.default { Some(dflt) -> expr(opt_type(tag(acc, t_param_default()), p.ty), dflt), None -> opt_type(acc, p.ty) });
+  let z3: Nz = constraints(opt_row(opt_type(z2, d.ret), d.effects), d.constraints);
+  let z4: Nz = {..z3, values: append(z3.values, map(d.params, |p: Param| p.name.name))};
+  expr(z4, d.body)
+}
+
+// Sorted and deduplicated: the same two constraints in the other order are one definition.
+fn constraints(z: Nz, cs: List<Constraint>) -> Nz = {
+  let levels = fold(cs, [], |acc: List<{ level: Int, deriver: Int }>, c: Constraint|
+    match rposition(z.ty_params, c.param.name) { Some(level) -> push(acc, { level: level, deriver: deriver_byte(c.deriver) }), None -> acc });
+  let sorted = fold(levels, [], |acc: List<{ level: Int, deriver: Int }>, x: { level: Int, deriver: Int }| insert_pair(acc, x));
+  fold(sorted, u32v(z, len(sorted)), |acc: Nz, x: { level: Int, deriver: Int }| tag(u32v(tag(acc, t_constraint()), x.level), x.deriver))
+}
+
+fn insert_pair(sorted: List<{ level: Int, deriver: Int }>, x: { level: Int, deriver: Int }) -> List<{ level: Int, deriver: Int }> = {
+  let dup = fold(sorted, false, |b: Bool, y: { level: Int, deriver: Int }| b || (y.level == x.level && y.deriver == x.deriver));
+  if dup { sorted } else {
+    let n = len(sorted);
+    let i = fold(range(0, n), n, |acc: Int, j: Int| if acc < n { acc } else { let y = at(sorted, j); if x.level < y.level || (x.level == y.level && x.deriver < y.deriver) { j } else { acc } });
+    append(push(take(sorted, i), x), map(range(i, n), |j: Int| at(sorted, j)))
+  }
+}
+
+fn type_def(z: Nz, d: TypeDef) -> Nz = {
+  let z0: Nz = tag(z, t_type());
+  let z1: Nz = {..z0, ty_params: append(z0.ty_params, map(d.params, |p: Ident| p.name))};
+  let z2: Nz = u32v(z1, len(d.params));
+  match d.body {
+    TDAlias(t) -> type_expr(tag(z2, t_type_alias()), t),
+    TDSum(variants) -> fold(variants, u32v(tag(z2, t_type_sum()), len(variants)), |acc: Nz, v: VariantDef|
+      fold(v.fields, u32v(strv(tag(acc, t_variant()), v.name.name), len(v.fields)), |a: Nz, f: TypeExpr| type_expr(a, f))),
+  }
+}
+
+// Operations are looked up by name, so their declaration order is sorted away.
+fn effect_def(z: Nz, d: EffectDef) -> Nz = {
+  let z1: Nz = boolv(tag(z, t_effect()), d.is_nondet);
+  let ops = fold(d.ops, { z: z1, encoded: [] }, |acc: { z: Nz, encoded: List<Bytes> }, op: OpDef| {
+    let c: Captured = capture(acc.z, |x: Nz| op_def(x, op));
+    { z: c.z, encoded: push(acc.encoded, c.bytes) }
+  });
+  let sorted = sort_bytes(ops.encoded);
+  fold(sorted, u32v(ops.z, len(sorted)), |acc: Nz, b: Bytes| emit(acc, b))
+}
+
+fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare_values(a, b) { Less -> true, _ -> false }
+
+fn sort_bytes(xs: List<Bytes>) -> List<Bytes> =
+  fold(xs, [], |acc: List<Bytes>, x: Bytes| {
+    let n = len(acc);
+    let i = fold(range(0, n), n, |p: Int, j: Int| if p < n { p } else if bytes_lt(x, at(acc, j)) { j } else { p });
+    append(push(take(acc, i), x), map(range(i, n), |j: Int| at(acc, j)))
+  })
+
+fn op_def(z: Nz, op: OpDef) -> Nz = {
+  let z1: Nz = boolv(emit(strv(tag(z, t_op()), op.name.name), byte_of(mode_byte(op.mode))), op.resource_param);
+  type_expr(fold(op.params, u32v(z1, len(op.params)), |acc: Nz, p: TypeExpr| type_expr(acc, p)), op.ret)
+}
+
+pub fn test_def(z: Nz, d: TestDef) -> Nz = expr(boolv(tag(z, t_test()), d.is_nondet), d.body)
+
+// A law's binder types are part of its identity; their names are levels like any other binder.
+pub fn law_def(z: Nz, d: LawDef) -> Nz = {
+  let z1: Nz = fold(d.binders, u32v(boolv(tag(z, t_law()), d.host), len(d.binders)), |acc: Nz, b: Binder| type_expr(acc, b.ty));
+  let z2: Nz = {..z1, values: append(z1.values, map(d.binders, |b: Binder| b.name.name))};
+  expr(opt_expr(z2, d.guard), d.body)
+}
+
+// One `requires` or `ensures`, in the scope its owner gives it: generics, parameters, and
+// `result` beside them for an `ensures`. A parameter's default is not written here.
+pub fn spec_clause(z: Nz, owner: FnDef, clause: SpecClause) -> Nz = {
+  let z1: Nz = push_generics(u32v(u32v(emit(tag(z, t_spec()), byte_of(spec_tag(clause.kind))), len(owner.generics.types)), len(owner.generics.effects)), owner);
+  let counted: Nz = u32v(z1, len(owner.params));
+  let z2: Nz = {..counted, values: append(counted.values, map(owner.params, |p: Param| p.name.name))};
+  let z3: Nz = match clause.kind { SEnsures -> {..z2, values: push(z2.values, b"result")}, SRequires -> z2 };
+  expr(z3, clause.expr)
+}
+
+fn type_expr(z: Nz, t: TypeExpr) -> Nz =
+  match t {
+    TVar(name) -> u32v(type_ref(tag(z, t_ty_con()), None, name.name), 0),
+    TCon(c) -> fold(c.args, u32v(type_ref(tag(z, t_ty_con()), qualifier(c.name), c.name.name.name), len(c.args)), |acc: Nz, a: TypeExpr| type_expr(acc, a)),
+    TFn(f) -> opt_row(type_expr(fold(f.params, u32v(tag(z, t_ty_fn()), len(f.params)), |acc: Nz, p: TypeExpr| type_expr(acc, p)), f.ret), f.effects),
+    // A record type is a map from label to type, so field order is sorted away.
+    TRecord(r) -> {
+      let fields = fold(r.fields, { z: tag(z, t_ty_record()), encoded: [] }, |acc: { z: Nz, encoded: List<Bytes> }, f: { name: Ident, ty: TypeExpr }| {
+        let c: Captured = capture(acc.z, |x: Nz| type_expr(strv(x, f.name.name), f.ty));
+        { z: c.z, encoded: push(acc.encoded, c.bytes) }
+      });
+      let sorted = sort_bytes(fields.encoded);
+      fold(sorted, u32v(fields.z, len(sorted)), |acc: Nz, b: Bytes| emit(acc, b))
+    },
+    TUnit(_) -> tag(z, t_ty_unit()),
+    TBad(_) -> tag(z, t_ty_unit()),
+  }
+
+type AtomEncoding = { bytes: Bytes, tie: Bytes, held: List<Int> }
+
+// A row is a set: its atoms sorted by their own encoding, then by the declaration the atom's
+// effect names, and deduplicated. Every atom is mentioned, including one the dedup drops.
+fn row_expr(z: Nz, r: RowExpr) -> Nz = {
+  let z0: Nz = tag(z, t_row());
+  let atoms = fold(r.atoms, { z: z0, encoded: [] }, |acc: { z: Nz, encoded: List<AtomEncoding> }, a: AtomExpr| {
+    let outer = acc.z.deferred;
+    let c: Captured = capture({..acc.z, deferred: Some([])}, |x: Nz| atom(x, a));
+    let held = match c.z.deferred { Some(h) -> h, None -> [] };
+    let tie = match effect_target(acc.z.index, acc.z.module, a.eff) {
+      Some(node) -> match map_get(acc.z.index.effect_sketches, node) { Some(s) -> s, None -> b"" },
+      None -> b"",
+    };
+    { z: {..c.z, deferred: outer}, encoded: push(acc.encoded, { bytes: c.bytes, tie: tie, held: held }) }
+  });
+  let sorted = fold(atoms.encoded, [], |acc: List<AtomEncoding>, x: AtomEncoding| insert_atom(acc, x));
+  let distinct = fold(range(0, len(sorted)), 0, |acc: Int, i: Int| if i == 0 || at(sorted, i - 1).bytes != at(sorted, i).bytes { acc + 1 } else { acc });
+  let written = fold(range(0, len(sorted)), u32v(atoms.z, distinct), |acc: Nz, i: Int| {
+    let x = at(sorted, i);
+    let mentioned: Nz = fold(x.held, acc, |a: Nz, node: Int| mention(a, node));
+    if i > 0 && at(sorted, i - 1).bytes == x.bytes { mentioned } else { emit(mentioned, x.bytes) }
+  });
+  match r.tail {
+    None -> tag(written, t_none()),
+    Some(t) -> match rposition(written.row_params, t.name) {
+      Some(level) -> u32v(tag(tag(written, t_some()), t_row_param()), level),
+      None -> strv(tag(tag(written, t_some()), t_free()), t.name),
+    },
+  }
+}
+
+fn atom_lt(a: AtomEncoding, b: AtomEncoding) -> Bool =
+  bytes_lt(a.bytes, b.bytes) || (a.bytes == b.bytes && bytes_lt(a.tie, b.tie))
+
+// A stable insertion: equal keys keep their arrival order, as the reference's sort does.
+fn insert_atom(sorted: List<AtomEncoding>, x: AtomEncoding) -> List<AtomEncoding> = {
+  let n = len(sorted);
+  let i = fold(range(0, n), n, |p: Int, j: Int| if p < n { p } else if atom_lt(x, at(sorted, j)) { j } else { p });
+  append(push(take(sorted, i), x), map(range(i, n), |j: Int| at(sorted, j)))
+}
+
+fn atom(z: Nz, a: AtomExpr) -> Nz = opt_name(emit(effect_ref(tag(z, t_atom()), a.eff), byte_of(mode_byte(a.mode))), a.resource)
+
+fn expr(z: Nz, e: Expr) -> Nz =
+  match e {
+    // `{ e }` and `e` are the same computation.
+    EBlock(b) -> if len(b.stmts) == 0 { match b.tail { Some(t) -> expr(z, t), None -> block(z, b.stmts, b.tail) } } else { block(z, b.stmts, b.tail) },
+    ELit(l) -> lit(tag(z, t_e_lit()), l.lit),
+    EVar(v) -> value_ref(tag(z, t_e_var()), v.name),
+    EBinary(b) -> expr(expr(emit(tag(z, t_e_binary()), byte_of(binop_byte(b.op))), b.lhs), b.rhs),
+    EUnary(u) -> expr(emit(tag(z, t_e_unary()), byte_of(unop_byte(u.op))), u.operand),
+    ELambda(l) -> {
+      let z1: Nz = fold(l.params, u32v(tag(z, t_e_lambda()), len(l.params)), |acc: Nz, p: Param| opt_type(acc, p.ty));
+      let inner: Nz = expr({..z1, values: append(z1.values, map(l.params, |p: Param| p.name.name))}, l.body);
+      {..inner, values: z1.values}
+    },
+    EApp(a) -> fold(a.args, u32v(expr(tag(z, t_e_app()), a.func), len(a.args)), |acc: Nz, x: Expr| expr(acc, x)),
+    EIf(i) -> expr(expr(expr(tag(z, t_e_if()), i.cond), i.then_branch), i.else_branch),
+    EMatch(m) -> fold(m.arms, u32v(expr(tag(z, t_e_match()), m.scrutinee), len(m.arms)), |acc: Nz, arm: MatchArm| {
+      let inner: Nz = expr(opt_expr(pattern(tag(acc, t_arm()), arm.pat), arm.guard), arm.body);
+      {..inner, values: acc.values}
+    }),
+    ERecord(r) -> fold(r.fields, u32v(tag(z, t_e_record()), len(r.fields)), |acc: Nz, f: RecField| expr(strv(acc, f.name.name), f.value)),
+    ERecordUpdate(_) -> panic("`{..b, f: e}` is expanded away before hashing"),
+    ETry(_) -> panic("`e?` is expanded away before hashing"),
+    EField(f) -> strv(expr(tag(z, t_e_field()), f.base), f.field.name),
+    EList(l) -> fold(l.items, u32v(tag(z, t_e_list()), len(l.items)), |acc: Nz, x: Expr| expr(acc, x)),
+    EPerform(p) -> fold(p.args, u32v(opt_name(strv(effect_ref(tag(z, t_e_perform()), p.eff), p.op.name), p.resource), len(p.args)), |acc: Nz, x: Expr| expr(acc, x)),
+    EHandle(h) -> {
+      let clauses: Nz = fold(h.clauses, u32v(expr(tag(z, t_e_handle()), h.body), len(h.clauses)), |acc: Nz, c: HandleClause| {
+        let head: Nz = u32v(opt_name(strv(effect_ref(tag(acc, t_clause()), c.eff), c.op.name), c.resource), len(c.params));
+        let bound: Nz = {..head, values: append(head.values, map(c.params, |p: Ident| p.name))};
+        // Whether a clause binds a continuation is part of what the definition is.
+        let resumed: Nz = match c.resume {
+          None -> tag(bound, t_none()),
+          Some(k) -> { let some: Nz = tag(bound, t_some()); {..some, values: push(some.values, k.name)} },
+        };
+        let inner: Nz = expr(resumed, c.body);
+        {..inner, values: acc.values}
+      });
+      match h.ret {
+        None -> tag(clauses, t_none()),
+        Some(rc) -> {
+          let head: Nz = tag(tag(clauses, t_some()), t_return_clause());
+          let inner: Nz = expr({..head, values: push(head.values, rc.binder.name)}, rc.body);
+          {..inner, values: clauses.values}
+        },
+      }
+    },
+    EWithCell(c) -> {
+      let head: Nz = expr(strv(tag(z, t_e_with_cell()), c.resource.name), c.init);
+      let inner: Nz = expr({..head, values: push(head.values, c.binder.name)}, c.body);
+      {..inner, values: head.values}
+    },
+    EWithRegion(w) -> expr(strv(tag(z, t_e_with_region()), w.region.name), w.body),
+    ESimulate(s) -> expr(tag(z, t_e_simulate()), s.body),
+    EBad(_) -> panic("a placeholder reached the hasher"),
+  }
+
+fn block(z: Nz, stmts: List<Stmt>, tail: Option<Expr>) -> Nz = {
+  let head: Nz = u32v(tag(z, t_e_block()), len(stmts));
+  let ordered: { z: Nz, order: List<Int> } = stmt_order(head, stmts);
+  let walked: Nz = fold(ordered.order, ordered.z, |acc: Nz, i: Int| stmt(acc, at(stmts, i)));
+  let tailed: Nz = opt_expr(walked, tail);
+  {..tailed, values: head.values}
+}
+
+// Consecutive `let`s that commute are emitted in the order their own encodings sort in.
+fn stmt_order(z: Nz, stmts: List<Stmt>) -> { z: Nz, order: List<Int> } = {
+  let n = len(stmts);
+  let walked = iterate({ z: z, i: 0, order: [] }, n + 2, |s: { z: Nz, i: Int, order: List<Int> }|
+    if s.i >= n { Stop(s) } else {
+      let run = commutable_run(stmts, s.i);
+      if run < 2 { Continue({..s, i: s.i + 1, order: push(s.order, s.i)}) }
+      else {
+        let sorted: { z: Nz, order: List<Int> } = sorted_run(s.z, stmts, s.i, s.i + run);
+        Continue({ z: sorted.z, i: s.i + run, order: append(s.order, sorted.order) })
+      }
+    });
+  { z: walked.z, order: walked.order }
+}
+
+// The members of the run, ordered by their encodings; ties keep their source order.
+fn sorted_run(z: Nz, stmts: List<Stmt>, from: Int, to: Int) -> { z: Nz, order: List<Int> } = {
+  let keyed = fold(range(from, to), { z: z, keys: [] }, |acc: { z: Nz, keys: List<{ key: Bytes, i: Int }> }, i: Int| {
+    let c: Captured = capture(acc.z, |x: Nz| stmt(x, at(stmts, i)));
+    { z: {..c.z, values: acc.z.values}, keys: push(acc.keys, { key: c.bytes, i: i }) }
+  });
+  let sorted = fold(keyed.keys, [], |acc: List<{ key: Bytes, i: Int }>, x: { key: Bytes, i: Int }| {
+    let n = len(acc);
+    let at_ = fold(range(0, n), n, |p: Int, j: Int| if p < n { p } else { let y = at(acc, j); if bytes_lt(x.key, y.key) || (x.key == y.key && x.i < y.i) { j } else { p } });
+    append(push(take(acc, at_), x), map(range(at_, n), |j: Int| at(acc, j)))
+  });
+  { z: keyed.z, order: map(sorted, |x: { key: Bytes, i: Int }| x.i) }
+}
+
+fn stmt(z: Nz, s: Stmt) -> Nz =
+  match s {
+    SLet(l) -> pattern(expr(opt_type(tag(z, t_s_let()), l.ty), l.value), l.pat),
+    SExpr(e) -> expr(tag(z, t_s_expr()), e),
+  }
+
+fn lit(z: Nz, l: Lit) -> Nz =
+  match l {
+    LInt(i) -> emit(tag(z, t_lit_int()), i64_le(i)),
+    LBool(b) -> boolv(tag(z, t_lit_bool()), b),
+    LStr(s) -> strv(tag(z, t_lit_str()), s),
+    LBytes(b) -> emit(u32v(tag(z, t_lit_bytes()), bytes_len(b)), b),
+    LFloat(text) -> emit(tag(z, t_lit_float()), i64_le(float_bits(text))),
+    LDec(text) -> { let p = decimal_parts(text); emit(emit(tag(z, t_lit_decimal()), p.mantissa), u32_le(p.scale)) },
+    LUnit -> tag(z, t_lit_unit()),
+    LBad -> panic("a placeholder literal reached the hasher"),
+  }
+
+fn pattern(z: Nz, p: Pattern) -> Nz =
+  match p {
+    PWild(_) -> tag(z, t_p_wildcard()),
+    PVar(v) -> { let t: Nz = tag(z, t_p_var()); {..t, values: push(t.values, v.name.name)} },
+    PLit(l) -> lit(tag(z, t_p_lit()), l.lit),
+    PCtor(c) -> fold(c.args, u32v(ctor_ref(tag(z, t_p_ctor()), c.name), len(c.args)), |acc: Nz, a: Pattern| pattern(acc, a)),
+    PRecord(r) -> boolv(fold(r.fields, u32v(tag(z, t_p_record()), len(r.fields)), |acc: Nz, f: { name: Ident, pat: Pattern }| pattern(strv(acc, f.name.name), f.pat)), r.rest),
+    PList(l) -> {
+      let items: Nz = fold(l.items, u32v(tag(z, t_p_list()), len(l.items)), |acc: Nz, i: Pattern| pattern(acc, i));
+      match l.rest { None -> tag(items, t_none()), Some(rest) -> pattern(tag(items, t_some()), rest) }
+    },
+    PBad(_) -> panic("a placeholder pattern reached the hasher"),
+  }
+
+// How many statements from `from` are `let`s that may be written in any order.
+fn commutable_run(stmts: List<Stmt>, from: Int) -> Int = {
+  let n = len(stmts);
+  let to = iterate(from, n - from + 1, |i: Int|
+    if i >= n { Stop(i) } else { match at(stmts, i) { SLet(l) -> if is_pure(l.value) { Continue(i + 1) } else { Stop(i) }, _ -> Stop(i) } });
+  if to - from < 2 { 0 } else {
+    let run = map(range(from, to), |i: Int| at(stmts, i));
+    let counted = fold(run, { count: 0, bound: [] }, |acc: { count: Int, bound: List<Bytes> }, s: Stmt|
+      match s { SLet(l) -> { let b = pattern_binders(l.pat, acc.bound); { count: acc.count + b.count, bound: b.bound } }, _ -> acc });
+    if counted.count != len(counted.bound) { 0 }
+    else if fold(run, false, |b: Bool, s: Stmt| b || (match s { SLet(l) -> mentions(l.value, counted.bound), _ -> false })) { 0 }
+    else { to - from }
+  }
+}
+
+fn insert_name(xs: List<Bytes>, v: Bytes) -> List<Bytes> = if contains_bytes(xs, v) { xs } else { push(xs, v) }
+
+fn pattern_binders(p: Pattern, out: List<Bytes>) -> { count: Int, bound: List<Bytes> } =
+  match p {
+    PVar(v) -> { count: 1, bound: insert_name(out, v.name.name) },
+    PWild(_) -> { count: 0, bound: out },
+    PLit(_) -> { count: 0, bound: out },
+    PBad(_) -> { count: 0, bound: out },
+    PCtor(c) -> fold(c.args, { count: 0, bound: out }, |acc: { count: Int, bound: List<Bytes> }, a: Pattern| { let b = pattern_binders(a, acc.bound); { count: acc.count + b.count, bound: b.bound } }),
+    PRecord(r) -> fold(r.fields, { count: 0, bound: out }, |acc: { count: Int, bound: List<Bytes> }, f: { name: Ident, pat: Pattern }| { let b = pattern_binders(f.pat, acc.bound); { count: acc.count + b.count, bound: b.bound } }),
+    PList(l) -> {
+      let items = fold(l.items, { count: 0, bound: out }, |acc: { count: Int, bound: List<Bytes> }, i: Pattern| { let b = pattern_binders(i, acc.bound); { count: acc.count + b.count, bound: b.bound } });
+      match l.rest { Some(rest) -> { let b = pattern_binders(rest, items.bound); { count: items.count + b.count, bound: b.bound } }, None -> items }
+    },
+  }
+
+// `ast::is_pure`: evaluates without calling or performing anything.
+pub fn is_pure(e: Expr) -> Bool =
+  match e {
+    EApp(_) -> false,
+    EPerform(_) -> false,
+    EHandle(_) -> false,
+    EWithCell(_) -> false,
+    EWithRegion(_) -> false,
+    ESimulate(_) -> false,
+    ETry(_) -> false,
+    EBad(_) -> false,
+    ELit(_) -> true,
+    EVar(_) -> true,
+    EBinary(b) -> is_pure(b.lhs) && is_pure(b.rhs),
+    EUnary(u) -> is_pure(u.operand),
+    ELambda(l) -> is_pure(l.body),
+    EIf(i) -> is_pure(i.cond) && is_pure(i.then_branch) && is_pure(i.else_branch),
+    EMatch(m) -> is_pure(m.scrutinee) && fold(m.arms, true, |acc: Bool, a: MatchArm| acc && is_pure(a.body) && (match a.guard { Some(g) -> is_pure(g), None -> true })),
+    EBlock(b) -> fold(b.stmts, true, |acc: Bool, s: Stmt| acc && (match s { SLet(l) -> is_pure(l.value), SExpr(x) -> is_pure(x) })) && (match b.tail { Some(t) -> is_pure(t), None -> true }),
+    ERecord(r) -> fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    ERecordUpdate(r) -> is_pure(r.base) && fold(r.fields, true, |acc: Bool, f: RecField| acc && is_pure(f.value)),
+    EField(f) -> is_pure(f.base),
+    EList(l) -> fold(l.items, true, |acc: Bool, x: Expr| acc && is_pure(x)),
+  }
+
+// Deliberately blind to scope: any occurrence of the name counts.
+fn mentions(e: Expr, names: List<Bytes>) -> Bool =
+  match e {
+    ELit(_) -> false,
+    EBad(_) -> false,
+    EVar(v) -> is_bare(v.name) && contains_bytes(names, v.name.name.name),
+    EBinary(b) -> mentions(b.lhs, names) || mentions(b.rhs, names),
+    EUnary(u) -> mentions(u.operand, names),
+    ELambda(l) -> fold(l.params, false, |acc: Bool, p: Param| acc || contains_bytes(names, p.name.name)) || mentions(l.body, names),
+    EApp(a) -> mentions(a.func, names) || fold(a.args, false, |acc: Bool, x: Expr| acc || mentions(x, names)),
+    EIf(i) -> mentions(i.cond, names) || mentions(i.then_branch, names) || mentions(i.else_branch, names),
+    EMatch(m) -> mentions(m.scrutinee, names) || fold(m.arms, false, |acc: Bool, a: MatchArm|
+      acc || pattern_mentions(a.pat, names) || (match a.guard { Some(g) -> mentions(g, names), None -> false }) || mentions(a.body, names)),
+    EBlock(b) -> fold(b.stmts, false, |acc: Bool, s: Stmt| acc || (match s { SLet(l) -> pattern_mentions(l.pat, names) || mentions(l.value, names), SExpr(x) -> mentions(x, names) }))
+      || (match b.tail { Some(t) -> mentions(t, names), None -> false }),
+    ERecord(r) -> fold(r.fields, false, |acc: Bool, f: RecField| acc || mentions(f.value, names)),
+    ERecordUpdate(r) -> mentions(r.base, names) || fold(r.fields, false, |acc: Bool, f: RecField| acc || mentions(f.value, names)),
+    EField(f) -> mentions(f.base, names),
+    ETry(t) -> mentions(t.operand, names),
+    EList(l) -> fold(l.items, false, |acc: Bool, x: Expr| acc || mentions(x, names)),
+    EPerform(p) -> fold(p.args, false, |acc: Bool, x: Expr| acc || mentions(x, names)),
+    EHandle(h) -> mentions(h.body, names)
+      || fold(h.clauses, false, |acc: Bool, c: HandleClause| acc || fold(c.params, false, |b: Bool, p: Ident| b || contains_bytes(names, p.name)) || mentions(c.body, names))
+      || (match h.ret { Some(rc) -> contains_bytes(names, rc.binder.name) || mentions(rc.body, names), None -> false }),
+    EWithCell(c) -> contains_bytes(names, c.binder.name) || mentions(c.init, names) || mentions(c.body, names),
+    EWithRegion(w) -> mentions(w.body, names),
+    ESimulate(s) -> mentions(s.body, names),
+  }
+
+fn pattern_mentions(p: Pattern, names: List<Bytes>) -> Bool =
+  match p {
+    PWild(_) -> false,
+    PLit(_) -> false,
+    PBad(_) -> false,
+    PVar(v) -> contains_bytes(names, v.name.name),
+    PCtor(c) -> (is_bare(c.name) && contains_bytes(names, c.name.name.name)) || fold(c.args, false, |acc: Bool, a: Pattern| acc || pattern_mentions(a, names)),
+    PRecord(r) -> fold(r.fields, false, |acc: Bool, f: { name: Ident, pat: Pattern }| acc || pattern_mentions(f.pat, names)),
+    PList(l) -> fold(l.items, false, |acc: Bool, i: Pattern| acc || pattern_mentions(i, names)) || (match l.rest { Some(rest) -> pattern_mentions(rest, names), None -> false }),
+  }
+
+// --- `lib.rs`: the hash table ----------------------------------------------------------------------
+
+fn spec_domain() -> Bytes = b"ply.spec.1"
+fn spec_text_domain() -> Bytes = b"ply.spec.text.1"
+fn own_domain() -> Bytes = b"ply.own.1"
+
+fn spec_text_hash(kind: Int, index: Int, normalized: Bytes) -> Bytes =
+  blake3(bytes_concat_all([spec_text_domain(), byte_of(kind), u32_le(index), normalized]))
+
+fn own_hash(normalized: Bytes) -> Bytes = blake3(bytes_concat(own_domain(), normalized))
+
+pub fn spec_hash(owner: Bytes, kind: Int, index: Int, normalized: Bytes) -> Bytes =
+  blake3(bytes_concat_all([spec_domain(), owner, byte_of(kind), u32_le(index), normalized]))
+
+// A member of a component, given the component's own hash.
+fn member_hash(component: Bytes, class: Int) -> Bytes = blake3(bytes_concat(component, u32_le(class)))
+
+pub type HashOutput = { defs: List<{ name: Bytes, hash: Bytes }>, own: List<{ name: Bytes, hash: Bytes }>, decls: List<{ name: Bytes, hash: Bytes }>,
+                        tests: List<Bytes>, laws: List<Bytes>, specs: List<{ name: Bytes, hashes: List<Bytes> }>, spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
+                        law_texts: List<Bytes>, deps: List<{ name: Bytes, names: List<Bytes> }>, closure: List<{ name: Bytes, names: Names }> }
+
+type Sccs = { component_of: List<Int>, orders: List<List<Int>> }
+
+// The effects one component can see, in an order derived only from what it references.
+fn effect_order(index: Index, refs: List<Int>, scc: Sccs, own: Option<Int>, out: List<Int>) -> List<Int> =
+  fold(refs, out, |acc: List<Int>, r: Int| {
+    let with_effect = if is_effect(index, r) { push_unique(acc, r) } else { acc };
+    let ci = if r < len(scc.component_of) { at(scc.component_of, r) } else { 0 - 1 };
+    if (match own { Some(o) -> o == ci, None -> false }) || ci < 0 || ci >= len(scc.orders) { with_effect }
+    else { fold(at(scc.orders, ci), with_effect, |a: List<Int>, node: Int| push_unique(a, node)) }
+  })
+
+fn push_unique(xs: List<Int>, v: Int) -> List<Int> = if contains_int(xs, v) { xs } else { push(xs, v) }
+
+fn slots(order: List<Int>) -> Map<Int, Int> = fold(range(0, len(order)), map_new(), |acc: Map<Int, Int>, i: Int| map_insert(acc, at(order, i), i))
+
+// One item with a body, encoded the way a test is: a first pass with nothing known yields the
+// references, which fix the effect enumeration, and a second pass writes the bytes.
+fn encode_item(index: Index, module: Int, scc: Sccs, hashes: Map<Int, Bytes>, by_name: Bool, encode: (Nz) -> Nz) -> Finished = {
+  let first: Finished = finish(encode(new_nz(index, module, map_new(), map_new(), map_new())));
+  let effects = slots(effect_order(index, first.refs, scc, None, []));
+  let z: Nz = new_nz(index, module, hashes, map_new(), effects);
+  finish(encode({..z, by_name: by_name}))
+}
+
+fn sketch_lt(a: Bytes, ia: Int, b: Bytes, ib: Int) -> Bool = bytes_lt(a, b) || (a == b && ia < ib)
+
+type Refined = { members: List<{ node: Int, hash: Bytes }>, packed: Bytes, classes: Map<Int, Int> }
+
+// A cyclic component hashed as a unit, each member identified by a class from refinement: every
+// member in one class, re-encoded with each intra-component reference written as the referent's
+// class, split until nothing splits, then one more round so the labels are the settled ones.
+fn hash_component(index: Index, component: List<Int>, hashes: Map<Int, Bytes>, effects: Map<Int, Int>) -> Refined = {
+  let encode = |classes: Map<Int, Int>, v: Int| finish(normalize_node(new_nz(index, at(index.nodes, v).module, hashes, classes, effects), at(index.nodes, v).body)).bytes;
+  let relabel = |encodings: List<Bytes>| {
+    let distinct = dedup_sorted(sort_bytes(encodings));
+    fold(range(0, len(component)), map_new(), |acc: Map<Int, Int>, i: Int| map_insert(acc, at(component, i), position_bytes(distinct, at(encodings, i))))
+  };
+  let grouping = |classes: Map<Int, Int>| sort_groups(fold(component, map_new(), |acc: Map<Int, List<Int>>, v: Int| {
+    let c = match map_get(classes, v) { Some(x) -> x, None -> 0 };
+    map_insert(acc, c, push(match map_get(acc, c) { Some(g) -> g, None -> [] }, v))
+  }));
+  let start = fold(component, map_new(), |acc: Map<Int, Int>, v: Int| map_insert(acc, v, 0));
+  let settled = iterate({ classes: start, encodings: map(component, |v: Int| encode(start, v)) }, len(component) + 2, |s: { classes: Map<Int, Int>, encodings: List<Bytes> }| {
+    let next = relabel(s.encodings);
+    let same = grouping(next) == grouping(s.classes);
+    let re = { classes: next, encodings: map(component, |v: Int| encode(next, v)) };
+    if same { Stop(re) } else { Continue(re) }
+  });
+  let width = fold(component, 0, |acc: Int, v: Int| max(acc, match map_get(settled.classes, v) { Some(c) -> c, None -> 0 })) + 1;
+  let by_class = fold(range(0, len(component)), map(range(0, width), |i: Int| b""), |acc: List<Bytes>, i: Int|
+    set_at(acc, match map_get(settled.classes, at(component, i)) { Some(c) -> c, None -> 0 }, at(settled.encodings, i)));
+  let packed = bytes_concat(u32_le(len(by_class)), bytes_concat_all(map(by_class, |m: Bytes| bytes_concat(u32_le(bytes_len(m)), m))));
+  let component_hash = blake3(packed);
+  { members: map(component, |v: Int| { node: v, hash: member_hash(component_hash, match map_get(settled.classes, v) { Some(c) -> c, None -> 0 }) }),
+    packed: packed, classes: settled.classes }
+}
+
+fn dedup_sorted(xs: List<Bytes>) -> List<Bytes> =
+  fold(xs, [], |acc: List<Bytes>, x: Bytes| if len(acc) > 0 && at(acc, len(acc) - 1) == x { acc } else { push(acc, x) })
+
+fn position_bytes(xs: List<Bytes>, v: Bytes) -> Int =
+  fold(range(0, len(xs)), 0, |acc: Int, i: Int| if at(xs, i) == v { i } else { acc })
+
+// Groups by class, each sorted, the groups sorted: the shape two labellings are compared by.
+fn sort_groups(groups: Map<Int, List<Int>>) -> List<List<Int>> = {
+  let out = map_fold(groups, [], |acc: List<List<Int>>, k: Int, g: List<Int>| push(acc, sort_ints(g)));
+  fold(out, [], |acc: List<List<Int>>, g: List<Int>| {
+    let n = len(acc);
+    let i = fold(range(0, n), n, |p: Int, j: Int| if p < n { p } else if ints_lt(g, at(acc, j)) { j } else { p });
+    append(push(take(acc, i), g), map(range(i, n), |j: Int| at(acc, j)))
+  })
+}
+
+fn sort_ints(xs: List<Int>) -> List<Int> =
+  fold(xs, [], |acc: List<Int>, x: Int| {
+    let n = len(acc);
+    let i = fold(range(0, n), n, |p: Int, j: Int| if p < n { p } else if x < at(acc, j) { j } else { p });
+    append(push(take(acc, i), x), map(range(i, n), |j: Int| at(acc, j)))
+  })
+
+fn ints_lt(a: List<Int>, b: List<Int>) -> Bool = match compare_values(a, b) { Less -> true, _ -> false }
+
+type Forms = { own: List<{ name: Bytes, hash: Bytes }>, specs: List<{ name: Bytes, hashes: List<Bytes> }>, spec_texts: List<{ name: Bytes, hashes: List<Bytes> }> }
+
+type Hashed = { hashes: Map<Int, Bytes>, tests: List<Bytes>, test_refs: List<List<Int>>, laws: List<Bytes>, law_refs: List<List<Int>>, law_texts: List<Bytes>,
+                own: List<{ name: Bytes, hash: Bytes }>, specs: List<{ name: Bytes, hashes: List<Bytes> }>, spec_texts: List<{ name: Bytes, hashes: List<Bytes> }> }
+
+pub fn hash_index(index: Index) -> HashOutput = {
+  let n = len(index.nodes);
+  // One pass with nothing known yields the reference graph, plus a sketch that orders a cycle's
+  // members without appealing to source position.
+  let first = map(index.nodes, |node: Node| finish(normalize_node(new_nz(index, node.module, map_new(), map_new(), map_new()), node.body)));
+  let edges = map(first, |f: Finished| f.refs);
+  let sketches = map(first, |f: Finished| f.bytes);
+  let components = tarjan(n, edges);
+  let component_of = fold(range(0, len(components)), map(range(0, n), |i: Int| 0 - 1), |acc: List<Int>, ci: Int|
+    fold(at(components, ci), acc, |a: List<Int>, v: Int| set_at(a, v, ci)));
+  // Components arrive dependency-first, so a component's own enumeration can splice in the ones
+  // it references.
+  let orders = fold(range(0, len(components)), [], |acc: List<List<Int>>, ci: Int| {
+    let members = fold(at(components, ci), [], |ms: List<Int>, v: Int| {
+      let k = len(ms);
+      let i = fold(range(0, k), k, |p: Int, j: Int| if p < k { p } else if sketch_lt(at(sketches, v), v, at(sketches, at(ms, j)), at(ms, j)) { j } else { p });
+      append(push(take(ms, i), v), map(range(i, k), |j: Int| at(ms, j)))
+    });
+    let scc = { component_of: component_of, orders: acc };
+    push(acc, fold(members, [], |o: List<Int>, v: Int| effect_order(index, at(edges, v), scc, Some(ci), o)))
+  });
+  let scc = { component_of: component_of, orders: orders };
+  let hashes = fold(range(0, len(components)), map_new(), |acc: Map<Int, Bytes>, ci: Int| {
+    let component = at(components, ci);
+    let effects = slots(at(orders, ci));
+    if is_cyclic(component, edges) {
+      let refined: Refined = hash_component(index, component, acc, effects);
+      fold(refined.members, acc, |a: Map<Int, Bytes>, m: { node: Int, hash: Bytes }| map_insert(a, m.node, m.hash))
+    } else {
+      let v = at(component, 0);
+      let node = at(index.nodes, v);
+      map_insert(acc, v, blake3(finish(normalize_node(new_nz(index, node.module, acc, map_new(), effects), node.body)).bytes))
+    }
+  });
+  let tests = fold(index.tests, { hashes: [], refs: [] }, |acc: { hashes: List<Bytes>, refs: List<List<Int>> }, t: TestNode| {
+    let f: Finished = encode_item(index, t.module, scc, hashes, false, |z: Nz| test_def(z, t.def));
+    { hashes: push(acc.hashes, blake3(f.bytes)), refs: push(acc.refs, f.refs) }
+  });
+  let laws = fold(index.laws, { hashes: [], refs: [], texts: [] }, |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, l: LawNode| {
+    let f: Finished = encode_item(index, l.module, scc, hashes, false, |z: Nz| law_def(z, l.def));
+    let text: Finished = encode_item(index, l.module, scc, hashes, true, |z: Nz| law_def(z, l.def));
+    { hashes: push(acc.hashes, blake3(f.bytes)), refs: push(acc.refs, f.refs), texts: push(acc.texts, spec_text_hash(0, 0, text.bytes)) }
+  });
+  let forms = fold(index.order, { own: [], specs: [], spec_texts: [] }, |acc: Forms, e: Entry|
+    match e {
+      EDef(v) -> {
+        let node = at(index.nodes, v);
+        match node.body {
+          NFn(def) -> {
+            let form: Finished = encode_item(index, node.module, scc, hashes, true, |z: Nz| normalize_node(z, NFn(def)));
+            let owned: Forms = {..acc, own: push(acc.own, { name: node.name, hash: own_hash(form.bytes) })};
+            if len(def.spec) == 0 { owned } else {
+              match map_get(hashes, v) {
+                None -> owned,
+                Some(owner) -> {
+                  let clauses = map(range(0, len(def.spec)), |i: Int| {
+                    let c = at(def.spec, i);
+                    spec_hash(owner, spec_tag(c.kind), i, encode_item(index, node.module, scc, hashes, false, |z: Nz| spec_clause(z, def, c)).bytes)
+                  });
+                  let texts = map(range(0, len(def.spec)), |i: Int| {
+                    let c = at(def.spec, i);
+                    spec_text_hash(spec_tag(c.kind), i, encode_item(index, node.module, scc, hashes, true, |z: Nz| spec_clause(z, def, c)).bytes)
+                  });
+                  {..owned, specs: push(owned.specs, { name: node.name, hashes: clauses }), spec_texts: push(owned.spec_texts, { name: node.name, hashes: texts })}
+                },
+              }
+            }
+          },
+          _ -> acc,
+        }
+      },
+      _ -> acc,
+    });
+  assemble(index, components, edges, { hashes: hashes, tests: tests.hashes, test_refs: tests.refs, laws: laws.hashes, law_refs: laws.refs, law_texts: laws.texts,
+                                        own: forms.own, specs: forms.specs, spec_texts: forms.spec_texts })
+}
+
+// A `BTreeSet` of names: a map, whose keys come back in byte order.
+type Names = Map<Bytes, Bool>
+
+fn names_union(a: Names, b: Names) -> Names = map_fold(b, a, |acc: Names, k: Bytes, v: Bool| map_insert(acc, k, true))
+
+fn names_of(ns: Names) -> List<Bytes> = map_fold(ns, [], |acc: List<Bytes>, k: Bytes, v: Bool| push(acc, k))
+
+fn assemble(index: Index, components: List<List<Int>>, edges: List<List<Int>>, h: Hashed) -> HashOutput = {
+  let n = len(index.nodes);
+  let component_of = fold(range(0, len(components)), map(range(0, n), |i: Int| 0 - 1), |acc: List<Int>, ci: Int|
+    fold(at(components, ci), acc, |a: List<Int>, v: Int| set_at(a, v, ci)));
+  // Dependency-first, so every closure a component needs is built by the time it is reached.
+  let closures = fold(range(0, len(components)), [], |acc: List<Names>, ci: Int| {
+    let component = at(components, ci);
+    let own = fold(component, map_new(), |c: Names, v: Int| map_insert(c, at(index.nodes, v).name, true));
+    let reached = fold(component, own, |c: Names, v: Int| fold(at(edges, v), c, |cc: Names, r: Int| {
+      let rc = at(component_of, r);
+      if rc != ci && rc >= 0 && rc < len(acc) { names_union(cc, at(acc, rc)) } else { cc }
+    }));
+    push(acc, reached)
+  });
+  let empty: HashOutput = { defs: [], own: h.own, decls: [], tests: h.tests, laws: h.laws, specs: h.specs, spec_texts: h.spec_texts, law_texts: h.law_texts, deps: [], closure: [] };
+  fold(index.order, empty, |out: HashOutput, e: Entry|
+    match e {
+      EDef(v) -> {
+        let node = at(index.nodes, v);
+        let keyed: HashOutput = match map_get(h.hashes, v) {
+          None -> out,
+          Some(hash) -> match node.body {
+            NFn(_) -> {..out, defs: push(out.defs, { name: node.name, hash: hash })},
+            _ -> {..out, decls: push(out.decls, { name: node.name, hash: hash })},
+          },
+        };
+        let deps = map(at(edges, v), |r: Int| at(index.nodes, r).name);
+        let closure = { let ci = at(component_of, v); if ci >= 0 && ci < len(closures) { at(closures, ci) } else { map_new() } };
+        record(keyed, node.name, deps, closure)
+      },
+      ETest(t) -> {
+        let key = at(index.tests, t).key;
+        let r = reached(at(h.test_refs, t), index, component_of, closures, key);
+        record(out, key, r.deps, r.closure)
+      },
+      // A law's references are what it is a claim about.
+      ELaw(l) -> {
+        let key = at(index.laws, l).key;
+        let r = reached(at(h.law_refs, l), index, component_of, closures, key);
+        record(out, key, r.deps, r.closure)
+      },
+    })
+}
+
+fn reached(refs: List<Int>, index: Index, component_of: List<Int>, closures: List<Names>, own: Bytes) -> { deps: List<Bytes>, closure: Names } = {
+  let deps = map(refs, |r: Int| at(index.nodes, r).name);
+  let closure = fold(refs, map_insert(map_new(), own, true), |acc: Names, r: Int| { let ci = at(component_of, r); if ci >= 0 && ci < len(closures) { names_union(acc, at(closures, ci)) } else { acc } });
+  { deps: deps, closure: closure }
+}
+
+// Names collide across namespaces, so entries are merged rather than replaced.
+fn record(out: HashOutput, name: Bytes, deps: List<Bytes>, closure: Names) -> HashOutput = {
+  let deps_ = match fold(range(0, len(out.deps)), None, |acc: Option<Int>, i: Int| match acc { Some(_) -> acc, None -> if at(out.deps, i).name == name { Some(i) } else { None } }) {
+    Some(i) -> { let existing = at(out.deps, i); set_at(out.deps, i, { name: name, names: fold(deps, existing.names, |acc: List<Bytes>, d: Bytes| if contains_bytes(acc, d) { acc } else { push(acc, d) }) }) },
+    None -> push(out.deps, { name: name, names: deps }),
+  };
+  let closure_ = match fold(range(0, len(out.closure)), None, |acc: Option<Int>, i: Int| match acc { Some(_) -> acc, None -> if at(out.closure, i).name == name { Some(i) } else { None } }) {
+    Some(i) -> { let existing = at(out.closure, i); set_at(out.closure, i, { name: name, names: names_union(existing.names, closure) }) },
+    None -> push(out.closure, { name: name, names: closure }),
+  };
+  {..out, deps: deps_, closure: closure_}
+}
+
+// --- The dump -------------------------------------------------------------------------------------------
+
+fn hexes(hs: List<Bytes>) -> Bytes =
+  fold(range(0, len(hs)), b"", |acc: Bytes, i: Int| if i == 0 { hex(at(hs, i)) } else { bytes_concat_all([acc, b",", hex(at(hs, i))]) })
+
+fn names_text(ns: List<Bytes>) -> Bytes =
+  fold(range(0, len(ns)), b"", |acc: Bytes, i: Int| if i == 0 { at(ns, i) } else { bytes_concat_all([acc, b",", at(ns, i)]) })
+
+fn dump_hashes(out: HashOutput) -> Bytes =
+  bytes_concat_all([
+    bytes_concat_all(map(out.defs, |d: { name: Bytes, hash: Bytes }| bytes_concat_all([b"H;", d.name, b";", hex(d.hash), b";"]))),
+    bytes_concat_all(map(out.decls, |d: { name: Bytes, hash: Bytes }| bytes_concat_all([b"Y;", d.name, b";", hex(d.hash), b";"]))),
+    bytes_concat_all(map(out.tests, |h: Bytes| bytes_concat_all([b"T;", hex(h), b";"]))),
+    bytes_concat_all(map(out.laws, |h: Bytes| bytes_concat_all([b"L;", hex(h), b";"]))),
+    bytes_concat_all(map(out.law_texts, |h: Bytes| bytes_concat_all([b"W;", hex(h), b";"]))),
+    bytes_concat_all(map(out.own, |d: { name: Bytes, hash: Bytes }| bytes_concat_all([b"O;", d.name, b";", hex(d.hash), b";"]))),
+    bytes_concat_all(map(out.specs, |s: { name: Bytes, hashes: List<Bytes> }| bytes_concat_all([b"S;", s.name, b";", hexes(s.hashes), b";"]))),
+    bytes_concat_all(map(out.spec_texts, |s: { name: Bytes, hashes: List<Bytes> }| bytes_concat_all([b"X;", s.name, b";", hexes(s.hashes), b";"]))),
+    bytes_concat_all(map(out.deps, |d: { name: Bytes, names: List<Bytes> }| bytes_concat_all([b"D;", d.name, b";", names_text(d.names), b";"]))),
+    bytes_concat_all(map(out.closure, |d: { name: Bytes, names: Names }| bytes_concat_all([b"C;", d.name, b";", names_text(names_of(d.names)), b";"]))),
+  ])
+
+type Parsed = { name: Bytes, module: Module, derived: List<Derived>, diags: List<Diag> }
+
+// The driver's order: parse with the rewrites, expand every `derive`, resolve, hash.
+pub fn hash_dump(sources: List<Source>) -> String = {
+  let parsed = map(range(0, len(sources)), |i: Int| {
+    let s = at(sources, i);
+    let r = parse(s.src);
+    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let d: Expansion = expand_derives(i, x.module);
+    { name: s.name, module: d.module, derived: d.derived, diags: d.diags }
+  });
+  let expansion = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  let mods = map(parsed, |p: Parsed| { name: p.name, module: p.module, derived: p.derived });
+  let head = bytes_concat_all([b"K;", num(len(sources)), b";"]);
+  let body = if len(expansion) > 0 { bytes_concat(b"E;", dump_diags(expansion)) } else {
+    match resolve_modules(mods) {
+      Failed(ds) -> bytes_concat(b"E;", dump_diags(ds)),
+      Resolved_(x) -> {
+        let built = build_index(x.mods, x.r);
+        if len(built.diags) > 0 { bytes_concat(b"E;", dump_diags(built.diags)) } else { dump_hashes(hash_index(built.index)) }
+      },
+    }
+  };
+  string_of_bytes(bytes_concat(head, body))
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// The differential (`harness/tests/hash.rs`) is the instrument; these pin the port's own shape.
+
+test "the little-endian encoders write what the reference writes" {
+  assert_eq(u32_le(1), b"\x01\x00\x00\x00");
+  assert_eq(u32_le(0x01020304), b"\x04\x03\x02\x01");
+  assert_eq(i64_le(0 - 1), b"\xff\xff\xff\xff\xff\xff\xff\xff");
+  assert_eq(hex(b"\x00\xab\xff"), b"00abff");
+  assert_eq(i128_le_of_digits(b"256"), b"\x00\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
+}
+
+test "a float literal is read as its correctly rounded bit pattern" {
+  assert_eq(float_bits(b"1.5"), 0x3FF8000000000000);
+  assert_eq(float_bits(b"1e2"), bits_of_float(100.0));
+  assert_eq(float_bits(b"2.5e-1"), bits_of_float(0.25));
+  let parts = decimal_parts(b"1.50m");
+  assert_eq(parts.scale, 2);
+  assert_eq(bytes_at(parts.mantissa, 0), 150)
+}
+
+test "renaming a definition does not move its hash, and a change to a callee does" {
+  let a = hash_dump([{ name: b"m", src: b"fn helper(x: Int) -> Int = x + 1\nfn f() -> Int = helper(1)" }]);
+  let b = hash_dump([{ name: b"m", src: b"fn aide(x: Int) -> Int = x + 1\nfn f() -> Int = aide(1)" }]);
+  let c = hash_dump([{ name: b"m", src: b"fn helper(x: Int) -> Int = x + 2\nfn f() -> Int = helper(1)" }]);
+  let hash_of = |dump: String, name: Bytes| {
+    let d = bytes_of_string(dump);
+    let key = bytes_concat_all([b"H;", name, b";"]);
+    let start = match bytes_index_of(d, key) { Some(i) -> i + bytes_len(key), None -> panic("the dump names the definition") };
+    bytes_slice(d, start, start + 64)
+  };
+  assert_eq(hash_of(a, b"m.helper"), hash_of(b, b"m.aide"));
+  assert_eq(hash_of(a, b"m.f"), hash_of(b, b"m.f"));
+  assert(hash_of(a, b"m.f") != hash_of(c, b"m.f"))
+}
+
+test "a mutually recursive pair hashes as one component with two members" {
+  let d = bytes_of_string(hash_dump([{ name: b"m", src: b"fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) }" }]));
+  assert(match bytes_index_of(d, b"C;m.even;m.even,m.odd;") { Some(_) -> true, None -> false });
+  assert(match bytes_index_of(d, b"C;m.odd;m.even,m.odd;") { Some(_) -> true, None -> false })
+}
