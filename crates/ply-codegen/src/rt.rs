@@ -125,6 +125,10 @@ impl Tables {
         if let Some(id) = identity(v) {
             words.insert(id, w);
         }
+        // A scalar answer is its own word, with no parts to remember.
+        if heap::is_imm(w) || w == 0 {
+            return;
+        }
         let o = obj(w);
         let parts: Vec<(Word, &Value)> = match v {
             Value::Record(fields) => fields

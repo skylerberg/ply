@@ -21,7 +21,9 @@ benchmark.
   with `crates/ply-syntax` on the reference corpus, tree and diagnostics, byte
   for byte; the inputs they disagree on are the ones written in syntax that
   postdates the port (`spikes/ply-parser/GAPS.md` §11R). CI runs the differential
-  on every push (`.github/workflows/ci.yml`, job `spikes/ply-parser`).
+  on every push (`.github/workflows/ci.yml`, job `spikes/ply-parser`), every
+  phase of it under the compiled backend through `ply run --backend`, which is
+  what keeps that job at the build's length rather than the interpreter's.
 - **The call ceiling.** `iterate` gives a parser the reference's own shape —
   loops for sequences, recursion only for grammar nesting — at depth one (ADR
   0022). A raisable ceiling is refused there, with the reason.

@@ -1,6 +1,6 @@
 use super::common::{
-    IND, counters_json, describe_schema, diagnostic_json, emit_json, location, plural,
-    print_diagnostics, report_bind_error, report_load_error,
+    IND, backend_spec, build_backend, counters_json, describe_schema, diagnostic_json, emit_json,
+    location, plural, print_diagnostics, report_bind_error, report_load_error,
 };
 use crate::cli::RunArgs;
 use crate::hosts::Hosts;
@@ -152,6 +152,12 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let module = entry.module.to_string();
     let span = entry.span;
     let plan = crate::simulation::run_plan(args.seed.as_ref());
+    let backend = match compiled_backend(args.backend.as_ref(), &loaded) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            return report_bind_error("run", &[diagnostic], &loaded.sources, args.json, style);
+        }
+    };
     // The counters are process-wide and cumulative, so they mean nothing unless this run is the
     // only thing they have seen.
     ply_eval::rc::reset();
@@ -162,6 +168,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
         &plan,
         &hosts,
         declared.as_ref(),
+        backend,
     );
 
     let counters_value = counters_json(&ply_eval::rc::stats());
@@ -407,6 +414,19 @@ fn print_handshakes(hosts: &Hosts, style: Style) {
 /// Under `both`, the authoritative engine's answer is what `main` produced and the other engine's
 /// is only ever a reason to fail: a value the two disagree about must never be printed as if it
 /// were the program's.
+/// `--backend`, built over the loaded program and attached as `ply test` attaches it: the
+/// machine drops into compiled code at the leaves and the answer is what `main` produced.
+pub fn compiled_backend(
+    flag: Option<&String>,
+    loaded: &Loaded,
+) -> Result<Option<std::rc::Rc<dyn ply_eval::Compiled>>, Diagnostic> {
+    let Some(spec) = backend_spec(flag)? else {
+        return Ok(None);
+    };
+    let provider = build_backend(&spec, &loaded.program, &loaded.resolved, &loaded.check)?;
+    Ok(Some(provider.attach(&spec)))
+}
+
 fn evaluate(
     loaded: &Loaded,
     name: &str,
@@ -414,8 +434,12 @@ fn evaluate(
     plan: &Plan,
     hosts: &Hosts,
     declared: Option<&Footprint>,
+    backend: Option<std::rc::Rc<dyn ply_eval::Compiled>>,
 ) -> Result<PlyValue, Diagnostic> {
     let mut machine = Machine::new(&loaded.program, &loaded.resolved, &loaded.check);
+    if let Some(backend) = backend {
+        machine.set_compiled(backend);
+    }
     machine.set_host_binding(hosts.binding());
     if let Some(runtime) = hosts.runtime() {
         machine.set_host_runtime(runtime);
