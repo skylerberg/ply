@@ -20,7 +20,7 @@ fn class_of(arity: usize) -> Option<usize> {
 }
 
 /// A vector with room for `arity` arguments and nothing in it.
-pub(crate) fn take(arity: usize) -> Vec<Value> {
+pub fn take(arity: usize) -> Vec<Value> {
     if let Some(class) = class_of(arity) {
         let recycled = FREE
             .try_with(|free| free.borrow_mut()[class].pop())
@@ -36,14 +36,14 @@ pub(crate) fn take(arity: usize) -> Vec<Value> {
 
 /// A pooled vector holding exactly `values`, for a builtin handing arguments to the function it
 /// calls: the callee drains it and gives it back, so a loop's callback steps allocate nothing.
-pub(crate) fn of<const N: usize>(values: [Value; N]) -> Vec<Value> {
+pub fn of<const N: usize>(values: [Value; N]) -> Vec<Value> {
     let mut out = take(N);
     out.extend(values);
     out
 }
 
 /// Takes back a vector the callee has finished with.
-pub(crate) fn give(args: Vec<Value>) {
+pub fn give(args: Vec<Value>) {
     if !args.is_empty() {
         return;
     }

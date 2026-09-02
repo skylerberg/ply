@@ -6,7 +6,7 @@
 #![allow(clippy::arc_with_non_send_sync)]
 
 pub mod arena;
-mod argv;
+pub mod argv;
 pub mod backend;
 pub mod builtins;
 pub mod census;
@@ -25,7 +25,7 @@ pub mod list;
 pub use list::List;
 pub mod machine;
 pub mod map;
-mod memo;
+pub mod memo;
 mod pool;
 pub mod rc;
 pub mod region;

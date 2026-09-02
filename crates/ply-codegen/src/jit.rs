@@ -14,11 +14,13 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use ply_eval::code::{Arm, Pat, Stmt, lower_fn};
+use ply_eval::rc::Own;
 use ply_eval::{Builtin, Code, NodeKind, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{BinOp, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// A compiled function: `extern "C" fn(ctx, args) -> handle`.
@@ -90,6 +92,8 @@ struct Helpers {
     fold: FuncId,
     iterate: FuncId,
     shift_count: FuncId,
+    dup: FuncId,
+    constant: FuncId,
 }
 
 /// A lambda met while lowering a body: declared where it was met, so the closure that names it
@@ -160,6 +164,9 @@ pub struct Jit {
     fields: Vec<Symbol>,
     builtins: Vec<Builtin>,
     funcs: HashMap<String, (FuncId, usize, usize)>,
+    /// The nullary functions whose published row is pure: called through `rt_constant`, which
+    /// remembers their value the way the machine's memo does.
+    constants: HashSet<FuncId>,
     helpers: Helpers,
     nodes: HashMap<String, usize>,
     /// Every function a closure may name, by the index `rt_closure` is handed.
@@ -245,6 +252,7 @@ impl Jit {
                 fields: jit.fields,
                 builtins: jit.builtins,
                 functions,
+                memo: RefCell::new(Vec::new()),
             }),
             nodes: jit.nodes,
             compile_nanos,
@@ -363,10 +371,10 @@ impl Jit {
             list_at: declare(&mut module, "rt_list_at", 3, true)?,
             list_rest: declare(&mut module, "rt_list_rest", 3, true)?,
             ctor_is: declare(&mut module, "rt_ctor_is", 3, true)?,
-            ctor_arg: declare(&mut module, "rt_ctor_arg", 3, true)?,
+            ctor_arg: declare(&mut module, "rt_ctor_arg", 4, true)?,
             record: declare(&mut module, "rt_record", 4, true)?,
             record_update: declare(&mut module, "rt_record_update", 5, true)?,
-            field: declare(&mut module, "rt_field", 3, true)?,
+            field: declare(&mut module, "rt_field", 4, true)?,
             no_fuel: declare(&mut module, "rt_no_fuel", 1, false)?,
             closure: declare(&mut module, "rt_closure", 5, true)?,
             builtin_value: declare(&mut module, "rt_builtin_value", 2, true)?,
@@ -377,6 +385,8 @@ impl Jit {
             fold: declare(&mut module, "rt_fold", 4, true)?,
             iterate: declare(&mut module, "rt_iterate", 4, true)?,
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
+            dup: declare(&mut module, "rt_dup", 2, true)?,
+            constant: declare(&mut module, "rt_constant", 2, true)?,
         };
 
         let mut jit = Jit {
@@ -388,6 +398,7 @@ impl Jit {
             fields: Vec::new(),
             builtins: Vec::new(),
             funcs: HashMap::new(),
+            constants: HashSet::new(),
             helpers,
             nodes: HashMap::new(),
             functions: Vec::new(),
@@ -406,6 +417,11 @@ impl Jit {
             jit.funcs
                 .insert((*name).to_string(), (id, def.params.len(), module_index));
             jit.functions.push(id);
+            if def.params.is_empty()
+                && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(name))
+            {
+                jit.constants.insert(id);
+            }
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
             // With the parameters as the window's leading slots, so a lambda that reads one
             // captures it rather than reading a global that does not exist.
@@ -717,6 +733,54 @@ impl Fx<'_, '_> {
         self.builder.ins().call(func, &all);
     }
 
+    /// A value about to be consumed — handed to a helper that takes its arguments, bound by a
+    /// `let`, captured by a closure. A local read at the binding's last use (`Own::Owned`, the
+    /// lowering's mark) is the slot's own handle and is taken; a local read anywhere else is
+    /// first duplicated into a fresh slot, Perceus's `dup`, so the binding's slot survives the
+    /// take. Everything else is a temporary already. A read that only looks — a field, an
+    /// unbox, a comparison, a pattern test — takes nothing and uses the slot as it is, so it pins
+    /// no record: a duplicate that stayed in a slot would hold the record shared until the entry
+    /// ended and cost every later update its reuse.
+    fn consumed(&mut self, code: &Code, scope: &mut Scope) -> Result<Val> {
+        let val = self.expr(code, scope)?;
+        if self.is_borrowed_local(code, scope) && val.kind == Kind::Boxed {
+            let v = self.helper(self.jit.helpers.dup, &[val.v]);
+            return Ok(Val {
+                kind: Kind::Boxed,
+                v,
+            });
+        }
+        Ok(val)
+    }
+
+    /// A captured value, by the capture's own mark.
+    fn captured(&mut self, own: Own, val: Val) -> Val {
+        if own == Own::Owned || val.kind != Kind::Boxed {
+            return val;
+        }
+        let v = self.helper(self.jit.helpers.dup, &[val.v]);
+        Val {
+            kind: Kind::Boxed,
+            v,
+        }
+    }
+
+    fn is_local(&self, code: &Code, scope: &Scope) -> bool {
+        matches!(&code.kind, NodeKind::Var { name: q, .. }
+            if q.is_bare() && scope.iter().any(|(s, _)| s == q.symbol()))
+    }
+
+    fn is_borrowed_local(&self, code: &Code, scope: &Scope) -> bool {
+        code.own != Own::Owned && self.is_local(code, scope)
+    }
+
+    /// Whether `arg` is a local whose read here is the binding's last.
+    fn last_use_of_local(&self, arg: &Code, scope: &Scope) -> bool {
+        arg.own == Own::Owned
+            && matches!(&arg.kind, NodeKind::Var { name: q, .. }
+                if q.is_bare() && scope.iter().any(|(s, _)| s == q.symbol()))
+    }
+
     /// The argument array a call is handed: one stack slot, one store per argument, and every value
     /// boxed at the boundary.
     fn spill(&mut self, handles: &[cranelift_codegen::ir::Value]) -> cranelift_codegen::ir::Value {
@@ -1008,7 +1072,7 @@ impl Fx<'_, '_> {
                 for s in stmts.iter() {
                     match s {
                         Stmt::Let { pat, value, .. } => {
-                            let v = self.expr(value, &mut inner)?;
+                            let v = self.consumed(value, &mut inner)?;
                             match pat {
                                 Pat::Var { name, .. } => inner.push((name.name.clone(), v)),
                                 Pat::Wildcard => {}
@@ -1040,13 +1104,13 @@ impl Fx<'_, '_> {
                 let mut names = Vec::with_capacity(copies.len() + sets.len());
                 let mut handles = Vec::with_capacity(sets.len());
                 for (name, value) in sets.iter() {
-                    let v = self.expr(value, scope)?;
+                    let v = self.consumed(value, scope)?;
                     let h = self.boxed(v);
                     names.push(name.clone());
                     handles.push(h);
                 }
                 names.extend(copies.iter().map(|c| c.name.clone()));
-                let base = self.expr(base, scope)?;
+                let base = self.consumed(base, scope)?;
                 let base = self.boxed(base);
                 let shape = self.jit.shapes.len();
                 self.jit.shapes.push(names);
@@ -1067,7 +1131,7 @@ impl Fx<'_, '_> {
                 let mut names = Vec::with_capacity(fields.len());
                 let mut handles = Vec::with_capacity(fields.len());
                 for (name, value) in fields.iter() {
-                    let v = self.expr(value, scope)?;
+                    let v = self.consumed(value, scope)?;
                     let h = self.boxed(v);
                     names.push(name.clone());
                     handles.push(h);
@@ -1093,13 +1157,14 @@ impl Fx<'_, '_> {
                 // The captured values are the closure's environment and the body's leading
                 // parameters, in the order the lowering named them.
                 let mut env = Vec::with_capacity(captures.len());
-                for name in &captures.names {
+                for (name, own) in captures.names.iter().zip(&captures.owns) {
                     let Some((_, val)) = scope.iter().rev().find(|(s, _)| s == name) else {
                         return self.refuse(format!(
                             "a lambda capturing `{name}`, which is not a local of its body"
                         ));
                     };
-                    let handle = self.boxed(*val);
+                    let val = self.captured(*own, *val);
+                    let handle = self.boxed(val);
                     env.push(handle);
                 }
                 let index = self.jit.functions.len();
@@ -1130,12 +1195,25 @@ impl Fx<'_, '_> {
                 })
             }
 
-            NodeKind::Field { base, field } => {
-                let base = self.expr(base, scope)?;
+            NodeKind::Field { base: b, field } => {
+                // 0: a read of a local's record, which stays; 1: the local's last use, so the
+                // record is taken; 2: this field's last use while the record stays; 3: the base
+                // is a temporary, taken so it pins nothing.
+                let own = if self.last_use_of_local(b, scope) {
+                    1
+                } else if code.own == Own::OwnedField && self.is_local(b, scope) {
+                    2
+                } else if self.is_local(b, scope) {
+                    0
+                } else {
+                    3
+                };
+                let base = self.expr(b, scope)?;
                 let base = self.boxed(base);
                 let index = self.field_index(&field.name);
                 let index = self.builder.ins().iconst(types::I64, index);
-                let v = self.helper(self.jit.helpers.field, &[base, index]);
+                let own = self.builder.ins().iconst(types::I64, own);
+                let v = self.helper(self.jit.helpers.field, &[base, index, own]);
                 self.check();
                 Ok(Val {
                     kind: Kind::Boxed,
@@ -1146,7 +1224,7 @@ impl Fx<'_, '_> {
             NodeKind::List { items } => {
                 let mut handles = Vec::with_capacity(items.len());
                 for item in items.iter() {
-                    let v = self.expr(item, scope)?;
+                    let v = self.consumed(item, scope)?;
                     let h = self.boxed(v);
                     handles.push(h);
                 }
@@ -1390,18 +1468,19 @@ impl Fx<'_, '_> {
     fn app(&mut self, func: &Code, args: &[Code], scope: &mut Scope) -> Result<Val> {
         let NodeKind::Var { name: q, .. } = &func.kind else {
             // The callee is a value: evaluate it, then the arguments, then call through it.
-            let callee = self.expr(func, scope)?;
+            let callee = self.consumed(func, scope)?;
             let callee = self.boxed(callee);
             return self.call_value(callee, args, scope);
         };
         let denotes = self.denotation(q, scope)?;
         if let Denotes::Local(v) = denotes {
-            let callee = self.boxed(v);
+            let callee = self.captured(func.own, v);
+            let callee = self.boxed(callee);
             return self.call_value(callee, args, scope);
         }
         let mut handles = Vec::with_capacity(args.len());
         for a in args {
-            let v = self.expr(a, scope)?;
+            let v = self.consumed(a, scope)?;
             let h = self.boxed(v);
             handles.push(h);
         }
@@ -1415,6 +1494,18 @@ impl Fx<'_, '_> {
                         handles.len()
                     ));
                 }
+                if arity == 0 && self.jit.constants.contains(&id) {
+                    let index = self.function_index(id);
+                    let index = self.builder.ins().iconst(types::I64, index as i64);
+                    let v = self.helper(self.jit.helpers.constant, &[index]);
+                    self.check();
+                    return Ok(Val {
+                        kind: Kind::Boxed,
+                        v,
+                    });
+                }
+                // A compiled callee owns its parameters — each handle is a last use or a fresh
+                // duplicate by the read rule — and takes each at its own last use.
                 let ptr = self.spill(&handles);
                 let callee = self.jit.module.declare_func_in_func(id, self.builder.func);
                 let call = self.builder.ins().call(callee, &[self.ctx, ptr]);
@@ -1495,7 +1586,7 @@ impl Fx<'_, '_> {
     ) -> Result<Val> {
         let mut handles = Vec::with_capacity(args.len());
         for a in args {
-            let v = self.expr(a, scope)?;
+            let v = self.consumed(a, scope)?;
             let h = self.boxed(v);
             handles.push(h);
         }
@@ -1700,7 +1791,8 @@ impl Fx<'_, '_> {
                     self.builder.switch_to_block(cur);
                     self.builder.seal_block(cur);
                     let at = self.builder.ins().iconst(types::I64, i as i64);
-                    let sub = self.helper(self.jit.helpers.ctor_arg, &[base, at]);
+                    let read = self.builder.ins().iconst(types::I64, 0);
+                    let sub = self.helper(self.jit.helpers.ctor_arg, &[base, at, read]);
                     self.check();
                     let next = self.builder.create_block();
                     self.test_pattern(
@@ -1746,7 +1838,10 @@ impl Fx<'_, '_> {
                     }
                     self.builder.switch_to_block(present);
                     self.builder.seal_block(present);
-                    let field = self.helper(self.jit.helpers.field, &[base, index]);
+                    let field = {
+                        let borrowed = self.builder.ins().iconst(types::I64, 0);
+                        self.helper(self.jit.helpers.field, &[base, index, borrowed])
+                    };
                     self.check();
                     let next = self.builder.create_block();
                     self.test_pattern(
@@ -1777,7 +1872,17 @@ impl Fx<'_, '_> {
     }
 
     /// The bindings a pattern makes, emitted in the block that has already committed to the arm.
-    fn bind_pattern(&mut self, pat: &Pat, value: Val, scope: &mut Scope) -> Result<()> {
+    /// Binds a pattern's names. `moving`: the value is a temporary or a local at its last use,
+    /// so a bound field or constructor argument is moved out of a record or constructor nothing
+    /// else holds rather than cloned — a bound value is itself a temporary, so the binds below it
+    /// always move.
+    fn bind_pattern(
+        &mut self,
+        pat: &Pat,
+        value: Val,
+        moving: bool,
+        scope: &mut Scope,
+    ) -> Result<()> {
         match pat {
             Pat::Wildcard => {}
             Pat::Var { name: id, .. } => {
@@ -1801,6 +1906,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v,
                         },
+                        true,
                         scope,
                     )?;
                 }
@@ -1826,7 +1932,8 @@ impl Fx<'_, '_> {
                         continue;
                     }
                     let i = self.builder.ins().iconst(types::I64, i as i64);
-                    let v = self.helper(self.jit.helpers.ctor_arg, &[base, i]);
+                    let take = self.builder.ins().iconst(types::I64, i64::from(moving));
+                    let v = self.helper(self.jit.helpers.ctor_arg, &[base, i, take]);
                     self.check();
                     self.bind_pattern(
                         arg,
@@ -1834,6 +1941,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v,
                         },
+                        true,
                         scope,
                     )?;
                 }
@@ -1846,7 +1954,14 @@ impl Fx<'_, '_> {
                     }
                     let index = self.field_index(&name.name);
                     let index = self.builder.ins().iconst(types::I64, index);
-                    let v = self.helper(self.jit.helpers.field, &[base, index]);
+                    let v = {
+                        // 2 moves the field out in place when the record is unshared; 0 reads.
+                        let own = self
+                            .builder
+                            .ins()
+                            .iconst(types::I64, if moving { 2 } else { 0 });
+                        self.helper(self.jit.helpers.field, &[base, index, own])
+                    };
                     self.check();
                     self.bind_pattern(
                         sub,
@@ -1854,6 +1969,7 @@ impl Fx<'_, '_> {
                             kind: Kind::Boxed,
                             v,
                         },
+                        true,
                         scope,
                     )?;
                 }
@@ -1880,7 +1996,10 @@ impl Fx<'_, '_> {
             self.builder.switch_to_block(body_block);
             self.builder.seal_block(body_block);
             let mut inner = scope.clone();
-            self.bind_pattern(&arm.pat, value, &mut inner)?;
+            // A scrutinee that is a local still read afterwards keeps its fields; anything else
+            // — a temporary, or a local at its last use — gives them up.
+            let moving = !self.is_borrowed_local(scrutinee, scope);
+            self.bind_pattern(&arm.pat, value, moving, &mut inner)?;
             let body = self.expr(&arm.body, &mut inner)?;
             let body = self.boxed(body);
             self.builder.ins().jump(join, &[BlockArg::Value(body)]);
