@@ -155,8 +155,13 @@ measurement is confounded until the earlier one has moved.
    spelling), `?` inside lambdas (§2, `E0118` — **landed**: a lambda may write
    `-> T` before a block body and `?` reads it; an `iterate` step answers `Iter`
    and can never carry one), `?` as a `let`'s value inside a branch (`E0119`),
-   keywords reserved in the field namespace (§6), an expression-position
-   `unreachable` (§8), and §9's small pieces. Float construction is ADR 0020's
+   keywords reserved in the field namespace (§6 — **landed**: a keyword names
+   a field wherever a field is named, and only the punned forms, which bind a
+   variable too, are refused; the spike's own parser has not followed yet, so
+   its corpus carries none), an expression-position `unreachable` (§8 — the
+   expression exists: `panic` is typed `String -> a`, and what the spike wanted
+   beyond it was a placeholder *visible in the differential*, which is the
+   spike's choice rather than a gap), and §9's small pieces. Float construction is ADR 0020's
    one absolute hole. Each is an ordinary language
    change under ADR 0001's rule that no existing hash may move, and each moves
    `docs/GUIDE.md` in the same change.

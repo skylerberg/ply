@@ -16,6 +16,7 @@ mod hoist_staleness_audit;
 mod host_boundary;
 mod host_linearity_audit;
 mod host_trust_audit;
+mod keyword_fields;
 mod lambda_return;
 mod list_builtins;
 mod map_builtins;
