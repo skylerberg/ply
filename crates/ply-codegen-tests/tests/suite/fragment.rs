@@ -155,6 +155,24 @@ fn turned(x: Int, n: Int) -> Int = rotr32(x, n)
 fn wrapping(a: Int, b: Int) -> Int = wrap_add(a, b) + wrap_sub(a, b) + wrap_mul(a, b)
 
 fn turned_by_name(x: Int) -> Int = { let n = 4; let k = 32 - n; rotr32(x, n) + (x << k) }
+
+fn width_of(p: Pair) -> Int = p.x * 10 + p.y
+
+fn takes(p: Pair) -> Int = match p { {x, y} -> x - y }
+
+fn lent_then_read(n: Int) -> Int = { let p = {x: n, y: 1}; width_of(p) + p.x }
+
+fn lent_beside_a_move(n: Int) -> Int = { let p = {x: n, y: 2}; width_of(p) + takes(p) }
+
+fn lent_and_moved_in_order(n: Int) -> Int = { let p = {x: n, y: 3}; summed(width_of(p), takes(p)) }
+
+fn summed(a: Int, b: Int) -> Int = a + b
+
+fn lent_per_step(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + width_of({x: i, y: i}))
+
+fn read_by_step(acc: Pair, i: Int) -> Int = acc.x + i
+
+fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, |acc: Int, i: Int| acc + read_by_step(p, i)) + p.y }
 "#;
 
 fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
@@ -405,6 +423,26 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
             "m.turned_by_name",
             vec![Value::Int(1)],
             Value::Int(0x1000_0000 + (1 << 28)),
+        ),
+        // A callee that only reads a record borrows it: the caller's hold outlives the call,
+        // beside a later read, beside a call that takes it, and inside a step called per
+        // iteration.
+        ("m.lent_then_read", vec![Value::Int(4)], Value::Int(41 + 4)),
+        (
+            "m.lent_beside_a_move",
+            vec![Value::Int(5)],
+            Value::Int(52 + 3),
+        ),
+        (
+            "m.lent_and_moved_in_order",
+            vec![Value::Int(6)],
+            Value::Int(63 + 3),
+        ),
+        ("m.lent_per_step", vec![Value::Int(3)], Value::Int(11 + 22)),
+        (
+            "m.lent_to_a_step",
+            vec![Value::Int(7)],
+            Value::Int(7 * 3 + 3),
         ),
     ];
     for (name, args, want) in cases {
