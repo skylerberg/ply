@@ -174,24 +174,75 @@ pub struct Layouts {
     shapes: RefCell<Shapes>,
     pub ctors: Vec<(Symbol, usize)>,
     ctor_ids: HashMap<Symbol, u32>,
+    /// The prelude constructors the runtime builds itself, resolved once.
+    pub some: Option<u32>,
+    pub none: Option<u32>,
+    pub stop: Option<u32>,
+    pub go: Option<u32>,
+    /// Per shape, the offset of each field name the compiled unit reads by index, filled on the
+    /// shape's first such read so a lookup is a load rather than a search over symbols.
+    offsets: RefCell<Vec<Option<Box<[u16]>>>>,
+    /// The shape of a `{key, value}` entry, interned once.
+    entry_shape: u32,
 }
+
+/// No field at that index.
+const NO_FIELD: u16 = u16::MAX;
 
 impl Layouts {
     pub fn new(ctors: Vec<(Symbol, usize)>) -> Layouts {
-        let ctor_ids = ctors
+        let ctor_ids: HashMap<Symbol, u32> = ctors
             .iter()
             .enumerate()
             .map(|(i, (n, _))| (n.clone(), i as u32))
             .collect();
+        let by = |name: &str| ctor_ids.get(&Symbol::new(name)).copied();
+        let (some, none, stop, go) = (by("Some"), by("None"), by("Stop"), by("Continue"));
+        let mut shapes = Shapes::default();
+        let entry_shape = shapes.intern(vec![Symbol::new("key"), Symbol::new("value")]);
         Layouts {
-            shapes: RefCell::new(Shapes::default()),
+            shapes: RefCell::new(shapes),
             ctors,
             ctor_ids,
+            some,
+            none,
+            stop,
+            go,
+            offsets: RefCell::new(Vec::new()),
+            entry_shape,
         }
     }
 
     pub fn ctor_index(&self, name: &Symbol) -> Option<u32> {
         self.ctor_ids.get(name).copied()
+    }
+
+    pub fn entry_shape(&self) -> u32 {
+        self.entry_shape
+    }
+
+    /// The offset of the field named at `index` in `names`, in `shape`: cached per shape over
+    /// every name the unit reads, so that after the first read it is one load.
+    pub fn offset_by_index(&self, shape: u32, index: usize, names: &[Symbol]) -> Option<usize> {
+        {
+            let offsets = self.offsets.borrow();
+            if let Some(Some(row)) = offsets.get(shape as usize)
+                && let Some(at) = row.get(index)
+            {
+                return (*at != NO_FIELD).then_some(*at as usize);
+            }
+        }
+        let row: Box<[u16]> = names
+            .iter()
+            .map(|name| self.offset(shape, name).map_or(NO_FIELD, |at| at as u16))
+            .collect();
+        let at = row.get(index).copied();
+        let mut offsets = self.offsets.borrow_mut();
+        if offsets.len() <= shape as usize {
+            offsets.resize(shape as usize + 1, None);
+        }
+        offsets[shape as usize] = Some(row);
+        at.and_then(|at| (at != NO_FIELD).then_some(at as usize))
     }
 
     /// The id of the shape with exactly these fields, in any order.
@@ -555,6 +606,19 @@ pub fn inc(w: Word) {
 pub fn dec(w: Word) {
     if is_imm(w) {
         return;
+    }
+    // The common case allocates nothing: a holder that is not the last just counts down.
+    let o = obj(w);
+    unsafe {
+        if (*o).rc == IMMORTAL {
+            return;
+        }
+        debug_assert!((*o).kind != KIND_DEAD, "a dead object was released again");
+        if (*o).rc > 1 {
+            (*o).rc -= 1;
+            return;
+        }
+        (*o).rc = 1;
     }
     let mut pending = vec![w];
     while let Some(w) = pending.pop() {
