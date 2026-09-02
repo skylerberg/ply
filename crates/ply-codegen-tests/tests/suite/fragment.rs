@@ -113,6 +113,32 @@ fn aliased(n: Int) -> Int = {
   let u = {..t, value: 99};
   s.value + u.value
 }
+
+type Pair = { x: Int, y: Int }
+
+fn spin(p: Pair) -> Pair = { let a = p.x; let b = p.y; {x: b + 1, y: a} }
+
+fn spun(n: Int) -> Int = { let p = iterate({x: n, y: 0}, 100, |q: Pair| if q.x > 40 { Stop(q) } else { Continue(spin(q)) }); p.x * 100 + p.y }
+
+fn shared(n: Int) -> Int = { let p = {x: n, y: 1}; let q = spin(p); p.x * 1000 + q.x * 10 + q.y }
+
+fn swapped(n: Int) -> Int = { let p = {x: n, y: 7}; let q = {x: p.y, y: p.x}; let r = {x: q.y, y: q.x}; p.x + q.x * 10 + r.y * 100 }
+
+fn leftover(p: Pair, b: Bool) -> Int = { let s = p.x + p.y; if b { let q = {x: s, y: 0}; q.x } else { s } }
+
+fn boxed_field(n: Int) -> Int = { let h = {left: step(n), right: n}; let v = h.left.value; let k = {left: step(v), right: h.right}; k.left.value + k.right }
+
+fn counted(n: Int) -> Map<Int, Int> = fold(range(0, n), map_new(), |m: Map<Int, Int>, i: Int| map_insert(m, i % 3, i))
+
+fn looked_up(n: Int) -> Int = match map_get(counted(n), 1) { Some(v) -> v * 10, None -> 0 - 1 }
+
+fn looked_up_any(n: Int) -> Int = match map_get(counted(n), 1) { None -> 0 - 1, _ -> 7 }
+
+fn looked_up_nested(n: Int) -> Int = match map_get(counted(n), 2) { Some(5) -> 55, Some(v) -> v, None -> 0 - 1 }
+
+fn looked_up_twice(n: Int) -> Int = { let m = counted(n); match map_get(m, 0) { Some(a) -> match map_get(m, 1) { Some(b) -> a + b, None -> a }, None -> 0 } }
+
+fn looked_up_by_list(n: Int) -> Int = { let m = map_insert(map_new(), [n, n + 1], n); match map_get(m, [n, n + 1]) { Some(v) -> v, None -> 0 - 1 } }
 "#;
 
 fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
@@ -241,6 +267,7 @@ fn a_compiled_body_answers_what_the_interpreter_answers() {
 /// These paths are compiled by every census over the parser but entered by no workload measured
 /// so far, so without this the fixpoint's own count is the only thing vouching for them.
 #[test]
+#[allow(clippy::arc_with_non_send_sync)]
 fn a_compiled_body_answers_over_concat_and_nested_patterns() {
     let (_, unit) = unit(SHAPES);
     let cases: &[(&str, Vec<Value>, Value)] = &[
@@ -260,6 +287,50 @@ fn a_compiled_body_answers_over_concat_and_nested_patterns() {
         ("m.aliased", vec![Value::Int(4)], Value::Int(103)),
         ("m.listed", vec![Value::Int(5)], Value::Int(7)),
         ("m.joined", vec![Value::Int(11)], Value::Int(11)),
+        // A record rebuilt from a dying one of its width takes the dying one's memory
+        // (ADR 0036, Decision 8); one still held elsewhere is left where it is, and a literal
+        // written from a base of another shape, or from one read later, is built as written.
+        ("m.spun", vec![Value::Int(1)], Value::Int(4_140)),
+        ("m.shared", vec![Value::Int(3)], Value::Int(3_023)),
+        ("m.swapped", vec![Value::Int(2)], Value::Int(772)),
+        (
+            "m.leftover",
+            vec![
+                Value::Record(std::sync::Arc::new(
+                    [("x", Value::Int(4)), ("y", Value::Int(5))]
+                        .into_iter()
+                        .map(|(k, v)| (Symbol::new(k), v))
+                        .collect(),
+                )),
+                Value::Bool(true),
+            ],
+            Value::Int(9),
+        ),
+        (
+            "m.leftover",
+            vec![
+                Value::Record(std::sync::Arc::new(
+                    [("x", Value::Int(4)), ("y", Value::Int(5))]
+                        .into_iter()
+                        .map(|(k, v)| (Symbol::new(k), v))
+                        .collect(),
+                )),
+                Value::Bool(false),
+            ],
+            Value::Int(9),
+        ),
+        ("m.boxed_field", vec![Value::Int(4)], Value::Int(8)),
+        // A `match` over `map_get` whose arms only ask whether the key was found builds no
+        // constructor: the value found, or nothing, is tested directly.
+        ("m.looked_up", vec![Value::Int(6)], Value::Int(40)),
+        ("m.looked_up", vec![Value::Int(1)], Value::Int(-1)),
+        ("m.looked_up_any", vec![Value::Int(2)], Value::Int(7)),
+        ("m.looked_up_any", vec![Value::Int(1)], Value::Int(-1)),
+        ("m.looked_up_nested", vec![Value::Int(6)], Value::Int(55)),
+        ("m.looked_up_nested", vec![Value::Int(3)], Value::Int(2)),
+        ("m.looked_up_nested", vec![Value::Int(2)], Value::Int(-1)),
+        ("m.looked_up_twice", vec![Value::Int(6)], Value::Int(7)),
+        ("m.looked_up_by_list", vec![Value::Int(4)], Value::Int(4)),
     ];
     for (name, args, want) in cases {
         assert_eq!(

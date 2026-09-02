@@ -19,6 +19,9 @@ use std::collections::HashSet;
 const INLINE_BUDGET: usize = 64;
 /// How many times a callee's own calls are inlined in turn.
 const INLINE_DEPTH: usize = 2;
+/// A callee no larger than this that calls nothing is inlined however deep the site: a mask or
+/// a shift written as a function costs a call at the depth the budget runs out otherwise.
+const TINY_LEAF: usize = 8;
 
 /// `def`'s body, rewritten.
 pub fn optimize(loaded: &Source, module_index: usize, def: &FnDef) -> Expr {
@@ -28,9 +31,153 @@ pub fn optimize(loaded: &Source, module_index: usize, def: &FnDef) -> Expr {
     let body = cx.inline(&def.body, &def.name.name, INLINE_DEPTH, &mut scope);
     let body = scalarize(body);
     if std::env::var("PLY_OPT_DUMP").is_ok_and(|want| want == def.name.name.as_str()) {
-        eprintln!("optimized `{}`:\n{body:#?}", def.name.name);
+        let mut text = String::new();
+        render(&body, &mut text, 1);
+        eprintln!("optimized `{}`:\n{text}", def.name.name);
     }
     body
+}
+
+/// The expression as Ply-like text, one statement per line, for `PLY_OPT_DUMP`.
+fn render(e: &Expr, out: &mut String, depth: usize) {
+    use std::fmt::Write;
+    let pad = |out: &mut String, depth: usize| out.push_str(&"  ".repeat(depth));
+    match &e.kind {
+        ExprKind::Lit(l) => write!(out, "{l:?}").unwrap(),
+        ExprKind::Var(q) => out.push_str(q.name.name.as_str()),
+        ExprKind::Binary { op, lhs, rhs } => {
+            out.push('(');
+            render(lhs, out, depth);
+            write!(out, " {op:?} ").unwrap();
+            render(rhs, out, depth);
+            out.push(')');
+        }
+        ExprKind::Unary { op, operand } => {
+            write!(out, "{op:?}(").unwrap();
+            render(operand, out, depth);
+            out.push(')');
+        }
+        ExprKind::App { func, args, .. } => {
+            render(func, out, depth);
+            out.push('(');
+            for (i, a) in args.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render(a, out, depth);
+            }
+            out.push(')');
+        }
+        ExprKind::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            out.push_str("if ");
+            render(cond, out, depth);
+            out.push_str(" then ");
+            render(then_branch, out, depth);
+            out.push_str(" else ");
+            render(else_branch, out, depth);
+        }
+        ExprKind::Block { stmts, tail } => {
+            out.push_str("{\n");
+            for s in stmts {
+                pad(out, depth);
+                match s {
+                    Stmt::Let { pat, value, .. } => {
+                        write!(out, "let {} = ", render_pat(pat)).unwrap();
+                        render(value, out, depth + 1);
+                    }
+                    Stmt::Expr(x) => render(x, out, depth + 1),
+                }
+                out.push_str(";\n");
+            }
+            if let Some(t) = tail {
+                pad(out, depth);
+                render(t, out, depth + 1);
+                out.push('\n');
+            }
+            pad(out, depth - 1);
+            out.push('}');
+        }
+        ExprKind::Record { fields } => {
+            out.push('{');
+            for (i, (n, x)) in fields.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                write!(out, "{}: ", n.name).unwrap();
+                render(x, out, depth);
+            }
+            out.push('}');
+        }
+        ExprKind::RecordUpdate { base, fields } => {
+            out.push_str("{..");
+            render(base, out, depth);
+            for (n, x) in fields {
+                write!(out, ", {}: ", n.name).unwrap();
+                render(x, out, depth);
+            }
+            out.push('}');
+        }
+        ExprKind::Field { base, field } => {
+            render(base, out, depth);
+            write!(out, ".{}", field.name).unwrap();
+        }
+        ExprKind::List { items } => {
+            out.push('[');
+            for (i, x) in items.iter().enumerate() {
+                if i > 0 {
+                    out.push_str(", ");
+                }
+                render(x, out, depth);
+            }
+            out.push(']');
+        }
+        ExprKind::Match { scrutinee, arms } => {
+            out.push_str("match ");
+            render(scrutinee, out, depth);
+            out.push_str(" {\n");
+            for arm in arms {
+                pad(out, depth);
+                write!(out, "{} -> ", render_pat(&arm.pat)).unwrap();
+                render(&arm.body, out, depth + 1);
+                out.push_str(";\n");
+            }
+            pad(out, depth - 1);
+            out.push('}');
+        }
+        other => write!(out, "<{}>", std::any::type_name_of_val(other)).unwrap(),
+    }
+}
+
+fn render_pat(p: &Pattern) -> String {
+    match &p.kind {
+        PatternKind::Wildcard => "_".to_string(),
+        PatternKind::Lit(l) => format!("{l:?}"),
+        PatternKind::Var(id) => id.name.to_string(),
+        PatternKind::Ctor { name, args } => format!(
+            "{}({})",
+            name.name.name,
+            args.iter().map(render_pat).collect::<Vec<_>>().join(", ")
+        ),
+        PatternKind::Record { fields, rest } => format!(
+            "{{{}{}}}",
+            fields
+                .iter()
+                .map(|(n, sub)| format!("{}: {}", n.name, render_pat(sub)))
+                .collect::<Vec<_>>()
+                .join(", "),
+            if *rest { ", .." } else { "" }
+        ),
+        PatternKind::List { items, rest } => format!(
+            "[{}{}]",
+            items.iter().map(render_pat).collect::<Vec<_>>().join(", "),
+            rest.as_ref()
+                .map_or(String::new(), |r| format!(", ..{}", render_pat(r)))
+        ),
+    }
 }
 
 struct Cx<'a> {
@@ -65,14 +212,13 @@ impl<'a> Cx<'a> {
     fn inline(&mut self, e: &Expr, caller: &Symbol, depth: usize, scope: &mut Vec<Symbol>) -> Expr {
         let span = e.span;
         let site = match &e.kind {
-            ExprKind::App { func, args, named } if named.is_empty() && depth > 0 => {
-                match &func.kind {
-                    ExprKind::Var(q) if q.is_bare() && !scope.contains(&q.name.name) => self
-                        .callee(&q.name.name, caller, args.len())
-                        .map(|def| (def, args)),
-                    _ => None,
-                }
-            }
+            ExprKind::App { func, args, named } if named.is_empty() => match &func.kind {
+                ExprKind::Var(q) if q.is_bare() && !scope.contains(&q.name.name) => self
+                    .callee(&q.name.name, caller, args.len())
+                    .filter(|def| depth > 0 || tiny_leaf(&def.body))
+                    .map(|def| (def, args)),
+                _ => None,
+            },
             _ => None,
         };
         let kind = match site {
@@ -112,7 +258,12 @@ impl<'a> Cx<'a> {
                     inner_scope.push(fresh);
                 }
                 let body = self.freshen(&def.body, &mut env);
-                let body = self.inline(&body, &def.name.name, depth - 1, &mut inner_scope);
+                let body = self.inline(
+                    &body,
+                    &def.name.name,
+                    depth.saturating_sub(1),
+                    &mut inner_scope,
+                );
                 ExprKind::Block {
                     stmts,
                     tail: Some(Box::new(body)),
@@ -444,6 +595,12 @@ fn inlinable(e: &Expr) -> bool {
     ok
 }
 
+fn tiny_leaf(e: &Expr) -> bool {
+    let mut calls = false;
+    walk(e, &mut |x| calls |= matches!(x.kind, ExprKind::App { .. }));
+    !calls && size(e) <= TINY_LEAF
+}
+
 fn size(e: &Expr) -> usize {
     let mut n = 0;
     walk(e, &mut |_| n += 1);
@@ -703,33 +860,37 @@ fn scalarize(e: Expr) -> Expr {
                         value,
                         span,
                     } => {
-                        let value = scalarize(*value);
-                        let value_span = value.span;
+                        let mut value = scalarize(*value);
+                        let var = matches!(pat.kind, PatternKind::Var(_));
                         // A block bound by a `let` opens into the block around it when every
-                        // name it binds is the inliner's, since those shadow nothing outside.
-                        match value.kind {
-                            ExprKind::Block {
-                                stmts: inner,
-                                tail: Some(inner_tail),
-                            } if matches!(pat.kind, PatternKind::Var(_)) && all_fresh(&inner) => {
-                                flat.extend(inner);
-                                flat.push(Stmt::Let {
-                                    pat,
-                                    ty,
-                                    value: inner_tail,
-                                    span,
-                                });
+                        // name it binds is the inliner's, since those shadow nothing outside —
+                        // and so does its tail, an inlined callee's own block under the block
+                        // that bound its parameters.
+                        loop {
+                            let value_span = value.span;
+                            match value.kind {
+                                ExprKind::Block {
+                                    stmts: inner,
+                                    tail: Some(inner_tail),
+                                } if var && all_fresh(&inner) => {
+                                    flat.extend(inner);
+                                    value = *inner_tail;
+                                }
+                                kind => {
+                                    value = Expr {
+                                        kind,
+                                        span: value_span,
+                                    };
+                                    break;
+                                }
                             }
-                            kind => flat.push(Stmt::Let {
-                                pat,
-                                ty,
-                                value: Box::new(Expr {
-                                    kind,
-                                    span: value_span,
-                                }),
-                                span,
-                            }),
                         }
+                        flat.push(Stmt::Let {
+                            pat,
+                            ty,
+                            value: Box::new(value),
+                            span,
+                        });
                     }
                     Stmt::Expr(x) => flat.push(Stmt::Expr(scalarize(x))),
                 }
@@ -1016,4 +1177,63 @@ fn map_children(e: &mut Expr, f: fn(Expr) -> Expr) {
         );
         *c = f(taken);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ply_syntax::ast::{ModuleName, Program};
+
+    fn optimized(src: &str, name: &str) -> String {
+        let src: &'static str = Box::leak(src.to_string().into_boxed_str());
+        let mut sources = ply_span::SourceMap::new();
+        let id = sources.add("m.ply", src);
+        let mut program = ply_syntax::parse_program(vec![(id, ModuleName::from_dotted("m"), src)])
+            .expect("parses");
+        let resolved = ply_syntax::resolve::resolve(&mut program).expect("resolves");
+        let check = ply_core::check_program(&program, &resolved).expect("checks");
+        let program: &'static Program = Box::leak(Box::new(program));
+        let source = Source::new(
+            program,
+            Box::leak(Box::new(resolved)),
+            Box::leak(Box::new(check)),
+        );
+        let def = program.modules[0]
+            .items
+            .iter()
+            .find_map(|item| match item {
+                Item::Fn(def) if def.name.name.as_str() == name => Some(&**def),
+                _ => None,
+            })
+            .expect("the function is defined");
+        let mut text = String::new();
+        render(&optimize(&source, 0, def), &mut text, 1);
+        text
+    }
+
+    /// An inlined callee's block opens into the caller's, and then the record it answers is
+    /// split into its fields, so a body over small records is a body over scalars.
+    #[test]
+    fn an_inlined_callee_flattens_and_its_record_splits_into_scalars() {
+        let text = optimized(
+            "type Q = { a: Int, b: Int }\n\
+             fn mask(x: Int) -> Int = x & 255\n\
+             fn g(q: Q, m: Int) -> Q = { let a = mask(q.a + m); let b = mask(q.b + a); {a: a, b: b} }\n\
+             fn round(p: Q) -> Int = { let c = g({a: p.a, b: p.b}, 3); let d = g({a: c.b, b: c.a}, 5); d.a + d.b }\n",
+            "round",
+        );
+        assert!(
+            !text.contains("= {\n"),
+            "a let still binds a block:\n{text}"
+        );
+        assert!(!text.contains("{a:"), "a record literal survived:\n{text}");
+        assert!(
+            !text.contains("mask("),
+            "a tiny leaf was left as a call:\n{text}"
+        );
+        assert!(
+            !text.contains("g("),
+            "the callee was left as a call:\n{text}"
+        );
+    }
 }
