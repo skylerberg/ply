@@ -1617,6 +1617,13 @@ impl Parser {
                     span: start,
                 })
             }
+            TokenKind::Fixed { ty, bits } => {
+                self.advance();
+                Ok(Expr {
+                    kind: ExprKind::Lit(Lit::Fixed { ty, bits }),
+                    span: start,
+                })
+            }
             TokenKind::Float(v) => {
                 self.advance();
                 Ok(Expr {
@@ -2234,6 +2241,13 @@ impl Parser {
                     span: start,
                 })
             }
+            TokenKind::Fixed { ty, bits } => {
+                self.advance();
+                Ok(Pattern {
+                    kind: PatternKind::Lit(Lit::Fixed { ty, bits }),
+                    span: start,
+                })
+            }
             TokenKind::Float(v) => {
                 self.advance();
                 Ok(Pattern {
@@ -2253,12 +2267,21 @@ impl Parser {
             TokenKind::Minus
                 if matches!(
                     self.kind_at(1),
-                    TokenKind::Int(_) | TokenKind::Float(_) | TokenKind::Decimal { .. }
+                    TokenKind::Int(_)
+                        | TokenKind::Fixed { .. }
+                        | TokenKind::Float(_)
+                        | TokenKind::Decimal { .. }
                 ) =>
             {
                 self.advance();
                 let lit = match self.kind().clone() {
                     TokenKind::Int(v) => Lit::Int(-v),
+                    // Negated at the type's own width, where `-128i8` is a value and `128i8` is
+                    // not, so the smallest value of every signed type is writable in a pattern.
+                    TokenKind::Fixed { ty, bits } => Lit::Fixed {
+                        ty,
+                        bits: ty.normalize((ty.value(bits) as i64).wrapping_neg() as u64),
+                    },
                     TokenKind::Float(v) => Lit::Float(-v),
                     TokenKind::Decimal { mantissa, scale } => Lit::Decimal {
                         mantissa: -mantissa,

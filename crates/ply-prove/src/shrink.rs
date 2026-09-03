@@ -6,8 +6,9 @@ mod tests;
 use crate::property::{
     HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
 };
+use ply_core::ty::IntTy;
 use ply_core::{Type, prelude};
-use ply_eval::{Decimal, List, Value};
+use ply_eval::{Decimal, Fixed, List, Value};
 use ply_span::{Diagnostic, Symbol};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -90,6 +91,9 @@ pub fn size(value: &Value, world: &TypeWorld) -> u64 {
     while let Some(v) = pending.pop() {
         let here = match v {
             Value::Int(n) => int_size(*n),
+            // The same measure over the value, so a `U8` shrinks toward zero as an `Int` does and
+            // an `I8` shrinks positive-before-negative.
+            Value::Fixed(f) => int_size(f.value().clamp(i64::MIN as i128, i64::MAX as i128) as i64),
             Value::Bool(b) => u64::from(*b),
             Value::Unit => 0,
             // Ordered so that every candidate below is a strict descent: toward zero, and positive
@@ -210,6 +214,10 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
         }
         Type::Con(name, args) => match name.as_str() {
             "Int" => Ok(Value::Int(0)),
+            n if IntTy::from_name(n).is_some() => Ok(Value::Fixed(Fixed::new(
+                IntTy::from_name(n).expect("just checked"),
+                0,
+            ))),
             // `0.0`, not `-0.0`: the two are different values and the positive one is the floor.
             "Float" => Ok(Value::Float(0.0)),
             "Decimal" => Ok(Value::Decimal(Decimal::ZERO)),

@@ -96,6 +96,9 @@ fn secret_reason(deriver: Deriver) -> &'static str {
 pub fn shape(deriver: Deriver, name: &str) -> Shape {
     match name {
         "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Decimal" => Shape::Leaf,
+        // The eight fixed-width integer types are leaves for the same reason `Int` is: they have
+        // structural equality, a total order, and one obvious rendering.
+        "U8" | "U16" | "U32" | "U64" | "I8" | "I16" | "I32" | "I64" => Shape::Leaf,
         // A total order that disagrees with the language's `==` on its own keys is a lookup that
         // fails to find what it just inserted, and `NaN` makes `<` non-total.
         "Float" => match deriver {

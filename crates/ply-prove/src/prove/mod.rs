@@ -356,6 +356,7 @@ fn children(node: &term::Node) -> Vec<term::TermId> {
         | term::Node::Bool(_)
         | term::Node::Str(_)
         | term::Node::Decimal { .. }
+        | term::Node::Fixed { .. }
         | term::Node::Unit
         | term::Node::Sym(_)
         | term::Node::Opaque(_) => Vec::new(),

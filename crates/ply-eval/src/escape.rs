@@ -218,6 +218,7 @@ fn find(value: &Value, route: &mut Vec<String>) -> Option<Handle> {
         Value::Continuation(_) => Some(Handle::Continuation),
 
         Value::Int(_)
+        | Value::Fixed(_)
         | Value::Bool(_)
         | Value::Float(_)
         | Value::Decimal(_)

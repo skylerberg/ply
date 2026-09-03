@@ -267,6 +267,8 @@ pub mod codes {
     /// An arithmetic or ordered-comparison operand whose numeric type nothing
     /// determines.
     pub const NUMERIC_UNDETERMINED: &str = "E0210";
+    /// An integer literal that is not a value of the fixed-width type its context gave it.
+    pub const LITERAL_OUT_OF_RANGE: &str = "E0211";
     pub const UNBOUND_ROW_VAR: &str = "E0301";
     pub const EFFECT_NOT_PERMITTED: &str = "E0302";
     pub const UNHANDLED_EFFECT: &str = "E0303";
@@ -598,6 +600,7 @@ mod tests {
             ("ORPHAN_DERIVE", codes::ORPHAN_DERIVE, "E0208"),
             ("DECIMAL_DIVISION", codes::DECIMAL_DIVISION, "E0209"),
             ("NUMERIC_UNDETERMINED", codes::NUMERIC_UNDETERMINED, "E0210"),
+            ("LITERAL_OUT_OF_RANGE", codes::LITERAL_OUT_OF_RANGE, "E0211"),
             ("UNBOUND_ROW_VAR", codes::UNBOUND_ROW_VAR, "E0301"),
             ("EFFECT_NOT_PERMITTED", codes::EFFECT_NOT_PERMITTED, "E0302"),
             ("UNHANDLED_EFFECT", codes::UNHANDLED_EFFECT, "E0303"),

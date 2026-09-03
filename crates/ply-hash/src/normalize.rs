@@ -102,6 +102,10 @@ pub(crate) mod tag {
     pub const RETURN_CLAUSE: u8 = 94;
     /// A `where derivable(D, a)`.
     pub const CONSTRAINT: u8 = 95;
+    /// A suffixed integer literal. A new tag rather than a variant of [`LIT_INT`], because `5` and
+    /// `5u32` are different values of different types and must be different definitions; every
+    /// existing tag keeps its number, so no hash already in a store moves.
+    pub const LIT_FIXED: u8 = 96;
 }
 
 /// An explicit table rather than a discriminant cast: appending a row is free, renumbering one
@@ -902,6 +906,11 @@ impl<'a, 't> Normalizer<'a, 't> {
                 self.tag(tag::LIT_DECIMAL);
                 self.out.extend_from_slice(&mantissa.to_le_bytes());
                 self.out.extend_from_slice(&scale.to_le_bytes());
+            }
+            Lit::Fixed { ty, bits } => {
+                self.tag(tag::LIT_FIXED);
+                self.out.push(*ty as u8);
+                self.out.extend_from_slice(&bits.to_le_bytes());
             }
             Lit::Unit => self.tag(tag::LIT_UNIT),
         }

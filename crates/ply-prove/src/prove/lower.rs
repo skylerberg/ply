@@ -483,6 +483,7 @@ impl<'a, 'p> Lowering<'a, 'p> {
                 self.terms.sym(Some(Type::float()))
             }
             Lit::Decimal { mantissa, scale } => self.terms.decimal(*mantissa, *scale),
+            Lit::Fixed { ty, bits } => self.terms.fixed(*ty, *bits),
             Lit::Unit => self.terms.unit(),
         }
     }

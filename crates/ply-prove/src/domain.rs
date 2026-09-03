@@ -2,8 +2,9 @@
 
 use crate::ENUMERATION_BOUND;
 use crate::property::TypeWorld;
+use ply_core::ty::IntTy;
 use ply_core::{LawBinder, Type};
-use ply_eval::Value;
+use ply_eval::{Fixed, Value};
 use ply_span::Symbol;
 use std::collections::BTreeMap;
 
@@ -85,6 +86,14 @@ fn size_of(ty: &Type, world: &TypeWorld, open: &mut Vec<Symbol>) -> Option<u64> 
             // a proof by covering 2^64 points is not a proof anybody runs, and claiming a
             // cardinality here would put the whole domain inside `ENUMERATION_BOUND`'s arithmetic.
             "Int" | "String" | "Bytes" | "List" | "Float" | "Decimal" | "Map" => None,
+            // A fixed width *is* a finite set, and a small one at the narrow types: `U8` has 256
+            // values, which is inside `ENUMERATION_BOUND`, so `forall (b: U8)` is discharged by
+            // covering every byte rather than by sampling. Sixty-four bits is a cardinality no
+            // `u64` holds and no run would finish.
+            n if IntTy::from_name(n).is_some_and(|t| t.bits() < 64) => {
+                Some(1u64 << IntTy::from_name(n).expect("just checked").bits())
+            }
+            n if IntTy::from_name(n).is_some() => None,
             _ => {
                 if open.contains(name) {
                     return None;
@@ -116,6 +125,12 @@ fn value_at(ty: &Type, world: &TypeWorld, index: u64) -> Option<Value> {
             "Unit" => Some(Value::Unit),
             "Bool" => Some(Value::Bool(index == 1)),
             "Int" | "String" | "Bytes" | "List" | "Float" | "Decimal" | "Map" => None,
+            // Ascending from the type's smallest value, so an exhaustive run walks the type in
+            // its own order.
+            n if IntTy::from_name(n).is_some_and(|t| t.bits() < 64) => {
+                let t = IntTy::from_name(n).expect("just checked");
+                Fixed::of(t, t.min() + i128::from(index)).map(Value::Fixed)
+            }
             _ => {
                 let variants = world.variants(name)?;
                 let mut rest = index;

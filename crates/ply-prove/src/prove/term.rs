@@ -1,6 +1,7 @@
 //! The prover's term language: one hash-consed DAG per obligation.
 
 use ply_core::Type;
+use ply_core::ty::IntTy;
 use ply_span::Symbol;
 use std::collections::HashMap;
 
@@ -139,6 +140,13 @@ pub enum Node {
     Decimal {
         mantissa: i128,
         scale: u32,
+    },
+    /// A fixed-width integer literal. A node of its own rather than [`Node::Int`], because `5` and
+    /// `5u32` have different types and congruence between them would be a wrong answer wearing a
+    /// certificate. Arithmetic over it stays uninterpreted, since `is_int` is false for its type.
+    Fixed {
+        ty: IntTy,
+        bits: u64,
     },
     Unit,
     /// A `forall` binder, `result`, a constructor field exposed by a case split, or an opaque
@@ -286,6 +294,12 @@ impl Terms {
             scale -= 1;
         }
         self.mk(Node::Decimal { mantissa, scale }, Some(Type::decimal()))
+    }
+
+    /// Interned by value, so two occurrences of one literal are one term.
+    pub fn fixed(&mut self, ty: IntTy, bits: u64) -> TermId {
+        let bits = ty.normalize(bits);
+        self.mk(Node::Fixed { ty, bits }, Some(Type::con(ty.name())))
     }
 
     pub fn unit(&mut self) -> TermId {

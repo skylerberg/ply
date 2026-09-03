@@ -19,13 +19,13 @@ use crate::rc::Own;
 use crate::region::{self, Region, StepSite, Trail};
 use crate::sched::{HostPolicy, Policy, Resumption, Scheduler, Turn};
 use crate::semantics::{
-    OpTable, arity_error, ctor_value, err_non_exhaustive, err_not_a_function, err_overflow,
-    err_unknown_name, op_decl,
+    OpTable, arity_error, ctor_value, err_fixed_overflow, err_non_exhaustive, err_not_a_function,
+    err_overflow, err_unknown_name, op_decl,
 };
 use crate::sim::{Access, Answer, DEFAULT_STEPS, Seed};
 use crate::task_regions::TaskRegions;
 use crate::trace::Trace;
-use crate::value::{Closure, ClosureKind, Fields, Value};
+use crate::value::{Closure, ClosureKind, Fields, Fixed, Value};
 use crate::window::{SlotVal, Windows};
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
@@ -3004,6 +3004,12 @@ pub(crate) fn apply_unary(
         UnOp::Neg => match value {
             Value::Float(f) => Ok(Value::Float(-f)),
             Value::Decimal(d) => Ok(Value::Decimal(-*d)),
+            // Checked at the operand's own width, so `-x` at an unsigned type is an overflow for
+            // every `x` but zero — which is what the type says and not a special case.
+            Value::Fixed(f) => match Fixed::of(f.ty, -f.value()) {
+                Some(n) => Ok(Value::Fixed(n)),
+                None => Err(err_fixed_overflow(span, "negation", *f, *f)),
+            },
             _ => {
                 let i = value.as_int(operand_span, "negation")?;
                 match i.checked_neg() {
@@ -3013,8 +3019,12 @@ pub(crate) fn apply_unary(
             }
         },
         UnOp::Not => Ok(Value::Bool(!value.as_bool(operand_span, "`!`")?)),
-        // Every bit of the two's-complement pattern flipped, so `~0` is `-1`.
-        UnOp::BitNot => Ok(Value::Int(!value.as_int(operand_span, "`~`")?)),
+        // Every bit of the two's-complement pattern flipped, so `~0` is `-1` at `Int` and the
+        // largest value at an unsigned type.
+        UnOp::BitNot => match value {
+            Value::Fixed(f) => Ok(Value::Fixed(Fixed::new(f.ty, !f.bits()))),
+            _ => Ok(Value::Int(!value.as_int(operand_span, "`~`")?)),
+        },
     }
 }
 
