@@ -134,6 +134,10 @@ pub struct FrontEnd {
     pub defs: Vec<DefReport>,
     pub phases: Phases,
     pub warnings: Vec<Diagnostic>,
+    /// Files whose syntax tree came from the process's own last load rather than from a parse.
+    /// Reported because an equivalence that holds when nothing was reused proves nothing, and a
+    /// test asserting the resumed path agrees has to be able to say the path was taken.
+    pub reused: usize,
 }
 
 impl FrontEnd {
@@ -151,6 +155,49 @@ impl FrontEnd {
 
     pub fn cached(&self) -> usize {
         self.defs.iter().filter(|d| d.cached).count()
+    }
+}
+
+/// What one load leaves behind for the next one in the same process.
+///
+/// A syntax tree is a pure function of a file's bytes, so a file that still says what it said has
+/// the tree it had. `crates/ply-cli/src/driver.rs` assigns a `FileState`'s tree once and never
+/// mutates it — name resolution runs on the copy assembled into the `Program` — so what is held
+/// here is what a parse would produce again, not a tree some later pass has been over.
+///
+/// **A tree is only reusable under the source id it was parsed with**, because its spans carry
+/// that id and a report resolves them through it. Discovery sorts, so a file's id is stable while
+/// the file set is; when a file appears or disappears the ids after it shift, the check below
+/// fails, and the run parses. That is the safe direction and it is why the id is part of the key
+/// rather than an incidental field.
+#[derive(Default)]
+pub struct Resume {
+    trees: BTreeMap<PathBuf, (ContentHash, SourceId, Module)>,
+}
+
+impl Resume {
+    /// The tree for `path` if it was parsed from these bytes under this id, taken out: the load
+    /// that receives it owns it, and hands it back with [`Resume::keep`] when it finishes.
+    fn take(&mut self, path: &Path, content: ContentHash, source: SourceId) -> Option<Module> {
+        match self.trees.get(path) {
+            Some((had, id, _)) if *had == content && *id == source => {
+                self.trees.remove(path).map(|(_, _, ast)| ast)
+            }
+            _ => None,
+        }
+    }
+
+    fn keep(&mut self, path: PathBuf, content: ContentHash, source: SourceId, ast: Module) {
+        self.trees.insert(path, (content, source, ast));
+    }
+
+    /// How many trees are held, which is what a test asserting the reuse happened reads.
+    pub fn len(&self) -> usize {
+        self.trees.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.trees.is_empty()
     }
 }
 
@@ -178,12 +225,25 @@ pub fn run(
     store: Option<&mut Store>,
     needed: &[ModuleName],
 ) -> Result<Loaded, LoadError> {
+    run_resumed(path, mode, store, needed, None)
+}
+
+/// [`run`], reusing the syntax trees `resume` holds for files that still say what they said, and
+/// leaving this run's trees in it. A load that fails leaves it as it found it, so the next one
+/// parses rather than trusting a state no load finished with.
+pub fn run_resumed(
+    path: &Path,
+    mode: Mode,
+    store: Option<&mut Store>,
+    needed: &[ModuleName],
+    resume: Option<&mut Resume>,
+) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
     // Pruning deletes every fingerprint the run did not see, which is only correct when the run saw
     // everything.
     let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
     let needed = needed.iter().map(|m| m.as_symbol().clone()).collect();
-    Driver::new(root, discovered, mode, store, whole_project, needed)?.finish()
+    Driver::new(root, discovered, mode, store, whole_project, needed, resume)?.finish()
 }
 
 struct FileState {
@@ -194,6 +254,17 @@ struct FileState {
     content: ContentHash,
     fingerprint: Option<Arc<SourceFingerprint>>,
     ast: Option<Module>,
+    /// A tree this process parsed from these very bytes on an earlier load, waiting to be used
+    /// *if* this run decides to parse the file.
+    ///
+    /// Separate from `ast` because `ast.is_some()` means "parsed this run" and half the driver
+    /// reads it that way: a file with a tree publishes its exports from the tree, reports its
+    /// imports from the tree, and contributes its module to the program. A seed placed directly
+    /// in `ast` for a file gate 1 then skipped made that file publish *no* exports — it had a tree,
+    /// so the cached list was not consulted, and its definitions were not in the program to be
+    /// looked up — which refused its importers' skips and pulled a third of the project back into
+    /// every round.
+    seed: Option<Module>,
     parse: bool,
     recheck: bool,
     refusal: Refusal,
@@ -228,6 +299,10 @@ struct Driver<'s> {
     root: PathBuf,
     mode: Mode,
     store: Option<&'s mut Store>,
+    /// Trees held by the process that ran the last load, and where this one leaves its own.
+    resume: Option<&'s mut Resume>,
+    /// How many of this run's trees came from `resume`.
+    reused: usize,
     whole_project: bool,
     needed: BTreeSet<Symbol>,
     sources: SourceMap,
@@ -253,6 +328,7 @@ impl<'s> Driver<'s> {
         store: Option<&'s mut Store>,
         whole_project: bool,
         needed: BTreeSet<Symbol>,
+        mut resume: Option<&'s mut Resume>,
     ) -> Result<Driver<'s>, LoadError> {
         let mut phases = Phases::default();
         let mut sources = SourceMap::new();
@@ -281,6 +357,7 @@ impl<'s> Driver<'s> {
         // Naming is checked with the text already on hand so an unusable path is reported against
         // the file itself rather than against nowhere.
         let mut files = Vec::with_capacity(discovered.len());
+        let reused = 0usize;
         for (file, &(source, content)) in discovered.iter().zip(&read) {
             match ModuleName::from_relative_path(&file.relative) {
                 // `std` is reserved before anything else looks at the file.
@@ -299,6 +376,9 @@ impl<'s> Driver<'s> {
                     content,
                     fingerprint: None,
                     ast: None,
+                    seed: resume
+                        .as_mut()
+                        .and_then(|r| r.take(&file.path, content, source)),
                     parse: false,
                     recheck: false,
                     refusal: Refusal::None,
@@ -323,6 +403,8 @@ impl<'s> Driver<'s> {
             root,
             mode,
             store,
+            resume,
+            reused,
             whole_project,
             needed,
             sources,
@@ -623,14 +705,20 @@ impl<'s> Driver<'s> {
             (Mode::Incremental, Some(store)) => store.fingerprint(&path),
             _ => None,
         };
+        let content = ContentHash::of(source.as_bytes());
+        let seed = self
+            .resume
+            .as_mut()
+            .and_then(|r| r.take(&path, content, id));
         let mut file = FileState {
+            ast: None,
+            seed,
             path,
             module,
             source: id,
             text,
-            content: ContentHash::of(source.as_bytes()),
+            content,
             fingerprint,
-            ast: None,
             parse: false,
             recheck: false,
             refusal: Refusal::None,
@@ -678,9 +766,18 @@ impl<'s> Driver<'s> {
     fn parse_pending(&mut self) -> Result<(), LoadError> {
         let mut diagnostics = Vec::new();
         let files = &mut self.files;
+        let reused = &mut self.reused;
         timed(&mut self.phases.parse, || {
             for file in files {
                 if !file.parse || file.ast.is_some() {
+                    continue;
+                }
+                // A tree this process already parsed from these bytes, under this source id, is
+                // the tree a parse would produce. Taken only here, so that a file the run skips
+                // never looks parsed.
+                if let Some(seed) = file.seed.take() {
+                    file.ast = Some(seed);
+                    *reused += 1;
                     continue;
                 }
                 match ply_syntax::parse_module(file.source, file.module.clone(), &file.text) {
@@ -710,6 +807,11 @@ impl<'s> Driver<'s> {
     fn parse_and_hash(
         &mut self,
     ) -> Result<(Program, ply_syntax::resolve::Resolved, HashOutput, BodySet), LoadError> {
+        // `parse` and not merely "has a tree": before trees could be seeded from a previous load,
+        // holding one meant having been parsed this run, and every gate downstream reads the
+        // program as the set of parsed modules. A seeded tree for a file gate 1 skipped would put
+        // that module back into the program, which is not wrong — the hashes agree — but it is
+        // work about a file the run decided not to look at, and it grew every phase after this one.
         let modules: Vec<Module> = timed(&mut self.phases.assemble, || {
             self.files.iter().filter_map(|f| f.ast.clone()).collect()
         });
@@ -1189,6 +1291,7 @@ impl<'s> Driver<'s> {
         report.warnings.splice(0..0, stdlib);
         self.phases.write_back += writing.elapsed();
         report.phases = self.phases;
+        report.reused = self.reused;
 
         let files = self.files.iter().map(|f| f.path.clone()).collect();
         let complete = self.files.iter().all(|f| f.parse);
@@ -1199,6 +1302,19 @@ impl<'s> Driver<'s> {
                 .any(|item| matches!(item, Item::Fn(def) if def.reuse.is_some())),
             None => f.cached_defs().iter().any(|d| d.reuse),
         });
+        // Only here, on the path that produced a `Loaded`: a run that failed part way leaves the
+        // trees it was given where it found them, so the next one parses rather than resuming from
+        // a state no load finished with.
+        if let Some(resume) = self.resume.as_deref_mut() {
+            for file in &mut self.files {
+                // The seed too, and not only what was parsed: a file this run skipped still has the
+                // tree the run before it parsed, and dropping it would make the next run parse a
+                // file neither of them looked at.
+                if let Some(ast) = file.ast.take().or_else(|| file.seed.take()) {
+                    resume.keep(file.path.clone(), file.content, file.source, ast);
+                }
+            }
+        }
         Ok(Loaded {
             root: self.root,
             files,
