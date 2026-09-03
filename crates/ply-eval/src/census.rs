@@ -149,6 +149,7 @@ pub(crate) fn value_kind(v: &crate::value::Value) -> &'static str {
     use crate::value::Value::*;
     match v {
         Int(_) => "Int",
+        Fixed(f) => f.ty.name(),
         Bool(_) => "Bool",
         Float(_) => "Float",
         Decimal(_) => "Decimal",

@@ -1439,6 +1439,7 @@ fn op_str(op: BinOp) -> &'static str {
 fn dump_lit(l: &Lit) -> String {
     match l {
         Lit::Int(v) => v.to_string(),
+        Lit::Fixed { ty, bits } => format!("{}{}", ty.value(*bits), ty.name().to_lowercase()),
         Lit::Bool(b) => b.to_string(),
         Lit::Str(s) => format!("{s:?}"),
         Lit::Bytes(b) => format!("b{b:?}"),

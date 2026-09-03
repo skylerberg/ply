@@ -667,6 +667,16 @@ pub struct AtomExpr {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Lit {
     Int(i64),
+    /// `255u8`, `0x6A09_E667u32`. A suffixed literal is that type and nothing else, exactly as a
+    /// `Decimal` literal is written `1m` — Ply has no numeric tower and no implicit widening, so a
+    /// literal cannot be a value of two types and the spelling is what says which.
+    ///
+    /// `bits` is the value as the type reads it, normalized by [`IntTy::normalize`], so the lexer
+    /// has already refused anything the type does not hold.
+    Fixed {
+        ty: IntTy,
+        bits: u64,
+    },
     Bool(bool),
     Str(String),
     /// `b"GET "`.
@@ -1045,4 +1055,158 @@ pub fn is_default_expr(e: &Expr) -> bool {
 /// The grammar's constructor rule: a leading uppercase letter.
 pub fn is_ctor_name(name: &Symbol) -> bool {
     name.as_str().chars().next().is_some_and(char::is_uppercase)
+}
+
+/// A fixed-width integer type: eight of them, the widths the machine has.
+///
+/// `Int` is not one of these and is not a member of the family. It is the type a program counts
+/// and indexes with, and it stays exactly what it was — sixty-four bits, signed, checked. These
+/// exist for the algorithms that are *written* in a width: a hash's thirty-two-bit word, a byte,
+/// a wire format's field. Arithmetic on them is checked as `Int`'s is; `wrap_add` and its siblings
+/// are how a program says it meant the wrap.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
+pub enum IntTy {
+    U8,
+    U16,
+    U32,
+    U64,
+    I8,
+    I16,
+    I32,
+    I64,
+}
+
+/// Every fixed-width integer type, in the order the guide lists them.
+pub const INT_TYPES: [IntTy; 8] = [
+    IntTy::U8,
+    IntTy::U16,
+    IntTy::U32,
+    IntTy::U64,
+    IntTy::I8,
+    IntTy::I16,
+    IntTy::I32,
+    IntTy::I64,
+];
+
+impl IntTy {
+    pub fn name(self) -> &'static str {
+        match self {
+            IntTy::U8 => "U8",
+            IntTy::U16 => "U16",
+            IntTy::U32 => "U32",
+            IntTy::U64 => "U64",
+            IntTy::I8 => "I8",
+            IntTy::I16 => "I16",
+            IntTy::I32 => "I32",
+            IntTy::I64 => "I64",
+        }
+    }
+
+    pub fn from_name(name: &str) -> Option<IntTy> {
+        INT_TYPES.into_iter().find(|t| t.name() == name)
+    }
+
+    /// `u32_of_int`, and its seven siblings.
+    pub fn of_int_name(self) -> &'static str {
+        match self {
+            IntTy::U8 => "u8_of_int",
+            IntTy::U16 => "u16_of_int",
+            IntTy::U32 => "u32_of_int",
+            IntTy::U64 => "u64_of_int",
+            IntTy::I8 => "i8_of_int",
+            IntTy::I16 => "i16_of_int",
+            IntTy::I32 => "i32_of_int",
+            IntTy::I64 => "i64_of_int",
+        }
+    }
+
+    /// `int_of_u32`, and its seven siblings.
+    pub fn to_int_name(self) -> &'static str {
+        match self {
+            IntTy::U8 => "int_of_u8",
+            IntTy::U16 => "int_of_u16",
+            IntTy::U32 => "int_of_u32",
+            IntTy::U64 => "int_of_u64",
+            IntTy::I8 => "int_of_i8",
+            IntTy::I16 => "int_of_i16",
+            IntTy::I32 => "int_of_i32",
+            IntTy::I64 => "int_of_i64",
+        }
+    }
+
+    pub fn of_int_from_name(name: &str) -> Option<IntTy> {
+        INT_TYPES.into_iter().find(|t| t.of_int_name() == name)
+    }
+
+    pub fn to_int_from_name(name: &str) -> Option<IntTy> {
+        INT_TYPES.into_iter().find(|t| t.to_int_name() == name)
+    }
+
+    pub fn bits(self) -> u32 {
+        match self {
+            IntTy::U8 | IntTy::I8 => 8,
+            IntTy::U16 | IntTy::I16 => 16,
+            IntTy::U32 | IntTy::I32 => 32,
+            IntTy::U64 | IntTy::I64 => 64,
+        }
+    }
+
+    pub fn signed(self) -> bool {
+        matches!(self, IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64)
+    }
+
+    /// The largest value, as the `u64` the representation carries.
+    pub fn max(self) -> u64 {
+        if self.signed() {
+            (1u64 << (self.bits() - 1)) - 1
+        } else {
+            u64::MAX >> (64 - self.bits())
+        }
+    }
+
+    /// The smallest value, as an `i128` so that a signed minimum and an unsigned zero are one
+    /// vocabulary.
+    pub fn min(self) -> i128 {
+        if self.signed() {
+            -(1i128 << (self.bits() - 1))
+        } else {
+            0
+        }
+    }
+
+    /// Whether `v` — a literal's value, or an `Int` being converted — is one of this type's.
+    pub fn holds(self, v: i128) -> bool {
+        v >= self.min() && v <= self.max() as i128
+    }
+
+    /// `bits` reduced to this width and then extended the way this type reads it: zero-extended
+    /// when unsigned, sign-extended when signed. Every `Fixed` in the tree is in this form, so
+    /// two of one type compare, hash and render as that type orders them.
+    pub fn normalize(self, bits: u64) -> u64 {
+        let w = self.bits();
+        if w == 64 {
+            return bits;
+        }
+        let low = bits & (u64::MAX >> (64 - w));
+        if self.signed() && low >> (w - 1) == 1 {
+            low | (u64::MAX << w)
+        } else {
+            low
+        }
+    }
+
+    /// The mathematical value the bits stand for.
+    pub fn value(self, bits: u64) -> i128 {
+        if self.signed() {
+            (bits as i64) as i128
+        } else {
+            bits as i128
+        }
+    }
+}
+
+impl std::fmt::Display for IntTy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.name())
+    }
 }

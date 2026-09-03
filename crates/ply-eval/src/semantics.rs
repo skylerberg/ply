@@ -8,7 +8,7 @@
 //! the only surface a user reads.
 
 use crate::handler::OpDecl;
-use crate::value::{Closure, ClosureKind, Decimal, Value, type_error, values_equal};
+use crate::value::{Closure, ClosureKind, Decimal, Fixed, Value, type_error, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{BinOp, Ident, Lit, Mode, QName};
 use rustc_hash::FxHashMap;
@@ -33,6 +33,7 @@ pub(crate) fn op_decl(ops: &OpTable, effect: &Symbol, op: &Symbol) -> OpDecl {
 pub(crate) fn literal(lit: &Lit) -> Value {
     match lit {
         Lit::Int(i) => Value::Int(*i),
+        Lit::Fixed { ty, bits } => Value::Fixed(Fixed::new(*ty, *bits)),
         Lit::Bool(b) => Value::Bool(*b),
         Lit::Str(s) => Value::str(s),
         Lit::Bytes(b) => Value::bytes(b),
@@ -182,9 +183,19 @@ pub(crate) fn strict_binary(
             }
             let ordering = match (l, r) {
                 (Value::Int(a), Value::Int(b)) => a.cmp(b),
+                // By value, not by bits, so `I8` puts `-1` below `0`. The checker unified the two
+                // operands, so a pair of different fixed-width types cannot arrive.
+                (Value::Fixed(a), Value::Fixed(b)) if a.ty == b.ty => a.value().cmp(&b.value()),
                 (Value::Str(a), Value::Str(b)) => a.as_ref().cmp(b.as_ref()),
                 (Value::Decimal(a), Value::Decimal(b)) => a.cmp(b),
-                (Value::Int(_) | Value::Str(_) | Value::Decimal(_) | Value::Float(_), other) => {
+                (
+                    Value::Int(_)
+                    | Value::Fixed(_)
+                    | Value::Str(_)
+                    | Value::Decimal(_)
+                    | Value::Float(_),
+                    other,
+                ) => {
                     return Err(type_error(rspan, "a comparison", l.type_name(), other));
                 }
                 (other, _) => {
@@ -209,6 +220,9 @@ pub(crate) fn strict_binary(
                 (Value::Decimal(a), Value::Decimal(b)) => {
                     return decimal_arithmetic(op, *a, *b, rspan, span);
                 }
+                (Value::Fixed(a), Value::Fixed(b)) if a.ty == b.ty => {
+                    return fixed_arithmetic(op, *a, *b, rspan, span);
+                }
                 _ => {}
             }
             let a = l.as_int(lspan, "arithmetic")?;
@@ -230,6 +244,17 @@ pub(crate) fn strict_binary(
         // The two's-complement bit pattern of the `Int`, and nothing else: the checker
         // refused every other operand type.
         BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+            if let (Value::Fixed(a), Value::Fixed(b)) = (l, r)
+                && a.ty == b.ty
+            {
+                let (x, y) = (a.bits(), b.bits());
+                let bits = match op {
+                    BinOp::BitAnd => x & y,
+                    BinOp::BitOr => x | y,
+                    _ => x ^ y,
+                };
+                return Ok(Value::Fixed(Fixed::new(a.ty, bits)));
+            }
             let a = l.as_int(lspan, "a bit operator")?;
             let b = r.as_int(rspan, "a bit operator")?;
             Ok(Value::Int(match op {
@@ -243,8 +268,27 @@ pub(crate) fn strict_binary(
         // itself discards rather than raising, because a mixing step is defined to drop
         // the bits that leave.
         BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
-            let a = l.as_int(lspan, "a shift")?;
+            // The count is an `Int` whatever the word is; the bound it must sit inside is the
+            // *word's* width, so a count of 32 is a shift at `Int` and a refusal at `U32`.
             let n = r.as_int(rspan, "a shift")?;
+            if let Value::Fixed(a) = l {
+                let width = i64::from(a.ty.bits());
+                if !(0..width).contains(&n) {
+                    return Err(err_shift_count_at(rspan, n, a.ty.name(), width));
+                }
+                let n = n as u32;
+                let raw = a.raw();
+                let bits = match op {
+                    BinOp::Shl => raw << n,
+                    // Arithmetic, so the sign is what fills: at an unsigned type `Fixed` holds the
+                    // bits zero-extended and `value()` is non-negative, so the two shifts agree
+                    // there and differ exactly where the type is signed.
+                    BinOp::Shr => (a.value() >> n) as u64,
+                    _ => raw >> n,
+                };
+                return Ok(Value::Fixed(Fixed::new(a.ty, bits)));
+            }
+            let a = l.as_int(lspan, "a shift")?;
             if !(0..64).contains(&n) {
                 return Err(err_shift_count(rspan, n));
             }
@@ -419,6 +463,55 @@ pub(crate) fn err_shift_count(span: Span, n: i64) -> Diagnostic {
     Diagnostic::error(codes::RUNTIME_ERROR, "shift count out of range")
         .primary(span, format!("{n} is not in 0..=63"))
         .note("an `Int` is 64 bits, so no other count names a shift of it")
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn err_shift_count_at(span: Span, n: i64, ty: &str, width: i64) -> Diagnostic {
+    Diagnostic::error(codes::RUNTIME_ERROR, "shift count out of range")
+        .primary(span, format!("{n} is not in 0..={}", width - 1))
+        .note(format!(
+            "a `{ty}` is {width} bits, so no other count names a shift of it"
+        ))
+}
+
+#[cold]
+#[inline(never)]
+pub(crate) fn err_fixed_overflow(span: Span, what: &str, a: Fixed, b: Fixed) -> Diagnostic {
+    let detail = if what == "negation" {
+        format!("-{a} does not fit in {}", a.ty)
+    } else {
+        format!("{a} and {b} overflow {}", a.ty)
+    };
+    Diagnostic::error(codes::RUNTIME_ERROR, format!("integer overflow in {what}"))
+        .primary(span, detail)
+}
+
+/// Exact or a diagnostic, at whichever of the eight widths the operands are — the same rule `Int`
+/// keeps, at a narrower type. `wrap_add` and its siblings are how a program says it meant the
+/// wrap; nothing here wraps.
+fn fixed_arithmetic(
+    op: BinOp,
+    a: Fixed,
+    b: Fixed,
+    rspan: Span,
+    span: Span,
+) -> Result<Value, Diagnostic> {
+    let (result, what) = match op {
+        BinOp::Add => (a.checked(b, |x, y| Some(x + y)), "addition"),
+        BinOp::Sub => (a.checked(b, |x, y| Some(x - y)), "subtraction"),
+        BinOp::Mul => (a.checked(b, |x, y| Some(x * y)), "multiplication"),
+        BinOp::Div if b.value() == 0 => return Err(err_zero_divisor(rspan, "division")),
+        // Truncating toward zero, as `Int`'s is. Only one pair overflows: the signed minimum
+        // divided by minus one, whose quotient is one past the maximum.
+        BinOp::Div => (a.checked(b, |x, y| Some(x / y)), "division"),
+        _ if b.value() == 0 => return Err(err_zero_divisor(rspan, "remainder")),
+        _ => (a.checked(b, |x, y| Some(x % y)), "remainder"),
+    };
+    match result {
+        Some(v) => Ok(Value::Fixed(v)),
+        None => Err(err_fixed_overflow(span, what, a, b)),
+    }
 }
 
 #[cold]

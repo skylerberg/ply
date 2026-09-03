@@ -326,6 +326,15 @@ impl fmt::Display for Scheme {
     }
 }
 
+/// The fixed-width integer types live in `ply-syntax`, because a literal carries one and the
+/// lexer is what reads it.
+pub use ply_syntax::ast::{INT_TYPES, IntTy};
+
+/// The `Type` an [`IntTy`] names. Not a method on `IntTy`, which lives a crate below `Type`.
+pub fn int_ty(t: IntTy) -> Type {
+    Type::con(t.name())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
