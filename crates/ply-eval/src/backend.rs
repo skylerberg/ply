@@ -493,7 +493,8 @@ pub enum Kind {
     Reference,
     /// `ply_codegen::Cranelift`: native code, compiled at install time.
     Cranelift,
-    /// `ply_codegen::c`: the same fragment emitted as C and handed to `cc` (ADR 0040).
+    /// `ply_codegen::c`: the same fragment emitted as C and handed to `cc`. Slow to compile and
+    /// readable afterwards — its bodies carry symbols, which the in-process tier's do not.
     C,
 }
 
