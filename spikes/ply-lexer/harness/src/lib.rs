@@ -28,9 +28,11 @@ fn body(kind: &TokenKind) -> String {
     match kind {
         TokenKind::Ident(name) => format!("i:{name}"),
         TokenKind::Int(v) => format!("n:{v}"),
-        // `lexer.ply` has no width suffix yet, so no corpus input carries one and the two never
-        // compare here; the arm exists so this dumper builds. GAPS.md carries the divergence.
-        TokenKind::Fixed { ty, bits } => format!("w:{ty}:{bits}"),
+        // The **pattern**, as a signed sixty-four-bit word, rather than the value: `lexer.ply`
+        // holds a width's bits in an `Int` and cannot render an unsigned sixty-four-bit value at
+        // all, so the value would make the largest `U64` incomparable where the pattern is the
+        // same on both sides. Every narrower width renders identically either way.
+        TokenKind::Fixed { ty, bits } => format!("w:{ty}:{}", *bits as i64),
         TokenKind::Float(v) => format!("f:{:016x}", v.to_bits()),
         TokenKind::Decimal { mantissa, scale } => format!("d:{mantissa}:{scale}"),
         TokenKind::Str(s) => format!("s:{}", hex(s.as_bytes())),
