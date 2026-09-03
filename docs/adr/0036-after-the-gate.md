@@ -309,6 +309,55 @@ holds one, and no peephole over the arithmetic reaches it.
 cheaper instruments said nothing first: the gate's own ratio, and a sampling
 profiler that cannot see through compiled frames.
 
+### Levers tried on this, and what each was worth
+
+Written down because each looked like the answer and none of them is, and the
+next reader would otherwise spend the same day:
+
+| lever | effect |
+| --- | --- |
+| emit a plain add for every `+`, no overflow check anywhere | none; the ratio moved within its spread |
+| untag a field read with no tag test and no join | a tenth |
+| both of those together | a fourteenth, and half the code size — the code removed was cold |
+| raise the inline budget until a `round` folds into `compress` | **four times worse**; it raises pressure rather than relieving it |
+| sink a single-use field read to its use, to shorten live ranges | spills went *up*, time unchanged; the scheduler was already placing them |
+
+The last two are the useful ones: they say the function is not short of
+instructions to remove, it is short of registers, and anything that lengthens a
+live range or adds one costs more than the instructions it saves.
+
+### The two listings, side by side
+
+The bar is not doing anything exotic — no vector register appears anywhere in
+it. Its `round` is the same eight quarter-rounds, and it is **138 instructions
+with two stack operations**, of which:
+
+| | Rust `round` | Ply `round` |
+| --- | --- | --- |
+| add | 48 | 96, each with an overflow branch |
+| xor | 32 | 64 |
+| rotate | 32, one instruction each | 64, each narrowed and widened around |
+| mask | **none** | 330 |
+| loads | 17, in pairs (`ldp`) | 142 field loads, each with a tag test |
+| stores | 9, in pairs (`stp`) | 86 |
+| stack traffic | 2 | 524 |
+
+**One fact explains the first four rows.** Rust's words are `u32` in `w`
+registers: wrapping is what the register does, so there is nothing to mask, and
+a rotate is `ror w, w, #16`. Ply's are `Int`, which is a sixty-four-bit tagged
+word, so every add needs a mask after it, every rotate narrows and widens around
+itself, and every read out of a record needs its tag tested.
+
+The fifth and sixth rows follow from the same fact: two `u32` next to each other
+are one `ldp`, and two tagged words are two loads.
+
+So the gap is not the arithmetic, the checks, the records or the allocator. It is
+that **Ply has one integer type and it is not the one this algorithm is written
+in.** Nothing in the source, the checker or the code generator can say that a
+value is thirty-two bits wide, and every one of the differences above is what
+that costs. A bar of three would need most of them gone, and no peephole reaches
+any of them.
+
 ## Decision 12 — a parameter the body only reads is borrowed
 
 Every handle a compiled body was handed it owned: the caller held the value
