@@ -25,6 +25,11 @@ type Stamp = (Option<SystemTime>, u64);
 pub struct Warm {
     held: Option<Loaded>,
     stamps: BTreeMap<PathBuf, Stamp>,
+    /// The syntax trees this process has already parsed, which the next load reuses for every file
+    /// that still says what it said. A tree is a pure function of the bytes, so this is a cache of
+    /// work rather than a second source of truth; `driver::Resume` holds the rule that decides when
+    /// one may be reused.
+    pub resume: crate::driver::Resume,
     /// What each file *said* when the held state was built from it. A stamp is a cheap reason to
     /// skip reading; this is the reason to skip everything else, and it is why a file that was
     /// written without being changed — a save with no edit, which is most saves — costs a read
@@ -300,6 +305,7 @@ mod tests {
 
     fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
         Loaded {
+            run: None,
             root: root.to_path_buf(),
             files: files.iter().map(|f| root.join(f)).collect(),
             sources: ply_span::SourceMap::new(),

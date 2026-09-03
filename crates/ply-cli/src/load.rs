@@ -18,6 +18,15 @@ pub struct Loaded {
     /// Only the modules this run actually parsed.
     pub program: Program,
     pub resolved: Resolved,
+    /// The program to *run*, when it differs: `program` plus the modules a selected test needs the
+    /// bodies of and which nothing asked to re-derive.
+    ///
+    /// Separate from `program` rather than replacing it, because `program` is what this run
+    /// checked, and every command that reports on what it checked — `prove`'s obligations, the
+    /// cost report — must go on seeing that and not the larger set. Only the runner and the
+    /// backend it installs use this one, and they must use the same one as each other: a backend
+    /// answers only for the program it was built over.
+    pub run: Option<(Program, Resolved)>,
     /// Every module, whether it was checked or restored from the cache.
     pub check: CheckOutput,
     pub hashes: HashOutput,
@@ -27,6 +36,17 @@ pub struct Loaded {
     /// so a command knows whether the promise check has anything to check before it parses
     /// everything the check needs.
     pub promised: bool,
+}
+
+impl Loaded {
+    /// The program the runner and its backend work over: what was checked, plus the modules a
+    /// selected test needs the bodies of.
+    pub fn to_run(&self) -> (&Program, &Resolved) {
+        match &self.run {
+            Some((program, resolved)) => (program, resolved),
+            None => (&self.program, &self.resolved),
+        }
+    }
 }
 
 /// Carries the [`SourceMap`] even on failure: a parse error is useless without the text its spans

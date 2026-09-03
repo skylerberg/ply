@@ -87,6 +87,61 @@ fn agree(dir: &Path, what: &str) -> Loaded {
     incremental
 }
 
+/// The same equivalence one axis over, and the safety argument for a **resumable** front end:
+/// a load that reuses the syntax trees this process already parsed must answer what a load that
+/// parsed everything answers. `resume` carries across calls the way a warm process carries it.
+///
+/// `needed` names the modules the load must parse whatever the gates would have said, which is the
+/// shape `load_to_evaluate` has and the only one where reuse can pay: a run that skips a file does
+/// not parse it, so it has nothing to reuse for it.
+#[track_caller]
+fn agree_resumed(
+    dir: &Path,
+    resume: &mut driver::Resume,
+    needed: &[ModuleName],
+    what: &str,
+) -> Loaded {
+    let mut store = Store::open(dir).expect("the cache directory must be creatable");
+    let resumed = driver::run_resumed(
+        dir,
+        driver::Mode::Incremental,
+        Some(&mut store),
+        needed,
+        Some(resume),
+    )
+    .unwrap_or_else(|e| panic!("{what}: the resumed path failed: {:?}", codes(&e)));
+    let full = driver::load_full(dir)
+        .unwrap_or_else(|e| panic!("{what}: the full path failed: {:?}", codes(&e)));
+
+    let a = snapshot(&full);
+    let b = snapshot(&resumed);
+    let mut differences = Vec::new();
+    for key in a.keys().chain(b.keys()) {
+        if a.get(key) != b.get(key) {
+            differences.push(format!(
+                "  {key}\n    full    {:?}\n    resumed {:?}",
+                a.get(key),
+                b.get(key)
+            ));
+        }
+    }
+    differences.dedup();
+    assert!(
+        differences.is_empty(),
+        "{what}: the resumed path disagreed with a from-scratch check:\n{}",
+        differences.join("\n")
+    );
+    resumed
+}
+
+fn fixture_modules() -> Vec<ModuleName> {
+    ["core", "shop", "leaf"]
+        .iter()
+        .copied()
+        .map(ModuleName::from_dotted)
+        .collect()
+}
+
 fn codes(e: &ply_cli::load::LoadError) -> Vec<String> {
     e.diagnostics
         .iter()
@@ -877,4 +932,80 @@ fn a_promise_in_a_module_gate_one_skips_is_still_known_and_still_refused() {
     let broken = ply_cli::costs::promises(&full.program, &full.resolved);
     assert_eq!(broken.len(), 1, "{broken:#?}");
     assert_eq!(broken[0].code, ply_span::codes::REUSE_BROKEN);
+}
+
+// --- The resumable front end ------------------------------------------------
+
+/// The gate ADR 0038 puts ahead of every measurement: what a resumed load produces must be what a
+/// from-scratch load produces, through a sequence of edits rather than once. Each step asserts the
+/// reuse actually happened, because an equivalence that holds when nothing was reused is an
+/// equivalence about nothing.
+#[test]
+fn a_resumed_load_answers_what_a_full_one_answers_through_a_sequence_of_edits() {
+    let dir = corpus();
+    let dir = dir.path();
+    let mut resume = driver::Resume::default();
+
+    let all = fixture_modules();
+    let first = agree_resumed(dir, &mut resume, &all, "cold");
+    assert_eq!(
+        first.frontend.reused, 0,
+        "the first load had nothing to resume from and claimed it did"
+    );
+    assert!(
+        !resume.is_empty(),
+        "the first load left no trees, so nothing below can resume"
+    );
+
+    // A body in a leaf module, which moves one definition's hash and its dependents'.
+    edit(
+        dir,
+        "leaf.ply",
+        "pub fn one() -> Int = 1",
+        "pub fn one() -> Int = 11",
+    );
+    let second = agree_resumed(dir, &mut resume, &all, "after a body edit");
+    assert!(
+        second.frontend.reused > 0,
+        "nothing was reused after a one-file edit, so the equivalence above is vacuous"
+    );
+
+    // A body in an imported module, which moves what its importers were checked against.
+    edit(dir, "core.ply", "Note(_) -> 0", "Note(_) -> 1");
+    let third = agree_resumed(dir, &mut resume, &all, "after editing an imported module");
+    assert!(third.frontend.reused > 0, "nothing was reused");
+
+    // And back again: an edit that restores the original bytes must not be special.
+    edit(
+        dir,
+        "leaf.ply",
+        "pub fn one() -> Int = 11",
+        "pub fn one() -> Int = 1",
+    );
+    let fourth = agree_resumed(dir, &mut resume, &all, "after reverting the body");
+    assert!(fourth.frontend.reused > 0, "nothing was reused");
+}
+
+/// A file appearing shifts every source id after it, and a tree carries the id its spans resolve
+/// through. The resumed path must notice and parse rather than reuse a tree whose spans would
+/// point into the wrong file.
+#[test]
+fn a_new_file_is_not_resumed_over() {
+    let dir = corpus();
+    let dir = dir.path();
+    let mut resume = driver::Resume::default();
+    agree_resumed(dir, &mut resume, &fixture_modules(), "cold");
+
+    // `aaa` sorts before every fixture module, so every id after it moves.
+    write(dir, "aaa.ply", "pub fn zero() -> Int = 0\n");
+    let after = agree_resumed(
+        dir,
+        &mut resume,
+        &fixture_modules(),
+        "after a file appeared",
+    );
+    assert_eq!(
+        after.frontend.reused, 0,
+        "a tree was reused under a source id it was not parsed with"
+    );
 }
