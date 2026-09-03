@@ -1,9 +1,11 @@
 # ADR 0040 — What a second code generator is for
 
 **Accepted as a build and a placement. Ply has a second code generator; it does
-not go in the loop, and it does not clear ADR 0035's bar either.** What it does
-is answer the question ADR 0039 left open, and the answer is not the one that
-record predicted.
+not go in the loop, and on it the integer kernel reaches ADR 0035's bar without
+clearing it — the gate's word is *undecided*, twice.** The shipped tier is at
+5.18 and cannot follow, for a reason this record measures. What the tier mostly
+did was answer the question ADR 0039 left open, and the answer is not the one
+that record predicted.
 
 ADR 0037 listed the candidates for a tier and named what would choose among
 them. This builds the strongest one — emitted C, one `cc`, one `dlopen` — and
@@ -157,24 +159,6 @@ independent levers.
 lever here that is a language change rather than an emitter change — which is
 also why it is the only one both tiers get.
 
-## What is left, measured
-
-At about 3.3 times the bar, `chunk_compress` — the whole per-block body, folded
-— is under half of the profile and **memory management is the rest**:
-dismantling, resetting and allocating three objects per 64-byte block. The three
-are the compression's sixteen-word answer, the eight-word chaining value taken
-from it, and the loop's own state record holding both.
-
-None of the three can be held back the way the intermediates were, and the
-reason is one rule: only a record of immediates is elided, because only such a
-record holds no counts and so cannot be wrong about them. The state record holds
-two records, so it is built; and being built, it forces the two.
-
-**So the next lever is the counted case**, which is the ownership work the C
-tier does not have — ADR 0034's `reset` token generalised to a record whose
-fields are themselves records. That is a Perceus question rather than a code
-generation one, and it is where the remaining third of this kernel is.
-
 ## The seam is a cliff, and a partial tier falls off it
 
 The record kernel is the sharper result. Under Cranelift `k2` is inside the bar.
@@ -197,6 +181,37 @@ by the refusal. This is ADR 0038's subject and this is the sharpest instance of
 it yet measured. It is not new — it reads the same at this tier's first commit
 — and it is the first thing any second tier has to answer, before code quality
 is worth discussing.
+
+## What a second code generator costs, which is not nothing
+
+It is checked against the first, and that is the reason to have one. It also has
+to *be* checked, and the checking is not free: this tier ran for its whole first
+week against the interpreter's answers on its own unit tests and against BLAKE3's
+published vectors, and was wrong in three ways that neither could see.
+
+- **`None` was a closure.** A constructor named as a value is two things by
+  arity — `None` is a singleton, `Some` is a function value — and the tier asked
+  for the function in both cases. Every body that answered `None` answered with a
+  closure where a variant belonged.
+- **Every worker wrote the same file.** The build directory was keyed on the
+  process id, and a run compiles the unit once per worker plus a pre-flight, in
+  one process. The losers of the race declined every call and the run went
+  quietly on with the interpreter — green, and over nothing.
+- **A record built in a loop was built once.** Records are held back and built on
+  demand under a guard; inside a loop the guard handed back the object the first
+  iteration built. `std.hash`'s vectors passed throughout, because they hash one
+  and two chunks and the gate hashes sixty-four.
+
+**All three were found in one afternoon by running `--backend c --audit-backend`
+over `examples/`, which the other tier had been doing since it existed.** None
+of them needed a new idea, only the check that was already written for the other
+tier and not pointed at this one. That is the real cost of a second code
+generator, and it is a cost in *discipline* rather than in code: the first tier's
+harness has to be aimed at the second on the day it lands, or the second is a
+tier nobody is checking.
+
+The two steps are in CI now, and the second is the shape that broke: sixty-four
+chunks, audited against the machine.
 
 ## What it costs the loop
 
@@ -224,28 +239,33 @@ the seam or the bytes primitive — which is where every measurement in this
 record says the kernel's time is. A fourth code generator would be a fourth way
 to emit 321 instructions where 139 will do.
 
-## What would clear the bar, in the order the measurements put them
+## What would clear the bar, now that two of the three have been taken
 
-Not code generation. In descending size, each with the measurement that sizes
-it:
+The three this record first named were a word-wide `Bytes` read, local
+aggregates that are not heap records, and the tag off the words inside a body.
+The first is `bytes_u32_le` and the second is the elision above; the third came
+with the second, since a record that is never built is never tagged. Together
+they are 5.79 to 3.14, and the bar is 3.
 
-1. **A word-wide read on `Bytes`.** `block_words` is 1080 instructions for what
-   the bar does in sixteen loads, and the reason is that Ply's only primitive is
-   `bytes_at`. This is a language surface question — Rust has `from_le_bytes`,
-   Go has `binary.LittleEndian.Uint32` — and it is the cheapest of the three.
-2. **Local aggregates that are not heap records.** `compress`'s own work equals
-   its seven rounds, and all of it is building and reading records that never
-   escape. ADR 0034 has the in-place update; what this wants is the step past it
-   — an escaping analysis and scalar replacement, so a record whose every use is
-   a field read is never a record.
-3. **The tag off the words inside a body.** 32 `lsr` per round, measured above.
-   ADR 0039 ablated this inside the Cranelift tier and got a twentieth back
-   because the allocator took the rest; that result is about that allocator, and
-   the ablation should be re-taken here, where the arithmetic is already at
-   parity and there is nothing else in the way.
+What is left is one thing, and it is the one the elision rule excludes:
 
-The first two are language and representation decisions and the third is a
-consequence of them. None is a code generator.
+**A record whose fields are themselves records.** Only a record of immediates is
+held back, because only such a record holds no counts and so cannot be wrong
+about them. The kernel's chunk loop carries `{cv, i, out}` — the compression's
+sixteen-word answer, the eight-word chaining value taken from it, and an integer
+— so it is built, and being built it forces the two it holds. Those three
+objects, allocated and dismantled per 64-byte block, are what the profile has
+left: **memory management is about two fifths of the kernel and the emitted code
+is the rest.**
+
+Extending the rule to the counted case is ADR 0034's `reset` token generalised —
+a Perceus question rather than a code generation one — and it is worth roughly
+what is between 3.14 and the bar, twice over.
+
+**For the shipped tier the answer is different**, and this record does not have
+it. Cranelift cannot take the inlining the elision needs; either it learns the
+elision in its own record handling, where the inlining is not the enabler, or
+the tier that clears the bar is not the tier that ships.
 
 ## What the gate said, this time
 
@@ -258,16 +278,27 @@ null control, load gate held:
 
 | kernel | Cranelift | C tier | bar |
 | --- | --- | --- | --- |
-| k1 (BLAKE3) | 5.79 | **4.69** | 3.0 |
-| k2 (records) | 1.86 | **10398** | 3.0 |
+| k1 (BLAKE3) | 5.18 | **3.14 — undecided** | 3.0 |
+| k2 (records) | 1.84 | 10060 | 3.0 |
 
-**The integer kernel clears the bar on neither tier.** The C tier is the closer
-of the two and the size of the gain is the finding: cutting `round` from 706
-instructions to 321 — better than half — bought **a fifth** at the gate. That is
-the whole of what a much better register allocator is worth here, measured
-rather than argued, and it is the single most useful number in this record. It
-rules out the class of answer ADR 0036, ADR 0039 and ADR 0037 were all reaching
-for, and it points at three that are not code generators.
+**The integer kernel reaches the bar on the C tier and does not clear it.** The
+gate's own word is *undecided (within the resolution of the bar)*, and it said
+the same on the run before at 3.00, so this is a kernel sitting on its bar rather
+than one that has passed it. `raw-c-tier.txt` is the series.
+
+Two things about that number are worth more than the number.
+
+**The first is where it came from.** 5.79 to 3.14 is not a code generator getting
+better at emitting the same program; it is four changes that stop the program
+being emitted — §"What the tier was for" — of which one is a language addition
+and three are refusals to build what nothing reads. The one that moved *both*
+tiers is the language addition.
+
+**The second is that the other tier cannot follow.** Cranelift is at 5.18 and
+the elisions above are unavailable to it, because they need the whole-body
+inlining its register allocator cannot hold. The shipped tier is the one that
+does not clear, and closing that is either a different allocator or the same
+elisions taught to Cranelift's own record handling.
 
 The k2 column is not a slow tier; it is §"The seam is a cliff" in one number.
 
