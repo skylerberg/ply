@@ -15,20 +15,64 @@ use ply_syntax::ast::{
 };
 use std::collections::HashSet;
 
-/// The most syntax nodes a callee may have to be inlined.
-const INLINE_BUDGET: usize = 64;
-/// How many times a callee's own calls are inlined in turn.
-const INLINE_DEPTH: usize = 2;
+/// How hard the inliner works. It differs by tier, and the difference is measured rather than
+/// assumed: what a wider budget exposes is a chain of records built and read in one body, and
+/// whether that is a win depends entirely on what the code generator downstream does with it.
+#[derive(Clone, Copy)]
+pub struct Inlining {
+    /// The most syntax nodes a callee may have to be inlined.
+    pub budget: usize,
+    /// How many times a callee's own calls are inlined in turn.
+    pub depth: usize,
+}
+
+impl Inlining {
+    /// The in-process tier's. Wider was measured there and was **worse** -- the register allocator
+    /// spills more than the calls cost -- so this is the ceiling rather than a default nobody
+    /// tried.
+    pub const IN_PROCESS: Inlining = Inlining {
+        budget: 64,
+        depth: 2,
+    };
+
+    /// The emitted tier's. Wide enough to fold BLAKE3's rounds into its compression, because the
+    /// C compiler forwards the record chain that exposes instead of spilling it: about a fifth off
+    /// the integer kernel, for about twice the compile. That trade is only available to a tier
+    /// that is already off the loop's path.
+    pub const EMITTED: Inlining = Inlining {
+        budget: 2000,
+        depth: 4,
+    };
+
+    /// `PLY_INLINE_BUDGET` and `PLY_INLINE_DEPTH` override, for a measurement.
+    fn overridden(self) -> Inlining {
+        let n = |k: &str, d: usize| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(d)
+        };
+        Inlining {
+            budget: n("PLY_INLINE_BUDGET", self.budget),
+            depth: n("PLY_INLINE_DEPTH", self.depth),
+        }
+    }
+}
 /// A callee no larger than this that calls nothing is inlined however deep the site: a mask or
 /// a shift written as a function costs a call at the depth the budget runs out otherwise.
 const TINY_LEAF: usize = 8;
 
 /// `def`'s body, rewritten.
-pub fn optimize(loaded: &Source, module_index: usize, def: &FnDef) -> Expr {
+pub fn optimize(loaded: &Source, module_index: usize, def: &FnDef, how: Inlining) -> Expr {
+    let how = how.overridden();
     let module = &loaded.program.modules[module_index];
-    let mut cx = Cx { module, fresh: 0 };
+    let mut cx = Cx {
+        module,
+        fresh: 0,
+        how,
+    };
     let mut scope: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
-    let body = cx.inline(&def.body, &def.name.name, INLINE_DEPTH, &mut scope);
+    let body = cx.inline(&def.body, &def.name.name, how.depth, &mut scope);
     let body = scalarize(body);
     if std::env::var("PLY_OPT_DUMP").is_ok_and(|want| want == def.name.name.as_str()) {
         let mut text = String::new();
@@ -183,6 +227,7 @@ fn render_pat(p: &Pattern) -> String {
 struct Cx<'a> {
     module: &'a Module,
     fresh: u32,
+    how: Inlining,
 }
 
 impl<'a> Cx<'a> {
@@ -201,7 +246,7 @@ impl<'a> Cx<'a> {
                     && def.params.len() == arity
                     && def.params.iter().all(|p| p.default.is_none())
                     && def.name.name != *caller
-                    && size(&def.body) <= INLINE_BUDGET
+                    && size(&def.body) <= self.how.budget
                     && inlinable(&def.body);
                 return plain.then_some(def);
             }
@@ -1315,7 +1360,11 @@ mod tests {
             })
             .expect("the function is defined");
         let mut text = String::new();
-        render(&optimize(&source, 0, def), &mut text, 1);
+        render(
+            &optimize(&source, 0, def, Inlining::IN_PROCESS),
+            &mut text,
+            1,
+        );
         text
     }
 

@@ -644,6 +644,13 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*b);
             Some(heap::imm(i64::from(byte)))
         }
+        (Builtin::BytesU32Le, [b, i]) if heap::kind(*b) == KIND_BYTES => {
+            let index = usize::try_from(heap::as_int(*i)?).ok()?;
+            let four = unsafe { bytes_of(obj(*b)) }.get(index..index + 4)?;
+            let w = u32::from_le_bytes(four.try_into().ok()?);
+            heap::dec(*b);
+            Some(heap::imm(i64::from(w)))
+        }
         (Builtin::BytesSlice, [b, s, e]) if heap::kind(*b) == KIND_BYTES => {
             let bytes = unsafe { bytes_of(obj(*b)) };
             let (start, end) = slice_range(*s, *e, bytes.len())?;
@@ -1115,6 +1122,14 @@ pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
 }
 
 /// A constructor used as a value, likewise.
+/// The singleton a nullary constructor *is*, as against the constructor as a function value,
+/// which is what `rt_ctor_value` answers. The two are not interchangeable: `None` is a value and
+/// `Some` is a function, and a tier that asks for the wrong one gets a closure where a variant
+/// belongs and answers every `None` case wrongly.
+pub unsafe extern "C" fn rt_nullary(ctx: *mut Ctx, index: i64) -> i64 {
+    unsafe { &*ctx }.nullary(index as u32)
+}
+
 pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let (name, arity) = ctx.tables.layouts.ctors[index as usize].clone();
