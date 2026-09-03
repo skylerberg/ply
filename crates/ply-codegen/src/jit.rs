@@ -479,15 +479,23 @@ impl Jit {
         })
     }
 
-    /// Which of `name`'s handle parameters its body only reads: every mention the base of a
-    /// field read, none captured by a lambda, and no record literal of the parameter's width
-    /// in the body, which would rather take a parameter that dies there.
+    /// Which of `name`'s handle parameters its body only reads: every mention the base of a field
+    /// read, and none captured by a lambda.
+    ///
+    /// A parameter whose width the body also *builds* would rather stay owned, so that a record
+    /// dying here donates its memory to the literal instead of the allocator — but **only one
+    /// donor per width is any use**, since there is one token slot for each. Keeping every such
+    /// parameter owned charges the rest a duplicate in the caller and a release here for a
+    /// donation that can never happen: `round(s, m)` in `std.hash` has one state record that dies
+    /// at the call and one message record the caller needs again, and the second was paying the
+    /// first's price. The first of each width stays owned; the rest borrow.
     fn borrowed_params(&self, name: &str, params: &[Symbol], code: &Code) -> Vec<bool> {
         let Some(func) = self.funcs.get(name) else {
             return vec![false; params.len()];
         };
         let mut widths = BTreeSet::new();
         record_widths(code, &mut widths);
+        let mut donor_taken: BTreeSet<usize> = BTreeSet::new();
         params
             .iter()
             .enumerate()
@@ -499,7 +507,10 @@ impl Jit {
                     Ty::Record(fields) => Some(fields.len()),
                     _ => None,
                 };
-                if width.is_some_and(|w| widths.contains(&w)) {
+                if let Some(w) = width
+                    && widths.contains(&w)
+                    && donor_taken.insert(w)
+                {
                     return false;
                 }
                 let mut only_read = true;
