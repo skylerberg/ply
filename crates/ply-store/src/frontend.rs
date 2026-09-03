@@ -226,6 +226,19 @@ pub struct CachedDef {
     /// See [`witness_holds`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub names: Vec<NameRef>,
+    /// Whether this definition can execute a `perform` its published row does not show — the
+    /// answer `ply_core`'s propagation computes over a whole program, and the one a compiled
+    /// backend consults before entering anything.
+    ///
+    /// Carried here because a run that restores a definition rather than checking it has no body
+    /// to walk, and the conservative answer costs the backend every entry into a module the run
+    /// did not have to re-derive. `true` when absent, which is that conservative answer.
+    #[serde(default = "yes")]
+    pub internally_effectful: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 impl CachedDef {
@@ -234,6 +247,7 @@ impl CachedDef {
     pub fn new(scheme: Scheme, footprint: Footprint) -> CachedDef {
         CachedDef {
             scheme,
+            internally_effectful: true,
             performed: footprint.clone(),
             footprint,
             row_aliases: Vec::new(),
@@ -260,6 +274,12 @@ impl CachedDef {
         witness_holds(&self.names, resolve)
     }
 
+    /// Whether this definition can perform an effect its published row does not show.
+    pub fn performing_internally(mut self, yes: bool) -> CachedDef {
+        self.internally_effectful = yes;
+        self
+    }
+
     /// What [`crate::Store::put_def`] stores.
     pub fn canonicalized(self) -> CachedDef {
         CachedDef {
@@ -268,6 +288,7 @@ impl CachedDef {
             performed: self.performed,
             row_aliases: self.row_aliases,
             names: canonical_names(self.names),
+            internally_effectful: self.internally_effectful,
         }
     }
 }

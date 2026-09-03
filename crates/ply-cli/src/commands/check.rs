@@ -421,6 +421,7 @@ fn report_json(loaded: &Loaded, warnings: &[Diagnostic]) -> Value {
             "skipped": loaded.frontend.skipped(),
             "cached": loaded.frontend.cached(),
             "rechecked": loaded.frontend.rechecked(),
+            "reused": loaded.frontend.reused,
             "phases": super::common::phases_json(&loaded.frontend.phases),
             "files": loaded.frontend.files.iter().map(|f| json!({
                 "file": f.path.display().to_string(),
