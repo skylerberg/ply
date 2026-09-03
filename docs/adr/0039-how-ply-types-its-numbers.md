@@ -248,15 +248,32 @@ reader does not spend the day:
 | --- | --- |
 | a wider inline budget, so `round` folds into `compress` | **worse: 9.17 against 6.01.** ADR 0036 measured this over `Int` and found four times worse; the width does not change the conclusion, and `compress` goes to 76KB |
 | borrowing the two state records instead of reusing the dying one | **worse: 6.45 against 6.01.** The bump allocation the reuse saves costs more than the reference counting and the doubled body it pays |
-| storing a width raw and packed in a flat record | not built. It is the one thing left that *only* a type can do — no analysis can make two adjacent words one `ldp` when the record does not store them that way — and the arithmetic says it is worth under a tenth: 64 untags out of 706 instructions, plus whatever pairing buys |
+| storing a width raw in a flat record, so the tag round-trip goes | **a twentieth, and the reason is the fourth time the same wall appears.** Ablated: the 64 untags and 32 tags per `round` do go, and 96 instructions out buys 33, because the loads rise from 102 to 113 and the stack traffic from 114 to 136. Taking the shift away lengthens the live range it was shortening, and the allocator spills the difference. (The ablation also segfaults, since a generic path reads a record's word without its shape's field types — which is what a shipped version would have to teach.) |
 
-**So the remainder is not the type's and it is not the record's either.** It is
-the seven state records per compress living in memory, which goes away only if
-`round` is inlined into `compress` — and Cranelift's register allocator is
-measurably worse when it is. That is a property of the tier, not of the language,
-and it is `docs/adr/0037-the-loop-is-the-goal.md`'s question rather than this
-one's. **A kernel this record cannot close is the strongest evidence ADR 0037
-has for its own table.**
+**Four levers, and every one of them ends at the same wall.** Inline the round
+and the allocator spills; borrow the records and the allocation it saved costs
+more; untag the fields and the allocator takes back two thirds of what was
+removed; and ADR 0036 already recorded a fifth, sinking a field read to its use,
+with the same result in the same words — *spills went up, time unchanged*. The
+binding constraint is Cranelift's register allocator over a body with
+thirty-two live values, and it is not something a type can move.
+
+**So the bar is not reachable from the type system, and the probe says what it
+is reachable from.** `width-probe`'s `i64t` arm is Ply's compiled representation
+exactly — tagged words, masked and checked, in a memory-resident sixteen-field
+record — and under LLVM it is **1.21 times the bar**, inside a bar of three with
+room to spare. The representation was never what stood between this kernel and
+its bar. The code generator is, and
+`docs/adr/0037-the-loop-is-the-goal.md` is where that is decided.
+
+**What this record leaves the tier is a kernel it can actually clear.** `U32`
+arithmetic in `w` registers is what a C compiler wants to be handed; the masks
+and narrow-and-widens this deleted are the ones it would otherwise have had to
+prove away. The next lever inside *this* tier, if one is wanted before the tier
+changes, is destination-passing — letting a caller hand `round` the memory to
+write into, which is the only shape that gets both the borrow's freedom from
+reference counting and the reuse's freedom from allocation, and which Koka and
+Lean both have for exactly this reason.
 
 ## What is not built
 
@@ -300,11 +317,12 @@ has for its own table.**
   where a literal should have. Polymorphic literals could be restored — but only
   behind a cache-safe way to carry inference's answer to the evaluator, which is
   the thing that sank them the first time.
-- **If the record layout turns out to be worth more than the arithmetic says.**
-  The estimate above is an instruction count, not a measurement: packing a flat
-  record of widths to four bytes a field would halve its footprint and could pair
-  its loads, and cache behaviour is not in an instruction count. It is the
-  cheapest unbuilt lever and the only remaining one the type enables.
+- **If packing, rather than merely untagging, turns out to be worth more.** The
+  ablation above removed the tag and kept eight bytes a field. Packing to four
+  would halve the record's footprint and could pair its loads, and cache
+  behaviour is in no instruction count. It is the last thing the type enables
+  that has not been measured — though the ablation's result, that the allocator
+  takes back two thirds of anything removed, is not encouraging.
 - **If ADR 0037's tier lands and the kernel still does not clear.** Then the
   memory traffic was not the remainder either, and the next reading has to come
   from a profile of the compiled frames rather than from a listing — which is the
