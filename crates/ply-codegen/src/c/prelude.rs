@@ -124,6 +124,7 @@ helpers![
     ("rt_ctor_arg", 3, true),
     ("rt_alloc", 4, true),
     ("rt_list_index", 2, true),
+    ("rt_nullary", 1, true),
 ];
 
 /// The declarations, the function-pointer table and the exported binder, generated from

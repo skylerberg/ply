@@ -68,7 +68,14 @@ fn compiler() -> String {
 /// One process and one link for the whole unit, which is the shape `benches/c-floor/` found is a
 /// constant rather than an exponent — and the opposite of the per-definition image it refused.
 pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
-    let dir = std::env::temp_dir().join(format!("ply-c-{}-{}", std::process::id(), stem));
+    // A directory of its own per build, not per process. A run compiles the unit once per worker
+    // plus a pre-flight, all in one process, so a path keyed on the process id alone had every
+    // worker writing the same `unit.c` and loading the same object while its neighbour was still
+    // writing it. What that looked like was not a crash: the losers failed to build, declined
+    // every call they were offered, and the run went quietly on with the interpreter.
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("ply-c-{}-{stem}-{n}", std::process::id()));
     std::fs::create_dir_all(&dir)?;
     let c = dir.join("unit.c");
     let so = dir.join(if cfg!(target_os = "macos") {

@@ -612,9 +612,24 @@ impl<'a> Emit<'a> {
             self.check();
             return Ok(v);
         }
-        // A nullary constructor is the singleton the tables hold for it, and never allocated.
+        // A constructor named as a value is two different things by arity, and the tier asked for
+        // the wrong one: `None` is the singleton the tables hold, and `Some` is a function value.
+        // Asking for the function in both cases put a closure where a variant belonged, so every
+        // body that answered `None` answered wrongly -- which four tests in `examples/` had been
+        // saying since this tier's first commit, to nothing that was listening.
         if let Some(i) = self.unit.ctor_index(q.symbol()) {
-            let v = self.bind(Kind::Boxed, format!("rt_ctor_value_p(ctx, {i})"));
+            let nullary = self
+                .unit
+                .layouts
+                .ctors
+                .get(i as usize)
+                .is_some_and(|(_, arity)| *arity == 0);
+            let call = if nullary {
+                format!("rt_nullary_p(ctx, {i})")
+            } else {
+                format!("rt_ctor_value_p(ctx, {i})")
+            };
+            let v = self.bind(Kind::Boxed, call);
             self.check();
             return Ok(v);
         }
