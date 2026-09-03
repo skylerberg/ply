@@ -55,6 +55,14 @@ pub enum CTy {
     Bytes,
     List,
     Record(Vec<(Symbol, CTy)>),
+    /// A type the checker fixed that this tier will not read as a number: a `Float`, a `Decimal`,
+    /// and the two widths past the immediate.
+    ///
+    /// Distinct from `Unknown`, and the distinction is load-bearing. `Unknown` is the emitter
+    /// having lost the type; this is the type being one the emitter must not guess `Int` for. An
+    /// operator may refuse on this and must not refuse on that -- refusing on `Unknown` took down
+    /// every body with a `match` arm binding a payload, which is most of them.
+    Opaque,
 }
 
 impl CTy {
@@ -66,6 +74,7 @@ impl CTy {
                 "Int" => CTy::Int,
                 "Bool" => CTy::Bool,
                 "Bytes" => CTy::Bytes,
+                "Float" | "Decimal" => CTy::Opaque,
                 // A width past sixty-two bits is not an immediate, so carrying one in a register
                 // would need a heap object of its own kind and a test for it -- the cost the
                 // family exists to remove. `jit::carried_width` draws the line in the same place
@@ -73,7 +82,8 @@ impl CTy {
                 // the tag on the way into a record.
                 other => match IntTy::from_name(other) {
                     Some(t) if t.bits() < 64 => CTy::Num(t),
-                    _ => CTy::Unknown,
+                    Some(_) => CTy::Opaque,
+                    None => CTy::Unknown,
                 },
             },
             Type::Con(name, args) if name.as_str() == "List" && args.len() == 1 => CTy::List,
@@ -383,12 +393,16 @@ impl<'a> Emit<'a> {
     /// Whether a value may be read as an `Int` at all. A raw register is one by construction; a
     /// word is one only if the checker said so.
     ///
-    /// Nothing else can be: `rt_unbox_int` raises on a `Float`, a `Decimal` and on the two widths
-    /// this tier does not carry, so an operator reaching for `as_int` on an unknown word is a body
-    /// that would answer with a diagnostic where the interpreter answers with a number. Refusing
-    /// is the tier's answer to that, and it is the same answer it gives a lambda.
+    /// `rt_unbox_int` raises on a `Float`, a `Decimal` and on the two widths this tier does not
+    /// carry, so an operator reaching for `as_int` on one of those is a body that would answer
+    /// with a diagnostic where the interpreter answers with a number. Refusing is the tier's
+    /// answer to that, and it is the same answer it gives a lambda.
+    ///
+    /// A word whose type the emitter merely lost is not one of those: the checker has already
+    /// agreed the operands of a `+` are numbers of one type, so an unknown word under an operator
+    /// is an `Int` unless the type says otherwise -- and `CTy::Opaque` is the type saying so.
     fn int_like(v: &V) -> bool {
-        v.k != Kind::Boxed || v.ty == CTy::Int
+        v.k != Kind::Boxed || v.ty != CTy::Opaque
     }
 
     fn refuse_unless_int(&self, l: &V, r: &V, what: &str) -> Result<()> {
@@ -1097,6 +1111,20 @@ impl<'a> Emit<'a> {
                 }
             }
         }
+        // The base is dead once its copies are in hand, and letting it go here is the difference
+        // between an update and a leak. `field` makes the same release for the same reason, under
+        // the same condition -- a variable at its last use, which is what `Own::Owned` says.
+        //
+        // Every copy was counted above before this runs, so the walk that lets the base's children
+        // go leaves the ones this record keeps alone, and drops exactly the ones it replaced.
+        if matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. }) {
+            let n = names.len();
+            self.tokens.insert(n);
+            self.line(format!(
+                "if (tok{n} == 0) {{ tok{n} = rt_reset_p(ctx, {0}); }} else {{ rt_dec_p(ctx, {0}); }}",
+                held_base.c
+            ));
+        }
         Ok(self.emit_record(&names, words, kinds))
     }
 
@@ -1269,7 +1297,8 @@ impl<'a> Emit<'a> {
             return Ok(self.bind(Kind::Num(t), format!("({}){}", ctype(Kind::Num(t)), held.c)));
         }
         if args.len() == 1
-            && let Some(_t) = b.converts_from()
+            && let Some(t) = b.converts_from()
+            && carried(t)
         {
             let e = self.as_int(&vals[0]);
             return Ok(self.bind(Kind::Int, e));
@@ -1281,7 +1310,12 @@ impl<'a> Emit<'a> {
         if let Some(v) = self.inline_bytes(b, &vals)? {
             return Ok(v);
         }
-        // Everything else goes through the runtime, which is the interpreter's own path.
+        // Everything else goes through the runtime, which is the interpreter's own path. It
+        // answers with a word of no known type -- except that a width this tier does not carry
+        // stays uncarried through it, so that an operator downstream refuses rather than reading
+        // a `U64` as an `Int`.
+        let opaque = b.converts_into().is_some_and(|t| !carried(t))
+            || vals.iter().any(|v| v.ty == CTy::Opaque);
         let mut ws = Vec::with_capacity(vals.len());
         for v in &vals.clone() {
             ws.push(self.owned(v));
@@ -1296,8 +1330,9 @@ impl<'a> Emit<'a> {
             }
         ));
         let index = self.unit.builtin(b);
-        let v = self.bind(
+        let v = self.bind_as(
             Kind::Boxed,
+            if opaque { CTy::Opaque } else { CTy::Unknown },
             format!(
                 "rt_builtin_p(ctx, {index}, (Word)(intptr_t){arr}, {})",
                 ws.len()
