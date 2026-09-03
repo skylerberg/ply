@@ -2331,6 +2331,7 @@ int_to_string(n) -> String
 ```ply
 bytes_len(b) -> Int
 bytes_at(b, i) -> Int                         // 0..=255; raises out of range
+bytes_u32_le(b, i) -> U32                     // four bytes, least significant first; raises out of range
 bytes_slice(b, start, end) -> Bytes           // never clamped
 bytes_concat(a, b) -> Bytes
 bytes_concat_all(bs: List<Bytes>) -> Bytes    // one allocation over the whole list
@@ -2459,7 +2460,7 @@ $ ply std
    std.config  15           5      4810
    std.db      292          34     110073
    std.fs      25           9      12652
-   std.hash    30           5      9391
+   std.hash    30           5      9476
    std.http    166          53     102957
    std.json    137          38     55912
    std.net     7            3      3720
@@ -2469,7 +2470,7 @@ $ ply std
 
    `import std.<name>` to use one; `ply std --show <name>` prints its source
 
-   digest: b3:c2c540917269
+   digest: b3:b7762efd639b
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`
@@ -3353,7 +3354,7 @@ rather than left to be discovered.
   caller that keeps reading what it passed. Position in the enclosing
   expression decides nothing: `ply check --costs` names each copy's cause.
 * `string_find` raises when the needle is absent; guard with `string_contains`.
-* `bytes_at` and `string_slice` **raise** out of range. `list_at` does not — it
+* `bytes_at`, `bytes_u32_le` and `string_slice` **raise** out of range. `list_at` does not — it
   answers `None`. The two containers are indexed by different conventions on
   purpose; §13.2 and §13.6 say which is which, and
   `docs/adr/0027-a-list-index.md` says why.

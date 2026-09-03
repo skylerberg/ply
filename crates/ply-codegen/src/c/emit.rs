@@ -1501,6 +1501,7 @@ impl<'a> Emit<'a> {
     fn inline_bytes(&mut self, b: Builtin, vals: &[V]) -> Result<Option<V>> {
         let (kind, want, known) = match (b, vals.len()) {
             (Builtin::BytesAt, 2) => (crate::heap::KIND_BYTES, 2, vals[0].ty == CTy::Bytes),
+            (Builtin::BytesU32Le, 2) => (crate::heap::KIND_BYTES, 2, vals[0].ty == CTy::Bytes),
             (Builtin::BytesLen, 1) => (crate::heap::KIND_BYTES, 1, vals[0].ty == CTy::Bytes),
             (Builtin::Len, 1) => (crate::heap::KIND_LIST, 1, vals[0].ty == CTy::List),
             _ => return Ok(None),
@@ -1514,6 +1515,28 @@ impl<'a> Emit<'a> {
                 let w = self.word(&vals[0]);
                 self.bind(Kind::Boxed, w)
             };
+            // One bounds test and one four-byte load, where the same answer assembled a byte at a
+            // time cost four of each plus the shifts. `memcpy` of four bytes is how a C compiler
+            // is told to emit an unaligned load: it lowers to a single `ldur` and never a call.
+            if matches!(b, Builtin::BytesU32Le) {
+                let i = self.as_int(&vals[1]);
+                let idx = self.bind(Kind::Int, i);
+                let index = self.unit.builtin(b);
+                self.line(format!(
+                    "if ((uint64_t){0} + 4 > (uint64_t)ply_obj({1})->len) {{ Word a[2]; a[0] = {1}; ply_inc(a[0]); a[1] = ply_imm({0}); rt_builtin_p(ctx, {index}, (Word)(intptr_t)a, 2); return 0; }}",
+                    idx.c, t.c
+                ));
+                let w = self.fresh();
+                self.line(format!(
+                    "uint32_t {w}; memcpy(&{w}, (unsigned char *)ply_words({}) + {}, 4);",
+                    t.c, idx.c
+                ));
+                return Ok(Some(V {
+                    k: Kind::Num(IntTy::U32),
+                    c: format!("ply_le32({w})"),
+                    ty: CTy::Num(IntTy::U32),
+                }));
+            }
             if want == 2 {
                 let i = self.as_int(&vals[1]);
                 let idx = self.bind(Kind::Int, i);

@@ -644,6 +644,13 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*b);
             Some(heap::imm(i64::from(byte)))
         }
+        (Builtin::BytesU32Le, [b, i]) if heap::kind(*b) == KIND_BYTES => {
+            let index = usize::try_from(heap::as_int(*i)?).ok()?;
+            let four = unsafe { bytes_of(obj(*b)) }.get(index..index + 4)?;
+            let w = u32::from_le_bytes(four.try_into().ok()?);
+            heap::dec(*b);
+            Some(heap::imm(i64::from(w)))
+        }
         (Builtin::BytesSlice, [b, s, e]) if heap::kind(*b) == KIND_BYTES => {
             let bytes = unsafe { bytes_of(obj(*b)) };
             let (start, end) = slice_range(*s, *e, bytes.len())?;

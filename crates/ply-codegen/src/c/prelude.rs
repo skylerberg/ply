@@ -37,6 +37,14 @@ typedef struct {
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
 static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }
 static inline int ply_is_imm(Word w) { return (w & 1) != 0; }
+/* Four bytes read least-significant-first, whatever this machine's order is. */
+static inline uint32_t ply_le32(uint32_t v) {
+#if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+  return __builtin_bswap32(v);
+#else
+  return v;
+#endif
+}
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return ((v << 1) >> 1) == v; }
