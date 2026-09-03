@@ -1,9 +1,11 @@
 # ADR 0040 — What a second code generator is for
 
 **Accepted as a build and a placement. Ply has a second code generator; it does
-not go in the loop, and on it the integer kernel reaches ADR 0035's bar without
-clearing it — the gate's word is *undecided*, twice.** The shipped tier is at
-5.18 and cannot follow, for a reason this record measures. What the tier mostly
+not go in the loop, and on it the integer kernel clears ADR 0035's bar** — three
+runs of four *within the bar*, the fourth undecided, from 5.79 when it was built.
+The model still does not stand, because the *record* kernel does not clear on
+this tier. The shipped tier is at 5.18 on the integer kernel and cannot follow,
+for a reason this record measures. What the tier mostly
 did was answer the question ADR 0039 left open, and the answer is not the one
 that record predicted.
 
@@ -290,6 +292,8 @@ rather than the mean. Five moved nothing; the sixth is the one worth keeping.
 | **not** eliding records past a width, on the theory that Rust's bar keeps its message in memory and reloads it | **1.3× worse.** The ablation that shows the elision is doing the work, and the theory was wrong |
 | deciding a block's padding once, *with* a field-wise `if` join so the elision survives the branch | **about five percent off the median**, and a tighter distribution. The minimum does not move, and the minimum is what the gate reads |
 | remembering a pure nullary root, which the in-process tier already did | **about six percent off the minimum.** Not a lever so much as a parity gap: the kernel's input is a 65KB literal and `rt_lit` rebuilds a literal every evaluation |
+| inlining six deep rather than four, which was never swept after the budget was raised | **about three percent off the minimum and five off the median**, and past it nothing: 6000:6, 6000:8 and 20000:8 are all worse than 2000:6 |
+| taking a field out of a record nobody else holds, which is ADR 0034's rule and which the in-process tier already applied | **neutral on both kernels**, and kept for parity rather than for the measurement |
 
 **And then the instrument.** Run the same binary against *itself* through that
 harness and the two arms differ by about five percent. The distance from 3.14 to
@@ -321,13 +325,18 @@ null control, load gate held:
 
 | kernel | Cranelift | C tier | bar |
 | --- | --- | --- | --- |
-| k1 (BLAKE3) | 5.18 | **2.97 – 3.23 over four runs** | 3.0 |
-| k2 (records) | 1.84 | 4.5 – 5.4 | 3.0 |
+| k1 (BLAKE3) | 5.18 | **2.62, 2.66, 2.90, 2.97** | 3.0 |
+| k2 (records) | 1.84 | 4.2 – 5.0 | 3.0 |
 
-**The integer kernel reaches the bar on the C tier and does not clear it.** Four
-runs straddle it — one below, two the gate calls *undecided (within the
-resolution of the bar)*, and one over. A kernel sitting on its bar rather than
-one that has passed it.
+**The integer kernel clears the bar on the C tier.** Four runs: three *within the
+bar*, one *undecided (within the resolution of the bar)*, none over. It began at
+seven times the bar, and 5.79 when this tier was built.
+
+**The model does not stand**, because ADR 0035's gate asks both kernels and the
+record kernel is at about 4.6. That is a different kernel with a different story:
+its time is in the persistent map's own path-copying and in building a two-byte
+key per iteration, and the in-process tier does the same work in a third of the
+time. Why is not answered here.
 
 The k2 column is the one that moved most and it is not a code generation number
 either: `fold` was refused, so the fold ran interpreted and crossed the seam per
@@ -339,7 +348,7 @@ it is a data structure question.
 
 Two things about that number are worth more than the number.
 
-**The first is where it came from.** 5.79 to about 3.1 is not a code generator
+**The first is where it came from.** 5.79 to about 2.8 is not a code generator
 getting better at emitting the same program. It is a handful of changes that stop
 the program being emitted — §"What the tier was for" — plus two that are not
 about the kernel at all: deciding a block's padding once rather than sixteen
