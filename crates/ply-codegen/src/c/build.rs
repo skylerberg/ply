@@ -200,6 +200,7 @@ fn emit_one(loaded: &'static Source, unit: &mut Unit, name: &str) -> Result<Stri
     let word = e.word(&answer);
     let mut out = head;
     out.push_str(&e.token_decls());
+    out.push_str(&e.record_decls());
     out.push_str(&e.out);
     out.push_str(&format!("  ctx->fuel += 1;\n  return {word};\n}}\n"));
     // The entry the seam and a closure reach the body through, over the handle ABI.
