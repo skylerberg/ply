@@ -342,7 +342,7 @@ impl<'a> Emit<'a> {
         // zero until it is, and copying that zero into a second local is a null the next reader
         // walks into. Its local is declared for the whole body, so naming it again is safe and
         // naming it is all a rename needed to do.
-        if self.record_locals.iter().any(|r| *r == e) {
+        if self.record_locals.contains(&e) {
             return V { k, c: e, ty };
         }
         // A binding that is only a rename carries the fields the record was built from with it.
@@ -976,6 +976,19 @@ impl<'a> Emit<'a> {
     }
 
     fn block(&mut self, stmts: &[Stmt], tail: Option<&Code>) -> Result<V> {
+        let mark = self.block_stmts(stmts)?;
+        let answer = match tail {
+            Some(t) => self.expr(t)?,
+            None => V::boxed(unit_word()),
+        };
+        // The answer is bound before the scope closes, since a name it reads goes out of scope.
+        let held = self.bind_as(answer.k, answer.ty.clone(), answer.c);
+        self.scope.truncate(mark);
+        Ok(held)
+    }
+
+    /// A block's statements, with the scope mark to close it at.
+    fn block_stmts(&mut self, stmts: &[Stmt]) -> Result<usize> {
         let mark = self.scope.len();
         for s in stmts {
             match s {
@@ -1005,14 +1018,7 @@ impl<'a> Emit<'a> {
                 }
             }
         }
-        let answer = match tail {
-            Some(t) => self.expr(t)?,
-            None => V::boxed(unit_word()),
-        };
-        // The answer is bound before the scope closes, since a name it reads goes out of scope.
-        let held = self.bind_as(answer.k, answer.ty.clone(), answer.c);
-        self.scope.truncate(mark);
-        Ok(held)
+        Ok(mark)
     }
 
     fn field(&mut self, base: &Code, name: &Symbol) -> Result<V> {
@@ -1577,6 +1583,17 @@ impl<'a> Emit<'a> {
         let mark = self.scope.len();
         let held = self.bind_as(Kind::Boxed, state_ty.clone(), state.clone());
         self.scope.push((params[0].clone(), held));
+        // The step's answer is a `Stop` or a `Continue` that this loop takes apart one line later.
+        // When its shape says so all the way down, write straight into the loop's own control
+        // instead: no constructor built, none taken apart, and one fewer object to dismantle per
+        // iteration -- which over a hash is one per 64-byte block.
+        if self.fusable_step(body) {
+            self.emit_step(body, &state, &answer, stop, go)?;
+            self.scope.truncate(mark);
+            self.depth -= 1;
+            self.line("}");
+            return Ok(V::boxed(answer));
+        }
         let r = self.expr(body)?;
         let rw = self.word(&r);
         let step_answer = self.bind(Kind::Boxed, rw);
@@ -1608,6 +1625,89 @@ impl<'a> Emit<'a> {
         self.depth -= 1;
         self.line("}");
         Ok(V::boxed(answer))
+    }
+
+    /// Whether every way out of this step is a `Stop` or a `Continue` written here, so that the
+    /// loop can be given the payload rather than a constructor holding it.
+    fn fusable_step(&self, code: &Code) -> bool {
+        match &code.kind {
+            NodeKind::App { func, args } if args.len() == 1 => {
+                matches!(&func.kind, NodeKind::Var { name, .. }
+                if self.ctor_index(name).is_some_and(|i| {
+                    Some(i) == self.unit.layouts.stop || Some(i) == self.unit.layouts.go
+                }))
+            }
+            NodeKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => self.fusable_step(then_branch) && self.fusable_step(else_branch),
+            NodeKind::Block {
+                tail: Some(tail), ..
+            } => self.fusable_step(tail),
+            _ => false,
+        }
+    }
+
+    /// The step, with `Stop` and `Continue` written into the loop instead of built.
+    fn emit_step(
+        &mut self,
+        code: &Code,
+        state: &str,
+        answer: &str,
+        stop: u32,
+        go: u32,
+    ) -> Result<()> {
+        match &code.kind {
+            NodeKind::App { func, args } => {
+                let NodeKind::Var { name, .. } = &func.kind else {
+                    unreachable!("checked by `fusable_step`")
+                };
+                let which = self.ctor_index(name).expect("checked by `fusable_step`");
+                let v = self.expr(&args[0])?;
+                let w = self.word(&v);
+                if Some(which) == self.unit.layouts.stop {
+                    debug_assert_eq!(which, stop);
+                    self.line(format!("{answer} = {w};"));
+                    self.line("break;");
+                } else {
+                    debug_assert_eq!(which, go);
+                    self.line(format!("{state} = {w};"));
+                }
+                Ok(())
+            }
+            NodeKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                let c = self.expr(cond)?;
+                let cb = self.as_bool(&c);
+                self.line(format!("if ({cb}) {{"));
+                self.depth += 1;
+                self.emit_step(then_branch, state, answer, stop, go)?;
+                self.depth -= 1;
+                self.line("} else {");
+                self.depth += 1;
+                self.emit_step(else_branch, state, answer, stop, go)?;
+                self.depth -= 1;
+                self.line("}");
+                Ok(())
+            }
+            NodeKind::Block { stmts, tail } => {
+                let mark = self.block_stmts(stmts)?;
+                self.emit_step(
+                    tail.as_ref().expect("checked by `fusable_step`"),
+                    state,
+                    answer,
+                    stop,
+                    go,
+                )?;
+                self.scope.truncate(mark);
+                Ok(())
+            }
+            _ => unreachable!("checked by `fusable_step`"),
+        }
     }
 
     /// `bytes_at`, `bytes_len` and `len`, read straight off the object's header and payload when
