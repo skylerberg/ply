@@ -333,7 +333,14 @@ measurement is confounded until the earlier one has moved.
    literal step as the loop's own body, the round's rotate as one
    instruction, and a parameter a body only reads borrowed for the call; its
    series are `benches/value-model/after-borrows.txt` and
-   `benches/front-end-whole/observation-8.txt`.
+   `benches/front-end-whole/observation-8.txt`. **The record kernel is inside
+   the bar and the integer kernel is not**, and what keeps it out is now
+   measured rather than listed: `benches/value-model/k1-where.sh` prices the
+   checked adds at nothing, the masks at a few percent and the records at a
+   fifth, and finds a round that spills four hundred times because every word
+   is a sixty-four-bit tagged value and thirty-two of them are live at once.
+   Ply has one integer type, so nothing in the source or the checker can say a
+   value is thirty-two bits; ADR 0036 carries what that means.
 10. **Emit C, for release; inside the loop it is priced and not chosen.** Where
     the path ends, decided as a direction and gated on step 9: the eventual host
     is a C compiler and libc, with the compiler and its runtime written in Ply,

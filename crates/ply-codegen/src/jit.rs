@@ -350,7 +350,23 @@ impl Jit {
                 *module_index,
                 Some(&func.sig),
             )?;
+            // `PLY_CODEGEN_ASM=<program-wide name>` prints what one definition compiles to, which
+            // is the only way to see the costs the source does not show: spills, rematerialised
+            // constants, and the untagging a field read expands into. `benches/value-model` used
+            // it to find that the integer kernel's gap is register pressure rather than the
+            // arithmetic, after two cheaper instruments said nothing.
+            let asm = std::env::var("PLY_CODEGEN_ASM").is_ok_and(|want| want == *name);
+            if asm {
+                clif.set_disasm(true);
+            }
             jit.module.define_function(func.typed, &mut clif)?;
+            if asm && let Some(compiled) = clif.compiled_code() {
+                eprintln!(
+                    "compiled `{name}`: {} bytes\n{}",
+                    compiled.code_buffer().len(),
+                    compiled.vcode.as_deref().unwrap_or("<no listing>")
+                );
+            }
             clif.clear();
             clif.func.signature = jit.entry_signature();
             jit.define_entry(&mut clif, &mut fctx, loaded, &func);
