@@ -26,7 +26,8 @@ import spine (push_front, positional, Span, Ident, QName, Ctx, P, R, Ate, Acc, P
               k_true, k_false,
               num, rec, nlist, opt, payload, word, dump_list, dump_opt,
               dump_ident, dump_qname, dump_diags, start)
-import lexer (Tok, Token, TIdent, TInt, TFloat, TDec, TStr, TBytes, TKw, TPunct, TEof)
+import lexer (Tok, Token, TIdent, TInt, TFixed, TFloat, TDec, TStr, TBytes, TKw, TPunct,
+  TEof, Width, width_named, width_normalize)
 
 // --- Literals ---------------------------------------------------------------
 
@@ -49,6 +50,8 @@ import lexer (Tok, Token, TIdent, TInt, TFloat, TDec, TStr, TBytes, TKw, TPunct,
 // disagree about what a float is.
 pub type Lit =
   | LInt(Int)
+  // ADR 0039's suffixed literal: the width's name and the pattern the width reads.
+  | LFixed(Bytes, Int)
   | LBool(Bool)
   | LStr(Bytes)
   | LBytes(Bytes)
@@ -60,6 +63,8 @@ pub type Lit =
 pub fn dump_lit(l: Lit) -> Bytes =
   match l {
     LInt(v) -> bytes_concat(word(b"int"), payload(num(v))),
+    LFixed(ty, v) ->
+      bytes_concat(word(b"fixed"), payload(bytes_concat_all([ty, b":", num(v)]))),
     LBool(b) -> bytes_concat(word(b"bool"), payload(if b { b"1" } else { b"0" })),
     LStr(s) -> bytes_concat(word(b"str"), payload(s)),
     LBytes(b) -> bytes_concat(word(b"bytes"), payload(b)),
@@ -137,12 +142,19 @@ fn lit_pat(c: Ctx, p: P, l: Lit) -> Result<R<Pattern>, P> = {
 fn src_over(c: Ctx, s: Span) -> Bytes = bytes_slice(c.src, s.start, s.end)
 
 fn is_num_tok(t: Tok) -> Bool =
-  match t { TInt(v) -> true, TFloat(f) -> true, TDec(m, sc) -> true, _ -> false }
+  match t {
+    TInt(v) -> true,
+    TFixed(ty, v) -> true,
+    TFloat(f) -> true,
+    TDec(m, sc) -> true,
+    _ -> false,
+  }
 
 fn pattern_body(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   let st = cur_span(c, p);
   match kind(c, p) {
     TInt(v) -> lit_pat(c, p, LInt(v)),
+    TFixed(ty, v) -> lit_pat(c, p, LFixed(ty, v)),
     // `lexer.ply`'s payload is discarded on purpose: what goes in the tree is
     // the source, sliced. See the note on `Lit`.
     TFloat(f) -> lit_pat(c, p, LFloat(src_over(c, st))),
@@ -171,6 +183,15 @@ fn pattern_body(c: Ctx, p: P) -> Result<R<Pattern>, P> = {
   }
 }
 
+fn string_lower_bytes(b: Bytes) -> Bytes = bytes_of_string(string_lower(string_of_bytes(b)))
+
+// `-v` taken modulo the width, which is what `IntTy::normalize` of a wrapped negation gives.
+fn neg_at_width(ty: Bytes, v: Int) -> Int =
+  match width_named(string_lower_bytes(ty)) {
+    Some(w) -> width_normalize(w, wrap_sub(0, v)),
+    None -> 0 - v,
+  }
+
 fn neg_lit(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
   let m = advance(c, p);
   let a = advance(c, m.p);
@@ -180,6 +201,10 @@ fn neg_lit(c: Ctx, p: P, st: Span) -> Result<R<Pattern>, P> = {
   // the `-` in it.
   match kind(c, m.p) {
     TInt(v) -> Ok({ p: a.p, node: PLit({ span: s, lit: LInt(0 - v) }) }),
+    // Negated at the width, where `-128i8` is a value and `128i8` is not, so the smallest value
+    // of every signed type is writable in a pattern.
+    TFixed(ty, v) ->
+      Ok({ p: a.p, node: PLit({ span: s, lit: LFixed(ty, neg_at_width(ty, v)) }) }),
     TFloat(f) -> Ok({ p: a.p, node: PLit({ span: s, lit: LFloat(src_over(c, s)) }) }),
     TDec(mm, sc) -> Ok({ p: a.p, node: PLit({ span: s, lit: LDec(src_over(c, s)) }) }),
     // Unreachable: `is_num_tok` on `kind_at(1)` is what reached this function.
