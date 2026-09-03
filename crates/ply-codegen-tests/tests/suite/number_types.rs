@@ -59,6 +59,16 @@ fn round_trip(seed: Int) -> Int = {
   int_of_u32(q.a ^ q.b ^ q.c ^ q.d)
 }
 
+// An `if` whose branches answer a width, which is the shape `std.hash`'s flags are built with.
+// It is here because it once compiled to `ubfx x5, x0, #0, #64` --- a join block parameter typed
+// `I64` where both branches passed an `I32`, which Cranelift's verifier accepted, the assembler
+// encoded and the processor refused with SIGILL.
+fn flags(i: Int, last: Bool, is_root: Bool) -> Int =
+  int_of_u32(
+    (if i == 0 { 1u32 } else { 0u32 })
+    | (if last { 2u32 } else { 0u32 })
+    | (if last && is_root { 8u32 } else { 0u32 }))
+
 // A loop over the widths, so the fused-loop path carries them too.
 fn mixed(n: Int) -> Int =
   int_of_u32(fold(range(0, n), 0u32, |acc: U32, i: Int| rotr(acc ^ u32_of_int(i), 7)))
@@ -169,6 +179,16 @@ fn a_compiled_body_answers_what_the_interpreter_answers_at_each_width() {
             Value::Bool(true),
         ),
         ("m.from_literal", vec![], Value::Int(0x6A09_E667)),
+        (
+            "m.flags",
+            vec![Value::Int(0), Value::Bool(true), Value::Bool(true)],
+            Value::Int(11),
+        ),
+        (
+            "m.flags",
+            vec![Value::Int(3), Value::Bool(false), Value::Bool(false)],
+            Value::Int(0),
+        ),
         (
             "m.literal_arithmetic",
             vec![Value::Int(100)],
