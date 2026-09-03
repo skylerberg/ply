@@ -174,6 +174,9 @@ pub struct Emit<'a> {
     /// and what `rt_reset` answers. Without it the integer kernel takes sixteen fresh records per
     /// block and touches two megabytes of cold memory per hash.
     pub tokens: std::collections::BTreeSet<usize>,
+    /// For each C local holding a record this body built, the values its fields were built from.
+    /// A later read of one of those fields is that value, not a load: see `emit_record`.
+    built: std::collections::HashMap<String, Vec<(Symbol, V)>>,
 }
 
 /// What an emitted unit accumulates that is not code. It is the Cranelift tier's `Jit` state,
@@ -262,6 +265,7 @@ impl<'a> Emit<'a> {
             unit,
             depth: 0,
             tokens: std::collections::BTreeSet::new(),
+            built: std::collections::HashMap::new(),
         }
     }
 
@@ -314,6 +318,12 @@ impl<'a> Emit<'a> {
         let name = self.fresh();
         let ct = ctype(k);
         let e = expr.as_ref().to_string();
+        // A binding that is only a rename carries the fields the record was built from with it.
+        // The inliner turns every argument into a `let`, so without this the knowledge is lost at
+        // the first one -- which is immediately.
+        if let Some(fields) = self.built.get(&e).cloned() {
+            self.built.insert(name.clone(), fields);
+        }
         self.line(format!("{ct} {name} = {e};"));
         V { k, c: name, ty }
     }
@@ -940,6 +950,17 @@ impl<'a> Emit<'a> {
         // which is what this emitter did first — costs a call per word, and the integer kernel
         // reads thirty-two per round.
         let base_local = held.c.clone();
+        // Built in this body: the value is already in a register, and reading it back out of
+        // memory only to take the tag off is the traffic `emit_record`'s note is about.
+        if let Some(v) = self
+            .built
+            .get(&b.c)
+            .and_then(|fs| fs.iter().find(|(n, _)| n == name))
+            .map(|(_, v)| v.clone())
+        {
+            self.release_base(base, &b, &base_local);
+            return Ok(v);
+        }
         let w = match at {
             Some(at) => self.bind(Kind::Boxed, format!("ply_words({})[{at}]", held.c)),
             None => {
@@ -977,18 +998,29 @@ impl<'a> Emit<'a> {
         // Narrow on purpose. The base must be a variable at its last use — which is what the
         // lowering's `Own::Owned` says and what the interpreter reads too — and the field must be
         // a scalar, so the value just read cannot be inside the memory being let go.
-        if matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. }) {
-            match record_width(&b.ty) {
-                Some(n) => {
-                    self.tokens.insert(n);
-                    self.line(format!(
-                        "if (tok{n} == 0) {{ tok{n} = ply_reset_flat({base_local}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {base_local}); }} else {{ rt_dec_p(ctx, {base_local}); }}"
-                    ));
-                }
-                None => self.line(format!("rt_dec_p(ctx, {base_local});")),
-            }
-        }
+        self.release_base(base, &b, &base_local);
         Ok(held)
+    }
+
+    /// A record read to its last field is dead; letting it go here puts its memory on the free
+    /// list, where the next record of its size class takes it instead of fresh memory. Without it
+    /// the integer kernel touches two megabytes per hash and every record is cold.
+    ///
+    /// Narrow on purpose. The base must be a variable at its last use -- which is what the
+    /// lowering's `Own::Owned` says and what the interpreter reads too.
+    fn release_base(&mut self, base: &Code, b: &V, base_local: &str) {
+        if !(matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. })) {
+            return;
+        }
+        match record_width(&b.ty) {
+            Some(n) => {
+                self.tokens.insert(n);
+                self.line(format!(
+                    "if (tok{n} == 0) {{ tok{n} = ply_reset_flat({base_local}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {base_local}); }} else {{ rt_dec_p(ctx, {base_local}); }}"
+                ));
+            }
+            None => self.line(format!("rt_dec_p(ctx, {base_local});")),
+        }
     }
 
     fn record(&mut self, fields: &[(Symbol, Code)]) -> Result<V> {
@@ -996,6 +1028,7 @@ impl<'a> Emit<'a> {
         names.sort();
         let mut words = Vec::with_capacity(fields.len());
         let mut kinds = Vec::with_capacity(fields.len());
+        let mut vals = Vec::with_capacity(fields.len());
         for name in &names {
             let (_, code) = fields
                 .iter()
@@ -1004,8 +1037,9 @@ impl<'a> Emit<'a> {
             let v = self.expr(code)?;
             kinds.push(v.ty.clone());
             words.push(self.owned(&v));
+            vals.push(v);
         }
-        Ok(self.emit_record(&names, words, kinds))
+        Ok(self.emit_record(&names, words, kinds, Some(vals)))
     }
 
     /// The tail both record forms share: a Perceus token if one is in hand, a fresh allocation
@@ -1015,7 +1049,13 @@ impl<'a> Emit<'a> {
     /// answered with no type at all. In the integer kernel the permuted message word *is* a record
     /// update, so one untyped record put the next round's thirty-two field reads back on the
     /// runtime, and the round after that, for a hundred and sixty calls per compression.
-    fn emit_record(&mut self, names: &[Symbol], words: Vec<String>, kinds: Vec<CTy>) -> V {
+    fn emit_record(
+        &mut self,
+        names: &[Symbol],
+        words: Vec<String>,
+        kinds: Vec<CTy>,
+        built_from: Option<Vec<V>>,
+    ) -> V {
         let shape = self.unit.shape(names);
         // A record of nothing but immediates holds no counts, and saying so is what lets the
         // runtime skip walking its fields when it dies or is freed. The kernel's records are
@@ -1051,6 +1091,18 @@ impl<'a> Emit<'a> {
         for (at, w) in words.iter().enumerate() {
             self.line(format!("ply_words({})[{at}] = {w};", r.c));
         }
+        // What went in is what will come out: a record is immutable once built, so a field read of
+        // it later in this body is the value already in a register. Remembering them here is what
+        // lets that read skip the store, the load and the tag -- which is 32 of the 182
+        // instructions `round` spends above the Rust bar, and all of `compress`'s own work once
+        // the rounds are inlined into it.
+        //
+        // Sound because the values are C locals of this body, and a record that leaves the body
+        // leaves through a name this table has no entry for.
+        if let Some(vals) = built_from {
+            self.built
+                .insert(r.c.clone(), names.iter().cloned().zip(vals).collect());
+        }
         r
     }
 
@@ -1078,16 +1130,36 @@ impl<'a> Emit<'a> {
         let held_base = self.bind(Kind::Boxed, bw);
         let mut words = Vec::with_capacity(names.len());
         let mut kinds = Vec::with_capacity(names.len());
+        let mut vals: Option<Vec<V>> = Some(Vec::with_capacity(names.len()));
         for name in &names {
             match written.iter().find(|(n, _)| n == name) {
                 Some((_, v)) => {
                     let v = v.clone();
                     kinds.push(v.ty.clone());
                     words.push(self.owned(&v));
+                    if let Some(vs) = vals.as_mut() {
+                        vs.push(v);
+                    }
                 }
                 None => {
                     let ft = base_ty.field(name).cloned().unwrap_or(CTy::Unknown);
-                    kinds.push(ft);
+                    kinds.push(ft.clone());
+                    // A field the base itself remembered is the value, not a load. This is what
+                    // carries the knowledge along a chain of updates: BLAKE3's message schedule is
+                    // six permutations one after another, and one link read from memory puts the
+                    // next round's thirty-two reads back there too.
+                    let known = self
+                        .built
+                        .get(&held_base.c)
+                        .and_then(|fs| fs.iter().find(|(n, _)| n == name))
+                        .map(|(_, v)| v.clone());
+                    if let Some(v) = known {
+                        words.push(self.owned(&v));
+                        if let Some(vs) = vals.as_mut() {
+                            vs.push(v);
+                        }
+                        continue;
+                    }
                     match base_ty.offset(name) {
                         // A copied field of a shape the checker fixed is a load, as in `field`.
                         // The count has to go up by hand here: the runtime's reader takes one on
@@ -1096,7 +1168,22 @@ impl<'a> Emit<'a> {
                             let t = self.fresh();
                             self.line(format!("Word {t} = ply_words({})[{at}];", held_base.c));
                             self.line(format!("ply_inc({t});"));
+                            let w = V {
+                                k: Kind::Boxed,
+                                c: t.clone(),
+                                ty: ft.clone(),
+                            };
                             words.push(t);
+                            match ft.kind() {
+                                Kind::Boxed => vals = None,
+                                kind => {
+                                    let e = self.as_kind(&w, kind);
+                                    let held = self.bind_as(kind, ft, e);
+                                    if let Some(vs) = vals.as_mut() {
+                                        vs.push(held);
+                                    }
+                                }
+                            }
                         }
                         None => {
                             let index = self.unit.field(name);
@@ -1106,6 +1193,7 @@ impl<'a> Emit<'a> {
                             );
                             self.check();
                             words.push(f.c);
+                            vals = None;
                         }
                     }
                 }
@@ -1125,7 +1213,7 @@ impl<'a> Emit<'a> {
                 held_base.c
             ));
         }
-        Ok(self.emit_record(&names, words, kinds))
+        Ok(self.emit_record(&names, words, kinds, vals))
     }
 
     fn list(&mut self, items: &[Code]) -> Result<V> {

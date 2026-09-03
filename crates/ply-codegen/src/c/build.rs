@@ -161,7 +161,7 @@ fn emit_one(loaded: &'static Source, unit: &mut Unit, name: &str) -> Result<Stri
         }
         .into());
     };
-    let body = crate::opt::optimize(loaded, module_index, def);
+    let body = crate::opt::optimize(loaded, module_index, def, crate::opt::Inlining::EMITTED);
     let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
     let lowered = lower_fn(&params, &body);
     let mut e = Emit::new(loaded, unit, name, module_index);
