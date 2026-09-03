@@ -250,13 +250,27 @@ reader does not spend the day:
 | borrowing the two state records instead of reusing the dying one | **worse: 6.45 against 6.01.** The bump allocation the reuse saves costs more than the reference counting and the doubled body it pays |
 | storing a width raw in a flat record, so the tag round-trip goes | **a twentieth, and the reason is the fourth time the same wall appears.** Ablated: the 64 untags and 32 tags per `round` do go, and 96 instructions out buys 33, because the loads rise from 102 to 113 and the stack traffic from 114 to 136. Taking the shift away lengthens the live range it was shortening, and the allocator spills the difference. (The ablation also segfaults, since a generic path reads a record's word without its shape's field types — which is what a shipped version would have to teach.) |
 
-**Four levers, and every one of them ends at the same wall.** Inline the round
+### Three more, and where the hoisting actually happens
+
+| lever | effect |
+| --- | --- |
+| borrow every parameter past the first donor of each width — the old rule kept *all* of them owned, though one token slot means only one can ever donate | **neutral: 6.01, and a `round` 8.5% smaller.** The duplicate in the caller and the release here did go; the time did not move. Kept anyway, since the rule is now true rather than merely safe |
+| sink a pure field read used once to its use, so the inliner stops binding thirty-two of them above the reference-count prologue | **neutral, and the reason is worth more than the lever.** The IR comes out exactly right — `PLY_OPT_DUMP` shows `s.m0` read where it is used — and the machine code is byte-for-byte what it was. **Cranelift's own mid-end hoists them straight back.** Not kept |
+| `opt_level = "none"`, which stops the hoisting | **7.27, worse.** With it off the loads stay sunk — 5 before the first rotate against 38, and stack traffic 65 against 108 — and the kernel is slower anyway, because the GVN and the dead code the same pass removes are worth more than the spills it causes |
+
+That last pair is the most useful thing in this section. **The thirty-two live
+values are not something the language hands Cranelift; Cranelift makes them**,
+and it makes them because on balance it is right to. There is no arrangement of
+the IR that avoids it and no setting that improves on it.
+
+**Seven levers, and every one of them ends at the same wall.** Inline the round
 and the allocator spills; borrow the records and the allocation it saved costs
-more; untag the fields and the allocator takes back two thirds of what was
-removed; and ADR 0036 already recorded a fifth, sinking a field read to its use,
-with the same result in the same words — *spills went up, time unchanged*. The
-binding constraint is Cranelift's register allocator over a body with
-thirty-two live values, and it is not something a type can move.
+more; untag the fields and the allocator takes back two thirds; sink the loads
+and the mid-end undoes it; stop the mid-end and lose more than the spills cost.
+ADR 0036 recorded the same result in the same words before any of them —
+*spills went up, time unchanged*. The binding constraint is Cranelift's register
+allocator over a body with thirty-two live values, and it is not something a
+type, or an IR, or a flag can move.
 
 **So the bar is not reachable from the type system, and the probe says what it
 is reachable from.** `width-probe`'s `i64t` arm is Ply's compiled representation
