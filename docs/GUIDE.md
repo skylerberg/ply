@@ -1755,6 +1755,16 @@ and the replay command.
 twice — once with it and once without — and fails the run on any disagreement
 (`E0503`). It is off by default because it doubles what a run costs.
 
+The flag always takes a value, and there are three. `reference` is a nested
+machine over the same fragment, which is what the seam is checked against rather
+than a way to go faster. `cranelift` compiles to native code in process, and is
+the one to reach for. `c` emits the same code as C, hands it to `cc`, and loads
+the result — far slower to compile, and not what you want in a loop, but its
+bodies carry symbols, so a sampling profiler and a disassembler can both read
+what a definition became. `PLY_C_KEEP=1` leaves the `.c` and the shared object
+behind for that; `PLY_C_REFUSALS=1` says which definitions the tier declined and
+why, since a definition a tier refuses is left to the machine.
+
 A run with a backend attached does use the result cache, in a namespace of its
 own. A stored pass names the engine that earned it, so a backed run selects
 against what backed runs proved and never against what the machine proved, and
@@ -2321,6 +2331,7 @@ int_to_string(n) -> String
 ```ply
 bytes_len(b) -> Int
 bytes_at(b, i) -> Int                         // 0..=255; raises out of range
+bytes_u32_le(b, i) -> U32                     // four bytes, least significant first; raises out of range
 bytes_slice(b, start, end) -> Bytes           // never clamped
 bytes_concat(a, b) -> Bytes
 bytes_concat_all(bs: List<Bytes>) -> Bytes    // one allocation over the whole list
@@ -2449,7 +2460,7 @@ $ ply std
    std.config  15           5      4810
    std.db      292          34     110073
    std.fs      25           9      12652
-   std.hash    30           5      9391
+   std.hash    30           5      9476
    std.http    166          53     102957
    std.json    137          38     55912
    std.net     7            3      3720
@@ -2459,7 +2470,7 @@ $ ply std
 
    `import std.<name>` to use one; `ply std --show <name>` prints its source
 
-   digest: b3:c2c540917269
+   digest: b3:b7762efd639b
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`
@@ -3011,7 +3022,7 @@ is `E0127` with exit code 2 (§6.7).
 | `--bisect auto\|always\|never` | attribute a failure to the change that caused it |
 | `--bisect-budget N` | hybrid programs a bisection may evaluate (default 64) |
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
-| `--backend BACKEND` | attach a compiled backend to the machine |
+| `--backend BACKEND` | attach a compiled backend: `reference`, `cranelift` or `c` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
 | `--audit-backend` | also run each test without the backend and fail on any disagreement |
 | `--host` | bind the real host handlers |
 | `--std` | also select the tests the shipped modules declare |
@@ -3343,7 +3354,7 @@ rather than left to be discovered.
   caller that keeps reading what it passed. Position in the enclosing
   expression decides nothing: `ply check --costs` names each copy's cause.
 * `string_find` raises when the needle is absent; guard with `string_contains`.
-* `bytes_at` and `string_slice` **raise** out of range. `list_at` does not — it
+* `bytes_at`, `bytes_u32_le` and `string_slice` **raise** out of range. `list_at` does not — it
   answers `None`. The two containers are indexed by different conventions on
   purpose; §13.2 and §13.6 say which is which, and
   `docs/adr/0027-a-list-index.md` says why.

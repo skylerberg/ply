@@ -3,7 +3,9 @@
 **Accepted for the language surface. The performance claim it was motivated by
 has now been taken and it did not clear: the integer kernel moved from about
 seven times the Rust bar to about six, against a bar of three.** §"What the gate
-said" is the reading, registered before the arm existed and unchanged since. It adds eight scalar types, one literal form, one
+said" is the reading, registered before the arm existed and unchanged since —
+except for what it attributed the remainder to, which
+`docs/adr/0040-what-a-second-code-generator-is-for.md` measured and corrected. It adds eight scalar types, one literal form, one
 diagnostic code, seventeen prelude names and one normalizer tag. It refuses
 three things: a modular type whose `+` wraps, arbitrary bit widths, and a
 literal that is a value of more than one type.
@@ -268,17 +270,25 @@ and the allocator spills; borrow the records and the allocation it saved costs
 more; untag the fields and the allocator takes back two thirds; sink the loads
 and the mid-end undoes it; stop the mid-end and lose more than the spills cost.
 ADR 0036 recorded the same result in the same words before any of them —
-*spills went up, time unchanged*. The binding constraint is Cranelift's register
-allocator over a body with thirty-two live values, and it is not something a
-type, or an IR, or a flag can move.
+*spills went up, time unchanged*. Every lever inside this tier is spent, and
+that much stands.
 
-**So the bar is not reachable from the type system, and the probe says what it
-is reachable from.** `width-probe`'s `i64t` arm is Ply's compiled representation
-exactly — tagged words, masked and checked, in a memory-resident sixteen-field
-record — and under LLVM it is **1.21 times the bar**, inside a bar of three with
-room to spare. The representation was never what stood between this kernel and
-its bar. The code generator is, and
-`docs/adr/0037-the-loop-is-the-goal.md` is where that is decided.
+**So the bar is not reachable from the type system**, and this section was half
+wrong about what it *is* reachable from;
+`docs/adr/0040-what-a-second-code-generator-is-for.md` has the measurement.
+Reading `width-probe`'s 1.21× as clearing the representation of suspicion was
+the error: the representation is the cost, and a second code generator prices it
+at 182 instructions per round — the tag coming off each word and the record
+going to memory and back — against arithmetic that is within three instructions
+of the Rust bar's.
+
+Naming the register allocator was right, for a reason not given here. Removing
+that representation needs the rounds folded into the compression that calls
+them, and the wider inline budget the levers above measured as *worse* is
+exactly what that folding requires. It is still worse here — about ten times the
+bar against 4.86 — and it is a win on a tier whose allocator can hold the folded
+body. The allocator binds this tier by making the transformation unaffordable,
+not by costing instructions in the round.
 
 **What this record leaves the tier is a kernel it can actually clear.** `U32`
 arithmetic in `w` registers is what a C compiler wants to be handed; the masks

@@ -47,7 +47,7 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     Int,
     Bool,
     Boxed,
@@ -170,7 +170,7 @@ struct Sig {
 /// field at its offset rather than by name. A record type is its fields sorted, each with its own
 /// type, which is the order the shape lays them out in.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Ty {
+pub(crate) enum Ty {
     Unknown,
     Int,
     Bool,
@@ -815,7 +815,8 @@ impl Jit {
             let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
             // With the parameters as the window's leading slots, so a lambda that reads one
             // captures it rather than reading a global that does not exist.
-            let body = crate::opt::optimize(loaded, module_index, def);
+            let body =
+                crate::opt::optimize(loaded, module_index, def, crate::opt::Inlining::IN_PROCESS);
             let code = lower_fn(&params, &body).code;
             let borrowed = jit.borrowed_params(name, &params, &code);
             if let Some(func) = jit.funcs.get_mut(*name) {

@@ -908,6 +908,13 @@ impl<'a> Checker<'a> {
                 "bytes_at",
                 mono(vec![Type::bytes(), Type::int()], Type::int()),
             ),
+            // Four bytes as one `U32`, least significant first. The width family is what makes
+            // this expressible: before it, four bytes assembled into an `Int` was the only shape
+            // available, and it cost a bounds check a byte.
+            (
+                "bytes_u32_le",
+                mono(vec![Type::bytes(), Type::int()], int_ty(IntTy::U32)),
+            ),
             (
                 "bytes_slice",
                 mono(vec![Type::bytes(), Type::int(), Type::int()], Type::bytes()),

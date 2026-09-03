@@ -2,7 +2,7 @@
 
 use crate::jit::{Entry, Jit, Opts, Unit};
 use crate::source::Source;
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{Context, Result, bail};
 use ply_eval::{Compilation, Counters, Entered, Policed, Provider, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::{Program, TypeExpr};
@@ -61,7 +61,18 @@ impl Declines {
 
 /// One run's cranelift backend: the program it answers for, the set of definitions it compiles, and
 /// the counters every worker's backend adds to.
+/// Which code generator a unit's bodies come out of. The fragment, the refusals and the registry
+/// above this are the same either way.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tier {
+    /// Cranelift, in process, compiled at attach.
+    Jit,
+    /// C, emitted and handed to `cc` — one process and one link per unit.
+    C,
+}
+
 pub struct Cranelift {
+    tier: Tier,
     /// The address of the `Program` the machine is running, for `Compiled::describes`.
     origin: usize,
     source: &'static Source,
@@ -90,6 +101,26 @@ impl Cranelift {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
     ) -> Result<&'static Cranelift> {
+        Cranelift::tiered(program, resolved, check, Tier::Jit)
+    }
+
+    /// The same fragment through the C tier: emitted as C and handed to `cc` (ADR 0040). The
+    /// analysis above it is identical, which is the point — one code generator's *decisions*,
+    /// two code generators' output.
+    pub fn over_c(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        check: &ply_core::CheckOutput,
+    ) -> Result<&'static Cranelift> {
+        Cranelift::tiered(program, resolved, check, Tier::C)
+    }
+
+    fn tiered(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        check: &ply_core::CheckOutput,
+        tier: Tier,
+    ) -> Result<&'static Cranelift> {
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
         let origin = std::ptr::from_ref(program) as usize;
@@ -108,6 +139,7 @@ impl Cranelift {
             .collect();
         let analysis_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
         let unit = Cranelift {
+            tier,
             origin,
             source,
             compiled,
@@ -154,13 +186,25 @@ impl Cranelift {
 
     fn build(&'static self) -> Result<Bodies> {
         let names: Vec<&str> = self.compiled.iter().map(String::as_str).collect();
-        let unit = Jit::compile(self.source, &names)?;
+        let started = std::time::Instant::now();
+        let code = match self.tier {
+            Tier::Jit => Code::Jit(Jit::compile(self.source, &names)?),
+            Tier::C => {
+                let (native, _refused) =
+                    crate::c::build(self.source, &names, crate::jit::Opts::default())?;
+                Code::C(native)
+            }
+        };
         self.codegen_nanos.fetch_add(
-            u64::try_from(unit.compile_nanos).unwrap_or(u64::MAX),
+            u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         self.compiles.fetch_add(1, Ordering::Relaxed);
-        Bodies::new(self, unit)
+        Bodies::new(self, code)
+    }
+
+    pub fn tier(&self) -> Tier {
+        self.tier
     }
 }
 
@@ -181,7 +225,10 @@ impl Provider for Cranelift {
     }
 
     fn name(&self) -> &'static str {
-        "cranelift"
+        match self.tier {
+            Tier::Jit => "cranelift",
+            Tier::C => "c",
+        }
     }
 
     /// The registry width, because it decides which definitions run natively at all: a pass earned
@@ -242,10 +289,51 @@ impl Policed for Absent {
 }
 
 /// One worker's compiled bodies, offered to a `Machine` through `ply_eval::Compiled`.
+/// One unit's code, whichever tier produced it. Both are kept only to hold the pages the entries
+/// point into alive.
+#[allow(clippy::large_enum_variant)]
+pub enum Code {
+    Jit(Unit),
+    C(crate::c::Native),
+}
+
+impl Code {
+    fn entry(&self, name: &str) -> Option<crate::jit::Entry> {
+        match self {
+            Code::Jit(u) => u.entry(name),
+            Code::C(n) => n.entry(name),
+        }
+    }
+    fn arity(&self, name: &str) -> Option<usize> {
+        match self {
+            Code::Jit(u) => u.arity(name),
+            Code::C(n) => n.arity(name),
+        }
+    }
+    fn constant_index(&self, name: &str) -> Option<usize> {
+        match self {
+            Code::Jit(u) => u.constant_index(name),
+            Code::C(n) => n.constant_index(name),
+        }
+    }
+    fn tables(&self) -> &std::rc::Rc<crate::rt::Tables> {
+        match self {
+            Code::Jit(u) => u.tables(),
+            Code::C(n) => n.tables(),
+        }
+    }
+    fn context(&self) -> crate::rt::Ctx {
+        match self {
+            Code::Jit(u) => u.context(),
+            Code::C(n) => n.context(),
+        }
+    }
+}
+
 pub struct Bodies {
     unit: &'static Cranelift,
     /// Kept alive because every [`Entry`] below points into its executable pages.
-    _code: Unit,
+    _code: Code,
     admitted: HashMap<Symbol, Admitted>,
     /// One context for every entry, and the `RefCell` is the proof rather than a comment:
     /// [`crate::rt::Ctx::slots`] is a bump arena with no pop, so an entry that began inside another
@@ -257,7 +345,7 @@ pub struct Bodies {
 }
 
 impl Bodies {
-    fn new(unit: &'static Cranelift, code: Unit) -> Result<Bodies> {
+    fn new(unit: &'static Cranelift, code: Code) -> Result<Bodies> {
         if let Some(what) = code.tables().retains_a_handle() {
             bail!(
                 "the constant pool holds {what}, which must not outlive the call that made it; \
@@ -266,12 +354,18 @@ impl Bodies {
         }
         let mut admitted = HashMap::new();
         for name in &unit.members {
-            let entry = code
-                .entry(name.as_str())
-                .ok_or_else(|| anyhow!("`{name}` was admitted and not compiled"))?;
-            let arity = code
-                .arity(name.as_str())
-                .ok_or_else(|| anyhow!("`{name}` was compiled without an arity"))?;
+            let Some(entry) = code.entry(name.as_str()) else {
+                // The C tier decides its own fragment on top of the shared analysis, so a name
+                // the Cranelift emitter would take can still be refused here. It is simply not
+                // offered; the seam declines and the machine answers.
+                if matches!(unit.tier, Tier::C) {
+                    continue;
+                }
+                bail!("`{name}` was admitted and not compiled");
+            };
+            let Some(arity) = code.arity(name.as_str()) else {
+                bail!("`{name}` was compiled without an arity");
+            };
             if arity > MAX_ARITY {
                 bail!(
                     "`{name}` takes {arity} arguments and this boundary carries {MAX_ARITY}; \

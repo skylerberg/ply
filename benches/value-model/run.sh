@@ -8,6 +8,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 ply="${PLY_BIN:-$root/target/release/ply}"
+# Which tier the `ply` arm runs on. `cranelift` is the gate's own; `c` is ADR 0040's.
+backend="${PLY_BACKEND:-cranelift}"
 raw="$here/raw.txt"
 
 load1() { uptime | sed 's/.*load averages*: *//' | awk -F'[ ,]+' '{print $1}'; }
@@ -39,12 +41,13 @@ echo "==> probe project: $dir"
 
 : > "$raw"
 echo "binary $(shasum -a 256 "$ply" | cut -c1-16)" >> "$raw"
+echo "backend $backend" >> "$raw"
 echo "load-before $l" >> "$raw"
 
 "$ply" test "$dir" --no-cache --jobs 1 --filter "kernel:nothing-matches" >/dev/null 2>&1 || true
 
 ply_arm() {                       # prints "k1=<ms> k2=<ms>" from the report a user reads
-  "$ply" test "$dir" --no-cache --jobs 1 --filter "kernel:" --backend cranelift --json 2>/dev/null |
+  "$ply" test "$dir" --no-cache --jobs 1 --filter "kernel:" --backend "$backend" --json 2>/dev/null |
     python3 -c 'import json,sys
 r=json.load(sys.stdin)
 out={}
