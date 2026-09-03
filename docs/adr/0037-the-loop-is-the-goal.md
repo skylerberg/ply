@@ -267,8 +267,10 @@ slope for neither tier.
    cost of an invocation, and a warm process removes both while a code cache
    removes one. **Started, not finished.** `ply test --watch` is a process that
    stays: it holds the store, the checked front end and the compiled unit across
-   iterations, and an iteration where nothing moved pays a stat per file instead
-   of a front end. An iteration where something *did* move still pays the front
+   iterations. A save that changed no byte — the common case, since a save is
+   what wakes the loop — costs a read of the files whose timestamps moved and no
+   front end at all, which `watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had`
+   asserts and was seen to fail. An iteration where something *did* move still pays the front
    end in full, because `crates/ply-cli/src/driver.rs` is one-shot: it works over
    the whole program whatever changed.
 
