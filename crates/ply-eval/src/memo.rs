@@ -66,6 +66,7 @@ pub fn world_independent(value: &Value) -> bool {
     while let Some(value) = pending.pop() {
         match value {
             Value::Int(_)
+            | Value::Fixed(_)
             | Value::Bool(_)
             | Value::Float(_)
             | Value::Decimal(_)

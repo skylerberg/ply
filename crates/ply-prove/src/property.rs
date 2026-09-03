@@ -9,9 +9,10 @@ use crate::{
     Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan, Vacuity,
     VacuityKind,
 };
+use ply_core::ty::IntTy;
 use ply_core::{CtorInfo, Row, TyVar, Type};
 use ply_core::{LawBinder, prelude};
-use ply_eval::{Closure, ClosureKind, Decimal, Value};
+use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Value};
 use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_syntax::ast::{BinOp, Expr, ExprKind, Ident, QName};
@@ -255,6 +256,7 @@ impl TypeWorld {
             Type::Fn { .. } => None,
             Type::Con(name, _) => match name.as_str() {
                 "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Float" | "Decimal" => Some(0),
+                n if IntTy::from_name(n).is_some() => Some(0),
                 // The empty collection needs nothing, whatever it holds.
                 "List" | "Map" => Some(0),
                 "Cell" => None,
@@ -387,6 +389,7 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
         }
         Type::Con(name, args) => match name.as_str() {
             "Int" | "Bool" | "String" | "Bytes" | "Unit" | "Float" | "Decimal" => Ok(()),
+            n if IntTy::from_name(n).is_some() => Ok(()),
             "List" | "Map" => args.iter().try_for_each(|a| generatable(a, world)),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
@@ -487,6 +490,10 @@ impl Gen<'_> {
             }
             Type::Con(name, args) => match name.as_str() {
                 "Int" => self.int(),
+                n if IntTy::from_name(n).is_some() => {
+                    let t = IntTy::from_name(n).expect("just checked");
+                    Ok(Value::Fixed(self.fixed(t)))
+                }
                 "Float" => Ok(Value::Float(self.float())),
                 "Decimal" => Ok(Value::Decimal(self.decimal())),
                 "Bool" => Ok(Value::Bool(self.bool())),
@@ -507,6 +514,27 @@ impl Gen<'_> {
                 _ if name.as_str() == ply_core::ty::SECRET => Err(Ungeneratable::Secret),
                 _ => self.adt(name, args, depth),
             },
+        }
+    }
+
+    /// The same shape as [`Self::int`], reduced to the type: the edges of the *type* rather than
+    /// of `Int`, because `0`, `1`, the minimum and the maximum are where a fixed width breaks.
+    fn fixed(&mut self, t: IntTy) -> Fixed {
+        let edges = [0i128, 1, -1, t.min(), t.max() as i128, t.max() as i128 - 1];
+        let pick = |i: u64| {
+            let v = edges[i as usize % edges.len()];
+            Fixed::of(t, v).unwrap_or_else(|| Fixed::new(t, v as u64))
+        };
+        match self.edge {
+            Some(i) => pick(u64::from(i)),
+            None => {
+                let selector = self.stream.next_u64() % 32;
+                if (selector as usize) < edges.len() {
+                    pick(selector)
+                } else {
+                    Fixed::new(t, self.stream.next_u64())
+                }
+            }
         }
     }
 

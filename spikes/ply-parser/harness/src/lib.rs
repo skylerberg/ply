@@ -502,6 +502,13 @@ impl<'a> Dumper<'a> {
                 self.word("int");
                 self.payload(v.to_string().as_bytes());
             }
+            // `parser.ply` has no width suffix yet, so no corpus input carries one and the two
+            // never compare here; the arm exists so this dumper builds. GAPS.md carries the
+            // divergence.
+            Lit::Fixed { ty, bits } => {
+                self.word("fixed");
+                self.payload(format!("{ty}:{bits}").as_bytes());
+            }
             Lit::Bool(b) => {
                 self.word("bool");
                 self.payload(if *b { b"1" } else { b"0" });

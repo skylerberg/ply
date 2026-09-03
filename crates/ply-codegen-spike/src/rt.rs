@@ -57,6 +57,7 @@ fn holds_a_handle(value: &Value) -> Option<&'static str> {
         Value::Record(fields) => fields.values().find_map(holds_a_handle),
         Value::Ctor { args, .. } => args.iter().find_map(holds_a_handle),
         Value::Int(_)
+        | Value::Fixed(_)
         | Value::Bool(_)
         | Value::Float(_)
         | Value::Decimal(_)

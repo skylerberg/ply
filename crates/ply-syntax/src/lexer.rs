@@ -1,5 +1,6 @@
 //! Hand-written lexer.
 
+use crate::ast::IntTy;
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -69,6 +70,11 @@ impl Kw {
 pub enum TokenKind {
     Ident(Symbol),
     Int(i64),
+    /// `255u8`, `0x6A09_E667u32`: an integer literal with its width written on it.
+    Fixed {
+        ty: IntTy,
+        bits: u64,
+    },
     /// `1.5`, `1e9`.
     Float(f64),
     /// `1.50m`.
@@ -137,6 +143,7 @@ impl TokenKind {
         match self {
             TokenKind::Ident(n) => format!("identifier `{n}`"),
             TokenKind::Int(v) => format!("integer `{v}`"),
+            TokenKind::Fixed { ty, bits } => format!("`{}` literal `{}`", ty, ty.value(*bits)),
             TokenKind::Float(v) => format!("float `{v}`"),
             TokenKind::Decimal { mantissa, scale } => {
                 format!("decimal `{}`", render_decimal(*mantissa, *scale))
@@ -188,6 +195,7 @@ impl TokenKind {
             TokenKind::Question => "?",
             TokenKind::Ident(_)
             | TokenKind::Int(_)
+            | TokenKind::Fixed { .. }
             | TokenKind::Float(_)
             | TokenKind::Decimal { .. }
             | TokenKind::Str(_)
@@ -370,6 +378,38 @@ impl<'a> Lexer<'a> {
         }
     }
 
+    /// A width suffix — `u8`, `u16`, `u32`, `u64`, `i8`, `i16`, `i32`, `i64` — if one follows the
+    /// digits. `None` is no suffix at all, which is an `Int`; `Some(Err(()))` is a suffix that was
+    /// read and refused, already reported.
+    fn width_suffix(&mut self, lit_start: usize) -> Option<Result<IntTy, ()>> {
+        if !self.peek().is_some_and(is_ident_start) {
+            return None;
+        }
+        let start = self.pos;
+        while let Some(c) = self.peek() {
+            if is_ident_continue(c) {
+                self.bump();
+            } else {
+                break;
+            }
+        }
+        let suffix = &self.text[start..self.pos];
+        match IntTy::from_name(&suffix.to_ascii_uppercase()) {
+            Some(ty) => Some(Ok(ty)),
+            None => {
+                let message = format!("invalid suffix `{suffix}` on a numeric literal");
+                self.error(
+                    codes::UNEXPECTED_TOKEN,
+                    message,
+                    self.span_from(lit_start),
+                    "the suffixes are `m` for a `Decimal` and a width — `u8`, `i32` and the six \
+                     others; separate a name with a space",
+                );
+                Some(Err(()))
+            }
+        }
+    }
+
     /// `0xFF`, `0xdead_beef`: the same `Lit::Int` as the decimal spelling, bounded as a
     /// `u64` bit pattern so `0xFFFF_FFFF_FFFF_FFFF` is `-1`.
     fn hex(&mut self, start: usize) -> TokenKind {
@@ -395,16 +435,31 @@ impl<'a> Lexer<'a> {
             );
             return TokenKind::Int(0);
         }
-        if self.peek().is_some_and(is_ident_start) {
-            self.error(
-                codes::UNEXPECTED_TOKEN,
-                "invalid suffix on a hex literal",
-                self.span_from(start),
-                "a hex literal is an `Int` and takes no suffix; separate a name with a space",
-            );
-        }
+        let suffix = self.width_suffix(start);
         match u64::from_str_radix(&digits, 16) {
-            Ok(v) => TokenKind::Int(v as i64),
+            Ok(v) => match suffix {
+                // A hex literal is a bit pattern, so its bound is the width and not the type's
+                // range: `0xFFu8` is 255 and `0xFFFF_FFFF_FFFF_FFFFu64` is the largest `U64`.
+                Some(Ok(ty)) => {
+                    if ty.bits() < 64 && v > (u64::MAX >> (64 - ty.bits())) {
+                        self.error(
+                            codes::LITERAL_OUT_OF_RANGE,
+                            format!("`0x{digits}` does not fit in `{ty}`"),
+                            self.span_from(start),
+                            format!("a `{ty}` is {} bits", ty.bits()),
+                        );
+                        return TokenKind::Fixed { ty, bits: 0 };
+                    }
+                    TokenKind::Fixed {
+                        ty,
+                        bits: ty.normalize(v),
+                    }
+                }
+                // A suffix that is not a width is reported and then ignored, which is what this
+                // lexer did before widths existed: the token is still the digits, so one bad
+                // suffix is one diagnostic rather than a second one from a `0` nobody wrote.
+                Some(Err(())) | None => TokenKind::Int(v as i64),
+            },
             Err(_) => {
                 self.error(
                     codes::UNEXPECTED_TOKEN,
@@ -443,6 +498,36 @@ impl<'a> Lexer<'a> {
             return self.decimal(start, &whole, &fraction, exponent.is_some());
         }
 
+        // A width suffix is only a literal's own type where the literal is an integer; on
+        // `1.5u8` the `u8` is read and then refused below with everything else that follows a
+        // fraction or an exponent.
+        let width = if !has_fraction && exponent.is_none() {
+            self.width_suffix(start)
+        } else {
+            None
+        };
+        if let Some(Ok(ty)) = width {
+            return match whole.parse::<i128>() {
+                // A decimal spelling is a value, so its bound is the type's range: `255u8` is the
+                // largest `U8` and `256u8` is refused here rather than three passes later.
+                Ok(v) if ty.holds(v) => TokenKind::Fixed {
+                    ty,
+                    bits: ty.normalize(v as u64),
+                },
+                _ => {
+                    self.error(
+                        codes::LITERAL_OUT_OF_RANGE,
+                        format!("`{whole}` is not a value of `{ty}`"),
+                        self.span_from(start),
+                        format!("`{ty}` holds {} to {}", ty.min(), ty.max()),
+                    );
+                    TokenKind::Fixed { ty, bits: 0 }
+                }
+            };
+        }
+        // A suffix that was read and refused falls through to the plain integer below, for the
+        // reason the hex path gives.
+
         if self.peek().is_some_and(is_ident_start) {
             let suffix_start = self.pos;
             while let Some(c) = self.peek() {
@@ -457,7 +542,8 @@ impl<'a> Lexer<'a> {
                 codes::UNEXPECTED_TOKEN,
                 format!("invalid suffix `{suffix}` on a numeric literal"),
                 self.span_from(start),
-                "the only suffix is `m`, for a `Decimal`; separate a name with a space",
+                "the suffixes are `m` for a `Decimal` and a width — `u8`, `i32` and the six \
+                 others; separate a name with a space",
             );
         }
 

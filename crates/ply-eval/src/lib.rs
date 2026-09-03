@@ -84,8 +84,8 @@ pub use sim::{
 };
 pub use trace::Trace;
 pub use value::{
-    Closure, ClosureKind, Decimal, Fields, Map, SECRET_REDACTED, Value, constant_time_eq,
-    first_difference, values_equal,
+    Closure, ClosureKind, Decimal, Fields, Fixed, IntTy, Map, SECRET_REDACTED, Value,
+    constant_time_eq, first_difference, values_equal,
 };
 pub use window::{SlotVal, Windows};
 

@@ -1426,6 +1426,20 @@ impl Decoder<'_> {
                 }
                 Ok(Lit::Decimal { mantissa, scale })
             }
+            tag::LIT_FIXED => {
+                let which = self.c.u8()?;
+                let ty = *ply_syntax::ast::INT_TYPES
+                    .get(which as usize)
+                    .ok_or_else(|| bad(format!("{which} is not a fixed-width integer type")))?;
+                let bits = self.c.i64()? as u64;
+                // Normalized on the way in as the lexer normalizes it, so a stream carrying a
+                // pattern outside the width decodes to the value that width holds rather than to
+                // one no program could have written.
+                Ok(Lit::Fixed {
+                    ty,
+                    bits: ty.normalize(bits),
+                })
+            }
             tag::LIT_UNIT => Ok(Lit::Unit),
             other => Err(bad(format!("tag {other} is not a literal"))),
         }

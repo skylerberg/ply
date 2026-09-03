@@ -4,6 +4,7 @@ use crate::code::Code;
 use crate::cont::Continuation;
 use crate::limit::{self, MAX_VALUE_DEPTH, grow};
 use crate::sim::TaskId;
+pub use ply_core::ty::IntTy;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, render_float};
 use rpds::RedBlackTreeMap;
@@ -142,6 +143,11 @@ impl<'a> IntoIterator for &'a Fields {
 #[derive(Clone)]
 pub enum Value {
     Int(i64),
+    /// A fixed-width integer, and which of the eight it is. The type is carried on the value
+    /// because arithmetic is dispatched on the value here — `wrap_add` at `U8` and at `U32` are
+    /// different answers to the same call — and because the differential oracle compares values,
+    /// not the types the checker gave them.
+    Fixed(Fixed),
     Bool(bool),
     /// IEEE-754 binary64, unmodified.
     Float(f64),
@@ -330,6 +336,7 @@ impl Value {
     pub fn type_name(&self) -> &'static str {
         match self {
             Value::Int(_) => "Int",
+            Value::Fixed(f) => f.ty.name(),
             Value::Bool(_) => "Bool",
             Value::Float(_) => "Float",
             Value::Decimal(_) => "Decimal",
@@ -356,6 +363,14 @@ impl Value {
         match self {
             Value::Int(i) => Ok(*i),
             other => Err(type_error(span, what, "Int", other)),
+        }
+    }
+
+    /// The bits of a fixed-width value, with the type they are read as.
+    pub fn as_fixed(&self, span: Span, what: &str) -> Result<Fixed, Diagnostic> {
+        match self {
+            Value::Fixed(f) => Ok(*f),
+            other => Err(type_error(span, what, "a fixed-width integer", other)),
         }
     }
 
@@ -436,6 +451,12 @@ impl Value {
         match self {
             Value::Int(i) => {
                 let _ = write!(out, "{i}");
+            }
+            // The value, not the bits: `U8` renders `255` and `I8` renders `-1`. The type is not
+            // in the rendering, for the reason `Int` is not — a test's expected and actual are
+            // the same type or the program did not check.
+            Value::Fixed(f) => {
+                let _ = write!(out, "{}", f.value());
             }
             Value::Bool(b) => {
                 let _ = write!(out, "{b}");
@@ -677,6 +698,70 @@ fn escape_byte(b: u8) -> String {
     }
 }
 
+/// One value of one of the eight fixed-width integer types.
+///
+/// `bits` is always [`IntTy::normalize`]d, so two `Fixed` of one type are equal exactly when they
+/// are the same value, and a `Hash` derived on the pair is a hash of the value. Nothing in the
+/// tree may build one any other way; [`Fixed::new`] is the only constructor.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Fixed {
+    pub ty: IntTy,
+    bits: u64,
+}
+
+impl Fixed {
+    pub fn new(ty: IntTy, bits: u64) -> Fixed {
+        Fixed {
+            ty,
+            bits: ty.normalize(bits),
+        }
+    }
+
+    /// `None` when `v` is not one of this type's values. Every conversion into a fixed-width type
+    /// that is not a deliberate truncation goes through here.
+    pub fn of(ty: IntTy, v: i128) -> Option<Fixed> {
+        ty.holds(v).then(|| Fixed::new(ty, v as u64))
+    }
+
+    pub fn bits(self) -> u64 {
+        self.bits
+    }
+
+    /// The mathematical value, which is what a rendering, an ordering and an overflow report use.
+    pub fn value(self) -> i128 {
+        self.ty.value(self.bits)
+    }
+
+    /// The bits with nothing above this type's width — what a shift, a mask or a rotate turns on,
+    /// where a sign extension would be wrong.
+    pub fn raw(self) -> u64 {
+        if self.ty.bits() == 64 {
+            self.bits
+        } else {
+            self.bits & (u64::MAX >> (64 - self.ty.bits()))
+        }
+    }
+
+    /// `f(a, b)` in `i128`, refused if it leaves the type. `i128` is wide enough that no product
+    /// of two 64-bit values overflows *it*, so the check below is the whole of the check.
+    pub fn checked(self, other: Fixed, f: impl Fn(i128, i128) -> Option<i128>) -> Option<Fixed> {
+        let v = f(self.value(), other.value())?;
+        Fixed::of(self.ty, v)
+    }
+
+    /// The same operation with the answer taken modulo the width: what `wrap_add` and its siblings
+    /// mean, and the only way this tree ever wraps.
+    pub fn wrapping(self, other: Fixed, f: impl Fn(i128, i128) -> i128) -> Fixed {
+        Fixed::new(self.ty, f(self.value(), other.value()) as u64)
+    }
+}
+
+impl fmt::Display for Fixed {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.value())
+    }
+}
+
 /// A variant's position in the total order below.
 fn discriminant(v: &Value) -> u8 {
     match v {
@@ -696,6 +781,7 @@ fn discriminant(v: &Value) -> u8 {
         Value::Task(_) => 13,
         Value::Continuation(_) => 14,
         Value::Secret(_) => 15,
+        Value::Fixed(_) => 16,
     }
 }
 
@@ -710,6 +796,11 @@ impl Ord for Value {
             (Value::Unit, Value::Unit) => Ordering::Equal,
             (Value::Bool(x), Value::Bool(y)) => x.cmp(y),
             (Value::Int(x), Value::Int(y)) => x.cmp(y),
+            // By value rather than by bits, so `I8` orders `-1` below `0`. Two of different
+            // types cannot arrive: a map's keys are one type, and so are a comparison's operands.
+            (Value::Fixed(x), Value::Fixed(y)) => {
+                x.ty.cmp(&y.ty).then_with(|| x.value().cmp(&y.value()))
+            }
             // Total and deterministic where IEEE `<` is neither.
             (Value::Float(x), Value::Float(y)) => x.total_cmp(y),
             // By numeric value, so `1.50m` and `1.5m` are one key.
@@ -865,6 +956,9 @@ fn descend(
 fn equal_at(a: &Value, b: &Value, span: Span, depth: usize) -> Result<bool, Diagnostic> {
     Ok(match (a, b) {
         (Value::Int(x), Value::Int(y)) => x == y,
+        // Both halves: a `U8` is never equal to an `I8`, which the falling-through arm would also
+        // give, and the checker refuses the comparison before it is reached.
+        (Value::Fixed(x), Value::Fixed(y)) => x == y,
         (Value::Bool(x), Value::Bool(y)) => x == y,
         // IEEE `==`, so `NaN != NaN` and `0.0 == -0.0`.
         (Value::Float(x), Value::Float(y)) => x == y,
