@@ -85,9 +85,10 @@ the conclusion look forced.
 It was the wrong conclusion, and this tier is what shows it. Clang's register
 allocator is not Cranelift's: handed the same body it emits 321 instructions
 where Cranelift emits 706, less than half. If the allocator were the binding
-constraint, halving its output would move the kernel. **It does not move the
-kernel** — §"What the gate said, this time" below. The 2.2× on the body buys
-nothing at the gate.
+constraint, halving its output would halve the kernel's gap. It does not: the
+gate moves from 5.79 to 4.69, a fifth, against a bar of three. The 2.2× on the
+body buys a fifth at the gate, and §"What the gate said, this time" is the
+reading.
 
 What ADR 0039 got right is that the levers it tried were exhausted. What it got
 wrong is the inference from that: the levers were being pulled on a body that is
@@ -135,8 +136,9 @@ probes, and together they are two thirds of the kernel.
 ## The seam is a cliff, and a partial tier falls off it
 
 The record kernel is the sharper result. Under Cranelift `k2` is inside the bar.
-Under this tier it takes **about ninety seconds** — not slower than the other
-tier, slower than *no tier at all*, by more than two orders of magnitude.
+Under this tier it takes **about ninety seconds**: 10398 times the bar, against
+the other tier's 1.86. That is not slower than the other tier, it is slower than
+*no tier at all*, by more than two orders of magnitude.
 
 Nothing in the emitted code explains it and the profile says so plainly: the
 time is in `Heap::to_value_counted` and `Heap::to_word`. `fold` is a builtin
@@ -214,15 +216,18 @@ null control, load gate held:
 
 | kernel | Cranelift | C tier | bar |
 | --- | --- | --- | --- |
-| k1 (BLAKE3) | 5.79 | see `raw.txt` | 3.0 |
-| k2 (records) | 1.86 | far outside, and §"The seam is a cliff" is why | 3.0 |
+| k1 (BLAKE3) | 5.79 | **4.69** | 3.0 |
+| k2 (records) | 1.86 | **10398** | 3.0 |
 
-**The integer kernel does not clear the bar on either tier, and the C tier is
-not the closer of the two.** Halving the instructions in the body that dominates
-it moved it by nothing worth reporting, which is the single most useful thing
-this record contains: it rules out the whole class of answer that ADR 0036,
-ADR 0039 and ADR 0037 were all reaching for, and it points at three that are
-not code generators.
+**The integer kernel clears the bar on neither tier.** The C tier is the closer
+of the two and the size of the gain is the finding: cutting `round` from 706
+instructions to 321 — better than half — bought **a fifth** at the gate. That is
+the whole of what a much better register allocator is worth here, measured
+rather than argued, and it is the single most useful number in this record. It
+rules out the class of answer ADR 0036, ADR 0039 and ADR 0037 were all reaching
+for, and it points at three that are not code generators.
+
+The k2 column is not a slow tier; it is §"The seam is a cliff" in one number.
 
 ## What would make this wrong
 
