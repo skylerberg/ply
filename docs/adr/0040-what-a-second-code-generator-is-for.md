@@ -294,6 +294,7 @@ rather than the mean. Five moved nothing; the sixth is the one worth keeping.
 | remembering a pure nullary root, which the in-process tier already did | **about six percent off the minimum.** Not a lever so much as a parity gap: the kernel's input is a 65KB literal and `rt_lit` rebuilds a literal every evaluation |
 | inlining six deep rather than four, which was never swept after the budget was raised | **about three percent off the minimum and five off the median**, and past it nothing: 6000:6, 6000:8 and 20000:8 are all worse than 2000:6 |
 | taking a field out of a record nobody else holds, which is ADR 0034's rule and which the in-process tier already applied | **neutral on both kernels**, and kept for parity rather than for the measurement |
+| reading a folded list thirty-two at a time rather than one, since the list is a trie and `list::get` walks from the root | **none**, and not kept. The descent is cache-hot in practice; what a bare fold's time actually goes to is `range` building the list, which is why a fold measured against a *remembered* list is 132ms on this tier against the other's 156 |
 
 **And then the instrument.** Run the same binary against *itself* through that
 harness and the two arms differ by about five percent. The distance from 3.14 to
