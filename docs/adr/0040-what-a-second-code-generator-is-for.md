@@ -133,6 +133,48 @@ tests, a load, a shift and an or. The bar does the same work in sixteen loads.
 Neither of those is a register-allocation problem, neither was measured by the
 probes, and together they are two thirds of the kernel.
 
+## What the tier was for: the levers it made visible, and what they were worth
+
+Everything below was found by reading this tier's output — the emitted C, or the
+disassembly of the image it loads — and each is a form of *not building what
+nothing looks at*. None is a code generator improvement.
+
+| lever | what it removes | k1 on this tier |
+| --- | --- | --- |
+| a field read answered from the register the record was built from | the load and the tag | nothing, alone |
+| the rounds folded into the compression that calls them | the call, and it is what puts a record's build and its reads in one body | with the above, **4.69 → 3.9** |
+| `bytes_u32_le`, four bytes in one read | 128 branches and 131 comparisons per block, bounds-testing bytes one at a time | nothing on this tier; **5.79 → 4.8 on the other** |
+| a flat record nothing reads is never built | the allocation, sixteen tags, sixteen stores, and one dismantling | **3.9 → 3.4** |
+| `Stop` and `Continue` written into the loop rather than built | a constructor built and taken apart per block | **3.4 → 3.3** |
+
+**The first two are one lever.** Forwarding alone measures as noise, because
+`round` reads its parameters rather than records it built; folding alone leaves
+the reads going to memory. Together they are a fifth. This is the kind of thing
+a table of independent levers cannot show, and ADR 0039's table is a table of
+independent levers.
+
+**The bytes read is the one that moved the other tier**, and it is the only
+lever here that is a language change rather than an emitter change — which is
+also why it is the only one both tiers get.
+
+## What is left, measured
+
+At about 3.3 times the bar, `chunk_compress` — the whole per-block body, folded
+— is under half of the profile and **memory management is the rest**:
+dismantling, resetting and allocating three objects per 64-byte block. The three
+are the compression's sixteen-word answer, the eight-word chaining value taken
+from it, and the loop's own state record holding both.
+
+None of the three can be held back the way the intermediates were, and the
+reason is one rule: only a record of immediates is elided, because only such a
+record holds no counts and so cannot be wrong about them. The state record holds
+two records, so it is built; and being built, it forces the two.
+
+**So the next lever is the counted case**, which is the ownership work the C
+tier does not have — ADR 0034's `reset` token generalised to a record whose
+fields are themselves records. That is a Perceus question rather than a code
+generation one, and it is where the remaining third of this kernel is.
+
 ## The seam is a cliff, and a partial tier falls off it
 
 The record kernel is the sharper result. Under Cranelift `k2` is inside the bar.

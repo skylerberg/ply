@@ -273,18 +273,22 @@ ADR 0036 recorded the same result in the same words before any of them —
 *spills went up, time unchanged*. Every lever inside this tier is spent, and
 that much stands.
 
-**So the bar is not reachable from the type system.** What it *is* reachable
-from was answered wrongly here and is answered in
-`docs/adr/0040-what-a-second-code-generator-is-for.md`. What was written here
-read the exhausted levers as naming Cranelift's register allocator the binding
-constraint, and read `width-probe`'s 1.21× as clearing the representation of
-suspicion. A second code generator has since been built and held to the same
-gate: clang emits this round in 321 instructions where Cranelift emits 706, with
-the arithmetic within three instructions of the Rust bar's — and the kernel does
-not move. The allocator was not the constraint. The 182 instructions the C tier
-spends above the bar are the tag coming off each word and the record going to
-memory and back, and two thirds of the kernel is in bodies neither this section
-nor the probe measured.
+**So the bar is not reachable from the type system**, and this section was half
+wrong about what it *is* reachable from;
+`docs/adr/0040-what-a-second-code-generator-is-for.md` has the measurement.
+Reading `width-probe`'s 1.21× as clearing the representation of suspicion was
+the error: the representation is the cost, and a second code generator prices it
+at 182 instructions per round — the tag coming off each word and the record
+going to memory and back — against arithmetic that is within three instructions
+of the Rust bar's.
+
+Naming the register allocator was right, for a reason not given here. Removing
+that representation needs the rounds folded into the compression that calls
+them, and the wider inline budget the levers above measured as *worse* is
+exactly what that folding requires. It is still worse here — about ten times the
+bar against 4.86 — and it is a win on a tier whose allocator can hold the folded
+body. The allocator binds this tier by making the transformation unaffordable,
+not by costing instructions in the round.
 
 **What this record leaves the tier is a kernel it can actually clear.** `U32`
 arithmetic in `w` registers is what a C compiler wants to be handed; the masks
