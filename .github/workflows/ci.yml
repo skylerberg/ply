@@ -1090,6 +1090,60 @@ jobs:
           python3 -c 'import json,sys; r=json.load(open("/tmp/plain.json")); \
             sys.exit(0 if r["ok"] and r["backend"] is None else "examples/ is red with no backend")'
 
+      # The same over the C tier, which had none. It shipped a wrong BLAKE3 digest
+      # on a 64KB input while every test it had passed --- the input was the first
+      # one long enough for a loop to come round --- so the audit below is paired
+      # with a hash long enough to build a tree, which is the shape that broke.
+      - name: The C tier agrees with the machine over examples/
+        run: |
+          set -uo pipefail
+          ./target/release/ply test examples --backend c --audit-backend \
+            --json > /tmp/ctier.json || true
+          set -e
+          python3 - <<'PY'
+          import json, sys
+          r = json.load(open("/tmp/ctier.json"))
+          b = r.get("backend") or {}
+          print(json.dumps(b, indent=2))
+          if not r["ok"] or r["summary"]["failed"]:
+              sys.exit("the C tier disagreed with the machine over examples/")
+          if b.get("name") != "c":
+              sys.exit(f"a run asked for the C tier installed {b.get('name')!r}")
+          if not b.get("entered"):
+              sys.exit("the C tier entered nothing, so the run above is green over a "
+                       "seam no call reached")
+          if not b.get("units"):
+              sys.exit("no unit was compiled, so `c` is not a code generator here")
+          PY
+
+      - name: The C tier hashes a long input the way the machine does
+        run: |
+          set -e
+          d=$(mktemp -d)
+          python3 - "$d/input.ply" <<'PY'
+          import sys
+          data = bytes((i % 251) for i in range(65536))
+          lit = 'b"' + ''.join(('\\x%02x' % b) if (b < 0x20 or b >= 0x7f or b in (0x22, 0x5c))
+                               else chr(b) for b in data) + '"'
+          open(sys.argv[1], "w").write("pub fn long() -> Bytes = %s\n" % lit)
+          PY
+          cat > "$d/h.ply" <<'PLY'
+          import std.hash (blake3)
+          import input (long)
+          // Sixty-four chunks: the tree path, and long enough that every loop in the
+          // hash comes round with a record its tier may have held back.
+          test "a long input hashes the same compiled as interpreted" {
+            assert_eq(blake3(long()), blake3(long()))
+          }
+          pub fn digest() -> Bytes = blake3(long())
+          PLY
+          ./target/release/ply test "$d" --no-cache --json > /tmp/plain-hash.json
+          ./target/release/ply test "$d" --no-cache --backend c --audit-backend --json \
+            > /tmp/c-hash.json
+          python3 -c 'import json,sys; r=json.load(open("/tmp/c-hash.json")); \
+            sys.exit(0 if r["ok"] and not r["summary"]["failed"] else \
+              "the C tier hashes a long input differently from the machine")'
+
       - name: examples/same-tests.sh
         run: ./examples/same-tests.sh
 

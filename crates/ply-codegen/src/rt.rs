@@ -1122,6 +1122,14 @@ pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
 }
 
 /// A constructor used as a value, likewise.
+/// The singleton a nullary constructor *is*, as against the constructor as a function value,
+/// which is what `rt_ctor_value` answers. The two are not interchangeable: `None` is a value and
+/// `Some` is a function, and a tier that asks for the wrong one gets a closure where a variant
+/// belongs and answers every `None` case wrongly.
+pub unsafe extern "C" fn rt_nullary(ctx: *mut Ctx, index: i64) -> i64 {
+    unsafe { &*ctx }.nullary(index as u32)
+}
+
 pub unsafe extern "C" fn rt_ctor_value(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let (name, arity) = ctx.tables.layouts.ctors[index as usize].clone();
