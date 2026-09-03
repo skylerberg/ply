@@ -943,6 +943,51 @@ impl<'a> Emit<'a> {
         let (t, t_text) = self.buffered(|s| s.expr(then_branch))?;
         let (e, e_text) = self.buffered(|s| s.expr(else_branch))?;
         self.depth -= 1;
+        // Both arms built a record of the same shape: join field by field rather than record by
+        // record, so that a record whose only difference is *which branch made it* stays in
+        // registers. Without this an `if` is where elision stops.
+        if let (Some(tf), Some(ef)) = (self.built.get(&t.c).cloned(), self.built.get(&e.c).cloned())
+            && tf.len() == ef.len()
+            && tf
+                .iter()
+                .zip(&ef)
+                .all(|((n1, v1), (n2, v2))| n1 == n2 && v1.k == v2.k && v1.k != Kind::Boxed)
+        {
+            let mut locals = Vec::with_capacity(tf.len());
+            for (_, v) in &tf {
+                let name = self.fresh();
+                self.line(format!("{} {name} = 0;", ctype(v.k)));
+                locals.push(V {
+                    k: v.k,
+                    c: name,
+                    ty: v.ty.clone(),
+                });
+            }
+            self.line(format!("if ({cb}) {{"));
+            self.out.push_str(&t_text);
+            self.depth += 1;
+            for (i, (_, v)) in tf.iter().enumerate() {
+                let x = self.as_kind(v, locals[i].k);
+                self.line(format!("{} = {x};", locals[i].c));
+            }
+            self.depth -= 1;
+            self.line("} else {");
+            self.out.push_str(&e_text);
+            self.depth += 1;
+            for (i, (_, v)) in ef.iter().enumerate() {
+                let x = self.as_kind(v, locals[i].k);
+                self.line(format!("{} = {x};", locals[i].c));
+            }
+            self.depth -= 1;
+            self.line("}");
+            let names: Vec<Symbol> = tf.iter().map(|(n, _)| n.clone()).collect();
+            let kinds: Vec<CTy> = locals.iter().map(|v| v.ty.clone()).collect();
+            let mut words = Vec::with_capacity(locals.len());
+            for v in &locals.clone() {
+                words.push(self.word(v));
+            }
+            return Ok(self.emit_record(&names, words, kinds, Some(locals)));
+        }
         let join = match (t.k, e.k) {
             (Kind::Num(a), Kind::Num(b)) if a == b => Kind::Num(a),
             (Kind::Int, Kind::Int) => Kind::Int,
@@ -1470,6 +1515,14 @@ impl<'a> Emit<'a> {
         {
             return self.fused_iterate(&args[0], &args[1], &args[2]);
         }
+        // `fold` over a list is the other loop this language writes, and a tier that refuses it
+        // does not merely fall back: the fold runs interpreted and crosses the seam into whatever
+        // it calls, once per element, deep-converting the accumulator each way. Over a list of
+        // two hundred thousand that is quadratic, and it is why the record kernel took ninety
+        // seconds on this tier while the interpreter alone took less than one.
+        if b == Builtin::Fold && args.len() == 3 {
+            return self.fused_fold(&args[0], &args[1], &args[2]);
+        }
         if b.higher_order() {
             return self.refuse(format!("`{}`, a builtin that calls user code", b.name()));
         }
@@ -1573,6 +1626,69 @@ impl<'a> Emit<'a> {
 
     /// `iterate(seed, budget, |s| ..)` as a `for(;;)`: the step's body inlined, its parameter the
     /// loop's state, and `Stop`/`Continue` read off the answer's header rather than matched.
+    /// `fold(xs, init, f)`: the list walked here, with `f` called on each element.
+    ///
+    /// The accumulator and the element are both owned by this frame and both consumed by the
+    /// call, so neither is duplicated on the way in -- which is what `owned` would do and what
+    /// would leak one count per element.
+    fn fused_fold(&mut self, items: &Code, init: &Code, f: &Code) -> Result<V> {
+        let xs = self.expr(items)?;
+        let xw = self.word(&xs);
+        let list = self.bind(Kind::Boxed, xw);
+        // Through the runtime, once, rather than off the header: the list usually comes from
+        // `range`, whose answer the fragment has no type for, and `len` is where a value that is
+        // not a list is caught -- with the diagnostic the interpreter would have given.
+        let len = self.unit.builtin(Builtin::Len);
+        let arr = self.fresh();
+        self.line(format!(
+            "Word {arr}[1] = {{{}}}; ply_inc({arr}[0]);",
+            list.c
+        ));
+        let n_word = self.bind(
+            Kind::Boxed,
+            format!("rt_builtin_p(ctx, {len}, (Word)(intptr_t){arr}, 1)"),
+        );
+        self.check();
+        let n_e = self.as_int(&n_word);
+        let n = self.bind(Kind::Int, n_e);
+        let seed = self.expr(init)?;
+        let sw = self.word(&seed);
+        let acc = self.fresh();
+        self.line(format!("Word {acc} = {sw};"));
+        let i = self.fresh();
+        self.line(format!("int64_t {i} = 0;"));
+        self.line(format!("for (; {i} < {}; {i} += 1) {{", n.c));
+        self.depth += 1;
+        let x = self.bind(Kind::Boxed, format!("rt_list_at_p(ctx, {}, {i})", list.c));
+        self.check();
+        let call = self.step_call(f, acc.clone(), x.c.clone())?;
+        self.line(format!("{acc} = {call};"));
+        self.check();
+        self.depth -= 1;
+        self.line("}");
+        self.line(format!("rt_dec_p(ctx, {});", list.c));
+        Ok(V {
+            k: Kind::Boxed,
+            c: acc,
+            ty: CTy::Unknown,
+        })
+    }
+
+    /// The call a fold makes per element: a named function directly, a lambda by its body.
+    fn step_call(&mut self, f: &Code, acc: String, x: String) -> Result<String> {
+        if let NodeKind::Var { name, .. } = &f.kind
+            && let Some(full) = self.resolve_q(name)
+            && self.unit.functions.contains(&full)
+            && self
+                .src
+                .definition(&full)
+                .is_some_and(|(d, _)| d.params.len() == 2)
+        {
+            return Ok(format!("{}(ctx, {acc}, {x})", mangle(&full)));
+        }
+        self.refuse("`fold` over a function this tier cannot name")
+    }
+
     fn fused_iterate(&mut self, seed: &Code, budget: &Code, step: &Code) -> Result<V> {
         let (Some(stop), Some(go)) = (self.unit.layouts.stop, self.unit.layouts.go) else {
             return self.refuse("`iterate` with no `Stop` and `Continue` in the program");

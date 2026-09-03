@@ -178,9 +178,14 @@ times.
 per call and can see neither that the caller is interpreted nor that the
 argument is large, so compiling a callee whose caller was refused is a trap laid
 by the refusal. This is ADR 0038's subject and this is the sharpest instance of
-it yet measured. It is not new — it reads the same at this tier's first commit
-— and it is the first thing any second tier has to answer, before code quality
-is worth discussing.
+it yet measured.
+
+**Fixed by removing the refusal, not by teaching the seam.** `iterate` was
+already fused because it *is* the loop in this language; `fold` is the other one,
+and fusing it took k2 from 88,736ms to 43.6ms with the crossings from 200,007 to
+5. That is the cheap half. The expensive half stands: a refusal anywhere else —
+`map`, a call through a value — lays the same trap, and nothing in the seam knows
+it. Every construct this tier refuses is a cliff until it does.
 
 ## What a second code generator costs, which is not nothing
 
@@ -267,6 +272,44 @@ it. Cranelift cannot take the inlining the elision needs; either it learns the
 elision in its own record handling, where the inlining is not the enabler, or
 the tier that clears the bar is not the tier that ships.
 
+## Six more levers, and the instrument that cannot see them
+
+With the gate reading *undecided* the obvious move is to find another few
+percent. Six were tried, each measured by running two binaries alternately so
+that background load falls on both, and reading the **minimum** of a dozen runs
+rather than the mean. Five moved nothing; the sixth is the one worth keeping.
+
+| lever | effect |
+| --- | --- |
+| `cc -O3`, and other optimisation levels | none |
+| fusing `fold`, so the record kernel stops crossing the seam per element | nothing on k1; **2000× on k2**, and it is what made k1's own measurement usable — the C series varied by a fifth while the other tier varied by a thirtieth, and the difference was ninety seconds of full-tilt k2 between k1 readings |
+| deciding a block's padding once rather than once per word, so the padding arm is not inlined sixteen times | none on this tier; a little on the other. It needs the row below to not *lose* by it |
+| joining an `if` whose arms are records field by field, so elision survives a branch | neutral alone: nothing in the kernel needs it until the row above exists |
+| carrying the loop's state as three locals instead of a record | **not worth it.** It removes an allocation and a walk per block and costs register pressure across a 2,400-instruction body; the two cancel, and it needs ownership work the tier does not have |
+| dropping `-fno-strict-aliasing`, on the theory that alias analysis was blocking store forwarding | none, so that was not what blocked it |
+| **not** eliding records past a width, on the theory that Rust's bar keeps its message in memory and reloads it | **1.3× worse.** The ablation that shows the elision is doing the work, and the theory was wrong |
+| deciding a block's padding once, *with* a field-wise `if` join so the elision survives the branch | **about five percent off the median**, and a tighter distribution. The minimum does not move, and the minimum is what the gate reads |
+| remembering a pure nullary root, which the in-process tier already did | **about six percent off the minimum.** Not a lever so much as a parity gap: the kernel's input is a 65KB literal and `rt_lit` rebuilds a literal every evaluation |
+
+**And then the instrument.** Run the same binary against *itself* through that
+harness and the two arms differ by about five percent. The distance from 3.14 to
+3.0 is smaller than that. This is not a fact about the kernel: it is why the gate
+says *undecided (within the resolution of the bar)* rather than yes or no, and no
+amount of measuring on this machine will turn it into either.
+
+**What would give it room.** Ply's folded per-block body is about 2,400
+instructions against the bar's ~1,100, and the arithmetic in each is the same
+865. But the *time* ratio is larger than the instruction ratio, so the extra
+instructions are also cheaper-per-instruction than the bar's -- which is what a
+body with thirty-two live values on a machine with thirty-one registers looks
+like. Rust's bar answers that by keeping sixteen words in registers and reloading
+the other sixteen from memory each round. Ply has no way to say that, and the row
+above shows that the crude version of saying it -- refusing to elide the wide
+record -- is much worse than not saying it at all.
+
+So the next thing is not another lever. It is either a body that does not need
+thirty-two values live at once, or a way to tell the tier which sixteen to keep.
+
 ## What the gate said, this time
 
 Registered before the arm existed: the C tier would be accepted as the loop's
@@ -278,21 +321,32 @@ null control, load gate held:
 
 | kernel | Cranelift | C tier | bar |
 | --- | --- | --- | --- |
-| k1 (BLAKE3) | 5.18 | **3.14 — undecided** | 3.0 |
-| k2 (records) | 1.84 | 10060 | 3.0 |
+| k1 (BLAKE3) | 5.18 | **2.97 – 3.23 over four runs** | 3.0 |
+| k2 (records) | 1.84 | 4.5 – 5.4 | 3.0 |
 
-**The integer kernel reaches the bar on the C tier and does not clear it.** The
-gate's own word is *undecided (within the resolution of the bar)*, and it said
-the same on the run before at 3.00, so this is a kernel sitting on its bar rather
-than one that has passed it. `raw-c-tier.txt` is the series.
+**The integer kernel reaches the bar on the C tier and does not clear it.** Four
+runs straddle it — one below, two the gate calls *undecided (within the
+resolution of the bar)*, and one over. A kernel sitting on its bar rather than
+one that has passed it.
+
+The k2 column is the one that moved most and it is not a code generation number
+either: `fold` was refused, so the fold ran interpreted and crossed the seam per
+element. Fusing it took **88,736ms to 43.6ms** and the crossings from 200,007 to
+5. What is left there is that the fused fold walks the list by index and the
+compiled list is a trie, so a sequential walk pays a `log32 n` chase per element
+that the interpreter's `Vec` does not. That is the next thing on that kernel and
+it is a data structure question.
 
 Two things about that number are worth more than the number.
 
-**The first is where it came from.** 5.79 to 3.14 is not a code generator getting
-better at emitting the same program; it is four changes that stop the program
-being emitted — §"What the tier was for" — of which one is a language addition
-and three are refusals to build what nothing reads. The one that moved *both*
-tiers is the language addition.
+**The first is where it came from.** 5.79 to about 3.1 is not a code generator
+getting better at emitting the same program. It is a handful of changes that stop
+the program being emitted — §"What the tier was for" — plus two that are not
+about the kernel at all: deciding a block's padding once rather than sixteen
+times, and remembering a pure nullary root the way the other tier already did,
+which alone was six percent because the kernel's input is a sixty-five-kilobyte
+literal that was being rebuilt on every call. The one that moved *both* tiers is
+the language addition.
 
 **The second is that the other tier cannot follow.** Cranelift is at 5.18 and
 the elisions above are unavailable to it, because they need the whole-body
