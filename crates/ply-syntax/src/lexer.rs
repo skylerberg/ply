@@ -455,8 +455,10 @@ impl<'a> Lexer<'a> {
                         bits: ty.normalize(v),
                     }
                 }
-                Some(Err(())) => TokenKind::Int(0),
-                None => TokenKind::Int(v as i64),
+                // A suffix that is not a width is reported and then ignored, which is what this
+                // lexer did before widths existed: the token is still the digits, so one bad
+                // suffix is one diagnostic rather than a second one from a `0` nobody wrote.
+                Some(Err(())) | None => TokenKind::Int(v as i64),
             },
             Err(_) => {
                 self.error(
@@ -504,10 +506,7 @@ impl<'a> Lexer<'a> {
         } else {
             None
         };
-        if let Some(width) = width {
-            let Ok(ty) = width else {
-                return TokenKind::Int(0);
-            };
+        if let Some(Ok(ty)) = width {
             return match whole.parse::<i128>() {
                 // A decimal spelling is a value, so its bound is the type's range: `255u8` is the
                 // largest `U8` and `256u8` is refused here rather than three passes later.
@@ -526,6 +525,8 @@ impl<'a> Lexer<'a> {
                 }
             };
         }
+        // A suffix that was read and refused falls through to the plain integer below, for the
+        // reason the hex path gives.
 
         if self.peek().is_some_and(is_ident_start) {
             let suffix_start = self.pos;
