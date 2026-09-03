@@ -163,9 +163,13 @@ is attached at each call and discharged with every other integer-type obligation
 so a wrong operand is a diagnostic naming the type rather than an unsolved
 variable.
 
-`rotr32` stays, as the `Int`-only spelling that predates the family. It becomes
-dead surface the moment `std.hash` moves to `U32`, and should be removed in that
-change rather than this one.
+`rotr32` stays, as the `Int`-only spelling that predates the family, and it now
+has no user in any `.ply` file — `std.hash` turns on `rotr` at `U32`. It is kept
+rather than removed for one reason: `benches/value-model/k1-where.sh` is a
+recorded measurement whose source must keep compiling, and a measurement that no
+longer runs is worth less than a builtin nobody calls. It is dead surface, it is
+recorded here as dead surface, and `docs/dead-surfaces-report.md` is where a
+sweep would find it.
 
 ## Refused: arbitrary bit widths
 
@@ -231,13 +235,22 @@ than the representation, and the next record is about the loop tier
 
 ## What is not built
 
-- **The code generator refuses every definition whose type mentions a
-  fixed-width type**, and refuses `rotr` and all sixteen conversions as
-  builtins, so nothing inside a compiled body can reach a width its signature
-  does not name. A program using the family runs on the interpreter, correctly
-  and slowly. That is deliberate: a compiled body holds every integer as a
-  sixty-four-bit word and would answer a `U32` addition as an `Int` one, which
-  is a wrong answer rather than a slow one.
+- **`U64` and `I64` are outside the compiled fragment.** Every other width fits
+  the sixty-three bits an immediate carries, so boxing one is a shift and an or
+  with no branch and no allocator and unboxing needs no tag test — the property
+  the whole lowering rests on. A `U64` past `2^62` does not have it, so carrying
+  those two means a heap object of their own kind and an unboxing that tests for
+  it. They check, they evaluate, they do not compile.
+- **A signature mentioning a width does not cross the seam**, in either
+  direction. Compiled code holds a width as the tagged immediate an `Int` is
+  held as, so a value crossing would be read as an `Int` where a `U32` was
+  declared. The bodies still compile and still call each other directly, which
+  is what lets `std.hash`'s internals work at `U32` while `blake3` itself is
+  entered whole — but it costs the differential its per-function coverage of
+  `compress`, `round` and `g`, which are now checked only through `blake3`.
+  Closing it means a type-directed conversion at the seam, which the layout
+  already has the information for (`Ty::Record` knows each field's `Ty`) and
+  which nothing needs yet.
 - **The prover leaves fixed-width arithmetic uninterpreted.** A literal is an
   interned constant node, so two occurrences of `5u32` are one term, but `+` at
   `U32` is not the integer `+` the linear arithmetic reasons about. It could not
