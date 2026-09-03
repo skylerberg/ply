@@ -493,6 +493,8 @@ pub enum Kind {
     Reference,
     /// `ply_codegen::Cranelift`: native code, compiled at install time.
     Cranelift,
+    /// `ply_codegen::c`: the same fragment emitted as C and handed to `cc` (ADR 0040).
+    C,
 }
 
 impl Kind {
@@ -500,6 +502,7 @@ impl Kind {
         match self {
             Kind::Reference => "reference",
             Kind::Cranelift => "cranelift",
+            Kind::C => "c",
         }
     }
 }
@@ -538,16 +541,23 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
                 ..Spec::honest()
             });
         }
+        "c" => {
+            return Ok(Spec {
+                kind: Kind::C,
+                ..Spec::honest()
+            });
+        }
         _ => {}
     }
     let (backend, rest) = match spec.split_once(':') {
         Some(("cranelift", rest)) => (Kind::Cranelift, rest),
+        Some(("c", rest)) => (Kind::C, rest),
         Some(("reference", rest)) => (Kind::Reference, rest),
         _ => (Kind::Reference, spec),
     };
     let Some(rest) = rest.strip_prefix("wrong:") else {
         return Err(format!(
-            "unknown backend `{spec}`; one of `reference`, `cranelift`, or \
+            "unknown backend `{spec}`; one of `reference`, `cranelift`, `c`, or \
              `[<backend>:]wrong:<mutation>` where <mutation> is off-by-one, inverted, stale, \
              wrong-type, unoffered, handle, exceeds-budget[={{k}}] or answers={{int}}, each optionally \
              @<definition>"

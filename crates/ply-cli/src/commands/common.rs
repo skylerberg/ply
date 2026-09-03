@@ -32,6 +32,7 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
     let (name, variant) = match spec.kind {
         ply_eval::BackendKind::Reference => ("reference", ""),
         ply_eval::BackendKind::Cranelift => ("cranelift", ply_codegen::backend::registry_width()),
+        ply_eval::BackendKind::C => ("c", ply_codegen::backend::registry_width()),
     };
     ply_test::Engine::of_backend(name, variant, spec)
 }
@@ -45,6 +46,20 @@ pub fn build_backend(
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     match spec.kind {
         ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(program, resolved, check)),
+        ply_eval::BackendKind::C => ply_codegen::Cranelift::over_c(program, resolved, check)
+            .map(|unit| unit as &'static dyn ply_eval::Provider)
+            .map_err(|error| {
+                Diagnostic::error(
+                    codes::BACKEND_UNAVAILABLE,
+                    format!("the C backend could not be built: {error:#}"),
+                )
+                .note(
+                    "a backend that failed to build would decline every call, so the run is \
+                     refused rather than reported green over a seam nothing reached",
+                )
+                .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
+                .note("`--backend reference` needs no code generator and runs anywhere")
+            }),
         ply_eval::BackendKind::Cranelift => ply_codegen::Cranelift::over(program, resolved, check)
             .map(|unit| unit as &'static dyn ply_eval::Provider)
             .map_err(|error| {
