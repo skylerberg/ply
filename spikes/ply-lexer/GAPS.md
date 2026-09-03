@@ -770,18 +770,18 @@ speed up, which is worth saying plainly: the verification-loop argument for
 self-hosting is about *incrementality*, not about throughput, and this
 measurement does not settle whether the trade is worth it.
 
-## The width suffix, and the prelude names beside it
+## The width suffix, ported, with one value it cannot reach
 
-`crates/ply-syntax` lexes `255u8` and `0x6A09_E667u32` and the port does not
-(ADR 0039). The differential is corpus-driven and **no corpus input carries a
-suffixed literal**, so it is green and stays green until somebody writes one in
-— at which point the port disagrees on that input and nothing else.
+`lexer.ply` lexes ADR 0039's `255u8` and `0x6A09_E667u32`, and agrees with
+`crates/ply-syntax` over the whole shipped standard library --- `hash.ply`
+included, which is now written in `U32` and is what made the port necessary
+rather than optional.
 
-This is the fifth entry of the shape `README.md` predicted: a language feature
-lands in the reference and the port learns it later. Recorded when the feature
-landed rather than when the disagreement was found, which is the only difference
-from the four before it.
-
-The same holds for `infer.ply`'s prelude table, which lists `rotr32` and does not
-list `rotr` or the sixteen conversions, and for `hash.ply`'s normalizer, which
-has no tag for `Lit::Fixed`.
+**One case is out of reach and it is this list's own kind of gap.** A `U64`
+literal above the largest `Int` --- `9223372036854775808u64` and up --- is a
+value the reference accepts, because it bounds a decimal spelling in `i128`.
+This lexer computes in `Int`, where `two_to(63)` overflows before it can be
+compared against, so the bound it applies at sixty-four bits is `int_max`'s: it
+refuses about half the `U64` range that the reference accepts. `fixtures/widths.ply`
+stays inside the reachable half deliberately, so the differential is green and
+this paragraph is the record that it is green over less than the whole domain.

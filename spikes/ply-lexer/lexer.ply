@@ -72,6 +72,9 @@ fn scan_until(src: Bytes, i: Int, set: Bytes) -> Int =
 pub type Tok =
   | TIdent(Bytes)
   | TInt(Int)
+  // ADR 0039's `255u8` and `0x6A09_E667u32`: the width's name and the value as the width reads
+  // it, normalized the way `IntTy::normalize` normalizes it, so the two lexers compare as text.
+  | TFixed(Bytes, Int)
   | TFloat(Bytes)
   | TDec(Bytes, Int)
   | TStr(Bytes)
@@ -122,6 +125,9 @@ fn seek(s: Scan, p: Int) -> Scan =
   { pos: p, diags: s.diags, toks: s.toks }
 
 fn unexpected() -> Bytes = b"E0001"
+
+// `E0211` LITERAL_OUT_OF_RANGE: a suffixed literal that is not a value of the width it names.
+fn out_of_range() -> Bytes = b"E0211"
 
 fn unterminated() -> Bytes = b"E0002"
 
@@ -279,15 +285,37 @@ fn hex_literal(src: Bytes, s: Scan, start: Int) -> Scan = {
   if bytes_len(digits) == 0 {
     emit(err(s, start, fin, unexpected()), start, fin, TInt(0))
   } else {
-    let s1 = if is_ident_start(at(src, fin)) { err(s, start, fin, unexpected()) } else { s };
-    let d = strip_zeros(digits);
-    if bytes_len(d) > 16 {
-      emit(err(s1, start, fin, unexpected()), start, fin, TInt(0))
-    } else {
-      emit(s1, start, fin, TInt(hex_of_digits(d)))
+    let sufe = if is_ident_start(at(src, fin)) { scan(src, fin, ident_chars()) } else { fin };
+    let suffix = bytes_slice(src, fin, sufe);
+    match width_named(suffix) {
+      // A hex literal is a bit pattern, so its bound is the width rather than the type's range:
+      // `0xFFu8` is 255 and `0xFFFF_FFFF_FFFF_FFFFu64` is the largest `U64`.
+      Some(w) -> hex_fixed(s, start, sufe, strip_zeros(digits), w),
+      None -> {
+        let s1 = if sufe > fin { err(s, start, sufe, unexpected()) } else { s };
+        let d = strip_zeros(digits);
+        if bytes_len(d) > 16 {
+          emit(err(s1, start, fin, unexpected()), start, fin, TInt(0))
+        } else {
+          emit(s1, start, fin, TInt(hex_of_digits(d)))
+        }
+      },
     }
   }
 }
+
+fn hex_fixed(s: Scan, start: Int, fin: Int, d: Bytes, w: Width) -> Scan =
+  if bytes_len(d) > 16 || (w.bits < 64 && bytes_len(d) * 4 > w.bits && hex_over(d, w)) {
+    emit(err(s, start, fin, out_of_range()), start, fin, TFixed(width_upper(w), 0))
+  } else {
+    emit(s, start, fin, TFixed(width_upper(w), width_normalize(w, hex_of_digits(d))))
+  }
+
+// Whether the pattern needs more than `bits` bits, decided on the digit string so no `Int`
+// arithmetic has to hold it.
+fn hex_over(d: Bytes, w: Width) -> Bool =
+  bytes_len(strip_zeros(d)) * 4 > w.bits + 3
+  && (bytes_len(strip_zeros(d)) - 1) * 4 >= w.bits
 
 fn hex_of_digits(d: Bytes) -> Int =
   fold(range(0, bytes_len(d)), 0, |a: Int, i: Int| wrap_add(wrap_mul(a, 16), hex_digit(bytes_at(d, i))))
@@ -335,10 +363,33 @@ fn number_tail(src: Bytes, s: Scan, m: Num) -> Scan =
     decimal(s, m, m.cur + 1)
   } else if is_ident_start(at(src, m.cur)) {
     let fin = scan(src, m.cur, ident_chars());
-    number_value(err(s, m.start, fin, unexpected()), m, fin)
+    // A width is only a literal's own type where the literal is an integer; on `1.5u8` the `u8`
+    // is read and then refused with everything else that follows a fraction or an exponent.
+    match (if m.hasf || m.hase { None } else { width_named(bytes_slice(src, m.cur, fin)) }) {
+      Some(w) -> fixed_value(s, m, fin, w),
+      None -> number_value(err(s, m.start, fin, unexpected()), m, fin),
+    }
   } else {
     number_value(s, m, m.cur)
   }
+
+// A decimal spelling is a value, so its bound is the type's range.
+fn fixed_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan = {
+  let d = strip_zeros(m.whole);
+  let k = bytes_len(d);
+  let too_long = k > 19 || (k == 19 && compare(d, int_max()) == Greater);
+  if too_long || over_width(d, w) {
+    emit(err(s, m.start, fin, out_of_range()), m.start, fin, TFixed(width_upper(w), 0))
+  } else {
+    emit(s, m.start, fin, TFixed(width_upper(w), width_normalize(w, int_of_digits(d))))
+  }
+}
+
+// Whether the digits name a value past the width's largest. At sixty-four bits neither maximum is
+// computable in an `Int`, so the `int_max` length check beside this call is the whole of the
+// bound there — which is exact for `I64` and one value short for `U64`.
+fn over_width(d: Bytes, w: Width) -> Bool =
+  if w.bits == 64 { false } else { int_of_digits(d) > width_max(w) }
 
 fn number_value(s: Scan, m: Num, fin: Int) -> Scan =
   if !m.hasf && !m.hase {
@@ -381,6 +432,53 @@ fn int_value(s: Scan, m: Num, fin: Int) -> Scan = {
 
 fn int_of_digits(d: Bytes) -> Int =
   fold(range(0, bytes_len(d)), 0, |a: Int, i: Int| a * 10 + (bytes_at(d, i) - 48))
+
+// --- Widths -----------------------------------------------------------------
+
+// ADR 0039's eight, by the name a suffix spells them with. `bits` is the width and `signed` says
+// which end of it the range sits at; both are what bound a literal.
+pub type Width = { name: Bytes, bits: Int, signed: Bool }
+
+fn widths() -> List<Width> = [
+  { name: b"u8", bits: 8, signed: false },
+  { name: b"u16", bits: 16, signed: false },
+  { name: b"u32", bits: 32, signed: false },
+  { name: b"u64", bits: 64, signed: false },
+  { name: b"i8", bits: 8, signed: true },
+  { name: b"i16", bits: 16, signed: true },
+  { name: b"i32", bits: 32, signed: true },
+  { name: b"i64", bits: 64, signed: true },
+]
+
+// The width a suffix names, or `None`. A suffix that is not one of the eight is the error the
+// reference raises and the digits lex on regardless, so this answers only the match.
+fn width_named(suffix: Bytes) -> Option<Width> =
+  fold(widths(), None, |found: Option<Width>, w: Width|
+    match found { Some(_) -> found, None -> if w.name == suffix { Some(w) } else { None } })
+
+// The uppercase name a `Width` is printed by, since `IntTy::name` is `U8` and the suffix is `u8`.
+fn width_upper(w: Width) -> Bytes = string_upper_bytes(w.name)
+
+fn string_upper_bytes(b: Bytes) -> Bytes = bytes_of_string(string_upper(string_of_bytes(b)))
+
+// `2^(bits-1)` and `2^bits - 1`, built by doubling because `Int` has no power.
+fn two_to(n: Int) -> Int = fold(range(0, n), 1, |a: Int, _i: Int| a * 2)
+
+// The largest value the width holds, as an `Int`, and **only for the widths below sixty-four**:
+// neither sixty-four-bit maximum is reachable here, since `two_to(63)` overflows the `Int` this
+// lexer computes in. `over_width` is what guards the call, and `GAPS.md` carries the limit.
+fn width_max(w: Width) -> Int =
+  if w.signed { two_to(w.bits - 1) - 1 } else { two_to(w.bits) - 1 }
+
+// `bits` normalized the way the reference normalizes them: the low `bits` kept, and the sign
+// extended when the width is signed.
+fn width_normalize(w: Width, v: Int) -> Int =
+  if w.bits == 64 {
+    v
+  } else {
+    let low = v & (two_to(w.bits) - 1);
+    if w.signed && (low >>> (w.bits - 1)) == 1 { low | (0 - two_to(w.bits)) } else { low }
+  }
 
 // --- Decimals ---------------------------------------------------------------
 
@@ -609,6 +707,7 @@ fn body(t: Tok) -> Bytes =
   match t {
     TIdent(b) -> bytes_concat(b"i:", b),
     TInt(v) -> bytes_concat(b"n:", num(v)),
+    TFixed(ty, v) -> bytes_concat_all([b"w:", ty, b":", num(v)]),
     TFloat(txt) -> bytes_concat(b"f:", txt),
     TDec(m, sc) -> bytes_concat_all([b"d:", m, b":", num(sc)]),
     TStr(b) -> bytes_concat(b"s:", hex(b)),
