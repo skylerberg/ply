@@ -44,11 +44,18 @@ pub struct Options {
     /// Repetitions per scenario; the fastest is reported, because a slower run only ever means the
     /// machine did something else as well.
     pub repeats: usize,
+    /// The backend to attach, as `ply test --backend` spells it, or `None` for the evaluator.
+    /// Every scenario is measured under whichever this names, so a row is one engine and two rows
+    /// are the comparison.
+    pub backend: Option<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
-        Options { repeats: 3 }
+        Options {
+            repeats: 3,
+            backend: None,
+        }
     }
 }
 
@@ -269,7 +276,7 @@ fn measure_inner(
             }
             Reset::None => {}
         }
-        let (timings, shape) = once(root)?;
+        let (timings, shape) = once(root, options.backend.as_deref())?;
         let keep = match &best {
             None => true,
             Some((current, _)) => timings.total() < current.total(),
@@ -317,7 +324,7 @@ struct Shape {
     failed: usize,
 }
 
-fn once(root: &Path) -> Result<(Timings, Shape)> {
+fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
     let Front {
         program,
         resolved,
@@ -327,26 +334,59 @@ fn once(root: &Path) -> Result<(Timings, Shape)> {
         ..
     } = front(root)?;
 
+    let spec = match backend {
+        None => None,
+        Some(flag) => Some(
+            ply_eval::backend::parse(flag)
+                .map_err(|message| anyhow::anyhow!("`--backend {flag}`: {message}"))?,
+        ),
+    };
+    let engine = ply_cli::commands::common::engine_of(spec.as_ref());
+
     let started = Instant::now();
     let mut store = Store::open(root).context("opening the result cache")?;
     timings.record(Phase::CacheOpen, started.elapsed());
 
     let started = Instant::now();
-    let selection = ply_test::select(&check, &hashes, &store, &Plan::default());
+    let selection = ply_test::select(&check, &hashes, &store, &Plan::default(), &engine);
     timings.record(Phase::Select, started.elapsed());
 
+    // Timed apart from the run, because it is the phase an edit does not shrink: the unit closes
+    // over every function the fragment compiles whatever moved, and nothing holds it across runs.
+    // Skipped when the selection is empty, exactly as `ply test` skips it: a unit compiled to enter
+    // nothing would put the whole project's compile into a scenario that runs no test, and the row
+    // would report a cost the command does not pay.
     let started = Instant::now();
-    let report = ply_test::run(
-        &selection,
-        &program,
-        &resolved,
-        &check,
-        &hashes,
-        &mut store,
-        false,
-        ply_test::Search::of(&selection),
-        ply_test::Hosting::hermetic(),
-    );
+    let provider = match &spec {
+        Some(spec) if !selection.to_run.is_empty() => Some(
+            ply_cli::commands::common::build_backend(spec, &program, &resolved, &check)
+                .map_err(|d| anyhow::anyhow!("building the backend: {}", d.message))?,
+        ),
+        _ => None,
+    };
+    timings.record(Phase::Compile, started.elapsed());
+
+    let started = Instant::now();
+    let report = match (provider, spec) {
+        (Some(provider), Some(spec)) => {
+            let executor = ply_test::InterpExecutor::new(&program, &resolved, &check)
+                .with_search(ply_test::Search::of(&selection))
+                .with_hosts(ply_test::Hosting::hermetic())
+                .with_backend(provider, spec);
+            ply_test::run_with(&selection, &check, &hashes, &mut store, &executor)
+        }
+        _ => ply_test::run(
+            &selection,
+            &program,
+            &resolved,
+            &check,
+            &hashes,
+            &mut store,
+            false,
+            ply_test::Search::of(&selection),
+            ply_test::Hosting::hermetic(),
+        ),
+    };
     timings.record(Phase::Execute, started.elapsed());
 
     Ok((
@@ -489,7 +529,14 @@ mod tests {
         let root = dir.path().join("corpus");
         corpus_at(&root);
 
-        let report = run(&root, &Options { repeats: 2 }).unwrap();
+        let report = run(
+            &root,
+            &Options {
+                repeats: 2,
+                backend: None,
+            },
+        )
+        .unwrap();
         let named = |name: &str| {
             report
                 .scenarios
@@ -514,7 +561,14 @@ mod tests {
         let root = dir.path().join("corpus");
         corpus_at(&root);
 
-        let report = run(&root, &Options { repeats: 1 }).unwrap();
+        let report = run(
+            &root,
+            &Options {
+                repeats: 1,
+                backend: None,
+            },
+        )
+        .unwrap();
         let warm = report.scenarios.iter().find(|s| s.name == "warm").unwrap();
         let rename = report
             .scenarios

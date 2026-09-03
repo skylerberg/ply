@@ -22,7 +22,7 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 pub fn execute(args: &TestArgs, style: Style) -> i32 {
-    let mut warnings = Vec::new();
+    let warnings = Vec::new();
     // Before the store is opened, because a misspelled `--backend` must not leave a cache directory
     // behind for a run that is about to refuse.
     let backend = match backend_spec(args.backend.as_ref()) {
@@ -42,6 +42,9 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
         }
     };
     let no_cache = cache_bypassed(args);
+    // Which engine's history this run reads and adds to. Decided before the store is opened,
+    // because it is what selection is read against.
+    let engine = super::common::engine_of(backend.as_ref());
     let mut cache = match Cache::open(&project_root(&args.path), no_cache) {
         Ok(cache) => cache,
         Err(diagnostic) => {
@@ -58,6 +61,58 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             return EXIT_COMPILE_ERROR;
         }
     };
+    // The store, the front end and the compiled unit outlive one iteration under `--watch`, which
+    // is the whole of what a warm process is: `benches/marginal-change/` reads an invocation that
+    // rechecks nothing and still pays a front end proportional to the project.
+    let mut warm = crate::warm::Warm::default();
+    if !args.watch {
+        return iterate(
+            args, style, &mut cache, &backend, &engine, &mut warm, warnings,
+        );
+    }
+    watch(
+        args, style, &mut cache, &backend, &engine, &mut warm, warnings,
+    )
+}
+
+/// Re-run whenever the tree moves, holding what the last iteration built.
+fn watch(
+    args: &TestArgs,
+    style: Style,
+    cache: &mut Cache,
+    backend: &Option<ply_eval::BackendSpec>,
+    engine: &ply_test::Engine,
+    warm: &mut crate::warm::Warm,
+    warnings: Vec<Diagnostic>,
+) -> i32 {
+    let root = project_root(&args.path);
+    iterate(args, style, cache, backend, engine, warm, warnings);
+    loop {
+        // A poll rather than a filesystem notification: the scan is a stat per file and this
+        // command already owes the tree a walk to discover it, so a watcher would be a dependency
+        // buying latency this loop cannot use.
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        if !warm.tree_moved(&root) {
+            continue;
+        }
+        if !args.json {
+            println!();
+        }
+        iterate(args, style, cache, backend, engine, warm, Vec::new());
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn iterate(
+    args: &TestArgs,
+    style: Style,
+    cache: &mut Cache,
+    backend: &Option<ply_eval::BackendSpec>,
+    engine: &ply_test::Engine,
+    warm: &mut crate::warm::Warm,
+    mut warnings: Vec<Diagnostic>,
+) -> i32 {
+    let no_cache = cache_bypassed(args);
     warnings.append(&mut cache.warnings);
     let opened = cache.store.take_warnings();
     let migration = crate::migrate::notice(&cache.store, &opened);
@@ -65,13 +120,24 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     warnings.extend(migration);
 
     let incremental = !args.no_incremental && !no_cache;
-    let loaded = if incremental {
-        driver::load_incremental(&args.path, &mut cache.store)
-    } else {
-        load(&args.path)
+    // What the last iteration built, if every file is still as it was. The front end is a function
+    // of the sources, so an unmoved tree has the same one — and re-deriving it is the cost that
+    // dominates a small edit.
+    let (held, reuse) = warm.take(&project_root(&args.path));
+    let loaded = match held {
+        Some(loaded) => Ok(loaded),
+        None if incremental => driver::load_incremental(&args.path, &mut cache.store),
+        None => load(&args.path),
     };
     let mut loaded = match loaded {
-        Ok(loaded) => loaded,
+        Ok(mut loaded) => {
+            if reuse == crate::warm::Reuse::Whole {
+                // Nothing was read, parsed, hashed or restored this iteration, and the report says
+                // so rather than repeating what the iteration that did the work spent.
+                loaded.frontend.phases = driver::Phases::default();
+            }
+            loaded
+        }
         Err(err) => return report_load_error("test", &err, args.json, style),
     };
     warnings.extend(cache.store.take_warnings());
@@ -81,7 +147,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     // Half of what a simulated test is cached under, so it is decided before selection and never
     // after it.
     let search = crate::simulation::plan(&args.simulation);
-    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
+    let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
     let mut plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
 
     // Evaluation needs an AST, and gate 1 may have skipped the file a selected test lives in.
@@ -110,7 +176,8 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
                 }
                 loaded = full;
                 hashes = loaded.hashes.clone();
-                let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search);
+                let selected =
+                    ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
                 plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
             }
             Err(err) => return report_load_error("test", &err, args.json, style),
@@ -180,8 +247,14 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let runtime = hosts.runtime_factory();
     // One per run, not one per worker: a backend may not borrow the program (`Machine`'s `compiled`
     // field says why), so building one costs a copy of the AST and the workers share it.
+    // A unit compiled to run nothing is the whole project's compile spent on an empty selection,
+    // and `benches/marginal-change/` prices it at about half of a backed run. A run that selected
+    // no test has nothing to enter, so it builds nothing — which is what makes a warm loop under a
+    // backend cost the edit rather than the project.
+    let nothing_to_run = plan.selection.to_run.is_empty();
     let provider = match backend
         .as_ref()
+        .filter(|_| !nothing_to_run)
         .map(|spec| build_backend(spec, &loaded.program, &loaded.resolved, &loaded.check))
     {
         None => None,
@@ -240,7 +313,7 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let warnings = once_each(warnings);
 
     let view = HostView::of(&hosts, &plan, &loaded.check, &report);
-    let backend_view = BackendView::of(backend.as_ref(), provider, &report);
+    let backend_view = BackendView::of(backend.as_ref(), provider, &report, engine);
     let ok = report.is_success() && view.escapes.is_empty() && backend_view.escapes.is_empty();
 
     if args.json {
@@ -270,6 +343,9 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
             style,
         );
     }
+    // Held for the next iteration, and only now: an iteration that returned early left nothing
+    // behind, so the next one loads rather than trusting a state no run finished with.
+    warm.keep(loaded);
     exit_code(ok)
 }
 
@@ -296,6 +372,7 @@ impl BackendView {
         spec: Option<&ply_eval::BackendSpec>,
         provider: Option<&'static dyn ply_eval::Provider>,
         report: &RunReport,
+        selected_under: &ply_test::Engine,
     ) -> BackendView {
         let Some(spec) = spec else {
             return BackendView {
@@ -321,7 +398,7 @@ impl BackendView {
             .filter_map(|r| r.backend)
             .map(|b| b.declines)
             .sum();
-        let mut escapes = backend_escapes(report);
+        let mut escapes = backend_escapes(report, selected_under);
         // A worker whose backend failed to build declines every call, so the run would be green
         // over a seam nothing reached.
         let unbuilt = provider.map_or(0, ply_eval::Provider::unbuilt);
@@ -364,27 +441,38 @@ impl BackendView {
 
 /// A test that entered native code and whose pass was written to the result cache — the run caching
 /// a claim about a third execution strategy.
-fn backend_escapes(report: &RunReport) -> Vec<Diagnostic> {
-    report
+fn backend_escapes(report: &RunReport, selected_under: &ply_test::Engine) -> Vec<Diagnostic> {
+    if &report.engine == selected_under {
+        return Vec::new();
+    }
+    // The invariant is about what was written, so a run that wrote nothing cannot have broken it.
+    // This is the case where the two legitimately differ: a run that selected no test builds no
+    // backend, because a unit compiled to enter nothing is the whole project's compile spent on an
+    // empty selection — so the runner sees no provider and names the evaluator, over a run that
+    // recorded no pass under either engine.
+    if !report
         .results
         .iter()
-        .filter(|r| {
-            r.recorded.as_ref().is_some_and(Record::is_written)
-                && r.backend.is_some_and(|b| b.entries > 0)
-        })
-        .map(|r| {
-            Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                format!(
-                    "`{}` entered compiled code, and its pass was written to the result cache",
-                    r.name
-                ),
-            )
-            .note("a backend is a second execution strategy; a cached `Pass` is a claim about the evaluator's own answer")
-            .note("run `ply cache clear`: an entry written here would be believed by a later run with no backend")
-            .note("this is Ply's fault — the runner and the backend disagree about what this run may record")
-        })
-        .collect()
+        .any(|r| r.recorded.as_ref().is_some_and(Record::is_written))
+    {
+        return Vec::new();
+    }
+    vec![
+        Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            format!(
+                "this run selected against `{}` and recorded under `{}`",
+                selected_under.label(),
+                report.engine.label()
+            ),
+        )
+        .note("a `Pass` is a claim about the engine that earned it, so the two must name the same one")
+        .note(
+            "the command names the engine before it builds a provider, because selection decides              whether building one is worth anything; the run names it from the provider it built",
+        )
+        .note("run `ply cache clear`: this run skipped what one engine proved and recorded it as another's")
+        .note("this is Ply's fault — `common::engine_of` and `Executor::engine` disagree")
+    ]
 }
 
 /// What the binding contributed to this run, threaded through both projections so the human summary
@@ -470,10 +558,27 @@ fn cache_escapes(report: &RunReport, check: &CheckOutput, hosts: &Hosts) -> Vec<
         .collect()
 }
 
-/// A stored `Pass` is a claim about what the authoritative engine did, so a run on any other engine
-/// may neither believe one nor leave one behind.
+/// Whether this run gets no store at all.
+///
+/// A backend used to be reason enough, on the ground that a stored `Pass` is a claim about what
+/// the authoritative engine did. That reason is about *results*, and one store holds two caches:
+/// bypassing it also threw away the front end's, which is the same work whichever engine executes
+/// afterwards. So the results are namespaced by engine instead (`ply_test::Engine`) and the store
+/// stays open. What still gets nothing is a backend that is **wrong on purpose**: it exists so a
+/// green run can be read as evidence, and a run that skipped a test because a previous run passed
+/// it is not evidence about anything.
 fn cache_bypassed(args: &TestArgs) -> bool {
-    args.no_cache || args.backend.is_some()
+    args.no_cache || backend_is_corrupt(args)
+}
+
+/// Whether `--backend` asked for a deliberately wrong one.
+fn backend_is_corrupt(args: &TestArgs) -> bool {
+    args.backend
+        .as_deref()
+        .and_then(|flag| ply_eval::backend::parse(flag).ok())
+        .is_some_and(|spec| {
+            spec.mutation != ply_eval::backend::Mutation::None || spec.target.is_some()
+        })
 }
 
 /// What `--backend` asked for, or the diagnostic that refuses it.
@@ -1775,7 +1880,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     fn plan_for(filter: Option<&str>) -> (tempfile::TempDir, Loaded, HashOutput, Plan) {
         let (dir, loaded, hashes) = fixture();
         let store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let plan = Plan::new(selected, &loaded.check, filter, false);
         (dir, loaded, hashes, plan)
     }
@@ -1802,7 +1913,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )
         .expect("the fixture binds");
         let view = HostView::of(&hosts, plan, &loaded.check, report);
-        let backend = BackendView::of(None, None, report);
+        let backend = BackendView::of(None, None, report, &ply_test::Engine::Evaluator);
         let ok = report.is_success() && view.escapes.is_empty();
         report_json(
             loaded,
@@ -1820,6 +1931,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
     fn args_for(filter: Option<&str>) -> TestArgs {
         TestArgs {
+            watch: false,
             path: PathBuf::from("."),
             json: true,
             explain: false,
@@ -1935,7 +2047,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
         let select = |needle| {
             Plan::new(
-                ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
+                ply_test::select(
+                    &loaded.check,
+                    &hashes,
+                    &store,
+                    &SimPlan::default(),
+                    &ply_test::Engine::Evaluator,
+                ),
                 &loaded.check,
                 Some(needle),
                 false,
@@ -1949,13 +2067,25 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     fn a_warm_cache_selects_nothing_and_a_second_run_stays_empty() {
         let (dir, loaded, hashes) = fixture();
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.passed, 4);
         assert_eq!(report.failed, 0);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let again = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert!(again.to_run.is_empty());
         assert_eq!(again.cached.len(), 4);
         assert_eq!(
@@ -1981,7 +2111,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         assert_eq!(loaded.module_count(), 2);
 
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert_eq!(selected.total, 2);
         let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.passed, 2, "failures: {:?}", report.failures);
@@ -1998,7 +2134,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             ),
         ]);
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let report = run(&loaded, &selected, &mut store);
 
         assert_eq!(report.failed, 1);
@@ -2021,8 +2163,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
                 .scratch
                 .clone()
                 .expect("bypass must use a scratch store");
-            let selected =
-                ply_test::select(&loaded.check, &hashes, &cache.store, &SimPlan::default());
+            let selected = ply_test::select(
+                &loaded.check,
+                &hashes,
+                &cache.store,
+                &SimPlan::default(),
+                &ply_test::Engine::Evaluator,
+            );
             assert_eq!(selected.to_run.len(), 4);
             run(&loaded, &selected, &mut cache.store);
             assert!(!cache.store.is_empty());
@@ -2067,14 +2214,26 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )]);
         let mut store = Store::open(dir.path()).unwrap();
 
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let report = run(&loaded, &selected, &mut store);
         assert_eq!(report.failed, 1);
         assert_eq!(exit_code(report.is_success()), crate::EXIT_FAILED);
         assert_eq!(report.failures[0].diagnostic.code, codes::ASSERTION_FAILED);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let again = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert_eq!(again.to_run.len(), 1, "a red test must re-run");
     }
 
@@ -2088,7 +2247,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )]);
         let mut store = Store::open(dir.path()).unwrap();
         let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
+            ply_test::select(
+                &loaded.check,
+                &hashes,
+                &store,
+                &SimPlan::default(),
+                &ply_test::Engine::Evaluator,
+            ),
             &loaded.check,
             None,
             false,
@@ -2138,7 +2303,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         )]);
         let mut store = Store::open(dir.path()).unwrap();
         let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
+            ply_test::select(
+                &loaded.check,
+                &hashes,
+                &store,
+                &SimPlan::default(),
+                &ply_test::Engine::Evaluator,
+            ),
             &loaded.check,
             None,
             false,
@@ -2199,7 +2370,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
         let render = || {
             let mut store = Store::open(dir.path()).unwrap();
             let plan = Plan::new(
-                ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
+                ply_test::select(
+                    &loaded.check,
+                    &hashes,
+                    &store,
+                    &SimPlan::default(),
+                    &ply_test::Engine::Evaluator,
+                ),
                 &loaded.check,
                 None,
                 false,
@@ -2216,7 +2393,13 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     fn failing(source: &str) -> (tempfile::TempDir, Loaded, HashOutput, RunReport) {
         let (dir, loaded, hashes) = project(&[("m.ply", source)]);
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let report = run(&loaded, &selected, &mut store);
         (dir, loaded, hashes, report)
     }
@@ -2251,6 +2434,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
                 &hashes,
                 &Store::open(_dir.path()).unwrap(),
                 &SimPlan::default(),
+                &ply_test::Engine::Evaluator,
             ),
             &loaded.check,
             None,
@@ -2388,7 +2572,13 @@ test \"stuck\" {
         ]);
         let mut store = Store::open(dir.path()).unwrap();
         let plan = Plan::new(
-            ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default()),
+            ply_test::select(
+                &loaded.check,
+                &hashes,
+                &store,
+                &SimPlan::default(),
+                &ply_test::Engine::Evaluator,
+            ),
             &loaded.check,
             None,
             false,
@@ -2433,12 +2623,24 @@ test \"stuck\" {
         )]);
         let mut store = Store::open(dir.path()).unwrap();
 
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert_eq!(selected.reason(0), Some(Reason::Nondet));
         run(&loaded, &selected, &mut store);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let again = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert_eq!(again.to_run, vec![0]);
     }
 
@@ -2552,11 +2754,23 @@ test \"stuck\" {
     fn cached_results_do_not_appear_as_run_results() {
         let (dir, loaded, hashes) = fixture();
         let mut store = Store::open(dir.path()).unwrap();
-        let first = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let first = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         run(&loaded, &first, &mut store);
 
         let mut store = Store::open(dir.path()).unwrap();
-        let second = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let second = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let report = run(&loaded, &second, &mut store);
         assert!(report.results.is_empty());
         assert_eq!(report.cached, 4);
@@ -2576,7 +2790,13 @@ test \"stuck\" {
         );
         store.flush().unwrap();
 
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert_eq!(selected.reason(0), Some(Reason::PreviousFailure));
         assert!(selected.to_run.contains(&0));
     }
@@ -2602,8 +2822,58 @@ test \"stuck\" {
         .expect("the fixture binds")
     }
 
+    fn recorded_result(recorded: Option<Record>) -> TestResult {
+        TestResult {
+            index: 0,
+            name: "a".into(),
+            hash: None,
+            group: 0,
+            duration: Duration::ZERO,
+            status: Status::Passed,
+            failure: None,
+            simulation: None,
+            recorded,
+            audited: None,
+            backend: None,
+        }
+    }
+
+    /// The check can fire, which is the whole of its value: the command names the engine before it
+    /// builds a provider and the run names it from the provider it built, so the two are separate
+    /// readings of one fact and nothing else compares them.
+    #[test]
+    fn recording_under_an_engine_the_run_did_not_select_against_is_an_escape() {
+        let mut report = report_over(vec![recorded_result(Some(Record::Under(vec![])))]);
+        report.engine = ply_test::Engine::backend("cranelift:wide");
+        let escapes = backend_escapes(&report, &ply_test::Engine::Evaluator);
+        assert_eq!(escapes.len(), 1, "the disagreement was not reported");
+        assert!(
+            escapes[0].message.contains("evaluator"),
+            "{}",
+            escapes[0].message
+        );
+        assert!(
+            escapes[0].message.contains("cranelift:wide"),
+            "{}",
+            escapes[0].message
+        );
+    }
+
+    /// And the one case where they legitimately differ: a run that selected nothing builds no
+    /// backend, so the runner names the evaluator over a run that recorded no pass at all.
+    #[test]
+    fn a_run_that_recorded_nothing_cannot_have_escaped() {
+        let mut report = report_over(vec![recorded_result(None)]);
+        report.engine = ply_test::Engine::Evaluator;
+        assert!(
+            backend_escapes(&report, &ply_test::Engine::backend("cranelift:wide")).is_empty(),
+            "a run that wrote nothing was reported as writing in the wrong namespace"
+        );
+    }
+
     fn report_over(results: Vec<TestResult>) -> RunReport {
         RunReport {
+            engine: ply_test::Engine::Evaluator,
             passed: 0,
             failed: 0,
             cached: 0,
@@ -2828,12 +3098,24 @@ test \"stuck\" {
         assert_eq!(hashes.tests[0], hashes.tests[1]);
 
         let mut store = Store::open(dir.path()).unwrap();
-        let selected = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let selected = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert_eq!(selected.to_run.len(), 2);
         run(&loaded, &selected, &mut store);
 
         let store = Store::open(dir.path()).unwrap();
-        let again = ply_test::select(&loaded.check, &hashes, &store, &SimPlan::default());
+        let again = ply_test::select(
+            &loaded.check,
+            &hashes,
+            &store,
+            &SimPlan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert!(again.to_run.is_empty());
         assert_eq!(again.cached.len(), 2);
     }

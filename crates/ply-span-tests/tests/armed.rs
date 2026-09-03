@@ -1656,9 +1656,12 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
         "crates/ply-test/src/lib.rs",
         "`InterpExecutor::machine_lowering`, installing what `InterpExecutor::with_backend` \
          was handed. It is the route `ply test` has, and it arms the cache rule on it \
-         twice: `cache_bypassed` reads `args.backend` so nothing is read, and `run_with` \
-         records `Record::Backend` so nothing is written. \
-         crates/ply-cli/tests/suite/backend.rs holds both, each seen to fail.",
+         twice: `run_with` records under `Executor::engine`, so a pass goes into the \
+         installed backend's namespace and never the evaluator's, and `cache_bypassed` \
+         reads the spec so a backend that is wrong on purpose gets no store in either \
+         direction. crates/ply-cli/tests/suite/cli.rs holds both — \
+         `one_engines_pass_is_never_another_engines` and \
+         `a_corrupt_backend_neither_reads_nor_writes_the_cache` — each seen to fail.",
     ),
     (
         "crates/ply-cli/src/commands/run.rs",
@@ -1697,10 +1700,12 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
     assert!(
         unlisted.is_empty(),
         "{unlisted:?} installs a compiled backend and is not listed in BACKEND_INSTALLERS.\n\n\
-             A run with a backend attached is a third execution strategy, and a cached `Pass` is \
-             a claim about the authoritative engine. Every route that can install one owes both \
-             halves of the cache rule: the command must not READ the cache (a clause \
-             `cache_bypassed` can see) and the runner must not WRITE it (`Record::Backend`).\n\
+             A run with a backend attached is a second execution strategy, and a cached `Pass` \
+             is a claim about the engine that earned it. Every route that can install one owes \
+             both halves of the cache rule: the run must WRITE under that engine's namespace \
+             (`Executor::engine`, which `run_with` passes to `record_under`), and a backend that \
+             is wrong on purpose must get no store at all (a clause `cache_bypassed` can \
+             see).\n\
              Add the route here with the reason it is safe, and a test that has been seen to \
              fail. Do NOT loosen this gate to make the entry disappear."
     );
@@ -1719,8 +1724,8 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
     let bypassed = between(&cli.text, b"fn cache_bypassed(", b"\n}");
     assert!(
         contains(&bypassed, b"backend"),
-        "`cache_bypassed` cannot see whether a backend was installed, so a backend run would \
-         read the result cache: the cache rule.\ncache_bypassed reads: {}",
+        "`cache_bypassed` cannot see the backend, so a backend that is wrong on purpose would \
+         read and write the result cache: the cache rule.\ncache_bypassed reads: {}",
         String::from_utf8_lossy(&bypassed)
     );
 
@@ -1729,10 +1734,15 @@ fn a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache() {
         .find(|s| s.rel == "crates/ply-test/src/lib.rs")
         .expect("the runner is production source");
     assert!(
-        contains(&runner.text, b"Record::Backend"),
-        "the runner no longer records `Record::Backend`, so a test that entered native code can \
-         have its pass written. That is the half of the rule that survives a backend arriving by \
-         a route no flag names."
+        contains(&runner.text, b"Engine::of_backend(provider.name()"),
+        "the runner no longer builds its engine from the installed provider, so a run that \
+         entered native code would record where the evaluator reads. That is the half of the \
+         rule that survives a backend arriving by a route no flag names."
+    );
+    assert!(
+        contains(&runner.text, b"record_under(") && contains(&runner.text, b"&engine,"),
+        "`run_with` no longer passes an engine to `record_under`, so every engine's passes go \
+         into one namespace again."
     );
 }
 

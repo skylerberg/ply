@@ -371,6 +371,13 @@ pub struct TestArgs {
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
+    /// Stay running: re-select and re-run whenever a `.ply` file under the path changes,
+    /// keeping the front end and the caches in memory between iterations. An iteration where
+    /// nothing changed costs a scan of the tree rather than a whole front end, which is what an
+    /// invocation costs otherwise.
+    #[arg(long)]
+    pub watch: bool,
+
     /// Run each test twice — once with the backend attached and once without —
     /// and fail the run on any disagreement.
     ///

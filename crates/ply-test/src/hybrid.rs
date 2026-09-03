@@ -1,7 +1,7 @@
 //! Building and running one mixed definition graph.
 
 use crate::bisect::{DefKey, Delta, Hybrid, Trial, Unresolved};
-use crate::key::result_key;
+use crate::key::{Engine, result_key};
 use crate::schedule::is_seeded;
 use crate::sim::seed_run;
 use ply_eval::{Plan, Seed};
@@ -235,7 +235,10 @@ impl Hybrid for BodyHybrid<'_> {
         let hash = rehashed
             .tests
             .first()
-            .map(|hash| result_key(*hash, seeded, &self.plan));
+            // `Engine::Evaluator` whatever the run around this one installed: the trial below
+            // builds a bare `Machine`, so what it proves is the evaluator's claim and belongs in
+            // the evaluator's namespace.
+            .map(|hash| result_key(*hash, seeded, &self.plan, &Engine::Evaluator));
         if let Some(hash) = hash
             && matches!(self.store.get(hash), Some(Outcome::Pass))
         {

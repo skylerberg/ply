@@ -140,7 +140,13 @@ fn run_hosted(source: &str, tasks: bool) -> Ran {
         .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let search = Search::of(&selection);
     let report = ply_test::run(
         &selection,
@@ -372,7 +378,13 @@ test/nondet "one socket, one send" {
         .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let search = Search::of(&selection);
     let report = ply_test::run(
         &selection,
@@ -455,7 +467,13 @@ fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
     let root = TempRoot::new();
     let mut store = root.store();
     let plan = Plan::once(ply_eval::Seed::default());
-    let selection = select(&compiled.check, &compiled.hashes, &store, &plan);
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &plan,
+        &ply_test::Engine::Evaluator,
+    );
     assert!(
         !plan.re_executes(),
         "the fixture only bites if this plan really runs the test once"
@@ -500,7 +518,13 @@ fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
     let counter = Arc::new(Counting::default());
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let report = ply_test::run(
         &selection,
         &compiled.program,
@@ -540,7 +564,13 @@ fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
     let root = TempRoot::new();
     let mut store = root.store();
     let plan = Plan::once(ply_eval::Seed::default());
-    let selection = select(&compiled.check, &compiled.hashes, &store, &plan);
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &plan,
+        &ply_test::Engine::Evaluator,
+    );
     let report = ply_test::run(
         &selection,
         &compiled.program,
@@ -587,7 +617,13 @@ test "a det test over a deterministic host handler" {
 
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let search = Search::of(&selection);
     let report = ply_test::run(
         &selection,
@@ -656,7 +692,13 @@ test/nondet "spawns without a binding" {
     let counter = Arc::new(Counting::default());
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     let search = Search::of(&selection);
     let report = ply_test::run(
         &selection,

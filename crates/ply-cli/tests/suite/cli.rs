@@ -194,6 +194,147 @@ fn a_second_run_selects_nothing_because_the_cache_is_exact() {
     assert!(text.contains("0 failed, 0 passed, 2 cached"));
 }
 
+/// The compiled loop's whole point, and what it could not do before engines were told apart: a
+/// backed run reads the passes backed runs earned, so a second one selects nothing.
+#[test]
+fn a_second_backed_run_selects_nothing() {
+    let dir = project(GREEN);
+    ply(dir.path())
+        .args(["test", "--backend", "cranelift"])
+        .assert()
+        .success();
+
+    let out = ply(dir.path())
+        .args(["test", "--backend", "cranelift"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let text = stdout_of(&out);
+    assert!(text.contains("selected 0 of 2 (2 cached)"), "got:\n{text}");
+}
+
+/// And the reason it may: a `Pass` names the engine that earned it. Neither run may read the
+/// other's, so the first run on each engine executes whatever the other already passed.
+#[test]
+fn one_engines_pass_is_never_another_engines() {
+    let dir = project(GREEN);
+    ply(dir.path()).arg("test").assert().success();
+
+    let out = ply(dir.path())
+        .args(["test", "--backend", "cranelift"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 2 of 2 (0 cached)"),
+        "a backed run read the evaluator's passes:\n{text}"
+    );
+
+    // And back the other way, over a cache the backed run has now written to.
+    let out = ply(dir.path()).arg("test").output().unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 0 of 2 (2 cached)"),
+        "the evaluator lost its own passes:\n{text}"
+    );
+}
+
+/// A backend that is wrong on purpose exists so that a green run can be read as evidence, and a
+/// run that skipped the test is not evidence. It gets no store in either direction.
+#[test]
+fn a_corrupt_backend_neither_reads_nor_writes_the_cache() {
+    let dir = project(GREEN);
+    ply(dir.path()).arg("test").assert().success();
+
+    let out = ply(dir.path())
+        .args(["test", "--backend", "wrong:off-by-one"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 2 of 2 (0 cached)"),
+        "a corrupt backend skipped a test:\n{text}"
+    );
+
+    // Nothing it did is readable afterwards, by it or by anything else.
+    let out = ply(dir.path())
+        .args(["test", "--backend", "wrong:off-by-one"])
+        .output()
+        .unwrap();
+    let text = stdout_of(&out);
+    assert!(
+        text.contains("selected 2 of 2 (0 cached)"),
+        "a corrupt backend left a cache behind:\n{text}"
+    );
+}
+
+/// The warm process, end to end: one invocation, two runs, and the second one does not pay a front
+/// end at all because the tree it holds is the tree on disk.
+#[test]
+fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
+    let dir = project(GREEN);
+    let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ply"))
+        .current_dir(dir.path())
+        .args(["--color", "never", "test", "--watch", "--json"])
+        .stdout(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdout = child.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut text = String::new();
+        let mut stdout = stdout;
+        let _ = stdout.read_to_string(&mut text);
+        let _ = tx.send(text);
+    });
+
+    // Let the first iteration land, then save the module byte for byte as it already is — the
+    // common case in a loop, and the one that must not cost a front end. The waits are budgets
+    // rather than measurements: nothing here asserts on elapsed time, only on how many iterations
+    // happened and what each of them said.
+    std::thread::sleep(std::time::Duration::from_secs(2));
+    std::fs::write(dir.path().join("m.ply"), GREEN).unwrap();
+    std::thread::sleep(std::time::Duration::from_secs(5));
+    let _ = child.kill();
+    let _ = child.wait();
+    let text = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
+    let mut reports = Vec::new();
+    // One JSON object per iteration, concatenated; `into_iter` over the stream splits them.
+    for report in serde_json::Deserializer::from_str(&text).into_iter::<Value>() {
+        match report {
+            Ok(v) => reports.push(v),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        reports.len() >= 2,
+        "`--watch` did not run again when the tree moved; it emitted {} report(s):\n{text}",
+        reports.len()
+    );
+    for (i, report) in reports.iter().enumerate() {
+        assert_eq!(report["ok"], Value::Bool(true), "iteration {i}: {report}");
+    }
+
+    // The property the warm process exists for, and the one an unarmed claim would rot around: the
+    // save changed no byte, so the second iteration re-derived no front end. A cold invocation
+    // cannot report this, because it has no front end to keep.
+    let second = &reports[1];
+    assert_eq!(
+        second["front_end"]["phases"]["total"], 0.0,
+        "a warm iteration over an unchanged tree paid a front end anyway: {}",
+        second["front_end"]
+    );
+    assert!(
+        reports[0]["front_end"]["phases"]["total"]
+            .as_f64()
+            .is_some_and(|t| t > 0.0),
+        "the first iteration paid no front end either, so the assertion above proves nothing: {}",
+        reports[0]["front_end"]
+    );
+}
+
 #[test]
 fn renaming_a_definition_re_runs_nothing() {
     let dir = project("fn width() -> Int = 3\ntest \"width is three\" { assert_eq(width(), 3) }\n");

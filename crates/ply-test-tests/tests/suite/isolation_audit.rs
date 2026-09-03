@@ -312,8 +312,13 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     for round in 0..3 {
         let root = TempRoot::new();
         let mut store = root.store();
-        let selection =
-            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+        let selection = ply_test::select(
+            &compiled.check,
+            &compiled.hashes,
+            &store,
+            &Plan::default(),
+            &ply_test::Engine::Evaluator,
+        );
 
         assert_eq!(
             selection.groups.len(),
@@ -353,7 +358,13 @@ fn the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = ply_test::select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     assert_eq!(selection.groups.len(), 1);
 
     let executor = Recording {
@@ -442,7 +453,13 @@ fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = ply_test::select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     assert_eq!(selection.groups.len(), 1);
 
     let executor = Recording {
@@ -488,7 +505,13 @@ fn the_group_fixture_is_built_once_and_carries_each_tests_write_to_the_next() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = ply_test::select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     assert_eq!(selection.groups.len(), 1);
 
     let executor = FixtureProbe::default();
@@ -591,7 +614,13 @@ fn a_group_spread_over_eight_workers_gets_one_fixture_each() {
     let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
     let root = TempRoot::new();
     let mut store = root.store();
-    let selection = ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = ply_test::select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     assert_eq!(selection.groups.len(), 1);
 
     let executor = FixtureProbe::default();
@@ -652,8 +681,13 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
     let run_at = |jobs: usize| {
         let root = TempRoot::new();
         let mut store = root.store();
-        let selection =
-            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+        let selection = ply_test::select(
+            &compiled.check,
+            &compiled.hashes,
+            &store,
+            &Plan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         let groups = selection.groups.clone();
         let parallelism = selection.parallelism;
         let pool = rayon::ThreadPoolBuilder::new()
@@ -729,8 +763,13 @@ test "real writer" { db.put[users](1) }
         let compiled = Compiled::anonymous(&format!("{shared}{pure}"));
         let root = TempRoot::new();
         let store = root.store();
-        let selection =
-            ply_test::select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+        let selection = ply_test::select(
+            &compiled.check,
+            &compiled.hashes,
+            &store,
+            &Plan::default(),
+            &ply_test::Engine::Evaluator,
+        );
         assert_eq!(selection.parallelism.isolated, extra);
         assert_eq!(selection.parallelism.region_contended, 0);
         assert!(selection.parallelism.holds(), "{:?}", selection.parallelism);

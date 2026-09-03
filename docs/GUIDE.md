@@ -1716,8 +1716,16 @@ and the replay command.
 
 `--backend` attaches a compiled backend (§17). `--audit-backend` runs each test
 twice — once with it and once without — and fails the run on any disagreement
-(`E0503`). It is off by default because it doubles what a run costs, and a run
-with a backend attached neither reads nor writes the result cache either way.
+(`E0503`). It is off by default because it doubles what a run costs.
+
+A run with a backend attached does use the result cache, in a namespace of its
+own. A stored pass names the engine that earned it, so a backed run selects
+against what backed runs proved and never against what the machine proved, and
+the machine never reads a backed run's. Switching backends, or switching
+`PLY_CODEGEN_REGISTER`, is therefore a cold first run and not a wrong answer. A
+`wrong:` corruption is the exception and gets no cache in either direction: it
+exists so that a green run can be read as evidence, and a run that skipped a
+test is not evidence.
 Every function the fragment compiles is entered when a call's arguments and
 answer are carried, and a test whose body the fragment compiles is entered
 whole, the backend's answer being the pass. A test the fragment refused is
@@ -1727,7 +1735,35 @@ too, and a pass there fails the test with `E0503`, since a backend that fails
 a test the machine passes is the disagreement `--backend` exists to surface.
 A `wrong:` corruption (§17) leaves every test to the machine, where each call
 crosses the seam it corrupts. `PLY_CODEGEN_REGISTER=narrow` limits entry to
-scalar signatures, the measurement arm ADR 0030 shipped.
+scalar signatures, the measurement arm ADR 0030 shipped; it is part of the
+backend's cache namespace, since a pass under it entered fewer definitions.
+
+### 9.8 Staying warm
+
+`ply test --watch` does not exit. It runs, then waits for a `.ply` file under
+the path to change, then runs again — keeping the caches, the checked front end
+and the compiled unit in memory between iterations.
+
+The reason is a measurement rather than a convenience.
+`benches/marginal-change/` prices an edit at three project sizes, and what it
+found is that the cost which dominates a small edit is not the edit: an
+invocation that rechecks **nothing** still pays a front end proportional to the
+project, because it starts knowing nothing and has to hash every definition to
+establish that none moved. A process that already knows does not pay it.
+
+What an iteration costs today:
+
+- **A save that changed no byte** — the common case, since a save is what wakes
+  the loop and most saves change one file or none: a read of the files whose
+  timestamps moved, and no front end at all. The front end is a function of the
+  bytes, so bytes that did not change have the front end they had.
+- **A save that changed something.** The front end again, as a fresh invocation
+  would run it. The driver works over the whole program whatever moved, so this
+  is the part still to do; ADR 0038 says what finishing it would mean.
+
+Under `--json` each iteration prints one report, so a stream of them is a
+stream of objects. `Ctrl-C` ends the loop; anything the caches learned that has
+not been written is recomputed by the next run rather than lost.
 
 ---
 
@@ -2918,6 +2954,7 @@ is `E0127` with exit code 2 (§6.7).
 | flag | meaning |
 | --- | --- |
 | `--filter SUBSTRING` | only tests whose `<module>.<label>` contains it |
+| `--watch` | stay running and re-run whenever a `.ply` file under the path changes (§9.8) |
 | `--jobs N`, `-j N` | worker threads (default: one per core) |
 | `--no-cache` | neither read nor write the result cache |
 | `--no-incremental` | neither read nor write the front-end cache |

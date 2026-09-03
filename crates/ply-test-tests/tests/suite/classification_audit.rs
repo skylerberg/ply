@@ -73,7 +73,13 @@ fn report_for(executor: &Answering) -> RunReport {
     let root = TempRoot::new();
     let mut store = root.store();
     let compiled = Compiled::anonymous(CORPUS);
-    let selection = select(&compiled.check, &compiled.hashes, &store, &Plan::default());
+    let selection = select(
+        &compiled.check,
+        &compiled.hashes,
+        &store,
+        &Plan::default(),
+        &ply_test::Engine::Evaluator,
+    );
     run_with(
         &selection,
         &compiled.check,

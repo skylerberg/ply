@@ -77,7 +77,13 @@ impl Program {
     }
 
     fn select_under(&self, store: &Store, plan: &Plan) -> Selection {
-        select(&self.check, &self.hashes, store, plan)
+        select(
+            &self.check,
+            &self.hashes,
+            store,
+            plan,
+            &crate::Engine::Evaluator,
+        )
     }
 
     /// Both engines, so that every scheduling and caching test in this file is also a differential
@@ -2225,7 +2231,11 @@ fn a_dpor_search_never_narrows_and_writes_no_per_root_key() {
     for root in &plan.roots {
         assert!(
             store
-                .get(crate::seed_key(hash, &Seed::root(*root)))
+                .get(crate::seed_key(
+                    hash,
+                    &Seed::root(*root),
+                    &crate::Engine::Evaluator
+                ))
                 .is_none(),
             "root {root} is not a standalone claim under dpor"
         );
@@ -2310,7 +2320,11 @@ fn a_simulated_failure_is_never_cached_under_any_key() {
     for root in &plan.roots {
         assert!(
             store
-                .get(crate::seed_key(hash, &Seed::root(*root)))
+                .get(crate::seed_key(
+                    hash,
+                    &Seed::root(*root),
+                    &crate::Engine::Evaluator
+                ))
                 .is_none()
         );
     }

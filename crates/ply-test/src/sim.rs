@@ -1,6 +1,6 @@
 //! What a run's searches are written under, and what it reports about them.
 
-use crate::key::{result_key, seed_key, writes_seed_keys};
+use crate::key::{Engine, result_key, seed_key, writes_seed_keys};
 use ply_eval::explore::Interleaving;
 use ply_eval::{Exploration, Machine, Plan, Seed};
 use ply_hash::DefHash;
@@ -34,9 +34,6 @@ pub enum Record {
     /// The run reached a host handler, so its green verdict is a statement about a socket at one
     /// moment and about nothing else.
     Host,
-    /// The run entered natively compiled code, so its green verdict is a statement about a third
-    /// execution strategy and not about the authoritative engine.
-    Backend,
 }
 
 impl Record {
@@ -61,6 +58,7 @@ pub fn record_under(
     run: &Plan,
     ran: &Plan,
     exploration: Option<&Exploration>,
+    engine: &Engine,
 ) -> Record {
     if seeded && exploration.is_none() {
         return Record::Unobserved;
@@ -71,17 +69,17 @@ pub fn record_under(
         return Record::Exhausted;
     }
     if !seeded {
-        return Record::Under(vec![test_hash]);
+        return Record::Under(vec![result_key(test_hash, false, run, engine)]);
     }
     let mut keys = Vec::with_capacity(ran.roots.len() + 1);
     if writes_seed_keys(run) {
         keys.extend(
             ran.roots
                 .iter()
-                .map(|&root| seed_key(test_hash, &Seed::root(root))),
+                .map(|&root| seed_key(test_hash, &Seed::root(root), engine)),
         );
     }
-    keys.push(result_key(test_hash, true, run));
+    keys.push(result_key(test_hash, true, run, engine));
     Record::Under(keys)
 }
 
@@ -155,7 +153,7 @@ mod tests {
     fn an_unsimulated_test_is_written_under_its_own_hash_and_nothing_else() {
         let plan = Plan::default();
         assert_eq!(
-            record_under(hash(1), false, &plan, &plan, None),
+            record_under(hash(1), false, &plan, &plan, None, &Engine::Evaluator),
             Record::Under(vec![hash(1)])
         );
     }
@@ -165,7 +163,14 @@ mod tests {
     #[test]
     fn a_seeded_test_is_never_written_under_its_bare_hash() {
         let plan = Plan::default();
-        let record = record_under(hash(1), true, &plan, &plan, Some(&passing(12)));
+        let record = record_under(
+            hash(1),
+            true,
+            &plan,
+            &plan,
+            Some(&passing(12)),
+            &Engine::Evaluator,
+        );
         assert!(record.is_written());
         assert!(!record.keys().contains(&hash(1)));
         assert_eq!(record.keys(), [crate::sim_key(hash(1), &plan)]);
@@ -178,7 +183,14 @@ mod tests {
             ..Plan::default()
         };
         assert_eq!(plan.mode, SimMode::Dpor);
-        let record = record_under(hash(1), true, &plan, &plan, Some(&passing(9)));
+        let record = record_under(
+            hash(1),
+            true,
+            &plan,
+            &plan,
+            Some(&passing(9)),
+            &Engine::Evaluator,
+        );
         assert_eq!(record.keys().len(), 1);
     }
 
@@ -189,12 +201,19 @@ mod tests {
             roots: vec![2, 3],
             ..run.clone()
         };
-        let record = record_under(hash(1), true, &run, &ran, Some(&passing(2)));
+        let record = record_under(
+            hash(1),
+            true,
+            &run,
+            &ran,
+            Some(&passing(2)),
+            &Engine::Evaluator,
+        );
         assert_eq!(
             record.keys(),
             [
-                crate::seed_key(hash(1), &Seed::root(2)),
-                crate::seed_key(hash(1), &Seed::root(3)),
+                crate::seed_key(hash(1), &Seed::root(2), &Engine::Evaluator),
+                crate::seed_key(hash(1), &Seed::root(3), &Engine::Evaluator),
                 crate::sim_key(hash(1), &run),
             ]
         );
@@ -210,7 +229,14 @@ mod tests {
             ..Exploration::default()
         };
         for plan in [Plan::default(), Plan::random(4)] {
-            let record = record_under(hash(1), true, &plan, &plan, Some(&spent));
+            let record = record_under(
+                hash(1),
+                true,
+                &plan,
+                &plan,
+                Some(&spent),
+                &Engine::Evaluator,
+            );
             assert_eq!(record, Record::Exhausted);
             assert!(record.keys().is_empty());
         }
@@ -227,7 +253,14 @@ mod tests {
             ..Exploration::default()
         };
         assert_eq!(
-            record_under(hash(1), false, &plan, &plan, Some(&spent)),
+            record_under(
+                hash(1),
+                false,
+                &plan,
+                &plan,
+                Some(&spent),
+                &Engine::Evaluator
+            ),
             Record::Exhausted
         );
     }
@@ -236,7 +269,7 @@ mod tests {
     fn a_seeded_test_whose_search_was_not_observed_writes_nothing() {
         let plan = Plan::default();
         assert_eq!(
-            record_under(hash(1), true, &plan, &plan, None),
+            record_under(hash(1), true, &plan, &plan, None, &Engine::Evaluator),
             Record::Unobserved
         );
     }
@@ -291,7 +324,15 @@ mod tests {
             ..passing(12)
         };
         assert_eq!(
-            record_under(hash(1), true, &plan, &plan, Some(&measured)).keys(),
+            record_under(
+                hash(1),
+                true,
+                &plan,
+                &plan,
+                Some(&measured),
+                &Engine::Evaluator
+            )
+            .keys(),
             [crate::sim_key(hash(1), &plan)]
         );
     }
