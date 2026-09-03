@@ -305,6 +305,7 @@ mod tests {
 
     fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
         Loaded {
+            run: None,
             root: root.to_path_buf(),
             files: files.iter().map(|f| root.join(f)).collect(),
             sources: ply_span::SourceMap::new(),

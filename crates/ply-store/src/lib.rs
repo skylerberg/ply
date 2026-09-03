@@ -41,13 +41,13 @@ pub use schema::fingerprint as schema_fingerprint;
 pub const RUNTIME_VERSION: &str = "0.14.0";
 
 /// Bumping this discards every cached type, footprint and source fingerprint.
-pub const FRONTEND_VERSION: &str = "0.20.0";
+pub const FRONTEND_VERSION: &str = "0.21.0";
 
 /// Bumping this re-attempts every obligation and re-runs **no test**.
 pub const PROVER_VERSION: &str = "0.6.0";
 
 /// The on-disk generation of the front-end cache, carried in its file header.
-pub const FRONTEND_FORMAT: u32 = 5;
+pub const FRONTEND_FORMAT: u32 = 6;
 
 /// The version of the definition-body encoding, which lives in `ply-hash`.
 pub const BODY_ENCODING: u32 = ply_hash::body::BODY_ENCODING;

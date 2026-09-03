@@ -1758,12 +1758,11 @@ What an iteration costs today:
   timestamps moved, and no front end at all. The front end is a function of the
   bytes, so bytes that did not change have the front end they had.
 - **A save that changed something.** The files that changed are re-read and
-  re-parsed; the rest keep the syntax trees this process already has. What the
-  rest of the iteration costs is what the tests that must run *reach*: a project
-  whose tests are all deterministic re-derives only what the edit touched, and one
-  with nondeterministic tests re-derives every module they reach, because a test
-  that must run is given its modules' bodies by treating them as changed files.
-  ADR 0038 carries that seam.
+  re-parsed; the rest keep the syntax trees this process already has. Only what
+  the edit reached is re-derived — a test that must run is given its modules'
+  bodies without anything about them being checked or hashed again, so a project
+  with nondeterministic tests costs what one without them costs. ADR 0038 carries
+  the reading.
 
 Under `--json` each iteration prints one report, so a stream of them is a
 stream of objects. `Ctrl-C` ends the loop; anything the caches learned that has

@@ -357,7 +357,7 @@ mod tests {
     use super::*;
 
     /// The digest of the shapes this build stores.
-    const PINNED: &str = "00c3b67068e47ecd4484dc388cf9faf4bd04c642cb6c0e63247bc413164d4ed8";
+    const PINNED: &str = "4b9a638dc981d58852e5d7a7ad30e1d129c49f0deb292e2033e228a7b56f4f32";
 
     #[test]
     fn the_stored_schema_is_pinned() {

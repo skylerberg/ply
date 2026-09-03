@@ -353,6 +353,7 @@ pub(crate) fn encode_def(def: &CachedDef) -> Vec<u8> {
     for alias in &def.row_aliases {
         w.symbol(alias);
     }
+    w.count(usize::from(def.internally_effectful));
     w.tag(tag::END);
     w.finish()
 }
@@ -370,6 +371,7 @@ pub(crate) fn decode_def(bytes: &[u8]) -> Decoded<CachedDef> {
     for _ in 0..count {
         row_aliases.push(r.symbol(WHAT)?);
     }
+    let internally_effectful = r.count(WHAT)? != 0;
     r.tag(tag::END, WHAT)?;
     r.end(WHAT)?;
     Ok(CachedDef {
@@ -378,6 +380,7 @@ pub(crate) fn decode_def(bytes: &[u8]) -> Decoded<CachedDef> {
         performed,
         row_aliases,
         names,
+        internally_effectful,
     })
 }
 
