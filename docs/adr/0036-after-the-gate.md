@@ -11,9 +11,10 @@ is the series after it and `benches/front-end-whole/observation-8.txt` the
 front-end row, both under their own pre-registrations. What they say: the
 record kernel is inside the bar since Decision 9; the integer kernel is
 outside it by a smaller factor than at the re-take — its round is
-straight-line arithmetic over one record rebuilt in place since Decision 8,
-and what remains is that arithmetic, every add checked and every word masked
-as the source writes it, and the records the source keeps alive by shape; and
+straight-line arithmetic over one record rebuilt in place since Decision 8.
+**What remains is not what this record first said it was**: it named the
+checked adds, the masks and the records, and `k1-where.sh` prices all three and
+finds the gap elsewhere. See §"What remains of the integer kernel"; and
 the whole front end under the backend is under a second of wall time where it
 was several before ADR 0035 and tens interpreted, every phase entered whole,
 and every test entered whole since Decision 7.
@@ -272,9 +273,41 @@ propagates a `let` of a scalar literal to its reads and folds an operator over
 two literals, so a count a callee named is a literal where the shift happens
 and needs no check.
 
-What remains of the integer kernel is the compiled arithmetic with each add
-checked, the state records loaded and stored once per round where Rust holds
-them in registers, and the records the source keeps alive by shape.
+## What remains of the integer kernel
+
+This section said the arithmetic with each add checked, the state records, and
+the records the source keeps alive by shape. `benches/value-model/k1-where.sh`
+prices each of those and **none of them is the gap.** Its
+`observation-k1-where.txt` is the reading:
+
+- **The checked adds cost nothing.** A build that emits a plain add for every
+  `+`, with no overflow check anywhere, hashes no faster: the gate's ratio moved
+  from 7.25 to 7.39, which is the run-to-run spread. The checks are a
+  never-taken branch the predictor gets right, and they sit off the critical
+  path. In a tight arithmetic loop with nothing else in it they are worth under
+  a tenth, which is what made them look like a cause.
+- **The masks are worth about that much too**, by the same tight loop.
+- **The records are a fifth.** Loading the words is a quarter of the hash and
+  compressing them the rest; the field traffic in one `round` is a third of its
+  stack traffic.
+
+**What the gap is: the round spills.** One `round` compiles to seven thousand
+bytes, and in it are four hundred and fourteen stack loads and a hundred and ten
+stack stores — against a hundred and forty-two loads of the record fields it is
+actually reading. Eight quarter-rounds that the Rust bar does in about a dozen
+instructions each. The state is sixteen words and the message sixteen more, all
+live across the round, and every one of them is a sixty-four-bit tagged word
+whose every operation needs a temporary the allocator has no register for.
+
+So the lever is not the arithmetic, it is **how many registers a word costs**.
+Ply has one integer type, so neither the source nor the checker can say that
+these values are thirty-two-bit, and the code generator cannot infer it through
+a record field. Until something can, the round will hold two words where the bar
+holds one, and no peephole over the arithmetic reaches it.
+
+`PLY_CODEGEN_ASM=<name>` is what found this, and it is in the tree because two
+cheaper instruments said nothing first: the gate's own ratio, and a sampling
+profiler that cannot see through compiled frames.
 
 ## Decision 12 — a parameter the body only reads is borrowed
 
