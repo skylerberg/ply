@@ -943,6 +943,51 @@ impl<'a> Emit<'a> {
         let (t, t_text) = self.buffered(|s| s.expr(then_branch))?;
         let (e, e_text) = self.buffered(|s| s.expr(else_branch))?;
         self.depth -= 1;
+        // Both arms built a record of the same shape: join field by field rather than record by
+        // record, so that a record whose only difference is *which branch made it* stays in
+        // registers. Without this an `if` is where elision stops.
+        if let (Some(tf), Some(ef)) = (self.built.get(&t.c).cloned(), self.built.get(&e.c).cloned())
+            && tf.len() == ef.len()
+            && tf
+                .iter()
+                .zip(&ef)
+                .all(|((n1, v1), (n2, v2))| n1 == n2 && v1.k == v2.k && v1.k != Kind::Boxed)
+        {
+            let mut locals = Vec::with_capacity(tf.len());
+            for (_, v) in &tf {
+                let name = self.fresh();
+                self.line(format!("{} {name} = 0;", ctype(v.k)));
+                locals.push(V {
+                    k: v.k,
+                    c: name,
+                    ty: v.ty.clone(),
+                });
+            }
+            self.line(format!("if ({cb}) {{"));
+            self.out.push_str(&t_text);
+            self.depth += 1;
+            for (i, (_, v)) in tf.iter().enumerate() {
+                let x = self.as_kind(v, locals[i].k);
+                self.line(format!("{} = {x};", locals[i].c));
+            }
+            self.depth -= 1;
+            self.line("} else {");
+            self.out.push_str(&e_text);
+            self.depth += 1;
+            for (i, (_, v)) in ef.iter().enumerate() {
+                let x = self.as_kind(v, locals[i].k);
+                self.line(format!("{} = {x};", locals[i].c));
+            }
+            self.depth -= 1;
+            self.line("}");
+            let names: Vec<Symbol> = tf.iter().map(|(n, _)| n.clone()).collect();
+            let kinds: Vec<CTy> = locals.iter().map(|v| v.ty.clone()).collect();
+            let mut words = Vec::with_capacity(locals.len());
+            for v in &locals.clone() {
+                words.push(self.word(v));
+            }
+            return Ok(self.emit_record(&names, words, kinds, Some(locals)));
+        }
         let join = match (t.k, e.k) {
             (Kind::Num(a), Kind::Num(b)) if a == b => Kind::Num(a),
             (Kind::Int, Kind::Int) => Kind::Int,

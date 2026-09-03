@@ -2460,7 +2460,7 @@ $ ply std
    std.config  15           5      4810
    std.db      292          34     110073
    std.fs      25           9      12652
-   std.hash    30           5      9476
+   std.hash    32           5      10301
    std.http    166          53     102957
    std.json    137          38     55912
    std.net     7            3      3720
@@ -2470,7 +2470,7 @@ $ ply std
 
    `import std.<name>` to use one; `ply std --show <name>` prints its source
 
-   digest: b3:b7762efd639b
+   digest: b3:0e9070d1bd17
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`
