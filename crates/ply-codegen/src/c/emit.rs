@@ -177,6 +177,24 @@ pub struct Emit<'a> {
     /// For each C local holding a record this body built, the values its fields were built from.
     /// A later read of one of those fields is that value, not a load: see `emit_record`.
     built: std::collections::HashMap<String, Vec<(Symbol, V)>>,
+    /// Records built but not yet put in memory, by the local that will hold one when it is.
+    ///
+    /// A record of immediates whose every read is answered from `built` is never looked at, so
+    /// building it is an allocation, sixteen tags and sixteen stores that nothing observes. These
+    /// wait until something asks for the *word* -- a call, a return, a field of another record --
+    /// and a record that is asked for its fields and then dies never becomes one at all.
+    deferred: std::collections::HashMap<String, Deferred>,
+    /// The locals the deferred records above will land in, declared once at the top so that
+    /// materialising inside a branch still names something the whole body can see.
+    record_locals: Vec<String>,
+}
+
+/// A record that has been described but not built: what `emit_record` would have emitted.
+struct Deferred {
+    shape: u32,
+    n: usize,
+    flags: i32,
+    words: Vec<String>,
 }
 
 /// What an emitted unit accumulates that is not code. It is the Cranelift tier's `Jit` state,
@@ -266,6 +284,8 @@ impl<'a> Emit<'a> {
             depth: 0,
             tokens: std::collections::BTreeSet::new(),
             built: std::collections::HashMap::new(),
+            deferred: std::collections::HashMap::new(),
+            record_locals: Vec::new(),
         }
     }
 
@@ -318,6 +338,13 @@ impl<'a> Emit<'a> {
         let name = self.fresh();
         let ct = ctype(k);
         let e = expr.as_ref().to_string();
+        // A record still waiting to be built is *not* renamed: the local it will land in holds a
+        // zero until it is, and copying that zero into a second local is a null the next reader
+        // walks into. Its local is declared for the whole body, so naming it again is safe and
+        // naming it is all a rename needed to do.
+        if self.record_locals.iter().any(|r| *r == e) {
+            return V { k, c: e, ty };
+        }
         // A binding that is only a rename carries the fields the record was built from with it.
         // The inliner turns every argument into a `let`, so without this the knowledge is lost at
         // the first one -- which is immediately.
@@ -365,7 +392,57 @@ impl<'a> Emit<'a> {
 
     /// A value as a word: an `Int` that fits is tagged in place and one that does not is boxed by
     /// the runtime; a width always fits; a `Bool` is one of the two singletons.
+    /// Build a record that was held back, here, because something is about to want the word.
+    ///
+    /// Guarded on the local still being zero, and the guard is not paranoia: emission follows the
+    /// branch structure, so the *first* place that wants the word may be inside one arm of an `if`
+    /// while another arm wants it too. Building under `if (!x)` is correct on every path and free
+    /// on the one that already built it, where a build emitted once is right on one path and a
+    /// null dereference on the rest.
+    fn materialise(&mut self, name: &str) {
+        let Some(d) = self.deferred.get(name) else {
+            return;
+        };
+        let (shape, n, flags) = (d.shape, d.n, d.flags);
+        let words = d.words.clone();
+        self.tokens.insert(n);
+        self.line(format!("if (!{name}) {{"));
+        self.depth += 1;
+        self.line(format!("if (tok{n}) {{"));
+        self.depth += 1;
+        self.line(format!("{name} = tok{n}; tok{n} = 0;"));
+        self.line(format!(
+            "ply_obj({name})->rc = 1; ply_obj({name})->flags = {flags}; ply_obj({name})->len = {n}; ply_obj({name})->layout = {shape};"
+        ));
+        self.depth -= 1;
+        self.line("} else {");
+        self.depth += 1;
+        self.line(format!(
+            "{name} = rt_alloc_p(ctx, 3, {n}, {shape}, {flags});"
+        ));
+        self.line("if (ctx->failed) return 0;");
+        self.depth -= 1;
+        self.line("}");
+        for (at, w) in words.iter().enumerate() {
+            self.line(format!("ply_words({name})[{at}] = {w};"));
+        }
+        self.depth -= 1;
+        self.line("}");
+    }
+
+    /// The locals a deferred record lands in, declared at the top of the body so that building one
+    /// inside a branch still names something every later statement can see.
+    pub fn record_decls(&self) -> String {
+        self.record_locals
+            .iter()
+            .map(|n| format!("  Word {n} = 0;\n"))
+            .collect()
+    }
+
     pub fn word(&mut self, v: &V) -> String {
+        if v.k == Kind::Boxed && self.deferred.contains_key(&v.c) {
+            self.materialise(&v.c.clone());
+        }
         match v.k {
             Kind::Boxed => v.c.clone(),
             Kind::Int => format!(
@@ -942,6 +1019,17 @@ impl<'a> Emit<'a> {
         let b = self.expr(base)?;
         let field_ty = b.ty.field(name).cloned().unwrap_or(CTy::Unknown);
         let at = b.ty.offset(name);
+        // Built in this body: the value is already in a register, and asking for the word here
+        // would be what forces a record into memory that nothing else ever looks at.
+        if let Some(v) = self
+            .built
+            .get(&b.c)
+            .and_then(|fs| fs.iter().find(|(n, _)| n == name))
+            .map(|(_, v)| v.clone())
+        {
+            self.release_base(base, &b);
+            return Ok(v);
+        }
         let bw = self.word(&b);
         let held = self.bind(Kind::Boxed, bw);
         // A field whose record type the checker fixed is a load at its offset, and nothing else.
@@ -949,18 +1037,6 @@ impl<'a> Emit<'a> {
         // the position in the declared type *is* the offset. Going through the runtime instead —
         // which is what this emitter did first — costs a call per word, and the integer kernel
         // reads thirty-two per round.
-        let base_local = held.c.clone();
-        // Built in this body: the value is already in a register, and reading it back out of
-        // memory only to take the tag off is the traffic `emit_record`'s note is about.
-        if let Some(v) = self
-            .built
-            .get(&b.c)
-            .and_then(|fs| fs.iter().find(|(n, _)| n == name))
-            .map(|(_, v)| v.clone())
-        {
-            self.release_base(base, &b, &base_local);
-            return Ok(v);
-        }
         let w = match at {
             Some(at) => self.bind(Kind::Boxed, format!("ply_words({})[{at}]", held.c)),
             None => {
@@ -998,7 +1074,7 @@ impl<'a> Emit<'a> {
         // Narrow on purpose. The base must be a variable at its last use — which is what the
         // lowering's `Own::Owned` says and what the interpreter reads too — and the field must be
         // a scalar, so the value just read cannot be inside the memory being let go.
-        self.release_base(base, &b, &base_local);
+        self.release_base(base, &b);
         Ok(held)
     }
 
@@ -1008,10 +1084,25 @@ impl<'a> Emit<'a> {
     ///
     /// Narrow on purpose. The base must be a variable at its last use -- which is what the
     /// lowering's `Own::Owned` says and what the interpreter reads too.
-    fn release_base(&mut self, base: &Code, b: &V, base_local: &str) {
+    fn release_base(&mut self, base: &Code, b: &V) {
         if !(matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. })) {
             return;
         }
+        // A record held back dies without ever having been built, and holds no counts -- only a
+        // flat record is ever held back -- so there is nothing to let go of. Guarded rather than
+        // skipped, because another path may have wanted the word and built it.
+        if self.deferred.contains_key(&b.c) {
+            let name = b.c.clone();
+            let Some(n) = record_width(&b.ty) else {
+                return;
+            };
+            self.tokens.insert(n);
+            self.line(format!(
+                "if ({name}) {{ if (tok{n} == 0) {{ tok{n} = ply_reset_flat({name}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {name}); }} else {{ rt_dec_p(ctx, {name}); }} {name} = 0; }}"
+            ));
+            return;
+        }
+        let base_local = &self.word(b);
         match record_width(&b.ty) {
             Some(n) => {
                 self.tokens.insert(n);
@@ -1069,6 +1160,29 @@ impl<'a> Emit<'a> {
         let flags = i32::from(flat);
         let ty = CTy::Record(names.iter().cloned().zip(kinds).collect());
         let n = words.len();
+        // Flat and fully known: hold it back. Nothing here can be wrong if it is never built --
+        // no count was taken, because a record of immediates holds none -- and if something does
+        // ask for the word later, `materialise` emits exactly what this would have.
+        if flat && let Some(vals) = built_from.clone() {
+            let name = self.fresh();
+            self.record_locals.push(name.clone());
+            self.deferred.insert(
+                name.clone(),
+                Deferred {
+                    shape,
+                    n,
+                    flags,
+                    words,
+                },
+            );
+            self.built
+                .insert(name.clone(), names.iter().cloned().zip(vals).collect());
+            return V {
+                k: Kind::Boxed,
+                c: name,
+                ty,
+            };
+        }
         self.tokens.insert(n);
         let r = self.bind_as(Kind::Boxed, ty, "0");
         self.line(format!("if (tok{n}) {{"));
