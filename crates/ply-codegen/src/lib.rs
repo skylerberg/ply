@@ -9,6 +9,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 pub mod backend;
+pub mod c;
 pub mod heap;
 pub mod jit;
 pub mod list;

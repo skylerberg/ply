@@ -47,7 +47,7 @@ impl std::fmt::Display for Refused {
 impl std::error::Error for Refused {}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Kind {
+pub(crate) enum Kind {
     Int,
     Bool,
     Boxed,
@@ -170,7 +170,7 @@ struct Sig {
 /// field at its offset rather than by name. A record type is its fields sorted, each with its own
 /// type, which is the order the shape lays them out in.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-enum Ty {
+pub(crate) enum Ty {
     Unknown,
     Int,
     Bool,
