@@ -126,7 +126,15 @@ fn iterate(
     let (held, reuse) = warm.take(&project_root(&args.path));
     let loaded = match held {
         Some(loaded) => Ok(loaded),
-        None if incremental => driver::load_incremental(&args.path, &mut cache.store),
+        // Resumed rather than reloaded: the trees for files that still say what they said are the
+        // ones this process already parsed, and parsing them again is work about nothing.
+        None if incremental => driver::run_resumed(
+            &args.path,
+            driver::Mode::Incremental,
+            Some(&mut cache.store),
+            &[],
+            Some(&mut warm.resume),
+        ),
         None => load(&args.path),
     };
     let mut loaded = match loaded {
@@ -164,8 +172,16 @@ fn iterate(
     }
     if needed.iter().any(|m| !loaded.has_ast(m)) {
         let unparsed = needed;
+        // Resumed like the load above, and for the same reason: this is the load that parses what
+        // the selected tests need to run, so it is where most of a warm iteration's parsing is.
         let reloaded = if incremental {
-            driver::load_to_evaluate(&args.path, &mut cache.store, &unparsed)
+            driver::run_resumed(
+                &args.path,
+                driver::Mode::Incremental,
+                Some(&mut cache.store),
+                &unparsed,
+                Some(&mut warm.resume),
+            )
         } else {
             load(&args.path)
         };
@@ -1597,6 +1613,7 @@ fn report_json(
             "skipped": loaded.frontend.skipped(),
             "cached": loaded.frontend.cached(),
             "rechecked": loaded.frontend.rechecked(),
+            "reused": loaded.frontend.reused,
             "phases": phases_json(&loaded.frontend.phases),
         }),
         "ok": ok,
