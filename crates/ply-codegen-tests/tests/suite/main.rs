@@ -8,4 +8,5 @@
 
 mod fragment;
 mod kernel;
+mod number_types;
 mod parser_census;

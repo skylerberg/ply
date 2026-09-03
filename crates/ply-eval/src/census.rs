@@ -137,6 +137,7 @@ pub(crate) fn gate_name(gate: Gate) -> &'static str {
         Gate::NotLoweredCode => "NotLoweredCode",
         Gate::ArgumentShape => "ArgumentShape",
         Gate::ArgumentType => "ArgumentType",
+        Gate::AnswerType => "AnswerType",
         Gate::SimulateRegion => "SimulateRegion",
         Gate::Anonymous => "Anonymous",
         Gate::PublishedRow => "PublishedRow",

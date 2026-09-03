@@ -469,6 +469,20 @@ pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     ctx.fail(d);
 }
 
+/// An `Int` that is not one of the target width's values, reported as the interpreter's builtin
+/// reports it. `which` indexes [`ply_syntax::ast::INT_TYPES`].
+pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64) {
+    let ctx = unsafe { &mut *ctx };
+    let t = ply_syntax::ast::INT_TYPES[which as usize];
+    let d = error(format!(
+        "`{}` was given {value}: `{t}` holds {} to {}",
+        t.of_int_name(),
+        t.min(),
+        t.max()
+    ));
+    ctx.fail(d);
+}
+
 /// `==` and `!=` on anything that is not a pair of `Int`s or a pair of `Bool`s: two immediates
 /// compare as themselves, and anything else is answered by the evaluator's own comparison so the
 /// two cannot disagree. Reads both.
@@ -1999,6 +2013,7 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_unbox_bool", rt_unbox_bool as *const u8),
         ("rt_arith", rt_arith as *const u8),
         ("rt_overflow", rt_overflow as *const u8),
+        ("rt_not_that_width", rt_not_that_width as *const u8),
         ("rt_no_match", rt_no_match as *const u8),
         ("rt_lit", rt_lit as *const u8),
         ("rt_equal", rt_equal as *const u8),

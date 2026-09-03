@@ -2,7 +2,7 @@
 
 use crate::value::{Closure, ClosureKind, Value};
 use ply_core::CheckOutput;
-use ply_core::ty::{SECRET, TyVar, Type};
+use ply_core::ty::{IntTy, SECRET, TyVar, Type};
 use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::Program;
 use rustc_hash::FxHashMap;
@@ -43,6 +43,20 @@ pub(crate) fn crossable(value: &Value) -> bool {
     )
 }
 
+/// Whether `ty` mentions a fixed-width integer anywhere, at any depth.
+pub fn mentions_a_width(ty: &Type) -> bool {
+    match ty {
+        Type::Var(_) => false,
+        Type::Con(name, args) => {
+            IntTy::from_name(name.as_str()).is_some() || args.iter().any(mentions_a_width)
+        }
+        Type::Fn { params, ret, .. } => {
+            params.iter().any(mentions_a_width) || mentions_a_width(ret)
+        }
+        Type::Record(fields) => fields.values().any(mentions_a_width),
+    }
+}
+
 /// The `Value` kinds a *carried type* can denote, which is what an argument's discriminant is
 /// tested against.
 pub(crate) fn crossable_argument_kind(value: &Value) -> bool {
@@ -80,6 +94,11 @@ struct Sig {
     params: Vec<Option<Denotes>>,
     /// The same for the declared return type.
     ret: Option<Denotes>,
+    /// Whether the declared return type mentions a fixed-width integer. Kept beside `ret` rather
+    /// than folded into it because the two answer different questions: `ret` being `None` is the
+    /// ordinary "not carried", which the *answer* is checked against on the way back, and this is
+    /// the one case where that check cannot work — see [`Gate::AnswerType`].
+    ret_is_a_width: bool,
 }
 
 struct Decl {
@@ -170,6 +189,7 @@ impl CarriedTypes {
                     Sig {
                         params: params.iter().map(|t| table.denotes(t)).collect(),
                         ret: table.denotes(ret),
+                        ret_is_a_width: mentions_a_width(ret),
                     },
                 )),
                 _ => None,
@@ -220,6 +240,14 @@ impl CarriedTypes {
                 "Float" | "Decimal" => false,
                 // A world handle and a credential are `Type::Con`s like any other.
                 "Cell" | ply_core::prelude::TASK_TYPE | SECRET => false,
+                // The fixed-width integer types, explicitly rather than by falling through to the
+                // undeclared arm below. Compiled code holds one as a tagged immediate, which is
+                // what an `Int` is held as, so a value crossing back would arrive as an `Int` and
+                // be a *wrong* answer rather than a slow one. The bodies still compile and still
+                // call each other directly (ADR 0039); it is the crossing that is refused, and
+                // this arm is what makes `std.hash`'s `compress` unreachable from the differential
+                // while `blake3` itself is entered whole.
+                n if IntTy::from_name(n).is_some() => false,
                 _ => match self.decls.get(name) {
                     Some(decl) => {
                         decl.vars.len() == args.len()
@@ -323,6 +351,13 @@ impl CarriedTypes {
             || crossable(value)
     }
 
+    /// Whether `name`'s declared return type mentions a fixed-width integer. Asked before the
+    /// call, for the reason [`Gate::AnswerType`] gives — and asked of *only* that case, because
+    /// every other uncarried return type is caught on the way back by [`crossable`].
+    pub(crate) fn answers_a_width(&self, name: &Symbol) -> bool {
+        self.sigs.get(name).is_some_and(|sig| sig.ret_is_a_width)
+    }
+
     /// Whether every position of `name`'s declared signature is carried — the registry question,
     /// asked of a definition rather than of a call.
     pub(crate) fn signature_carried(&self, name: &Symbol) -> bool {
@@ -352,6 +387,13 @@ pub(crate) enum Gate {
     /// The published row is empty and the definition performs anyway, under a `handle` of its own
     /// or of something it calls — see [`internally_effectful`].
     InternalEffects,
+    /// A declared *return* type this boundary does not carry, checked before the call rather than
+    /// after it. Every other uncarried type's values are refused on the way back by
+    /// [`crossable`] — a `Float` answer is not a crossable value — but a fixed-width integer is
+    /// held in compiled code as the tagged immediate an `Int` is held as, so its answer *would*
+    /// cross and would be a `Value::Int` where a `U32` was declared. This gate is what keeps that
+    /// from being a wrong answer (ADR 0039).
+    AnswerType,
     /// No nested call left before the machine's own bound.
     Budget,
 }
@@ -419,6 +461,11 @@ pub(crate) fn admit_with<'a>(
         && !types.args_cross(name, args)
     {
         return Err(Gate::ArgumentType);
+    }
+    if let Some(types) = types
+        && types.answers_a_width(name)
+    {
+        return Err(Gate::AnswerType);
     }
     let budget = max_calls.checked_sub(calls).ok_or(Gate::Budget)?;
     if budget == 0 {
