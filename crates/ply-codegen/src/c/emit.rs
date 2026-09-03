@@ -293,14 +293,31 @@ impl<'a> Emit<'a> {
     }
 
     pub fn param(&mut self, name: &Symbol, c: String, ty: CTy) {
-        self.scope.push((
-            name.clone(),
-            V {
-                k: Kind::Boxed,
-                c,
-                ty,
-            },
-        ));
+        let word = V {
+            k: Kind::Boxed,
+            c,
+            ty: ty.clone(),
+        };
+        // A parameter whose checked type is a scalar arrives as a word and is then read many
+        // times over -- `word_at` reads its offset three times and its limit twice -- and each
+        // read was a test, a branch and a shift. Unbox it once, here where the prologue is, and
+        // let every use downstream be the register.
+        let v = match ty {
+            CTy::Int => {
+                let e = self.as_int(&word);
+                self.bind_as(Kind::Int, CTy::Int, e)
+            }
+            CTy::Num(t) => {
+                let e = self.as_num(&word, t);
+                self.bind_as(Kind::Num(t), CTy::Num(t), e)
+            }
+            CTy::Bool => {
+                let e = self.as_bool(&word);
+                self.bind_as(Kind::Bool, CTy::Bool, e)
+            }
+            _ => word,
+        };
+        self.scope.push((name.clone(), v));
     }
 
     // --- conversions --------------------------------------------------------------------
@@ -747,27 +764,59 @@ impl<'a> Emit<'a> {
         let c = self.expr(cond)?;
         let cb = self.as_bool(&c);
         let out = self.fresh();
-        self.line(format!("Word {out} = 0;"));
-        self.line(format!("if ({cb}) {{"));
+        // Both arms are emitted into a buffer of their own before anything is written, because the
+        // local the join lands in is typed by what the arms turn out to be. Two arms that agree on
+        // a scalar keep it raw: `word_at` boxed a byte on the way out of a bounds test and unboxed
+        // it one line later, four times per word, and that round trip was most of the body.
         self.depth += 1;
-        let t = self.expr(then_branch)?;
-        let t_ty = t.ty.clone();
-        let tw = self.word(&t);
+        let (t, t_text) = self.buffered(|s| s.expr(then_branch))?;
+        let (e, e_text) = self.buffered(|s| s.expr(else_branch))?;
+        self.depth -= 1;
+        let join = match (t.k, e.k) {
+            (Kind::Num(a), Kind::Num(b)) if a == b => Kind::Num(a),
+            (Kind::Int, Kind::Int) => Kind::Int,
+            (Kind::Bool, Kind::Bool) => Kind::Bool,
+            _ => Kind::Boxed,
+        };
+        self.line(format!("{} {out} = 0;", ctype(join)));
+        self.line(format!("if ({cb}) {{"));
+        self.out.push_str(&t_text);
+        self.depth += 1;
+        let tw = self.as_kind(&t, join);
         self.line(format!("{out} = {tw};"));
         self.depth -= 1;
         self.line("} else {");
+        self.out.push_str(&e_text);
         self.depth += 1;
-        let e = self.expr(else_branch)?;
-        let e_ty = e.ty.clone();
-        let ew = self.word(&e);
+        let ew = self.as_kind(&e, join);
         self.line(format!("{out} = {ew};"));
         self.depth -= 1;
         self.line("}");
         Ok(V {
-            k: Kind::Boxed,
+            k: join,
             c: out,
-            ty: if t_ty == e_ty { t_ty } else { CTy::Unknown },
+            ty: if t.ty == e.ty { t.ty } else { CTy::Unknown },
         })
+    }
+
+    /// Run `f` with the output diverted, and hand back what it wrote alongside its answer. The
+    /// statements come out in the order they were made either way; what this buys is the chance to
+    /// decide the enclosing declaration after seeing them.
+    fn buffered(&mut self, f: impl FnOnce(&mut Self) -> Result<V>) -> Result<(V, String)> {
+        let saved = std::mem::take(&mut self.out);
+        let answer = f(self);
+        let text = std::mem::replace(&mut self.out, saved);
+        Ok((answer?, text))
+    }
+
+    /// A value read at some other kind: the one conversion the several below are chosen by.
+    fn as_kind(&mut self, v: &V, k: Kind) -> String {
+        match k {
+            Kind::Boxed => self.word(v),
+            Kind::Int => self.as_int(v),
+            Kind::Bool => self.as_bool(v),
+            Kind::Num(t) => self.as_num(v, t),
+        }
     }
 
     fn block(&mut self, stmts: &[Stmt], tail: Option<&Code>) -> Result<V> {
@@ -887,7 +936,18 @@ impl<'a> Emit<'a> {
             kinds.push(v.ty.clone());
             words.push(self.owned(&v));
         }
-        let shape = self.unit.shape(&names);
+        Ok(self.emit_record(&names, words, kinds))
+    }
+
+    /// The tail both record forms share: a Perceus token if one is in hand, a fresh allocation
+    /// otherwise, then the words written straight into it.
+    ///
+    /// `{..b, f: e}` used to go through `rt_record` instead, which cost a call, and — worse —
+    /// answered with no type at all. In the integer kernel the permuted message word *is* a record
+    /// update, so one untyped record put the next round's thirty-two field reads back on the
+    /// runtime, and the round after that, for a hundred and sixty calls per compression.
+    fn emit_record(&mut self, names: &[Symbol], words: Vec<String>, kinds: Vec<CTy>) -> V {
+        let shape = self.unit.shape(names);
         let ty = CTy::Record(names.iter().cloned().zip(kinds).collect());
         let n = words.len();
         self.tokens.insert(n);
@@ -909,7 +969,7 @@ impl<'a> Emit<'a> {
         for (at, w) in words.iter().enumerate() {
             self.line(format!("ply_words({})[{at}] = {w};", r.c));
         }
-        Ok(r)
+        r
     }
 
     /// `{..b, f: e}`: the written fields, then the copied ones read out of the base. Built fresh
@@ -931,45 +991,45 @@ impl<'a> Emit<'a> {
             written.push((name.clone(), held));
         }
         let b = self.expr(base)?;
+        let base_ty = b.ty.clone();
         let bw = self.word(&b);
         let held_base = self.bind(Kind::Boxed, bw);
         let mut words = Vec::with_capacity(names.len());
+        let mut kinds = Vec::with_capacity(names.len());
         for name in &names {
             match written.iter().find(|(n, _)| n == name) {
                 Some((_, v)) => {
                     let v = v.clone();
+                    kinds.push(v.ty.clone());
                     words.push(self.owned(&v));
                 }
                 None => {
-                    let index = self.unit.field(name);
-                    let f = self.bind(
-                        Kind::Boxed,
-                        format!("rt_field_p(ctx, {}, {index}, 0)", held_base.c),
-                    );
-                    self.check();
-                    words.push(f.c);
+                    let ft = base_ty.field(name).cloned().unwrap_or(CTy::Unknown);
+                    kinds.push(ft);
+                    match base_ty.offset(name) {
+                        // A copied field of a shape the checker fixed is a load, as in `field`.
+                        // The count has to go up by hand here: the runtime's reader takes one on
+                        // the way out and a load does not.
+                        Some(at) => {
+                            let t = self.fresh();
+                            self.line(format!("Word {t} = ply_words({})[{at}];", held_base.c));
+                            self.line(format!("ply_inc({t});"));
+                            words.push(t);
+                        }
+                        None => {
+                            let index = self.unit.field(name);
+                            let f = self.bind(
+                                Kind::Boxed,
+                                format!("rt_field_p(ctx, {}, {index}, 0)", held_base.c),
+                            );
+                            self.check();
+                            words.push(f.c);
+                        }
+                    }
                 }
             }
         }
-        let arr = self.fresh();
-        self.line(format!(
-            "Word {arr}[] = {{{}}};",
-            if words.is_empty() {
-                "0".to_string()
-            } else {
-                words.join(", ")
-            }
-        ));
-        let shape = self.unit.shape(&names);
-        let v = self.bind(
-            Kind::Boxed,
-            format!(
-                "rt_record_p(ctx, {shape}, (Word)(intptr_t){arr}, {})",
-                names.len()
-            ),
-        );
-        self.check();
-        Ok(v)
+        Ok(self.emit_record(&names, words, kinds))
     }
 
     fn list(&mut self, items: &[Code]) -> Result<V> {
