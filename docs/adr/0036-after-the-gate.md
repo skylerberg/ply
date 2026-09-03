@@ -332,15 +332,23 @@ The bar is not doing anything exotic — no vector register appears anywhere in
 it. Its `round` is the same eight quarter-rounds, and it is **138 instructions
 with two stack operations**, of which:
 
-| | Rust `round` | Ply `round` |
-| --- | --- | --- |
-| add | 48 | 96, each with an overflow branch |
-| xor | 32 | 64 |
-| rotate | 32, one instruction each | 64, each narrowed and widened around |
-| mask | **none** | 330 |
-| loads | 17, in pairs (`ldp`) | 142 field loads, each with a tag test |
-| stores | 9, in pairs (`stp`) | 86 |
-| stack traffic | 2 | 524 |
+| | Rust `round` | Ply `round`, over `Int` | Ply `round`, over `U32` |
+| --- | --- | --- | --- |
+| add | 48 | 96, each with an overflow branch | 96, in `w` registers, none checked |
+| xor | 32 | 64 | 64 |
+| rotate | 32, one instruction each | 64, each narrowed and widened around | 64, one instruction each |
+| mask | **none** | 330 | **none** |
+| loads | 17, in pairs (`ldp`) | 142 field loads, each with a tag test | 102, each an untag and no test |
+| stores | 9, in pairs (`stp`) | 86 | 76 |
+| stack traffic | 2 | 524 | 114 |
+| instructions | 141 | about 1750 | 706 |
+
+**The third column is ADR 0039's, and it holds the round twice** — once for the
+path that reuses the dying state record's memory and once for the path that
+allocates — so one execution walks about half of it. Every row the width was
+supposed to move, moved: the masks are gone entirely, the rotate is
+`extr w, w, #16`, the adds are `add w` and none of them is checked because the
+source says `wrap_add`. What is left is not arithmetic.
 
 **One fact explains the first four rows.** Rust's words are `u32` in `w`
 registers: wrapping is what the register does, so there is nothing to mask, and
@@ -357,6 +365,14 @@ in.** Nothing in the source, the checker or the code generator can say that a
 value is thirty-two bits wide, and every one of the differences above is what
 that costs. A bar of three would need most of them gone, and no peephole reaches
 any of them.
+
+**That diagnosis was right about the cause and wrong about the size.** ADR 0039
+gave the language the width, `std.hash` is written over `U32`, every row above
+moved, and the kernel went from about seven times the bar to about six — a fifth,
+not the factor this section's framing implies. The sentence to keep is the first
+one; the sentence a reader would infer, that the width is most of the seven, is
+false and `docs/adr/0039-how-ply-types-its-numbers.md` §"What the gate said"
+carries what replaced it.
 
 ## Decision 12 — a parameter the body only reads is borrowed
 
