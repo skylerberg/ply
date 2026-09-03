@@ -203,6 +203,17 @@ struct Func {
 /// The Cranelift type a width is held in. Cranelift has exactly `I8 I16 I32 I64 I128` and puts
 /// signedness in the *operation* rather than the type, which is why `U32` and `I32` share one here
 /// and differ only in which instruction is selected.
+/// The Cranelift type a value of this kind is held in. Every join carrying a value of a computed
+/// kind must give its block parameter *this* type: a `Kind::Num` is narrower than a word, and a
+/// block parameter that says `I64` where the branches pass an `I32` is an instruction the
+/// assembler encodes and the processor refuses.
+fn clif_kind(k: Kind) -> types::Type {
+    match k {
+        Kind::Num(t) => clif_int(t),
+        _ => types::I64,
+    }
+}
+
 fn clif_int(t: IntTy) -> types::Type {
     match t.bits() {
         8 => types::I8,
@@ -1983,9 +1994,13 @@ impl Fx<'_, '_> {
     fn token_of(&self, ty: u32) -> Option<(cranelift_codegen::ir::StackSlot, bool)> {
         match &self.jit.tys[ty as usize] {
             Ty::Record(fields) => {
-                let flat = fields
-                    .iter()
-                    .all(|(_, t)| matches!(self.jit.tys[*t as usize], Ty::Int | Ty::Bool));
+                // A fixed width belongs here beside `Int` and `Bool`: a carried width is always
+                // boxed as an immediate, so a record of them holds no count and its release walks
+                // nothing. Leaving it out cost more than the whole family bought — sixteen tag
+                // tests and sixteen conditional decrements per `round` of the integer kernel.
+                let flat = fields.iter().all(|(_, t)| {
+                    matches!(self.jit.tys[*t as usize], Ty::Int | Ty::Bool | Ty::Num(_))
+                });
                 self.token_for(fields.len()).map(|slot| (slot, flat))
             }
             _ => None,
@@ -2601,7 +2616,7 @@ impl Fx<'_, '_> {
                 let then_block = self.builder.create_block();
                 let else_block = self.builder.create_block();
                 let join = self.builder.create_block();
-                self.builder.append_block_param(join, types::I64);
+                self.builder.append_block_param(join, clif_kind(kind));
                 self.builder.ins().brif(c, then_block, &[], else_block, &[]);
 
                 self.builder.switch_to_block(then_block);
@@ -2882,6 +2897,10 @@ impl Fx<'_, '_> {
                     let kind = match self.jit.tys[ty as usize] {
                         Ty::Int => Kind::Int,
                         Ty::Bool => Kind::Bool,
+                        // A field of a carried width is a scalar like the two above it: read
+                        // straight into a register of its own width, with no tag test — the
+                        // 142 of them ADR 0036 counted per `round` are this line.
+                        Ty::Num(t) => Kind::Num(t),
                         _ => Kind::Boxed,
                     };
                     let w = self.builder.ins().load(
