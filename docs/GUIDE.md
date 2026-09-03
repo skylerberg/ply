@@ -1757,9 +1757,11 @@ What an iteration costs today:
   the loop and most saves change one file or none: a read of the files whose
   timestamps moved, and no front end at all. The front end is a function of the
   bytes, so bytes that did not change have the front end they had.
-- **A save that changed something.** The front end again, as a fresh invocation
-  would run it. The driver works over the whole program whatever moved, so this
-  is the part still to do; ADR 0038 says what finishing it would mean.
+- **A save that changed something.** The files that changed are re-read and
+  re-parsed; the rest keep the syntax trees this process already has. Everything
+  after parsing — resolving, hashing, checking, restoring and writing back — still
+  runs over the whole program, so this is the part still to do; ADR 0038 says
+  what finishing it would mean.
 
 Under `--json` each iteration prints one report, so a stream of them is a
 stream of objects. `Ctrl-C` ends the loop; anything the caches learned that has

@@ -1,7 +1,11 @@
 # ADR 0038 — The invocation is the cost: what a resumable front end has to do
 
-**Registered, not decided. It states a problem the measurement found, fixes the
-criteria a solution is judged by before one exists, and builds nothing.**
+**Registered, and started. It states a problem the measurement found, fixes the
+criteria a solution is judged by, and one phase is done against them.**
+`crates/ply-cli/tests/suite/incremental.rs` holds the gate; `driver::Resume`
+holds the state; the parse phase no longer runs for a file that still says what
+it said. Nothing else below is done, and the bar the last section sets is not
+met.
 ADR 0037 ordered the loop's work and its row answered the question it was
 registered for. This record starts where that answer left off.
 
@@ -45,6 +49,29 @@ the result; gate 2 widens and repeats; the merge restores every interface and
 writes every fingerprint. None of that is wrong. It is what a process that
 starts knowing nothing has to do.
 
+## Where the time actually is, one level down
+
+The phase report says no phase dominates. Below the phases, each of the big
+three divides again, and this is what a plan has to work against rather than the
+phase names:
+
+- **Hashing is three things**: a normalization pass over every definition that
+  yields the reference graph, a second pass that hashes each component against
+  its referents' hashes, and the tests, laws and specs — which are hashed the
+  same way and are, on a project with more tests than definitions, the largest of
+  the three. A test is a leaf: nothing references it, so its hash is a function
+  of its own text and the hashes it names.
+- **Writing back is two things**: building the tables a fingerprint is cut from,
+  and re-encoding every definition's interface to compare it with the one the
+  store already holds. The second is the larger, and every byte of it is spent
+  on definitions that did not move.
+- **Restoring** merges each file's contribution into one output, whether the
+  file was checked this run or read back from the store, and it merges all of
+  them every time.
+
+None of these is a hot loop to tighten. Each is a whole-program pass that would
+have to learn what changed.
+
 ## The question
 
 **What does a front end have to hold, and what does it have to redo, for an
@@ -85,6 +112,12 @@ The differential must be armed the way the others are: a mutation that makes the
 resumable path wrong has to turn it red. A comparison that cannot fail is the
 defect class `CONTRIBUTING.md` §"The one rule" names.
 
+**The gate exists.** `agree_resumed` compares a resumed load against a
+from-scratch load over a sequence of edits, using the snapshot the cold-versus-
+warm equivalence already uses, and each step asserts reuse happened. Both halves
+of the reuse key are armed: dropping the file's content makes it red, and
+dropping the source id makes `a_new_file_is_not_resumed_over` red.
+
 **Then the row.** `benches/marginal-change/` re-taken with a warm arm, at the
 same three sizes:
 
@@ -105,6 +138,26 @@ wrong reason.
 A hub edit is read for where its knee falls, not against a bar — its dependent
 set really is proportional to the project, and a loop that recomputes it is
 correct.
+
+## What is done, and what the rule says about stopping
+
+Done: the gate, and the parse phase. A file that still says what it said keeps
+the tree this process parsed, which takes parsing out of a warm iteration
+entirely. Getting there also found the shape of the mistake this record is most
+likely to invite — see §"Where the time actually is": a seed put where a parsed
+tree goes made files the run had skipped look parsed, and the answers still
+agreed while the work grew by half. The gate did not catch that, because the
+gate is about answers. The row caught it.
+
+Not done: everything else, and the bar above is not met. **That is the rule
+working rather than the work stalling.** Each remaining phase is worth about a
+tenth of an iteration, so each is a constant-factor win on a cost that still
+follows the project, and the decision rule refuses exactly that. Taking them one
+at a time would produce a sequence of green commits and a loop that is still
+O(project), which is the milestone reporting success for the wrong reason.
+
+What the next attempt should carry: the whole-program passes have to learn what
+changed, together, and the differential above is what makes that safe to try.
 
 ## What would make this wrong
 
