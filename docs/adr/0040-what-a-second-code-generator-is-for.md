@@ -267,6 +267,41 @@ it. Cranelift cannot take the inlining the elision needs; either it learns the
 elision in its own record handling, where the inlining is not the enabler, or
 the tier that clears the bar is not the tier that ships.
 
+## Six more levers, and the instrument that cannot see them
+
+With the gate reading *undecided* the obvious move is to find another few
+percent. Six were tried, each measured by running two binaries alternately so
+that background load falls on both, and reading the **minimum** of a dozen runs
+rather than the mean. Five moved nothing; the sixth is the one worth keeping.
+
+| lever | effect |
+| --- | --- |
+| `cc -O3`, and other optimisation levels | none |
+| deciding a block's padding once rather than once per word, so the padding arm is not inlined sixteen times | none on this tier; a little on the other. It needs the row below to not *lose* by it |
+| joining an `if` whose arms are records field by field, so elision survives a branch | neutral alone: nothing in the kernel needs it until the row above exists |
+| carrying the loop's state as three locals instead of a record | **not worth it.** It removes an allocation and a walk per block and costs register pressure across a 2,400-instruction body; the two cancel, and it needs ownership work the tier does not have |
+| dropping `-fno-strict-aliasing`, on the theory that alias analysis was blocking store forwarding | none, so that was not what blocked it |
+| **not** eliding records past a width, on the theory that Rust's bar keeps its message in memory and reloads it | **1.3× worse.** The ablation that shows the elision is doing the work, and the theory was wrong |
+
+**And then the instrument.** Run the same binary against *itself* through that
+harness and the two arms differ by about five percent. The distance from 3.14 to
+3.0 is smaller than that. This is not a fact about the kernel: it is why the gate
+says *undecided (within the resolution of the bar)* rather than yes or no, and no
+amount of measuring on this machine will turn it into either.
+
+**What would give it room.** Ply's folded per-block body is about 2,400
+instructions against the bar's ~1,100, and the arithmetic in each is the same
+865. But the *time* ratio is larger than the instruction ratio, so the extra
+instructions are also cheaper-per-instruction than the bar's -- which is what a
+body with thirty-two live values on a machine with thirty-one registers looks
+like. Rust's bar answers that by keeping sixteen words in registers and reloading
+the other sixteen from memory each round. Ply has no way to say that, and the row
+above shows that the crude version of saying it -- refusing to elide the wide
+record -- is much worse than not saying it at all.
+
+So the next thing is not another lever. It is either a body that does not need
+thirty-two values live at once, or a way to tell the tier which sixteen to keep.
+
 ## What the gate said, this time
 
 Registered before the arm existed: the C tier would be accepted as the loop's
