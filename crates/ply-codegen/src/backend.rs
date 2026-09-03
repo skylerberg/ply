@@ -279,6 +279,22 @@ impl Bodies {
                      every call and no reason recorded against it"
                 );
             }
+            // A definition whose signature mentions a fixed width is compiled and called
+            // directly by its neighbours, and is not offered here: compiled code holds a width as
+            // the tagged immediate an `Int` is held as, so a value crossing either way would be
+            // read as an `Int` where a `U32` was declared — a wrong answer rather than a slow one
+            // (ADR 0039). `ply_eval`'s `Gate::ArgumentType` and `Gate::AnswerType` refuse the same
+            // call on the machine's side; this is the provider declining rather than relying on
+            // that, so nothing depends on which of the two runs first.
+            if unit
+                .source
+                .check
+                .defs
+                .get(name)
+                .is_some_and(|def| ply_eval::mentions_a_width(&def.scheme.ty))
+            {
+                continue;
+            }
             let constant = code.constant_index(name.as_str());
             admitted.insert(
                 name.clone(),
