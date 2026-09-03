@@ -20,7 +20,7 @@ import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBl
               ERecordUpdate, ETry, EField, EList, EPerform, EHandle, EWithCell, EWithRegion,
               ESimulate, EBad, Stmt, SLet, SExpr, Param, NamedArg, MatchArm, HandleClause,
               ReturnClause, RecField, expr_span)
-import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LBool, LStr,
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool, LStr,
                  LBytes, LFloat, LDec, LUnit, pat_span)
 import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn, TyRecord, Field,
                Scheme, Fresh, Subst, TypeEnv, Free, UnifyError, Mismatch, Arity, OccursTy, OccursRow,
@@ -62,6 +62,9 @@ type LawBinder = { name: Bytes, ty: Type }
 type LawInfo = { key: Bytes, binders: List<LawBinder>, has_guard: Bool, host: Bool, footprint: List<Atom> }
 type PerformSite = { atom: Atom, module: Int, span: Span, direct: Bool }
 type Numeric = { span: Span, op: Bytes, ty: Type }
+// A bit operator's or an integer builtin's operand, kept until its type is known (ADR 0039).
+// `what` is how a diagnostic names the site, which is why the two are not one type.
+type BitOp = { span: Span, what: Bytes, ty: Type }
 type Sig = { ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, fn_ty: Type, params: List<Type>,
              ret: Type, declared: Option<Row>, published_row: Row, scope: Int }
 type Assumed = { deriver: Deriver, vars: List<Int> }
@@ -110,6 +113,7 @@ type Cx = {
   scope: Int,
   constraints: Map<Bytes, List<DefConstraint>>,
   numerics: List<Numeric>,
+  bit_ops: List<BitOp>,
   simulate_depth: Int,
   open_regions: List<OpenRegion>,
   regions: List<RegionSite>,
@@ -190,6 +194,9 @@ fn seed_atom() -> Atom = { effect: b"sim", resource: RSingleton, mode: MRead }
 
 fn builtin_type_arities() -> List<{ name: Bytes, arity: Int }> =
   [{ name: b"Int", arity: 0 }, { name: b"Bool", arity: 0 }, { name: b"String", arity: 0 }, { name: b"Bytes", arity: 0 },
+   // ADR 0039's eight fixed-width integer types.
+   { name: b"U8", arity: 0 }, { name: b"U16", arity: 0 }, { name: b"U32", arity: 0 }, { name: b"U64", arity: 0 },
+   { name: b"I8", arity: 0 }, { name: b"I16", arity: 0 }, { name: b"I32", arity: 0 }, { name: b"I64", arity: 0 },
    { name: b"Float", arity: 0 }, { name: b"Decimal", arity: 0 }, { name: b"Unit", arity: 0 }, { name: b"List", arity: 1 },
    { name: b"Map", arity: 2 }, { name: b"Cell", arity: 1 }, { name: b"Secret", arity: 1 }, { name: b"Task", arity: 1 },
    { name: b"Option", arity: 1 }, { name: b"Result", arity: 2 }, { name: b"Ordering", arity: 0 }, { name: b"Rounding", arity: 0 },
@@ -308,10 +315,30 @@ fn install_prelude(cx0: Cx) -> Cx = {
     { name: b"fold", sc: poly_fn([a.v, b.v], [e.v], [t_list(ta), tb, t_fn([tb, ta], tb, re)], tb, re) },
     { name: b"iterate", sc: poly_fn([a.v, b.v], [e.v], [ta, t_int(), t_fn([ta], t_iter(ta, tb), re)], tb, re) },
     { name: b"range", sc: mono_fn([t_int(), t_int()], t_list(t_int())) },
-    { name: b"wrap_add", sc: mono_fn([t_int(), t_int()], t_int()) },
-    { name: b"wrap_sub", sc: mono_fn([t_int(), t_int()], t_int()) },
-    { name: b"wrap_mul", sc: mono_fn([t_int(), t_int()], t_int()) },
+    // ADR 0039: the wrapping family is `forall a. (a, a) -> a`, with the obligation that `a` is
+    // an integer type attached at each call by `infer_app` and discharged by `settle_bit_ops`.
+    { name: b"wrap_add", sc: poly_fn([a.v], [], [ta, ta], ta, row_empty()) },
+    { name: b"wrap_sub", sc: poly_fn([a.v], [], [ta, ta], ta, row_empty()) },
+    { name: b"wrap_mul", sc: poly_fn([a.v], [], [ta, ta], ta, row_empty()) },
+    { name: b"rotr", sc: poly_fn([a.v], [], [ta, t_int()], ta, row_empty()) },
     { name: b"rotr32", sc: mono_fn([t_int(), t_int()], t_int()) },
+    // The sixteen conversions, eight each way.
+    { name: b"u8_of_int", sc: mono_fn([t_int()], con(b"U8")) },
+    { name: b"u16_of_int", sc: mono_fn([t_int()], con(b"U16")) },
+    { name: b"u32_of_int", sc: mono_fn([t_int()], con(b"U32")) },
+    { name: b"u64_of_int", sc: mono_fn([t_int()], con(b"U64")) },
+    { name: b"i8_of_int", sc: mono_fn([t_int()], con(b"I8")) },
+    { name: b"i16_of_int", sc: mono_fn([t_int()], con(b"I16")) },
+    { name: b"i32_of_int", sc: mono_fn([t_int()], con(b"I32")) },
+    { name: b"i64_of_int", sc: mono_fn([t_int()], con(b"I64")) },
+    { name: b"int_of_u8", sc: mono_fn([con(b"U8")], t_int()) },
+    { name: b"int_of_u16", sc: mono_fn([con(b"U16")], t_int()) },
+    { name: b"int_of_u32", sc: mono_fn([con(b"U32")], t_int()) },
+    { name: b"int_of_u64", sc: mono_fn([con(b"U64")], t_int()) },
+    { name: b"int_of_i8", sc: mono_fn([con(b"I8")], t_int()) },
+    { name: b"int_of_i16", sc: mono_fn([con(b"I16")], t_int()) },
+    { name: b"int_of_i32", sc: mono_fn([con(b"I32")], t_int()) },
+    { name: b"int_of_i64", sc: mono_fn([con(b"I64")], t_int()) },
     { name: b"min", sc: mono_fn([t_int(), t_int()], t_int()) },
     { name: b"max", sc: mono_fn([t_int(), t_int()], t_int()) },
     { name: b"byte_of_int", sc: mono_fn([t_int()], t_bytes()) },
@@ -872,7 +899,7 @@ fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
 // --- Expressions ------------------------------------------------------------------------------
 
 fn lit_type(l: Lit) -> Type =
-  match l { LInt(_) -> t_int(), LBool(_) -> t_bool(), LStr(_) -> t_string(), LBytes(_) -> t_bytes(), LFloat(_) -> t_float(), LDec(_) -> t_decimal(), _ -> t_unit() }
+  match l { LInt(_) -> t_int(), LFixed(ty, _) -> con(bytes_of_string(string_upper(string_of_bytes(ty)))), LBool(_) -> t_bool(), LStr(_) -> t_string(), LBytes(_) -> t_bytes(), LFloat(_) -> t_float(), LDec(_) -> t_decimal(), _ -> t_unit() }
 
 fn record_site(cx: Cx, atom: Atom, span: Span, direct: Bool) -> Cx =
   if span.start == 0 && span.end == 0 { cx } else { {..cx, performs: push(cx.performs, { atom: atom, module: cx.module, span: span, direct: direct })} }
@@ -948,6 +975,27 @@ fn expect(cx: Cx, span: Span, expected: Type, found: Type, context: Bytes) -> { 
   match u.err { Some(e) -> { cx: report_unify(c, e, span, context), ok: false }, None -> { cx: c, ok: true } }
 }
 
+// A bit operand's type is routinely a variable at the node, exactly as an arithmetic operand's
+// is, so the obligation is kept and discharged in `settle_bit_ops`.
+fn note_bits(cx: Cx, span: Span, found: Type, what: Bytes) -> Cx =
+  {..cx, bit_ops: push(cx.bit_ops, { span: span, what: what, ty: found })}
+
+fn settle_bit_ops(cx: Cx) -> Cx = {
+  let entries = cx.bit_ops;
+  fold(entries, {..cx, bit_ops: []}, |c: Cx, entry: BitOp| {
+    let ty = resolve(c, entry.ty);
+    match ty {
+      TyVar(_) -> err1(c, b"E0210", entry.span, 2),
+      TyCon(k) ->
+        if len(k.args) != 0 { err1(c, b"E0201", entry.span, 1) }
+        else if is_int_name(k.name) { c }
+        else if k.name == b"Bool" { err1(c, b"E0201", entry.span, 2) }
+        else { err1(c, b"E0201", entry.span, 1) },
+      _ -> err1(c, b"E0201", entry.span, 1),
+    }
+  })
+}
+
 fn expect_bits(cx: Cx, span: Span, found: Type, context: Bytes) -> Cx = {
   let o: Expected = expect(cx, span, t_int(), found, context);
   if o.ok { o.cx } else {
@@ -983,7 +1031,7 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
     EUnary(u) -> {
       let o: Inferred = infer(cx, u.operand);
       if u.op == b"neg" { { cx: {..o.cx, numerics: push(o.cx.numerics, { span: u.span, op: b"sub", ty: o.ty })}, ty: o.ty, row: o.row } }
-      else if u.op == b"bitnot" { { cx: expect_bits(o.cx, expr_span(u.operand), o.ty, b"operand of `~`"), ty: t_int(), row: o.row } }
+      else if u.op == b"bitnot" { { cx: note_bits(o.cx, expr_span(u.operand), o.ty, b"the operand of `~`"), ty: o.ty, row: o.row } }
       else { let x: Expected = expect(o.cx, expr_span(u.operand), t_bool(), o.ty, b"operand of a unary operator"); { cx: x.cx, ty: t_bool(), row: o.row } }
     },
     EBinary(b) -> infer_binary(cx, b.span, b.op, b.lhs, b.rhs),
@@ -1084,6 +1132,12 @@ fn infer_var(cx: Cx, q: QName) -> Inferred = {
   }
 }
 
+// ADR 0039: `Int` and the eight widths are the integer types, and the bit operators are defined
+// at all nine and at nothing else.
+fn is_int_name(n: Bytes) -> Bool =
+  n == b"Int" || n == b"U8" || n == b"U16" || n == b"U32" || n == b"U64"
+  || n == b"I8" || n == b"I16" || n == b"I32" || n == b"I64"
+
 fn is_arithmetic(op: Bytes) -> Bool = op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
 fn is_ordered(op: Bytes) -> Bool = op == b"lt" || op == b"le" || op == b"gt" || op == b"ge"
 fn is_bits(op: Bytes) -> Bool = op == b"bitand" || op == b"bitor" || op == b"bitxor" || op == b"shl" || op == b"shr" || op == b"ushr"
@@ -1098,9 +1152,20 @@ fn infer_binary(cx: Cx, span: Span, op: Bytes, lhs: Expr, rhs: Expr) -> Inferred
     let noted: Cx = if x.ok { {..x.cx, numerics: push(x.cx.numerics, { span: span, op: op, ty: l.ty })} } else { x.cx };
     { cx: noted, ty: if is_arithmetic(op) { l.ty } else { t_bool() }, row: j.r }
   } else if is_bits(op) {
-    let c1: Cx = expect_bits(c, expr_span(lhs), l.ty, bytes_concat_all([b"left operand of `", bits_text(op), b"`"]));
-    let c2: Cx = expect_bits(c1, expr_span(rhs), r.ty, bytes_concat_all([b"right operand of `", bits_text(op), b"`"]));
-    { cx: c2, ty: t_int(), row: j.r }
+    // The answer has the operands' type, and a shift is not symmetric: its right operand is a
+    // *count*, which is an `Int` whatever the word is.
+    let shifting = op == b"shl" || op == b"shr" || op == b"ushr";
+    let c1: Cx = note_bits(c, expr_span(lhs), l.ty, bytes_concat_all([b"the left operand of `", bits_text(op), b"`"]));
+    let c2: Cx =
+      if shifting {
+        expect(c1, expr_span(rhs), t_int(), r.ty,
+          bytes_concat_all([b"the count of a `", bits_text(op), b"` is an `Int`"])).cx
+      } else {
+        let c1b: Cx = note_bits(c1, expr_span(rhs), r.ty, bytes_concat_all([b"the right operand of `", bits_text(op), b"`"]));
+        expect(c1b, expr_span(rhs), l.ty, r.ty,
+          bytes_concat_all([b"both operands of `", bits_text(op), b"` have one type"])).cx
+      };
+    { cx: c2, ty: l.ty, row: j.r }
   } else if op == b"and" || op == b"or" {
     let c1: Cx = expect(c, expr_span(lhs), t_bool(), l.ty, b"left operand").cx;
     let c2: Cx = expect(c1, expr_span(rhs), t_bool(), r.ty, b"right operand").cx;
@@ -1141,6 +1206,19 @@ fn infer_app(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferred =
     _ -> infer_app_general(cx, span, func, args),
   }
 
+// The prelude names whose first parameter must be an integer type, checked at each call because
+// nothing in a scheme can say "an integer".
+fn int_builtin_name(func: Expr) -> Bytes =
+  match func {
+    EVar(v) -> if is_bare(v.name) { v.name.name.name } else { b"" },
+    _ -> b"",
+  }
+
+fn is_int_builtin(func: Expr) -> Bool = {
+  let n = int_builtin_name(func);
+  n == b"wrap_add" || n == b"wrap_sub" || n == b"wrap_mul" || n == b"rotr"
+}
+
 fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferred = {
   let f: Inferred = infer(cx, func);
   let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_all(f.cx, args, span);
@@ -1154,8 +1232,15 @@ fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferr
         { cx: j.cx, ty: fn_.ret, row: j.r }
       } else {
         let checked: Cx = fold(range(0, len(args)), c, |cc: Cx, i: Int| expect(cc, expr_span(at(args, i)), at(fn_.params, i), at(as_.tys, i), b"argument type").cx);
-        let effects = resolve_r(checked, fn_.effects);
-        let recorded: Cx = fold(effects.atoms, checked, |cc: Cx, a: Atom| record_site(cc, a, span, false));
+        // `wrap_add` and its siblings are `forall a.`, which alone would take two `String`s; the
+        // obligation that `a` is an integer type goes on the instantiated variable here, at the
+        // call, and is discharged with every other one (ADR 0039).
+        let obliged: Cx =
+          if is_int_builtin(func) && len(fn_.params) > 0 {
+            note_bits(checked, span, at(fn_.params, 0), bytes_concat_all([b"`", int_builtin_name(func), b"`"]))
+          } else { checked };
+        let effects = resolve_r(obliged, fn_.effects);
+        let recorded: Cx = fold(effects.atoms, obliged, |cc: Cx, a: Atom| record_site(cc, a, span, false));
         let j: WithRow = join(recorded, span, j0.r, effects);
         { cx: j.cx, ty: fn_.ret, row: j.r }
       },
@@ -1827,7 +1912,7 @@ fn check_component_walked(cx: Cx, m: Mod, fns: List<FnDef>, comp: List<Int>, qua
     let walked: Cx = {..o.cx, derived: None};
     { cx: record_spec_env(walked, def, at(qualified, slot), sig), rows: push(acc.rows, o.row) }
   });
-  let settled: Cx = settle_numerics(bodies.cx);
+  let settled: Cx = settle_bit_ops(settle_numerics(bodies.cx));
   let required: Cx = fold(range(0, len(comp)), settled, |c: Cx, slot: Int| require_written_signature(c, at(fns, at(comp, slot)), at(sigs.sigs, slot)));
   let closed: Cx = fold(sigs.sigs, required, |c: Cx, s: Sig| close_unreachable_row(c, s));
   let removed: Cx = fold(qualified, closed, |c: Cx, name: Bytes| {..c, env: env_remove_global(c.env, name)});
@@ -1930,7 +2015,7 @@ fn settle_numerics(cx: Cx) -> Cx = {
       TyVar(_) -> err1(c, b"E0210", entry.span, 2),
       TyCon(k) ->
         if len(k.args) != 0 { err1(c, b"E0201", entry.span, 1) }
-        else if k.name == b"Int" || k.name == b"Float" { c }
+        else if is_int_name(k.name) || k.name == b"Float" { c }
         else if k.name == b"Decimal" { if entry.op == b"div" { err1(c, b"E0209", entry.span, 2) } else { c } }
         else { err1(c, b"E0201", entry.span, 1) },
       _ -> err1(c, b"E0201", entry.span, 1),
@@ -2554,7 +2639,7 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
                     types: map_new(), effects: [], effect_index: map_new(), ctors: [], ctor_index: map_new(),
                     defs: [], def_index: map_new(), tests: [], laws: [], ty_params: map_new(), row_params: map_new(),
                     auto_ty_params: false, alias_stack: [], refused_atoms: [], performs: [], comparisons: [], scope: 0,
-                    constraints: map_new(), numerics: [], simulate_depth: 0, open_regions: [], regions: [], simulations: [],
+                    constraints: map_new(), numerics: [], bit_ops: [], simulate_depth: 0, open_regions: [], regions: [], simulations: [],
                     map_keys: [], constrained_uses: [], spec_kind: None, spec_envs: [], derived: None, known: known, assumed: [] })
 
 type Checked = { cx: Cx, ok: Bool }
@@ -2571,7 +2656,7 @@ pub fn check_program_with(r: Resolved, mods: List<Mod>, known: Known) -> Checked
   let checked: Cx = fold(r.order, declared, |c: Cx, i: Int| { let m = at(mods, i); check_specs(check_fns({..c, module: i}, m), m) });
   let tested: Cx = fold(range(0, len(mods)), checked, |c: Cx, i: Int| check_laws(check_tests({..c, module: i}, at(mods, i)), at(mods, i)));
   // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
-  let settled: Cx = settle_numerics(tested);
+  let settled: Cx = settle_bit_ops(settle_numerics(tested));
   let constrained: Cx = check_constraints(check_map_keys(check_comparisons(settled)));
   let solved: Cx = check_regions(check_simulations(attribute_generated(check_derives(constrained))));
   let marked: Cx = mark_internal_effects(solved);
