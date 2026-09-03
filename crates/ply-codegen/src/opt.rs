@@ -41,7 +41,7 @@ impl Inlining {
     /// that is already off the loop's path.
     pub const EMITTED: Inlining = Inlining {
         budget: 2000,
-        depth: 4,
+        depth: 6,
     };
 
     /// `PLY_INLINE_BUDGET` and `PLY_INLINE_DEPTH` override, for a measurement.
