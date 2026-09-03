@@ -24,6 +24,7 @@ pub struct Native {
     /// Kept alive because every [`Entry`] below points into its pages.
     lib: Library,
     entries: HashMap<String, (Entry, usize)>,
+    constants: HashMap<String, usize>,
     tables: Rc<Tables>,
 }
 
@@ -36,9 +37,14 @@ impl Native {
         self.entries.get(name).map(|(_, a)| *a)
     }
 
-    /// The C tier has no memo of pure nullary roots yet; every call runs.
-    pub fn constant_index(&self, _name: &str) -> Option<usize> {
-        None
+    /// The memo index of a pure nullary root, if `name` is one.
+    ///
+    /// The same rule the in-process tier applies, and the same reason: a nullary function whose
+    /// published row says it is pure answers the same thing every time, so the seam remembers it
+    /// rather than running it. Without this the gate's kernel rebuilds a sixty-five-kilobyte byte
+    /// literal on every call, which the other tier does not.
+    pub fn constant_index(&self, name: &str) -> Option<usize> {
+        self.constants.get(name).copied()
     }
 
     pub fn tables(&self) -> &Rc<Tables> {
@@ -141,11 +147,25 @@ pub fn build(
             ),
         );
     }
+    // The pure nullary roots, numbered as the in-process tier numbers them: the index is into the
+    // seam's memo, and what it indexes is an answer rather than a call.
+    let mut constants = HashMap::new();
+    for name in &taken {
+        if loaded
+            .definition(name)
+            .is_some_and(|(d, _)| d.params.is_empty())
+            && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(name))
+        {
+            let next = constants.len();
+            constants.insert(name.clone(), next);
+        }
+    }
     let tables = Rc::new(tables_of(unit, &ctors));
     Ok((
         Native {
             lib,
             entries,
+            constants,
             tables,
         },
         refusals,
