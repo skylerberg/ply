@@ -238,12 +238,37 @@ pub fn run_resumed(
     needed: &[ModuleName],
     resume: Option<&mut Resume>,
 ) -> Result<Loaded, LoadError> {
+    run_with(path, mode, store, needed, &[], resume)
+}
+
+/// [`run_resumed`], and `bodies` names modules whose bodies are wanted without asking for anything
+/// about them to be re-derived — what a test runner needs, and what a command that *reports* on a
+/// module does not. See `Driver::bodies`.
+pub fn run_with(
+    path: &Path,
+    mode: Mode,
+    store: Option<&mut Store>,
+    needed: &[ModuleName],
+    bodies: &[ModuleName],
+    resume: Option<&mut Resume>,
+) -> Result<Loaded, LoadError> {
     let (root, discovered) = discover(path).map_err(LoadError::bare)?;
     // Pruning deletes every fingerprint the run did not see, which is only correct when the run saw
     // everything.
     let whole_project = std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false);
     let needed = needed.iter().map(|m| m.as_symbol().clone()).collect();
-    Driver::new(root, discovered, mode, store, whole_project, needed, resume)?.finish()
+    let bodies = bodies.iter().map(|m| m.as_symbol().clone()).collect();
+    Driver::new(
+        root,
+        discovered,
+        mode,
+        store,
+        whole_project,
+        needed,
+        bodies,
+        resume,
+    )?
+    .finish()
 }
 
 struct FileState {
@@ -254,6 +279,20 @@ struct FileState {
     content: ContentHash,
     fingerprint: Option<Arc<SourceFingerprint>>,
     ast: Option<Module>,
+    /// Whether this module's *bodies* are wanted so that a selected test can run, without anything
+    /// about it being re-derived.
+    ///
+    /// A test that must run every time — a nondeterministic one — needs the bodies of every module
+    /// it reaches, and the only way the driver had to obtain a tree was to mark the file parsed,
+    /// which is the treatment a *changed* file gets: hashed, walked by the checker, written back,
+    /// to arrive at what its fingerprint already said. `benches/marginal-change/warm-loop.sh`
+    /// measured what that costs, and ADR 0038 carries the reading.
+    ///
+    /// A file wanted only to run is restored like any other unchanged file, and its tree is added
+    /// to the program the evaluator gets. That is sound because the parsed set is closed under
+    /// imports (`close_over_imports`), so nothing that *is* re-derived can reference a definition
+    /// in a file that is only wanted to run.
+    for_eval: bool,
     /// A tree this process parsed from these very bytes on an earlier load, waiting to be used
     /// *if* this run decides to parse the file.
     ///
@@ -305,6 +344,12 @@ struct Driver<'s> {
     reused: usize,
     whole_project: bool,
     needed: BTreeSet<Symbol>,
+    /// Modules whose *bodies* a caller needs, without asking for anything about them to be
+    /// re-derived. `needed` is the stronger request and the two are separate because most callers
+    /// that name a module also report on it: `prove` discharges its obligations, the effect-set
+    /// report prints its rows, and both read what this run checked. Only the test runner is content
+    /// with bodies alone.
+    bodies: BTreeSet<Symbol>,
     sources: SourceMap,
     files: Vec<FileState>,
     by_module: IndexMap<Symbol, usize>,
@@ -321,6 +366,7 @@ fn timed<T>(slot: &mut Duration, f: impl FnOnce() -> T) -> T {
 }
 
 impl<'s> Driver<'s> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         root: PathBuf,
         discovered: Vec<Discovered>,
@@ -328,6 +374,7 @@ impl<'s> Driver<'s> {
         store: Option<&'s mut Store>,
         whole_project: bool,
         needed: BTreeSet<Symbol>,
+        bodies: BTreeSet<Symbol>,
         mut resume: Option<&'s mut Resume>,
     ) -> Result<Driver<'s>, LoadError> {
         let mut phases = Phases::default();
@@ -376,6 +423,7 @@ impl<'s> Driver<'s> {
                     content,
                     fingerprint: None,
                     ast: None,
+                    for_eval: false,
                     seed: resume
                         .as_mut()
                         .and_then(|r| r.take(&file.path, content, source)),
@@ -407,6 +455,7 @@ impl<'s> Driver<'s> {
             reused,
             whole_project,
             needed,
+            bodies,
             sources,
             files,
             by_module,
@@ -440,12 +489,60 @@ impl<'s> Driver<'s> {
         }
     }
 
+    /// The files whose bodies a selected test needs, closed over imports.
+    ///
+    /// Separate from `parse` and closed separately: a module a test reaches imports others, and the
+    /// evaluator needs those bodies too. Closing this set through `parse` instead would drag every
+    /// one of them back into the round, which is the cost this exists to remove.
+    ///
+    /// Run after the gates have settled, and it seeds itself here rather than earlier so that a
+    /// shipped module — which `add_shipped` files during gate 1, after any earlier pass would have
+    /// looked — is marked like any other.
+    fn close_over_run_imports(&mut self) -> Result<(), LoadError> {
+        for i in 0..self.files.len() {
+            if !self.files[i].parse && self.bodies.contains(self.files[i].module.as_symbol()) {
+                self.files[i].for_eval = true;
+            }
+        }
+        loop {
+            self.parse_pending()?;
+            let mut added = false;
+            for i in 0..self.files.len() {
+                if !self.files[i].for_eval && !self.files[i].parse {
+                    continue;
+                }
+                let Some(ast) = &self.files[i].ast else {
+                    continue;
+                };
+                let imports: Vec<Symbol> = ast
+                    .imports
+                    .iter()
+                    .map(|d| d.module_name().as_symbol().clone())
+                    .collect();
+                for name in imports {
+                    let Some(&j) = self.by_module.get(&name) else {
+                        continue;
+                    };
+                    if !self.files[j].parse && !self.files[j].for_eval {
+                        self.files[j].for_eval = true;
+                        added = true;
+                    }
+                }
+            }
+            if !added {
+                return Ok(());
+            }
+        }
+    }
+
     /// The same decision for one file, so that a stdlib module pulled in after [`forced`] has run
     /// reaches it by the same route rather than by a second copy of the rule.
     fn forced_refusal(&self, file: &FileState) -> Refusal {
         match &file.fingerprint {
             _ if self.mode == Mode::Full => Refusal::NotIncremental,
             _ if self.needed.contains(file.module.as_symbol()) => Refusal::NeededToEvaluate,
+            // A file with nothing cached has to be parsed whatever it is wanted for.
+            None if self.bodies.contains(file.module.as_symbol()) => Refusal::NeededToEvaluate,
             None => Refusal::NoFingerprint,
             Some(f) if f.content_hash != file.content => Refusal::ContentChanged,
             Some(_) => Refusal::None,
@@ -498,7 +595,36 @@ impl<'s> Driver<'s> {
                 "a wave gave up only names it had already given up, so it cannot make progress"
             );
         };
+        // After the gates have settled, so that a file which ended up parsed is never also carried
+        // here, and its trees come from the same seeded parse the rest did.
+        self.close_over_run_imports()?;
         self.merge(program, resolved, hashes, bodies, check, cached)
+    }
+
+    /// The program the evaluator gets: everything that was re-derived, plus the modules wanted only
+    /// so that a selected test can run.
+    ///
+    /// Built and resolved separately from the one that was hashed and checked, because those two
+    /// answer different questions. Returns `None` when nothing is wanted only to run, which is
+    /// every command that is not running tests — there is then one program and no second resolve.
+    fn evaluation_program(
+        &self,
+    ) -> Result<Option<(Program, ply_syntax::resolve::Resolved)>, LoadError> {
+        if !self.files.iter().any(|f| f.for_eval) {
+            return Ok(None);
+        }
+        let modules: Vec<Module> = self
+            .files
+            .iter()
+            .filter(|f| f.parse || f.for_eval)
+            .filter_map(|f| f.ast.clone())
+            .collect();
+        let mut program = Program { modules };
+        let resolved = resolve(&mut program).map_err(|diagnostics| LoadError {
+            sources: self.sources.clone(),
+            diagnostics,
+        })?;
+        Ok(Some((program, resolved)))
     }
 
     /// Definitions gate 2 restored that call one whose published interface turned out to have
@@ -712,6 +838,7 @@ impl<'s> Driver<'s> {
             .and_then(|r| r.take(&path, content, id));
         let mut file = FileState {
             ast: None,
+            for_eval: false,
             seed,
             path,
             module,
@@ -769,7 +896,7 @@ impl<'s> Driver<'s> {
         let reused = &mut self.reused;
         timed(&mut self.phases.parse, || {
             for file in files {
-                if !file.parse || file.ast.is_some() {
+                if (!file.parse && !file.for_eval) || file.ast.is_some() {
                     continue;
                 }
                 // A tree this process already parsed from these bytes, under this source id, is
@@ -1293,6 +1420,9 @@ impl<'s> Driver<'s> {
         report.phases = self.phases;
         report.reused = self.reused;
 
+        // Before the trees are handed back to the resume below, which takes them.
+        let evaluation = self.evaluation_program()?;
+
         let files = self.files.iter().map(|f| f.path.clone()).collect();
         let complete = self.files.iter().all(|f| f.parse);
         let promised = self.files.iter().any(|f| match &f.ast {
@@ -1317,6 +1447,7 @@ impl<'s> Driver<'s> {
         }
         Ok(Loaded {
             root: self.root,
+            run: evaluation,
             files,
             sources: self.sources,
             program,
@@ -1469,10 +1600,12 @@ impl<'s> Driver<'s> {
                             spec: Vec::new(),
                             // Needs `CachedDef` to carry them, which it does not yet.
                             constraints: Vec::new(),
-                            // There is no body to walk, so the answer is the conservative one —
-                            // which costs nothing, because a skipped module contributes no AST and
-                            // so no closure the seam could be offered.
-                            internally_effectful: true,
+                            // The answer the run that checked it computed, carried in the cached
+                            // definition. It was the conservative `true` on the ground that a
+                            // skipped module contributes no AST — which stopped being true once a
+                            // module could be kept for its bodies alone, and cost the backend every
+                            // entry into one.
+                            internally_effectful: cached.internally_effectful,
                             span: entry.span.rebase(source),
                         },
                     );
@@ -1892,7 +2025,8 @@ impl<'s> Driver<'s> {
                             CachedDef::new(d.scheme.clone(), d.footprint.clone())
                                 .performing(d.performed.clone())
                                 .written_as(d.row_aliases.clone())
-                                .witnessed_by(names),
+                                .witnessed_by(names)
+                                .performing_internally(d.internally_effectful),
                         )
                     }),
                     Item::Type(def) => {

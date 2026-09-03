@@ -1,13 +1,13 @@
 # ADR 0038 — The invocation is the cost: what a resumable front end has to do
 
-**Registered, started, and re-aimed by its own measurement.** It began by
-claiming an invocation costs the project; a warm arm taken at three sizes over
-two corpora says the cost is what the tests that must run *reach*, and that a
-project whose tests are all deterministic is already flat in project size. The
-question is therefore narrower than the one this record opened with, and it is
-stated in §"The question". `crates/ply-cli/tests/suite/incremental.rs` holds the
-gate, `driver::Resume` holds the state, and the parse phase no longer runs for a
-file that still says what it said. The seam §"The question" names is not done.
+**Decided, implemented, and met.** It began by claiming an invocation costs the
+project; a warm arm taken at three sizes over two corpora said the cost is what
+the tests that must run *reach*. That narrowed the question to one seam — a
+module needed only to run was re-derived as though it had changed — and the seam
+is now closed. `benches/marginal-change/observation-warm.txt` is the reading: an
+edit costs the same whether or not a project has tests that run every time, and
+it does not grow with the project across a sixteenfold range. The bar
+§"Criteria" sets is met.
 ADR 0037 ordered the loop's work and its row answered the question it was
 registered for. This record starts where that answer left off.
 
@@ -100,10 +100,22 @@ That is one seam, not eight phases. It is a much smaller question than the one
 this record asked when it was written, and it is the one the measurement
 supports.
 
+**The answer is implemented.** `driver::run_with` takes a `bodies` set beside
+`needed`: a module named there has its tree attached to the program the runner
+gets and is otherwise restored like any other unchanged file. `ply test` asks
+for bodies; every command that *reports* on a module — `prove`'s obligations,
+the effect-set rows — goes on asking for the stronger thing, because those read
+what the run checked. `Loaded::to_run` is the program the runner and its backend
+work over, and it is deliberately not `Loaded::program`.
+
 ## What makes it harder than it looks
 
 The obvious route — hash only the modules that changed and take the rest from
-their fingerprints — is sound about cycles and unsound about effects.
+their fingerprints — is sound about cycles and unsound about effects. **The
+route taken avoids it entirely**: nothing is frozen inside the hasher, because a
+module wanted only for its bodies is simply not in the program that gets hashed,
+and the parsed set is already closed under imports, so nothing that *is* hashed
+can reference it.
 
 - **Cycles are safe to split on modules.** Import cycles are a diagnostic
   (`crates/ply-syntax/src/resolve.rs`), so the module graph is a directed acyclic
@@ -120,15 +132,18 @@ their fingerprints — is sound about cycles and unsound about effects.
   cache-format change, and every cached result everywhere depends on it. A hasher
   that is subtly wrong does not fail — it answers a different hash, and the cache
   believes it.
-- **And there is a second seam, not only hashing.** A restored definition is
+- **And there was a second seam, not only hashing.** A restored definition was
   recorded as internally effectful, on the stated ground that a skipped module
-  contributes no AST. A module kept for its bodies does contribute one, so that
-  answer would become conservative where it used to be exact — which costs the
-  compiled backend entries rather than correctness, and has to be decided rather
-  than inherited.
+  contributes no AST. A module kept for its bodies does contribute one, and the
+  conservative answer cost the compiled backend **every** entry into such a
+  module — measured as zero entries on a corpus that had tens of thousands.
+  Fixed by carrying the fact rather than recomputing it: `CachedDef` records what
+  the run that checked the definition computed, and a restore reads it. That is a
+  cache-format change, so `FRONTEND_FORMAT` and `FRONTEND_VERSION` both move and
+  the two pinned-encoding tests move with them.
 
-The third is why this is a record and not yet a branch. The second is what the
-branch would have to solve first.
+The first two are why the hasher was left alone. The third would still apply to
+anyone who goes back to it.
 
 ## Criteria, registered before anything is built
 
@@ -174,35 +189,33 @@ A hub edit is read for where its knee falls, not against a bar — its dependent
 set really is proportional to the project, and a loop that recomputes it is
 correct.
 
-## What is done, and what is left
-
-Done, and armed:
+## What is done
 
 - **The gate.** `agree_resumed` compares a resumed load against a from-scratch
   load over a sequence of edits. Both halves of its reuse key were seen to fail.
-- **The parse phase.** A file that still says what it said keeps the tree this
-  process parsed, which takes parsing out of a warm iteration.
-- **The measurement that re-aimed this record.** `warm-loop.sh` and its
-  `observation-warm.txt`.
+- **Syntax trees are held across iterations.** A file that still says what it
+  said keeps the tree this process parsed. A tree is reusable only under the
+  source id it was parsed with, since its spans resolve through that id.
+- **A module needed only to run is no longer re-derived.** `run_with`'s `bodies`
+  set, `Loaded::to_run`, and the internally-effectful fact carried in the cache.
+- **The measurement.** `warm-loop.sh` and its `observation-warm.txt`, which
+  re-aimed this record and then confirmed the answer.
 
-Left, and now a single seam rather than eight phases: **a module needed only to
-run should not be re-derived.** What it needs is its bodies; what the driver
-gives it is `Refusal::NeededToEvaluate`, which is the same treatment a changed
-file gets.
+What it is worth, on a 4,000-definition project whose tests include the corpus
+generator's default fraction of nondeterministic ones: an iteration's front end
+falls to about a fifth of what it was, nothing is re-derived, and the reading
+becomes indistinguishable from the same project with every test deterministic.
+The compiled backend still enters — tens of thousands of times on that corpus —
+over modules the run never re-derived, which is the fact the cached flag exists
+to preserve.
 
-Not attempted here, and the reason is in §"What makes it harder than it looks":
-freezing a module's hashes needs its effect ordering carried with them, and
-getting that wrong does not fail — it answers a different hash. The gate above
-compares answers and would catch it on the fixtures; that is necessary and not
-sufficient for a change to the bytes that are the cache's identity.
-
-**A note on the shape of the mistake this invites**, because it has now happened
-twice in this record's own work. Both times the answers stayed correct and the
-*work* changed: a seed placed where a parsed tree goes made skipped files look
-parsed and grew an iteration by half, and this record's first premise read a
-whole-project cost off a corpus whose tests reach the whole project. Neither was
-a wrong answer, so neither could have been caught by comparing answers. The row
-caught both.
+**What is left is not in this record's question.** A warm iteration's remaining
+cost is restoring every file's contribution, reading every file, and writing
+back; each is proportional to the project rather than to the edit, and together
+they are the flat floor an iteration now pays. They did not show while
+re-derivation dominated. Anyone taking them next should re-read
+§"Where the time actually is" against a fresh profile rather than that one,
+which was taken before the seam closed.
 
 ## What would make this wrong
 

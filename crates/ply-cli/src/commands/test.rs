@@ -175,10 +175,13 @@ fn iterate(
         // Resumed like the load above, and for the same reason: this is the load that parses what
         // the selected tests need to run, so it is where most of a warm iteration's parsing is.
         let reloaded = if incremental {
-            driver::run_resumed(
+            // `bodies` rather than `needed`: running a test wants its modules' bodies, and nothing
+            // about them re-derived. ADR 0038 carries what that is worth.
+            driver::run_with(
                 &args.path,
                 driver::Mode::Incremental,
                 Some(&mut cache.store),
+                &[],
                 &unparsed,
                 Some(&mut warm.resume),
             )
@@ -268,10 +271,14 @@ fn iterate(
     // no test has nothing to enter, so it builds nothing — which is what makes a warm loop under a
     // backend cost the edit rather than the project.
     let nothing_to_run = plan.selection.to_run.is_empty();
+    // The program the runner works over, which is `loaded.program` plus whatever a selected test
+    // needs the bodies of. The backend is built over the same one: it answers only for the program
+    // it was built over, and the machine checks that before installing it.
+    let (run_program, run_resolved) = loaded.to_run();
     let provider = match backend
         .as_ref()
         .filter(|_| !nothing_to_run)
-        .map(|spec| build_backend(spec, &loaded.program, &loaded.resolved, &loaded.check))
+        .map(|spec| build_backend(spec, run_program, run_resolved, &loaded.check))
     {
         None => None,
         Some(Ok(provider)) => Some(provider),
@@ -290,11 +297,10 @@ fn iterate(
         }
     };
     let mut run = || {
-        let mut executor =
-            ply_test::InterpExecutor::new(&loaded.program, &loaded.resolved, &loaded.check)
-                .with_backend_audit(args.audit_backend)
-                .with_search(simulation.clone())
-                .with_hosts(hosting(&hosts, &runtime));
+        let mut executor = ply_test::InterpExecutor::new(run_program, run_resolved, &loaded.check)
+            .with_backend_audit(args.audit_backend)
+            .with_search(simulation.clone())
+            .with_hosts(hosting(&hosts, &runtime));
         if let (Some(provider), Some(spec)) = (provider, backend.clone()) {
             executor = executor.with_backend(provider, spec);
         }
@@ -313,11 +319,13 @@ fn iterate(
     warnings.extend(report.warnings.iter().cloned());
 
     // After the run, and against the store as the run left it: a pass this run recorded is a
-    // legitimate baseline for a *different* test's failure.
+    // legitimate baseline for a *different* test's failure. Over the program that ran, because a
+    // bisection rebuilds the failing test from its own definitions and a test in a module wanted
+    // only to run has none in the checked program.
     warnings.extend(ply_test::diagnose_failures(
         &mut report,
-        &loaded.program,
-        &loaded.resolved,
+        run_program,
+        run_resolved,
         &loaded.check,
         &hashes,
         &mut cache.store,
