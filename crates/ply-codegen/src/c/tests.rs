@@ -117,6 +117,12 @@ pub mod tests_support {
     use ply_syntax::ast::ModuleName;
 
     pub fn unit(text: &str) -> Option<(&'static Source, Native)> {
+        with_refusals(text).map(|(s, n, _)| (s, n))
+    }
+
+    pub fn with_refusals(
+        text: &str,
+    ) -> Option<(&'static Source, Native, Vec<crate::jit::Refused>)> {
         let mut sources = ply_span::SourceMap::new();
         let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
         let id = sources.add("m.ply", owned.to_string());
@@ -132,7 +138,7 @@ pub mod tests_support {
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         match crate::c::build(source, &refs, crate::jit::Opts::default()) {
-            Ok((native, _refused)) => Some((source, native)),
+            Ok((native, refused)) => Some((source, native, refused)),
             Err(e) if e.to_string().contains("could not run") => None,
             Err(e) => panic!("{e}"),
         }
@@ -207,4 +213,37 @@ pub fn matched(n: Int) -> Int = match n { 0 -> 100, 1 -> 200, _ -> n * 3 }
         let got = crate::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
         assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
     }
+}
+
+/// A `U64` past `2^62` is not an immediate: tagging one eats its top bit, and `rt_unbox_int`
+/// raises on it rather than answering. `jit::carried_width` stops below sixty-four for exactly
+/// that reason and this tier has to stop in the same place.
+///
+/// What it must *not* do is stop quietly. A tier that emits a body it cannot get right is worse
+/// than one that declines it, because the seam has an interpreter behind it and no way to know it
+/// is needed. So the property here is a refusal, not an answer.
+#[test]
+fn a_width_the_tier_cannot_carry_is_refused_rather_than_answered_wrongly() {
+    let source = r#"
+pub fn wide(n: Int) -> Int = {
+  let a = u64_of_int(n);
+  let b = wrap_mul(wrap_add(a, a), 0x9E37_79B9_7F4A_7C15u64);
+  int_of_u64(rotr(b, 7) & 0xFFFFu64)
+}
+pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 2654435761u32), 7))
+"#;
+    let Some((_, native, refused)) = tests_support::with_refusals(source) else {
+        return;
+    };
+    assert!(
+        native.entry("m.wide").is_none(),
+        "a body over `U64` must not be compiled by this tier"
+    );
+    assert!(
+        refused.iter().any(|r| r.function == "m.wide"),
+        "the refusal has to be recorded, not silent: {refused:?}"
+    );
+    // And the same shape at a width the tier does carry still compiles, so the rule above is a
+    // line at sixty-four bits and not a retreat from the family.
+    assert!(native.entry("m.narrow").is_some());
 }

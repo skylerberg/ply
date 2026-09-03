@@ -785,9 +785,9 @@ fn call_with(
                 && x.ty == y.ty
             {
                 let v = match b {
-                    Builtin::WrapAdd => x.wrapping(*y, |a, c| a + c),
-                    Builtin::WrapSub => x.wrapping(*y, |a, c| a - c),
-                    _ => x.wrapping(*y, |a, c| a * c),
+                    Builtin::WrapAdd => x.wrapping(*y, |a, c| a.wrapping_add(c)),
+                    Builtin::WrapSub => x.wrapping(*y, |a, c| a.wrapping_sub(c)),
+                    _ => x.wrapping(*y, |a, c| a.wrapping_mul(c)),
                 };
                 return Ok(Step::Done(Value::Fixed(v)));
             }
