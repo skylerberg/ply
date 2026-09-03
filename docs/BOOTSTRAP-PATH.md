@@ -367,39 +367,50 @@ several sizes.
 
 What the compiled loop does not have, in the order to take them:
 
-- **Both caches, bypassed for one cache's reason.** `ply test --backend`
-  bypasses the store (`crates/ply-cli/src/commands/test.rs cache_bypassed`):
-  the run opens a scratch cache, so the front end loads whole *and* every test
-  runs. The stated reason covers only the second — a cached `Pass` is a claim
-  about the evaluator's own answer, and a backend is a second execution
-  strategy, which `backend_escapes` polices. The front end is the same work
-  whichever engine runs afterwards, so its half of the bypass is collateral
-  from one flag serving two caches. Reading the front-end cache under a backend
-  is the cheap half; what a cached `Pass` claims when a backend answered is the
-  design half. Both come before anything below.
-- **A compiled-code cache.** `crates/ply-codegen` persists nothing across runs:
-  no `DefHash -> code`, and `cranelift-jit` rather than `cranelift-object`, so
-  there is no object output for a cache to hold. `Cranelift::over` closes the
-  unit over every function the fragment compiles, builds it once as a
-  pre-flight, and builds it again for every worker that attaches, so a run
-  compiles the whole unit once more than it has workers. A `.plyx` carries
-  definitions rather than code, so building one changes nothing here.
-- **A warm process.** No `watch`, no daemon and no server in `Command`: an
-  invocation starts cold, reads what caches it reads from disk, and exits. A
-  warm process holds interfaces, compiled code and selection in memory, and
-  sidesteps serialising compiled code at all, which is the harder half of the
-  gap above.
-- **The row under `--backend`, fitted.** `ply-corpus bench` has the scenarios
-  and `sweep` has the sizes; what is missing is a backend arm, a fit across the
-  sizes, and the process start `bench` does not pay because it runs the phases
-  in-process. ADR 0037 registers the arm and the fit with the criteria fixed
-  first. What the row will say under the backend is already legible from the
-  code above — every stage is O(project) — and what it prices is the
-  constants, which order the items above against each other.
+- **Both caches, bypassed for one cache's reason — landed.** `ply test
+  --backend` used to open a scratch store, so the front end loaded whole *and*
+  every test ran, though the stated reason covered only the second. A result now
+  names the engine that earned it (`ply_test::Engine`), so a backed run selects
+  against what backed runs proved and neither engine reads the other's; the
+  front-end cache is read whatever executes; and a backend that is wrong on
+  purpose still gets no store, since a run that skipped a test is not evidence.
+  `crates/ply-cli/tests/suite/cli.rs` holds both halves, and
+  `armed.rs::a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache`
+  fails if a new route to a backend forgets either.
+- **The row under `--backend`, fitted — taken.** `benches/marginal-change/`
+  is it: `ply-corpus bench --backend`, the five edit scenarios at three sizes in
+  a ratio of four, fitted step by step, with a `compile` phase of its own and an
+  arm that reads what the real command pays. What it found, and what reordered
+  the two items below: a rename costs nothing under either engine and a leaf
+  edit is flat under the interpreter, but **the cost that dominates a small edit
+  is the invocation**. A warm run that rechecks nothing still pays a front end
+  proportional to the project — hashing every definition to establish that none
+  moved, restoring every interface, writing them back — and under the backend
+  the compile is about half of that again.
+- **A warm process**, which is what the row chose — `ply test --watch`, started
+  and not finished. It holds the store, the checked front end and the compiled
+  unit across iterations, so an iteration where nothing moved pays a stat per
+  file. An iteration where something moved still pays the whole front end,
+  because the driver is one-shot. The phase report says there is no single term
+  to fix: hashing is about a quarter of a warm run that rechecks nothing,
+  writing back a fifth, and parsing, restoring, resolving, checking, assembling
+  and reading divide the rest, each proportional to the project. So the work is
+  to hold the front end and update it rather than to make one phase incremental,
+  and **ADR 0038** fixes what that has to mean before anyone builds it: equal to
+  a from-scratch load bit for bit, and flat in project size rather than merely
+  smaller.
+- **A compiled-code cache**, which the row demoted. `crates/ply-codegen`
+  persists nothing across runs: no `DefHash -> code`, and `cranelift-jit` rather
+  than `cranelift-object`, so there is no object output for a cache to hold, and
+  `Cranelift::over` builds the whole unit once as a pre-flight and again for
+  every worker that attaches. A warm process removes that cost without
+  serialising anything, so this is only needed if the warm process is not
+  enough.
 
-Take the decision and the row before re-ordering anything above them. A lever's
-share of a whole-project run says nothing about its share of one edit, and every
-row the path above is ordered on measures the former.
+The row is taken and it re-ordered these itself. A lever's share of a
+whole-project run says nothing about its share of one edit, and every row the
+path above is ordered on measures the former — which is how the invocation's own
+cost went unnoticed until something measured an edit.
 
 ## Where this ends: two tiers, over a C compiler and libc
 

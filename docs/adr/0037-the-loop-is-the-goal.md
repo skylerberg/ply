@@ -51,25 +51,25 @@ prices an edit — `cold`, `warm`, `rename`, `edit-leaf` and `edit-hub`, nine
 phases each — at every size `ply-corpus sweep` is given. `README.md` §"The
 loop" is one size of that row.
 
-The compiled loop does not have it, and every stage of a backend run is
+The compiled loop did not have it, and every stage of a backend run was
 O(project), for three reasons that read in `crates/ply-cli/src/commands/test.rs`
-and `crates/ply-codegen/src/backend.rs`:
+and `crates/ply-codegen/src/backend.rs`. The first is fixed; the other two
+stand:
 
-- **The caches are bypassed — both of them, for one cache's reason.**
-  `cache_bypassed` is true whenever `--backend` is given, so the run opens a
-  scratch store. Its doc comment gives the reason, and the reason is about
-  results only: a stored `Pass` is a claim about what the authoritative engine
-  did, so a run on another engine may neither believe one nor leave one behind,
-  which `backend_escapes` also polices. But one store holds both caches, and
-  the same flag clears `incremental`, so a backend run also re-parses,
-  re-resolves and re-checks the whole program — and the front end is the same
-  work whichever engine executes afterwards. **The result half is a decision;
-  the front-end half has no stated reason and reads as collateral from one flag
-  serving two caches.** So this item splits: reading the front-end cache under
-  a backend costs nothing to justify, and what a cached `Pass` claims when a
-  backend answered is a design question. Both come before anything below,
-  because a backend run cannot be O(change) at any stage until it can skip
-  work.
+- **The caches were bypassed — both of them, for one cache's reason. Fixed.**
+  `cache_bypassed` was true whenever `--backend` was given, so the run opened a
+  scratch store, and the runner refused to record a test that entered compiled
+  code. The reason given was about results only: a stored `Pass` is a claim
+  about what the authoritative engine did. But one store holds both caches, so
+  the same flag also cleared `incremental`, and a backed run re-parsed,
+  re-resolved and re-checked the whole program — work that is the same whichever
+  engine executes afterwards. Both halves are decided rather than fused now: a
+  result names the engine that earned it (`ply_test::Engine`), so a backed run
+  selects against what backed runs proved and neither engine reads the other's;
+  and the front-end cache is read whatever executes. What still gets no store at
+  all is a backend that is **wrong on purpose**, since a run that skipped a test
+  is not evidence. The cost is a cold first run per engine, which this record's
+  own falsifier named as the acceptable outcome.
 - **The unit is whole and compiled per worker.** `Cranelift::over` closes the
   unit over every function the fragment compiles and builds it once as a
   pre-flight; `Provider::attach` builds it again for every worker. A run
@@ -168,20 +168,34 @@ loop.
 
 | tier | depends on | per changed definition | per run | code quality | what it costs the tree |
 | --- | --- | --- | --- | --- | --- |
-| Cranelift over a `DefHash -> code` cache | a Rust library, until the line's goal removes it | a Cranelift compile, unmeasured per definition | none; the code is already in the process | Cranelift's | a per-definition unit and a way to hold code across runs; keeps Rust |
+| Cranelift over a `DefHash -> code` cache | a Rust library, until the line's goal removes it | a Cranelift compile — hundreds of microseconds, `benches/marginal-change/` | none; the code is already in the process | Cranelift's | a per-definition unit and a way to hold code across runs; keeps Rust |
 | emitted C, an object per definition, linked and loaded once per run | a C compiler at run time | a process and a compile | a link and a load — `benches/c-floor/` | the C compiler's, at the level chosen | one code generator serving both tiers |
 | emitted C, an image per definition, loaded by reach | a C compiler at run time | a process, a compile and a link | superlinear in the images loaded — **the row above refuses this shape** | the C compiler's | one code generator, and a loader cost that grows faster than the reach |
 | a C compiler linked in process (libtcc is the instance) | a C library at run time | a compile, no process | unmeasured | unoptimised | one code generator; a second C toolchain to bind |
 | copy-and-patch | clang at build time — the stencils need a calling convention that passes every register through, and CPython's JIT builds with a pinned LLVM for that reason | a copy and a relocation patch | none | about an unoptimising compiler's | a second code generator in Ply, with its own differential |
 
 What would choose: the per-run and per-definition constants against the loop's
-budget, which `benches/c-floor/` has half of and the marginal-change row sets;
-the code quality against how long the suite runs, which the marginal-change row
-separates only if test length is varied; and one code generator against two,
-since the release tier is C either way and every code generator in Ply is a
-differential to maintain. The C row that survives its own measurement is the
-second, and what is missing to compare it with the first is Cranelift's own
-per-definition cost, which nothing has read because the unit is compiled whole.
+budget; the code quality against how long the suite runs, which the
+marginal-change row separates only if test length is varied; and one code
+generator against two, since the release tier is C either way and every code
+generator in Ply is a differential to maintain.
+
+**Both constants are now read, and they are two orders of magnitude apart.**
+`benches/marginal-change/` reports what Cranelift charges per definition it
+compiles, at three project sizes; `benches/c-floor/` reports what a C toolchain
+charges for one changed definition, dominated by the process rather than by the
+compiling. Cranelift is the cheaper by roughly sixty times, and neither reading
+is an estimate. That does not settle the table on its own — an in-process tier
+still has to be hostable without Rust, which is the whole of the line's goal —
+but it does say that a C tier inside the loop buys its single code generator at
+a price the loop can feel, and that the shape which pays it least is the one
+`benches/c-floor/` already picked out: an object cached per definition, one link
+over the reach, one image loaded.
+
+The same row says the unit is compiled once per worker plus a pre-flight, so a
+run pays that per-definition cost as many times as it has workers and one more.
+Sharing one compiled unit across workers is the next bounded win under a
+backend, and it is blocked on `Unit` holding an `Rc`; nothing has attempted it.
 
 **LLVM in place of C, for the line rather than the loop — priced and rejected.**
 Two forms, both losing. Linking LLVM trades a Rust dependency for a larger C++
@@ -224,12 +238,13 @@ size and cannot be fitted, so it is not in the row.
 
 **Decision rule.** Under the interpreter, `rename` and `edit-leaf` move less
 across the sizes than `warm` does, and `cold` moves in proportion to the size.
-Under the backend the same test, and it is expected to fail on every arm — the
-code above says so — and the row's reading is *which phase* carries the growth,
-front end, execute or compile, because that is what orders the pass decision,
-the per-definition cache and the warm process. Growth mostly in execute means
-the pass decision is the whole of the first step; mostly in compile, the cache;
-a fixed cost that dominates both, the warm process.
+Under the backend the same test, and it is expected to fail — the code above
+says the compile does not shrink with the edit — and the row's reading is
+*which phase* carries the growth, because that is what orders the two items
+left. Growth in compile means the per-definition cache; a fixed cost that
+dominates it means the warm process. The front end and the tests re-run are no
+longer candidates: item 1 took them out, and the row is what shows whether it
+did.
 
 That rule is CONTRIBUTING §"Measure an ADR's motivating claim before accepting
 the ADR" applied to the claim this whole project rests on, which has been
@@ -238,16 +253,81 @@ slope for neither tier.
 
 ## The order
 
-1. Read the front-end cache under a backend: the front end does not depend on
-   which engine executes, and only the result half of the bypass has a reason.
-   Then decide what a cached `Pass` claims when a backend answered, and key the
-   store on it. Nothing below matters until a backend run can skip work.
-2. Take the row above with its backend arm. It says which of the next two pays
-   first.
-3. A `DefHash -> code` cache, which needs per-definition units and an object
-   format, or a warm process, which needs neither.
-4. Re-take `benches/c-floor/` against Cranelift's per-definition constant once
-   the unit is per-definition, and choose the loop's tier from the table above.
+1. **Done.** A result names the engine that earned it, the front-end cache is
+   read whatever executes, and a backend that is wrong on purpose still gets no
+   store. `one_engines_pass_is_never_another_engines` and
+   `a_second_backed_run_selects_nothing` in `crates/ply-cli/tests/suite/cli.rs`
+   hold the two halves, and `armed.rs` fails if a new route to a backend
+   forgets either.
+2. **Done, and it decided item 3.** `benches/marginal-change/` is the row:
+   `ply-corpus bench --backend`, five edits at three sizes, fitted step by step.
+   What it says is in its `observation-1.txt`, and the short form is below.
+3. **A warm process**, which the row chose over the `DefHash -> code` cache: the
+   cost that dominates a small edit is not the compile alone but the whole fixed
+   cost of an invocation, and a warm process removes both while a code cache
+   removes one. **Started, not finished.** `ply test --watch` is a process that
+   stays: it holds the store, the checked front end and the compiled unit across
+   iterations. A save that changed no byte — the common case, since a save is
+   what wakes the loop — costs a read of the files whose timestamps moved and no
+   front end at all, which `watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had`
+   asserts and was seen to fail. An iteration where something *did* move still pays the front
+   end in full, because `crates/ply-cli/src/driver.rs` is one-shot: it works over
+   the whole program whatever changed.
+
+   **And the phase report says there is no single term to fix.** On a warm run
+   that rechecks nothing, hashing is about a quarter, writing back a fifth, and
+   parsing, restoring, resolving, checking, assembling the modules and reading
+   the files divide the rest — every one of them proportional to the project.
+   Assembling was in no phase at all until this record's branch gave it one: gate
+   1 runs to a fixed point and copies every parsed module each round, so a cost
+   proportional to the program was invisible in a report that accounted for
+   everything else.
+
+   That shape is the finding. A loop cannot be made O(change) by making hashing
+   incremental, or by any other single lever, because no single lever is where
+   the time is. What it needs is for the front end to be *held* and updated,
+   which is what a resumable driver means, and that is the last O(project) term
+   in a warm loop. **ADR 0038 is that record**: it fixes what correctness means
+   for a resumable front end and what the row must show, before a branch exists
+   to judge.
+4. Choose the loop's tier from the table above. **The comparison it was waiting
+   on is taken**: `benches/marginal-change/` reads Cranelift's per-definition
+   cost and `benches/c-floor/` reads C's, and they are two orders of magnitude
+   apart. What is still open is not a number but the line's goal — whether an
+   in-process tier can be hosted without Rust — and that is a design question
+   rather than a measurement. The re-take against a *per-definition* unit is
+   conditional on item 3: a warm process holds compiled code in memory and never
+   serialises it, so a per-definition unit is only needed if the warm process
+   turns out not to be enough.
+
+## What the row said
+
+`benches/marginal-change/observation-1.txt`, taken above the load gate at the
+end and therefore an observation. The counts in it are deterministic and carry
+most of the argument.
+
+- **A rename costs nothing, under either engine.** Its marginal cost never rises
+  above the measurement's own resolution at any size. That is ADR 0021's claim
+  holding where it is sharpest, and under the compiled backend it holds only
+  because item 1 landed.
+- **A leaf edit is flat under the interpreter** across a project sixteen times
+  larger, and `cold` is proportional. The two arms that had to separate, did.
+- **And the cost that dominates a small edit is neither of those. It is the
+  invocation.** A warm `ply test` that rechecks *nothing* — the report says
+  `rechecked 0` at every size — still pays a front end proportional to the
+  project: over the step where the reading is above the noise floor, four times
+  the project costs four times the time. It goes on hashing every definition to
+  establish that none moved, restoring every interface, and writing them back.
+- **Under the backend, compile is about half of that warm run** and does not
+  shrink with the edit, because the unit closes over every function the fragment
+  compiles and nothing holds it across runs.
+
+So the ordering the row decides is: **the warm process, not the code cache.**
+The code cache removes the compile and leaves the front end's fixed cost; the
+warm process removes both, because what makes an invocation cost the project is
+that it starts knowing nothing. This record's own falsifier — *if a warm process
+removes the backend's cost by itself, persisting compiled code is never needed* —
+is the live hypothesis rather than a hedge.
 
 ## What would make this wrong
 
@@ -256,7 +336,10 @@ slope for neither tier.
   what it found once the row says where.
 - **If a warm process removes the backend's cost by itself.** Then persisting
   compiled code is never needed and the daemon is the whole of that work rather
-  than half of it.
+  than half of it. This is the live hypothesis rather than a hedge, and what
+  would settle it is the resumable driver: until an iteration stops rebuilding
+  the whole program's tables, a warm process cannot be read as evidence about
+  what holding compiled code is worth.
 - **If the loop tier's code quality decides the loop rather than its latency.**
   A tier that compiles instantly and runs the tests several times slower loses
   to one that compiles slowly and runs them fast, once the tests run long
@@ -269,7 +352,8 @@ slope for neither tier.
   loader's. Another platform is a re-take, not an inference, and a loader
   without that property would put the per-definition-image shape back on the
   table.
-- **If a cached pass under a backend cannot be given a meaning the evaluator's
-  cache can share.** Then the compiled tier keeps a cache with its own key, and
-  O(change) holds per tier rather than across them — still the property, at the
-  cost of a cold first run per tier.
+- ~~**If a cached pass under a backend cannot be given a meaning the
+  evaluator's cache can share.**~~ **This fired.** It could not, and the
+  outcome this named is the one taken: each engine keeps its own namespace, so
+  O(change) holds per engine rather than across them, at the cost of a cold
+  first run per engine.

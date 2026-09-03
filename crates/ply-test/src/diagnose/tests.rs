@@ -936,6 +936,7 @@ fn failure_with(attribution: crate::Attribution) -> crate::Failure {
 
 fn summary_of(attribution: crate::Attribution) -> Vec<String> {
     crate::RunReport {
+        engine: crate::Engine::Evaluator,
         passed: 0,
         failed: 1,
         cached: 0,

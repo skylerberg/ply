@@ -86,6 +86,11 @@ pub struct DefReport {
 pub struct Phases {
     pub read: Duration,
     pub parse: Duration,
+    /// Copying the parsed modules into the `Program` the rest of the round runs on. Its own phase
+    /// because it is not analysis and it was in no phase at all: gate 1 runs to a fixed point and
+    /// every round copies every parsed module, so a cost proportional to the program was
+    /// invisible in a report that accounts for everything else.
+    pub assemble: Duration,
     pub resolve: Duration,
     pub hash: Duration,
     pub check: Duration,
@@ -98,6 +103,7 @@ impl Phases {
     pub fn total(&self) -> Duration {
         self.read
             + self.parse
+            + self.assemble
             + self.resolve
             + self.hash
             + self.check
@@ -105,10 +111,11 @@ impl Phases {
             + self.write_back
     }
 
-    pub fn labelled(&self) -> [(&'static str, Duration); 7] {
+    pub fn labelled(&self) -> [(&'static str, Duration); 8] {
         [
             ("read", self.read),
             ("parse", self.parse),
+            ("assemble", self.assemble),
             ("resolve", self.resolve),
             ("hash", self.hash),
             ("check", self.check),
@@ -703,7 +710,9 @@ impl<'s> Driver<'s> {
     fn parse_and_hash(
         &mut self,
     ) -> Result<(Program, ply_syntax::resolve::Resolved, HashOutput, BodySet), LoadError> {
-        let modules: Vec<Module> = self.files.iter().filter_map(|f| f.ast.clone()).collect();
+        let modules: Vec<Module> = timed(&mut self.phases.assemble, || {
+            self.files.iter().filter_map(|f| f.ast.clone()).collect()
+        });
         // Mutable because `resolve` fills every call's defaults and places its named arguments.
         let mut program = Program { modules };
         let resolved =
