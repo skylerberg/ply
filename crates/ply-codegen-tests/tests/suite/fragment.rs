@@ -6,10 +6,10 @@ use ply_eval::{Provider, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{ModuleName, Program};
 
-struct Loaded {
-    program: &'static Program,
-    resolved: &'static ply_syntax::resolve::Resolved,
-    check: &'static ply_core::CheckOutput,
+pub struct Loaded {
+    pub program: &'static Program,
+    pub resolved: &'static ply_syntax::resolve::Resolved,
+    pub check: &'static ply_core::CheckOutput,
 }
 
 /// The shipped standard library plus `source` as a module named `m`.
@@ -39,7 +39,7 @@ fn load(source: &str) -> Loaded {
     }
 }
 
-fn unit(source: &str) -> (&'static Loaded, &'static Cranelift) {
+pub fn unit(source: &str) -> (&'static Loaded, &'static Cranelift) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
     let unit = Cranelift::over(loaded.program, loaded.resolved, loaded.check)
         .expect("this host has a cranelift backend");
@@ -175,7 +175,7 @@ fn read_by_step(acc: Pair, i: Int) -> Int = acc.x + i
 fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, |acc: Int, i: Int| acc + read_by_step(p, i)) + p.y }
 "#;
 
-fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
+pub fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
     backend.enter(&Symbol::new(name), args, 10_000)
 }

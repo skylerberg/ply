@@ -2250,18 +2250,24 @@ they lie. The lesson for every measurement of a Ply front end: a nullary
 constant is free on the second call only if the memo kept it, and until this
 change nothing said whether it had.
 
-## The width suffix, and the prelude names beside it
+## The width suffix and the family beside it, ported in the same change
 
-`crates/ply-syntax` lexes `255u8` and `0x6A09_E667u32` and the port does not
-(ADR 0039). The differential is corpus-driven and **no corpus input carries a
-suffixed literal**, so it is green and stays green until somebody writes one in
-— at which point the port disagrees on that input and nothing else.
+ADR 0039 gave the language eight fixed-width integer types, a suffixed literal
+and seventeen prelude names, and **the port learned all three in the change that
+added them** rather than four features later. `lexer.ply` lexes `255u8` and
+`0x6A09_E667u32`; `patterns.ply` and `exprs.ply` carry `LFixed`; `hash.ply` has a
+tag of its own for it, because `5` and `5u32` are values of different types and
+must be different definitions; and `infer.ply` has the eight type names, the
+bit operators answering their operands' type with a shift's count still an `Int`,
+the deferred obligation that a bit operand is an integer, and the prelude's
+`rotr` and sixteen conversions.
 
-This is the fifth entry of the shape `README.md` predicted: a language feature
-lands in the reference and the port learns it later. Recorded when the feature
-landed rather than when the disagreement was found, which is the only difference
-from the four before it.
+That is the whole reason this file exists. `README.md` predicted the shape --- a
+language feature lands in the reference and the port learns it later --- and was
+right four times. This is the first time it was not, and the differential over
+`crates/ply-std/ply` is what says so: `hash.ply` is written in `U32` now, so the
+port could not have stayed silent about it.
 
-The same holds for `infer.ply`'s prelude table, which lists `rotr32` and does not
-list `rotr` or the sixteen conversions, and for `hash.ply`'s normalizer, which
-has no tag for `Lit::Fixed`.
+**One value is out of reach**, and it is `spikes/ply-lexer/GAPS.md`'s: a `U64`
+literal above the largest `Int`. Both ports compute in `Int`, where the bound
+cannot be built.

@@ -2443,13 +2443,13 @@ test and obligation counts must not change with a compiler upgrade.
 
 ```
 $ ply std
-   10 modules · 825 definitions · shipped with this compiler
+   10 modules · 823 definitions · shipped with this compiler
 
    MODULE      DEFINITIONS  TESTS  BYTES
    std.config  15           5      4810
    std.db      292          34     110073
    std.fs      25           9      12652
-   std.hash    32           5      8921
+   std.hash    30           5      9391
    std.http    166          53     102957
    std.json    137          38     55912
    std.net     7            3      3720
@@ -2459,7 +2459,7 @@ $ ply std
 
    `import std.<name>` to use one; `ply std --show <name>` prints its source
 
-   digest: b3:6da18d2b810f
+   digest: b3:c2c540917269
 ```
 
 `ply std --show std.json` prints a module's source — the full name, `std`
@@ -2762,6 +2762,12 @@ the language rather than exposed as a builtin — so the function deciding what 
 definition *is* is a definition you can read. It is also the demonstration that
 §3.5's operators and §13.10's builtins are enough to write real bit-level code:
 before ADR 0033 this module could not have existed.
+
+**Every word in it is a `U32`** (§5.1), which is why the quarter-round reads the
+way the specification writes it — `wrap_add(wrap_add(a, b), mx)` and a `rotr`,
+with no mask anywhere. It was written over `Int`s masked with `& 0xFFFF_FFFF`
+until ADR 0039 gave the language a width to say, and the masks are what that
+record exists to have deleted.
 
 **It is slower than the compiler's own hash by orders of magnitude when
 interpreted, and by a large factor under `--backend`**, which is a property of

@@ -1,7 +1,9 @@
 # ADR 0039 — How Ply types its numbers
 
-**Accepted for the language surface; the performance claim it was motivated by
-is not yet taken.** It adds eight scalar types, one literal form, one
+**Accepted for the language surface. The performance claim it was motivated by
+has now been taken and it did not clear: the integer kernel moved from about
+seven times the Rust bar to about six, against a bar of three.** §"What the gate
+said" is the reading, registered before the arm existed and unchanged since. It adds eight scalar types, one literal form, one
 diagnostic code, seventeen prelude names and one normalizer tag. It refuses
 three things: a modular type whose `+` wraps, arbitrary bit widths, and a
 literal that is a value of more than one type.
@@ -17,10 +19,8 @@ type a program counts and indexes with.
 > width rather than at sixty-four bits only.
 >
 > **What it does not decide.** That the family closes the integer kernel's gap
-> to its bar. The code generator does not carry a fixed-width value yet — it
-> refuses every definition that mentions one — so no ratio has moved and none is
-> claimed here. That is the next record's, and §"The measurement this rests on,
-> and the one it does not" says what is already known about it.
+> to its bar. It does not, and §"What the gate said" is the measurement rather
+> than an expectation.
 
 ## What made this necessary, measured
 
@@ -163,9 +163,13 @@ is attached at each call and discharged with every other integer-type obligation
 so a wrong operand is a diagnostic naming the type rather than an unsolved
 variable.
 
-`rotr32` stays, as the `Int`-only spelling that predates the family. It becomes
-dead surface the moment `std.hash` moves to `U32`, and should be removed in that
-change rather than this one.
+`rotr32` stays, as the `Int`-only spelling that predates the family, and it now
+has no user in any `.ply` file — `std.hash` turns on `rotr` at `U32`. It is kept
+rather than removed for one reason: `benches/value-model/k1-where.sh` is a
+recorded measurement whose source must keep compiling, and a measurement that no
+longer runs is worth less than a builtin nobody calls. It is dead surface, it is
+recorded here as dead surface, and `docs/dead-surfaces-report.md` is where a
+sweep would find it.
 
 ## Refused: arbitrary bit widths
 
@@ -206,38 +210,72 @@ layouts, or a wire format that needs sub-byte fields.
 every byte** rather than by sampling. That is a stronger obligation than the same
 property at `Int` can ever have, and it came free with the type.
 
-## The measurement this rests on, and the one it does not
+## What the gate said
 
-The LLVM probe above is a control, not the gate: it says what a *good* optimiser
-does with each representation, which is why it argues that Cranelift is most of
-the seven. It does not say what Cranelift does with an `I32` value, because
-nothing has built one yet.
+**Registered before the arm existed:** if K1 clears the bar, ADR 0036's
+diagnosis is confirmed and the family is what confirmed it. If K1 moves but does
+not clear, the remainder is the record layout and the loop tier, in that order,
+and this record's premise was right and incomplete. If K1 does not move at all,
+the width was never the lever.
 
-**The gate is `benches/value-model/`'s, unchanged and not re-taken.** What it
-will take: the code generator carrying a fixed-width value in a register of its
-own width and in a record field of its own width, `std.hash` rewritten at `U32`,
-and the same protocol — counterbalanced arms, a null control, the binary checked
-current, `analyze.py` holding the bar at 3.0 where a number cannot set it
-afterwards.
+**It moved and did not clear: about seven times the bar before, about six after,
+against a bar of three** (`benches/value-model/after-widths.txt`, by
+`PRE-REGISTERED.md`'s protocol with `analyze.py` holding the bar where a number
+cannot set it afterwards). So the second branch, and the middle sentence of it
+is the finding: **right about the cause, wrong about the size.**
 
-**Registered before that arm exists, so the reading cannot be chosen after it:**
-if K1 clears the bar, the diagnosis in ADR 0036 §"The two listings" is confirmed
-and the family is what confirmed it. If K1 moves but does not clear, the
-remainder is the record layout and the loop tier, in that order, and this
-record's premise was right and incomplete. **If K1 does not move at all, the
-width was never the lever, the LLVM probe was measuring the optimiser rather
-than the representation, and the next record is about the loop tier
-(ADR 0037) rather than about types.**
+**The width did everything a width can do**, which the two listings side by side
+say exactly (ADR 0036 §"The two listings"): the 330 masks per `round` are gone
+entirely, the rotate is `extr w, w, #16`, the adds are `add w` and none is
+checked, the field loads carry no tag test, and the compiled body went from about
+1750 instructions to 706 — of which about half is one execution, because the body
+holds the round twice, once for the path that reuses the dying state record and
+once for the path that allocates.
+
+**And the LLVM probe predicted the size, which is the part worth keeping.** It
+put Ply's whole representation — masked, checked and tagged — at about a fifth
+over the `u32` bar. A fifth is what removing the representation was worth. The
+probe was not a curiosity beside the decision; it was the decision's most
+accurate instrument, and it said before any of this was built that the seven was
+mostly the code generator.
+
+### What is left, measured rather than listed
+
+Three levers were tried on the remainder and all three are recorded so the next
+reader does not spend the day:
+
+| lever | effect |
+| --- | --- |
+| a wider inline budget, so `round` folds into `compress` | **worse: 9.17 against 6.01.** ADR 0036 measured this over `Int` and found four times worse; the width does not change the conclusion, and `compress` goes to 76KB |
+| borrowing the two state records instead of reusing the dying one | **worse: 6.45 against 6.01.** The bump allocation the reuse saves costs more than the reference counting and the doubled body it pays |
+| storing a width raw and packed in a flat record | not built. It is the one thing left that *only* a type can do — no analysis can make two adjacent words one `ldp` when the record does not store them that way — and the arithmetic says it is worth under a tenth: 64 untags out of 706 instructions, plus whatever pairing buys |
+
+**So the remainder is not the type's and it is not the record's either.** It is
+the seven state records per compress living in memory, which goes away only if
+`round` is inlined into `compress` — and Cranelift's register allocator is
+measurably worse when it is. That is a property of the tier, not of the language,
+and it is `docs/adr/0037-the-loop-is-the-goal.md`'s question rather than this
+one's. **A kernel this record cannot close is the strongest evidence ADR 0037
+has for its own table.**
 
 ## What is not built
 
-- **The code generator refuses every definition whose type mentions a
-  fixed-width type**, and refuses `rotr` and all sixteen conversions as
-  builtins, so nothing inside a compiled body can reach a width its signature
-  does not name. A program using the family runs on the interpreter, correctly
-  and slowly. That is deliberate: a compiled body holds every integer as a
-  sixty-four-bit word and would answer a `U32` addition as an `Int` one, which
-  is a wrong answer rather than a slow one.
+- **`U64` and `I64` are outside the compiled fragment.** Every other width fits
+  the sixty-three bits an immediate carries, so boxing one is a shift and an or
+  with no branch and no allocator and unboxing needs no tag test — the property
+  the whole lowering rests on. A `U64` past `2^62` does not have it, so carrying
+  those two means a heap object of their own kind and an unboxing that tests for
+  it. They check, they evaluate, they do not compile.
+- **A signature mentioning a width does not cross the seam**, in either
+  direction. Compiled code holds a width as the tagged immediate an `Int` is
+  held as, so a value crossing would be read as an `Int` where a `U32` was
+  declared. The bodies still compile and still call each other directly, which
+  is what lets `std.hash`'s internals work at `U32` while `blake3` itself is
+  entered whole — but it costs the differential its per-function coverage of
+  `compress`, `round` and `g`, which are now checked only through `blake3`.
+  Closing it means a type-directed conversion at the seam, which the layout
+  already has the information for (`Ty::Record` knows each field's `Ty`) and
+  which nothing needs yet.
 - **The prover leaves fixed-width arithmetic uninterpreted.** A literal is an
   interned constant node, so two occurrences of `5u32` are one term, but `+` at
   `U32` is not the integer `+` the linear arithmetic reasons about. It could not
@@ -247,8 +285,9 @@ than the representation, and the next record is about the loop tier
   and will stay green until somebody writes a suffixed literal into the corpus.
   That is a latent divergence, recorded here rather than discovered later, and
   it is the same shape as the four the spike's `README.md` predicted.
-- **`std.hash` is still written over masked `Int`s.** Moving it is the change
-  that re-takes the gate.
+- **The state records still live in memory across a round**, seven of them per
+  compress, because inlining them away costs more than it saves under this tier.
+  That is the remainder, and it is ADR 0037's.
 
 ## What would make this wrong
 
@@ -261,5 +300,13 @@ than the representation, and the next record is about the loop tier
   where a literal should have. Polymorphic literals could be restored — but only
   behind a cache-safe way to carry inference's answer to the evaluator, which is
   the thing that sank them the first time.
-- **If the gate does not move.** See the registered reading above; the third
-  branch retires the whole premise, not just the ordering.
+- **If the record layout turns out to be worth more than the arithmetic says.**
+  The estimate above is an instruction count, not a measurement: packing a flat
+  record of widths to four bytes a field would halve its footprint and could pair
+  its loads, and cache behaviour is not in an instruction count. It is the
+  cheapest unbuilt lever and the only remaining one the type enables.
+- **If ADR 0037's tier lands and the kernel still does not clear.** Then the
+  memory traffic was not the remainder either, and the next reading has to come
+  from a profile of the compiled frames rather than from a listing — which is the
+  instrument `benches/value-model/k1-where.sh` exists to be, and which has not
+  been re-taken since the width landed.

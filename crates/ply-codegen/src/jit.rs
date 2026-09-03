@@ -18,7 +18,7 @@ use ply_eval::code::{Arm, Pat, Stmt, lower_fn};
 use ply_eval::rc::Own;
 use ply_eval::{Builtin, Code, NodeKind, Value};
 use ply_span::Symbol;
-use ply_syntax::ast::{BinOp, Lit, QName, UnOp};
+use ply_syntax::ast::{BinOp, IntTy, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
 use std::cell::RefCell;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -51,6 +51,22 @@ enum Kind {
     Int,
     Bool,
     Boxed,
+    /// A fixed-width integer, held in a Cranelift register of its own width — which is the whole
+    /// point of the family (ADR 0039): at `U32` an add is `add w`, a rotate is one instruction,
+    /// and there is nothing to mask.
+    ///
+    /// Only the six widths below sixty-four appear. A value of one of those always fits the
+    /// sixty-three bits an immediate carries, so boxing one is a shift and an or with no branch
+    /// and no allocator, and unboxing needs no tag test. `U64` and `I64` do not have that
+    /// property and are left outside the fragment ([`carried_width`]).
+    Num(IntTy),
+}
+
+/// Whether the fragment carries values of this width, and the reason it does not carry the other
+/// two: a `U64` past `2^62` does not fit an immediate, so it would need a heap object of its own
+/// kind and an unboxing that tests for it — the cost the family exists to remove.
+fn carried_width(t: IntTy) -> bool {
+    t.bits() < 64
 }
 
 #[derive(Clone, Copy)]
@@ -69,6 +85,7 @@ struct Helpers {
     unbox_bool: FuncId,
     arith: FuncId,
     overflow: FuncId,
+    not_that_width: FuncId,
     no_match: FuncId,
     lit: FuncId,
     equal: FuncId,
@@ -157,6 +174,7 @@ enum Ty {
     Unknown,
     Int,
     Bool,
+    Num(IntTy),
     Record(Vec<(Symbol, u32)>),
 }
 
@@ -182,12 +200,38 @@ struct Func {
     sig: Sig,
 }
 
+/// The Cranelift type a width is held in. Cranelift has exactly `I8 I16 I32 I64 I128` and puts
+/// signedness in the *operation* rather than the type, which is why `U32` and `I32` share one here
+/// and differ only in which instruction is selected.
+/// The Cranelift type a value of this kind is held in. Every join carrying a value of a computed
+/// kind must give its block parameter *this* type: a `Kind::Num` is narrower than a word, and a
+/// block parameter that says `I64` where the branches pass an `I32` is an instruction the
+/// assembler encodes and the processor refuses.
+fn clif_kind(k: Kind) -> types::Type {
+    match k {
+        Kind::Num(t) => clif_int(t),
+        _ => types::I64,
+    }
+}
+
+fn clif_int(t: IntTy) -> types::Type {
+    match t.bits() {
+        8 => types::I8,
+        16 => types::I16,
+        32 => types::I32,
+        _ => types::I64,
+    }
+}
+
 fn kind_of_type(t: &ply_core::ty::Type) -> Kind {
     match t {
         ply_core::ty::Type::Con(name, args) if args.is_empty() => match name.as_str() {
             "Int" => Kind::Int,
             "Bool" => Kind::Bool,
-            _ => Kind::Boxed,
+            other => match IntTy::from_name(other) {
+                Some(t) if carried_width(t) => Kind::Num(t),
+                _ => Kind::Boxed,
+            },
         },
         _ => Kind::Boxed,
     }
@@ -583,7 +627,10 @@ impl Jit {
             Type::Con(name, args) if args.is_empty() => match name.as_str() {
                 "Int" => Ty::Int,
                 "Bool" => Ty::Bool,
-                _ => Ty::Unknown,
+                other => match IntTy::from_name(other) {
+                    Some(t) if carried_width(t) => Ty::Num(t),
+                    _ => Ty::Unknown,
+                },
             },
             Type::Record(fields) => {
                 let fields: Vec<(Symbol, u32)> = fields
@@ -646,6 +693,7 @@ impl Jit {
             unbox_bool: declare(&mut module, "rt_unbox_bool", 2, true)?,
             arith: declare(&mut module, "rt_arith", 4, true)?,
             overflow: declare(&mut module, "rt_overflow", 2, false)?,
+            not_that_width: declare(&mut module, "rt_not_that_width", 3, false)?,
             no_match: declare(&mut module, "rt_no_match", 1, false)?,
             lit: declare(&mut module, "rt_lit", 2, true)?,
             equal: declare(&mut module, "rt_equal", 3, true)?,
@@ -779,19 +827,6 @@ impl Jit {
         module_index: usize,
         sig: Option<&Sig>,
     ) -> Result<()> {
-        // The fixed-width integer types are not in the fragment yet: a compiled body holds every
-        // integer as a sixty-four-bit word and would answer a `U32` addition as an `Int` one. The
-        // conversions that mint one are refused beside this, so nothing inside a body can reach a
-        // width the signature does not name either.
-        if let Some(def) = loaded.check.defs.get(&Symbol::new(name))
-            && let Some(width) = fixed_width_in(&def.scheme.ty)
-        {
-            return Err(Refused {
-                function: name.to_string(),
-                construct: format!("a `{width}`, which the fragment does not carry"),
-            }
-            .into());
-        }
         let mut builder = FunctionBuilder::new(&mut clif.func, fctx);
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
@@ -839,9 +874,16 @@ impl Jit {
             // A typed body: each parameter is the register it arrived in, of its own kind.
             Some(sig) => {
                 for (i, (p, kind)) in params.iter().zip(&sig.params).enumerate() {
+                    // Every parameter arrives in a sixty-four-bit register whatever it means, so a
+                    // fixed-width one is narrowed here and widened again at each call: the typed
+                    // ABI carries the *value*, extended, not the tagged word.
+                    let v = match kind {
+                        Kind::Num(t) => fx.builder.ins().ireduce(clif_int(*t), block_params[i + 1]),
+                        _ => block_params[i + 1],
+                    };
                     let val = Val {
                         kind: *kind,
-                        v: block_params[i + 1],
+                        v,
                         ty: sig.param_tys[i],
                         home: 0,
                     };
@@ -877,7 +919,7 @@ impl Jit {
         }
 
         let result = fx.consumed(body, &mut scope)?;
-        let answer = fx.coerce(result, sig.map_or(Kind::Boxed, |s| s.ret));
+        let answer = fx.abi_out(result, sig.map_or(Kind::Boxed, |s| s.ret));
         fx.release_tokens();
         fx.release_homes_from(0);
         // The only path that gives the nested call back.
@@ -936,7 +978,11 @@ impl Jit {
             if func.sig.borrowed[i] {
                 lent.push(handle);
             }
-            let v = fx.coerce(
+            // `abi_out`, not `coerce`: the typed body takes every position in a sixty-four-bit
+            // register, so a fixed-width one travels extended. Nothing the seam admits has a
+            // width in its signature (`Compiled::carries` refuses it), but a compiled closure
+            // reaches its neighbour's entry and this path has to be right for that.
+            let v = fx.abi_out(
                 Val {
                     kind: Kind::Boxed,
                     v: handle,
@@ -957,9 +1003,10 @@ impl Jit {
         for w in lent {
             fx.dec_inline(w);
         }
+        let narrowed = fx.abi_in(r, func.sig.ret);
         let handle = fx.boxed(Val {
             kind: func.sig.ret,
-            v: r,
+            v: narrowed,
             ty: 0,
             home: 0,
         });
@@ -1279,6 +1326,22 @@ fn inline_builtin_answers(b: Builtin, arity: usize) -> bool {
         (b, arity),
         (Builtin::BytesAt, 2) | (Builtin::BytesLen, 1) | (Builtin::Len, 1)
     ) || scalar_builtin_answers(b, arity)
+        || width_builtin(b, arity).is_some()
+}
+
+/// The width a conversion builtin answers at, if it is one the fragment carries. `int_of_u32`
+/// answers an `Int` and appears here as `None` for the width and `true` for being one.
+fn width_builtin(b: Builtin, arity: usize) -> Option<Option<IntTy>> {
+    if arity != 1 {
+        return None;
+    }
+    if let Some(t) = b.converts_into() {
+        return carried_width(t).then_some(Some(t));
+    }
+    if let Some(t) = b.converts_from() {
+        return carried_width(t).then_some(None);
+    }
+    None
 }
 
 /// The builtins over two `Int`s that are one instruction each: the wrapping arithmetic and the
@@ -1287,33 +1350,25 @@ fn scalar_builtin_answers(b: Builtin, arity: usize) -> bool {
     arity == 2
         && matches!(
             b,
-            Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul | Builtin::Rotr32
+            Builtin::WrapAdd
+                | Builtin::WrapSub
+                | Builtin::WrapMul
+                | Builtin::Rotr32
+                | Builtin::Rotr
         )
-}
-
-/// The first fixed-width integer type `ty` mentions, if it mentions one.
-fn fixed_width_in(ty: &ply_core::ty::Type) -> Option<&'static str> {
-    use ply_core::ty::Type;
-    match ty {
-        Type::Var(_) => None,
-        Type::Con(name, args) => ply_core::ty::IntTy::from_name(name.as_str())
-            .map(|t| t.name())
-            .or_else(|| args.iter().find_map(fixed_width_in)),
-        Type::Fn { params, ret, .. } => params
-            .iter()
-            .find_map(fixed_width_in)
-            .or_else(|| fixed_width_in(ret)),
-        Type::Record(fields) => fields.values().find_map(fixed_width_in),
-    }
 }
 
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
     if b.higher_order() && !lowered_callback(b) {
         return Err(format!("`{}`, a builtin that calls user code", b.name()));
     }
-    if b == Builtin::Rotr || b.converts_into().is_some() || b.converts_from().is_some() {
+    // `U64` and `I64` are outside the fragment, so their conversions are too: a value of either
+    // may not fit an immediate, which is the property every carried width has.
+    if let Some(t) = b.converts_into().or_else(|| b.converts_from())
+        && !carried_width(t)
+    {
         return Err(format!(
-            "`{}`, which names a fixed-width integer type the fragment does not carry",
+            "`{}`, whose width the fragment does not carry",
             b.name()
         ));
     }
@@ -1549,6 +1604,17 @@ impl Fx<'_, '_> {
                 self.builder.seal_block(join);
                 self.builder.block_params(join)[0]
             }
+            // Always an immediate, so no fits test and no allocator: a value of a carried width
+            // is at most thirty-two bits and an immediate holds sixty-three.
+            Kind::Num(t) => {
+                let wide = if t.signed() {
+                    self.builder.ins().sextend(types::I64, val.v)
+                } else {
+                    self.builder.ins().uextend(types::I64, val.v)
+                };
+                let shifted = self.builder.ins().ishl_imm(wide, 1);
+                self.builder.ins().bor_imm(shifted, 1)
+            }
             Kind::Bool => {
                 let t = self
                     .builder
@@ -1590,6 +1656,80 @@ impl Fx<'_, '_> {
                 self.builder.seal_block(join);
                 self.builder.block_params(join)[0]
             }
+        }
+    }
+
+    /// The width a binary operation is at, if either operand is already at one. The checker
+    /// unified the two operands, so one side knowing the width is the whole of the question.
+    fn num_width(l: Val, r: Val) -> Option<IntTy> {
+        match (l.kind, r.kind) {
+            (Kind::Num(t), _) | (_, Kind::Num(t)) => Some(t),
+            _ => None,
+        }
+    }
+
+    /// `v`, refused unless it is one of `t`'s values. The check `Int` gets from `sadd_overflow`,
+    /// at a width Cranelift has no overflow instruction for.
+    fn checked_narrow(&mut self, wide: cranelift_codegen::ir::Value, t: IntTy, sub: bool) -> Val {
+        let low = self.builder.ins().iconst(types::I64, t.min() as i64);
+        let high = self.builder.ins().iconst(types::I64, t.max() as i64);
+        let cc = if t.signed() {
+            (IntCC::SignedLessThan, IntCC::SignedGreaterThan)
+        } else {
+            (IntCC::SignedLessThan, IntCC::UnsignedGreaterThan)
+        };
+        let under = self.builder.ins().icmp(cc.0, wide, low);
+        let over = self.builder.ins().icmp(cc.1, wide, high);
+        let bad = self.builder.ins().bor(under, over);
+        let overflowed = self.builder.create_block();
+        let ok = self.builder.create_block();
+        self.builder.ins().brif(bad, overflowed, &[], ok, &[]);
+        self.builder.switch_to_block(overflowed);
+        self.builder.seal_block(overflowed);
+        let what = self.builder.ins().iconst(types::I64, i64::from(sub));
+        self.helper_void(self.jit.helpers.overflow, &[what]);
+        self.builder.ins().jump(self.failure, &[]);
+        self.builder.switch_to_block(ok);
+        self.builder.seal_block(ok);
+        let v = self.builder.ins().ireduce(clif_int(t), wide);
+        Val {
+            kind: Kind::Num(t),
+            v,
+            ty: 0,
+            home: 0,
+        }
+    }
+
+    /// A value as a register of width `t`. From a word this is an untag and a narrowing with **no
+    /// tag test**, which is what the type buys over `as_int`: a value of a carried width is an
+    /// immediate by construction, so there is nothing to branch on.
+    fn as_num(&mut self, val: Val, t: IntTy) -> cranelift_codegen::ir::Value {
+        let width = clif_int(t);
+        match val.kind {
+            Kind::Num(have) if have == t => val.v,
+            Kind::Num(_) | Kind::Int => {
+                let wide = self.as_wide(val);
+                self.builder.ins().ireduce(width, wide)
+            }
+            _ => {
+                let w = self.boxed(val);
+                let raw = self.builder.ins().sshr_imm(w, 1);
+                self.builder.ins().ireduce(width, raw)
+            }
+        }
+    }
+
+    /// A numeric register widened to the sixty-four bits the typed ABI passes, still untagged.
+    fn as_wide(&mut self, val: Val) -> cranelift_codegen::ir::Value {
+        match val.kind {
+            Kind::Num(t) => {
+                if t.signed() {
+                    self.builder.ins().sextend(types::I64, val.v)
+                } else {
+                    self.builder.ins().uextend(types::I64, val.v)
+                }
+            }
+            _ => self.as_int(val),
         }
     }
 
@@ -1854,9 +1994,13 @@ impl Fx<'_, '_> {
     fn token_of(&self, ty: u32) -> Option<(cranelift_codegen::ir::StackSlot, bool)> {
         match &self.jit.tys[ty as usize] {
             Ty::Record(fields) => {
-                let flat = fields
-                    .iter()
-                    .all(|(_, t)| matches!(self.jit.tys[*t as usize], Ty::Int | Ty::Bool));
+                // A fixed width belongs here beside `Int` and `Bool`: a carried width is always
+                // boxed as an immediate, so a record of them holds no count and its release walks
+                // nothing. Leaving it out cost more than the whole family bought — sixteen tag
+                // tests and sixteen conditional decrements per `round` of the integer kernel.
+                let flat = fields.iter().all(|(_, t)| {
+                    matches!(self.jit.tys[*t as usize], Ty::Int | Ty::Bool | Ty::Num(_))
+                });
                 self.token_for(fields.len()).map(|slot| (slot, flat))
             }
             _ => None,
@@ -2164,6 +2308,7 @@ impl Fx<'_, '_> {
     fn kind_of_uncached(&mut self, code: &Code, scope: &Scope) -> Result<Kind> {
         Ok(match &code.kind {
             NodeKind::Lit(Lit::Int(_), _) => Kind::Int,
+            NodeKind::Lit(Lit::Fixed { ty, .. }, _) if carried_width(*ty) => Kind::Num(*ty),
             NodeKind::Lit(Lit::Bool(_), _) => Kind::Bool,
             NodeKind::Lit(..) => Kind::Boxed,
             NodeKind::Var { name: q, .. } => match self.denotation(q, scope)? {
@@ -2177,7 +2322,20 @@ impl Fx<'_, '_> {
                     Denotes::Builtin(index)
                         if inline_builtin_answers(self.jit.builtins[index], args.len()) =>
                     {
-                        Kind::Int
+                        let b = self.jit.builtins[index];
+                        match width_builtin(b, args.len()) {
+                            Some(Some(t)) => Kind::Num(t),
+                            Some(None) => Kind::Int,
+                            // The wrapping family answers at its operand's width, which the
+                            // argument's own kind is what says.
+                            None if scalar_builtin_answers(b, args.len()) => {
+                                match self.kind_of(&args[0], scope)? {
+                                    Kind::Num(t) => Kind::Num(t),
+                                    _ => Kind::Int,
+                                }
+                            }
+                            None => Kind::Int,
+                        }
                     }
                     _ => Kind::Boxed,
                 },
@@ -2191,6 +2349,7 @@ impl Fx<'_, '_> {
                         Some((_, ty)) => match self.jit.tys[ty as usize] {
                             Ty::Int => Kind::Int,
                             Ty::Bool => Kind::Bool,
+                            Ty::Num(t) => Kind::Num(t),
                             _ => Kind::Boxed,
                         },
                         None => Kind::Boxed,
@@ -2199,11 +2358,14 @@ impl Fx<'_, '_> {
                 },
                 _ => Kind::Boxed,
             },
-            NodeKind::Unary { op, .. } => match op {
+            NodeKind::Unary { op, operand } => match op {
                 UnOp::Not => Kind::Bool,
-                UnOp::Neg | UnOp::BitNot => Kind::Int,
+                UnOp::Neg | UnOp::BitNot => match self.kind_of(operand, scope)? {
+                    Kind::Num(t) => Kind::Num(t),
+                    _ => Kind::Int,
+                },
             },
-            NodeKind::Binary { op, .. } => match op {
+            NodeKind::Binary { op, lhs, rhs } => match op {
                 BinOp::BitAnd
                 | BinOp::BitOr
                 | BinOp::BitXor
@@ -2214,7 +2376,21 @@ impl Fx<'_, '_> {
                 | BinOp::Sub
                 | BinOp::Mul
                 | BinOp::Div
-                | BinOp::Rem => Kind::Int,
+                | BinOp::Rem => {
+                    // The answer has the operands' type. A shift's right operand is a count and
+                    // never says the width, so the left is asked first.
+                    match self.kind_of(lhs, scope)? {
+                        Kind::Num(t) => Kind::Num(t),
+                        _ => match self.kind_of(rhs, scope)? {
+                            Kind::Num(t)
+                                if !matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) =>
+                            {
+                                Kind::Num(t)
+                            }
+                            _ => Kind::Int,
+                        },
+                    }
+                }
                 BinOp::Eq
                 | BinOp::Ne
                 | BinOp::Lt
@@ -2263,11 +2439,41 @@ impl Fx<'_, '_> {
         })
     }
 
+    /// [`Fx::coerce`] into the sixty-four-bit register the typed ABI passes every position in.
+    /// A fixed-width value travels there as its *value*, extended, rather than as a tagged word:
+    /// two instructions at each boundary and none in between.
+    fn abi_out(&mut self, val: Val, to: Kind) -> cranelift_codegen::ir::Value {
+        let v = self.coerce(val, to);
+        match to {
+            Kind::Num(t) => {
+                if t.signed() {
+                    self.builder.ins().sextend(types::I64, v)
+                } else {
+                    self.builder.ins().uextend(types::I64, v)
+                }
+            }
+            _ => v,
+        }
+    }
+
+    /// The other side of [`Fx::abi_out`]: a value arriving from one.
+    fn abi_in(
+        &mut self,
+        v: cranelift_codegen::ir::Value,
+        kind: Kind,
+    ) -> cranelift_codegen::ir::Value {
+        match kind {
+            Kind::Num(t) => self.builder.ins().ireduce(clif_int(t), v),
+            _ => v,
+        }
+    }
+
     fn coerce(&mut self, val: Val, to: Kind) -> cranelift_codegen::ir::Value {
         match to {
             Kind::Boxed => self.boxed(val),
             Kind::Int => self.as_int(val),
             Kind::Bool => self.as_bool(val),
+            Kind::Num(t) => self.as_num(val, t),
         }
     }
 
@@ -2323,6 +2529,17 @@ impl Fx<'_, '_> {
                 let value = self.expr(operand, scope)?;
                 match op {
                     UnOp::BitNot => {
+                        // The pattern flipped is the *type's* pattern, so `~0u8` is `255u8`.
+                        if let Kind::Num(t) = value.kind {
+                            let a = self.as_num(value, t);
+                            let v = self.builder.ins().bnot(a);
+                            return Ok(Val {
+                                kind: Kind::Num(t),
+                                v,
+                                ty: 0,
+                                home: 0,
+                            });
+                        }
                         let a = self.as_int(value);
                         let v = self.builder.ins().bnot(a);
                         Ok(Val {
@@ -2347,6 +2564,18 @@ impl Fx<'_, '_> {
                     // operand at run time and the entry declines, which is what every other
                     // arithmetic node here already does.
                     UnOp::Neg => {
+                        // Checked at the width like every other arithmetic node, which at an
+                        // unsigned type refuses every operand but zero — what the type says.
+                        if let Kind::Num(t) = value.kind {
+                            let a = self.as_num(value, t);
+                            let wide = if t.signed() {
+                                self.builder.ins().sextend(types::I64, a)
+                            } else {
+                                self.builder.ins().uextend(types::I64, a)
+                            };
+                            let negated = self.builder.ins().ineg(wide);
+                            return Ok(self.checked_narrow(negated, t, true));
+                        }
                         let a = self.as_int(value);
                         let overflowed = self.builder.create_block();
                         let ok = self.builder.create_block();
@@ -2387,7 +2616,7 @@ impl Fx<'_, '_> {
                 let then_block = self.builder.create_block();
                 let else_block = self.builder.create_block();
                 let join = self.builder.create_block();
-                self.builder.append_block_param(join, types::I64);
+                self.builder.append_block_param(join, clif_kind(kind));
                 self.builder.ins().brif(c, then_block, &[], else_block, &[]);
 
                 self.builder.switch_to_block(then_block);
@@ -2668,6 +2897,10 @@ impl Fx<'_, '_> {
                     let kind = match self.jit.tys[ty as usize] {
                         Ty::Int => Kind::Int,
                         Ty::Bool => Kind::Bool,
+                        // A field of a carried width is a scalar like the two above it: read
+                        // straight into a register of its own width, with no tag test — the
+                        // 142 of them ADR 0036 counted per `round` are this line.
+                        Ty::Num(t) => Kind::Num(t),
                         _ => Kind::Boxed,
                     };
                     let w = self.builder.ins().load(
@@ -2790,6 +3023,20 @@ impl Fx<'_, '_> {
                 ty: 0,
                 home: 0,
             }),
+            Lit::Fixed { ty, bits } if carried_width(*ty) => Ok(Val {
+                kind: Kind::Num(*ty),
+                // `iconst` takes the pattern; at a narrow type Cranelift wants it inside the
+                // width, which `raw` is and a sign-extended `bits` would not be.
+                v: self.builder.ins().iconst(
+                    clif_int(*ty),
+                    (bits & (u64::MAX >> (64 - ty.bits()))) as i64,
+                ),
+                ty: 0,
+                home: 0,
+            }),
+            Lit::Fixed { ty, .. } => self.refuse(format!(
+                "a `{ty}` literal, whose width the fragment does not carry"
+            )),
             Lit::Bool(b) => Ok(Val {
                 kind: Kind::Bool,
                 v: self.builder.ins().iconst(types::I64, i64::from(*b)),
@@ -2867,6 +3114,23 @@ impl Fx<'_, '_> {
         let r = self.expr(rhs, scope)?;
         match op {
             BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor => {
+                // At a fixed width the operators are the register's own, and the answer has the
+                // operands' type: `~0u8` is `255u8` because the register is eight bits wide.
+                if let Some(t) = Fx::num_width(l, r) {
+                    let a = self.as_num(l, t);
+                    let b = self.as_num(r, t);
+                    let v = match op {
+                        BinOp::BitAnd => self.builder.ins().band(a, b),
+                        BinOp::BitOr => self.builder.ins().bor(a, b),
+                        _ => self.builder.ins().bxor(a, b),
+                    };
+                    return Ok(Val {
+                        kind: Kind::Num(t),
+                        v,
+                        ty: 0,
+                        home: 0,
+                    });
+                }
                 let a = self.as_int(l);
                 let b = self.as_int(r);
                 let v = match op {
@@ -2882,13 +3146,21 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Shl | BinOp::Shr | BinOp::Ushr => {
-                let a = self.as_int(l);
+                // The count is an `Int` whatever the word is, and the bound it must sit inside is
+                // the *word's* width, as the interpreter refuses it.
+                let width = match l.kind {
+                    Kind::Num(t) => i64::from(t.bits()),
+                    _ => 64,
+                };
+                let a = match l.kind {
+                    Kind::Num(t) => self.as_num(l, t),
+                    _ => self.as_int(l),
+                };
                 let n = self.as_int(r);
-                // The interpreter refuses a count outside `0..64` rather than masking it.
                 let bad = self
                     .builder
                     .ins()
-                    .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, n, 64);
+                    .icmp_imm(IntCC::UnsignedGreaterThanOrEqual, n, width);
                 let refused = self.builder.create_block();
                 let ok = self.builder.create_block();
                 self.builder.ins().brif(bad, refused, &[], ok, &[]);
@@ -2898,6 +3170,22 @@ impl Fx<'_, '_> {
                 self.builder.ins().jump(self.failure, &[]);
                 self.builder.switch_to_block(ok);
                 self.builder.seal_block(ok);
+                if let Kind::Num(t) = l.kind {
+                    let count = self.builder.ins().ireduce(clif_int(t), n);
+                    // The two right shifts differ exactly where the type is signed; `>>` on an
+                    // unsigned register fills with zeros either way, which is what the value says.
+                    let v = match op {
+                        BinOp::Shl => self.builder.ins().ishl(a, count),
+                        BinOp::Shr if t.signed() => self.builder.ins().sshr(a, count),
+                        _ => self.builder.ins().ushr(a, count),
+                    };
+                    return Ok(Val {
+                        kind: Kind::Num(t),
+                        v,
+                        ty: 0,
+                        home: 0,
+                    });
+                }
                 let v = match op {
                     BinOp::Shl => self.builder.ins().ishl(a, n),
                     BinOp::Shr => self.builder.ins().sshr(a, n),
@@ -2911,6 +3199,30 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Add | BinOp::Sub => {
+                // Checked at the width, as `Int`'s is at sixty-four: the sum is taken wide, where
+                // no pair of values of a carried width can overflow, and refused if it left the
+                // type. Two instructions more than the wrapping spelling, and never taken.
+                if let Some(t) = Fx::num_width(l, r) {
+                    let a = self.as_num(l, t);
+                    let b = self.as_num(r, t);
+                    let (wa, wb) = if t.signed() {
+                        (
+                            self.builder.ins().sextend(types::I64, a),
+                            self.builder.ins().sextend(types::I64, b),
+                        )
+                    } else {
+                        (
+                            self.builder.ins().uextend(types::I64, a),
+                            self.builder.ins().uextend(types::I64, b),
+                        )
+                    };
+                    let wide = if matches!(op, BinOp::Add) {
+                        self.builder.ins().iadd(wa, wb)
+                    } else {
+                        self.builder.ins().isub(wa, wb)
+                    };
+                    return Ok(self.checked_narrow(wide, t, matches!(op, BinOp::Sub)));
+                }
                 let a = self.as_int(l);
                 let b = self.as_int(r);
                 let (v, carry) = if matches!(op, BinOp::Add) {
@@ -2939,6 +3251,34 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Mul | BinOp::Div | BinOp::Rem => {
+                // Widened to sixty-four and given to the same helper `Int` uses — which is where
+                // the zero divisor is reported — then refused if the answer left the type. A
+                // product of two values of a carried width is at most sixty-four bits, so the
+                // helper's own overflow check cannot fire and the narrowing is the whole of it.
+                if let Some(t) = Fx::num_width(l, r) {
+                    let a = self.as_num(l, t);
+                    let b = self.as_num(r, t);
+                    let (wa, wb) = if t.signed() {
+                        (
+                            self.builder.ins().sextend(types::I64, a),
+                            self.builder.ins().sextend(types::I64, b),
+                        )
+                    } else {
+                        (
+                            self.builder.ins().uextend(types::I64, a),
+                            self.builder.ins().uextend(types::I64, b),
+                        )
+                    };
+                    let code = match op {
+                        BinOp::Mul => 0,
+                        BinOp::Div => 1,
+                        _ => 2,
+                    };
+                    let code = self.builder.ins().iconst(types::I64, code);
+                    let wide = self.helper(self.jit.helpers.arith, &[code, wa, wb]);
+                    self.check();
+                    return Ok(self.checked_narrow(wide, t, false));
+                }
                 let a = self.as_int(l);
                 let b = self.as_int(r);
                 let code = match op {
@@ -2957,13 +3297,21 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
-                let a = self.as_int(l);
-                let b = self.as_int(r);
-                let cc = match op {
-                    BinOp::Lt => IntCC::SignedLessThan,
-                    BinOp::Le => IntCC::SignedLessThanOrEqual,
-                    BinOp::Gt => IntCC::SignedGreaterThan,
-                    _ => IntCC::SignedGreaterThanOrEqual,
+                // By value, so an unsigned width compares unsigned and a signed one signed:
+                // `255u8 > 0u8` and `i8_of_int(-128) < 0i8` are both true.
+                let (a, b, signed) = match Fx::num_width(l, r) {
+                    Some(t) => (self.as_num(l, t), self.as_num(r, t), t.signed()),
+                    None => (self.as_int(l), self.as_int(r), true),
+                };
+                let cc = match (op, signed) {
+                    (BinOp::Lt, true) => IntCC::SignedLessThan,
+                    (BinOp::Le, true) => IntCC::SignedLessThanOrEqual,
+                    (BinOp::Gt, true) => IntCC::SignedGreaterThan,
+                    (_, true) => IntCC::SignedGreaterThanOrEqual,
+                    (BinOp::Lt, false) => IntCC::UnsignedLessThan,
+                    (BinOp::Le, false) => IntCC::UnsignedLessThanOrEqual,
+                    (BinOp::Gt, false) => IntCC::UnsignedGreaterThan,
+                    (_, false) => IntCC::UnsignedGreaterThanOrEqual,
                 };
                 let v = self.builder.ins().icmp(cc, a, b);
                 let v = self.builder.ins().uextend(types::I64, v);
@@ -2975,23 +3323,20 @@ impl Fx<'_, '_> {
                 })
             }
             BinOp::Eq | BinOp::Ne => {
+                let width = Fx::num_width(l, r);
                 let native = (l.kind == Kind::Int && r.kind == Kind::Int)
-                    || (l.kind == Kind::Bool && r.kind == Kind::Bool);
+                    || (l.kind == Kind::Bool && r.kind == Kind::Bool)
+                    || width.is_some();
                 let v = if native {
                     let cc = if matches!(op, BinOp::Eq) {
                         IntCC::Equal
                     } else {
                         IntCC::NotEqual
                     };
-                    let a = if l.kind == Kind::Int {
-                        self.as_int(l)
-                    } else {
-                        self.as_bool(l)
-                    };
-                    let b = if r.kind == Kind::Int {
-                        self.as_int(r)
-                    } else {
-                        self.as_bool(r)
+                    let (a, b) = match width {
+                        Some(t) => (self.as_num(l, t), self.as_num(r, t)),
+                        None if l.kind == Kind::Int => (self.as_int(l), self.as_int(r)),
+                        None => (self.as_bool(l), self.as_bool(r)),
                     };
                     let c = self.builder.ins().icmp(cc, a, b);
                     self.builder.ins().uextend(types::I64, c)
@@ -3650,7 +3995,85 @@ impl Fx<'_, '_> {
         for a in args {
             vals.push(self.consumed(a, scope)?);
         }
+        // `u32_of_int` and its siblings: a range test and a narrowing, with the refusal cold and
+        // off the path. `int_of_u32` and its siblings are a widening and nothing else, since every
+        // carried width fits an `Int`.
+        if args.len() == 1
+            && let Some(t) = b.converts_into()
+            && carried_width(t)
+        {
+            let n = self.as_int(vals[0]);
+            let low = self.builder.ins().iconst(types::I64, t.min() as i64);
+            let high = self.builder.ins().iconst(types::I64, t.max() as i64);
+            let under = self.builder.ins().icmp(IntCC::SignedLessThan, n, low);
+            let over = self.builder.ins().icmp(IntCC::SignedGreaterThan, n, high);
+            let bad = self.builder.ins().bor(under, over);
+            let refused = self.builder.create_block();
+            let ok = self.builder.create_block();
+            self.builder.ins().brif(bad, refused, &[], ok, &[]);
+            self.builder.switch_to_block(refused);
+            self.builder.seal_block(refused);
+            let which = self.builder.ins().iconst(types::I64, t as i64);
+            self.helper_void(self.jit.helpers.not_that_width, &[which, n]);
+            self.builder.ins().jump(self.failure, &[]);
+            self.builder.switch_to_block(ok);
+            self.builder.seal_block(ok);
+            let v = self.builder.ins().ireduce(clif_int(t), n);
+            return Ok(Val {
+                kind: Kind::Num(t),
+                v,
+                ty: 0,
+                home: 0,
+            });
+        }
+        if args.len() == 1
+            && let Some(t) = b.converts_from()
+            && carried_width(t)
+        {
+            let v = self.as_wide(vals[0]);
+            return Ok(Val {
+                kind: Kind::Int,
+                v,
+                ty: 0,
+                home: 0,
+            });
+        }
         if scalar_builtin_answers(b, args.len()) {
+            // At a fixed width the whole family is one instruction on the register: wrapping is
+            // what the register does, and a rotate turns the word it is.
+            if let Kind::Num(t) = vals[0].kind {
+                let a = self.as_num(vals[0], t);
+                let v = match b {
+                    Builtin::WrapAdd => {
+                        let n = self.as_num(vals[1], t);
+                        self.builder.ins().iadd(a, n)
+                    }
+                    Builtin::WrapSub => {
+                        let n = self.as_num(vals[1], t);
+                        self.builder.ins().isub(a, n)
+                    }
+                    Builtin::WrapMul => {
+                        let n = self.as_num(vals[1], t);
+                        self.builder.ins().imul(a, n)
+                    }
+                    // The count is an `Int`, taken modulo the width so every count names a
+                    // rotation, and narrowed to the register the rotate turns.
+                    _ => {
+                        let n = self.as_int(vals[1]);
+                        let count = self.builder.ins().srem_imm(n, i64::from(t.bits()));
+                        let count = self.builder.ins().iadd_imm(count, i64::from(t.bits()));
+                        let count = self.builder.ins().srem_imm(count, i64::from(t.bits()));
+                        let count = self.builder.ins().ireduce(clif_int(t), count);
+                        self.builder.ins().rotr(a, count)
+                    }
+                };
+                return Ok(Val {
+                    kind: Kind::Num(t),
+                    v,
+                    ty: 0,
+                    home: 0,
+                });
+            }
             let a = self.as_int(vals[0]);
             let n = self.as_int(vals[1]);
             let v = match b {
@@ -3826,7 +4249,7 @@ impl Fx<'_, '_> {
                     }
                     v
                 };
-                let v = self.coerce(v, *kind);
+                let v = self.abi_out(v, *kind);
                 vals.push(v);
             }
             let callee = self
@@ -3835,6 +4258,7 @@ impl Fx<'_, '_> {
                 .declare_func_in_func(f.typed, self.builder.func);
             let call = self.builder.ins().call(callee, &vals);
             let v = self.builder.inst_results(call)[0];
+            let v = self.abi_in(v, f.sig.ret);
             self.check();
             for w in lent {
                 self.dec_inline(w);
