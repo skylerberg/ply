@@ -373,6 +373,7 @@ their meaning.
 | --- | --- | --- |
 | `42`, `1_000_000` | `Int` | 64-bit signed. `_` separators anywhere between digits. A literal that does not fit is a lex error. |
 | `0xFF`, `0xdead_beef` | `Int` | The same type and the same value as the decimal spelling — `0xFF` and `255` are one literal and one definition hash. The bound is 64 bits *as a bit pattern*, so `0xFFFF_FFFF_FFFF_FFFF` is `-1`. No hex `Float` and no hex `Decimal`. |
+| `255u8`, `0x6A09_E667u32`, `-1i8` | a fixed width (§5.1) | The suffix is the type, one of `u8` `u16` `u32` `u64` `i8` `i16` `i32` `i64`. A decimal spelling is bounded by the type's **range** (`256u8` is `E0211`); a hex spelling by its **width**, so `0xFFu8` is 255 and `0xFFFF_FFFF_FFFF_FFFFu64` is the largest `U64`. `5` and `5u32` are different literals with different types and different definition hashes. |
 | `1.5`, `1e9`, `2.5e-3` | `Float` | IEEE-754 binary64. A fraction or an exponent is what makes a literal a `Float`. |
 | `1.50m`, `0m`, `12345m` | `Decimal` | Base-10, exact. Up to 28 fractional digits and a 96-bit mantissa. No exponent form. |
 | `"text"` | `String` | UTF-8. May not span a line break. |
@@ -410,14 +411,14 @@ From loosest to tightest:
 | 1 | `\|\|` | left | `Bool` |
 | 2 | `&&` | left | `Bool` |
 | 3 | `==` `!=` `<` `<=` `>` `>=` | left | see below |
-| 4 | `\|` | left | `Int` |
-| 5 | `^` | left | `Int` |
-| 6 | `&` | left | `Int` |
-| 7 | `<<` `>>` `>>>` | left | `Int` |
+| 4 | `\|` | left | any integer type |
+| 5 | `^` | left | any integer type |
+| 6 | `&` | left | any integer type |
+| 7 | `<<` `>>` `>>>` | left | any integer type; the **count** is always `Int` |
 | 8 | `++` | left | `String` |
-| 9 | `+` `-` | left | `Int`, `Float` or `Decimal` |
-| 10 | `*` `/` `%` | left | `Int`, `Float` or `Decimal` |
-| — | unary `-`, unary `!`, unary `~` | prefix | numeric / `Bool` / `Int` |
+| 9 | `+` `-` | left | any numeric type |
+| 10 | `*` `/` `%` | left | any numeric type |
+| — | unary `-`, unary `!`, unary `~` | prefix | numeric / `Bool` / any integer type |
 | — | `f(x)`, `r.field`, `e.op[r](x)`, `e?` | postfix | |
 
 Notes that matter:
@@ -428,8 +429,10 @@ Notes that matter:
   is the only thing a credential is allowed to tell you. At `Float` they are
   IEEE equality, so `NaN != NaN`, which is why a `Float` cannot be a `Map` key
   (§5.4).
-* `<`, `<=`, `>`, `>=` are defined at `Int`, `Float` and `Decimal` and nowhere
-  else. To order other values use `compare`, which returns an `Ordering`.
+* `<`, `<=`, `>`, `>=` are defined at every numeric type — `Int`, the eight
+  fixed widths, `Float` and `Decimal` — and nowhere else. Both sides are one
+  type: a `U8` and a `U16` do not compare. To order other values use `compare`,
+  which returns an `Ordering`.
 * `++` is string concatenation only. There is no list or bytes `++`; use
   `bytes_concat` / `push` / `fold`.
 * `/` applied to `Decimal` is refused (`E0209`): the exact quotient of two
@@ -437,13 +440,17 @@ Notes that matter:
   a rounding nobody wrote down is the defect the type exists to prevent. Use
   `decimal_div(a, b, scale, mode)`. `%` on `Decimal` *is* allowed.
 * `&&` and `||` short-circuit. The **bitwise** operators are `&`, `|`, `^` and
-  unary `~`, and they are defined at `Int` and nowhere else — a `&` between two
-  `Bool`s is `E0201`, not a non-short-circuiting `&&`. They operate on the
-  two's-complement bit pattern, so `~0` is `-1`.
+  unary `~`, and they are defined at every integer type and nowhere else — a `&`
+  between two `Bool`s is `E0201`, not a non-short-circuiting `&&`. They answer
+  their operands' type and operate on **that type's** two's-complement pattern,
+  so `~0` is `-1` and `~0u8` is `255u8`.
 * The shifts are `<<`, `>>` (arithmetic, sign-propagating) and `>>>` (logical,
   zero-filling). A count outside `0..=63` **raises** `E0502`, for the reason a
   zero divisor does: there is no answer, and C's undefined behaviour, Rust's
-  panic and Java's silent mask by 63 are three different inventions of one.
+  panic and Java's silent mask by 63 are three different inventions of one. The
+  bound is the **word's** width, so a count of 32 shifts an `Int` and raises on a
+  `U32`; the count itself is an `Int` whatever the word is, because a count is
+  not a word.
   `<<` is the one place arithmetic is *not* checked — it discards the bits
   shifted out rather than raising, because a shift is a bit operation and a
   hash's mixing step is defined to drop them (ADR 0033 §2.2).
@@ -554,7 +561,8 @@ checked against it.
 
 | type | values |
 | --- | --- |
-| `Int` | 64-bit signed integers. Arithmetic is **checked**: overflow raises `E0502` rather than wrapping. Two exceptions, both deliberate: `<<` discards the bits it shifts out, and `wrap_add`/`wrap_sub`/`wrap_mul` (§13.10) wrap by definition. |
+| `Int` | 64-bit signed integers, and the type a program counts and indexes with. Arithmetic is **checked**: overflow raises `E0502` rather than wrapping. Two exceptions, both deliberate: `<<` discards the bits it shifts out, and `wrap_add`/`wrap_sub`/`wrap_mul` (§13.10) wrap by definition. |
+| `U8` `U16` `U32` `U64` `I8` `I16` `I32` `I64` | Fixed-width integers, for the algorithms that are *written* in a width: a hash's 32-bit word, a byte, a wire format's field. Arithmetic is checked exactly as `Int`'s is — **nothing wraps silently at any width** — and the same two exceptions apply, at the type's own width rather than at 64 bits. |
 | `Float` | IEEE-754 binary64. `NaN != NaN`; not orderable as a map key. |
 | `Decimal` | Exact base-10 with a scale. Money. `+`, `-`, `*`, `%` are exact or they raise; `/` is `E0209`. |
 | `Bool` | `true`, `false` |
@@ -568,18 +576,34 @@ something decodes it, because a peer is free to send bytes that are not UTF-8.
 `bytes_of_string` always succeeds; `string_of_bytes` raises on invalid UTF-8 and
 `string_of_bytes_lossy` substitutes U+FFFD.
 
-### 5.2 Numbers, and why there are three
+### 5.2 Numbers, and why there are eleven
 
 There is no numeric tower and no implicit widening. `a + b` requires both sides
-to have the same numeric type, and mixing two is one `E0201`.
+to have the same numeric type, and mixing two is one `E0201` — including two
+integer types, so `a: U8` and `b: U16` do not add and `a: U32` and `b: Int` do
+not either. A conversion is written down or it does not happen.
+
+**A literal's type is its spelling.** `1`, `1.0`, `1m` and `1u32` are four
+literals with four types; there is no literal that is a value of two of them and
+no defaulting rule that picks between them. That is the same decision §3.4 took
+for `Decimal` years earlier, extended rather than revisited, and it is why
+`fn f(x: U16) -> U16 = x + 1` is an error and `x + 1u16` is not.
+
+**Nine integer types, and `Int` is the one to reach for.** Use a fixed width
+where the *algorithm* is written in one — where a value is defined modulo 2^32,
+or is a byte, or is a field on a wire. Everything else counts and indexes, and
+that is `Int`. Under the compiled backend a fixed-width value is held in a
+register of its own width, which is the reason the family exists
+(`docs/adr/0039-how-ply-types-its-numbers.md`).
 
 The operand type of an arithmetic operator is not decided at the node — it is
 usually still unknown there — but once the enclosing definition has been
-inferred. So both of these check:
+inferred. So all of these check:
 
 ```ply
 fn f(a: Float) -> Float = a + 1.0
 fn g(a: Decimal) -> Decimal = 1m + a
+fn h(a: U32) -> U32 = a + 1u32
 ```
 
 An operand type **nothing pins** is `E0210`, not a default. Since every
@@ -600,6 +624,19 @@ mode, answers `Option`), `float_of_decimal`, `decimal_of_float` (`Option`),
 `decimal_of_string` (`Option`), `decimal_to_string`, `int_to_string`, and the
 IEEE 754 bit pattern both ways, `bits_of_float` and `float_of_bits`, which are
 total: every pattern is a `Float`, NaNs included.
+
+Between `Int` and a fixed width there are sixteen more, eight each way:
+`u32_of_int` and its seven siblings **raise** when the value is not one of that
+type's — mask first if a truncation is what you meant, `u8_of_int(n & 0xFF)` —
+and `int_of_u32` and its seven siblings are total but for `int_of_u64`, which
+raises past the largest `Int`. **Two fixed widths reach each other through
+`Int`**: `u32_of_int(int_of_u8(b))`. That is verbose, and it is the point — every
+narrowing in a program is one call a reader can find.
+
+One thing the family cannot spell: the smallest value of a signed type, because
+`-128i8` is a negation of `128i8` and `128i8` is not an `I8`. Write
+`i8_of_int(-128)`. `Int` has had the identical limit at `i64::MIN` since the
+beginning.
 
 ### 5.3 Records
 
@@ -2368,28 +2405,31 @@ credential from a wrong one.
 ### 13.10 Wrapping arithmetic
 
 ```
-wrap_add(a: Int, b: Int) -> Int
-wrap_sub(a: Int, b: Int) -> Int
-wrap_mul(a: Int, b: Int) -> Int
+wrap_add(a: a, b: a) -> a          // a is any integer type
+wrap_sub(a: a, b: a) -> a
+wrap_mul(a: a, b: a) -> a
+rotr(x: a, n: Int) -> a
 rotr32(x: Int, n: Int) -> Int
 ```
 
-Two's complement, modulo 2^64, and the only arithmetic in the language that
-cannot raise. `+`, `-` and `*` stay checked, which is the point: the easy
-spelling is the safe one, and a step that is *defined* to wrap — a 64-bit mixing
-function, a linear congruential generator — says so in the name it calls rather
-than in a comment beside an operator that means something else.
+Two's complement, modulo the operand's own width, and the only arithmetic in the
+language that cannot raise. `+`, `-` and `*` stay checked at every one of the
+nine integer types, which is the point: the easy spelling is the safe one, and a
+step that is *defined* to wrap — a mixing function, a linear congruential
+generator — says so in the name it calls rather than in a comment beside an
+operator that means something else. **This is the whole of the wrapping
+surface**; there is no modular *type* whose `+` wraps, and adding one is
+recorded as a deliberate non-decision in
+`docs/adr/0039-how-ply-types-its-numbers.md`.
 
-`rotr32` answers the low thirty-two bits of `x` rotated right by `n` modulo
-thirty-two, as the non-negative `Int` a masked word is, whatever `x` held above
-that word and whatever the sign of `n`. It is the rotate a hash written over
-masked words turns on every quarter-round, which spelled with shifts is two
-counts checked, a subtraction and a mask; under the compiled backend it is one
-instruction, as the three above are.
+The four are polymorphic over the integer types and nothing else: `wrap_add`
+over two `String`s is an `E0201` naming the type, not an unsolved variable.
 
-You will reach for these less often than you expect. Arithmetic on values masked
-to 32 bits cannot overflow an `Int` at all, so `std.hash`'s BLAKE3 masks with
-`& 0xFFFF_FFFF`, adds with `+`, and of the four calls only `rotr32`.
+`rotr` turns the whole word at the operand's own width and takes the count
+modulo it, so every count names a rotation. `rotr32` is the `Int`-only spelling
+that predates the fixed-width types — it turns the low thirty-two bits of an
+`Int` — and `rotr` at `U32` is the same operation with the width in the type.
+Both are one instruction under the compiled backend, as the three above are.
 
 ---
 
@@ -3090,7 +3130,8 @@ program.
 | `E0207` | unknown deriver |
 | `E0208` | orphan `derive` |
 | `E0209` | `/` applied to `Decimal` |
-| `E0210` | an arithmetic or comparison operand whose numeric type nothing determines |
+| `E0210` | an arithmetic, comparison or bit operand whose numeric type nothing determines |
+| `E0211` | an integer literal that is not a value of the fixed-width type its suffix names |
 
 ### Effects
 

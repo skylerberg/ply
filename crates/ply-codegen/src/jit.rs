@@ -779,6 +779,19 @@ impl Jit {
         module_index: usize,
         sig: Option<&Sig>,
     ) -> Result<()> {
+        // The fixed-width integer types are not in the fragment yet: a compiled body holds every
+        // integer as a sixty-four-bit word and would answer a `U32` addition as an `Int` one. The
+        // conversions that mint one are refused beside this, so nothing inside a body can reach a
+        // width the signature does not name either.
+        if let Some(def) = loaded.check.defs.get(&Symbol::new(name))
+            && let Some(width) = fixed_width_in(&def.scheme.ty)
+        {
+            return Err(Refused {
+                function: name.to_string(),
+                construct: format!("a `{width}`, which the fragment does not carry"),
+            }
+            .into());
+        }
         let mut builder = FunctionBuilder::new(&mut clif.func, fctx);
         let entry = builder.create_block();
         builder.append_block_params_for_function_params(entry);
@@ -1278,9 +1291,31 @@ fn scalar_builtin_answers(b: Builtin, arity: usize) -> bool {
         )
 }
 
+/// The first fixed-width integer type `ty` mentions, if it mentions one.
+fn fixed_width_in(ty: &ply_core::ty::Type) -> Option<&'static str> {
+    use ply_core::ty::Type;
+    match ty {
+        Type::Var(_) => None,
+        Type::Con(name, args) => ply_core::ty::IntTy::from_name(name.as_str())
+            .map(|t| t.name())
+            .or_else(|| args.iter().find_map(fixed_width_in)),
+        Type::Fn { params, ret, .. } => params
+            .iter()
+            .find_map(fixed_width_in)
+            .or_else(|| fixed_width_in(ret)),
+        Type::Record(fields) => fields.values().find_map(fixed_width_in),
+    }
+}
+
 fn admissible_builtin(b: Builtin) -> Result<(), String> {
     if b.higher_order() && !lowered_callback(b) {
         return Err(format!("`{}`, a builtin that calls user code", b.name()));
+    }
+    if b == Builtin::Rotr || b.converts_into().is_some() || b.converts_from().is_some() {
+        return Err(format!(
+            "`{}`, which names a fixed-width integer type the fragment does not carry",
+            b.name()
+        ));
     }
     match b {
         Builtin::CellGet | Builtin::CellSet => Err(format!(

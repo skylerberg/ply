@@ -57,9 +57,11 @@ fn an_operator_pins_an_inferred_binder_to_int() {
 #[test]
 fn a_bit_operator_over_two_bools_names_both_sides() {
     let d = errors("fn bad(a: Bool, b: Bool) -> Int = a & b\n");
+    // The operand diagnostics only: a `&` answers its operands' type, so a `Bool` one also fails
+    // against the written `-> Int`, and that third diagnostic is a cascade rather than a side.
     let mismatches: Vec<&Diagnostic> = d
         .iter()
-        .filter(|d| d.code == codes::TYPE_MISMATCH)
+        .filter(|d| d.code == codes::TYPE_MISMATCH && d.message.contains("operand of `&`"))
         .collect();
     assert_eq!(
         mismatches.len(),

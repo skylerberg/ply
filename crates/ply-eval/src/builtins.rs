@@ -4,7 +4,10 @@ use crate::arena::{Arena, Slot};
 use crate::cont::Frame;
 use crate::map;
 use crate::semantics::arity_error;
-use crate::value::{Decimal, List, Value, first_difference, type_error, values_equal};
+use crate::value::{
+    Decimal, Fixed, IntTy, List, Value, first_difference, type_error, values_equal,
+};
+use ply_core::ty::INT_TYPES;
 use ply_span::{Diagnostic, Span, codes};
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
@@ -38,6 +41,31 @@ pub enum Builtin {
     /// The low thirty-two bits rotated right, the one step a hash written over masked words
     /// spells as two shifts, a subtraction and a mask otherwise.
     Rotr32,
+    /// The same step at a fixed-width type, turning the whole word: `rotr` at `U32` is what
+    /// `rotr32` was at `Int`, and at `U8` it turns eight bits.
+    Rotr,
+    /// `u32_of_int` and its seven siblings: an `Int` read as a fixed-width type, raising when it
+    /// is not one of that type's values. Mask first if a truncation is what you meant.
+    ///
+    /// Sixteen field-less variants rather than two carrying an [`IntTy`], because the enum is
+    /// cast to an index for the per-builtin caches and a payload would forbid the cast.
+    /// [`Builtin::of_int`] and [`Builtin::int_of`] are how the rest of the tree names them.
+    U8OfInt,
+    U16OfInt,
+    U32OfInt,
+    U64OfInt,
+    I8OfInt,
+    I16OfInt,
+    I32OfInt,
+    I64OfInt,
+    IntOfU8,
+    IntOfU16,
+    IntOfU32,
+    IntOfU64,
+    IntOfI8,
+    IntOfI16,
+    IntOfI32,
+    IntOfI64,
     /// The smaller and the larger of two integers.
     Min,
     Max,
@@ -117,6 +145,12 @@ pub enum Builtin {
 
 impl Builtin {
     pub fn from_name(name: &str) -> Option<Builtin> {
+        if let Some(t) = IntTy::of_int_from_name(name) {
+            return Some(Builtin::of_int(t));
+        }
+        if let Some(t) = IntTy::to_int_from_name(name) {
+            return Some(Builtin::int_of(t));
+        }
         Some(match name {
             "assert" => Builtin::Assert,
             "assert_eq" => Builtin::AssertEq,
@@ -133,6 +167,7 @@ impl Builtin {
             "wrap_sub" => Builtin::WrapSub,
             "wrap_mul" => Builtin::WrapMul,
             "rotr32" => Builtin::Rotr32,
+            "rotr" => Builtin::Rotr,
             "byte_of_int" => Builtin::ByteOfInt,
             "int_to_string" => Builtin::IntToString,
             "string_concat" => Builtin::StringConcat,
@@ -219,6 +254,23 @@ impl Builtin {
             Builtin::WrapSub => "wrap_sub",
             Builtin::WrapMul => "wrap_mul",
             Builtin::Rotr32 => "rotr32",
+            Builtin::Rotr => "rotr",
+            Builtin::U8OfInt => "u8_of_int",
+            Builtin::U16OfInt => "u16_of_int",
+            Builtin::U32OfInt => "u32_of_int",
+            Builtin::U64OfInt => "u64_of_int",
+            Builtin::I8OfInt => "i8_of_int",
+            Builtin::I16OfInt => "i16_of_int",
+            Builtin::I32OfInt => "i32_of_int",
+            Builtin::I64OfInt => "i64_of_int",
+            Builtin::IntOfU8 => "int_of_u8",
+            Builtin::IntOfU16 => "int_of_u16",
+            Builtin::IntOfU32 => "int_of_u32",
+            Builtin::IntOfU64 => "int_of_u64",
+            Builtin::IntOfI8 => "int_of_i8",
+            Builtin::IntOfI16 => "int_of_i16",
+            Builtin::IntOfI32 => "int_of_i32",
+            Builtin::IntOfI64 => "int_of_i64",
             Builtin::ByteOfInt => "byte_of_int",
             Builtin::IntToString => "int_to_string",
             Builtin::StringConcat => "string_concat",
@@ -319,7 +371,23 @@ impl Builtin {
             | Builtin::BitsOfFloat
             | Builtin::FloatOfBits
             | Builtin::SecretOfString
-            | Builtin::SecretIsEmpty => (1, 1),
+            | Builtin::SecretIsEmpty
+            | Builtin::U8OfInt
+            | Builtin::U16OfInt
+            | Builtin::U32OfInt
+            | Builtin::U64OfInt
+            | Builtin::I8OfInt
+            | Builtin::I16OfInt
+            | Builtin::I32OfInt
+            | Builtin::I64OfInt
+            | Builtin::IntOfU8
+            | Builtin::IntOfU16
+            | Builtin::IntOfU32
+            | Builtin::IntOfU64
+            | Builtin::IntOfI8
+            | Builtin::IntOfI16
+            | Builtin::IntOfI32
+            | Builtin::IntOfI64 => (1, 1),
             Builtin::AssertEq
             | Builtin::Push
             | Builtin::ListAt
@@ -355,6 +423,7 @@ impl Builtin {
             | Builtin::WrapSub
             | Builtin::WrapMul
             | Builtin::Rotr32
+            | Builtin::Rotr
             | Builtin::Range => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
@@ -386,6 +455,44 @@ impl Builtin {
         )
     }
 
+    /// The conversion into `t`, as a builtin.
+    pub fn of_int(t: IntTy) -> Builtin {
+        match t {
+            IntTy::U8 => Builtin::U8OfInt,
+            IntTy::U16 => Builtin::U16OfInt,
+            IntTy::U32 => Builtin::U32OfInt,
+            IntTy::U64 => Builtin::U64OfInt,
+            IntTy::I8 => Builtin::I8OfInt,
+            IntTy::I16 => Builtin::I16OfInt,
+            IntTy::I32 => Builtin::I32OfInt,
+            IntTy::I64 => Builtin::I64OfInt,
+        }
+    }
+
+    /// The conversion out of `t`, as a builtin.
+    pub fn int_of(t: IntTy) -> Builtin {
+        match t {
+            IntTy::U8 => Builtin::IntOfU8,
+            IntTy::U16 => Builtin::IntOfU16,
+            IntTy::U32 => Builtin::IntOfU32,
+            IntTy::U64 => Builtin::IntOfU64,
+            IntTy::I8 => Builtin::IntOfI8,
+            IntTy::I16 => Builtin::IntOfI16,
+            IntTy::I32 => Builtin::IntOfI32,
+            IntTy::I64 => Builtin::IntOfI64,
+        }
+    }
+
+    /// Which type this converts into, if it converts into one.
+    pub fn converts_into(self) -> Option<IntTy> {
+        INT_TYPES.into_iter().find(|t| Builtin::of_int(*t) == self)
+    }
+
+    /// Which type this converts out of, if it converts out of one.
+    pub fn converts_from(self) -> Option<IntTy> {
+        INT_TYPES.into_iter().find(|t| Builtin::int_of(*t) == self)
+    }
+
     pub fn all() -> &'static [Builtin] {
         &[
             Builtin::Assert,
@@ -402,6 +509,23 @@ impl Builtin {
             Builtin::WrapSub,
             Builtin::WrapMul,
             Builtin::Rotr32,
+            Builtin::Rotr,
+            Builtin::U8OfInt,
+            Builtin::U16OfInt,
+            Builtin::U32OfInt,
+            Builtin::U64OfInt,
+            Builtin::I8OfInt,
+            Builtin::I16OfInt,
+            Builtin::I32OfInt,
+            Builtin::I64OfInt,
+            Builtin::IntOfU8,
+            Builtin::IntOfU16,
+            Builtin::IntOfU32,
+            Builtin::IntOfU64,
+            Builtin::IntOfI8,
+            Builtin::IntOfI16,
+            Builtin::IntOfI32,
+            Builtin::IntOfI64,
             Builtin::Min,
             Builtin::Max,
             Builtin::ByteOfInt,
@@ -632,8 +756,41 @@ fn call_with(
             ))))
         }
 
+        // The word turned whole, at whatever width the operand's type is, and the count taken
+        // modulo that width so every count names a rotation.
+        Builtin::Rotr => {
+            let n = args[1].as_int(span, "`rotr`")?;
+            if let Value::Fixed(f) = &args[0] {
+                let w = f.ty.bits();
+                let k = n.rem_euclid(i64::from(w)) as u32;
+                let raw = f.raw();
+                let bits = if k == 0 {
+                    raw
+                } else {
+                    (raw >> k) | (raw << (w - k))
+                };
+                return Ok(Step::Done(Value::Fixed(Fixed::new(f.ty, bits))));
+            }
+            let x = args[0].as_int(span, "`rotr`")?;
+            Ok(Step::Done(Value::Int(
+                (x as u64).rotate_right(n.rem_euclid(64) as u32) as i64,
+            )))
+        }
+
+        // Total by construction at every type, which is the whole of why they exist beside the
+        // checked operators.
         Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul => {
             let what = b.name();
+            if let (Value::Fixed(x), Value::Fixed(y)) = (&args[0], &args[1])
+                && x.ty == y.ty
+            {
+                let v = match b {
+                    Builtin::WrapAdd => x.wrapping(*y, |a, c| a + c),
+                    Builtin::WrapSub => x.wrapping(*y, |a, c| a - c),
+                    _ => x.wrapping(*y, |a, c| a * c),
+                };
+                return Ok(Step::Done(Value::Fixed(v)));
+            }
             let x = args[0].as_int(span, &format!("`{what}`"))?;
             let y = args[1].as_int(span, &format!("`{what}`"))?;
             Ok(Step::Done(Value::Int(match b {
@@ -641,6 +798,55 @@ fn call_with(
                 Builtin::WrapSub => x.wrapping_sub(y),
                 _ => x.wrapping_mul(y),
             })))
+        }
+
+        // Out of range raises rather than truncating, for the reason `byte_of_int` does: a value
+        // silently reduced is one nobody chose. `x & 0xFFFF_FFFF` first is how a program says it
+        // meant the truncation.
+        Builtin::U8OfInt
+        | Builtin::U16OfInt
+        | Builtin::U32OfInt
+        | Builtin::U64OfInt
+        | Builtin::I8OfInt
+        | Builtin::I16OfInt
+        | Builtin::I32OfInt
+        | Builtin::I64OfInt => {
+            let t = b.converts_into().expect("every `_of_int` names its type");
+            let n = args[0].as_int(span, &format!("`{}`", t.of_int_name()))?;
+            match Fixed::of(t, i128::from(n)) {
+                Some(v) => Ok(Step::Done(Value::Fixed(v))),
+                None => Err(Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    format!("`{}` was given {n}", t.of_int_name()),
+                )
+                .primary(span, format!("`{t}` holds {} to {}", t.min(), t.max()))
+                .note(format!(
+                    "mask the value before the call if that is what you meant: `n & 0x{:X}`",
+                    t.max()
+                ))),
+            }
+        }
+
+        // The same value as an `Int`. Only `U64` reaches past `Int`, and only above its largest.
+        Builtin::IntOfU8
+        | Builtin::IntOfU16
+        | Builtin::IntOfU32
+        | Builtin::IntOfU64
+        | Builtin::IntOfI8
+        | Builtin::IntOfI16
+        | Builtin::IntOfI32
+        | Builtin::IntOfI64 => {
+            let t = b.converts_from().expect("every `int_of_` names its type");
+            let f = args[0].as_fixed(span, &format!("`{}`", t.to_int_name()))?;
+            match i64::try_from(f.value()) {
+                Ok(n) => Ok(Step::Done(Value::Int(n))),
+                Err(_) => Err(Diagnostic::error(
+                    codes::RUNTIME_ERROR,
+                    format!("`{}` was given {f}", t.to_int_name()),
+                )
+                .primary(span, "past the largest `Int`")
+                .note("an `Int` is 64 bits and signed, so it does not hold every `U64`")),
+            }
         }
 
         // Out of range raises rather than masking, because a silent `& 0xFF` would write a
@@ -2930,7 +3136,19 @@ mod tests {
                 "float_of_bits",
                 "float_of_decimal",
                 "fold",
+                "i16_of_int",
+                "i32_of_int",
+                "i64_of_int",
+                "i8_of_int",
                 "int_of_decimal",
+                "int_of_i16",
+                "int_of_i32",
+                "int_of_i64",
+                "int_of_i8",
+                "int_of_u16",
+                "int_of_u32",
+                "int_of_u64",
+                "int_of_u8",
                 "int_to_string",
                 "iterate",
                 "len",
@@ -2954,6 +3172,7 @@ mod tests {
                 "panic",
                 "push",
                 "range",
+                "rotr",
                 "rotr32",
                 "secret_is_empty",
                 "secret_of_string",
@@ -2971,6 +3190,10 @@ mod tests {
                 "string_starts_with",
                 "string_trim",
                 "string_upper",
+                "u16_of_int",
+                "u32_of_int",
+                "u64_of_int",
+                "u8_of_int",
                 "wrap_add",
                 "wrap_mul",
                 "wrap_sub",

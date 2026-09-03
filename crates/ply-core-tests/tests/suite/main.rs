@@ -17,6 +17,7 @@ mod fused_update_builtins;
 mod iterate_builtin;
 mod list_builtins;
 mod map_keys;
+mod number_types;
 mod record_update;
 mod region_escape_audit;
 mod regions;

@@ -3,7 +3,7 @@ use crate::env::{TypeEnv, generalize, instantiate, instantiate_with};
 use crate::prelude;
 use crate::print::{Printer, region_of, region_type_name};
 use crate::scc::sccs;
-use crate::ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
+use crate::ty::{EffectAtom, Footprint, IntTy, Resource, Row, RowVar, Scheme, TyVar, Type, int_ty};
 use crate::unify::{Fresh, Subst, UnifyError, unify, unify_row};
 use crate::{
     CheckOutput, CtorInfo, DefConstraint, DefInfo, EffectInfo, Known, LawBinder, LawInfo,
@@ -26,6 +26,14 @@ const RESULT: &str = "result";
 /// Names no `type` item may claim, with their arities.
 const BUILTIN_TYPE_CONS: &[(&str, usize)] = &[
     ("Int", 0),
+    ("U8", 0),
+    ("U16", 0),
+    ("U32", 0),
+    ("U64", 0),
+    ("I8", 0),
+    ("I16", 0),
+    ("I32", 0),
+    ("I64", 0),
     ("Bool", 0),
     ("String", 0),
     ("Bytes", 0),
@@ -78,6 +86,7 @@ pub fn check_program_with(
     }
     // Whatever `check_fns` did not drain: a spec clause, a test body, a law.
     c.settle_numerics();
+    c.settle_bit_ops();
     c.check_comparisons();
     c.check_map_keys();
     c.check_constraints();
@@ -249,8 +258,11 @@ struct Checker<'a> {
     /// the call is first walked.
     constrained_uses: Vec<ConstraintSite>,
     /// Arithmetic and ordered comparisons whose operand type has yet to be pinned to one of the
-    /// three numeric types.
+    /// numeric types.
     numerics: Vec<Numeric>,
+    /// Bit operators, whose operand may be any integer type and is routinely a variable at the
+    /// node, exactly as an arithmetic operand is.
+    bit_ops: Vec<BitOp>,
     /// `simulate` regions, checked for the same reason: a region's result type and the row of what
     /// it calls are both routinely unsolved while its own definition is still being walked.
     simulations: Vec<Simulation>,
@@ -273,6 +285,19 @@ struct Checker<'a> {
 struct Numeric {
     span: Span,
     op: BinOp,
+    ty: Type,
+}
+
+/// The prelude names whose first parameter must be an integer type, checked at each call because
+/// their published signatures are `forall a.` and nothing in a scheme can say "an integer".
+const INT_BUILTINS: &[&str] = &["wrap_add", "wrap_sub", "wrap_mul", "rotr"];
+
+/// One site whose operand must be an integer type — a bit operator, or one of [`INT_BUILTINS`] —
+/// kept until the type is known, for the reason [`Numeric`] is kept.
+struct BitOp {
+    span: Span,
+    /// How a diagnostic names the site: "the left operand of `&`", "`~`", "`wrap_add`".
+    what: String,
     ty: Type,
 }
 
@@ -424,6 +449,7 @@ impl<'a> Checker<'a> {
             constraints: IndexMap::new(),
             constrained_uses: Vec::new(),
             numerics: Vec::new(),
+            bit_ops: Vec::new(),
             simulations: Vec::new(),
             open_regions: Vec::new(),
             regions: Vec::new(),
@@ -754,20 +780,120 @@ impl<'a> Checker<'a> {
                 "range",
                 mono(vec![Type::int(), Type::int()], Type::list(Type::int())),
             ),
-            // The three arithmetic operators that answer rather than raise.
+            // The three arithmetic operators that answer rather than raise, at every integer
+            // type. `a` here is not free: [`INT_BUILTINS`] puts an obligation on it at each call,
+            // discharged by [`Checker::settle_bit_ops`], so `wrap_add` over two `String`s is a
+            // diagnostic naming the type rather than an unsolved variable.
             (
                 "wrap_add",
-                mono(vec![Type::int(), Type::int()], Type::int()),
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![ta.clone(), ta.clone()],
+                    ta.clone(),
+                    Row::empty(),
+                ),
             ),
             (
                 "wrap_sub",
-                mono(vec![Type::int(), Type::int()], Type::int()),
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![ta.clone(), ta.clone()],
+                    ta.clone(),
+                    Row::empty(),
+                ),
             ),
             (
                 "wrap_mul",
-                mono(vec![Type::int(), Type::int()], Type::int()),
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![ta.clone(), ta.clone()],
+                    ta.clone(),
+                    Row::empty(),
+                ),
+            ),
+            // The count is an `Int` whatever the word is, exactly as a shift's is.
+            (
+                "rotr",
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![ta.clone(), Type::int()],
+                    ta.clone(),
+                    Row::empty(),
+                ),
             ),
             ("rotr32", mono(vec![Type::int(), Type::int()], Type::int())),
+            // Sixteen conversions, and no implicit widening anywhere: `u32_of_int` raises when
+            // its argument is not a `U32`, and `int_of_u32` is total. A conversion between two
+            // fixed-width types goes through `Int`, which is verbose and is the point — every
+            // narrowing in a program is written down.
+            (
+                IntTy::U8.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::U8)),
+            ),
+            (
+                IntTy::U16.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::U16)),
+            ),
+            (
+                IntTy::U32.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::U32)),
+            ),
+            (
+                IntTy::U64.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::U64)),
+            ),
+            (
+                IntTy::I8.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::I8)),
+            ),
+            (
+                IntTy::I16.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::I16)),
+            ),
+            (
+                IntTy::I32.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::I32)),
+            ),
+            (
+                IntTy::I64.of_int_name(),
+                mono(vec![Type::int()], int_ty(IntTy::I64)),
+            ),
+            (
+                IntTy::U8.to_int_name(),
+                mono(vec![int_ty(IntTy::U8)], Type::int()),
+            ),
+            (
+                IntTy::U16.to_int_name(),
+                mono(vec![int_ty(IntTy::U16)], Type::int()),
+            ),
+            (
+                IntTy::U32.to_int_name(),
+                mono(vec![int_ty(IntTy::U32)], Type::int()),
+            ),
+            (
+                IntTy::U64.to_int_name(),
+                mono(vec![int_ty(IntTy::U64)], Type::int()),
+            ),
+            (
+                IntTy::I8.to_int_name(),
+                mono(vec![int_ty(IntTy::I8)], Type::int()),
+            ),
+            (
+                IntTy::I16.to_int_name(),
+                mono(vec![int_ty(IntTy::I16)], Type::int()),
+            ),
+            (
+                IntTy::I32.to_int_name(),
+                mono(vec![int_ty(IntTy::I32)], Type::int()),
+            ),
+            (
+                IntTy::I64.to_int_name(),
+                mono(vec![int_ty(IntTy::I64)], Type::int()),
+            ),
             ("min", mono(vec![Type::int(), Type::int()], Type::int())),
             ("max", mono(vec![Type::int(), Type::int()], Type::int())),
             // The inverse of `bytes_at`, which had none.
@@ -1957,6 +2083,7 @@ impl<'a> Checker<'a> {
             // pins a callee's operand type, and defaulting one body at a time would decide `Int`
             // before the other body said `Decimal`.
             self.settle_numerics();
+            self.settle_bit_ops();
             // After `settle_numerics` for the same reason it runs after the
             // whole component: the type this reports is the one a reader would
             // have to write, and one body in the group can be what pins it.
@@ -3019,8 +3146,12 @@ impl<'a> Checker<'a> {
                     return (t, row);
                 }
                 if let UnOp::BitNot = op {
-                    self.expect_bits(operand.span, &t, "operand of `~`");
-                    return (Type::int(), row);
+                    self.bit_ops.push(BitOp {
+                        span: operand.span,
+                        what: "the operand of `~`".to_string(),
+                        ty: t.clone(),
+                    });
+                    return (t, row);
                 }
                 let want = Type::bool();
                 self.expect(operand.span, &want, &t, "operand of a unary operator");
@@ -3263,16 +3394,49 @@ impl<'a> Checker<'a> {
             return (if arithmetic { lt } else { Type::bool() }, row);
         }
 
-        // Each side is checked against `Int` rather than against the other, so `a & b` over
-        // two `Bool`s names both of them instead of hiding the second.
-        if matches!(
-            op,
-            BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor | BinOp::Shl | BinOp::Shr | BinOp::Ushr
-        ) {
+        // A bit operator is defined at every integer type and at nothing else, so — as with
+        // arithmetic — the operand type is unified here and *which* integer type it is is settled
+        // once the definition around it has been. The answer has the operand's type: `a & b` over
+        // two `U32` is a `U32`.
+        if matches!(op, BinOp::BitAnd | BinOp::BitOr | BinOp::BitXor) {
             let what = op.text();
-            self.expect_bits(lhs.span, &lt, &format!("left operand of `{what}`"));
-            self.expect_bits(rhs.span, &rt, &format!("right operand of `{what}`"));
-            return (Type::int(), row);
+            // One obligation per side rather than one for the pair, so two `Bool`s are two
+            // diagnostics naming both operands instead of one naming whichever was unified first.
+            self.bit_ops.push(BitOp {
+                span: lhs.span,
+                what: format!("the left operand of `{what}`"),
+                ty: lt.clone(),
+            });
+            self.bit_ops.push(BitOp {
+                span: rhs.span,
+                what: format!("the right operand of `{what}`"),
+                ty: rt.clone(),
+            });
+            self.expect(
+                rhs.span,
+                &lt,
+                &rt,
+                &format!("both operands of `{what}` have one type"),
+            );
+            return (lt, row);
+        }
+
+        // A shift is not symmetric: the left operand is the word and may be any integer type, and
+        // the right is a *count*, which is an `Int` whatever the word is.
+        if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
+            let what = op.text();
+            self.bit_ops.push(BitOp {
+                span: lhs.span,
+                what: format!("the left operand of `{what}`"),
+                ty: lt.clone(),
+            });
+            self.expect(
+                rhs.span,
+                &Type::int(),
+                &rt,
+                &format!("the count of a `{what}` is an `Int`"),
+            );
+            return (lt, row);
         }
 
         let (operand, result) = match op {
@@ -3298,6 +3462,56 @@ impl<'a> Checker<'a> {
         (result, row)
     }
 
+    /// Decides which integer type each bit operator was applied at. The set is every integer type
+    /// and nothing else — a `&` between two `Bool`s is a type error naming both, rather than a
+    /// silently-different short-circuit.
+    fn settle_bit_ops(&mut self) {
+        for entry in std::mem::take(&mut self.bit_ops) {
+            let ty = self.subst.resolve_ty(&entry.ty);
+            let name = match &ty {
+                Type::Var(_) => {
+                    self.bits_undetermined(&entry);
+                    continue;
+                }
+                Type::Con(name, args) if args.is_empty() => name.clone(),
+                _ => {
+                    self.bits_mismatch(&entry, &ty);
+                    continue;
+                }
+            };
+            if name.as_str() != "Int" && IntTy::from_name(name.as_str()).is_none() {
+                self.bits_mismatch(&entry, &ty);
+            }
+        }
+    }
+
+    fn bits_undetermined(&mut self, entry: &BitOp) {
+        self.diags.push(
+            Diagnostic::error(
+                codes::NUMERIC_UNDETERMINED,
+                format!("the integer type of {} is not determined", entry.what),
+            )
+            .primary(entry.span, "nothing here says which integer type this is")
+            .note("`Int` and the eight fixed-width types are the integer types")
+            .note("annotate the operand, or write a literal that pins it"),
+        );
+    }
+
+    fn bits_mismatch(&mut self, entry: &BitOp, ty: &Type) {
+        let mut printer = Printer::new();
+        let name = printer.ty(ty);
+        let mut d = Diagnostic::error(
+            codes::TYPE_MISMATCH,
+            format!("{} is not defined on `{name}`", entry.what),
+        )
+        .primary(entry.span, format!("has type `{name}`"))
+        .note("`Int` and the eight fixed-width types are the integer types");
+        if name == "Bool" {
+            d = d.note("`Bool` has `&&`, `||` and `!`; the bit operators are integers only");
+        }
+        self.diags.push(d);
+    }
+
     /// Decides which numeric type each `+`, `-`, `*`, `/`, `%`, `<`, `<=`, `>` or `>=` was applied
     /// at, now that the definition around it has been inferred.
     fn settle_numerics(&mut self) {
@@ -3316,6 +3530,7 @@ impl<'a> Checker<'a> {
             };
             match (name.as_str(), entry.op) {
                 ("Int" | "Float", _) => {}
+                (n, _) if IntTy::from_name(n).is_some() => {}
                 // The one place W2 refuses what every other language allows.
                 ("Decimal", BinOp::Div) => self.diags.push(
                     Diagnostic::error(codes::DECIMAL_DIVISION, "`/` is not defined on `Decimal`")
@@ -3428,7 +3643,10 @@ impl<'a> Checker<'a> {
                 format!("the numeric type of this {what} is not determined"),
             )
             .primary(entry.span, "nothing here says which numeric type this is")
-            .note("`Int`, `Float` and `Decimal` are the numeric types, and there is no tower")
+            .note(
+                "the numeric types are `Int`, the eight fixed-width integers, `Float` and \
+                   `Decimal`, and there is no tower",
+            )
             .note("annotate the operand, or write a literal that pins it (`1`, `1.0`, `1m`)"),
         );
     }
@@ -3450,7 +3668,10 @@ impl<'a> Checker<'a> {
                 ),
             )
             .primary(entry.span, format!("{what} here"))
-            .note("`Int`, `Float` and `Decimal` are the numeric types"),
+            .note(
+                "the numeric types are `Int`, the eight fixed-width integers, `Float` and \
+                   `Decimal`",
+            ),
         );
     }
 
@@ -3829,6 +4050,14 @@ impl<'a> Checker<'a> {
         {
             return self.infer_cell_op(e, args, form);
         }
+        let integer_builtin = match &func.kind {
+            ExprKind::Var(q) if q.is_bare() => {
+                let name = q.symbol().as_str().to_string();
+                (INT_BUILTINS.contains(&name.as_str()) && self.declared_value(q).is_none())
+                    .then_some(name)
+            }
+            _ => None,
+        };
 
         let (ft, mut row) = self.infer(func);
         let mut arg_tys = Vec::new();
@@ -3866,6 +4095,18 @@ impl<'a> Checker<'a> {
                 }
                 for ((want, got), arg) in params.iter().zip(&arg_tys).zip(args) {
                     self.expect(arg.span, want, got, "argument type");
+                }
+                // `wrap_add` and its siblings are written `forall a. (a, a) -> a`, which alone
+                // would accept two `String`s. The obligation is put on the instantiated variable
+                // here, at the call, and discharged where every other integer-type obligation is.
+                if let Some(name) = integer_builtin
+                    && let Some(first) = params.first()
+                {
+                    self.bit_ops.push(BitOp {
+                        span: e.span,
+                        what: format!("`{name}`"),
+                        ty: first.clone(),
+                    });
                 }
                 let effects = self.subst.resolve_row(&effects);
                 for atom in &effects.atoms {
@@ -5212,23 +5453,6 @@ impl<'a> Checker<'a> {
         );
     }
 
-    /// A bit operand, with the note a `Bool` gets: `&` written where `&&` was meant.
-    fn expect_bits(&mut self, span: Span, found: &Type, context: &str) {
-        if self.expect(span, &Type::int(), found, context) {
-            return;
-        }
-        let bool_operand = match self.subst.resolve_ty(found) {
-            Type::Con(name, args) => args.is_empty() && name.as_str() == "Bool",
-            _ => false,
-        };
-        if !bool_operand {
-            return;
-        }
-        let Some(last) = self.diags.pop() else { return };
-        self.diags
-            .push(last.note("`Bool` has `&&`, `||` and `!`; the bit operators are `Int` only"));
-    }
-
     fn expect(&mut self, span: Span, expected: &Type, found: &Type, context: &str) -> bool {
         if let Err(e) = unify(&mut self.subst, &mut self.fresh, expected, found) {
             self.report_unify(&e, span, context);
@@ -5363,9 +5587,13 @@ struct Signature {
     scope: u32,
 }
 
+/// Every literal form has exactly one type, which is the decision §5.2 already took for
+/// `Decimal`: `1`, `1.0`, `1m` and `1u32` are four literals with four types, and nothing widens
+/// between them.
 fn lit_type(l: &Lit) -> Type {
     match l {
         Lit::Int(_) => Type::int(),
+        Lit::Fixed { ty, .. } => int_ty(*ty),
         Lit::Bool(_) => Type::bool(),
         Lit::Str(_) => Type::string(),
         Lit::Bytes(_) => Type::bytes(),
