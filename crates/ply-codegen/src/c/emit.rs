@@ -187,6 +187,9 @@ pub struct Emit<'a> {
     /// The locals the deferred records above will land in, declared once at the top so that
     /// materialising inside a branch still names something the whole body can see.
     record_locals: Vec<String>,
+    /// Locals that already carry a count, because the field read that produced them took it out
+    /// of the record rather than borrowing it. Handing one to a consumer must not take a second.
+    taken: std::collections::HashSet<String>,
 }
 
 /// A record that has been described but not built: what `emit_record` would have emitted.
@@ -286,6 +289,7 @@ impl<'a> Emit<'a> {
             built: std::collections::HashMap::new(),
             deferred: std::collections::HashMap::new(),
             record_locals: Vec::new(),
+            taken: std::collections::HashSet::new(),
         }
     }
 
@@ -512,12 +516,16 @@ impl<'a> Emit<'a> {
     /// A word a helper is about to take. Duplicated first, because nothing here is ever released
     /// and a helper that takes will release: the duplicate is what puts the count back.
     fn owned(&mut self, v: &V) -> String {
+        // Already counted: a field read at its last use took the count out of the record instead
+        // of borrowing it, so this hands the same count on. Removed as it is spent, so a second
+        // use of the same local takes one of its own.
+        let already = self.taken.remove(&v.c);
         let w = self.word(v);
         let t = self.fresh();
         self.line(format!("Word {t} = {w};"));
         // A scalar is an immediate and holds no count, so there is nothing to take: the kernel
         // builds sixteen-field records of them and the increments were the whole of the cost.
-        if !matches!(v.k, Kind::Num(_) | Kind::Int | Kind::Bool) {
+        if !already && !matches!(v.k, Kind::Num(_) | Kind::Int | Kind::Bool) {
             self.line(format!("ply_inc({t});"));
         }
         t
@@ -537,7 +545,7 @@ impl<'a> Emit<'a> {
                 else_branch,
             } => self.if_expr(cond, then_branch, else_branch),
             NodeKind::Block { stmts, tail } => self.block(stmts, tail.as_ref()),
-            NodeKind::Field { base, field } => self.field(base, &field.name),
+            NodeKind::Field { base, field } => self.field(base, &field.name, code.own),
             NodeKind::Record { fields } => self.record(fields),
             NodeKind::List { items } => self.list(items),
             NodeKind::App { func, args } => self.app(func, args),
@@ -1081,7 +1089,8 @@ impl<'a> Emit<'a> {
         Ok(mark)
     }
 
-    fn field(&mut self, base: &Code, name: &Symbol) -> Result<V> {
+    fn field(&mut self, base: &Code, name: &Symbol, own: Own) -> Result<V> {
+        let base_own = own;
         let b = self.expr(base)?;
         let field_ty = b.ty.field(name).cloned().unwrap_or(CTy::Unknown);
         let at = b.ty.offset(name);
@@ -1120,6 +1129,22 @@ impl<'a> Emit<'a> {
         // the first field read.
         let kind = field_ty.kind();
         if kind == Kind::Boxed {
+            // ADR 0034's in-place update, which this tier did not have. When the lowering says
+            // this is the field's last use, take it *out* of a record nobody else holds rather
+            // than borrowing it and counting it again at the call: a map read out of a record and
+            // handed to `map_insert` was reaching the insert at a count of two, so every insert
+            // copied the node it meant to write. Borrowing where the record is shared, as before.
+            if base_own == Own::OwnedField
+                && let Some(at) = at
+            {
+                self.line(format!(
+                    "if (ply_obj({0})->rc == 1) {{ ply_words({0})[{at}] = {1}; }} else {{ ply_inc({2}); }}",
+                    held.c,
+                    unit_word(),
+                    w.c
+                ));
+                self.taken.insert(w.c.clone());
+            }
             return Ok(V {
                 k: Kind::Boxed,
                 c: w.c,
