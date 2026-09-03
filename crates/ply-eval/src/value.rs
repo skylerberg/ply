@@ -742,8 +742,10 @@ impl Fixed {
         }
     }
 
-    /// `f(a, b)` in `i128`, refused if it leaves the type. `i128` is wide enough that no product
-    /// of two 64-bit values overflows *it*, so the check below is the whole of the check.
+    /// `f(a, b)` in `i128`, refused if it leaves the type -- and refused too if it leaves `i128`,
+    /// which a product of two `U64`s does: `(2^64 - 1)^2` is past `i128::MAX`. So the closure
+    /// answers with an `Option` and the caller uses `i128`'s own checked arithmetic, rather than
+    /// this relying on the wider type to be wide enough.
     pub fn checked(self, other: Fixed, f: impl Fn(i128, i128) -> Option<i128>) -> Option<Fixed> {
         let v = f(self.value(), other.value())?;
         Fixed::of(self.ty, v)
@@ -751,8 +753,13 @@ impl Fixed {
 
     /// The same operation with the answer taken modulo the width: what `wrap_add` and its siblings
     /// mean, and the only way this tree ever wraps.
-    pub fn wrapping(self, other: Fixed, f: impl Fn(i128, i128) -> i128) -> Fixed {
-        Fixed::new(self.ty, f(self.value(), other.value()) as u64)
+    ///
+    /// Over the *bits*, not the values. Two's complement makes `+`, `-` and `*` agree on the
+    /// pattern whether the type is signed or not, once the answer is cut to the width -- and
+    /// going through `value()` instead would have to hold a `U64` product, which no signed 128-bit
+    /// integer can.
+    pub fn wrapping(self, other: Fixed, f: impl Fn(u128, u128) -> u128) -> Fixed {
+        Fixed::new(self.ty, f(self.raw() as u128, other.raw() as u128) as u64)
     }
 }
 

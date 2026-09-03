@@ -66,9 +66,14 @@ impl CTy {
                 "Int" => CTy::Int,
                 "Bool" => CTy::Bool,
                 "Bytes" => CTy::Bytes,
+                // A width past sixty-two bits is not an immediate, so carrying one in a register
+                // would need a heap object of its own kind and a test for it -- the cost the
+                // family exists to remove. `jit::carried_width` draws the line in the same place
+                // and for the same reason; a `U64` left in a register here loses its top bit to
+                // the tag on the way into a record.
                 other => match IntTy::from_name(other) {
-                    Some(t) => CTy::Num(t),
-                    None => CTy::Unknown,
+                    Some(t) if t.bits() < 64 => CTy::Num(t),
+                    _ => CTy::Unknown,
                 },
             },
             Type::Con(name, args) if name.as_str() == "List" && args.len() == 1 => CTy::List,
@@ -127,6 +132,12 @@ pub fn ctype(k: Kind) -> &'static str {
 }
 
 /// The unsigned C type of a width, which every operation defined to wrap is computed in.
+/// Whether a value of this width is carried in a register at all. The same line
+/// `jit::carried_width` draws, for the same reason: past sixty-two bits the tag has nowhere to go.
+fn carried(t: IntTy) -> bool {
+    t.bits() < 64
+}
+
 fn utype(t: IntTy) -> &'static str {
     match t.bits() {
         8 => "uint8_t",
@@ -276,7 +287,17 @@ impl<'a> Emit<'a> {
     /// Bind an expression to a fresh local of its kind's C type, so that evaluation order is the
     /// order the statements are in and nothing is evaluated twice.
     fn bind(&mut self, k: Kind, expr: impl AsRef<str>) -> V {
-        self.bind_as(k, CTy::Unknown, expr)
+        // A scalar kind *is* its type; only a word leaves the type open. Deriving it here rather
+        // than at each of the several dozen call sites is what keeps a width attached to the value
+        // carrying it: `wrap_add` bound its answer at `Kind::Num(U32)` with no type beside it, so
+        // the record built from sixteen of them looked to have sixteen fields of unknown type.
+        let ty = match k {
+            Kind::Int => CTy::Int,
+            Kind::Bool => CTy::Bool,
+            Kind::Num(t) => CTy::Num(t),
+            Kind::Boxed => CTy::Unknown,
+        };
+        self.bind_as(k, ty, expr)
     }
 
     fn bind_as(&mut self, k: Kind, ty: CTy, expr: impl AsRef<str>) -> V {
@@ -359,6 +380,26 @@ impl<'a> Emit<'a> {
         }
     }
 
+    /// Whether a value may be read as an `Int` at all. A raw register is one by construction; a
+    /// word is one only if the checker said so.
+    ///
+    /// Nothing else can be: `rt_unbox_int` raises on a `Float`, a `Decimal` and on the two widths
+    /// this tier does not carry, so an operator reaching for `as_int` on an unknown word is a body
+    /// that would answer with a diagnostic where the interpreter answers with a number. Refusing
+    /// is the tier's answer to that, and it is the same answer it gives a lambda.
+    fn int_like(v: &V) -> bool {
+        v.k != Kind::Boxed || v.ty == CTy::Int
+    }
+
+    fn refuse_unless_int(&self, l: &V, r: &V, what: &str) -> Result<()> {
+        if Self::int_like(l) && Self::int_like(r) {
+            return Ok(());
+        }
+        self.refuse(format!(
+            "`{what}` over a value whose type the fragment does not fix"
+        ))
+    }
+
     fn as_bool(&mut self, v: &V) -> String {
         match v.k {
             Kind::Bool => v.c.clone(),
@@ -413,11 +454,19 @@ impl<'a> Emit<'a> {
                 c: format!("INT64_C({i})"),
                 ty: CTy::Int,
             }),
-            Lit::Fixed { ty, bits } => Ok(V {
+            Lit::Fixed { ty, bits } if ty.bits() < 64 => Ok(V {
                 k: Kind::Num(*ty),
                 c: format!("(({}){})", ctype(Kind::Num(*ty)), *bits as i64),
                 ty: CTy::Num(*ty),
             }),
+            // A sixty-four bit literal is a constant like any other: it goes in the pool, where
+            // the value keeps every bit, rather than into a register the tag would clip.
+            Lit::Fixed { .. } => {
+                let index = self.unit.constant(value.clone());
+                let v = self.bind(Kind::Boxed, format!("rt_lit_p(ctx, {index})"));
+                self.check();
+                Ok(v)
+            }
             Lit::Bool(b) => Ok(V {
                 k: Kind::Bool,
                 c: (if *b { "1" } else { "0" }).to_string(),
@@ -608,6 +657,7 @@ impl<'a> Emit<'a> {
                         Ok(self.bind(Kind::Num(t), format!("({a}) {c} ({b})")))
                     }
                     None => {
+                        self.refuse_unless_int(&l, &r, c)?;
                         let a = self.as_int(&l);
                         let b = self.as_int(&r);
                         Ok(self.bind(Kind::Int, format!("({a}) {c} ({b})")))
@@ -629,6 +679,7 @@ impl<'a> Emit<'a> {
                         Ok(self.bind(Kind::Bool, format!("({a}) {c} ({b})")))
                     }
                     None => {
+                        self.refuse_unless_int(&l, &r, c)?;
                         let a = self.as_int(&l);
                         let b = self.as_int(&r);
                         Ok(self.bind(Kind::Bool, format!("({a}) {c} ({b})")))
@@ -636,6 +687,8 @@ impl<'a> Emit<'a> {
                 }
             }
             BinOp::Eq | BinOp::Ne => {
+                // Equality has a runtime path that is right for every value, so this one only
+                // has to decide when the cheap comparison is *also* right -- no refusal needed.
                 let native = width.is_some()
                     || (l.k == Kind::Int && r.k == Kind::Int)
                     || (l.k == Kind::Bool && r.k == Kind::Bool);
@@ -696,6 +749,7 @@ impl<'a> Emit<'a> {
                 self.narrow(&wide, t, matches!(op, BinOp::Sub))
             }
             None => {
+                self.refuse_unless_int(l, r, "arithmetic")?;
                 let a = self.as_int(l);
                 let b = self.as_int(r);
                 match op {
@@ -749,6 +803,7 @@ impl<'a> Emit<'a> {
                 Ok(self.bind(Kind::Num(t), e))
             }
             None => {
+                self.refuse_unless_int(l, l, "a shift")?;
                 let a = self.as_int(l);
                 let e = match op {
                     BinOp::Shl => format!("(int64_t)((uint64_t)({a}) << {})", count.c),
@@ -913,7 +968,7 @@ impl<'a> Emit<'a> {
                 Some(n) => {
                     self.tokens.insert(n);
                     self.line(format!(
-                        "if (tok{n} == 0) {{ tok{n} = rt_reset_p(ctx, {base_local}); }} else {{ rt_dec_p(ctx, {base_local}); }}"
+                        "if (tok{n} == 0) {{ tok{n} = ply_reset_flat({base_local}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {base_local}); }} else {{ rt_dec_p(ctx, {base_local}); }}"
                     ));
                 }
                 None => self.line(format!("rt_dec_p(ctx, {base_local});")),
@@ -948,6 +1003,16 @@ impl<'a> Emit<'a> {
     /// runtime, and the round after that, for a hundred and sixty calls per compression.
     fn emit_record(&mut self, names: &[Symbol], words: Vec<String>, kinds: Vec<CTy>) -> V {
         let shape = self.unit.shape(names);
+        // A record of nothing but immediates holds no counts, and saying so is what lets the
+        // runtime skip walking its fields when it dies or is freed. The kernel's records are
+        // sixteen scalars each and this tier was leaving the flag clear, so every death walked
+        // sixteen children to decide there was nothing there.
+        //
+        // `Int` does not count, and the distinction is the whole of the correctness here: a width
+        // this tier carries is under sixty-three bits and always an immediate, but an `Int` past
+        // `2^62` is a heap object, and a record marked flat never lets its children go.
+        let flat = !kinds.is_empty() && kinds.iter().all(|k| matches!(k, CTy::Num(_) | CTy::Bool));
+        let flags = i32::from(flat);
         let ty = CTy::Record(names.iter().cloned().zip(kinds).collect());
         let n = words.len();
         self.tokens.insert(n);
@@ -956,13 +1021,16 @@ impl<'a> Emit<'a> {
         self.depth += 1;
         self.line(format!("{0} = tok{n}; tok{n} = 0;", r.c));
         self.line(format!(
-            "ply_obj({0})->rc = 1; ply_obj({0})->flags = 0; ply_obj({0})->len = {n}; ply_obj({0})->layout = {shape};",
+            "ply_obj({0})->rc = 1; ply_obj({0})->flags = {flags}; ply_obj({0})->len = {n}; ply_obj({0})->layout = {shape};",
             r.c
         ));
         self.depth -= 1;
         self.line("} else {");
         self.depth += 1;
-        self.line(format!("{0} = rt_alloc_p(ctx, 3, {n}, {shape}, 0);", r.c));
+        self.line(format!(
+            "{0} = rt_alloc_p(ctx, 3, {n}, {shape}, {flags});",
+            r.c
+        ));
         self.line("if (ctx->failed) return 0;");
         self.depth -= 1;
         self.line("}");
@@ -1159,6 +1227,7 @@ impl<'a> Emit<'a> {
                 Builtin::WrapAdd | Builtin::WrapSub | Builtin::WrapMul | Builtin::Rotr
             )
             && let Kind::Num(t) = vals[0].k
+            && carried(t)
         {
             let u = utype(t);
             let a = self.as_num(&vals[0], t);
@@ -1186,6 +1255,7 @@ impl<'a> Emit<'a> {
         }
         if args.len() == 1
             && let Some(t) = b.converts_into()
+            && carried(t)
         {
             let n = self.as_int(&vals[0]);
             let held = self.bind(Kind::Int, n);

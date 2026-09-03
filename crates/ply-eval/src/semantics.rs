@@ -498,15 +498,17 @@ fn fixed_arithmetic(
     span: Span,
 ) -> Result<Value, Diagnostic> {
     let (result, what) = match op {
-        BinOp::Add => (a.checked(b, |x, y| Some(x + y)), "addition"),
-        BinOp::Sub => (a.checked(b, |x, y| Some(x - y)), "subtraction"),
-        BinOp::Mul => (a.checked(b, |x, y| Some(x * y)), "multiplication"),
+        BinOp::Add => (a.checked(b, i128::checked_add), "addition"),
+        BinOp::Sub => (a.checked(b, i128::checked_sub), "subtraction"),
+        // Checked in `i128` too: two `U64`s near the top multiply past `i128::MAX`, and a product
+        // that leaves the wider type has certainly left the narrower one.
+        BinOp::Mul => (a.checked(b, i128::checked_mul), "multiplication"),
         BinOp::Div if b.value() == 0 => return Err(err_zero_divisor(rspan, "division")),
         // Truncating toward zero, as `Int`'s is. Only one pair overflows: the signed minimum
         // divided by minus one, whose quotient is one past the maximum.
-        BinOp::Div => (a.checked(b, |x, y| Some(x / y)), "division"),
+        BinOp::Div => (a.checked(b, i128::checked_div), "division"),
         _ if b.value() == 0 => return Err(err_zero_divisor(rspan, "remainder")),
-        _ => (a.checked(b, |x, y| Some(x % y)), "remainder"),
+        _ => (a.checked(b, i128::checked_rem), "remainder"),
     };
     match result {
         Some(v) => Ok(Value::Fixed(v)),
