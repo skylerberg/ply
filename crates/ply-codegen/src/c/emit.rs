@@ -1172,6 +1172,12 @@ impl<'a> Emit<'a> {
         if flat && let Some(vals) = built_from.clone() {
             let name = self.fresh();
             self.record_locals.push(name.clone());
+            // Cleared where the record is *described*, not only where it is built. A description
+            // inside a loop runs once per iteration and must describe a new record each time; the
+            // guard in `materialise` would otherwise hand back the one the first iteration built,
+            // with the first iteration's contents. That is a wrong answer rather than a crash, and
+            // it showed as a wrong digest on an input long enough to loop.
+            self.line(format!("{name} = 0;"));
             self.deferred.insert(
                 name.clone(),
                 Deferred {

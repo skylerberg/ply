@@ -173,6 +173,10 @@ pub fn bytes_sum(b: Bytes) -> Int =
     else { Continue({i: s.i + 1, acc: s.acc + bytes_at(b, s.i)}) })
 pub fn shifted(a: Int, n: Int) -> Int = (a << n) + (a >> n) + (a >>> n)
 pub fn matched(n: Int) -> Int = match n { 0 -> 100, 1 -> 200, _ -> n * 3 }
+pub fn looped(n: Int) -> Int =
+  iterate({i: 0, q: {a: 1u32, b: 2u32, c: 3u32, d: 4u32}}, n + 1, |s: {i: Int, q: Quad}|
+    if s.i >= n { Stop(int_of_u32(s.q.a ^ s.q.b ^ s.q.c ^ s.q.d)) }
+    else { Continue({i: s.i + 1, q: g(s.q, u32_of_int(s.i))}) })
 "#;
     let Some((loaded, native)) = tests_support::unit(source) else {
         return;
@@ -182,6 +186,12 @@ pub fn matched(n: Int) -> Int = match n { 0 -> 100, 1 -> 200, _ -> n * 3 }
         ("m.mixed", vec![ply_eval::Value::Int(0xDEAD_BEEF)]),
         ("m.mixed", vec![ply_eval::Value::Int(0)]),
         ("m.counted", vec![ply_eval::Value::Int(40)]),
+        // A record built at one site but *described* once per iteration. The tier holds such a
+        // record back and builds it on demand, and the build has to describe a new one each time
+        // round -- reusing the first iteration's object is a wrong answer, not a crash, and it
+        // takes an input long enough to loop before anything notices.
+        ("m.looped", vec![ply_eval::Value::Int(1)]),
+        ("m.looped", vec![ply_eval::Value::Int(7)]),
         (
             "m.bytes_sum",
             vec![ply_eval::Value::bytes(b"the quick brown fox")],
