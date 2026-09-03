@@ -1753,10 +1753,13 @@ establish that none moved. A process that already knows does not pay it.
 
 What an iteration costs today:
 
-- **Nothing changed.** A stat of each file, and no front end at all.
-- **Something changed.** The front end again, as a fresh invocation would run
-  it. The driver builds its tables over the whole program whatever moved, so
-  this is the part still to do; ADR 0037 carries it.
+- **A save that changed no byte** — the common case, since a save is what wakes
+  the loop and most saves change one file or none: a read of the files whose
+  timestamps moved, and no front end at all. The front end is a function of the
+  bytes, so bytes that did not change have the front end they had.
+- **A save that changed something.** The front end again, as a fresh invocation
+  would run it. The driver works over the whole program whatever moved, so this
+  is the part still to do; ADR 0038 says what finishing it would mean.
 
 Under `--json` each iteration prints one report, so a stream of them is a
 stream of objects. `Ctrl-C` ends the loop; anything the caches learned that has

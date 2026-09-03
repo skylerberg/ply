@@ -271,7 +271,7 @@ fn a_corrupt_backend_neither_reads_nor_writes_the_cache() {
 /// The warm process, end to end: one invocation, two runs, and the second one does not pay a front
 /// end at all because the tree it holds is the tree on disk.
 #[test]
-fn watch_runs_again_when_the_tree_moves_and_holds_what_did_not() {
+fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
     let dir = project(GREEN);
     let mut child = std::process::Command::new(assert_cmd::cargo::cargo_bin("ply"))
         .current_dir(dir.path())
@@ -290,11 +290,12 @@ fn watch_runs_again_when_the_tree_moves_and_holds_what_did_not() {
         let _ = tx.send(text);
     });
 
-    // Let the first iteration land, touch the module without changing what it says, and give the
-    // second one room. The waits are budgets rather than measurements: nothing here asserts on
-    // elapsed time, only on how many iterations happened and what each of them said.
+    // Let the first iteration land, then save the module byte for byte as it already is — the
+    // common case in a loop, and the one that must not cost a front end. The waits are budgets
+    // rather than measurements: nothing here asserts on elapsed time, only on how many iterations
+    // happened and what each of them said.
     std::thread::sleep(std::time::Duration::from_secs(2));
-    std::fs::write(dir.path().join("m.ply"), format!("{GREEN}\n// nudged\n")).unwrap();
+    std::fs::write(dir.path().join("m.ply"), GREEN).unwrap();
     std::thread::sleep(std::time::Duration::from_secs(5));
     let _ = child.kill();
     let _ = child.wait();
@@ -315,6 +316,23 @@ fn watch_runs_again_when_the_tree_moves_and_holds_what_did_not() {
     for (i, report) in reports.iter().enumerate() {
         assert_eq!(report["ok"], Value::Bool(true), "iteration {i}: {report}");
     }
+
+    // The property the warm process exists for, and the one an unarmed claim would rot around: the
+    // save changed no byte, so the second iteration re-derived no front end. A cold invocation
+    // cannot report this, because it has no front end to keep.
+    let second = &reports[1];
+    assert_eq!(
+        second["front_end"]["phases"]["total"], 0.0,
+        "a warm iteration over an unchanged tree paid a front end anyway: {}",
+        second["front_end"]
+    );
+    assert!(
+        reports[0]["front_end"]["phases"]["total"]
+            .as_f64()
+            .is_some_and(|t| t > 0.0),
+        "the first iteration paid no front end either, so the assertion above proves nothing: {}",
+        reports[0]["front_end"]
+    );
 }
 
 #[test]

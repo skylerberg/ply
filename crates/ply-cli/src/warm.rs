@@ -7,6 +7,7 @@
 //! nothing. This holds what a second iteration would otherwise re-establish.
 
 use crate::load::Loaded;
+use ply_store::ContentHash;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -24,6 +25,11 @@ type Stamp = (Option<SystemTime>, u64);
 pub struct Warm {
     held: Option<Loaded>,
     stamps: BTreeMap<PathBuf, Stamp>,
+    /// What each file *said* when the held state was built from it. A stamp is a cheap reason to
+    /// skip reading; this is the reason to skip everything else, and it is why a file that was
+    /// written without being changed — a save with no edit, which is most saves — costs a read
+    /// rather than a front end.
+    content: BTreeMap<PathBuf, ContentHash>,
 }
 
 /// Why an iteration did or did not reuse what the last one built.
@@ -48,15 +54,37 @@ impl Warm {
         let Some(held) = held else {
             return (None, Reuse::Cold);
         };
+        // A file appearing or disappearing changes the module set, which `held` cannot describe,
+        // and no stamp on a file that is still there would show it.
+        if discovered_more(root, &self.stamps) {
+            return (None, Reuse::Reloaded { changed: 0 });
+        }
         let now = stamps(&held.files);
-        let changed = self
+        let moved: Vec<&PathBuf> = self
             .stamps
             .iter()
             .filter(|(path, was)| now.get(*path) != Some(was))
-            .count()
-            + now.keys().filter(|p| !self.stamps.contains_key(*p)).count();
-        // A file appearing or disappearing changes the module set, which `held` cannot describe.
-        if changed == 0 && now.len() == self.stamps.len() && !discovered_more(root, &now) {
+            .map(|(path, _)| path)
+            .collect();
+        if moved.is_empty() {
+            return (Some(held), Reuse::Whole);
+        }
+        // A stamp that moved is only a reason to look. The front end is a function of the bytes, so
+        // a file written with the same bytes has the same front end — and that is the common case
+        // in a loop, where a save is what wakes it and most saves change one file or none.
+        let mut changed = 0;
+        for path in moved {
+            let same = std::fs::read(path)
+                .ok()
+                .map(|bytes| ContentHash::of(&bytes))
+                .is_some_and(|hash| self.content.get(path) == Some(&hash));
+            if !same {
+                changed += 1;
+            }
+        }
+        if changed == 0 {
+            // Re-stamp, or every later iteration reads these files again to reach the same answer.
+            self.stamps = now;
             return (Some(held), Reuse::Whole);
         }
         (None, Reuse::Reloaded { changed })
@@ -65,6 +93,14 @@ impl Warm {
     /// Hold this state for the next iteration.
     pub fn keep(&mut self, loaded: Loaded) {
         self.stamps = stamps(&loaded.files);
+        self.content = loaded
+            .files
+            .iter()
+            .filter_map(|path| {
+                let bytes = std::fs::read(path).ok()?;
+                Some((path.clone(), ContentHash::of(&bytes)))
+            })
+            .collect();
         self.held = Some(loaded);
     }
 }
@@ -140,27 +176,36 @@ mod tests {
     /// A `Loaded` is expensive to build here, so the state is exercised through the two questions
     /// the watch loop actually asks: has the tree moved, and may the held state be reused.
     fn held(root: &std::path::Path, files: &[&str]) -> Warm {
-        Warm {
-            stamps: stamps(&files.iter().map(|f| root.join(f)).collect::<Vec<_>>()),
+        let paths: Vec<_> = files.iter().map(|f| root.join(f)).collect();
+        let mut warm = Warm {
+            stamps: stamps(&paths),
             ..Warm::default()
-        }
+        };
+        warm.held = Some(fake_loaded(root, files));
+        warm.content = paths
+            .iter()
+            .filter_map(|p| Some((p.clone(), ContentHash::of(&std::fs::read(p).ok()?))))
+            .collect();
+        warm
     }
 
     #[test]
     fn an_unmoved_tree_has_not_moved() {
         let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
-        let mut warm = held(dir.path(), &["m.ply"]);
-        // No held state means there is nothing to reuse, whatever the stamps say.
-        assert!(warm.tree_moved(dir.path()));
-        warm.held = Some(fake_loaded(dir.path(), &["m.ply"]));
+        let warm = held(dir.path(), &["m.ply"]);
         assert!(!warm.tree_moved(dir.path()));
+        // And with nothing held there is nothing to reuse, whatever the stamps say.
+        let bare = Warm {
+            stamps: warm.stamps.clone(),
+            ..Warm::default()
+        };
+        assert!(bare.tree_moved(dir.path()));
     }
 
     #[test]
     fn a_rewritten_file_moves_the_tree() {
         let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
-        let mut warm = held(dir.path(), &["m.ply"]);
-        warm.held = Some(fake_loaded(dir.path(), &["m.ply"]));
+        let warm = held(dir.path(), &["m.ply"]);
         std::fs::write(dir.path().join("m.ply"), "fn a() -> Int = 2222222\n").unwrap();
         assert!(
             warm.tree_moved(dir.path()),
@@ -173,8 +218,7 @@ mod tests {
     #[test]
     fn a_new_file_moves_the_tree() {
         let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
-        let mut warm = held(dir.path(), &["m.ply"]);
-        warm.held = Some(fake_loaded(dir.path(), &["m.ply"]));
+        let warm = held(dir.path(), &["m.ply"]);
         assert!(!warm.tree_moved(dir.path()));
         std::fs::write(dir.path().join("n.ply"), "fn b() -> Int = 2\n").unwrap();
         assert!(
@@ -189,8 +233,7 @@ mod tests {
             ("m.ply", "fn a() -> Int = 1\n"),
             ("n.ply", "fn b() -> Int = 2\n"),
         ]);
-        let mut warm = held(dir.path(), &["m.ply", "n.ply"]);
-        warm.held = Some(fake_loaded(dir.path(), &["m.ply", "n.ply"]));
+        let warm = held(dir.path(), &["m.ply", "n.ply"]);
         std::fs::remove_file(dir.path().join("n.ply")).unwrap();
         assert!(warm.tree_moved(dir.path()));
     }
@@ -202,8 +245,7 @@ mod tests {
         let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
         std::fs::create_dir(dir.path().join(".ply-cache")).unwrap();
         std::fs::write(dir.path().join(".ply-cache").join("frontend.ply"), "x").unwrap();
-        let mut warm = held(dir.path(), &["m.ply"]);
-        warm.held = Some(fake_loaded(dir.path(), &["m.ply"]));
+        let warm = held(dir.path(), &["m.ply"]);
         assert!(!warm.tree_moved(dir.path()));
     }
 
@@ -213,7 +255,6 @@ mod tests {
     fn taking_leaves_nothing_behind() {
         let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
         let mut warm = held(dir.path(), &["m.ply"]);
-        warm.held = Some(fake_loaded(dir.path(), &["m.ply"]));
         let (taken, reuse) = warm.take(dir.path());
         assert!(taken.is_some());
         assert_eq!(reuse, Reuse::Whole);
@@ -225,11 +266,36 @@ mod tests {
     fn a_moved_tree_is_not_reused() {
         let dir = project(&[("m.ply", "fn a() -> Int = 1\n")]);
         let mut warm = held(dir.path(), &["m.ply"]);
-        warm.held = Some(fake_loaded(dir.path(), &["m.ply"]));
         std::fs::write(dir.path().join("m.ply"), "fn a() -> Int = 999999\n").unwrap();
         let (taken, reuse) = warm.take(dir.path());
         assert!(taken.is_none());
         assert!(matches!(reuse, Reuse::Reloaded { .. }));
+    }
+
+    /// The case the whole reuse path exists for, and the one a stamp alone cannot see: the loop
+    /// wakes because a file was written, and the file says exactly what it said before. Most saves
+    /// are this, and before the content was compared the reuse path could not fire at all — the
+    /// loop only wakes when a stamp moved, and a moved stamp was taken as a changed file.
+    #[test]
+    fn a_file_written_with_the_same_bytes_is_reused_whole() {
+        let text = "fn a() -> Int = 1\n";
+        let dir = project(&[("m.ply", text)]);
+        let mut warm = held(dir.path(), &["m.ply"]);
+
+        // Rewrite it byte for byte, and put the stamp somewhere it cannot match. Set rather than
+        // waited for: a filesystem's timestamp resolution is not this test's subject, and a rewrite
+        // inside one tick would leave the stamp equal and quietly test nothing.
+        std::fs::write(dir.path().join("m.ply"), text).unwrap();
+        warm.stamps
+            .insert(dir.path().join("m.ply"), (None, u64::MAX));
+        assert!(
+            warm.tree_moved(dir.path()),
+            "the stamp did not move, so this test is not exercising the path it is about"
+        );
+
+        let (taken, reuse) = warm.take(dir.path());
+        assert_eq!(reuse, Reuse::Whole, "a save that changed nothing reloaded");
+        assert!(taken.is_some());
     }
 
     fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
