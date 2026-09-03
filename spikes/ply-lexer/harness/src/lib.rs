@@ -28,6 +28,9 @@ fn body(kind: &TokenKind) -> String {
     match kind {
         TokenKind::Ident(name) => format!("i:{name}"),
         TokenKind::Int(v) => format!("n:{v}"),
+        // `lexer.ply` has no width suffix yet, so no corpus input carries one and the two never
+        // compare here; the arm exists so this dumper builds. GAPS.md carries the divergence.
+        TokenKind::Fixed { ty, bits } => format!("w:{ty}:{bits}"),
         TokenKind::Float(v) => format!("f:{:016x}", v.to_bits()),
         TokenKind::Decimal { mantissa, scale } => format!("d:{mantissa}:{scale}"),
         TokenKind::Str(s) => format!("s:{}", hex(s.as_bytes())),
@@ -78,6 +81,7 @@ fn punct_name(kind: &TokenKind) -> &'static str {
         // Unreachable: `body` routes every payload-carrying kind above.
         TokenKind::Ident(_)
         | TokenKind::Int(_)
+        | TokenKind::Fixed { .. }
         | TokenKind::Float(_)
         | TokenKind::Decimal { .. }
         | TokenKind::Str(_)

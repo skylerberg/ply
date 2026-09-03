@@ -769,3 +769,19 @@ At 85 KB/s the front end would be the bottleneck of the build it was written to
 speed up, which is worth saying plainly: the verification-loop argument for
 self-hosting is about *incrementality*, not about throughput, and this
 measurement does not settle whether the trade is worth it.
+
+## The width suffix, and the prelude names beside it
+
+`crates/ply-syntax` lexes `255u8` and `0x6A09_E667u32` and the port does not
+(ADR 0039). The differential is corpus-driven and **no corpus input carries a
+suffixed literal**, so it is green and stays green until somebody writes one in
+— at which point the port disagrees on that input and nothing else.
+
+This is the fifth entry of the shape `README.md` predicted: a language feature
+lands in the reference and the port learns it later. Recorded when the feature
+landed rather than when the disagreement was found, which is the only difference
+from the four before it.
+
+The same holds for `infer.ply`'s prelude table, which lists `rotr32` and does not
+list `rotr` or the sixteen conversions, and for `hash.ply`'s normalizer, which
+has no tag for `Lit::Fixed`.

@@ -2249,3 +2249,19 @@ unbounded, with a test that a constant is judged by its leaves however deep
 they lie. The lesson for every measurement of a Ply front end: a nullary
 constant is free on the second call only if the memo kept it, and until this
 change nothing said whether it had.
+
+## The width suffix, and the prelude names beside it
+
+`crates/ply-syntax` lexes `255u8` and `0x6A09_E667u32` and the port does not
+(ADR 0039). The differential is corpus-driven and **no corpus input carries a
+suffixed literal**, so it is green and stays green until somebody writes one in
+— at which point the port disagrees on that input and nothing else.
+
+This is the fifth entry of the shape `README.md` predicted: a language feature
+lands in the reference and the port learns it later. Recorded when the feature
+landed rather than when the disagreement was found, which is the only difference
+from the four before it.
+
+The same holds for `infer.ply`'s prelude table, which lists `rotr32` and does not
+list `rotr` or the sixteen conversions, and for `hash.ply`'s normalizer, which
+has no tag for `Lit::Fixed`.
