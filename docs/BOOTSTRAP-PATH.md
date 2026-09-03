@@ -394,11 +394,13 @@ What the compiled loop does not have, in the order to take them:
   because the driver is one-shot. The phase report says there is no single term
   to fix: hashing is about a quarter of a warm run that rechecks nothing,
   writing back a fifth, and parsing, restoring, resolving, checking, assembling
-  and reading divide the rest, each proportional to the project. So the work is
-  to hold the front end and update it rather than to make one phase incremental,
-  and **ADR 0038** fixes what that has to mean before anyone builds it: equal to
-  a from-scratch load bit for bit, and flat in project size rather than merely
-  smaller.
+  and reading divide the rest. **ADR 0038 then measured what drives that**, and
+  the answer is not project size: an edit in a warm process costs what the tests
+  that must run *reach*, and a project whose tests are all deterministic is
+  already flat across a project sixteen times larger. What is left is one seam —
+  a module needed only to run is re-derived as though it changed — and that
+  record carries it, together with the two things that make it harder than it
+  looks.
 - **A compiled-code cache**, which the row demoted. `crates/ply-codegen`
   persists nothing across runs: no `DefHash -> code`, and `cranelift-jit` rather
   than `cranelift-object`, so there is no object output for a cache to hold, and
