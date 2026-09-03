@@ -11,9 +11,10 @@ is the series after it and `benches/front-end-whole/observation-8.txt` the
 front-end row, both under their own pre-registrations. What they say: the
 record kernel is inside the bar since Decision 9; the integer kernel is
 outside it by a smaller factor than at the re-take — its round is
-straight-line arithmetic over one record rebuilt in place since Decision 8,
-and what remains is that arithmetic, every add checked and every word masked
-as the source writes it, and the records the source keeps alive by shape; and
+straight-line arithmetic over one record rebuilt in place since Decision 8.
+**What remains is not what this record first said it was**: it named the
+checked adds, the masks and the records, and `k1-where.sh` prices all three and
+finds the gap elsewhere. See §"What remains of the integer kernel"; and
 the whole front end under the backend is under a second of wall time where it
 was several before ADR 0035 and tens interpreted, every phase entered whole,
 and every test entered whole since Decision 7.
@@ -272,9 +273,90 @@ propagates a `let` of a scalar literal to its reads and folds an operator over
 two literals, so a count a callee named is a literal where the shift happens
 and needs no check.
 
-What remains of the integer kernel is the compiled arithmetic with each add
-checked, the state records loaded and stored once per round where Rust holds
-them in registers, and the records the source keeps alive by shape.
+## What remains of the integer kernel
+
+This section said the arithmetic with each add checked, the state records, and
+the records the source keeps alive by shape. `benches/value-model/k1-where.sh`
+prices each of those and **none of them is the gap.** Its
+`observation-k1-where.txt` is the reading:
+
+- **The checked adds cost nothing.** A build that emits a plain add for every
+  `+`, with no overflow check anywhere, hashes no faster: the gate's ratio moved
+  from 7.25 to 7.39, which is the run-to-run spread. The checks are a
+  never-taken branch the predictor gets right, and they sit off the critical
+  path. In a tight arithmetic loop with nothing else in it they are worth under
+  a tenth, which is what made them look like a cause.
+- **The masks are worth about that much too**, by the same tight loop.
+- **The records are a fifth.** Loading the words is a quarter of the hash and
+  compressing them the rest; the field traffic in one `round` is a third of its
+  stack traffic.
+
+**What the gap is: the round spills.** One `round` compiles to seven thousand
+bytes, and in it are four hundred and fourteen stack loads and a hundred and ten
+stack stores — against a hundred and forty-two loads of the record fields it is
+actually reading. Eight quarter-rounds that the Rust bar does in about a dozen
+instructions each. The state is sixteen words and the message sixteen more, all
+live across the round, and every one of them is a sixty-four-bit tagged word
+whose every operation needs a temporary the allocator has no register for.
+
+So the lever is not the arithmetic, it is **how many registers a word costs**.
+Ply has one integer type, so neither the source nor the checker can say that
+these values are thirty-two-bit, and the code generator cannot infer it through
+a record field. Until something can, the round will hold two words where the bar
+holds one, and no peephole over the arithmetic reaches it.
+
+`PLY_CODEGEN_ASM=<name>` is what found this, and it is in the tree because two
+cheaper instruments said nothing first: the gate's own ratio, and a sampling
+profiler that cannot see through compiled frames.
+
+### Levers tried on this, and what each was worth
+
+Written down because each looked like the answer and none of them is, and the
+next reader would otherwise spend the same day:
+
+| lever | effect |
+| --- | --- |
+| emit a plain add for every `+`, no overflow check anywhere | none; the ratio moved within its spread |
+| untag a field read with no tag test and no join | a tenth |
+| both of those together | a fourteenth, and half the code size — the code removed was cold |
+| raise the inline budget until a `round` folds into `compress` | **four times worse**; it raises pressure rather than relieving it |
+| sink a single-use field read to its use, to shorten live ranges | spills went *up*, time unchanged; the scheduler was already placing them |
+
+The last two are the useful ones: they say the function is not short of
+instructions to remove, it is short of registers, and anything that lengthens a
+live range or adds one costs more than the instructions it saves.
+
+### The two listings, side by side
+
+The bar is not doing anything exotic — no vector register appears anywhere in
+it. Its `round` is the same eight quarter-rounds, and it is **138 instructions
+with two stack operations**, of which:
+
+| | Rust `round` | Ply `round` |
+| --- | --- | --- |
+| add | 48 | 96, each with an overflow branch |
+| xor | 32 | 64 |
+| rotate | 32, one instruction each | 64, each narrowed and widened around |
+| mask | **none** | 330 |
+| loads | 17, in pairs (`ldp`) | 142 field loads, each with a tag test |
+| stores | 9, in pairs (`stp`) | 86 |
+| stack traffic | 2 | 524 |
+
+**One fact explains the first four rows.** Rust's words are `u32` in `w`
+registers: wrapping is what the register does, so there is nothing to mask, and
+a rotate is `ror w, w, #16`. Ply's are `Int`, which is a sixty-four-bit tagged
+word, so every add needs a mask after it, every rotate narrows and widens around
+itself, and every read out of a record needs its tag tested.
+
+The fifth and sixth rows follow from the same fact: two `u32` next to each other
+are one `ldp`, and two tagged words are two loads.
+
+So the gap is not the arithmetic, the checks, the records or the allocator. It is
+that **Ply has one integer type and it is not the one this algorithm is written
+in.** Nothing in the source, the checker or the code generator can say that a
+value is thirty-two bits wide, and every one of the differences above is what
+that costs. A bar of three would need most of them gone, and no peephole reaches
+any of them.
 
 ## Decision 12 — a parameter the body only reads is borrowed
 
