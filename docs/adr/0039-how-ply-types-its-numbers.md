@@ -3,7 +3,9 @@
 **Accepted for the language surface. The performance claim it was motivated by
 has now been taken and it did not clear: the integer kernel moved from about
 seven times the Rust bar to about six, against a bar of three.** §"What the gate
-said" is the reading, registered before the arm existed and unchanged since. It adds eight scalar types, one literal form, one
+said" is the reading, registered before the arm existed and unchanged since —
+except for what it attributed the remainder to, which
+`docs/adr/0040-what-a-second-code-generator-is-for.md` measured and corrected. It adds eight scalar types, one literal form, one
 diagnostic code, seventeen prelude names and one normalizer tag. It refuses
 three things: a modular type whose `+` wraps, arbitrary bit widths, and a
 literal that is a value of more than one type.
@@ -268,17 +270,21 @@ and the allocator spills; borrow the records and the allocation it saved costs
 more; untag the fields and the allocator takes back two thirds; sink the loads
 and the mid-end undoes it; stop the mid-end and lose more than the spills cost.
 ADR 0036 recorded the same result in the same words before any of them —
-*spills went up, time unchanged*. The binding constraint is Cranelift's register
-allocator over a body with thirty-two live values, and it is not something a
-type, or an IR, or a flag can move.
+*spills went up, time unchanged*. Every lever inside this tier is spent, and
+that much stands.
 
-**So the bar is not reachable from the type system, and the probe says what it
-is reachable from.** `width-probe`'s `i64t` arm is Ply's compiled representation
-exactly — tagged words, masked and checked, in a memory-resident sixteen-field
-record — and under LLVM it is **1.21 times the bar**, inside a bar of three with
-room to spare. The representation was never what stood between this kernel and
-its bar. The code generator is, and
-`docs/adr/0037-the-loop-is-the-goal.md` is where that is decided.
+**So the bar is not reachable from the type system.** What it *is* reachable
+from was answered wrongly here and is answered in
+`docs/adr/0040-what-a-second-code-generator-is-for.md`. What was written here
+read the exhausted levers as naming Cranelift's register allocator the binding
+constraint, and read `width-probe`'s 1.21× as clearing the representation of
+suspicion. A second code generator has since been built and held to the same
+gate: clang emits this round in 321 instructions where Cranelift emits 706, with
+the arithmetic within three instructions of the Rust bar's — and the kernel does
+not move. The allocator was not the constraint. The 182 instructions the C tier
+spends above the bar are the tag coming off each word and the record going to
+memory and back, and two thirds of the kernel is in bodies neither this section
+nor the probe measured.
 
 **What this record leaves the tier is a kernel it can actually clear.** `U32`
 arithmetic in `w` registers is what a C compiler wants to be handed; the masks

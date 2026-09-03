@@ -1755,6 +1755,16 @@ and the replay command.
 twice — once with it and once without — and fails the run on any disagreement
 (`E0503`). It is off by default because it doubles what a run costs.
 
+The flag always takes a value, and there are three. `reference` is a nested
+machine over the same fragment, which is what the seam is checked against rather
+than a way to go faster. `cranelift` compiles to native code in process, and is
+the one to reach for. `c` emits the same code as C, hands it to `cc`, and loads
+the result — far slower to compile, and not what you want in a loop, but its
+bodies carry symbols, so a sampling profiler and a disassembler can both read
+what a definition became. `PLY_C_KEEP=1` leaves the `.c` and the shared object
+behind for that; `PLY_C_REFUSALS=1` says which definitions the tier declined and
+why, since a definition a tier refuses is left to the machine.
+
 A run with a backend attached does use the result cache, in a namespace of its
 own. A stored pass names the engine that earned it, so a backed run selects
 against what backed runs proved and never against what the machine proved, and
@@ -3011,7 +3021,7 @@ is `E0127` with exit code 2 (§6.7).
 | `--bisect auto\|always\|never` | attribute a failure to the change that caused it |
 | `--bisect-budget N` | hybrid programs a bisection may evaluate (default 64) |
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
-| `--backend BACKEND` | attach a compiled backend to the machine |
+| `--backend BACKEND` | attach a compiled backend: `reference`, `cranelift` or `c` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
 | `--audit-backend` | also run each test without the backend and fail on any disagreement |
 | `--host` | bind the real host handlers |
 | `--std` | also select the tests the shipped modules declare |
