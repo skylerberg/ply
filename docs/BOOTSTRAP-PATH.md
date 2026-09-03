@@ -339,8 +339,13 @@ measurement is confounded until the earlier one has moved.
    checked adds at nothing, the masks at a few percent and the records at a
    fifth, and finds a round that spills four hundred times because every word
    is a sixty-four-bit tagged value and thirty-two of them are live at once.
-   Ply has one integer type, so nothing in the source or the checker can say a
-   value is thirty-two bits; ADR 0036 carries what that means.
+   Ply had one integer type, so nothing in the source or the checker could say a
+   value is thirty-two bits. **ADR 0039 gave it eight more and the kernel moved
+   from about seven times the bar to about six** — every mask, tag test and
+   narrow-and-widen the listing named is gone, and what is left is the seven
+   state records per compress living in memory, which only inlining removes and
+   which this tier's register allocator is measurably worse for. The kernel is
+   still outside the bar, and the reason is now step 10's rather than step 9's.
 10. **Emit C, for release; inside the loop it is priced and not chosen.** Where
     the path ends, decided as a direction and gated on step 9: the eventual host
     is a C compiler and libc, with the compiler and its runtime written in Ply,
