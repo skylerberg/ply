@@ -46,19 +46,15 @@ echo "load-before $l" >> "$raw"
 
 "$ply" test "$dir" --no-cache --jobs 1 --filter "kernel:nothing-matches" >/dev/null 2>&1 || true
 
-ply_arm() {                       # prints "k1=<ms> k2=<ms>" from the report a user reads
-  "$ply" test "$dir" --no-cache --jobs 1 --filter "kernel:" --backend "$backend" --json 2>/dev/null |
-    python3 -c 'import json,sys
-r=json.load(sys.stdin)
-out={}
-for t in (r.get("tests") or r.get("results") or []):
-    n=t.get("name") or ""
-    if not t.get("passed", True) and t.get("status") not in (None, "ok", "passed"):
-        sys.exit("a kernel failed: %s" % n)
-    if "k1" in n: out["k1"]=t.get("duration_ms")
-    if "k2" in n: out["k2"]=t.get("duration_ms")
-print("k1=%s k2=%s" % (out.get("k1"), out.get("k2")))'
-}
+# The Ply arm, measured the way the Rust arm is: one process, the kernel called directly, the
+# minimum over repeats. It used to be `ply test --json`, which runs a kernel *once* per process —
+# so at k1's fifth of a millisecond the arm carried a whole run's fixed cost where the Rust arm
+# carried none of it, and the ratio moved by 1.5 points between invocations at one load. It is
+# 0.20 now. See `observation-in-process.txt`; the readings before it are not comparable to the
+# ones after, and that is the point of the change rather than a side effect of it.
+(cd "$root" && cargo build --release --quiet -p ply-arm)
+armbin="$root/target/release/ply-arm"
+ply_arm() { "$armbin" "$dir" "$backend" | sed 's/ digest=.*//'; }
 
 rust_arm() { "$bars" | sed 's/ digest=.*//'; }
 
