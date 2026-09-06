@@ -120,6 +120,34 @@ pub mod tests_support {
         with_refusals(text).map(|(s, n, _)| (s, n))
     }
 
+    /// The same, with a key per definition so the emit cache is live. The keys only have to be
+    /// stable and distinct — the cache asks nothing else of them — so the name is one.
+    pub fn keyed(text: &str) -> Option<&'static Source> {
+        let mut sources = ply_span::SourceMap::new();
+        let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
+        let id = sources.add("m.ply", owned.to_string());
+        let mut ast =
+            ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
+        let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
+        let check = ply_core::check_program(&ast, &resolved).expect("checks");
+        let bare = Source::new(
+            Box::leak(Box::new(ast)),
+            Box::leak(Box::new(resolved)),
+            Box::leak(Box::new(check)),
+        );
+        let keys = bare
+            .functions()
+            .into_iter()
+            .map(|n| (n.clone(), format!("h-{n}")))
+            .collect();
+        let program = bare.program;
+        let resolved = bare.resolved;
+        let check = bare.check;
+        Some(Box::leak(Box::new(Source::keyed(
+            program, resolved, check, keys,
+        ))))
+    }
+
     pub fn with_refusals(
         text: &str,
     ) -> Option<(&'static Source, Native, Vec<crate::jit::Refused>)> {
@@ -458,4 +486,73 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
         let got = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
         assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
     }
+}
+
+/// A run that compiles fewer definitions must not poison the next one that compiles more.
+///
+/// A refusal is cached, because refusing costs the inliner in full and a definition this tier
+/// will not take pays that on every run. It is keyed on the digest of what was *offered*, because
+/// a body is refused when something it calls was not — so the two have to be the same set. They
+/// were not: the instruments that narrow the offered set filtered it after the digest was taken,
+/// so a narrowed run's refusals were served back to an unfiltered one. The unit that came out had
+/// bodies compiled against a program that never existed, and it segfaulted rather than answering
+/// wrongly, which is the only lucky thing about it.
+#[test]
+fn a_narrower_run_does_not_poison_a_wider_one() {
+    let source = r#"
+fn twice(n: Int) -> Int = n * 2
+// Recursive, so the inliner leaves it a call: withholding it has to refuse `both`, and an
+// inlined callee would be part of `both`'s body and refuse nothing.
+fn thrice(n: Int) -> Int = if n <= 0 { 0 } else { 3 + thrice(n - 1) }
+pub fn both(n: Int) -> Int = twice(n) + thrice(n)
+pub fn alone(n: Int) -> Int = twice(n)
+"#;
+    let dir = std::env::temp_dir().join(format!("ply-c-poison-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    // Safe here and only here: `cargo nextest` gives each test its own process.
+    unsafe { std::env::set_var("PLY_C_CACHE", &dir) };
+
+    let Some(loaded) = tests_support::keyed(source) else {
+        return;
+    };
+    let all: Vec<String> = loaded.functions();
+    let all: Vec<&str> = all.iter().map(String::as_str).collect();
+
+    let answer = |native: &Native, name: &str, n: i64| -> Option<i64> {
+        let entry: crate::jit::Entry = native.entry(name)?;
+        let mut ctx = native.context();
+        ctx.fuel = 10_000;
+        let words = [crate::heap::imm(n)];
+        let w = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised");
+        Some(crate::heap::imm_value(w))
+    };
+
+    let (wide, _) = crate::c::build(loaded, &all, crate::jit::Opts::default()).expect("builds");
+    assert_eq!(answer(&wide, "m.both", 5), Some(25));
+    drop(wide);
+
+    // The same offered set, narrowed by the instrument rather than by the caller. This is the
+    // path the digest has to follow: `names` is unchanged, so a digest taken before the filter is
+    // the same digest, and the refusals below land under the wider run's key.
+    unsafe { std::env::set_var("PLY_C_SKIP", "m.thrice") };
+    let (narrowed, refused) =
+        crate::c::build(loaded, &all, crate::jit::Opts::default()).expect("builds");
+    assert!(
+        refused.iter().any(|r| r.function == "m.both"),
+        "`m.both` calls a definition this build was not offered: {refused:?}"
+    );
+    assert_eq!(answer(&narrowed, "m.alone", 5), Some(10));
+    drop(narrowed);
+
+    unsafe { std::env::remove_var("PLY_C_SKIP") };
+    // The one that used to come back wrong.
+    let (again, refused) =
+        crate::c::build(loaded, &all, crate::jit::Opts::default()).expect("builds");
+    assert!(
+        refused.is_empty(),
+        "the wider build was served the narrower one's refusals: {refused:?}"
+    );
+    assert_eq!(answer(&again, "m.both", 5), Some(25));
+    let _ = std::fs::remove_dir_all(&dir);
 }

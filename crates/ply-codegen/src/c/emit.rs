@@ -820,7 +820,7 @@ impl<'a> Emit<'a> {
                 .src
                 .definition(&full)
                 .is_some_and(|(d, _)| d.params.is_empty())
-            && self.unit.functions.contains(&full)
+            && self.took(&full)
         {
             self.tables.calls.push(full.clone());
             let v = self.bind(Kind::Boxed, format!("{}(ctx)", mangle(&full)));
@@ -831,10 +831,16 @@ impl<'a> Emit<'a> {
         // handle-ABI entry the seam enters it by. Passing one to `map` is how most of the
         // self-hosted front end spells a callback, so without this the closure work above buys
         // the tier the lambda literals and none of the named functions.
-        if let Some(full) = self.resolve_q(q)
-            && self.unit.functions.contains(&full)
-            && let Some((def, _)) = self.src.definition(&full)
-        {
+        if let Some(full) = self.resolve_q(q) {
+            // A name the program defines shadows a builtin spelled the same way, so a definition
+            // this unit did not take has to refuse rather than fall through to the builtin behind
+            // it. `std.hash` defines `min`, and there is a builtin `min`.
+            if !self.took(&full) {
+                return self.refuse(format!("`{full}`, which is not in this compiled unit"));
+            }
+            let Some((def, _)) = self.src.definition(&full) else {
+                return self.refuse(format!("`{full}`, which resolves to no definition"));
+            };
             let arity = def.params.len();
             self.tables.calls.push(full.clone());
             let index = self.local_lambda(&format!("{}_entry", mangle(&full)));
@@ -1342,7 +1348,7 @@ impl<'a> Emit<'a> {
     }
 
     fn field(&mut self, base: &Code, name: &Symbol, own: Own) -> Result<V> {
-        let base_own = own;
+        let _ = own;
         let b = self.expr(base)?;
         let field_ty = b.ty.field(name).cloned().unwrap_or(CTy::Unknown);
         let at = b.ty.offset(name);
@@ -1381,22 +1387,24 @@ impl<'a> Emit<'a> {
         // the first field read.
         let kind = field_ty.kind();
         if kind == Kind::Boxed {
-            // ADR 0034's in-place update, which this tier did not have. When the lowering says
-            // this is the field's last use, take it *out* of a record nobody else holds rather
-            // than borrowing it and counting it again at the call: a map read out of a record and
-            // handed to `map_insert` was reaching the insert at a count of two, so every insert
-            // copied the node it meant to write. Borrowing where the record is shared, as before.
-            if base_own == Own::OwnedField
-                && let Some(at) = at
-            {
-                self.line(format!(
-                    "if (ply_obj({0})->rc == 1) {{ ply_words({0})[{at}] = {1}; }} else {{ ply_inc({2}); }}",
-                    held.c,
-                    unit_word(),
-                    w.c
-                ));
-                self.taken.insert(w.c.clone());
-            }
+            // ADR 0034's in-place field take is *not* here, and the reason is recorded rather
+            // than left to be rediscovered.
+            //
+            // It read a field marked `Own::OwnedField`, moved its count out of the record and
+            // wrote `unit` where it had been, so the next record of that shape could reuse the
+            // memory. That is correct only where nothing reads the field again, and the emitter
+            // cannot tell: the lowering marks the last use *in its own order*, and a field is read
+            // by more than `Field` nodes -- a record update copies the fields it does not write, a
+            // record pattern binds the ones it names, and the seam walks every field of a record
+            // it converts. Counting the readers it can see admitted a take in `infer.dump_outcome`
+            // whose `unit` reached `fold` as its list. Five tests of the self-hosted front end
+            // said so; `examples/` and every smaller corpus passed throughout.
+            //
+            // What it was worth, measured on the kernel ADR 0034 cites -- a map read out of a
+            // record and handed to `map_insert` -- is 30.75ms against 30.90ms, three runs each,
+            // minimum. That is nothing, and it is the whole reason this is a deletion rather than
+            // a puzzle to solve: a correct version needs the last read in *emission* order, which
+            // is a real piece of work to buy half a percent.
             return Ok(V {
                 k: Kind::Boxed,
                 c: w.c,
@@ -1940,9 +1948,10 @@ impl<'a> Emit<'a> {
     fn app(&mut self, func: &Code, args: &[Code]) -> Result<V> {
         if let NodeKind::Var { name: q, .. } = &func.kind {
             let bare = q.symbol().as_str().to_string();
-            if let Some(full) = self.resolve_q(q)
-                && self.unit.functions.contains(&full)
-            {
+            if let Some(full) = self.resolve_q(q) {
+                if !self.took(&full) {
+                    return self.refuse(format!("`{full}`, which is not in this compiled unit"));
+                }
                 let (def, _) = self.src.definition(&full).expect("resolved");
                 if def.params.len() != args.len() {
                     return self.refuse(format!("`{bare}` called with {} arguments", args.len()));
@@ -2294,12 +2303,18 @@ impl<'a> Emit<'a> {
             return None;
         };
         let full = self.resolve_q(name)?;
-        (self.unit.functions.contains(&full)
+        (self.took(&full)
             && self
                 .src
                 .definition(&full)
                 .is_some_and(|(d, _)| d.params.len() == arity))
         .then_some(full)
+    }
+
+    /// Whether the unit carries `full`. A no ends in a refusal at every caller, and a refusal is
+    /// cached against the digest of what was offered, so nothing more has to travel with it.
+    fn took(&self, full: &str) -> bool {
+        self.unit.functions.iter().any(|f| f == full)
     }
 
     /// The call a fold makes per element, where the function is one this unit compiled: straight
@@ -2681,9 +2696,66 @@ impl<'a> Emit<'a> {
                 }
                 Ok(test)
             }
-            Pat::Record { .. } | Pat::List { .. } | Pat::Lit(_) => {
-                self.refuse("a pattern this tier does not carry yet")
+            // Refutable despite the shape, and for three reasons: a record pattern fails on a
+            // value that is not a record, on a field count when there is no `..`, and on a field
+            // the value does not have. The field read is guarded by the test built so far,
+            // because `rt_field` raises on a non-record rather than answering.
+            Pat::Record { fields, rest } => {
+                let mut test = format!(
+                    "rt_record_fits_p(ctx, {}, {}, {})",
+                    v.c,
+                    fields.len(),
+                    i64::from(!*rest)
+                );
+                for (name, sub) in fields {
+                    let index = self.local_field(&name.name);
+                    test = format!("({test} && rt_record_has_p(ctx, {}, {index}))", v.c);
+                    if self.irrefutable_pat(sub) {
+                        continue;
+                    }
+                    let field = self.bind(
+                        Kind::Boxed,
+                        format!("({test} ? rt_field_p(ctx, {}, {index}, 0) : 0)", v.c),
+                    );
+                    self.check();
+                    let inner = self.test(sub, &field)?;
+                    test = format!("({test} && {inner})");
+                }
+                Ok(test)
             }
+            // A refutable `..rest` would need the tail built before it could be tested, which is a
+            // list allocated inside a test that may fail. The in-process tier draws the same line.
+            Pat::List { items, rest } => {
+                if let Some(bad) = rest.iter().find(|p| !self.irrefutable_pat(p)) {
+                    return self.refuse(format!(
+                        "a {} pattern as a list pattern's rest",
+                        pattern_name(bad)
+                    ));
+                }
+                let mut test = format!(
+                    "rt_list_fits_p(ctx, {}, {}, {})",
+                    v.c,
+                    items.len(),
+                    i64::from(rest.is_none())
+                );
+                for (i, item) in items.iter().enumerate() {
+                    if self.irrefutable_pat(item) {
+                        continue;
+                    }
+                    let at = self.bind(
+                        Kind::Boxed,
+                        format!("({test} ? rt_list_at_p(ctx, {}, {i}) : 0)", v.c),
+                    );
+                    self.check();
+                    let inner = self.test(item, &at)?;
+                    test = format!("({test} && {inner})");
+                }
+                Ok(test)
+            }
+            Pat::Lit(_) => self.refuse(format!(
+                "a {} pattern, which this tier does not carry yet",
+                pattern_name(pat)
+            )),
         }
     }
 
@@ -2750,7 +2822,34 @@ impl<'a> Emit<'a> {
                 }
                 Ok(())
             }
-            _ => self.refuse("a pattern this tier does not carry yet"),
+            Pat::Record { fields, .. } => {
+                for (name, sub) in fields {
+                    let index = self.local_field(&name.name);
+                    // `rt_field` at mode 0 answers the field held once more, so unlike the
+                    // constructor case above there is no increment to add here.
+                    let field =
+                        self.bind(Kind::Boxed, format!("rt_field_p(ctx, {}, {index}, 0)", v.c));
+                    self.check();
+                    self.bind_pattern(sub, &field)?;
+                }
+                Ok(())
+            }
+            Pat::List { items, rest } => {
+                for (i, item) in items.iter().enumerate() {
+                    let at = self.bind(Kind::Boxed, format!("rt_list_at_p(ctx, {}, {i})", v.c));
+                    self.check();
+                    self.bind_pattern(item, &at)?;
+                }
+                if let Some(r) = rest {
+                    let tail = self.bind(
+                        Kind::Boxed,
+                        format!("rt_list_rest_p(ctx, {}, {})", v.c, items.len()),
+                    );
+                    self.check();
+                    self.bind_pattern(r, &tail)?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -2806,4 +2905,30 @@ fn direct_helper(b: Builtin, args: usize) -> Option<&'static str> {
         (Builtin::ListAt, 2) => "rt_list_index_p",
         _ => return None,
     })
+}
+
+/// What to call a pattern in a refusal.
+fn pattern_name(pat: &Pat) -> &'static str {
+    match pat {
+        Pat::Wildcard => "wildcard",
+        Pat::Var { .. } => "binding",
+        Pat::Lit(Lit::Str(_)) => "string literal",
+        Pat::Lit(Lit::Bytes(_)) => "bytes literal",
+        Pat::Lit(_) => "literal",
+        Pat::Ctor { .. } => "constructor",
+        Pat::Record { .. } => "record",
+        Pat::List { .. } => "list",
+    }
+}
+
+impl Emit<'_> {
+    /// Whether a pattern can fail. A binding and a wildcard cannot; a bare name that is a nullary
+    /// constructor can, which is why this asks rather than matching on the shape alone.
+    fn irrefutable_pat(&self, pat: &Pat) -> bool {
+        match pat {
+            Pat::Wildcard => true,
+            Pat::Var { name, .. } => self.ctor_of(&QName::bare(name.clone())).is_none(),
+            _ => false,
+        }
+    }
 }
