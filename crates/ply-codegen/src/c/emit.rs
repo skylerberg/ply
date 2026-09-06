@@ -190,6 +190,15 @@ pub struct Emit<'a> {
     /// Locals that already carry a count, because the field read that produced them took it out
     /// of the record rather than borrowing it. Handing one to a consumer must not take a second.
     taken: std::collections::HashSet<String>,
+    /// Bases already let go of, so that a second read marked as a last use does not let go again.
+    released: std::collections::HashSet<String>,
+    /// A local that is only another local's name, to the one it renames. The inliner binds a `let`
+    /// per argument, so one object commonly wears several names and a rule about *the object* has
+    /// to see through them.
+    alias: std::collections::HashMap<String, String>,
+    /// How many times each name is read in this body. A release is only safe where the answer is
+    /// one: see `release_base`.
+    reads: std::collections::HashMap<Symbol, usize>,
 }
 
 /// A record that has been described but not built: what `emit_record` would have emitted.
@@ -290,6 +299,9 @@ impl<'a> Emit<'a> {
             deferred: std::collections::HashMap::new(),
             record_locals: Vec::new(),
             taken: std::collections::HashSet::new(),
+            released: std::collections::HashSet::new(),
+            alias: std::collections::HashMap::new(),
+            reads: std::collections::HashMap::new(),
         }
     }
 
@@ -299,6 +311,67 @@ impl<'a> Emit<'a> {
             .iter()
             .map(|n| format!("  Word tok{n} = 0;\n"))
             .collect()
+    }
+
+    /// Count every bare name the body reads, once, before anything is emitted.
+    ///
+    /// `release_base` needs to know whether a binding is read anywhere else, and the emitter walks
+    /// the tree in an order the tree does not fix -- a record's fields are emitted in the shape's
+    /// order, not the source's -- so "is this the last read" cannot be answered by counting as it
+    /// goes. One read is the answer it can trust.
+    pub fn count_reads(&mut self, code: &Code) {
+        if let NodeKind::Var { name, .. } = &code.kind
+            && name.is_bare()
+        {
+            *self.reads.entry(name.symbol().clone()).or_insert(0) += 1;
+        }
+        let mut go = |c: &Code| self.count_reads(c);
+        match &code.kind {
+            NodeKind::Unary { operand, .. } => go(operand),
+            NodeKind::Binary { lhs, rhs, .. } => {
+                go(lhs);
+                go(rhs);
+            }
+            NodeKind::If {
+                cond,
+                then_branch,
+                else_branch,
+            } => {
+                go(cond);
+                go(then_branch);
+                go(else_branch);
+            }
+            NodeKind::Block { stmts, tail } => {
+                for st in stmts.iter() {
+                    go(st.code());
+                }
+                if let Some(t) = tail {
+                    go(t);
+                }
+            }
+            NodeKind::Field { base, .. } => go(base),
+            NodeKind::Record { fields } => fields.iter().for_each(|(_, c)| go(c)),
+            NodeKind::RecordUpdate { base, sets, .. } => {
+                go(base);
+                sets.iter().for_each(|(_, c)| go(c));
+            }
+            NodeKind::List { items } => items.iter().for_each(&mut go),
+            NodeKind::App { func, args } => {
+                go(func);
+                args.iter().for_each(&mut go);
+            }
+            NodeKind::Match { scrutinee, arms } => {
+                go(scrutinee);
+                for a in arms.iter() {
+                    if let Some(g) = &a.guard {
+                        go(g);
+                    }
+                    go(&a.body);
+                }
+            }
+            NodeKind::Lambda { body, .. } => go(body),
+            _ => {}
+        }
     }
 
     fn refuse<T>(&self, what: impl Into<String>) -> Result<T> {
@@ -342,6 +415,15 @@ impl<'a> Emit<'a> {
         let name = self.fresh();
         let ct = ctype(k);
         let e = expr.as_ref().to_string();
+        // A binding that is only another local's name is recorded as such, so that a rule about the
+        // object it names sees one thing rather than two.
+        if e.len() > 1
+            && (e.starts_with('t') || e.starts_with('p'))
+            && e[1..].bytes().all(|c| c.is_ascii_digit())
+        {
+            let root = self.root(&e);
+            self.alias.insert(name.clone(), root);
+        }
         // A record still waiting to be built is *not* renamed: the local it will land in holds a
         // zero until it is, and copying that zero into a second local is a null the next reader
         // walks into. Its local is declared for the whole body, so naming it again is safe and
@@ -1175,8 +1257,49 @@ impl<'a> Emit<'a> {
     ///
     /// Narrow on purpose. The base must be a variable at its last use -- which is what the
     /// lowering's `Own::Owned` says and what the interpreter reads too.
+    /// The local a name ultimately renames.
+    fn root(&self, name: &str) -> String {
+        let mut cur = name.to_string();
+        let mut hops = 0;
+        while let Some(next) = self.alias.get(&cur) {
+            if *next == cur || hops > 64 {
+                break;
+            }
+            cur = next.clone();
+            hops += 1;
+        }
+        cur
+    }
+
     fn release_base(&mut self, base: &Code, b: &V) {
         if !(matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. })) {
+            return;
+        }
+        // At most once per binding. `Own::Owned` marks a *use* as the last one, and a caller that
+        // hands a record to a function and then reads a field of it for a later argument has two
+        // reads the lowering marks that way -- which is the shape every parser state setter in the
+        // spike has. Releasing at both freed a record the first release had already given back,
+        // and the seam then read a dead word out of the answer. The in-process tier avoids it by
+        // marking the local moved; this is the same rule, keyed on the local the binding holds.
+        //
+        // Deliberately conservative in the other direction: two releases on two arms of an `if`
+        // are both legitimate and only one survives here, which leaks rather than frees twice.
+        if !self.released.insert(self.root(&b.c)) {
+            return;
+        }
+        // And only where the binding is read *once*. `Own::Owned` marks a use as the last one, but
+        // the emitter does not visit reads in the order the lowering marked them -- a record's
+        // fields are emitted in the shape's order -- so a body that hands a record on and also
+        // reads a field of it releases at whichever read the emitter reached second and then reads
+        // the freed record through the other. That freed a parser's whole state under the seam's
+        // feet, and `spine.shallower` -- `with_depth(p, p.depth - 1)` -- is three words of it.
+        //
+        // One read means no other name for the object is live, whatever the order. It costs the
+        // release wherever a record is read field by field, which is where `record_update`'s own
+        // release takes over: that one reads every copy before it lets go, by construction.
+        if !matches!(&base.kind, NodeKind::Var { name, .. }
+            if name.is_bare() && self.reads.get(name.symbol()) == Some(&1))
+        {
             return;
         }
         // A record held back dies without ever having been built, and holds no counts -- only a
@@ -1411,19 +1534,13 @@ impl<'a> Emit<'a> {
             }
         }
         // The base is dead once its copies are in hand, and letting it go here is the difference
-        // between an update and a leak. `field` makes the same release for the same reason, under
-        // the same condition -- a variable at its last use, which is what `Own::Owned` says.
+        // between an update and a leak. Through `release_base` rather than beside it: an update and
+        // a field read of the same variable both see a last use, and two releases of one record is
+        // what freed it under the seam's feet.
         //
         // Every copy was counted above before this runs, so the walk that lets the base's children
         // go leaves the ones this record keeps alone, and drops exactly the ones it replaced.
-        if matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. }) {
-            let n = names.len();
-            self.tokens.insert(n);
-            self.line(format!(
-                "if (tok{n} == 0) {{ tok{n} = rt_reset_p(ctx, {0}); }} else {{ rt_dec_p(ctx, {0}); }}",
-                held_base.c
-            ));
-        }
+        self.release_base(base, &b);
         Ok(self.emit_record(&names, words, kinds, vals))
     }
 
