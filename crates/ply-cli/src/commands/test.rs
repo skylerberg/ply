@@ -275,13 +275,29 @@ fn iterate(
     // needs the bodies of. The backend is built over the same one: it answers only for the program
     // it was built over, and the machine checks that before installing it.
     let (run_program, run_resolved) = loaded.to_run();
+    // The unit the last iteration compiled, when every definition still says what it said. The
+    // front end was already held across iterations and the unit was not, so a warm run under a
+    // backend recompiled the whole project each time -- which for the emitted tier is tens of
+    // seconds and is most of what an iteration costs.
+    let held_unit = backend
+        .as_ref()
+        .filter(|_| !nothing_to_run)
+        .and_then(|spec| warm.unit_for(spec, &hashes));
     let provider = match backend
         .as_ref()
         .filter(|_| !nothing_to_run)
+        .filter(|_| held_unit.is_none())
         .map(|spec| build_backend(spec, run_program, run_resolved, &loaded.check))
     {
-        None => None,
-        Some(Ok(provider)) => Some(provider),
+        None => held_unit,
+        Some(Ok(provider)) => {
+            // Held for the next iteration, which is what makes a warm loop pay for the edit rather
+            // than for the project a second time.
+            if let Some(spec) = backend.as_ref() {
+                warm.keep_unit(spec, &hashes, provider);
+            }
+            Some(provider)
+        }
         Some(Err(diagnostic)) => {
             if args.json {
                 emit_json(&json!({
