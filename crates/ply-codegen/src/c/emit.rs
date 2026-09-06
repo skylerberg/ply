@@ -14,11 +14,12 @@
 use crate::jit::{Kind, Refused};
 use crate::source::Source;
 use anyhow::Result;
-use ply_eval::code::{Arm, Pat, Stmt};
+use ply_eval::code::{Arm, Captures, Pat, Stmt};
 use ply_eval::rc::Own;
 use ply_eval::{Builtin, Code, NodeKind, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{BinOp, IntTy, Lit, QName, UnOp};
+use ply_syntax::resolve::Namespace;
 
 /// A value the emitted C holds: the C expression naming it, what it means, and what the checker
 /// said its type is — which is how a width survives a record field, and without which `rotr` on a
@@ -199,6 +200,22 @@ pub struct Emit<'a> {
     /// How many times each name is read in this body. A release is only safe where the answer is
     /// one: see `release_base`.
     reads: std::collections::HashMap<Symbol, usize>,
+    /// For each object -- named by the local at the end of its rename chain -- how many times the
+    /// tree reads *any* name for it. Accumulated as names are bound rather than searched for at
+    /// each release, which on the self-hosted front end is the difference between 190ms of emit
+    /// and 800ms. Never decremented: a name counted after its scope ended suppresses a release,
+    /// which leaks, where missing one frees a live object.
+    reads_by_root: std::collections::HashMap<String, usize>,
+    /// The (object, name) pairs already added to `reads_by_root`, so that rebinding a name to the
+    /// same object does not count its reads twice.
+    counted: std::collections::HashSet<(String, Symbol)>,
+    /// Whether `count_reads` has run. `bind_name` reads the table it fills.
+    counted_reads: bool,
+    /// The lambda bodies this definition contains, as whole C functions, emitted beside it rather
+    /// than inside it. Its length is how the next one is numbered; which *row* of the unit's code
+    /// table each takes is `tables.lambdas`, which also holds the entries of definitions this body
+    /// uses as values and so is not parallel to this.
+    lambda_defs: Vec<String>,
     /// The unit-wide things this body names, in the order it met them.
     ///
     /// The text says `@@c3@@` where a constant's index belongs and `assemble` rewrites it, so a
@@ -219,6 +236,10 @@ pub struct Tables {
     /// Every definition this body calls, so that a body restored from a cache can be checked
     /// against the set the fixpoint took rather than trusted.
     pub calls: Vec<String>,
+    /// The C symbols of the lambda entries this body defines, in the order it met them. A closure
+    /// names its code by an index into the unit's table of them, and the body's own text writes
+    /// its own position, which `resolve` rewrites into the unit's.
+    pub lambdas: Vec<String>,
 }
 
 impl Tables {
@@ -231,6 +252,38 @@ impl Tables {
             }
         }
     }
+}
+
+/// Where a release is being made from. A field read and a record update both see the lowering's
+/// last use, and the two are not equally safe to act on.
+#[derive(PartialEq)]
+enum Site {
+    /// A field read: the base may be read again through a name this one does not know about, at a
+    /// point the emitter reaches later than the lowering marked it.
+    Field,
+    /// A record update, which has read every field it copies before it lets go.
+    Update,
+}
+
+/// One function's worth of emitter state, so that a lambda can be written as a function of its
+/// own without losing its owner's place. Every field here is one of [`Emit`]'s.
+#[derive(Default)]
+struct Frame {
+    out: String,
+    tmp: usize,
+    scope: Vec<(Symbol, V)>,
+    depth: usize,
+    tokens: std::collections::BTreeSet<usize>,
+    built: std::collections::HashMap<String, Vec<(Symbol, V)>>,
+    deferred: std::collections::HashMap<String, Deferred>,
+    record_locals: Vec<String>,
+    taken: std::collections::HashSet<String>,
+    released: std::collections::HashSet<String>,
+    alias: std::collections::HashMap<String, String>,
+    reads: std::collections::HashMap<Symbol, usize>,
+    reads_by_root: std::collections::HashMap<String, usize>,
+    counted: std::collections::HashSet<(String, Symbol)>,
+    counted_reads: bool,
 }
 
 /// A record that has been described but not built: what `emit_record` would have emitted.
@@ -251,6 +304,9 @@ pub struct Unit {
     pub functions: Vec<String>,
     /// The shapes and constructor indices the runtime reads a record and a variant against.
     pub layouts: crate::heap::Layouts,
+    /// The C symbol of every lambda entry in the unit. `rt_closure` is handed a position in this,
+    /// and `Tables::functions` holds the address `dlsym` found for each.
+    pub lambdas: Vec<String>,
 }
 
 impl Unit {
@@ -261,16 +317,13 @@ impl Unit {
             builtins: Vec::new(),
             functions,
             layouts: crate::heap::Layouts::new(ctors),
+            lambdas: Vec::new(),
         }
     }
 
     /// The shape a field set interns to, in the same table the runtime will read it against.
     pub fn shape(&mut self, names: &[Symbol]) -> u32 {
         self.layouts.shape(names.to_vec())
-    }
-
-    pub fn ctor_index(&self, name: &Symbol) -> Option<u32> {
-        self.layouts.ctor_index(name)
     }
 }
 
@@ -286,6 +339,14 @@ impl Unit {
         }
         self.fields.push(name.clone());
         self.fields.len() - 1
+    }
+
+    pub(super) fn lambda(&mut self, symbol: &str) -> usize {
+        if let Some(i) = self.lambdas.iter().position(|l| l == symbol) {
+            return i;
+        }
+        self.lambdas.push(symbol.to_string());
+        self.lambdas.len() - 1
     }
 
     pub(super) fn builtin(&mut self, b: Builtin) -> usize {
@@ -334,6 +395,10 @@ impl<'a> Emit<'a> {
             released: std::collections::HashSet::new(),
             alias: std::collections::HashMap::new(),
             reads: std::collections::HashMap::new(),
+            reads_by_root: std::collections::HashMap::new(),
+            counted: std::collections::HashSet::new(),
+            counted_reads: false,
+            lambda_defs: Vec::new(),
             tables: Tables::default(),
         }
     }
@@ -353,6 +418,7 @@ impl<'a> Emit<'a> {
     /// order, not the source's -- so "is this the last read" cannot be answered by counting as it
     /// goes. One read is the answer it can trust.
     pub fn count_reads(&mut self, code: &Code) {
+        self.counted_reads = true;
         if let NodeKind::Var { name, .. } = &code.kind
             && name.is_bare()
         {
@@ -420,6 +486,13 @@ impl<'a> Emit<'a> {
     }
     fn local_field(&mut self, name: &Symbol) -> String {
         format!("@@f{}@@", Tables::at(&mut self.tables.fields, name.clone()))
+    }
+    /// The position of a code address in the unit's table, as this body's own.
+    fn local_lambda(&mut self, symbol: &str) -> String {
+        format!(
+            "@@l{}@@",
+            Tables::at(&mut self.tables.lambdas, symbol.to_string())
+        )
     }
     fn local_shape(&mut self, names: &[Symbol]) -> String {
         format!(
@@ -525,7 +598,7 @@ impl<'a> Emit<'a> {
             }
             _ => word,
         };
-        self.scope.push((name.clone(), v));
+        self.bind_name(name.clone(), v);
     }
 
     // --- conversions --------------------------------------------------------------------
@@ -686,7 +759,12 @@ impl<'a> Emit<'a> {
             NodeKind::List { items } => self.list(items),
             NodeKind::App { func, args } => self.app(func, args),
             NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms),
-            NodeKind::Lambda { .. } => self.refuse("a lambda, which this tier does not carry yet"),
+            NodeKind::Lambda {
+                params,
+                body,
+                captures,
+                ..
+            } => self.lambda(params, body, captures),
             NodeKind::RecordUpdate { base, copies, sets } => self.record_update(base, copies, sets),
             other => self.refuse(describe(other).to_string()),
         }
@@ -749,6 +827,26 @@ impl<'a> Emit<'a> {
             self.check();
             return Ok(v);
         }
+        // A compiled function used as a value is a closure over nothing, through the same
+        // handle-ABI entry the seam enters it by. Passing one to `map` is how most of the
+        // self-hosted front end spells a callback, so without this the closure work above buys
+        // the tier the lambda literals and none of the named functions.
+        if let Some(full) = self.resolve_q(q)
+            && self.unit.functions.contains(&full)
+            && let Some((def, _)) = self.src.definition(&full)
+        {
+            let arity = def.params.len();
+            self.tables.calls.push(full.clone());
+            let index = self.local_lambda(&format!("{}_entry", mangle(&full)));
+            let arr = self.fresh();
+            self.line(format!("Word {arr}[] = {{0}};"));
+            let v = self.bind(
+                Kind::Boxed,
+                format!("rt_closure_p(ctx, {index}, {arity}, (Word)(intptr_t){arr}, 0)"),
+            );
+            self.check();
+            return Ok(v);
+        }
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
         {
@@ -762,14 +860,8 @@ impl<'a> Emit<'a> {
         // Asking for the function in both cases put a closure where a variant belonged, so every
         // body that answered `None` answered wrongly -- which four tests in `examples/` had been
         // saying since this tier's first commit, to nothing that was listening.
-        if let Some(i) = self.unit.ctor_index(q.symbol()) {
-            let nullary = self
-                .unit
-                .layouts
-                .ctors
-                .get(i as usize)
-                .is_some_and(|(_, arity)| *arity == 0);
-            let call = if nullary {
+        if let Some((i, arity)) = self.ctor_of(q) {
+            let call = if arity == 0 {
                 format!("rt_nullary_p(ctx, {i})")
             } else {
                 format!("rt_ctor_value_p(ctx, {i})")
@@ -803,6 +895,29 @@ impl<'a> Emit<'a> {
     /// The program-wide name a `QName` denotes: its own module's for a bare name, and the module
     /// the import named for a qualified one.
     fn resolve_q(&self, q: &QName) -> Option<String> {
+        // The resolver first, which is the only thing that knows about `import spine (start, ..)`:
+        // a selective import puts another module's name in this one's scope *bare*, and guessing
+        // `{this module}.{name}` finds nothing for it. The self-hosted front end imports that way
+        // throughout, so without this the tier refuses every body that calls across a module.
+        let scoped = if q.is_bare() {
+            self.src
+                .resolved
+                .scopes
+                .get(self.module_index)
+                .and_then(|s| s.get(Namespace::Value, q.symbol()))
+                .map(|b| b.qualified.to_string())
+        } else {
+            self.src
+                .resolved
+                .lookup(self.module_index, Namespace::Value, q)
+                .ok()
+                .map(|b| b.qualified.to_string())
+        };
+        if let Some(full) = scoped
+            && self.src.definition(&full).is_some()
+        {
+            return Some(full);
+        }
         if q.is_bare() {
             let module = &self.src.program.modules[self.module_index].name;
             let full = format!("{module}.{}", q.symbol());
@@ -1023,7 +1138,7 @@ impl<'a> Emit<'a> {
                         let out = self.fresh();
                         self.line(format!("int64_t {out};"));
                         self.line(format!(
-                            "if (__builtin_{sign}_overflow({a}, {b}, &{out})) {{ rt_overflow_p(ctx, {}); return 0; }}",
+                            "if (ply_{sign}_ov({a}, {b}, &{out})) {{ rt_overflow_p(ctx, {}); return 0; }}",
                             i64::from(matches!(op, BinOp::Sub))
                         ));
                         Ok(V {
@@ -1206,7 +1321,7 @@ impl<'a> Emit<'a> {
                             // the type would lose every width and every known record one call
                             // deep — which is most of a body after inlining.
                             let held = self.bind_as(v.k, v.ty.clone(), v.c.clone());
-                            self.scope.push((name.name.clone(), held));
+                            self.bind_name(name.name.clone(), held);
                         }
                         Pat::Wildcard => {}
                         _ => {
@@ -1326,7 +1441,162 @@ impl<'a> Emit<'a> {
         cur
     }
 
+    /// Swap in a fresh function's worth of state, and hand back what was there.
+    ///
+    /// A lambda becomes a C function beside its owner rather than a block inside it, so every
+    /// "where am I in this body" -- the statements, the temporaries, the scope, the reuse tokens,
+    /// the ownership tables -- has to step aside while it is written and come back afterwards.
+    fn swap(&mut self, f: &mut Frame) {
+        std::mem::swap(&mut self.out, &mut f.out);
+        std::mem::swap(&mut self.tmp, &mut f.tmp);
+        std::mem::swap(&mut self.scope, &mut f.scope);
+        std::mem::swap(&mut self.depth, &mut f.depth);
+        std::mem::swap(&mut self.tokens, &mut f.tokens);
+        std::mem::swap(&mut self.built, &mut f.built);
+        std::mem::swap(&mut self.deferred, &mut f.deferred);
+        std::mem::swap(&mut self.record_locals, &mut f.record_locals);
+        std::mem::swap(&mut self.taken, &mut f.taken);
+        std::mem::swap(&mut self.released, &mut f.released);
+        std::mem::swap(&mut self.alias, &mut f.alias);
+        std::mem::swap(&mut self.reads, &mut f.reads);
+        std::mem::swap(&mut self.reads_by_root, &mut f.reads_by_root);
+        std::mem::swap(&mut self.counted, &mut f.counted);
+        std::mem::swap(&mut self.counted_reads, &mut f.counted_reads);
+    }
+
+    /// A lambda: the captured words as a closure over a compiled function.
+    ///
+    /// The same shape the in-process tier uses, because the runtime is shared: the body becomes a
+    /// function whose leading parameters are the captures, and the closure object holds their
+    /// words beside the code's address. `rt_call` enters it, and so does the interpreter through
+    /// the seam, so a closure this tier makes is callable from everywhere one made by the other
+    /// is.
+    fn lambda(&mut self, params: &[Symbol], body: &Code, captures: &Captures) -> Result<V> {
+        // The environment, in the order the lowering named it. `rt_closure` takes these, so each
+        // is handed over owned.
+        let mut env = Vec::with_capacity(captures.names.len());
+        for name in &captures.names {
+            let Some((_, v)) = self.scope.iter().rev().find(|(s, _)| s == name).cloned() else {
+                return self.refuse(format!(
+                    "a lambda capturing `{name}`, which is not a local of its body"
+                ));
+            };
+            env.push(self.owned(&v));
+        }
+        let index = self.lambda_defs.len();
+        let symbol = format!("{}_lambda{index}", mangle(&self.function));
+        // Reserved before the body is emitted, so that a lambda nested inside this one numbers
+        // itself after this one rather than over it.
+        self.lambda_defs.push(String::new());
+        let slot = self.local_lambda(&format!("{symbol}_entry"));
+
+        let mut frame = Frame::default();
+        self.swap(&mut frame);
+        let emitted = self.lambda_body(&symbol, params, body, captures);
+        self.swap(&mut frame);
+        self.lambda_defs[index] = emitted?;
+
+        let arr = self.fresh();
+        self.line(format!(
+            "Word {arr}[] = {{{}}};",
+            if env.is_empty() {
+                "0".to_string()
+            } else {
+                env.join(", ")
+            }
+        ));
+        let v = self.bind(
+            Kind::Boxed,
+            format!(
+                "rt_closure_p(ctx, {slot}, {}, (Word)(intptr_t){arr}, {})",
+                params.len(),
+                env.len()
+            ),
+        );
+        self.check();
+        Ok(v)
+    }
+
+    /// The lambda's own C function, emitted into a frame of its own.
+    fn lambda_body(
+        &mut self,
+        symbol: &str,
+        params: &[Symbol],
+        body: &Code,
+        captures: &Captures,
+    ) -> Result<String> {
+        self.count_reads(body);
+        let names: Vec<&Symbol> = captures.names.iter().chain(params.iter()).collect();
+        let mut head = format!("Word {symbol}(PlyCtx *ctx");
+        for (i, name) in names.iter().enumerate() {
+            head.push_str(&format!(", Word q{i}"));
+            // No declared type: the checker publishes a scheme per definition, not per lambda, so
+            // every parameter arrives boxed. Widths are lost at a lambda boundary, which is a
+            // reason to fuse a loop rather than close over one wherever the shape allows.
+            self.param(name, format!("q{i}"), CTy::Unknown);
+        }
+        head.push_str(") {\n");
+        head.push_str(
+            "  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n",
+        );
+        let answer = self.expr(body)?;
+        let word = self.word(&answer);
+        let mut out = head;
+        out.push_str(&self.token_decls());
+        out.push_str(&self.record_decls());
+        out.push_str(&self.out);
+        out.push_str(&format!("  ctx->fuel += 1;\n  return {word};\n}}\n"));
+        out.push_str(&format!(
+            "Word {symbol}_entry(PlyCtx *ctx, const Word *args) {{\n  return {symbol}(ctx{});\n}}\n",
+            (0..names.len())
+                .map(|i| format!(", args[{i}]"))
+                .collect::<Vec<_>>()
+                .join("")
+        ));
+        Ok(out)
+    }
+
+    /// The C functions this definition's lambdas became, to go out beside it.
+    pub fn lambda_defs(&self) -> String {
+        self.lambda_defs.concat()
+    }
+
+    /// Bind a tree name to a local, charging that name's reads to the object the local holds.
+    fn bind_name(&mut self, name: Symbol, v: V) {
+        // A real assert, not a `debug_assert`: the suite runs in release, and the failure this
+        // guards is a use-after-free in emitted C rather than a wrong number.
+        assert!(
+            self.counted_reads,
+            "`count_reads` has to run before any name is bound, or the binding charges zero reads \
+             to the object it holds and `release_base` frees something still live"
+        );
+        let root = self.root(&v.c);
+        if self.counted.insert((root.clone(), name.clone())) {
+            let n = self.reads.get(&name).copied().unwrap_or(0);
+            *self.reads_by_root.entry(root).or_insert(0) += n;
+        }
+        self.scope.push((name, v));
+    }
+
+    /// How many times the tree reads *any* name for the object `local` holds.
+    ///
+    /// Not the same question as how many times one name is read. The emitter renames freely --
+    /// the inliner turns every argument into a `let`, and `bind_as` records a rename as an alias
+    /// rather than a second object -- so one object can wear several tree names, each read once,
+    /// with no increment between them. Counting a single name there says "one read, safe to
+    /// release" about an object three other names still hold.
+    fn shared_reads(&self, local: &str) -> usize {
+        self.reads_by_root
+            .get(&self.root(local))
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn release_base(&mut self, base: &Code, b: &V) {
+        self.release_from(base, b, Site::Field)
+    }
+
+    fn release_from(&mut self, base: &Code, b: &V, from: Site) {
         if !(matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. })) {
             return;
         }
@@ -1352,9 +1622,40 @@ impl<'a> Emit<'a> {
         // One read means no other name for the object is live, whatever the order. It costs the
         // release wherever a record is read field by field, which is where `record_update`'s own
         // release takes over: that one reads every copy before it lets go, by construction.
-        if !matches!(&base.kind, NodeKind::Var { name, .. }
-            if name.is_bare() && self.reads.get(name.symbol()) == Some(&1))
-        {
+        //
+        // Counted over every *name* for the object, not over the one the base happens to wear.
+        // `spine.advance_n` is the case: `advance(c, p).p` inlines to a rename of `p`, read once
+        // under its inlined name and three times more under `p`, so the one-read rule said yes
+        // and the reset freed the parser state that `cur_span(c, p)` then read a field of.
+        if !matches!(&base.kind, NodeKind::Var { name, .. } if name.is_bare()) {
+            return;
+        }
+        // The rule applies at both sites, and the state kernel pays for it.
+        //
+        // An update reads every field it copies before it lets go, so it looked exempt: what the
+        // rule guards against is a *field* read emitted after the release, and an update has none
+        // left. Exempting it put the reuse back and cost correctness --
+        // `let c1 = {..acc.cx, ty_params: map_new()}` in `infer.collect_effects` takes its base
+        // from a field read whose object `duplicate(acc.cx, ..)` reads again, and the reclaim
+        // freed it. The rule is about every later read of the *object*, and an update knows no
+        // more about those than a field read does.
+        //
+        // Counting reads *as they are emitted* and releasing when none is left does not work
+        // either, and it is the attractive one: emission order is execution order in straight-line
+        // code, and a branch is safe both ways round. It still failed the front end, with and
+        // without a guard for the fused loops -- where a body's reads are emitted once and run once
+        // per iteration -- so something else the count does not see reads the object again. Do not
+        // retry it without a smaller failing case in hand than thirteen thousand lines.
+        //
+        // What it costs is measured rather than guessed: `{..s, ..}` over the state kernel's
+        // five-field record reads `s` seven times, so the release is suppressed and each of two
+        // hundred thousand iterations allocates afresh. ADR 0035's gate reads 3.7x there against
+        // a bar of 3.0, where the in-process tier reads 2.0x. That is the open item on this tier,
+        // and the shape of the fix is a read *counted as it is emitted* rather than in total: the
+        // release is safe exactly when no read of the object is still to come, which neither the
+        // total nor the lowering's order answers.
+        let _ = from;
+        if self.shared_reads(&b.c) != 1 {
             return;
         }
         // A record held back dies without ever having been built, and holds no counts -- only a
@@ -1367,7 +1668,7 @@ impl<'a> Emit<'a> {
             };
             self.tokens.insert(n);
             self.line(format!(
-                "if ({name}) {{ if (tok{n} == 0) {{ tok{n} = ply_reset_flat({name}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {name}); }} else {{ rt_dec_p(ctx, {name}); }} {name} = 0; }}"
+                "if ({name}) {{ if (tok{n} == 0) {{ tok{n} = ply_reset_flat({name}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {name}); }} else {{ ply_dec(ctx, {name}); }} {name} = 0; }}"
             ));
             return;
         }
@@ -1376,28 +1677,42 @@ impl<'a> Emit<'a> {
             Some(n) => {
                 self.tokens.insert(n);
                 self.line(format!(
-                    "if (tok{n} == 0) {{ tok{n} = ply_reset_flat({base_local}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {base_local}); }} else {{ rt_dec_p(ctx, {base_local}); }}"
+                    "if (tok{n} == 0) {{ tok{n} = ply_reset_flat({base_local}); if (!tok{n}) tok{n} = rt_reset_p(ctx, {base_local}); }} else {{ ply_dec(ctx, {base_local}); }}"
                 ));
             }
-            None => self.line(format!("rt_dec_p(ctx, {base_local});")),
+            None => self.line(format!("ply_dec(ctx, {base_local});")),
         }
     }
 
     fn record(&mut self, fields: &[(Symbol, Code)]) -> Result<V> {
+        // Evaluated in the order they are written, assembled in the order the shape holds them.
+        //
+        // These are not the same order -- a shape is interned under its sorted field names -- and
+        // evaluating in the shape's order is a reordering the *lowering* does not know about. Its
+        // ownership marks say which read of a name is the last one in its own order, so a body
+        // that hands a record to one field's expression and reads a field of it for another
+        // released at whichever the emitter reached second and then read the freed record through
+        // the other. `spine.advance_n` is three lines of it: `advance(c, p).p` builds `{p: .., node:
+        // cur_span(c, p)}`, and `node` sorts first while `p` consumes.
         let mut names: Vec<Symbol> = fields.iter().map(|(n, _)| n.clone()).collect();
         names.sort();
+        let mut written: Vec<(Symbol, String, CTy, V)> = Vec::with_capacity(fields.len());
+        for (name, code) in fields {
+            let v = self.expr(code)?;
+            let w = self.owned(&v);
+            written.push((name.clone(), w, v.ty.clone(), v));
+        }
         let mut words = Vec::with_capacity(fields.len());
         let mut kinds = Vec::with_capacity(fields.len());
         let mut vals = Vec::with_capacity(fields.len());
         for name in &names {
-            let (_, code) = fields
+            let (_, w, ty, v) = written
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|(n, ..)| n == name)
                 .expect("a field of the shape");
-            let v = self.expr(code)?;
-            kinds.push(v.ty.clone());
-            words.push(self.owned(&v));
-            vals.push(v);
+            words.push(w.clone());
+            kinds.push(ty.clone());
+            vals.push(v.clone());
         }
         Ok(self.emit_record(&names, words, kinds, Some(vals)))
     }
@@ -1595,7 +1910,7 @@ impl<'a> Emit<'a> {
         //
         // Every copy was counted above before this runs, so the walk that lets the base's children
         // go leaves the ones this record keeps alone, and drops exactly the ones it replaced.
-        self.release_base(base, &b);
+        self.release_from(base, &b, Site::Update);
         Ok(self.emit_record(&names, words, kinds, vals))
     }
 
@@ -1668,7 +1983,14 @@ impl<'a> Emit<'a> {
                 return self.builtin_call(b, args);
             }
             // A constructor applied to arguments.
-            if let Some(i) = self.unit.ctor_index(q.symbol()) {
+            if let Some((i, arity)) = self.ctor_of(q) {
+                if arity != args.len() {
+                    return self.refuse(format!(
+                        "the constructor `{}` takes {arity} fields and was given {}",
+                        q.symbol(),
+                        args.len()
+                    ));
+                }
                 let mut ws = Vec::with_capacity(args.len());
                 for a in args {
                     let v = self.expr(a)?;
@@ -1692,7 +2014,35 @@ impl<'a> Emit<'a> {
             }
             let _ = bare;
         }
-        self.refuse("a call through a value, which this tier does not carry yet")
+        // A call through a value: a local holding a closure, a parameter, a field, or an
+        // expression that answers one. `rt_call` sorts out what it is -- a compiled closure it
+        // enters directly, a builtin or a constructor through the interpreter's own -- which is
+        // the same helper the in-process tier reaches for and the same object either tier builds.
+        let f = self.expr(func)?;
+        let callee = self.owned(&f);
+        let mut ws = Vec::with_capacity(args.len());
+        for a in args {
+            let v = self.expr(a)?;
+            ws.push(self.owned(&v));
+        }
+        let arr = self.fresh();
+        self.line(format!(
+            "Word {arr}[] = {{{}}};",
+            if ws.is_empty() {
+                "0".to_string()
+            } else {
+                ws.join(", ")
+            }
+        ));
+        let v = self.bind(
+            Kind::Boxed,
+            format!(
+                "rt_call_p(ctx, {callee}, (Word)(intptr_t){arr}, {})",
+                args.len()
+            ),
+        );
+        self.check();
+        Ok(v)
     }
 
     fn builtin_call(&mut self, b: Builtin, args: &[Code]) -> Result<V> {
@@ -1721,8 +2071,31 @@ impl<'a> Emit<'a> {
         if b == Builtin::Fold && args.len() == 3 {
             return self.fused_fold(&args[0], &args[1], &args[2]);
         }
+        // The callback family, through the helpers the in-process tier uses. Those helpers walk
+        // the list themselves and enter each call through `call_value`, so a compiled closure is
+        // entered directly and an interpreted one goes back over the seam -- which is what makes
+        // this the same answer either tier gives. The fused forms above are still preferred where
+        // the shape allows: they keep the loop in the body, with no closure object per element.
         if b.higher_order() {
-            return self.refuse(format!("`{}`, a builtin that calls user code", b.name()));
+            let helper = match (b, args.len()) {
+                (Builtin::Map, 2) => Some("rt_map_p"),
+                (Builtin::Filter, 2) => Some("rt_filter_p"),
+                (Builtin::Fold, 3) => Some("rt_fold_p"),
+                (Builtin::MapFold, 3) => Some("rt_map_fold_p"),
+                (Builtin::Iterate, 3) => Some("rt_iterate_p"),
+                _ => None,
+            };
+            let Some(helper) = helper else {
+                return self.refuse(format!("`{}`, a builtin that calls user code", b.name()));
+            };
+            let mut ws = Vec::with_capacity(args.len());
+            for a in args {
+                let v = self.expr(a)?;
+                ws.push(self.owned(&v));
+            }
+            let v = self.bind(Kind::Boxed, format!("{helper}(ctx, {})", ws.join(", ")));
+            self.check();
+            return Ok(v);
         }
         let mut vals = Vec::with_capacity(args.len());
         for a in args {
@@ -1790,6 +2163,21 @@ impl<'a> Emit<'a> {
         if let Some(v) = self.inline_bytes(b, &vals)? {
             return Ok(v);
         }
+        // The map, list and bytes family, called by name rather than dispatched. The generic path
+        // below costs an argument array, a builtin index and a match on it for every call, and k2
+        // makes four of those per element over two hundred thousand elements. The in-process tier
+        // has called these directly since it was written, and the gate says what the difference
+        // is: on the value kernel that tier was within the bar at 1.9x where this one was over it
+        // at 4.2x, on the same runtime and the same data structures.
+        if let Some(helper) = direct_helper(b, vals.len()) {
+            let mut ws = Vec::with_capacity(vals.len());
+            for v in &vals.clone() {
+                ws.push(self.owned(v));
+            }
+            let v = self.bind(Kind::Boxed, format!("{helper}(ctx, {})", ws.join(", ")));
+            self.check();
+            return Ok(v);
+        }
         // Everything else goes through the runtime, which is the interpreter's own path. It
         // answers with a word of no known type -- except that a width this tier does not carry
         // stays uncarried through it, so that an operator downstream refuses rather than reading
@@ -1831,8 +2219,15 @@ impl<'a> Emit<'a> {
     /// would leak one count per element.
     fn fused_fold(&mut self, items: &Code, init: &Code, f: &Code) -> Result<V> {
         let xs = self.expr(items)?;
-        let xw = self.word(&xs);
-        let list = self.bind(Kind::Boxed, xw);
+        // A count of the loop's own, because the loop releases at the end. `rt_list_at` reads the
+        // list rather than taking it, so one count covers every element -- but the fold had been
+        // releasing a count it never took, and a caller that reads the list *again* then walked
+        // freed memory. `len(walk(xs).types) + len(walk(xs).aliases)` is three lines of that.
+        let list = V {
+            k: Kind::Boxed,
+            c: self.owned(&xs),
+            ty: xs.ty.clone(),
+        };
         // Through the runtime, once, rather than off the header: the list usually comes from
         // `range`, whose answer the fragment has no type for, and `len` is where a value that is
         // not a list is caught -- with the diagnostic the interpreter would have given.
@@ -1849,6 +2244,16 @@ impl<'a> Emit<'a> {
         self.check();
         let n_e = self.as_int(&n_word);
         let n = self.bind(Kind::Int, n_e);
+        // A function this tier cannot name is held as a value, evaluated once outside the loop
+        // rather than per element. `rt_call` takes its callee, so each iteration hands it a
+        // count of its own and the loop lets go of the last one at the end.
+        let held = match self.nameable_step(f, 2) {
+            Some(_) => None,
+            None => {
+                let v = self.expr(f)?;
+                Some(self.owned(&v))
+            }
+        };
         let seed = self.expr(init)?;
         let sw = self.word(&seed);
         let acc = self.fresh();
@@ -1859,12 +2264,23 @@ impl<'a> Emit<'a> {
         self.depth += 1;
         let x = self.bind(Kind::Boxed, format!("rt_list_at_p(ctx, {}, {i})", list.c));
         self.check();
-        let call = self.step_call(f, acc.clone(), x.c.clone())?;
+        let call = match &held {
+            Some(callee) => {
+                let arr = self.fresh();
+                self.line(format!("Word {arr}[] = {{{acc}, {}}};", x.c));
+                self.line(format!("ply_inc({callee});"));
+                format!("rt_call_p(ctx, {callee}, (Word)(intptr_t){arr}, 2)")
+            }
+            None => self.step_call(f, acc.clone(), x.c.clone())?,
+        };
         self.line(format!("{acc} = {call};"));
         self.check();
         self.depth -= 1;
         self.line("}");
-        self.line(format!("rt_dec_p(ctx, {});", list.c));
+        if let Some(callee) = &held {
+            self.line(format!("ply_dec(ctx, {callee});"));
+        }
+        self.line(format!("ply_dec(ctx, {});", list.c));
         Ok(V {
             k: Kind::Boxed,
             c: acc,
@@ -1872,20 +2288,30 @@ impl<'a> Emit<'a> {
         })
     }
 
-    /// The call a fold makes per element: a named function directly, a lambda by its body.
-    fn step_call(&mut self, f: &Code, acc: String, x: String) -> Result<String> {
-        if let NodeKind::Var { name, .. } = &f.kind
-            && let Some(full) = self.resolve_q(name)
-            && self.unit.functions.contains(&full)
+    /// The program-wide name of a definition of `arity` that `f` denotes directly, if it does.
+    fn nameable_step(&self, f: &Code, arity: usize) -> Option<String> {
+        let NodeKind::Var { name, .. } = &f.kind else {
+            return None;
+        };
+        let full = self.resolve_q(name)?;
+        (self.unit.functions.contains(&full)
             && self
                 .src
                 .definition(&full)
-                .is_some_and(|(d, _)| d.params.len() == 2)
-        {
-            self.tables.calls.push(full.clone());
-            return Ok(format!("{}(ctx, {acc}, {x})", mangle(&full)));
+                .is_some_and(|(d, _)| d.params.len() == arity))
+        .then_some(full)
+    }
+
+    /// The call a fold makes per element, where the function is one this unit compiled: straight
+    /// to its typed body, with no closure object and no dispatch.
+    fn step_call(&mut self, f: &Code, acc: String, x: String) -> Result<String> {
+        match self.nameable_step(f, 2) {
+            Some(full) => {
+                self.tables.calls.push(full.clone());
+                Ok(format!("{}(ctx, {acc}, {x})", mangle(&full)))
+            }
+            None => self.refuse("`fold` over a function this tier cannot name"),
         }
-        self.refuse("`fold` over a function this tier cannot name")
     }
 
     fn fused_iterate(&mut self, seed: &Code, budget: &Code, step: &Code) -> Result<V> {
@@ -1918,7 +2344,7 @@ impl<'a> Emit<'a> {
         self.line(format!("{left} -= 1;"));
         let mark = self.scope.len();
         let held = self.bind_as(Kind::Boxed, state_ty.clone(), state.clone());
-        self.scope.push((params[0].clone(), held));
+        self.bind_name(params[0].clone(), held);
         // The step's answer is a `Stop` or a `Continue` that this loop takes apart one line later.
         // When its shape says so all the way down, write straight into the loop's own control
         // instead: no constructor built, none taken apart, and one fewer object to dismantle per
@@ -2205,12 +2631,12 @@ impl<'a> Emit<'a> {
             Pat::Var { slot: Some(_), .. } => Ok("1".to_string()),
             Pat::Var { name, .. } => {
                 // A nullary constructor wearing a variable's shape.
-                match self.ctor_index(&QName::bare(name.clone())) {
-                    Some(i) => Ok(format!(
+                match self.ctor_of(&QName::bare(name.clone())) {
+                    Some((i, 0)) => Ok(format!(
                         "(!ply_is_imm({0}) && ply_obj({0})->kind == 4 && ply_obj({0})->layout == {i})",
                         v.c
                     )),
-                    None => Ok("1".to_string()),
+                    _ => Ok("1".to_string()),
                 }
             }
             Pat::Lit(Lit::Int(k)) => Ok(format!(
@@ -2227,9 +2653,16 @@ impl<'a> Emit<'a> {
                 if *b { true_word() } else { false_word() }
             )),
             Pat::Ctor { name, args } => {
-                let Some(i) = self.ctor_index(name) else {
+                let Some((i, arity)) = self.ctor_of(name) else {
                     return self.refuse(format!("the constructor `{}`", name.symbol()));
                 };
+                if arity != args.len() {
+                    return self.refuse(format!(
+                        "the constructor pattern `{}` binds {} of its {arity} fields",
+                        name.symbol(),
+                        args.len()
+                    ));
+                }
                 let mut test = format!(
                     "(!ply_is_imm({0}) && ply_obj({0})->kind == 4 && ply_obj({0})->layout == {i} && ply_obj({0})->len == {1})",
                     v.c,
@@ -2255,7 +2688,46 @@ impl<'a> Emit<'a> {
     }
 
     fn ctor_index(&self, name: &QName) -> Option<u32> {
-        self.unit.ctor_index(name.symbol())
+        self.ctor_of(name).map(|(i, _)| i)
+    }
+
+    /// The unit's index for the constructor `q` names, and its arity.
+    ///
+    /// A user constructor is interned under the program-wide name its module qualifies it with,
+    /// and a body names it bare, so the resolver is what stands between the two. Reading the
+    /// unit's table with the bare symbol finds only the prelude's constructors, which is why this
+    /// tier refused every `type` a program declared.
+    ///
+    /// The nullary case in `Pat::Var` is defensive rather than reached: the parser makes every
+    /// upper-case bare name in pattern position a `Ctor`, so a constructor does not arrive
+    /// wearing a variable's shape from source. It is kept because the arity is what separates the
+    /// two, and reading it wrongly is a match that succeeds rather than a refusal.
+    fn ctor_of(&self, q: &QName) -> Option<(u32, usize)> {
+        let global = if q.is_bare() {
+            self.src
+                .resolved
+                .scopes
+                .get(self.module_index)
+                .and_then(|s| s.get(Namespace::Value, q.symbol()))
+                .map(|b| b.qualified.clone())
+        } else {
+            self.src
+                .resolved
+                .lookup(self.module_index, Namespace::Value, q)
+                .ok()
+                .map(|b| b.qualified.clone())
+        };
+        let name = global.or_else(|| {
+            (q.is_bare() && self.unit.layouts.ctors.iter().any(|(n, _)| n == q.symbol()))
+                .then(|| q.symbol().clone())
+        })?;
+        let index = self
+            .unit
+            .layouts
+            .ctors
+            .iter()
+            .position(|(n, _)| *n == name)?;
+        Some((index as u32, self.unit.layouts.ctors[index].1))
     }
 
     fn bind_pattern(&mut self, pat: &Pat, v: &V) -> Result<()> {
@@ -2266,7 +2738,7 @@ impl<'a> Emit<'a> {
                 slot: Some(_),
             } => {
                 let held = self.bind(Kind::Boxed, v.c.clone());
-                self.scope.push((name.name.clone(), held));
+                self.bind_name(name.name.clone(), held);
                 Ok(())
             }
             Pat::Var { .. } | Pat::Lit(_) => Ok(()),
@@ -2314,4 +2786,24 @@ fn false_word() -> String {
 }
 fn unit_word() -> String {
     "ply_unit".to_string()
+}
+
+/// The helper that answers a builtin directly, where one does. Each takes its arguments exactly as
+/// the generic path does -- they fall back to the same `direct` over values -- so the call is a
+/// swap and nothing about ownership changes.
+fn direct_helper(b: Builtin, args: usize) -> Option<&'static str> {
+    Some(match (b, args) {
+        (Builtin::Push, 2) => "rt_push_p",
+        (Builtin::MapInsert, 3) => "rt_map_insert_p",
+        (Builtin::MapContains, 2) => "rt_map_contains_p",
+        (Builtin::MapGet, 2) => "rt_map_get_p",
+        (Builtin::Compare, 2) => "rt_compare_p",
+        (Builtin::ByteOfInt, 1) => "rt_byte_of_int_p",
+        (Builtin::BytesConcat, 2) => "rt_bytes_concat_p",
+        (Builtin::BytesSlice, 3) => "rt_bytes_slice_p",
+        (Builtin::BytesScan, 4) => "rt_bytes_scan_p",
+        (Builtin::BytesScanUntil, 4) => "rt_bytes_scan_until_p",
+        (Builtin::ListAt, 2) => "rt_list_index_p",
+        _ => return None,
+    })
 }

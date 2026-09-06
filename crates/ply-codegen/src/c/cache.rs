@@ -35,7 +35,7 @@ fn dir() -> PathBuf {
 pub fn key(def_hash: &str, ctors: &str, inlining: (usize, usize)) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
-        "ply-c-emit-1",
+        "ply-c-emit-2",
         &exe_stamp(),
         &format!("{}:{}", inlining.0, inlining.1),
         ctors,
@@ -173,6 +173,10 @@ fn encode(text: &str, t: &Tables) -> String {
                 .join(" ")
         ));
     }
+    out.push_str(&format!("lambdas {}\n", t.lambdas.len()));
+    for l in &t.lambdas {
+        out.push_str(&format!("{l}\n"));
+    }
     out.push_str(&format!("calls {}\n", t.calls.len()));
     for c in &t.calls {
         out.push_str(&format!("{c}\n"));
@@ -229,6 +233,10 @@ fn decode(s: &str) -> Option<(String, Tables)> {
         t.shapes
             .push(line.split_whitespace().map(Symbol::new).collect::<Vec<_>>());
     }
+    let n = count(lines.next()?, "lambdas")?;
+    for _ in 0..n {
+        t.lambdas.push(lines.next()?.to_string());
+    }
     let n = count(lines.next()?, "calls")?;
     for _ in 0..n {
         t.calls.push(lines.next()?.to_string());
@@ -284,6 +292,7 @@ mod tests {
         t.fields.push(Symbol::new("text"));
         t.shapes.push(vec![Symbol::new("text"), Symbol::new("b")]);
         t.calls.push("text".to_string());
+        t.lambdas.push("ply_m_f_lambda0".to_string());
         let text = "Word f(void) {\n  return @@c1@@;\n}\ntext\n";
 
         let (back, out) = decode(&encode(text, &t)).expect("the encoding round trips");
@@ -291,6 +300,7 @@ mod tests {
         assert_eq!(out.fields, t.fields);
         assert_eq!(out.shapes, t.shapes);
         assert_eq!(out.calls, t.calls);
+        assert_eq!(out.lambdas, t.lambdas);
         assert_eq!(out.builtins, t.builtins);
         assert_eq!(out.consts.len(), 3);
         assert!(matches!(out.consts[0], Value::Unit));
