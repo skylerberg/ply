@@ -69,10 +69,10 @@ pub fn build(
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let fragment = super::cache::fragment_digest(names);
-    let inlining = (
-        crate::opt::Inlining::EMITTED.budget,
-        crate::opt::Inlining::EMITTED.depth,
-    );
+    // What the inliner will actually be told, override included, because that is what the emitted
+    // body is a function of and the cache is keyed on it.
+    let how = crate::opt::Inlining::EMITTED.overridden();
+    let inlining = (how.budget, how.depth);
     let mut taken: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
     // A bisecting instrument: compile only the definitions named, so that a wrong answer can be
     // narrowed to the body that produces it. The fixpoint then refuses whatever calls the rest.

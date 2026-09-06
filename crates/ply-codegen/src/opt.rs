@@ -37,15 +37,34 @@ impl Inlining {
 
     /// The emitted tier's. Wide enough to fold BLAKE3's rounds into its compression, because the
     /// C compiler forwards the record chain that exposes instead of spilling it: about a fifth off
-    /// the integer kernel, for about twice the compile. That trade is only available to a tier
-    /// that is already off the loop's path.
+    /// the integer kernel. That trade is only available to a tier already off the loop's path.
+    ///
+    /// The depth was six, and six was chosen when this tier took about three hundred mostly small
+    /// definitions. It now takes eleven hundred, and the two knobs turned out not to be
+    /// interchangeable. Over the self-hosted front end's unit:
+    ///
+    /// | budget/depth | lines | k1 |
+    /// | --- | --- | --- |
+    /// | 2000/6 | 1,511,403 | 0.315ms |
+    /// | 2000/3 | 506,955 | 0.301ms |
+    /// | 500/6 | 1,506,403 | 0.313ms |
+    /// | 200/6 | 1,464,037 | 0.234ms |
+    /// | 64/2 (the other tier's) | 286,589 | 0.399ms |
+    ///
+    /// Depth is what the size follows and the budget is nearly free, which is the opposite of the
+    /// way round they read. At six the unit was 96MB and `cc -O2` took eight minutes on it; at
+    /// three it is a third of that for a kernel that did not move.
     pub const EMITTED: Inlining = Inlining {
         budget: 2000,
-        depth: 6,
+        depth: 3,
     };
 
     /// `PLY_INLINE_BUDGET` and `PLY_INLINE_DEPTH` override, for a measurement.
-    fn overridden(self) -> Inlining {
+    ///
+    /// Public because the emitted tier's cache is keyed on what the inliner was *told*, and the
+    /// override is part of that: keyed on the constant instead, a measurement at one depth served
+    /// bodies emitted at another and read as though the depth had not moved.
+    pub fn overridden(self) -> Inlining {
         let n = |k: &str, d: usize| {
             std::env::var(k)
                 .ok()
