@@ -7,6 +7,8 @@
 //! nothing. This holds what a second iteration would otherwise re-establish.
 
 use crate::load::Loaded;
+use ply_hash::{DefHash, HashOutput};
+use ply_span::Symbol;
 use ply_store::ContentHash;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -35,6 +37,50 @@ pub struct Warm {
     /// written without being changed — a save with no edit, which is most saves — costs a read
     /// rather than a front end.
     content: BTreeMap<PathBuf, ContentHash>,
+    /// The compiled unit the last iteration built, if it built one.
+    unit: Option<HeldUnit>,
+}
+
+/// A compiled unit and the definitions it was compiled from.
+///
+/// The front end was already held; the unit was not, so a warm iteration under `--backend`
+/// recompiled the whole project — which `benches/marginal-change/` reads as about half of what a
+/// backed run costs, and which for the emitted tier is tens of seconds. A unit is a function of the
+/// definitions it compiled, so an iteration where every definition still says what it said runs on
+/// the one already in memory.
+struct HeldUnit {
+    provider: &'static dyn ply_eval::Provider,
+    /// The backend asked for, since two specs are two different units under one name.
+    spec: ply_eval::BackendSpec,
+    /// Every hash the front end published, as it stood. Conservative on purpose: a definition the
+    /// unit never compiled moving still rebuilds, which costs a compile and cannot answer from
+    /// stale code.
+    ///
+    /// **Tests as well as functions**, and that is not a detail. A test body is compiled like any
+    /// other definition -- a run enters the test's own root -- and `HashOutput` keeps tests in a
+    /// collection of their own. Keyed on `defs` alone, an edit to a test reused a unit holding the
+    /// *old* test and the watch loop reported the old answer, which is the failure mode this whole
+    /// mechanism must not have.
+    key: Key,
+}
+
+/// What the front end published about every definition, test and declaration.
+type Key = (Vec<(Symbol, DefHash)>, Vec<DefHash>, Vec<(Symbol, DefHash)>);
+
+fn key_of(hashes: &HashOutput) -> Key {
+    (
+        hashes
+            .defs
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect(),
+        hashes.tests.clone(),
+        hashes
+            .decls
+            .iter()
+            .map(|(n, h)| (n.clone(), h.clone()))
+            .collect(),
+    )
 }
 
 /// Why an iteration did or did not reuse what the last one built.
@@ -107,6 +153,30 @@ impl Warm {
             })
             .collect();
         self.held = Some(loaded);
+    }
+
+    /// The unit the last iteration compiled, if this iteration would compile the same one.
+    pub fn unit_for(
+        &self,
+        spec: &ply_eval::BackendSpec,
+        hashes: &HashOutput,
+    ) -> Option<&'static dyn ply_eval::Provider> {
+        let held = self.unit.as_ref()?;
+        (held.spec == *spec && held.key == key_of(hashes)).then_some(held.provider)
+    }
+
+    /// Hold this unit for the next iteration.
+    pub fn keep_unit(
+        &mut self,
+        spec: &ply_eval::BackendSpec,
+        hashes: &HashOutput,
+        provider: &'static dyn ply_eval::Provider,
+    ) {
+        self.unit = Some(HeldUnit {
+            provider,
+            spec: spec.clone(),
+            key: key_of(hashes),
+        });
     }
 }
 
@@ -301,6 +371,59 @@ mod tests {
         let (taken, reuse) = warm.take(dir.path());
         assert_eq!(reuse, Reuse::Whole, "a save that changed nothing reloaded");
         assert!(taken.is_some());
+    }
+
+    /// A held unit is a function of everything the front end published, **tests included**.
+    ///
+    /// Keyed on `defs` alone, an edit to a test reuses a unit holding the old test and the watch
+    /// loop reports the old answer. That is a wrong answer with nothing to notice it, so it is
+    /// pinned here rather than left to a loop nobody runs in a test.
+    #[test]
+    fn a_held_unit_is_dropped_when_a_test_moves() {
+        struct Nothing;
+        impl ply_eval::Provider for Nothing {
+            fn attach(
+                &'static self,
+                _: &ply_eval::BackendSpec,
+            ) -> std::rc::Rc<dyn ply_eval::Compiled> {
+                unreachable!("this provider is never attached")
+            }
+            fn name(&self) -> &'static str {
+                "nothing"
+            }
+            fn len(&self) -> usize {
+                0
+            }
+            fn offers(&self) -> ply_eval::backend::Offers {
+                ply_eval::backend::Offers::default()
+            }
+        }
+        let provider: &'static dyn ply_eval::Provider = Box::leak(Box::new(Nothing));
+        let spec = ply_eval::BackendSpec::default();
+        let mut warm = Warm::default();
+        let mut hashes = HashOutput::default();
+        hashes.defs.insert(Symbol::new("m.f"), DefHash([1; 32]));
+        hashes.tests.push(DefHash([2; 32]));
+
+        warm.keep_unit(&spec, &hashes, provider);
+        assert!(
+            warm.unit_for(&spec, &hashes).is_some(),
+            "nothing moved, so the unit still answers for this program"
+        );
+
+        let mut moved = hashes.clone();
+        moved.tests[0] = DefHash([3; 32]);
+        assert!(
+            warm.unit_for(&spec, &moved).is_none(),
+            "a test moved, so the unit holds the old one and must not be reused"
+        );
+
+        let mut moved = hashes.clone();
+        moved.defs.insert(Symbol::new("m.f"), DefHash([4; 32]));
+        assert!(
+            warm.unit_for(&spec, &moved).is_none(),
+            "a definition moved, so the unit holds the old one"
+        );
     }
 
     fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
