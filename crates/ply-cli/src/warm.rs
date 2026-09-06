@@ -69,17 +69,9 @@ type Key = (Vec<(Symbol, DefHash)>, Vec<DefHash>, Vec<(Symbol, DefHash)>);
 
 fn key_of(hashes: &HashOutput) -> Key {
     (
-        hashes
-            .defs
-            .iter()
-            .map(|(n, h)| (n.clone(), *h))
-            .collect(),
+        hashes.defs.iter().map(|(n, h)| (n.clone(), *h)).collect(),
         hashes.tests.clone(),
-        hashes
-            .decls
-            .iter()
-            .map(|(n, h)| (n.clone(), *h))
-            .collect(),
+        hashes.decls.iter().map(|(n, h)| (n.clone(), *h)).collect(),
     )
 }
 
