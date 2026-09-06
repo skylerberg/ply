@@ -68,6 +68,12 @@ pub fn build(
 ) -> Result<(Native, Vec<Refused>)> {
     let ctors = loaded.ctors();
     let mut taken: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
+    // A bisecting instrument: compile only the definitions named, so that a wrong answer can be
+    // narrowed to the body that produces it. The fixpoint then refuses whatever calls the rest.
+    if let Ok(only) = std::env::var("PLY_C_ONLY") {
+        let want: Vec<&str> = only.split(',').filter(|s| !s.is_empty()).collect();
+        taken.retain(|n| want.iter().any(|w| n == w));
+    }
     let mut refusals: Vec<Refused> = Vec::new();
 
     // The fixpoint: emit everything, drop what refused, and go round again, because dropping a
@@ -216,6 +222,7 @@ fn emit_one(loaded: &'static Source, unit: &mut Unit, name: &str) -> Result<Stri
     // normal return, so a compiled recursion is bounded by the number the machine bounds an
     // interpreted one by.
     head.push_str("  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n");
+    e.count_reads(&lowered.code);
     let answer = e.expr(&lowered.code)?;
     let word = e.word(&answer);
     let mut out = head;
@@ -265,6 +272,17 @@ fn bind(lib: &Library) -> Result<()> {
     let addrs = helper_addresses();
     debug_assert_eq!(addrs.len(), HELPERS.len());
     unsafe { bind(addrs.as_ptr()) };
+    let Some(p) = lib.symbol("ply_bind_singletons") else {
+        bail!("the unit the C tier built has no `ply_bind_singletons`");
+    };
+    let singletons: unsafe extern "C" fn(Word, Word, Word) = unsafe { std::mem::transmute(p) };
+    unsafe {
+        singletons(
+            crate::heap::bool(true),
+            crate::heap::bool(false),
+            crate::heap::unit(),
+        )
+    };
     Ok(())
 }
 

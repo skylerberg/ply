@@ -142,6 +142,14 @@ pub fn runtime_decls() -> String {
             pointer_name(h.name)
         ));
     }
+    // The three singletons, bound rather than baked. They are heap addresses, so writing them into
+    // the source made the source different in every process -- which is invisible while a unit is
+    // compiled and thrown away, and fatal the moment one is *kept*: a cached object would carry
+    // another run's pointers. Bound here, the emitted C is a function of the program alone.
+    out.push_str("\nstatic Word ply_true, ply_false, ply_unit;\n");
+    out.push_str(
+        "void ply_bind_singletons(Word t, Word f, Word u) { ply_true = t; ply_false = f; ply_unit = u; }\n",
+    );
     out.push_str("\nvoid ply_bind(void **fns) {\n");
     for (i, h) in HELPERS.iter().enumerate() {
         let ret = if h.answers { "Word" } else { "void" };
