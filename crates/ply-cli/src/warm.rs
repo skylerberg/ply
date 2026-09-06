@@ -72,13 +72,13 @@ fn key_of(hashes: &HashOutput) -> Key {
         hashes
             .defs
             .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .map(|(n, h)| (n.clone(), *h))
             .collect(),
         hashes.tests.clone(),
         hashes
             .decls
             .iter()
-            .map(|(n, h)| (n.clone(), h.clone()))
+            .map(|(n, h)| (n.clone(), *h))
             .collect(),
     )
 }
