@@ -1097,6 +1097,12 @@ pub fn is_unique(w: Word) -> bool {
 pub fn kind(w: Word) -> u8 {
     if is_imm(w) {
         KIND_INT
+    } else if w == 0 {
+        // Zero is the emitted tier's "no word here": a record it has not built yet, and the answer
+        // of a guarded read whose guard was false. It is not an address, and `kind` is the first
+        // thing every runtime helper asks -- so without this line a zero reaching one of them
+        // reads `(*null).kind`, which is a fault at address 4 rather than a diagnostic.
+        KIND_DEAD
     } else {
         unsafe { (*obj(w)).kind }
     }
