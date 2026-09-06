@@ -69,10 +69,10 @@ pub fn build(
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let fragment = super::cache::fragment_digest(names);
-    let inlining = (
-        crate::opt::Inlining::EMITTED.budget,
-        crate::opt::Inlining::EMITTED.depth,
-    );
+    // What the inliner will actually be told, override included, because that is what the emitted
+    // body is a function of and the cache is keyed on it.
+    let how = crate::opt::Inlining::EMITTED.overridden();
+    let inlining = (how.budget, how.depth);
     let mut taken: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
     // A bisecting instrument: compile only the definitions named, so that a wrong answer can be
     // narrowed to the body that produces it. The fixpoint then refuses whatever calls the rest.
@@ -160,6 +160,16 @@ pub fn build(
     let lib = compile_and_load(&text, "unit")?;
     bind(&lib)?;
 
+    // The address of every lambda entry, in the order `resolve` numbered them: what
+    // `rt_closure` indexes to put a code pointer in a closure object.
+    let mut functions = Vec::with_capacity(unit.lambdas.len());
+    for symbol in &unit.lambdas {
+        let Some(p) = lib.symbol(symbol) else {
+            bail!("the unit the C tier built has no `{symbol}`");
+        };
+        functions.push(p as usize);
+    }
+
     let mut entries = HashMap::new();
     for name in &taken {
         let Some((def, _)) = loaded.definition(name) else {
@@ -190,7 +200,9 @@ pub fn build(
             constants.insert(name.clone(), next);
         }
     }
-    let tables = Rc::new(tables_of(unit, &ctors));
+    let mut tables = tables_of(unit, &ctors);
+    tables.functions = functions;
+    let tables = Rc::new(tables);
     Ok((
         Native {
             lib,
@@ -272,6 +284,10 @@ fn emit_one(
     let t1 = std::time::Instant::now();
     let _guard = Timed(t1);
     let mut e = Emit::new(loaded, unit, name, module_index);
+    // Before the parameters are bound, not after: binding a name charges its reads to the object
+    // it holds, so a parameter bound while the table was empty contributes nothing and a rule that
+    // asks "does anything else read this object" hears no about the body's own argument.
+    e.count_reads(&lowered.code);
     // Not `static`: an exported body carries a symbol, and a symbol is what lets a
     // sampling profiler attribute time to a Ply definition. The Cranelift tier cannot be read
     // this way at all, which is a real difference between the two and not a small one.
@@ -303,7 +319,6 @@ fn emit_one(
     // normal return, so a compiled recursion is bounded by the number the machine bounds an
     // interpreted one by.
     head.push_str("  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n");
-    e.count_reads(&lowered.code);
     let answer = match e.expr(&lowered.code) {
         Ok(answer) => answer,
         Err(err) => {
@@ -330,6 +345,9 @@ fn emit_one(
             .collect::<Vec<_>>()
             .join("")
     ));
+    // The lambdas this body defines, as functions beside it. Part of the body's text, so they
+    // are cached and restored with it, and their placeholders are resolved with it.
+    out.push_str(&e.lambda_defs());
     if let Some(k) = &key {
         super::cache::write(k, &out, &e.tables);
     }
@@ -349,6 +367,7 @@ fn resolve(text: &str, tables: &super::emit::Tables, unit: &mut Unit) -> String 
     let builtins: Vec<usize> = tables.builtins.iter().map(|b| unit.builtin(*b)).collect();
     let fields: Vec<usize> = tables.fields.iter().map(|f| unit.field(f)).collect();
     let shapes: Vec<u32> = tables.shapes.iter().map(|n| unit.shape(n)).collect();
+    let lambdas: Vec<usize> = tables.lambdas.iter().map(|l| unit.lambda(l)).collect();
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("@@") {
@@ -364,7 +383,8 @@ fn resolve(text: &str, tables: &super::emit::Tables, unit: &mut Unit) -> String 
             "b" => builtins[i],
             "f" => fields[i],
             "s" => shapes[i] as usize,
-            other => unreachable!("an emitted placeholder is one of four kinds, not `{other}`"),
+            "l" => lambdas[i],
+            other => unreachable!("an emitted placeholder is one of five kinds, not `{other}`"),
         };
         out.push_str(&resolved.to_string());
         rest = &body[end + 2..];

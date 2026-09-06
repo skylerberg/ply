@@ -333,3 +333,129 @@ pub fn two(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
     assert!(native.entry("m.one").is_some(), "`one` has no body");
     assert!(native.entry("m.two").is_some(), "`two` has no body");
 }
+
+/// A constructor a *program* declares, rather than one the prelude does.
+///
+/// The unit interns a user constructor under the program-wide name its module qualifies it with,
+/// and a body names it bare, so nothing but the resolver stands between the two. Reading the
+/// table with the bare symbol found only the prelude's, so every `type` a program declared was
+/// refused -- and the fixpoint then refused each of that body's callers in turn, which is most of
+/// why this tier took 295 of the front end's 1400 definitions and not why you would guess.
+#[test]
+fn a_constructor_a_program_declares_is_built_and_matched_like_a_preludes() {
+    let source = r#"
+type Tok = TEof | TNum(Int) | TName(Bytes)
+pub fn code(t: Tok) -> Int =
+  match t {
+    TEof -> 0,
+    TNum(n) -> n,
+    TName(b) -> bytes_len(b),
+  }
+pub fn round(n: Int) -> Int = code(TNum(n))
+pub fn eof() -> Int = code(TEof)
+pub fn named(b: Bytes) -> Int = code(TName(b))
+"#;
+    let Some((loaded, native, refused)) = tests_support::with_refusals(source) else {
+        return;
+    };
+    assert!(
+        refused.is_empty(),
+        "nothing here is outside the fragment: {refused:?}"
+    );
+    let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let cases: &[(&str, Vec<ply_eval::Value>)] = &[
+        ("m.round", vec![ply_eval::Value::Int(7)]),
+        ("m.eof", vec![]),
+        ("m.named", vec![ply_eval::Value::bytes(b"abcd")]),
+    ];
+    for (name, args) in cases {
+        let want = machine
+            .call(name, args.clone(), ply_span::Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let entry: crate::jit::Entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.fuel = 100_000;
+        let layouts: *const crate::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        let got = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
+    }
+}
+
+/// A list read after a fold over it, and a closure called through a value.
+///
+/// Two defects met here, and both were silent in every workload smaller than the self-hosted
+/// front end.
+///
+/// `rt_dec` is `Heap::release_last`: it frees *unconditionally*, because it is the `rc == 1` case
+/// its caller has already established. The in-process tier establishes it — it emits the count
+/// test and calls the helper only on the branch where the count is one. This tier called it bare
+/// at all five of its release sites, so a release freed the object whatever else was holding it.
+/// The `debug_assert` that says so is compiled out of the profile the suite runs.
+///
+/// And `fused_fold` released a count it had never taken, so a caller that read the list again was
+/// reading freed memory even once the release itself was guarded. `fold(xs, 0, add) + len(xs)` is
+/// the whole reproduction; it had been wrong since this tier's first commit.
+#[test]
+fn a_list_survives_a_fold_over_it_and_a_closure_survives_being_called() {
+    let source = r#"
+fn add(a: Int, x: Int) -> Int = a + x
+pub fn twice(xs: List<Int>) -> Int = fold(xs, 0, add) + fold(xs, 0, add)
+pub fn and_len(xs: List<Int>) -> Int = fold(xs, 0, add) + len(xs)
+pub fn through_a_value(xs: List<Int>, k: Int) -> Int = fold(xs, 0, |a: Int, x: Int| a + x * k)
+pub fn mapped(xs: List<Int>, k: Int) -> List<Int> = map(xs, |x: Int| x * k)
+pub fn by_name(xs: List<Int>) -> Int = fold(map(xs, |x: Int| x + 1), 0, add)
+pub fn adder(n: Int) -> (Int) -> Int = |x: Int| x + n
+pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
+"#;
+    let Some((loaded, native, refused)) = tests_support::with_refusals(source) else {
+        return;
+    };
+    assert!(
+        refused.is_empty(),
+        "the callback family is inside the fragment now: {refused:?}"
+    );
+    let list =
+        |xs: &[i64]| ply_eval::Value::list(xs.iter().map(|n| ply_eval::Value::Int(*n)).collect());
+    let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let cases: &[(&str, Vec<ply_eval::Value>)] = &[
+        ("m.twice", vec![list(&[1, 2, 3])]),
+        ("m.and_len", vec![list(&[1, 2, 3])]),
+        (
+            "m.through_a_value",
+            vec![list(&[1, 2, 3]), ply_eval::Value::Int(10)],
+        ),
+        ("m.mapped", vec![list(&[1, 2, 3]), ply_eval::Value::Int(3)]),
+        ("m.by_name", vec![list(&[1, 2, 3, 4])]),
+        (
+            "m.used_twice",
+            vec![ply_eval::Value::Int(5), ply_eval::Value::Int(2)],
+        ),
+    ];
+    for (name, args) in cases {
+        let want = machine
+            .call(name, args.clone(), ply_span::Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let entry: crate::jit::Entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.fuel = 100_000;
+        let layouts: *const crate::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        let got = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
+    }
+}
