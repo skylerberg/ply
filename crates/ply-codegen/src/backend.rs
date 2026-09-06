@@ -647,7 +647,11 @@ fn scalar_signature(source: &Source, name: &str) -> bool {
 
 /// The largest subset of `candidates` the fragment compiles **as one unit**, and every function
 /// that was dropped with the reason.
-fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed> {
+///
+/// Public so that a measurement can compile the same set the tier does. `Jit::compile` fails on
+/// the first definition outside the fragment, which is right for a caller that has already chosen
+/// one and wrong for a caller that has not.
+pub fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed> {
     let mut set: Vec<String> = candidates.to_vec();
     let mut lost: Vec<(String, String)> = Vec::new();
     loop {
@@ -680,4 +684,4 @@ fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed> {
 }
 
 /// The surviving set, and every function that was dropped with the reason.
-type Closed = (Vec<String>, Vec<(String, String)>);
+pub type Closed = (Vec<String>, Vec<(String, String)>);

@@ -18,6 +18,6 @@ pub mod opt;
 pub mod rt;
 pub mod source;
 
-pub use backend::{Bodies, Cranelift, Declines};
+pub use backend::{Bodies, Closed, Cranelift, Declines, closure};
 pub use jit::{Jit, Opts, Refused, Unit};
 pub use source::{Source, test_root_name};

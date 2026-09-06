@@ -41,10 +41,19 @@ algorithm is a broken bar.
 
 | arm | command |
 | --- | --- |
-| `ply` | `ply test <dir> --no-cache --jobs 1 --filter kernel: --backend cranelift` |
+| `ply` | `ply-arm/target/release/ply-arm <dir> <backend>` |
 | `null` | the same command under a different label — the control |
 | `rust` | `benches/value-model/rust/target/release/kernels` |
 | `floor` | `ply test <dir> --no-cache --jobs 1 --filter kernel:nothing-matches` — the run's fixed cost |
+
+The Ply arm was `ply test --json` until it was not. That command runs a kernel **once** per
+process, where the Rust arm takes the minimum over repeats inside one, so the Ply arm carried a
+whole run's fixed cost and the Rust arm carried none of it. At k1's fifth of a millisecond that
+was most of the reading: the ratio moved by 1.5 points between invocations at one load, against a
+bar of 3.0. `ply-arm` builds the fragment once and calls the kernel's entry directly, which is the
+same call the machine makes — k1 crosses the seam once and never returns
+(`--audit-backend`: `entered 1, declined 0`). See `observation-in-process.txt`. **Readings taken
+before that change are not comparable to ones taken after it.**
 
 Every arm sits in every position across three blocks. Per-kernel durations are
 read from `--json` for the Ply arm and from the binary's own report for the
@@ -56,6 +65,11 @@ and the Rust binary has its own, smaller, fixed cost.
 Per kernel, the ratio of the Ply arm's minimum time to the Rust arm's minimum
 time over the blocks. The null control's distance from `ply` is the resolution;
 a ratio within the resolution of the bar is reported as undecided, not as a pass.
+
+Each arm's own reading is itself a minimum: 200 calls for k1 and 20 for k2, k1 getting more
+because it is two hundred times the shorter and its minimum had not settled at twenty. That is
+what makes the resolution mean something — it was 1.5 ratio points when each reading was a single
+call, and is 0.20 now.
 
 ## Decision rule
 
