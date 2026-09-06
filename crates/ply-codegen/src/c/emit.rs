@@ -1640,6 +1640,13 @@ impl<'a> Emit<'a> {
         // freed it. The rule is about every later read of the *object*, and an update knows no
         // more about those than a field read does.
         //
+        // Counting reads *as they are emitted* and releasing when none is left does not work
+        // either, and it is the attractive one: emission order is execution order in straight-line
+        // code, and a branch is safe both ways round. It still failed the front end, with and
+        // without a guard for the fused loops -- where a body's reads are emitted once and run once
+        // per iteration -- so something else the count does not see reads the object again. Do not
+        // retry it without a smaller failing case in hand than thirteen thousand lines.
+        //
         // What it costs is measured rather than guessed: `{..s, ..}` over the state kernel's
         // five-field record reads `s` seven times, so the release is suppressed and each of two
         // hundred thousand iterations allocates afresh. ADR 0035's gate reads 3.7x there against
