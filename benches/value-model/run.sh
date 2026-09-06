@@ -52,8 +52,8 @@ echo "load-before $l" >> "$raw"
 # carried none of it, and the ratio moved by 1.5 points between invocations at one load. It is
 # 0.20 now. See `observation-in-process.txt`; the readings before it are not comparable to the
 # ones after, and that is the point of the change rather than a side effect of it.
-(cd "$here/ply-arm" && cargo build --release --quiet)
-armbin="$here/ply-arm/target/release/ply-arm"
+(cd "$root" && cargo build --release --quiet -p ply-arm)
+armbin="$root/target/release/ply-arm"
 ply_arm() { "$armbin" "$dir" "$backend" | sed 's/ digest=.*//'; }
 
 rust_arm() { "$bars" | sed 's/ digest=.*//'; }

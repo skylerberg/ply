@@ -41,7 +41,7 @@ algorithm is a broken bar.
 
 | arm | command |
 | --- | --- |
-| `ply` | `ply-arm/target/release/ply-arm <dir> <backend>` |
+| `ply` | `target/release/ply-arm <dir> <backend>` |
 | `null` | the same command under a different label — the control |
 | `rust` | `benches/value-model/rust/target/release/kernels` |
 | `floor` | `ply test <dir> --no-cache --jobs 1 --filter kernel:nothing-matches` — the run's fixed cost |
