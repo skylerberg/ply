@@ -67,6 +67,12 @@ pub fn build(
     _opts: Opts,
 ) -> Result<(Native, Vec<Refused>)> {
     let ctors = loaded.ctors();
+    let ctors_digest = super::cache::ctors_digest(&ctors);
+    let fragment = super::cache::fragment_digest(names);
+    let inlining = (
+        crate::opt::Inlining::EMITTED.budget,
+        crate::opt::Inlining::EMITTED.depth,
+    );
     let mut taken: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
     // A bisecting instrument: compile only the definitions named, so that a wrong answer can be
     // narrowed to the body that produces it. The fixpoint then refuses whatever calls the rest.
@@ -77,14 +83,15 @@ pub fn build(
     let mut refusals: Vec<Refused> = Vec::new();
 
     // The fixpoint: emit everything, drop what refused, and go round again, because dropping a
-    // body can refuse the ones that call it.
-    let (unit, bodies) = loop {
+    // body can refuse the ones that call it. A body's text names the unit's tables by its own
+    // positions, so nothing here touches the unit and a round is the emitting alone.
+    let emitted = loop {
         let mut unit = Unit::new(ctors.clone(), taken.clone());
-        let mut bodies: Vec<(String, String)> = Vec::new();
+        let mut emitted: Vec<(String, String, super::emit::Tables)> = Vec::new();
         let mut round: Vec<Refused> = Vec::new();
         for name in &taken {
-            match emit_one(loaded, &mut unit, name) {
-                Ok(text) => bodies.push((name.clone(), text)),
+            match emit_one(loaded, &mut unit, name, &ctors_digest, inlining, &fragment) {
+                Ok((text, tables)) => emitted.push((name.clone(), text, tables)),
                 Err(e) => match e.downcast::<Refused>() {
                     Ok(r) => round.push(r),
                     Err(other) => return Err(other),
@@ -92,13 +99,22 @@ pub fn build(
             }
         }
         if round.is_empty() {
-            break (unit, bodies);
+            break emitted;
         }
         for r in &round {
             taken.retain(|n| n != &r.function);
         }
         refusals.extend(round);
     };
+    // The tables the settled set actually needs, filled once rather than once per round.
+    let mut unit = Unit::new(ctors.clone(), taken.clone());
+    let bodies: Vec<(String, String)> = emitted
+        .into_iter()
+        .map(|(name, text, tables)| {
+            let text = resolve(&text, &tables, &mut unit);
+            (name, text)
+        })
+        .collect();
 
     let arities: Vec<(String, usize)> = taken
         .iter()
@@ -113,6 +129,14 @@ pub fn build(
             eprintln!("c tier refused `{}`: {}", r.function, r.construct);
         }
         eprintln!("c tier took {} of {} definitions", taken.len(), names.len());
+    }
+    if std::env::var("PLY_C_SPLIT").is_ok() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "c emit: optimise+lower {}ms, emit {}ms",
+            OPTIMISE.load(Relaxed) / 1000,
+            EMIT.load(Relaxed) / 1000
+        );
     }
     let text = assemble(&bodies, &arities);
     if let Ok(want) = std::env::var("PLY_C_DUMP") {
@@ -178,8 +202,58 @@ pub fn build(
     ))
 }
 
+/// PROBE: where the emit's time goes, in microseconds.
+pub static OPTIMISE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static EMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+struct Timed(std::time::Instant);
+impl Drop for Timed {
+    fn drop(&mut self) {
+        EMIT.fetch_add(
+            self.0.elapsed().as_micros() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 /// The C for one body, or the refusal that stopped it.
-fn emit_one(loaded: &'static Source, unit: &mut Unit, name: &str) -> Result<String> {
+fn emit_one(
+    loaded: &'static Source,
+    unit: &mut Unit,
+    name: &str,
+    ctors_digest: &str,
+    inlining: (usize, usize),
+    fragment: &str,
+) -> Result<(String, super::emit::Tables)> {
+    // Kept from a previous run, when the caller said what this body is a function of and the
+    // definitions it calls are still ones this unit has. The check on the calls is what makes a
+    // restored body safe: the fixpoint may have dropped a callee since, and a body that names one
+    // it no longer has would not link.
+    // The *name* as well as the hash. A definition's hash is over its content, deliberately, so
+    // two definitions that say the same thing share one -- and an emitted body carries its own
+    // mangled name, so serving one for the other puts two definitions of the same symbol in the
+    // unit. `lexer.hex1` and `lexer.hex2` are that pair, and the C compiler said so.
+    let key = loaded
+        .keys
+        .get(name)
+        .map(|h| super::cache::key(&format!("{name}\0{h}"), ctors_digest, inlining));
+    let refusal = loaded.keys.get(name).map(|h| {
+        super::cache::refusal_key(&format!("{name}\0{h}"), ctors_digest, inlining, fragment)
+    });
+    if let Some(k) = &refusal
+        && let Some(reason) = super::cache::read_refusal(k)
+    {
+        return Err(Refused {
+            function: name.to_string(),
+            construct: reason,
+        }
+        .into());
+    }
+    if let Some(k) = &key
+        && let Some((text, tables)) = super::cache::read(k)
+        && tables.calls.iter().all(|c| unit.functions.contains(c))
+    {
+        return Ok((text, tables));
+    }
     let Some((def, module_index)) = loaded.definition(name) else {
         return Err(Refused {
             function: name.to_string(),
@@ -187,9 +261,16 @@ fn emit_one(loaded: &'static Source, unit: &mut Unit, name: &str) -> Result<Stri
         }
         .into());
     };
+    let t0 = std::time::Instant::now();
     let body = crate::opt::optimize(loaded, module_index, def, crate::opt::Inlining::EMITTED);
     let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
     let lowered = lower_fn(&params, &body);
+    OPTIMISE.fetch_add(
+        t0.elapsed().as_micros() as u64,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    let t1 = std::time::Instant::now();
+    let _guard = Timed(t1);
     let mut e = Emit::new(loaded, unit, name, module_index);
     // Not `static`: an exported body carries a symbol, and a symbol is what lets a
     // sampling profiler attribute time to a Ply definition. The Cranelift tier cannot be read
@@ -223,7 +304,17 @@ fn emit_one(loaded: &'static Source, unit: &mut Unit, name: &str) -> Result<Stri
     // interpreted one by.
     head.push_str("  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n");
     e.count_reads(&lowered.code);
-    let answer = e.expr(&lowered.code)?;
+    let answer = match e.expr(&lowered.code) {
+        Ok(answer) => answer,
+        Err(err) => {
+            if let Some(k) = &refusal
+                && let Some(r) = err.downcast_ref::<Refused>()
+            {
+                super::cache::write_refusal(k, &r.construct);
+            }
+            return Err(err);
+        }
+    };
     let word = e.word(&answer);
     let mut out = head;
     out.push_str(&e.token_decls());
@@ -239,7 +330,47 @@ fn emit_one(loaded: &'static Source, unit: &mut Unit, name: &str) -> Result<Stri
             .collect::<Vec<_>>()
             .join("")
     ));
-    Ok(out)
+    if let Some(k) = &key {
+        super::cache::write(k, &out, &e.tables);
+    }
+    Ok((out, e.tables.clone()))
+}
+
+/// A body's placeholders, resolved against the unit it is going into.
+///
+/// The text names a constant, a builtin, a field or a shape by *its own* position, so that the
+/// text is a function of the body alone. This is where those become the unit's positions.
+fn resolve(text: &str, tables: &super::emit::Tables, unit: &mut Unit) -> String {
+    let consts: Vec<usize> = tables
+        .consts
+        .iter()
+        .map(|v| unit.constant(v.clone()))
+        .collect();
+    let builtins: Vec<usize> = tables.builtins.iter().map(|b| unit.builtin(*b)).collect();
+    let fields: Vec<usize> = tables.fields.iter().map(|f| unit.field(f)).collect();
+    let shapes: Vec<u32> = tables.shapes.iter().map(|n| unit.shape(n)).collect();
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(at) = rest.find("@@") {
+        out.push_str(&rest[..at]);
+        let body = &rest[at + 2..];
+        let end = body
+            .find("@@")
+            .expect("an emitted placeholder always closes");
+        let (kind, digits) = body[..end].split_at(1);
+        let i: usize = digits.parse().expect("an emitted placeholder is numbered");
+        let resolved = match kind {
+            "c" => consts[i],
+            "b" => builtins[i],
+            "f" => fields[i],
+            "s" => shapes[i] as usize,
+            other => unreachable!("an emitted placeholder is one of four kinds, not `{other}`"),
+        };
+        out.push_str(&resolved.to_string());
+        rest = &body[end + 2..];
+    }
+    out.push_str(rest);
+    out
 }
 
 /// The whole translation unit: the prelude, the runtime, every body's prototype, then the bodies.
