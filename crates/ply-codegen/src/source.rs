@@ -16,6 +16,10 @@ pub struct Source {
     definitions: HashMap<String, (&'static FnDef, usize)>,
     /// The tests, as the program-wide names of the roots synthesized for them.
     test_roots: Vec<String>,
+    /// What each definition's emitted code is a function of, when the caller knows: its hash over
+    /// its own text and everything it references. Empty when nobody supplied any, and then nothing
+    /// is kept between runs.
+    pub keys: HashMap<String, String>,
 }
 
 /// The name a test's root takes: its place among its module's tests, which `ply_eval`'s test
@@ -88,6 +92,20 @@ impl Source {
             check,
             definitions,
             test_roots: roots,
+            keys: HashMap::new(),
+        }
+    }
+
+    /// The same, told what each definition's code is a function of.
+    pub fn keyed(
+        program: &'static Program,
+        resolved: &'static Resolved,
+        check: &'static CheckOutput,
+        keys: HashMap<String, String>,
+    ) -> Source {
+        Source {
+            keys,
+            ..Source::new(program, resolved, check)
         }
     }
 

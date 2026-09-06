@@ -199,11 +199,43 @@ pub struct Emit<'a> {
     /// How many times each name is read in this body. A release is only safe where the answer is
     /// one: see `release_base`.
     reads: std::collections::HashMap<Symbol, usize>,
+    /// The unit-wide things this body names, in the order it met them.
+    ///
+    /// The text says `@@c3@@` where a constant's index belongs and `assemble` rewrites it, so a
+    /// body's C is a function of *the body* rather than of what else happened to be emitted
+    /// beside it. That is what lets one be kept and reused in another unit -- and the emitter's
+    /// time is dominated by the inliner that produces the body, so keeping the text is keeping
+    /// nearly all of it.
+    pub tables: Tables,
+}
+
+/// What one body names of the unit around it, by the positions its own text uses.
+#[derive(Default, Clone)]
+pub struct Tables {
+    pub consts: Vec<Value>,
+    pub builtins: Vec<Builtin>,
+    pub fields: Vec<Symbol>,
+    pub shapes: Vec<Vec<Symbol>>,
+    /// Every definition this body calls, so that a body restored from a cache can be checked
+    /// against the set the fixpoint took rather than trusted.
+    pub calls: Vec<String>,
+}
+
+impl Tables {
+    fn at<T: PartialEq>(xs: &mut Vec<T>, x: T) -> usize {
+        match xs.iter().position(|y| *y == x) {
+            Some(i) => i,
+            None => {
+                xs.push(x);
+                xs.len() - 1
+            }
+        }
+    }
 }
 
 /// A record that has been described but not built: what `emit_record` would have emitted.
 struct Deferred {
-    shape: u32,
+    shape: String,
     n: usize,
     flags: i32,
     words: Vec<String>,
@@ -243,12 +275,12 @@ impl Unit {
 }
 
 impl Unit {
-    fn constant(&mut self, v: Value) -> usize {
+    pub(super) fn constant(&mut self, v: Value) -> usize {
         self.consts.push(v);
         self.consts.len() - 1
     }
 
-    fn field(&mut self, name: &Symbol) -> usize {
+    pub(super) fn field(&mut self, name: &Symbol) -> usize {
         if let Some(i) = self.fields.iter().position(|f| f == name) {
             return i;
         }
@@ -256,7 +288,7 @@ impl Unit {
         self.fields.len() - 1
     }
 
-    fn builtin(&mut self, b: Builtin) -> usize {
+    pub(super) fn builtin(&mut self, b: Builtin) -> usize {
         if let Some(i) = self.builtins.iter().position(|x| *x == b) {
             return i;
         }
@@ -302,6 +334,7 @@ impl<'a> Emit<'a> {
             released: std::collections::HashSet::new(),
             alias: std::collections::HashMap::new(),
             reads: std::collections::HashMap::new(),
+            tables: Tables::default(),
         }
     }
 
@@ -372,6 +405,27 @@ impl<'a> Emit<'a> {
             NodeKind::Lambda { body, .. } => go(body),
             _ => {}
         }
+    }
+
+    /// A constant, a builtin, a field or a shape as this body's own position in it, written as the
+    /// placeholder `assemble` rewrites.
+    fn local_const(&mut self, v: Value) -> String {
+        // `Value` has no equality that means "the same literal", so constants are not deduplicated
+        // here; the unit's own pool does that when the placeholder is resolved.
+        self.tables.consts.push(v);
+        format!("@@c{}@@", self.tables.consts.len() - 1)
+    }
+    fn local_builtin(&mut self, b: Builtin) -> String {
+        format!("@@b{}@@", Tables::at(&mut self.tables.builtins, b))
+    }
+    fn local_field(&mut self, name: &Symbol) -> String {
+        format!("@@f{}@@", Tables::at(&mut self.tables.fields, name.clone()))
+    }
+    fn local_shape(&mut self, names: &[Symbol]) -> String {
+        format!(
+            "@@s{}@@",
+            Tables::at(&mut self.tables.shapes, names.to_vec())
+        )
     }
 
     fn refuse<T>(&self, what: impl Into<String>) -> Result<T> {
@@ -489,7 +543,7 @@ impl<'a> Emit<'a> {
         let Some(d) = self.deferred.get(name) else {
             return;
         };
-        let (shape, n, flags) = (d.shape, d.n, d.flags);
+        let (shape, n, flags) = (d.shape.clone(), d.n, d.flags);
         let words = d.words.clone();
         self.tokens.insert(n);
         self.line(format!("if (!{name}) {{"));
@@ -653,7 +707,7 @@ impl<'a> Emit<'a> {
             // A sixty-four bit literal is a constant like any other: it goes in the pool, where
             // the value keeps every bit, rather than into a register the tag would clip.
             Lit::Fixed { .. } => {
-                let index = self.unit.constant(value.clone());
+                let index = self.local_const(value.clone());
                 let v = self.bind(Kind::Boxed, format!("rt_lit_p(ctx, {index})"));
                 self.check();
                 Ok(v)
@@ -667,7 +721,7 @@ impl<'a> Emit<'a> {
                 self.refuse("a `Float` or `Decimal` literal, which the fragment has no path for")
             }
             Lit::Str(_) | Lit::Bytes(_) | Lit::Unit => {
-                let index = self.unit.constant(value.clone());
+                let index = self.local_const(value.clone());
                 let v = self.bind(Kind::Boxed, format!("rt_lit_p(ctx, {index})"));
                 self.check();
                 Ok(v)
@@ -690,6 +744,7 @@ impl<'a> Emit<'a> {
                 .is_some_and(|(d, _)| d.params.is_empty())
             && self.unit.functions.contains(&full)
         {
+            self.tables.calls.push(full.clone());
             let v = self.bind(Kind::Boxed, format!("{}(ctx)", mangle(&full)));
             self.check();
             return Ok(v);
@@ -697,7 +752,7 @@ impl<'a> Emit<'a> {
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
         {
-            let index = self.unit.builtin(b);
+            let index = self.local_builtin(b);
             let v = self.bind(Kind::Boxed, format!("rt_builtin_value_p(ctx, {index})"));
             self.check();
             return Ok(v);
@@ -1197,7 +1252,7 @@ impl<'a> Emit<'a> {
         let w = match at {
             Some(at) => self.bind(Kind::Boxed, format!("ply_words({})[{at}]", held.c)),
             None => {
-                let index = self.unit.field(name);
+                let index = self.local_field(name);
                 let v = self.bind(
                     Kind::Boxed,
                     format!("rt_field_p(ctx, {}, {index}, 0)", held.c),
@@ -1361,7 +1416,7 @@ impl<'a> Emit<'a> {
         kinds: Vec<CTy>,
         built_from: Option<Vec<V>>,
     ) -> V {
-        let shape = self.unit.shape(names);
+        let shape = self.local_shape(names);
         // A record of nothing but immediates holds no counts, and saying so is what lets the
         // runtime skip walking its fields when it dies or is freed. The kernel's records are
         // sixteen scalars each and this tier was leaving the flag clear, so every death walked
@@ -1520,7 +1575,7 @@ impl<'a> Emit<'a> {
                             }
                         }
                         None => {
-                            let index = self.unit.field(name);
+                            let index = self.local_field(name);
                             let f = self.bind(
                                 Kind::Boxed,
                                 format!("rt_field_p(ctx, {}, {index}, 0)", held_base.c),
@@ -1582,6 +1637,7 @@ impl<'a> Emit<'a> {
                     let v = self.expr(a)?;
                     ws.push(self.owned(&v));
                 }
+                self.tables.calls.push(full.clone());
                 let call = format!(
                     "{}(ctx{}{})",
                     mangle(&full),
@@ -1753,7 +1809,7 @@ impl<'a> Emit<'a> {
                 ws.join(", ")
             }
         ));
-        let index = self.unit.builtin(b);
+        let index = self.local_builtin(b);
         let v = self.bind_as(
             Kind::Boxed,
             if opaque { CTy::Opaque } else { CTy::Unknown },
@@ -1780,7 +1836,7 @@ impl<'a> Emit<'a> {
         // Through the runtime, once, rather than off the header: the list usually comes from
         // `range`, whose answer the fragment has no type for, and `len` is where a value that is
         // not a list is caught -- with the diagnostic the interpreter would have given.
-        let len = self.unit.builtin(Builtin::Len);
+        let len = self.local_builtin(Builtin::Len);
         let arr = self.fresh();
         self.line(format!(
             "Word {arr}[1] = {{{}}}; ply_inc({arr}[0]);",
@@ -1826,6 +1882,7 @@ impl<'a> Emit<'a> {
                 .definition(&full)
                 .is_some_and(|(d, _)| d.params.len() == 2)
         {
+            self.tables.calls.push(full.clone());
             return Ok(format!("{}(ctx, {acc}, {x})", mangle(&full)));
         }
         self.refuse("`fold` over a function this tier cannot name")
@@ -2014,7 +2071,7 @@ impl<'a> Emit<'a> {
             if matches!(b, Builtin::BytesU32Le) {
                 let i = self.as_int(&vals[1]);
                 let idx = self.bind(Kind::Int, i);
-                let index = self.unit.builtin(b);
+                let index = self.local_builtin(b);
                 self.line(format!(
                     "if ((uint64_t){0} + 4 > (uint64_t)ply_obj({1})->len) {{ Word a[2]; a[0] = {1}; ply_inc(a[0]); a[1] = ply_imm({0}); rt_builtin_p(ctx, {index}, (Word)(intptr_t)a, 2); return 0; }}",
                     idx.c, t.c
@@ -2033,7 +2090,7 @@ impl<'a> Emit<'a> {
             if want == 2 {
                 let i = self.as_int(&vals[1]);
                 let idx = self.bind(Kind::Int, i);
-                let index = self.unit.builtin(b);
+                let index = self.local_builtin(b);
                 self.line(format!(
                     "if ((uint64_t){0} >= (uint64_t)ply_obj({1})->len) {{ Word a[2]; a[0] = {1}; ply_inc(a[0]); a[1] = ply_imm({0}); rt_builtin_p(ctx, {index}, (Word)(intptr_t)a, 2); return 0; }}",
                     idx.c, t.c
@@ -2067,7 +2124,7 @@ impl<'a> Emit<'a> {
                 idx.c, t.c
             ));
             self.depth += 1;
-            let index = self.unit.builtin(b);
+            let index = self.local_builtin(b);
             let a0 = self.fresh();
             self.line(format!("Word {a0}[2];"));
             self.line(format!("{a0}[0] = {}; ply_inc({a0}[0]);", t.c));
@@ -2088,7 +2145,7 @@ impl<'a> Emit<'a> {
                 t.c
             ));
             self.depth += 1;
-            let index = self.unit.builtin(b);
+            let index = self.local_builtin(b);
             let a0 = self.fresh();
             self.line(format!("Word {a0}[1];"));
             self.line(format!("{a0}[0] = {}; ply_inc({a0}[0]);", t.c));

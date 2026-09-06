@@ -314,3 +314,22 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         assert_eq!(got, want, "`{which}`: the tiers disagree");
     }
 }
+
+/// Two definitions that say exactly the same thing are one content hash, and an emitted body
+/// carries its own name -- so a cache keyed on the hash alone serves one body for both and the
+/// unit holds two definitions of one symbol and none of the other.
+///
+/// `spikes/ply-parser/lexer.ply` has that pair (`hex1` and `hex2`) and the C compiler is what
+/// noticed. This is the five-line version, and it fails without the name in the key.
+#[test]
+fn two_definitions_that_say_the_same_thing_get_their_own_bodies() {
+    let source = r#"
+pub fn one(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
+pub fn two(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
+"#;
+    let Some((_, native)) = tests_support::unit(source) else {
+        return;
+    };
+    assert!(native.entry("m.one").is_some(), "`one` has no body");
+    assert!(native.entry("m.two").is_some(), "`two` has no body");
+}
