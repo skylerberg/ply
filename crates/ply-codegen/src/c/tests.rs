@@ -428,10 +428,16 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
     let cases: &[(&str, Vec<ply_eval::Value>)] = &[
         ("m.twice", vec![list(&[1, 2, 3])]),
         ("m.and_len", vec![list(&[1, 2, 3])]),
-        ("m.through_a_value", vec![list(&[1, 2, 3]), ply_eval::Value::Int(10)]),
+        (
+            "m.through_a_value",
+            vec![list(&[1, 2, 3]), ply_eval::Value::Int(10)],
+        ),
         ("m.mapped", vec![list(&[1, 2, 3]), ply_eval::Value::Int(3)]),
         ("m.by_name", vec![list(&[1, 2, 3, 4])]),
-        ("m.used_twice", vec![ply_eval::Value::Int(5), ply_eval::Value::Int(2)]),
+        (
+            "m.used_twice",
+            vec![ply_eval::Value::Int(5), ply_eval::Value::Int(2)],
+        ),
     ];
     for (name, args) in cases {
         let want = machine
