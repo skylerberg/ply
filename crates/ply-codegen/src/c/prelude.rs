@@ -110,6 +110,12 @@ helpers![
     ("rt_ctor_value", 1, true),
     ("rt_constant", 1, true),
     ("rt_call", 3, true),
+    ("rt_closure", 4, true),
+    ("rt_map", 2, true),
+    ("rt_filter", 2, true),
+    ("rt_fold", 3, true),
+    ("rt_map_fold", 3, true),
+    ("rt_iterate", 3, true),
     ("rt_iterate_bad", 2, false),
     ("rt_shift_count", 1, false),
     ("rt_ctor", 3, true),
@@ -142,6 +148,23 @@ pub fn runtime_decls() -> String {
             pointer_name(h.name)
         ));
     }
+    // `heap::dec`, with the counted case inline and a call only for the release itself, which is
+    // the shape the in-process tier emits around its own `rt_dec` too.
+    //
+    // `rt_dec` is `release_last`: it frees *unconditionally*, because it is the `rc == 1` case a
+    // caller has already established. Cranelift establishes it -- it emits the count test and
+    // calls the helper only on the branch where the count is one. This tier called it bare, so
+    // every release freed an object whatever else was holding it, and `fold(xs, 0, add) + len(xs)`
+    // read a freed list. Three lines of Ply, and it had been in the tier from its first commit.
+    out.push_str(
+        "\nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
+         \x20 if (ply_is_imm(w) || w == 0) return;\n\
+         \x20 PlyObj *o = ply_obj(w);\n\
+         \x20 if (o->rc == UINT32_MAX) return;\n\
+         \x20 if (o->rc > 1) { o->rc -= 1; return; }\n\
+         \x20 rt_dec_p(ctx, w);\n\
+         }\n",
+    );
     // The three singletons, bound rather than baked. They are heap addresses, so writing them into
     // the source made the source different in every process -- which is invisible while a unit is
     // compiled and thrown away, and fatal the moment one is *kept*: a cached object would carry

@@ -160,6 +160,16 @@ pub fn build(
     let lib = compile_and_load(&text, "unit")?;
     bind(&lib)?;
 
+    // The address of every lambda entry, in the order `resolve` numbered them: what
+    // `rt_closure` indexes to put a code pointer in a closure object.
+    let mut functions = Vec::with_capacity(unit.lambdas.len());
+    for symbol in &unit.lambdas {
+        let Some(p) = lib.symbol(symbol) else {
+            bail!("the unit the C tier built has no `{symbol}`");
+        };
+        functions.push(p as usize);
+    }
+
     let mut entries = HashMap::new();
     for name in &taken {
         let Some((def, _)) = loaded.definition(name) else {
@@ -190,7 +200,9 @@ pub fn build(
             constants.insert(name.clone(), next);
         }
     }
-    let tables = Rc::new(tables_of(unit, &ctors));
+    let mut tables = tables_of(unit, &ctors);
+    tables.functions = functions;
+    let tables = Rc::new(tables);
     Ok((
         Native {
             lib,
@@ -333,6 +345,9 @@ fn emit_one(
             .collect::<Vec<_>>()
             .join("")
     ));
+    // The lambdas this body defines, as functions beside it. Part of the body's text, so they
+    // are cached and restored with it, and their placeholders are resolved with it.
+    out.push_str(&e.lambda_defs());
     if let Some(k) = &key {
         super::cache::write(k, &out, &e.tables);
     }
@@ -352,6 +367,7 @@ fn resolve(text: &str, tables: &super::emit::Tables, unit: &mut Unit) -> String 
     let builtins: Vec<usize> = tables.builtins.iter().map(|b| unit.builtin(*b)).collect();
     let fields: Vec<usize> = tables.fields.iter().map(|f| unit.field(f)).collect();
     let shapes: Vec<u32> = tables.shapes.iter().map(|n| unit.shape(n)).collect();
+    let lambdas: Vec<usize> = tables.lambdas.iter().map(|l| unit.lambda(l)).collect();
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(at) = rest.find("@@") {
@@ -367,7 +383,8 @@ fn resolve(text: &str, tables: &super::emit::Tables, unit: &mut Unit) -> String 
             "b" => builtins[i],
             "f" => fields[i],
             "s" => shapes[i] as usize,
-            other => unreachable!("an emitted placeholder is one of four kinds, not `{other}`"),
+            "l" => lambdas[i],
+            other => unreachable!("an emitted placeholder is one of five kinds, not `{other}`"),
         };
         out.push_str(&resolved.to_string());
         rest = &body[end + 2..];
