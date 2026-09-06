@@ -257,3 +257,60 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
     // line at sixty-four bits and not a retreat from the family.
     assert!(native.entry("m.narrow").is_some());
 }
+
+/// Which shape loses a counted field. Each is one step of a parser's state handling.
+#[test]
+fn a_record_with_a_counted_field_survives_being_rebuilt() {
+    for (which, body) in [
+        (
+            "plain",
+            "pub fn probe(n: Int) -> P = {pos: 0, depth: n, diags: [n]}",
+        ),
+        (
+            "rebuilt",
+            "pub fn probe(n: Int) -> P = with_depth({pos: 0, depth: n, diags: [n]}, 9)",
+        ),
+        (
+            "pushed",
+            "pub fn probe(n: Int) -> P = noted({pos: 0, depth: n, diags: [n]}, 7)",
+        ),
+        (
+            "let-bound",
+            "pub fn probe(n: Int) -> P = { let p = {pos: 0, depth: n, diags: [n]}; with_depth(p, p.depth + 1) }",
+        ),
+        (
+            "wrapped",
+            "pub fn probe(n: Int) -> Option<P> = Some({pos: 0, depth: n, diags: [n]})",
+        ),
+    ] {
+        let source = format!(
+            r#"
+type P = {{ pos: Int, depth: Int, diags: List<Int> }}
+fn with_depth(p: P, d: Int) -> P = {{ pos: p.pos, depth: d, diags: p.diags }}
+fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags, x) }}
+{body}
+"#
+        );
+        eprintln!("--- shape: {which}");
+        let Some((loaded, native)) = tests_support::unit(&source) else {
+            return;
+        };
+        let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+        let args = vec![ply_eval::Value::Int(4)];
+        let want = machine
+            .call("m.probe", args.clone(), ply_span::Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{which}` raised in the machine: {}", d.message));
+        let entry: crate::jit::Entry = native.entry("m.probe").expect("compiled");
+        let mut ctx = native.context();
+        ctx.fuel = 100_000;
+        let layouts_ptr: *const crate::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts_ptr }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{which}` raised in the C tier");
+        let got = crate::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
+        assert_eq!(got, want, "`{which}`: the tiers disagree");
+    }
+}
