@@ -254,6 +254,17 @@ impl Tables {
     }
 }
 
+/// Where a release is being made from. A field read and a record update both see the lowering's
+/// last use, and the two are not equally safe to act on.
+#[derive(PartialEq)]
+enum Site {
+    /// A field read: the base may be read again through a name this one does not know about, at a
+    /// point the emitter reaches later than the lowering marked it.
+    Field,
+    /// A record update, which has read every field it copies before it lets go.
+    Update,
+}
+
 /// One function's worth of emitter state, so that a lambda can be written as a function of its
 /// own without losing its owner's place. Every field here is one of [`Emit`]'s.
 #[derive(Default)]
@@ -1582,6 +1593,10 @@ impl<'a> Emit<'a> {
     }
 
     fn release_base(&mut self, base: &Code, b: &V) {
+        self.release_from(base, b, Site::Field)
+    }
+
+    fn release_from(&mut self, base: &Code, b: &V, from: Site) {
         if !(matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. })) {
             return;
         }
@@ -1612,9 +1627,28 @@ impl<'a> Emit<'a> {
         // `spine.advance_n` is the case: `advance(c, p).p` inlines to a rename of `p`, read once
         // under its inlined name and three times more under `p`, so the one-read rule said yes
         // and the reset freed the parser state that `cur_span(c, p)` then read a field of.
-        if !matches!(&base.kind, NodeKind::Var { name, .. } if name.is_bare())
-            || self.shared_reads(&b.c) != 1
-        {
+        if !matches!(&base.kind, NodeKind::Var { name, .. } if name.is_bare()) {
+            return;
+        }
+        // The rule applies at both sites, and the state kernel pays for it.
+        //
+        // An update reads every field it copies before it lets go, so it looked exempt: what the
+        // rule guards against is a *field* read emitted after the release, and an update has none
+        // left. Exempting it put the reuse back and cost correctness --
+        // `let c1 = {..acc.cx, ty_params: map_new()}` in `infer.collect_effects` takes its base
+        // from a field read whose object `duplicate(acc.cx, ..)` reads again, and the reclaim
+        // freed it. The rule is about every later read of the *object*, and an update knows no
+        // more about those than a field read does.
+        //
+        // What it costs is measured rather than guessed: `{..s, ..}` over the state kernel's
+        // five-field record reads `s` seven times, so the release is suppressed and each of two
+        // hundred thousand iterations allocates afresh. ADR 0035's gate reads 3.7x there against
+        // a bar of 3.0, where the in-process tier reads 2.0x. That is the open item on this tier,
+        // and the shape of the fix is a read *counted as it is emitted* rather than in total: the
+        // release is safe exactly when no read of the object is still to come, which neither the
+        // total nor the lowering's order answers.
+        let _ = from;
+        if self.shared_reads(&b.c) != 1 {
             return;
         }
         // A record held back dies without ever having been built, and holds no counts -- only a
@@ -1644,20 +1678,34 @@ impl<'a> Emit<'a> {
     }
 
     fn record(&mut self, fields: &[(Symbol, Code)]) -> Result<V> {
+        // Evaluated in the order they are written, assembled in the order the shape holds them.
+        //
+        // These are not the same order -- a shape is interned under its sorted field names -- and
+        // evaluating in the shape's order is a reordering the *lowering* does not know about. Its
+        // ownership marks say which read of a name is the last one in its own order, so a body
+        // that hands a record to one field's expression and reads a field of it for another
+        // released at whichever the emitter reached second and then read the freed record through
+        // the other. `spine.advance_n` is three lines of it: `advance(c, p).p` builds `{p: .., node:
+        // cur_span(c, p)}`, and `node` sorts first while `p` consumes.
         let mut names: Vec<Symbol> = fields.iter().map(|(n, _)| n.clone()).collect();
         names.sort();
+        let mut written: Vec<(Symbol, String, CTy, V)> = Vec::with_capacity(fields.len());
+        for (name, code) in fields {
+            let v = self.expr(code)?;
+            let w = self.owned(&v);
+            written.push((name.clone(), w, v.ty.clone(), v));
+        }
         let mut words = Vec::with_capacity(fields.len());
         let mut kinds = Vec::with_capacity(fields.len());
         let mut vals = Vec::with_capacity(fields.len());
         for name in &names {
-            let (_, code) = fields
+            let (_, w, ty, v) = written
                 .iter()
-                .find(|(n, _)| n == name)
+                .find(|(n, ..)| n == name)
                 .expect("a field of the shape");
-            let v = self.expr(code)?;
-            kinds.push(v.ty.clone());
-            words.push(self.owned(&v));
-            vals.push(v);
+            words.push(w.clone());
+            kinds.push(ty.clone());
+            vals.push(v.clone());
         }
         Ok(self.emit_record(&names, words, kinds, Some(vals)))
     }
@@ -1855,7 +1903,7 @@ impl<'a> Emit<'a> {
         //
         // Every copy was counted above before this runs, so the walk that lets the base's children
         // go leaves the ones this record keeps alone, and drops exactly the ones it replaced.
-        self.release_base(base, &b);
+        self.release_from(base, &b, Site::Update);
         Ok(self.emit_record(&names, words, kinds, vals))
     }
 
