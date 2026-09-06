@@ -272,6 +272,17 @@ fn bind(lib: &Library) -> Result<()> {
     let addrs = helper_addresses();
     debug_assert_eq!(addrs.len(), HELPERS.len());
     unsafe { bind(addrs.as_ptr()) };
+    let Some(p) = lib.symbol("ply_bind_singletons") else {
+        bail!("the unit the C tier built has no `ply_bind_singletons`");
+    };
+    let singletons: unsafe extern "C" fn(Word, Word, Word) = unsafe { std::mem::transmute(p) };
+    unsafe {
+        singletons(
+            crate::heap::bool(true),
+            crate::heap::bool(false),
+            crate::heap::unit(),
+        )
+    };
     Ok(())
 }
 

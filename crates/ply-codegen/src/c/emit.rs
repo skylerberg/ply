@@ -2244,15 +2244,17 @@ fn describe(kind: &NodeKind) -> &'static str {
     }
 }
 
-/// The two `Bool` singletons and `Unit`, as the addresses they are in this process. The unit is
-/// built and loaded by the process that will call it, so an address is a constant here in a way it
-/// could never be in an artefact meant to outlive the run.
+/// The two `Bool` singletons and `Unit`, as the names `ply_bind_singletons` fills in.
+///
+/// They were their addresses once, which is a constant in a process and nothing at all in a file:
+/// the emitted source differed on every run, so no two runs could share an object. Named, the
+/// source is a function of the program and an object outlives the run that built it.
 fn true_word() -> String {
-    format!("((Word)INT64_C({}))", crate::heap::bool(true))
+    "ply_true".to_string()
 }
 fn false_word() -> String {
-    format!("((Word)INT64_C({}))", crate::heap::bool(false))
+    "ply_false".to_string()
 }
 fn unit_word() -> String {
-    format!("((Word)INT64_C({}))", crate::heap::unit())
+    "ply_unit".to_string()
 }
