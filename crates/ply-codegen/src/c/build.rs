@@ -272,6 +272,10 @@ fn emit_one(
     let t1 = std::time::Instant::now();
     let _guard = Timed(t1);
     let mut e = Emit::new(loaded, unit, name, module_index);
+    // Before the parameters are bound, not after: binding a name charges its reads to the object
+    // it holds, so a parameter bound while the table was empty contributes nothing and a rule that
+    // asks "does anything else read this object" hears no about the body's own argument.
+    e.count_reads(&lowered.code);
     // Not `static`: an exported body carries a symbol, and a symbol is what lets a
     // sampling profiler attribute time to a Ply definition. The Cranelift tier cannot be read
     // this way at all, which is a real difference between the two and not a small one.
@@ -303,7 +307,6 @@ fn emit_one(
     // normal return, so a compiled recursion is bounded by the number the machine bounds an
     // interpreted one by.
     head.push_str("  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n");
-    e.count_reads(&lowered.code);
     let answer = match e.expr(&lowered.code) {
         Ok(answer) => answer,
         Err(err) => {

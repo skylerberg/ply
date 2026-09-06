@@ -19,6 +19,7 @@ use ply_eval::rc::Own;
 use ply_eval::{Builtin, Code, NodeKind, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{BinOp, IntTy, Lit, QName, UnOp};
+use ply_syntax::resolve::Namespace;
 
 /// A value the emitted C holds: the C expression naming it, what it means, and what the checker
 /// said its type is — which is how a width survives a record field, and without which `rotr` on a
@@ -199,6 +200,17 @@ pub struct Emit<'a> {
     /// How many times each name is read in this body. A release is only safe where the answer is
     /// one: see `release_base`.
     reads: std::collections::HashMap<Symbol, usize>,
+    /// For each object -- named by the local at the end of its rename chain -- how many times the
+    /// tree reads *any* name for it. Accumulated as names are bound rather than searched for at
+    /// each release, which on the self-hosted front end is the difference between 190ms of emit
+    /// and 800ms. Never decremented: a name counted after its scope ended suppresses a release,
+    /// which leaks, where missing one frees a live object.
+    reads_by_root: std::collections::HashMap<String, usize>,
+    /// The (object, name) pairs already added to `reads_by_root`, so that rebinding a name to the
+    /// same object does not count its reads twice.
+    counted: std::collections::HashSet<(String, Symbol)>,
+    /// Whether `count_reads` has run. `bind_name` reads the table it fills.
+    counted_reads: bool,
     /// The unit-wide things this body names, in the order it met them.
     ///
     /// The text says `@@c3@@` where a constant's index belongs and `assemble` rewrites it, so a
@@ -334,6 +346,9 @@ impl<'a> Emit<'a> {
             released: std::collections::HashSet::new(),
             alias: std::collections::HashMap::new(),
             reads: std::collections::HashMap::new(),
+            reads_by_root: std::collections::HashMap::new(),
+            counted: std::collections::HashSet::new(),
+            counted_reads: false,
             tables: Tables::default(),
         }
     }
@@ -353,6 +368,7 @@ impl<'a> Emit<'a> {
     /// order, not the source's -- so "is this the last read" cannot be answered by counting as it
     /// goes. One read is the answer it can trust.
     pub fn count_reads(&mut self, code: &Code) {
+        self.counted_reads = true;
         if let NodeKind::Var { name, .. } = &code.kind
             && name.is_bare()
         {
@@ -525,7 +541,7 @@ impl<'a> Emit<'a> {
             }
             _ => word,
         };
-        self.scope.push((name.clone(), v));
+        self.bind_name(name.clone(), v);
     }
 
     // --- conversions --------------------------------------------------------------------
@@ -762,14 +778,8 @@ impl<'a> Emit<'a> {
         // Asking for the function in both cases put a closure where a variant belonged, so every
         // body that answered `None` answered wrongly -- which four tests in `examples/` had been
         // saying since this tier's first commit, to nothing that was listening.
-        if let Some(i) = self.unit.ctor_index(q.symbol()) {
-            let nullary = self
-                .unit
-                .layouts
-                .ctors
-                .get(i as usize)
-                .is_some_and(|(_, arity)| *arity == 0);
-            let call = if nullary {
+        if let Some((i, arity)) = self.ctor_of(q) {
+            let call = if arity == 0 {
                 format!("rt_nullary_p(ctx, {i})")
             } else {
                 format!("rt_ctor_value_p(ctx, {i})")
@@ -1206,7 +1216,7 @@ impl<'a> Emit<'a> {
                             // the type would lose every width and every known record one call
                             // deep — which is most of a body after inlining.
                             let held = self.bind_as(v.k, v.ty.clone(), v.c.clone());
-                            self.scope.push((name.name.clone(), held));
+                            self.bind_name(name.name.clone(), held);
                         }
                         Pat::Wildcard => {}
                         _ => {
@@ -1326,6 +1336,37 @@ impl<'a> Emit<'a> {
         cur
     }
 
+    /// Bind a tree name to a local, charging that name's reads to the object the local holds.
+    fn bind_name(&mut self, name: Symbol, v: V) {
+        // A real assert, not a `debug_assert`: the suite runs in release, and the failure this
+        // guards is a use-after-free in emitted C rather than a wrong number.
+        assert!(
+            self.counted_reads,
+            "`count_reads` has to run before any name is bound, or the binding charges zero reads \
+             to the object it holds and `release_base` frees something still live"
+        );
+        let root = self.root(&v.c);
+        if self.counted.insert((root.clone(), name.clone())) {
+            let n = self.reads.get(&name).copied().unwrap_or(0);
+            *self.reads_by_root.entry(root).or_insert(0) += n;
+        }
+        self.scope.push((name, v));
+    }
+
+    /// How many times the tree reads *any* name for the object `local` holds.
+    ///
+    /// Not the same question as how many times one name is read. The emitter renames freely --
+    /// the inliner turns every argument into a `let`, and `bind_as` records a rename as an alias
+    /// rather than a second object -- so one object can wear several tree names, each read once,
+    /// with no increment between them. Counting a single name there says "one read, safe to
+    /// release" about an object three other names still hold.
+    fn shared_reads(&self, local: &str) -> usize {
+        self.reads_by_root
+            .get(&self.root(local))
+            .copied()
+            .unwrap_or(0)
+    }
+
     fn release_base(&mut self, base: &Code, b: &V) {
         if !(matches!(base.own, Own::Owned) && matches!(base.kind, NodeKind::Var { .. })) {
             return;
@@ -1352,8 +1393,13 @@ impl<'a> Emit<'a> {
         // One read means no other name for the object is live, whatever the order. It costs the
         // release wherever a record is read field by field, which is where `record_update`'s own
         // release takes over: that one reads every copy before it lets go, by construction.
-        if !matches!(&base.kind, NodeKind::Var { name, .. }
-            if name.is_bare() && self.reads.get(name.symbol()) == Some(&1))
+        //
+        // Counted over every *name* for the object, not over the one the base happens to wear.
+        // `spine.advance_n` is the case: `advance(c, p).p` inlines to a rename of `p`, read once
+        // under its inlined name and three times more under `p`, so the one-read rule said yes
+        // and the reset freed the parser state that `cur_span(c, p)` then read a field of.
+        if !matches!(&base.kind, NodeKind::Var { name, .. } if name.is_bare())
+            || self.shared_reads(&b.c) != 1
         {
             return;
         }
@@ -1668,7 +1714,14 @@ impl<'a> Emit<'a> {
                 return self.builtin_call(b, args);
             }
             // A constructor applied to arguments.
-            if let Some(i) = self.unit.ctor_index(q.symbol()) {
+            if let Some((i, arity)) = self.ctor_of(q) {
+                if arity != args.len() {
+                    return self.refuse(format!(
+                        "the constructor `{}` takes {arity} fields and was given {}",
+                        q.symbol(),
+                        args.len()
+                    ));
+                }
                 let mut ws = Vec::with_capacity(args.len());
                 for a in args {
                     let v = self.expr(a)?;
@@ -1918,7 +1971,7 @@ impl<'a> Emit<'a> {
         self.line(format!("{left} -= 1;"));
         let mark = self.scope.len();
         let held = self.bind_as(Kind::Boxed, state_ty.clone(), state.clone());
-        self.scope.push((params[0].clone(), held));
+        self.bind_name(params[0].clone(), held);
         // The step's answer is a `Stop` or a `Continue` that this loop takes apart one line later.
         // When its shape says so all the way down, write straight into the loop's own control
         // instead: no constructor built, none taken apart, and one fewer object to dismantle per
@@ -2205,12 +2258,12 @@ impl<'a> Emit<'a> {
             Pat::Var { slot: Some(_), .. } => Ok("1".to_string()),
             Pat::Var { name, .. } => {
                 // A nullary constructor wearing a variable's shape.
-                match self.ctor_index(&QName::bare(name.clone())) {
-                    Some(i) => Ok(format!(
+                match self.ctor_of(&QName::bare(name.clone())) {
+                    Some((i, 0)) => Ok(format!(
                         "(!ply_is_imm({0}) && ply_obj({0})->kind == 4 && ply_obj({0})->layout == {i})",
                         v.c
                     )),
-                    None => Ok("1".to_string()),
+                    _ => Ok("1".to_string()),
                 }
             }
             Pat::Lit(Lit::Int(k)) => Ok(format!(
@@ -2227,9 +2280,16 @@ impl<'a> Emit<'a> {
                 if *b { true_word() } else { false_word() }
             )),
             Pat::Ctor { name, args } => {
-                let Some(i) = self.ctor_index(name) else {
+                let Some((i, arity)) = self.ctor_of(name) else {
                     return self.refuse(format!("the constructor `{}`", name.symbol()));
                 };
+                if arity != args.len() {
+                    return self.refuse(format!(
+                        "the constructor pattern `{}` binds {} of its {arity} fields",
+                        name.symbol(),
+                        args.len()
+                    ));
+                }
                 let mut test = format!(
                     "(!ply_is_imm({0}) && ply_obj({0})->kind == 4 && ply_obj({0})->layout == {i} && ply_obj({0})->len == {1})",
                     v.c,
@@ -2255,7 +2315,46 @@ impl<'a> Emit<'a> {
     }
 
     fn ctor_index(&self, name: &QName) -> Option<u32> {
-        self.unit.ctor_index(name.symbol())
+        self.ctor_of(name).map(|(i, _)| i)
+    }
+
+    /// The unit's index for the constructor `q` names, and its arity.
+    ///
+    /// A user constructor is interned under the program-wide name its module qualifies it with,
+    /// and a body names it bare, so the resolver is what stands between the two. Reading the
+    /// unit's table with the bare symbol finds only the prelude's constructors, which is why this
+    /// tier refused every `type` a program declared.
+    ///
+    /// The nullary case in `Pat::Var` is defensive rather than reached: the parser makes every
+    /// upper-case bare name in pattern position a `Ctor`, so a constructor does not arrive
+    /// wearing a variable's shape from source. It is kept because the arity is what separates the
+    /// two, and reading it wrongly is a match that succeeds rather than a refusal.
+    fn ctor_of(&self, q: &QName) -> Option<(u32, usize)> {
+        let global = if q.is_bare() {
+            self.src
+                .resolved
+                .scopes
+                .get(self.module_index)
+                .and_then(|s| s.get(Namespace::Value, q.symbol()))
+                .map(|b| b.qualified.clone())
+        } else {
+            self.src
+                .resolved
+                .lookup(self.module_index, Namespace::Value, q)
+                .ok()
+                .map(|b| b.qualified.clone())
+        };
+        let name = global.or_else(|| {
+            (q.is_bare() && self.unit.layouts.ctors.iter().any(|(n, _)| n == q.symbol()))
+                .then(|| q.symbol().clone())
+        })?;
+        let index = self
+            .unit
+            .layouts
+            .ctors
+            .iter()
+            .position(|(n, _)| *n == name)?;
+        Some((index as u32, self.unit.layouts.ctors[index].1))
     }
 
     fn bind_pattern(&mut self, pat: &Pat, v: &V) -> Result<()> {
@@ -2266,7 +2365,7 @@ impl<'a> Emit<'a> {
                 slot: Some(_),
             } => {
                 let held = self.bind(Kind::Boxed, v.c.clone());
-                self.scope.push((name.name.clone(), held));
+                self.bind_name(name.name.clone(), held);
                 Ok(())
             }
             Pat::Var { .. } | Pat::Lit(_) => Ok(()),
