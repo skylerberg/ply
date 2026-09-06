@@ -1011,11 +1011,14 @@ fn evaluate(
     let name = opened.entry.as_str();
     let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
     if let Some(spec) = crate::commands::common::backend_spec(backend)? {
+        // No hashes here, so nothing is kept between runs: an artefact is opened once and the
+        // emit is not the cost that matters.
         let provider = crate::commands::common::build_backend(
             &spec,
             &opened.program,
             &opened.resolved,
             &opened.check,
+            &Default::default(),
         )?;
         machine.set_compiled(provider.attach(&spec));
     }

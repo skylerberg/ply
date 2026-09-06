@@ -423,7 +423,13 @@ pub fn compiled_backend(
     let Some(spec) = backend_spec(flag)? else {
         return Ok(None);
     };
-    let provider = build_backend(&spec, &loaded.program, &loaded.resolved, &loaded.check)?;
+    let provider = build_backend(
+        &spec,
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        &loaded.hashes,
+    )?;
     Ok(Some(provider.attach(&spec)))
 }
 

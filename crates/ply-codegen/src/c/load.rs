@@ -68,7 +68,7 @@ fn compiler() -> String {
 /// Where compiled units are kept between runs. `PLY_C_CACHE` names another directory; the default
 /// is under the system's temporary directory, which is swept by the OS rather than growing without
 /// bound.
-fn cache_dir() -> std::path::PathBuf {
+pub(super) fn cache_dir() -> std::path::PathBuf {
     std::env::var("PLY_C_CACHE")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("ply-c-cache"))

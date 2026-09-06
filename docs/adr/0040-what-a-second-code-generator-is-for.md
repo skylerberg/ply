@@ -230,6 +230,31 @@ single code generator at a price the loop can feel"*. It does. Nothing measured
 here argues with that record; this one only confirms it at the scale of a whole
 unit rather than a floor.
 
+**But the C compiler is not where the tier's time goes**, and that is worth
+having written down because the whole argument about C in a loop is about `cc`.
+Split three ways over the self-hosted front end's twelve modules, per unit:
+
+| | |
+| --- | --- |
+| optimise and lower | 1.7s |
+| generate the C | 0.085s |
+| `cc` | 1.6s |
+
+The inliner is the larger half and it belongs to neither tier — the in-process
+one pays it too. `PLY_C_SPLIT` prints this.
+
+**Both halves are kept now, and only one of them per change.** The emitted C is
+kept per body, keyed on the definition's hash, which the hasher builds over its
+text with every referent's hash spliced in — exactly what an inlining emitter
+needs. The object is kept per unit, keyed on the source. On the spike: **7.7s
+originally, 5.6s cold, 2.0s warm, and an edit to a definition a dozen others
+reference costs 40ms of emit** against 1,550ms cold.
+
+What is still O(project) is the compile: the unit's source changed, so `cc` runs
+over all of it. That is the shape ADR 0037 picked out and priced — an object per
+definition, one link over the reach, one image — and it is the next step rather
+than this one.
+
 ## The decision
 
 **Keep the tier, off the loop's path.** `--backend c` is an instrument and a

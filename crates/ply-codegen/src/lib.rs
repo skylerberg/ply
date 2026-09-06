@@ -20,4 +20,4 @@ pub mod source;
 
 pub use backend::{Bodies, Cranelift, Declines};
 pub use jit::{Jit, Opts, Refused, Unit};
-pub use source::Source;
+pub use source::{Source, test_root_name};
