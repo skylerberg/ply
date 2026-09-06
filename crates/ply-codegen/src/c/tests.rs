@@ -333,3 +333,58 @@ pub fn two(b: Bytes, i: Int) -> Int = bytes_at(b, i) + 1
     assert!(native.entry("m.one").is_some(), "`one` has no body");
     assert!(native.entry("m.two").is_some(), "`two` has no body");
 }
+
+/// A constructor a *program* declares, rather than one the prelude does.
+///
+/// The unit interns a user constructor under the program-wide name its module qualifies it with,
+/// and a body names it bare, so nothing but the resolver stands between the two. Reading the
+/// table with the bare symbol found only the prelude's, so every `type` a program declared was
+/// refused -- and the fixpoint then refused each of that body's callers in turn, which is most of
+/// why this tier took 295 of the front end's 1400 definitions and not why you would guess.
+#[test]
+fn a_constructor_a_program_declares_is_built_and_matched_like_a_preludes() {
+    let source = r#"
+type Tok = TEof | TNum(Int) | TName(Bytes)
+pub fn code(t: Tok) -> Int =
+  match t {
+    TEof -> 0,
+    TNum(n) -> n,
+    TName(b) -> bytes_len(b),
+  }
+pub fn round(n: Int) -> Int = code(TNum(n))
+pub fn eof() -> Int = code(TEof)
+pub fn named(b: Bytes) -> Int = code(TName(b))
+"#;
+    let Some((loaded, native, refused)) = tests_support::with_refusals(source) else {
+        return;
+    };
+    assert!(
+        refused.is_empty(),
+        "nothing here is outside the fragment: {refused:?}"
+    );
+    let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let cases: &[(&str, Vec<ply_eval::Value>)] = &[
+        ("m.round", vec![ply_eval::Value::Int(7)]),
+        ("m.eof", vec![]),
+        ("m.named", vec![ply_eval::Value::bytes(b"abcd")]),
+    ];
+    for (name, args) in cases {
+        let want = machine
+            .call(name, args.clone(), ply_span::Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let entry: crate::jit::Entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.fuel = 100_000;
+        let layouts: *const crate::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        let got = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
+    }
+}
