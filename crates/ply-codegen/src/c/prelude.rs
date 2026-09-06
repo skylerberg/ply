@@ -45,6 +45,35 @@ static inline uint32_t ply_le32(uint32_t v) {
   return v;
 #endif
 }
+/* Checked `Int` arithmetic. `__has_builtin` keeps clang's single-instruction form where it is
+   there; the fallback is the same test written out, for a C compiler that has no builtins. That
+   fallback is not hypothetical: it is what lets an unoptimising in-process compiler read this
+   emitter's output at all, and `tcc` -- which compiles the self-hosted front end's unit in 0.6s
+   where `cc -O2` takes eight minutes -- has none of the overflow builtins.
+   `PLY_NO_OV_BUILTIN` forces the fallback, so a test can read the two against each other. */
+#if defined(__has_builtin) && !defined(PLY_NO_OV_BUILTIN)
+#  if __has_builtin(__builtin_add_overflow)
+#    define PLY_OV_BUILTIN 1
+#  endif
+#endif
+#ifdef PLY_OV_BUILTIN
+static inline int ply_add_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_add_overflow(a, b, r); }
+static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) { return __builtin_sub_overflow(a, b, r); }
+#else
+/* Signed overflow is undefined in C, so the sum is formed unsigned and the sign bits are read:
+   an addition overflows when both operands differ in sign from the result. */
+static inline int ply_add_ov(int64_t a, int64_t b, int64_t *r) {
+  uint64_t s = (uint64_t)a + (uint64_t)b;
+  *r = (int64_t)s;
+  return (int)((((uint64_t)a ^ s) & ((uint64_t)b ^ s)) >> 63);
+}
+static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) {
+  uint64_t s = (uint64_t)a - (uint64_t)b;
+  *r = (int64_t)s;
+  return (int)((((uint64_t)a ^ (uint64_t)b) & ((uint64_t)a ^ s)) >> 63);
+}
+#endif
+
 static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
 static inline int64_t ply_imm_value(Word w) { return w >> 1; }
 static inline int ply_fits_imm(int64_t v) { return ((v << 1) >> 1) == v; }

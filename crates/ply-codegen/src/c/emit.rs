@@ -1138,7 +1138,7 @@ impl<'a> Emit<'a> {
                         let out = self.fresh();
                         self.line(format!("int64_t {out};"));
                         self.line(format!(
-                            "if (__builtin_{sign}_overflow({a}, {b}, &{out})) {{ rt_overflow_p(ctx, {}); return 0; }}",
+                            "if (ply_{sign}_ov({a}, {b}, &{out})) {{ rt_overflow_p(ctx, {}); return 0; }}",
                             i64::from(matches!(op, BinOp::Sub))
                         ));
                         Ok(V {
