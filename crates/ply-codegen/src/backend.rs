@@ -101,7 +101,7 @@ impl Cranelift {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
     ) -> Result<&'static Cranelift> {
-        Cranelift::tiered(program, resolved, check, Tier::Jit)
+        Cranelift::tiered(program, resolved, check, Tier::Jit, HashMap::new())
     }
 
     /// The same fragment through the C tier: emitted as C and handed to `cc` (ADR 0040). The
@@ -112,7 +112,18 @@ impl Cranelift {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
     ) -> Result<&'static Cranelift> {
-        Cranelift::tiered(program, resolved, check, Tier::C)
+        Cranelift::tiered(program, resolved, check, Tier::C, HashMap::new())
+    }
+
+    /// The same, told what each definition's code is a function of, so that emitted bodies can be
+    /// kept between runs. Without the keys nothing is kept and everything is emitted afresh.
+    pub fn over_c_keyed(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        check: &ply_core::CheckOutput,
+        keys: HashMap<String, String>,
+    ) -> Result<&'static Cranelift> {
+        Cranelift::tiered(program, resolved, check, Tier::C, keys)
     }
 
     fn tiered(
@@ -120,6 +131,7 @@ impl Cranelift {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
         tier: Tier,
+        keys: HashMap<String, String>,
     ) -> Result<&'static Cranelift> {
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
@@ -128,7 +140,8 @@ impl Cranelift {
         let resolved: &'static ply_syntax::resolve::Resolved =
             Box::leak(Box::new(resolved.clone()));
         let check: &'static ply_core::CheckOutput = Box::leak(Box::new(check.clone()));
-        let source: &'static Source = Box::leak(Box::new(Source::new(program, resolved, check)));
+        let source: &'static Source =
+            Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
         let candidates = source.functions();
         let started = std::time::Instant::now();
         let (compiled, refusals) = closure(source, &candidates)?;

@@ -38,28 +38,76 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
 }
 
 /// The run's backend, built once over a checked program, or the diagnostic that refuses it.
+/// What each definition's emitted code is a function of: its own hash, which the hasher builds
+/// over its text with every referent's hash spliced in -- so it moves when anything the emitter
+/// would inline moves, which is what an inlining emitter's cache has to be keyed on.
+///
+/// A test's root is a definition here like any other, named the way `ply_codegen` names it.
+/// `HashOutput::tests` is parallel to the program's tests walked module by module in load order,
+/// which `driver::test_hashes_of` already relies on and says so.
+fn emit_keys(
+    program: &ply_syntax::ast::Program,
+    hashes: &ply_hash::HashOutput,
+) -> std::collections::HashMap<String, String> {
+    use ply_syntax::ast::Item;
+    let mut keys = std::collections::HashMap::new();
+    let mut test_at = 0;
+    for module in &program.modules {
+        let mut ordinal = 0;
+        for item in &module.items {
+            match item {
+                Item::Fn(def) => {
+                    let name = module.name.qualify(&def.name.name).to_string();
+                    if let Some(h) = hashes.defs.get(&ply_span::Symbol::new(&name)) {
+                        keys.insert(name, h.to_hex());
+                    }
+                }
+                Item::Test(_) => {
+                    let name = module
+                        .name
+                        .qualify(&ply_codegen::test_root_name(ordinal))
+                        .to_string();
+                    if let Some(h) = hashes.tests.get(test_at) {
+                        keys.insert(name, h.to_hex());
+                    }
+                    ordinal += 1;
+                    test_at += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    keys
+}
+
 pub fn build_backend(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
     resolved: &ply_syntax::resolve::Resolved,
     check: &ply_core::CheckOutput,
+    hashes: &ply_hash::HashOutput,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     match spec.kind {
         ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(program, resolved, check)),
-        ply_eval::BackendKind::C => ply_codegen::Cranelift::over_c(program, resolved, check)
-            .map(|unit| unit as &'static dyn ply_eval::Provider)
-            .map_err(|error| {
-                Diagnostic::error(
-                    codes::BACKEND_UNAVAILABLE,
-                    format!("the C backend could not be built: {error:#}"),
-                )
-                .note(
-                    "a backend that failed to build would decline every call, so the run is \
+        ply_eval::BackendKind::C => ply_codegen::Cranelift::over_c_keyed(
+            program,
+            resolved,
+            check,
+            emit_keys(program, hashes),
+        )
+        .map(|unit| unit as &'static dyn ply_eval::Provider)
+        .map_err(|error| {
+            Diagnostic::error(
+                codes::BACKEND_UNAVAILABLE,
+                format!("the C backend could not be built: {error:#}"),
+            )
+            .note(
+                "a backend that failed to build would decline every call, so the run is \
                      refused rather than reported green over a seam nothing reached",
-                )
-                .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
-                .note("`--backend reference` needs no code generator and runs anywhere")
-            }),
+            )
+            .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
+            .note("`--backend reference` needs no code generator and runs anywhere")
+        }),
         ply_eval::BackendKind::Cranelift => ply_codegen::Cranelift::over(program, resolved, check)
             .map(|unit| unit as &'static dyn ply_eval::Provider)
             .map_err(|error| {

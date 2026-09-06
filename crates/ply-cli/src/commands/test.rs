@@ -287,7 +287,7 @@ fn iterate(
         .as_ref()
         .filter(|_| !nothing_to_run)
         .filter(|_| held_unit.is_none())
-        .map(|spec| build_backend(spec, run_program, run_resolved, &loaded.check))
+        .map(|spec| build_backend(spec, run_program, run_resolved, &loaded.check, &hashes))
     {
         None => held_unit,
         Some(Ok(provider)) => {

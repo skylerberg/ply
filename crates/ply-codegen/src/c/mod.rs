@@ -6,6 +6,7 @@
 //! This is that measurement made reachable from a shipping command.
 
 mod build;
+mod cache;
 mod emit;
 mod load;
 mod prelude;
