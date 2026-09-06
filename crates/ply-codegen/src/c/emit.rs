@@ -314,10 +314,6 @@ impl Unit {
     pub fn shape(&mut self, names: &[Symbol]) -> u32 {
         self.layouts.shape(names.to_vec())
     }
-
-    pub fn ctor_index(&self, name: &Symbol) -> Option<u32> {
-        self.layouts.ctor_index(name)
-    }
 }
 
 impl Unit {
@@ -482,7 +478,10 @@ impl<'a> Emit<'a> {
     }
     /// The position of a code address in the unit's table, as this body's own.
     fn local_lambda(&mut self, symbol: &str) -> String {
-        format!("@@l{}@@", Tables::at(&mut self.tables.lambdas, symbol.to_string()))
+        format!(
+            "@@l{}@@",
+            Tables::at(&mut self.tables.lambdas, symbol.to_string())
+        )
     }
     fn local_shape(&mut self, names: &[Symbol]) -> String {
         format!(
@@ -1526,7 +1525,9 @@ impl<'a> Emit<'a> {
             self.param(name, format!("q{i}"), CTy::Unknown);
         }
         head.push_str(") {\n");
-        head.push_str("  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n");
+        head.push_str(
+            "  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n",
+        );
         let answer = self.expr(body)?;
         let word = self.word(&answer);
         let mut out = head;
