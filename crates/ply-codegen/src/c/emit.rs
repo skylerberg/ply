@@ -2108,6 +2108,21 @@ impl<'a> Emit<'a> {
         if let Some(v) = self.inline_bytes(b, &vals)? {
             return Ok(v);
         }
+        // The map, list and bytes family, called by name rather than dispatched. The generic path
+        // below costs an argument array, a builtin index and a match on it for every call, and k2
+        // makes four of those per element over two hundred thousand elements. The in-process tier
+        // has called these directly since it was written, and the gate says what the difference
+        // is: on the value kernel that tier was within the bar at 1.9x where this one was over it
+        // at 4.2x, on the same runtime and the same data structures.
+        if let Some(helper) = direct_helper(b, vals.len()) {
+            let mut ws = Vec::with_capacity(vals.len());
+            for v in &vals.clone() {
+                ws.push(self.owned(v));
+            }
+            let v = self.bind(Kind::Boxed, format!("{helper}(ctx, {})", ws.join(", ")));
+            self.check();
+            return Ok(v);
+        }
         // Everything else goes through the runtime, which is the interpreter's own path. It
         // answers with a word of no known type -- except that a width this tier does not carry
         // stays uncarried through it, so that an operator downstream refuses rather than reading
@@ -2716,4 +2731,24 @@ fn false_word() -> String {
 }
 fn unit_word() -> String {
     "ply_unit".to_string()
+}
+
+/// The helper that answers a builtin directly, where one does. Each takes its arguments exactly as
+/// the generic path does -- they fall back to the same `direct` over values -- so the call is a
+/// swap and nothing about ownership changes.
+fn direct_helper(b: Builtin, args: usize) -> Option<&'static str> {
+    Some(match (b, args) {
+        (Builtin::Push, 2) => "rt_push_p",
+        (Builtin::MapInsert, 3) => "rt_map_insert_p",
+        (Builtin::MapContains, 2) => "rt_map_contains_p",
+        (Builtin::MapGet, 2) => "rt_map_get_p",
+        (Builtin::Compare, 2) => "rt_compare_p",
+        (Builtin::ByteOfInt, 1) => "rt_byte_of_int_p",
+        (Builtin::BytesConcat, 2) => "rt_bytes_concat_p",
+        (Builtin::BytesSlice, 3) => "rt_bytes_slice_p",
+        (Builtin::BytesScan, 4) => "rt_bytes_scan_p",
+        (Builtin::BytesScanUntil, 4) => "rt_bytes_scan_until_p",
+        (Builtin::ListAt, 2) => "rt_list_index_p",
+        _ => return None,
+    })
 }
