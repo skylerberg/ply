@@ -80,6 +80,13 @@ pub fn build(
         let want: Vec<&str> = only.split(',').filter(|s| !s.is_empty()).collect();
         taken.retain(|n| want.iter().any(|w| n == w));
     }
+    // The other half of `PLY_C_ONLY`, and the usable one at corpus scale: an allow-list of 1400
+    // names does not fit in an environment variable, and a truncated one silently compiles a
+    // different program than the one asked for. A prefix to *drop* is short whatever the corpus.
+    if let Ok(skip) = std::env::var("PLY_C_SKIP") {
+        let drop: Vec<&str> = skip.split(',').filter(|s| !s.is_empty()).collect();
+        taken.retain(|n| !drop.iter().any(|d| n.starts_with(d)));
+    }
     let mut refusals: Vec<Refused> = Vec::new();
 
     // The fixpoint: emit everything, drop what refused, and go round again, because dropping a
