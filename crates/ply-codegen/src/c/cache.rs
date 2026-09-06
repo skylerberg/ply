@@ -35,7 +35,7 @@ fn dir() -> PathBuf {
 pub fn key(def_hash: &str, ctors: &str, inlining: (usize, usize)) -> String {
     let mut h = blake3::Hasher::new();
     for part in [
-        "ply-c-emit-2",
+        "ply-c-emit-3",
         &exe_stamp(),
         &format!("{}:{}", inlining.0, inlining.1),
         ctors,

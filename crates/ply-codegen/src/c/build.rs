@@ -68,18 +68,31 @@ pub fn build(
 ) -> Result<(Native, Vec<Refused>)> {
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
-    let fragment = super::cache::fragment_digest(names);
+    let mut offered: Vec<&str> = names.to_vec();
     // What the inliner will actually be told, override included, because that is what the emitted
     // body is a function of and the cache is keyed on it.
     let how = crate::opt::Inlining::EMITTED.overridden();
     let inlining = (how.budget, how.depth);
-    let mut taken: Vec<String> = names.iter().map(|n| (*n).to_string()).collect();
     // A bisecting instrument: compile only the definitions named, so that a wrong answer can be
     // narrowed to the body that produces it. The fixpoint then refuses whatever calls the rest.
     if let Ok(only) = std::env::var("PLY_C_ONLY") {
         let want: Vec<&str> = only.split(',').filter(|s| !s.is_empty()).collect();
-        taken.retain(|n| want.iter().any(|w| n == w));
+        offered.retain(|n| want.iter().any(|w| n == w));
     }
+    // The other half of `PLY_C_ONLY`, and the usable one at corpus scale: an allow-list of 1400
+    // names does not fit in an environment variable, and a truncated one silently compiles a
+    // different program than the one asked for. A prefix to *drop* is short whatever the corpus.
+    if let Ok(skip) = std::env::var("PLY_C_SKIP") {
+        let drop: Vec<&str> = skip.split(',').filter(|s| !s.is_empty()).collect();
+        offered.retain(|n| !drop.iter().any(|d| n.starts_with(d)));
+    }
+    // *Then* the digest, over what is actually offered rather than over what the caller asked
+    // for. A refusal is cached against this, because a body is refused when something it calls was
+    // not offered -- so an instrument that narrows the offered set has to move the digest with it.
+    // Filtering after it meant a bisecting run's refusals were served back to an unfiltered one,
+    // which built a unit neither run would produce and crashed in it. That cost most of a day.
+    let fragment = super::cache::fragment_digest(&offered);
+    let mut taken: Vec<String> = offered.iter().map(|n| (*n).to_string()).collect();
     let mut refusals: Vec<Refused> = Vec::new();
 
     // The fixpoint: emit everything, drop what refused, and go round again, because dropping a
