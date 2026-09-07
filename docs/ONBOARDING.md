@@ -120,50 +120,16 @@ treat 13.7s as the first-run cost and not as what you will see.
 
 There is no `rustfmt.toml` and no `clippy.toml`; both run on defaults.
 
-### `crates/ply-codegen-spike` is outside the workspace
+### Every crate is in the workspace
 
-It builds on the pinned toolchain — no `+1.94.0` prefix anywhere in this
-repository any more — and `cargo test --release` from inside the crate is green.
+There is no crate outside it any more. `crates/ply-codegen-spike` was — a third
+code generator with a runtime of its own, declaring its own `[workspace]`, so
+that `cargo build --workspace`, `cargo test --workspace` and `cargo clippy
+--workspace --all-targets` did not compile one line of it. It bit-rotted that way
+twice, each time discovered long after the change that broke it, which is the
+whole argument for `crates/ply-codegen` being a member. Its hazard suite lives at
+`crates/ply-codegen-tests/tests/suite/hazards.rs` now, over the shipping tier.
 
-**The thing to know is structural, not the transcript.** The crate declares its
-own `[workspace]`, so `cargo build --workspace`, `cargo test --workspace` and
-`cargo clippy --workspace --all-targets` do not compile one line of it. It has
-bit-rotted that way twice, each time discovered long after the change that broke
-it. CI gives it a job of its own for exactly that reason, and
-`.github/ci-shards.sh verify` fails if a crate ends up in no job at all.
-
-Two live caveats:
-
-- It is **not clippy-clean** and never was; the project's stated gate does not
-  reach it.
-- `cargo test --release` green does **not** mean the spike agrees with the
-  interpreters. `mcts --dir benches/kernel --only agreement` exits 1. See
-  `CONTRIBUTING.md` §"Things known to be broken".
-## 2. Test
-
-```
-cargo nextest run --workspace
-```
-
-[nextest](https://nexte.st) is the one tool the loop needs that `rustup` does
-not install: `cargo install cargo-nextest --locked`, or a pre-built binary from
-its site. `cargo test --workspace` still works and is what runs doctests;
-nextest is faster because it runs every binary's tests as one pool, one process
-per test, instead of one binary after another. `CONTRIBUTING.md` §"The loop"
-says what `.config/nextest.toml` does with the wall-clock tests.
-
-**Budget a few minutes on an unloaded machine, and do not run it under load.**
-The wall clock on this command has ranged widely across its history, and the
-slow readings are the machine rather than the tree — in the worst of them *user
-time was below real time*, which is a run spending minutes waiting for cores
-rather than using them.
-
-No test count is given here on purpose. It changes on every commit that adds a
-test, nothing in the tree checks it, and every re-take this file used to carry
-found it stale without anything having failed. What matters at this command is
-that nothing failed.
-
-Two sections follow that are worth reading before you trust a green run.
 ### Five things a green suite does not prove
 
 `cargo nextest run --workspace` green is weaker than it looks, and the reason is always
@@ -175,7 +141,6 @@ the same: **a gate that is closed makes its tests pass without running them.**
 | `PLY_TEST_DB` unset | the `ply-host` pool tests pass, printing *nothing* | set it; a *wrong* value is loud, only a missing one is silent |
 | no `initdb`/`postgres`/`psql` on `PATH` | the cluster-gated suites skip | install postgres |
 | not Unix | `#![cfg(unix)]` files are not compiled at all — no notice whatsoever | run on Linux or macOS |
-| `crates/ply-codegen-spike` | outside the workspace, so `--workspace` never builds it | `cd` in and build it |
 
 The worst of these is `PLY_TEST_DB`, because it prints no skip line at all — not
 on stdout, not on stderr. The tests report as passing and nothing distinguishes
@@ -534,8 +499,7 @@ the order below.
 | `ply-cli` | 20.0k | the `ply` binary and its subcommands |
 | `ply-corpus` | 20.9k | the `ply-corpus` measurement harness |
 
-`crates/ply-codegen-spike` (2.7k) is **outside** the workspace and does not
-build — see §1.
+Every crate above is a workspace member; none is outside it — see §1.
 
 ### The two features the audit asked for, located
 
@@ -618,9 +582,6 @@ absent, and CI forces each open:
   `cluster::available()` looks, and the job fails if they are absent.
 - **`#![cfg(unix)]`** compiles, because the runner is Linux, and a step fails if
   that binary reports zero tests.
-- **`crates/ply-codegen-spike`** gets a job of its own, because it declares its
-  own `[workspace]` and `--workspace` has never reached it. Not a skip — a crate
-  nothing builds. It has bit-rotted twice with nothing to say so.
 
 **And one check that is not a gate in that sense.** The tree checks in
 `crates/ply-span-tests/tests/armed.rs` run a second time by name, so that a rename or
@@ -698,7 +659,7 @@ purpose: each item moves the number the next one is judged against.
 > than entering saves. That is the lever to argue about, and ADRs 0026 and 0030
 > carry the series.
 
-Plus two small recorded obligations: delete `crates/ply-codegen-spike` per ADR 0011, and fix `Machine::constant` refusing the memo inside any open
+Plus one small recorded obligation (the other, deleting `crates/ply-codegen-spike` per ADR 0011, is done): fix `Machine::constant` refusing the memo inside any open
 scheduler region, which costs a spawning service 1.77x on `/health`.
 
 > **Do not delete the spike yet.** ADR 0011 wants it gone, and it is the
@@ -840,10 +801,10 @@ Everything here cost this audit real time. In descending order of cost.
     because nothing in the tree names a holder or a year. A human should
     confirm it.~~ **A human did, on 2026-08-28, and the answer was to drop it:
     `LICENSE-MIT` now carries no copyright line and begins at `Permission is
-    hereby granted`. CONTRIBUTING item 7 carries what that costs.** The rest stands: all thirteen member crates inherit the
-    expression with `license.workspace = true`, and only
-    `crates/ply-codegen-spike/Cargo.toml` declares no license, being its own
-    workspace — still true, and deliberately left alone.
+    hereby granted`. CONTRIBUTING item 7 carries what that costs.** The rest stands: every member crate inherits the
+    expression with `license.workspace = true`. The one manifest that declared no
+    license was `crates/ply-codegen-spike/Cargo.toml`, being its own workspace,
+    and it is gone.
 
 ~~Items 2–5, 7 and 11 are one-line fixes.~~ **Item 5 has since been made** — it
 was a false comment rather than a behaviour, so a documentation pass could fix

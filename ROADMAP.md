@@ -10,7 +10,6 @@
 > | `cluster::available()` | `crates/ply-host-tests/tests/support/cluster.rs:38` | no `initdb`/`postgres` on the machine | yes, on stderr of a passing test |
 > | `PLY_PG_URL` | `crates/ply-host/src/db/scope/tests/live.rs:101` | the variable is unset — nothing sets it on a stock local checkout, and **CI sets it** | yes, on stderr of a passing test |
 > | `#![cfg(unix)]` | `crates/ply-cli/tests/suite/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
-> | its own `[workspace]` | `crates/ply-codegen-spike/Cargo.toml` | always, under `cargo test --workspace` | no |
 > | `PLY_TEST_DB` | `crates/ply-host/src/db/pool/tests.rs:25` | the variable is unset | **no — nothing is printed at all, on either stream** |
 >
 > **This table describes a stock local checkout, not CI.** All five gates are
