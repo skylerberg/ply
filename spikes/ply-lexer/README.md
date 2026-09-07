@@ -1,5 +1,13 @@
 # `spikes/ply-lexer` — a lexer for Ply, written in Ply
 
+> **The lexer itself lives in `spikes/ply-parser/lexer.ply`, not here.** There were two: 810
+> lines differing in forty — four `pub` markers, one branch reordered, a reshuffled test block —
+> each with its own differential against `ply-syntax`. The front end's copy is the superset and the
+> one that stays current, so this directory keeps the *differential*, the fixtures and `GAPS.md`,
+> and reads the lexer from there. Line counts in `GAPS.md` and in `spikes/ply-parser/GAPS*.md` were
+> taken on the copy while it existed and are left as they were recorded.
+
+
 **This is a spike. Nothing in the workspace imports it, builds it, or runs it.**
 `cargo build --workspace`, `cargo test --workspace` and `cargo clippy
 --workspace` do not reach any of it; the root `Cargo.toml`'s `members` list is
@@ -37,7 +45,7 @@ whole thing is minutes.
 Separately:
 
 ```
-./target/debug/ply test spikes/ply-lexer/lexer.ply          # 15 tests, in Ply
+./target/debug/ply test spikes/ply-parser/lexer.ply         # the lexer's own tests, in Ply
 cd spikes/ply-lexer/harness && cargo test                   # 22 tests, the comparison
 cd spikes/ply-lexer/harness && cargo run --bin plydump -- ../../../examples/clock.ply
 ```
@@ -182,8 +190,8 @@ same rule that exists for `crates/ply-codegen-spike/target/`.
 Taken 2026-08-24, in `~/.worktrees/ply/lexer`, on the machine in
 `docs/ONBOARDING.md` §Provenance at load 12–26.
 
-- `ply check spikes/ply-lexer/lexer.ply` — 1 module, 58 definitions, 15 tests.
-- `ply test spikes/ply-lexer/lexer.ply --no-cache` — **15 passed, 0 failed**.
+- `ply check spikes/ply-parser/lexer.ply` — 1 module, 58 definitions, 15 tests.
+- `ply test spikes/ply-parser/lexer.ply --no-cache` — **15 passed, 0 failed**.
 - `cd harness && cargo test` — **22 passed, 0 failed** (18 integration, 4 lib).
 - Agreement holds on all **33** files.
 - No file outside `spikes/ply-lexer/` was modified.

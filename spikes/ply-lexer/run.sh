@@ -12,8 +12,8 @@ echo "==> building target/release/ply (the harness shells out to it)"
 cargo build --manifest-path "$root/Cargo.toml" --release -p ply-cli --bin ply
 
 echo
-echo "==> the lexer's own tests, in Ply"
-"$root/target/release/ply" test "$here/lexer.ply" --no-cache
+echo "==> the lexer's own tests, in Ply (the front end's lexer; there is only one)"
+"$root/target/release/ply" test "$root/spikes/ply-parser/lexer.ply" --no-cache
 
 echo
 echo "==> the differential harness: this lexer against crates/ply-syntax"
