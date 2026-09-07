@@ -60,7 +60,31 @@ impl Native {
     }
 }
 
-/// Emit, compile and load `names` as one unit, with what it refused.
+/// One body as C, with its placeholders unresolved.
+///
+/// The oracle a C emitter written in Ply is compared against. A body's text names the unit's
+/// tables by its *own* positions -- `@@c3@@` for the third constant this body met -- so it is a
+/// function of the body alone, which is what makes one comparable at all: two emitters that agree
+/// here agree whatever else is in the unit around them.
+pub fn emit_body(loaded: &'static Source, name: &str) -> Result<String> {
+    let ctors = loaded.ctors();
+    let ctors_digest = super::cache::ctors_digest(&ctors);
+    let how = super::toolchain::Profile::current().inlining().overridden();
+    let names: Vec<String> = loaded.functions();
+    let offered: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fragment = super::cache::fragment_digest(&offered);
+    let mut unit = Unit::new(ctors, names.clone());
+    let (text, _tables) = emit_one(
+        loaded,
+        &mut unit,
+        name,
+        &ctors_digest,
+        (how.budget, how.depth),
+        &fragment,
+    )?;
+    Ok(text)
+}
+
 /// The definitions actually offered, after the two bisecting instruments, and the digest a refusal
 /// is cached against. Both callers need the same answer: a refusal is cached against this digest,
 /// so an instrument that narrows the offered set has to move it.
@@ -217,6 +241,7 @@ fn emit_all(
     })
 }
 
+/// Emit, compile and load `names` as one unit, with what it refused.
 pub fn build(
     loaded: &'static Source,
     names: &[&str],
