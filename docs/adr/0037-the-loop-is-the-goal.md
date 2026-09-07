@@ -194,8 +194,17 @@ over the reach, one image loaded.
 
 The same row says the unit is compiled once per worker plus a pre-flight, so a
 run pays that per-definition cost as many times as it has workers and one more.
-Sharing one compiled unit across workers is the next bounded win under a
-backend, and it is blocked on `Unit` holding an `Rc`; nothing has attempted it.
+Sharing one compiled unit across workers was the next bounded win under a
+backend, and it is taken — through the file system rather than in process. In
+process is not available and the reason is deeper than the `Rc` inside `Unit`
+this ADR first named: `ply_eval::Value` holds `Rc` too, so nothing containing a
+constant crosses a rayon worker, and every route to a shared `Unit` carries one.
+What crosses instead is a recording of the unit beside its object — `c/cache.rs`
+`UnitCache` — and a worker that finds one skips emitting the source entirely
+rather than assembling twenty-nine megabytes of C to hand to an object cache
+that already had the answer. A worker's warm build is milliseconds, and the
+build that emits and the build that reads back are one path, so a recording that
+will not reconstruct fails every test rather than only a warm one.
 
 **LLVM in place of C, for the line rather than the loop — priced and rejected.**
 Two forms, both losing. Linking LLVM trades a Rust dependency for a larger C++
