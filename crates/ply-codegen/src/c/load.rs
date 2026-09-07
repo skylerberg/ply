@@ -56,9 +56,9 @@ unsafe impl Send for Library {}
 
 /// The C compiler this tier shells out to. `cc` rather than a pinned name, for the reason ADR 0037
 /// gives for preferring C over LLVM in the first place: the dependency should be the one every
-/// machine already has.
+/// machine already has. Which one, and on what flag, is the profile's answer -- see `toolchain.rs`.
 fn compiler() -> String {
-    std::env::var("PLY_CC").unwrap_or_else(|_| "cc".to_string())
+    super::toolchain::Profile::current().compiler()
 }
 
 /// Compile `source` into a shared object beside it and load it.
@@ -122,7 +122,7 @@ pub(super) fn object_key(source: &str) -> String {
 /// The optimisation flag, in one place: three callers ask, and one of them asking differently
 /// would have the unit cache record a key the object cache never writes.
 fn opt_level() -> String {
-    std::env::var("PLY_CC_OPT").unwrap_or_else(|_| "-O2".to_string())
+    super::toolchain::Profile::current().opt_level()
 }
 
 fn ext() -> &'static str {
@@ -133,8 +133,9 @@ fn ext() -> &'static str {
     }
 }
 
-/// The compiler's path, so that its stamp can go in the key.
-fn which(cc: &str) -> Option<std::path::PathBuf> {
+/// The compiler's path: its stamp goes in the key, and `toolchain::extra_args` reads what sits
+/// beside it.
+pub(super) fn which(cc: &str) -> Option<std::path::PathBuf> {
     if cc.contains('/') {
         return Some(std::path::PathBuf::from(cc));
     }
@@ -174,7 +175,10 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
     let c = dir.join("unit.c");
     let so = dir.join(format!("unit.{ext}"));
     std::fs::write(&c, source)?;
-    let out = std::process::Command::new(compiler())
+    let cc = compiler();
+    let support = super::toolchain::extra_args(&cc);
+    let out = std::process::Command::new(&cc)
+        .args(&support)
         .arg(&level)
         .arg("-fPIC")
         .arg("-shared")
@@ -183,7 +187,7 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
         .arg(&so)
         .arg(&c)
         .output()
-        .map_err(|e| anyhow!("could not run {}: {e}", compiler()))?;
+        .map_err(|e| anyhow!("could not run {cc}: {e}"))?;
     if !out.status.success() {
         bail!(
             "the C tier's compiler refused the unit it emitted ({}):\n{}",
@@ -207,7 +211,17 @@ pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
     } else {
         so
     };
-    Library::open(&landed)
+    // An object this run just built and cannot load is worth a sentence about the compiler that
+    // built it. tcc is the one that does this: it finds `libtcc1.a` relative to `-B` and a build
+    // that is not installed has no default that finds it, so the *compile succeeds* and `dlopen`
+    // refuses with an empty reason. `toolchain::extra_args` supplies the flag when it can see
+    // where the library is; when it cannot, this is what says so.
+    Library::open(&landed).map_err(|e| match cc.ends_with("tcc") && support.is_empty() {
+        true => e.context(format!(
+            "`{cc}` compiled the unit but no `libtcc1.a` was found beside it or in `../lib/tcc`,              so the object is missing the support routines every tcc object needs; pass              `-B<directory holding libtcc1.a>` through a wrapper named by `PLY_CC`"
+        )),
+        false => e,
+    })
 }
 
 impl Library {
