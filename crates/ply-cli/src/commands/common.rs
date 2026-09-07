@@ -21,6 +21,31 @@ pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpe
     })
 }
 
+/// Fixes the toolchain the emitted C tier compiles with, before anything compiles.
+///
+/// Not part of `Engine`'s variant, and the rule for that is `Provider::variant`'s own: what
+/// belongs there is a knob that changes *which* definitions run natively. This one changes how the
+/// same set is compiled, and the two profiles are required to answer identically -- which is what
+/// `--audit-backend` checks and what a namespaced result cache would hide rather than prove.
+pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
+    let Some(profile) = ply_codegen::Profile::parse(flag) else {
+        return Err(Diagnostic::error(
+            codes::BACKEND_UNAVAILABLE,
+            format!("`--profile {flag}` is not a profile"),
+        )
+        .note(
+            "`development` compiles fast for code that runs slowly enough; `release` compiles \
+             slowly for code that runs fast",
+        )
+        .note(
+            "the two are required to answer identically, so this decides what a run costs and \
+             not what it means",
+        ));
+    };
+    ply_codegen::select_profile(profile);
+    Ok(())
+}
+
 /// The engine a run under `spec` selects against and records under, named before a provider
 /// exists — selection is what decides whether building one is worth anything.
 /// `a_commands_engine_is_the_one_the_run_records_under` pins that this agrees with what the
