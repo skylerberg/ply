@@ -122,6 +122,14 @@ echo "==> the seventh differential: code.ply's lowering against ply_eval::code"
 PLY_BIN="$root/target/release/ply" cargo test --test lower_diff -- --nocapture --test-threads=2 |
   grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
 
+echo
+echo "==> the oracle for the stage after that: the C a body emits"
+# Not a differential either -- the Ply emitter is not written. What it checks is that the oracle it
+# will be compared against is usable, and it records the one coupling a first attempt would
+# otherwise spend a day on: `emit_body` optimises before it lowers, so `1 + 2` reaches the emitter
+# as `3`.
+cargo test --test emit -- --nocapture
+
 
 if [ "${1:-}" = "--arm" ]; then
   echo

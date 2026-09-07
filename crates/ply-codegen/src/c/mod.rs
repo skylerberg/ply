@@ -44,7 +44,7 @@ mod load;
 mod prelude;
 mod toolchain;
 
-pub use build::{Native, build, emit_unit};
+pub use build::{Native, build, emit_body, emit_unit};
 pub use load::Library;
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
 pub use toolchain::{Profile, select as select_profile};

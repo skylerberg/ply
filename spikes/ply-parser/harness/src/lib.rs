@@ -1766,6 +1766,50 @@ fn lower_hex(bytes: &[u8]) -> String {
     s
 }
 
+/// The C one body emits, with its placeholders unresolved: the oracle for a code generator.
+///
+/// The stage after the lowering, and the one the goal names. `reference_lower_dump` says whether a
+/// Ply implementation builds the right *tree*; this says whether it writes the right *program*.
+/// Placeholders are left as they are (`@@c3@@`, `@@b7@@`) because they are a body's own positions
+/// in the unit's tables, which is what makes one body comparable without the unit around it.
+pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (module, _) =
+            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        program.modules.push(module);
+    }
+    let mut out = String::new();
+    out.push_str(&format!("C;{};", modules.len()));
+    if !ply_derive::expand_program(&mut program).is_empty() {
+        out.push_str("E;");
+        return out;
+    }
+    let Ok(resolved) = ply_syntax::resolve::resolve(&mut program) else {
+        out.push_str("R;");
+        return out;
+    };
+    let Ok(check) = ply_core::check_program(&program, &resolved) else {
+        out.push_str("T;");
+        return out;
+    };
+    let source: &'static ply_codegen::Source = Box::leak(Box::new(ply_codegen::Source::new(
+        Box::leak(Box::new(program)),
+        Box::leak(Box::new(resolved)),
+        Box::leak(Box::new(check)),
+    )));
+    for name in source.functions() {
+        // A body the reference refuses is left out, exactly as a body the port has not reached is:
+        // what is compared is what both sides produced.
+        if let Ok(text) = ply_codegen::c::emit_body(source, &name) {
+            out.push_str(&format!("f:{name};{text};"));
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
