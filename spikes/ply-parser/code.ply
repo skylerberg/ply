@@ -17,8 +17,8 @@
 // how far this port has got.
 
 import spine (Span, Ident, QName, dummy_span, num)
-import patterns (Pattern, PVar, Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
-import exprs (Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock, EList,
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import exprs (MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock, EList,
               ERecord, EField, ELambda, EMatch, EPerform, EHandle, EWithCell,
               EWithRegion, ESimulate, EBad, ERecordUpdate, ETry, Stmt, SLet, SExpr,
               RecField)
@@ -45,9 +45,24 @@ pub type Node =
   | NBlock({ stmts: List<CStmt>, tail: Option<Code> })
   | NList({ items: List<Code> })
   | NRecord({ fields: List<CField> })
+  | NMatch({ scrutinee: Code, arms: List<CArm> })
   | NField({ base: Code, field: Bytes })
 
 pub type CField = { name: Bytes, value: Code }
+
+// `ply_eval::code::Pat`: a pattern with its binders resolved to slots, which is
+// what lets a match write bindings straight into the window.
+pub type CPat =
+  | PxWild
+  | PxVar({ name: Bytes, slot: Option<Int> })
+  | PxLit(Lit)
+  | PxCtor({ name: Bytes, args: List<CPat> })
+  | PxRecord({ fields: List<CPatField>, rest: Bool })
+  | PxList({ items: List<CPat>, rest: Option<CPat> })
+
+pub type CPatField = { name: Bytes, pat: CPat }
+
+pub type CArm = { pat: CPat, guard: Option<Code>, body: Code }
 
 // The slot a `let` writes, which is what the ownership pass drops when it walks
 // backwards past the binder.
@@ -97,6 +112,27 @@ pub fn hex(s: Bytes) -> Bytes =
 fn slot_tag(s: Option<Int>) -> Bytes =
   match s { Some(n) -> num(n), None -> b"-" }
 
+pub fn dump_pat(p: CPat) -> Bytes =
+  match p {
+    PxWild -> b"_",
+    PxVar(v) -> bytes_concat_all([b"v:", v.name, b":", slot_tag(v.slot)]),
+    PxLit(l) -> bytes_concat(b"l:", dump_lit(l)),
+    PxCtor(c) ->
+      bytes_concat_all([b"c:", c.name, b"(",
+                        fold(c.args, b"", |acc: Bytes, a: CPat| bytes_concat_all([acc, dump_pat(a), b","])),
+                        b")"]),
+    PxRecord(r) ->
+      bytes_concat_all([b"r:(",
+                        fold(r.fields, b"", |acc: Bytes, f: CPatField|
+                          bytes_concat_all([acc, f.name, b"=", dump_pat(f.pat), b","])),
+                        if r.rest { b"..)" } else { b")" }]),
+    PxList(l) ->
+      bytes_concat_all([b"s:(",
+                        fold(l.items, b"", |acc: Bytes, i: CPat| bytes_concat_all([acc, dump_pat(i), b","])),
+                        match l.rest { Some(r) -> bytes_concat(b"..", dump_pat(r)), None -> b"" },
+                        b")"]),
+  }
+
 pub fn dump(c: Code) -> Bytes =
   bytes_concat(own_tag(c.own), dump_node(c.node))
 
@@ -131,6 +167,13 @@ fn dump_node(n: Node) -> Bytes =
       bytes_concat_all([b"rec(",
                         fold(r.fields, b"", |acc: Bytes, fd: CField|
                           bytes_concat_all([acc, fd.name, b"=", dump(fd.value), b","])),
+                        b")"]),
+    NMatch(m) ->
+      bytes_concat_all([b"match(", dump(m.scrutinee),
+                        fold(m.arms, b"", |acc: Bytes, a: CArm|
+                          bytes_concat_all([acc, b",arm(", dump_pat(a.pat), b",",
+                                            match a.guard { Some(g) -> dump(g), None -> b"-" },
+                                            b",", dump(a.body), b")"])),
                         b")"]),
     NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
   }
@@ -179,7 +222,7 @@ fn at(xs: List<Bind>, i: Int) -> Bind =
 pub fn covers() -> List<Bytes> =
   [b"literals", b"unary", b"binary", b"if", b"list", b"field", b"application",
    b"records", b"blocks and `let`", b"parameters and their slots",
-   b"the ownership marks"]
+   b"the ownership marks", b"match and every pattern form"]
 
 type Out = { code: Code, frame: Frame }
 
@@ -242,6 +285,32 @@ fn lower_in(e: Expr, f: Frame) -> Option<Out> =
           },
         }
       },
+    EMatch(x) -> match lower_in(x.scrutinee, f) {
+      None -> None,
+      Some(sc) -> {
+        let depth = len(sc.frame.scope);
+        let walked = fold(x.arms, { arms: [], frame: sc.frame, ok: true },
+          |acc: ArmAcc, a: MatchArm|
+            if !acc.ok { acc } else {
+              // Each arm binds into the same barrier and its binders leave scope
+              // at the arm's end; the slots they took do not come back.
+              let pd = len(acc.frame.scope);
+              let pat = lower_pat(a.pat, acc.frame);
+              match a.guard {
+                Some(_) -> { arms: acc.arms, frame: acc.frame, ok: false },
+                None -> match lower_in(a.body, pat.frame) {
+                  None -> { arms: acc.arms, frame: acc.frame, ok: false },
+                  Some(b) -> { arms: push(acc.arms, { pat: pat.pat, guard: None, body: b.code }),
+                               frame: unscope(b.frame, pd), ok: true },
+                },
+              }
+            });
+        if !walked.ok { None } else {
+          Some({ code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: walked.arms }) },
+                 frame: unscope(walked.frame, depth) })
+        }
+      },
+    },
     EBlock(x) -> lower_block(x.stmts, x.tail, f),
     _ -> None,
   }
@@ -267,6 +336,8 @@ fn lower_seq(xs: List<Expr>, f: Frame) -> Option<Seq> =
 // A block opens a scope its binders leave at the end, and only a plain `let x =`
 // is reached: a destructuring pattern binds more than one slot and is the next
 // thing this port needs.
+type ArmAcc = { arms: List<CArm>, frame: Frame, ok: Bool }
+
 type BlockAcc = { stmts: List<CStmt>, frame: Frame, ok: Bool }
 
 fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, f: Frame) -> Option<Out> = {
@@ -304,6 +375,88 @@ fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, f: Frame) -> Option<Out> =
     }
   }
 }
+
+type PatOut = { pat: CPat, frame: Frame }
+
+// A pattern's binders take slots in the order the walk meets them, which is what
+// lets an arm write its bindings straight into the window. A bare name may
+// really be a nullary constructor -- the tree cannot tell -- so it takes a slot
+// either way and the machine consults the constructor table before writing it.
+fn lower_pat(p: Pattern, f: Frame) -> PatOut =
+  match p {
+    PWild(_) -> { pat: PxWild, frame: f },
+    PVar(v) -> {
+      let name = v.name.name;
+      let g = bind(f, name);
+      { pat: PxVar({ name: name, slot: find(g, name) }), frame: g }
+    },
+    PLit(v) -> { pat: PxLit(v.lit), frame: f },
+    PCtor(c) -> {
+      let r = lower_pats(c.args, f);
+      { pat: PxCtor({ name: qname_text(c.name), args: r.pats }), frame: r.frame }
+    },
+    PRecord(r) -> {
+      let walked = fold(r.fields, { pats: [], frame: f, names: [] },
+        |acc: PatFields, fd: { name: Ident, pat: Pattern }| {
+          let o = lower_pat(fd.pat, acc.frame);
+          { pats: push(acc.pats, o.pat), frame: o.frame, names: push(acc.names, fd.name.name) }
+        });
+      { pat: PxRecord({ fields: map(range(0, len(walked.pats)), |i: Int|
+                          { name: nth_bytes(walked.names, i), pat: nth_pat(walked.pats, i) }),
+                        rest: r.rest }),
+        frame: walked.frame }
+    },
+    PList(l) -> {
+      let r = lower_pats(l.items, f);
+      match l.rest {
+        None -> { pat: PxList({ items: r.pats, rest: None }), frame: r.frame },
+        Some(rp) -> {
+          let o = lower_pat(rp, r.frame);
+          { pat: PxList({ items: r.pats, rest: Some(o.pat) }), frame: o.frame }
+        },
+      }
+    },
+    PBad(_) -> { pat: PxWild, frame: f },
+  }
+
+type PatFields = { pats: List<CPat>, frame: Frame, names: List<Bytes> }
+type PatSeq = { pats: List<CPat>, frame: Frame }
+
+fn lower_pats(ps: List<Pattern>, f: Frame) -> PatSeq =
+  fold(ps, { pats: [], frame: f }, |acc: PatSeq, p: Pattern| {
+    let o = lower_pat(p, acc.frame);
+    { pats: push(acc.pats, o.pat), frame: o.frame }
+  })
+
+fn nth_bytes(xs: List<Bytes>, i: Int) -> Bytes =
+  match list_at(xs, i) { Some(x) -> x, None -> b"" }
+
+fn nth_pat(xs: List<CPat>, i: Int) -> CPat =
+  match list_at(xs, i) { Some(x) -> x, None -> PxWild }
+
+// A qualified name as the oracle writes it: `module.name`, or the bare name.
+fn qname_text(q: QName) -> Bytes =
+  match q.module {
+    // `::`, which is how `ply_span::Symbol` renders a qualified name and what
+    // the oracle therefore writes -- not the `.` the source spells it with.
+    Some(m) -> bytes_concat_all([m.name, b"::", q.name.name]),
+    None -> q.name.name,
+  }
+
+// The slots a pattern binds, which the ownership pass drops when it walks back
+// past the arm that binds them.
+fn pat_slots(p: CPat) -> List<Int> =
+  match p {
+    PxWild -> [],
+    PxVar(v) -> match v.slot { Some(s) -> [s], None -> [] },
+    PxLit(_) -> [],
+    PxCtor(c) -> fold(c.args, [], |acc: List<Int>, a: CPat| live_union(acc, pat_slots(a))),
+    PxRecord(r) -> fold(r.fields, [], |acc: List<Int>, f: CPatField| live_union(acc, pat_slots(f.pat))),
+    PxList(l) -> {
+      let items = fold(l.items, [], |acc: List<Int>, i: CPat| live_union(acc, pat_slots(i)));
+      match l.rest { Some(r) -> live_union(items, pat_slots(r)), None -> items }
+    },
+  }
 
 // Only the shape that binds exactly one name. Anything else binds a set of
 // slots and needs the pattern half of `slots.rs`, which this port has not
@@ -412,6 +565,25 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
           livef: fuse_add(livef, s, fd.field) }
       },
     },
+    // Every arm sees the same future, as the branches of an `if` do, and each
+    // arm's binders die at the arm: nothing before the match can read a slot a
+    // pattern wrote.
+    NMatch(m) -> {
+      let marked = fold(m.arms, { arms: [], live: [], livew: [], livef: [] },
+        |acc: ArmMark, a: CArm| {
+          let bound = pat_slots(a.pat);
+          let b = mark(a.body, live, livew, livef);
+          let after = fold(bound, { l: b.live, w: b.livew, f: b.livef },
+            |x: Dropped, s: Int| { l: live_drop(x.l, s), w: live_drop(x.w, s), f: live_drop_f(x.f, s) });
+          { arms: push(acc.arms, { pat: a.pat, guard: None, body: b.code }),
+            live: live_union(acc.live, after.l),
+            livew: live_union(acc.livew, after.w),
+            livef: fuse_union(acc.livef, after.f) }
+        });
+      let sc = mark(m.scrutinee, marked.live, marked.livew, marked.livef);
+      { code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
+        live: sc.live, livew: sc.livew, livef: sc.livef }
+    },
     NIf(i) -> {
       let t = mark(i.then_branch, live, livew, livef);
       let e = mark(i.else_branch, live, livew, livef);
@@ -457,6 +629,10 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
         live: walked.live, livew: walked.livew, livef: walked.livef }
     },
   }
+
+type ArmMark = { arms: List<CArm>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+
+type Dropped = { l: List<Int>, w: List<Int>, f: List<FieldUse> }
 
 type Seq2 = { codes: List<CStmt>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
 
@@ -559,8 +735,13 @@ test "a `let` takes the next slot and the binder dies at it" {
             "L;1;f:m.f:1:2;bblock(let(v:b:1,bbin(add,ovar(a,0),blit(i1))),ovar(b,1));")
 }
 
+test "a match binds its arms into the window and each arm's binders leave at its end" {
+  assert_eq(lower_dump(b"fn f(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n"),
+            "L;1;f:m.f:1:2;bmatch(ovar(o,0),arm(c:Some(v:n:1,),-,ovar(n,1)),arm(c:None(),-,blit(i0)));")
+}
+
 test "a function this port does not reach is skipped rather than dumped wrongly" {
-  let out = lower_module(b"fn f(g: (Int) -> Int) -> Int = g(1)\nfn h() -> Int = match 1 { _ -> 2 }\nfn k() -> Int = 1\n");
-  assert_eq(out.lowered, 2);
+  let out = lower_module(b"fn f() -> Int = fold([1], 0, |a: Int, b: Int| a + b)\nfn k() -> Int = 1\n");
+  assert_eq(out.lowered, 1);
   assert_eq(out.skipped, 1)
 }
