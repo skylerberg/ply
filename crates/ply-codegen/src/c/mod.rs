@@ -2,8 +2,38 @@
 //! and handed to `cc`.
 //!
 //! ADR 0037 listed the candidates and `benches/value-model/c-tier/` priced this one on the value
-//! model Ply actually compiles: about one and a half times the Rust bar where Cranelift is six.
-//! This is that measurement made reachable from a shipping command.
+//! model Ply actually compiles, before it was built, at about one and a half times the Rust bar
+//! where Cranelift was six. What was built reads 2.5 on the integer kernel against Cranelift's
+//! 4.2-4.5, and 3.8 on the state kernel against Cranelift's 1.7 -- so the prediction had the
+//! ordering right on one kernel and does not describe the other. `benches/value-model/` carries
+//! the readings; this line is here because the prediction used to stand in for them.
+//!
+//! ## The instruments
+//!
+//! Eleven environment variables steer this tier, and until they were listed here the only way to
+//! find one was to grep. None changes what a program means; each narrows, widens or reports on
+//! how it gets compiled.
+//!
+//! | variable | what it does | where |
+//! | --- | --- | --- |
+//! | `PLY_C_ONLY` | compile only the definitions named, comma-separated. An allow-list does not fit in an environment variable at corpus scale -- fourteen hundred names is about thirty kilobytes -- and a truncated one silently compiles a different program | `build.rs` |
+//! | `PLY_C_SKIP` | the same the other way round: drop every definition whose name starts with one of these prefixes. This is the one to reach for | `build.rs` |
+//! | `PLY_C_REFUSALS` | print what the tier refused and why, and how much of the offered set it took | `build.rs` |
+//! | `PLY_C_DUMP` | print one body's emitted C by name, or `*` for the unit's size and its largest bodies | `build.rs` |
+//! | `PLY_C_SPLIT` | print where the emit's time went: optimise-and-lower against emit | `build.rs` |
+//! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
+//! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |
+//! | `PLY_CC` | the C compiler to shell out to, `cc` by default | `load.rs` |
+//! | `PLY_CC_OPT` | the optimisation flag it is given, `-O2` by default | `load.rs` |
+//! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
+//! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
+//!
+//! Two things a twelfth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
+//! **before** its digest is taken, because a refusal is cached against that digest -- filtering
+//! after it served a narrowed run's refusals back to an unfiltered one and built a unit neither
+//! run would produce. And anything that changes an emitted body has to reach the cache key:
+//! `PLY_INLINE_*` does, through `Inlining::overridden`, and did not until a measurement at one
+//! depth was served bodies emitted at another.
 
 mod build;
 mod cache;
