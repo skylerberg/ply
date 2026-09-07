@@ -25,9 +25,9 @@ import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LB
 
 // The C type a value is held in, and what the emitter knows about it. `Boxed` is
 // a `Word`; `Int` is the untagged sixty-four bits inside one.
-pub type Kind = | KBoxed | KInt
+pub type Kind = | KBoxed | KInt | KBool
 
-pub fn ctype(k: Kind) -> Bytes = match k { KBoxed -> b"int64_t", KInt -> b"int64_t" }
+pub fn ctype(k: Kind) -> Bytes = match k { KBoxed -> b"int64_t", KInt -> b"int64_t", KBool -> b"int64_t" }
 
 // One emitted value: the kind it is held at, and the C expression naming it.
 pub type V = { k: Kind, c: Bytes }
@@ -58,6 +58,7 @@ fn check(em: Em) -> Em = line(em, b"if (ctx->failed) return 0;")
 fn as_int(em: Em, v: V) -> Out =
   match v.k {
     KInt -> { em: em, v: v },
+    KBool -> { em: em, v: { k: KInt, c: v.c } },
     KBoxed -> bind(em, KInt,
       bytes_concat_all([b"(ply_is_imm(", v.c, b") ? ply_imm_value(", v.c,
                         b") : rt_unbox_int_p(ctx, ", v.c, b"))"])),
@@ -67,6 +68,8 @@ fn as_int(em: Em, v: V) -> Out =
 fn as_word(v: V) -> Bytes =
   match v.k {
     KBoxed -> v.c,
+    // A `Bool` leaves as one of the two immortal words the runtime holds for it.
+    KBool -> bytes_concat_all([b"(", v.c, b" ? ply_true : ply_false)"]),
     KInt -> bytes_concat_all([b"(ply_fits_imm(", v.c, b") ? ply_imm(", v.c,
                               b") : rt_box_int_p(ctx, ", v.c, b"))"]),
   }
@@ -79,7 +82,8 @@ fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
 
 pub fn covers() -> List<Bytes> =
   [b"integer literals", b"parameters read as integers",
-   b"add, sub, mul, div and rem on Int"]
+   b"add, sub, mul, div and rem on Int",
+   b"lt, le, gt, ge, eq and ne on Int"]
 
 fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
   match c.node {
@@ -96,7 +100,7 @@ fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
       } else { None },
     },
     NBinary(b) ->
-      if !is_arith(b.op) { None } else {
+      if !is_arith(b.op) && compare_op(b.op) == None { None } else {
         match expr(em, b.lhs, params) {
           None -> None,
           Some(l) -> match expr(l.em, b.rhs, params) {
@@ -104,7 +108,17 @@ fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
             Some(r) -> {
               let a = as_int(r.em, l.v);
               let bb = as_int(a.em, r.v);
-              Some(arithmetic(bb.em, b.op, a.v, bb.v))
+              match compare_op(b.op) {
+                // `!=` is written as the negation of `==`, which is what the
+                // reference emits: one comparison in the C for the two spellings.
+                Some(c) -> Some(bind(bb.em, KBool,
+                  if b.op == b"ne" {
+                    bytes_concat_all([b"!((", a.v.c, b") == (", bb.v.c, b"))"])
+                  } else {
+                    bytes_concat_all([b"(", a.v.c, b") ", c, b" (", bb.v.c, b")"])
+                  })),
+                None -> Some(arithmetic(bb.em, b.op, a.v, bb.v)),
+              }
             },
           },
         }
@@ -114,6 +128,17 @@ fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
 
 fn is_arith(op: Bytes) -> Bool =
   op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+
+// The six orderings, which compile to C's own on the untagged integers rather
+// than to a helper: an `Int` comparison cannot raise.
+fn compare_op(op: Bytes) -> Option<Bytes> =
+  if op == b"lt" { Some(b"<") }
+  else if op == b"le" { Some(b"<=") }
+  else if op == b"gt" { Some(b">") }
+  else if op == b"ge" { Some(b">=") }
+  else if op == b"eq" { Some(b"==") }
+  else if op == b"ne" { Some(b"!=") }
+  else { None }
 
 // Addition and subtraction are checked in the emitted C, because a wrap is a
 // wrong answer and the runtime's own overflow report is what the machine gives.
