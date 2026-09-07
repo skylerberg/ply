@@ -1581,13 +1581,20 @@ fn dump_code(out: &mut String, c: &ply_eval::code::Code) {
                     c.resume.is_some(),
                     c.size
                 ));
+                // A clause opens a barrier and copies in what its body reads from where the
+                // handler was installed. The size without the captures compares the window and
+                // not what fills it.
+                out.push(',');
+                dump_captures(out, &c.captures);
                 out.push(',');
                 dump_code(out, &c.body);
                 out.push(')');
             }
             match ret {
                 Some(r) => {
-                    out.push_str(",ret(");
+                    out.push_str(&format!(",ret({},", r.size));
+                    dump_captures(out, &r.captures);
+                    out.push(',');
                     dump_code(out, &r.body);
                     out.push(')');
                 }

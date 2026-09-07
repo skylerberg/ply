@@ -18,7 +18,7 @@
 
 import spine (Span, Ident, QName, dummy_span, num)
 import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
-import exprs (MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock, EList,
+import exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock, EList,
               ERecord, EField, ELambda, EMatch, EPerform, EHandle, EWithCell,
               EWithRegion, ESimulate, EBad, ERecordUpdate, ETry, Stmt, SLet, SExpr,
               RecField)
@@ -50,6 +50,8 @@ pub type Node =
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
   | NRegion({ body: Code })
   | NLambda({ params: Int, size: Int, caps: List<Cap>, body: Code })
+  | NSim({ size: Int, caps: List<Cap>, body: Code })
+  | NHandle({ body: Code, clauses: List<CClause>, ret: Option<CRet> })
   | NField({ base: Code, field: Bytes })
 
 pub type CField = { name: Bytes, value: Code }
@@ -72,6 +74,14 @@ pub type CArm = { pat: CPat, guard: Option<Code>, body: Code }
 // in the enclosing barrier, the slot it lands in here, and how the read that
 // copies it takes the value.
 pub type Cap = { src: Int, dst: Int, own: Own }
+
+// A handler clause, which opens a barrier of its own: its parameters and its
+// `resume` binder take its leading slots, and what its body reads from where the
+// handler was installed is copied in.
+pub type CClause = { effect: Bytes, op: Bytes, resource: Bytes, params: Int,
+                     resume: Bool, size: Int, caps: List<Cap>, body: Code }
+
+pub type CRet = { size: Int, caps: List<Cap>, body: Code }
 
 // The slot a `let` writes, which is what the ownership pass drops when it walks
 // backwards past the binder.
@@ -120,6 +130,12 @@ pub fn hex(s: Bytes) -> Bytes =
 
 fn slot_tag(s: Option<Int>) -> Bytes =
   match s { Some(n) -> num(n), None -> b"-" }
+
+fn dump_caps(cs: List<Cap>) -> Bytes =
+  bytes_concat_all([b"[",
+                    fold(cs, b"", |acc: Bytes, c: Cap|
+                      bytes_concat_all([acc, num(c.src), b">", num(c.dst), own_tag(c.own), b" "])),
+                    b"]"])
 
 pub fn dump_pat(p: CPat) -> Bytes =
   match p {
@@ -192,11 +208,24 @@ fn dump_node(n: Node) -> Bytes =
       bytes_concat_all([b"cell(", c.resource, b",", c.binder, b",", slot_tag(c.slot), b",",
                         dump(c.init), b",", dump(c.body), b")"]),
     NRegion(r) -> bytes_concat_all([b"region(", dump(r.body), b")"]),
+    NSim(sm) ->
+      bytes_concat_all([b"sim(", num(sm.size), b",", dump_caps(sm.caps), b",", dump(sm.body), b")"]),
+    NHandle(h) ->
+      bytes_concat_all([b"handle(", dump(h.body),
+                        fold(h.clauses, b"", |acc: Bytes, c: CClause|
+                          bytes_concat_all([acc, b",cl(", c.effect, b",", c.op, b",", c.resource, b",",
+                                            num(c.params), b",", if c.resume { b"true" } else { b"false" },
+                                            b",", num(c.size), b",", dump_caps(c.caps), b",",
+                                            dump(c.body), b")"])),
+                        match h.ret {
+                          Some(r) -> bytes_concat_all([b",ret(", num(r.size), b",", dump_caps(r.caps),
+                                                       b",", dump(r.body), b")"]),
+                          None -> b",-",
+                        },
+                        b")"]),
     NLambda(l) ->
-      bytes_concat_all([b"lam(", num(l.params), b",", num(l.size), b",[",
-                        fold(l.caps, b"", |acc: Bytes, c: Cap|
-                          bytes_concat_all([acc, num(c.src), b">", num(c.dst), own_tag(c.own), b" "])),
-                        b"],", dump(l.body), b")"]),
+      bytes_concat_all([b"lam(", num(l.params), b",", num(l.size), b",", dump_caps(l.caps), b",",
+                        dump(l.body), b")"]),
     NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
   }
 
@@ -331,7 +360,8 @@ pub fn covers() -> List<Bytes> =
    b"records", b"blocks and `let`", b"parameters and their slots",
    b"the ownership marks", b"match and every pattern form",
    b"perform, with_cell and with_region",
-   b"a lambda and the names it captures, through any depth of barrier"]
+   b"a lambda and the names it captures, through any depth of barrier",
+   b"handle with its clauses and return arm, and simulate"]
 
 type Out = { code: Code, st: Stack }
 
@@ -478,6 +508,67 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         Some(b) -> Some(lam_of(params, b)),
       }
     },
+    // `simulate` opens a barrier, as a lambda does, and takes no parameters.
+    ESimulate(x) -> match lower_in(x.body, st_push(st, empty_frame())) {
+      None -> None,
+      Some(b) -> {
+        let inner = st_top(b.st);
+        Some({ code: { own: Borrowed, node: NSim({ size: len(inner.names), caps: inner.caps,
+                                                   body: mark(b.code, [], [], []).code }) },
+               st: st_pop(b.st) })
+      },
+    },
+    // `handle`: the body runs in the barrier it is written in, and every clause
+    // opens one of its own whose leading slots are the clause parameters and its
+    // `resume` binder.
+    EHandle(x) -> match lower_in(x.body, st) {
+      None -> None,
+      Some(b) -> {
+        let cls = fold(x.clauses, { clauses: [], st: b.st, ok: true },
+          |acc: ClauseAcc, c: HandleClause|
+            if !acc.ok { acc } else {
+              let names = match c.resume {
+                Some(rid) -> push(map(c.params, |i: Ident| i.name), rid.name),
+                None -> map(c.params, |i: Ident| i.name),
+              };
+              let inner = fold(names, empty_frame(), |g: Frame, n: Bytes| bind(g, n));
+              match lower_in(c.body, st_push(acc.st, inner)) {
+                None -> { clauses: acc.clauses, st: acc.st, ok: false },
+                Some(cb) -> {
+                  let f = st_top(cb.st);
+                  { clauses: push(acc.clauses, {
+                      effect: qname_text(c.eff), op: c.op.name,
+                      resource: match c.resource { Some(id) -> id.name, None -> b"" },
+                      params: len(c.params), resume: match c.resume { Some(_) -> true, None -> false },
+                      size: len(f.names), caps: f.caps,
+                      body: mark(cb.code, [], [], []).code }),
+                    st: st_pop(cb.st), ok: true }
+                },
+              }
+            });
+        if !cls.ok { None } else {
+          match x.ret {
+            None -> Some({ code: { own: Borrowed, node: NHandle({ body: b.code, clauses: cls.clauses,
+                                                                  ret: None }) },
+                           st: cls.st }),
+            Some(r) -> {
+              let inner = bind(empty_frame(), r.binder.name);
+              match lower_in(r.body, st_push(cls.st, inner)) {
+                None -> None,
+                Some(rb) -> {
+                  let f = st_top(rb.st);
+                  Some({ code: { own: Borrowed, node: NHandle({
+                           body: b.code, clauses: cls.clauses,
+                           ret: Some({ size: len(f.names), caps: f.caps,
+                                       body: mark(rb.code, [], [], []).code }) }) },
+                         st: st_pop(rb.st) })
+                },
+              }
+            },
+          }
+        }
+      },
+    },
     EBlock(x) -> lower_block(x.stmts, x.tail, st),
     _ -> None,
   }
@@ -513,6 +604,8 @@ fn lam_of(params: List<Bytes>, b: Out) -> Out = {
                                            body: mark(b.code, [], [], []).code }) },
     st: st_pop(b.st) }
 }
+
+type ClauseAcc = { clauses: List<CClause>, st: Stack, ok: Bool }
 
 type ArmAcc = { arms: List<CArm>, st: Stack, ok: Bool }
 
@@ -766,16 +859,28 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
     // lowered. What happens *here* is the captures: each is a read of a slot of
     // this barrier, at the point the closure is made.
     NLambda(l) -> {
-      let walked = fold(rev_caps(l.caps), { caps: [], live: live, livew: livew },
-        |acc: CapMark, cp: Cap| {
-          { caps: push(acc.caps, { src: cp.src, dst: cp.dst,
-                                   own: if live_has(acc.live, cp.src) { Borrowed } else { Owned } }),
-            live: live_add(acc.live, cp.src),
-            livew: live_add(acc.livew, cp.src) }
-        });
+      let w = mark_caps(l.caps, live, livew);
       { code: { own: Borrowed, node: NLambda({ params: l.params, size: l.size,
-                                               caps: rev_caps(walked.caps), body: l.body }) },
-        live: walked.live, livew: walked.livew, livef: livef }
+                                               caps: w.caps, body: l.body }) },
+        live: w.live, livew: w.livew, livef: livef }
+    },
+    // A barrier's captures are reads of *this* barrier, at the point the barrier
+    // is entered, exactly as a lambda's are.
+    NSim(sm) -> {
+      let w = mark_caps(sm.caps, live, livew);
+      { code: { own: Borrowed, node: NSim({ size: sm.size, caps: w.caps, body: sm.body }) },
+        live: w.live, livew: w.livew, livef: livef }
+    },
+    NHandle(h) -> {
+      let cls = fold(h.clauses, { caps: [], live: live, livew: livew },
+        |acc: CapMark, c: CClause| {
+          let w = mark_caps(c.caps, acc.live, acc.livew);
+          { caps: acc.caps, live: w.live, livew: w.livew }
+        });
+      let marked = map(h.clauses, |c: CClause| c);
+      let b = mark(h.body, cls.live, cls.livew, livef);
+      { code: { own: Borrowed, node: NHandle({ body: b.code, clauses: marked, ret: h.ret }) },
+        live: b.live, livew: b.livew, livef: b.livef }
     },
     NRegion(r) -> {
       let b = mark(r.body, live, livew, livef);
@@ -847,6 +952,18 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
   }
 
 type CapMark = { caps: List<Cap>, live: List<Int>, livew: List<Int> }
+
+// Each capture is a read of the enclosing barrier's slot, `Owned` when nothing
+// after it wants that slot.
+fn mark_caps(caps: List<Cap>, live: List<Int>, livew: List<Int>) -> CapMark = {
+  let walked = fold(rev_caps(caps), { caps: [], live: live, livew: livew },
+    |acc: CapMark, cp: Cap|
+      { caps: push(acc.caps, { src: cp.src, dst: cp.dst,
+                               own: if live_has(acc.live, cp.src) { Borrowed } else { Owned } }),
+        live: live_add(acc.live, cp.src),
+        livew: live_add(acc.livew, cp.src) });
+  { caps: rev_caps(walked.caps), live: walked.live, livew: walked.livew }
+}
 
 type ArmMark = { arms: List<CArm>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
 
@@ -962,8 +1079,19 @@ test "a match binds its arms into the window and each arm's binders leave at its
             "L;1;f:m.f:1:2;bmatch(ovar(o,0),arm(c:Some(v:n:1,),-,ovar(n,1)),arm(c:None(),-,blit(i0)));")
 }
 
-test "a function this port does not reach is skipped rather than dumped wrongly" {
-  let out = lower_module(b"fn f(n: Int) -> Int = handle { n } with { }\nfn k() -> Int = 1\n");
-  assert_eq(out.lowered, 1);
-  assert_eq(out.skipped, 1)
+test "what the dump holds is what the count reports" {
+  // The differential compares the records this dump holds and asserts how many
+  // there are. Those two have to be the same number or the share it reports is
+  // about something other than what it compared.
+  let out = lower_module(b"fn f() -> Int = 1\nfn g(a: Int) -> Int = a\nfn h() -> Int = 2\n");
+  assert_eq(out.lowered, 3);
+  assert_eq(out.skipped, 0);
+  assert_eq(count_records(bytes_of_string(lower_dump(b"fn f() -> Int = 1\nfn g(a: Int) -> Int = a\nfn h() -> Int = 2\n"))), 3)
 }
+
+// `f:m.` at the head of a record, counted the way the differential splits them.
+fn count_records(d: Bytes) -> Int =
+  fold(range(0, bytes_len(d) - 3), 0, |acc: Int, i: Int|
+    if bytes_at(d, i) == 102 && bytes_at(d, i + 1) == 58
+       && bytes_at(d, i + 2) == 109 && bytes_at(d, i + 3) == 46 { acc + 1 } else { acc })
+
