@@ -316,6 +316,13 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn chained(a: Int, b: Int, c: Int) -> Int = a * b + c\n",
         "fn unused(a: Int, b: Int) -> Int = b\n",
         "fn onbool(a: Int, b: Bool) -> Int = if b { a } else { 0 }\n",
+        // Blocks: a binding is renamed even when its value is already a
+        // temporary, and the block binds its own tail on the way out.
+        "fn onelet(a: Int, b: Int) -> Int = {\n  let c = a + b;\n  c - a\n}\n",
+        "fn twolet(a: Int, b: Int) -> Int = {\n  let c = a + b;\n  let d = c * c;\n  d - b\n}\n",
+        "fn letif(a: Int, b: Int) -> Int = {\n  let c = if a < b { b } else { a };\n  c + 1\n}\n",
+        // A binding inside a branch, whose slot the other branch never fills.
+        "fn iflet(a: Int, b: Int) -> Int = if a < b {\n  let c = a * 2;\n  c + b\n} else { b }\n",
     ];
     let inputs: Vec<(String, Vec<u8>)> = programs
         .iter()
@@ -328,7 +335,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 19, "only {reached} bodies were emitted");
+    assert!(reached >= 23, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.

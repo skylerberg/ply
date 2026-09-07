@@ -17,7 +17,7 @@
 // `opt.rs`, not of this file.
 
 import spine (num)
-import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, Own, Borrowed, Owned, OwnedField, lower_fn)
+import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, CStmt, CLet, CDo, Own, Borrowed, Owned, OwnedField, lower_fn)
 import items (Item, IFn, parse)
 import exprs (Param)
 import types (TypeExpr, TCon)
@@ -43,7 +43,7 @@ pub type V = { k: Kind, c: Bytes }
 // that unboxed per read would answer the same and write different C.
 pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int }
 
-pub type Conv = { slot: Int, c: Bytes }
+pub type Conv = { slot: Int, k: Kind, c: Bytes }
 
 // A parameter, as the emitter needs it: the C word arrives boxed and the
 // declared type says how to open it.
@@ -68,11 +68,13 @@ fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv,
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
   { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind }, name: bytes_concat(b"t", num(em.n + 1)) }
 
-fn conv_of(em: Em, slot: Int) -> Option<Bytes> =
-  fold(em.conv, None, |acc: Option<Bytes>, c: Conv| if c.slot == slot { Some(c.c) } else { acc })
+// The last entry wins: a `let` may shadow a slot an enclosing scope filled.
+fn conv_of(em: Em, slot: Int) -> Option<V> =
+  fold(em.conv, None, |acc: Option<V>, c: Conv|
+    if c.slot == slot { Some({ k: c.k, c: c.c }) } else { acc })
 
-fn remember(em: Em, slot: Int, c: Bytes) -> Em =
-  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, c: c }), ind: em.ind }
+fn remember(em: Em, slot: Int, v: V) -> Em =
+  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, k: v.k, c: v.c }), ind: em.ind }
 
 // A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
 fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
@@ -116,7 +118,7 @@ pub fn covers() -> List<Bytes> =
    b"add, sub, mul, div and rem on Int",
    b"lt, le, gt, ge, eq and ne on Int",
    b"if, with either branch's value joined in one temporary",
-   b"a block that binds nothing"]
+   b"a block, and the `let`s in it"]
 
 fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
@@ -129,7 +131,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     NVar(v) -> match v.slot {
       None -> None,
       Some(s) -> match conv_of(em, s) {
-        Some(c) -> Some({ em: em, v: { k: KInt, c: c } }),
+        Some(v) -> Some({ em: em, v: v }),
         None -> None,
       },
     },
@@ -157,12 +159,18 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           },
         }
       },
-    // A block with no statements is what lowering wraps every `if` branch and
-    // every function body in. `let` needs a slot window this port does not have
-    // yet, so a block that binds anything is refused rather than mis-emitted.
+    // Lowering wraps every `if` branch and every `{ }` body in one of these. A
+    // block binds its tail even when it holds no statements, which is why an
+    // `if` branch shows a rename the branch itself did not ask for.
     NBlock(bl) -> match bl.tail {
       None -> None,
-      Some(t) -> if len(bl.stmts) == 0 { expr(em, t, params) } else { None },
+      Some(t) -> match stmts(em, bl.stmts, params, 0) {
+        None -> None,
+        Some(after) -> match expr(after, t, params) {
+          None -> None,
+          Some(o) -> Some(bind(o.em, o.v.k, o.v.c)),
+        },
+      },
     },
     NIf(i) -> match expr(em, i.cond, params) {
       None -> None,
@@ -199,14 +207,37 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     _ -> None,
   }
 
-// One arm of an `if`: the value, coerced to the join's kind, bound, assigned.
+// A block's statements, in order. A `let` binds its value under its own name --
+// the reference writes the rename even when the value is already a temporary --
+// and records it against the slot the body reads it back through.
+fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
+  if i >= len(xs) { Some(em) } else {
+    match list_at(xs, i) {
+      None -> None,
+      Some(st) -> match st {
+        CLet(l) -> match expr(em, l.value, params) {
+          None -> None,
+          Some(o) -> {
+            let b = bind(o.em, o.v.k, o.v.c);
+            stmts(remember(b.em, l.slot, b.v), xs, params, i + 1)
+          },
+        },
+        CDo(d) -> match expr(em, d.code, params) {
+          None -> None,
+          Some(o) -> stmts(o.em, xs, params, i + 1),
+        },
+      },
+    }
+  }
+
+// One arm of an `if`: the value, coerced to the join's kind, assigned. The bind
+// the reference writes here belongs to the block lowering wrapped the branch in.
 fn branch(em: Em, c: Code, params: List<P>, k: Kind, join: Bytes) -> Option<Em> =
   match expr(em, c, params) {
     None -> None,
     Some(o) -> {
       let cv = coerce(o.em, k, o.v);
-      let b = bind(cv.em, k, cv.v.c);
-      Some(line(b.em, bytes_concat_all([join, b" = ", b.v.c, b";"])))
+      Some(line(cv.em, bytes_concat_all([join, b" = ", cv.v.c, b";"])))
     },
   }
 
@@ -264,7 +295,7 @@ fn prologue(em: Em, params: List<P>) -> Em =
       _ -> bytes_concat_all([b"(ply_is_imm(p", num(i), b") ? ply_imm_value(p", num(i),
                              b") : rt_unbox_int_p(ctx, p", num(i), b"))"]),
     });
-    remember(o.em, i, o.v.c)
+    remember(o.em, i, o.v)
   })
 
 // `Int` and `Bool` are the two the prologue knows how to open. Anything else --
