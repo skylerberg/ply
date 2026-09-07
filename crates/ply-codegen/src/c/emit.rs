@@ -188,9 +188,6 @@ pub struct Emit<'a> {
     /// The locals the deferred records above will land in, declared once at the top so that
     /// materialising inside a branch still names something the whole body can see.
     record_locals: Vec<String>,
-    /// Locals that already carry a count, because the field read that produced them took it out
-    /// of the record rather than borrowing it. Handing one to a consumer must not take a second.
-    taken: std::collections::HashSet<String>,
     /// Bases already let go of, so that a second read marked as a last use does not let go again.
     released: std::collections::HashSet<String>,
     /// A local that is only another local's name, to the one it renames. The inliner binds a `let`
@@ -284,7 +281,6 @@ struct Frame {
     built: std::collections::HashMap<String, Vec<(Symbol, V)>>,
     deferred: std::collections::HashMap<String, Deferred>,
     record_locals: Vec<String>,
-    taken: std::collections::HashSet<String>,
     released: std::collections::HashSet<String>,
     alias: std::collections::HashMap<String, String>,
     reads: std::collections::HashMap<Symbol, usize>,
@@ -398,7 +394,6 @@ impl<'a> Emit<'a> {
             built: std::collections::HashMap::new(),
             deferred: std::collections::HashMap::new(),
             record_locals: Vec::new(),
-            taken: std::collections::HashSet::new(),
             released: std::collections::HashSet::new(),
             alias: std::collections::HashMap::new(),
             reads: std::collections::HashMap::new(),
@@ -763,19 +758,15 @@ impl<'a> Emit<'a> {
         }
     }
 
-    /// A word a helper is about to take. Duplicated first, because nothing here is ever released
-    /// and a helper that takes will release: the duplicate is what puts the count back.
+    /// A word a helper is about to take. Duplicated first, because a helper that takes will
+    /// release: the duplicate is what puts the count back.
     fn owned(&mut self, v: &V) -> String {
-        // Already counted: a field read at its last use took the count out of the record instead
-        // of borrowing it, so this hands the same count on. Removed as it is spent, so a second
-        // use of the same local takes one of its own.
-        let already = self.taken.remove(&v.c);
         let w = self.word(v);
         let t = self.fresh();
         self.line(format!("Word {t} = {w};"));
         // A scalar is an immediate and holds no count, so there is nothing to take: the kernel
         // builds sixteen-field records of them and the increments were the whole of the cost.
-        if !already && !matches!(v.k, Kind::Num(_) | Kind::Int | Kind::Bool) {
+        if !matches!(v.k, Kind::Num(_) | Kind::Int | Kind::Bool) {
             self.line(format!("ply_inc({t});"));
         }
         t
@@ -1507,7 +1498,6 @@ impl<'a> Emit<'a> {
         std::mem::swap(&mut self.built, &mut f.built);
         std::mem::swap(&mut self.deferred, &mut f.deferred);
         std::mem::swap(&mut self.record_locals, &mut f.record_locals);
-        std::mem::swap(&mut self.taken, &mut f.taken);
         std::mem::swap(&mut self.released, &mut f.released);
         std::mem::swap(&mut self.alias, &mut f.alias);
         std::mem::swap(&mut self.reads, &mut f.reads);

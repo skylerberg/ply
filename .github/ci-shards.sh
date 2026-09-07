@@ -276,9 +276,7 @@ declare -a SPIKE_JOBS=(
 # nothing for a job to assert, and a benchmark whose output is a number is not a
 # check. `spikes/ply-lexer` itself has both and is in SPIKE_JOBS.
 declare -a SPIKES_OUTSIDE_CI=(
-  "ply-lexer-nesting:three files -- main.ply, nesting.ply, bench.sh -- and no harness, no fixtures and no differential. It measures how deep a fold nests; its output is a number for the call-ceiling decision, not a pass or a fail"
-  "ply-lexer-rc:same shape -- main.ply, fieldorder.ply, bench.sh. It measures what building a container anywhere but last in a record literal costs, which is spikes/ply-lexer/GAPS.md 1's measurement. A number, not a check"
-  "ply-lexer-throughput:same shape -- main.ply, lexer.ply, bench.sh. It measures tokens per second for the self-hosting spike. A number, not a check"
+  "ply-lexer-throughput:three files -- main.ply, lexer.ply, bench.sh -- and no harness, no fixtures and no differential. It measures tokens per second for the self-hosting spike: a number, not a check. It is not unrun, though -- benches/hash-throughput/run.sh calls its bench.sh, which is why it is here and its two siblings are not"
 )
 
 shard_packages() {
