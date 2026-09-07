@@ -1,6 +1,6 @@
 use super::common::{
     IND, backend_spec, build_backend, counters_json, describe_schema, diagnostic_json, emit_json,
-    location, plural, print_diagnostics, report_bind_error, report_load_error,
+    location, plural, print_diagnostics, report_bind_error, report_load_error, select_profile,
 };
 use crate::cli::RunArgs;
 use crate::hosts::Hosts;
@@ -152,7 +152,9 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let module = entry.module.to_string();
     let span = entry.span;
     let plan = crate::simulation::run_plan(args.seed.as_ref());
-    let backend = match compiled_backend(args.backend.as_ref(), &loaded) {
+    let backend = match select_profile(&args.profile)
+        .and_then(|()| compiled_backend(args.backend.as_ref(), &loaded))
+    {
         Ok(backend) => backend,
         Err(diagnostic) => {
             return report_bind_error("run", &[diagnostic], &loaded.sources, args.json, style);

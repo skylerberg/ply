@@ -3023,6 +3023,7 @@ is `E0127` with exit code 2 (§6.7).
 | `--bisect-budget N` | hybrid programs a bisection may evaluate (default 64) |
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
 | `--backend BACKEND` | attach a compiled backend: `reference`, `cranelift` or `c` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
+| `--profile PROFILE` | which toolchain the C tier compiles with: `development` (the default — the fastest compiler on the machine, inlining off) or `release` (`cc -O2`, inlining on). Requires `--backend`; the two profiles are required to answer identically, so this decides what a run costs and not what it means |
 | `--audit-backend` | also run each test without the backend and fail on any disagreement |
 | `--host` | bind the real host handlers |
 | `--std` | also select the tests the shipped modules declare |
@@ -3034,7 +3035,7 @@ is `E0127` with exit code 2 (§6.7).
 
 `--host`, `--seed`, the TLS/db/config flags, `--fs NAME=PATH` (§15.7,
 repeatable, refused without `--host`), `--trace`, `--drain-ms`,
-`--drain-lead-ms`, `--backend BACKEND`, `--json`. A `.plyx` path is run out
+`--drain-lead-ms`, `--backend BACKEND`, `--profile PROFILE`, `--json`. A `.plyx` path is run out
 of its own verified definitions rather than out of a source tree it may not be
 next to. `--backend` attaches a compiled backend exactly as `ply test`'s flag
 does (§9.7), to a source tree or to an artifact: `main` runs with the machine

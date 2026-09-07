@@ -89,7 +89,15 @@ fn main() {
         ply_eval::Value::Bytes(b) => b.iter().map(|x| format!("{x:02x}")).collect::<String>(),
         other => panic!("blake3 answered {other:?}"),
     };
-    println!("k1={k1:.3} k2={k2:.3} digest={hex}");
+    // The profile goes in the line because the C tier's default is `development` -- `cc -O0` with
+    // the inliner off, forty times slower on k1 -- and a reading taken under it against a bar taken
+    // under `release` is a verdict about a compiler flag wearing a verdict about a value model.
+    // `run.sh` exports `release` and refuses to start otherwise; this is what puts it in the raw
+    // file, where a reader who did not run the script can still see which one it was.
+    println!(
+        "k1={k1:.3} k2={k2:.3} digest={hex} profile={}",
+        ply_codegen::Profile::current().name()
+    );
 }
 
 // The same allowance `ply_codegen::backend::Code` makes for the same reason: both variants are

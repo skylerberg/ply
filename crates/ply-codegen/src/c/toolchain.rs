@@ -10,13 +10,15 @@
 //!
 //! | profile | compiler | inlining | the front end's unit | compile | k1 |
 //! | --- | --- | --- | --- | --- | --- |
+//! | `development` | `tcc`, else `cc -O0` | depth 0 | 7MB | 0.26s / 1.96s | 6.4ms / 4.7ms |
 //! | `release` | `cc -O2` | depth 3 | 29MB | 38.5s | 0.15ms |
-//! | `loop` | `tcc`, else `cc -O0` | depth 0 | 7MB | 0.26s / 1.96s | 6.4ms / 4.7ms |
 //!
-//! One code generator, two toolchains. `loop` costs about forty times on the integer kernel and
-//! buys back two orders of magnitude on an edit; the front end's own warm run is *faster* under
-//! it (1.38s against 1.51s), because a suite's time is not in the arithmetic those forty times are
-//! charged to. Which is the point: the profile to pick is the one that fits what the run is for.
+//! One code generator, two toolchains, and **`development` is the default** because that is what
+//! the numbers say a run is usually for. It costs about forty times on the integer kernel and buys
+//! back two orders of magnitude on an edit; the front end's own warm run is *faster* under it
+//! (1.38s against 1.51s), because a suite's time is not in the arithmetic those forty times are
+//! charged to. A measurement wants the other one and has to say so -- `--profile release`, or
+//! `PLY_C_PROFILE=release`, which is what `benches/value-model/run.sh` passes.
 //!
 //! **The inlining is not a separate knob and this is the trap.** A non-optimising compiler gives
 //! every temporary its own stack slot and coalesces nothing across sibling blocks, so the tier's
@@ -28,19 +30,43 @@
 /// What this run is compiling for.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Profile {
-    /// Compile slowly for code that runs fast. What ships, and what the gate measures.
+    /// Compile fast for code that runs slowly enough. The default, and what an edit-to-green loop
+    /// wants.
     #[default]
+    Development,
+    /// Compile slowly for code that runs fast. What ships, and what a measurement must ask for.
     Release,
-    /// Compile fast for code that runs slowly enough. What an edit-to-green loop wants.
-    Loop,
 }
 
 impl Profile {
-    /// `PLY_C_PROFILE=loop` asks for the fast toolchain; anything else is the release one.
+    pub fn name(self) -> &'static str {
+        match self {
+            Profile::Development => "development",
+            Profile::Release => "release",
+        }
+    }
+
+    /// The profile this process compiles under.
+    ///
+    /// Three sources, in this order: `PLY_C_PROFILE`, which is how a bench script pins one without
+    /// a command line; `select`, which is how the CLI's `--profile` passes one; and the default.
+    /// The environment wins because the scripts that set it are the ones that must not be moved by
+    /// a change to what the flag defaults to.
     pub fn current() -> Profile {
         match std::env::var("PLY_C_PROFILE").as_deref() {
-            Ok("loop") => Profile::Loop,
-            _ => Profile::Release,
+            Ok("development") => return Profile::Development,
+            Ok("release") => return Profile::Release,
+            _ => {}
+        }
+        SELECTED.get().copied().unwrap_or_default()
+    }
+
+    /// Parses the spelling `--profile` and `PLY_C_PROFILE` share.
+    pub fn parse(name: &str) -> Option<Profile> {
+        match name {
+            "development" => Some(Profile::Development),
+            "release" => Some(Profile::Release),
+            _ => None,
         }
     }
 
@@ -55,7 +81,7 @@ impl Profile {
             // tcc when it is here and `cc -O0` when it is not. The fallback is the point: this
             // profile is worth twenty times on an edit with nothing installed that was not already
             // installed, and tcc makes it another seven.
-            Profile::Loop => match super::load::which("tcc") {
+            Profile::Development => match super::load::which("tcc") {
                 Some(_) => "tcc".to_string(),
                 None => "cc".to_string(),
             },
@@ -69,7 +95,7 @@ impl Profile {
         }
         match self {
             Profile::Release => "-O2".to_string(),
-            Profile::Loop => "-O0".to_string(),
+            Profile::Development => "-O0".to_string(),
         }
     }
 
@@ -78,12 +104,22 @@ impl Profile {
     pub fn inlining(self) -> crate::opt::Inlining {
         match self {
             Profile::Release => crate::opt::Inlining::EMITTED,
-            Profile::Loop => crate::opt::Inlining {
+            Profile::Development => crate::opt::Inlining {
                 depth: 0,
                 ..crate::opt::Inlining::EMITTED
             },
         }
     }
+}
+
+/// What the CLI's `--profile` chose, once per process. Set before anything compiles.
+static SELECTED: std::sync::OnceLock<Profile> = std::sync::OnceLock::new();
+
+/// Fixes the profile for this process. The first call wins; a second is ignored rather than an
+/// error, because a caller that sets it twice with the same value is not doing anything wrong and
+/// one that sets it twice with different values has already compiled under the first.
+pub fn select(profile: Profile) {
+    let _ = SELECTED.set(profile);
 }
 
 /// The arguments a particular compiler needs that the others do not.
@@ -129,7 +165,7 @@ mod tests {
     /// assertion is in your way, that is what it is in the way of.
     #[test]
     fn the_fast_toolchain_does_not_inline() {
-        assert_eq!(Profile::Loop.inlining().depth, 0);
+        assert_eq!(Profile::Development.inlining().depth, 0);
         assert_eq!(
             Profile::Release.inlining().depth,
             crate::opt::Inlining::EMITTED.depth
