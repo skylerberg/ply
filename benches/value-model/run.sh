@@ -10,10 +10,17 @@ root="$(cd "$here/../.." && pwd)"
 ply="${PLY_BIN:-$root/target/release/ply}"
 # Which tier the `ply` arm runs on. `cranelift` is the gate's own; `c` is ADR 0040's.
 backend="${PLY_BACKEND:-cranelift}"
+# The C tier compiles under `development` unless told otherwise, and this file exists to measure
+# code rather than to compile it quickly: `development` is `cc -O0` with the inliner off, which is
+# forty times slower on k1 and would move this gate's verdict without moving anything it is a gate
+# on. Exported rather than defaulted so that the raw file's readings and the command that took
+# them agree, and asserted below because a silently different profile is a silently different bar.
+export PLY_C_PROFILE=release
 raw="$here/raw.txt"
 
 load1() { uptime | sed 's/.*load averages*: *//' | awk -F'[ ,]+' '{print $1}'; }
 
+[ "$PLY_C_PROFILE" = release ] || { echo "the profile is $PLY_C_PROFILE, not release; this gate measures code" >&2; exit 2; }
 echo "==> instrument check: is the binary the one this tree would produce?"
 "$root/.github/binary-is-current.sh" || { echo "STALE -- rebuild before measuring" >&2; exit 2; }
 echo "==> the Rust bars"
@@ -61,6 +68,9 @@ rust_arm() { "$bars" | sed 's/ digest=.*//'; }
 arms=(ply null rust)
 n=3
 echo "blocks $n" >> "$raw"
+# In the raw file, because a reading is only interpretable beside the profile that produced it:
+# `development` reads k1=4.9 where `release` reads 0.2, and both are honest about different things.
+echo "profile $PLY_C_PROFILE" >> "$raw"
 for ((b=1; b<=n; b++)); do
   for ((k=0; k<3; k++)); do
     arm=${arms[$(( (b-1+k) % 3 ))]}

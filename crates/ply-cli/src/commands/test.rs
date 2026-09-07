@@ -2,6 +2,7 @@ use super::common::{
     IND, backend_spec, build_backend, build_pool, describe_schema, diagnostic_json,
     diagnostics_json, emit_json, exit_code, location, millis, once_each, phases_json, plural,
     print_diagnostics, print_phases, print_warnings, report_bind_error, report_load_error,
+    select_profile,
 };
 use crate::EXIT_COMPILE_ERROR;
 use crate::cli::{TestArgs, When};
@@ -25,22 +26,23 @@ pub fn execute(args: &TestArgs, style: Style) -> i32 {
     let warnings = Vec::new();
     // Before the store is opened, because a misspelled `--backend` must not leave a cache directory
     // behind for a run that is about to refuse.
-    let backend = match backend_spec(args.backend.as_ref()) {
-        Ok(spec) => spec,
-        Err(diagnostic) => {
-            if args.json {
-                emit_json(&json!({
-                    "command": "test",
-                    "ok": false,
-                    "exit_code": EXIT_COMPILE_ERROR,
-                    "diagnostics": [diagnostic_json(&diagnostic, &SourceMap::new())],
-                }));
-            } else {
-                print_diagnostics(std::slice::from_ref(&diagnostic), &SourceMap::new(), style);
+    let backend =
+        match select_profile(&args.profile).and_then(|()| backend_spec(args.backend.as_ref())) {
+            Ok(spec) => spec,
+            Err(diagnostic) => {
+                if args.json {
+                    emit_json(&json!({
+                        "command": "test",
+                        "ok": false,
+                        "exit_code": EXIT_COMPILE_ERROR,
+                        "diagnostics": [diagnostic_json(&diagnostic, &SourceMap::new())],
+                    }));
+                } else {
+                    print_diagnostics(std::slice::from_ref(&diagnostic), &SourceMap::new(), style);
+                }
+                return EXIT_COMPILE_ERROR;
             }
-            return EXIT_COMPILE_ERROR;
-        }
-    };
+        };
     let no_cache = cache_bypassed(args);
     // Which engine's history this run reads and adds to. Decided before the store is opened,
     // because it is what selection is read against.
@@ -1972,6 +1974,7 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
 
     fn args_for(filter: Option<&str>) -> TestArgs {
         TestArgs {
+            profile: "development".to_string(),
             watch: false,
             path: PathBuf::from("."),
             json: true,
