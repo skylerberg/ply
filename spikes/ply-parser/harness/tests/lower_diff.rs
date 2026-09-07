@@ -293,8 +293,8 @@ fn the_lowering_agrees_with_ply_eval_wherever_the_port_reaches() {
     // and it is written down so that raising it is a visible change and lowering it is a failure.
     println!("  the port reaches {reached} of {available} function bodies");
     assert!(
-        reached >= 910,
-        "the port lowered {reached} of {available} bodies, and it reached 910 when this was \
+        reached >= 1000,
+        "the port lowered {reached} of {available} bodies, and it reached 1000 when this was \
          written -- raise this number when the port grows, and never lower it"
     );
 }
