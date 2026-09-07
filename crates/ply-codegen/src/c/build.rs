@@ -70,9 +70,9 @@ pub fn build(
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let mut offered: Vec<&str> = names.to_vec();
-    // What the inliner will actually be told, override included, because that is what the emitted
-    // body is a function of and the cache is keyed on it.
-    let how = crate::opt::Inlining::EMITTED.overridden();
+    // What the inliner will actually be told, profile and override included, because that is what
+    // the emitted body is a function of and the cache is keyed on it.
+    let how = super::toolchain::Profile::current().inlining().overridden();
     let inlining = (how.budget, how.depth);
     // A bisecting instrument: compile only the definitions named, so that a wrong answer can be
     // narrowed to the body that produces it. The fixpoint then refuses whatever calls the rest.
@@ -386,7 +386,17 @@ fn emit_one(
         .into());
     };
     let t0 = std::time::Instant::now();
-    let body = crate::opt::optimize(loaded, module_index, def, crate::opt::Inlining::EMITTED);
+    // The tuple the key was taken over, rather than the constant: two derivations of the same
+    // setting are two chances for the cache to be keyed on one and the body emitted at the other.
+    let body = crate::opt::optimize(
+        loaded,
+        module_index,
+        def,
+        crate::opt::Inlining {
+            budget: inlining.0,
+            depth: inlining.1,
+        },
+    );
     let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
     let lowered = lower_fn(&params, &body);
     OPTIMISE.fetch_add(

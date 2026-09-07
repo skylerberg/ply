@@ -1,0 +1,72 @@
+# Two toolchains for one code generator. What `PLY_C_PROFILE=loop` is, and what it costs.
+#
+# observation-tcc.txt priced an in-process C compiler and left the question of how to *use* one
+# open. This is that question answered, and it did not have the shape the earlier file assumed:
+# the compiler cannot be swapped on its own. The inlining depth has to move with it.
+
+## The trap, first, because it is the reason the profile carries two settings
+#
+# A non-optimising compiler gives every temporary its own stack slot and coalesces nothing across
+# sibling blocks. This tier's bodies at inlining depth 3 are large, so:
+#
+#   clang -O0 -Wframe-larger-than=8192   largest frames 53,696 / 80,000 / 128,304 bytes
+#   clang -O2 -Wframe-larger-than=8192   nothing reported
+#
+# 128KB of frame is about sixty-four frames to an 8MB stack. The self-hosted front end's parser
+# recurses much further than that, so at depth 3 it does not fail -- it aborts:
+#
+#   fatal runtime error: stack overflow, aborting
+#
+# with no diagnostic, no test name, and nothing to attribute it to. `tcc`, `cc -O0` and `cc -O1`
+# all do this. All three run the whole corpus at depth 0.
+#
+# observation-tcc.txt reports the front end passing 156/156 under tcc at depth 3. That was true
+# when it was written and is not now, and the variable is this tier's own coverage: it took 1153
+# definitions then and takes 1400 today. What it did not take fell back to the interpreter, whose
+# stack is on the heap. Every definition this tier gains turns an interpreter frame into a native
+# one -- so the corpus got deeper as the tier got better. Excluding just `items.` and `exprs.`,
+# the two recursive-descent modules, is enough to make tcc at depth 3 run again.
+
+## The profiles
+#
+# The front end (1400 definitions), --jobs 1, cold cache, one worker's phases:
+
+profile   compiler   depth   source   emit     compile+load
+release   cc -O2     3       29 MB    ~500ms   38.5s
+loop      tcc        0        7 MB    ~255ms    0.25s
+loop      cc -O0     0        7 MB    ~256ms    1.95s
+
+# The fallback is the point. `loop` is worth twenty times on an edit with nothing installed that
+# was not already installed; tcc makes it another seven and a half.
+
+## What the fast toolchain costs
+#
+# ADR 0035's kernels through `benches/value-model/ply-arm`, minimum of three. Same machine, same
+# session. The Rust bar read k1=0.072 k2=7.87.
+
+setting              k1 ms   k2 ms
+cc -O2, depth 3      0.151   27.7
+cc -O1, depth 0      0.976   28.6
+cc -O0, depth 0      4.679   40.0
+tcc,    depth 0      6.412   46.5
+
+# Forty times on the integer kernel, under six on the state kernel -- the split observation-tcc.txt
+# already explained: k2 spends itself inside runtime helpers that are already-optimised Rust, so
+# the compiler that emitted the calls around them matters much less.
+#
+# Note what the middle row says about the depth on its own: `cc -O1` at depth 0 is 6.5x worse than
+# `cc -O2` at depth 3 on k1 and identical on k2, and takes 10s to compile. It is not a third
+# profile; it is the reading that says the loop's cost is mostly the depth, not the compiler.
+
+## And what it buys, measured where the loop actually is
+#
+# The front end's whole warm run -- 156 tests, unit read back from the cache, best of three:
+
+arm                  warm run   after an edit
+cranelift            5.53s      5.4s
+c, release profile   1.51s      ~39s
+c, loop profile      1.38s      ~0.8s
+
+# The loop profile is *faster* warm than the release profile despite forty times worse code on k1,
+# because a test suite's time is not in the arithmetic those forty times are charged to. That is
+# the whole case for the profile: pick the toolchain that fits what the run is for.
