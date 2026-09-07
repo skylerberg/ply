@@ -1630,7 +1630,7 @@ pub enum NodeKind { Lit, Var, Unary, Binary, Lambda, App, If, Match, Block,
 pub struct Node { pub kind: NodeKind, pub span: Span, pub own: Own }
 //   NodeKind::Lit carries the Value it denotes, built once at lowering rather
 //   than per evaluation — ADR 0019 The Lit stays because
-//   `crates/ply-codegen-spike` dispatches on it to pick a Cranelift type.
+//   the code generator dispatches on it to pick a Cranelift type.
 Lit(Lit, Value),
 //   and Stmt::Expr is a struct variant, which is what bit-rotted the spike.
 Stmt::Expr { code: Code, dead: bool },
