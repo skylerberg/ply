@@ -17,20 +17,21 @@
 //! t1 = unbox(a); t2 = unbox(b); t3 = mul(t1,t2); t4 = unbox(c); t5 = add(t3,t4)
 //! ```
 //!
-//! Same arithmetic, same answer, different order: the reference unboxes every operand of the
-//! *outer* node before the inner node's arithmetic runs.
+//! Same arithmetic, same answer, different order: the reference's three unboxes stand at the top
+//! of the body, ahead of any arithmetic at all.
 //!
-//! **It is not the emitter, and the first note here said it was.** Two things settle that.
-//! `reference_lower_dump` on the same function is
-//! `bbin(add,bbin(mul,ovar(a,0),ovar(b,1)),ovar(c,2))` -- the tree this port lowers, so the two
-//! agree on the input. And `c/emit.rs`'s `binary` reads `expr(lhs)` then `expr(rhs)` then
-//! `arithmetic`, which emits the inner node's `rt_arith` *before* the outer's right operand is
-//! touched -- the port's order, not the reference's. So the reordering happens in `optimize`,
-//! between the tree above and the tree the emitter is handed, which is the coupling `tests/emit.rs`
-//! records.
+//! **It is the function's entry, not the arithmetic.** The reference opens every parameter in
+//! declaration order as the body starts, whether the body reads it first, last, or never --
+//! `fn unused(a: Int, b: Int) -> Int = b` still binds a dead temporary for `a`, and a `Bool`
+//! parameter opens through `rt_unbox_bool_p` rather than the immediate test. Unboxing lazily, at
+//! each first read, answers the same and writes the temporaries in the order the *body* happens to
+//! reach them. `chained`, `unused` and `onbool` in the corpus below are the three shapes that
+//! separate the two, and all three agree.
 //!
-//! Settling it means emitting without optimising and comparing there. It is not cosmetic: an
-//! unbox can raise, so the order decides which diagnostic a body with two bad operands gives.
+//! Two earlier notes here were wrong and are gone: the first blamed the emitter's operand
+//! sequencing, the second blamed `optimize`'s reordering. `reference_lower_dump` on `chained` is
+//! `bbin(add,bbin(mul,ovar(a,0),ovar(b,1)),ovar(c,2))` -- the tree this port lowers -- so the two
+//! stages never disagreed about the input, and nothing was reordered.
 //!
 //! **The corpus here is hand-written and small, and that is deliberate.** The reference optimises
 //! before it lowers, so `1 + 2` reaches its emitter as `3` while this port's emitter sees the
@@ -302,6 +303,19 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn ne(a: Int, b: Int) -> Bool = a != b\n",
         // The shape that showed the port unboxing per read where the reference binds once.
         "fn nested(a: Int, b: Int) -> Int = (a + b) * (a - b)\n",
+        "fn mx(a: Int, b: Int) -> Int = if a < b { b } else { a }\n",
+        "fn mn(a: Int, b: Int) -> Int = if a < b { a } else { b }\n",
+        // Nested, so the join of the inner `if` is a branch value of the outer.
+        "fn clamp3(a: Int, b: Int) -> Int = if a < b { if a < 0 { 0 } else { a } } else { b }\n",
+        // A branch that unboxes a slot the other branch never reads: the
+        // temporary is block-scoped and must not be reused after the brace.
+        "fn pick(a: Int, b: Int, c: Int) -> Int = (if c < 0 { a } else { b }) + a\n",
+        // The entry prologue: every parameter is opened, in order, whether the
+        // body reads it first, last or not at all, and a `Bool` opens through
+        // its own helper.
+        "fn chained(a: Int, b: Int, c: Int) -> Int = a * b + c\n",
+        "fn unused(a: Int, b: Int) -> Int = b\n",
+        "fn onbool(a: Int, b: Bool) -> Int = if b { a } else { 0 }\n",
     ];
     let inputs: Vec<(String, Vec<u8>)> = programs
         .iter()
@@ -314,7 +328,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 12, "only {reached} bodies were emitted");
+    assert!(reached >= 19, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.

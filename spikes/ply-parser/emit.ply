@@ -17,9 +17,10 @@
 // `opt.rs`, not of this file.
 
 import spine (num)
-import code (Code, Node, NLit, NVar, NBinary, Own, Borrowed, Owned, OwnedField, lower_fn)
+import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, Own, Borrowed, Owned, OwnedField, lower_fn)
 import items (Item, IFn, parse)
 import exprs (Param)
+import types (TypeExpr, TCon)
 import rewrite (expand)
 import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
 
@@ -40,23 +41,38 @@ pub type V = { k: Kind, c: Bytes }
 // untagged value once and every later integer read of that slot names the same
 // temporary, so `(a + b) * (a - b)` unboxes twice and not four times. An emitter
 // that unboxed per read would answer the same and write different C.
-pub type Em = { out: Bytes, n: Int, conv: List<Conv> }
+pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int }
 
 pub type Conv = { slot: Int, c: Bytes }
+
+// A parameter, as the emitter needs it: the C word arrives boxed and the
+// declared type says how to open it.
+pub type P = { name: Bytes, k: Kind }
 
 pub type Out = { em: Em, v: V }
 
 fn line(em: Em, text: Bytes) -> Em =
-  { out: bytes_concat_all([em.out, b"  ", text, b"\n"]), n: em.n, conv: em.conv }
+  { out: bytes_concat_all([em.out, pad(em.ind), text, b"\n"]), n: em.n, conv: em.conv, ind: em.ind }
+
+fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
+
+fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1 }
+
+fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1 }
+
+// A branch leaves the enclosing scope with the temporaries it unboxed: they are
+// declared inside the C block and are gone at the brace. `conv` goes back to
+// what it was, or a later read names a dead variable.
+fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
-  { em: { out: em.out, n: em.n + 1, conv: em.conv }, name: bytes_concat(b"t", num(em.n + 1)) }
+  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind }, name: bytes_concat(b"t", num(em.n + 1)) }
 
 fn conv_of(em: Em, slot: Int) -> Option<Bytes> =
   fold(em.conv, None, |acc: Option<Bytes>, c: Conv| if c.slot == slot { Some(c.c) } else { acc })
 
 fn remember(em: Em, slot: Int, c: Bytes) -> Em =
-  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, c: c }) }
+  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, c: c }), ind: em.ind }
 
 // A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
 fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
@@ -98,9 +114,11 @@ fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
 pub fn covers() -> List<Bytes> =
   [b"integer literals", b"parameters read as integers",
    b"add, sub, mul, div and rem on Int",
-   b"lt, le, gt, ge, eq and ne on Int"]
+   b"lt, le, gt, ge, eq and ne on Int",
+   b"if, with either branch's value joined in one temporary",
+   b"a block that binds nothing"]
 
-fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
+fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
     NLit(l) -> match l {
       LInt(n) -> Some({ em: em, v: { k: KInt, c: bytes_concat_all([b"INT64_C(", num(n), b")"]) } }),
@@ -110,17 +128,10 @@ fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
     // piece of this port.
     NVar(v) -> match v.slot {
       None -> None,
-      Some(s) -> if s < len(params) {
-        match conv_of(em, s) {
-          Some(c) -> Some({ em: em, v: { k: KInt, c: c } }),
-          None -> {
-            let o = bind(em, KInt,
-              bytes_concat_all([b"(ply_is_imm(p", num(s), b") ? ply_imm_value(p", num(s),
-                                b") : rt_unbox_int_p(ctx, p", num(s), b"))"]));
-            Some({ em: remember(o.em, s, o.v.c), v: o.v })
-          },
-        }
-      } else { None },
+      Some(s) -> match conv_of(em, s) {
+        Some(c) -> Some({ em: em, v: { k: KInt, c: c } }),
+        None -> None,
+      },
     },
     NBinary(b) ->
       if !is_arith(b.op) && compare_op(b.op) == None { None } else {
@@ -146,7 +157,63 @@ fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
           },
         }
       },
+    // A block with no statements is what lowering wraps every `if` branch and
+    // every function body in. `let` needs a slot window this port does not have
+    // yet, so a block that binds anything is refused rather than mis-emitted.
+    NBlock(bl) -> match bl.tail {
+      None -> None,
+      Some(t) -> if len(bl.stmts) == 0 { expr(em, t, params) } else { None },
+    },
+    NIf(i) -> match expr(em, i.cond, params) {
+      None -> None,
+      Some(cnd) -> {
+        let cv = as_int(cnd.em, cnd.v);
+        // The join temporary is numbered before either branch is emitted, so
+        // its kind cannot be read off a branch's value. Emitting the then
+        // branch into a scratch buffer -- one number ahead, to leave room for
+        // the join itself -- answers the kind without writing anything.
+        match expr({ out: b"", n: cv.em.n + 1, conv: cv.em.conv, ind: cv.em.ind + 1 },
+                   i.then_branch, params) {
+          None -> None,
+          Some(peek) -> {
+            let j = fresh(cv.em);
+            let opened = line(
+              line(j.em, bytes_concat_all([ctype(peek.v.k), b" ", j.name, b" = 0;"])),
+              bytes_concat_all([b"if (", cv.v.c, b") {"]));
+            match branch(indent(opened), i.then_branch, params, peek.v.k, j.name) {
+              None -> None,
+              Some(t) -> {
+                let mid = line(rescope(outdent(t), cv.em.conv), b"} else {");
+                match branch(indent(mid), i.else_branch, params, peek.v.k, j.name) {
+                  None -> None,
+                  Some(e) -> Some({
+                    em: line(rescope(outdent(e), cv.em.conv), b"}"),
+                    v: { k: peek.v.k, c: j.name } }),
+                }
+              },
+            }
+          },
+        }
+      },
+    },
     _ -> None,
+  }
+
+// One arm of an `if`: the value, coerced to the join's kind, bound, assigned.
+fn branch(em: Em, c: Code, params: List<P>, k: Kind, join: Bytes) -> Option<Em> =
+  match expr(em, c, params) {
+    None -> None,
+    Some(o) -> {
+      let cv = coerce(o.em, k, o.v);
+      let b = bind(cv.em, k, cv.v.c);
+      Some(line(b.em, bytes_concat_all([join, b" = ", b.v.c, b";"])))
+    },
+  }
+
+fn coerce(em: Em, k: Kind, v: V) -> Out =
+  match k {
+    KBoxed -> { em: em, v: { k: KBoxed, c: as_word(v) } },
+    _ -> as_int(em, v),
   }
 
 fn is_arith(op: Bytes) -> Bool =
@@ -184,14 +251,43 @@ fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
 // One definition as the C that runs it: the signature, the fuel the machine
 // bounds a compiled recursion by, the body, and the entry the seam calls it
 // through.
-pub fn emit_fn(name: Bytes, params: List<Bytes>, body: Code) -> Option<Bytes> =
-  match expr({ out: b"", n: 0, conv: [] }, body, params) {
+// Every parameter is opened at entry, in declaration order, whether the body
+// reads it or not -- an unused one still gets its temporary, and a `Bool` opens
+// through a different helper than an `Int`. Opening lazily at the first read
+// answers the same and writes the temporaries in a different order, which is
+// what `a * b + c` showed.
+fn prologue(em: Em, params: List<P>) -> Em =
+  fold(range(0, len(params)), em, |acc: Em, i: Int| {
+    let k = match list_at(params, i) { Some(p) -> p.k, None -> KInt };
+    let o = bind(acc, KInt, match k {
+      KBool -> bytes_concat_all([b"rt_unbox_bool_p(ctx, p", num(i), b")"]),
+      _ -> bytes_concat_all([b"(ply_is_imm(p", num(i), b") ? ply_imm_value(p", num(i),
+                             b") : rt_unbox_int_p(ctx, p", num(i), b"))"]),
+    });
+    remember(o.em, i, o.v.c)
+  })
+
+// `Int` and `Bool` are the two the prologue knows how to open. Anything else --
+// a record, a list, a type variable, a missing annotation -- refuses the whole
+// function rather than guessing at a helper.
+pub fn param_kind(t: Option<TypeExpr>) -> Option<Kind> =
+  match t {
+    Some(TCon(c)) ->
+      if len(c.args) != 0 || c.name.module != None { None }
+      else if c.name.name.name == b"Int" { Some(KInt) }
+      else if c.name.name.name == b"Bool" { Some(KBool) }
+      else { None },
+    _ -> None,
+  }
+
+pub fn emit_fn(name: Bytes, params: List<P>, body: Code) -> Option<Bytes> =
+  match expr(prologue({ out: b"", n: 0, conv: [], ind: 0 }, params), body, params) {
     None -> None,
     Some(o) -> {
       let sig = bytes_concat_all([b"Word ply_", name, b"(PlyCtx *ctx",
         fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
-      let prologue = bytes_concat_all([
+      let head = bytes_concat_all([
         b"  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n",
         b"  ctx->fuel -= 1;\n"]);
       let epilogue = bytes_concat_all([b"  ctx->fuel += 1;\n  return ", as_word(o.v), b";\n}\n"]);
@@ -199,7 +295,7 @@ pub fn emit_fn(name: Bytes, params: List<Bytes>, body: Code) -> Option<Bytes> =
         b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
         b"(ctx", fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"]);
-      Some(bytes_concat_all([sig, prologue, o.em.out, epilogue, entry]))
+      Some(bytes_concat_all([sig, head, o.em.out, epilogue, entry]))
     },
   }
 
@@ -226,10 +322,16 @@ pub fn emit_dump(src: Bytes) -> String = {
   string_of_bytes(fold(x.module.items, b"C;1;", |acc: Bytes, it: Item|
     match it {
       IFn(d) -> {
-        let params = map(d.params, |p: Param| p.name.name);
-        match lower_fn(params, d.body) {
+        let names = map(d.params, |p: Param| p.name.name);
+        let kinds = map(d.params, |p: Param| param_kind(p.ty));
+        let known = fold(kinds, true, |acc: Bool, k: Option<Kind>| acc && k != None);
+        match if known { lower_fn(names, d.body) } else { None } {
           None -> acc,
-          Some(l) -> match emit_fn(bytes_concat(b"m_", d.name.name), params, l.code) {
+          Some(l) -> match emit_fn(bytes_concat(b"m_", d.name.name),
+                                   map(range(0, len(names)), |i: Int|
+                                     { name: match list_at(names, i) { Some(n) -> n, None -> b"" },
+                                       k: match list_at(kinds, i) { Some(Some(k)) -> k, _ -> KInt } }),
+                                   l.code) {
             None -> acc,
             Some(c) -> bytes_concat_all([acc, b"f:m.", d.name.name, b";", c, b";"]),
           },
