@@ -1339,6 +1339,354 @@ pub fn programs(text: &str) -> Vec<Vec<(String, String)>> {
     out
 }
 
+// --- the lowered intermediate form -------------------------------------------
+//
+// The seventh reference dump, and the first for something that is not a phase of the *front* end.
+//
+// `crates/ply-codegen`'s emitter does not read the AST. It reads `ply_eval::code::Code` -- the
+// form `slots.rs` has numbered the windows of and `rc.rs` has marked the ownership of -- so a
+// code generator written in Ply has to produce that form before it can produce anything. Which
+// makes this the oracle for the stage after the front end, in the shape every stage before it was
+// checked in: one canonical string per input, compared byte for byte.
+//
+// What it encodes is what a code generator reads and nothing else. The slot numbers are here,
+// because a body's window is what a compiled frame is. The ownership marks are here, because
+// `Own::Owned` is what tells an emitter a read is the last one -- the single most consequential
+// bit in the tree, and the one three separate defects in the C tier have turned on. Spans are
+// **not** here: the emitter reads none, and including them would make this an AST dump wearing a
+// different name.
+
+/// One lowered function body as a canonical string: `params;size;code`.
+pub fn reference_lower_dump(modules: &[(String, String)]) -> String {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (module, _) =
+            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        program.modules.push(module);
+    }
+    let mut out = String::new();
+    out.push_str(&format!("L;{};", modules.len()));
+    let expansion = ply_derive::expand_program(&mut program);
+    if !expansion.is_empty() {
+        out.push_str("E;");
+        resolve_diags(&mut out, &expansion);
+        return out;
+    }
+    if ply_syntax::resolve::resolve(&mut program).is_err() {
+        out.push_str("R;");
+        return out;
+    }
+    // Every function of every module, in load order, so the dump moves when a definition does and
+    // a port cannot pass by lowering a different set.
+    for module in &program.modules {
+        for item in &module.items {
+            let Item::Fn(def) = item else { continue };
+            let params: Vec<ply_span::Symbol> =
+                def.params.iter().map(|p| p.name.name.clone()).collect();
+            let lowered = ply_eval::code::lower_fn(&params, &def.body);
+            out.push_str(&format!(
+                "f:{}:{}:{};",
+                module.name.qualify(&def.name.name),
+                params.len(),
+                lowered.size
+            ));
+            dump_code(&mut out, &lowered.code);
+            out.push(';');
+        }
+    }
+    out
+}
+
+fn dump_own(out: &mut String, own: ply_eval::rc::Own) {
+    out.push(match own {
+        ply_eval::rc::Own::Borrowed => 'b',
+        ply_eval::rc::Own::Owned => 'o',
+        ply_eval::rc::Own::OwnedField => 'f',
+    });
+}
+
+fn dump_slot(out: &mut String, slot: Option<u32>) {
+    match slot {
+        Some(n) => out.push_str(&format!("{n}")),
+        None => out.push('-'),
+    }
+}
+
+fn dump_code(out: &mut String, c: &ply_eval::code::Code) {
+    use ply_eval::code::NodeKind as N;
+    dump_own(out, c.own);
+    match &c.kind {
+        N::Lit(lit, _) => {
+            out.push_str("lit(");
+            dump_lit(out, lit);
+            out.push(')');
+        }
+        N::Var { name, slot } => {
+            out.push_str(&format!("var({name},"));
+            dump_slot(out, *slot);
+            out.push(')');
+        }
+        N::Unary { op, operand } => {
+            out.push_str(&format!("un({op:?},"));
+            dump_code(out, operand);
+            out.push(')');
+        }
+        N::Binary { op, lhs, rhs } => {
+            out.push_str(&format!("bin({op:?},"));
+            dump_code(out, lhs);
+            out.push(',');
+            dump_code(out, rhs);
+            out.push(')');
+        }
+        N::Lambda {
+            params,
+            body,
+            size,
+            captures,
+        } => {
+            out.push_str(&format!("lam({},{size},", params.len()));
+            dump_captures(out, captures);
+            out.push(',');
+            dump_code(out, body);
+            out.push(')');
+        }
+        N::App { func, args } => {
+            out.push_str("app(");
+            dump_code(out, func);
+            for a in args.iter() {
+                out.push(',');
+                dump_code(out, a);
+            }
+            out.push(')');
+        }
+        N::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            out.push_str("if(");
+            dump_code(out, cond);
+            out.push(',');
+            dump_code(out, then_branch);
+            out.push(',');
+            dump_code(out, else_branch);
+            out.push(')');
+        }
+        N::Match { scrutinee, arms } => {
+            out.push_str("match(");
+            dump_code(out, scrutinee);
+            for arm in arms.iter() {
+                out.push_str(",arm(");
+                dump_pat(out, &arm.pat);
+                out.push(',');
+                match &arm.guard {
+                    Some(g) => dump_code(out, g),
+                    None => out.push('-'),
+                }
+                out.push(',');
+                dump_code(out, &arm.body);
+                out.push(')');
+            }
+            out.push(')');
+        }
+        N::Block { stmts, tail } => {
+            out.push_str("block(");
+            for s in stmts.iter() {
+                match s {
+                    ply_eval::code::Stmt::Let { pat, value, .. } => {
+                        out.push_str("let(");
+                        dump_pat(out, pat);
+                        out.push(',');
+                        dump_code(out, value);
+                        out.push_str("),");
+                    }
+                    ply_eval::code::Stmt::Expr { code } => {
+                        out.push_str("do(");
+                        dump_code(out, code);
+                        out.push_str("),");
+                    }
+                }
+            }
+            match tail {
+                Some(t) => dump_code(out, t),
+                None => out.push('-'),
+            }
+            out.push(')');
+        }
+        N::Record { fields } => {
+            out.push_str("rec(");
+            for (n, v) in fields.iter() {
+                out.push_str(&format!("{n}="));
+                dump_code(out, v);
+                out.push(',');
+            }
+            out.push(')');
+        }
+        N::RecordUpdate { base, copies, sets } => {
+            out.push_str("upd(");
+            dump_code(out, base);
+            for c in copies.iter() {
+                out.push_str(&format!(",c:{}", c.name));
+            }
+            for (n, v) in sets.iter() {
+                out.push_str(&format!(",s:{n}="));
+                dump_code(out, v);
+            }
+            out.push(')');
+        }
+        N::Field { base, field } => {
+            out.push_str("fld(");
+            dump_code(out, base);
+            out.push_str(&format!(",{})", field.name));
+        }
+        N::List { items } => {
+            out.push_str("list(");
+            for i in items.iter() {
+                dump_code(out, i);
+                out.push(',');
+            }
+            out.push(')');
+        }
+        N::Perform {
+            effect,
+            op,
+            resource,
+            args,
+        } => {
+            out.push_str(&format!(
+                "perform({effect},{op},{}",
+                resource.as_ref().map(|r| r.to_string()).unwrap_or_default()
+            ));
+            for a in args.iter() {
+                out.push(',');
+                dump_code(out, a);
+            }
+            out.push(')');
+        }
+        N::Handle { body, clauses, ret } => {
+            out.push_str("handle(");
+            dump_code(out, body);
+            for c in clauses.iter() {
+                out.push_str(&format!(
+                    ",cl({},{},{},{},{},{}",
+                    c.effect,
+                    c.op,
+                    c.resource
+                        .as_ref()
+                        .map(|r| r.to_string())
+                        .unwrap_or_default(),
+                    c.params.len(),
+                    c.resume.is_some(),
+                    c.size
+                ));
+                out.push(',');
+                dump_code(out, &c.body);
+                out.push(')');
+            }
+            match ret {
+                Some(r) => {
+                    out.push_str(",ret(");
+                    dump_code(out, &r.body);
+                    out.push(')');
+                }
+                None => out.push_str(",-"),
+            }
+            out.push(')');
+        }
+        N::WithCell {
+            resource,
+            init,
+            binder,
+            slot,
+            body,
+        } => {
+            out.push_str(&format!("cell({resource},{binder},"));
+            dump_slot(out, *slot);
+            out.push(',');
+            dump_code(out, init);
+            out.push(',');
+            dump_code(out, body);
+            out.push(')');
+        }
+        N::Simulate {
+            body,
+            size,
+            captures,
+        } => {
+            out.push_str(&format!("sim({size},"));
+            dump_captures(out, captures);
+            out.push(',');
+            dump_code(out, body);
+            out.push(')');
+        }
+        N::WithRegion { body } => {
+            out.push_str("region(");
+            dump_code(out, body);
+            out.push(')');
+        }
+    }
+}
+
+fn dump_captures(out: &mut String, c: &ply_eval::code::Captures) {
+    out.push('[');
+    for i in 0..c.src.len() {
+        out.push_str(&format!("{}>{}", c.src[i], c.dst[i]));
+        dump_own(out, c.owns[i]);
+        out.push(' ');
+    }
+    out.push(']');
+}
+
+fn dump_pat(out: &mut String, p: &ply_eval::code::Pat) {
+    use ply_eval::code::Pat as P;
+    match p {
+        P::Wildcard => out.push('_'),
+        P::Var { name, slot } => {
+            out.push_str(&format!("v:{}:", name.name));
+            dump_slot(out, *slot);
+        }
+        P::Lit(lit) => {
+            out.push_str("l:");
+            dump_lit(out, lit);
+        }
+        P::Ctor { name, args } => {
+            out.push_str(&format!("c:{name}("));
+            for a in args {
+                dump_pat(out, a);
+                out.push(',');
+            }
+            out.push(')');
+        }
+        P::Record { fields, rest } => {
+            out.push_str("r:(");
+            for (n, sub) in fields {
+                out.push_str(&format!("{}=", n.name));
+                dump_pat(out, sub);
+                out.push(',');
+            }
+            out.push_str(if *rest { "..)" } else { ")" });
+        }
+        P::List { items, rest } => {
+            out.push_str("s:(");
+            for i in items {
+                dump_pat(out, i);
+                out.push(',');
+            }
+            if let Some(r) = rest {
+                out.push_str("..");
+                dump_pat(out, r);
+            }
+            out.push(')');
+        }
+    }
+}
+
+fn dump_lit(out: &mut String, lit: &Lit) {
+    out.push_str(&format!("{lit:?}"));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
