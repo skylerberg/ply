@@ -33,15 +33,30 @@ pub fn ctype(k: Kind) -> Bytes = match k { KBoxed -> b"int64_t", KInt -> b"int64
 pub type V = { k: Kind, c: Bytes }
 
 // The emitter's state: the lines written so far and the next temporary's number.
-pub type Em = { out: Bytes, n: Int }
+// The lines written so far, the next temporary's number, and the slots whose
+// word has already been unboxed.
+//
+// The last is not a cache for its own sake: the reference binds a parameter's
+// untagged value once and every later integer read of that slot names the same
+// temporary, so `(a + b) * (a - b)` unboxes twice and not four times. An emitter
+// that unboxed per read would answer the same and write different C.
+pub type Em = { out: Bytes, n: Int, conv: List<Conv> }
+
+pub type Conv = { slot: Int, c: Bytes }
 
 pub type Out = { em: Em, v: V }
 
 fn line(em: Em, text: Bytes) -> Em =
-  { out: bytes_concat_all([em.out, b"  ", text, b"\n"]), n: em.n }
+  { out: bytes_concat_all([em.out, b"  ", text, b"\n"]), n: em.n, conv: em.conv }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
-  { em: { out: em.out, n: em.n + 1 }, name: bytes_concat(b"t", num(em.n + 1)) }
+  { em: { out: em.out, n: em.n + 1, conv: em.conv }, name: bytes_concat(b"t", num(em.n + 1)) }
+
+fn conv_of(em: Em, slot: Int) -> Option<Bytes> =
+  fold(em.conv, None, |acc: Option<Bytes>, c: Conv| if c.slot == slot { Some(c.c) } else { acc })
+
+fn remember(em: Em, slot: Int, c: Bytes) -> Em =
+  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, c: c }) }
 
 // A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
 fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
@@ -96,7 +111,15 @@ fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
     NVar(v) -> match v.slot {
       None -> None,
       Some(s) -> if s < len(params) {
-        Some({ em: em, v: { k: KBoxed, c: bytes_concat(b"p", num(s)) } })
+        match conv_of(em, s) {
+          Some(c) -> Some({ em: em, v: { k: KInt, c: c } }),
+          None -> {
+            let o = bind(em, KInt,
+              bytes_concat_all([b"(ply_is_imm(p", num(s), b") ? ply_imm_value(p", num(s),
+                                b") : rt_unbox_int_p(ctx, p", num(s), b"))"]));
+            Some({ em: remember(o.em, s, o.v.c), v: o.v })
+          },
+        }
       } else { None },
     },
     NBinary(b) ->
@@ -162,7 +185,7 @@ fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
 // bounds a compiled recursion by, the body, and the entry the seam calls it
 // through.
 pub fn emit_fn(name: Bytes, params: List<Bytes>, body: Code) -> Option<Bytes> =
-  match expr({ out: b"", n: 0 }, body, params) {
+  match expr({ out: b"", n: 0, conv: [] }, body, params) {
     None -> None,
     Some(o) -> {
       let sig = bytes_concat_all([b"Word ply_", name, b"(PlyCtx *ctx",
