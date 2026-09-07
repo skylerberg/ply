@@ -1,0 +1,192 @@
+// The C emitter, in Ply: what a code generator writes.
+//
+// `code.ply` builds the tree `crates/ply-codegen`'s emitter reads; this writes
+// what it writes. The oracle is `reference_emit_dump` in `harness/src/lib.rs`,
+// and the comparison is byte for byte over one body's C -- placeholders and all,
+// because a body names the unit's tables by its own positions and is therefore a
+// function of the body alone.
+//
+// **What is covered is written down and refused otherwise.** `emit_fn` answers
+// `None` for a form this port has not reached, exactly as `code.ply`'s `lower`
+// does, so the differential compares what was written rather than a guess.
+//
+// One coupling the emit oracle records and this file has to live with: the
+// reference optimises before it lowers, so `1 + 2` reaches its emitter as `3`
+// while this one sees the addition. The comparison is over programs where that
+// makes no difference, and closing the gap is `fold_literals` -- a piece of
+// `opt.rs`, not of this file.
+
+import spine (num)
+import code (Code, Node, NLit, NVar, NBinary, Own, Borrowed, Owned, OwnedField, lower_fn)
+import items (Item, IFn, parse)
+import exprs (Param)
+import rewrite (expand)
+import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+
+// The C type a value is held in, and what the emitter knows about it. `Boxed` is
+// a `Word`; `Int` is the untagged sixty-four bits inside one.
+pub type Kind = | KBoxed | KInt
+
+pub fn ctype(k: Kind) -> Bytes = match k { KBoxed -> b"int64_t", KInt -> b"int64_t" }
+
+// One emitted value: the kind it is held at, and the C expression naming it.
+pub type V = { k: Kind, c: Bytes }
+
+// The emitter's state: the lines written so far and the next temporary's number.
+pub type Em = { out: Bytes, n: Int }
+
+pub type Out = { em: Em, v: V }
+
+fn line(em: Em, text: Bytes) -> Em =
+  { out: bytes_concat_all([em.out, b"  ", text, b"\n"]), n: em.n }
+
+fn fresh(em: Em) -> { em: Em, name: Bytes } =
+  { em: { out: em.out, n: em.n + 1 }, name: bytes_concat(b"t", num(em.n + 1)) }
+
+// A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
+fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
+  let f = fresh(em);
+  { em: line(f.em, bytes_concat_all([ctype(k), b" ", f.name, b" = ", expr, b";"])),
+    v: { k: k, c: f.name } }
+}
+
+// The check after any helper that can raise: a body that failed answers nothing.
+fn check(em: Em) -> Em = line(em, b"if (ctx->failed) return 0;")
+
+// A word as the sixty-four bits inside it, which is where integer arithmetic
+// happens. Already-`Int` values are themselves.
+fn as_int(em: Em, v: V) -> Out =
+  match v.k {
+    KInt -> { em: em, v: v },
+    KBoxed -> bind(em, KInt,
+      bytes_concat_all([b"(ply_is_imm(", v.c, b") ? ply_imm_value(", v.c,
+                        b") : rt_unbox_int_p(ctx, ", v.c, b"))"])),
+  }
+
+// The other direction, for a value leaving the body.
+fn as_word(v: V) -> Bytes =
+  match v.k {
+    KBoxed -> v.c,
+    KInt -> bytes_concat_all([b"(ply_fits_imm(", v.c, b") ? ply_imm(", v.c,
+                              b") : rt_box_int_p(ctx, ", v.c, b"))"]),
+  }
+
+// `rt_arith`'s opcode: multiply, divide, and everything else.
+fn arith_code(op: Bytes) -> Int =
+  if op == b"mul" { 0 } else if op == b"div" { 1 } else { 2 }
+
+fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
+
+pub fn covers() -> List<Bytes> =
+  [b"integer literals", b"parameters read as integers",
+   b"add, sub, mul, div and rem on Int"]
+
+fn expr(em: Em, c: Code, params: List<Bytes>) -> Option<Out> =
+  match c.node {
+    NLit(l) -> match l {
+      LInt(n) -> Some({ em: em, v: { k: KInt, c: bytes_concat_all([b"INT64_C(", num(n), b")"]) } }),
+      _ -> None,
+    },
+    // A parameter is `pN`; anything else needs the window, which is the next
+    // piece of this port.
+    NVar(v) -> match v.slot {
+      None -> None,
+      Some(s) -> if s < len(params) {
+        Some({ em: em, v: { k: KBoxed, c: bytes_concat(b"p", num(s)) } })
+      } else { None },
+    },
+    NBinary(b) ->
+      if !is_arith(b.op) { None } else {
+        match expr(em, b.lhs, params) {
+          None -> None,
+          Some(l) -> match expr(l.em, b.rhs, params) {
+            None -> None,
+            Some(r) -> {
+              let a = as_int(r.em, l.v);
+              let bb = as_int(a.em, r.v);
+              Some(arithmetic(bb.em, b.op, a.v, bb.v))
+            },
+          },
+        }
+      },
+    _ -> None,
+  }
+
+fn is_arith(op: Bytes) -> Bool =
+  op == b"add" || op == b"sub" || op == b"mul" || op == b"div" || op == b"rem"
+
+// Addition and subtraction are checked in the emitted C, because a wrap is a
+// wrong answer and the runtime's own overflow report is what the machine gives.
+// The rest go through `rt_arith`, which raises for a zero divisor.
+fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
+  if is_add_or_sub(op) {
+    let f = fresh(em);
+    let e1 = line(f.em, bytes_concat_all([b"int64_t ", f.name, b";"]));
+    let e2 = line(e1, bytes_concat_all([b"if (ply_", op, b"_ov(", l.c, b", ", r.c, b", &", f.name,
+                                        b")) { rt_overflow_p(ctx, ",
+                                        if op == b"sub" { b"1" } else { b"0" },
+                                        b"); return 0; }"]));
+    { em: e2, v: { k: KInt, c: f.name } }
+  } else {
+    let o = bind(em, KInt, bytes_concat_all([b"rt_arith_p(ctx, ", num(arith_code(op)), b", ",
+                                             l.c, b", ", r.c, b")"]));
+    { em: check(o.em), v: o.v }
+  }
+
+// One definition as the C that runs it: the signature, the fuel the machine
+// bounds a compiled recursion by, the body, and the entry the seam calls it
+// through.
+pub fn emit_fn(name: Bytes, params: List<Bytes>, body: Code) -> Option<Bytes> =
+  match expr({ out: b"", n: 0 }, body, params) {
+    None -> None,
+    Some(o) -> {
+      let sig = bytes_concat_all([b"Word ply_", name, b"(PlyCtx *ctx",
+        fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
+          bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
+      let prologue = bytes_concat_all([
+        b"  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n",
+        b"  ctx->fuel -= 1;\n"]);
+      let epilogue = bytes_concat_all([b"  ctx->fuel += 1;\n  return ", as_word(o.v), b";\n}\n"]);
+      let entry = bytes_concat_all([
+        b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
+        b"(ctx", fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
+          bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"]);
+      Some(bytes_concat_all([sig, prologue, o.em.out, epilogue, entry]))
+    },
+  }
+
+test "a body that answers a literal" {
+  assert_eq(string_of_bytes(match emit_fn(b"m_f", [], { own: Borrowed, node: NLit(LInt(7)) }) {
+    Some(c) -> c, None -> b"" }),
+    "Word ply_m_f(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\nWord ply_m_f_entry(PlyCtx *ctx, const Word *args) {\n  return ply_m_f(ctx);\n}\n")
+}
+
+test "a form this port does not reach is refused" {
+  assert_eq(match emit_fn(b"m_f", [], { own: Borrowed, node: NLit(LBool(true)) }) {
+    Some(_) -> false, None -> true }, true)
+}
+
+// --- the emitter's entry ----------------------------------------------------
+//
+// Lower each function, hand it to `emit.ply`, and answer the C for the ones both
+// stages reached. Framed as the emit oracle frames it: `C;n;` then `f:<name>;`
+// and the body per definition.
+
+pub fn emit_dump(src: Bytes) -> String = {
+  let r = parse(src);
+  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  string_of_bytes(fold(x.module.items, b"C;1;", |acc: Bytes, it: Item|
+    match it {
+      IFn(d) -> {
+        let params = map(d.params, |p: Param| p.name.name);
+        match lower_fn(params, d.body) {
+          None -> acc,
+          Some(l) -> match emit_fn(bytes_concat(b"m_", d.name.name), params, l.code) {
+            None -> acc,
+            Some(c) -> bytes_concat_all([acc, b"f:m.", d.name.name, b";", c, b";"]),
+          },
+        }
+      },
+      _ -> acc,
+    }))
+}
