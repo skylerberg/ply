@@ -103,6 +103,36 @@ fn key_of(source: &str, level: &str) -> String {
     h.finalize().to_hex().to_string()
 }
 
+/// The object a key names, if it is already built and loadable.
+///
+/// The whole-unit cache reaches this without the source: the source is a function of the same
+/// inputs the unit key is taken over, so a worker that finds a unit entry has no reason to build
+/// twenty-nine megabytes of C to discover the name of an object it already has.
+pub(super) fn open_by_key(key: &str) -> Option<Library> {
+    let path = cache_dir().join(format!("{key}.{}", ext()));
+    path.is_file().then(|| Library::open(&path).ok()).flatten()
+}
+
+/// The key an assembled source and the current compiler settle on, so it can be recorded beside
+/// the unit that produced it.
+pub(super) fn object_key(source: &str) -> String {
+    key_of(source, &opt_level())
+}
+
+/// The optimisation flag, in one place: three callers ask, and one of them asking differently
+/// would have the unit cache record a key the object cache never writes.
+fn opt_level() -> String {
+    std::env::var("PLY_CC_OPT").unwrap_or_else(|_| "-O2".to_string())
+}
+
+fn ext() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "dylib"
+    } else {
+        "so"
+    }
+}
+
 /// The compiler's path, so that its stamp can go in the key.
 fn which(cc: &str) -> Option<std::path::PathBuf> {
     if cc.contains('/') {
@@ -115,12 +145,8 @@ fn which(cc: &str) -> Option<std::path::PathBuf> {
 }
 
 pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
-    let level = std::env::var("PLY_CC_OPT").unwrap_or_else(|_| "-O2".to_string());
-    let ext = if cfg!(target_os = "macos") {
-        "dylib"
-    } else {
-        "so"
-    };
+    let level = opt_level();
+    let ext = ext();
     // A unit already compiled from this source, by this compiler, on these flags is this object:
     // load it rather than spend the process again. The emitted tier's compile is what keeps it off
     // the loop's path, and for the self-hosted front end it is tens of seconds -- every invocation,

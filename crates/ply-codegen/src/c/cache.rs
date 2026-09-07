@@ -142,41 +142,7 @@ pub fn write(key: &str, text: &str, tables: &Tables) {
 
 /// One body as lines: the tables it names, then its text.
 fn encode(text: &str, t: &Tables) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("consts {}\n", t.consts.len()));
-    for v in &t.consts {
-        out.push_str(&match v {
-            Value::Unit => "u\n".to_string(),
-            Value::Str(s) => format!("s {}\n", hex(s.as_bytes())),
-            Value::Bytes(b) => format!("b {}\n", hex(b)),
-            Value::Fixed(f) => format!("f {} {}\n", f.ty as u8, f.bits()),
-            // Nothing else reaches the pool: `literal` puts only these four there.
-            other => unreachable!("a constant this tier does not pool: {other:?}"),
-        });
-    }
-    out.push_str(&format!("builtins {}\n", t.builtins.len()));
-    for b in &t.builtins {
-        out.push_str(&format!("{}\n", b.name()));
-    }
-    out.push_str(&format!("fields {}\n", t.fields.len()));
-    for f in &t.fields {
-        out.push_str(&format!("{f}\n"));
-    }
-    out.push_str(&format!("shapes {}\n", t.shapes.len()));
-    for names in &t.shapes {
-        out.push_str(&format!(
-            "{}\n",
-            names
-                .iter()
-                .map(|n| n.as_str().to_string())
-                .collect::<Vec<_>>()
-                .join(" ")
-        ));
-    }
-    out.push_str(&format!("lambdas {}\n", t.lambdas.len()));
-    for l in &t.lambdas {
-        out.push_str(&format!("{l}\n"));
-    }
+    let mut out = encode_tables(&t.consts, &t.builtins, &t.fields, &t.shapes, &t.lambdas);
     out.push_str(&format!("calls {}\n", t.calls.len()));
     for c in &t.calls {
         out.push_str(&format!("{c}\n"));
@@ -186,24 +152,58 @@ fn encode(text: &str, t: &Tables) -> String {
     out
 }
 
-/// Read one line and step the cursor past it, so that the text's start is a byte offset rather
-/// than a search for a marker: a field, a call or a shape can be spelled anything at all, `text`
-/// included, and a marker they can spell is a marker that splits the file in the wrong place.
-fn line<'a>(s: &'a str, at: &mut usize) -> Option<&'a str> {
-    let rest = s.get(*at..)?;
-    let end = rest.find('\n')?;
-    *at += end + 1;
-    Some(&rest[..end])
+/// The five tables a body and a whole unit both name, in one encoding, so the two cannot drift.
+fn encode_tables(
+    consts: &[Value],
+    builtins: &[ply_eval::Builtin],
+    fields: &[Symbol],
+    shapes: &[Vec<Symbol>],
+    lambdas: &[String],
+) -> String {
+    let mut out = format!("consts {}\n", consts.len());
+    for v in consts {
+        out.push_str(&match v {
+            Value::Unit => "u\n".to_string(),
+            Value::Str(s) => format!("s {}\n", hex(s.as_bytes())),
+            Value::Bytes(b) => format!("b {}\n", hex(b)),
+            Value::Fixed(f) => format!("f {} {}\n", f.ty as u8, f.bits()),
+            // Nothing else reaches the pool: `literal` puts only these four there.
+            other => unreachable!("a constant this tier does not pool: {other:?}"),
+        });
+    }
+    out.push_str(&format!("builtins {}\n", builtins.len()));
+    for b in builtins {
+        out.push_str(&format!("{}\n", b.name()));
+    }
+    out.push_str(&format!("fields {}\n", fields.len()));
+    for f in fields {
+        out.push_str(&format!("{f}\n"));
+    }
+    out.push_str(&format!("shapes {}\n", shapes.len()));
+    for names in shapes {
+        out.push_str(&format!(
+            "{}\n",
+            names
+                .iter()
+                .map(|n| n.as_str().to_string())
+                .collect::<Vec<_>>()
+                .join(" ")
+        ));
+    }
+    out.push_str(&format!("lambdas {}\n", lambdas.len()));
+    for l in lambdas {
+        out.push_str(&format!("{l}\n"));
+    }
+    out
 }
 
-fn decode(s: &str) -> Option<(String, Tables)> {
-    let mut at = 0usize;
-    let mut lines = std::iter::from_fn(|| line(s, &mut at));
+/// The same five, read back. Leaves the cursor after them.
+fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
     let mut t = Tables::default();
-    let n = count(lines.next()?, "consts")?;
+    let n = count(line(s, at)?, "consts")?;
     for _ in 0..n {
-        let line = lines.next()?;
-        let (tag, rest) = line.split_at(1);
+        let l = line(s, at)?;
+        let (tag, rest) = l.split_at(1);
         let rest = rest.strip_prefix(' ').unwrap_or(rest);
         t.consts.push(match tag {
             "u" => Value::Unit,
@@ -218,30 +218,45 @@ fn decode(s: &str) -> Option<(String, Tables)> {
             _ => return None,
         });
     }
-    let n = count(lines.next()?, "builtins")?;
+    let n = count(line(s, at)?, "builtins")?;
     for _ in 0..n {
         t.builtins
-            .push(ply_eval::Builtin::from_name(&Symbol::new(lines.next()?))?);
+            .push(ply_eval::Builtin::from_name(&Symbol::new(line(s, at)?))?);
     }
-    let n = count(lines.next()?, "fields")?;
+    let n = count(line(s, at)?, "fields")?;
     for _ in 0..n {
-        t.fields.push(Symbol::new(lines.next()?));
+        t.fields.push(Symbol::new(line(s, at)?));
     }
-    let n = count(lines.next()?, "shapes")?;
+    let n = count(line(s, at)?, "shapes")?;
     for _ in 0..n {
-        let line = lines.next()?;
         t.shapes
-            .push(line.split_whitespace().map(Symbol::new).collect::<Vec<_>>());
+            .push(line(s, at)?.split_whitespace().map(Symbol::new).collect());
     }
-    let n = count(lines.next()?, "lambdas")?;
+    let n = count(line(s, at)?, "lambdas")?;
     for _ in 0..n {
-        t.lambdas.push(lines.next()?.to_string());
+        t.lambdas.push(line(s, at)?.to_string());
     }
-    let n = count(lines.next()?, "calls")?;
+    Some(t)
+}
+
+/// Read one line and step the cursor past it, so that the text's start is a byte offset rather
+/// than a search for a marker: a field, a call or a shape can be spelled anything at all, `text`
+/// included, and a marker they can spell is a marker that splits the file in the wrong place.
+fn line<'a>(s: &'a str, at: &mut usize) -> Option<&'a str> {
+    let rest = s.get(*at..)?;
+    let end = rest.find('\n')?;
+    *at += end + 1;
+    Some(&rest[..end])
+}
+
+fn decode(s: &str) -> Option<(String, Tables)> {
+    let mut at = 0usize;
+    let mut t = decode_tables(s, &mut at)?;
+    let n = count(line(s, &mut at)?, "calls")?;
     for _ in 0..n {
-        t.calls.push(lines.next()?.to_string());
+        t.calls.push(line(s, &mut at)?.to_string());
     }
-    if lines.next()? != "text" {
+    if line(s, &mut at)? != "text" {
         return None;
     }
     Some((s.get(at..)?.to_string(), t))
@@ -272,6 +287,108 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         out.push((hi * 16 + lo) as u8);
     }
     Some(out)
+}
+
+/// Everything a worker needs to put a unit back together without emitting it.
+///
+/// A body cache saves the *emitting*, which is most of one worker's time and none of the other
+/// ten's: each still walks fourteen hundred cached bodies, substitutes their placeholders and
+/// assembles twenty-nine megabytes of C, only to hand it to an object cache that already had the
+/// answer. Sharing the built unit in process is not available -- `ply_eval::Value` holds `Rc`,
+/// so nothing containing one crosses a rayon worker -- so what is shared is this, through the
+/// same file system the objects already live on.
+pub struct UnitCache {
+    /// The object the assembled source hashes to, recorded so no source is needed to find it.
+    pub object: String,
+    pub taken: Vec<String>,
+    pub consts: Vec<Value>,
+    pub fields: Vec<Symbol>,
+    pub builtins: Vec<ply_eval::Builtin>,
+    pub shapes: Vec<Vec<Symbol>>,
+    pub lambdas: Vec<String>,
+}
+
+/// What a unit is a function of: every offered definition and its hash, the constructor table,
+/// the inlining, and the binary. The *names* alone are not enough -- an edit leaves the offered
+/// set identical and changes what the unit contains.
+pub fn unit_key(
+    keys: &std::collections::HashMap<String, String>,
+    offered: &[&str],
+    ctors: &str,
+    inlining: (usize, usize),
+) -> Option<String> {
+    let mut sorted: Vec<&str> = offered.to_vec();
+    sorted.sort_unstable();
+    let mut h = blake3::Hasher::new();
+    h.update(b"ply-c-unit-1");
+    for name in sorted {
+        // Without a hash for every offered definition there is nothing to notice an edit by, and
+        // a unit cache that cannot notice one is a wrong answer rather than a slow one.
+        let hash = keys.get(name)?;
+        h.update(name.as_bytes());
+        h.update(&[0]);
+        h.update(hash.as_bytes());
+        h.update(&[0]);
+    }
+    Some(key(&h.finalize().to_hex()[..32], ctors, inlining))
+}
+
+/// How many times a unit has been rebuilt from the cache rather than emitted.
+///
+/// The saving here is invisible from the outside: a unit put back together answers exactly what
+/// the one that built it answered, which is the whole point and also means a test cannot tell the
+/// two apart by asking. This is what it asks instead.
+pub static UNITS_REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn read_unit(key: &str) -> Option<UnitCache> {
+    decode_unit(&std::fs::read_to_string(dir().join(format!("{key}.unit"))).ok()?)
+}
+
+pub fn write_unit(key: &str, u: &UnitCache) {
+    let d = dir();
+    if std::fs::create_dir_all(&d).is_err() {
+        return;
+    }
+    let tmp = d.join(format!("{key}.{}.utmp", std::process::id()));
+    if std::fs::write(&tmp, encode_unit(u)).is_ok() {
+        let _ = std::fs::rename(&tmp, d.join(format!("{key}.unit")));
+    }
+}
+
+fn encode_unit(u: &UnitCache) -> String {
+    let mut out = format!("object {}\n", u.object);
+    out.push_str(&format!("taken {}\n", u.taken.len()));
+    for t in &u.taken {
+        out.push_str(&format!("{t}\n"));
+    }
+    out.push_str(&encode_tables(
+        &u.consts,
+        &u.builtins,
+        &u.fields,
+        &u.shapes,
+        &u.lambdas,
+    ));
+    out
+}
+
+fn decode_unit(s: &str) -> Option<UnitCache> {
+    let mut at = 0usize;
+    let object = line(s, &mut at)?.strip_prefix("object ")?.to_string();
+    let n = count(line(s, &mut at)?, "taken")?;
+    let mut taken = Vec::with_capacity(n);
+    for _ in 0..n {
+        taken.push(line(s, &mut at)?.to_string());
+    }
+    let t = decode_tables(s, &mut at)?;
+    Some(UnitCache {
+        object,
+        taken,
+        consts: t.consts,
+        fields: t.fields,
+        builtins: t.builtins,
+        shapes: t.shapes,
+        lambdas: t.lambdas,
+    })
 }
 
 #[cfg(test)]
