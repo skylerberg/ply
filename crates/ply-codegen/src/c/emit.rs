@@ -2388,6 +2388,28 @@ impl<'a> Emit<'a> {
     /// The accumulator and the element are both owned by this frame and both consumed by the
     /// call, so neither is duplicated on the way in -- which is what `owned` would do and what
     /// would leak one count per element.
+    /// **`map` and `filter` are not fused here, and one attempt at it is recorded rather than
+    /// left to be repeated.** The in-process tier fuses all three -- `jit.rs`'s `fused_loop`, with
+    /// a `Step::Inline` that lowers a lambda literal in the loop's own body -- and this tier sends
+    /// `map` and `filter` through `rt_map`/`rt_filter`, which walk the list themselves and enter
+    /// each element through `call_value`. Over the self-hosted front end that is 273 `map` sites
+    /// and 19 `filter` sites, and `call_value` is the largest item in its profile.
+    ///
+    /// The attempt fused both, inlining the lambda the way `fused_iterate` already does, and took
+    /// the sites from 273 and 19 down to 5 and 2. The whole Rust suite passed, both corpora passed
+    /// under `--audit-backend`, and the self-hosted front end's *check* phase went from 0.52s to
+    /// 2.4s -- because it was aborting partway with `a word of kind 255 was read after its object
+    /// died`, and no corpus in this tree reaches the shape that does it.
+    ///
+    /// What went wrong is the ownership question, in the form `release_from` above records two
+    /// other answers to. A fused loop owns the element it reads, and an inlined body either spends
+    /// that count or does not; the attempt asked the `made` set which, and the set is keyed on the
+    /// local the value arrived in, while the body spends it through the *alias* `bind_as` makes
+    /// when the parameter is bound. So it released a count the body had already handed on.
+    ///
+    /// A next attempt needs the release keyed on the object rather than the name -- `root` is the
+    /// existing spelling of that -- and a corpus that reaches it, which is the harder half: the
+    /// front end and `examples/` both pass with the bug in.
     fn fused_fold(&mut self, items: &Code, init: &Code, f: &Code) -> Result<V> {
         let xs = self.expr(items)?;
         // A count of the loop's own, because the loop releases at the end. `rt_list_at` reads the
