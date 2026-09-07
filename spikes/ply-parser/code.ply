@@ -49,6 +49,7 @@ pub type Node =
   | NPerform({ effect: Bytes, op: Bytes, resource: Bytes, args: List<Code> })
   | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
   | NRegion({ body: Code })
+  | NLambda({ params: Int, size: Int, body: Code })
   | NField({ base: Code, field: Bytes })
 
 pub type CField = { name: Bytes, value: Code }
@@ -186,6 +187,10 @@ fn dump_node(n: Node) -> Bytes =
       bytes_concat_all([b"cell(", c.resource, b",", c.binder, b",", slot_tag(c.slot), b",",
                         dump(c.init), b",", dump(c.body), b")"]),
     NRegion(r) -> bytes_concat_all([b"region(", dump(r.body), b")"]),
+    // The capture list is empty by construction: this port lowers a lambda only
+    // when it captures nothing, so the brackets are always bare.
+    NLambda(l) ->
+      bytes_concat_all([b"lam(", num(l.params), b",", num(l.size), b",[],", dump(l.body), b")"]),
     NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
   }
 
@@ -234,7 +239,8 @@ pub fn covers() -> List<Bytes> =
   [b"literals", b"unary", b"binary", b"if", b"list", b"field", b"application",
    b"records", b"blocks and `let`", b"parameters and their slots",
    b"the ownership marks", b"match and every pattern form",
-   b"perform, with_cell and with_region"]
+   b"perform, with_cell and with_region",
+   b"a lambda that captures nothing"]
 
 type Out = { code: Code, frame: Frame }
 
@@ -355,6 +361,29 @@ fn lower_in(e: Expr, f: Frame) -> Option<Out> =
         }
       },
     },
+    // A lambda opens a barrier of its own, and a name it reads from outside is a
+    // *capture*: a slot in this barrier filled from one in the enclosing barrier
+    // when the closure is made. Threading that chain is what `handle` and
+    // `simulate` need too, and it is not here.
+    //
+    // What is here is the closed case, and it is refused rather than guessed at
+    // when it is not: the body is lowered in a barrier holding only the lambda's
+    // parameters, and if any name in it is unresolved *and* would have resolved
+    // outside, this is a capture and the port stops.
+    ELambda(x) -> {
+      let params = map(x.params, |p: Param| p.name.name);
+      let inner = fold(params, { names: [], scope: [] }, |g: Frame, n: Bytes| bind(g, n));
+      match lower_in(x.body, inner) {
+        None -> None,
+        Some(b) ->
+          if captures_anything(b.code, f) { None } else {
+            Some({ code: { own: Borrowed, node: NLambda({ params: len(params),
+                                                          size: len(b.frame.names),
+                                                          body: mark(b.code, [], [], []).code }) },
+                   frame: f })
+          },
+      }
+    },
     EBlock(x) -> lower_block(x.stmts, x.tail, f),
     _ -> None,
   }
@@ -380,6 +409,36 @@ fn lower_seq(xs: List<Expr>, f: Frame) -> Option<Seq> =
 // A block opens a scope its binders leave at the end, and only a plain `let x =`
 // is reached: a destructuring pattern binds more than one slot and is the next
 // thing this port needs.
+// Whether any unresolved name in `c` would have resolved in `outer` -- which is
+// what makes it a capture rather than a global.
+fn captures_anything(c: Code, outer: Frame) -> Bool =
+  match c.node {
+    NVar(v) -> match v.slot {
+      Some(_) -> false,
+      None -> match find(outer, v.name) { Some(_) -> true, None -> false },
+    },
+    NLit(_) -> false,
+    NUnary(u) -> captures_anything(u.operand, outer),
+    NBinary(b) -> captures_anything(b.lhs, outer) || captures_anything(b.rhs, outer),
+    NField(fd) -> captures_anything(fd.base, outer),
+    NIf(i) -> captures_anything(i.cond, outer) || captures_anything(i.then_branch, outer)
+              || captures_anything(i.else_branch, outer),
+    NList(l) -> fold(l.items, false, |a: Bool, x: Code| a || captures_anything(x, outer)),
+    NRecord(r) -> fold(r.fields, false, |a: Bool, x: CField| a || captures_anything(x.value, outer)),
+    NApp(ap) -> captures_anything(ap.func, outer)
+                || fold(ap.args, false, |a: Bool, x: Code| a || captures_anything(x, outer)),
+    NMatch(m) -> captures_anything(m.scrutinee, outer)
+                 || fold(m.arms, false, |a: Bool, x: CArm| a || captures_anything(x.body, outer)),
+    NBlock(bl) ->
+      fold(bl.stmts, false, |a: Bool, st: CStmt|
+        a || match st { CLet(l) -> captures_anything(l.value, outer), CDo(d) -> captures_anything(d.code, outer) })
+      || match bl.tail { Some(t) -> captures_anything(t, outer), None -> false },
+    NPerform(pf) -> fold(pf.args, false, |a: Bool, x: Code| a || captures_anything(x, outer)),
+    NCell(ce) -> captures_anything(ce.init, outer) || captures_anything(ce.body, outer),
+    NRegion(rg) -> captures_anything(rg.body, outer),
+    NLambda(la) -> captures_anything(la.body, outer),
+  }
+
 type ArmAcc = { arms: List<CArm>, frame: Frame, ok: Bool }
 
 type BlockAcc = { stmts: List<CStmt>, frame: Frame, ok: Bool }
@@ -628,6 +687,9 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
       { code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
         live: sc.live, livew: sc.livew, livef: sc.livef }
     },
+    // A lambda's body is its own barrier: nothing outside it is live inside, and
+    // its marks were settled when it was lowered.
+    NLambda(_) -> { code: c, live: live, livew: livew, livef: livef },
     NRegion(r) -> {
       let b = mark(r.body, live, livew, livef);
       { code: { own: Borrowed, node: NRegion({ body: b.code }) },
@@ -808,7 +870,7 @@ test "a match binds its arms into the window and each arm's binders leave at its
 }
 
 test "a function this port does not reach is skipped rather than dumped wrongly" {
-  let out = lower_module(b"fn f() -> Int = fold([1], 0, |a: Int, b: Int| a + b)\nfn k() -> Int = 1\n");
+  let out = lower_module(b"fn f(n: Int) -> Int = fold([1], 0, |a: Int, b: Int| a + b + n)\nfn k() -> Int = 1\n");
   assert_eq(out.lowered, 1);
   assert_eq(out.skipped, 1)
 }
