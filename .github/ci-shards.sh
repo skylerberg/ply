@@ -275,8 +275,11 @@ declare -a SPIKE_JOBS=(
 # `.ply` files and a `bench.sh` with no harness and no differential: there is
 # nothing for a job to assert, and a benchmark whose output is a number is not a
 # check. `spikes/ply-lexer` itself has both and is in SPIKE_JOBS.
+# **This list is now empty, and that is the point of it.** Every directory under `spikes/` is run
+# by a required CI job. The last entry was `ply-lexer-throughput`, which was a bench rather than a
+# spike -- `benches/hash-throughput/run.sh` called it -- and it now lives at
+# `benches/lexer-throughput/`, where what it is and what runs it agree.
 declare -a SPIKES_OUTSIDE_CI=(
-  "ply-lexer-throughput:three files -- main.ply, lexer.ply, bench.sh -- and no harness, no fixtures and no differential. It measures tokens per second for the self-hosting spike: a number, not a check. It is not unrun, though -- benches/hash-throughput/run.sh calls its bench.sh, which is why it is here and its two siblings are not"
 )
 
 shard_packages() {
