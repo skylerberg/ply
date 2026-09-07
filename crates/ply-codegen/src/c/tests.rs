@@ -120,8 +120,11 @@ pub mod tests_support {
         with_refusals(text).map(|(s, n, _)| (s, n))
     }
 
-    /// The same, with a key per definition so the emit cache is live. The keys only have to be
-    /// stable and distinct — the cache asks nothing else of them — so the name is one.
+    /// The same, with a key per definition so the emit cache is live.
+    ///
+    /// The key has to move when the text does. A name alone is stable and distinct, which is all
+    /// the cache asks of the *shape* of a key, but two tests that both define `m.f` would then
+    /// share an entry and the second would be served the first one's C.
     pub fn keyed(text: &str) -> Option<&'static Source> {
         let mut sources = ply_span::SourceMap::new();
         let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
@@ -135,10 +138,11 @@ pub mod tests_support {
             Box::leak(Box::new(resolved)),
             Box::leak(Box::new(check)),
         );
+        let stamp = blake3::hash(text.as_bytes()).to_hex();
         let keys = bare
             .functions()
             .into_iter()
-            .map(|n| (n.clone(), format!("h-{n}")))
+            .map(|n| (n.clone(), format!("h-{n}-{}", &stamp[..16])))
             .collect();
         let program = bare.program;
         let resolved = bare.resolved;
@@ -555,4 +559,89 @@ pub fn alone(n: Int) -> Int = twice(n)
     );
     assert_eq!(answer(&again, "m.both", 5), Some(25));
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A unit built once is put back together, not built again.
+///
+/// Every worker used to rebuild it: reading each cached body, substituting its placeholders and
+/// assembling the whole translation unit, only to hand it to an object cache that already had the
+/// answer. Sharing the built unit in process is not open to this tier -- `ply_eval::Value` holds
+/// `Rc`, so nothing containing one crosses a rayon worker -- so it goes through the file system,
+/// and this is the property that has to hold when it does: the second build answers what the
+/// first one did.
+///
+/// The shapes are the part to distrust. Their ids are baked into the emitted C as numbers, so a
+/// unit read back has to intern them in the order it recorded them or the C reads the wrong field
+/// of the wrong record. `finish` refuses a unit whose ids come back different rather than guessing.
+///
+/// The nonce is what makes the first build a miss: the unit key is a function of every offered
+/// definition's hash, so a body no previous run has seen has no entry waiting for it. Without it
+/// this test would pass on its second-ever run without exercising the write path at all.
+#[test]
+fn a_unit_read_back_from_the_cache_answers_what_it_answered_when_built() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let source = format!(
+        r#"
+type Shape = {{ wide: Int, tall: Int }}
+type Tag = TA | TB(Int)
+fn area(s: Shape) -> Int = s.wide * s.tall
+fn label(t: Tag) -> Int = match t {{ TA -> 0, TB(n) -> n }}
+pub fn nonce() -> Int = {}
+pub fn both(w: Int, h: Int) -> Int = area({{ wide: w, tall: h }}) + label(TB(w)) + nonce() - nonce()
+pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
+"#,
+        nonce % 1_000_000
+    );
+
+    let Some(loaded) = tests_support::keyed(&source) else {
+        return;
+    };
+    let names: Vec<String> = loaded.functions();
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let ask = |native: &Native, name: &str, args: &[i64]| -> i64 {
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was refused"));
+        let mut ctx = native.context();
+        ctx.fuel = 10_000;
+        let words: Vec<crate::heap::Word> = args.iter().map(|a| crate::heap::imm(*a)).collect();
+        let w = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised");
+        crate::heap::imm_value(w)
+    };
+
+    let (built, _) =
+        crate::c::build(loaded, &names, crate::jit::Opts::default()).expect("the first build");
+    let first = (
+        ask(&built, "m.both", &[3, 4]),
+        ask(&built, "m.tagged", &[7]),
+        ask(&built, "m.tagged", &[0]),
+    );
+    assert_eq!(
+        first,
+        (15, 7, 0),
+        "the built unit is wrong before the cache is even involved"
+    );
+    drop(built);
+
+    let reused = super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
+    let (again, _) =
+        crate::c::build(loaded, &names, crate::jit::Opts::default()).expect("the second build");
+    assert_eq!(
+        super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed),
+        reused + 1,
+        "the second build emitted a unit instead of reading back the one the first build wrote"
+    );
+    assert_eq!(
+        (
+            ask(&again, "m.both", &[3, 4]),
+            ask(&again, "m.tagged", &[7]),
+            ask(&again, "m.tagged", &[0])
+        ),
+        first,
+        "the unit read back from the cache does not answer what the one that wrote it did"
+    );
 }

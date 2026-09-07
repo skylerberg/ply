@@ -294,6 +294,17 @@ impl Layouts {
         self.shapes.borrow_mut().intern(fields)
     }
 
+    /// Every shape's fields, in id order, so a unit read back from a cache can intern them in the
+    /// same order and land on the same ids. The ids are baked into emitted C as numbers.
+    pub fn all_shape_names(&self) -> Vec<Vec<Symbol>> {
+        self.shapes
+            .borrow()
+            .names
+            .iter()
+            .map(|n| n.to_vec())
+            .collect()
+    }
+
     pub fn shape_names(&self, shape: u32) -> Rc<[Symbol]> {
         self.shapes.borrow().names[shape as usize].clone()
     }
