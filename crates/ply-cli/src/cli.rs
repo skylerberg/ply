@@ -371,6 +371,28 @@ pub struct TestArgs {
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
+    /// Which toolchain the emitted C tier compiles with, and the inlining that
+    /// goes with it. Ignored by every other backend, which have one each.
+    ///
+    /// `development`, the default, is the fastest compiler on the machine —
+    /// `tcc` if it is installed, else `cc -O0` — with inlining off. Over the
+    /// self-hosted front end that is a quarter of a second against `release`'s
+    /// thirty-eight, and it is what an edit-to-green loop wants.
+    ///
+    /// `release` is `cc -O2` with the inliner on: forty times faster code on
+    /// integer arithmetic, and the profile any measurement must ask for.
+    ///
+    /// The two settings are one choice, not two. A non-optimising compiler
+    /// gives every temporary its own stack slot, so `release`'s inlining under
+    /// `development`'s compiler overflows the stack on a deep enough program.
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        default_value = "development",
+        requires = "backend"
+    )]
+    pub profile: String,
+
     /// Stay running: re-select and re-run whenever a `.ply` file under the path changes,
     /// keeping the front end and the caches in memory between iterations. An iteration where
     /// nothing changed costs a scan of the tree rather than a whole front end, which is what an
@@ -597,6 +619,28 @@ pub struct RunArgs {
     /// it the same way.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
+
+    /// Which toolchain the emitted C tier compiles with, and the inlining that
+    /// goes with it. Ignored by every other backend, which have one each.
+    ///
+    /// `development`, the default, is the fastest compiler on the machine —
+    /// `tcc` if it is installed, else `cc -O0` — with inlining off. Over the
+    /// self-hosted front end that is a quarter of a second against `release`'s
+    /// thirty-eight, and it is what an edit-to-green loop wants.
+    ///
+    /// `release` is `cc -O2` with the inliner on: forty times faster code on
+    /// integer arithmetic, and the profile any measurement must ask for.
+    ///
+    /// The two settings are one choice, not two. A non-optimising compiler
+    /// gives every temporary its own stack slot, so `release`'s inlining under
+    /// `development`'s compiler overflows the stack on a deep enough program.
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        default_value = "development",
+        requires = "backend"
+    )]
+    pub profile: String,
 }
 
 #[derive(Args, Debug)]

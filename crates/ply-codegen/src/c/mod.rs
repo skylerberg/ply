@@ -24,7 +24,7 @@
 //! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache | `build.rs` |
 //! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
 //! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |
-//! | `PLY_C_PROFILE` | `loop` picks the fast toolchain and the inlining that survives it -- `tcc` if installed, else `cc -O0`, at depth 0. Anything else is `release`. The compiler and the depth are one choice, not two: read `toolchain.rs` before separating them | `toolchain.rs` |
+//! | `PLY_C_PROFILE` | `development` (the default) picks the fast toolchain and the inlining that survives it -- `tcc` if installed, else `cc -O0`, at depth 0; `release` is `cc -O2` at depth 3. Overrides the CLI's `--profile`, so that a bench script pins one without a command line. The compiler and the depth are one choice, not two: read `toolchain.rs` before separating them | `toolchain.rs` |
 //! | `PLY_CC` | the C compiler to shell out to, overriding the profile's | `load.rs` |
 //! | `PLY_CC_OPT` | the optimisation flag it is given, overriding the profile's | `load.rs` |
 //! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
@@ -47,6 +47,7 @@ mod toolchain;
 pub use build::{Native, build};
 pub use load::Library;
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
+pub use toolchain::{Profile, select as select_profile};
 
 /// The addresses the loaded unit binds, in [`HELPERS`]' order, so a helper cannot be declared and
 /// left unbound: the table below and the table there are read together by a test.
