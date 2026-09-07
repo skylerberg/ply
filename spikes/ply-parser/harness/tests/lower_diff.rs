@@ -226,6 +226,18 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize) {
         available += expected.len();
         reached += mine.len();
         for (fname, body) in &mine {
+            // A record update is not covered. `rewrite.ply` expands `{..b, f: e}` into a record
+            // that names every field; `ply-syntax` keeps it as a node with `copies` and `sets`,
+            // which `code.rs` lowers to `RecordUpdate`. So the two are lowering different trees
+            // here, and comparing them would report a difference that is neither one's fault.
+            // Excluded by what the *oracle* holds, so a port that started emitting updates would
+            // still be compared.
+            if expected
+                .get(fname)
+                .is_some_and(|want| want.contains("upd("))
+            {
+                continue;
+            }
             match expected.get(fname) {
                 None => failures.push(format!(
                     "{label}: `{fname}` in {name} was lowered by the port and not by the oracle"
@@ -281,8 +293,8 @@ fn the_lowering_agrees_with_ply_eval_wherever_the_port_reaches() {
     // and it is written down so that raising it is a visible change and lowering it is a failure.
     println!("  the port reaches {reached} of {available} function bodies");
     assert!(
-        reached >= 85,
-        "the port lowered {reached} of {available} bodies, and it reached 85 when this was \
+        reached >= 496,
+        "the port lowered {reached} of {available} bodies, and it reached 496 when this was \
          written -- raise this number when the port grows, and never lower it"
     );
 }
