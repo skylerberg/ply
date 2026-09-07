@@ -18,10 +18,19 @@
 //! ```
 //!
 //! Same arithmetic, same answer, different order: the reference unboxes every operand of the
-//! *outer* node before the inner node's arithmetic runs. Which is right is not obvious and it is
-//! not a detail -- an unbox can raise, so the order decides which diagnostic a body with two bad
-//! operands gives. Resolving it means reading how `binary` sequences `expr` against `as_int`, and
-//! that is the next piece of this port rather than something to guess at.
+//! *outer* node before the inner node's arithmetic runs.
+//!
+//! **It is not the emitter, and the first note here said it was.** Two things settle that.
+//! `reference_lower_dump` on the same function is
+//! `bbin(add,bbin(mul,ovar(a,0),ovar(b,1)),ovar(c,2))` -- the tree this port lowers, so the two
+//! agree on the input. And `c/emit.rs`'s `binary` reads `expr(lhs)` then `expr(rhs)` then
+//! `arithmetic`, which emits the inner node's `rt_arith` *before* the outer's right operand is
+//! touched -- the port's order, not the reference's. So the reordering happens in `optimize`,
+//! between the tree above and the tree the emitter is handed, which is the coupling `tests/emit.rs`
+//! records.
+//!
+//! Settling it means emitting without optimising and comparing there. It is not cosmetic: an
+//! unbox can raise, so the order decides which diagnostic a body with two bad operands gives.
 //!
 //! **The corpus here is hand-written and small, and that is deliberate.** The reference optimises
 //! before it lowers, so `1 + 2` reaches its emitter as `3` while this port's emitter sees the
