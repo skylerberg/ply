@@ -741,3 +741,47 @@ pub fn with_wide(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, wide).i
     );
     let _ = loaded;
 }
+
+/// A temporary a body makes and hands on is counted once, not twice.
+///
+/// Every runtime helper that answers a word answers an **owned** one: `rt_ctor` allocates,
+/// `rt_field` increments what it reads out, `rt_concat` builds a new string, and each releases the
+/// word arguments it was given -- which is what the duplicate on the way *in* is for. The emitter
+/// took a second count at every use of such an answer, so `f(g(x))` counted `g`'s answer once for
+/// `f` and once for nobody, and the second one was never released.
+///
+/// Asserted on the emitted text because that is where the property lives and nothing downstream
+/// can see it: a doubled count is not a wrong answer, it is an object that cannot die. `wrap`
+/// makes one word with a helper and hands it straight to another, so a correct emit takes no count
+/// at all -- and the version this replaces took exactly one.
+#[test]
+fn a_helper_answer_handed_to_a_helper_is_not_counted_again() {
+    let source = r#"
+pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
+"#;
+    let Some(loaded) = tests_support::keyed(source) else {
+        return;
+    };
+    let ctors = loaded.ctors();
+    let digest = super::cache::ctors_digest(&ctors);
+    let mut unit = super::emit::Unit::new(ctors, vec!["m.wrap".to_string()]);
+    let inlining = crate::opt::Inlining::EMITTED;
+    let (text, _) = super::build::emit_one(
+        loaded,
+        &mut unit,
+        "m.wrap",
+        &digest,
+        (inlining.budget, inlining.depth),
+        "",
+    )
+    .expect("`wrap` emits");
+    assert!(
+        text.contains("rt_byte_of_int_p") && text.contains("rt_list_p"),
+        "the body no longer has the shape this test is about:\n{text}"
+    );
+    assert_eq!(
+        text.matches("ply_inc(").count(),
+        0,
+        "a count was taken on a word the helper had already counted:\n{text}"
+    );
+}

@@ -338,6 +338,7 @@ pub struct Heap {
     persistent: bool,
     /// Objects allocated since the last reset.
     count: usize,
+    recycled: usize,
     /// Dead objects by size class, for an allocation of that class to take before the bump
     /// pointer moves: what keeps an entry's memory bounded by what it holds rather than by what
     /// it ever held. Filled only while `reuse` is set, which a release build does and a debug
@@ -432,6 +433,7 @@ impl Heap {
             bridges: Vec::new(),
             persistent: false,
             count: 0,
+            recycled: 0,
             free: Vec::new(),
             reuse: !cfg!(debug_assertions),
         }
@@ -453,6 +455,21 @@ impl Heap {
     /// How many objects have been allocated since the last reset.
     pub fn allocated(&self) -> usize {
         self.count
+    }
+
+    /// Allocations served from the free list rather than from fresh memory.
+    ///
+    /// The observable for whether anything is being *released*. `allocated` counts either kind, so
+    /// a body that leaks every temporary and one that recycles them read the same there; this is
+    /// what tells them apart.
+    ///
+    /// **Over the emitted tier it reads zero**, and that is the finding it exists to make legible:
+    /// that tier takes no count it should not any more, but it still releases nothing at the end
+    /// of a scope, so a temporary built and dropped without being handed on has a count of one and
+    /// nobody to drop it. Reading a number here is what would say the other half of the ownership
+    /// discipline had landed.
+    pub fn recycled(&self) -> usize {
+        self.recycled
     }
 
     /// Moves to a chunk with `need` bytes free: the next one already on hand that fits, or a
@@ -494,7 +511,10 @@ impl Heap {
         // A dead object of this class, if the entry has one, before the bump pointer moves.
         let recycled = self.free.get_mut(size / 8).and_then(Vec::pop);
         let p = match recycled {
-            Some(p) => p,
+            Some(p) => {
+                self.recycled += 1;
+                p
+            }
             None => {
                 if (self.end as usize).wrapping_sub(self.cur as usize) < size || self.cur.is_null()
                 {
@@ -695,6 +715,7 @@ impl Heap {
         }
         self.chunk = 0;
         self.count = 0;
+        self.recycled = 0;
         for class in &mut self.free {
             class.clear();
         }
