@@ -131,6 +131,10 @@ echo "==> the oracle for the stage after that: the C a body emits"
 cargo test --test emit -- --nocapture
 
 echo
+echo "==> what compiling effects would have to carry, and the corpus for it"
+cargo test --manifest-path "$here/harness/Cargo.toml" --test effects -- --nocapture
+
+echo
 echo "==> the eighth differential: emit.ply's C against crates/ply-codegen's"
 PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=2 |
   grep -E "agreeing|^test result|^error|panicked" || true
