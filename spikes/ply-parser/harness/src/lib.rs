@@ -1374,10 +1374,10 @@ pub fn reference_lower_dump(modules: &[(String, String)]) -> String {
         resolve_diags(&mut out, &expansion);
         return out;
     }
-    if ply_syntax::resolve::resolve(&mut program).is_err() {
-        out.push_str("R;");
-        return out;
-    }
+    // Deliberately no `resolve`. Lowering reads a body and the binders in it -- `slots::resolve`
+    // is local to a function -- so a module that does not resolve because its imports are absent
+    // still lowers, and refusing here would make the oracle silent on nine of the ten standard
+    // library modules when they are dumped one at a time.
     // Every function of every module, in load order, so the dump moves when a definition does and
     // a port cannot pass by lowering a different set.
     for module in &program.modules {
@@ -1429,12 +1429,12 @@ fn dump_code(out: &mut String, c: &ply_eval::code::Code) {
             out.push(')');
         }
         N::Unary { op, operand } => {
-            out.push_str(&format!("un({op:?},"));
+            out.push_str(&format!("un({},", unop_name(*op)));
             dump_code(out, operand);
             out.push(')');
         }
         N::Binary { op, lhs, rhs } => {
-            out.push_str(&format!("bin({op:?},"));
+            out.push_str(&format!("bin({},", binop_name(*op)));
             dump_code(out, lhs);
             out.push(',');
             dump_code(out, rhs);
@@ -1683,8 +1683,80 @@ fn dump_pat(out: &mut String, p: &ply_eval::code::Pat) {
     }
 }
 
+/// A literal, spelled out rather than through `Debug`.
+///
+/// `{lit:?}` was the first spelling and it is not a canonical form: it is a rendering Rust chooses,
+/// it moves when a field is added or renamed, and nothing on the other side of a differential can
+/// reproduce it. An oracle whose format only one of the two implementations can produce compares
+/// nothing.
 fn dump_lit(out: &mut String, lit: &Lit) {
-    out.push_str(&format!("{lit:?}"));
+    match lit {
+        Lit::Int(n) => out.push_str(&format!("i{n}")),
+        Lit::Fixed { ty, bits } => out.push_str(&format!("x{}:{bits}", int_ty_name(*ty))),
+        Lit::Bool(b) => out.push_str(if *b { "T" } else { "F" }),
+        Lit::Str(s) => out.push_str(&format!("s{}:{}", s.len(), lower_hex(s.as_bytes()))),
+        Lit::Bytes(b) => out.push_str(&format!("y{}:{}", b.len(), lower_hex(b))),
+        // The tag and not the value, for both. A `Float` cannot be *built* by a Ply program
+        // (`spikes/ply-parser/GAPS.md` §3), so no port could reproduce a value here; and the
+        // consumer this oracle exists for refuses a `Float` or `Decimal` literal outright
+        // (`c/emit.rs`, "which the fragment has no path for"), so the value is not read by
+        // anything downstream of this dump.
+        Lit::Float(_) => out.push('f'),
+        Lit::Decimal { .. } => out.push('d'),
+        Lit::Unit => out.push('u'),
+    }
+}
+
+/// The operators by name, not as `Debug` renders them.
+///
+/// Same reason as the literals: `Debug` is a rendering Rust chooses and nothing on the other side
+/// of a differential can reproduce it. These are the names `spikes/ply-parser/exprs.ply` already
+/// carries in its own tree -- `add`, `bitxor`, `concat` -- so both sides hold the string rather
+/// than deriving it.
+fn binop_name(op: BinOp) -> &'static str {
+    match op {
+        BinOp::Add => "add",
+        BinOp::Sub => "sub",
+        BinOp::Mul => "mul",
+        BinOp::Div => "div",
+        BinOp::Rem => "rem",
+        BinOp::Eq => "eq",
+        BinOp::Ne => "ne",
+        BinOp::Lt => "lt",
+        BinOp::Le => "le",
+        BinOp::Gt => "gt",
+        BinOp::Ge => "ge",
+        BinOp::And => "and",
+        BinOp::Or => "or",
+        BinOp::Concat => "concat",
+        BinOp::BitAnd => "bitand",
+        BinOp::BitOr => "bitor",
+        BinOp::BitXor => "bitxor",
+        BinOp::Shl => "shl",
+        BinOp::Shr => "shr",
+        BinOp::Ushr => "ushr",
+    }
+}
+
+fn unop_name(op: UnOp) -> &'static str {
+    match op {
+        UnOp::Neg => "neg",
+        UnOp::Not => "not",
+        UnOp::BitNot => "bitnot",
+    }
+}
+
+fn int_ty_name(ty: IntTy) -> String {
+    format!("{}{}", if ty.signed() { "i" } else { "u" }, ty.bits())
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(char::from_digit((b >> 4) as u32, 16).unwrap_or('0'));
+        s.push(char::from_digit((b & 0xf) as u32, 16).unwrap_or('0'));
+    }
+    s
 }
 
 #[cfg(test)]

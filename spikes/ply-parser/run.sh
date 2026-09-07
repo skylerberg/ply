@@ -114,6 +114,15 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-hash.log || {
   exit 1
 }
 
+echo
+echo "==> the seventh differential: code.ply's lowering against ply_eval::code"
+# The first comparison for a stage *after* the front end. It compares only what the port claims to
+# lower -- `lower` answers `None` for a node kind it has not reached -- and asserts the share it
+# reaches, so a port that quietly lowered nothing would fail rather than agree with itself.
+PLY_BIN="$root/target/release/ply" cargo test --test lower_diff -- --nocapture --test-threads=2 |
+  grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
+
+
 if [ "${1:-}" = "--arm" ]; then
   echo
   echo "==> arming it: twenty-two corruptions of the Ply parser, each seen to go red"

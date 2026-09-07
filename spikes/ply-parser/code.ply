@@ -1,0 +1,256 @@
+// The lowered intermediate form, in Ply: the shape a code generator reads.
+//
+// `crates/ply-codegen`'s emitter does not read the AST. It reads
+// `ply_eval::code::Code` -- windows numbered by `slots.rs`, ownership marked by
+// `rc.rs` -- so converting the emitter to Ply starts here, with the form it
+// consumes, and not with the emitter.
+//
+// The oracle is `reference_lower_dump` in `harness/src/lib.rs`, and this file
+// exists to be compared against it byte for byte, in the shape the six earlier
+// differentials use. `dump` below writes exactly that string.
+//
+// **What is covered so far is written down rather than implied.** `lower`
+// answers `Some` for the forms it lowers and `None` for the rest, and the
+// differential compares only where it answered -- so this file grows one node
+// kind at a time with a green comparison at every step, instead of arriving
+// whole and unverifiable. `covers` is the list, and it is the honest measure of
+// how far this port has got.
+
+import spine (Span, Ident, QName, dummy_span, num)
+import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import exprs (Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock, EList,
+              ERecord, EField, ELambda, EMatch, EPerform, EHandle, EWithCell,
+              EWithRegion, ESimulate, EBad, ERecordUpdate, ETry, Stmt, SLet, SExpr)
+import items (Module, Item, IFn, parse)
+import rewrite (expand)
+
+// How a read takes its value. `rc.rs`'s `Own`, with the same three cases and
+// the same one-letter spellings the oracle writes.
+pub type Own = | Borrowed | Owned | OwnedField
+
+pub fn own_tag(o: Own) -> Bytes =
+  match o { Borrowed -> b"b", Owned -> b"o", OwnedField -> b"f" }
+
+// One lowered node: what it is, and how the read that produced it takes it.
+pub type Code = { own: Own, node: Node }
+
+pub type Node =
+  | NLit(Lit)
+  | NVar({ name: Bytes, slot: Option<Int> })
+  | NUnary({ op: Bytes, operand: Code })
+  | NBinary({ op: Bytes, lhs: Code, rhs: Code })
+  | NApp({ func: Code, args: List<Code> })
+  | NIf({ cond: Code, then_branch: Code, else_branch: Code })
+  | NBlock({ stmts: List<CStmt>, tail: Option<Code> })
+  | NList({ items: List<Code> })
+  | NField({ base: Code, field: Bytes })
+
+pub type CStmt = | CLet({ value: Code }) | CDo({ code: Code })
+
+// --- the dump ---------------------------------------------------------------
+//
+// Byte for byte what `reference_lower_dump` writes for the same tree. A
+// difference here is a difference in the *dump* rather than in the lowering,
+// which is why every piece of it is spelled out rather than derived.
+
+pub fn dump_lit(l: Lit) -> Bytes =
+  match l {
+    LInt(n) -> bytes_concat(b"i", num(n)),
+    // Lowercased: the lexer keeps the suffix as written (`U32`) and the oracle derives it from
+    // the type (`u32`), so one of the two has to say which spelling the dump uses.
+    LFixed(name, bits) -> bytes_concat_all([b"x", lower_bytes(name), b":", num(bits)]),
+    LBool(b) -> if b { b"T" } else { b"F" },
+    LStr(s) -> bytes_concat_all([b"s", num(bytes_len(s)), b":", hex(s)]),
+    LBytes(s) -> bytes_concat_all([b"y", num(bytes_len(s)), b":", hex(s)]),
+    // The tag and not the value: a Ply program cannot build a `Float`, and the
+    // consumer this oracle exists for refuses a `Float` literal outright.
+    LFloat(_) -> b"f",
+    LDec(_) -> b"d",
+    // The parser's two placeholders. Neither reaches a lowered tree from a
+    // program that checks, and dumping them as themselves is what would make it
+    // visible if one ever did.
+    LUnit -> b"u",
+    LBad -> b"!",
+  }
+
+fn lower_bytes(s: Bytes) -> Bytes =
+  fold(range(0, bytes_len(s)), b"", |acc: Bytes, i: Int| {
+    let c = bytes_at(s, i);
+    bytes_concat(acc, byte_of_int(if c >= 65 && c <= 90 { c + 32 } else { c }))
+  })
+
+fn hex_digit(v: Int) -> Bytes =
+  bytes_slice(b"0123456789abcdef", v, v + 1)
+
+pub fn hex(s: Bytes) -> Bytes =
+  fold(range(0, bytes_len(s)), b"", |acc: Bytes, i: Int| {
+    let byte = bytes_at(s, i);
+    bytes_concat_all([acc, hex_digit(byte / 16), hex_digit(byte % 16)])
+  })
+
+fn slot_tag(s: Option<Int>) -> Bytes =
+  match s { Some(n) -> num(n), None -> b"-" }
+
+pub fn dump(c: Code) -> Bytes =
+  bytes_concat(own_tag(c.own), dump_node(c.node))
+
+fn dump_node(n: Node) -> Bytes =
+  match n {
+    NLit(l) -> bytes_concat_all([b"lit(", dump_lit(l), b")"]),
+    NVar(v) -> bytes_concat_all([b"var(", v.name, b",", slot_tag(v.slot), b")"]),
+    NUnary(u) -> bytes_concat_all([b"un(", u.op, b",", dump(u.operand), b")"]),
+    NBinary(b) ->
+      bytes_concat_all([b"bin(", b.op, b",", dump(b.lhs), b",", dump(b.rhs), b")"]),
+    NApp(a) ->
+      bytes_concat_all([b"app(", dump(a.func),
+                        fold(a.args, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, b",", dump(x)])),
+                        b")"]),
+    NIf(i) ->
+      bytes_concat_all([b"if(", dump(i.cond), b",", dump(i.then_branch), b",",
+                        dump(i.else_branch), b")"]),
+    NBlock(b) ->
+      bytes_concat_all([b"block(",
+                        fold(b.stmts, b"", |acc: Bytes, s: CStmt|
+                          bytes_concat(acc, match s {
+                            CLet(l) -> bytes_concat_all([b"let(_,", dump(l.value), b"),"]),
+                            CDo(d) -> bytes_concat_all([b"do(", dump(d.code), b"),"]),
+                          })),
+                        match b.tail { Some(t) -> dump(t), None -> b"-" },
+                        b")"]),
+    NList(l) ->
+      bytes_concat_all([b"list(",
+                        fold(l.items, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, dump(x), b","])),
+                        b")"]),
+    NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
+  }
+
+// --- the lowering ------------------------------------------------------------
+//
+// `None` where this port does not reach yet, so the differential can compare
+// what is covered and say what is not, rather than comparing a wrong answer.
+
+pub fn covers() -> List<Bytes> =
+  [b"literals", b"unary", b"binary", b"if", b"list", b"field",
+   b"application", b"blocks without binders", b"names with no binder"]
+
+pub fn lower(e: Expr) -> Option<Code> =
+  match e {
+    ELit(x) -> Some({ own: Borrowed, node: NLit(x.lit) }),
+    // A name no binder introduces: a definition, a constructor or a builtin.
+    // A *bound* name needs the slot table, which is the next stage.
+    EVar(x) -> match x.name.module {
+      Some(_) -> None,
+      None -> Some({ own: Borrowed, node: NVar({ name: x.name.name.name, slot: None }) }),
+    },
+    EUnary(x) -> match lower(x.operand) {
+      Some(o) -> Some({ own: Borrowed, node: NUnary({ op: x.op, operand: o }) }),
+      None -> None,
+    },
+    EBinary(x) -> match lower(x.lhs) {
+      None -> None,
+      Some(l) -> match lower(x.rhs) {
+        None -> None,
+        Some(r) -> Some({ own: Borrowed, node: NBinary({ op: x.op, lhs: l, rhs: r }) }),
+      },
+    },
+    EIf(x) -> match lower(x.cond) {
+      None -> None,
+      Some(c) -> match lower(x.then_branch) {
+        None -> None,
+        Some(t) -> match lower(x.else_branch) {
+          None -> None,
+          Some(el) -> Some({ own: Borrowed, node: NIf({ cond: c, then_branch: t, else_branch: el }) }),
+        },
+      },
+    },
+    EField(x) -> match lower(x.base) {
+      Some(b) -> Some({ own: Borrowed, node: NField({ base: b, field: x.field.name }) }),
+      None -> None,
+    },
+    EList(x) -> match lower_all(x.items) {
+      Some(items) -> Some({ own: Borrowed, node: NList({ items: items }) }),
+      None -> None,
+    },
+    EApp(x) ->
+      if len(x.named) > 0 { None } else {
+        match lower(x.func) {
+          None -> None,
+          Some(f) -> match lower_all(x.args) {
+            Some(args) -> Some({ own: Borrowed, node: NApp({ func: f, args: args }) }),
+            None -> None,
+          },
+        }
+      },
+    // A block with no binders: every `let` needs the slot table.
+    EBlock(x) ->
+      if len(x.stmts) > 0 { None } else {
+        match x.tail {
+          None -> Some({ own: Borrowed, node: NBlock({ stmts: [], tail: None }) }),
+          Some(t) -> match lower(t) {
+            Some(c) -> Some({ own: Borrowed, node: NBlock({ stmts: [], tail: Some(c) }) }),
+            None -> None,
+          },
+        }
+      },
+    _ -> None,
+  }
+
+fn lower_all(xs: List<Expr>) -> Option<List<Code>> =
+  fold(xs, Some([]), |acc: Option<List<Code>>, x: Expr|
+    match acc {
+      None -> None,
+      Some(done) -> match lower(x) { Some(c) -> Some(push(done, c)), None -> None },
+    })
+
+// --- the differential's entry -----------------------------------------------
+//
+// One module of source in, one dump out, in the oracle's own framing: `L;n;`
+// then a record per function this port lowered. A function it does not reach is
+// left out entirely rather than dumped wrongly, and the count of those is what
+// the comparison reports.
+
+pub type LowerOut = { dump: Bytes, lowered: Int, skipped: Int }
+
+pub fn lower_module(src: Bytes) -> LowerOut = {
+  let r = parse(src);
+  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  fold(x.module.items, { dump: b"L;1;", lowered: 0, skipped: 0 },
+    |acc: LowerOut, it: Item|
+      match it {
+        IFn(d) ->
+          if len(d.params) > 0 { { dump: acc.dump, lowered: acc.lowered, skipped: acc.skipped + 1 } }
+          else {
+            match lower(d.body) {
+              None -> { dump: acc.dump, lowered: acc.lowered, skipped: acc.skipped + 1 },
+              Some(c) -> {
+                dump: bytes_concat_all([acc.dump, b"f:m.", d.name.name, b":0:0;", dump(c), b";"]),
+                lowered: acc.lowered + 1,
+                skipped: acc.skipped,
+              },
+            }
+          },
+        _ -> acc,
+      })
+}
+
+pub fn lower_dump(src: Bytes) -> String = string_of_bytes(lower_module(src).dump)
+
+test "a literal lowers to itself" {
+  assert_eq(lower_dump(b"fn f() -> Int = 1\n"), "L;1;f:m.f:0:0;blit(i1);")
+}
+
+test "binary operands are lowered left to right" {
+  assert_eq(lower_dump(b"fn f() -> Int = 1 + 2\n"),
+            "L;1;f:m.f:0:0;bbin(add,blit(i1),blit(i2));")
+}
+
+test "a name with no binder has no slot" {
+  assert_eq(lower_dump(b"fn f() -> Int = g()\n"),
+            "L;1;f:m.f:0:0;bapp(bvar(g,-));")
+}
+
+test "a function this port does not reach is skipped rather than dumped wrongly" {
+  let out = lower_module(b"fn f(x: Int) -> Int = x\nfn g() -> Int = 1\n");
+  assert_eq(out.lowered, 1);
+  assert_eq(out.skipped, 1)
+}
