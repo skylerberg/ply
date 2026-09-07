@@ -3079,6 +3079,22 @@ property of the binary.
 `--deps` (also print each definition's direct references and transitive closure),
 `--json`.
 
+### `ply bootstrap [path]`
+
+Writes the front end out as the C that builds it, which is what a self-hosted
+compiler archives: text rather than a per-platform binary, and needing only a C
+compiler rather than the compiler it replaces.
+
+`--out DIR` (default `bootstrap`), `--verify` (re-emit and compare, writing
+nothing), `--profile release|development` — `release` by default here, unlike
+everywhere else, because an archive is the compiler somebody else runs.
+
+Two digests, answering different questions. **`source`** is over every
+definition's content hash: it names *which version* of the front end this is, and
+two trees with the same one hold the same compiler however differently they emit
+it. **`artifact`** is over the C: it says whether this file is the one that
+version produces, which is what `--verify` checks.
+
 ### `ply cache <action>`
 
 | action | meaning |
