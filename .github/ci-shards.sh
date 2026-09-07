@@ -115,46 +115,18 @@ POSTGRES_SHARD=postgres
 # /bin/bash on macOS, treats "${empty[@]}" as unset under `set -u`, and this
 # list is meant to become empty.
 #
-# The reason attached to the one entry below was rewritten on 2026-08-28,
-# because the old one had stopped being true. It read: "its own workspace on
-# purpose, per the codegen spike, so that deferring M9 deletes it with rm -r". R5
-# falsified that: `rm -r crates/ply-codegen-spike` leaves the whole compiled
-# seam standing in `crates/ply-eval/src/compiled.rs`, so the deletion no longer
-# buys what the codegen spike said it buys, and performing it today would remove the
-# only implementation of `Compiled` in existence and leave the declaration
-# behind. the backend authorisation amends 3.5 accordingly and makes the deletion
-# conditional on something checkable, which is what the entry now records.
-#
-# The reproduction was done on 2026-08-28 and the condition came back NOT
-# satisfied, so the entry is narrowed rather than deleted. Seven of the eight
-# configurations moved: five into crates/ply-eval-tests/tests/suite/differential_corpus.rs
-# over ply_eval::backend::Reference at corpus scale, exceeds-budget=4 through
-# `ply test --backend` in crates/ply-cli/tests/suite/backend.rs, and answers= on the
-# offer count of zero that is its whole point. The eighth does not move, for a
-# structural reason: the spike's backend is native code on a fixed stack, so
-# ignoring the budget entirely CRASHES and run_guarded reports it from outside;
-# Reference evaluates on a nested machine whose frames grow on the heap, so the
-# same corruption HANGS -- measured at no output and no exit in 45 seconds against
-# 0.03s for the run that reports. Nothing in the workspace can report a run that
-# never comes back, so the spike is still the only place that demonstration
-# lives.
-# **The condition is MET as of 2026-08-31 and the entry is still here.** The
-# note below read, until then: "seven of eight is where 2026-08-28 left it --
-# the unbounded exceeds-budget runaway crashes under the spike's native frames
-# and only hangs under an interpreting backend, and a run that never comes back
-# cannot be reported from inside it". The workspace now has a backend with native frames:
-# `ply test --backend cranelift:wrong:exceeds-budget` over a recursion with no
-# base case aborts, exit 134, in 0.02s, and `ply-cli/tests/suite/backend.rs` has
-# always run `ply` as a child so the reporter was never the problem. Eight of
-# eight, under `cargo test --workspace`.
-#
-# What holds the entry is no longer the condition. It is that deleting the crate
-# deletes the only instrument for two open things: CONTRIBUTING.md item 18's 42
-# unexplained agreement disagreements, and the compute-kernel record's 6.199x, which nothing
-# else produces. the backend authorisation records both and says item 18 should carry the
-# deletion.
+# **It is empty.** The one entry was `crates/ply-codegen-spike`, a third code
+# generator with a runtime of its own, and what held it after its own deletion
+# condition was met on 2026-08-31 was its hazard suite: twenty-five tests of a
+# compiled seam with no equivalent in the shipping tree. Those tests were about
+# *the spike's* seam, though, which is a demonstration about a program nothing
+# ships. They are ported -- `crates/ply-codegen-tests/tests/suite/hazards.rs`,
+# over `ply_codegen::Cranelift` and the machine it attaches to -- so the tree
+# gained the coverage rather than kept it. Two of them changed meaning in the
+# port and say so where they stand: this tier runs a higher-order builtin the
+# spike had to refuse, and it registers a `Float` signature the spike declined
+# at registration and lets the value boundary stop the call instead.
 declare -a KNOWN_OUTSIDE=(
-  "ply-codegen-spike:its own workspace on purpose; the backend authorisation's deletion condition -- ALL EIGHT wrong backends reproduced in the workspace -- was MET on 2026-08-31 by crates/ply-codegen, so what keeps this crate is no longer the condition but the two open findings only it can measure: CONTRIBUTING.md item 18's 42 agreement disagreements and the compute-kernel record's 6.199x kernel figure. Closing item 18 is what should carry the rm -r"
 )
 
 # Tests whose assertion reads a wall clock, as `package:target:test`, where
