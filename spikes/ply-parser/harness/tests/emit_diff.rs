@@ -300,6 +300,8 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn ge(a: Int, b: Int) -> Bool = a >= b\n",
         "fn eq(a: Int, b: Int) -> Bool = a == b\n",
         "fn ne(a: Int, b: Int) -> Bool = a != b\n",
+        // The shape that showed the port unboxing per read where the reference binds once.
+        "fn nested(a: Int, b: Int) -> Int = (a + b) * (a - b)\n",
     ];
     let inputs: Vec<(String, Vec<u8>)> = programs
         .iter()
@@ -312,7 +314,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 11, "only {reached} bodies were emitted");
+    assert!(reached >= 12, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
