@@ -8,6 +8,7 @@
 
 mod artifact;
 mod backend;
+mod bootstrap_archive;
 mod cli;
 mod config_cli;
 mod db_cli;

@@ -58,6 +58,9 @@ pub enum Command {
     Std(StdArgs),
     /// Print the content hash of every definition.
     Hash(HashArgs),
+    /// Write the front end out as the C that builds it, with the digests that
+    /// name the version and verify the artifact.
+    Bootstrap(BootstrapArgs),
     /// Read, reclaim or discard what the caches hold.
     Cache(CacheArgs),
 }
@@ -938,4 +941,27 @@ mod tests {
         assert!(Cli::try_parse_from(["ply", "test", "--bisect", "sometimes"]).is_err());
         assert!(Cli::try_parse_from(["ply", "test", "--bisect", "never"]).is_ok());
     }
+}
+
+#[derive(Args, Debug)]
+pub struct BootstrapArgs {
+    /// A `.ply` file, or a project root: the front end to write out.
+    pub path: PathBuf,
+
+    /// Where the archive goes. The C and its manifest are written here.
+    #[arg(long, value_name = "DIR", default_value = "bootstrap")]
+    pub out: PathBuf,
+
+    /// Re-emit and compare against the archive already there, writing nothing.
+    /// Non-zero if the tree no longer produces what the archive records.
+    #[arg(long)]
+    pub verify: bool,
+
+    /// Which toolchain the archive is emitted for. `release` by default here,
+    /// unlike everywhere else: an archive is the compiler somebody else runs.
+    #[arg(long, value_name = "PROFILE", default_value = "release")]
+    pub profile: String,
+
+    #[arg(long)]
+    pub json: bool,
 }
