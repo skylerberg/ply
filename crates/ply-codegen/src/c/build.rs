@@ -410,6 +410,7 @@ fn emit_one(
     // it holds, so a parameter bound while the table was empty contributes nothing and a rule that
     // asks "does anything else read this object" hears no about the body's own argument.
     e.count_reads(&lowered.code);
+    e.mark_tails(&lowered.code);
     // Not `static`: an exported body carries a symbol, and a symbol is what lets a
     // sampling profiler attribute time to a Ply definition. The Cranelift tier cannot be read
     // this way at all, which is a real difference between the two and not a small one.
