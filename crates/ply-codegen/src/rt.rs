@@ -1192,13 +1192,21 @@ fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
             // The callee owns every parameter: the captures are held once more, since the
             // closure may be called again, and the arguments were taken by the caller's mask. A
             // stack array holds the words for any arity a body has, so a call allocates nothing.
-            let mut handles = [0i64; 64];
+            //
+            // Uninitialised, and that is the point. This was `[0i64; 64]`, which is five hundred
+            // and twelve bytes memset on **every closure call** -- the compiler cannot see that
+            // only `total` of them are written, so it zeroes all of them first. Over the
+            // self-hosted front end `call_value` was 20.3% of the profile's self time and this was
+            // most of it. Exactly `total` entries are written below and the callee reads exactly
+            // `total`, so nothing uninitialised is ever read.
+            let mut handles = [const { std::mem::MaybeUninit::<i64>::uninit() }; 64];
             let mut spilled: Vec<i64> = Vec::new();
             let captures = len - CLOSURE_CAPTURES;
             let total = captures + args.len();
+            let inline = total <= handles.len();
             let mut push = |w: Word, i: usize| {
-                if total <= handles.len() {
-                    handles[i] = w;
+                if inline {
+                    handles[i].write(w);
                 } else {
                     spilled.push(w);
                 }
@@ -1211,8 +1219,8 @@ fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
             for (i, w) in args.iter().enumerate() {
                 push(*w, captures + i);
             }
-            let ptr = if total <= handles.len() {
-                handles.as_ptr()
+            let ptr = if inline {
+                handles.as_ptr() as *const i64
             } else {
                 spilled.as_ptr()
             };
