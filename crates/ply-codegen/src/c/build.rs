@@ -66,6 +66,7 @@ pub fn build(
     names: &[&str],
     _opts: Opts,
 ) -> Result<(Native, Vec<Refused>)> {
+    let started = std::time::Instant::now();
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
     let mut offered: Vec<&str> = names.to_vec();
@@ -93,6 +94,28 @@ pub fn build(
     // which built a unit neither run would produce and crashed in it. That cost most of a day.
     let fragment = super::cache::fragment_digest(&offered);
     let mut taken: Vec<String> = offered.iter().map(|n| (*n).to_string()).collect();
+    // A unit this binary already built, against this program, this constructor table and this
+    // inlining. Every worker rebuilt it: reading fourteen hundred cached bodies, substituting
+    // their placeholders and assembling twenty-nine megabytes of C, to hand it to an object cache
+    // that already had the answer. Sharing the built unit in process is not open to us --
+    // `ply_eval::Value` holds `Rc`, so nothing containing one crosses a rayon worker -- so it is
+    // shared through the same file system the objects are.
+    let unit_key = super::cache::unit_key(&loaded.keys, &offered, &ctors_digest, inlining);
+    // A unit entry that will not reconstruct is a reason to build one, never to fail.
+    if let Some(k) = &unit_key
+        && let Some(cached) = super::cache::read_unit(k)
+        && let Some(lib) = super::load::open_by_key(&cached.object)
+        && let Ok(native) = finish(loaded, lib, cached, ctors.clone())
+    {
+        super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if std::env::var("PLY_C_PHASES").is_ok() {
+            eprintln!(
+                "phases: whole unit from cache, {}ms",
+                started.elapsed().as_millis()
+            );
+        }
+        return Ok((native, Vec::new()));
+    }
     let mut refusals: Vec<Refused> = Vec::new();
 
     // The fixpoint: emit everything, drop what refused, and go round again, because dropping a
@@ -151,7 +174,9 @@ pub fn build(
             EMIT.load(Relaxed) / 1000
         );
     }
+    let t_emit = started.elapsed();
     let text = assemble(&bodies, &arities);
+    let t_assemble = started.elapsed();
     if let Ok(want) = std::env::var("PLY_C_DUMP") {
         if want == "*" {
             let mut sizes: Vec<(usize, &str)> = bodies
@@ -171,10 +196,67 @@ pub fn build(
         }
     }
     let lib = compile_and_load(&text, "unit")?;
-    bind(&lib)?;
+    let t_cc = started.elapsed();
 
-    // The address of every lambda entry, in the order `resolve` numbered them: what
-    // `rt_closure` indexes to put a code pointer in a closure object.
+    // Everything about the unit that is not the object: what a worker would otherwise emit
+    // twenty-nine megabytes of C to rediscover. Recording it *here*, and then going on to build
+    // this run's `Native` out of it, is what keeps the cached door honest -- the two doors are one
+    // path, so a unit that will not reconstruct fails every test rather than only a warm one.
+    let built = super::cache::UnitCache {
+        object: super::load::object_key(&text),
+        taken,
+        shapes: unit.layouts.all_shape_names(),
+        consts: unit.consts,
+        fields: unit.fields,
+        builtins: unit.builtins,
+        lambdas: unit.lambdas,
+    };
+    if let Some(k) = &unit_key {
+        super::cache::write_unit(k, &built);
+    }
+    let native = finish(loaded, lib, built, ctors)?;
+    if std::env::var("PLY_C_PHASES").is_ok() {
+        eprintln!(
+            "phases: emit+resolve {}ms, assemble {}ms, cc+load {}ms, tables {}ms, source {}MB",
+            t_emit.as_millis(),
+            (t_assemble - t_emit).as_millis(),
+            (t_cc - t_assemble).as_millis(),
+            (started.elapsed() - t_cc).as_millis(),
+            text.len() / 1_000_000,
+        );
+    }
+    Ok((native, refusals))
+}
+
+/// A loaded object plus a unit's tables, made into the `Native` a caller can enter.
+///
+/// Both doors reach it: the one that just emitted the unit and the one that found it in the cache.
+/// It takes a `UnitCache` from either, so the reconstruction is not a second implementation to be
+/// kept in step -- there is one, and every build exercises it.
+///
+/// A `Unit` is exactly what this rebuilds: its consts, fields, builtins and lambdas are recorded
+/// as they are, its `functions` is the taken set, and its `Layouts` is `ctors` plus the shapes
+/// interned in id order. Nothing else is in a `Unit`, which is why a recording of those is
+/// faithful; if a field is ever added to one, it has to be added here too or the ids move.
+fn finish(
+    loaded: &'static Source,
+    lib: Library,
+    cached: super::cache::UnitCache,
+    ctors: Vec<(Symbol, usize)>,
+) -> Result<Native> {
+    bind(&lib)?;
+    let mut unit = Unit::new(ctors.clone(), cached.taken);
+    unit.consts = cached.consts;
+    unit.fields = cached.fields;
+    unit.builtins = cached.builtins;
+    unit.lambdas = cached.lambdas;
+    // In id order, so the numbers baked into the emitted C still name these shapes.
+    for (id, names) in cached.shapes.iter().enumerate() {
+        let got = unit.layouts.shape(names.clone());
+        if got as usize != id {
+            bail!("a cached unit's shapes do not intern to the ids its C was emitted against");
+        }
+    }
     let mut functions = Vec::with_capacity(unit.lambdas.len());
     for symbol in &unit.lambdas {
         let Some(p) = lib.symbol(symbol) else {
@@ -182,7 +264,7 @@ pub fn build(
         };
         functions.push(p as usize);
     }
-
+    let taken = unit.functions.clone();
     let mut entries = HashMap::new();
     for name in &taken {
         let Some((def, _)) = loaded.definition(name) else {
@@ -215,16 +297,12 @@ pub fn build(
     }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
-    let tables = Rc::new(tables);
-    Ok((
-        Native {
-            lib,
-            entries,
-            constants,
-            tables,
-        },
-        refusals,
-    ))
+    Ok(Native {
+        lib,
+        entries,
+        constants,
+        tables: Rc::new(tables),
+    })
 }
 
 /// PROBE: where the emit's time goes, in microseconds.

@@ -10,7 +10,7 @@
 //!
 //! ## The instruments
 //!
-//! Eleven environment variables steer this tier, and until they were listed here the only way to
+//! Twelve environment variables steer this tier, and until they were listed here the only way to
 //! find one was to grep. None changes what a program means; each narrows, widens or reports on
 //! how it gets compiled.
 //!
@@ -21,6 +21,7 @@
 //! | `PLY_C_REFUSALS` | print what the tier refused and why, and how much of the offered set it took | `build.rs` |
 //! | `PLY_C_DUMP` | print one body's emitted C by name, or `*` for the unit's size and its largest bodies | `build.rs` |
 //! | `PLY_C_SPLIT` | print where the emit's time went: optimise-and-lower against emit | `build.rs` |
+//! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache | `build.rs` |
 //! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
 //! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |
 //! | `PLY_CC` | the C compiler to shell out to, `cc` by default | `load.rs` |
@@ -28,7 +29,7 @@
 //! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
 //! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
 //!
-//! Two things a twelfth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
+//! Two things a thirteenth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
 //! **before** its digest is taken, because a refusal is cached against that digest -- filtering
 //! after it served a narrowed run's refusals back to an unfiltered one and built a unit neither
 //! run would produce. And anything that changes an emitted body has to reach the cache key:
