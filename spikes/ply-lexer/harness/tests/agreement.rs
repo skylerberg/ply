@@ -46,6 +46,21 @@ fn spike_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// The lexer under test, which lives in `spikes/ply-parser` and not beside this harness.
+///
+/// There used to be a copy here. The two were 810 lines differing in forty: four `pub` markers,
+/// one branch in a different order, and a reshuffled test block -- with the parser spike's the
+/// superset, since the front end is what keeps it current. Two near-identical implementations of
+/// the same grammar, each with its own differential against `ply-syntax`, is one more than can be
+/// kept in step, and the copy that is not in the front end is the one that goes stale.
+fn lexer_source() -> PathBuf {
+    spike_dir()
+        .parent()
+        .expect("the spike sits under spikes/")
+        .join("ply-parser")
+        .join("lexer.ply")
+}
+
 /// Run the Ply lexer over `bytes` and return its dump.
 fn ply_dump(bytes: &[u8], label: &str) -> String {
     // A counter as well as the label: two tests may lex the same fixture, and `cargo test` runs
@@ -59,7 +74,7 @@ fn ply_dump(bytes: &[u8], label: &str) -> String {
     ));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).expect("a temp directory");
-    std::fs::copy(spike_dir().join("lexer.ply"), dir.join("lexer.ply")).expect("copy the lexer");
+    std::fs::copy(lexer_source(), dir.join("lexer.ply")).expect("copy the lexer");
     std::fs::write(
         dir.join("probe.ply"),
         format!(
@@ -417,7 +432,7 @@ fn the_comparison_notices_a_diagnostic_that_was_not_raised() {
 /// red rather than the harness quietly agreeing with itself.
 #[test]
 fn a_broken_ply_lexer_makes_the_agreement_tests_fail() {
-    let source = std::fs::read_to_string(spike_dir().join("lexer.ply")).expect("the lexer");
+    let source = std::fs::read_to_string(lexer_source()).expect("the lexer");
     // `++` is `plusplus`; a lexer that forgot maximal munch would call it two `plus` tokens.
     let broken = source.replacen("b\"plusplus\", b\"plus\"", "b\"plus\", b\"plus\"", 1);
     assert_ne!(broken, source, "the mutation did not apply to lexer.ply");

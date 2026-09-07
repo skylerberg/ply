@@ -114,7 +114,7 @@ fn targets(root: &Path) -> Vec<(String, Loaded)> {
     }
     for (file, name) in [
         ("examples/desk.ply", "desk"),
-        ("spikes/ply-lexer/lexer.ply", "lexer"),
+        ("spikes/ply-parser/lexer.ply", "lexer"),
     ] {
         if let Some(loaded) = load_file(root, file, name) {
             out.push((file.to_string(), loaded));
