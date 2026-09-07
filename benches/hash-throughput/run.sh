@@ -39,7 +39,7 @@ for t in (r.get("tests") or r.get("results") or []):
   echo "hash $arm 65536 bytes ${ms} ms"
 done
 
-echo "lexer none (spikes/ply-lexer-throughput/bench.sh, bytes/s is the rate the record's bar names)"
-(cd "$root/spikes/ply-lexer-throughput" && ./bench.sh "$ply")
+echo "lexer none (benches/lexer-throughput/bench.sh, bytes/s is the rate the record's bar names)"
+(cd "$root/benches/lexer-throughput" && ./bench.sh "$ply")
 echo "load-after $(load1)"
 "$root/.github/binary-is-current.sh" >/dev/null || { echo "the binary went STALE during the series; void" >&2; exit 2; }
