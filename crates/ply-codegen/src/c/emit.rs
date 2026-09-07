@@ -188,6 +188,19 @@ pub struct Emit<'a> {
     /// The locals the deferred records above will land in, declared once at the top so that
     /// materialising inside a branch still names something the whole body can see.
     record_locals: Vec<String>,
+    /// Locals holding a count on an object **this body just made** and nothing else can name.
+    ///
+    /// A helper that allocates hands back a word with a count of one, and the emitter then took a
+    /// second one at every use -- so `{a: f(x)}` built the field, counted it once for the record
+    /// and once more for nobody, and the second count was never released. That is the leak the
+    /// state kernel showed at 56 bytes an iteration *per temporary*, and it is `ply_inc` sitting at
+    /// 11.3% of the compiled front end's own profile.
+    ///
+    /// Only the fresh ones. A word read out of a record or a list is aliased by the thing it came
+    /// from, and moving a count out of an alias is how a record gets freed under a later read of
+    /// it -- ADR 0034's take, deleted twice. An allocation a helper just made is aliased by
+    /// nothing, so handing its count on is unambiguous.
+    made: std::collections::HashSet<String>,
     /// Bases already let go of, so that a second read marked as a last use does not let go again.
     released: std::collections::HashSet<String>,
     /// A local that is only another local's name, to the one it renames. The inliner binds a `let`
@@ -281,6 +294,7 @@ struct Frame {
     built: std::collections::HashMap<String, Vec<(Symbol, V)>>,
     deferred: std::collections::HashMap<String, Deferred>,
     record_locals: Vec<String>,
+    made: std::collections::HashSet<String>,
     released: std::collections::HashSet<String>,
     alias: std::collections::HashMap<String, String>,
     reads: std::collections::HashMap<Symbol, usize>,
@@ -394,6 +408,7 @@ impl<'a> Emit<'a> {
             built: std::collections::HashMap::new(),
             deferred: std::collections::HashMap::new(),
             record_locals: Vec::new(),
+            made: std::collections::HashSet::new(),
             released: std::collections::HashSet::new(),
             alias: std::collections::HashMap::new(),
             reads: std::collections::HashMap::new(),
@@ -574,6 +589,26 @@ impl<'a> Emit<'a> {
         self.bind_as(k, ty, expr)
     }
 
+    /// Whether `expr` is a call to a runtime helper that answers a word.
+    ///
+    /// Read off the expression text rather than passed at each of the two dozen call sites,
+    /// because the property belongs to the *helper* and the table in `prelude.rs` is where helpers
+    /// are declared. A helper added there is covered here without anyone remembering to.
+    ///
+    /// Every such helper answers an **owned** word: `rt_field` increments what it reads out,
+    /// `rt_ctor` allocates, `rt_concat` builds a new string, and each of them releases the word
+    /// arguments it was given -- which is what `owned` duplicates for on the way in. So the count
+    /// this body receives is its own to hand on, and taking a second one is the leak.
+    fn answers_owned(expr: &str) -> bool {
+        let Some(open) = expr.find('(') else {
+            return false;
+        };
+        let name = &expr[..open];
+        super::prelude::HELPERS
+            .iter()
+            .any(|h| h.answers && super::prelude::pointer_name(h.name) == name)
+    }
+
     fn bind_as(&mut self, k: Kind, ty: CTy, expr: impl AsRef<str>) -> V {
         let name = self.fresh();
         let ct = ctype(k);
@@ -601,6 +636,9 @@ impl<'a> Emit<'a> {
             self.built.insert(name.clone(), fields);
         }
         self.line(format!("{ct} {name} = {e};"));
+        if k == Kind::Boxed && Emit::answers_owned(&e) {
+            self.made.insert(name.clone());
+        }
         V { k, c: name, ty }
     }
 
@@ -760,16 +798,28 @@ impl<'a> Emit<'a> {
 
     /// A word a helper is about to take. Duplicated first, because a helper that takes will
     /// release: the duplicate is what puts the count back.
+    ///
+    /// Unless this body already holds a count on something nothing else can name, in which case it
+    /// hands *that* one on. Removed as it is spent, so a second use of the same local takes one of
+    /// its own -- which is what makes handing on safe where a plain "it was freshly made" flag
+    /// would not be.
     fn owned(&mut self, v: &V) -> String {
+        let already = self.made.remove(&v.c);
         let w = self.word(v);
         let t = self.fresh();
         self.line(format!("Word {t} = {w};"));
         // A scalar is an immediate and holds no count, so there is nothing to take: the kernel
         // builds sixteen-field records of them and the increments were the whole of the cost.
-        if !matches!(v.k, Kind::Num(_) | Kind::Int | Kind::Bool) {
+        if !already && !matches!(v.k, Kind::Num(_) | Kind::Int | Kind::Bool) {
             self.line(format!("ply_inc({t});"));
         }
         t
+    }
+
+    /// Records that `v` holds a count on an object this body just made and nothing else can name.
+    fn made_here(&mut self, v: V) -> V {
+        self.made.insert(v.c.clone());
+        v
     }
 
     // --- the walk -----------------------------------------------------------------------
@@ -886,7 +936,7 @@ impl<'a> Emit<'a> {
                 format!("rt_closure_p(ctx, {index}, {arity}, (Word)(intptr_t){arr}, 0)"),
             );
             self.check();
-            return Ok(v);
+            return Ok(self.made_here(v));
         }
         if q.is_bare()
             && let Some(b) = Builtin::from_name(q.symbol())
@@ -1498,6 +1548,7 @@ impl<'a> Emit<'a> {
         std::mem::swap(&mut self.built, &mut f.built);
         std::mem::swap(&mut self.deferred, &mut f.deferred);
         std::mem::swap(&mut self.record_locals, &mut f.record_locals);
+        std::mem::swap(&mut self.made, &mut f.made);
         std::mem::swap(&mut self.released, &mut f.released);
         std::mem::swap(&mut self.alias, &mut f.alias);
         std::mem::swap(&mut self.reads, &mut f.reads);
@@ -1556,7 +1607,7 @@ impl<'a> Emit<'a> {
             ),
         );
         self.check();
-        Ok(v)
+        Ok(self.made_here(v))
     }
 
     /// The lambda's own C function, emitted into a frame of its own.
@@ -1868,7 +1919,7 @@ impl<'a> Emit<'a> {
             self.built
                 .insert(r.c.clone(), names.iter().cloned().zip(vals).collect());
         }
-        r
+        self.made_here(r)
     }
 
     /// `{..b, f: e}`: the written fields, then the copied ones read out of the base. Built fresh
@@ -1996,7 +2047,7 @@ impl<'a> Emit<'a> {
             format!("rt_list_p(ctx, (Word)(intptr_t){arr}, {})", items.len()),
         );
         self.check();
-        Ok(v)
+        Ok(self.made_here(v))
     }
 
     fn app(&mut self, func: &Code, args: &[Code]) -> Result<V> {
@@ -2097,7 +2148,7 @@ impl<'a> Emit<'a> {
                     format!("rt_ctor_p(ctx, {i}, (Word)(intptr_t){arr}, {})", args.len()),
                 );
                 self.check();
-                return Ok(v);
+                return Ok(self.made_here(v));
             }
             let _ = bare;
         }
