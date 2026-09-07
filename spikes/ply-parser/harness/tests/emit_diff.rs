@@ -294,6 +294,12 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn k(a: Int, b: Int) -> Int = a - b\n",
         "fn d(a: Int, b: Int) -> Int = a / b\n",
         "fn r(a: Int, b: Int) -> Int = a % b\n",
+        "fn lt(a: Int, b: Int) -> Bool = a < b\n",
+        "fn le(a: Int, b: Int) -> Bool = a <= b\n",
+        "fn gt(a: Int, b: Int) -> Bool = a > b\n",
+        "fn ge(a: Int, b: Int) -> Bool = a >= b\n",
+        "fn eq(a: Int, b: Int) -> Bool = a == b\n",
+        "fn ne(a: Int, b: Int) -> Bool = a != b\n",
     ];
     let inputs: Vec<(String, Vec<u8>)> = programs
         .iter()
@@ -306,7 +312,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 5, "only {reached} bodies were emitted");
+    assert!(reached >= 11, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
