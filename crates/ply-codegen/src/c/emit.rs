@@ -211,6 +211,10 @@ pub struct Emit<'a> {
     counted: std::collections::HashSet<(String, Symbol)>,
     /// Whether `count_reads` has run. `bind_name` reads the table it fills.
     counted_reads: bool,
+    /// The nodes in the body's tail position, by identity. Filled by `mark_tails` before anything
+    /// is emitted, and the one place an update is allowed to let its base go without asking how
+    /// many other names read it.
+    tails: std::collections::HashSet<*const Code>,
     /// The lambda bodies this definition contains, as whole C functions, emitted beside it rather
     /// than inside it. Its length is how the next one is numbered; which *row* of the unit's code
     /// table each takes is `tables.lambdas`, which also holds the entries of definitions this body
@@ -256,13 +260,16 @@ impl Tables {
 
 /// Where a release is being made from. A field read and a record update both see the lowering's
 /// last use, and the two are not equally safe to act on.
-#[derive(PartialEq)]
+#[derive(PartialEq, Eq, Clone, Copy)]
 enum Site {
     /// A field read: the base may be read again through a name this one does not know about, at a
     /// point the emitter reaches later than the lowering marked it.
     Field,
     /// A record update, which has read every field it copies before it lets go.
     Update,
+    /// The same, in the body's tail position: nothing in this function is emitted after it, so
+    /// there is no later read to be wrong about. See `mark_tails`.
+    TailUpdate,
 }
 
 /// One function's worth of emitter state, so that a lambda can be written as a function of its
@@ -398,6 +405,7 @@ impl<'a> Emit<'a> {
             reads_by_root: std::collections::HashMap::new(),
             counted: std::collections::HashSet::new(),
             counted_reads: false,
+            tails: std::collections::HashSet::new(),
             lambda_defs: Vec::new(),
             tables: Tables::default(),
         }
@@ -409,6 +417,39 @@ impl<'a> Emit<'a> {
             .iter()
             .map(|n| format!("  Word tok{n} = 0;\n"))
             .collect()
+    }
+
+    /// The nodes nothing in this function is emitted after.
+    ///
+    /// `release_base` cannot ask "is this the last read" of the tree, because the emitter does not
+    /// walk it in the order the lowering marked -- a record's fields go in the shape's order, not
+    /// the source's -- and two attempts to answer it by counting reads as they are emitted both
+    /// failed the self-hosted front end. This asks a smaller question that has an answer: *is
+    /// anything emitted after this at all*. Down a block's tail, and into both arms of an `if` and
+    /// every arm of a `match`, because only one of those runs.
+    ///
+    /// Deliberately not into a call's arguments, which is what keeps a fused `fold` out: its
+    /// lambda body is emitted once and runs once per iteration, so "nothing after it" is true of
+    /// the text and false of the execution.
+    pub fn mark_tails(&mut self, code: &Code) {
+        self.tails.insert(code as *const Code);
+        match &code.kind {
+            NodeKind::Block { tail: Some(t), .. } => self.mark_tails(t),
+            NodeKind::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                self.mark_tails(then_branch);
+                self.mark_tails(else_branch);
+            }
+            NodeKind::Match { arms, .. } => {
+                for arm in arms.iter() {
+                    self.mark_tails(&arm.body);
+                }
+            }
+            _ => {}
+        }
     }
 
     /// Count every bare name the body reads, once, before anything is emitted.
@@ -765,7 +806,10 @@ impl<'a> Emit<'a> {
                 captures,
                 ..
             } => self.lambda(params, body, captures),
-            NodeKind::RecordUpdate { base, copies, sets } => self.record_update(base, copies, sets),
+            NodeKind::RecordUpdate { base, copies, sets } => {
+                let tail = self.tails.contains(&(code as *const Code));
+                self.record_update(base, copies, sets, tail)
+            }
             other => self.refuse(describe(other).to_string()),
         }
     }
@@ -1655,15 +1699,34 @@ impl<'a> Emit<'a> {
         // per iteration -- so something else the count does not see reads the object again. Do not
         // retry it without a smaller failing case in hand than thirteen thousand lines.
         //
-        // What it costs is measured rather than guessed: `{..s, ..}` over the state kernel's
-        // five-field record reads `s` seven times, so the release is suppressed and each of two
-        // hundred thousand iterations allocates afresh. ADR 0035's gate reads 3.7x there against
-        // a bar of 3.0, where the in-process tier reads 2.0x. That is the open item on this tier,
-        // and the shape of the fix is a read *counted as it is emitted* rather than in total: the
-        // release is safe exactly when no read of the object is still to come, which neither the
-        // total nor the lowering's order answers.
-        let _ = from;
-        if self.shared_reads(&b.c) != 1 {
+        // The exception below is the answer, and it is position rather than counting. At the
+        // body's *tail* nothing is emitted after the update, so the later read this guard exists
+        // to protect cannot be there to protect -- which is a syntactic fact about the text rather
+        // than an inference about order, and that is the whole difference from the two attempts
+        // above. `mark_tails` says which nodes those are, and deliberately does not follow a
+        // call's arguments: a fused `fold`'s lambda body is emitted once and runs once per
+        // iteration, so "nothing after it" is true of the text and false of the execution.
+        //
+        // What it recovers, measured: the state kernel's `{..s, ..}` reads `s` seven times, so
+        // every one of two hundred thousand iterations used to allocate a five-field record and
+        // keep it. The kernel's resident memory falls 167MB to 156MB -- 56 bytes an iteration,
+        // which is exactly the record. Its *clock* does not move, and that is the honest reading:
+        // the allocation was already cheap. k2 stands at 3.5x against a bar of 3.0 either way.
+        //
+        // What is left is larger than this and is not a guard. This tier's return ABI hands back
+        // a borrow -- a caller `ply_inc`s a call's result to keep it -- and nothing releases an
+        // owned temporary, so `let k = key_of(x)` leaks the bytes it built whatever this rule
+        // says. That is why the kernel is still 3.3GB over twenty repeats where the in-process
+        // tier is 240MB. Fixing it means owned returns and a release for every temporary, which
+        // is a discipline rather than a rule, and it is the open item on this tier.
+        // A tail update is the exception, and the only one: nothing in this function is emitted
+        // after it, so the read this guard exists to protect cannot be there to protect. Without
+        // it a body that reads its record parameter more than once -- which is every accumulator
+        // this tier compiles -- never lets the record go at all. The state kernel allocates two
+        // hundred thousand five-field records and frees none: 3.7GB of resident memory against
+        // the in-process tier's 240MB, and `{..s, a: s.a + x}` over a boxed field grows a run's
+        // memory linearly in its iterations.
+        if from != Site::TailUpdate && self.shared_reads(&b.c) != 1 {
             return;
         }
         // A record held back dies without ever having been built, and holds no counts -- only a
@@ -1826,6 +1889,7 @@ impl<'a> Emit<'a> {
         base: &Code,
         copies: &[ply_syntax::ast::Ident],
         sets: &[(Symbol, Code)],
+        tail: bool,
     ) -> Result<V> {
         let mut names: Vec<Symbol> = sets.iter().map(|(n, _)| n.clone()).collect();
         names.extend(copies.iter().map(|c| c.name.clone()));
@@ -1918,7 +1982,7 @@ impl<'a> Emit<'a> {
         //
         // Every copy was counted above before this runs, so the walk that lets the base's children
         // go leaves the ones this record keeps alone, and drops exactly the ones it replaced.
-        self.release_from(base, &b, Site::Update);
+        self.release_from(base, &b, if tail { Site::TailUpdate } else { Site::Update });
         Ok(self.emit_record(&names, words, kinds, vals))
     }
 

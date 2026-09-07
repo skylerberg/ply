@@ -694,3 +694,50 @@ pub fn probe(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len
     );
     let _ = loaded;
 }
+
+/// Reading the accumulator more than once costs no allocations.
+///
+/// The rule that lets a record go is guarded on the base being read exactly once, because the
+/// emitter does not visit reads in the order the lowering marked them and two attempts to relax
+/// that guard by counting freed a record something later read. Every accumulator this tier
+/// compiles reads its record more than once -- `{..s, count: s.count + 1}` is two -- so the guard
+/// meant the record was never let go at all, and a fold allocated one per iteration and kept it.
+///
+/// The exception is position rather than counting: at the body's tail nothing is emitted after the
+/// update, so the later read the guard protects cannot be there to protect. This is what says so.
+/// `wide` and `narrow` differ only in how many times they read `s`, and on the old rule `wide`
+/// allocated one five-word record per iteration that `narrow` did not.
+#[test]
+fn an_accumulator_read_more_than_once_is_still_let_go() {
+    let source = r#"
+type S = { i: Int, tag: Bytes }
+fn narrow(s: S, x: Int) -> S = {..s, i: x}
+fn wide(s: S, x: Int) -> S = {..s, i: s.i + x}
+pub fn with_narrow(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, narrow).i
+pub fn with_wide(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, wide).i
+"#;
+    let Some((loaded, native)) = tests_support::unit(source) else {
+        return;
+    };
+    let rounds = 500i64;
+    let allocations = |name: &str| -> usize {
+        let entry: crate::jit::Entry = native.entry(name).expect("compiled");
+        let mut ctx = native.context();
+        ctx.fuel = 1_000_000;
+        let before = ctx.heap.allocated();
+        let args = [crate::heap::imm(rounds)];
+        let w = unsafe { entry(&mut ctx, args.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised");
+        let _ = w;
+        ctx.heap.allocated() - before
+    };
+    let narrow = allocations("m.with_narrow");
+    let wide = allocations("m.with_wide");
+    assert!(
+        wide <= narrow,
+        "reading the accumulator twice allocated {} more object(s) over {rounds} rounds than \
+         reading it once: the update is not letting its base go",
+        wide - narrow
+    );
+    let _ = loaded;
+}
