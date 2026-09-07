@@ -198,6 +198,10 @@ pub fn build(
     let lib = compile_and_load(&text, "unit")?;
     let t_cc = started.elapsed();
 
+    // For its effect on the code table, whose rows are recorded just below: `finish` reads the
+    // same slots back out of the table this completes.
+    let _ = constants_of(loaded, &mut unit);
+
     // Everything about the unit that is not the object: what a worker would otherwise emit
     // twenty-nine megabytes of C to rediscover. Recording it *here*, and then going on to build
     // this run's `Native` out of it, is what keeps the cached door honest -- the two doors are one
@@ -257,6 +261,9 @@ fn finish(
             bail!("a cached unit's shapes do not intern to the ids its C was emitted against");
         }
     }
+    // Before the addresses, because it can add a row: a root nothing calls still needs a slot for
+    // the seam to remember it in, and the slot is a row of the same table.
+    let constants = constants_of(loaded, &mut unit);
     let mut functions = Vec::with_capacity(unit.lambdas.len());
     for symbol in &unit.lambdas {
         let Some(p) = lib.symbol(symbol) else {
@@ -282,19 +289,6 @@ fn finish(
             ),
         );
     }
-    // The pure nullary roots, numbered as the in-process tier numbers them: the index is into the
-    // seam's memo, and what it indexes is an answer rather than a call.
-    let mut constants = HashMap::new();
-    for name in &taken {
-        if loaded
-            .definition(name)
-            .is_some_and(|(d, _)| d.params.is_empty())
-            && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(name))
-        {
-            let next = constants.len();
-            constants.insert(name.clone(), next);
-        }
-    }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
     Ok(Native {
@@ -303,6 +297,33 @@ fn finish(
         constants,
         tables: Rc::new(tables),
     })
+}
+
+/// The memo slot of every pure nullary root, which is also the row of the unit's code table that
+/// `rt_constant` enters it through.
+///
+/// One numbering, not two. The seam reads a slot to answer without entering, and `rt_constant`
+/// reads the same slot to answer without calling; they have to agree or a value remembered by one
+/// is invisible to the other. Interning the entry symbol into the code table is what makes them
+/// agree, and it is why this runs before the addresses are looked up: a root the compiled code
+/// never calls is not in the table yet and still needs a slot.
+///
+/// The emitter's own test is narrower -- it also asks that the answer be a handle, since a root
+/// that answers a register is cheaper to call than to look up. A root listed here and not emitted
+/// against simply keeps a slot only the seam uses, which is what the in-process tier does too.
+fn constants_of(loaded: &'static Source, unit: &mut Unit) -> HashMap<String, usize> {
+    let mut constants = HashMap::new();
+    for name in &unit.functions.clone() {
+        if loaded
+            .definition(name)
+            .is_some_and(|(d, _)| d.params.is_empty())
+            && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(name))
+        {
+            let slot = unit.lambda(&format!("{}_entry", mangle(name)));
+            constants.insert(name.clone(), slot);
+        }
+    }
+    constants
 }
 
 /// PROBE: where the emit's time goes, in microseconds.

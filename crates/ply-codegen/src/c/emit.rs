@@ -1956,6 +1956,31 @@ impl<'a> Emit<'a> {
                 if def.params.len() != args.len() {
                     return self.refuse(format!("`{bare}` called with {} arguments", args.len()));
                 }
+                let ret = self.declared_ret(&full);
+                // A pure nullary root whose answer is a handle: ask the runtime for the answer it
+                // already has rather than building it again. Without this the gate's k1 rebuilds a
+                // sixty-five-kilobyte byte literal per call, and a two-hundred-element list built
+                // in a twenty-thousand-iteration fold costs 56ms here against 0.1ms in process --
+                // not because the code is worse, but because the in-process tier remembers and
+                // this one did not. One that answers a register is cheaper to call than to look up,
+                // which is why the test is on the declared return.
+                if args.is_empty()
+                    && ret.kind() == Kind::Boxed
+                    && ply_eval::memo::pure_by_published_row(
+                        Some(self.src.check),
+                        &Symbol::new(&full),
+                    )
+                {
+                    self.tables.calls.push(full.clone());
+                    let index = self.local_lambda(&format!("{}_entry", mangle(&full)));
+                    let held = self.bind(Kind::Boxed, format!("rt_constant_p(ctx, {index})"));
+                    self.check();
+                    return Ok(V {
+                        k: Kind::Boxed,
+                        c: held.c,
+                        ty: ret,
+                    });
+                }
                 let mut ws = Vec::with_capacity(args.len());
                 for a in args {
                     let v = self.expr(a)?;
@@ -1968,7 +1993,6 @@ impl<'a> Emit<'a> {
                     if ws.is_empty() { "" } else { ", " },
                     ws.join(", ")
                 );
-                let ret = self.declared_ret(&full);
                 let held = self.bind(Kind::Boxed, call);
                 self.check();
                 let kind = ret.kind();

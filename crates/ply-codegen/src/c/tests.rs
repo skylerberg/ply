@@ -645,3 +645,52 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
         "the unit read back from the cache does not answer what the one that wrote it did"
     );
 }
+
+/// A pure nullary root that answers a handle is asked once, not once per call.
+///
+/// The in-process tier has always done this: `rt_constant` runs the root, remembers the word, and
+/// answers it from then on. This tier declared the helper, bound it, and never emitted it -- so a
+/// two-hundred-and-fifty-six-element list built inside a twenty-thousand-iteration fold cost 56ms
+/// here against 0.1ms in process. Not worse code; the same code, run twenty thousand more times.
+///
+/// The memo is the observable, and it is the right one to assert on rather than a clock: without
+/// the emitted `rt_constant` the compiled body calls the root directly and the slot stays empty
+/// however long the run takes.
+///
+/// The slot is also a row of the unit's code table, which is what `rt_constant` calls through. Two
+/// numberings here would be a value remembered by the seam that compiled code cannot see, and the
+/// index this tier handed the seam was not a row of that table until the helper was emitted.
+#[test]
+fn a_pure_nullary_root_that_answers_a_handle_is_asked_once() {
+    let source = r#"
+pub fn table() -> List<Int> = map(range(0, 32), |i: Int| i * 7 + 1)
+pub fn probe(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len(table()))
+"#;
+    let Some((loaded, native)) = tests_support::unit(source) else {
+        return;
+    };
+    let slot = native
+        .constant_index("m.table")
+        .expect("a pure nullary root is given a memo slot");
+    assert!(
+        slot < native.tables().functions.len(),
+        "the memo slot is not a row of the code table `rt_constant` calls through"
+    );
+    assert!(
+        native.tables().memoized(slot).is_none(),
+        "something was remembered before the root ever ran"
+    );
+
+    let entry: crate::jit::Entry = native.entry("m.probe").expect("`probe` was refused");
+    let mut ctx = native.context();
+    ctx.fuel = 100_000;
+    let args = [crate::heap::imm(64)];
+    let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
+    assert_eq!(ctx.failed, 0, "`probe` raised");
+    assert_eq!(crate::heap::imm_value(answer), 32 * 64);
+    assert!(
+        native.tables().memoized(slot).is_some(),
+        "`probe` called the root directly instead of asking the runtime for its answer"
+    );
+    let _ = loaded;
+}
