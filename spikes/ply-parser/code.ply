@@ -46,6 +46,9 @@ pub type Node =
   | NList({ items: List<Code> })
   | NRecord({ fields: List<CField> })
   | NMatch({ scrutinee: Code, arms: List<CArm> })
+  | NPerform({ effect: Bytes, op: Bytes, resource: Bytes, args: List<Code> })
+  | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
+  | NRegion({ body: Code })
   | NField({ base: Code, field: Bytes })
 
 pub type CField = { name: Bytes, value: Code }
@@ -175,6 +178,14 @@ fn dump_node(n: Node) -> Bytes =
                                             match a.guard { Some(g) -> dump(g), None -> b"-" },
                                             b",", dump(a.body), b")"])),
                         b")"]),
+    NPerform(p) ->
+      bytes_concat_all([b"perform(", p.effect, b",", p.op, b",", p.resource,
+                        fold(p.args, b"", |acc: Bytes, a: Code| bytes_concat_all([acc, b",", dump(a)])),
+                        b")"]),
+    NCell(c) ->
+      bytes_concat_all([b"cell(", c.resource, b",", c.binder, b",", slot_tag(c.slot), b",",
+                        dump(c.init), b",", dump(c.body), b")"]),
+    NRegion(r) -> bytes_concat_all([b"region(", dump(r.body), b")"]),
     NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
   }
 
@@ -222,7 +233,8 @@ fn at(xs: List<Bind>, i: Int) -> Bind =
 pub fn covers() -> List<Bytes> =
   [b"literals", b"unary", b"binary", b"if", b"list", b"field", b"application",
    b"records", b"blocks and `let`", b"parameters and their slots",
-   b"the ownership marks", b"match and every pattern form"]
+   b"the ownership marks", b"match and every pattern form",
+   b"perform, with_cell and with_region"]
 
 type Out = { code: Code, frame: Frame }
 
@@ -308,6 +320,38 @@ fn lower_in(e: Expr, f: Frame) -> Option<Out> =
         if !walked.ok { None } else {
           Some({ code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: walked.arms }) },
                  frame: unscope(walked.frame, depth) })
+        }
+      },
+    },
+    // The effect forms that open no barrier of their own. `handle` and
+    // `simulate` do, and are not here.
+    EWithRegion(x) -> match lower_in(x.body, f) {
+      Some(b) -> Some({ code: { own: Borrowed, node: NRegion({ body: b.code }) }, frame: b.frame }),
+      None -> None,
+    },
+    EPerform(x) -> match lower_seq(x.args, f) {
+      None -> None,
+      Some(r) -> Some({
+        code: { own: Borrowed, node: NPerform({
+          effect: qname_text(x.eff), op: x.op.name,
+          resource: match x.resource { Some(id) -> id.name, None -> b"" },
+          args: r.codes }) },
+        frame: r.frame }),
+    },
+    // The binder is in scope for the body and leaves at its end; the init is
+    // evaluated before it exists.
+    EWithCell(x) -> match lower_in(x.init, f) {
+      None -> None,
+      Some(i) -> {
+        let depth = len(i.frame.scope);
+        let inner = bind(i.frame, x.binder.name);
+        match lower_in(x.body, inner) {
+          None -> None,
+          Some(b) -> Some({
+            code: { own: Borrowed, node: NCell({
+              resource: x.resource.name, binder: x.binder.name,
+              slot: find(inner, x.binder.name), init: i.code, body: b.code }) },
+            frame: unscope(b.frame, depth) }),
         }
       },
     },
@@ -583,6 +627,29 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
       let sc = mark(m.scrutinee, marked.live, marked.livew, marked.livef);
       { code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
         live: sc.live, livew: sc.livew, livef: sc.livef }
+    },
+    NRegion(r) -> {
+      let b = mark(r.body, live, livew, livef);
+      { code: { own: Borrowed, node: NRegion({ body: b.code }) },
+        live: b.live, livew: b.livew, livef: b.livef }
+    },
+    NPerform(p) -> {
+      let r = mark_seq(p.args, live, livew, livef);
+      { code: { own: Borrowed, node: NPerform({ effect: p.effect, op: p.op, resource: p.resource,
+                                                args: r.codes }) },
+        live: r.live, livew: r.livew, livef: r.livef }
+    },
+    // The binder dies at the `with_cell`, as a `let`'s does at its `let`.
+    NCell(c) -> {
+      let b = mark(c.body, live, livew, livef);
+      let after = match c.slot {
+        None -> { l: b.live, w: b.livew, f: b.livef },
+        Some(s) -> { l: live_drop(b.live, s), w: live_drop(b.livew, s), f: live_drop_f(b.livef, s) },
+      };
+      let i = mark(c.init, after.l, after.w, after.f);
+      { code: { own: Borrowed, node: NCell({ resource: c.resource, binder: c.binder, slot: c.slot,
+                                             init: i.code, body: b.code }) },
+        live: i.live, livew: i.livew, livef: i.livef }
     },
     NIf(i) -> {
       let t = mark(i.then_branch, live, livew, livef);
