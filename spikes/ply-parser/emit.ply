@@ -17,7 +17,7 @@
 // `opt.rs`, not of this file.
 
 import spine (num)
-import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, CStmt, CLet, CDo, Own, Borrowed, Owned, OwnedField, lower_fn)
+import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, CStmt, CLet, CDo, Own, Borrowed, Owned, OwnedField, lower_fn)
 import items (Item, IFn, parse)
 import exprs (Param)
 import types (TypeExpr, TCon)
@@ -83,6 +83,15 @@ fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
     v: { k: k, c: f.name } }
 }
 
+// A value collected into an aggregate: boxed, and held in a local declared
+// `Word` rather than by its kind's C type, because the array a list is built
+// from is an array of words.
+fn bind_word(em: Em, v: V) -> Out = {
+  let f = fresh(em);
+  { em: line(f.em, bytes_concat_all([b"Word ", f.name, b" = ", as_word(v), b";"])),
+    v: { k: KBoxed, c: f.name } }
+}
+
 // The check after any helper that can raise: a body that failed answers nothing.
 fn check(em: Em) -> Em = line(em, b"if (ctx->failed) return 0;")
 
@@ -98,6 +107,13 @@ fn as_int(em: Em, v: V) -> Out =
   }
 
 // The other direction, for a value leaving the body.
+fn as_bool(em: Em, v: V) -> Out =
+  match v.k {
+    KBool -> { em: em, v: v },
+    KInt -> { em: em, v: { k: KBool, c: bytes_concat_all([b"((", v.c, b") != 0)"]) } },
+    KBoxed -> { em: em, v: { k: KBool, c: bytes_concat_all([b"rt_unbox_bool_p(ctx, ", v.c, b")"]) } },
+  }
+
 fn as_word(v: V) -> Bytes =
   match v.k {
     KBoxed -> v.c,
@@ -118,12 +134,16 @@ pub fn covers() -> List<Bytes> =
    b"add, sub, mul, div and rem on Int",
    b"lt, le, gt, ge, eq and ne on Int",
    b"if, with either branch's value joined in one temporary",
-   b"a block, and the `let`s in it"]
+   b"a block, and the `let`s in it",
+   b"a list of values",
+   b"neg and not, and the Bool literals"]
 
 fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
     NLit(l) -> match l {
       LInt(n) -> Some({ em: em, v: { k: KInt, c: bytes_concat_all([b"INT64_C(", num(n), b")"]) } }),
+      // A `Bool` is C's own 1 and 0 until something asks for its word.
+      LBool(b) -> Some({ em: em, v: { k: KBool, c: if b { b"1" } else { b"0" } } }),
       _ -> None,
     },
     // A parameter is `pN`; anything else needs the window, which is the next
@@ -172,6 +192,35 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         },
       },
     },
+    NUnary(u) -> match expr(em, u.operand, params) {
+      None -> None,
+      Some(o) ->
+        if u.op == b"not" {
+          let bo = as_bool(o.em, o.v);
+          Some(bind(bo.em, KBool, bytes_concat_all([b"!(", bo.v.c, b")"])))
+        } else if u.op == b"neg" {
+          let a = as_int(o.em, o.v);
+          // Negation overflows at one input, and the guard runs before the value
+          // exists rather than after: code 2, as `rt_arith_p`'s table numbers it.
+          let g = line(a.em, bytes_concat_all([b"if (", a.v.c,
+            b" == INT64_MIN) { rt_overflow_p(ctx, 2); return 0; }"]));
+          Some(bind(g, KInt, bytes_concat_all([b"-(", a.v.c, b")"])))
+        } else { None },
+    },
+    // A list: every item boxed into a `Word` local, then the array they are
+    // read out of, then the helper. The helper can raise, so the check follows.
+    NList(l) -> match items(em, l.items, params, 0, []) {
+      None -> None,
+      Some(w) -> {
+        let arr = fresh(w.em);
+        // C has no empty initialiser, so an empty list still declares one word.
+        let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
+          if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
+        let o = bind(e, KBoxed, bytes_concat_all([b"rt_list_p(ctx, (Word)(intptr_t)", arr.name,
+          b", ", num(len(l.items)), b")"]));
+        Some({ em: check(o.em), v: o.v })
+      },
+    },
     NIf(i) -> match expr(em, i.cond, params) {
       None -> None,
       Some(cnd) -> {
@@ -206,6 +255,27 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     },
     _ -> None,
   }
+
+// The items of a list, left to right, each boxed into its own `Word` local.
+fn items(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
+    -> Option<{ em: Em, names: List<Bytes> }> =
+  if i >= len(xs) { Some({ em: em, names: acc }) } else {
+    match list_at(xs, i) {
+      None -> None,
+      Some(x) -> match expr(em, x, params) {
+        None -> None,
+        Some(o) -> {
+          let w = bind_word(o.em, o.v);
+          items(w.em, xs, params, i + 1, push(acc, w.v.c))
+        },
+      },
+    }
+  }
+
+fn bytes_join(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
+    bytes_concat_all([acc, if i == 0 { b"" } else { sep },
+                      match list_at(xs, i) { Some(x) -> x, None -> b"" }]))
 
 // A block's statements, in order. A `let` binds its value under its own name --
 // the reference writes the rename even when the value is already a temporary --
@@ -290,7 +360,7 @@ fn arithmetic(em: Em, op: Bytes, l: V, r: V) -> Out =
 fn prologue(em: Em, params: List<P>) -> Em =
   fold(range(0, len(params)), em, |acc: Em, i: Int| {
     let k = match list_at(params, i) { Some(p) -> p.k, None -> KInt };
-    let o = bind(acc, KInt, match k {
+    let o = bind(acc, k, match k {
       KBool -> bytes_concat_all([b"rt_unbox_bool_p(ctx, p", num(i), b")"]),
       _ -> bytes_concat_all([b"(ply_is_imm(p", num(i), b") ? ply_imm_value(p", num(i),
                              b") : rt_unbox_int_p(ctx, p", num(i), b"))"]),

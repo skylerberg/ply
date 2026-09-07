@@ -323,6 +323,17 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn letif(a: Int, b: Int) -> Int = {\n  let c = if a < b { b } else { a };\n  c + 1\n}\n",
         // A binding inside a branch, whose slot the other branch never fills.
         "fn iflet(a: Int, b: Int) -> Int = if a < b {\n  let c = a * 2;\n  c + b\n} else { b }\n",
+        // Lists: each item boxed into a `Word` local, then the array, then the helper.
+        "fn lst(a: Int) -> List<Int> = [a, 1]\n",
+        "fn lst1(a: Int, b: Int) -> List<Int> = [a + b]\n",
+        "fn lst0() -> List<Int> = []\n",
+        // The unary pair, and the literal that is not an `Int`.
+        "fn tru() -> Bool = true\n",
+        "fn fls() -> Bool = false\n",
+        "fn neg(a: Int) -> Int = -a\n",
+        "fn nt(b: Bool) -> Bool = !b\n",
+        "fn ntc(a: Int, b: Int) -> Bool = !(a < b)\n",
+        "fn negif(a: Int, b: Int) -> Int = if a < b { -a } else { -b }\n",
     ];
     let inputs: Vec<(String, Vec<u8>)> = programs
         .iter()
@@ -335,7 +346,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 23, "only {reached} bodies were emitted");
+    assert!(reached >= 32, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
