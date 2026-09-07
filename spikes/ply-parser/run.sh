@@ -44,6 +44,15 @@ cargo test --lib
 cargo test --test fields -- --nocapture
 
 echo
+echo "==> the oracle for the stage after the front end: the lowered form"
+# Not a differential yet -- the second implementation is not written. What it checks is that the
+# oracle a code generator in Ply would be compared against is usable: total over the shipped
+# corpus, stable run to run, and sensitive to the slot a name reads and to whether a read is its
+# last. A canonical form that erased either would compare two ports equal while one of them freed
+# too early, which is the class three separate defects in the C tier have been.
+cargo test --test lower -- --nocapture
+
+echo
 echo "==> the differential: this parser against crates/ply-syntax"
 # Piped through `tee` and then grepped for a **non-zero** pass count, for the
 # reason `.github/workflows/ci.yml`'s `test` job gives at length about its own
