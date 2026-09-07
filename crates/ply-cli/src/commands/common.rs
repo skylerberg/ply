@@ -70,7 +70,7 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
 /// A test's root is a definition here like any other, named the way `ply_codegen` names it.
 /// `HashOutput::tests` is parallel to the program's tests walked module by module in load order,
 /// which `driver::test_hashes_of` already relies on and says so.
-fn emit_keys(
+pub(crate) fn emit_keys(
     program: &ply_syntax::ast::Program,
     hashes: &ply_hash::HashOutput,
 ) -> std::collections::HashMap<String, String> {

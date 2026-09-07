@@ -61,19 +61,11 @@ impl Native {
 }
 
 /// Emit, compile and load `names` as one unit, with what it refused.
-pub fn build(
-    loaded: &'static Source,
-    names: &[&str],
-    _opts: Opts,
-) -> Result<(Native, Vec<Refused>)> {
-    let started = std::time::Instant::now();
-    let ctors = loaded.ctors();
-    let ctors_digest = super::cache::ctors_digest(&ctors);
+/// The definitions actually offered, after the two bisecting instruments, and the digest a refusal
+/// is cached against. Both callers need the same answer: a refusal is cached against this digest,
+/// so an instrument that narrows the offered set has to move it.
+fn offered_set<'a>(names: &[&'a str]) -> (Vec<&'a str>, String) {
     let mut offered: Vec<&str> = names.to_vec();
-    // What the inliner will actually be told, profile and override included, because that is what
-    // the emitted body is a function of and the cache is keyed on it.
-    let how = super::toolchain::Profile::current().inlining().overridden();
-    let inlining = (how.budget, how.depth);
     // A bisecting instrument: compile only the definitions named, so that a wrong answer can be
     // narrowed to the body that produces it. The fixpoint then refuses whatever calls the rest.
     if let Ok(only) = std::env::var("PLY_C_ONLY") {
@@ -93,7 +85,151 @@ pub fn build(
     // Filtering after it meant a bisecting run's refusals were served back to an unfiltered one,
     // which built a unit neither run would produce and crashed in it. That cost most of a day.
     let fragment = super::cache::fragment_digest(&offered);
+    (offered, fragment)
+}
+
+/// Everything the fixpoint settles on: the assembled source, the unit its tables ended in, the
+/// definitions it kept, and the ones it refused.
+struct Emitted {
+    text: String,
+    unit: Unit,
+    taken: Vec<String>,
+    refusals: Vec<Refused>,
+}
+
+/// The whole unit as C, without compiling it.
+///
+/// What a bootstrap archives. `build` compiles and loads; this stops one step earlier and hands
+/// back the text, so a tree can keep its front end as a C file that any C compiler turns into a
+/// working front end -- the only form of "check in the compiler" that is neither a per-platform
+/// binary nor a dependency on the compiler being replaced.
+pub fn emit_unit(loaded: &'static Source, names: &[&str]) -> Result<(String, Vec<Refused>)> {
+    let ctors = loaded.ctors();
+    let ctors_digest = super::cache::ctors_digest(&ctors);
+    let (offered, fragment) = offered_set(names);
+    let how = super::toolchain::Profile::current().inlining().overridden();
+    let e = emit_all(
+        loaded,
+        &offered,
+        &fragment,
+        &ctors,
+        &ctors_digest,
+        (how.budget, how.depth),
+    )?;
+    Ok((e.text, e.refusals))
+}
+
+fn emit_all(
+    loaded: &'static Source,
+    offered: &[&str],
+    fragment: &str,
+    ctors: &[(Symbol, usize)],
+    ctors_digest: &str,
+    inlining: (usize, usize),
+) -> Result<Emitted> {
     let mut taken: Vec<String> = offered.iter().map(|n| (*n).to_string()).collect();
+    let mut refusals: Vec<Refused> = Vec::new();
+
+    // The fixpoint: emit everything, drop what refused, and go round again, because dropping a
+    // body can refuse the ones that call it. A body's text names the unit's tables by its own
+    // positions, so nothing here touches the unit and a round is the emitting alone.
+    let emitted = loop {
+        let mut unit = Unit::new(ctors.to_vec(), taken.clone());
+        let mut emitted: Vec<(String, String, super::emit::Tables)> = Vec::new();
+        let mut round: Vec<Refused> = Vec::new();
+        for name in &taken {
+            match emit_one(loaded, &mut unit, name, ctors_digest, inlining, fragment) {
+                Ok((text, tables)) => emitted.push((name.clone(), text, tables)),
+                Err(e) => match e.downcast::<Refused>() {
+                    Ok(r) => round.push(r),
+                    Err(other) => return Err(other),
+                },
+            }
+        }
+        if round.is_empty() {
+            break emitted;
+        }
+        for r in &round {
+            taken.retain(|n| n != &r.function);
+        }
+        refusals.extend(round);
+    };
+    // The tables the settled set actually needs, filled once rather than once per round.
+    let mut unit = Unit::new(ctors.to_vec(), taken.clone());
+    let bodies: Vec<(String, String)> = emitted
+        .into_iter()
+        .map(|(name, text, tables)| {
+            let text = resolve(&text, &tables, &mut unit);
+            (name, text)
+        })
+        .collect();
+
+    let arities: Vec<(String, usize)> = taken
+        .iter()
+        .filter_map(|n| {
+            loaded
+                .definition(n)
+                .map(|(d, _)| (n.clone(), d.params.len()))
+        })
+        .collect();
+    if std::env::var("PLY_C_REFUSALS").is_ok() {
+        for r in &refusals {
+            eprintln!("c tier refused `{}`: {}", r.function, r.construct);
+        }
+        eprintln!(
+            "c tier took {} of {} definitions",
+            taken.len(),
+            offered.len()
+        );
+    }
+    if std::env::var("PLY_C_SPLIT").is_ok() {
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "c emit: optimise+lower {}ms, emit {}ms",
+            OPTIMISE.load(Relaxed) / 1000,
+            EMIT.load(Relaxed) / 1000
+        );
+    }
+    let text = assemble(&bodies, &arities);
+    if let Ok(want) = std::env::var("PLY_C_DUMP") {
+        if want == "*" {
+            let mut sizes: Vec<(usize, &str)> = bodies
+                .iter()
+                .map(|(n, b)| (b.lines().count(), n.as_str()))
+                .collect();
+            sizes.sort_by(|a, b| b.0.cmp(&a.0));
+            eprintln!("unit: {} lines over {} bodies", text.len(), bodies.len());
+            for (n, name) in sizes.iter().take(8) {
+                eprintln!("  {n:6} lines  {name}");
+            }
+        }
+        for (name, body) in &bodies {
+            if *name == want {
+                eprintln!("--- {name} ---\n{body}");
+            }
+        }
+    }
+    Ok(Emitted {
+        text,
+        unit,
+        taken,
+        refusals,
+    })
+}
+
+pub fn build(
+    loaded: &'static Source,
+    names: &[&str],
+    _opts: Opts,
+) -> Result<(Native, Vec<Refused>)> {
+    let started = std::time::Instant::now();
+    let ctors = loaded.ctors();
+    let ctors_digest = super::cache::ctors_digest(&ctors);
+    let (offered, fragment) = offered_set(names);
+    // What the inliner will actually be told, profile and override included, because that is what
+    // the emitted body is a function of and the cache is keyed on it.
+    let how = super::toolchain::Profile::current().inlining().overridden();
+    let inlining = (how.budget, how.depth);
     // A unit this binary already built, against this program, this constructor table and this
     // inlining. Every worker rebuilt it: reading fourteen hundred cached bodies, substituting
     // their placeholders and assembling twenty-nine megabytes of C, to hand it to an object cache
@@ -116,85 +252,14 @@ pub fn build(
         }
         return Ok((native, Vec::new()));
     }
-    let mut refusals: Vec<Refused> = Vec::new();
-
-    // The fixpoint: emit everything, drop what refused, and go round again, because dropping a
-    // body can refuse the ones that call it. A body's text names the unit's tables by its own
-    // positions, so nothing here touches the unit and a round is the emitting alone.
-    let emitted = loop {
-        let mut unit = Unit::new(ctors.clone(), taken.clone());
-        let mut emitted: Vec<(String, String, super::emit::Tables)> = Vec::new();
-        let mut round: Vec<Refused> = Vec::new();
-        for name in &taken {
-            match emit_one(loaded, &mut unit, name, &ctors_digest, inlining, &fragment) {
-                Ok((text, tables)) => emitted.push((name.clone(), text, tables)),
-                Err(e) => match e.downcast::<Refused>() {
-                    Ok(r) => round.push(r),
-                    Err(other) => return Err(other),
-                },
-            }
-        }
-        if round.is_empty() {
-            break emitted;
-        }
-        for r in &round {
-            taken.retain(|n| n != &r.function);
-        }
-        refusals.extend(round);
-    };
-    // The tables the settled set actually needs, filled once rather than once per round.
-    let mut unit = Unit::new(ctors.clone(), taken.clone());
-    let bodies: Vec<(String, String)> = emitted
-        .into_iter()
-        .map(|(name, text, tables)| {
-            let text = resolve(&text, &tables, &mut unit);
-            (name, text)
-        })
-        .collect();
-
-    let arities: Vec<(String, usize)> = taken
-        .iter()
-        .filter_map(|n| {
-            loaded
-                .definition(n)
-                .map(|(d, _)| (n.clone(), d.params.len()))
-        })
-        .collect();
-    if std::env::var("PLY_C_REFUSALS").is_ok() {
-        for r in &refusals {
-            eprintln!("c tier refused `{}`: {}", r.function, r.construct);
-        }
-        eprintln!("c tier took {} of {} definitions", taken.len(), names.len());
-    }
-    if std::env::var("PLY_C_SPLIT").is_ok() {
-        use std::sync::atomic::Ordering::Relaxed;
-        eprintln!(
-            "c emit: optimise+lower {}ms, emit {}ms",
-            OPTIMISE.load(Relaxed) / 1000,
-            EMIT.load(Relaxed) / 1000
-        );
-    }
+    let Emitted {
+        text,
+        mut unit,
+        taken,
+        refusals,
+    } = emit_all(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
     let t_emit = started.elapsed();
-    let text = assemble(&bodies, &arities);
     let t_assemble = started.elapsed();
-    if let Ok(want) = std::env::var("PLY_C_DUMP") {
-        if want == "*" {
-            let mut sizes: Vec<(usize, &str)> = bodies
-                .iter()
-                .map(|(n, b)| (b.lines().count(), n.as_str()))
-                .collect();
-            sizes.sort_by(|a, b| b.0.cmp(&a.0));
-            eprintln!("unit: {} lines over {} bodies", text.len(), bodies.len());
-            for (n, name) in sizes.iter().take(8) {
-                eprintln!("  {n:6} lines  {name}");
-            }
-        }
-        for (name, body) in &bodies {
-            if *name == want {
-                eprintln!("--- {name} ---\n{body}");
-            }
-        }
-    }
     let lib = compile_and_load(&text, "unit")?;
     let t_cc = started.elapsed();
 
