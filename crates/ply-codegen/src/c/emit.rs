@@ -2080,6 +2080,39 @@ impl<'a> Emit<'a> {
         if b == Builtin::Fold && args.len() == 3 {
             return self.fused_fold(&args[0], &args[1], &args[2]);
         }
+        // `bytes_concat_all([a, b, ..])` joins the pieces without building the list. The runtime
+        // has `rt_bytes_join` for exactly this and this tier declared it, bound it and never
+        // called it -- so the state kernel's `key_of`, which is this shape, allocated a
+        // two-element list and went through the generic builtin dispatch two hundred thousand
+        // times. The in-process tier has taken this path since it was written.
+        if b == Builtin::BytesConcatAll
+            && args.len() == 1
+            && let NodeKind::List { items } = &args[0].kind
+        {
+            let mut ws = Vec::with_capacity(items.len());
+            for item in items.iter() {
+                let v = self.expr(item)?;
+                ws.push(self.owned(&v));
+            }
+            let arr = self.fresh();
+            self.line(format!(
+                "Word {arr}[] = {{{}}};",
+                if ws.is_empty() {
+                    "0".to_string()
+                } else {
+                    ws.join(", ")
+                }
+            ));
+            let v = self.bind(
+                Kind::Boxed,
+                format!(
+                    "rt_bytes_join_p(ctx, (Word)(intptr_t){arr}, {})",
+                    items.len()
+                ),
+            );
+            self.check();
+            return Ok(v);
+        }
         // The callback family, through the helpers the in-process tier uses. Those helpers walk
         // the list themselves and enter each call through `call_value`, so a compiled closure is
         // entered directly and an interpreted one goes back over the seam -- which is what makes
