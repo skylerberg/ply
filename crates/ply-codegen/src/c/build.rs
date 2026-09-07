@@ -340,7 +340,7 @@ impl Drop for Timed {
 }
 
 /// The C for one body, or the refusal that stopped it.
-fn emit_one(
+pub(super) fn emit_one(
     loaded: &'static Source,
     unit: &mut Unit,
     name: &str,
