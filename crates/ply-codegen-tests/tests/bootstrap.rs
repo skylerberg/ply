@@ -178,3 +178,67 @@ fn the_compiled_front_end_answers_what_the_interpreted_one_answers() {
     );
     let _ = Symbol::new(entry);
 }
+
+/// The artefact hands back the *tree*, not only a rendering of it.
+///
+/// `items.dump` answers a `String`, which is the shape the spike's differentials compare and the
+/// shape that needs no bridge. Replacing `crates/ply-syntax` needs the other one: `items.parse`
+/// answers an `RModule`, a record of records and constructors, and the question this settles is
+/// whether that crosses at all -- whether the seam converts a whole parse tree into a `Value` a
+/// bridge could walk, or declines it the way it declines a handle.
+///
+/// It crosses. What is left between here and a Ply front end that replaces the Rust one is a
+/// converter from that `Value` to `ply_syntax::ast::Program` -- fifteen enums and about
+/// ninety-five variants, so on the order of the 1,437 lines the spike's own dumper takes to walk
+/// the same tree the other way.
+#[test]
+fn the_artefact_hands_back_a_tree_and_not_only_a_rendering() {
+    let loaded = front_end();
+    let native = artefact(loaded);
+    let entry = "items.parse";
+    let Some(f) = native.entry(entry) else {
+        panic!("the artefact has no `{entry}`");
+    };
+
+    let mut ctx = native.context();
+    ctx.fuel = 10_000_000;
+    let arg = Value::bytes(Vec::from(
+        "fn f(x: Int) -> Int = x + 1
+type T = { a: Int }
+"
+        .as_bytes(),
+    ));
+    let word = ctx.heap.to_word(&native.tables().layouts, &arg);
+    let answer = unsafe { f(&mut ctx, [word].as_ptr()) };
+    assert_eq!(ctx.failed, 0, "`{entry}` raised");
+
+    let mut walked = ply_codegen::heap::Walked::default();
+    let tree =
+        ply_codegen::heap::Heap::to_value_counted(&native.tables().layouts, answer, &mut walked);
+    assert!(
+        !walked.handle,
+        "the parse tree carries a handle, so it cannot leave the entry that made it"
+    );
+    let Value::Record(fields) = &tree else {
+        panic!("`{entry}` answered {} and not a record", tree.type_name());
+    };
+    assert!(
+        fields.iter().any(|(n, _)| n.as_str() == "node"),
+        "the answer has no `node`, so it is not the `RModule` this bridge would start from: {:?}",
+        fields
+            .iter()
+            .map(|(n, _)| n.to_string())
+            .collect::<Vec<_>>()
+    );
+    // The same tree the interpreter builds, which is what makes it a bridge's input rather than
+    // merely a value.
+    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let reference = machine
+        .call(entry, vec![arg], Span::DUMMY)
+        .expect("the interpreter parses");
+    assert_eq!(
+        tree.render(),
+        reference.render(),
+        "the compiled parse tree and the interpreted one differ"
+    );
+}
