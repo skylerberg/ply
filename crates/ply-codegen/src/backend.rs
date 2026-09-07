@@ -174,6 +174,15 @@ impl Cranelift {
         Ok(leaked)
     }
 
+    /// The bodies this unit builds, as the concrete type rather than behind `dyn Compiled`.
+    ///
+    /// `attach` is the machine's door and hands back the trait object it wants. A test that is
+    /// about the seam rather than about a program needs the counters, `admits` and the reentrancy
+    /// hook that only `Bodies` has, and this is that door.
+    pub fn bodies(&'static self) -> Result<Rc<Bodies>> {
+        self.build().map(Rc::new)
+    }
+
     /// The definitions the fragment compiles, closed under calls.
     pub fn compiled(&self) -> &[String] {
         &self.compiled
@@ -426,6 +435,29 @@ impl Bodies {
     /// Native bodies actually run, over this backend's whole life.
     pub fn entered(&self) -> u64 {
         self.entered.get()
+    }
+
+    /// Runs `f` with this backend's context already borrowed.
+    ///
+    /// `Ctx` is one flat frame, so an entry that arrives while another is running would alias the
+    /// outer one's words; `enter` declines on `try_borrow_mut` rather than nesting. That guard is
+    /// unreachable from a program -- the machine is single-threaded and an entry does not call
+    /// back into `enter` -- so this is how a test reaches it, and it exists for that.
+    pub fn while_entered<T>(&self, f: impl FnOnce() -> T) -> T {
+        let _held = self.ctx.borrow_mut();
+        f()
+    }
+
+    /// Whether this backend would be offered `name` at all: it is registered, its signature
+    /// carries, and it has a body. What the machine asks before it asks anything else.
+    pub fn admits(&self, name: &str) -> bool {
+        self.admitted.contains_key(&Symbol::new(name))
+    }
+
+    /// Forgets what has been entered and declined, so a test can count one call rather than a run.
+    pub fn reset_counts(&self) {
+        self.entered.set(0);
+        self.declines.set(Declines::default());
     }
 
     pub fn declines(&self) -> Declines {

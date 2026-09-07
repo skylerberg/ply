@@ -1,4 +1,11 @@
 # Benchmarks
+> **`crates/ply-codegen-spike` is deleted.** Several readings below name it as the
+> command that took them, and those lines are provenance rather than instructions:
+> the crate was a third code generator with a runtime of its own, and its own
+> deletion condition was met. Its hazard suite is
+> `crates/ply-codegen-tests/tests/suite/hazards.rs` now, over the shipping tier, and
+> `benches/kernel/` is measured by `ply test benches/kernel --backend cranelift|c`.
+
 
 `ply-corpus` generates a synthetic Ply project of a given size and reports where
 a run's wall clock goes. The corpus is not a toy: it compiles, typechecks and
@@ -394,7 +401,7 @@ either way.
 > served-HTTP rungs, so this instrument cannot have decided a question about the
 > language. Re-run today it still reads 35% (227.4µs of 658.9µs), a 1.53×
 > ceiling and a 1.46× projection. The re-take is
-`cargo +1.94.0 run --release --manifest-path crates/ply-codegen-spike/Cargo.toml -- --no-served --iterations 4000 --repeats 15 --half benches/w6-spike-r4.json`,
+`cargo +1.94.0 run --release --manifest-path crates/ply-codegen-spike/Cargo.toml -- --no-served --iterations 4000 --repeats 15 --half benches/w6-spike-r4.json` (the crate is deleted; this is what took the reading),
 run on a machine whose load average was 8.5 falling to 5.2. **Take it on a quiet
 machine.** The same command at `--repeats 7` under a load average of 9.6
 reported `2.92x` for the same variant, because the ratio is
@@ -633,7 +640,9 @@ request. ADR 0018 is ordered on the assumption that an MCTS inner loop is
 assumption must be tested before anything is built. This is that test.
 
 ```
-cd crates/ply-codegen-spike && cargo build --release   # 1.93.1; was +1.94.0 before cranelift 0.132.3
+# `crates/ply-codegen-spike` is deleted; the command below is the one that took the
+# reading and is kept for provenance, not to be run. `benches/kernel/` is now measured
+# by `ply test benches/kernel --backend cranelift|c`.
 ./crates/ply-codegen-spike/target/release/mcts \
     --dir benches/kernel --iterations 100 --inner 3 --repeats 21 \
     --out benches/adr0018-mcts.json

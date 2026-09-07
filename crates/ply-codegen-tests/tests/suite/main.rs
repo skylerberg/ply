@@ -7,6 +7,7 @@
 //! `ply_eval::census`, whose accumulator is a `static` the whole binary writes.
 
 mod fragment;
+mod hazards;
 mod kernel;
 mod number_types;
 mod parser_census;
