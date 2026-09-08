@@ -1398,7 +1398,13 @@ fn args_owned(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
 // for it: every value held once more, the array they are read out of, then the call. The
 // answer is opaque when any argument was, which is what keeps `Float` arithmetic out of the
 // inline operators.
-fn builtin_call(em: Em, name: Bytes, vals: List<V>) -> Out = {
+// A credential must not sit in the fragment's value arena, so the builtin that makes one is
+// refused, as the reference refuses it.
+fn builtin_call(em: Em, name: Bytes, vals: List<V>) -> Out =
+  if name == b"secret_of_string" { refused(em, b"`secret_of_string`, which would put a credential in the fragment's value arena") }
+  else { builtin_call_emitted(em, name, vals) }
+
+fn builtin_call_emitted(em: Em, name: Bytes, vals: List<V>) -> Out = {
   let opaque = fold(vals, false, |acc: Bool, v: V| acc || v.ty == TyOpaque);
   let w = fold(vals, { em: em, names: [] }, |a: { em: Em, names: List<Bytes> }, v: V| {
     let o = owned(a.em, v);
@@ -2467,12 +2473,13 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
   let named = fold(clauses, Some([]), |acc: Option<List<{ global: Bytes, c: CClause }>>, c: CClause|
     match acc {
       None -> None,
-      Some(xs) -> if c.resume && !resume_in_tail_only(c.body, c.params) { None } else {
-        match effect_global(em, c.effect) { Some(g) -> Some(push(xs, { global: g, c: c })), None -> None }
-      },
+      Some(xs) -> match effect_global(em, c.effect) { Some(g) -> Some(push(xs, { global: g, c: c })), None -> None },
     });
+  // A clause that binds `resume` and calls it off the tail detaches the body: it runs on a stack
+  // of its own and the clause on the resumer's, so the body is a closure rather than inline.
+  let detached = fold(clauses, false, |acc: Bool, c: CClause| acc || (c.resume && !resume_in_tail_only(c.body, c.params)));
   match named {
-    None -> Some(refused(em, b"a `handle` this tier cannot carry: an effect it cannot resolve, or a `resume` called other than in tail position")),
+    None -> Some(refused(em, b"a `handle` this tier cannot carry: an effect it cannot resolve")),
     Some(cs) -> {
       let ans = fresh(em);
       let opened = line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"]));
@@ -2492,7 +2499,8 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
                 Some({ em: note_handles(op.em, bytes_concat_all([x.global, b"#", x.c.op])),
                        entries: push(st.entries, bytes_concat_all([field_ref(ef.i), b", ",
                          match res { Some(r) -> field_ref(r.i), None -> b"-1" }, b", ", field_ref(op.i), b", ",
-                         held.v.c, b", ", if x.c.resume { b"1" } else { b"0" }])) })
+                         held.v.c, b", ",
+                         if !x.c.resume { b"0" } else if resume_in_tail_only(x.c.body, x.c.params) { b"1" } else { b"2" }])) })
               },
             }
           },
@@ -2513,7 +2521,21 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
           };
           match retc {
             None -> None,
-            Some(rc) -> {
+            Some(rc) -> if detached {
+              // The body closes over every slot it reads, at the same slot numbers, so nothing in
+              // it is renumbered; the runtime runs it on its own stack.
+              let reads = dedup(slots_read(body));
+              let lam = { own: Borrowed, node: NLambda({ params: 0, size: fold(reads, 0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
+                                                         caps: map(reads, |r: Int| { src: r, dst: r, own: Borrowed }), body: body }) };
+              match expr(notail(rc.em), lam, params) {
+                None -> None,
+                Some(cl) -> {
+                  let held = owned(cl.em, cl.v);
+                  let out = bind(held.em, KBoxed, bytes_concat_all([b"rt_handle_detached_p(ctx, (Word)(intptr_t)", arr.name, b", ", num(len(cs)), b", ", rc.c, b", ", held.v.c, b")"]));
+                  Some({ em: check(out.em), v: out.v })
+                },
+              }
+            } else {
               let depth = bind(rc.em, KInt, bytes_concat_all([b"rt_handle_push_p(ctx, (Word)(intptr_t)", arr.name, b", ", num(len(cs)), b", ", rc.c, b")"]));
               let mark = fresh(depth.em);
               let label = bytes_concat(b"land_", num(mark.em.n));
@@ -2534,6 +2556,9 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
     },
   }
 }
+
+fn dedup(xs: List<Int>) -> List<Int> =
+  fold(xs, [], |acc: List<Int>, x: Int| if count_of(acc, x) > 0 { acc } else { push(acc, x) })
 
 // The items of a list, left to right, each boxed into its own `Word` local.
 // One pass, and **not** the two an argument list makes. An aggregate's item is

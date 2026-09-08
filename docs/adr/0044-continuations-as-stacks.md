@@ -1,6 +1,6 @@
 # ADR 0044 — Continuations as stacks: the runtime the fifth step leaves
 
-**Accepted, and the first stage is built.** ADR 0042 placed deleting the
+**Accepted, and the first two stages are built.** ADR 0042 placed deleting the
 machine fifth and ADR 0043 stopped at the line "what the runtime is once the
 machine is gone". This record is that line: what a suspended computation is in
 the compiled tier, how `simulate` and the three effects it answers are served
@@ -22,6 +22,28 @@ step for step, and it is green over the examples and the standard library with
 the chain entered whole, every simulated test paired. The census above loses
 its first three rows and the cascade, so what the tier refuses over the
 shipped corpus is the host-served performs and the credential.
+
+**Built, second stage:** `resume` off the tail, once. Handler frames live per
+stack, chained to the stack a task or a body was entered under, so a depth
+names a frame that never moves and a resumed body's `perform` searches its
+own frames and then the resumer's, as a deep handler's does. A `handle` with a
+clause that binds `resume` and calls it elsewhere than last runs its body on a
+detached stack (`crates/ply-codegen/src/detached.rs`): the emitter closes the
+body over the slots it reads at their own numbers and hands the closure to
+`rt_handle_detached`, the clause runs on the stack that was running when the
+body stopped, `k` is a switch into the body from wherever it is called, and
+the body's next stop comes back to that caller. A body dropped without
+resuming is dropped with its stack; a `return` clause runs inside `k`, on the
+body's side. A second resumption is refused with `E0502` until the third
+stage. The producer test drives `k(n + 1) * 2`, `k(n) + 1000` under a
+`return` clause, a clause that resumes on one branch and not the other, and a
+`k` bound by a `let`, and the tier answers what the machine answers. Building
+it found that the emitter written in Ply compiled `secret_of_string`, which
+the reference refuses so that no credential sits in the compiled arena; it
+refuses it now, and the `desk` example, whose two handlers reach one, returns
+to the machine with every performer they serve. That row of the census is the
+fifth stage's to remove: a runtime with no machine behind it has to hold a
+secret somewhere, and where is a decision that record has not made.
 
 > **What this decides.** That a suspended computation in the compiled tier is
 > **a C stack the runtime owns**, switched to and from with the C library's
@@ -326,10 +348,11 @@ language test written in Ply re-runs only when an edit reaches it.
    Oracle, met: the audit in whole mode over the examples takes `bank`,
    `pipeline` and `timeout`'s tests, every seed paired and every schedule the
    machine's, and the census above lost its first three rows and the cascade.
-2. **`resume` off the tail, once.** The capture is a switch out and the call a
-   switch in, on the primitive stage one built. Oracle: the producer test that
-   asserts "cannot carry" for a non-tail `resume` asserts the body runs, and
-   the audit agrees with the machine on it.
+2. **`resume` off the tail, once.** Built. The capture is a switch out and the
+   call a switch in, on the primitive stage one built. Oracle, met: the
+   producer test that asserted "cannot carry" for a non-tail `resume` now
+   asserts a handler refused for another reason cascades, and a test of its own
+   drives four shapes of off-tail resumption against the machine.
 3. **Multi-shot by restore.** The snapshot, the in-place restore, the rule and
    its code. Oracle: the language's multi-shot tests moved to Ply and run by
    both sides under the audit, `k(true) + k(false)` among them.

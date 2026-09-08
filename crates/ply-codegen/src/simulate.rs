@@ -8,7 +8,7 @@
 //! continuation, so a plan chooses the same interleaving on both sides.
 
 use crate::heap::{self, Word};
-use crate::rt::{Ctx, FAILED_UNWIND, HandlerFrame, call_value, values_taken};
+use crate::rt::{Ctx, FAILED_UNWIND, call_value, values_taken};
 use crate::stack::{Stack, switch};
 use ply_eval::sched::{Resumption, Scheduler, Turn};
 use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, signature};
@@ -26,9 +26,8 @@ pub struct Simulation {
     request: Option<Request>,
     /// What the task being switched to gets back from the `perform` it stopped at.
     answer: Word,
-    /// The index of the region's frame in the context's handler stack. Frames a task pushes
-    /// above it are the task's, and travel with its stack.
-    depth: usize,
+    /// The stack the region was entered on, whose frames every task's chain to.
+    stack: usize,
     floor_below: usize,
     /// The closure the task being started runs, read by its entry on the new stack.
     starting: Option<Word>,
@@ -38,7 +37,7 @@ pub struct Simulation {
 #[derive(Default)]
 struct TaskStack {
     stack: Option<Stack>,
-    frames: Vec<HandlerFrame>,
+    frames: usize,
     sp: usize,
 }
 
@@ -57,7 +56,7 @@ impl Simulation {
         root_seed: u64,
         drawn: u64,
         steps: u32,
-        depth: usize,
+        stack: usize,
         floor_below: usize,
         root: Word,
     ) -> Simulation {
@@ -69,7 +68,7 @@ impl Simulation {
             running: None,
             request: None,
             answer: 0,
-            depth,
+            stack,
             floor_below,
             starting: None,
             root,
@@ -109,17 +108,15 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
         let sim = c.sims.last_mut().expect("a region is running");
         let slot = &mut sim.tasks[at];
         c.stack_floor = slot.stack.as_ref().expect("a task has a stack").floor();
-        c.handlers.append(&mut slot.frames);
+        c.current = slot.frames;
         sim.running = Some(task);
         let from = &mut sim.scheduler_sp as *mut usize;
         unsafe { switch(&mut *from, sp) };
 
         let c = unsafe { &mut *ctx };
         let sim = c.sims.last_mut().expect("a region is running");
-        let depth = sim.depth;
         sim.running = None;
-        let frames = c.handlers.split_off(depth + 1);
-        sim.tasks[at].frames = frames;
+        c.current = sim.stack;
         c.stack_floor = sim.floor_below;
         if sim.sched.records_steps() {
             c.trail.end_step(Span::DUMMY);
@@ -184,9 +181,12 @@ unsafe fn start(ctx: *mut Ctx, at: usize, closure: Word) -> usize {
     let sim = c.sims.last_mut().expect("a region is running");
     let stack = Stack::new();
     let sp = stack.prepare(task_entry, ctx as usize);
+    let parent = sim.stack;
+    let frames = c.open_stack(Some(parent));
+    let sim = c.sims.last_mut().expect("a region is running");
     sim.tasks[at] = TaskStack {
         stack: Some(stack),
-        frames: Vec::new(),
+        frames,
         sp,
     };
     sim.starting = Some(closure);
