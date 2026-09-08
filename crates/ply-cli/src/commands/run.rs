@@ -152,6 +152,7 @@ pub fn execute(args: &RunArgs, style: Style) -> i32 {
     let module = entry.module.to_string();
     let span = entry.span;
     let plan = crate::simulation::run_plan(args.seed.as_ref());
+    ply_codegen::c::producer::set_host_served(super::common::host_served(&hosts.binding()));
     let backend = match select_profile(&args.profile)
         .and_then(|()| compiled_backend(args.backend.as_ref(), &loaded))
     {

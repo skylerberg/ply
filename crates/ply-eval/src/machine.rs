@@ -487,6 +487,7 @@ impl<'a> Machine<'a> {
                 // A test's body answers the unit; anything else is a backend answering wrongly,
                 // which the machine's own run of the body catches as it catches every wrong call.
                 Some(Entered::Answered(Value::Unit)) => {
+                    self.record_compiled_atoms();
                     self.compiled_entries.set(self.compiled_entries.get() + 1);
                     self.end_entry_point();
                     return Ok(());
@@ -2020,6 +2021,7 @@ impl<'a> Machine<'a> {
             self.census_call(closure, &args);
         }
         if let Some(value) = self.compiled_answer(closure, &args) {
+            self.record_compiled_atoms();
             // The interpreted path moves these into the callee's window; a scalar carries no
             // refcount and no `Drop`, so dropping them here is the same observation.
             args.clear();
@@ -2273,6 +2275,19 @@ impl<'a> Machine<'a> {
     fn carried_types(&self) -> &crate::compiled::CarriedTypes {
         self.carried_types
             .get_or_init(|| crate::compiled::CarriedTypes::over(self.check))
+    }
+
+    /// What compiled code performed during the entry that just answered, recorded as this
+    /// machine records its own performs.
+    fn record_compiled_atoms(&mut self) {
+        let atoms = self
+            .compiled
+            .as_ref()
+            .map(|backend| backend.take_performed())
+            .unwrap_or_default();
+        for atom in atoms {
+            self.trace.record(atom);
+        }
     }
 
     fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {
