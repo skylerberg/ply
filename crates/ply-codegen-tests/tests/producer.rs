@@ -646,3 +646,141 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
         );
     }
 }
+
+const MULTISHOT: &str = r#"
+effect amb {
+  read flip[coin]() -> Bool
+}
+
+effect pick {
+  read choose[r]() -> Int
+}
+
+fn both(seed: Int) -> Int =
+  handle { if amb.flip[coin]() { seed } else { seed * 100 } } with {
+    amb.flip[coin]() resume k -> k(true) + k(false),
+    return x -> x
+  }
+
+fn thrice(seed: Int) -> Int =
+  handle { pick.choose[r]() * seed } with {
+    pick.choose[r]() resume k -> k(1) + k(2) + k(3),
+    return x -> x
+  }
+
+fn joined(s: String) -> String =
+  handle {
+    string_concat(string_concat(s, if amb.flip[coin]() { "b" } else { "c" }), "d")
+  } with {
+    amb.flip[coin]() resume k -> string_concat(k(true), k(false)),
+    return x -> x
+  }
+
+fn shared(seed: Int) -> Int =
+  with_cell[trace](seed) { c -> {
+    let answer = handle {
+      let b = amb.flip[coin]();
+      cell_set(c, cell_get(c) + 1);
+      if b { 10 } else { 20 }
+    } with {
+      amb.flip[coin]() resume k -> k(true) + k(false),
+      return x -> x
+    };
+    answer * 1000 + cell_get(c)
+  } }
+
+fn siblings(seed: Int) -> Int =
+  handle {
+    let b = amb.flip[coin]();
+    let tag = if b { 1 } else { 2 };
+    tag * 10 + (if b { seed } else { seed * 2 })
+  } with {
+    amb.flip[coin]() resume k -> k(true) + k(false),
+    return x -> x
+  }
+
+fn across(seed: Int) -> Int =
+  with_cell[n](seed) { c -> {
+    handle {
+      simulate {
+        let a = task.spawn(|| { let v = pick.choose[n](); cell_set(c, cell_get(c) + v) });
+        task.join(a)
+      }
+    } with {
+      pick.choose[n]() resume k -> { k(1); k(2) },
+    };
+    cell_get(c)
+  } }
+"#;
+
+/// A continuation resumed again after its body finished restores the stack it was captured on
+/// and runs the body from there once more: the machine's multi-shot answers, including a string
+/// built twice from one argument, a cell shared across the resumptions, and slot writes that do
+/// not leak between siblings. A capture under a task belongs to a region that has ended by the
+/// second resumption, and both engines say so.
+#[test]
+fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", MULTISHOT)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let cases: Vec<(&str, Vec<Value>)> = vec![
+        ("m.both", vec![Value::Int(3)]),
+        ("m.thrice", vec![Value::Int(7)]),
+        ("m.joined", vec![Value::Str("a".into())]),
+        ("m.shared", vec![Value::Int(0)]),
+        ("m.siblings", vec![Value::Int(1)]),
+        ("m.across", vec![Value::Int(0)]),
+    ];
+    for (name, args) in cases {
+        let want = machine.call(name, args.clone(), Span::DUMMY);
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        match want {
+            Ok(want) => {
+                assert_eq!(
+                    ctx.failed,
+                    0,
+                    "`{name}{args:?}` raised in the C tier: {:?}",
+                    ctx.diagnostic.as_ref().map(|d| d.message.clone())
+                );
+                let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+                assert_eq!(
+                    got, want,
+                    "`{name}{args:?}`: the tier and the machine disagree"
+                );
+            }
+            Err(theirs) => {
+                assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
+                    theirs.message
+                );
+                let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
+                assert_eq!(
+                    ours.code, theirs.code,
+                    "`{name}{args:?}`: {} vs {}",
+                    ours.message, theirs.message
+                );
+            }
+        }
+        ctx.end();
+    }
+}

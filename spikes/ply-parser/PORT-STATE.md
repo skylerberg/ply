@@ -256,9 +256,10 @@ reference emits none of it, so the ratchet is unchanged; the instrument for this
 audit with every simulated test's seeds paired against the machine, green over both corpora.
 
 A `handle` with a clause that binds `resume` and calls it off the tail is no longer refused:
-the body becomes a nullary closure over every slot it reads, at the same slot numbers so nothing
-in it is renumbered, handed to `rt_handle_detached_p` with the clause table, in which the resume
-column says `2` for such a clause. The port also refuses `secret_of_string` as the reference
+the body becomes a nullary closure over every slot it reads that the enclosing scope binds, a
+parameter included, at the same slot numbers so nothing in it is renumbered, handed to
+`rt_handle_detached_p` with the clause table, in which the resume column says `2` for such a
+clause. The runtime resumes such a body as often as the clause asks. The port also refuses `secret_of_string` as the reference
 does; it had compiled it, which whole mode would have shipped.
 
 ## Beyond the port

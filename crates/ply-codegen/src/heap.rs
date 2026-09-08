@@ -331,6 +331,10 @@ pub struct Heap {
     cur: *mut u8,
     end: *mut u8,
     chunks: Vec<(*mut u8, usize)>,
+    /// One bit per eight bytes of each chunk, set where an object starts, so that a word found on
+    /// a captured stack can be told from an integer or a stale address: a continuation resumed
+    /// again pins the objects its snapshot references, and this is how it knows which they are.
+    starts: Vec<Vec<u64>>,
     /// Which chunk `cur` is in.
     chunk: usize,
     /// Bridged values allocated since the last reset, whose interpreter value must be dropped.
@@ -429,6 +433,7 @@ impl Heap {
             cur: std::ptr::null_mut(),
             end: std::ptr::null_mut(),
             chunks: Vec::new(),
+            starts: Vec::new(),
             chunk: 0,
             bridges: Vec::new(),
             persistent: false,
@@ -489,6 +494,7 @@ impl Heap {
         let p = unsafe { alloc(Layout::from_size_align(cap, 16).expect("a chunk layout")) };
         assert!(!p.is_null(), "the heap is out of memory");
         self.chunks.push((p, cap));
+        self.starts.push(vec![0; cap / 512 + 1]);
         self.chunk = self.chunks.len() - 1;
         self.cur = p;
         self.end = unsafe { p.add(cap) };
@@ -535,8 +541,41 @@ impl Heap {
                 layout,
             });
         }
+        self.mark_start(p as usize);
         self.count += 1;
         p
+    }
+
+    fn mark_start(&mut self, address: usize) {
+        for (i, (base, cap)) in self.chunks.iter().enumerate() {
+            let base = *base as usize;
+            if address >= base && address < base + *cap {
+                let bit = (address - base) / 8;
+                self.starts[i][bit / 64] |= 1 << (bit % 64);
+                return;
+            }
+        }
+    }
+
+    /// Whether `w` is the address of an object this heap allocated in the entry now running and
+    /// has not dismantled: aligned, inside a chunk, at a start the allocator marked, and headed.
+    pub fn is_object(&self, w: Word) -> bool {
+        if is_imm(w) || w == 0 || !(w as usize).is_multiple_of(8) {
+            return false;
+        }
+        let address = w as usize;
+        for (i, (base, cap)) in self.chunks.iter().enumerate() {
+            let base = *base as usize;
+            if address >= base && address < base + *cap {
+                let bit = (address - base) / 8;
+                if self.starts[i][bit / 64] & (1 << (bit % 64)) == 0 {
+                    return false;
+                }
+                let o = address as *const Obj;
+                return unsafe { (*o).kind != KIND_DEAD && (*o).rc != 0 };
+            }
+        }
+        false
     }
 
     /// A fresh object with `len` payload words.
@@ -718,6 +757,9 @@ impl Heap {
         self.recycled = 0;
         for class in &mut self.free {
             class.clear();
+        }
+        for bits in &mut self.starts {
+            bits.fill(0);
         }
     }
 
@@ -1718,5 +1760,25 @@ mod tests {
             Heap::to_value(&l, w),
             Value::list(vec![Value::str("a"), Value::Int(1)])
         );
+    }
+
+    #[test]
+    fn a_word_is_an_object_only_at_a_live_start() {
+        let mut heap = Heap::new();
+        enter(&mut heap);
+        let o = heap.alloc(KIND_RECORD, 0, 2, 0);
+        let w = o as Word;
+        assert!(heap.is_object(w));
+        assert!(
+            !heap.is_object(w + 8),
+            "an interior address is not an object"
+        );
+        assert!(!heap.is_object(imm(7)), "an immediate is not an object");
+        assert!(!heap.is_object(0));
+        dec(w);
+        assert!(!heap.is_object(w), "a released object is not one");
+        leave();
+        heap.end();
+        assert!(!heap.is_object(w), "nothing survives the entry");
     }
 }
