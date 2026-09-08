@@ -237,6 +237,7 @@ TREE_CHECKS=(
 declare -a SPIKE_JOBS=(
   "ply-parser:parser-spike"
   "ply-lexer:lexer-spike"
+  "ucontext:ucontext-spike"
 )
 
 # Spikes deliberately in no CI job, with the reason, in `KNOWN_OUTSIDE`'s shape.
