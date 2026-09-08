@@ -53,6 +53,11 @@ pub type Node =
   | NSim({ size: Int, caps: List<Cap>, body: Code })
   | NHandle({ body: Code, clauses: List<CClause>, ret: Option<CRet> })
   | NField({ base: Code, field: Bytes })
+  // `{..b, f: e}` after it has been desugared into a record naming every field.
+  // Not a node the parser leaves behind on either side: it is *recognised* in a
+  // plain literal, one in which some field is `b.<its own name>` for a single
+  // slot variable `b`.
+  | NUpd({ base: Code, copies: List<Bytes>, sets: List<CField> })
 
 pub type CField = { name: Bytes, value: Code }
 
@@ -227,6 +232,10 @@ fn dump_node(n: Node) -> Bytes =
       bytes_concat_all([b"lam(", num(l.params), b",", num(l.size), b",", dump_caps(l.caps), b",",
                         dump(l.body), b")"]),
     NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
+    NUpd(u) -> bytes_concat_all([b"upd(", dump(u.base),
+      fold(u.copies, b"", |acc: Bytes, n: Bytes| bytes_concat_all([acc, b",c:", n])),
+      fold(u.sets, b"", |acc: Bytes, f: CField|
+        bytes_concat_all([acc, b",s:", f.name, b"=", dump(f.value)])), b")"]),
   }
 
 // --- slots ------------------------------------------------------------------
@@ -421,7 +430,9 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
       Some(r) -> Some({ code: { own: Borrowed, node: NList({ items: r.codes }) }, st: r.st }),
       None -> None,
     },
-    ERecord(x) ->
+    ERecord(x) -> match as_update(x.fields, st) {
+      Some(u) -> Some(u),
+      None ->
       match lower_seq(map(x.fields, |fd: RecField| fd.value), st) {
         None -> None,
         Some(r) -> Some({
@@ -431,6 +442,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
           st: r.st,
         }),
       },
+    },
     EApp(x) ->
       if len(x.named) > 0 { None } else {
         match lower_in(x.func, st) {
@@ -589,6 +601,124 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
 
 fn field_name(fs: List<RecField>, i: Int) -> Bytes =
   match list_at(fs, i) { Some(fd) -> fd.name.name, None -> b"" }
+
+// A record literal that is an update: some field is `b.<its own name>` for one
+// slot variable `b`, and every such copy is of that same `b`. The base is read
+// after every written field and reads only the copied ones, which is what its
+// own mark has to say -- so it is lowered here and marked in `mark`.
+//
+// The reference recovers the node the same way and for the same reason: a
+// `RecordUpdate` expression does not survive either parser, so neither side has
+// one to lower.
+fn as_update(fields: List<RecField>, st: Stack) -> Option<{ code: Code, st: Stack }> = {
+  let slots = fold(fields, [], |acc: List<Int>, f: RecField| match copy_of(f, st) {
+    Some(sl) -> if fold(acc, false, |seen: Bool, x: Int| seen || x == sl) { acc } else { push(acc, sl) },
+    None -> acc,
+  });
+  // A literal that rewrites every field has no copy to name its base. A record
+  // it *projects from* inside a written field dies there just the same, and its
+  // cells are what to reuse, so the first such variable is the base.
+  let picked = if len(slots) == 1 { list_at(slots, 0) }
+               else if len(slots) == 0 {
+                 fold(fields, None, |acc: Option<Int>, f: RecField|
+                   match acc { Some(_) -> acc, None -> projected_slot(f.value, st) })
+               } else { None };
+  match picked {
+    None -> None,
+    Some(_) -> {
+    match picked {
+      None -> None,
+      Some(sl) -> {
+        let copies = fold(fields, [], |acc: List<Bytes>, f: RecField|
+          match copy_of(f, st) { Some(_) -> push(acc, f.name.name), None -> acc });
+        let sets = filter(fields, |f: RecField| copy_of(f, st) == None);
+        match lower_seq(map(sets, |f: RecField| f.value), st) {
+          None -> None,
+          Some(r) -> Some({
+            code: { own: Borrowed, node: NUpd({
+              base: { own: Borrowed, node: NVar({ name: base_name(fields, st), slot: Some(sl) }) },
+              copies: copies,
+              sets: map(range(0, len(sets)), |i: Int|
+                { name: match list_at(sets, i) { Some(f) -> f.name.name, None -> b"" },
+                  value: nth(r.codes, i) }) }) },
+            st: r.st })
+        }
+      },
+    }
+    },
+  }
+}
+
+// The first bare slot variable a field read projects from, anywhere inside `e`
+// and not through a barrier of its own.
+fn projected_slot(e: Expr, st: Stack) -> Option<Int> =
+  match e {
+    EField(x) -> match x.base {
+      EVar(v) -> if v.name.module != None { None } else { resolve(st, v.name.name.name).slot },
+      _ -> projected_slot(x.base, st),
+    },
+    EApp(x) -> fold(x.args, projected_slot(x.func, st), |acc: Option<Int>, a: Expr|
+      match acc { Some(_) -> acc, None -> projected_slot(a, st) }),
+    EBinary(x) -> match projected_slot(x.lhs, st) {
+      Some(v) -> Some(v), None -> projected_slot(x.rhs, st),
+    },
+    EUnary(x) -> projected_slot(x.operand, st),
+    ERecord(x) -> fold(x.fields, None, |acc: Option<Int>, f: RecField|
+      match acc { Some(_) -> acc, None -> projected_slot(f.value, st) }),
+    EList(x) -> fold(x.items, None, |acc: Option<Int>, i: Expr|
+      match acc { Some(_) -> acc, None -> projected_slot(i, st) }),
+    _ -> None,
+  }
+
+// The slot a field copies from, when the field is `b.<its own name>` for a bare
+// variable `b` that resolves to one.
+fn copy_of(f: RecField, st: Stack) -> Option<Int> =
+  match f.value {
+    EField(x) -> if x.field.name != f.name.name { None } else {
+      match x.base {
+        EVar(v) -> if v.name.module != None { None } else { resolve(st, v.name.name.name).slot },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+
+// The base's own name: from a copy where there is one, and otherwise from the
+// projection that named it.
+fn base_name(fields: List<RecField>, st: Stack) -> Bytes = {
+  let from_copy = fold(fields, b"", |acc: Bytes, f: RecField| match copy_of(f, st) {
+    None -> acc,
+    Some(_) -> match f.value {
+      EField(x) -> match x.base { EVar(v) -> v.name.name.name, _ -> acc },
+      _ -> acc,
+    },
+  });
+  if from_copy != b"" { from_copy } else {
+    fold(fields, b"", |acc: Bytes, f: RecField|
+      if acc != b"" { acc } else { match projected_name(f.value, st) { Some(n) -> n, None -> acc } })
+  }
+}
+
+fn projected_name(e: Expr, st: Stack) -> Option<Bytes> =
+  match e {
+    EField(x) -> match x.base {
+      EVar(v) -> if v.name.module != None { None }
+                 else { match resolve(st, v.name.name.name).slot {
+                   Some(_) -> Some(v.name.name.name), None -> None } },
+      _ -> projected_name(x.base, st),
+    },
+    EApp(x) -> fold(x.args, projected_name(x.func, st), |acc: Option<Bytes>, a: Expr|
+      match acc { Some(_) -> acc, None -> projected_name(a, st) }),
+    EBinary(x) -> match projected_name(x.lhs, st) {
+      Some(v) -> Some(v), None -> projected_name(x.rhs, st),
+    },
+    EUnary(x) -> projected_name(x.operand, st),
+    ERecord(x) -> fold(x.fields, None, |acc: Option<Bytes>, f: RecField|
+      match acc { Some(_) -> acc, None -> projected_name(f.value, st) }),
+    EList(x) -> fold(x.items, None, |acc: Option<Bytes>, i: Expr|
+      match acc { Some(_) -> acc, None -> projected_name(i, st) }),
+    _ -> None,
+  }
 
 fn nth(cs: List<Code>, i: Int) -> Code =
   match list_at(cs, i) { Some(c) -> c, None -> { own: Borrowed, node: NLit(LUnit) } }
@@ -808,6 +938,27 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
         livew: live_add(livew, s),
         livef: livef,
       },
+    },
+    // The base is read *after* every written field, so backwards it is marked
+    // first, and it reads only the copied fields: a whole read, and one per copy.
+    NUpd(u) -> {
+      let s = match base_slot(u.base) { Some(x) -> x, None -> -1 };
+      let owned = s >= 0 && !live_has(live, s);
+      let base = { own: if owned { Owned } else { Borrowed }, node: u.base.node };
+      let after = if s < 0 { { live: live, livew: livew, livef: livef } } else {
+        // The base's read is **not** a whole read: it takes only the copied
+        // fields, so a projection of an uncopied one earlier may still be taken
+        // in place. Adding it to `livew` blocked exactly those.
+        { live: live_add(live, s), livew: livew,
+          livef: fold(u.copies, livef, |acc: List<FieldUse>, n: Bytes|
+            push(acc, { slot: s, field: n })) }
+      };
+      let r = mark_seq(map(u.sets, |f: CField| f.value), after.live, after.livew, after.livef);
+      { code: { own: Borrowed, node: NUpd({ base: base, copies: u.copies,
+          sets: map(range(0, len(u.sets)), |i: Int|
+            { name: match list_at(u.sets, i) { Some(f) -> f.name, None -> b"" },
+              value: nth(r.codes, i) }) }) },
+        live: r.live, livew: r.livew, livef: r.livef }
     },
     NUnary(u) -> {
       let o = mark(u.operand, live, livew, livef);
