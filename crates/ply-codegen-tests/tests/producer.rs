@@ -338,8 +338,6 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
     producer::set_whole(true);
-    // An operation the run's host binding would answer stays the machine's, handler or not.
-    producer::set_host_served(vec!["m.served#ping".to_string()]);
     let loaded = load(&[("m", DROPPED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -365,22 +363,134 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
         "{}",
         reason("m.performer")
     );
-    assert!(
-        reason("m.lonely").contains("nothing in the program"),
-        "{}",
-        reason("m.lonely")
+    // A `perform` no handler in the program answers is compiled: it reaches the host binding
+    // from the runtime, with the machine's checks, and an unbound one fails there as the
+    // machine fails it.
+    for taken in ["m.lonely", "m.hosted", "m.hosting"] {
+        assert!(
+            !refused.iter().any(|r| r.function == taken),
+            "`{taken}` was refused: {refused:?}"
+        );
+    }
+}
+
+const HOSTED: &str = r#"
+effect served {
+  write ping(n: Int) -> Int
+}
+
+fn hosted(n: Int) -> Int / {served.write} = served.ping(n) * 10
+
+fn ticking() -> Int / {clock.read} = clock.now() + 1
+"#;
+
+struct Doubler;
+
+impl ply_eval::HostHandler for Doubler {
+    fn call(
+        &self,
+        _rt: &dyn ply_eval::HostRuntime,
+        req: &ply_eval::HostRequest<'_>,
+    ) -> Result<ply_eval::HostAnswer, ply_span::Diagnostic> {
+        let Some(Value::Int(n)) = req.args.first() else {
+            panic!("ping takes an Int");
+        };
+        Ok(ply_eval::HostAnswer::Value(Value::Int(n * 2)))
+    }
+}
+
+/// A `perform` nothing on the stack answers reaches the host binding from the runtime: a bound
+/// handler answers it as it answers the machine, and a hermetic binding refuses it with the
+/// machine's diagnostic.
+#[test]
+fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", HOSTED)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut registry = ply_eval::HostRegistry::new();
+    registry.register(
+        ply_eval::HostOp {
+            effect: ply_span::Symbol::new("m.served"),
+            op: ply_span::Symbol::new("ping"),
+            resource: ply_eval::HostResource::Any,
+            determinism: ply_eval::Determinism::Nondeterministic,
+            linearity: ply_eval::Linearity::Repeatable,
+            blocking: false,
+            secrets: false,
+            path: "test::ping",
+        },
+        std::sync::Arc::new(Doubler),
     );
-    assert!(
-        reason("m.hosted").contains("the host"),
-        "{}",
-        reason("m.hosted")
-    );
-    // The handler calls the performer, so the cascade takes it too, naming the performer.
-    assert!(
-        reason("m.hosting").contains("m.hosted"),
-        "{}",
-        reason("m.hosting")
-    );
+    let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
+    let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
+    let cases: Vec<(&str, Vec<Value>, std::sync::Arc<ply_eval::HostBinding>)> = vec![
+        (
+            "m.hosted",
+            vec![Value::Int(4)],
+            std::sync::Arc::clone(&bound),
+        ),
+        (
+            "m.hosted",
+            vec![Value::Int(4)],
+            std::sync::Arc::clone(&hermetic),
+        ),
+        ("m.ticking", vec![], std::sync::Arc::clone(&bound)),
+        ("m.ticking", vec![], std::sync::Arc::clone(&hermetic)),
+    ];
+    for (name, args, binding) in cases {
+        let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+        machine.set_host_binding(std::sync::Arc::clone(&binding));
+        let want = machine.call(name, args.clone(), Span::DUMMY);
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.set_host(binding, None);
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        match want {
+            Ok(want) => {
+                assert_eq!(
+                    ctx.failed,
+                    0,
+                    "`{name}{args:?}` raised in the C tier: {:?}",
+                    ctx.diagnostic.as_ref().map(|d| d.message.clone())
+                );
+                let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+                assert_eq!(
+                    got, want,
+                    "`{name}{args:?}`: the tier and the machine disagree"
+                );
+            }
+            Err(theirs) => {
+                assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
+                    theirs.message
+                );
+                let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
+                assert_eq!(
+                    ours.code, theirs.code,
+                    "`{name}{args:?}`: {} vs {}",
+                    ours.message, theirs.message
+                );
+            }
+        }
+        ctx.end();
+    }
 }
 
 /// `Float` and `Decimal` literals are constants the runtime holds, opaque to the emitted C:

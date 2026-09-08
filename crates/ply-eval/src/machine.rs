@@ -303,11 +303,23 @@ impl<'a> Machine<'a> {
     /// Bind the host boundary.
     pub fn set_host_binding(&mut self, binding: Arc<HostBinding>) {
         self.binding = binding;
+        self.share_host();
+    }
+
+    /// The backend performs against the same binding, reactor and declared footprint the machine
+    /// does, whichever was set last.
+    fn share_host(&self) {
+        if let Some(backend) = &self.compiled {
+            backend.set_host(Arc::clone(&self.binding), self.runtime.clone());
+            backend.set_declared(self.declared.clone());
+            backend.set_re_executed(self.re_executed);
+        }
     }
 
     /// The reactor a [`HostAnswer::Pending`] is polled on.
     pub fn set_host_runtime(&mut self, runtime: Rc<dyn HostRuntime>) {
         self.runtime = Some(runtime);
+        self.share_host();
     }
 
     pub fn host_binding(&self) -> &HostBinding {
@@ -322,6 +334,7 @@ impl<'a> Machine<'a> {
     /// The declared footprint of the entry point about to run.
     pub fn set_declared_footprint(&mut self, footprint: Footprint) {
         self.declared = Some(footprint);
+        self.share_host();
     }
 
     /// Declare that this entry point is one of several runs of the same test, so that reaching the
@@ -329,6 +342,7 @@ impl<'a> Machine<'a> {
     /// interleaving.
     pub fn set_re_executed(&mut self, re_executed: bool) {
         self.re_executed = re_executed;
+        self.share_host();
     }
 
     /// What the last entry point reached across the boundary, or `None` when it reached none.
@@ -409,6 +423,7 @@ impl<'a> Machine<'a> {
     pub fn set_compiled(&mut self, compiled: Rc<dyn crate::Compiled>) {
         if compiled.describes(self.program) {
             self.compiled = Some(compiled);
+            self.share_host();
         }
     }
 
@@ -2287,14 +2302,17 @@ impl<'a> Machine<'a> {
     /// What compiled code performed during the entry that just answered, recorded as this
     /// machine records its own performs.
     fn record_compiled_atoms(&mut self) {
-        let atoms = self
-            .compiled
-            .as_ref()
-            .map(|backend| backend.take_performed())
-            .unwrap_or_default();
-        for atom in atoms {
+        let Some(backend) = self.compiled.as_ref() else {
+            return;
+        };
+        for atom in backend.take_performed() {
             self.trace.record(atom);
         }
+        // What the backend asked of the host is what this entry asked of it.
+        let (used, ops) = backend.take_host_use();
+        self.host_use.atoms = self.host_use.atoms.union(&used.atoms);
+        self.host_use.operations += used.operations;
+        self.host_ops = self.host_ops.saturating_add(ops);
     }
 
     fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {
@@ -2786,7 +2804,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 }
 
 /// The runtime a machine has when nobody gave it one.
-struct Unbound;
+/// A runtime for a context that has none: every wait is a failure that names itself.
+pub struct Unbound;
 
 impl HostRuntime for Unbound {
     fn poll(&self, pending: &Pending) -> Result<Option<Value>, Diagnostic> {
@@ -2829,7 +2848,12 @@ fn err_unbound_runtime(what: &str) -> Diagnostic {
 /// A `HostAnswer::Pending` with no reactor to resolve it.
 #[cold]
 #[inline(never)]
-fn err_no_runtime(span: Span, operation: &str, pending: Pending, path: &'static str) -> Diagnostic {
+pub fn err_no_runtime(
+    span: Span,
+    operation: &str,
+    pending: Pending,
+    path: &'static str,
+) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("`{operation}` did not complete and this run has no host runtime to wait on it"),
@@ -2843,7 +2867,7 @@ fn err_no_runtime(span: Span, operation: &str, pending: Pending, path: &'static 
 /// atom for it.
 #[cold]
 #[inline(never)]
-fn err_unenumerated_atom(span: Span, operation: &str, path: &'static str) -> Diagnostic {
+pub fn err_unenumerated_atom(span: Span, operation: &str, path: &'static str) -> Diagnostic {
     Diagnostic::error(
         codes::HOST_FOOTPRINT_ESCAPE,
         format!("`{operation}` reached a bound host handler that this run never enumerated"),
@@ -2872,7 +2896,7 @@ fn err_backend_raised(label: &str, span: Span, raised: &Diagnostic) -> Diagnosti
 /// `E0427` — a host handler answered an atom outside the entry point's row.
 #[cold]
 #[inline(never)]
-fn err_footprint_escape(
+pub fn err_footprint_escape(
     span: Span,
     operation: &str,
     atom: &EffectAtom,
@@ -2890,7 +2914,7 @@ fn err_footprint_escape(
 }
 
 /// Whether a value handed across the boundary holds a credential anywhere.
-pub(crate) fn check_host_answer(
+pub fn check_host_answer(
     operation: &str,
     path: &'static str,
     value: &Value,
@@ -2903,7 +2927,7 @@ pub(crate) fn check_host_answer(
     )
 }
 
-fn carries_secret(v: &Value) -> bool {
+pub fn carries_secret(v: &Value) -> bool {
     match v {
         Value::Secret(_) => true,
         Value::List(xs) => crate::limit::grow(|| xs.iter().any(carries_secret)),
@@ -2921,7 +2945,7 @@ fn carries_secret(v: &Value) -> bool {
 /// receive one.
 #[cold]
 #[inline(never)]
-fn err_secret_to_host(
+pub fn err_secret_to_host(
     span: Span,
     operation: &str,
     position: usize,
@@ -2941,7 +2965,7 @@ fn err_secret_to_host(
 /// `E0425` — a host operation reached from inside a `simulate` region.
 #[cold]
 #[inline(never)]
-pub(crate) fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diagnostic {
+pub fn err_host_in_simulation(span: Span, operation: &str, region: Span) -> Diagnostic {
     Diagnostic::error(
         codes::HOST_IN_SIMULATION,
         format!("`{operation}` reached the host boundary from inside a `simulate` region"),

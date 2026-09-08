@@ -12,13 +12,11 @@ per-operation rule in the unit's fixpoint, and the performed atoms crossing the
 seam into the machine's trace. The emitter written in Ply carries every one of
 them, the reference none; they compile with the chain entered whole
 (`PLY_C_EMITTER=ply-whole:<dir>`), and the audit is green over the standard
-library and the examples in that mode. The host route is not built: a
-`perform` no frame answers is refused before it is compiled, by the rule below,
-so nothing reaches the runtime's "no handler" failure from a shipped program.
-What the tier refuses over the shipped corpus now is a `perform` of an
-operation the run's host binding would answer, a `resume` called off the tail,
-and their callers; `simulate` and `task.*` were refused when this was written
-and are ADR 0044's first stage, built. The `Float` and `Decimal` literals the
+library and the examples in that mode. The host route was not built
+when this was written, and a `perform` no frame answered was refused before it
+was compiled, by a rule the fixpoint carried; ADR 0044 built the route and
+retired the rule, and what the tier refuses over the shipped corpus now is a
+`task` operation no region answers, the credential, and their callers. The `Float` and `Decimal` literals the
 reference never carried are constants the runtime holds, and compiling their
 bodies found the rule the inline `Int` arithmetic had wrong on both sides: an
 operator over two words of a type the emitter cannot see goes through the
@@ -132,12 +130,10 @@ of the `return` clause when there is one. Four helpers carry it:
   inventory of what that route needs -- the binding, the hermetic and
   footprint checks, and a span to hang a diagnostic on -- and each of them is a
   field on the frame or the context rather than a reason to refuse. Until it
-  is built, the fixpoint refuses a performer of an operation nothing in the
+  was built, the fixpoint refused a performer of an operation nothing in the
   program handles, and one of every operation the run's host binding would
-  answer -- the driver hands the producer that list when it builds the
-  backend -- so a compiled `perform` never has to reach the host, and the
-  runtime's failure for the unhandled case is the machine's own diagnostic for
-  a compiler defect.
+  answer, so that a compiled `perform` never had to reach the host; ADR 0044
+  built the route and retired both rules.
 - Every `perform` records its atom on the context, and the backend hands the
   atoms across the seam after each entry for the machine to record in its
   trace: the observed row is a claim the tests make, and a handled perform is
@@ -193,7 +189,7 @@ with every `handle` refused.
 3. **The host route.** A `perform` no frame answers reaches the binding. The
    suite's host tests under `--backend c` are the oracle, and the hermetic
    diagnostics have codes (`docs/GUIDE.md` §7.8) the tier has to raise
-   verbatim.
+   verbatim. Built under ADR 0044, whose fourth stage it became.
 4. **The measurement the fifth step needs.** With the three above, the tier's
    refusals over the shipped corpus are `simulate`, `task.*`, a `resume` that
    captures, and the literals the reference never carried. That list is what

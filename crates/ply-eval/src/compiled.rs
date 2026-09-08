@@ -1,13 +1,17 @@
 //! Where a natively compiled body may be entered in place of evaluating one.
 
+use crate::host::{HostBinding, HostRuntime, HostUse};
 use crate::region::Record;
 use crate::sim::Seed;
 use crate::value::{Closure, ClosureKind, Value};
 use ply_core::CheckOutput;
+use ply_core::Footprint;
 use ply_core::ty::{EffectAtom, IntTy, SECRET, TyVar, Type};
 use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::Program;
 use rustc_hash::FxHashMap;
+use std::rc::Rc;
+use std::sync::Arc;
 
 /// A source of natively compiled bodies for a program's definitions.
 pub trait Compiled {
@@ -36,6 +40,19 @@ pub trait Compiled {
     /// What the last entry's regions did, for the search, if it opened any.
     fn simulated(&self) -> Option<Record> {
         None
+    }
+
+    /// The host binding a `perform` nothing on the stack answers reaches, and the reactor a
+    /// pending answer is waited on.
+    fn set_host(&self, _binding: Arc<HostBinding>, _runtime: Option<Rc<dyn HostRuntime>>) {}
+
+    fn set_declared(&self, _declared: Option<Footprint>) {}
+
+    fn set_re_executed(&self, _re_executed: bool) {}
+
+    /// What the entries since the last take asked of the host, and how many linear operations.
+    fn take_host_use(&self) -> (HostUse, u64) {
+        (HostUse::default(), 0)
     }
 }
 
