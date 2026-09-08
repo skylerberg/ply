@@ -208,15 +208,14 @@ fn emit_all(
                     continue;
                 }
                 for op in &tables.performs {
-                    let missing = if super::producer::host_served().contains(op) {
-                        Some("the host, which the tier has no route to".to_string())
-                    } else {
-                        match handlers.get(op) {
-                            None => Some("nothing in the program".to_string()),
-                            Some(hs) => hs.iter().find(|h| !taken_now.contains(h)).map(|h| {
-                                format!("`{h}`, which handles it and is not in this compiled unit")
-                            }),
-                        }
+                    // A `perform` no handler in the program answers reaches the host binding
+                    // from the runtime, with the machine's checks, and a `task` operation
+                    // outside any region opens the production region the binding permits.
+                    let missing = match handlers.get(op) {
+                        None => None,
+                        Some(hs) => hs.iter().find(|h| !taken_now.contains(h)).map(|h| {
+                            format!("`{h}`, which handles it and is not in this compiled unit")
+                        }),
                     };
                     if let Some(why) = missing {
                         round.push(Refused {

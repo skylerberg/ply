@@ -12,6 +12,7 @@ pub mod backend;
 pub mod c;
 pub mod detached;
 pub mod heap;
+pub mod host;
 pub mod list;
 pub mod map;
 pub mod opt;

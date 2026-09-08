@@ -64,19 +64,6 @@ pub fn installed() -> bool {
 }
 
 static WHOLE: AtomicBool = AtomicBool::new(false);
-/// The operations the run's host binding would answer, as `effect#op`. A compiled `perform`
-/// has no route to the host (ADR 0043's third stage is not built), so a performer of one of
-/// these stays the machine's, whatever the binding does with it.
-static HOST_SERVED: OnceLock<Vec<String>> = OnceLock::new();
-
-pub fn set_host_served(ops: Vec<String>) {
-    let _ = HOST_SERVED.set(ops);
-}
-
-pub fn host_served() -> &'static [String] {
-    HOST_SERVED.get().map_or(&[], Vec::as_slice)
-}
-
 /// Whether the producer's answer is the unit's: its bodies taken and its refusals dropped by the
 /// fixpoint, with the reference emitter not run at all. ADR 0042's third step.
 pub fn set_whole(whole: bool) {

@@ -338,8 +338,6 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
     producer::set_whole(true);
-    // An operation the run's host binding would answer stays the machine's, handler or not.
-    producer::set_host_served(vec!["m.served#ping".to_string()]);
     let loaded = load(&[("m", DROPPED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -365,22 +363,134 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
         "{}",
         reason("m.performer")
     );
-    assert!(
-        reason("m.lonely").contains("nothing in the program"),
-        "{}",
-        reason("m.lonely")
+    // A `perform` no handler in the program answers is compiled: it reaches the host binding
+    // from the runtime, with the machine's checks, and an unbound one fails there as the
+    // machine fails it.
+    for taken in ["m.lonely", "m.hosted", "m.hosting"] {
+        assert!(
+            !refused.iter().any(|r| r.function == taken),
+            "`{taken}` was refused: {refused:?}"
+        );
+    }
+}
+
+const HOSTED: &str = r#"
+effect served {
+  write ping(n: Int) -> Int
+}
+
+fn hosted(n: Int) -> Int / {served.write} = served.ping(n) * 10
+
+fn ticking() -> Int / {clock.read} = clock.now() + 1
+"#;
+
+struct Doubler;
+
+impl ply_eval::HostHandler for Doubler {
+    fn call(
+        &self,
+        _rt: &dyn ply_eval::HostRuntime,
+        req: &ply_eval::HostRequest<'_>,
+    ) -> Result<ply_eval::HostAnswer, ply_span::Diagnostic> {
+        let Some(Value::Int(n)) = req.args.first() else {
+            panic!("ping takes an Int");
+        };
+        Ok(ply_eval::HostAnswer::Value(Value::Int(n * 2)))
+    }
+}
+
+/// A `perform` nothing on the stack answers reaches the host binding from the runtime: a bound
+/// handler answers it as it answers the machine, and a hermetic binding refuses it with the
+/// machine's diagnostic.
+#[test]
+fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", HOSTED)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut registry = ply_eval::HostRegistry::new();
+    registry.register(
+        ply_eval::HostOp {
+            effect: ply_span::Symbol::new("m.served"),
+            op: ply_span::Symbol::new("ping"),
+            resource: ply_eval::HostResource::Any,
+            determinism: ply_eval::Determinism::Nondeterministic,
+            linearity: ply_eval::Linearity::Repeatable,
+            blocking: false,
+            secrets: false,
+            path: "test::ping",
+        },
+        std::sync::Arc::new(Doubler),
     );
-    assert!(
-        reason("m.hosted").contains("the host"),
-        "{}",
-        reason("m.hosted")
-    );
-    // The handler calls the performer, so the cascade takes it too, naming the performer.
-    assert!(
-        reason("m.hosting").contains("m.hosted"),
-        "{}",
-        reason("m.hosting")
-    );
+    let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
+    let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
+    let cases: Vec<(&str, Vec<Value>, std::sync::Arc<ply_eval::HostBinding>)> = vec![
+        (
+            "m.hosted",
+            vec![Value::Int(4)],
+            std::sync::Arc::clone(&bound),
+        ),
+        (
+            "m.hosted",
+            vec![Value::Int(4)],
+            std::sync::Arc::clone(&hermetic),
+        ),
+        ("m.ticking", vec![], std::sync::Arc::clone(&bound)),
+        ("m.ticking", vec![], std::sync::Arc::clone(&hermetic)),
+    ];
+    for (name, args, binding) in cases {
+        let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+        machine.set_host_binding(std::sync::Arc::clone(&binding));
+        let want = machine.call(name, args.clone(), Span::DUMMY);
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.set_host(binding, None);
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        match want {
+            Ok(want) => {
+                assert_eq!(
+                    ctx.failed,
+                    0,
+                    "`{name}{args:?}` raised in the C tier: {:?}",
+                    ctx.diagnostic.as_ref().map(|d| d.message.clone())
+                );
+                let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+                assert_eq!(
+                    got, want,
+                    "`{name}{args:?}`: the tier and the machine disagree"
+                );
+            }
+            Err(theirs) => {
+                assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
+                    theirs.message
+                );
+                let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
+                assert_eq!(
+                    ours.code, theirs.code,
+                    "`{name}{args:?}`: {} vs {}",
+                    ours.message, theirs.message
+                );
+            }
+        }
+        ctx.end();
+    }
 }
 
 /// `Float` and `Decimal` literals are constants the runtime holds, opaque to the emitted C:
@@ -753,6 +863,173 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        match want {
+            Ok(want) => {
+                assert_eq!(
+                    ctx.failed,
+                    0,
+                    "`{name}{args:?}` raised in the C tier: {:?}",
+                    ctx.diagnostic.as_ref().map(|d| d.message.clone())
+                );
+                let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+                assert_eq!(
+                    got, want,
+                    "`{name}{args:?}`: the tier and the machine disagree"
+                );
+            }
+            Err(theirs) => {
+                assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
+                    theirs.message
+                );
+                let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
+                assert_eq!(
+                    ours.code, theirs.code,
+                    "`{name}{args:?}`: {} vs {}",
+                    ours.message, theirs.message
+                );
+            }
+        }
+        ctx.end();
+    }
+}
+
+const PRODUCTION: &str = r#"
+effect slow {
+  write fetch(n: Int) -> Int
+}
+
+fn spawned(n: Int) -> Int / {task.write} = { let t = task.spawn(|| n * 2); task.join(t) + 1 }
+
+fn parked(n: Int) -> Int / {slow.write, task.write} = {
+  let t = task.spawn(|| slow.fetch(n));
+  task.join(t) + slow.fetch(n + 1)
+}
+"#;
+
+struct Slow;
+
+impl ply_eval::HostHandler for Slow {
+    fn call(
+        &self,
+        _rt: &dyn ply_eval::HostRuntime,
+        req: &ply_eval::HostRequest<'_>,
+    ) -> Result<ply_eval::HostAnswer, ply_span::Diagnostic> {
+        let Some(Value::Int(n)) = req.args.first() else {
+            panic!("fetch takes an Int");
+        };
+        Ok(ply_eval::HostAnswer::Pending(ply_eval::Pending {
+            token: *n as u64,
+            label: "fetch",
+        }))
+    }
+}
+
+/// A reactor that resolves every pending answer to three times its token on the next poll.
+struct Reactor;
+
+impl ply_eval::HostRuntime for Reactor {
+    fn poll(&self, pending: &ply_eval::Pending) -> Result<Option<Value>, ply_span::Diagnostic> {
+        Ok(Some(Value::Int(pending.token as i64 * 3)))
+    }
+
+    fn park(&self) -> Result<(), ply_span::Diagnostic> {
+        Ok(())
+    }
+
+    fn block_on(&self, pending: ply_eval::Pending) -> Result<Value, ply_span::Diagnostic> {
+        Ok(Value::Int(pending.token as i64 * 3))
+    }
+}
+
+/// A `task` operation outside any `simulate` opens the production region the binding permits,
+/// with the performer's stack as the root: tasks spawn and join, a pending host answer parks
+/// the task until the reactor resolves it, and the region drains after the root returns. A
+/// hermetic binding refuses the region with the machine's code.
+#[test]
+fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", PRODUCTION)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut registry = ply_eval::HostRegistry::new();
+    registry.register(
+        ply_eval::HostOp {
+            effect: ply_span::Symbol::new("m.slow"),
+            op: ply_span::Symbol::new("fetch"),
+            resource: ply_eval::HostResource::Any,
+            determinism: ply_eval::Determinism::Nondeterministic,
+            linearity: ply_eval::Linearity::Repeatable,
+            blocking: true,
+            secrets: false,
+            path: "test::fetch",
+        },
+        std::sync::Arc::new(Slow),
+    );
+    // The binding names the scheduler's operations as the host crate's does; neither engine
+    // calls the handler, since a region answers them.
+    for op in ply_eval::sim::TASK_OPS {
+        registry.register(
+            ply_eval::HostOp {
+                effect: ply_span::Symbol::new("task"),
+                op: ply_span::Symbol::new(*op),
+                resource: ply_eval::HostResource::Any,
+                determinism: ply_eval::Determinism::Nondeterministic,
+                linearity: ply_eval::Linearity::Repeatable,
+                blocking: false,
+                secrets: false,
+                path: "test::task",
+            },
+            std::sync::Arc::new(Slow),
+        );
+    }
+    let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
+    let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
+    let cases: Vec<(&str, Vec<Value>, std::sync::Arc<ply_eval::HostBinding>)> = vec![
+        (
+            "m.spawned",
+            vec![Value::Int(4)],
+            std::sync::Arc::clone(&bound),
+        ),
+        (
+            "m.parked",
+            vec![Value::Int(2)],
+            std::sync::Arc::clone(&bound),
+        ),
+        (
+            "m.spawned",
+            vec![Value::Int(4)],
+            std::sync::Arc::clone(&hermetic),
+        ),
+    ];
+    for (name, args, binding) in cases {
+        let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+        machine.set_host_binding(std::sync::Arc::clone(&binding));
+        machine.set_host_runtime(std::rc::Rc::new(Reactor));
+        let want = machine.call(name, args.clone(), Span::DUMMY);
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.set_host(binding, Some(std::rc::Rc::new(Reactor)));
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let mut answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
+            answer = unsafe { ply_codegen::simulate::finish_root(&mut ctx, answer) };
+        }
         match want {
             Ok(want) => {
                 assert_eq!(
