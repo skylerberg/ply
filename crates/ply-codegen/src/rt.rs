@@ -255,6 +255,24 @@ impl HandlerFrame {
     }
 }
 
+/// The handler frames of one stack. A task's or a detached body's frames chain to the stack it
+/// was entered from through `parent`, so a `perform` searches its own stack and then the one it
+/// runs under, which is what a deep handler means when a resumed body runs inside the clause
+/// that resumed it. A depth names a frame within one stack and does not move.
+pub(crate) struct Frames {
+    pub(crate) list: Vec<HandlerFrame>,
+    pub(crate) parent: Option<usize>,
+}
+
+impl Frames {
+    pub(crate) fn under(parent: Option<usize>) -> Frames {
+        Frames {
+            list: Vec::new(),
+            parent,
+        }
+    }
+}
+
 /// One clause: its effect and resource under their program-wide names, the operation, the
 /// closure the clause body became, and whether the clause binds `resume`.
 struct FrameClause {
@@ -311,7 +329,10 @@ pub struct Ctx {
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
     pub builtin_calls: u64,
-    pub handlers: Vec<HandlerFrame>,
+    /// One entry per stack that has run in this entry, the entry's own first; `current` is the
+    /// one running.
+    pub(crate) stacks: Vec<Frames>,
+    pub(crate) current: usize,
     /// Every atom a compiled `perform` performed since the entry began, for the machine's trace:
     /// the observed row is a claim the tests make, and a handled perform is still a perform.
     pub performed: Vec<EffectAtom>,
@@ -325,7 +346,7 @@ pub struct Ctx {
     pub record: Option<ply_eval::region::Record>,
     entered_sims: u32,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
-    unwind: Option<(usize, Word)>,
+    unwind: Option<(usize, usize, Word)>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     resumed: Option<Word>,
 }
@@ -346,7 +367,8 @@ impl Ctx {
             cells_baseline: baseline,
             diagnostic: None,
             builtin_calls: 0,
-            handlers: Vec::new(),
+            stacks: vec![Frames::under(None)],
+            current: 0,
             performed: Vec::new(),
             sims: Vec::new(),
             seed: ply_eval::Seed::default(),
@@ -367,7 +389,9 @@ impl Ctx {
         self.fuel = fuel;
         self.stack_floor = stack_floor();
         self.diagnostic = None;
-        self.handlers.clear();
+        self.stacks.clear();
+        self.stacks.push(Frames::under(None));
+        self.current = 0;
         self.performed.clear();
         self.sims.clear();
         self.trail = ply_eval::region::Trail::new(self.seed.clone());
@@ -423,6 +447,16 @@ impl Ctx {
     /// The singleton a nullary constructor is.
     pub fn nullary(&self, index: u32) -> Word {
         self.tables.nullaries[index as usize]
+    }
+
+    pub(crate) fn frames(&mut self) -> &mut Vec<HandlerFrame> {
+        &mut self.stacks[self.current].list
+    }
+
+    /// A new stack's frames, chained under `parent`; its index names it.
+    pub(crate) fn open_stack(&mut self, parent: Option<usize>) -> usize {
+        self.stacks.push(Frames::under(parent));
+        self.stacks.len() - 1
     }
 
     pub(crate) fn fail(&mut self, d: Diagnostic) -> i64 {
@@ -1465,12 +1499,13 @@ pub unsafe extern "C" fn rt_handle_push(
             resumes: w[4] != 0,
         })
         .collect();
-    c.handlers.push(HandlerFrame {
+    let frames = c.frames();
+    frames.push(HandlerFrame {
         clauses,
         ret,
         simulate: false,
     });
-    (c.handlers.len() - 1) as i64
+    (frames.len() - 1) as i64
 }
 
 /// The `k` a clause that binds `resume` is handed: calling it in tail position records the
@@ -1482,7 +1517,26 @@ unsafe extern "C" fn rt_resume_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
     v
 }
 
-fn resume_token(c: &mut Ctx, depth: usize) -> Word {
+fn hide_above(c: &mut Ctx, stack: usize, depth: usize) -> Vec<(usize, Vec<HandlerFrame>)> {
+    let mut hidden = Vec::new();
+    let mut s = c.current;
+    while s != stack {
+        hidden.push((s, std::mem::take(&mut c.stacks[s].list)));
+        s = c.stacks[s]
+            .parent
+            .expect("the handler's stack is in the chain");
+    }
+    hidden.push((stack, c.stacks[stack].list.split_off(depth)));
+    hidden
+}
+
+fn restore_hidden(c: &mut Ctx, hidden: Vec<(usize, Vec<HandlerFrame>)>) {
+    for (s, frames) in hidden.into_iter().rev() {
+        c.stacks[s].list.extend(frames);
+    }
+}
+
+fn resume_token(c: &mut Ctx, stack: usize, depth: usize) -> Word {
     let o = c
         .heap
         .alloc(KIND_CLOSURE, 0, (1 + CLOSURE_CAPTURES) as u32, 1);
@@ -1492,7 +1546,11 @@ fn resume_token(c: &mut Ctx, depth: usize) -> Word {
             CLOSURE_CODE,
             rt_resume_entry as *const () as usize as Word,
         );
-        set_word(o, CLOSURE_CAPTURES, heap::imm(depth as i64));
+        set_word(
+            o,
+            CLOSURE_CAPTURES,
+            heap::imm(((stack << 32) | depth) as i64),
+        );
     }
     o as Word
 }
@@ -1529,27 +1587,36 @@ pub unsafe extern "C" fn rt_perform(
     }
     c.performed.push(atom);
     let mut found = None;
-    for (i, f) in c.handlers.iter().enumerate().rev() {
-        if f.simulate {
-            if effect.as_str() == "sim" && op.as_str() == "seed" {
-                let root = c.seed.root as i64;
-                return c.word(&Value::Int(root));
+    let mut stack = c.current;
+    'search: loop {
+        for (i, f) in c.stacks[stack].list.iter().enumerate().rev() {
+            if f.simulate {
+                if effect.as_str() == "sim" && op.as_str() == "seed" {
+                    let root = c.seed.root as i64;
+                    return c.word(&Value::Int(root));
+                }
+                if ply_eval::sim::is_scheduled(effect.as_str(), op.as_str()) {
+                    return unsafe {
+                        crate::simulate::perform(ctx, &effect, &op, args_of(args, n))
+                    };
+                }
+                continue;
             }
-            if ply_eval::sim::is_scheduled(effect.as_str(), op.as_str()) {
-                return unsafe { crate::simulate::perform(ctx, &effect, &op, args_of(args, n)) };
+            if let Some(cl) = f
+                .clauses
+                .iter()
+                .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
+            {
+                found = Some((stack, i, cl.closure, cl.resumes));
+                break 'search;
             }
-            continue;
         }
-        if let Some(cl) = f
-            .clauses
-            .iter()
-            .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
-        {
-            found = Some((i, cl.closure, cl.resumes));
-            break;
+        match c.stacks[stack].parent {
+            Some(p) => stack = p,
+            None => break,
         }
     }
-    let Some((depth, closure, resumes)) = found else {
+    let Some((stack, depth, closure, resumes)) = found else {
         // The machine's own diagnostic for an operation nothing handles: a performer of one
         // the host would answer is never compiled, so this is the case the machine calls a
         // compiler defect too.
@@ -1558,15 +1625,17 @@ pub unsafe extern "C" fn rt_perform(
         return c.fail(d);
     };
     let mut call_args: Vec<Word> = args_of(args, n).to_vec();
-    let above = c.handlers.split_off(depth);
+    // The clause runs outside the handler: the frame and everything above it, in this stack and
+    // in every stack chained under it down to the performer's, are out of reach until it returns.
+    let hidden = hide_above(c, stack, depth);
     if resumes {
-        let k = resume_token(c, depth);
+        let k = resume_token(c, stack, depth);
         call_args.push(k);
         c.resumed = None;
     }
     let r = call_value(ctx, closure, &call_args);
     let c = unsafe { &mut *ctx };
-    c.handlers.extend(above);
+    restore_hidden(c, hidden);
     if c.failed != 0 {
         return 0;
     }
@@ -1576,7 +1645,7 @@ pub unsafe extern "C" fn rt_perform(
     match c.resumed.take() {
         Some(v) => v,
         None => {
-            c.unwind = Some((depth, r));
+            c.unwind = Some((stack, depth, r));
             c.failed = FAILED_UNWIND;
             0
         }
@@ -1600,21 +1669,23 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     let id = ply_eval::SimId(c.entered_sims);
     c.entered_sims += 1;
     c.trail.enter(Span::DUMMY);
-    let depth = c.handlers.len();
-    c.handlers.push(HandlerFrame::simulate());
+    let stack = c.current;
+    let depth = c.frames().len();
+    c.frames().push(HandlerFrame::simulate());
     let sim = crate::simulate::Simulation::new(
         id,
         c.seed.root,
         c.trail.drawn(),
         c.sim_steps,
-        depth,
+        stack,
         c.stack_floor,
         body,
     );
     c.sims.push(sim);
     let r = unsafe { crate::simulate::run(ctx) };
     let c = unsafe { &mut *ctx };
-    for f in c.handlers.split_off(depth) {
+    c.current = stack;
+    for f in c.stacks[stack].list.split_off(depth) {
         drop_frame(f);
     }
     c.sims.pop();
@@ -1625,7 +1696,8 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
 pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let depth = depth as usize;
-    let mut popped = c.handlers.split_off(depth);
+    let stack = c.current;
+    let mut popped = c.frames().split_off(depth);
     let mine = if popped.is_empty() {
         None
     } else {
@@ -1635,16 +1707,16 @@ pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -
         drop_frame(f);
     }
     if c.failed == FAILED_UNWIND
-        && let Some((target, v)) = c.unwind.take()
+        && let Some((target_stack, target, v)) = c.unwind.take()
     {
-        if target == depth {
+        if target_stack == stack && target == depth {
             c.failed = 0;
             if let Some(f) = mine {
                 drop_frame(f);
             }
             return v;
         }
-        c.unwind = Some((target, v));
+        c.unwind = Some((target_stack, target, v));
     }
     if c.failed != 0 {
         if let Some(f) = mine {
