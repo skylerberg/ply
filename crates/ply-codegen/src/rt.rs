@@ -1463,9 +1463,11 @@ pub unsafe extern "C" fn rt_perform(
             .map(|cl| (i, cl.closure, cl.resumes))
     });
     let Some((depth, closure, resumes)) = found else {
-        let d = error(format!(
-            "`{effect}.{op}` reached no handler in the compiled fragment"
-        ));
+        // The machine's own diagnostic for an operation nothing handles: a performer of one
+        // the host would answer is never compiled, so this is the case the machine calls a
+        // compiler defect too.
+        let d = ply_eval::handler::err_unhandled(Span::DUMMY, &effect, &op, resource.as_ref())
+            .primary(Span::DUMMY, "in compiled code");
         return c.fail(d);
     };
     let mut call_args: Vec<Word> = args_of(args, n).to_vec();

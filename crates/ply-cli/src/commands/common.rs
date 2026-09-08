@@ -221,6 +221,17 @@ pub(crate) fn install_producer_from_env() {
     );
 }
 
+/// The operations a binding would answer, as the producer keys them: a compiled `perform` of
+/// one stays the machine's until the tier has a route to the host.
+pub(crate) fn host_served(binding: &ply_eval::HostBinding) -> Vec<String> {
+    binding
+        .listing()
+        .rows
+        .iter()
+        .map(|row| format!("{}#{}", row.effect, row.op))
+        .collect()
+}
+
 pub fn build_backend(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
