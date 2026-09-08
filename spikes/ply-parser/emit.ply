@@ -23,7 +23,7 @@ import resolve (Mod, Source, Resolved_, Failed, resolve_modules)
 import derive (expand_derives)
 import infer (pure_definitions)
 import exprs (Param)
-import types (TypeExpr, TCon, TRecord)
+import types (TypeExpr, TVar, TCon, TRecord)
 import rewrite (expand)
 import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
 
@@ -51,7 +51,7 @@ pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyOpaque
 // as the name: a scalar field is read into a register of its own kind and a
 // field of any other type stays the word it is, and reading every field as an
 // `Int` writes an unbox the reference does not.
-pub type FieldTy = { name: Bytes, k: Kind }
+pub type FieldTy = { name: Bytes, k: Kind, ty: Ty }
 
 // The emitter's state: the lines written so far and the next temporary's number.
 // The lines written so far, the next temporary's number, and the slots whose
@@ -160,7 +160,13 @@ pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool }
 pub type Imported = { name: Bytes, module: Bytes, defs: List<Def> }
 
 // One module's definitions, for the imports that name it.
-pub type ModDefs = { module: Bytes, defs: List<Def> }
+pub type ModDefs = { module: Bytes, defs: List<Def>, aliases: List<Alias> }
+
+// A `type` item that names a type: its parameters, and the type in its own module's scope.
+pub type Alias = { name: Bytes, params: List<Bytes>, ty: TypeExpr }
+
+// A type variable an alias's argument bound, resolved where the argument was written.
+pub type Bound = { name: Bytes, k: Kind, ty: Ty }
 
 // A record this body built, and the values its fields were built from. A later
 // field read of it is that value: it is already in a register, and going to
@@ -829,7 +835,7 @@ fn caps_owned(em: Em, cs: List<Cap>, i: Int, acc: List<Bytes>)
 // carried back out. Emitting it against a copy numbered a second body's
 // constants and builtins from zero.
 fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>, body: Code })
-    -> Option<{ text: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, calls: List<Bytes>, refused: Option<Bytes> }> = {
+    -> Option<{ text: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, calls: List<Bytes>, refused: Option<Bytes> }> = {
   let n = len(l.caps) + l.params;
   let window = fold(range(0, l.params),
     fold(range(0, len(l.caps)), [], |acc: List<Conv>, i: Int|
@@ -847,7 +853,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
                 ctors: em.ctors, extra: b"", lambdas: [], owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: [], alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused };
   match expr(start, l.body, []) {
     None -> None,
-    Some(o) -> Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, calls: o.em.calls, refused: o.em.refused,
+    Some(o) -> Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, fields: o.em.fields, calls: o.em.calls, refused: o.em.refused,
       text: bytes_concat_all([
       b"Word ply_", name, b"(PlyCtx *ctx",
       fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word q", num(i)])),
@@ -971,10 +977,10 @@ fn count_of(reads: List<Int>, slot: Int) -> Int =
 fn width_of(ty: Ty) -> Option<Int> =
   match ty { TyRec(fs) -> Some(len(fs)), _ -> None }
 
-fn field_at(ty: Ty, name: Bytes) -> Option<{ at: Int, k: Kind }> =
+fn field_at(ty: Ty, name: Bytes) -> Option<{ at: Int, k: Kind, ty: Ty }> =
   match ty {
-    TyRec(fs) -> fold(fs, None, |acc: Option<{ at: Int, k: Kind }>, f: FieldTy|
-      if f.name == name { Some({ at: rank_of(names_of(fs), name), k: f.k }) } else { acc }),
+    TyRec(fs) -> fold(fs, None, |acc: Option<{ at: Int, k: Kind, ty: Ty }>, f: FieldTy|
+      if f.name == name { Some({ at: rank_of(names_of(fs), name), k: f.k, ty: f.ty }) } else { acc }),
     _ -> None,
   }
 
@@ -1213,7 +1219,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             shapes: sub_out.shapes, built: e.built, module: e.module, made: e.made,
                             here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
                             extra: bytes_concat(e.extra, sub_out.text), lambdas: e.lambdas,
-                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: e.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused };
+                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: sub_out.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused };
               // The closure names its code by the entry's place in the body's table.
               let entry = lambda_of(grown, bytes_concat_all([b"ply_", sub, b"_entry"]));
               let o = bind(entry.em, KBoxed, bytes_concat_all([
@@ -1259,7 +1265,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             // scalar field then goes into a register of its own kind; anything
             // else stays the word it already is.
             Some(i) -> {
-              let w = bind(held.em, KBoxed,
+              let w = bind_keeping(held.em, KBoxed, i.ty,
                 bytes_concat_all([b"ply_words(", held.v.c, b")[", num(i.at), b"]"]));
               match i.k {
                 // A field whose own kind is a word does **not** release the base.
@@ -1276,11 +1282,14 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 },
               }
             },
-            // The shape is not known and neither is the offset. `field_of`
-            // writes the runtime's read by name for it, and it is not switched
-            // on -- see the note in `emit_diff.rs` for what it reaches and what
-            // still disagrees.
-            None -> Some(refused(b.em, bytes_concat(b"a field of a shape this port cannot see: ", f.field))),
+            // The shape is not known and neither is the offset: the runtime's read by name,
+            // through this body's field table. It answers a word, and a field whose kind is a
+            // word does not release its base.
+            None -> {
+              let idx = field_of(held.em, f.field);
+              let w = bind(idx.em, KBoxed, bytes_concat_all([b"rt_field_p(ctx, ", held.v.c, b", @@f", num(idx.i), b"@@, 0)"]));
+              Some({ em: check(w.em), v: w.v })
+            },
           }
         },
       },
@@ -1307,20 +1316,32 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               |acc: { em: Em, ws: List<Bytes> }, at: Int| {
                 let nm = match list_at(names, at) { Some(x) -> x, None -> b"" };
                 if fold(u.copies, false, |seen: Bool, c: Bytes| seen || c == nm) {
-                  let w = bind_word_of(acc.em, bytes_concat_all([
-                    b"ply_words(", held.v.c, b")[", num(at), b"]"]));
-                  let inc = line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"]));
-                  // A scalar copy is read into a register of its own kind, as any
-                  // field read is -- and the register is then unused, because the
-                  // *word* is what the store takes. A copy whose field is already
-                  // a word converts nothing.
-                  let k = match field_at(bv.v.ty, nm) { Some(x) -> x.k, None -> KBoxed };
-                  let done = match k {
-                    KBoxed -> inc,
-                    _ -> { let c = bind(inc, k, match k { KBool -> as_bool(w.v), _ -> as_int(w.v) });
-                           c.em },
-                  };
-                  { em: done, ws: push(acc.ws, w.v.c) }
+                  match field_at(bv.v.ty, nm) {
+                    // Read at the field's place in the **base's** shape, which is the new
+                    // record's only when the update writes no field the base lacks -- and a
+                    // literal recognised as an update usually does.
+                    Some(f) -> {
+                      let w = bind_word_of(acc.em, bytes_concat_all([
+                        b"ply_words(", held.v.c, b")[", num(f.at), b"]"]));
+                      let inc = line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"]));
+                      // A scalar copy is read into a register of its own kind, as any
+                      // field read is -- and the register is then unused, because the
+                      // *word* is what the store takes. A copy whose field is already
+                      // a word converts nothing.
+                      let done = match f.k {
+                        KBoxed -> inc,
+                        _ -> { let c = bind(inc, f.k, match f.k { KBool -> as_bool(w.v), _ -> as_int(w.v) });
+                               c.em },
+                      };
+                      { em: done, ws: push(acc.ws, w.v.c) }
+                    },
+                    None -> {
+                      let idx = field_of(acc.em, nm);
+                      let w = bind(idx.em, KBoxed, bytes_concat_all([
+                        b"rt_field_p(ctx, ", held.v.c, b", @@f", num(idx.i), b"@@, 0)"]));
+                      { em: check(w.em), ws: push(acc.ws, w.v.c) }
+                    },
+                  }
                 } else {
                   match set_value(u.sets, ev.vals, nm) {
                     None -> { em: acc.em, ws: push(acc.ws, b"0") },
@@ -1367,7 +1388,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                            b"] = ", match list_at(filled.ws, at) { Some(x) -> x, None -> b"0" },
                            b";"]))), rec.v.c),
                        v: { k: KBoxed, c: rec.v.c,
-                            ty: TyRec(map(names, |nm: Bytes| { name: nm, k: KBoxed })) } })
+                            ty: TyRec(map(names, |nm: Bytes| { name: nm, k: KBoxed, ty: TyOpen })) } })
               },
             }
           },
@@ -1406,7 +1427,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                  v: { k: KBoxed, c: rec.v.c,
                       ty: TyRec(map(range(0, len(names)), |i: Int|
                         { name: match list_at(names, i) { Some(n) -> n, None -> b"" },
-                          k: match list_at(w.vals, i) { Some(v) -> v.k, None -> KBoxed } })) } })
+                          k: match list_at(w.vals, i) { Some(v) -> v.k, None -> KBoxed },
+                          ty: match list_at(w.vals, i) { Some(v) -> v.ty, None -> TyOpen } })) } })
         },
       }
     },
@@ -1901,7 +1923,7 @@ fn rebuild(em: Em, names: List<Bytes>, js: List<Bytes>) -> Option<Out> = {
              as_word({ k: KInt, c: match list_at(js, at) { Some(x) -> x, None -> b"0" },
                        ty: TyOpen }), b";"]))),
          v: { k: KBoxed, c: rec.v.c,
-              ty: TyRec(map(names, |n: Bytes| { name: n, k: KInt })) } })
+              ty: TyRec(map(names, |n: Bytes| { name: n, k: KInt, ty: TyOpen })) } })
 }
 
 // The kind a node answers, without emitting it.
@@ -2085,19 +2107,76 @@ fn prologue(em: Em, params: List<P>) -> Em =
 // reached through a scrutinee is still a tail. The disagreements went 38 to 8
 // over them, and the port reaches 484 shipped bodies against 426.
 
-fn param_kind_in(aliases: List<{ name: Bytes, ty: TypeExpr }>, t: Option<TypeExpr>)
+// A module's type aliases, under the binder an import gives it in the module being emitted.
+pub type ModAliases = { binder: Bytes, aliases: List<Alias> }
+
+fn param_kind_in(aliases: List<Alias>, t: Option<TypeExpr>)
+    -> Option<{ k: Kind, ty: Ty }> = param_kind_with(aliases, [], t)
+
+// The same, with the imported modules' aliases in reach: `http::Response` resolves through
+// `http`'s own aliases to the record it names, and a field of it is read at an offset.
+fn param_kind_with(aliases: List<Alias>, others: List<ModAliases>, t: Option<TypeExpr>)
+    -> Option<{ k: Kind, ty: Ty }> = written_kind(aliases, others, [], t)
+
+// An alias's arguments are resolved where they are written, and its body in the alias's own
+// module with its parameters bound to them: `Ran<http::Response>` reads `response.status` at
+// an offset, through two modules' scopes.
+fn bind_args(aliases: List<Alias>, others: List<ModAliases>, vars: List<Bound>,
+             params: List<Bytes>, args: List<TypeExpr>) -> List<Bound> =
+  map(range(0, len(params)), |i: Int| {
+    let name = match list_at(params, i) { Some(n) -> n, None -> b"" };
+    match list_at(args, i) {
+      Some(arg) -> match written_kind(aliases, others, vars, Some(arg)) {
+        Some(x) -> { name: name, k: x.k, ty: x.ty },
+        None -> { name: name, k: KBoxed, ty: TyOpen },
+      },
+      None -> { name: name, k: KBoxed, ty: TyOpen },
+    }
+  })
+
+fn alias_named(aliases: List<Alias>, name: Bytes) -> Option<Alias> =
+  fold(aliases, None, |acc: Option<Alias>, a: Alias| if a.name == name { Some(a) } else { acc })
+
+fn written_kind(aliases: List<Alias>, others: List<ModAliases>, vars: List<Bound>, t: Option<TypeExpr>)
     -> Option<{ k: Kind, ty: Ty }> =
   match t {
-    Some(TCon(c)) ->
-      // A *parameterised* alias resolves too. Its arguments are not substituted:
-      // a field whose type is one of them answers a word either way, which is
-      // what the shape needs to know. `Cut<Expr>` is the shape that showed it.
-      if c.name.module != None { param_kind(t) }
-      else { match fold(aliases, None, |acc: Option<TypeExpr>, a: { name: Bytes, ty: TypeExpr }|
-                    if a.name == c.name.name.name { Some(a.ty) } else { acc }) {
-        Some(u) -> param_kind(Some(u)),
+    Some(TVar(id)) ->
+      match fold(vars, None, |acc: Option<Bound>, b: Bound| if b.name == id.name { Some(b) } else { acc }) {
+        Some(b) -> Some({ k: b.k, ty: b.ty }),
         None -> param_kind(t),
-      } },
+      },
+    Some(TCon(c)) ->
+      match c.name.module {
+        Some(binder) -> match fold(others, None, |acc: Option<List<Alias>>, o: ModAliases|
+                                if o.binder == binder.name { Some(o.aliases) } else { acc }) {
+          None -> param_kind(t),
+          Some(theirs) -> match alias_named(theirs, c.name.name.name) {
+            // Resolved in the other module's own scope: its aliases, and none of ours.
+            Some(a) -> written_kind(theirs, [], bind_args(aliases, others, vars, a.params, c.args), Some(a.ty)),
+            None -> param_kind(t),
+          },
+        },
+        None -> match alias_named(aliases, c.name.name.name) {
+          Some(a) -> written_kind(aliases, others, bind_args(aliases, others, vars, a.params, c.args), Some(a.ty)),
+          None -> param_kind_record(aliases, others, vars, t),
+        },
+      },
+    _ -> param_kind_record(aliases, others, vars, t),
+  }
+
+// A record's fields resolve in the same scope as the record: a field typed by an alias, or by
+// another module's type, is a shape the port can then see.
+fn param_kind_record(aliases: List<Alias>, others: List<ModAliases>, vars: List<Bound>, t: Option<TypeExpr>)
+    -> Option<{ k: Kind, ty: Ty }> =
+  match t {
+    Some(TRecord(r)) ->
+      if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
+                acc || written_kind(aliases, others, vars, Some(f.ty)) == None) { None }
+      else { Some({ k: KBoxed, ty: TyRec(map(r.fields, |f: { name: Ident, ty: TypeExpr }|
+               match written_kind(aliases, others, vars, Some(f.ty)) {
+                 Some(x) -> { name: f.name.name, k: x.k, ty: x.ty },
+                 None -> { name: f.name.name, k: KBoxed, ty: TyOpen },
+               })) }) },
     _ -> param_kind(t),
   }
 
@@ -2127,8 +2206,10 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
       if fold(r.fields, false, |acc: Bool, f: { name: Ident, ty: TypeExpr }|
                 acc || param_kind(Some(f.ty)) == None) { None }
       else { Some({ k: KBoxed, ty: TyRec(map(r.fields, |f: { name: Ident, ty: TypeExpr }|
-               { name: f.name.name,
-                 k: match param_kind(Some(f.ty)) { Some(x) -> x.k, None -> KBoxed } })) }) },
+               match param_kind(Some(f.ty)) {
+                 Some(x) -> { name: f.name.name, k: x.k, ty: x.ty },
+                 None -> { name: f.name.name, k: KBoxed, ty: TyOpen },
+               })) }) },
     // Any other written type -- a function, a variable, a unit -- is a word too.
     // What stays refused is a parameter with no annotation at all, where there is
     // nothing to read.
@@ -2225,7 +2306,7 @@ fn ty_of(env: List<Shaped>, here: List<Def>, c: Code) -> Ty =
   match c.node {
     NVar(v) -> match v.slot { Some(s) -> shape_at(env, s), None -> TyOpen },
     NBlock(b) -> match b.tail { Some(t) -> ty_of(env, here, t), None -> TyOpen },
-    NRecord(r) -> TyRec(map(r.fields, |f: CField| { name: f.name, k: KBoxed })),
+    NRecord(r) -> TyRec(map(r.fields, |f: CField| { name: f.name, k: KBoxed, ty: TyOpen })),
     NApp(a) -> match a.func.node {
       NVar(fv) -> match fv.slot { Some(_) -> TyOpen, None -> ret_of(here, fv.name).ty },
       _ -> TyOpen,
@@ -2365,20 +2446,36 @@ fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: By
 }
 
 // Every definition of a module, with its declared return as the emitter reads it.
-fn defs_in(module: Bytes, m: Module, pure: List<Bytes>) -> List<Def> = {
-  let aliases = fold(m.items, [], |acc: List<{ name: Bytes, ty: TypeExpr }>, it: Item|
+fn aliases_in(m: Module) -> List<Alias> =
+  fold(m.items, [], |acc: List<Alias>, it: Item|
     match it {
       IType(t) -> match t.body {
-        TDAlias(u) -> push(acc, { name: t.name.name, ty: u }),
+        TDAlias(u) -> push(acc, { name: t.name.name, params: map(t.params, |i: Ident| i.name), ty: u }),
         _ -> acc,
       },
       _ -> acc,
-    });
+    })
+
+// The imported modules' aliases, each under the binder this module gives it.
+fn others_of(m: Module, program: List<ModDefs>) -> List<ModAliases> =
+  fold(m.imports, [], |acc: List<ModAliases>, im: ImportDecl| {
+    let path = bytes_join_dots(map(im.path, |i: Ident| i.name));
+    let theirs = fold(program, [], |a: List<Alias>, md: ModDefs| if md.module == path { md.aliases } else { a });
+    match im.kind {
+      IModule -> push(acc, { binder: last_segment(im.path), aliases: theirs }),
+      IAlias(a2) -> push(acc, { binder: a2.name, aliases: theirs }),
+      INames(_) -> acc,
+    }
+  })
+
+fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) -> List<Def> = {
+  let aliases = aliases_in(m);
+  let others = others_of(m, program);
   fold(m.items, [], |acc: List<Def>, it: Item|
     match it {
       IFn(d) -> push(acc, { name: d.name.name,
-                            ret: match param_kind_in(aliases, d.ret) { Some(r) -> Some(r.k), None -> None },
-                            ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen },
+                            ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
+                            ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
                             pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])) }),
       _ -> acc,
     })
@@ -2403,7 +2500,8 @@ fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<By
       Resolved_(x) -> match pure_definitions(x.r, x.mods) {
         None -> [],
         Some(pure) -> {
-          let program = map(x.mods, |m: Mod| { module: m.name, defs: defs_in(m.name, m.module, pure) });
+          let with_aliases = map(x.mods, |m: Mod| { module: m.name, defs: [], aliases: aliases_in(m.module) });
+          let program = map(x.mods, |m: Mod| { module: m.name, defs: defs_in(m.name, m.module, pure, with_aliases), aliases: aliases_in(m.module) });
           fold(x.mods, [], |acc: List<Emitted>, m: Mod|
             fold(emit_module(m.name, m.module, ctors, builtins, program, pure), acc, |a: List<Emitted>, e: Emitted| push(a, e)))
         },
@@ -2415,6 +2513,7 @@ fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<By
 fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>, program: List<ModDefs>, pure: List<Bytes>) -> List<Emitted> = {
   let x = { module: x_module };
   let defs_of = |path: Bytes| fold(program, [], |acc: List<Def>, md: ModDefs| if md.module == path { md.defs } else { acc });
+  let others = others_of(x.module, program);
   let imports = fold(x.module.imports, [], |acc: List<Imported>, im: ImportDecl|
     match im.kind {
       INames(ns) -> {
@@ -2433,10 +2532,10 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
         push(acc, { name: a2.name, module: path, defs: defs_of(path) })
       },
     });
-  let aliases = fold(x.module.items, [], |acc: List<{ name: Bytes, ty: TypeExpr }>, it: Item|
+  let aliases = fold(x.module.items, [], |acc: List<Alias>, it: Item|
     match it {
       IType(t) -> match t.body {
-        TDAlias(u) -> push(acc, { name: t.name.name, ty: u }),
+        TDAlias(u) -> push(acc, { name: t.name.name, params: map(t.params, |i: Ident| i.name), ty: u }),
         _ -> acc,
       },
       _ -> acc,
@@ -2444,8 +2543,8 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
   let here = fold(x.module.items, [], |acc: List<Def>, it: Item|
     match it {
       IFn(d) -> push(acc, { name: d.name.name,
-                            ret: match param_kind_in(aliases, d.ret) { Some(r) -> Some(r.k), None -> None },
-                            ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen },
+                            ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
+                            ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
                             pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])) }),
       _ -> acc,
     });
@@ -2453,7 +2552,7 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
     match it {
       IFn(d) -> {
         let names = map(d.params, |p: Param| p.name.name);
-        let kinds = map(d.params, |p: Param| param_kind_in(aliases, p.ty));
+        let kinds = map(d.params, |p: Param| param_kind_with(aliases, others, p.ty));
         let known = fold(kinds, true, |acc: Bool, k: Option<{ k: Kind, ty: Ty }>| acc && k != None);
         let full = bytes_concat_all([module, b".", d.name.name]);
         let ps = map(range(0, len(names)), |i: Int|

@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **842 of 1282** shipped bodies |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1005 of 1282** shipped bodies, 991 resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -54,13 +54,21 @@ Ownership and ordering:
 - The unit's tables are the **unit's**: a lambda's constants, shapes and builtins
   keep counting from what the function that builds it met.
 
-## The named gaps
+## The disagreements
 
-`emit_diff.rs` asserts the twelve by name. Four `std.hash` bodies want the
-*deferred record local*, which is the half of deferring this port does not do: a
-record whose every read is answered from the built table is never materialised,
-and the local it would land in is declared at the top of the body. The other four
-have causes written beside them.
+`emit_diff.rs` compares each shipped body on the C it *resolves* to -- every table placeholder
+replaced by its entry -- and holds two floors and a ceiling: bodies reached, bodies agreeing,
+bodies disagreeing. It no longer asserts the disagreeing names; the test prints them, and
+`PLY_EMIT_DIFF_LIST=1` marks each reached body `agrees` or `differs` so two runs diff. A body
+the port emits differently runs under the tier's audit like every other, so a disagreement is
+a slower body or a rule not yet taken, never a silent wrong one -- the audit is the oracle.
+
+Fourteen disagree, and they are one family and one body. The family is the release rule
+below: the reference releases a record -- an update's base, a let-bound one, a parameter
+before the result is built -- where the port does not, and four `std.hash` bodies want the
+*deferred record local* on top of it, the half of deferring this port does not do. The body
+is `std.hash.round`, which reads declared `U32` fields at their width where the port reads
+words.
 
 ## What is not started
 
@@ -68,6 +76,21 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**A field's type travels, and an update's copy reads the base's rank.** A field read over a
+shape the port cannot see is the runtime's read by name through the body's field table, as the
+reference's is, so the `None` arm of `field_at` is an emission rather than a refusal. That
+alone opened bodies that then disagreed, and the resolved-C comparison found why: a lambda
+handed back its constants and shapes but not the fields it interned; a record type carried
+each field's *kind* and not its type, so a read of a read was generic; a parameterised alias
+did not substitute its arguments, so `Ran<http::Response>` hid `response.status`. `FieldTy`
+carries `ty` now, `Alias` carries its parameters and `written_kind` binds them where the
+argument was written. And the last one was wrong C rather than a slow body: the lowering
+recognises `{headers: acc, count: count, next: l.next}` as an update of `l`, and the port
+read the copy at `next`'s rank in the *new* record, which is `l`'s own rank only when the
+two shapes agree. `std.http.field_line` read `stop` for `next`. The copy reads at the base's
+rank now, by name when the base's shape is unknown, as the reference does. 842 to 1005
+reached, 991 the reference's C exactly.
 
 **The release family, for the next pass.** Seven named gaps are one rule: the reference
 releases a record -- an update's base, a let-bound one, a parameter before the result is
