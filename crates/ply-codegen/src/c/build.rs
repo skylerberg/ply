@@ -638,6 +638,14 @@ pub(super) fn emit_one(
             .into()),
         };
     }
+    if crate::source::is_spec_root(name) {
+        return Err(Refused {
+            function: name.to_string(),
+            construct: "a specification root, which only the emitter written in Ply carries"
+                .to_string(),
+        }
+        .into());
+    }
     let t0 = std::time::Instant::now();
     // The tuple the key was taken over, rather than the constant: two derivations of the same
     // setting are two chances for the cache to be keyed on one and the body emitted at the other.

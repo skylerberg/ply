@@ -746,7 +746,7 @@ pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
         other => match other.as_int(Span::DUMMY, "negation") {
             Ok(i) => match i.checked_neg() {
                 Some(n) => Value::Int(n),
-                None => return c.fail(error("negation overflowed")),
+                None => return c.fail(error("integer overflow in negation")),
             },
             Err(d) => return c.fail(d),
         },
@@ -917,7 +917,7 @@ pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
         1 => "subtraction",
         _ => "negation",
     };
-    let d = error(format!("this {name} overflowed"));
+    let d = error(format!("integer overflow in {name}"));
     ctx.fail(d);
 }
 
