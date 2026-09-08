@@ -248,6 +248,13 @@ gaps are therefore things to *make work*, not things to make byte-identical, and
 the release rules above are the reference emitter's heuristics rather than
 requirements. Read that record before the sections above.
 
+The port emits `simulate`. The node's body is a nullary lambda over the region's captures,
+handed to `rt_simulate_p` as a closure word; the site notes the eight operations a region
+answers as handled, so the fixpoint takes a `perform` of `task`, `clock` or `random` whose
+nearest region is in the unit, and `task` joined the prelude effects the port resolves. The
+reference emits none of it, so the ratchet is unchanged; the instrument for this shape is the
+audit with every simulated test's seeds paired against the machine, green over both corpora.
+
 ## Beyond the port
 
 `docs/adr/0041-effects-in-a-compiled-tier.md` carries the effects work: `with

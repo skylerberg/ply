@@ -245,6 +245,7 @@ impl Trail {
 }
 
 /// What one entry point's simulated regions did, as [`crate::explore`] reads it.
+#[derive(Clone)]
 pub struct Record {
     pub steps: Vec<Step>,
     pub virtual_time: i64,

@@ -452,3 +452,114 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
         );
     }
 }
+
+const SIMULATED: &str = r#"
+fn work(n: Int) -> Int / {clock.read, clock.write} {
+  clock.sleep(n);
+  clock.now() + n
+}
+
+fn ordered(seed: Int) -> Int =
+  simulate {
+    let a = task.spawn(|| work(seed));
+    let b = task.spawn(|| work(seed * 2));
+    task.join(a) * 1000 + task.join(b)
+  }
+
+fn timed(n: Int) -> Int = simulate { clock.sleep(n); clock.now() }
+
+fn drawn(bound: Int) -> Int = simulate { random.below(bound) * 7 + random.below(bound) }
+
+fn racing(n: Int) -> Int =
+  with_cell[r](0) { c ->
+    simulate {
+      let t = task.spawn(|| {
+        cell_set(c, cell_get(c) + 1);
+        task.yield();
+        cell_set(c, cell_get(c) * 10);
+        0
+      });
+      cell_set(c, cell_get(c) + n);
+      task.yield();
+      task.join(t);
+      cell_get(c)
+    }
+  }
+"#;
+
+/// A `simulate` region compiles to a frame the runtime serves, and under one seed the compiled
+/// scheduler makes the machine's choices: the answers agree, and so does every step's footprint.
+#[test]
+fn the_chain_entered_whole_schedules_as_the_machine_does() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", SIMULATED)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let cases: Vec<(&str, Vec<Value>)> = vec![
+        ("m.ordered", vec![Value::Int(3)]),
+        ("m.timed", vec![Value::Int(1500)]),
+        ("m.drawn", vec![Value::Int(100)]),
+        ("m.racing", vec![Value::Int(5)]),
+    ];
+    for (name, args) in cases {
+        let want = machine
+            .call(name, args.clone(), Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let theirs = machine
+            .simulated()
+            .expect("the machine ran a region")
+            .clone();
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(
+            ctx.failed,
+            0,
+            "`{name}{args:?}` raised in the C tier: {:?}",
+            ctx.diagnostic.as_ref().map(|d| d.message.clone())
+        );
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        let ours = ctx.record.clone().expect("the tier ran a region");
+        ctx.end();
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the machine disagree"
+        );
+        let shape = |r: &ply_eval::region::Record| -> Vec<String> {
+            r.steps
+                .iter()
+                .map(|s| {
+                    format!(
+                        "{:?} of {:?} chose {} touching {:?}",
+                        s.task, s.enabled, s.choice, s.accesses
+                    )
+                })
+                .collect()
+        };
+        assert_eq!(
+            shape(&ours),
+            shape(&theirs),
+            "`{name}{args:?}`: the schedules differ"
+        );
+        assert_eq!(
+            ours.virtual_time, theirs.virtual_time,
+            "`{name}{args:?}`: virtual time differs"
+        );
+    }
+}

@@ -1,10 +1,12 @@
 //! What a run's searches are written under, and what it reports about them.
 
 use crate::key::{Engine, result_key, seed_key, writes_seed_keys};
-use ply_eval::explore::Interleaving;
+use ply_eval::explore::{Interleaving, Verdict};
+use ply_eval::sim::Access;
 use ply_eval::{Exploration, Machine, Plan, Seed};
 use ply_hash::DefHash;
 use ply_span::Diagnostic;
+use std::collections::BTreeMap;
 
 /// Fix the interleaving the next entry point will take.
 pub fn seed_run(machine: &mut Machine<'_>, seed: &Seed, steps: u32) {
@@ -130,6 +132,73 @@ impl SimSummary {
 /// The command that replays exactly this failure.
 pub fn replay_command(seed: &Seed, test_name: &str) -> String {
     format!("ply test --seed {seed} --filter \"{test_name}\"")
+}
+
+/// The first way two runs of one seed disagree, or `None` when they are one schedule.
+pub fn schedules_differ(ours: &Interleaving, theirs: &Interleaving) -> Option<String> {
+    let verdict = |i: &Interleaving| match &i.verdict {
+        Verdict::Passed => "passed".to_string(),
+        Verdict::Failed(d) => format!("failed: {}", d.message),
+    };
+    if matches!(ours.verdict, Verdict::Passed) != matches!(theirs.verdict, Verdict::Passed) {
+        return Some(format!(
+            "the compiled tier {} and the machine {}",
+            verdict(ours),
+            verdict(theirs)
+        ));
+    }
+    if ours.steps.len() != theirs.steps.len() {
+        return Some(format!(
+            "the compiled tier took {} step(s) and the machine {}",
+            ours.steps.len(),
+            theirs.steps.len()
+        ));
+    }
+    // A cell is named by its slot in an arena, and the two engines' arenas number theirs
+    // differently; what must agree is which accesses touch the same cell, so each side's cells
+    // are renamed by first appearance before the footprints are compared.
+    let canonical = |steps: &[ply_eval::explore::Step]| -> Vec<Vec<String>> {
+        let mut names: BTreeMap<String, usize> = BTreeMap::new();
+        steps
+            .iter()
+            .map(|step| {
+                step.accesses
+                    .accesses()
+                    .map(|access| match access {
+                        Access::Cell { id, mode } => {
+                            let key = format!("{id:?}");
+                            let next = names.len();
+                            let n = *names.entry(key).or_insert(next);
+                            format!("cell #{n} {mode:?}")
+                        }
+                        other => format!("{other:?}"),
+                    })
+                    .collect()
+            })
+            .collect()
+    };
+    let (ours_cells, theirs_cells) = (canonical(&ours.steps), canonical(&theirs.steps));
+    for (i, (a, b)) in ours.steps.iter().zip(&theirs.steps).enumerate() {
+        if a.task != b.task || a.enabled != b.enabled || a.choice != b.choice {
+            return Some(format!(
+                "at step {i} the compiled tier ran {:?} (choice {} of {:?}) and the machine {:?} (choice {} of {:?})",
+                a.task, a.choice, a.enabled, b.task, b.choice, b.enabled
+            ));
+        }
+        if ours_cells[i] != theirs_cells[i] {
+            return Some(format!(
+                "at step {i} {:?} touched {:?} in the compiled tier and {:?} in the machine",
+                a.task, ours_cells[i], theirs_cells[i]
+            ));
+        }
+    }
+    if ours.virtual_time != theirs.virtual_time {
+        return Some(format!(
+            "the compiled tier ended at virtual time {} and the machine at {}",
+            ours.virtual_time, theirs.virtual_time
+        ));
+    }
+    None
 }
 
 #[cfg(test)]

@@ -783,6 +783,7 @@ impl<'a> InterpExecutor<'a> {
         Option<Exploration>,
         Option<ply_eval::host::HostUse>,
         Option<BackendUse>,
+        Option<bool>,
     ) {
         let plan = self.search.plan_for(index);
         // A search re-runs the test whole, so a host operation anywhere in it — not only inside the
@@ -796,6 +797,8 @@ impl<'a> InterpExecutor<'a> {
         let region = &worker.region;
         let lowering = worker.lowering();
         let backend = worker.backend.clone();
+        let auditing = matches!(worker.engines, Engines::Audited(_, _));
+        let mut paired = auditing;
         let mut interleaving = |seed: &Seed| {
             let mut machine = self.machine_lowering(lowering.clone(), backend.clone());
             if !region.is_empty() {
@@ -816,15 +819,56 @@ impl<'a> InterpExecutor<'a> {
                 into.entries = into.entries.saturating_add(entries);
                 into.declines = into.declines.saturating_add(declines);
             }
-            match sim::interleaving_of(machine.as_ref(), &outcome) {
+            let ours = match sim::interleaving_of(machine.as_ref(), &outcome) {
                 Some(interleaving) => interleaving,
-                // The verdict is still the run's own.
                 None => {
                     observed = false;
                     match outcome {
                         Ok(()) => Interleaving::passed(Vec::new()),
                         Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
                     }
+                }
+            };
+            // Under the audit a seed the backend took is run again on the machine alone, and the
+            // two schedules must be one schedule: the same task chosen from the same enabled set
+            // at every step, touching the same resources, ending at the same virtual time.
+            if !auditing || machine.compiled_counts().0 == 0 {
+                paired = false;
+                return ours;
+            }
+            let mut plain = self.machine_lowering(lowering.clone(), None);
+            if !region.is_empty() {
+                plain.set_regions(region.open().0);
+            }
+            self.arm_footprint_check(plain.as_mut(), index);
+            plain.set_re_executed(re_executed);
+            sim::seed_run(plain.as_mut(), seed, plan.steps);
+            let plain_outcome = self.run_one(plain.as_mut(), index);
+            let Some(theirs) = sim::interleaving_of(plain.as_ref(), &plain_outcome) else {
+                paired = false;
+                return ours;
+            };
+            match sim::schedules_differ(&ours, &theirs) {
+                None => ours,
+                Some(why) => {
+                    let subject = self
+                        .check
+                        .tests
+                        .get(index)
+                        .map(|t| t.key.to_string())
+                        .unwrap_or_else(|| format!("test {index}"));
+                    let span = self
+                        .check
+                        .tests
+                        .get(index)
+                        .map_or(ply_span::Span::DUMMY, |t| t.span);
+                    let diagnostic = Diagnostic::error(
+                        codes::ENGINE_DIVERGENCE,
+                        format!("`{subject}`: the compiled tier and the machine schedule seed {seed} differently"),
+                    )
+                    .primary(span, "this test's simulated region")
+                    .note(why);
+                    Interleaving::failed(ours.steps, diagnostic)
                 }
             }
         };
@@ -843,6 +887,7 @@ impl<'a> InterpExecutor<'a> {
             observed.then_some(explored.exploration),
             host,
             used,
+            auditing.then_some(paired),
         )
     }
 }
@@ -912,10 +957,10 @@ impl<'a> Executor for InterpExecutor<'a> {
         let before = worker.backed().map(Machine::compiled_counts);
         worker.backend_use = None;
         if self.searches(index) {
-            // A searched test is re-run per interleaving on a machine built for the schedule, so
-            // the pair never runs and there is no second answer to compare against.
-            worker.audited = auditing.then_some(false);
-            let (outcome, exploration, host, searched) = self.search(worker, index);
+            // A searched test is re-run per interleaving on a machine built for the schedule, and
+            // under the audit each seed the backend took is paired with a machine's run of it.
+            let (outcome, exploration, host, searched, audited) = self.search(worker, index);
+            worker.audited = audited;
             worker.exploration = exploration;
             worker.host = host;
             // A searched test runs on machines built per interleaving, so the worker's own counters

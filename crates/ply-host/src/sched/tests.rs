@@ -592,7 +592,8 @@ fn a_production_region_spends_a_budget_only_when_one_was_set() {
         .unwrap_or_else(|e| panic!("64 yields is not a livelock: {}", e.message));
     assert_eq!(unbounded.steps, 65);
 
-    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit()).with_step_budget(4);
+    let mut sched: Sched =
+        Scheduler::production(SimId(0), Span::DUMMY, permit()).with_step_budget(4);
     let rt = Threads::new();
     for _ in 0..4 {
         let Turn::Run { .. } = sched.next_host(&*rt).expect("within the budget") else {

@@ -1,7 +1,7 @@
 //! The production task scheduler's half of the boundary.
 
-use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::MachineScheduler;
+use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRequest, HostResource,

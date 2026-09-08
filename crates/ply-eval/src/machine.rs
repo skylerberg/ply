@@ -479,15 +479,19 @@ impl<'a> Machine<'a> {
                 .name
                 .qualify(&Symbol::new(format!("test#{ordinal}")));
             self.reset();
-            let entered = self
-                .compiled
-                .as_ref()
-                .map(|backend| backend.enter_test(&root, self.max_calls));
+            let entered = self.compiled.as_ref().map(|backend| {
+                backend.set_seed(self.seed.clone(), self.sim_steps);
+                backend.enter_test(&root, self.max_calls)
+            });
             match entered {
                 // A test's body answers the unit; anything else is a backend answering wrongly,
                 // which the machine's own run of the body catches as it catches every wrong call.
                 Some(Entered::Answered(Value::Unit)) => {
                     self.record_compiled_atoms();
+                    self.record = self
+                        .compiled
+                        .as_ref()
+                        .and_then(|backend| backend.simulated());
                     self.compiled_entries.set(self.compiled_entries.get() + 1);
                     self.end_entry_point();
                     return Ok(());
@@ -2694,7 +2698,7 @@ fn take_args<const N: usize>(
 
 #[cold]
 #[inline(never)]
-fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
+pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
     Diagnostic::error(
         codes::NESTED_SIMULATION,
         "a `simulate` region may not run inside another one",

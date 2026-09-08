@@ -1,13 +1,27 @@
 # ADR 0044 — Continuations as stacks: the runtime the fifth step leaves
 
-**Proposed.** ADR 0042 placed deleting the machine fifth and ADR 0043 stopped
-at the line "what the runtime is once the machine is gone". This record is
-that line: what a suspended computation is in the compiled tier, how
-`simulate` and the three effects it answers are served there, where a
-`perform` nothing on the stack answers goes, and which parts of
+**Accepted, and the first stage is built.** ADR 0042 placed deleting the
+machine fifth and ADR 0043 stopped at the line "what the runtime is once the
+machine is gone". This record is that line: what a suspended computation is in
+the compiled tier, how `simulate` and the three effects it answers are served
+there, where a `perform` nothing on the stack answers goes, and which parts of
 `crates/ply-eval` the deletion keeps. Like the two records before it, it is a
 design before it is code, and each stage below names the instrument that
 decides whether it landed.
+
+**Built:** the stacks and the switch between them (`crates/ply-codegen/src/stack.rs`,
+with the in-place restore tested there), the scheduler made generic over what
+it suspends, and `simulate` as a frame the runtime serves
+(`crates/ply-codegen/src/simulate.rs`): the body runs as the root task on a
+stack of its own, every `task.spawn` gets one, a `perform` of `task`, `clock`
+or `random` switches to the loop that drives the machine's scheduler, and the
+footprints are recorded at the three events. The emitter written in Ply emits
+the node; the reference does not. The audit pairs every seed of a simulated
+test the tier took with a run of the machine alone and compares the schedules
+step for step, and it is green over the examples and the standard library with
+the chain entered whole, every simulated test paired. The census above loses
+its first three rows and the cascade, so what the tier refuses over the
+shipped corpus is the host-served performs and the credential.
 
 > **What this decides.** That a suspended computation in the compiled tier is
 > **a C stack the runtime owns**, switched to and from with the C library's
@@ -125,10 +139,15 @@ of the semantics exactly as ADR 0042 said an interpreter written in Ply would.
 **A stack the runtime owns.** Emitted C is ordinary C. The only thing that has
 to change for a suspension is *which stack* the C is running on: a task body
 runs on a stack of its own, and a scheduling decision is a switch from one
-stack to another. Nothing emitted knows this happened. The C library has the
-three functions it takes (`getcontext`, `makecontext`, `swapcontext`), and the
-switch is the one place the runtime's Rust touches a stack that is not its
-own.
+stack to another. Nothing emitted knows this happened. The switch is the one
+place the runtime's Rust touches a stack that is not its own, and it is two
+naked functions of a dozen instructions each per architecture, saving the
+callee-saved registers on the stack being left and popping them on the one
+being entered; a fresh stack is laid out so that its first switch returns into
+a trampoline that calls the entry. The C library's context functions would do
+the same and the probe below used them, but their structure has no declared
+layout on this side of the foreign-function boundary, and the assembly is the
+smaller thing to own.
 
 The probe that decided it, and the cost:
 
@@ -139,18 +158,17 @@ cc -w -o /tmp/uctx spikes/ucontext/uctx.c && /tmp/uctx
 cc -O2 -w -o /tmp/uctx_bench spikes/ucontext/uctx_bench.c && /tmp/uctx_bench
 ```
 
-On macOS arm64 the functions are deprecated and present, the probe prints its
-second shot with the local the first shot saw, and a switch there and back
-costs about a microsecond because Darwin's `swapcontext` saves the signal mask
-with a system call. The CI runner is glibc, which has them and costs the same
-system call. `musl` does not implement `makecontext`, and Windows has fibers
-instead; the switcher's interface is three functions, so a platform without
-`ucontext` gets an assembly switcher of about a hundred lines per architecture
-behind the same interface, and nothing above it changes. A microsecond is
-where the decision stops mattering: a scheduling step under the machine costs
-several microseconds by the same command (`ply test examples/bank.ply`, nine
-interleavings in under a millisecond), and the search's cost is in
-running interleavings, not in switching between tasks inside one.
+On macOS arm64 the library's functions are deprecated and present, the probe
+prints its second shot with the local the first shot saw, and a switch there
+and back through them costs about a microsecond because Darwin's `swapcontext`
+saves the signal mask with a system call; the CI runner is glibc, which does
+the same. That is the ceiling the runtime's own switcher sits well under, with
+no system call, and it is also where the decision stops mattering: a scheduling
+step under the machine costs several microseconds by the same command
+(`ply test examples/bank.ply`, nine interleavings in under a millisecond), and
+the search's cost is in running interleavings, not in switching between tasks
+inside one. The probe is kept as a spike CI runs, because the in-place restore
+it shows is the claim the third stage rests on.
 
 ### The stack, and what the context keeps per stack
 
@@ -298,13 +316,16 @@ language test written in Ply re-runs only when an edit reaches it.
 
 ## Staging, and the oracle at each stage
 
-1. **Stacks, and `simulate` with its three effects.** The switcher, the stack
-   allocator, the trampoline, the frame kind the runtime serves, the scheduler
-   and simulation moved and made generic, footprints at the three events, the
-   compiled `Simulation` driver, and the count comparison in the audit. Oracle:
-   the audit in whole mode over the examples takes `bank`, `pipeline` and
-   `timeout`'s tests with the machine's interleaving counts, and the census
-   above loses its first three rows and the cascade.
+1. **Stacks, and `simulate` with its three effects.** Built. The switcher, the
+   stack allocator, the trampoline, the frame kind the runtime serves, the
+   scheduler made generic and driven from the runtime, footprints at the three
+   events, the seed and the record crossing the seam, and the audit pairing
+   every seed the tier took with the machine's run of it. The scheduler and
+   the simulation did not move: they stay in `crates/ply-eval` and the runtime
+   instantiates them, which is what the deletion needs and less than a move.
+   Oracle, met: the audit in whole mode over the examples takes `bank`,
+   `pipeline` and `timeout`'s tests, every seed paired and every schedule the
+   machine's, and the census above lost its first three rows and the cascade.
 2. **`resume` off the tail, once.** The capture is a switch out and the call a
    switch in, on the primitive stage one built. Oracle: the producer test that
    asserts "cannot carry" for a non-tail `resume` asserts the body runs, and
@@ -342,10 +363,10 @@ against the machine, which is why it is last.
   large reservation costs address space and not memory, and the guard page
   turns an overrun into `rt_no_stack`; if the corpus's servers spawn enough
   tasks that address space matters, the reservation is a knob, not a design.
-- **If `ucontext` is where the time goes.** It is a system call per switch on
-  both platforms the tree builds on; the assembly switcher removes it behind
-  the same interface. Measure a served example's steps per second before
-  building one.
+- **If a third architecture is needed.** The switcher exists for aarch64 and
+  x86_64, which are the two the tree builds on; another is a third copy of two
+  short functions behind the same interface, and the stack module's tests say
+  whether it is right.
 - **If the search should be in Ply.** Stage five leaves `explore.rs` in Rust
   in the runtime, and step six of ADR 0042 deletes the front end, not the
   runtime. Translating the search is a later record, if the loop wants it.
