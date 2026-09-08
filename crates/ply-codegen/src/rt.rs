@@ -875,15 +875,18 @@ pub unsafe extern "C" fn rt_arith(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64
     let ctx = unsafe { &mut *ctx };
     let (result, what) = match op {
         0 => (a.checked_mul(b), "multiplication"),
-        1 if b == 0 => (None, "division"),
         1 => (a.checked_div(b), "division"),
-        2 if b == 0 => (None, "remainder"),
         _ => (a.checked_rem(b), "remainder"),
     };
     match result {
         Some(n) => n,
         None => {
-            let d = error(format!("{what} of {a} and {b} is not representable"));
+            // The machine's own words, so a failure reads the same on either engine.
+            let d = if op != 0 && b == 0 {
+                error(format!("{what} by zero"))
+            } else {
+                error(format!("integer overflow in {what}"))
+            };
             ctx.fail(d)
         }
     }
@@ -2341,11 +2344,23 @@ pub unsafe extern "C" fn rt_not_a_list(ctx: *mut Ctx, which: i64, value: i64) {
 }
 
 /// A shift count outside `0..64`, which the interpreter refuses too.
-pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64) {
+/// A shift count outside the word, reported as the machine reports it: `which` indexes
+/// [`ply_syntax::ast::INT_TYPES`], and is `-1` for `Int`.
+pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     let ctx = unsafe { &mut *ctx };
-    let d = error(format!(
-        "a shift count must be between 0 and 63, and this is {n}"
-    ));
+    let (ty, width) = match usize::try_from(which)
+        .ok()
+        .and_then(|i| ply_syntax::ast::INT_TYPES.get(i))
+    {
+        Some(t) => (t.name(), i64::from(t.bits())),
+        None => ("Int", 64),
+    };
+    // The machine says this on a label at the shift; compiled code has no span for one.
+    let d = error("shift count out of range")
+        .note(format!("{n} is not in 0..={}", width - 1))
+        .note(format!(
+            "a `{ty}` is {width} bits, so no other count names a shift of it"
+        ));
     ctx.fail(d);
 }
 

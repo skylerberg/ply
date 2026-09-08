@@ -70,21 +70,6 @@ impl Compiled {
         check_program(&program, &resolved).err().unwrap_or_default()
     }
 
-    /// Every test in `source`, run under the machine, for a fixture that asserts on what a
-    /// completed run left behind rather than on the run itself.
-    #[track_caller]
-    pub fn ran(source: &str) -> Compiled {
-        let c = Compiled::new(source);
-        assert!(!c.check.tests.is_empty(), "the source declares no test");
-        let mut machine = c.machine();
-        for (i, t) in c.check.tests.iter().enumerate() {
-            if let Err(d) = machine.eval_test(i) {
-                panic!("`{}` failed under the machine: {d:#?}", t.name);
-            }
-        }
-        c
-    }
-
     pub fn machine(&self) -> Machine<'_> {
         Machine::new(&self.program, &self.resolved, &self.check)
     }

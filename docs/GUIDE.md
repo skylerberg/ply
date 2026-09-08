@@ -1657,6 +1657,16 @@ Any other failure — `panic("...")`, integer overflow, division by zero, an
 out-of-range index, a spent `iterate` budget, the recursion limit — is `E0502`
 and fails the test the same way.
 
+**The language's own tests live in `tests/lang/`.** A claim about what a
+program means — an operator's answer, a builtin's contract, a type's range —
+is a `.ply` file there with `test` items, and CI runs the directory on the
+machine, paired with the compiled tier, and with the tier as the only
+engine. A claim that a program *raises*, which a test cannot state, is a
+fixture under `tests/fixtures/lang/` whose header lines say which of its
+tests fail and with what text, driven from the CLI's own suite on both
+engines. Sorting `crates/ply-eval-tests` into those two places is ADR 0045's
+fourth stage.
+
 ### 9.2 Selection and the cache
 
 A test is selected exactly when its hash is absent from the result cache. There

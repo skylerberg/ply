@@ -3,9 +3,7 @@
 
 mod fixture;
 
-mod bit_operators;
 mod blake3_differential;
-mod byte_builtins;
 mod cell_arena_wiring;
 mod constant_memo;
 mod ctor_value_sharing;
@@ -16,13 +14,7 @@ mod hoist_staleness_audit;
 mod host_boundary;
 mod host_linearity_audit;
 mod host_trust_audit;
-mod keyword_fields;
-mod lambda_return;
-mod list_builtins;
-mod map_builtins;
 mod map_order;
-mod min_max;
-mod number_types;
 mod ownership_checker_armed;
 mod ownership_checker_oracle;
 mod position_invariance_g1;
@@ -47,7 +39,6 @@ mod simulation;
 mod slot_resolution;
 mod stdlib_accumulator_cost;
 mod transaction_scope_audit;
-mod tuples;
 mod use_after_free_audit;
 mod value_semantics_audit;
 mod vertical_slice;
