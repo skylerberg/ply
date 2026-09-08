@@ -1819,6 +1819,19 @@ pub fn reference_ctors(modules: &[(String, String)]) -> Vec<String> {
         .collect()
 }
 
+/// Every builtin's name, in the order `Builtin::all()` gives them.
+///
+/// The port is handed this for the same reason it is handed the constructor table: a bare name
+/// that is neither a definition of the module nor one of its imports is a builtin, and there is no
+/// way to know which from one module's text. What the port does with the list is its own -- the
+/// index each takes is this body's own position for it.
+pub fn reference_builtins() -> Vec<String> {
+    ply_eval::Builtin::all()
+        .iter()
+        .map(|b| b.name().to_string())
+        .collect()
+}
+
 pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
     let mut program = Program {
         modules: Vec::new(),
