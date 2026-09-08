@@ -648,15 +648,16 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
          for a refusal that is more correct than what it replaces"
     );
     assert!(
-        agreeing >= 991,
+        agreeing >= 1000,
         "{agreeing} shipped bodies resolve to the reference's C -- raise this when it grows"
     );
-    // What disagrees is one family and one body: a record the reference releases -- an update's
-    // base, a let-bound one, a parameter before the result is built -- where the port does not,
-    // and `std.hash.round`, which reads declared `U32` fields at their width where the port reads
-    // words. Start at `agreement.memory_step`, with `PLY_EMIT_DIFF_SHOW`.
+    // What disagrees is five `std.hash` bodies. Four want the *deferred record local*, the half
+    // of deferring this port does not do: a record whose every read is answered from the built
+    // table is never materialised, and the local it would land in is declared at the top of the
+    // body. `std.hash.round` reads declared `U32` fields at their width where the port reads
+    // words; the port carries one width and the reference six.
     assert!(
-        differ.len() <= 14,
+        differ.len() <= 5,
         "{} shipped bodies disagree with the reference -- lower this when they close, and raise \
          it only for a body that is right by the audit and slower on purpose",
         differ.len()
