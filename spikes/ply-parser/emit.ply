@@ -18,7 +18,7 @@
 
 import spine (num, Ident)
 import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
-import items (Item, IFn, IType, TypeDef, TypeDefBody, TDAlias, TDSum, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
+import items (Item, IFn, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
 import exprs (Param)
 import types (TypeExpr, TCon, TRecord)
 import rewrite (expand)
@@ -102,12 +102,22 @@ pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>
                 // field of it for a later argument has two reads marked that way.
                 // Releasing at both frees a record the first release gave back.
                 released: List<Int>,
-                // The token widths this body declared, up front. A release needs
-                // one of its width, and the pre-pass that finds them can only see
-                // the shapes a *declaration* gives -- so a release whose width it
-                // did not foresee refuses the body rather than naming a local
-                // that was never declared.
-                toks: List<Int> }
+                // The reuse-token widths this body has *used*, collected as it
+                // goes. The declarations are written afterwards and put in front,
+                // which is what the reference does -- a pre-pass that predicted
+                // them instead had to predict the release rule too, and the two
+                // disagreed on every body where a shape reached the emitter that
+                // the pass could not see.
+                toks: List<Int>,
+                // A rename is an alias, not a second object. `alias` follows a
+                // local back to the one it renames, and `by_root` charges each
+                // binding's reads to the object the local holds -- so an object
+                // wearing three names, each read once, counts three and not one.
+                //
+                // Counting a single name there says "one read, safe to release"
+                // about an object three other names still hold.
+                alias: List<{ local: Bytes, root: Bytes }>,
+                by_root: List<{ root: Bytes, n: Int }> }
 
 // A definition of this module, with what a call of it answers. The *shape* as
 // well as the kind: a call whose answer is a record of known fields is where a
@@ -138,29 +148,31 @@ pub type P = { name: Bytes, k: Kind, ty: Ty }
 pub type Out = { em: Em, v: V }
 
 fn line(em: Em, text: Bytes) -> Em =
-  { out: bytes_concat_all([em.out, pad(em.ind), text, b"\n"]), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+  { out: bytes_concat_all([em.out, pad(em.ind), text, b"\n"]), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
 
-fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
-fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 // A branch leaves the enclosing scope with the temporaries it unboxed: they are
 // declared inside the C block and are gone at the brace. `conv` goes back to
 // what it was, or a later read names a dead variable.
-fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
-  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }, name: bytes_concat(b"t", num(em.n + 1)) }
+  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }, name: bytes_concat(b"t", num(em.n + 1)) }
 
 // The last entry wins: a `let` may shadow a slot an enclosing scope filled.
 fn conv_of(em: Em, slot: Int) -> Option<V> =
   fold(em.conv, None, |acc: Option<V>, c: Conv|
     if c.slot == slot { Some({ k: c.k, c: c.c, ty: c.ty }) } else { acc })
 
-fn remember(em: Em, slot: Int, v: V) -> Em =
-  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, k: v.k, c: v.c, ty: v.ty }), ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+fn remember(em0: Em, slot: Int, v: V) -> Em = {
+  let em = charge(em0, slot, v.c);
+  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, k: v.k, c: v.c, ty: v.ty }), ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
+}
 
 // A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
 fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
@@ -169,10 +181,11 @@ fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
   // A binding that is only a rename carries the fields the record was built from
   // with it. A block binds its tail, so without this the knowledge is lost at
   // the first one -- which is immediately, since every `if` arm is a block.
-  let kept = match built_of(o, expr) {
+  let kept0 = match built_of(o, expr) {
     Some(b) -> remember_built(o, f.name, b.names, b.vals),
     None -> o,
   };
+  let kept = if is_local(expr) { note_alias(kept0, f.name, root_of(kept0, expr)) } else { kept0 };
   { em: if k == KBoxed && answers_owned(expr) { note_made(kept, f.name) } else { kept },
     v: { k: k, c: f.name, ty: TyOpen } }
 }
@@ -183,6 +196,45 @@ fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
 fn bind_keeping(em: Em, k: Kind, ty: Ty, expr: Bytes) -> Out = {
   let o = bind(em, k, expr);
   { em: o.em, v: { k: o.v.k, c: o.v.c, ty: ty } }
+}
+
+// A local name: `t12`, `p0`, `q1`. Anything else is an expression.
+fn is_local(e: Bytes) -> Bool =
+  bytes_len(e) > 1
+    && (bytes_at(e, 0) == 116 || bytes_at(e, 0) == 112 || bytes_at(e, 0) == 113)
+    && fold(range(1, bytes_len(e)), true, |acc: Bool, i: Int|
+         acc && bytes_at(e, i) >= 48 && bytes_at(e, i) <= 57)
+
+fn root_of(em: Em, local: Bytes) -> Bytes =
+  fold(em.alias, local, |acc: Bytes, a: { local: Bytes, root: Bytes }|
+    if a.local == local { a.root } else { acc })
+
+fn note_alias(em: Em, local: Bytes, root: Bytes) -> Em =
+  { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
+    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
+    consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
+    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
+    alias: push(em.alias, { local: local, root: root }), by_root: em.by_root }
+
+// Charge a slot's reads to the object the local holds, once per (object, slot).
+fn charge(em: Em, slot: Int, local: Bytes) -> Em = {
+  let r = root_of(em, local);
+  let already = fold(em.by_root, false, |acc: Bool, e: { root: Bytes, n: Int }|
+    acc || e.root == bytes_concat_all([r, b"#", num(slot)]));
+  if already { em } else {
+    { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
+      built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
+      consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
+      builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
+      alias: em.alias,
+      by_root: push(push(em.by_root, { root: bytes_concat_all([r, b"#", num(slot)]), n: 0 }),
+                    { root: r, n: count_of(em.reads, slot) }) }
+  }
+}
+
+fn reads_of_root(em: Em, local: Bytes) -> Int = {
+  let r = root_of(em, local);
+  fold(em.by_root, 0, |acc: Int, e: { root: Bytes, n: Int }| if e.root == r { acc + e.n } else { acc })
 }
 
 fn built_of(em: Em, local: Bytes) -> Option<Built> =
@@ -196,13 +248,13 @@ fn answers_owned(expr: Bytes) -> Bool =
 
 fn note_made(em: Em, name: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: em.built, module: em.module, made: push(em.made, name), here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+    built: em.built, module: em.module, made: push(em.made, name), here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 fn spend_made(em: Em, name: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module,
     made: fold(em.made, [], |acc: List<Bytes>, m: Bytes| if m == name { acc } else { push(acc, m) }),
-    here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+    here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 // A value collected into an aggregate: boxed, and held in a local declared
 // `Word` rather than by its kind's C type, because the array a list is built
@@ -261,14 +313,14 @@ fn release_base(em: Em, base: Code, b: V, params: List<P>) -> Option<Em> =
       NVar(v) -> match v.slot {
         None -> Some(em),
         // At most once per binding, and only where the binding is read once.
-        Some(s) -> if count_of(em.reads, s) != 1
+        Some(s) -> if reads_of_root(em, b.c) != 1
                       || fold(em.released, false, |acc: Bool, r: Int| acc || r == s) { Some(em) }
                    else {
           let em = note_released(em, s);
           match width_of(b.ty) {
             None -> Some(line(em, bytes_concat_all([b"ply_dec(ctx, ", as_word(b), b");"]))),
-            Some(n) -> if !fold(em.toks, false, |acc: Bool, w: Int| acc || w == n) { None }
-                       else { Some(line(em, bytes_concat_all([
+            Some(n) -> { let em = note_tok(em, n);
+                       Some(line(em, bytes_concat_all([
               b"if (tok", num(n), b" == 0) { tok", num(n), b" = ply_reset_flat(", as_word(b),
               b"); if (!tok", num(n), b") tok", num(n), b" = rt_reset_p(ctx, ", as_word(b),
               b"); } else { ply_dec(ctx, ", as_word(b), b"); }"]))) },
@@ -337,7 +389,7 @@ fn from_table(em: Em, l: Lit) -> Out = {
 fn const_of(em: Em, l: Lit) -> { em: Em, i: Int } =
   { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
           shapes: em.shapes, built: em.built, module: em.module, made: em.made,
-          here: em.here, imports: em.imports, consts: push(em.consts, l), ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks },
+          here: em.here, imports: em.imports, consts: push(em.consts, l), ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root },
     i: len(em.consts) }
 
 // A capital first letter, after any module binder.
@@ -554,7 +606,7 @@ fn builtin_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
                     shapes: em.shapes, built: em.built, module: em.module, made: em.made,
                     here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors,
                     extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-                    builtins: em.builtins, met: push(em.met, name), fields: em.fields, released: em.released, toks: em.toks },
+                    builtins: em.builtins, met: push(em.met, name), fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root },
                i: len(em.met) },
   }
 
@@ -641,7 +693,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
   let reads = slots_read(l.body);
   let start = { out: b"", n: 0, conv: window, ind: 0, reads: reads, shapes: [], built: [],
                 module: em.module, made: [], here: em.here, imports: em.imports, consts: [],
-                ctors: em.ctors, extra: b"", lambdas: 0, owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks };
+                ctors: em.ctors, extra: b"", lambdas: 0, owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root };
   match expr(start, l.body, []) {
     None -> None,
     Some(o) -> Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes,
@@ -696,7 +748,7 @@ fn field_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
                     shapes: em.shapes, built: em.built, module: em.module, made: em.made,
                     here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors,
                     extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-                    builtins: em.builtins, met: em.met, fields: push(em.fields, name), released: em.released, toks: em.toks },
+                    builtins: em.builtins, met: em.met, fields: push(em.fields, name), released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root },
                i: len(em.fields) },
   }
 
@@ -712,7 +764,7 @@ fn built_field(em: Em, local: Bytes, name: Bytes) -> Option<V> =
 
 fn remember_built(em: Em, local: Bytes, names: List<Bytes>, vals: List<V>) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: push(em.built, { local: local, names: names, vals: vals }), module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+    built: push(em.built, { local: local, names: names, vals: vals }), module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
   match fold(range(0, len(em.shapes)), None, |acc: Option<Int>, i: Int|
@@ -722,7 +774,7 @@ fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
           }) {
     Some(i) -> { em: em, i: i },
     None -> { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
-                    shapes: push(em.shapes, names), built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks },
+                    shapes: push(em.shapes, names), built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root },
               i: len(em.shapes) },
   }
 
@@ -744,11 +796,20 @@ fn word_at_rank(names: List<Bytes>, words: List<Bytes>, at: Int) -> Bytes =
 fn rank_of(names: List<Bytes>, name: Bytes) -> Int =
   fold(names, 0, |acc: Int, n: Bytes| if compare(n, name) == Less { acc + 1 } else { acc })
 
+fn note_tok(em: Em, w: Int) -> Em =
+  if fold(em.toks, false, |acc: Bool, x: Int| acc || x == w) { em } else {
+    { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
+      built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
+      consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
+      builtins: em.builtins, met: em.met, fields: em.fields, released: em.released,
+      toks: push(em.toks, w), alias: em.alias, by_root: em.by_root }
+  }
+
 fn note_released(em: Em, slot: Int) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, slot), toks: em.toks }
+    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, slot), toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 fn count_of(reads: List<Int>, slot: Int) -> Int =
   fold(reads, 0, |acc: Int, s: Int| if s == slot { acc + 1 } else { acc })
@@ -953,7 +1014,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             shapes: sub_out.shapes, built: e.built, module: e.module, made: e.made,
                             here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
                             extra: bytes_concat(e.extra, sub_out.text), lambdas: idx + 1,
-                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: e.fields, released: e.released, toks: e.toks };
+                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: e.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root };
               let o = bind(grown, KBoxed, bytes_concat_all([
                 b"rt_closure_p(ctx, @@l", num(idx), b"@@, ", num(l.params),
                 b", (Word)(intptr_t)", arr.name, b", ", num(len(l.caps)), b")"]));
@@ -1040,7 +1101,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           let sh = shape_of(w.em, names);
           let n = len(names);
           let rec = bind(sh.em, KBoxed, b"0");
-          let opened = line(rec.em, bytes_concat_all([b"if (tok", num(n), b") {"]));
+          let opened = line(note_tok(rec.em, n), bytes_concat_all([b"if (tok", num(n), b") {"]));
           let took = line(
             line(indent(opened), bytes_concat_all([rec.v.c, b" = tok", num(n), b"; tok", num(n), b" = 0;"])),
             bytes_concat_all([b"ply_obj(", rec.v.c, b")->rc = 1; ply_obj(", rec.v.c,
@@ -1281,7 +1342,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                               built: js.em.built, module: js.em.module, made: js.em.made,
                               here: js.em.here, imports: js.em.imports, consts: js.em.consts,
                               ctors: js.em.ctors, extra: js.em.extra, lambdas: js.em.lambdas,
-                              owner: js.em.owner, builtins: js.em.builtins, met: js.em.met, fields: js.em.fields, released: js.em.released, toks: js.em.toks },
+                              owner: js.em.owner, builtins: js.em.builtins, met: js.em.met, fields: js.em.fields, released: js.em.released, toks: js.em.toks, alias: js.em.alias, by_root: js.em.by_root },
                             names, js.names)
                   },
                   None -> {
@@ -1291,7 +1352,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                       imports: e.em.imports, consts: e.em.consts, ctors: e.em.ctors,
                                       extra: e.em.extra, lambdas: e.em.lambdas, owner: e.em.owner,
                                       builtins: e.em.builtins, met: e.em.met,
-                                      fields: e.em.fields, released: e.em.released, toks: e.em.toks },
+                                      fields: e.em.fields, released: e.em.released, toks: e.em.toks, alias: e.em.alias, by_root: e.em.by_root },
                                     bytes_concat_all([ctype(kt), b" ", j.name, b" = 0;"]));
                     let body = bytes_concat_all([
                       j.em.out, decl.out, pad(decl.ind), b"if (", cv.v.c, b") {\n",
@@ -1304,7 +1365,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                  built: decl.built, module: decl.module, made: decl.made,
                                  here: decl.here, imports: decl.imports, consts: decl.consts,
                                  ctors: decl.ctors, extra: decl.extra, lambdas: decl.lambdas,
-                                 owner: decl.owner, builtins: decl.builtins, met: decl.met, fields: decl.fields, released: decl.released, toks: decl.toks },
+                                 owner: decl.owner, builtins: decl.builtins, met: decl.met, fields: decl.fields, released: decl.released, toks: decl.toks, alias: decl.alias, by_root: decl.by_root },
                            v: { k: kt, c: j.name, ty: TyOpen } })
                   },
                 }
@@ -1483,7 +1544,7 @@ fn blank(em: Em) -> Em =
   { out: b"", n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks }
+    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root }
 
 fn strip(em: Em) -> Bytes = em.out
 
@@ -1611,8 +1672,10 @@ fn prologue(em: Em, params: List<P>) -> Em =
       None -> acc,
       Some(p) -> match p.k {
         // A record arrives as its word and is never opened here: there is nothing
-        // to untag, and each read of it binds the word where the read is.
-        KBoxed -> acc,
+        // to untag, and each read of it binds the word where the read is. Its
+        // reads are still charged to it, or the release rule sees an object
+        // nothing reads and lets nothing go.
+        KBoxed -> charge(acc, i, bytes_concat(b"p", num(i))),
         KBool -> {
           let o = bind(acc, KBool, bytes_concat_all([b"rt_unbox_bool_p(ctx, p", num(i), b")"]));
           remember(o.em, i, o.v)
@@ -1629,22 +1692,16 @@ fn prologue(em: Em, params: List<P>) -> Em =
 // `Int` and `Bool` are the two the prologue knows how to open. Anything else --
 // a record, a list, a type variable, a missing annotation -- refuses the whole
 // function rather than guessing at a helper.
-// A named type this module declares as an alias for a record, so a parameter
-// written `v: Values` carries the same shape one written `v: { .. }` does. Most
-// Ply code names its records, and without this a field read of one goes through
-// the runtime where the reference emits a load.
-pub fn param_kind_in(aliases: List<{ name: Bytes, ty: TypeExpr }>, t: Option<TypeExpr>)
-    -> Option<{ k: Kind, ty: Ty }> =
-  match t {
-    Some(TCon(c)) ->
-      if c.name.module != None || len(c.args) != 0 { param_kind(t) }
-      else { match fold(aliases, None, |acc: Option<TypeExpr>, a: { name: Bytes, ty: TypeExpr }|
-                    if a.name == c.name.name.name { Some(a.ty) } else { acc }) {
-        Some(u) -> param_kind(Some(u)),
-        None -> param_kind(t),
-      } },
-    _ -> param_kind(t),
-  }
+// A named type is **not** resolved to the record it stands for, and that is the
+// reference's rule rather than a gap in this one. `CTy::of` maps a structural
+// `Type::Record` and nothing else: a `Type::Con` is opaque whatever it was
+// declared as, so `v: Values` carries no shape on either side.
+//
+// Resolving it here reads as an improvement and is a divergence. It reaches 484
+// shipped bodies against 421, and the 38 that then disagree all say the same
+// thing: the port releases a record through a reuse token of its width where the
+// reference, not knowing the width, releases it with a plain `ply_dec`. The
+// shape was not missing; it was never there.
 
 pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
   match t {
@@ -1683,8 +1740,7 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
   let reads = slots_read(body);
   // The reuse tokens come before the prologue, and are named by width rather
   // than numbered, so finding them does not disturb the temporaries.
-  let widths = sorted_widths(widths_released(body, params, here, reads));
-  let start = fold(widths, { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: 0, owner: name, builtins: builtins, met: [], fields: [], released: [], toks: widths },
+  let start = fold([], { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: 0, owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [] },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
     None -> None,
@@ -1701,7 +1757,12 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
         b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
         b"(ctx", fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"]);
-      Some(bytes_concat_all([sig, head, o.em.out, epilogue, entry, o.em.extra]))
+      // The declarations are written now that the body has said which it used,
+      // and go in front of it. They take no temporary of their own, so nothing
+      // the body wrote has to move.
+      let toks = fold(sorted_widths(o.em.toks), b"", |acc: Bytes, w: Int|
+        bytes_concat_all([acc, b"  Word tok", num(w), b" = 0;\n"]));
+      Some(bytes_concat_all([sig, head, toks, o.em.out, epilogue, entry, o.em.extra]))
     },
   }
 }
@@ -1857,14 +1918,6 @@ pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, sr
       IModule -> push(acc, { name: last_segment(im.path), module: bytes_join_dots(map(im.path, |i: Ident| i.name)) }),
       IAlias(a2) -> push(acc, { name: a2.name, module: bytes_join_dots(map(im.path, |i: Ident| i.name)) }),
     });
-  let _aliases = fold(x.module.items, [], |acc: List<{ name: Bytes, ty: TypeExpr }>, it: Item|
-    match it {
-      IType(t) -> match t.body {
-        TDAlias(u) -> if len(t.params) == 0 { push(acc, { name: t.name.name, ty: u }) } else { acc },
-        _ -> acc,
-      },
-      _ -> acc,
-    });
   let here = fold(x.module.items, [], |acc: List<Def>, it: Item|
     match it {
       IFn(d) -> push(acc, { name: d.name.name,
@@ -1876,14 +1929,6 @@ pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, sr
     match it {
       IFn(d) -> {
         let names = map(d.params, |p: Param| p.name.name);
-        // `param_kind_in` resolves a named record type to its fields, so
-        // `v: Values` would carry what `v: { .. }` does. It is written and not
-        // switched on: it reaches 484 shipped bodies against 421 and 38 then
-        // disagree, and after the token pre-pass was taught the same shapes the
-        // symptom is the other way round -- the port now declares a reuse token
-        // for a body the reference does not release in at all. So the two sides
-        // disagree about *when a release happens*, not about the width, and that
-        // is the rule to find before this is turned on.
         let kinds = map(d.params, |p: Param| param_kind(p.ty));
         let known = fold(kinds, true, |acc: Bool, k: Option<{ k: Kind, ty: Ty }>| acc && k != None);
         match if known { lower_fn(names, d.body) } else { None } {
