@@ -529,10 +529,11 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // update in the lowering was the refusal it was a symptom of.
     // The six after the first three are all one thing: an update whose base is a parameter of a
     // *named* record type. The emission needs the base's shape -- to know each copied field's
-    // kind, and to know the width the released record's cells are reused at -- and
-    // `param_kind_in`, which resolves a named type to its fields, is written and switched off
-    // above. With it these six agree and 58 more bodies are reached, at the cost of 18 others; it
-    // goes on when those are had.
+    // kind, and the width the released record's cells are reused at -- and the resolution that
+    // gives it is written and switched off in `emit.ply`. With it these six agree and 58 more
+    // bodies are reached, at the cost of 17 others: down from 38 as the release rules were found,
+    // and seven of the seventeen are one thing again -- an update whose base the port does not
+    // release where the reference does.
     let expected_gaps = [
         "std.hash.full_words",
         "std.hash.padded_words",
