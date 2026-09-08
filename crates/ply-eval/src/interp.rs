@@ -68,8 +68,8 @@ impl Interpreter<'static> {
         let origin = std::ptr::from_ref(program) as usize;
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static Resolved = Box::leak(Box::new(resolved.clone()));
-        let check: &'static CheckOutput = Box::leak(Box::new(check.clone()));
-        Box::leak(Box::new(Interpreter::build(origin, program, resolved, check)))
+        let _ = check;
+        Box::leak(Box::new(Interpreter::build(origin, program, resolved)))
     }
 
     pub fn over_static(
@@ -77,32 +77,25 @@ impl Interpreter<'static> {
         resolved: &'static Resolved,
         check: &'static CheckOutput,
     ) -> &'static Interpreter<'static> {
-        Box::leak(Box::new(Interpreter::build(
-            std::ptr::from_ref(program) as usize,
-            program,
-            resolved,
-            check,
-        )))
+        { let _ = check; Box::leak(Box::new(Interpreter::build(std::ptr::from_ref(program) as usize, program, resolved))) }
     }
 }
 
 impl<'p> Interpreter<'p> {
     /// Build the tables borrowing the program, for an engine whose life is the borrow's.
-    pub fn borrow(
-        program: &'p Program,
-        resolved: &'p Resolved,
-        check: &'p CheckOutput,
-    ) -> Interpreter<'p> {
+    pub fn borrow(program: &'p Program, resolved: &'p Resolved) -> Interpreter<'p> {
         let origin = std::ptr::from_ref(program) as usize;
-        Interpreter::build(origin, program, resolved, check)
+        Interpreter::build(origin, program, resolved)
     }
 
-    fn build(
-        origin: usize,
-        program: &'p Program,
-        resolved: &'p Resolved,
-        _check: &'p CheckOutput,
-    ) -> Interpreter<'p> {
+    /// The parameters, body and home module of a definition, for an engine entering it whole.
+    pub fn def(&self, name: &Symbol) -> Option<(code::Params, &'p Expr, usize)> {
+        self.defs
+            .get(name)
+            .map(|d| (Rc::new(d.params.clone()), d.body, d.module))
+    }
+
+    fn build(origin: usize, program: &'p Program, resolved: &'p Resolved) -> Interpreter<'p> {
         let mut defs = FxHashMap::default();
         let mut tests = FxHashMap::default();
         let mut ctors: FxHashMap<Symbol, usize> =
@@ -201,7 +194,7 @@ impl Provider for Interpreter<'static> {
 /// The eval walk and the per-run state it mutates: a cell/region arena reset per entry, the
 /// caches a run fills, and the active handler stack. Borrows the program [`Interpreter`] tables.
 pub struct Core<'p> {
-    lowering: Lowering<'p>,
+    lowering: Rc<Lowering<'p>>,
     regions: TaskRegions,
     globals: FxHashMap<GlobalKey, Value>,
     lowered: FxHashMap<Symbol, Lowered>,
@@ -212,13 +205,24 @@ pub struct Core<'p> {
 impl<'p> Core<'p> {
     pub fn new(program: &'p Program) -> Core<'p> {
         Core {
-            lowering: Lowering::for_program(program),
+            lowering: Rc::new(Lowering::for_program(program)),
             regions: TaskRegions::new(),
             globals: FxHashMap::default(),
             lowered: FxHashMap::default(),
             handlers: Vec::new(),
             performed: Vec::new(),
         }
+    }
+
+    /// The lowering cache to hand a `Core` built next over the same program, so a body is lowered
+    /// once for the program rather than once per engine.
+    pub fn lowering(&self) -> Rc<Lowering<'p>> {
+        Rc::clone(&self.lowering)
+    }
+
+    /// Lower into `lowering` rather than into a cache of this `Core`'s own.
+    pub fn set_lowering(&mut self, lowering: Rc<Lowering<'p>>) {
+        self.lowering = lowering;
     }
 
     pub fn regions(&self) -> &TaskRegions {
@@ -274,11 +278,38 @@ impl<'p, 'x> Run<'p, 'x> {
         args: Vec<Value>,
         budget: usize,
     ) -> Entered {
-        self.reset_run();
         let lowered = self.st.lowering.of(&params, body);
+        self.enter_lowered(lowered, module, &args, budget)
+    }
+
+    /// Enter an expression from this program, with `bindings` written into its leading slots as a
+    /// function's parameters would be — the path `eval_expr` takes for a law body or a const.
+    pub fn enter_expr_in(
+        &mut self,
+        e: &'p Expr,
+        bindings: &[(Symbol, Value)],
+        module: usize,
+        budget: usize,
+    ) -> Entered {
+        let params: code::Params = Rc::new(bindings.iter().map(|(n, _)| n.clone()).collect());
+        let lowered = self.st.lowering.of(&params, e);
+        let values: Vec<Value> = bindings.iter().map(|(_, v)| v.clone()).collect();
+        self.enter_lowered(lowered, module, &values, budget)
+    }
+
+    /// Reset the world, seed the window with `bindings`, and walk a lowered body under a fresh
+    /// recursion budget.
+    pub fn enter_lowered(
+        &mut self,
+        lowered: Lowered,
+        module: usize,
+        bindings: &[Value],
+        budget: usize,
+    ) -> Entered {
+        self.reset_run();
         let mut window = vec![None; lowered.size as usize];
-        for (i, v) in args.into_iter().enumerate() {
-            window[i] = Some(v);
+        for (i, v) in bindings.iter().enumerate() {
+            window[i] = Some(v.clone());
         }
         let calls = Calls {
             depth: 0,

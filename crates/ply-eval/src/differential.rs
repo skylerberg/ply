@@ -1,7 +1,7 @@
 //! Running one program with a compiled backend attached and without, and comparing what they did.
 
 use crate::arena::Arena;
-use crate::machine::Machine;
+use crate::evaluator::Machine;
 use crate::task_regions::Fixture;
 use crate::value::Value;
 use ply_core::ty::Footprint;

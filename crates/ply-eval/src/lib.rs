@@ -17,14 +17,13 @@ pub mod costs;
 pub mod differential;
 pub mod escape;
 pub mod explore;
-mod frame;
 pub mod handler;
 pub mod host;
 pub mod interp;
 pub mod limit;
 pub mod list;
 pub use list::List;
-pub mod machine;
+pub mod evaluator;
 pub mod map;
 pub mod memo;
 mod pool;
@@ -75,7 +74,10 @@ pub use explore::{
     measure_reduction,
 };
 pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
-pub use machine::{Machine, Progress};
+pub use evaluator::{
+    Machine, Unbound, carries_secret, check_host_answer, err_footprint_escape, err_host_in_simulation,
+    err_nested_simulation, err_no_runtime, err_secret_to_host, err_unenumerated_atom,
+};
 pub use rc::{Own, Stats as RcStats};
 pub use region::{MachineScheduler, Spawned};
 pub use region_kind::Regions;
