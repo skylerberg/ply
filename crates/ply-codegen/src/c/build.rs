@@ -66,10 +66,12 @@ impl Native {
 /// tables by its *own* positions -- `@@c3@@` for the third constant this body met -- so it is a
 /// function of the body alone, which is what makes one comparable at all: two emitters that agree
 /// here agree whatever else is in the unit around them.
-pub fn emit_body(loaded: &'static Source, name: &str) -> Result<String> {
+/// `how` is passed rather than read from the profile so that a caller comparing *emitters* can
+/// take the optimiser out of the comparison: at a budget and depth of zero a call is emitted as a
+/// call, and what is left is the emitter alone.
+pub fn emit_body(loaded: &'static Source, name: &str, how: crate::opt::Inlining) -> Result<String> {
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
-    let how = super::toolchain::Profile::current().inlining().overridden();
     let names: Vec<String> = loaded.functions();
     let offered: Vec<&str> = names.iter().map(String::as_str).collect();
     let fragment = super::cache::fragment_digest(&offered);
