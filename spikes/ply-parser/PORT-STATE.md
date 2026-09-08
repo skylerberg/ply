@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1239 of 1282** shipped bodies, 1233 resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1262 of 1282** shipped bodies, every one resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -20,17 +20,11 @@ The emitter differential pins the reference's inlining at **zero** and passes it
 explicitly. What is compared is the *emitter*; the inliner is a stage of its own
 and this port does not have it.
 
-## Two pieces written and switched off, with what they cost
+## Nothing is switched off
 
-Both are in `emit.ply`, both reached by deleting a `None ->` and restoring the
-body recorded beside it.
-
-- **`field_of`** — the runtime's field read by name, for a base whose shape is
-  not known. Reaches **565**, with **24** disagreeing.
-- The **generic** half of the shape work is on. What is left of the 24 is *not*
-  about releases, which is the change from earlier in the session: the reference
-  reads at an offset where the port asks by name, from a shape it has and this
-  port does not.
+Every piece written for this port is on. The runtime's field read by name, once held back
+behind a `None ->` because it opened bodies that then disagreed, is the reference's own
+fallback and emits wherever the shape is not in reach.
 
 ## The rules the corpus taught, all recorded at their site
 
@@ -63,11 +57,8 @@ bodies disagreeing. It no longer asserts the disagreeing names; the test prints 
 the port emits differently runs under the tier's audit like every other, so a disagreement is
 a slower body or a rule not yet taken, never a silent wrong one -- the audit is the oracle.
 
-Six disagree, all in `std.hash`. Four want the *deferred record local*, the half of
-deferring this port does not do: a record whose every read is answered from the built table
-is never materialised, and the local it would land in is declared at the top of the body.
-`std.hash.round` and `std.hash.blake3` read declared `U32` fields at their width where the
-port reads words; the port carries one width and the reference six.
+None disagree. The ceiling is zero, and the test says to raise it only for a body that is
+right by the audit and slower on purpose, with the reason named beside it.
 
 ## What is not started
 
@@ -75,6 +66,19 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**Every width, and the record held back.** The kind carries a width: the six below
+sixty-four bits open at entry, read at a field's offset and join in an `if` in their own C
+type; arithmetic is done wide and narrowed back under the overflow guard; a shift is tested
+against the width; the bitwise operators, `~`, `wrap_add` and its family, and the sixteen
+conversions are in place over a carried width and the runtime's call otherwise; the two
+widths at sixty-four are words the reference treats as opaque. With widths in, every state
+record in `std.hash` is flat, and a flat record built from locals is *held back*: its local is
+declared at the top, it is built only where something asks for its word, its fields are read
+from the values it was built from, an update copies from those values, and its release is
+guarded on whether it was ever built. One record builder serves the literal, the update and
+the `if` join, and the flat flag the port had hard-wired to zero comes from it. 1239 to 1262
+reached, and nothing disagrees. The census leads with a lambda inside a lambda.
 
 **Any callee is a value.** A call whose callee is not a name -- a field holding a function,
 a call's answer -- goes through the runtime as a call of a bound variable already did: the
