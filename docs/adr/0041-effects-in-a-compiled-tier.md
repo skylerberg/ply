@@ -127,7 +127,8 @@ has:
    touches it. Independent of everything below.
 2. **`perform` under the whole-program criterion**, with the binding threaded
    into `Ctx` and a refusal, naming the handler it found, when the criterion
-   fails.
+   fails. This is where the definitions are: a dozen directly and most of
+   `http`'s cascade behind them. Both tiers, since the fragment is Cranelift's.
 3. **`handle`** — **not taken.** Reopen it when a body containing one is what a
    measurement shows the tier losing, and price the state-machine transform
    against the interpreter before writing any of it.
@@ -142,7 +143,10 @@ somewhere, that is the next thing to build rather than stage 3.
 
 That the cascade argument is wrong: if refusing an effectful body turns out to
 cost only that body, the coverage motivation goes with it, and stage 2 should be
-re-priced against what else the tier is refusing.
+re-priced against what else the tier is refusing. The instrument prints that
+comparison every run, and the largest single reason in the library is not an
+effect at all -- it is the `Decimal` literal, which costs nine definitions and
+thirty-four test roots and is nothing this record covers.
 
 That the balance is too weak a check. It says the arena was given back; it does
 not by itself say no cell *escaped*, and what stops that is a separate refusal of
