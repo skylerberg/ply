@@ -259,6 +259,38 @@ fn spend_made(em: Em, name: Bytes) -> Em =
 // A value collected into an aggregate: boxed, and held in a local declared
 // `Word` rather than by its kind's C type, because the array a list is built
 // from is an array of words.
+fn sets_bound(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<V>)
+    -> Option<{ em: Em, vals: List<V> }> =
+  if i >= len(xs) { Some({ em: em, vals: acc }) } else {
+    match list_at(xs, i) {
+      None -> None,
+      Some(x) -> match expr(em, x, params) {
+        None -> None,
+        Some(o) -> {
+          let b = bind_keeping(o.em, o.v.k, o.v.ty, o.v.c);
+          sets_bound(b.em, xs, params, i + 1, push(acc, b.v))
+        },
+      },
+    }
+  }
+
+fn concat_names(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
+  fold(b, a, |acc: List<Bytes>, x: Bytes| push(acc, x))
+
+fn set_value(sets: List<CField>, vals: List<V>, name: Bytes) -> Option<V> =
+  fold(range(0, len(sets)), None, |acc: Option<V>, i: Int|
+    match list_at(sets, i) {
+      Some(f) -> if f.name == name { list_at(vals, i) } else { acc },
+      None -> acc,
+    })
+
+// A `Word` local holding an expression, without taking a count for it.
+fn bind_word_of(em: Em, e: Bytes) -> Out = {
+  let f = fresh(em);
+  { em: line(f.em, bytes_concat_all([b"Word ", f.name, b" = ", e, b";"])),
+    v: { k: KBoxed, c: f.name, ty: TyOpen } }
+}
+
 fn bind_word(em: Em, v: V) -> Out = {
   let f = fresh(em);
   { em: line(f.em, bytes_concat_all([b"Word ", f.name, b" = ", as_word(v), b";"])),
@@ -1082,6 +1114,79 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           }
         },
       },
+    },
+    // `{..b, f: e}`, which is a record built out of the base's own memory rather
+    // than fresh: the base is released *before* the allocation, so its cells are
+    // the token this build then takes.
+    //
+    // The written fields are evaluated first, then the base is read, then each
+    // field in the shape's order -- a copy through the base, a set from what was
+    // evaluated -- and the stores follow.
+    NUpd(u) -> {
+      let names = sorted_names(concat_names(u.copies, map(u.sets, |f: CField| f.name)));
+      // Each written field is evaluated **and bound** before the base is read.
+      // A literal set writes a line of its own here, which is the only sign the
+      // binding happens at all.
+      match sets_bound(em, map(u.sets, |f: CField| f.value), params, 0, []) {
+        None -> None,
+        Some(ev) -> match expr(ev.em, u.base, params) {
+          None -> None,
+          Some(bv) -> {
+            let held = bind(bv.em, KBoxed, as_word(bv.v));
+            let filled = fold(range(0, len(names)), { em: held.em, ws: [] },
+              |acc: { em: Em, ws: List<Bytes> }, at: Int| {
+                let nm = match list_at(names, at) { Some(x) -> x, None -> b"" };
+                if fold(u.copies, false, |seen: Bool, c: Bytes| seen || c == nm) {
+                  let w = bind_word_of(acc.em, bytes_concat_all([
+                    b"ply_words(", held.v.c, b")[", num(at), b"]"]));
+                  let inc = line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"]));
+                  // A scalar copy is read into a register of its own kind, as any
+                  // field read is -- and the register is then unused, because the
+                  // *word* is what the store takes. A copy whose field is already
+                  // a word converts nothing.
+                  let k = match field_at(bv.v.ty, nm) { Some(x) -> x.k, None -> KBoxed };
+                  let done = match k {
+                    KBoxed -> inc,
+                    _ -> { let c = bind(inc, k, match k { KBool -> as_bool(w.v), _ -> as_int(w.v) });
+                           c.em },
+                  };
+                  { em: done, ws: push(acc.ws, w.v.c) }
+                } else {
+                  match set_value(u.sets, ev.vals, nm) {
+                    None -> { em: acc.em, ws: push(acc.ws, b"0") },
+                    Some(v) -> { let w = bind_word(acc.em, v); { em: w.em, ws: push(acc.ws, w.v.c) } },
+                  }
+                }
+              });
+            match release_base(filled.em, u.base, bv.v, params) {
+              None -> None,
+              Some(rel) -> {
+                let n = len(names);
+                let sh = shape_of(rel, names);
+                let rec = bind(sh.em, KBoxed, b"0");
+                let opened = line(note_tok(rec.em, n), bytes_concat_all([b"if (tok", num(n), b") {"]));
+                let took = line(
+                  line(indent(opened), bytes_concat_all([rec.v.c, b" = tok", num(n), b"; tok", num(n), b" = 0;"])),
+                  bytes_concat_all([b"ply_obj(", rec.v.c, b")->rc = 1; ply_obj(", rec.v.c,
+                                    b")->flags = 0; ply_obj(", rec.v.c, b")->len = ", num(n),
+                                    b"; ply_obj(", rec.v.c, b")->layout = @@s", num(sh.i), b"@@;"]));
+                let made = line(
+                  line(indent(line(outdent(took), b"} else {")),
+                       bytes_concat_all([rec.v.c, b" = rt_alloc_p(ctx, 3, ", num(n), b", @@s",
+                                         num(sh.i), b"@@, 0);"])),
+                  b"if (ctx->failed) return 0;");
+                let closed = line(outdent(made), b"}");
+                Some({ em: fold(range(0, n), closed, |acc: Em, at: Int|
+                         line(acc, bytes_concat_all([b"ply_words(", rec.v.c, b")[", num(at),
+                           b"] = ", match list_at(filled.ws, at) { Some(x) -> x, None -> b"0" },
+                           b";"]))),
+                       v: { k: KBoxed, c: rec.v.c,
+                            ty: TyRec(map(names, |nm: Bytes| { name: nm, k: KBoxed })) } })
+              },
+            }
+          },
+        },
+      }
     },
     // A record: values in the order they are written, assembled in the order the
     // shape holds them, which is by name. The memory comes from a reuse token of
