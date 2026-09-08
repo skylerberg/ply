@@ -2,7 +2,7 @@
 
 use super::common::{
     IND, diagnostic_json, diagnostics_json, emit_json, millis, once_each, plural,
-    print_diagnostics, print_warnings,
+    print_diagnostics, print_warnings, report_bind_error,
 };
 use super::prove::{
     coverage_json, diagnostics, evidence_summary, gap_summary, law_labels, load_complete,
@@ -81,6 +81,12 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
 
     let plan = crate::simulation::prove_plan(&args.prove, &args.simulation);
     let specified = obligation::specified(&scoped, &laws, &collected.obligations);
+    let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            return report_bind_error("review", &[diagnostic], &loaded.sources, args.json, style);
+        }
+    };
     let (engine, engine_warning) = crate::engine::of(
         &loaded.program,
         &loaded.resolved,
@@ -90,6 +96,7 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
         // `ply review` reports what moved; it binds nothing, so a `law/host` is a gap here exactly
         // as it is under a hermetic `ply prove`.
         None,
+        backend,
     );
     warnings.extend(engine_warning);
     let mut proved = obligation::prove(

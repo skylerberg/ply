@@ -227,6 +227,18 @@ first stage's facade is therefore taken consumer by consumer, each switched
 to the tier-only engine with its own oracle, rather than as one wrapping
 pass before any of them.
 
+**Built, for the judge and the prover.** §"The facade" said an expression in
+a scope is a definition, and it is: `Source` synthesises one per law guard
+and body and per `requires` and `ensures` clause, named `law#N.guard`,
+`law#N.body`, `f#requires#K` and `f#ensures#K` under the module, its
+parameters the binders or the owner's parameters and then `result`, its
+answer `Bool`; the emitter written in Ply emits them as it emits a test
+root, and the reference emitter refuses them by name. `ply prove` and
+`ply review` take `--backend`, and `Cases` and the concurrency search enter
+the roots with each case's values, falling back to the machine only where
+the unit does not hold one. Oracle: `ply prove` over both corpora reports the
+same with and without the backend, and CI compares the two.
+
 ## Staging, and the oracle at each stage
 
 1. **The facade with the machine inside it.** `Engine` wraps a `Machine`;

@@ -18,7 +18,7 @@
 
 import spine (num, Ident)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CLetPat, CDo, pat_slots, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn, qname_text)
-import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
+import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, ILaw, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias, Binder, SpecClause, SRequires, SEnsures, FnDef)
 import resolve (Mod, Source, Resolved_, Failed, resolve_modules, Resolved, Scope, Binding, ModBind)
 import derive (expand_derives)
 import infer (pure_definitions)
@@ -3883,7 +3883,7 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
                             arity: len(d.params) }),
       _ -> acc,
     });
-  let walked = fold(x.module.items, { out: [], tests: 0 }, |acc: { out: List<Emitted>, tests: Int }, it: Item|
+  let walked = fold(x.module.items, { out: [], tests: 0, laws: 0 }, |acc: Walk, it: Item|
     match it {
       IFn(d) -> {
         let names = map(d.params, |p: Param| p.name.name);
@@ -3894,35 +3894,53 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
                    { name: match list_at(names, i) { Some(n) -> n, None -> b"" },
                      k: match list_at(kinds, i) { Some(Some(p)) -> p.k, _ -> KInt },
                      ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen } });
-        match if known { lower_fn(names, d.body) } else { None } {
+        let after = match if known { lower_fn(names, d.body) } else { None } {
           // What the body handles is read off the source, so the unit's fixpoint still drops
           // its performers when the lowering never reached the body.
           None -> { out: push(acc.out, { name: full, text: b"", tables: b"", handles: ast_handles(d.body, effects),
                                          why: Some(if known { b"a body the lowering does not reach" } else { b"a parameter with no written type" }) }),
-                    tests: acc.tests },
+                    tests: acc.tests, laws: acc.laws },
           Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", d.name.name]), ps, l.code, effects, release) {
             None -> { out: push(acc.out, { name: full, text: b"", tables: b"", handles: walk_handles(l.code, effects),
                                            why: emit_fn_why(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", d.name.name]), ps, l.code, effects, release) }),
-                      tests: acc.tests },
-            Some(c) -> { out: push(acc.out, { name: bytes_concat_all([module, b".", d.name.name]), text: c.text, tables: c.tables, why: None, handles: [] }), tests: acc.tests },
+                      tests: acc.tests, laws: acc.laws },
+            Some(c) -> { out: push(acc.out, { name: bytes_concat_all([module, b".", d.name.name]), text: c.text, tables: c.tables, why: None, handles: [] }), tests: acc.tests, laws: acc.laws },
           },
-        }
+        };
+        clause_roots(after, d, names, kinds, module, here, imports, ctors, builtins, effects, release, aliases, others)
       },
       // A test is a root the machine enters whole: a nullary body named by its place
       // among the module's tests, as the reference names it.
       ITest(t) -> {
         let root = bytes_concat_all([b"test_", num(acc.tests)]);
-        let next = { out: acc.out, tests: acc.tests + 1 };
         let full = bytes_concat_all([module, b".test#", num(acc.tests)]);
         match lower_fn([], t.body) {
-          None -> { out: push(acc.out, { name: full, text: b"", tables: b"", why: Some(b"a body the lowering does not reach"), handles: [] }), tests: acc.tests + 1 },
+          None -> { out: push(acc.out, { name: full, text: b"", tables: b"", why: Some(b"a body the lowering does not reach"), handles: [] }), tests: acc.tests + 1, laws: acc.laws },
           Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", root]), [], l.code, effects, release) {
             None -> { out: push(acc.out, { name: full, text: b"", tables: b"", handles: walk_handles(l.code, effects),
                                            why: emit_fn_why(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", root]), [], l.code, effects, release) }),
-                      tests: acc.tests + 1 },
-            Some(c) -> { out: push(acc.out, { name: full, text: c.text, tables: c.tables, why: None, handles: [] }), tests: acc.tests + 1 },
+                      tests: acc.tests + 1, laws: acc.laws },
+            Some(c) -> { out: push(acc.out, { name: full, text: c.text, tables: c.tables, why: None, handles: [] }), tests: acc.tests + 1, laws: acc.laws },
           },
         }
+      },
+      // A law's guard and body are roots the judge enters with the binders' values, named as
+      // the reference names them (ADR 0045 §"The facade").
+      ILaw(d) -> {
+        let names = map(d.binders, |b: Binder| b.name.name);
+        let kinds = map(d.binders, |b: Binder| param_kind_with(aliases, others, Some(b.ty)));
+        let ps = params_of(names, kinds);
+        let known = fold(kinds, true, |acc2: Bool, k: Option<{ k: Kind, ty: Ty }>| acc2 && k != None);
+        let with_guard = match d.guard {
+          None -> acc.out,
+          Some(g) -> push(acc.out, root_emitted(module, here, imports, ctors, builtins, effects, release,
+            bytes_concat_all([module, b".law#", num(acc.laws), b".guard"]),
+            bytes_concat_all([b"law_", num(acc.laws), b"_guard"]), names, ps, known, g)),
+        };
+        { out: push(with_guard, root_emitted(module, here, imports, ctors, builtins, effects, release,
+            bytes_concat_all([module, b".law#", num(acc.laws), b".body"]),
+            bytes_concat_all([b"law_", num(acc.laws), b"_body"]), names, ps, known, d.body)),
+          tests: acc.tests, laws: acc.laws + 1 }
       },
       _ -> acc,
     });
@@ -3932,6 +3950,57 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
 // One emitted definition: its program-wide name, its C, and its tables encoded.
 // `why` is the refusal's reason, and then `text` and `tables` are empty.
 pub type Emitted = { name: Bytes, text: Bytes, tables: Bytes, why: Option<Bytes>, handles: List<Bytes> }
+
+type Walk = { out: List<Emitted>, tests: Int, laws: Int }
+
+fn params_of(names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>) -> List<P> =
+  map(range(0, len(names)), |i: Int|
+    { name: match list_at(names, i) { Some(n) -> n, None -> b"" },
+      k: match list_at(kinds, i) { Some(Some(p)) -> p.k, _ -> KInt },
+      ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen } })
+
+// A proposition as a root: the same emission a definition gets, refused with the same reasons.
+fn root_emitted(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
+                effects: List<EffectName>, release: Bool, full: Bytes, cname: Bytes,
+                names: List<Bytes>, ps: List<P>, known: Bool, body: Expr) -> Emitted =
+  match if known { lower_fn(names, body) } else { None } {
+    None -> { name: full, text: b"", tables: b"", handles: ast_handles(body, effects),
+              why: Some(if known { b"a body the lowering does not reach" } else { b"a parameter with no written type" }) },
+    Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", cname]), ps, l.code, effects, release) {
+      None -> { name: full, text: b"", tables: b"", handles: walk_handles(l.code, effects),
+                why: emit_fn_why(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", cname]), ps, l.code, effects, release) },
+      Some(c) -> { name: full, text: c.text, tables: c.tables, why: None, handles: [] },
+    },
+  }
+
+// A definition's `requires` clauses over its parameters and its `ensures` clauses over them and
+// then `result`, each a root of its own: `<owner>#requires#<k>`, `<owner>#ensures#<k>`.
+fn clause_roots(acc: Walk, d: FnDef, names: List<Bytes>, kinds: List<Option<{ k: Kind, ty: Ty }>>, module: Bytes,
+                here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>,
+                effects: List<EffectName>, release: Bool, aliases: List<Alias>, others: List<ModAliases>) -> Walk = {
+  let known = fold(kinds, true, |acc2: Bool, k: Option<{ k: Kind, ty: Ty }>| acc2 && k != None);
+  let walked = fold(d.spec, { out: acc.out, requires: 0, ensures: 0 },
+    |s: { out: List<Emitted>, requires: Int, ensures: Int }, c: SpecClause|
+      match c.kind {
+        SRequires -> { out: push(s.out, root_emitted(module, here, imports, ctors, builtins, effects, release,
+                         bytes_concat_all([module, b".", d.name.name, b"#requires#", num(s.requires)]),
+                         bytes_concat_all([d.name.name, b"_requires_", num(s.requires)]), names, params_of(names, kinds), known, c.expr)),
+                       requires: s.requires + 1, ensures: s.ensures },
+        SEnsures -> match d.ret {
+          None -> { out: s.out, requires: s.requires, ensures: s.ensures + 1 },
+          Some(r) -> {
+            let rnames = push(names, b"result");
+            let rkinds = push(kinds, param_kind_with(aliases, others, Some(r)));
+            let rknown = known && param_kind_with(aliases, others, Some(r)) != None;
+            { out: push(s.out, root_emitted(module, here, imports, ctors, builtins, effects, release,
+                bytes_concat_all([module, b".", d.name.name, b"#ensures#", num(s.ensures)]),
+                bytes_concat_all([d.name.name, b"_ensures_", num(s.ensures)]), rnames, params_of(rnames, rkinds), rknown, c.expr)),
+              requires: s.requires, ensures: s.ensures + 1 }
+          },
+        },
+      });
+  { out: walked.out, tests: acc.tests, laws: acc.laws }
+}
 
 fn concat_effects(a: List<EffectName>, b: List<EffectName>) -> List<EffectName> =
   fold(b, a, |acc: List<EffectName>, x: EffectName| push(acc, x))
