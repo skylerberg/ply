@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **623 of 1282** shipped bodies |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **789 of 1282** shipped bodies |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -56,7 +56,7 @@ Ownership and ordering:
 
 ## The named gaps
 
-`emit_diff.rs` asserts the six by name. Four `std.hash` bodies want the
+`emit_diff.rs` asserts the nine by name. Four `std.hash` bodies want the
 *deferred record local*, which is the half of deferring this port does not do: a
 record whose every read is answered from the built table is never materialised,
 and the local it would land in is declared at the top of the body. The other four
@@ -68,6 +68,15 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**The constant table.** A pure nullary definition answering a word is asked of
+`rt_constant` as the reference asks it; purity is the checker's word, through
+`infer.pure_definitions`, so the port runs its checker over the program before it emits.
+The body's code table (`Em.lambdas`) holds the constants' entries beside the lambdas', and a
+closure names its code by the entry's place in it. A `let` keeps its value's whole type now,
+as the reference does, and a type of another module is a word. That was 623 to 789. What it
+opened, three bodies that differ on the port's release rules and on declared widths, is in
+the named gaps.
 
 **A refusal carries its reason now.** `Em.refused` holds the first reason a body was refused;
 a refusal poisons the state and emission runs out, so no signature changed. `emit_fn_why`
