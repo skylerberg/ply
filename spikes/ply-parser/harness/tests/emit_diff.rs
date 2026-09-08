@@ -512,13 +512,12 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
         differ, expected_gaps,
         "the disagreements are not the ones this test knows about"
     );
-    // Lowered once, on purpose, from 279. The `if` join used to take the *then* branch's kind,
-    // which is an approximation: where the two arms answer different kinds the reference reads the
-    // checker's type and this port cannot. It now refuses those, which costs one body and stops
-    // the port writing the wrong conversion into both arms -- seen as `t = v` where the reference
-    // writes `t = (v ? ply_true : ply_false)`. A correct refusal is worth more than a body.
+    // Lowered once, on purpose, from 279 to 278, when the `if` join stopped guessing: where the
+    // two arms answer different kinds the reference reads the checker's type and this port cannot,
+    // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
+    // more than a body. It has since risen well past that.
     assert!(
-        reached >= 278,
+        reached >= 327,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );
