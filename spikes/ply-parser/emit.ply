@@ -110,7 +110,7 @@ pub type Em = { out: List<Bytes>, n: Int, conv: List<Conv>, ind: Int, reads: Lis
                 // Locals holding a count on something this body made and nothing
                 // else can name. A callee that takes one of these is handed the
                 // count rather than a duplicate of it.
-                made: List<Bytes>,
+                made: List<Made>,
                 // The definitions of the module being emitted, with the kind each
                 // answers. A bare name that is not one of them is a builtin or an
                 // import, and this port resolves neither, so it refuses rather
@@ -190,7 +190,13 @@ pub type Em = { out: List<Bytes>, n: Int, conv: List<Conv>, ind: Int, reads: Lis
                 // Counting a single name there says "one read, safe to release"
                 // about an object three other names still hold.
                 alias: List<{ local: Bytes, root: Bytes }>,
-                by_root: List<{ root: Bytes, n: Int }> }
+                by_root: List<{ root: Bytes, n: Int }>,
+                // Whether this body releases what it holds (ADR 0046). Off, every count is kept
+                // until the entry ends, which is the reference's rule and the text the ratchet
+                // compares. On, `made` is every local holding a count, `bound` the ones a slot
+                // names -- moved only at a read the lowering marked `Owned` -- and `pinned` the
+                // ones a fused loop's body may read but never move.
+                release: Bool, pinned: List<Bytes>, bound: List<Bytes> }
 
 // A definition of this module, with what a call of it answers. The *shape* as
 // well as the kind: a call whose answer is a record of known fields is where a
@@ -227,6 +233,10 @@ pub type Built = { local: Bytes, names: List<Bytes>, vals: List<V> }
 
 pub type Deferred = { name: Bytes, shape: Int, n: Int, flags: Int, words: List<Bytes> }
 
+// A C local holding one count, and the block depth it is declared at: released at that
+// block's close unless spent first.
+pub type Made = { name: Bytes, ind: Int }
+
 pub type EffectName = { written: Bytes, global: Bytes, ops: List<OpMode> }
 
 pub type OpMode = { name: Bytes, write: Bool }
@@ -242,13 +252,13 @@ pub type Out = { em: Em, v: V }
 // A line is pushed, and a body's text joined once: appending to one string would copy the
 // body so far for every line, which is quadratic in a heap that keeps what an entry lets go.
 fn line(em: Em, text: Bytes) -> Em =
-  { out: push(em.out, bytes_concat_all([pad(em.ind), text, b"\n"])), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+  { out: push(em.out, bytes_concat_all([pad(em.ind), text, b"\n"])), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
 
-fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
-fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 // A branch leaves the enclosing scope with the temporaries it unboxed: they are
 // declared inside the C block and are gone at the brace. `conv` goes back to
@@ -263,7 +273,7 @@ fn withtail(em: Em, t: Bool) -> Em =
       built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
       consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
-      alias: em.alias, by_root: em.by_root, tail: t, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+      alias: em.alias, by_root: em.by_root, tail: t, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
   }
 
 fn notail(em: Em) -> Em =
@@ -272,13 +282,13 @@ fn notail(em: Em) -> Em =
       built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
       consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
-      alias: em.alias, by_root: em.by_root, tail: false, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+      alias: em.alias, by_root: em.by_root, tail: false, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
   }
 
-fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
-  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }, name: bytes_concat(b"t", num(em.n + 1)) }
+  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }, name: bytes_concat(b"t", num(em.n + 1)) }
 
 // The last entry wins: a `let` may shadow a slot an enclosing scope filled.
 fn conv_of(em: Em, slot: Int) -> Option<V> =
@@ -287,7 +297,8 @@ fn conv_of(em: Em, slot: Int) -> Option<V> =
 
 fn remember(em0: Em, slot: Int, v: V) -> Em = {
   let em = charge(em0, slot, v.c);
-  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, k: v.k, c: v.c, ty: v.ty }), ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+  let em1: Em = if v.k == KBoxed { note_bound(em, v.c) } else { em };
+  { ..em1, conv: push(em1.conv, { slot: slot, k: v.k, c: v.c, ty: v.ty }) }
 }
 
 // A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
@@ -305,8 +316,11 @@ fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
     None -> o,
   };
   let kept = if is_local(expr) { note_alias(kept0, f.name, root_of(kept0, expr)) } else { kept0 };
-  { em: if k == KBoxed && answers_owned(expr) { note_made(kept, f.name) } else { kept },
-    v: { k: k, c: f.name, ty: TyOpen } }
+  let held = if k == KBoxed && answers_owned(kept, expr) { note_made(kept, f.name) }
+             else if k == KBoxed && kept.release && spendable(kept, expr) {
+               note_made(line(spend_made(kept, expr), bytes_concat_all([expr, b" = 0;"])), f.name)
+             } else { kept };
+  { em: held, v: { k: k, c: f.name, ty: TyOpen } }
   }
 }
 
@@ -349,7 +363,7 @@ fn with_reads(em: Em, reads: List<Int>) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn with_out(em: Em, out: List<Bytes>) -> Em =
   { out: out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -357,7 +371,7 @@ fn with_out(em: Em, out: List<Bytes>) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn with_landing(em: Em, landing: Option<Bytes>) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -365,7 +379,7 @@ fn with_landing(em: Em, landing: Option<Bytes>) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: landing, effects: em.effects }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn note_performs(em: Em, eff: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -373,7 +387,7 @@ fn note_performs(em: Em, eff: Bytes) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: push(em.performs, eff), handles: em.handles, landing: em.landing, effects: em.effects }
+    deferred: em.deferred, rlocals: em.rlocals, performs: push(em.performs, eff), handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn note_handles(em: Em, eff: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -381,16 +395,18 @@ fn note_handles(em: Em, eff: Bytes) -> Em =
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
-    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: push(em.handles, eff), landing: em.landing, effects: em.effects }
+    deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: push(em.handles, eff), landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
-fn note_deferred(em: Em, d: Deferred) -> Em =
+fn note_deferred(em: Em, d: Deferred) -> Em = note_holder(note_deferred0(em, d), d.name)
+
+fn note_deferred0(em: Em, d: Deferred) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
     alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
     deferred: push(em.deferred, d), rlocals: push(em.rlocals, d.name),
-    performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 // One record, from its sorted names, the words that fill it and the values those words came
 // from: the reference's `emit_record`. A record whose every field is a width or a `Bool` is
@@ -460,7 +476,7 @@ fn note_alias(em: Em, local: Bytes, root: Bytes) -> Em =
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
     builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
-    alias: push(em.alias, { local: local, root: root }), by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    alias: push(em.alias, { local: local, root: root }), by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 // Charge a slot's reads to the object the local holds, once per (object, slot).
 fn charge(em: Em, slot: Int, local: Bytes) -> Em = {
@@ -474,7 +490,7 @@ fn charge(em: Em, slot: Int, local: Bytes) -> Em = {
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
       alias: em.alias,
       by_root: push(push(em.by_root, { root: bytes_concat_all([r, b"#", num(slot)]), n: 0 }),
-                    { root: r, n: count_of(em.reads, slot) }), tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+                    { root: r, n: count_of(em.reads, slot) }), tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
   }
 }
 
@@ -489,19 +505,28 @@ fn built_of(em: Em, local: Bytes) -> Option<Built> =
 // A runtime helper hands back a word it owns. A *compiled* call does not count,
 // and the distinction is the reference's: a call's result is duplicated before
 // it is handed on, and only a helper's count is handed over.
-fn answers_owned(expr: Bytes) -> Bool =
-  bytes_len(expr) > 3 && bytes_slice(expr, 0, 3) == b"rt_"
+fn answers_owned(em: Em, expr: Bytes) -> Bool =
+  (bytes_len(expr) > 3 && bytes_slice(expr, 0, 3) == b"rt_")
+  || (em.release
+      && ((bytes_len(expr) > 4 && bytes_slice(expr, 0, 4) == b"ply_" && calls_with_ctx(expr))
+          || (bytes_len(expr) > 13 && bytes_slice(expr, 0, 13) == b"(ply_fits_imm")))
+
+// A compiled call: `ply_<name>(ctx, ...)`, told from a load or an immediate by what follows the
+// first parenthesis.
+fn calls_with_ctx(expr: Bytes) -> Bool = {
+  let p = bytes_scan_until(expr, 0, b"(", bytes_len(expr));
+  p + 4 <= bytes_len(expr) && bytes_slice(expr, p, p + 4) == b"(ctx"
+}
 
 fn note_made(em: Em, name: Bytes) -> Em =
-  { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: em.built, module: em.module, made: push(em.made, name), here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+  { ..em, made: push(em.made, { name: name, ind: em.ind }) }
 
 // A refusal: the first reason is kept, and emission runs out on a placeholder value.
 fn poison(em: Em, why: Bytes) -> Em =
   match em.refused {
     Some(_) -> em,
     None -> { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-      built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: Some(why), deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects },
+      built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: Some(why), deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
   }
 
 fn refused(em: Em, why: Bytes) -> Out =
@@ -513,19 +538,108 @@ fn lambda_of(em: Em, sym: Bytes) -> { em: Em, i: Int } =
           match list_at(em.lambdas, i) { Some(x) -> if x == sym { Some(i) } else { acc }, None -> acc }) {
     Some(i) -> { em: em, i: i },
     None -> { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-                    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: push(em.lambdas, sym), owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects },
+                    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: push(em.lambdas, sym), owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
               i: len(em.lambdas) },
   }
 
 fn note_call(em: Em, full: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: push(em.calls, full), refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: push(em.calls, full), refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn spend_made(em: Em, name: Bytes) -> Em =
-  { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: em.built, module: em.module,
-    made: fold(em.made, [], |acc: List<Bytes>, m: Bytes| if m == name { acc } else { push(acc, m) }),
-    here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+  { ..em, made: fold(em.made, [], |acc: List<Made>, m: Made| if m.name == name { acc } else { push(acc, m) }) }
+
+fn is_made(em: Em, name: Bytes) -> Bool =
+  fold(em.made, false, |acc: Bool, m: Made| acc || m.name == name)
+
+fn is_bound(em: Em, name: Bytes) -> Bool =
+  fold(em.bound, false, |acc: Bool, b: Bytes| acc || b == name)
+
+fn is_pinned(em: Em, name: Bytes) -> Bool =
+  fold(em.pinned, false, |acc: Bool, p: Bytes| acc || p == name)
+
+// A count a consumer may take in place: held by a local no slot names and no loop pins. A
+// slot's local is spent only by a read marked `Owned`, which moves it out under a name of its
+// own first.
+fn spendable(em: Em, name: Bytes) -> Bool =
+  is_made(em, name) && !is_bound(em, name) && !is_pinned(em, name)
+
+// A holder, under release only: the reference's text keeps every count until the entry ends.
+fn note_holder(em: Em, name: Bytes) -> Em =
+  if em.release { note_made(em, name) } else { em }
+
+fn note_bound(em: Em, name: Bytes) -> Em = { ..em, bound: push(em.bound, name) }
+
+// Every holder in scope, pinned for a fused loop's body: the text is read once and runs as
+// often as the loop does, so a mark that says "last use" is about the text.
+fn pin_all(em: Em) -> Em =
+  { ..em, pinned: fold(em.made, em.pinned, |acc: List<Bytes>, m: Made| push(acc, m.name)) }
+
+fn with_pinned(em: Em, pinned: List<Bytes>) -> Em = { ..em, pinned: pinned }
+
+fn with_made(em: Em, made: List<Made>) -> Em = { ..em, made: made }
+
+// What may still be held after either of two paths: released at the scope's end, where the
+// path that spent it left it null.
+fn union_made(a: List<Made>, b: List<Made>) -> List<Made> =
+  fold(b, a, |acc: List<Made>, m: Made|
+    if fold(acc, false, |seen: Bool, x: Made| seen || x.name == m.name) { acc } else { push(acc, m) })
+
+// Releases every holder declared at depth `from` or deeper and forgets the block's own. A
+// `break` names the loop's depth and keeps the enclosing blocks' holders for the paths that
+// stay.
+fn release_at(em: Em, from: Int) -> Em =
+  if !em.release { em } else {
+    let out: Em = fold(em.made, em, |acc: Em, m: Made|
+      if m.ind >= from { line(acc, bytes_concat_all([b"ply_dec(ctx, ", m.name, b");"])) } else { acc });
+    { ..out, made: fold(em.made, [], |acc: List<Made>, m: Made| if m.ind >= em.ind { acc } else { push(acc, m) }) }
+  }
+
+// The close of a block that may have declared holders.
+fn close(em: Em) -> Em = line(outdent(release_at(em, em.ind)), b"}")
+
+// A slot's local at the read the lowering marked its last use: moved out under a name of its
+// own, which a consumer then takes, and nulled so the scope's release passes it by. A pinned
+// local stays, and a held-back record is built first.
+fn move_read(em: Em, own: Own, v: V) -> Out =
+  if !em.release || own != Owned || v.k != KBoxed || !is_made(em, v.c) || is_pinned(em, v.c) { { em: em, v: v } } else {
+    let b = match deferred_of(em, v.c) {
+      Some(_) -> bind_word_of(materialise(em, v.c), v.c),
+      None -> bind_keeping(em, KBoxed, v.ty, v.c),
+    };
+    { em: note_made(line(spend_made(b.em, v.c), bytes_concat_all([v.c, b" = 0;"])), b.v.c),
+      v: { k: KBoxed, c: b.v.c, ty: v.ty } }
+  }
+
+// A local a slot is about to name holds a count of its own: taken over from a temporary
+// already, or added to what another name still holds.
+fn ensure_owned(em: Em, v: V) -> Em =
+  if !em.release || v.k != KBoxed || is_made(em, v.c) { em } else {
+    note_made(line(em, bytes_concat_all([b"ply_inc(", v.c, b");"])), v.c)
+  }
+
+// `target = word;` where the target holds a count afterwards: a temporary's count moves, a
+// name still held elsewhere is held once more, and an expression answers a count of its own.
+fn assign_owned(em: Em, target: Bytes, c: Bytes) -> Em =
+  if !em.release { em }
+  else if spendable(em, c) { line(spend_made(em, c), bytes_concat_all([c, b" = 0;"])) }
+  else if is_local(c) { line(em, bytes_concat_all([b"ply_inc(", target, b");"])) }
+  else { em }
+
+// A value nothing takes: a statement's, released where it is.
+fn drop_value(em: Em, v: V) -> Em =
+  if em.release && v.k == KBoxed && spendable(em, v.c) {
+    line(spend_made(em, v.c), bytes_concat_all([b"ply_dec(ctx, ", v.c, b"); ", v.c, b" = 0;"]))
+  } else { em }
+
+// The word a function answers, owned by its caller: under release the count is taken or added
+// first, and everything the body still holds is released before the return.
+fn returned(em: Em, v: V) -> { em: Em, c: Bytes } =
+  if !em.release { word_of(em, v) } else {
+    let r = owned(em, v);
+    { em: release_at(r.em, 0), c: r.v.c }
+  }
+
 
 // A value collected into an aggregate: boxed, and held in a local declared
 // `Word` rather than by its kind's C type, because the array a list is built
@@ -539,7 +653,8 @@ fn sets_bound(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<V>)
         None -> None,
         Some(o) -> {
           let b = bind_keeping(o.em, o.v.k, o.v.ty, o.v.c);
-          sets_bound(b.em, xs, params, i + 1, push(acc, b.v))
+          let s = secure(b.em, b.v);
+          sets_bound(s.em, xs, params, i + 1, push(acc, s.v))
         },
       },
     }
@@ -573,12 +688,12 @@ fn bind_word(em: Em, v: V) -> Out = {
 // will release, and the duplicate is what puts the count back. A scalar is an
 // immediate and holds no count, so there is nothing to take.
 fn owned(em: Em, v: V) -> Out = {
-  let already = fold(em.made, false, |acc: Bool, m: Bytes| acc || m == v.c);
-  let w = bind_word(spend_made(em, v.c), v);
+  let spend = if em.release { spendable(em, v.c) } else { is_made(em, v.c) };
+  let w = bind_word(if spend { spend_made(em, v.c) } else { em }, v);
   match v.k {
-    KBoxed -> if already { w } else {
-      { em: line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"])), v: w.v }
-    },
+    KBoxed -> if spend { if em.release { { em: line(w.em, bytes_concat_all([v.c, b" = 0;"])), v: w.v } } else { w } }
+              else if em.release && answers_owned(em, v.c) { w }
+              else { { em: line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"])), v: w.v } },
     _ -> w,
   }
 }
@@ -624,6 +739,9 @@ fn release_base(em: Em, base: Code, b: V, params: List<P>) -> Option<Em> =
 // because nothing is emitted after the node and the later read that guard exists
 // to protect against cannot be there.
 fn release_from(em: Em, base: Code, b: V, params: List<P>, at_tail: Bool) -> Option<Em> =
+  if em.release {
+    if base_owned(base) && spendable(em, b.c) { Some(release_holder(spend_made(em, b.c), b)) } else { Some(em) }
+  } else {
   match base.own {
     Owned -> match base.node {
       NVar(v) -> match v.slot {
@@ -655,6 +773,39 @@ fn release_from(em: Em, base: Code, b: V, params: List<P>, at_tail: Bool) -> Opt
       _ -> Some(em),
     },
     _ -> Some(em),
+  } }
+
+// A base a slot names, at the read the lowering marked its last use.
+fn base_owned(base: Code) -> Bool =
+  match base.own {
+    Owned -> match base.node { NVar(v) -> v.slot != None, _ -> false },
+    _ -> false,
+  }
+
+// A holder's count let go, its cells kept as a reuse token where the shape is known, and the
+// local nulled so the scope's release passes it by.
+fn release_holder(em: Em, b: V) -> Em =
+  match deferred_of(em, b.c) {
+    Some(d) -> line(note_tok(em, d.n), bytes_concat_all([
+      b"if (", b.c, b") { if (tok", num(d.n), b" == 0) { tok", num(d.n), b" = ply_reset_flat(", b.c,
+      b"); if (!tok", num(d.n), b") tok", num(d.n), b" = rt_reset_p(ctx, ", b.c, b"); } else { ply_dec(ctx, ",
+      b.c, b"); } ", b.c, b" = 0; }"])),
+    None -> match width_of(b.ty) {
+      None -> line(em, bytes_concat_all([b"ply_dec(ctx, ", b.c, b"); ", b.c, b" = 0;"])),
+      Some(n) -> line(note_tok(em, n), bytes_concat_all([
+        b"if (tok", num(n), b" == 0) { tok", num(n), b" = ply_reset_flat(", b.c,
+        b"); if (!tok", num(n), b") tok", num(n), b" = rt_reset_p(ctx, ", b.c,
+        b"); } else { ply_dec(ctx, ", b.c, b"); } ", b.c, b" = 0;"])),
+    },
+  }
+
+// A field forwarded from the values a record was built of, when the record itself is about to
+// be released: held once more first, as `rt_field` moves a field out before it lets the base go.
+fn secure_field(em: Em, base: Code, b: V, v: V) -> Out =
+  if !em.release || v.k != KBoxed || !base_owned(base) || !spendable(em, b.c) { { em: em, v: v } } else {
+    let t = bind_word_of(em, v.c);
+    { em: note_made(line(t.em, bytes_concat_all([b"ply_inc(", t.v.c, b");"])), t.v.c),
+      v: { k: KBoxed, c: t.v.c, ty: v.ty } }
   }
 
 fn through_caps(reads: List<Int>, caps: List<Cap>) -> List<Int> =
@@ -730,7 +881,7 @@ fn from_table(em: Em, l: Lit) -> Out = {
 fn const_of(em: Em, l: Lit) -> { em: Em, i: Int } =
   { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
           shapes: em.shapes, built: em.built, module: em.module, made: em.made,
-          here: em.here, imports: em.imports, consts: push(em.consts, l), ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects },
+          here: em.here, imports: em.imports, consts: push(em.consts, l), ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
     i: len(em.consts) }
 
 // A capital first letter, after any module binder.
@@ -901,7 +1052,7 @@ fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: Li
             Some(sv) -> {
               let sw = word_of(sv.em, sv.v);
               let state = fresh(sw.em);
-              let s1 = line(state.em, bytes_concat_all([b"Word ", state.name, b" = ", sw.c, b";"]));
+              let s1 = assign_owned(line(state.em, bytes_concat_all([b"Word ", state.name, b" = ", sw.c, b";"])), state.name, sw.c);
               match expr(notail(s1), budget, params) {
                 None -> None,
                 Some(bv) -> {
@@ -933,10 +1084,12 @@ fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: Li
                     Some(window) -> {
                       // The body's counts are the lambda's own: its parameter's reads are of the
                       // state, and a capture's were charged to its object outside.
-                      let held = bind_keeping(with_reads(rescope(guarded, window), slots_read(l.body)), KBoxed, sv.v.ty, state.name);
-                      let inner = remember(held.em, 0, held.v);
+                      // Everything held outside the loop is pinned: the body reads it as often as
+                      // the loop runs. The state's rename is the iteration's own holder.
+                      let held = bind_keeping(with_reads(rescope(pin_all(guarded), window), slots_read(l.body)), KBoxed, sv.v.ty, state.name);
+                      let inner = remember(note_holder(held.em, held.v.c), 0, held.v);
                       let body = if fusable_step(inner, l.body) {
-                        emit_step(inner, l.body, state.name, answer.name, stop, go, params)
+                        emit_step(inner, l.body, state.name, answer.name, stop, go, params, inner.ind)
                       } else {
                         match expr(inner, l.body, params) {
                           None -> None,
@@ -949,7 +1102,7 @@ fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: Li
                               b")->kind == 4 && ply_obj(", sa.v.c, b")->len == 1) ? ply_obj(", sa.v.c, b")->layout : 0xFFFFFFFFu;"]));
                             let t2 = line(indent(line(t1, bytes_concat_all([b"if (", k.name, b" == ", num(stop), b"u) {"]))),
                               bytes_concat_all([answer.name, b" = ply_words(", sa.v.c, b")[0];"]));
-                            let t3 = line(line(t2, bytes_concat_all([b"ply_inc(", answer.name, b");"])), b"break;");
+                            let t3 = line(release_at(line(t2, bytes_concat_all([b"ply_inc(", answer.name, b");"])), inner.ind), b"break;");
                             let t4 = line(indent(line(outdent(t3), bytes_concat_all([b"} else if (", k.name, b" == ", num(go), b"u) {"]))),
                               bytes_concat_all([state.name, b" = ply_words(", sa.v.c, b")[0];"]));
                             let t5 = line(t4, bytes_concat_all([b"ply_inc(", state.name, b");"]));
@@ -961,7 +1114,7 @@ fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: Li
                       };
                       match body {
                         None -> None,
-                        Some(done) -> Some({ em: line(outdent(with_reads(rescope(done, guarded.conv), em.reads)), b"}"),
+                        Some(done) -> Some({ em: note_holder(with_pinned(close(with_reads(rescope(done, guarded.conv), em.reads)), em.pinned), answer.name),
                                              v: { k: KBoxed, c: answer.name, ty: TyOpen } }),
                       }
                     },
@@ -995,7 +1148,7 @@ fn fusable_step(em: Em, c: Code) -> Bool =
 
 // The loop's own assignments for a step that answers a constructor directly: `Stop(x)` sets the
 // answer and breaks, `Continue(x)` sets the state.
-fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, params: List<P>) -> Option<Em> =
+fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, params: List<P>, depth: Int) -> Option<Em> =
   match c.node {
     NApp(a) -> match list_at(a.args, 0) {
       None -> None,
@@ -1005,9 +1158,10 @@ fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, p
           let w = word_of(v.em, v.v);
           let which = match a.func.node { NVar(fv) -> tag_of(em, fv.name), _ -> None };
           if which == Some(stop) {
-            Some(line(line(w.em, bytes_concat_all([answer, b" = ", w.c, b";"])), b"break;"))
+            // The loop's holders go before the `break` leaves their block.
+            Some(line(release_at(assign_owned(line(w.em, bytes_concat_all([answer, b" = ", w.c, b";"])), answer, w.c), depth), b"break;"))
           } else {
-            Some(line(w.em, bytes_concat_all([state, b" = ", w.c, b";"])))
+            Some(assign_owned(line(w.em, bytes_concat_all([state, b" = ", w.c, b";"])), state, w.c))
           }
         },
       },
@@ -1016,13 +1170,14 @@ fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, p
       None -> None,
       Some(cv) -> {
         let opened = indent(line(cv.em, bytes_concat_all([b"if (", as_bool(cv.v), b") {"])));
-        match emit_step(opened, i.then_branch, state, answer, stop, go, params) {
+        match emit_step(opened, i.then_branch, state, answer, stop, go, params, depth) {
           None -> None,
           Some(t) -> {
-            let els = indent(line(outdent(t), b"} else {"));
-            match emit_step(els, i.else_branch, state, answer, stop, go, params) {
+            let t2 = release_at(t, t.ind);
+            let els = with_made(indent(line(outdent(t2), b"} else {")), opened.made);
+            match emit_step(els, i.else_branch, state, answer, stop, go, params, depth) {
               None -> None,
-              Some(e) -> Some(line(outdent(e), b"}")),
+              Some(e) -> { let e2 = close(e); Some(with_made(e2, union_made(t2.made, e2.made))) },
             }
           },
         }
@@ -1032,7 +1187,7 @@ fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, p
       None -> None,
       Some(t) -> match stmts(em, b.stmts, params, 0) {
         None -> None,
-        Some(after) -> emit_step(rescope(after, after.conv), t, state, answer, stop, go, params),
+        Some(after) -> emit_step(rescope(after, after.conv), t, state, answer, stop, go, params, depth),
       },
     },
     _ -> None,
@@ -1072,23 +1227,48 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
                 // `rt_call` takes its callee, so each iteration hands it a count of its own and
                 // the loop lets go of the last one at the end.
                 let step = nameable_step(n.em, f);
-                let held = match step {
-                  Some(_) -> Some({ em: n.em, v: { k: KBoxed, c: b"", ty: TyOpen } }),
-                  None -> match expr(notail(n.em), f, params) {
-                    None -> None,
-                    Some(cl) -> Some(owned(cl.em, cl.v)),
-                  },
-                };
-                match held {
-                  None -> None,
-                  Some(co) -> match expr(notail(co.em), init, params) {
+                // The reference builds the closure before it evaluates the seed; the machine
+                // evaluates the seed first, and under release the order is the machine's: a
+                // capture the closure takes at its last use is null once the closure is built.
+                let ordered = if n.em.release {
+                  match expr(notail(n.em), init, params) {
                     None -> None,
                     Some(iv) -> {
-                      // The accumulator's word, *not* held once more: the loop
-                      // hands it to the closure and takes back what the closure
-                      // answers, so the count it starts with is the one it ends
-                      // with.
-                      let acc = bind_word(iv.em, iv.v);
+                      let acc = owned(iv.em, iv.v);
+                      match step {
+                        Some(_) -> Some({ em: acc.em, co: { k: KBoxed, c: b"", ty: TyOpen }, acc: acc.v }),
+                        None -> match expr(notail(acc.em), f, params) {
+                          None -> None,
+                          Some(cl) -> { let held = owned(cl.em, cl.v); Some({ em: held.em, co: held.v, acc: acc.v }) },
+                        },
+                      }
+                    },
+                  }
+                } else {
+                  let held = match step {
+                    Some(_) -> Some({ em: n.em, v: { k: KBoxed, c: b"", ty: TyOpen } }),
+                    None -> match expr(notail(n.em), f, params) {
+                      None -> None,
+                      Some(cl) -> Some(owned(cl.em, cl.v)),
+                    },
+                  };
+                  match held {
+                    None -> None,
+                    Some(co) -> match expr(notail(co.em), init, params) {
+                      None -> None,
+                      // The accumulator's word, *not* held once more: the loop hands it to the
+                      // closure and takes back what the closure answers, so the count it starts
+                      // with is the one it ends with.
+                      Some(iv) -> { let acc = bind_word(iv.em, iv.v); Some({ em: acc.em, co: co.v, acc: acc.v }) },
+                    },
+                  }
+                };
+                match ordered {
+                  None -> None,
+                  Some(ord) -> {
+                    let co = { em: ord.em, v: ord.co };
+                    let acc = { em: ord.em, v: ord.acc };
+                    {
                       let i = bind(acc.em, KInt, b"0");
                       let head = line(i.em, bytes_concat_all([
                         b"for (; ", i.v.c, b" < ", n.v.c, b"; ", i.v.c, b" += 1) {"]));
@@ -1107,15 +1287,16 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
                                               b", (Word)(intptr_t)", a2.name, b", 2);"]))
                         },
                       };
-                      let done = line(outdent(check(call)), b"}");
+                      // The call took the element.
+                      let done = close(check(spend_made(call, at.v.c)));
                       let freed = match step {
                         Some(_) -> done,
                         None -> line(done, bytes_concat_all([b"ply_dec(ctx, ", co.v.c, b");"])),
                       };
-                      Some({ em: line(freed, bytes_concat_all([b"ply_dec(ctx, ", lo.v.c, b");"])),
+                      Some({ em: note_holder(line(freed, bytes_concat_all([b"ply_dec(ctx, ", lo.v.c, b");"])), acc.v.c),
                              v: acc.v })
-                    },
-                  },
+                    }
+                  }
                 }
               },
             },
@@ -1265,7 +1446,7 @@ fn kind_tested(em: Em, name: Bytes, v: V, index: Option<V>) -> Out = {
         bytes_concat_all([out.name, b" = ply_imm_value(r);"]))
     },
   };
-  { em: line(outdent(body), b"}"), v: { k: KInt, c: out.name, ty: TyOpen } }
+  { em: close(body), v: { k: KInt, c: out.name, ty: TyOpen } }
 }
 
 // `bytes_concat_all([a, b, ..])` joins the pieces without building the list; over anything
@@ -1360,7 +1541,7 @@ fn builtin_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
                     shapes: em.shapes, built: em.built, module: em.module, made: em.made,
                     here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors,
                     extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-                    builtins: em.builtins, met: push(em.met, name), fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects },
+                    builtins: em.builtins, met: push(em.met, name), fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
                i: len(em.met) },
   }
 
@@ -1488,7 +1669,8 @@ fn caps_owned(em: Em, cs: List<Cap>, params: List<P>, i: Int, acc: List<Bytes>)
         match found {
           None -> Some({ em: poison(em, b"a capture this port has not bound"), names: acc }),
           Some(v) -> {
-            let w = owned(em, v);
+            let mv = move_read(em, c.own, v);
+            let w = owned(mv.em, mv.v);
             caps_owned(w.em, cs, params, i + 1, push(acc, w.v.c))
           },
         }
@@ -1521,12 +1703,12 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
   // descend into a lambda, so an update at the end of one keeps the one-read guard.
   let start = { out: [], n: 0, conv: window, ind: 0, reads: reads, shapes: em.shapes, built: [],
                 module: em.module, made: [], here: em.here, imports: em.imports, consts: em.consts,
-                ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: [], toks: [], alias: [], by_root: [], tail: false, calls: em.calls, refused: em.refused, deferred: [], rlocals: [], performs: em.performs, handles: em.handles, landing: None, effects: em.effects };
-  let charged = fold(window, start, |acc: Em, w: Conv| charge(acc, w.slot, w.c));
+                ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: [], toks: [], alias: [], by_root: [], tail: false, calls: em.calls, refused: em.refused, deferred: [], rlocals: [], performs: em.performs, handles: em.handles, landing: None, effects: em.effects, release: em.release, pinned: [], bound: [] };
+  let charged = fold(window, start, |acc: Em, w: Conv| note_bound(note_holder(charge(acc, w.slot, w.c), w.c), w.c));
   match expr(charged, l.body, []) {
     None -> None,
     Some(o0) -> {
-      let w = word_of(o0.em, o0.v);
+      let w = returned(o0.em, o0.v);
       let o = { em: w.em, v: o0.v };
       Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, fields: o.em.fields, lambdas: o.em.lambdas, calls: o.em.calls, performs: o.em.performs, handles: o.em.handles, refused: o.em.refused,
       extra: o.em.extra,
@@ -1570,7 +1752,7 @@ fn args_evaled(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<V>)
       None -> None,
       Some(x) -> match expr(notail(em), x, params) {
         None -> None,
-        Some(o) -> args_evaled(o.em, xs, params, i + 1, push(acc, o.v)),
+        Some(o) -> { let s = secure(o.em, o.v); args_evaled(s.em, xs, params, i + 1, push(acc, s.v)) },
       },
     }
   }
@@ -1586,7 +1768,7 @@ fn field_of(em: Em, name: Bytes) -> { em: Em, i: Int } =
                     shapes: em.shapes, built: em.built, module: em.module, made: em.made,
                     here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors,
                     extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-                    builtins: em.builtins, met: em.met, fields: push(em.fields, name), released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects },
+                    builtins: em.builtins, met: em.met, fields: push(em.fields, name), released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
                i: len(em.fields) },
   }
 
@@ -1602,7 +1784,7 @@ fn built_field(em: Em, local: Bytes, name: Bytes) -> Option<V> =
 
 fn remember_built(em: Em, local: Bytes, names: List<Bytes>, vals: List<V>) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
-    built: push(em.built, { local: local, names: names, vals: vals }), module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    built: push(em.built, { local: local, names: names, vals: vals }), module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
   match fold(range(0, len(em.shapes)), None, |acc: Option<Int>, i: Int|
@@ -1612,7 +1794,7 @@ fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
           }) {
     Some(i) -> { em: em, i: i },
     None -> { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
-                    shapes: push(em.shapes, names), built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects },
+                    shapes: push(em.shapes, names), built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound },
               i: len(em.shapes) },
   }
 
@@ -1640,14 +1822,14 @@ fn note_tok(em: Em, w: Int) -> Em =
       built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
       consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
       builtins: em.builtins, met: em.met, fields: em.fields, released: em.released,
-      toks: push(em.toks, w), alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+      toks: push(em.toks, w), alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
   }
 
 fn note_released(em: Em, root: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, root), toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, root), toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn count_of(reads: List<Int>, slot: Int) -> Int =
   fold(reads, 0, |acc: Int, s: Int| if s == slot { acc + 1 } else { acc })
@@ -1778,13 +1960,13 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         } else { Some(refused(em, bytes_concat(b"a global this port cannot resolve: ", v.name))) },
       } },
       Some(s) -> match conv_of(em, s) {
-        Some(v) -> Some({ em: em, v: v }),
+        Some(v) -> Some(move_read(em, c.own, v)),
         // Not in the window: a parameter the prologue did not open, which is a
         // record. It is read as its own word, here, each time.
         None -> match list_at(params, s) {
           None -> Some(refused(em, bytes_concat(b"a local this port has not bound: ", v.name))),
           Some(p) -> match p.k {
-            KBoxed -> Some({ em: em, v: { k: KBoxed, c: bytes_concat(b"p", num(s)), ty: p.ty } }),
+            KBoxed -> Some(move_read(em, c.own, { k: KBoxed, c: bytes_concat(b"p", num(s)), ty: p.ty })),
             _ -> Some(refused(em, bytes_concat(b"a scalar parameter read outside its window: ", v.name))),
           },
         },
@@ -1809,7 +1991,9 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               None -> None,
               Some(r) -> {
                 let assigned = line(r.em, bytes_concat_all([out.name, b" = ", as_bool(r.v), b";"]));
-                Some({ em: line(outdent(assigned), b"}"), v: { k: KBool, c: out.name, ty: TyOpen } })
+                // One path runs the branch: what it moved is still held on the other.
+                let closed = close(assigned);
+                Some({ em: with_made(closed, union_made(opened.made, closed.made)), v: { k: KBool, c: out.name, ty: TyOpen } })
               },
             }
           },
@@ -1817,7 +2001,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       }
       // `++` joins two values the runtime knows how to join, and takes both.
       else if b.op == b"concat" {
-        match expr(notail(em), b.lhs, params) {
+        match secured(expr(notail(em), b.lhs, params)) {
           None -> None,
           Some(l) -> match expr(notail(l.em), b.rhs, params) {
             None -> None,
@@ -1834,7 +2018,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       else if !is_arith(b.op) && compare_op(b.op) == None && !is_bitop(b.op) && !is_shift(b.op) {
         Some(refused(em, bytes_concat(b"an operator this port does not emit: ", b.op)))
       } else {
-        match expr(notail(em), b.lhs, params) {
+        match secured(expr(notail(em), b.lhs, params)) {
           None -> None,
           Some(l) -> match expr(notail(l.em), b.rhs, params) {
             None -> None,
@@ -1922,7 +2106,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             shapes: sub_out.shapes, built: e.built, module: e.module, made: e.made,
                             here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
                             extra: bytes_concat_all([e.extra, sub_out.text, sub_out.extra]), lambdas: sub_out.lambdas,
-                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: sub_out.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused, deferred: e.deferred, rlocals: e.rlocals, performs: sub_out.performs, handles: sub_out.handles, landing: e.landing, effects: e.effects };
+                            owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: sub_out.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused, deferred: e.deferred, rlocals: e.rlocals, performs: sub_out.performs, handles: sub_out.handles, landing: e.landing, effects: e.effects, release: e.release, pinned: e.pinned, bound: e.bound };
               let o = bind(grown, KBoxed, bytes_concat_all([
                 b"rt_closure_p(ctx, @@l", num(entry.i), b"@@, ", num(l.params),
                 b", (Word)(intptr_t)", arr.name, b", ", num(len(l.caps)), b")"]));
@@ -1955,12 +2139,17 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // Built in this body: the value is already in a register, and asking for
         // the word here is what would force a record into memory that nothing
         // else ever looks at.
-        Some(v) -> match release_base(b.em, f.base, b.v, params) {
-          None -> None,
-          Some(r) -> Some({ em: r, v: v }),
+        Some(v) -> {
+          let kept = secure_field(b.em, f.base, b.v, v);
+          match release_base(kept.em, f.base, b.v, params) {
+            None -> None,
+            Some(r) -> Some({ em: r, v: kept.v }),
+          }
         },
         None -> {
           let held = bind(b.em, KBoxed, as_word(b.v));
+          // Under release the rename is the holder: the temporary it renamed was nulled.
+          let hv = if b.em.release { { k: KBoxed, c: held.v.c, ty: b.v.ty } } else { b.v };
           match field_at(b.v.ty, f.field) {
             // The shape is known, so the read is a load at the field's offset. A
             // scalar field then goes into a register of its own kind; anything
@@ -1973,10 +2162,18 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 // The reference returns before the release for exactly this case,
                 // and the reason is recorded there: the in-place field take that
                 // would make it safe is not in the tier.
-                KBoxed -> Some({ em: w.em, v: w.v }),
+                // Under release a base at its last use is let go here, the field held once more
+                // first, which is what `rt_field` does with its `own` of 1.
+                KBoxed -> if w.em.release && base_owned(f.base) && spendable(w.em, hv.c) {
+                    let tf = note_made(line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"])), w.v.c);
+                    match release_base(tf, f.base, hv, params) {
+                      None -> None,
+                      Some(r) -> Some({ em: r, v: w.v }),
+                    }
+                  } else { Some({ em: w.em, v: w.v }) },
                 _ -> {
                   let out = bind(w.em, i.k, as_kind(w.v, i.k));
-                  match release_base(out.em, f.base, b.v, params) {
+                  match release_base(out.em, f.base, hv, params) {
                     None -> None,
                     Some(r) -> Some({ em: r, v: out.v }),
                   }
@@ -1988,8 +2185,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             // word does not release its base.
             None -> {
               let idx = field_of(held.em, f.field);
-              let w = bind(idx.em, KBoxed, bytes_concat_all([b"rt_field_p(ctx, ", held.v.c, b", @@f", num(idx.i), b"@@, 0)"]));
-              Some({ em: check(w.em), v: w.v })
+              // The runtime takes a base at its last use, under release.
+              let take = idx.em.release && base_owned(f.base) && spendable(idx.em, hv.c);
+              let w = bind(idx.em, KBoxed, bytes_concat_all([b"rt_field_p(ctx, ", held.v.c, b", @@f", num(idx.i), b"@@, ",
+                                                            if take { b"1" } else { b"0" }, b")"]));
+              let spent = if take { line(spend_made(w.em, hv.c), bytes_concat_all([hv.c, b" = 0;"])) } else { w.em };
+              Some({ em: check(spent), v: w.v })
             },
           }
         },
@@ -2013,6 +2214,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           None -> None,
           Some(bv) -> {
             let held = bind(bv.em, KBoxed, as_word(bv.v));
+            let hv = if bv.em.release { { k: KBoxed, c: held.v.c, ty: bv.v.ty } } else { bv.v };
             // Each field's word, its kind by the base's declared type, and the value it came
             // from where the value is still in a register: a copy the base itself remembered is
             // the value rather than a load, which is what carries the knowledge along a chain of
@@ -2025,7 +2227,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                   match built_field(acc.em, held.v.c, nm) {
                     Some(v) -> {
                       let o = owned(acc.em, v);
-                      { em: o.em, ws: push(acc.ws, o.v.c), kinds: push(acc.kinds, fk), vals: push(acc.vals, v), known: acc.known }
+                      { em: o.em, ws: push(acc.ws, o.v.c), kinds: push(acc.kinds, fk), vals: push(acc.vals, taken_as(o.em, v, o.v)), known: acc.known }
                     },
                     None -> match field_at(bv.v.ty, nm) {
                       // Read at the field's place in the **base's** shape, which is the new
@@ -2049,7 +2251,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         let idx = field_of(acc.em, nm);
                         let w = bind(idx.em, KBoxed, bytes_concat_all([
                           b"rt_field_p(ctx, ", held.v.c, b", @@f", num(idx.i), b"@@, 0)"]));
-                        { em: check(w.em), ws: push(acc.ws, w.v.c), kinds: push(acc.kinds, fk), vals: acc.vals, known: false }
+                        // The runtime answers the copy held once more, and the record takes it.
+                        { em: spend_made(check(w.em), w.v.c), ws: push(acc.ws, w.v.c), kinds: push(acc.kinds, fk), vals: acc.vals, known: false }
                       },
                     },
                   }
@@ -2059,14 +2262,14 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                     // The written field's word is *held once more*: the record
                     // being built takes it, as a copy's read does.
                     Some(v) -> { let w = owned(acc.em, v);
-                                 { em: w.em, ws: push(acc.ws, w.v.c), kinds: push(acc.kinds, v.k), vals: push(acc.vals, v), known: acc.known } },
+                                 { em: w.em, ws: push(acc.ws, w.v.c), kinds: push(acc.kinds, v.k), vals: push(acc.vals, taken_as(w.em, v, w.v)), known: acc.known } },
                   }
                 }
               });
             // The release here is the reference's `Site::TailUpdate` at the body's tail, which
             // skips the one-read guard: nothing is emitted after the update, so the later read the
             // guard protects cannot be there.
-            match release_from(filled.em, u.base, bv.v, params, em.tail) {
+            match release_from(filled.em, u.base, hv, params, em.tail) {
               None -> None,
               Some(rel) -> Some(build_record(rel, names, filled.ws, filled.kinds,
                                              if filled.known { Some(filled.vals) } else { None })),
@@ -2244,11 +2447,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         let ans = fresh(subj.em);
         let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
         let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
-        match arms(withtail(opened, em.tail), m.arms, params, 0, subj.v, ans.name, flag.name) {
+        match arms(withtail(opened, em.tail), m.arms, params, 0, subj.v, ans.name, flag.name, opened.made, []) {
           None -> None,
           Some(after) -> Some({
-            em: line(after, bytes_concat_all([b"if (!", flag.name,
-                                              b") { rt_no_match_p(ctx); return 0; }"])),
+            em: note_holder(line(after, bytes_concat_all([b"if (!", flag.name,
+                                                          b") { rt_no_match_p(ctx); return 0; }"])), ans.name),
             v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
         }
       },
@@ -2272,7 +2475,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           let j = fresh(cv.em);
           match arm(withtail(blank(j.em), em.tail), i.then_branch, params) {
             None -> None,
-            Some(t) -> match arm(withtail(rescope(blank(t.em), cv.em.conv), em.tail),
+            Some(t) -> match arm(withtail(with_made(rescope(blank(t.em), cv.em.conv), j.em.made), em.tail),
                                  i.else_branch, params) {
               None -> None,
               Some(e) -> {
@@ -2293,17 +2496,17 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         { em: line(f.em, bytes_concat_all([ctype(k), b" ", f.name, b" = 0;"])),
                           names: push(acc.names, { k: k, c: f.name, ty: TyOpen }) }
                       });
-                    let tt = joined(e.em, t.text, t.v, names, js.names);
-                    let ee = joined(e.em, e.text, e.v, names, js.names);
+                    let tt = joined(e.em, t.em, t.text, t.v, names, js.names);
+                    let ee = joined(e.em, e.em, e.text, e.v, names, js.names);
                     let body = bytes_concat_all([
-                      bytes_join(j.em.out, b""), bytes_join(js.em.out, b""), pad(js.em.ind), b"if (", cv.v.c, b") {\n", tt,
-                      pad(js.em.ind), b"} else {\n", ee, pad(js.em.ind), b"}\n"]);
+                      bytes_join(j.em.out, b""), bytes_join(js.em.out, b""), pad(js.em.ind), b"if (", cv.v.c, b") {\n", tt.text,
+                      pad(js.em.ind), b"} else {\n", ee.text, pad(js.em.ind), b"}\n"]);
                     rebuild({ out: [body], n: js.em.n, conv: cv.em.conv,
                               ind: js.em.ind, reads: js.em.reads, shapes: js.em.shapes,
-                              built: js.em.built, module: js.em.module, made: js.em.made,
+                              built: js.em.built, module: js.em.module, made: union_made(tt.made, ee.made),
                               here: js.em.here, imports: js.em.imports, consts: js.em.consts,
                               ctors: js.em.ctors, extra: js.em.extra, lambdas: js.em.lambdas,
-                              owner: js.em.owner, builtins: js.em.builtins, met: js.em.met, fields: js.em.fields, released: js.em.released, toks: js.em.toks, alias: js.em.alias, by_root: js.em.by_root, tail: js.em.tail, calls: js.em.calls, refused: js.em.refused, deferred: js.em.deferred, rlocals: js.em.rlocals, performs: js.em.performs, handles: js.em.handles, landing: js.em.landing, effects: js.em.effects },
+                              owner: js.em.owner, builtins: js.em.builtins, met: js.em.met, fields: js.em.fields, released: js.em.released, toks: js.em.toks, alias: js.em.alias, by_root: js.em.by_root, tail: js.em.tail, calls: js.em.calls, refused: js.em.refused, deferred: js.em.deferred, rlocals: js.em.rlocals, performs: js.em.performs, handles: js.em.handles, landing: js.em.landing, effects: js.em.effects, release: js.em.release, pinned: js.em.pinned, bound: js.em.bound },
                             names, js.names)
                   },
                   None -> {
@@ -2314,10 +2517,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                       imports: e.em.imports, consts: e.em.consts, ctors: e.em.ctors,
                                       extra: e.em.extra, lambdas: e.em.lambdas, owner: e.em.owner,
                                       builtins: e.em.builtins, met: e.em.met,
-                                      fields: e.em.fields, released: e.em.released, toks: e.em.toks, alias: e.em.alias, by_root: e.em.by_root, tail: e.em.tail, calls: e.em.calls, refused: e.em.refused, deferred: e.em.deferred, rlocals: e.em.rlocals, performs: e.em.performs, handles: e.em.handles, landing: e.em.landing, effects: e.em.effects },
+                                      fields: e.em.fields, released: e.em.released, toks: e.em.toks, alias: e.em.alias, by_root: e.em.by_root, tail: e.em.tail, calls: e.em.calls, refused: e.em.refused, deferred: e.em.deferred, rlocals: e.em.rlocals, performs: e.em.performs, handles: e.em.handles, landing: e.em.landing, effects: e.em.effects, release: e.em.release, pinned: e.em.pinned, bound: e.em.bound },
                                     bytes_concat_all([ctype(kt), b" ", j.name, b" = 0;"]));
-                    let ta = assigned(decl, t.text, decl.ind, kt, t.v, j.name);
-                    let ea = assigned(ta.em, e.text, decl.ind, kt, e.v, j.name);
+                    let ta = assigned(decl, t.em, t.text, decl.ind, kt, t.v, j.name);
+                    let ea = assigned(ta.em, e.em, e.text, decl.ind, kt, e.v, j.name);
                     let fin = ea.em;
                     let body = bytes_concat_all([
                       bytes_join(j.em.out, b""), bytes_join(decl.out, b""), pad(decl.ind), b"if (", cv.v.c, b") {\n",
@@ -2325,12 +2528,13 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                       pad(decl.ind), b"} else {\n",
                       ea.text,
                       pad(decl.ind), b"}\n"]);
-                    Some({ em: { out: [body], n: fin.n, conv: cv.em.conv,
+                    let fin_em: Em = { out: [body], n: fin.n, conv: cv.em.conv,
                                  ind: fin.ind, reads: fin.reads, shapes: fin.shapes,
-                                 built: fin.built, module: fin.module, made: fin.made,
+                                 built: fin.built, module: fin.module, made: union_made(ta.made, ea.made),
                                  here: fin.here, imports: fin.imports, consts: fin.consts,
                                  ctors: fin.ctors, extra: fin.extra, lambdas: fin.lambdas,
-                                 owner: fin.owner, builtins: fin.builtins, met: fin.met, fields: fin.fields, released: fin.released, toks: fin.toks, alias: fin.alias, by_root: fin.by_root, tail: fin.tail, calls: fin.calls, refused: fin.refused, deferred: fin.deferred, rlocals: fin.rlocals, performs: fin.performs, handles: fin.handles, landing: fin.landing, effects: fin.effects },
+                                 owner: fin.owner, builtins: fin.builtins, met: fin.met, fields: fin.fields, released: fin.released, toks: fin.toks, alias: fin.alias, by_root: fin.by_root, tail: fin.tail, calls: fin.calls, refused: fin.refused, deferred: fin.deferred, rlocals: fin.rlocals, performs: fin.performs, handles: fin.handles, landing: fin.landing, effects: fin.effects, release: fin.release, pinned: fin.pinned, bound: fin.bound };
+                    Some({ em: if kt == KBoxed { note_holder(fin_em, j.name) } else { fin_em },
                            v: { k: kt, c: j.name, ty: if t.v.ty == e.v.ty { t.v.ty } else { TyOpen } } })
                   },
                 }
@@ -2371,9 +2575,13 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     NCell(c) -> match expr(notail(em), c.init, params) {
       None -> None,
       Some(iv) -> {
-        let w = word_of(iv.em, iv.v);
-        let region = bind(w.em, KInt, b"rt_region_p(ctx, 0)");
-        let made = bind(region.em, KBoxed, bytes_concat_all([b"rt_cell_p(ctx, ", w.c, b")"]));
+        // The runtime takes the initial value; the reference hands it a word it still holds.
+        let init = if iv.em.release { owned(iv.em, iv.v) } else {
+          let w0 = word_of(iv.em, iv.v);
+          { em: w0.em, v: { k: KBoxed, c: w0.c, ty: TyOpen } }
+        };
+        let region = bind(init.em, KInt, b"rt_region_p(ctx, 0)");
+        let made = bind(region.em, KBoxed, bytes_concat_all([b"rt_cell_p(ctx, ", init.v.c, b")"]));
         let cell = bind(made.em, KBoxed, made.v.c);
         let bound = match c.slot { Some(sl) -> remember(cell.em, sl, cell.v), None -> cell.em };
         match expr(bound, c.body, params) {
@@ -2554,12 +2762,18 @@ fn handle_site(em: Em, body: Code, clauses: List<CClause>, ret: Option<CRet>, pa
               let depth = bind(rc.em, KInt, bytes_concat_all([b"rt_handle_push_p(ctx, (Word)(intptr_t)", arr.name, b", ", num(len(cs)), b", ", rc.c, b")"]));
               let mark = fresh(depth.em);
               let label = bytes_concat(b"land_", num(mark.em.n));
-              match expr(notail(with_landing(mark.em, Some(label))), body, params) {
+              // Under release the body is a block of its own: a failing call jumps to the label
+              // past the declarations after it, so what the body holds is released at the block's
+              // close and is out of scope at the label. What the body may have moved is released
+              // at the enclosing scope's end on the path that did not run it.
+              let opened = if mark.em.release { indent(line(mark.em, b"{")) } else { mark.em };
+              match expr(notail(with_landing(opened, Some(label))), body, params) {
                 None -> None,
                 Some(b) -> {
                   let bw = owned(b.em, b.v);
                   let set = line(bw.em, bytes_concat_all([ans.name, b" = ", bw.v.c, b";"]));
-                  let landed = line(with_landing(set, em.landing), bytes_concat_all([label, b":;"]));
+                  let closed = if set.release { with_made(close(set), union_made(mark.em.made, release_at(set, set.ind).made)) } else { set };
+                  let landed = line(with_landing(closed, em.landing), bytes_concat_all([label, b":;"]));
                   let out = bind(landed, KBoxed, bytes_concat_all([b"rt_handle_land_p(ctx, ", depth.v.c, b", ", ans.name, b")"]));
                   Some({ em: check(out.em), v: out.v })
                 },
@@ -2593,11 +2807,28 @@ fn items_from(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>,
         None -> None,
         Some(o) -> {
           let w = owned(o.em, o.v);
-          items_from(w.em, xs, params, i + 1, push(acc, w.v.c), push(vs, o.v))
+          items_from(w.em, xs, params, i + 1, push(acc, w.v.c), push(vs, taken_as(w.em, o.v, w.v)))
         },
       },
     }
   }
+
+// The value a record remembers a field by, once the record has taken the word: under release
+// the temporary it came from is null, so the word the record holds is remembered instead.
+fn taken_as(em: Em, v: V, w: V) -> V =
+  if em.release && v.k == KBoxed { { k: KBoxed, c: w.c, ty: v.ty } } else { v }
+
+// A value read now and taken later, held once more now: the machine clones at the read, and a
+// read in between may be the binding's last use and move it. Under release only; the reference
+// holds everything after evaluating everything.
+fn secure(em: Em, v: V) -> Out =
+  if !em.release || v.k != KBoxed || spendable(em, v.c) { { em: em, v: v } } else {
+    let w = owned(em, v);
+    { em: note_made(w.em, w.v.c), v: { k: KBoxed, c: w.v.c, ty: v.ty } }
+  }
+
+fn secured(o: Option<Out>) -> Option<Out> =
+  match o { None -> None, Some(x) -> Some(secure(x.em, x.v)) }
 
 fn bytes_join(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|
@@ -2617,7 +2848,7 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
           Some(o) -> {
             // The type stays with the binding, as the reference keeps it.
             let b = bind_keeping(o.em, o.v.k, o.v.ty, o.v.c);
-            stmts(remember(b.em, l.slot, b.v), xs, params, i + 1)
+            stmts(remember(ensure_owned(b.em, b.v), l.slot, b.v), xs, params, i + 1)
           },
         },
         // The value is held as a word and the pattern's names are bound from it, as an arm's are;
@@ -2632,7 +2863,7 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
         },
         CDo(d) -> match expr(notail(em), d.code, params) {
           None -> None,
-          Some(o) -> stmts(line(o.em, bytes_concat_all([b"(void)(", as_word(o.v), b");"])), xs, params, i + 1),
+          Some(o) -> stmts(drop_value(line(o.em, bytes_concat_all([b"(void)(", as_word(o.v), b");"])), o.v), xs, params, i + 1),
         },
       },
     }
@@ -2640,15 +2871,16 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
 
 // The arms, in order. Each is guarded by the flag rather than by an `else`, so
 // an arm's own test is written at one depth whatever the arm before it did.
-fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, flag: Bytes)
+fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, flag: Bytes,
+        base: List<Made>, seen: List<Made>)
     -> Option<Em> =
-  if i >= len(xs) { Some(em) } else {
+  if i >= len(xs) { Some(with_made(em, if i == 0 { em.made } else { seen })) } else {
     match list_at(xs, i) {
       None -> None,
       // A guard is a second test after the pattern binds, and this port does not
       // reach one yet.
       Some(a) -> if a.guard != None { Some(poison(em, b"a match guard")) } else {
-        match pat_test(a.pat, subj, indent(line(em, bytes_concat_all([b"if (!", flag, b") {"])))) {
+        match pat_test(a.pat, subj, indent(line(with_made(em, base), bytes_concat_all([b"if (!", flag, b") {"])))) {
           None -> Some(poison(em, b"a pattern this port cannot test")),
           Some(t) -> {
             let opened = line(t.em, bytes_concat_all([b"if (", t.c, b") {"]));
@@ -2658,11 +2890,12 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
               None -> None,
               Some(o) -> {
                 let w = word_of(o.em, o.v);
-                let done = line(line(w.em, bytes_concat_all([ans, b" = ", w.c, b";"])),
+                let done = line(assign_owned(line(w.em, bytes_concat_all([ans, b" = ", w.c, b";"])), ans, w.c),
                                 bytes_concat_all([flag, b" = 1;"]));
-                let closed = line(outdent(line(outdent(done), b"}")), b"}");
+                let closed = close(close(done));
                 // The next arm is a tail when this one was: the body's own nodes cleared the flag.
-                arms(withtail(rescope(closed, em.conv), em.tail), xs, params, i + 1, subj, ans, flag)
+                arms(withtail(rescope(closed, em.conv), em.tail), xs, params, i + 1, subj, ans, flag,
+                     base, union_made(seen, closed.made))
               },
             }
           },
@@ -2734,7 +2967,7 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
             if irrefutable(f.pat) { Some({ em: idx.em, c: has }) } else {
               let field = bind(idx.em, KBoxed, bytes_concat_all([
                 b"(", has, b" ? rt_field_p(ctx, ", subj.c, b", @@f", num(idx.i), b"@@, 0) : 0)"]));
-              match pat_test(f.pat, field.v, check(field.em)) {
+              match pat_test(f.pat, field.v, note_holder(check(field.em), field.v.c)) {
                 None -> None,
                 Some(inner) -> Some({ em: inner.em, c: bytes_concat_all([b"(", has, b" && ", inner.c, b")"]) }),
               }
@@ -2756,7 +2989,7 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
               Some(item) -> if irrefutable(item) { Some(t) } else {
                 let at = bind(t.em, KBoxed, bytes_concat_all([
                   b"(", t.c, b" ? rt_list_at_p(ctx, ", subj.c, b", ", num(i), b") : 0)"]));
-                match pat_test(item, at.v, check(at.em)) {
+                match pat_test(item, at.v, note_holder(check(at.em), at.v.c)) {
                   None -> None,
                   Some(inner) -> Some({ em: inner.em, c: bytes_concat_all([b"(", t.c, b" && ", inner.c, b")"]) }),
                 }
@@ -2774,7 +3007,7 @@ fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
     // `match r { x -> x.f }` reads the field at an offset, not by name.
     PxVar(v) -> match v.slot {
       None -> em,
-      Some(s) -> { let b = bind_keeping(em, KBoxed, subj.ty, subj.c); remember(b.em, s, b.v) },
+      Some(s) -> { let b = bind_keeping(em, KBoxed, subj.ty, subj.c); remember(ensure_owned(b.em, b.v), s, b.v) },
     },
     // **Every** argument is read out and held once more, whether or not the
     // pattern names it: the object still holds it, and the arm's scope is the
@@ -2783,7 +3016,7 @@ fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
     PxCtor(c) -> fold(range(0, len(c.args)), em, |acc: Em, i: Int| {
       let w = bind(acc, KBoxed,
         bytes_concat_all([b"ply_words(", subj.c, b")[", num(i), b"]"]));
-      let inc = line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"]));
+      let inc = note_holder(line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"])), w.v.c);
       match list_at(c.args, i) { Some(sub) -> pat_bind(inc, sub, w.v), None -> inc }
     }),
     // The runtime's read by name answers the field held once more, so there is no
@@ -2821,10 +3054,14 @@ fn arm(em: Em, c: Code, params: List<P>) -> Option<{ em: Em, text: Bytes, v: V }
   }
 
 // The same buffer with the join's assignment on the end.
-fn assigned(em: Em, text: Bytes, ind: Int, k: Kind, v: V, join: Bytes) -> { em: Em, text: Bytes } = {
-  let m = match k { KBoxed -> materialise(indent(with_out(em, [])), v.c), _ -> indent(with_out(em, [])) };
-  { em: outdent(with_out(m, em.out)),
-    text: bytes_concat_all([text, bytes_join(m.out, b""), pad(ind + 1), join, b" = ", as_kind(v, k), b";\n"]) }
+fn assigned(em: Em, arm_em: Em, text: Bytes, ind: Int, k: Kind, v: V, join: Bytes) -> { em: Em, text: Bytes, made: List<Made> } = {
+  let m0 = match k { KBoxed -> materialise(indent(with_out(em, [])), v.c), _ -> indent(with_out(em, [])) };
+  let m1 = line(m0, bytes_concat_all([join, b" = ", as_kind(v, k), b";"]));
+  // The join takes the arm's value, and the arm's own holders are released behind it.
+  let m2 = if k == KBoxed { assign_owned(with_made(m1, arm_em.made), join, v.c) } else { with_made(m1, arm_em.made) };
+  let m3 = release_at(m2, ind + 1);
+  { em: outdent(with_out(with_made(m3, em.made), em.out)),
+    text: bytes_concat_all([text, bytes_join(m3.out, b"")]), made: m3.made }
 }
 
 // A value as the kind a join holds it in: the reference's `as_kind`.
@@ -2838,23 +3075,24 @@ fn as_kind(v: V, k: Kind) -> Bytes =
 
 // The same, for a record-valued join: one assignment per field, from the values
 // the record was built out of rather than from the record.
-fn joined(em: Em, text: Bytes, v: V, names: List<Bytes>, js: List<V>) -> Bytes =
-  fold(range(0, len(names)), text, |acc: Bytes, i: Int|
-    bytes_concat_all([acc, pad(em.ind + 1),
-      match list_at(js, i) { Some(x) -> x.c, None -> b"" }, b" = ",
-      match list_at(names, i) {
-        Some(nm) -> match built_field(em, v.c, nm) {
-          Some(fv) -> as_kind(fv, match list_at(js, i) { Some(x) -> x.k, None -> KInt }),
-          None -> b"0",
-        },
-        None -> b"0",
-      }, b";\n"]))
+fn joined(em: Em, arm_em: Em, text: Bytes, v: V, names: List<Bytes>, js: List<V>) -> { text: Bytes, made: List<Made> } = {
+  let a0 = with_made(indent(with_out(em, [])), arm_em.made);
+  let a1 = fold(range(0, len(names)), a0, |acc: Em, i: Int| {
+    let target = match list_at(js, i) { Some(x) -> x.c, None -> b"" };
+    let jk = match list_at(js, i) { Some(x) -> x.k, None -> KInt };
+    let fv = match list_at(names, i) { Some(nm) -> built_field(em, v.c, nm), None -> None };
+    let l = line(acc, bytes_concat_all([target, b" = ", match fv { Some(x) -> as_kind(x, jk), None -> b"0" }, b";"]));
+    if jk == KBoxed { match fv { Some(x) -> assign_owned(l, target, x.c), None -> l } } else { l }
+  });
+  let a2 = release_at(a1, em.ind + 1);
+  { text: bytes_concat_all([text, bytes_join(a2.out, b"")]), made: a2.made }
+}
 
 fn blank(em: Em) -> Em =
   { out: [], n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects }
+    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: em.deferred, rlocals: em.rlocals, performs: em.performs, handles: em.handles, landing: em.landing, effects: em.effects, release: em.release, pinned: em.pinned, bound: em.bound }
 
 fn strip(em: Em) -> Bytes = bytes_join(em.out, b"")
 
@@ -3051,8 +3289,11 @@ fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
       // compare two *words* -- two pointers, for a record or a
       // constructor -- and answer no for equal values.
       if (op == b"eq" || op == b"ne") && !native {
-        let lo = owned(em, l);
-        let ro = owned(lo.em, r);
+        // The helper reads both. Under release they are handed over as they are held, and a
+        // temporary among them is released at its scope's end; the reference holds each once
+        // more and never lets go.
+        let lo = if em.release { let w = word_of(em, l); { em: w.em, v: { k: KBoxed, c: w.c, ty: l.ty } } } else { owned(em, l) };
+        let ro = if lo.em.release { let w = word_of(lo.em, r); { em: w.em, v: { k: KBoxed, c: w.c, ty: r.ty } } } else { owned(lo.em, r) };
         let e = bind(ro.em, KBool, bytes_concat_all([
           b"rt_equal_p(ctx, ", lo.v.c, b", ", ro.v.c, b")"]));
         // The helper walks two values and can raise, so the check follows.
@@ -3138,7 +3379,7 @@ fn prologue(em: Em, params: List<P>) -> Em =
   fold(range(0, len(params)), em, |acc: Em, i: Int|
     match list_at(params, i) {
       None -> acc,
-      Some(p) -> match p.k {
+      Some(p) -> { let acc = note_bound(note_holder(acc, bytes_concat(b"p", num(i))), bytes_concat(b"p", num(i))); match p.k {
         // A record arrives as its word and is never opened here: there is nothing
         // to untag, and each read of it binds the word where the read is. Its
         // reads are still charged to it, or the release rule sees an object
@@ -3158,7 +3399,7 @@ fn prologue(em: Em, params: List<P>) -> Em =
                               b") : rt_unbox_int_p(ctx, p", num(i), b"))"]));
           remember(o.em, i, o.v)
         },
-      },
+      } },
     })
 
 // `Int` and `Bool` are the two the prologue knows how to open. Anything else --
@@ -3295,7 +3536,7 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
 
 
 pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code) -> Option<Bytes> =
-  match emit_fn_full(module, here, imports, ctors, builtins, name, params, body, []) {
+  match emit_fn_full(module, here, imports, ctors, builtins, name, params, body, [], false) {
     None -> None,
     Some(f) -> Some(f.text),
   }
@@ -3303,11 +3544,11 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
 // The C of one definition, with the tables it names by its own positions, in the
 // encoding `crates/ply-codegen/src/c/cache.rs` keeps a body in: what the C tier
 // reads when this emitter is its producer.
-pub fn emit_fn_full(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code, effects: List<EffectName>) -> Option<{ text: Bytes, tables: Bytes }> = {
+pub fn emit_fn_full(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code, effects: List<EffectName>, release: Bool) -> Option<{ text: Bytes, tables: Bytes }> = {
   let reads = slots_read(body);
   // The reuse tokens come before the prologue, and are named by width rather
   // than numbered, so finding them does not disturb the temporaries.
-  let start = fold([], { out: [], n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects },
+  let start = fold([], { out: [], n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [] },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
     None -> None,
@@ -3317,7 +3558,7 @@ pub fn emit_fn_full(module: Bytes, here: List<Def>, imports: List<Imported>, cto
         fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
       let head = fuel_head();
-      let w = word_of(o.em, o.v);
+      let w = returned(o.em, o.v);
       let o = { em: w.em, v: o.v };
       let epilogue = bytes_concat_all([b"  ctx->fuel += 1;\n  return ", w.c, b";\n}\n"]);
       let entry = bytes_concat_all([
@@ -3337,9 +3578,9 @@ pub fn emit_fn_full(module: Bytes, here: List<Def>, imports: List<Imported>, cto
 }
 
 // Why a body was refused, or nothing when it was emitted: the same walk, read for its reason.
-pub fn emit_fn_why(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code, effects: List<EffectName>) -> Option<Bytes> = {
+pub fn emit_fn_why(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code, effects: List<EffectName>, release: Bool) -> Option<Bytes> = {
   let reads = slots_read(body);
-  let start = fold([], { out: [], n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects },
+  let start = fold([], { out: [], n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None, deferred: [], rlocals: [], performs: [], handles: [], landing: None, effects: effects, release: release, pinned: [], bound: [] },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
     None -> Some(b"refused without a reason"),
@@ -3528,10 +3769,10 @@ test "a form this port does not reach is refused" {
 // reference names it -- `std.hash.round`, not `m.round`.
 // One module's bodies, as it was parsed and rewritten but with no defaults filled: what the
 // per-module differential compares.
-fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes) -> List<Emitted> = {
+fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes, release: Bool) -> List<Emitted> = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
-  emit_module(module, x.module, ctors, builtins, [], [], [])
+  emit_module(module, x.module, ctors, builtins, [], [], [], release)
 }
 
 // Every definition of a module, with its declared return as the emitter reads it.
@@ -3575,7 +3816,7 @@ fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) 
 // filled and every `derive` is expanded, which is what the reference's emitter sees -- and then
 // emitted one module at a time. A program that does not resolve emits nothing: a body emitted
 // against unfilled calls would be wrong rather than partial.
-fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<Bytes>) -> List<Emitted> = {
+fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<Bytes>, release: Bool) -> List<Emitted> = {
   let parsed = map(range(0, len(sources)), |i: Int| {
     let s = match list_at(sources, i) { Some(x) -> x, None -> { name: b"", src: b"" } };
     let r = parse(s.src);
@@ -3595,7 +3836,7 @@ fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<By
           fold(range(0, len(x.mods)), [], |acc: List<Emitted>, i: Int|
             match list_at(x.mods, i) {
               None -> acc,
-              Some(m) -> fold(emit_module(m.name, m.module, ctors, builtins, program, pure, effects_in(x.r, i, x.mods)), acc, |a: List<Emitted>, e: Emitted| push(a, e)),
+              Some(m) -> fold(emit_module(m.name, m.module, ctors, builtins, program, pure, effects_in(x.r, i, x.mods), release), acc, |a: List<Emitted>, e: Emitted| push(a, e)),
             })
         },
       },
@@ -3603,7 +3844,7 @@ fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<By
   }
 }
 
-fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>, program: List<ModDefs>, pure: List<Bytes>, effects: List<EffectName>) -> List<Emitted> = {
+fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>, program: List<ModDefs>, pure: List<Bytes>, effects: List<EffectName>, release: Bool) -> List<Emitted> = {
   let x = { module: x_module };
   let defs_of = |path: Bytes| fold(program, [], |acc: List<Def>, md: ModDefs| if md.module == path { md.defs } else { acc });
   let others = others_of(x.module, program);
@@ -3659,9 +3900,9 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
           None -> { out: push(acc.out, { name: full, text: b"", tables: b"", handles: ast_handles(d.body, effects),
                                          why: Some(if known { b"a body the lowering does not reach" } else { b"a parameter with no written type" }) }),
                     tests: acc.tests },
-          Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", d.name.name]), ps, l.code, effects) {
+          Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", d.name.name]), ps, l.code, effects, release) {
             None -> { out: push(acc.out, { name: full, text: b"", tables: b"", handles: walk_handles(l.code, effects),
-                                           why: emit_fn_why(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", d.name.name]), ps, l.code, effects) }),
+                                           why: emit_fn_why(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", d.name.name]), ps, l.code, effects, release) }),
                       tests: acc.tests },
             Some(c) -> { out: push(acc.out, { name: bytes_concat_all([module, b".", d.name.name]), text: c.text, tables: c.tables, why: None, handles: [] }), tests: acc.tests },
           },
@@ -3675,9 +3916,9 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
         let full = bytes_concat_all([module, b".test#", num(acc.tests)]);
         match lower_fn([], t.body) {
           None -> { out: push(acc.out, { name: full, text: b"", tables: b"", why: Some(b"a body the lowering does not reach"), handles: [] }), tests: acc.tests + 1 },
-          Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", root]), [], l.code, effects) {
+          Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", root]), [], l.code, effects, release) {
             None -> { out: push(acc.out, { name: full, text: b"", tables: b"", handles: walk_handles(l.code, effects),
-                                           why: emit_fn_why(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", root]), [], l.code, effects) }),
+                                           why: emit_fn_why(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", root]), [], l.code, effects, release) }),
                       tests: acc.tests + 1 },
             Some(c) -> { out: push(acc.out, { name: full, text: c.text, tables: c.tables, why: None, handles: [] }), tests: acc.tests + 1 },
           },
@@ -3776,18 +4017,18 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
 
 // The differential's rendering: `f:<name>;<text>;` per body.
 pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes) -> String =
-  string_of_bytes(fold(emit_all_in(module, ctors, builtins, src), b"C;1;", |acc: Bytes, e: Emitted|
+  string_of_bytes(fold(emit_all_in(module, ctors, builtins, src, false), b"C;1;", |acc: Bytes, e: Emitted|
     if e.why != None { acc } else { bytes_concat_all([acc, b"f:", e.name, b";", e.text, b";"]) }))
 
 // The differential's rendering over a whole program, resolved together.
 pub fn emit_dump_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
-  string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins), b"C;1;", |acc: Bytes, e: Emitted|
+  string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, false), b"C;1;", |acc: Bytes, e: Emitted|
     if e.why != None { acc } else { bytes_concat_all([acc, b"f:", e.name, b";", e.text, b";"]) }))
 
 // Every body the port refused over a program, one per line as `<name> :: <reason>`: the census
 // of what keeps it out of the rest.
 pub fn emit_refusals_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
-  string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins), b"", |acc: Bytes, e: Emitted|
+  string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, true), b"", |acc: Bytes, e: Emitted|
     match e.why { None -> acc, Some(w) -> bytes_concat_all([acc, e.name, b" :: ", w, b"\n"]) }))
 
 // The unit's rendering over a whole program: every body as the producer's frame, and every
@@ -3796,7 +4037,7 @@ pub fn emit_refusals_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Byte
 // The frames are collected and joined once: appending each to the dump so far would copy the
 // dump per body, quadratic in a heap that keeps what an entry lets go.
 pub fn emit_unit_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
-  string_of_bytes(bytes_join(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins), [], |acc: List<Bytes>, e: Emitted|
+  string_of_bytes(bytes_join(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, true), [], |acc: List<Bytes>, e: Emitted|
     match e.why {
       // A refusal still says which operations the body would have handled, so the fixpoint can
       // drop their performers with it.
@@ -3812,7 +4053,16 @@ pub fn emit_unit_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, 
 
 // The producer's rendering over a whole program, resolved together.
 pub fn emit_bodies_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
-  string_of_bytes(bytes_join(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins), [], |acc: List<Bytes>, e: Emitted|
+  string_of_bytes(bytes_join(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, true), [], |acc: List<Bytes>, e: Emitted|
+    if e.why != None { acc } else {
+      let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
+      push(acc, bytes_concat_all([b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc]))
+    }), b""))
+
+// The same under the reference's ownership, which keeps every count until the entry ends:
+// the text `harness/tests/emit_diff.rs` compares against the reference's, body for body.
+pub fn emit_bodies_reference(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
+  string_of_bytes(bytes_join(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins, false), [], |acc: List<Bytes>, e: Emitted|
     if e.why != None { acc } else {
       let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
       push(acc, bytes_concat_all([b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc]))
@@ -3827,7 +4077,7 @@ fn zip_sources(names: List<Bytes>, srcs: List<Bytes>) -> List<Source> =
 // `body <name> <n>\n` and then exactly `n` bytes -- the tables in the cache's
 // encoding, `text\n`, and the C.
 pub fn emit_bodies_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes) -> String =
-  string_of_bytes(fold(emit_all_in(module, ctors, builtins, src), b"", |acc: Bytes, e: Emitted|
+  string_of_bytes(fold(emit_all_in(module, ctors, builtins, src, true), b"", |acc: Bytes, e: Emitted|
     if e.why != None { acc } else {
       let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
       bytes_concat_all([acc, b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc])

@@ -1786,7 +1786,12 @@ when that directory holds one, and by the built-in emitter otherwise or when
 `PLY_C_BOOTSTRAP=off` asks for it. `PLY_TIER_ONLY=1` with a backend attached
 makes the tier the only engine: a test or an entry point runs compiled or
 fails with `E0505` naming the body the tier does not hold, and the machine
-evaluates nothing. It is how the run behaves once the machine is gone. A simulated test
+evaluates nothing. It is how the run behaves once the machine is gone. The
+emitter in `<dir>` releases what a body holds as the machine does (ADR 0046):
+a value moves out of its binding at its last use and is let go at the close
+of the block that declared it, so an entry ends holding its answer and a loop
+runs in the memory of one iteration; `PLY_C_PHASES=1` prints what an entry
+allocated, recycled and left live. A simulated test
 the tier takes is scheduled by the runtime over the same seeded scheduler the
 machine drives, so a seed names one interleaving on either engine; under
 `--audit-backend` every seed the tier ran is run again on the machine alone and

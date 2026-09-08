@@ -277,8 +277,11 @@ built from the bundle emits, for its sources, C that builds an emitter that emit
 
 The port's output is now built as lines joined once per body and frames joined once per dump,
 which the measurement in ADR 0045 §"What the fixpoint measured" showed was not where the
-memory went: the tier releases nothing within an entry, and precise release is the work that
-record names next.
+memory went: the tier released nothing within an entry. ADR 0046 built the release: `emit.ply`
+carries the machine's ownership rule under `Em.release`, on for everything the producer emits
+and off for `emit_bodies_reference`, which is the text `emit_diff.rs` still compares against
+the reference. The three places release departs from the reference's order, and the two the
+reference had wrong, are in that record.
 
 ## Beyond the port
 
