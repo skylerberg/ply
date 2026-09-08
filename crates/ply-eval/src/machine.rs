@@ -2313,6 +2313,7 @@ impl<'a> Machine<'a> {
         self.host_use.atoms = self.host_use.atoms.union(&used.atoms);
         self.host_use.operations += used.operations;
         self.host_ops = self.host_ops.saturating_add(ops);
+        self.teardown.extend(backend.take_teardown());
     }
 
     fn compiled_answer(&self, closure: &Closure, args: &[Value]) -> Option<Value> {

@@ -209,13 +209,9 @@ fn emit_all(
                 }
                 for op in &tables.performs {
                     // A `perform` no handler in the program answers reaches the host binding
-                    // from the runtime, with the machine's checks; only a scheduler's operation
-                    // outside any region is the machine's, since the production region the
-                    // host policy opens is not built here.
+                    // from the runtime, with the machine's checks, and a `task` operation
+                    // outside any region opens the production region the binding permits.
                     let missing = match handlers.get(op) {
-                        None if op.starts_with("task#") => {
-                            Some("nothing in the program".to_string())
-                        }
                         None => None,
                         Some(hs) => hs.iter().find(|h| !taken_now.contains(h)).map(|h| {
                             format!("`{h}`, which handles it and is not in this compiled unit")

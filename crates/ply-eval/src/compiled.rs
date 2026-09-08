@@ -54,6 +54,11 @@ pub trait Compiled {
     fn take_host_use(&self) -> (HostUse, u64) {
         (HostUse::default(), 0)
     }
+
+    /// What the host runtime said when the entries ended.
+    fn take_teardown(&self) -> Vec<Diagnostic> {
+        Vec::new()
+    }
 }
 
 /// How a test root's entry ended.
