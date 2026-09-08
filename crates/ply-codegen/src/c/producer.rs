@@ -41,6 +41,12 @@ pub fn install(recipe: Recipe, identity: String) {
     let _ = RECIPE.set(recipe);
 }
 
+/// Forgets this thread's producer, so the recipe builds it again on the next ask: the fixpoint
+/// test builds the emitter twice in one process, from two bundles.
+pub fn reset_thread() {
+    MINE.with(|mine| *mine.borrow_mut() = None);
+}
+
 pub fn identity() -> &'static str {
     IDENTITY.get().map_or("", String::as_str)
 }
@@ -99,6 +105,11 @@ pub fn who() -> String {
 /// Runs `f` with this thread's producer, building it first if the recipe is installed and this
 /// thread has not built one. `None` when there is no producer, when it is being built, or when
 /// building it failed -- the failure is reported once, and the reference emits everything.
+/// Whether the producer's own unit is being built on this thread.
+pub fn building() -> bool {
+    BUILDING.with(Cell::get)
+}
+
 pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
     let recipe = RECIPE.get()?;
     if BUILDING.with(Cell::get) {

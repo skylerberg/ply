@@ -327,7 +327,7 @@ fn hosting(seed: Int) -> Int =
 
 fn handler(seed: Int) -> Int =
   handle { performer(seed) } with {
-    counter.bump(n) -> match secret_of_string("hidden") { _ -> n + 1 },
+    counter.bump(n) -> match n { x if x > 3 -> x, _ -> 0 },
   }
 
 fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
@@ -352,8 +352,9 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
             .map(|r| r.construct.clone())
             .unwrap_or_else(|| panic!("`{name}` was taken; refusals: {refused:?}"))
     };
+    // A match guard is what the port still refuses, at its lowering; the handler goes with it.
     assert!(
-        reason("m.handler").contains("credential"),
+        reason("m.handler").contains("lowering does not reach"),
         "{}",
         reason("m.handler")
     );

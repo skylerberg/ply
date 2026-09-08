@@ -284,6 +284,8 @@ pub struct Bodies {
     /// it, because the machine re-offers each call it evaluates and a refused dive repeated once
     /// per level is the whole recursion squared.
     floor: Cell<Option<usize>>,
+    /// `PLY_TIER_ONLY=1`: this backend is the only engine, and the machine evaluates nothing.
+    tier_only: bool,
 }
 
 impl Bodies {
@@ -344,6 +346,7 @@ impl Bodies {
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
             floor: Cell::new(None),
+            tier_only: std::env::var("PLY_TIER_ONLY").is_ok_and(|v| v == "1"),
         })
     }
 
@@ -560,6 +563,15 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
+    fn enter_whole(&self, name: &Symbol, args: &[Value], budget: usize) -> Entered {
+        self.unit.counters.note_offer(args);
+        match self.run(name, args, budget) {
+            Run::Answered(value) => Entered::Answered(value),
+            Run::Raised(raised) => Entered::Raised(raised),
+            Run::Declined => Entered::Declined,
+        }
+    }
+
     fn take_performed(&self) -> Vec<ply_core::ty::EffectAtom> {
         std::mem::take(&mut self.ctx.borrow_mut().performed)
     }
@@ -600,6 +612,10 @@ impl ply_eval::Compiled for Bodies {
 
     fn take_teardown(&self) -> Vec<ply_span::Diagnostic> {
         std::mem::take(&mut self.ctx.borrow_mut().teardown)
+    }
+
+    fn tier_only(&self) -> bool {
+        self.tier_only
     }
 }
 

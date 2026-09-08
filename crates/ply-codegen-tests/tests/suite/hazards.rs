@@ -10,7 +10,7 @@
 
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value, compare_answers};
-use ply_span::Span;
+use ply_span::{Span, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -214,16 +214,28 @@ fn a_higher_order_builtin_answers_what_the_interpreter_answers() {
     }
 }
 
-/// `Value::Secret` is the value the secret invariant arms the argument pool against, and it must
-/// not be reachable from compiled code at all.
+/// A credential is a value like any other inside an entry, so the body that mints one compiles;
+/// what the invariant asks is that it never leaves the entry: the seam declines to hand a
+/// `Secret` across as a value, and the machine, asked with the backend attached, answers the
+/// same as without.
 #[test]
-fn a_secret_never_reaches_the_fragment() {
-    let h = harness(hazards());
+fn a_secret_never_leaves_the_fragments_entry() {
+    let mut h = harness(hazards());
     assert!(
-        refusal(h.unit, "callbacks.keyed").is_some()
-            || !h.unit.compiled().iter().any(|c| c == "callbacks.keyed"),
-        "`callbacks.keyed` mints a `Secret` and was compiled anyway"
+        refusal(h.unit, "callbacks.keyed").is_none()
+            && h.unit.compiled().iter().any(|c| c == "callbacks.keyed"),
+        "`callbacks.keyed` mints a `Secret`, which compiles: {:?}",
+        refusal(h.unit, "callbacks.keyed")
     );
+    let args = [Value::str("hunter2")];
+    assert!(
+        ply_eval::Compiled::enter(&*h.bodies, &Symbol::new("callbacks.keyed"), &args, 10_000)
+            .is_none(),
+        "a `Secret` crossed the seam as a value"
+    );
+    if let Some(d) = h.agree("callbacks.keyed", &args) {
+        panic!("`callbacks.keyed`: {d}");
+    }
 }
 
 /// A `Float` or `Decimal` in the signature never produces a wrong answer.

@@ -137,7 +137,7 @@ cargo test --manifest-path "$here/harness/Cargo.toml" --test effects -- --nocapt
 echo
 echo "==> the eighth differential: emit.ply's C against crates/ply-codegen's,"
 echo "    on shapes chosen per node and then on the shipped corpus"
-PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=2 |
+PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=1 |
   tee /tmp/ply-parser-emit.log | grep -E "agreeing|^test result|^error|panicked"
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-emit.log || {
   echo "the emitter differential is red or ran nothing -- see the log above" >&2

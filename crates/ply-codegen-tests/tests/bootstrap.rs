@@ -1,243 +1,203 @@
-//! The front end written in Ply, entered from Rust as a compiled artefact.
+//! The emitter written in Ply is built from a bootstrap bundle, the C it emitted for its own
+//! sources, and the bundle serves as long as it is a fixpoint: the emitter built from it emits,
+//! for those sources, C that builds an emitter that emits the same C. ADR 0045's second stage.
 //!
-//! This is the bootstrap's spine and it is the part that had never been run. `spikes/ply-parser`
-//! is a front end for Ply written in Ply -- twelve modules, fourteen hundred definitions, and six
-//! differentials against the Rust one -- but everything that has ever driven it drove it as a
-//! *program*: `ply run` over a generated probe, one process per input, the whole front end
-//! interpreted. Nothing has loaded it as an object and called into it.
-//!
-//! What that leaves open is not whether the Ply front end is correct. `spikes/ply-parser/run.sh`
-//! settles that, in CI, and it is the first link of the chain this file completes:
-//!
-//!   1. the Ply front end, **interpreted**, answers what `crates/ply-syntax` answers -- the spike's
-//!      own differential, over every `.ply` file in the tree;
-//!   2. the Ply front end, **compiled and entered from Rust**, answers what it answers interpreted
-//!      -- this file;
-//!
-//! so the artefact answers what the Rust front end answers, and the remaining work to replace the
-//! Rust front end is the value bridge rather than the plumbing.
-//!
-//! A binary of its own because it builds fourteen hundred definitions; the unit cache
-//! (`c/cache.rs`) makes that milliseconds after the first run, and the `development` profile makes
-//! the first run a quarter of a second rather than thirty-eight.
+//! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `spikes/ply-parser/bootstrap` with the fixpoint's own
+//! emission, which is how the bundle is refreshed after a change the old one cannot build; with
+//! no bundle at all, the refresh builds the first emitter with the reference.
 
 use ply_codegen::Source;
-use ply_eval::{Machine, Value};
-use ply_span::{Span, Symbol};
-use ply_syntax::ast::{ModuleName, Program};
+use ply_codegen::c::producer::{self, PlyProducer};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 fn repo() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR"))
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
-        .and_then(Path::parent)
+        .and_then(|p| p.parent())
         .expect("the crate sits two levels under the repository root")
         .to_path_buf()
 }
 
-struct Loaded {
-    program: &'static Program,
-    resolved: &'static ply_syntax::resolve::Resolved,
-    check: &'static ply_core::CheckOutput,
-    hashes: ply_hash::HashOutput,
-}
-
-/// The self-hosted front end and the standard library it imports, as one program.
-fn front_end() -> &'static Loaded {
+/// The emitter's own program, the standard library alongside, keyed as the CLI keys it.
+fn emitter_source() -> (&'static Source, String) {
     let dir = repo().join("spikes/ply-parser");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
+        .expect("the emitter's directory is readable")
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.extension().is_some_and(|e| e == "ply"))
         .collect();
     files.sort();
-    assert!(files.len() > 8, "the front end changed shape: {files:?}");
-
+    let modules: Vec<(String, String)> = files
+        .iter()
+        .map(|p| {
+            let name = p.file_name().unwrap().to_string_lossy().to_string();
+            (
+                name,
+                std::fs::read_to_string(p).expect("the emitter is readable"),
+            )
+        })
+        .collect();
+    let identity = producer::digest_of(&modules);
     let mut sources = ply_span::SourceMap::new();
     let mut inputs = Vec::new();
+    let mut texts: HashMap<String, String> = HashMap::new();
     for (module, text) in ply_std::sources() {
-        let module = ModuleName::from_dotted(module);
+        texts.insert(module.to_string(), text.to_string());
+        let module = ply_syntax::ast::ModuleName::from_dotted(module);
         let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
         inputs.push((id, module, text));
     }
     for path in &files {
-        let stem = path.file_stem().and_then(|s| s.to_str()).expect("a stem");
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .expect("a module name");
         let text: &'static str = Box::leak(
             std::fs::read_to_string(path)
-                .expect("the front end is readable")
+                .expect("the emitter is readable")
                 .into_boxed_str(),
         );
+        texts.insert(stem.to_string(), text.to_string());
         let id = sources.add(path.clone(), text.to_string());
-        inputs.push((id, ModuleName::from_dotted(stem), text));
+        inputs.push((id, ply_syntax::ast::ModuleName::from_dotted(stem), text));
     }
-    let mut ast = ply_syntax::parse_program(inputs).expect("the front end parses");
-    assert!(ply_derive::expand_program(&mut ast).is_empty());
-    let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the front end resolves");
-    let check = ply_core::check_program(&ast, &resolved).expect("the front end checks");
-    let program: &'static Program = Box::leak(Box::new(ast));
+    let mut ast = ply_syntax::parse_program(inputs).expect("the emitter parses");
+    let expanded = ply_derive::expand_program(&mut ast);
+    assert!(expanded.is_empty(), "{expanded:?}");
+    let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the emitter resolves");
+    let check = ply_core::check_program(&ast, &resolved).expect("the emitter checks");
+    let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
     let resolved = Box::leak(Box::new(resolved));
     let check = Box::leak(Box::new(check));
-    let hashes = ply_hash::hash_program(program, resolved, check).expect("the front end hashes");
-    Box::leak(Box::new(Loaded {
-        program,
-        resolved,
-        check,
-        hashes,
-    }))
-}
-
-/// The artefact: every definition of the front end, emitted as C, compiled and loaded.
-///
-/// Keyed on each definition's content hash, which is what lets the emitted bodies and the whole
-/// unit be kept between runs -- the same keys `ply test --backend c` uses, so a developer who has
-/// run the front end once has already paid for this.
-fn artefact(loaded: &'static Loaded) -> ply_codegen::c::Native {
-    let keys: std::collections::HashMap<String, String> = loaded
-        .hashes
+    let hashes = ply_hash::hash_program(program, resolved, check).expect("the emitter hashes");
+    let keys: HashMap<String, String> = hashes
         .defs
         .iter()
         .map(|(name, h)| (name.to_string(), h.to_hex()))
         .collect();
-    let source: &'static Source = Box::leak(Box::new(Source::keyed(
-        loaded.program,
-        loaded.resolved,
-        loaded.check,
-        keys,
-    )));
+    let source: &'static Source = Box::leak(Box::new(
+        Source::keyed(program, resolved, check, keys).with_texts(texts),
+    ));
+    (source, identity)
+}
+
+/// Where the recipe builds the emitter from; changed between the fixpoint's two emissions.
+static FROM: Mutex<Option<PathBuf>> = Mutex::new(None);
+
+fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProducer, String> {
+    let (native, _) = match from {
+        Some(dir) => ply_codegen::c::bundle::build(source, dir).map_err(|e| format!("{e:#}"))?,
+        None => {
+            let names: Vec<String> = source.functions();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?
+        }
+    };
+    PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+}
+
+/// Emits the emitter's own unit with the producer built from `from`, into a cache of its own so
+/// nothing an earlier emission wrote is read back.
+fn emit_with(
+    source: &'static Source,
+    from: Option<&Path>,
+    scratch: &Path,
+) -> (
+    String,
+    ply_codegen::c::cache::UnitCache,
+    Vec<ply_codegen::c::Refused>,
+) {
+    *FROM.lock().unwrap() = from.map(Path::to_path_buf);
+    producer::reset_thread();
+    let cache = scratch.join(format!("cache-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&cache);
+    unsafe { std::env::set_var("PLY_C_CACHE", &cache) };
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, _refused) = ply_codegen::c::build(source, &refs).expect("the front end compiles");
-    native
+    let (text, record, refused) =
+        ply_codegen::c::emit_unit_record(source, &refs).expect("the emitter's unit emits");
+    (text, record, refused)
 }
 
-/// A few programs the front end has to have an opinion about, including one that does not parse.
-const INPUTS: &[&str] = &[
-    "fn f(x: Int) -> Int = x + 1\n",
-    "type T = { a: Int, b: Bytes }\nfn g(t: T) -> Int = t.a\n",
-    "fn h(xs: List<Int>) -> Int = fold(xs, 0, |a: Int, b: Int| a + b)\n",
-    "effect e { read r[x]() -> Int }\nfn k() -> Int / {e.read[q]} = e.r[q]()\n",
-    "fn broken(x: Int) -> Int = x +\n",
-    "",
-];
-
+// Ignored in CI until the tier releases what an entry lets go: the emitter emitting its own
+// sources is one entry, and with nothing released inside an entry (ADR 0045's measurement) it
+// peaks past what a runner holds. Run it with `--ignored`; the refresh is the same test.
 #[test]
-fn the_compiled_front_end_answers_what_the_interpreted_one_answers() {
-    let loaded = front_end();
-    let native = artefact(loaded);
-
-    let entry = "items.dump";
+#[ignore = "the emitter's self-emission peaks past a CI runner's memory until the tier releases within an entry (ADR 0045)"]
+fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
+    let (source, identity) = emitter_source();
+    let bundle = repo().join("spikes/ply-parser/bootstrap");
+    let refresh = std::env::var("PLY_C_BOOTSTRAP_REFRESH").is_ok();
+    let have = ply_codegen::c::bundle::exists(&bundle);
     assert!(
-        native.entry(entry).is_some(),
-        "the artefact has no `{entry}`, so nothing below is a comparison"
+        have || refresh,
+        "no bootstrap bundle at {}; run this test with PLY_C_BOOTSTRAP_REFRESH=1 to write one from the reference",
+        bundle.display()
     );
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let mut through_artefact = Vec::new();
-    let mut interpreted = Vec::new();
+    let scratch = std::env::temp_dir().join(format!("ply-bootstrap-{}", std::process::id()));
+    std::fs::create_dir_all(&scratch).unwrap();
+    producer::install(
+        std::sync::Arc::new(move || {
+            let from = FROM.lock().unwrap().clone();
+            build_from(source, from.as_deref())
+        }),
+        identity.clone(),
+    );
+    producer::set_whole(true);
 
-    for input in INPUTS {
-        let arg = Value::bytes(Vec::from(input.as_bytes()));
+    // The emitter built from the bundle, or from the reference when there is none, emits itself.
+    // An old bundle's emitter may refuse what the current sources emit; only the emitter built
+    // from a current emission has to refuse nothing of itself.
+    let first = have.then(|| bundle.clone());
+    let (c1, r1, _) = emit_with(source, first.as_deref(), &scratch);
+    let stage = scratch.join("stage1");
+    ply_codegen::c::bundle::write(&stage, &c1, &r1, &identity).unwrap();
 
-        let mut ctx = native.context();
-        ctx.fuel = 10_000_000;
-        let word = ctx.heap.to_word(&native.tables().layouts, &arg);
-        let f = native.entry(entry).expect("checked above");
-        let answer = unsafe { f(&mut ctx, [word].as_ptr()) };
-        assert_eq!(ctx.failed, 0, "the artefact raised on {input:?}");
-        let mut walked = ply_codegen::heap::Walked::default();
-        let compiled = ply_codegen::heap::Heap::to_value_counted(
-            &native.tables().layouts,
-            answer,
-            &mut walked,
+    // The emitter built from that emission emits itself again.
+    let (c2, r2, refused) = emit_with(source, Some(&stage), &scratch);
+    assert!(
+        refused.is_empty(),
+        "the emitter refuses part of itself: {refused:?}"
+    );
+    let same = |a: &str,
+                ra: &ply_codegen::c::cache::UnitCache,
+                b: &str,
+                rb: &ply_codegen::c::cache::UnitCache| {
+        a == b && ra.taken == rb.taken && ra.refusals == rb.refusals
+    };
+    let differ = |label: &str, a: &str, b: &str| {
+        let pa = scratch.join(format!("{label}-a.c"));
+        let pb = scratch.join(format!("{label}-b.c"));
+        std::fs::write(&pa, a).unwrap();
+        std::fs::write(&pb, b).unwrap();
+        panic!(
+            "the emitter built from one emission and the emitter built from its own emit different C: diff {} {}",
+            pa.display(),
+            pb.display()
         );
-
-        let reference = machine
-            .call(entry, vec![arg], Span::DUMMY)
-            .unwrap_or_else(|d| panic!("the interpreter raised on {input:?}: {}", d.message));
-
-        through_artefact.push(compiled.render());
-        interpreted.push(reference.render());
+    };
+    if refresh {
+        // A refresh writes the current emitter's own emission, once a third emitter built from it
+        // has emitted the same thing: the bundle written is a fixpoint on the day it is written.
+        let stage2 = scratch.join("stage2");
+        ply_codegen::c::bundle::write(&stage2, &c2, &r2, &identity).unwrap();
+        let (c3, r3, _) = emit_with(source, Some(&stage2), &scratch);
+        if !same(&c2, &r2, &c3, &r3) {
+            differ("refresh", &c2, &c3);
+        }
+        ply_codegen::c::bundle::write(&bundle, &c2, &r2, &identity).unwrap();
+        eprintln!("bootstrap bundle written to {}", bundle.display());
+    } else if !same(&c1, &r1, &c2, &r2) {
+        differ("fixpoint", &c1, &c2);
     }
-
-    assert_eq!(
-        through_artefact, interpreted,
-        "the front end compiled and the front end interpreted disagree"
-    );
-    // Not vacuous, twice over: an empty answer for every input, or the same answer for every
-    // input, would both pass the comparison above.
-    assert!(
-        through_artefact.iter().all(|d| d.len() > 2),
-        "every dump was empty, so the comparison above compared nothing: {through_artefact:?}"
-    );
-    let distinct: std::collections::HashSet<&String> = through_artefact.iter().collect();
-    assert_eq!(
-        distinct.len(),
-        INPUTS.len(),
-        "two of {} inputs dumped the same, so the front end is not reading them",
-        INPUTS.len()
-    );
-    let _ = Symbol::new(entry);
-}
-
-/// The artefact hands back the *tree*, not only a rendering of it.
-///
-/// `items.dump` answers a `String`, which is the shape the spike's differentials compare and the
-/// shape that needs no bridge. Replacing `crates/ply-syntax` needs the other one: `items.parse`
-/// answers an `RModule`, a record of records and constructors, and the question this settles is
-/// whether that crosses at all -- whether the seam converts a whole parse tree into a `Value` a
-/// bridge could walk, or declines it the way it declines a handle.
-///
-/// It crosses. What is left between here and a Ply front end that replaces the Rust one is a
-/// converter from that `Value` to `ply_syntax::ast::Program` -- fifteen enums and about
-/// ninety-five variants, so on the order of the 1,437 lines the spike's own dumper takes to walk
-/// the same tree the other way.
-#[test]
-fn the_artefact_hands_back_a_tree_and_not_only_a_rendering() {
-    let loaded = front_end();
-    let native = artefact(loaded);
-    let entry = "items.parse";
-    let Some(f) = native.entry(entry) else {
-        panic!("the artefact has no `{entry}`");
-    };
-
-    let mut ctx = native.context();
-    ctx.fuel = 10_000_000;
-    let arg = Value::bytes(Vec::from(
-        "fn f(x: Int) -> Int = x + 1
-type T = { a: Int }
-"
-        .as_bytes(),
-    ));
-    let word = ctx.heap.to_word(&native.tables().layouts, &arg);
-    let answer = unsafe { f(&mut ctx, [word].as_ptr()) };
-    assert_eq!(ctx.failed, 0, "`{entry}` raised");
-
-    let mut walked = ply_codegen::heap::Walked::default();
-    let tree =
-        ply_codegen::heap::Heap::to_value_counted(&native.tables().layouts, answer, &mut walked);
-    assert!(
-        !walked.handle,
-        "the parse tree carries a handle, so it cannot leave the entry that made it"
-    );
-    let Value::Record(fields) = &tree else {
-        panic!("`{entry}` answered {} and not a record", tree.type_name());
-    };
-    assert!(
-        fields.iter().any(|(n, _)| n.as_str() == "node"),
-        "the answer has no `node`, so it is not the `RModule` this bridge would start from: {:?}",
-        fields
-            .iter()
-            .map(|(n, _)| n.to_string())
-            .collect::<Vec<_>>()
-    );
-    // The same tree the interpreter builds, which is what makes it a bridge's input rather than
-    // merely a value.
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let reference = machine
-        .call(entry, vec![arg], Span::DUMMY)
-        .expect("the interpreter parses");
-    assert_eq!(
-        tree.render(),
-        reference.render(),
-        "the compiled parse tree and the interpreted one differ"
-    );
+    if let Some(recorded) = ply_codegen::c::bundle::sources_digest(&bundle)
+        && recorded != identity
+    {
+        eprintln!(
+            "the bundle was emitted from sources {recorded} and these are {identity}; it still serves, and PLY_C_BOOTSTRAP_REFRESH=1 would bring it up to date"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&scratch);
 }

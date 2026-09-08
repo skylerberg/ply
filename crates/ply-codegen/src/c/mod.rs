@@ -17,7 +17,7 @@
 //! | `PLY_C_REFUSALS` | print what the tier refused and why, and how much of the offered set it took | `build.rs` |
 //! | `PLY_C_DUMP` | print one body's emitted C by name, or `*` for the unit's size and its largest bodies | `build.rs` |
 //! | `PLY_C_SPLIT` | print where the emit's time went: optimise-and-lower against emit | `build.rs` |
-//! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache | `build.rs` |
+//! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache; and at every entry's end what it allocated, recycled and still held, by kind | `build.rs`, `rt.rs` |
 //! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
 //! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |
 //! | `PLY_C_PROFILE` | `development` (the default) picks the fast toolchain and the inlining that survives it -- `tcc` if installed, else `cc -O0`, at depth 0; `release` is `cc -O2` at depth 3. Overrides the CLI's `--profile`, so that a bench script pins one without a command line. The compiler and the depth are one choice, not two: read `toolchain.rs` before separating them | `toolchain.rs` |
@@ -25,6 +25,8 @@
 //! | `PLY_CC_OPT` | the optimisation flag it is given, overriding the profile's | `load.rs` |
 //! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
 //! | `PLY_C_EMITTER` | `ply:<dir>` makes the Ply emitter in `<dir>` this tier's producer, body by body, with this emitter as the fallback (ADR 0042); the driver builds it | `producer.rs` |
+//! | `PLY_C_BOOTSTRAP` | `off` builds the Ply emitter with the reference emitter instead of from `spikes/ply-parser/bootstrap`, the bundle of the C it last emitted for itself; the fixpoint test in `crates/ply-codegen-tests` is what says the bundle serves, and `PLY_C_BOOTSTRAP_REFRESH=1` on that test rewrites it | `bundle.rs` |
+//! | `PLY_TIER_ONLY` | `1` makes this backend the only engine: a test or an entry it does not hold fails with `E0505`, and the machine evaluates nothing (ADR 0045) | `backend.rs` |
 //! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
 //!
 //! Two things a fourteenth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
@@ -35,14 +37,15 @@
 //! depth was served bodies emitted at another.
 
 mod build;
-mod cache;
+pub mod bundle;
+pub mod cache;
 mod emit;
 mod load;
 mod prelude;
 pub mod producer;
 mod toolchain;
 
-pub use build::{Native, build, emit_body, emit_body_encoded, emit_unit};
+pub use build::{Native, build, emit_body, emit_body_encoded, emit_unit, emit_unit_record};
 pub use load::Library;
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
 pub use toolchain::{Profile, select as select_profile};
