@@ -500,10 +500,19 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
         "  the shipped corpus: the port emits {reached} of the {} bodies the reference does",
         expected.len()
     );
-    // Named, not tolerated. Each of these needs a *deferred* record: the reference declares the
-    // local the record will land in at the top of the body, so that materialising it inside a
-    // branch still names something the whole body can see, and a record whose every read is
-    // answered from the built table is never materialised at all. The port does not reach it.
+    // Named, not tolerated. Each of these needs a *deferred* record, and the shape is worth
+    // stating because it is not the one the name suggests. Each branch of the `if` still builds
+    // its record; what the join carries is not the record's *word* but its **fields**, one join
+    // local per field, and a third record is assembled from them after the branches close.
+    //
+    // Two things follow that the port cannot do as it stands. The join locals are numbered
+    // *after* every temporary in both branches and their declarations are written *before* the
+    // `if`, so the branches have to be emitted into buffers before the joins exist. And the
+    // assignment into each join is appended to a branch after that branch's body is finished,
+    // which a linear accumulator cannot write as it goes.
+    //
+    // `fn two(n: Int) -> { z: Int, a: Int } = if n < 0 { { z: n, a: 0 } } else { { z: 0, a: n } }`
+    // is the smallest program that shows it.
     //
     // Asserted as an equality rather than a subset, so a new disagreement fails here and fixing
     // `deferred` shrinks this list rather than leaving it to rot.
