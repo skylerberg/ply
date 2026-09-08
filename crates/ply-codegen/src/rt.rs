@@ -481,6 +481,23 @@ impl Ctx {
     pub fn end(&mut self) {
         heap::leave();
         self.last_entry = self.heap.allocated();
+        if std::env::var("PLY_C_PHASES").is_ok() {
+            eprintln!(
+                "entry: {} objects allocated, {} recycled, {}MB of chunks",
+                self.heap.allocated(),
+                self.heap.recycled(),
+                self.heap.chunk_bytes() / 1_000_000
+            );
+            let live = self.heap.live_by_kind();
+            if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
+                for (kind, n, bytes) in live {
+                    eprintln!(
+                        "  live at end: kind {kind}: {n} objects, {}MB",
+                        bytes / 1_000_000
+                    );
+                }
+            }
+        }
         self.heap.end();
     }
 

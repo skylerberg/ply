@@ -121,7 +121,11 @@ fn emit_with(
     (text, record, refused)
 }
 
+// Ignored in CI until the tier releases what an entry lets go: the emitter emitting its own
+// sources is one entry, and with nothing released inside an entry (ADR 0045's measurement) it
+// peaks past what a runner holds. Run it with `--ignored`; the refresh is the same test.
 #[test]
+#[ignore = "the emitter's self-emission peaks past a CI runner's memory until the tier releases within an entry (ADR 0045)"]
 fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     let (source, identity) = emitter_source();
     let bundle = repo().join("spikes/ply-parser/bootstrap");

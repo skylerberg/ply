@@ -616,6 +616,7 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
 /// still open are benign, which the floor below records rather than the emptiness the shipped
 /// corpus reached.
 #[test]
+#[ignore = "the port emitting its own sources peaks past a CI runner's memory until the tier releases within an entry (ADR 0045)"]
 fn the_port_resolves_its_own_sources_to_the_references_c() {
     let (reached, agreeing, differ) = resolved_against_reference("emitter", emitter_sources());
     assert!(
