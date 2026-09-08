@@ -629,7 +629,7 @@ pub unsafe extern "C" fn rt_no_stack(ctx: *mut Ctx) {
 
 /// Room kept below the floor for the runtime's own frames under the deepest compiled one, and
 /// for that frame itself: an unoptimising compiler has produced frames past a hundred kilobytes.
-const STACK_MARGIN: usize = 512 * 1024;
+pub(crate) const STACK_MARGIN: usize = 512 * 1024;
 
 /// The floor for the thread this is called on, asked of the platform once per thread.
 ///

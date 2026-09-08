@@ -1,6 +1,7 @@
 //! The production task scheduler's half of the boundary.
 
 use ply_eval::sched::{HostPolicy, Scheduler};
+use ply_eval::MachineScheduler;
 use ply_eval::sim::TASK_OPS;
 use ply_eval::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRequest, HostResource,
@@ -46,7 +47,11 @@ fn path_of(op: &str) -> &'static str {
 }
 
 /// Opens a production region, or says why it may not be opened.
-pub fn open(binding: &HostBinding, region: SimId, span: Span) -> Result<Scheduler, Diagnostic> {
+pub fn open(
+    binding: &HostBinding,
+    region: SimId,
+    span: Span,
+) -> Result<MachineScheduler, Diagnostic> {
     match HostPolicy::of(binding) {
         Some(permit) => Ok(Scheduler::production(region, span, permit)),
         None => Err(err_hermetic(span, binding)),
