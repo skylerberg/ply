@@ -327,7 +327,7 @@ fn hosting(seed: Int) -> Int =
 
 fn handler(seed: Int) -> Int =
   handle { performer(seed) } with {
-    counter.bump(n) -> if 1.5 > 1.0 { n } else { 0 },
+    counter.bump(n) resume k -> k(n) + 1,
   }
 
 fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
@@ -355,7 +355,7 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
             .unwrap_or_else(|| panic!("`{name}` was taken; refusals: {refused:?}"))
     };
     assert!(
-        reason("m.handler").contains("Float"),
+        reason("m.handler").contains("cannot carry"),
         "{}",
         reason("m.handler")
     );
