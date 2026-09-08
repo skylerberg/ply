@@ -552,7 +552,7 @@ impl Bodies {
                 None => Run::Declined,
             };
         }
-        if ctx.touched_cells() {
+        if !ctx.cells_balanced() {
             ctx.end();
             drop(ctx);
             return self.decline(|d| d.touched_cells += 1);

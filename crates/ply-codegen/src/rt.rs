@@ -239,9 +239,9 @@ pub struct Ctx {
     pub tables: Rc<Tables>,
     /// The arena `ply_eval::builtins::call` insists on.
     cells: ply_eval::TaskRegions,
-    /// `(allocations, regions_opened)` when the arena above was built, so [`Ctx::touched_cells`]
-    /// compares against what an empty one costs rather than against zero.
-    cells_baseline: (u64, u64),
+    /// The arena's `(depth, live)` at the start of the entry now running, so [`Ctx::cells_balanced`]
+    /// can ask whether the body gave back everything it took rather than whether it took anything.
+    cells_baseline: (usize, usize),
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
     pub builtin_calls: u64,
@@ -250,7 +250,7 @@ pub struct Ctx {
 impl Ctx {
     pub fn new(tables: Rc<Tables>) -> Ctx {
         let cells = ply_eval::TaskRegions::new();
-        let stats = cells.arena().stats();
+        let baseline = (cells.arena().depth(), cells.arena().live());
         Ctx {
             failed: 0,
             fuel: 0,
@@ -259,7 +259,7 @@ impl Ctx {
             unclosed_entries: 0,
             tables,
             cells,
-            cells_baseline: (stats.allocations, stats.regions_opened),
+            cells_baseline: baseline,
             diagnostic: None,
             builtin_calls: 0,
         }
@@ -267,6 +267,8 @@ impl Ctx {
 
     /// Between calls, and only between calls.
     pub fn begin(&mut self, fuel: i64) {
+        let arena = self.cells.arena();
+        self.cells_baseline = (arena.depth(), arena.live());
         self.failed = 0;
         self.fuel = fuel;
         self.diagnostic = None;
@@ -299,10 +301,20 @@ impl Ctx {
         self.unclosed_entries
     }
 
-    /// Whether a builtin allocated a cell in the private arena.
-    pub fn touched_cells(&self) -> bool {
-        let stats = self.cells.arena().stats();
-        (stats.allocations, stats.regions_opened) != self.cells_baseline
+    /// Whether the entry gave the arena back what it took: every region it opened closed, every
+    /// slot it allocated reclaimed with one of them.
+    ///
+    /// This is a *balance*, not a total, and the difference is the point. The counters in `stats`
+    /// only rise, so a body that opens a region and closes it looks identical to one that leaks it
+    /// — which is why the gate this replaced could only ever refuse a body that touched a cell at
+    /// all. Depth and live slots both come back down, so a `with cell` that ends is balanced and a
+    /// region left open is not.
+    ///
+    /// It is not on its own enough to let a cell out: a cell *word* in the answer is refused
+    /// separately, by the check that refuses a closure or a continuation there.
+    pub fn cells_balanced(&self) -> bool {
+        let arena = self.cells.arena();
+        (arena.depth(), arena.live()) == self.cells_baseline
     }
 
     /// The singleton a nullary constructor is.
@@ -360,6 +372,46 @@ fn values_taken(ctx: &mut Ctx, args: &[Word]) -> Vec<Value> {
         heap::dec(*w);
     }
     out
+}
+
+/// Opens the region a `with cell` site brands, answering the id `rt_cell_close` takes back.
+///
+/// `unique` says the analysis proved no continuation is captured across the region; it is decided
+/// per site where the unit is built, so the emitted call carries the answer rather than asking.
+pub unsafe extern "C" fn rt_region(ctx: *mut Ctx, unique: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let kind = match unique {
+        0 => ply_eval::RegionKind::Shared,
+        _ => ply_eval::RegionKind::Unique,
+    };
+    ctx.cells.open_region(kind, Span::DUMMY).0 as i64
+}
+
+/// Closes it again, reclaiming every cell allocated inside.
+///
+/// Only the *successful* path emits this. A body that fails leaves the region open, the entry is
+/// then unbalanced, and the seam declines it and lets the machine answer the call itself — which
+/// is the same fallback a failure already takes, so nothing depends on the emitted code unwinding.
+pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
+    let ctx = unsafe { &mut *ctx };
+    ctx.cells
+        .close_region(ply_eval::arena::RegionId(region as u32));
+}
+
+/// The cell a `with cell` opens, as the word its binder is bound to.
+///
+/// A cell is not reached through the handler stack -- `cell_get` and the two beside it are
+/// builtins over this value -- so opening one is an allocation and nothing more. The arena is the
+/// one the context already carries for those builtins, so a cell a compiled body opens and a cell
+/// an interpreted one opens are the same cell to everything that reads it.
+///
+/// The emitter refuses a site that opens a *region*, which is the part a C frame cannot carry.
+pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let v = ctx.value(init);
+    heap::dec(init);
+    let slot = ctx.cells.alloc_cell(v);
+    ctx.heap.bridge(Value::Cell(slot))
 }
 
 /// Perceus's `dup`: the same word, held once more.
@@ -2083,6 +2135,9 @@ pub fn symbols() -> Vec<(&'static str, *const u8)> {
         ("rt_not_a_list", rt_not_a_list as *const u8),
         ("rt_bad_range", rt_bad_range as *const u8),
         ("rt_shift_count", rt_shift_count as *const u8),
+        ("rt_cell", rt_cell as *const u8),
+        ("rt_region", rt_region as *const u8),
+        ("rt_region_close", rt_region_close as *const u8),
         ("rt_dup", rt_dup as *const u8),
         ("rt_dec", rt_dec as *const u8),
         ("rt_alloc", rt_alloc as *const u8),

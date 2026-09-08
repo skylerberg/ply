@@ -118,6 +118,10 @@ impl Harness {
     fn entered(&self) -> u64 {
         self.bodies.entered()
     }
+
+    fn declines(&self) -> ply_codegen::Declines {
+        self.bodies.declines()
+    }
 }
 
 /// Why a definition was refused, if it was.
@@ -133,16 +137,31 @@ fn refusal(unit: &Cranelift, name: &str) -> Option<String> {
 /// A definition whose *published* row is empty and which opens a region anyway.
 ///
 /// `pure_by_published_row` admits it and the machine offers it, which `memo.rs` says out loud, so
-/// the fragment has to be the one that refuses. The obvious smaller program -- a `Cell` parameter
-/// and two bare builtins -- does not typecheck at all, which is the test below it.
+/// something has to hold the arena hazard. It used to be the fragment, by refusing the body. It is
+/// now the seam, by measuring: an entry that does not give back the regions and the slots it took
+/// is declined, and the machine answers the call itself.
+///
+/// The stronger claim is the one worth testing, so this asserts the answer rather than the
+/// refusal: compiled and interpreted agree, the body actually ran compiled, and no entry was
+/// declined for leaving the arena unbalanced. A body that opened a region and did not close it
+/// would fail the third of those, and one that got the cell's counts wrong would fail the first.
 #[test]
-fn a_definition_that_opens_its_own_region_is_refused_by_the_fragment() {
-    let h = harness(hazards());
-    let why = refusal(h.unit, "cells.counted")
-        .expect("`cells.counted` opens its own region and was not refused");
+fn a_definition_that_opens_its_own_region_runs_compiled_and_gives_the_arena_back() {
+    let mut h = harness(hazards());
+    for n in [0i64, 1, 7, -3] {
+        if let Some(difference) = h.agree("cells.counted", &[Value::Int(n)]) {
+            panic!("`cells.counted({n})`: {difference}");
+        }
+    }
     assert!(
-        why.contains("cell") || why.contains("region") || why.contains("with_cell"),
-        "`cells.counted` was refused for a reason that is not the region it opens: {why}"
+        h.entered() > 0,
+        "`cells.counted` never ran compiled, so this proves nothing about the arena"
+    );
+    assert_eq!(
+        h.declines().touched_cells,
+        0,
+        "an entry was declined for leaving the arena unbalanced, so the region it opened was not \
+         closed on the way out"
     );
 }
 

@@ -1,0 +1,1261 @@
+// The lowered intermediate form, in Ply: the shape a code generator reads.
+//
+// `crates/ply-codegen`'s emitter does not read the AST. It reads
+// `ply_eval::code::Code` -- windows numbered by `slots.rs`, ownership marked by
+// `rc.rs` -- so converting the emitter to Ply starts here, with the form it
+// consumes, and not with the emitter.
+//
+// The oracle is `reference_lower_dump` in `harness/src/lib.rs`, and this file
+// exists to be compared against it byte for byte, in the shape the six earlier
+// differentials use. `dump` below writes exactly that string.
+//
+// **What is covered so far is written down rather than implied.** `lower`
+// answers `Some` for the forms it lowers and `None` for the rest, and the
+// differential compares only where it answered -- so this file grows one node
+// kind at a time with a green comparison at every step, instead of arriving
+// whole and unverifiable. `covers` is the list, and it is the honest measure of
+// how far this port has got.
+
+import spine (Span, Ident, QName, dummy_span, num)
+import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LBad)
+import exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock, EList,
+              ERecord, EField, ELambda, EMatch, EPerform, EHandle, EWithCell,
+              EWithRegion, ESimulate, EBad, ERecordUpdate, ETry, Stmt, SLet, SExpr,
+              RecField)
+import items (Module, Item, IFn, parse)
+import rewrite (expand)
+
+// How a read takes its value. `rc.rs`'s `Own`, with the same three cases and
+// the same one-letter spellings the oracle writes.
+pub type Own = | Borrowed | Owned | OwnedField
+
+pub fn own_tag(o: Own) -> Bytes =
+  match o { Borrowed -> b"b", Owned -> b"o", OwnedField -> b"f" }
+
+// One lowered node: what it is, and how the read that produced it takes it.
+pub type Code = { own: Own, node: Node }
+
+pub type Node =
+  | NLit(Lit)
+  | NVar({ name: Bytes, slot: Option<Int> })
+  | NUnary({ op: Bytes, operand: Code })
+  | NBinary({ op: Bytes, lhs: Code, rhs: Code })
+  | NApp({ func: Code, args: List<Code> })
+  | NIf({ cond: Code, then_branch: Code, else_branch: Code })
+  | NBlock({ stmts: List<CStmt>, tail: Option<Code> })
+  | NList({ items: List<Code> })
+  | NRecord({ fields: List<CField> })
+  | NMatch({ scrutinee: Code, arms: List<CArm> })
+  | NPerform({ effect: Bytes, op: Bytes, resource: Bytes, args: List<Code> })
+  | NCell({ resource: Bytes, binder: Bytes, slot: Option<Int>, init: Code, body: Code })
+  | NRegion({ body: Code })
+  | NLambda({ params: Int, size: Int, caps: List<Cap>, body: Code })
+  | NSim({ size: Int, caps: List<Cap>, body: Code })
+  | NHandle({ body: Code, clauses: List<CClause>, ret: Option<CRet> })
+  | NField({ base: Code, field: Bytes })
+  // `{..b, f: e}` after it has been desugared into a record naming every field.
+  // Not a node the parser leaves behind on either side: it is *recognised* in a
+  // plain literal, one in which some field is `b.<its own name>` for a single
+  // slot variable `b`.
+  | NUpd({ base: Code, copies: List<Bytes>, sets: List<CField> })
+
+pub type CField = { name: Bytes, value: Code }
+
+// `ply_eval::code::Pat`: a pattern with its binders resolved to slots, which is
+// what lets a match write bindings straight into the window.
+pub type CPat =
+  | PxWild
+  | PxVar({ name: Bytes, slot: Option<Int> })
+  | PxLit(Lit)
+  | PxCtor({ name: Bytes, args: List<CPat> })
+  | PxRecord({ fields: List<CPatField>, rest: Bool })
+  | PxList({ items: List<CPat>, rest: Option<CPat> })
+
+pub type CPatField = { name: Bytes, pat: CPat }
+
+pub type CArm = { pat: CPat, guard: Option<Code>, body: Code }
+
+// One free name a barrier copies in when it is entered: the slot it comes from
+// in the enclosing barrier, the slot it lands in here, and how the read that
+// copies it takes the value.
+pub type Cap = { src: Int, dst: Int, own: Own }
+
+// A handler clause, which opens a barrier of its own: its parameters and its
+// `resume` binder take its leading slots, and what its body reads from where the
+// handler was installed is copied in.
+pub type CClause = { effect: Bytes, op: Bytes, resource: Bytes, params: Int,
+                     resume: Bool, size: Int, caps: List<Cap>, body: Code }
+
+pub type CRet = { size: Int, caps: List<Cap>, body: Code }
+
+// The slot a `let` writes, which is what the ownership pass drops when it walks
+// backwards past the binder.
+pub type CStmt = | CLet({ name: Bytes, slot: Int, value: Code }) | CDo({ code: Code })
+
+// --- the dump ---------------------------------------------------------------
+//
+// Byte for byte what `reference_lower_dump` writes for the same tree. A
+// difference here is a difference in the *dump* rather than in the lowering,
+// which is why every piece of it is spelled out rather than derived.
+
+pub fn dump_lit(l: Lit) -> Bytes =
+  match l {
+    LInt(n) -> bytes_concat(b"i", num(n)),
+    // Lowercased: the lexer keeps the suffix as written (`U32`) and the oracle derives it from
+    // the type (`u32`), so one of the two has to say which spelling the dump uses.
+    LFixed(name, bits) -> bytes_concat_all([b"x", lower_bytes(name), b":", num(bits)]),
+    LBool(b) -> if b { b"T" } else { b"F" },
+    LStr(s) -> bytes_concat_all([b"s", num(bytes_len(s)), b":", hex(s)]),
+    LBytes(s) -> bytes_concat_all([b"y", num(bytes_len(s)), b":", hex(s)]),
+    // The tag and not the value: a Ply program cannot build a `Float`, and the
+    // consumer this oracle exists for refuses a `Float` literal outright.
+    LFloat(_) -> b"f",
+    LDec(_) -> b"d",
+    // The parser's two placeholders. Neither reaches a lowered tree from a
+    // program that checks, and dumping them as themselves is what would make it
+    // visible if one ever did.
+    LUnit -> b"u",
+    LBad -> b"!",
+  }
+
+fn lower_bytes(s: Bytes) -> Bytes =
+  fold(range(0, bytes_len(s)), b"", |acc: Bytes, i: Int| {
+    let c = bytes_at(s, i);
+    bytes_concat(acc, byte_of_int(if c >= 65 && c <= 90 { c + 32 } else { c }))
+  })
+
+fn hex_digit(v: Int) -> Bytes =
+  bytes_slice(b"0123456789abcdef", v, v + 1)
+
+pub fn hex(s: Bytes) -> Bytes =
+  fold(range(0, bytes_len(s)), b"", |acc: Bytes, i: Int| {
+    let byte = bytes_at(s, i);
+    bytes_concat_all([acc, hex_digit(byte / 16), hex_digit(byte % 16)])
+  })
+
+fn slot_tag(s: Option<Int>) -> Bytes =
+  match s { Some(n) -> num(n), None -> b"-" }
+
+fn dump_caps(cs: List<Cap>) -> Bytes =
+  bytes_concat_all([b"[",
+                    fold(cs, b"", |acc: Bytes, c: Cap|
+                      bytes_concat_all([acc, num(c.src), b">", num(c.dst), own_tag(c.own), b" "])),
+                    b"]"])
+
+pub fn dump_pat(p: CPat) -> Bytes =
+  match p {
+    PxWild -> b"_",
+    PxVar(v) -> bytes_concat_all([b"v:", v.name, b":", slot_tag(v.slot)]),
+    PxLit(l) -> bytes_concat(b"l:", dump_lit(l)),
+    PxCtor(c) ->
+      bytes_concat_all([b"c:", c.name, b"(",
+                        fold(c.args, b"", |acc: Bytes, a: CPat| bytes_concat_all([acc, dump_pat(a), b","])),
+                        b")"]),
+    PxRecord(r) ->
+      bytes_concat_all([b"r:(",
+                        fold(r.fields, b"", |acc: Bytes, f: CPatField|
+                          bytes_concat_all([acc, f.name, b"=", dump_pat(f.pat), b","])),
+                        if r.rest { b"..)" } else { b")" }]),
+    PxList(l) ->
+      bytes_concat_all([b"s:(",
+                        fold(l.items, b"", |acc: Bytes, i: CPat| bytes_concat_all([acc, dump_pat(i), b","])),
+                        match l.rest { Some(r) -> bytes_concat(b"..", dump_pat(r)), None -> b"" },
+                        b")"]),
+  }
+
+pub fn dump(c: Code) -> Bytes =
+  bytes_concat(own_tag(c.own), dump_node(c.node))
+
+fn dump_node(n: Node) -> Bytes =
+  match n {
+    NLit(l) -> bytes_concat_all([b"lit(", dump_lit(l), b")"]),
+    NVar(v) -> bytes_concat_all([b"var(", v.name, b",", slot_tag(v.slot), b")"]),
+    NUnary(u) -> bytes_concat_all([b"un(", u.op, b",", dump(u.operand), b")"]),
+    NBinary(b) ->
+      bytes_concat_all([b"bin(", b.op, b",", dump(b.lhs), b",", dump(b.rhs), b")"]),
+    NApp(a) ->
+      bytes_concat_all([b"app(", dump(a.func),
+                        fold(a.args, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, b",", dump(x)])),
+                        b")"]),
+    NIf(i) ->
+      bytes_concat_all([b"if(", dump(i.cond), b",", dump(i.then_branch), b",",
+                        dump(i.else_branch), b")"]),
+    NBlock(b) ->
+      bytes_concat_all([b"block(",
+                        fold(b.stmts, b"", |acc: Bytes, s: CStmt|
+                          bytes_concat(acc, match s {
+                            CLet(l) -> bytes_concat_all([b"let(v:", l.name, b":", num(l.slot), b",", dump(l.value), b"),"]),
+                            CDo(d) -> bytes_concat_all([b"do(", dump(d.code), b"),"]),
+                          })),
+                        match b.tail { Some(t) -> dump(t), None -> b"-" },
+                        b")"]),
+    NList(l) ->
+      bytes_concat_all([b"list(",
+                        fold(l.items, b"", |acc: Bytes, x: Code| bytes_concat_all([acc, dump(x), b","])),
+                        b")"]),
+    NRecord(r) ->
+      bytes_concat_all([b"rec(",
+                        fold(r.fields, b"", |acc: Bytes, fd: CField|
+                          bytes_concat_all([acc, fd.name, b"=", dump(fd.value), b","])),
+                        b")"]),
+    NMatch(m) ->
+      bytes_concat_all([b"match(", dump(m.scrutinee),
+                        fold(m.arms, b"", |acc: Bytes, a: CArm|
+                          bytes_concat_all([acc, b",arm(", dump_pat(a.pat), b",",
+                                            match a.guard { Some(g) -> dump(g), None -> b"-" },
+                                            b",", dump(a.body), b")"])),
+                        b")"]),
+    NPerform(p) ->
+      bytes_concat_all([b"perform(", p.effect, b",", p.op, b",", p.resource,
+                        fold(p.args, b"", |acc: Bytes, a: Code| bytes_concat_all([acc, b",", dump(a)])),
+                        b")"]),
+    NCell(c) ->
+      bytes_concat_all([b"cell(", c.resource, b",", c.binder, b",", slot_tag(c.slot), b",",
+                        dump(c.init), b",", dump(c.body), b")"]),
+    NRegion(r) -> bytes_concat_all([b"region(", dump(r.body), b")"]),
+    NSim(sm) ->
+      bytes_concat_all([b"sim(", num(sm.size), b",", dump_caps(sm.caps), b",", dump(sm.body), b")"]),
+    NHandle(h) ->
+      bytes_concat_all([b"handle(", dump(h.body),
+                        fold(h.clauses, b"", |acc: Bytes, c: CClause|
+                          bytes_concat_all([acc, b",cl(", c.effect, b",", c.op, b",", c.resource, b",",
+                                            num(c.params), b",", if c.resume { b"true" } else { b"false" },
+                                            b",", num(c.size), b",", dump_caps(c.caps), b",",
+                                            dump(c.body), b")"])),
+                        match h.ret {
+                          Some(r) -> bytes_concat_all([b",ret(", num(r.size), b",", dump_caps(r.caps),
+                                                       b",", dump(r.body), b")"]),
+                          None -> b",-",
+                        },
+                        b")"]),
+    NLambda(l) ->
+      bytes_concat_all([b"lam(", num(l.params), b",", num(l.size), b",", dump_caps(l.caps), b",",
+                        dump(l.body), b")"]),
+    NField(f) -> bytes_concat_all([b"fld(", dump(f.base), b",", f.field, b")"]),
+    NUpd(u) -> bytes_concat_all([b"upd(", dump(u.base),
+      fold(u.copies, b"", |acc: Bytes, n: Bytes| bytes_concat_all([acc, b",c:", n])),
+      fold(u.sets, b"", |acc: Bytes, f: CField|
+        bytes_concat_all([acc, b",s:", f.name, b"=", dump(f.value)])), b")"]),
+  }
+
+// --- slots ------------------------------------------------------------------
+//
+// `slots.rs`, for one barrier. Every binding gets a slot, every occurrence
+// resolves to one, and a block's scope ends without the slot numbers going
+// backwards -- a window is sized by how many bindings a body has, not by how
+// many are live at once.
+//
+// A forward pass, because a slot is decided by what is in scope to the left of
+// an occurrence. Ownership is the other direction and is the pass below.
+
+type Bind = { name: Bytes, slot: Int }
+
+// `names` is the barrier's window in order; `scope` is what is visible here,
+// innermost last, so a shadowing binder is found first by searching backwards.
+type Frame = { names: List<Bytes>, scope: List<Bind>, caps: List<Cap>, capnames: List<Bytes> }
+
+fn bind(f: Frame, name: Bytes) -> Frame =
+  { names: push(f.names, name),
+    scope: push(f.scope, { name: name, slot: len(f.names) }),
+    caps: f.caps, capnames: f.capnames }
+
+fn find(f: Frame, name: Bytes) -> Option<Int> =
+  fold(f.scope, None, |acc: Option<Int>, b: Bind|
+    if b.name == name { Some(b.slot) } else { acc })
+
+// The barriers in scope, innermost last. A lambda opens one; a name free in it
+// and bound further out is threaded through every barrier between, taking a slot
+// in each, which is what `slots.rs` does and what a single frame cannot express.
+type Stack = { frames: List<Frame> }
+
+fn st_top(st: Stack) -> Frame =
+  match list_at(st.frames, len(st.frames) - 1) { Some(f) -> f, None -> empty_frame() }
+
+fn empty_frame() -> Frame = { names: [], scope: [], caps: [], capnames: [] }
+
+fn st_at(st: Stack, i: Int) -> Frame =
+  match list_at(st.frames, i) { Some(f) -> f, None -> empty_frame() }
+
+fn st_set(st: Stack, i: Int, f: Frame) -> Stack =
+  { frames: map(range(0, len(st.frames)), |j: Int| if j == i { f } else { st_at(st, j) }) }
+
+fn st_top_set(st: Stack, f: Frame) -> Stack = st_set(st, len(st.frames) - 1, f)
+
+fn st_push(st: Stack, f: Frame) -> Stack = { frames: push(st.frames, f) }
+
+fn st_pop(st: Stack) -> Stack =
+  { frames: map(range(0, len(st.frames) - 1), |j: Int| st_at(st, j)) }
+
+// The depth whose barrier has `name` in scope or already captures it, innermost first.
+fn st_depth(st: Stack, name: Bytes) -> Option<Int> =
+  fold(range(0, len(st.frames)), None, |acc: Option<Int>, i: Int| {
+    let f = st_at(st, i);
+    match find(f, name) {
+      Some(_) -> Some(i),
+      None -> match find_cap(f, name) { Some(_) -> Some(i), None -> acc },
+    }
+  })
+
+fn slot_in(f: Frame, name: Bytes) -> Option<Int> =
+  match find(f, name) { Some(s) -> Some(s), None -> find_cap(f, name) }
+
+// Resolves `name` at the innermost barrier, threading a capture through every
+// barrier between the occurrence and the binding when the name is free.
+type Resolved = { slot: Option<Int>, st: Stack }
+
+fn resolve(st: Stack, name: Bytes) -> Resolved =
+  match st_depth(st, name) {
+    None -> { slot: None, st: st },
+    Some(d) -> {
+      let start = match slot_in(st_at(st, d), name) { Some(s) -> s, None -> 0 };
+      fold(range(d + 1, len(st.frames)), { slot: Some(start), st: st },
+        |acc: Resolved, i: Int| {
+          let f = st_at(acc.st, i);
+          let from = match acc.slot { Some(s) -> s, None -> 0 };
+          match find_cap(f, name) {
+            Some(s) -> { slot: Some(s), st: acc.st },
+            None -> {
+              let g = capture(f, name, from);
+              { slot: find_cap(g, name), st: st_set(acc.st, i, g) }
+            },
+          }
+        })
+    },
+  }
+
+// A block's binders leave scope at its end; the slots they took do not come
+// back. `names` is untouched and only `scope` is cut.
+// Binding and lookup act on the innermost barrier.
+fn bind_st(st: Stack, name: Bytes) -> Stack = st_top_set(st, bind(st_top(st), name))
+
+fn unscope(f: Frame, to: Int) -> Frame =
+  { names: f.names, scope: take(f.scope, to), caps: f.caps, capnames: f.capnames }
+
+// A scope closes on the innermost barrier only.
+fn unscope_st(st: Stack, to: Int) -> Stack = st_top_set(st, unscope(st_top(st), to))
+
+fn depth_of(st: Stack) -> Int = len(st_top(st).scope)
+
+// A name this barrier already copies in, if it does.
+fn find_cap(f: Frame, name: Bytes) -> Option<Int> =
+  fold(range(0, len(f.capnames)), None, |acc: Option<Int>, i: Int|
+    if nth_bytes(f.capnames, i) == name {
+      match list_at(f.caps, i) { Some(c) -> Some(c.dst), None -> acc }
+    } else { acc })
+
+// Threads a capture: a slot in this barrier, filled from `src` in the enclosing
+// one. The own mark is settled by the *enclosing* barrier's backward pass, so it
+// is `Borrowed` here and rewritten there.
+fn capture(f: Frame, name: Bytes, src: Int) -> Frame =
+  { names: push(f.names, name),
+    scope: f.scope,
+    caps: push(f.caps, { src: src, dst: len(f.names), own: Borrowed }),
+    capnames: push(f.capnames, name) }
+
+fn take(xs: List<Bind>, n: Int) -> List<Bind> =
+  fold(range(0, n), [], |acc: List<Bind>, i: Int| push(acc, at(xs, i)))
+
+fn at(xs: List<Bind>, i: Int) -> Bind =
+  match list_at(xs, i) { Some(x) -> x, None -> { name: b"", slot: 0 } }
+
+// --- the lowering -----------------------------------------------------------
+//
+// `None` where this port does not reach yet, so the differential can compare
+// what is covered and say what is not, rather than comparing a wrong answer.
+// Every node is built `Borrowed`; `mark` below is what decides otherwise.
+
+pub fn covers() -> List<Bytes> =
+  [b"literals", b"unary", b"binary", b"if", b"list", b"field", b"application",
+   b"records", b"blocks and `let`", b"parameters and their slots",
+   b"the ownership marks", b"match and every pattern form",
+   b"perform, with_cell and with_region",
+   b"a lambda and the names it captures, through any depth of barrier",
+   b"handle with its clauses and return arm, and simulate"]
+
+type Out = { code: Code, st: Stack }
+
+fn lower_in(e: Expr, st: Stack) -> Option<Out> =
+  match e {
+    ELit(x) -> Some({ code: { own: Borrowed, node: NLit(x.lit) }, st: st }),
+    // `ERecordUpdate` is not lowered, and neither is it in the reference: it is
+    // expanded away before lowering on both sides. What the reference does that
+    // this port does not is *recognise* the result -- `lower_record_update` takes
+    // a plain record literal in which some field is `b.<its own name>`, for one
+    // slot variable `b` and every such copy of that same `b`, and rebuilds the
+    // update from it. No type information is needed, which is what makes it
+    // portable; what is needed is the ownership, where the base is read after
+    // every written field and reads only the copied ones.
+    EVar(x) -> match x.name.module {
+      // A qualified name is a global under the spelling it was written with, and
+      // never a slot: a module binder cannot be shadowed by a local.
+      Some(m) -> Some({
+        code: { own: Borrowed,
+                node: NVar({ name: bytes_concat_all([m.name, b"::", x.name.name.name]),
+                             slot: None }) },
+        st: st }),
+      None -> {
+        let name = x.name.name.name;
+        // `resolve` answers the innermost slot, threading a capture through
+        // every barrier between the occurrence and the binding on the way.
+        let r = resolve(st, name);
+        Some({ code: { own: Borrowed, node: NVar({ name: name, slot: r.slot }) }, st: r.st })
+      },
+    },
+    EUnary(x) -> match lower_in(x.operand, st) {
+      Some(o) -> Some({ code: { own: Borrowed, node: NUnary({ op: x.op, operand: o.code }) }, st: o.st }),
+      None -> None,
+    },
+    EBinary(x) -> match lower_in(x.lhs, st) {
+      None -> None,
+      Some(l) -> match lower_in(x.rhs, l.st) {
+        None -> None,
+        Some(r) -> Some({ code: { own: Borrowed, node: NBinary({ op: x.op, lhs: l.code, rhs: r.code }) }, st: r.st }),
+      },
+    },
+    EIf(x) -> match lower_in(x.cond, st) {
+      None -> None,
+      Some(c) -> match lower_in(x.then_branch, c.st) {
+        None -> None,
+        Some(t) -> match lower_in(x.else_branch, t.st) {
+          None -> None,
+          Some(el) -> Some({ code: { own: Borrowed, node: NIf({ cond: c.code, then_branch: t.code, else_branch: el.code }) }, st: el.st }),
+        },
+      },
+    },
+    EField(x) -> match lower_in(x.base, st) {
+      Some(b) -> Some({ code: { own: Borrowed, node: NField({ base: b.code, field: x.field.name }) }, st: b.st }),
+      None -> None,
+    },
+    EList(x) -> match lower_seq(x.items, st) {
+      Some(r) -> Some({ code: { own: Borrowed, node: NList({ items: r.codes }) }, st: r.st }),
+      None -> None,
+    },
+    ERecord(x) -> match as_update(x.fields, st) {
+      Some(u) -> Some(u),
+      None ->
+      match lower_seq(map(x.fields, |fd: RecField| fd.value), st) {
+        None -> None,
+        Some(r) -> Some({
+          code: { own: Borrowed, node: NRecord({
+            fields: map(range(0, len(x.fields)), |i: Int|
+              { name: field_name(x.fields, i), value: nth(r.codes, i) }) }) },
+          st: r.st,
+        }),
+      },
+    },
+    EApp(x) ->
+      if len(x.named) > 0 { None } else {
+        match lower_in(x.func, st) {
+          None -> None,
+          Some(fu) -> match lower_seq(x.args, fu.st) {
+            Some(r) -> Some({ code: { own: Borrowed, node: NApp({ func: fu.code, args: r.codes }) }, st: r.st }),
+            None -> None,
+          },
+        }
+      },
+    EMatch(x) -> match lower_in(x.scrutinee, st) {
+      None -> None,
+      Some(sc) -> {
+        let depth = depth_of(sc.st);
+        let walked = fold(x.arms, { arms: [], st: sc.st, ok: true },
+          |acc: ArmAcc, a: MatchArm|
+            if !acc.ok { acc } else {
+              // Each arm binds into the same barrier and its binders leave scope
+              // at the arm's end; the slots they took do not come back.
+              let pd = depth_of(acc.st);
+              let pat = lower_pat(a.pat, acc.st);
+              match a.guard {
+                Some(_) -> { arms: acc.arms, st: acc.st, ok: false },
+                None -> match lower_in(a.body, pat.st) {
+                  None -> { arms: acc.arms, st: acc.st, ok: false },
+                  Some(b) -> { arms: push(acc.arms, { pat: pat.pat, guard: None, body: b.code }),
+                               st: unscope_st(b.st, pd), ok: true },
+                },
+              }
+            });
+        if !walked.ok { None } else {
+          Some({ code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: walked.arms }) },
+                 st: unscope_st(walked.st, depth) })
+        }
+      },
+    },
+    // The effect forms that open no barrier of their own. `handle` and
+    // `simulate` do, and are not here.
+    EWithRegion(x) -> match lower_in(x.body, st) {
+      Some(b) -> Some({ code: { own: Borrowed, node: NRegion({ body: b.code }) }, st: b.st }),
+      None -> None,
+    },
+    EPerform(x) -> match lower_seq(x.args, st) {
+      None -> None,
+      Some(r) -> Some({
+        code: { own: Borrowed, node: NPerform({
+          effect: qname_text(x.eff), op: x.op.name,
+          resource: match x.resource { Some(id) -> id.name, None -> b"" },
+          args: r.codes }) },
+        st: r.st }),
+    },
+    // The binder is in scope for the body and leaves at its end; the init is
+    // evaluated before it exists.
+    EWithCell(x) -> match lower_in(x.init, st) {
+      None -> None,
+      Some(i) -> {
+        let depth = depth_of(i.st);
+        let inner = bind_st(i.st, x.binder.name);
+        match lower_in(x.body, inner) {
+          None -> None,
+          Some(b) -> Some({
+            code: { own: Borrowed, node: NCell({
+              resource: x.resource.name, binder: x.binder.name,
+              slot: slot_in(st_top(inner), x.binder.name), init: i.code, body: b.code }) },
+            st: unscope_st(b.st, depth) }),
+        }
+      },
+    },
+    // A lambda opens a barrier of its own, and a name it reads from outside is a
+    // *capture*: a slot in this barrier filled from one in the enclosing barrier
+    // when the closure is made. Threading that chain is what `handle` and
+    // `simulate` need too, and it is not here.
+    //
+    // What is here is the closed case, and it is refused rather than guessed at
+    // when it is not: the body is lowered in a barrier holding only the lambda's
+    // parameters, and if any name in it is unresolved *and* would have resolved
+    // outside, this is a capture and the port stops.
+    ELambda(x) -> {
+      let params = map(x.params, |p: Param| p.name.name);
+      let inner = fold(params, { names: [], scope: [], caps: [], capnames: [] }, |g: Frame, n: Bytes| bind(g, n));
+      match lower_in(x.body, st_push(st, inner)) {
+        None -> None,
+        // A lambda inside a lambda is refused outright, and the reason is that
+        // the failure is otherwise silent: a name free in the inner one and
+        // bound two barriers out resolves to *no slot at all* here, which reads
+        // as a global and lowers to a tree that is wrong rather than absent.
+        // Threading a slot through every barrier between is what would answer
+        // it, and that chain is not here.
+        Some(b) -> Some(lam_of(params, b)),
+      }
+    },
+    // `simulate` opens a barrier, as a lambda does, and takes no parameters.
+    ESimulate(x) -> match lower_in(x.body, st_push(st, empty_frame())) {
+      None -> None,
+      Some(b) -> {
+        let inner = st_top(b.st);
+        Some({ code: { own: Borrowed, node: NSim({ size: len(inner.names), caps: inner.caps,
+                                                   body: mark(b.code, [], [], []).code }) },
+               st: st_pop(b.st) })
+      },
+    },
+    // `handle`: the body runs in the barrier it is written in, and every clause
+    // opens one of its own whose leading slots are the clause parameters and its
+    // `resume` binder.
+    EHandle(x) -> match lower_in(x.body, st) {
+      None -> None,
+      Some(b) -> {
+        let cls = fold(x.clauses, { clauses: [], st: b.st, ok: true },
+          |acc: ClauseAcc, c: HandleClause|
+            if !acc.ok { acc } else {
+              let names = match c.resume {
+                Some(rid) -> push(map(c.params, |i: Ident| i.name), rid.name),
+                None -> map(c.params, |i: Ident| i.name),
+              };
+              let inner = fold(names, empty_frame(), |g: Frame, n: Bytes| bind(g, n));
+              match lower_in(c.body, st_push(acc.st, inner)) {
+                None -> { clauses: acc.clauses, st: acc.st, ok: false },
+                Some(cb) -> {
+                  let f = st_top(cb.st);
+                  { clauses: push(acc.clauses, {
+                      effect: qname_text(c.eff), op: c.op.name,
+                      resource: match c.resource { Some(id) -> id.name, None -> b"" },
+                      params: len(c.params), resume: match c.resume { Some(_) -> true, None -> false },
+                      size: len(f.names), caps: f.caps,
+                      body: mark(cb.code, [], [], []).code }),
+                    st: st_pop(cb.st), ok: true }
+                },
+              }
+            });
+        if !cls.ok { None } else {
+          match x.ret {
+            None -> Some({ code: { own: Borrowed, node: NHandle({ body: b.code, clauses: cls.clauses,
+                                                                  ret: None }) },
+                           st: cls.st }),
+            Some(r) -> {
+              let inner = bind(empty_frame(), r.binder.name);
+              match lower_in(r.body, st_push(cls.st, inner)) {
+                None -> None,
+                Some(rb) -> {
+                  let f = st_top(rb.st);
+                  Some({ code: { own: Borrowed, node: NHandle({
+                           body: b.code, clauses: cls.clauses,
+                           ret: Some({ size: len(f.names), caps: f.caps,
+                                       body: mark(rb.code, [], [], []).code }) }) },
+                         st: st_pop(rb.st) })
+                },
+              }
+            },
+          }
+        }
+      },
+    },
+    EBlock(x) -> lower_block(x.stmts, x.tail, st),
+    _ -> None,
+  }
+
+fn field_name(fs: List<RecField>, i: Int) -> Bytes =
+  match list_at(fs, i) { Some(fd) -> fd.name.name, None -> b"" }
+
+// A record literal that is an update: some field is `b.<its own name>` for one
+// slot variable `b`, and every such copy is of that same `b`. The base is read
+// after every written field and reads only the copied ones, which is what its
+// own mark has to say -- so it is lowered here and marked in `mark`.
+//
+// The reference recovers the node the same way and for the same reason: a
+// `RecordUpdate` expression does not survive either parser, so neither side has
+// one to lower.
+fn as_update(fields: List<RecField>, st: Stack) -> Option<{ code: Code, st: Stack }> = {
+  let slots = fold(fields, [], |acc: List<Int>, f: RecField| match copy_of(f, st) {
+    Some(sl) -> if fold(acc, false, |seen: Bool, x: Int| seen || x == sl) { acc } else { push(acc, sl) },
+    None -> acc,
+  });
+  // A literal that rewrites every field has no copy to name its base. A record
+  // it *projects from* inside a written field dies there just the same, and its
+  // cells are what to reuse, so the first such variable is the base.
+  let picked = if len(slots) == 1 { list_at(slots, 0) }
+               else if len(slots) == 0 {
+                 fold(fields, None, |acc: Option<Int>, f: RecField|
+                   match acc { Some(_) -> acc, None -> projected_slot(f.value, st) })
+               } else { None };
+  match picked {
+    None -> None,
+    Some(_) -> {
+    match picked {
+      None -> None,
+      Some(sl) -> {
+        let copies = fold(fields, [], |acc: List<Bytes>, f: RecField|
+          match copy_of(f, st) { Some(_) -> push(acc, f.name.name), None -> acc });
+        let sets = filter(fields, |f: RecField| copy_of(f, st) == None);
+        match lower_seq(map(sets, |f: RecField| f.value), st) {
+          None -> None,
+          Some(r) -> Some({
+            code: { own: Borrowed, node: NUpd({
+              base: { own: Borrowed, node: NVar({ name: base_name(fields, st), slot: Some(sl) }) },
+              copies: copies,
+              sets: map(range(0, len(sets)), |i: Int|
+                { name: match list_at(sets, i) { Some(f) -> f.name.name, None -> b"" },
+                  value: nth(r.codes, i) }) }) },
+            st: r.st })
+        }
+      },
+    }
+    },
+  }
+}
+
+// The first bare slot variable a field read projects from, anywhere inside `e`
+// and not through a barrier of its own.
+fn projected_slot(e: Expr, st: Stack) -> Option<Int> =
+  match e {
+    EField(x) -> match x.base {
+      EVar(v) -> if v.name.module != None { None } else { resolve(st, v.name.name.name).slot },
+      _ -> projected_slot(x.base, st),
+    },
+    EApp(x) -> fold(x.args, projected_slot(x.func, st), |acc: Option<Int>, a: Expr|
+      match acc { Some(_) -> acc, None -> projected_slot(a, st) }),
+    EBinary(x) -> match projected_slot(x.lhs, st) {
+      Some(v) -> Some(v), None -> projected_slot(x.rhs, st),
+    },
+    EUnary(x) -> projected_slot(x.operand, st),
+    ERecord(x) -> fold(x.fields, None, |acc: Option<Int>, f: RecField|
+      match acc { Some(_) -> acc, None -> projected_slot(f.value, st) }),
+    EList(x) -> fold(x.items, None, |acc: Option<Int>, i: Expr|
+      match acc { Some(_) -> acc, None -> projected_slot(i, st) }),
+    _ -> None,
+  }
+
+// The slot a field copies from, when the field is `b.<its own name>` for a bare
+// variable `b` that resolves to one.
+fn copy_of(f: RecField, st: Stack) -> Option<Int> =
+  match f.value {
+    EField(x) -> if x.field.name != f.name.name { None } else {
+      match x.base {
+        EVar(v) -> if v.name.module != None { None } else { resolve(st, v.name.name.name).slot },
+        _ -> None,
+      }
+    },
+    _ -> None,
+  }
+
+// The base's own name: from a copy where there is one, and otherwise from the
+// projection that named it.
+fn base_name(fields: List<RecField>, st: Stack) -> Bytes = {
+  let from_copy = fold(fields, b"", |acc: Bytes, f: RecField| match copy_of(f, st) {
+    None -> acc,
+    Some(_) -> match f.value {
+      EField(x) -> match x.base { EVar(v) -> v.name.name.name, _ -> acc },
+      _ -> acc,
+    },
+  });
+  if from_copy != b"" { from_copy } else {
+    fold(fields, b"", |acc: Bytes, f: RecField|
+      if acc != b"" { acc } else { match projected_name(f.value, st) { Some(n) -> n, None -> acc } })
+  }
+}
+
+fn projected_name(e: Expr, st: Stack) -> Option<Bytes> =
+  match e {
+    EField(x) -> match x.base {
+      EVar(v) -> if v.name.module != None { None }
+                 else { match resolve(st, v.name.name.name).slot {
+                   Some(_) -> Some(v.name.name.name), None -> None } },
+      _ -> projected_name(x.base, st),
+    },
+    EApp(x) -> fold(x.args, projected_name(x.func, st), |acc: Option<Bytes>, a: Expr|
+      match acc { Some(_) -> acc, None -> projected_name(a, st) }),
+    EBinary(x) -> match projected_name(x.lhs, st) {
+      Some(v) -> Some(v), None -> projected_name(x.rhs, st),
+    },
+    EUnary(x) -> projected_name(x.operand, st),
+    ERecord(x) -> fold(x.fields, None, |acc: Option<Bytes>, f: RecField|
+      match acc { Some(_) -> acc, None -> projected_name(f.value, st) }),
+    EList(x) -> fold(x.items, None, |acc: Option<Bytes>, i: Expr|
+      match acc { Some(_) -> acc, None -> projected_name(i, st) }),
+    _ -> None,
+  }
+
+fn nth(cs: List<Code>, i: Int) -> Code =
+  match list_at(cs, i) { Some(c) -> c, None -> { own: Borrowed, node: NLit(LUnit) } }
+
+type Seq = { codes: List<Code>, st: Stack }
+
+fn lower_seq(xs: List<Expr>, st: Stack) -> Option<Seq> =
+  fold(xs, Some({ codes: [], st: st }), |acc: Option<Seq>, x: Expr|
+    match acc {
+      None -> None,
+      Some(s) -> match lower_in(x, s.st) {
+        Some(o) -> Some({ codes: push(s.codes, o.code), st: o.st }),
+        None -> None,
+      },
+    })
+
+// A block opens a scope its binders leave at the end, and only a plain `let x =`
+// is reached: a destructuring pattern binds more than one slot and is the next
+// thing this port needs.
+// The lambda's own barrier is the top of the stack it was lowered on; what comes
+// back is the stack without it, carrying whatever captures were threaded into
+// the barriers below.
+fn lam_of(params: List<Bytes>, b: Out) -> Out = {
+  let inner = st_top(b.st);
+  { code: { own: Borrowed, node: NLambda({ params: len(params), size: len(inner.names),
+                                           caps: inner.caps,
+                                           body: mark(b.code, [], [], []).code }) },
+    st: st_pop(b.st) }
+}
+
+type ClauseAcc = { clauses: List<CClause>, st: Stack, ok: Bool }
+
+type ArmAcc = { arms: List<CArm>, st: Stack, ok: Bool }
+
+type BlockAcc = { stmts: List<CStmt>, st: Stack, ok: Bool }
+
+fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> = {
+  let depth = depth_of(st);
+  let walked = fold(stmts, { stmts: [], st: st, ok: true },
+    |acc: BlockAcc, st: Stmt|
+      if !acc.ok { acc } else {
+        match st {
+          SExpr(e) -> match lower_in(e, acc.st) {
+            Some(o) -> { stmts: push(acc.stmts, CDo({ code: o.code })), st: o.st, ok: true },
+            None -> { stmts: acc.stmts, st: acc.st, ok: false },
+          },
+          SLet(l) -> match binder_of(l.pat) {
+            None -> { stmts: acc.stmts, st: acc.st, ok: false },
+            Some(name) -> match lower_in(l.value, acc.st) {
+              None -> { stmts: acc.stmts, st: acc.st, ok: false },
+              Some(o) -> {
+                stmts: push(acc.stmts, CLet({ name: name, slot: len(st_top(o.st).names), value: o.code })),
+                st: bind_st(o.st, name),
+                ok: true,
+              },
+            },
+          },
+        }
+      });
+  if !walked.ok { None } else {
+    match tail {
+      None -> Some({ code: { own: Borrowed, node: NBlock({ stmts: walked.stmts, tail: None }) },
+                     st: unscope_st(walked.st, depth) }),
+      Some(t) -> match lower_in(t, walked.st) {
+        None -> None,
+        Some(o) -> Some({ code: { own: Borrowed, node: NBlock({ stmts: walked.stmts, tail: Some(o.code) }) },
+                          st: unscope_st(o.st, depth) }),
+      },
+    }
+  }
+}
+
+type PatOut = { pat: CPat, st: Stack }
+
+// A pattern's binders take slots in the order the walk meets them, which is what
+// lets an arm write its bindings straight into the window. A bare name may
+// really be a nullary constructor -- the tree cannot tell -- so it takes a slot
+// either way and the machine consults the constructor table before writing it.
+fn lower_pat(p: Pattern, st: Stack) -> PatOut =
+  match p {
+    PWild(_) -> { pat: PxWild, st: st },
+    PVar(v) -> {
+      let name = v.name.name;
+      let g = bind_st(st, name);
+      { pat: PxVar({ name: name, slot: slot_in(st_top(g), name) }), st: g }
+    },
+    PLit(v) -> { pat: PxLit(v.lit), st: st },
+    PCtor(c) -> {
+      let r = lower_pats(c.args, st);
+      { pat: PxCtor({ name: qname_text(c.name), args: r.pats }), st: r.st }
+    },
+    PRecord(r) -> {
+      let walked = fold(r.fields, { pats: [], st: st, names: [] },
+        |acc: PatFields, fd: { name: Ident, pat: Pattern }| {
+          let o = lower_pat(fd.pat, acc.st);
+          { pats: push(acc.pats, o.pat), st: o.st, names: push(acc.names, fd.name.name) }
+        });
+      { pat: PxRecord({ fields: map(range(0, len(walked.pats)), |i: Int|
+                          { name: nth_bytes(walked.names, i), pat: nth_pat(walked.pats, i) }),
+                        rest: r.rest }),
+        st: walked.st }
+    },
+    PList(l) -> {
+      let r = lower_pats(l.items, st);
+      match l.rest {
+        None -> { pat: PxList({ items: r.pats, rest: None }), st: r.st },
+        Some(rp) -> {
+          let o = lower_pat(rp, r.st);
+          { pat: PxList({ items: r.pats, rest: Some(o.pat) }), st: o.st }
+        },
+      }
+    },
+    PBad(_) -> { pat: PxWild, st: st },
+  }
+
+fn lower_pats(ps: List<Pattern>, st: Stack) -> PatSeq =
+  fold(ps, { pats: [], st: st }, |acc: PatSeq, p: Pattern| {
+    let o = lower_pat(p, acc.st);
+    { pats: push(acc.pats, o.pat), st: o.st }
+  })
+
+type PatFields = { pats: List<CPat>, st: Stack, names: List<Bytes> }
+type PatSeq = { pats: List<CPat>, st: Stack }
+
+fn nth_bytes(xs: List<Bytes>, i: Int) -> Bytes =
+  match list_at(xs, i) { Some(x) -> x, None -> b"" }
+
+fn nth_pat(xs: List<CPat>, i: Int) -> CPat =
+  match list_at(xs, i) { Some(x) -> x, None -> PxWild }
+
+// A qualified name as the oracle writes it: `module.name`, or the bare name.
+fn qname_text(q: QName) -> Bytes =
+  match q.module {
+    // `::`, which is how `ply_span::Symbol` renders a qualified name and what
+    // the oracle therefore writes -- not the `.` the source spells it with.
+    Some(m) -> bytes_concat_all([m.name, b"::", q.name.name]),
+    None -> q.name.name,
+  }
+
+// The slots a pattern binds, which the ownership pass drops when it walks back
+// past the arm that binds them.
+fn pat_slots(p: CPat) -> List<Int> =
+  match p {
+    PxWild -> [],
+    PxVar(v) -> match v.slot { Some(s) -> [s], None -> [] },
+    PxLit(_) -> [],
+    PxCtor(c) -> fold(c.args, [], |acc: List<Int>, a: CPat| live_union(acc, pat_slots(a))),
+    PxRecord(r) -> fold(r.fields, [], |acc: List<Int>, f: CPatField| live_union(acc, pat_slots(f.pat))),
+    PxList(l) -> {
+      let items = fold(l.items, [], |acc: List<Int>, i: CPat| live_union(acc, pat_slots(i)));
+      match l.rest { Some(r) -> live_union(items, pat_slots(r)), None -> items }
+    },
+  }
+
+// Only the shape that binds exactly one name. Anything else binds a set of
+// slots and needs the pattern half of `slots.rs`, which this port has not
+// reached.
+fn binder_of(p: Pattern) -> Option<Bytes> =
+  match p { PVar(id) -> Some(id.name.name), _ -> None }
+
+// --- ownership --------------------------------------------------------------
+//
+// `rc.rs`'s half, and the one an emitter cannot do without: a read is `Owned`
+// when the slot it reads is not read again after it, and `Borrowed` when it is.
+// Backwards, because "again after it" is a fact about the future, and the two
+// branches of an `if` each see the same future.
+//
+// The live set is slots, not names: a shadowed name is two slots and they die
+// at different points.
+
+type Marked = { code: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+
+// One (slot, field) pair still to be read. `Own::OwnedField` is the mark for a
+// projection that is the last read of *this field* while the record it comes
+// out of is read again for another -- the case a live set keyed on the slot
+// alone cannot see, and the one `rc.rs` exists to answer.
+type FieldUse = { slot: Int, field: Bytes }
+
+fn live_has(live: List<Int>, s: Int) -> Bool =
+  fold(live, false, |acc: Bool, x: Int| acc || x == s)
+
+fn live_add(live: List<Int>, s: Int) -> List<Int> =
+  if live_has(live, s) { live } else { push(live, s) }
+
+fn live_union(a: List<Int>, b: List<Int>) -> List<Int> =
+  fold(b, a, |acc: List<Int>, x: Int| live_add(acc, x))
+
+fn live_drop(live: List<Int>, s: Int) -> List<Int> =
+  filter(live, |x: Int| x != s)
+
+fn fuse_has(fs: List<FieldUse>, s: Int, f: Bytes) -> Bool =
+  fold(fs, false, |acc: Bool, u: FieldUse| acc || (u.slot == s && u.field == f))
+
+fn fuse_add(fs: List<FieldUse>, s: Int, f: Bytes) -> List<FieldUse> =
+  if fuse_has(fs, s, f) { fs } else { push(fs, { slot: s, field: f }) }
+
+fn fuse_union(a: List<FieldUse>, b: List<FieldUse>) -> List<FieldUse> =
+  fold(b, a, |acc: List<FieldUse>, u: FieldUse| fuse_add(acc, u.slot, u.field))
+
+fn live_drop_f(fs: List<FieldUse>, s: Int) -> List<FieldUse> =
+  filter(fs, |u: FieldUse| u.slot != s)
+
+// The slot a projection reads through, when its base is a bare variable.
+fn base_slot(c: Code) -> Option<Int> =
+  match c.node { NVar(v) -> v.slot, _ -> None }
+
+pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -> Marked =
+  match c.node {
+    NLit(_) -> { code: c, live: live, livew: livew, livef: livef },
+    NVar(v) -> match v.slot {
+      None -> { code: c, live: live, livew: livew, livef: livef },
+      Some(s) -> {
+        code: { own: if live_has(live, s) { Borrowed } else { Owned }, node: c.node },
+        live: live_add(live, s),
+        // A bare read is a read of the *whole* record, which is what stops a
+        // later projection being taken in place.
+        livew: live_add(livew, s),
+        livef: livef,
+      },
+    },
+    // The base is read *after* every written field, so backwards it is marked
+    // first, and it reads only the copied fields: a whole read, and one per copy.
+    NUpd(u) -> {
+      let s = match base_slot(u.base) { Some(x) -> x, None -> -1 };
+      let owned = s >= 0 && !live_has(live, s);
+      let base = { own: if owned { Owned } else { Borrowed }, node: u.base.node };
+      let after = if s < 0 { { live: live, livew: livew, livef: livef } } else {
+        // The base's read is **not** a whole read: it takes only the copied
+        // fields, so a projection of an uncopied one earlier may still be taken
+        // in place. Adding it to `livew` blocked exactly those.
+        { live: live_add(live, s), livew: livew,
+          livef: fold(u.copies, livef, |acc: List<FieldUse>, n: Bytes|
+            push(acc, { slot: s, field: n })) }
+      };
+      let r = mark_seq(map(u.sets, |f: CField| f.value), after.live, after.livew, after.livef);
+      { code: { own: Borrowed, node: NUpd({ base: base, copies: u.copies,
+          sets: map(range(0, len(u.sets)), |i: Int|
+            { name: match list_at(u.sets, i) { Some(f) -> f.name, None -> b"" },
+              value: nth(r.codes, i) }) }) },
+        live: r.live, livew: r.livew, livef: r.livef }
+    },
+    NUnary(u) -> {
+      let o = mark(u.operand, live, livew, livef);
+      { code: { own: Borrowed, node: NUnary({ op: u.op, operand: o.code }) }, live: o.live, livew: o.livew, livef: o.livef }
+    },
+    NBinary(b) -> {
+      let r = mark(b.rhs, live, livew, livef);
+      let l = mark(b.lhs, r.live, r.livew, r.livef);
+      { code: { own: Borrowed, node: NBinary({ op: b.op, lhs: l.code, rhs: r.code }) },
+        live: l.live, livew: l.livew, livef: l.livef }
+    },
+    // The one mark a slot-keyed live set cannot make. A projection whose base is
+    // a bare variable is `OwnedField` when the record is read again -- so the
+    // record cannot be taken -- but *this field* of it is not.
+    // The one mark a slot-keyed live set cannot make. A projection whose base is
+    // a bare variable is `OwnedField` when the record is read again -- so the
+    // record itself cannot be taken -- but *this field* of it is not, and no
+    // later read wants the record whole.
+    //
+    // The base is marked here rather than through `mark`, because reading a
+    // record *to project from it* is not a read of the whole record, and routing
+    // it through the general case would put the slot in `livew` and stop every
+    // earlier projection being taken.
+    NField(fd) -> match base_slot(fd.base) {
+      None -> {
+        let b = mark(fd.base, live, livew, livef);
+        { code: { own: Borrowed, node: NField({ base: b.code, field: fd.field }) },
+          live: b.live, livew: b.livew, livef: b.livef }
+      },
+      Some(s) -> {
+        let base = { own: if live_has(live, s) { Borrowed } else { Owned }, node: fd.base.node };
+        let own =
+          if !live_has(live, s) { Borrowed }
+          else if live_has(livew, s) { Borrowed }
+          else if fuse_has(livef, s, fd.field) { Borrowed }
+          else { OwnedField };
+        { code: { own: own, node: NField({ base: base, field: fd.field }) },
+          live: live_add(live, s),
+          livew: livew,
+          livef: fuse_add(livef, s, fd.field) }
+      },
+    },
+    // Every arm sees the same future, as the branches of an `if` do, and each
+    // arm's binders die at the arm: nothing before the match can read a slot a
+    // pattern wrote.
+    NMatch(m) -> {
+      let marked = fold(m.arms, { arms: [], live: [], livew: [], livef: [] },
+        |acc: ArmMark, a: CArm| {
+          let bound = pat_slots(a.pat);
+          let b = mark(a.body, live, livew, livef);
+          let after = fold(bound, { l: b.live, w: b.livew, f: b.livef },
+            |x: Dropped, s: Int| { l: live_drop(x.l, s), w: live_drop(x.w, s), f: live_drop_f(x.f, s) });
+          { arms: push(acc.arms, { pat: a.pat, guard: None, body: b.code }),
+            live: live_union(acc.live, after.l),
+            livew: live_union(acc.livew, after.w),
+            livef: fuse_union(acc.livef, after.f) }
+        });
+      let sc = mark(m.scrutinee, marked.live, marked.livew, marked.livef);
+      { code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
+        live: sc.live, livew: sc.livew, livef: sc.livef }
+    },
+    // A lambda's body is its own barrier and its marks were settled when it was
+    // lowered. What happens *here* is the captures: each is a read of a slot of
+    // this barrier, at the point the closure is made.
+    NLambda(l) -> {
+      let w = mark_caps(l.caps, live, livew);
+      { code: { own: Borrowed, node: NLambda({ params: l.params, size: l.size,
+                                               caps: w.caps, body: l.body }) },
+        live: w.live, livew: w.livew, livef: livef }
+    },
+    // A barrier's captures are reads of *this* barrier, at the point the barrier
+    // is entered, exactly as a lambda's are.
+    NSim(sm) -> {
+      let w = mark_caps(sm.caps, live, livew);
+      { code: { own: Borrowed, node: NSim({ size: sm.size, caps: w.caps, body: sm.body }) },
+        live: w.live, livew: w.livew, livef: livef }
+    },
+    NHandle(h) -> {
+      let cls = fold(h.clauses, { caps: [], live: live, livew: livew },
+        |acc: CapMark, c: CClause| {
+          let w = mark_caps(c.caps, acc.live, acc.livew);
+          { caps: acc.caps, live: w.live, livew: w.livew }
+        });
+      let marked = map(h.clauses, |c: CClause| c);
+      let b = mark(h.body, cls.live, cls.livew, livef);
+      { code: { own: Borrowed, node: NHandle({ body: b.code, clauses: marked, ret: h.ret }) },
+        live: b.live, livew: b.livew, livef: b.livef }
+    },
+    NRegion(r) -> {
+      let b = mark(r.body, live, livew, livef);
+      { code: { own: Borrowed, node: NRegion({ body: b.code }) },
+        live: b.live, livew: b.livew, livef: b.livef }
+    },
+    NPerform(p) -> {
+      let r = mark_seq(p.args, live, livew, livef);
+      { code: { own: Borrowed, node: NPerform({ effect: p.effect, op: p.op, resource: p.resource,
+                                                args: r.codes }) },
+        live: r.live, livew: r.livew, livef: r.livef }
+    },
+    // The binder dies at the `with_cell`, as a `let`'s does at its `let`.
+    NCell(c) -> {
+      let b = mark(c.body, live, livew, livef);
+      let after = match c.slot {
+        None -> { l: b.live, w: b.livew, f: b.livef },
+        Some(s) -> { l: live_drop(b.live, s), w: live_drop(b.livew, s), f: live_drop_f(b.livef, s) },
+      };
+      let i = mark(c.init, after.l, after.w, after.f);
+      { code: { own: Borrowed, node: NCell({ resource: c.resource, binder: c.binder, slot: c.slot,
+                                             init: i.code, body: b.code }) },
+        live: i.live, livew: i.livew, livef: i.livef }
+    },
+    NIf(i) -> {
+      let t = mark(i.then_branch, live, livew, livef);
+      let e = mark(i.else_branch, live, livew, livef);
+      let cnd = mark(i.cond, live_union(t.live, e.live), live_union(t.livew, e.livew),
+                     fuse_union(t.livef, e.livef));
+      { code: { own: Borrowed, node: NIf({ cond: cnd.code, then_branch: t.code, else_branch: e.code }) },
+        live: cnd.live, livew: cnd.livew, livef: cnd.livef }
+    },
+    NList(l) -> {
+      let r = mark_seq(l.items, live, livew, livef);
+      { code: { own: Borrowed, node: NList({ items: r.codes }) }, live: r.live, livew: r.livew, livef: r.livef }
+    },
+    NRecord(rc) -> {
+      let r = mark_seq(map(rc.fields, |fd: CField| fd.value), live, livew, livef);
+      { code: { own: Borrowed, node: NRecord({ fields: map(range(0, len(rc.fields)), |i: Int|
+          { name: cfield_name(rc.fields, i), value: nth(r.codes, i) }) }) },
+        live: r.live, livew: r.livew, livef: r.livef }
+    },
+    NApp(a) -> {
+      let args = mark_seq(a.args, live, livew, livef);
+      let fu = mark(a.func, args.live, args.livew, args.livef);
+      { code: { own: Borrowed, node: NApp({ func: fu.code, args: args.codes }) },
+        live: fu.live, livew: fu.livew, livef: fu.livef }
+    },
+    NBlock(b) -> {
+      let after = match b.tail {
+        None -> { code: { own: Borrowed, node: NLit(LUnit) }, live: live, livew: livew, livef: livef },
+        Some(t) -> mark(t, live, livew, livef),
+      };
+      let walked = fold(rev_stmts(b.stmts), { codes: [], live: after.live, livew: after.livew, livef: after.livef },
+        |acc: Seq2, st: CStmt|
+          match st {
+            CDo(d) -> { let m = mark(d.code, acc.live, acc.livew, acc.livef);
+                        { codes: push(acc.codes, CDo({ code: m.code })), live: m.live, livew: m.livew, livef: m.livef } },
+            // The binder dies at its `let`: nothing before it can read the slot,
+            // and nothing before it can read a field of it either.
+            CLet(l) -> { let m = mark(l.value, live_drop(acc.live, l.slot), live_drop(acc.livew, l.slot), live_drop_f(acc.livef, l.slot));
+                         { codes: push(acc.codes, CLet({ name: l.name, slot: l.slot, value: m.code })),
+                           live: m.live, livew: m.livew, livef: m.livef } },
+          });
+      { code: { own: Borrowed, node: NBlock({ stmts: rev_stmts(walked.codes),
+                                              tail: match b.tail { None -> None, Some(_) -> Some(after.code) } }) },
+        live: walked.live, livew: walked.livew, livef: walked.livef }
+    },
+  }
+
+type CapMark = { caps: List<Cap>, live: List<Int>, livew: List<Int> }
+
+// Each capture is a read of the enclosing barrier's slot, `Owned` when nothing
+// after it wants that slot.
+fn mark_caps(caps: List<Cap>, live: List<Int>, livew: List<Int>) -> CapMark = {
+  let walked = fold(rev_caps(caps), { caps: [], live: live, livew: livew },
+    |acc: CapMark, cp: Cap|
+      { caps: push(acc.caps, { src: cp.src, dst: cp.dst,
+                               own: if live_has(acc.live, cp.src) { Borrowed } else { Owned } }),
+        live: live_add(acc.live, cp.src),
+        livew: live_add(acc.livew, cp.src) });
+  { caps: rev_caps(walked.caps), live: walked.live, livew: walked.livew }
+}
+
+type ArmMark = { arms: List<CArm>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+
+type Dropped = { l: List<Int>, w: List<Int>, f: List<FieldUse> }
+
+type Seq2 = { codes: List<CStmt>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+
+fn cfield_name(fs: List<CField>, i: Int) -> Bytes =
+  match list_at(fs, i) { Some(fd) -> fd.name, None -> b"" }
+
+fn mark_seq(xs: List<Code>, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -> MarkedSeq = {
+  let walked = fold(rev_codes(xs), { codes: [], live: live, livew: livew, livef: livef },
+    |acc: MarkedSeq, x: Code| {
+      let m = mark(x, acc.live, acc.livew, acc.livef);
+      { codes: push(acc.codes, m.code), live: m.live, livew: m.livew, livef: m.livef }
+    });
+  { codes: rev_codes(walked.codes), live: walked.live, livew: walked.livew, livef: walked.livef }
+}
+
+type MarkedSeq = { codes: List<Code>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+
+// Reversal by index, because a `fold` that prepends needs `push_front` and this
+// corpus builds one per element type otherwise.
+fn rev_codes(xs: List<Code>) -> List<Code> =
+  map(range(0, len(xs)), |i: Int| nth(xs, len(xs) - 1 - i))
+
+fn rev_caps(xs: List<Cap>) -> List<Cap> =
+  map(range(0, len(xs)), |i: Int|
+    match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> { src: 0, dst: 0, own: Borrowed } })
+
+fn rev_stmts(xs: List<CStmt>) -> List<CStmt> =
+  map(range(0, len(xs)), |i: Int|
+    match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> CDo({ code: { own: Borrowed, node: NLit(LUnit) } }) })
+
+// --- the differential's entry -----------------------------------------------
+//
+// One module of source in, one dump out, in the oracle's own framing: `L;n;`
+// then a record per function this port lowered. A function it does not reach is
+// left out entirely rather than dumped wrongly, and the count of those is what
+// the comparison reports.
+
+pub type LowerOut = { dump: Bytes, lowered: Int, skipped: Int }
+
+/// One function body, lowered whole: slots resolved forwards, ownership marked
+/// backwards, and the window sized by how many bindings the body has.
+pub fn lower_fn(params: List<Bytes>, body: Expr) -> Option<{ code: Code, size: Int }> = {
+  let start = fold(params, { names: [], scope: [], caps: [], capnames: [] }, |f: Frame, p: Bytes| bind(f, p));
+  match lower_in(body, { frames: [start] }) {
+    None -> None,
+    Some(o) -> Some({ code: mark(o.code, [], [], []).code, size: len(st_top(o.st).names) }),
+  }
+}
+
+pub fn lower_module(src: Bytes) -> LowerOut = {
+  let r = parse(src);
+  let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  fold(x.module.items, { dump: b"L;1;", lowered: 0, skipped: 0 },
+    |acc: LowerOut, it: Item|
+      match it {
+        IFn(d) ->
+          match lower_fn(map(d.params, |p: Param| p.name.name), d.body) {
+            None -> { dump: acc.dump, lowered: acc.lowered, skipped: acc.skipped + 1 },
+            Some(l) -> {
+              dump: bytes_concat_all([acc.dump, b"f:m.", d.name.name, b":",
+                                      num(len(d.params)), b":", num(l.size), b";",
+                                      dump(l.code), b";"]),
+              lowered: acc.lowered + 1,
+              skipped: acc.skipped,
+            },
+          },
+        _ -> acc,
+      })
+}
+
+pub fn lower_dump(src: Bytes) -> String = string_of_bytes(lower_module(src).dump)
+
+test "a literal lowers to itself" {
+  assert_eq(lower_dump(b"fn f() -> Int = 1\n"), "L;1;f:m.f:0:0;blit(i1);")
+}
+
+test "binary operands are lowered left to right" {
+  assert_eq(lower_dump(b"fn f() -> Int = 1 + 2\n"),
+            "L;1;f:m.f:0:0;bbin(add,blit(i1),blit(i2));")
+}
+
+test "a name with no binder has no slot" {
+  assert_eq(lower_dump(b"fn f() -> Int = g()\n"),
+            "L;1;f:m.f:0:0;bapp(bvar(g,-));")
+}
+
+test "a parameter reads its slot and the last read owns it" {
+  assert_eq(lower_dump(b"fn f(a: Int, b: Int) -> Int = a * b\n"),
+            "L;1;f:m.f:2:2;bbin(mul,ovar(a,0),ovar(b,1));")
+}
+
+test "a read with another after it borrows" {
+  assert_eq(lower_dump(b"fn f(x: Int) -> Int = x + x\n"),
+            "L;1;f:m.f:1:1;bbin(add,bvar(x,0),ovar(x,0));")
+}
+
+test "both arms of an `if` see the same future" {
+  assert_eq(lower_dump(b"fn f(n: Int) -> Int = if n > 0 { n } else { 0 - n }\n"),
+            "L;1;f:m.f:1:1;bif(bbin(gt,bvar(n,0),blit(i0)),bblock(ovar(n,0)),bblock(bbin(sub,blit(i0),ovar(n,0))));")
+}
+
+test "a `let` takes the next slot and the binder dies at it" {
+  assert_eq(lower_dump(b"fn f(a: Int) -> Int = { let b = a + 1; b }\n"),
+            "L;1;f:m.f:1:2;bblock(let(v:b:1,bbin(add,ovar(a,0),blit(i1))),ovar(b,1));")
+}
+
+test "a match binds its arms into the window and each arm's binders leave at its end" {
+  assert_eq(lower_dump(b"fn f(o: Option<Int>) -> Int = match o { Some(n) -> n, None -> 0 }\n"),
+            "L;1;f:m.f:1:2;bmatch(ovar(o,0),arm(c:Some(v:n:1,),-,ovar(n,1)),arm(c:None(),-,blit(i0)));")
+}
+
+test "what the dump holds is what the count reports" {
+  // The differential compares the records this dump holds and asserts how many
+  // there are. Those two have to be the same number or the share it reports is
+  // about something other than what it compared.
+  let out = lower_module(b"fn f() -> Int = 1\nfn g(a: Int) -> Int = a\nfn h() -> Int = 2\n");
+  assert_eq(out.lowered, 3);
+  assert_eq(out.skipped, 0);
+  assert_eq(count_records(bytes_of_string(lower_dump(b"fn f() -> Int = 1\nfn g(a: Int) -> Int = a\nfn h() -> Int = 2\n"))), 3)
+}
+
+// `f:m.` at the head of a record, counted the way the differential splits them.
+fn count_records(d: Bytes) -> Int =
+  fold(range(0, bytes_len(d) - 3), 0, |acc: Int, i: Int|
+    if bytes_at(d, i) == 102 && bytes_at(d, i + 1) == 58
+       && bytes_at(d, i + 2) == 109 && bytes_at(d, i + 3) == 46 { acc + 1 } else { acc })

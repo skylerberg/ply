@@ -44,7 +44,7 @@ mod load;
 mod prelude;
 mod toolchain;
 
-pub use build::{Native, build, emit_unit};
+pub use build::{Native, build, emit_body, emit_unit};
 pub use load::Library;
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
 pub use toolchain::{Profile, select as select_profile};
@@ -56,6 +56,9 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
     let mut out: Vec<*mut std::ffi::c_void> = Vec::with_capacity(HELPERS.len());
     for h in HELPERS {
         let p = match h.name {
+            "rt_cell" => rt::rt_cell as *const (),
+            "rt_region" => rt::rt_region as *const (),
+            "rt_region_close" => rt::rt_region_close as *const (),
             "rt_dup" => rt::rt_dup as *const (),
             "rt_dec" => rt::rt_dec as *const (),
             "rt_reset" => rt::rt_reset as *const (),

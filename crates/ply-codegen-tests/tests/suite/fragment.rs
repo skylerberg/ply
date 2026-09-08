@@ -668,3 +668,176 @@ fn the_census_over_the_standard_library() {
     );
     assert!(functions > 100, "only {functions} functions were offered");
 }
+
+/// `with_cell`, which both tiers carry since ADR 0041.
+///
+/// A cell is the one effect construct that is not control: it binds a first-class value and its
+/// operations are builtins. What the tiers had to gain is the node that opens one, the region it
+/// brands, and the close on the way out.
+const CELLS: &str = "\
+pub fn tally(n: Int) -> Int = with_cell[t](0) { c -> {
+  cell_set(c, n * 2);
+  cell_set(c, cell_get(c) + 1);
+  cell_get(c)
+} }
+
+pub fn once(n: Int) -> Int = with_cell[t](n) { c -> cell_get(c) + 1 }
+
+pub fn nested(n: Int) -> Int = with_cell[outer](n) { a -> {
+  let inner = with_cell[inner](cell_get(a)) { b -> cell_get(b) * 2 };
+  cell_get(a) + inner
+} }
+
+pub fn unread(n: Int) -> Int = with_cell[t](n) { _c -> n + 1 }
+";
+
+#[test]
+fn a_cell_a_compiled_body_opens_answers_what_the_interpreter_answers() {
+    let (_, unit) = unit(CELLS);
+    let cases: &[(&str, Vec<Value>, Value)] = &[
+        ("m.tally", vec![Value::Int(20)], Value::Int(41)),
+        ("m.once", vec![Value::Int(7)], Value::Int(8)),
+        ("m.nested", vec![Value::Int(5)], Value::Int(15)),
+        ("m.unread", vec![Value::Int(5)], Value::Int(6)),
+    ];
+    for (name, args, want) in cases {
+        let got = call(unit, name, args);
+        assert_eq!(
+            got.as_ref(),
+            Some(want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
+        );
+    }
+}
+
+/// The bodies above are compiled rather than answered by a registry miss.
+///
+/// Without this the test beside it would pass over an empty fragment, which is the failure mode
+/// every claim about a code generator has.
+#[test]
+fn a_body_that_opens_a_cell_is_in_the_fragment() {
+    let (_, unit) = unit(CELLS);
+    for name in ["m.tally", "m.once", "m.nested", "m.unread"] {
+        assert!(
+            unit.compiled().iter().any(|c| c == name),
+            "`{name}` was refused: {:?}",
+            unit.refusals()
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, why)| why)
+        );
+    }
+}
+
+/// What the fragment refuses the shipped standard library for, split by whether the refusal costs
+/// a *definition* or a test root.
+///
+/// The split is the whole point. A refused test root runs interpreted, which is a test running the
+/// way tests ran before there was a code generator; a refused definition takes every caller in its
+/// unit with it. Counting them together says `handle` is the expensive construct, and counting
+/// them apart says the opposite -- `handle` costs one definition in the whole library and
+/// `perform` costs a dozen, with most of `http` cascading off them.
+///
+/// The ceilings ratchet **down**. Lower one when a construct lands; a rise is a regression and
+/// fails here.
+#[test]
+fn what_the_fragment_refuses_the_standard_library_for() {
+    let (_, unit) = unit("pub fn nothing() -> Int = 1\n");
+    let cost = |what: &str| -> (usize, Vec<String>) {
+        let (tests, defs): (Vec<&String>, Vec<&String>) = unit
+            .refusals()
+            .iter()
+            .filter(|(_, why)| why.contains(what))
+            .map(|(f, _)| f)
+            .partition(|f| f.contains("test#"));
+        (tests.len(), defs.iter().map(|s| (*s).clone()).collect())
+    };
+    for what in [
+        "a `handle`",
+        "perform",
+        "Decimal",
+        "not in this compiled unit",
+    ] {
+        let (tests, defs) = cost(what);
+        println!(
+            "  {what}: {tests} test root(s), {} definition(s) {defs:?}",
+            defs.len()
+        );
+    }
+    let (_, handled) = cost("a `handle`");
+    let (_, performed) = cost("perform");
+    let (_, cascade) = cost("not in this compiled unit");
+    assert!(
+        handled.len() <= 1,
+        "`handle` now costs {} definitions, not 1: {handled:?}",
+        handled.len()
+    );
+    assert!(
+        performed.len() <= 12,
+        "`perform` now costs {} definitions, not 12: {performed:?}",
+        performed.len()
+    );
+    assert!(
+        cascade.len() <= 9,
+        "{} definitions now cascade off a refusal, not 9: {cascade:?}",
+        cascade.len()
+    );
+    // The claim the ceilings are here to keep honest: `perform` is what the library is actually
+    // losing definitions to, and `handle` is not. ADR 0041 stages the work on this.
+    assert!(
+        performed.len() > handled.len(),
+        "`perform` no longer costs more definitions than `handle`, so ADR 0041's staging should \
+         be re-read: perform {performed:?}, handle {handled:?}"
+    );
+}
+
+/// The criterion ADR 0041's stage 2 rests on: whether a `perform` could find a handler on the
+/// stack rather than the host.
+///
+/// A handler resumes, and resuming captures the frame the `perform` is in, which a compiled frame
+/// cannot give. The host returns, which is a call. So this is the question that decides whether a
+/// `perform` is compilable at all, and it is a whole-program one: a compiled body can be called
+/// from inside an interpreted `handle`, and what makes the answer sound is that a handler the
+/// program does not declare cannot be the frame above.
+#[test]
+fn a_perform_that_could_reach_a_handler_is_told_apart_from_one_that_reaches_the_host() {
+    let (loaded, _) = unit(
+        "\
+pub nondet effect wire {
+  write recv[s](conn: Int) -> Int
+  write send[s](conn: Int, payload: Int) -> Int
+}
+pub fn caught(c: Int) -> Int = handle {
+  wire.recv[link](c)
+} with {
+  wire.recv[link](h) -> h + 1,
+}
+pub fn celled(n: Int) -> Int = with_cell[tally](n) { c -> cell_get(c) }
+",
+    );
+    let src = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check);
+    let handled = src.stack_handled();
+    assert!(
+        handled.could_reach("wire", "recv", None),
+        "`wire.recv` is handled by a clause in this program and was not seen"
+    );
+    assert!(
+        !handled.could_reach("wire", "send", None),
+        "`wire.send` has no clause anywhere here, so it can only reach the host"
+    );
+    // A cell answers the operations on its brand, so a `perform` naming that resource can find one.
+    assert!(
+        handled.could_reach("db", "get", Some(&Symbol::new("tally"))),
+        "`tally` is a cell's brand in this program and was not seen"
+    );
+    assert!(
+        !handled.could_reach("db", "get", Some(&Symbol::new("elsewhere"))),
+        "`elsewhere` brands no cell here"
+    );
+    // A `simulate` answers `task.*` by opening a region rather than through a clause, so it counts
+    // as reachable however the program is written.
+    assert!(
+        handled.could_reach("task", "spawn", None),
+        "`task.*` is answered by a region and must never be taken for a host call"
+    );
+}

@@ -6,6 +6,11 @@
 untouched, and `harness/` declares its own `[workspace]` so it resolves
 separately. Deleting this directory removes it completely.
 
+`PORT-STATE.md` is the working note for the *emitter* port -- what the two
+differentials say, the two pieces written and switched off with what each costs,
+the release and ordering rules the corpus taught, and the named gaps. Read it
+before touching `emit.ply` or `code.ply`.
+
 It exists to take **one number**. ADR 0020 §6.2 prices a self-hosted front end
 by assuming a multiplier from the lexer spike, and says so in its own words:
 
