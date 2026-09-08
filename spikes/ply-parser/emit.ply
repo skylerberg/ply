@@ -17,7 +17,7 @@
 // `opt.rs`, not of this file.
 
 import spine (num, Ident)
-import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
+import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
 import items (Module, Derived, Item, IFn, ITest, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
 import resolve (Mod, Source, Resolved_, Failed, resolve_modules)
 import derive (expand_derives)
@@ -813,18 +813,32 @@ fn args_owned_typed(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<B
     },
   }
 
-// The slots a lambda copies in, each held once more for the closure.
-fn caps_owned(em: Em, cs: List<Cap>, i: Int, acc: List<Bytes>)
+// The slots a lambda copies in, each held once more for the closure. A parameter the
+// prologue did not open is not in the window and is read as its own word, as a variable
+// read of it is.
+fn caps_owned(em: Em, cs: List<Cap>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes> }> =
   if i >= len(cs) { Some({ em: em, names: acc }) } else {
     match list_at(cs, i) {
       None -> None,
-      Some(c) -> match conv_of(em, c.src) {
-        None -> Some({ em: poison(em, b"a capture this port has not bound"), names: acc }),
-        Some(v) -> {
-          let w = owned(em, v);
-          caps_owned(w.em, cs, i + 1, push(acc, w.v.c))
-        },
+      Some(c) -> {
+        let found = match conv_of(em, c.src) {
+          Some(v) -> Some(v),
+          None -> match list_at(params, c.src) {
+            Some(p) -> match p.k {
+              KBoxed -> Some({ k: KBoxed, c: bytes_concat(b"p", num(c.src)), ty: p.ty }),
+              _ -> None,
+            },
+            None -> None,
+          },
+        };
+        match found {
+          None -> Some({ em: poison(em, b"a capture this port has not bound"), names: acc }),
+          Some(v) -> {
+            let w = owned(em, v);
+            caps_owned(w.em, cs, params, i + 1, push(acc, w.v.c))
+          },
+        }
       },
     }
   }
@@ -837,7 +851,7 @@ fn caps_owned(em: Em, cs: List<Cap>, i: Int, acc: List<Bytes>)
 // carried back out. Emitting it against a copy numbered a second body's
 // constants and builtins from zero.
 fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>, body: Code })
-    -> Option<{ text: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, calls: List<Bytes>, refused: Option<Bytes> }> = {
+    -> Option<{ text: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, refused: Option<Bytes> }> = {
   let n = len(l.caps) + l.params;
   let window = fold(range(0, l.params),
     fold(range(0, len(l.caps)), [], |acc: List<Conv>, i: Int|
@@ -852,10 +866,10 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
   // after what the body met, and what the body met stays in the table the lambda hands back.
   let start = { out: b"", n: 0, conv: window, ind: 0, reads: reads, shapes: em.shapes, built: [],
                 module: em.module, made: [], here: em.here, imports: em.imports, consts: em.consts,
-                ctors: em.ctors, extra: b"", lambdas: [], owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: [], alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused };
+                ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: [], alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused };
   match expr(start, l.body, []) {
     None -> None,
-    Some(o) -> Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, fields: o.em.fields, calls: o.em.calls, refused: o.em.refused,
+    Some(o) -> Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, fields: o.em.fields, lambdas: o.em.lambdas, calls: o.em.calls, refused: o.em.refused,
       text: bytes_concat_all([
       b"Word ply_", name, b"(PlyCtx *ctx",
       fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word q", num(i)])),
@@ -1205,7 +1219,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     // A lambda inside a lambda is refused: the numbering and the naming are the
     // owner's, and nothing here has been checked at that depth.
     NLambda(l) -> if em.owner == b"" { Some(refused(em, b"a lambda inside a lambda")) } else {
-      match caps_owned(em, l.caps, 0, []) {
+      match caps_owned(em, l.caps, params, 0, []) {
         None -> None,
         Some(w) -> {
           // Numbered among this body's lambdas; the code table holds constants' entries too.
@@ -1222,7 +1236,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               let grown = { out: e.out, n: e.n, conv: e.conv, ind: e.ind, reads: e.reads,
                             shapes: sub_out.shapes, built: e.built, module: e.module, made: e.made,
                             here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
-                            extra: bytes_concat(e.extra, sub_out.text), lambdas: e.lambdas,
+                            extra: bytes_concat(e.extra, sub_out.text), lambdas: sub_out.lambdas,
                             owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: sub_out.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused };
               // The closure names its code by the entry's place in the body's table.
               let entry = lambda_of(grown, bytes_concat_all([b"ply_", sub, b"_entry"]));
@@ -1773,11 +1787,10 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
       // A guard is a second test after the pattern binds, and this port does not
       // reach one yet.
       Some(a) -> if a.guard != None { Some(poison(em, b"a match guard")) } else {
-        match pat_test(a.pat, subj, em) {
+        match pat_test(a.pat, subj, indent(line(em, bytes_concat_all([b"if (!", flag, b") {"])))) {
           None -> Some(poison(em, b"a pattern this port cannot test")),
           Some(t) -> {
-            let opened = line(indent(line(em, bytes_concat_all([b"if (!", flag, b") {"]))),
-                              bytes_concat_all([b"if (", t, b") {"]));
+            let opened = line(t.em, bytes_concat_all([b"if (", t.c, b") {"]));
             let inner = indent(opened);
             let bound = pat_bind(inner, a.pat, subj);
             match expr(bound, a.body, params) {
@@ -1797,29 +1810,98 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
   }
 
 // The C condition an arm's pattern is. `1` where the pattern cannot fail.
-fn pat_test(p: CPat, subj: V, em: Em) -> Option<Bytes> =
+// A pattern that cannot fail: the reference's `irrefutable_pat`. A nullary constructor
+// wearing a variable's shape never arrives from the parser, which makes every upper-case bare
+// name in pattern position a constructor, so a variable is irrefutable here.
+fn irrefutable(p: CPat) -> Bool =
+  match p { PxWild -> true, PxVar(_) -> true, _ -> false }
+
+// The C condition an arm's pattern is, and the state after the reads the test itself
+// needs: a nested pattern tests a field held in a local, guarded by the test built so far,
+// because a read of a non-record raises rather than answering. `1` where the pattern cannot
+// fail; `None` for a pattern the reference refuses too.
+fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
   match p {
-    PxWild -> Some(b"1"),
-    PxVar(_) -> Some(b"1"),
+    PxWild -> Some({ em: em, c: b"1" }),
+    PxVar(_) -> Some({ em: em, c: b"1" }),
     PxLit(l) -> match l {
-      LInt(n) -> Some(bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
-                                        b") == INT64_C(", num(n), b") : 0)"])),
+      LInt(n) -> Some({ em: em, c: bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
+                                        b") == INT64_C(", num(n), b") : 0)"]) }),
+      LFixed(_, bits) -> Some({ em: em, c: bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
+                                        b") == INT64_C(", num(bits), b") : 0)"]) }),
+      LBool(b) -> Some({ em: em, c: bytes_concat_all([b"(", subj.c, b" == ", if b { b"ply_true" } else { b"ply_false" }, b")"]) }),
       _ -> None,
     },
-    // A constructor is its tag and its width, over an object rather than an
-    // immediate. Its arguments bind by position, so only the shapes this port
-    // binds are reached: a nested test would need the argument in a local first.
-    PxCtor(c) ->
-      if !fold(c.args, true, |acc: Bool, a: CPat|
-                acc && match a { PxWild -> true, PxVar(_) -> true, _ -> false }) { None }
-      else { match tag_of(em.ctors, c.name, em.module) {
-        None -> None,
-        Some(tag) -> Some(bytes_concat_all([
+    // A constructor is its tag and its width, over an object rather than an immediate. An
+    // argument with a test of its own is read into a local first, under the test so far.
+    PxCtor(c) -> match tag_of(em.ctors, c.name, em.module) {
+      None -> None,
+      Some(tag) -> {
+        let head = bytes_concat_all([
           b"(!ply_is_imm(", subj.c, b") && ply_obj(", subj.c, b")->kind == 4 && ply_obj(",
           subj.c, b")->layout == ", num(tag), b" && ply_obj(", subj.c, b")->len == ",
-          num(len(c.args)), b")"])),
-      } },
-    _ -> None,
+          num(len(c.args)), b")"]);
+        fold(range(0, len(c.args)), Some({ em: em, c: head }),
+          |acc: Option<{ em: Em, c: Bytes }>, k: Int| match acc {
+            None -> None,
+            Some(t) -> match list_at(c.args, k) {
+              None -> None,
+              Some(sub) -> if irrefutable(sub) { Some(t) } else {
+                let field = bind(t.em, KBoxed, bytes_concat_all([
+                  b"(", t.c, b" ? ply_words(", subj.c, b")[", num(k), b"] : 0)"]));
+                match pat_test(sub, field.v, field.em) {
+                  None -> None,
+                  Some(inner) -> Some({ em: inner.em, c: bytes_concat_all([b"(", t.c, b" && ", inner.c, b")"]) }),
+                }
+              },
+            },
+          })
+      },
+    },
+    // Refutable despite the shape: on a value that is not a record, on the field count when
+    // there is no `..`, and on a field the value does not have.
+    PxRecord(r) -> {
+      let head = bytes_concat_all([b"rt_record_fits_p(ctx, ", subj.c, b", ", num(len(r.fields)),
+                                   b", ", if r.rest { b"0" } else { b"1" }, b")"]);
+      fold(r.fields, Some({ em: em, c: head }),
+        |acc: Option<{ em: Em, c: Bytes }>, f: CPatField| match acc {
+          None -> None,
+          Some(t) -> {
+            let idx = field_of(t.em, f.name);
+            let has = bytes_concat_all([b"(", t.c, b" && rt_record_has_p(ctx, ", subj.c, b", @@f", num(idx.i), b"@@))"]);
+            if irrefutable(f.pat) { Some({ em: idx.em, c: has }) } else {
+              let field = bind(idx.em, KBoxed, bytes_concat_all([
+                b"(", has, b" ? rt_field_p(ctx, ", subj.c, b", @@f", num(idx.i), b"@@, 0) : 0)"]));
+              match pat_test(f.pat, field.v, check(field.em)) {
+                None -> None,
+                Some(inner) -> Some({ em: inner.em, c: bytes_concat_all([b"(", has, b" && ", inner.c, b")"]) }),
+              }
+            }
+          },
+        })
+    },
+    // A refutable `..rest` would need the tail built before it could be tested, which is a
+    // list allocated inside a test that may fail; the reference draws the same line.
+    PxList(l) ->
+      if match l.rest { Some(r) -> !irrefutable(r), None -> false } { None } else {
+        let head = bytes_concat_all([b"rt_list_fits_p(ctx, ", subj.c, b", ", num(len(l.items)),
+                                     b", ", match l.rest { Some(_) -> b"0", None -> b"1" }, b")"]);
+        fold(range(0, len(l.items)), Some({ em: em, c: head }),
+          |acc: Option<{ em: Em, c: Bytes }>, i: Int| match acc {
+            None -> None,
+            Some(t) -> match list_at(l.items, i) {
+              None -> None,
+              Some(item) -> if irrefutable(item) { Some(t) } else {
+                let at = bind(t.em, KBoxed, bytes_concat_all([
+                  b"(", t.c, b" ? rt_list_at_p(ctx, ", subj.c, b", ", num(i), b") : 0)"]));
+                match pat_test(item, at.v, check(at.em)) {
+                  None -> None,
+                  Some(inner) -> Some({ em: inner.em, c: bytes_concat_all([b"(", t.c, b" && ", inner.c, b")"]) }),
+                }
+              },
+            },
+          })
+      },
   }
 
 // What the pattern names, bound to the subject. A constructor's argument is a
@@ -1840,14 +1922,30 @@ fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
       let w = bind(acc, KBoxed,
         bytes_concat_all([b"ply_words(", subj.c, b")[", num(i), b"]"]));
       let inc = line(w.em, bytes_concat_all([b"ply_inc(", w.v.c, b");"]));
-      match list_at(c.args, i) {
-        Some(PxVar(v)) -> match v.slot {
-          Some(sl) -> { let held = bind(inc, KBoxed, w.v.c); remember(held.em, sl, held.v) },
-          None -> inc,
-        },
-        _ -> inc,
-      }
+      match list_at(c.args, i) { Some(sub) -> pat_bind(inc, sub, w.v), None -> inc }
     }),
+    // The runtime's read by name answers the field held once more, so there is no
+    // increment to add here.
+    PxRecord(r) -> fold(r.fields, em, |acc: Em, f: CPatField| {
+      let idx = field_of(acc, f.name);
+      let field = bind(idx.em, KBoxed, bytes_concat_all([
+        b"rt_field_p(ctx, ", subj.c, b", @@f", num(idx.i), b"@@, 0)"]));
+      pat_bind(check(field.em), f.pat, field.v)
+    }),
+    PxList(l) -> {
+      let items = fold(range(0, len(l.items)), em, |acc: Em, i: Int| {
+        let at = bind(acc, KBoxed, bytes_concat_all([b"rt_list_at_p(ctx, ", subj.c, b", ", num(i), b")"]));
+        match list_at(l.items, i) { Some(item) -> pat_bind(check(at.em), item, at.v), None -> check(at.em) }
+      });
+      match l.rest {
+        None -> items,
+        Some(r) -> {
+          let tail = bind(items, KBoxed, bytes_concat_all([
+            b"rt_list_rest_p(ctx, ", subj.c, b", ", num(len(l.items)), b")"]));
+          pat_bind(check(tail.em), r, tail.v)
+        },
+      }
+    },
     _ -> em,
   }
 
