@@ -651,19 +651,23 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     //
     // `std.router.name_fault` was here for the same reason and is gone: recognising a record
     // update in the lowering was the refusal it was a symptom of.
-    // Nine, in three groups.
+    // Twelve, in three groups.
     //
     // Four `std.hash` bodies want the *other* half of deferring, above: a record whose every read
     // is answered from the built table is never materialised, and the local it would land in is
     // declared at the top of the body. `Word t81 = 0;` is that local.
     //
-    // Four release an update's base -- or a let-bound record's -- where the port does not:
-    // `agreement.memory_step`, `std.db.collect_tuple`, `std.http.absorb` and
-    // `std.http.method_not_allowed`. `std.hash.round` reads declared `U32` fields at their width
-    // where the port reads words; the port carries one width and the reference six.
+    // Seven release a record -- an update's base, a let-bound one, a parameter before the result
+    // is built -- where the port does not: `agreement.memory_step`, `std.db.collect_tuple`, the
+    // three `std.fs.mem_*`, `std.http.absorb` and `std.http.method_not_allowed`. One family, and
+    // the next pass. `std.hash.round` reads declared `U32` fields at their width where the port
+    // reads words; the port carries one width and the reference six.
     let expected_gaps = [
         "agreement.memory_step",
         "std.db.collect_tuple",
+        "std.fs.mem_remove",
+        "std.fs.mem_rename",
+        "std.fs.mem_write",
         "std.hash.first8",
         "std.hash.full_words",
         "std.hash.padded_words",
@@ -681,7 +685,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
     // more than a body. It has since risen well past that.
     assert!(
-        reached >= 789,
+        reached >= 842,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );
@@ -821,6 +825,9 @@ fn the_ports_tables_agree_with_the_references_wherever_its_text_does() {
         [
             "agreement.memory_step",
             "std.db.collect_tuple",
+            "std.fs.mem_remove",
+            "std.fs.mem_rename",
+            "std.fs.mem_write",
             "std.hash.first8",
             "std.hash.full_words",
             "std.hash.padded_words",
@@ -980,6 +987,30 @@ fn the_census_of_what_keeps_the_port_out() {
     for (n, reason, names) in &reasons {
         let sample: Vec<&str> = names.iter().take(3).map(String::as_str).collect();
         println!("    {n:5}  {reason}  e.g. {}", sample.join(", "));
+    }
+    // `PLY_EMIT_DIFF_DETAIL=<head>` prints what follows the `: ` of every reason with that head,
+    // counted: which operator, which field, which name.
+    if let Ok(head) = std::env::var("PLY_EMIT_DIFF_DETAIL") {
+        let mut detail: std::collections::BTreeMap<String, usize> = Default::default();
+        for line in project.refusals_in(&names, &texts, &ctors).lines() {
+            let Some((name, why)) = line.split_once(" :: ") else {
+                continue;
+            };
+            if !expected.contains_key(name) {
+                continue;
+            }
+            if let Some((h, rest)) = why.split_once(": ")
+                && h == head
+            {
+                *detail.entry(rest.to_string()).or_default() += 1;
+            }
+        }
+        let mut rows: Vec<(usize, String)> = detail.into_iter().map(|(d, n)| (n, d)).collect();
+        rows.sort_by(|a, b| b.cmp(a));
+        println!("  `{head}`, by what follows it:");
+        for (n, d) in rows.iter().take(25) {
+            println!("    {n:5}  {d}");
+        }
     }
     println!("  of the unreached functions, those holding:");
     for (what, n) in &with {
