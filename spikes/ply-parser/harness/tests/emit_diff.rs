@@ -587,14 +587,60 @@ fn backend_args() -> Vec<String> {
 /// only fall.
 #[test]
 fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
-    let inputs = shipped();
+    let (reached, agreeing, differ) = resolved_against_reference("shipped", shipped());
+    // Lowered once, on purpose, from 279 to 278, when the `if` join stopped guessing: where the
+    // two arms answer different kinds the reference reads the checker's type and this port cannot,
+    // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
+    // more than a body. It has since risen well past that.
+    assert!(
+        reached >= 1282,
+        "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
+         for a refusal that is more correct than what it replaces"
+    );
+    assert!(
+        agreeing >= 1282,
+        "{agreeing} shipped bodies resolve to the reference's C -- raise this when it grows"
+    );
+    // Nothing disagrees. Raise this only for a body that is right by the audit and slower on
+    // purpose, and name the reason beside it.
+    assert!(
+        differ.is_empty(),
+        "{} shipped bodies disagree with the reference -- lower this when they close, and raise \
+         it only for a body that is right by the audit and slower on purpose",
+        differ.len()
+    );
+}
+
+/// The emitter's own sources, ratcheted on their own: the bootstrap runs what the port emits
+/// for them, and the audit of the emitter's tests under the tier is what says the differences
+/// still open are benign, which the floor below records rather than the emptiness the shipped
+/// corpus reached.
+#[test]
+fn the_port_resolves_its_own_sources_to_the_references_c() {
+    let (reached, agreeing, differ) = resolved_against_reference("emitter", emitter_sources());
+    assert!(
+        reached >= 2494,
+        "the port emitted {reached} of its own bodies -- raise this when it grows"
+    );
+    assert!(
+        agreeing >= 2261,
+        "{agreeing} of the port's own bodies resolve to the reference's C -- raise this when it \
+         grows, and never lower it"
+    );
+    println!("  {} of the port's own bodies still differ", differ.len());
+}
+
+fn resolved_against_reference(
+    label: &str,
+    inputs: Vec<(String, String)>,
+) -> (usize, usize, Vec<String>) {
     let expected = ply_parser_spike_harness::reference_emit_encoded(&inputs);
     assert!(
         expected.len() > 500,
         "the reference emitted only {} bodies, so this proves little",
         expected.len()
     );
-    let project = Project::new("shipped");
+    let project = Project::new(label);
     let texts: Vec<Vec<u8>> = inputs.iter().map(|(_, t)| t.as_bytes().to_vec()).collect();
     let names: Vec<String> = inputs.iter().map(|(n, _)| n.clone()).collect();
     let ctors = ply_parser_spike_harness::reference_ctors(&inputs);
@@ -621,7 +667,7 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
         }
     }
     println!(
-        "  the shipped corpus: the port emits {reached} of the {} bodies the reference does, \
+        "  {label}: the port emits {reached} of the {} bodies the reference does, \
          {agreeing} resolving to the reference's C",
         expected.len()
     );
@@ -638,27 +684,7 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
         }
     }
     println!("  disagreeing: {}", differ.join(" "));
-    // Lowered once, on purpose, from 279 to 278, when the `if` join stopped guessing: where the
-    // two arms answer different kinds the reference reads the checker's type and this port cannot,
-    // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
-    // more than a body. It has since risen well past that.
-    assert!(
-        reached >= 1282,
-        "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
-         for a refusal that is more correct than what it replaces"
-    );
-    assert!(
-        agreeing >= 1282,
-        "{agreeing} shipped bodies resolve to the reference's C -- raise this when it grows"
-    );
-    // Nothing disagrees. Raise this only for a body that is right by the audit and slower on
-    // purpose, and name the reason beside it.
-    assert!(
-        differ.is_empty(),
-        "{} shipped bodies disagree with the reference -- lower this when they close, and raise \
-         it only for a body that is right by the audit and slower on purpose",
-        differ.len()
-    );
+    (reached, agreeing, differ)
 }
 
 /// `body <name> <n>\n` and then `n` bytes, repeated: the framing the C tier's producer reads.
@@ -951,13 +977,23 @@ fn the_census_of_what_keeps_the_port_out() {
 
 /// The shipped standard library and examples, named as the reference names them.
 fn shipped() -> Vec<(String, String)> {
+    corpus(&["crates/ply-std/ply", "examples"])
+}
+
+/// The emitter's own sources: the bootstrap builds the emitter from what it emits for them, so
+/// a body of its own the port emits wrongly is a bug the bootstrap runs.
+fn emitter_sources() -> Vec<(String, String)> {
+    corpus(&["crates/ply-std/ply", "spikes/ply-parser"])
+}
+
+fn corpus(dirs: &[&str]) -> Vec<(String, String)> {
     let root = source_dir()
         .parent()
         .and_then(std::path::Path::parent)
         .expect("the spike sits two levels under the repository root")
         .to_path_buf();
     let mut out = Vec::new();
-    for dir in ["crates/ply-std/ply", "examples"] {
+    for dir in dirs {
         let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
             continue;
         };

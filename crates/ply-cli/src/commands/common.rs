@@ -211,10 +211,19 @@ pub(crate) fn install_producer_from_env() {
             let source: &'static ply_codegen::Source = Box::leak(Box::new(
                 ply_codegen::Source::keyed(program, resolved, check, keys),
             ));
-            let names: Vec<String> = source.functions();
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            let (native, _refused) =
-                ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?;
+            // The emitter is built from its bootstrap bundle when the directory holds one, and
+            // by the reference emitter otherwise or when `PLY_C_BOOTSTRAP=off` asks for the
+            // reference, which is how a bundle is refreshed.
+            let bundle = dir.join("bootstrap");
+            let from_bundle = ply_codegen::c::bundle::exists(&bundle)
+                && std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off");
+            let (native, _refused) = if from_bundle {
+                ply_codegen::c::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?
+            } else {
+                let names: Vec<String> = source.functions();
+                let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+                ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?
+            };
             ply_codegen::c::producer::PlyProducer::new(native).map_err(|e| format!("{e:#}"))
         }),
         identity,

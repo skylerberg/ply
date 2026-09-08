@@ -25,6 +25,7 @@
 //! | `PLY_CC_OPT` | the optimisation flag it is given, overriding the profile's | `load.rs` |
 //! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
 //! | `PLY_C_EMITTER` | `ply:<dir>` makes the Ply emitter in `<dir>` this tier's producer, body by body, with this emitter as the fallback (ADR 0042); the driver builds it | `producer.rs` |
+//! | `PLY_C_BOOTSTRAP` | `off` builds the Ply emitter with the reference emitter instead of from `spikes/ply-parser/bootstrap`, the bundle of the C it last emitted for itself; the fixpoint test in `crates/ply-codegen-tests` is what says the bundle serves, and `PLY_C_BOOTSTRAP_REFRESH=1` on that test rewrites it | `bundle.rs` |
 //! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
 //!
 //! Two things a fourteenth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
@@ -35,14 +36,15 @@
 //! depth was served bodies emitted at another.
 
 mod build;
-mod cache;
+pub mod bundle;
+pub mod cache;
 mod emit;
 mod load;
 mod prelude;
 pub mod producer;
 mod toolchain;
 
-pub use build::{Native, build, emit_body, emit_body_encoded, emit_unit};
+pub use build::{Native, build, emit_body, emit_body_encoded, emit_unit, emit_unit_record};
 pub use load::Library;
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
 pub use toolchain::{Profile, select as select_profile};

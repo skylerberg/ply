@@ -17,7 +17,7 @@
 // `opt.rs`, not of this file.
 
 import spine (num, Ident)
-import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
+import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, CPatField, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CLetPat, CDo, pat_slots, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
 import items (IEffect, OpDef, Module, Derived, Item, IFn, ITest, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
 import resolve (Mod, Source, Resolved_, Failed, resolve_modules, Resolved, Scope, Binding, ModBind)
 import derive (expand_derives)
@@ -677,6 +677,7 @@ fn slots_read(c: Code) -> List<Int> =
     NBlock(b) -> concat(
       fold(b.stmts, [], |acc: List<Int>, st: CStmt| concat(acc, match st {
         CLet(l) -> slots_read(l.value),
+        CLetPat(l) -> slots_read(l.value),
         CDo(d) -> slots_read(d.code),
       })),
       match b.tail { Some(t) -> slots_read(t), None -> [] }),
@@ -733,17 +734,30 @@ fn const_of(em: Em, l: Lit) -> { em: Em, i: Int } =
 // A capital first letter, after any module binder.
 // The tag a constructor takes: its position in the table, found by the name the
 // occurrence wrote. A bare name is this module's; a qualified one names another.
-fn tag_of(ctors: List<Bytes>, name: Bytes, module: Bytes) -> Option<Int> = {
+// A constructor's tag: the module's own, a qualified one, or one an import brought in bare.
+fn tag_of(em: Em, name: Bytes) -> Option<Int> = {
   let want = match qualified(name) {
-    Some(q) -> bytes_concat_all([b"std.", q.binder, b".", q.name]),
-    None -> bytes_concat_all([module, b".", name]),
+    Some(q) -> match from_import(em.imports, q.binder) {
+      Some(imp) -> bytes_concat_all([imp.module, b".", q.name]),
+      None -> bytes_concat_all([b"std.", q.binder, b".", q.name]),
+    },
+    None -> bytes_concat_all([em.module, b".", name]),
   };
+  match ctor_index(em.ctors, want, name) {
+    Some(t) -> Some(t),
+    None -> fold(em.imports, None, |acc: Option<Int>, imp: Imported| match acc {
+      Some(_) -> acc,
+      None -> ctor_index(em.ctors, bytes_concat_all([imp.module, b".", name]), b""),
+    }),
+  }
+}
+
+fn ctor_index(ctors: List<Bytes>, want: Bytes, bare: Bytes) -> Option<Int> =
   fold(range(0, len(ctors)), None, |acc: Option<Int>, i: Int|
     match list_at(ctors, i) {
-      Some(c) -> if c == want || c == name { Some(i) } else { acc },
+      Some(c) -> if c == want || (bare != b"" && c == bare) { Some(i) } else { acc },
       None -> acc,
     })
-}
 
 fn is_ctor_name(name: Bytes) -> Bool = {
   let bare = match qualified(name) { Some(q) -> q.name, None -> name };
@@ -872,9 +886,9 @@ fn iterate_call(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Optio
 // that answers `Stop` or `Continue` directly in every arm is written as the loop's own
 // assignments; any other body is called and its answer's tag is tested.
 fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: List<Cap>, body: Code }, params: List<P>) -> Option<Out> =
-  match tag_of(em.ctors, b"Stop", em.module) {
+  match tag_of(em, b"Stop") {
     None -> Some(refused(em, b"`iterate` with no `Stop` and `Continue` in the program")),
-    Some(stop) -> match tag_of(em.ctors, b"Continue", em.module) {
+    Some(stop) -> match tag_of(em, b"Continue") {
       None -> Some(refused(em, b"`iterate` with no `Stop` and `Continue` in the program")),
       Some(go) -> match list_at(args, 0) {
         None -> None,
@@ -965,8 +979,8 @@ fn fusable_step(em: Em, c: Code) -> Bool =
     NApp(a) -> len(a.args) == 1 && match a.func.node {
       NVar(fv) -> match fv.slot {
         Some(_) -> false,
-        None -> is_ctor_name(fv.name) && match tag_of(em.ctors, fv.name, em.module) {
-          Some(t) -> Some(t) == tag_of(em.ctors, b"Stop", em.module) || Some(t) == tag_of(em.ctors, b"Continue", em.module),
+        None -> is_ctor_name(fv.name) && match tag_of(em, fv.name) {
+          Some(t) -> Some(t) == tag_of(em, b"Stop") || Some(t) == tag_of(em, b"Continue"),
           None -> false,
         },
       },
@@ -987,7 +1001,7 @@ fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, p
         None -> None,
         Some(v) -> {
           let w = word_of(v.em, v.v);
-          let which = match a.func.node { NVar(fv) -> tag_of(em.ctors, fv.name, em.module), _ -> None };
+          let which = match a.func.node { NVar(fv) -> tag_of(em, fv.name), _ -> None };
           if which == Some(stop) {
             Some(line(line(w.em, bytes_concat_all([answer, b" = ", w.c, b";"])), b"break;"))
           } else {
@@ -1739,7 +1753,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       // A global. A nullary constructor is the one this port answers: it is a
       // singleton the runtime holds, not a call.
       None -> if is_ctor_name(v.name) {
-        match tag_of(em.ctors, v.name, em.module) {
+        match tag_of(em, v.name) {
           None -> Some(refused(em, bytes_concat(b"a constructor not in the table: ", v.name))),
           Some(tag) -> {
             let o = bind(em, KBoxed, bytes_concat_all([b"rt_nullary_p(ctx, ", num(tag), b")"]));
@@ -1836,7 +1850,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     // block binds its tail even when it holds no statements, which is why an
     // `if` branch shows a rename the branch itself did not ask for.
     NBlock(bl) -> match bl.tail {
-      None -> Some(refused(em, b"a block with no tail")),
+      // A block with no tail is its statements, and its value is the unit.
+      None -> match stmts(em, bl.stmts, params, 0) {
+        None -> None,
+        Some(after) -> Some(bind(withtail(after, em.tail), KBoxed, b"ply_unit")),
+      },
       Some(t) -> match stmts(em, bl.stmts, params, 0) {
         None -> None,
         // The statements are not tails and cleared the flag; the block's tail is one when the
@@ -2096,7 +2114,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       NVar(fv) -> match fv.slot {
         Some(_) -> call_value(em, a.func, a.args, params),
         None -> if is_ctor_name(fv.name) {
-        match tag_of(em.ctors, fv.name, em.module) {
+        match tag_of(em, fv.name) {
           None -> Some(refused(em, bytes_concat(b"a constructor not in the table: ", fv.name))),
           Some(tag) -> match items(em, a.args, params, 0, []) {
             None -> None,
@@ -2606,6 +2624,16 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
             stmts(remember(b.em, l.slot, b.v), xs, params, i + 1)
           },
         },
+        // The value is held as a word and the pattern's names are bound from it, as an arm's are;
+        // a `let` pattern is irrefutable, so there is no test.
+        CLetPat(l) -> match expr(notail(em), l.value, params) {
+          None -> None,
+          Some(o) -> {
+            let w = word_of(o.em, o.v);
+            let held = bind(w.em, KBoxed, w.c);
+            stmts(pat_bind(held.em, l.pat, held.v), xs, params, i + 1)
+          },
+        },
         CDo(d) -> match expr(notail(em), d.code, params) {
           None -> None,
           Some(o) -> stmts(line(o.em, bytes_concat_all([b"(void)(", as_word(o.v), b");"])), xs, params, i + 1),
@@ -2672,7 +2700,7 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
     },
     // A constructor is its tag and its width, over an object rather than an immediate. An
     // argument with a test of its own is read into a local first, under the test so far.
-    PxCtor(c) -> match tag_of(em.ctors, c.name, em.module) {
+    PxCtor(c) -> match tag_of(em, c.name) {
       None -> None,
       Some(tag) -> {
         let head = bytes_concat_all([
@@ -3424,6 +3452,8 @@ fn widths_in(c: Code, env: List<Shaped>, here: List<Def>, reads: List<Int>) -> L
         |acc: { env: List<Shaped>, ws: List<Int> }, st: CStmt| match st {
           CLet(l) -> { env: push(acc.env, { slot: l.slot, ty: ty_of(acc.env, here, l.value) }),
                        ws: merge_widths(acc.ws, widths_in(l.value, acc.env, here, reads)) },
+          CLetPat(l) -> { env: fold(pat_slots(l.pat), acc.env, |e: List<Shaped>, sl: Int| push(e, { slot: sl, ty: TyOpen })),
+                          ws: merge_widths(acc.ws, widths_in(l.value, acc.env, here, reads)) },
           CDo(d) -> { env: acc.env, ws: merge_widths(acc.ws, widths_in(d.code, acc.env, here, reads)) },
         });
       merge_widths(walked.ws,
@@ -3686,6 +3716,7 @@ fn walk_handles(c: Code, effects: List<EffectName>) -> List<Bytes> = {
     NBlock(b) -> {
       let stmts = fold(b.stmts, [], |acc: List<Bytes>, st: CStmt| match st {
         CLet(l) -> here(acc, l.value),
+        CLetPat(l) -> here(acc, l.value),
         CDo(d) -> here(acc, d.code),
       });
       match b.tail { Some(t) -> here(stmts, t), None -> stmts }

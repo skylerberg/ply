@@ -273,6 +273,8 @@ fn the_lowering_agrees_with_ply_eval_wherever_the_port_reaches() {
         ("stdlib", repo_root().join("crates/ply-std/ply")),
         ("examples", repo_root().join("examples")),
         ("fixtures", spike_dir().join("fixtures")),
+        // The emitter's own sources: the bootstrap builds the emitter from what it emits for them.
+        ("emitter", spike_dir()),
     ] {
         let (r, a, c) = compare(label, &files_in(&dir));
         reached += r;
@@ -287,14 +289,14 @@ fn the_lowering_agrees_with_ply_eval_wherever_the_port_reaches() {
     // which nothing verified; they now meet, and the second is the one that means anything.
     println!("  the port reaches {reached} of {available} function bodies, {compared} compared");
     assert!(
-        compared >= 1179,
-        "the port was compared on {compared} bodies, and it was 1073 when this was written -- \
-         raise this number when the port grows, and never lower it"
+        compared >= 2668,
+        "the port was compared on {compared} bodies, and it was 2668 when the emitter's own \
+         sources joined the corpus -- raise this number when the port grows, and never lower it"
     );
     assert!(
-        reached >= 1179,
-        "the port lowered {reached} of {available} bodies, and it reached 1179 when this was \
-         written -- raise this number when the port grows, and never lower it"
+        reached >= 2668,
+        "the port lowered {reached} of {available} bodies, and it reached 2668 when the emitter's \
+         own sources joined the corpus -- raise this number when the port grows, and never lower it"
     );
 }
 
