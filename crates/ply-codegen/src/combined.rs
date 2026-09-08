@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 /// The interpreter and the compiled unit over one program.
 pub struct Combined {
-    interp: &'static Interpreter,
+    interp: &'static Interpreter<'static>,
     unit: &'static Unit,
 }
 
