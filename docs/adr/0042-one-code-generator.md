@@ -119,6 +119,11 @@ behind an instrument that already exists.
 1. **This record.** One code generator.
 2. **The Ply emitter as the C backend's producer**, behind a flag, ratcheted on
    the suite passing under it rather than on bytes agreeing with `c/emit.rs`.
+   **Built:** `PLY_C_EMITTER=ply:<dir>` installs it, `c/producer.rs` is the
+   seam, and it answers a body as the pair the reference does -- the C and the
+   tables it names -- in the cache's own encoding, so a body the port answers
+   and a body the reference answers are kept and resolved alike. The
+   differential compares that pair now, not the text alone.
    The byte-exact differential was the right instrument for every front-end
    stage because a syntax tree's canonical dump is a semantic form; C text is
    not, and the six "release rules" the byte-exact chase found were heuristics

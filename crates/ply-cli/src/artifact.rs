@@ -1019,6 +1019,7 @@ fn evaluate(
             &opened.resolved,
             &opened.check,
             &Default::default(),
+            Default::default(),
         )?;
         machine.set_compiled(provider.attach(&spec));
     }

@@ -24,6 +24,7 @@
 //! | `PLY_CC` | the C compiler to shell out to, overriding the profile's | `load.rs` |
 //! | `PLY_CC_OPT` | the optimisation flag it is given, overriding the profile's | `load.rs` |
 //! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
+//! | `PLY_C_EMITTER` | `ply:<dir>` makes the Ply emitter in `<dir>` this tier's producer, body by body, with this emitter as the fallback (ADR 0042); the driver builds it | `producer.rs` |
 //! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
 //!
 //! Two things a fourteenth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
@@ -38,9 +39,10 @@ mod cache;
 mod emit;
 mod load;
 mod prelude;
+pub mod producer;
 mod toolchain;
 
-pub use build::{Native, build, emit_body, emit_unit};
+pub use build::{Native, build, emit_body, emit_body_encoded, emit_unit};
 pub use load::Library;
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
 pub use toolchain::{Profile, select as select_profile};

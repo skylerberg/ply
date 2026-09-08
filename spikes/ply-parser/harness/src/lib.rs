@@ -1837,6 +1837,43 @@ pub fn reference_builtins() -> Vec<String> {
         .collect()
 }
 
+/// Every body the reference emits, as the cache encodes it -- text and tables -- by program-wide
+/// name. What the port has to produce to stand in for the reference, so the differential compares
+/// this and not the text alone.
+pub fn reference_emit_encoded(
+    modules: &[(String, String)],
+) -> std::collections::BTreeMap<String, String> {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (module, _) =
+            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        program.modules.push(module);
+    }
+    let mut out = std::collections::BTreeMap::new();
+    if !ply_derive::expand_program(&mut program).is_empty() {
+        return out;
+    }
+    let Ok(resolved) = ply_syntax::resolve::resolve(&mut program) else {
+        return out;
+    };
+    let Ok(check) = ply_core::check_program(&program, &resolved) else {
+        return out;
+    };
+    let source: &'static ply_codegen::Source = Box::leak(Box::new(ply_codegen::Source::new(
+        Box::leak(Box::new(program)),
+        Box::leak(Box::new(resolved)),
+        Box::leak(Box::new(check)),
+    )));
+    for name in source.functions() {
+        if let Ok(enc) = ply_codegen::c::emit_body_encoded(source, &name, INLINING) {
+            out.insert(name, enc);
+        }
+    }
+    out
+}
+
 pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
     let mut program = Program {
         modules: Vec::new(),

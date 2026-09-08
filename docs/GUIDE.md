@@ -1764,7 +1764,10 @@ profiler and a disassembler can both read what a definition became.
 `PLY_C_REFUSALS=1` says which definitions the tier declined and why, since a
 definition the tier refuses is left to the machine. The emitted bodies and the
 built unit are both cached under `PLY_C_CACHE`, so a warm run compiles nothing
-and an edit recompiles one unit.
+and an edit recompiles one unit. `PLY_C_EMITTER=ply:<dir>` makes the emitter
+written in Ply in `<dir>` the tier's producer, body by body, with the built-in
+emitter answering whatever it does not reach; `PLY_C_REFUSALS=1` then also says
+how many bodies it answered.
 
 A run with a backend attached does use the result cache, in a namespace of its
 own. A stored pass names the engine that earned it, so a backed run selects
