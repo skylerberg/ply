@@ -150,7 +150,7 @@ pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>
 // reads through the runtime.
 // `pure` is the checker's word: an empty footprint and no constraint, which is what lets a
 // nullary call be answered from the constant table.
-pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool }
+pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool, arity: Int }
 
 // A name another module exports and this one brought in by name. An imported
 // name lowers to a bare global, indistinguishable from a builtin, so the module's
@@ -596,12 +596,68 @@ fn is_pure(here: List<Def>, name: Bytes) -> Bool =
 // The list is read through `rt_list_at_p` and its length through the *builtin*,
 // not through the inline length beside it -- the fused loop asks the same
 // question a different way, and matching means asking it the reference's way.
+// A definition of arity two that `f` names directly, with the C function it became: a fold
+// over one calls it straight, with no closure and no dispatch. The reference also asks
+// whether the unit took the definition; a body naming one the unit does not hold is refused
+// at the seam, so the answer here is the same.
+fn nameable_step(em: Em, f: Code) -> Option<{ full: Bytes, c: Bytes }> =
+  match f.node {
+    NVar(fv) -> match fv.slot {
+      Some(_) -> None,
+      None -> if is_ctor_name(fv.name) { None } else {
+        let target = match qualified(fv.name) {
+          Some(q) -> match from_import(em.imports, q.binder) {
+            Some(imp) -> Some({ module: imp.module, name: q.name, defs: imp.defs }),
+            None -> None,
+          },
+          None -> if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name)
+                  { Some({ module: em.module, name: fv.name, defs: em.here }) }
+                  else { match from_import(em.imports, fv.name) {
+                    Some(imp) -> Some({ module: imp.module, name: fv.name, defs: imp.defs }),
+                    None -> None,
+                  } },
+        };
+        match target {
+          None -> None,
+          Some(t) -> if fold(t.defs, false, |acc: Bool, d: Def| acc || (d.name == t.name && d.arity == 2)) {
+            Some({ full: bytes_concat_all([t.module, b".", t.name]),
+                   c: bytes_concat_all([b"ply_", mangle(t.module), b"_", t.name]) })
+          } else { None },
+        }
+      },
+    },
+    _ -> None,
+  }
+
+// `iterate` over a one-parameter lambda is the loop the reference emits into the body, which
+// this port has not read; over anything else it is the runtime's helper, as the reference
+// calls it.
+fn iterate_call(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
+  if name != b"iterate" || len(args) != 3 { None } else {
+    match list_at(args, 2) {
+      None -> None,
+      Some(f) -> match f.node {
+        NLambda(l) -> if l.params == 1 { None } else { helper_call(em, b"rt_iterate_p", args, params) },
+        _ -> helper_call(em, b"rt_iterate_p", args, params),
+      },
+    }
+  }
+
+fn helper_call(em: Em, helper: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
+  match args_one_pass(em, args, params, 0, []) {
+    None -> None,
+    Some(w) -> {
+      let o = bind(w.em, KBoxed, bytes_concat_all([helper, b"(ctx",
+        fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])), b")"]));
+      Some({ em: check(o.em), v: o.v })
+    },
+  }
+
 fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
   if name != b"fold" || len(args) != 3 { None } else {
     match list_at(args, 2) {
       None -> None,
-      Some(f) -> match f.node {
-        NLambda(_) -> match list_at(args, 0) {
+      Some(f) -> match list_at(args, 0) {
           None -> None,
           Some(xs) -> match list_at(args, 1) {
             None -> None,
@@ -616,43 +672,59 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
                 let raw = bind(bi.em, KBoxed, bytes_concat_all([
                   b"rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)", arr.name, b", 1)"]));
                 let n = bind(check(raw.em), KInt, as_int(raw.v));
-                match expr(notail(n.em), f, params) {
+                // A function the unit compiled is called straight, per element. Anything else
+                // is held as a value, evaluated once outside the loop rather than per element:
+                // `rt_call` takes its callee, so each iteration hands it a count of its own and
+                // the loop lets go of the last one at the end.
+                let step = nameable_step(n.em, f);
+                let held = match step {
+                  Some(_) -> Some({ em: n.em, v: { k: KBoxed, c: b"", ty: TyOpen } }),
+                  None -> match expr(notail(n.em), f, params) {
+                    None -> None,
+                    Some(cl) -> Some(owned(cl.em, cl.v)),
+                  },
+                };
+                match held {
                   None -> None,
-                  Some(cl) -> {
-                    let co = owned(cl.em, cl.v);
-                    match expr(notail(co.em), init, params) {
-                      None -> None,
-                      Some(iv) -> {
-                        // The accumulator's word, *not* held once more: the loop
-                        // hands it to the closure and takes back what the closure
-                        // answers, so the count it starts with is the one it ends
-                        // with.
-                        let acc = bind_word(iv.em, iv.v);
-                        let i = bind(acc.em, KInt, b"0");
-                        let head = line(i.em, bytes_concat_all([
-                          b"for (; ", i.v.c, b" < ", n.v.c, b"; ", i.v.c, b" += 1) {"]));
-                        let at = bind(indent(head), KBoxed, bytes_concat_all([
-                          b"rt_list_at_p(ctx, ", lo.v.c, b", ", i.v.c, b")"]));
-                        let a2 = fresh(check(at.em));
-                        let call = line(
-                          line(line(a2.em, bytes_concat_all([
-                            b"Word ", a2.name, b"[] = {", acc.v.c, b", ", at.v.c, b"};"])),
-                            bytes_concat_all([b"ply_inc(", co.v.c, b");"])),
-                          bytes_concat_all([acc.v.c, b" = rt_call_p(ctx, ", co.v.c,
-                                            b", (Word)(intptr_t)", a2.name, b", 2);"]));
-                        let done = line(outdent(check(call)), b"}");
-                        Some({ em: line(line(done, bytes_concat_all([b"ply_dec(ctx, ", co.v.c, b");"])),
-                                        bytes_concat_all([b"ply_dec(ctx, ", lo.v.c, b");"])),
-                               v: acc.v })
-                      },
-                    }
+                  Some(co) -> match expr(notail(co.em), init, params) {
+                    None -> None,
+                    Some(iv) -> {
+                      // The accumulator's word, *not* held once more: the loop
+                      // hands it to the closure and takes back what the closure
+                      // answers, so the count it starts with is the one it ends
+                      // with.
+                      let acc = bind_word(iv.em, iv.v);
+                      let i = bind(acc.em, KInt, b"0");
+                      let head = line(i.em, bytes_concat_all([
+                        b"for (; ", i.v.c, b" < ", n.v.c, b"; ", i.v.c, b" += 1) {"]));
+                      let at = bind(indent(head), KBoxed, bytes_concat_all([
+                        b"rt_list_at_p(ctx, ", lo.v.c, b", ", i.v.c, b")"]));
+                      let call = match step {
+                        Some(d) -> line(note_call(check(at.em), d.full), bytes_concat_all([
+                          acc.v.c, b" = ", d.c, b"(ctx, ", acc.v.c, b", ", at.v.c, b");"])),
+                        None -> {
+                          let a2 = fresh(check(at.em));
+                          line(
+                            line(line(a2.em, bytes_concat_all([
+                              b"Word ", a2.name, b"[] = {", acc.v.c, b", ", at.v.c, b"};"])),
+                              bytes_concat_all([b"ply_inc(", co.v.c, b");"])),
+                            bytes_concat_all([acc.v.c, b" = rt_call_p(ctx, ", co.v.c,
+                                              b", (Word)(intptr_t)", a2.name, b", 2);"]))
+                        },
+                      };
+                      let done = line(outdent(check(call)), b"}");
+                      let freed = match step {
+                        Some(_) -> done,
+                        None -> line(done, bytes_concat_all([b"ply_dec(ctx, ", co.v.c, b");"])),
+                      };
+                      Some({ em: line(freed, bytes_concat_all([b"ply_dec(ctx, ", lo.v.c, b");"])),
+                             v: acc.v })
+                    },
                   },
                 }
               },
             },
           },
-        },
-        _ -> None,
       },
     }
   }
@@ -667,6 +739,7 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
 fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
   if name == b"bytes_at" && len(args) == 2 { inline_at(em, args, params, false) }
   else if name == b"bytes_u32_le" && len(args) == 2 { inline_at(em, args, params, true) }
+  else if name == b"bytes_concat_all" && len(args) == 1 { inline_join(em, args, params) }
   else if len(args) != 1 { None }
   else if name != b"len" && name != b"bytes_len" { None }
   else { match list_at(args, 0) {
@@ -679,7 +752,7 @@ fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
           TyBytes -> name == b"bytes_len",
           _ -> false,
         };
-        if !fits { None } else {
+        if !fits { Some(kind_tested(o.em, name, o.v, None)) } else {
           let t = bind(o.em, KBoxed, as_word(o.v));
           Some(bind(t.em, KInt, bytes_concat_all([b"(int64_t)ply_obj(", t.v.c, b")->len"])))
         }
@@ -687,10 +760,79 @@ fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
     },
   } }
 
+// `len`, `bytes_len` or `bytes_at` over a value whose kind the declaration does not fix: a
+// kind test, with the header's own field (or the byte, under a bounds test) in the fast arm
+// and the runtime's call in the slow one -- which is where a value of the wrong kind is
+// caught, with the interpreter's own diagnostic.
+fn kind_tested(em: Em, name: Bytes, v: V, index: Option<V>) -> Out = {
+  let t = bind(em, KBoxed, as_word(v));
+  let out = fresh(t.em);
+  let o1 = line(out.em, bytes_concat_all([b"int64_t ", out.name, b" = 0;"]));
+  let ok = fresh(o1);
+  let kind = if name == b"len" { b"5" } else { b"10" };
+  let o2 = line(ok.em, bytes_concat_all([b"int ", ok.name, b" = (!ply_is_imm(", t.v.c, b") && ",
+    t.v.c, b" != 0 && ply_obj(", t.v.c, b")->kind == ", kind, b");"]));
+  let body = match index {
+    Some(iv) -> {
+      let idx = bind(o2, KInt, as_int(iv));
+      let opened = line(idx.em, bytes_concat_all([b"if (", ok.name, b" && (uint64_t)", idx.v.c,
+        b" < (uint64_t)ply_obj(", t.v.c, b")->len) { ", out.name,
+        b" = (int64_t)((unsigned char *)ply_words(", t.v.c, b"))[", idx.v.c, b"]; } else {"]));
+      let bi = builtin_of(indent(opened), name);
+      let a0 = fresh(bi.em);
+      line(line(line(line(line(line(a0.em,
+        bytes_concat_all([b"Word ", a0.name, b"[2];"])),
+        bytes_concat_all([a0.name, b"[0] = ", t.v.c, b"; ply_inc(", a0.name, b"[0]);"])),
+        bytes_concat_all([a0.name, b"[1] = (ply_fits_imm(", idx.v.c, b") ? ply_imm(", idx.v.c,
+                          b") : rt_box_int_p(ctx, ", idx.v.c, b"));"])),
+        bytes_concat_all([b"Word r = rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)", a0.name, b", 2);"])),
+        b"if (ctx->failed) return 0;"),
+        bytes_concat_all([out.name, b" = ply_imm_value(r);"]))
+    },
+    None -> {
+      let opened = line(o2, bytes_concat_all([b"if (", ok.name, b") { ", out.name,
+        b" = (int64_t)ply_obj(", t.v.c, b")->len; } else {"]));
+      let bi = builtin_of(indent(opened), name);
+      let a0 = fresh(bi.em);
+      line(line(line(line(line(a0.em,
+        bytes_concat_all([b"Word ", a0.name, b"[1];"])),
+        bytes_concat_all([a0.name, b"[0] = ", t.v.c, b"; ply_inc(", a0.name, b"[0]);"])),
+        bytes_concat_all([b"Word r = rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)", a0.name, b", 1);"])),
+        b"if (ctx->failed) return 0;"),
+        bytes_concat_all([out.name, b" = ply_imm_value(r);"]))
+    },
+  };
+  { em: line(outdent(body), b"}"), v: { k: KInt, c: out.name, ty: TyOpen } }
+}
+
+// `bytes_concat_all([a, b, ..])` joins the pieces without building the list; over anything
+// else it is the runtime's call.
+fn inline_join(em: Em, args: List<Code>, params: List<P>) -> Option<Out> =
+  match list_at(args, 0) {
+    None -> None,
+    Some(x) -> match x.node {
+      NList(l) -> match items(em, l.items, params, 0, []) {
+        None -> None,
+        Some(w) -> {
+          let arr = fresh(w.em);
+          let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
+            if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
+          let o = bind(e, KBoxed, bytes_concat_all([b"rt_bytes_join_p(ctx, (Word)(intptr_t)",
+            arr.name, b", ", num(len(l.items)), b")"]));
+          Some({ em: check(o.em), v: o.v })
+        },
+      },
+      _ -> match expr(notail(em), x, params) {
+        None -> None,
+        Some(o) -> Some(builtin_call(o.em, b"bytes_concat_all", [o.v])),
+      },
+    },
+  }
+
 // `bytes_at` and `bytes_u32_le` share everything but their width: one byte read
 // with a bounds test, or four read through a `memcpy` -- which is how a C
 // compiler is told to emit an unaligned load, and lowers to one instruction
-// rather than a call.
+// rather than a call. Over bytes the declaration does not fix, the runtime's call.
 fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool) -> Option<Out> =
   match list_at(args, 0) {
     None -> None,
@@ -698,9 +840,14 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool) -> Option<Ou
       None -> None,
       Some(i0) -> match expr(notail(em), b0, params) {
         None -> None,
-        Some(bv) -> if bv.v.ty != TyBytes { None } else { match expr(notail(bv.em), i0, params) {
+        Some(bv) -> match expr(notail(bv.em), i0, params) {
           None -> None,
-          Some(iv) -> {
+          // The reference's kind-tested arm for `bytes_u32_le` reads one byte wide, which is
+          // its own latent fault rather than a rule to take; no shipped body reaches it.
+          Some(iv) -> if bv.v.ty != TyBytes {
+            if wide { Some(refused(iv.em, b"bytes_u32_le over bytes the declaration does not fix")) }
+            else { Some(kind_tested(iv.em, b"bytes_at", bv.v, Some(iv.v))) }
+          } else {
             let t = bind(iv.em, KBoxed, as_word(bv.v));
             let idx = bind(t.em, KInt, as_int(iv.v));
             let bi = builtin_of(idx.em, if wide { b"bytes_u32_le" } else { b"bytes_at" });
@@ -721,20 +868,20 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool) -> Option<Ou
                 b"(int64_t)((unsigned char *)ply_words(", t.v.c, b"))[", idx.v.c, b"]"])))
             }
           },
-        } },
+        },
       },
     },
   }
 
 fn is_inlined(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
-    || name == b"bytes_concat_all" || name == b"bytes_join" || name == b"string_concat_all"
+    || name == b"bytes_concat_all"
 
 // The ones the reference does not answer with a plain call to the runtime.
 // `fold` is fused where its callback is written out, and `map_fold` and
 // `iterate` are shapes this port has not read.
 fn is_callback(name: Bytes) -> Bool =
-  name == b"fold" || name == b"map_fold" || name == b"iterate"
+  name == b"fold" || name == b"iterate"
 
 // The index a builtin takes in this body's own table, added on first use. Two
 // calls of one builtin share it, which is what the reference's table does and
@@ -774,6 +921,7 @@ fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
   // absent here.
   else if name == b"map" && args == 2 { Some(b"rt_map_p") }
   else if name == b"filter" && args == 2 { Some(b"rt_filter_p") }
+  else if name == b"map_fold" && args == 3 { Some(b"rt_map_fold_p") }
   // `map`, `filter` and `fold` are deliberately absent, and it is not an
   // oversight in the table they were copied from. Handed a *literal* lambda the
   // reference does not call a helper at all: it fuses the loop into the body and
@@ -799,6 +947,26 @@ fn args_owned(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     Some(w) -> Some({ em: w.em, names: w.names }),
   }
 
+// A builtin with no helper of its own goes through the runtime, under this body's own index
+// for it: every value held once more, the array they are read out of, then the call. The
+// answer is opaque when any argument was, which is what keeps `Float` arithmetic out of the
+// inline operators.
+fn builtin_call(em: Em, name: Bytes, vals: List<V>) -> Out = {
+  let opaque = fold(vals, false, |acc: Bool, v: V| acc || v.ty == TyOpaque);
+  let w = fold(vals, { em: em, names: [] }, |a: { em: Em, names: List<Bytes> }, v: V| {
+    let o = owned(a.em, v);
+    { em: o.em, names: push(a.names, o.v.c) }
+  });
+  let bi = builtin_of(w.em, name);
+  let arr = fresh(bi.em);
+  let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
+    if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
+  let o = bind_keeping(e, KBoxed, if opaque { TyOpaque } else { TyOpen }, bytes_concat_all([
+    b"rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)", arr.name, b", ",
+    num(len(vals)), b")"]));
+  { em: check(o.em), v: o.v }
+}
+
 fn args_owned_typed(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes>, opaque: Bool }> =
   match args_evaled(em, xs, params, i, []) {
@@ -810,6 +978,28 @@ fn args_owned_typed(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<B
           let w = owned(a.em, v);
           { em: w.em, names: push(a.names, w.v.c), opaque: a.opaque }
         }))
+    },
+  }
+
+// A call through the runtime of whatever the callee evaluates to: it may be a lambda of this
+// unit, a compiled function used as a value, or something the machine made. The callee is
+// held once more, then each argument as it is evaluated.
+fn call_value(em: Em, func: Code, args: List<Code>, params: List<P>) -> Option<Out> =
+  match expr(notail(em), func, params) {
+    None -> None,
+    Some(f) -> {
+      let fo = owned(f.em, f.v);
+      match args_one_pass(fo.em, args, params, 0, []) {
+        None -> None,
+        Some(w) -> {
+          let arr = fresh(w.em);
+          let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
+            if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
+          let o = bind(e, KBoxed, bytes_concat_all([b"rt_call_p(ctx, ", fo.v.c,
+            b", (Word)(intptr_t)", arr.name, b", ", num(len(args)), b")"]));
+          Some({ em: check(o.em), v: o.v })
+        },
+      }
     },
   }
 
@@ -1465,23 +1655,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       // the runtime: it may be a lambda of this unit, a compiled function used as
       // a value, or something the machine made.
       NVar(fv) -> match fv.slot {
-        Some(_) -> match expr(notail(em), a.func, params) {
-          None -> None,
-          Some(f) -> {
-            let fo = owned(f.em, f.v);
-            match args_one_pass(fo.em, a.args, params, 0, []) {
-              None -> None,
-              Some(w) -> {
-                let arr = fresh(w.em);
-                let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
-                  if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
-                let o = bind(e, KBoxed, bytes_concat_all([b"rt_call_p(ctx, ", fo.v.c,
-                  b", (Word)(intptr_t)", arr.name, b", ", num(len(a.args)), b")"]));
-                Some({ em: check(o.em), v: o.v })
-              },
-            }
-          },
-        },
+        Some(_) -> call_value(em, a.func, a.args, params),
         None -> if is_ctor_name(fv.name) {
         match tag_of(em.ctors, fv.name, em.module) {
           None -> Some(refused(em, bytes_concat(b"a constructor not in the table: ", fv.name))),
@@ -1542,25 +1716,16 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                       // header's own field.
                       None -> match fused_fold(em, fv.name, a.args, params) {
                         Some(o) -> Some(o),
+                        None -> match iterate_call(em, fv.name, a.args, params) {
+                        Some(o) -> Some(o),
                         None -> match inline_len(em, fv.name, a.args, params) {
                         Some(o) -> Some(o),
                         None -> if is_callback(fv.name) || is_inlined(fv.name) { Some(refused(em, bytes_concat(b"a callback or inline builtin outside its fused shape: ", fv.name))) }
                         else if !fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == fv.name) { Some(refused(em, bytes_concat(b"a name this port cannot resolve: ", fv.name))) }
-                        else { match args_owned_typed(em, a.args, params, 0, []) {
+                        else { match args_evaled(em, a.args, params, 0, []) {
                           None -> None,
-                          Some(w) -> {
-                            let bi = builtin_of(w.em, fv.name);
-                            let arr = fresh(bi.em);
-                            let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
-                              if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
-                              b"};"]));
-                            let o = bind_keeping(e, KBoxed, if w.opaque { TyOpaque } else { TyOpen },
-                              bytes_concat_all([
-                              b"rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)",
-                              arr.name, b", ", num(len(a.args)), b")"]));
-                            Some({ em: check(o.em), v: o.v })
-                          },
-                        } },
+                          Some(e) -> Some(builtin_call(e.em, fv.name, e.vals)),
+                        } } },
                       },
                       },
                       Some(imp) -> match args_one_pass(em, a.args, params, 0, []) {
@@ -1610,7 +1775,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           },
         } } },
       },
-      _ -> Some(refused(em, b"calling a value that is not a name")),
+      // Any other callee -- a field holding a function, a call's answer -- is a value too.
+      _ -> call_value(em, a.func, a.args, params),
     },
     // A `match` is arms in order over one flag: each arm runs only if no earlier
     // one matched, and a body that falls off the end raises rather than answering.
@@ -1637,20 +1803,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // already untagged and differ on a word, where this one is the runtime's
         // bool unbox rather than the integer's.
         let cv = { em: cnd.em, v: { k: KBool, c: as_bool(cnd.v), ty: TyOpen } };
-        // Where the two arms answer different kinds this port refuses rather than
-        // joining them at a word. The reference reads the *checker's* type for the
-        // join; `kind_of` is structural and does not always agree with it, and
-        // guessing wrong writes the wrong conversion into both arms. The one join
-        // it does take is a word one arm answers because it is opaque: there the
-        // structural answer is the checker's, and the other arm is boxed into it.
-        let kt0 = kind_of(em, i.then_branch, params);
-        let ke0 = kind_of(em, i.else_branch, params);
-        let join = if kt0 == ke0 { Some(kt0) }
-                   else if (kt0 == KBoxed && opaque_of(em, i.then_branch))
-                        || (ke0 == KBoxed && opaque_of(em, i.else_branch)) { Some(KBoxed) }
-                   else { None };
-        let kt = match join { Some(x) -> x, None -> KBoxed };
-        if join == None { Some(refused(em, b"an `if` whose arms answer different kinds")) } else {
+        // The join is the kind both arms *answered*, or a word: the arms are emitted into
+        // buffers first, and the join's local is declared before the `if` in the text but
+        // after both arms in the numbering.
+        {
           // The join's number is taken *before* either arm and its declaration is
           // written before the `if`, but the arms are emitted into buffers of
           // their own first: a record-valued join is not one local but one per
@@ -1692,6 +1848,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             names, js.names)
                   },
                   None -> {
+                    let kt = join_kind(t.v.k, e.v.k);
                     let decl = line({ out: b"", n: e.em.n, conv: cv.em.conv, ind: e.em.ind,
                                       reads: e.em.reads, shapes: e.em.shapes, built: e.em.built,
                                       module: e.em.module, made: e.em.made, here: e.em.here,
@@ -1712,7 +1869,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                  here: decl.here, imports: decl.imports, consts: decl.consts,
                                  ctors: decl.ctors, extra: decl.extra, lambdas: decl.lambdas,
                                  owner: decl.owner, builtins: decl.builtins, met: decl.met, fields: decl.fields, released: decl.released, toks: decl.toks, alias: decl.alias, by_root: decl.by_root, tail: decl.tail, calls: decl.calls, refused: decl.refused },
-                           v: { k: kt, c: j.name, ty: TyOpen } })
+                           v: { k: kt, c: j.name, ty: if t.v.ty == e.v.ty { t.v.ty } else { TyOpen } } })
                   },
                 }
               },
@@ -1960,8 +2117,20 @@ fn arm(em: Em, c: Code, params: List<P>) -> Option<{ em: Em, text: Bytes, v: V }
 
 // The same buffer with the join's assignment on the end.
 fn assigned(text: Bytes, ind: Int, k: Kind, v: V, join: Bytes) -> Bytes =
-  bytes_concat_all([text, pad(ind + 1),
-                    join, b" = ", match k { KBoxed -> as_word(v), _ -> as_int(v) }, b";\n"])
+  bytes_concat_all([text, pad(ind + 1), join, b" = ", as_kind(v, k), b";\n"])
+
+// A value as the kind a join holds it in: the reference's `as_kind`.
+fn as_kind(v: V, k: Kind) -> Bytes =
+  match k {
+    KBoxed -> as_word(v),
+    KInt -> as_int(v),
+    KBool -> as_bool(v),
+    KU32 -> match v.k {
+      KU32 -> v.c,
+      KBoxed -> bytes_concat_all([b"(uint32_t)ply_imm_value(", v.c, b")"]),
+      _ -> bytes_concat_all([b"(uint32_t)(", v.c, b")"]),
+    },
+  }
 
 // The same, for a record-valued join: one assignment per field, from the values
 // the record was built out of rather than from the record.
@@ -2028,30 +2197,6 @@ fn rebuild(em: Em, names: List<Bytes>, js: List<Bytes>) -> Option<Out> = {
          v: { k: KBoxed, c: rec.v.c,
               ty: TyRec(map(names, |n: Bytes| { name: n, k: KInt, ty: TyOpen })) } })
 }
-
-// The kind a node answers, without emitting it.
-//
-// Structural and cheap, which is the point: the join of an `if` has to be known
-// before either arm is written, and answering it by writing one costs an
-// emission per arm and doubles on every nesting level.
-fn kind_of(em: Em, c: Code, params: List<P>) -> Kind =
-  match c.node {
-    NLit(l) -> match l { LInt(_) -> KInt, LBool(_) -> KBool, _ -> KBoxed },
-    NVar(v) -> match v.slot {
-      None -> KBoxed,
-      Some(s) -> match conv_of(em, s) { Some(x) -> x.k, None -> KBoxed },
-    },
-    NUnary(u) -> if u.op == b"not" { KBool } else { KInt },
-    NBinary(b) -> if compare_op(b.op) != None || b.op == b"and" || b.op == b"or" { KBool }
-                  else if is_arith(b.op) {
-                    if opaque_of(em, b.lhs) || opaque_of(em, b.rhs) { KBoxed } else { KInt }
-                  } else { KBoxed },
-    NIf(i) -> join_kind(kind_of(em, i.then_branch, params),
-                        kind_of(em, i.else_branch, params)),
-    NBlock(b) -> match b.tail { Some(t) -> kind_of(em, t, params), None -> KBoxed },
-    NField(_) -> KInt,
-    _ -> KBoxed,
-  }
 
 // The `Int` two literals fold to under an operator, or nothing: the reference's
 // `fold_literals`, rule for rule. Addition, subtraction and multiplication only
@@ -2579,7 +2724,8 @@ fn defs_in(module: Bytes, m: Module, pure: List<Bytes>, program: List<ModDefs>) 
       IFn(d) -> push(acc, { name: d.name.name,
                             ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
                             ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
-                            pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])) }),
+                            pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])),
+                            arity: len(d.params) }),
       _ -> acc,
     })
 }
@@ -2648,7 +2794,8 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
       IFn(d) -> push(acc, { name: d.name.name,
                             ret: match param_kind_with(aliases, others, d.ret) { Some(r) -> Some(r.k), None -> None },
                             ret_ty: match param_kind_with(aliases, others, d.ret) { Some(r) -> r.ty, None -> TyOpen },
-                            pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])) }),
+                            pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])),
+                            arity: len(d.params) }),
       _ -> acc,
     });
   let walked = fold(x.module.items, { out: [], tests: 0 }, |acc: { out: List<Emitted>, tests: Int }, it: Item|
