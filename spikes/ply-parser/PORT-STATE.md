@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1128 of 1282** shipped bodies, 1123 resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1173 of 1282** shipped bodies, 1167 resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -63,11 +63,11 @@ bodies disagreeing. It no longer asserts the disagreeing names; the test prints 
 the port emits differently runs under the tier's audit like every other, so a disagreement is
 a slower body or a rule not yet taken, never a silent wrong one -- the audit is the oracle.
 
-Five disagree, all in `std.hash`. Four want the *deferred record local*, the half of
+Six disagree, all in `std.hash`. Four want the *deferred record local*, the half of
 deferring this port does not do: a record whose every read is answered from the built table
 is never materialised, and the local it would land in is declared at the top of the body.
-`std.hash.round` reads declared `U32` fields at their width where the port reads words; the
-port carries one width and the reference six.
+`std.hash.round` and `std.hash.blake3` read declared `U32` fields at their width where the
+port reads words; the port carries one width and the reference six.
 
 ## What is not started
 
@@ -75,6 +75,21 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**A callback is any callee, and an inline builtin has a slow arm.** `fold` fuses over any
+third argument now, as the reference does: a definition of arity two the body names directly
+is called straight per element, with no closure, and anything else is held as a value once
+outside the loop and called through `rt_call`. `iterate` goes through the runtime's helper
+unless it is the loop the reference emits into the body -- over a one-parameter lambda --
+which this port has not read yet and refuses; `map_fold` is a helper. `len`, `bytes_len` and
+`bytes_at` over a value the declaration does not fix are a kind test with the header's own
+field in the fast arm and the runtime's call in the slow one, which is where a value of the
+wrong kind is caught; `bytes_concat_all` over a written list joins without building it and
+over anything else is the call; `bytes_join` and `string_concat_all` were never inlined by the
+reference and are calls. One thing was found and not taken: the reference's kind-tested arm
+for `bytes_u32_le` reads one byte wide, so the port refuses that shape rather than write
+it. No shipped body reaches it. 1128 to 1173 reached; `std.hash.blake3` opened and joined
+the widths family. The census leads with an `if` whose arms answer different kinds.
 
 **A closure captures a parameter the prologue did not open.** A record or list parameter is
 never in the window -- it is read as its own word where the read is -- and a capture looked
