@@ -643,12 +643,12 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
     // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
     // more than a body. It has since risen well past that.
     assert!(
-        reached >= 1262,
+        reached >= 1282,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );
     assert!(
-        agreeing >= 1262,
+        agreeing >= 1282,
         "{agreeing} shipped bodies resolve to the reference's C -- raise this when it grows"
     );
     // Nothing disagrees. Raise this only for a body that is right by the audit and slower on
@@ -936,7 +936,9 @@ fn the_census_of_what_keeps_the_port_out() {
             forms.get(*n).map_or(0, String::len)
         );
     }
-    assert!(unreached + test_roots > 0 || expected.len() == reached.len());
+    // The census has something to say, or there is nothing left for it to say: the port reaches
+    // every body the reference emits, and may reach more.
+    assert!(unreached + test_roots > 0 || expected.keys().all(|n| reached.contains(n)));
 }
 
 /// The shipped standard library and examples, named as the reference names them.

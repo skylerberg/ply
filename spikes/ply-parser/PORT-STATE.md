@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1262 of 1282** shipped bodies, every one resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **every one of the 1282** shipped bodies the reference emits, each resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -66,6 +66,19 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**The port emits everything the reference emits.** The last four census items closed: a
+lambda inside a lambda is one more of its owner's, its entry interned before its body and its
+text written after its owner's, and it runs in a frame of its own -- fresh alias, release and
+read-count tables, and no tail -- as the reference gives every lambda a frame; `iterate` over
+a one-parameter lambda is the loop, emitted into the body with the lambda's parameter as the
+state and a body that answers `Stop` or `Continue` in every arm written as the loop's own
+assignments; a definition used as a value is a closure over its entry with nothing captured,
+or a call when nullary, and a builtin used as a value goes through the runtime. Two rules
+came with them: a lambda body's reads count in the lambda's own window, a capture's charged
+to the object it copies and the copy itself not a read; and a fused body's counts are the
+lambda's own. Of the 1282 shipped bodies the reference emits, the port emits 1282, each
+resolving to the reference's C. The census has nothing left to say over that corpus.
 
 **Every width, and the record held back.** The kind carries a width: the six below
 sixty-four bits open at entry, read at a field's offset and join in an `if` in their own C
