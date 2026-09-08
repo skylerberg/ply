@@ -798,6 +798,14 @@ impl<'a> Emit<'a> {
         v.k != Kind::Boxed || v.ty != CTy::Opaque
     }
 
+    /// An operand the emitter knows to be an `Int`: in a register, or a word the declaration
+    /// types. The inline arithmetic and comparisons need one such operand; the checker then
+    /// makes the other an `Int` too. Two words of unknown type may both be `Decimal`s, and the
+    /// runtime's operator is the one that knows.
+    fn known_int(v: &V) -> bool {
+        v.k != Kind::Boxed || v.ty == CTy::Int
+    }
+
     /// An operator over an operand whose type this emitter does not fix -- a `Float`, a
     /// `Decimal` -- through the machine's own operator, so the body compiles and answers what the
     /// machine answers. Every caller of such a body used to be refused with it.
@@ -1096,6 +1104,13 @@ impl<'a> Emit<'a> {
                     let wide = self.bind(Kind::Int, format!("-(int64_t)({a})"));
                     self.narrow(&wide, t, true)
                 }
+                Kind::Boxed if v.ty != CTy::Int => {
+                    let a = self.owned(&v);
+                    let out =
+                        self.bind_as(Kind::Boxed, v.ty.clone(), format!("rt_negate_p(ctx, {a})"));
+                    self.check();
+                    Ok(out)
+                }
                 _ => {
                     let a = self.as_int(&v);
                     self.line(format!(
@@ -1191,7 +1206,7 @@ impl<'a> Emit<'a> {
                         let b = self.as_num(&r, t);
                         Ok(self.bind(Kind::Bool, format!("({a}) {c} ({b})")))
                     }
-                    None if !(Self::int_like(&l) && Self::int_like(&r)) => {
+                    None if !(Self::known_int(&l) || Self::known_int(&r)) => {
                         self.generic_binary(op, &l, &r)
                     }
                     None => {
@@ -1263,7 +1278,7 @@ impl<'a> Emit<'a> {
                 };
                 self.narrow(&wide, t, matches!(op, BinOp::Sub))
             }
-            None if !(Self::int_like(l) && Self::int_like(r)) => self.generic_binary(op, l, r),
+            None if !(Self::known_int(l) || Self::known_int(r)) => self.generic_binary(op, l, r),
             None => {
                 let a = self.as_int(l);
                 let b = self.as_int(r);

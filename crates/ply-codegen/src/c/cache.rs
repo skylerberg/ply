@@ -175,7 +175,9 @@ fn encode_tables(
             Value::Str(s) => format!("s {}\n", hex(s.as_bytes())),
             Value::Bytes(b) => format!("b {}\n", hex(b)),
             Value::Fixed(f) => format!("f {} {}\n", f.ty as u8, f.bits()),
-            // Nothing else reaches the pool: `literal` puts only these four there.
+            // A `Float` by its bits and a `Decimal` by its mantissa and scale: exact both ways.
+            Value::Float(x) => format!("x {:016x}\n", x.to_bits()),
+            Value::Decimal(d) => format!("d {} {}\n", d.mantissa(), d.scale()),
             other => unreachable!("a constant this tier does not pool: {other:?}"),
         });
     }
@@ -223,6 +225,27 @@ fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                 let ty = ply_core::ty::INT_TYPES.iter().find(|t| **t as u8 == n)?;
                 Value::Fixed(ply_eval::Fixed::new(*ty, bits.parse().ok()?))
             }
+            "x" => Value::Float(f64::from_bits(u64::from_str_radix(rest, 16).ok()?)),
+            "d" => {
+                let (mantissa, scale) = rest.split_once(' ')?;
+                Value::Decimal(
+                    ply_eval::Decimal::try_from_i128_with_scale(
+                        mantissa.parse().ok()?,
+                        scale.parse().ok()?,
+                    )
+                    .ok()?,
+                )
+            }
+            // The emitter written in Ply keeps a literal as its source text, and converts it
+            // here by the rule the lexer converts it with: the same parse, underscores dropped,
+            // the `m` suffix off a `Decimal`.
+            "X" => Value::Float(rest.replace('_', "").parse().ok()?),
+            "D" => Value::Decimal(
+                rest.replace('_', "")
+                    .trim_end_matches('m')
+                    .parse::<ply_eval::Decimal>()
+                    .ok()?,
+            ),
             _ => return None,
         });
     }

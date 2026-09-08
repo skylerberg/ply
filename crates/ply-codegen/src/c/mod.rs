@@ -88,6 +88,7 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_no_fuel" => rt::rt_no_fuel as *const (),
             "rt_no_stack" => rt::rt_no_stack as *const (),
             "rt_binary" => rt::rt_binary as *const (),
+            "rt_negate" => rt::rt_negate as *const (),
             "rt_arith" => rt::rt_arith as *const (),
             "rt_lit" => rt::rt_lit as *const (),
             "rt_no_match" => rt::rt_no_match as *const (),
