@@ -126,7 +126,7 @@ pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>
                 // one, and a body that hands a record to a call and then reads a
                 // field of it for a later argument has two reads marked that way.
                 // Releasing at both frees a record the first release gave back.
-                released: List<Int>,
+                released: List<Bytes>,
                 // The reuse-token widths this body has *used*, collected as it
                 // goes. The declarations are written afterwards and put in front,
                 // which is what the reference does -- a pre-pass that predicted
@@ -435,11 +435,13 @@ fn release_from(em: Em, base: Code, b: V, params: List<P>, at_tail: Bool) -> Opt
     Owned -> match base.node {
       NVar(v) -> match v.slot {
         None -> Some(em),
-        // At most once per binding, and only where the binding is read once.
-        Some(s) -> if (!at_tail && reads_of_root(em, b.c) != 1)
-                      || fold(em.released, false, |acc: Bool, r: Int| acc || r == s) { Some(em) }
+        // At most once per binding -- keyed on the object the local holds, as the reference
+        // keys it, so a name each arm of a `match` binds afresh releases in each -- and only
+        // where the binding is read once.
+        Some(_) -> if (!at_tail && reads_of_root(em, b.c) != 1)
+                      || fold(em.released, false, |acc: Bool, r: Bytes| acc || r == root_of(em, b.c)) { Some(em) }
                    else {
-          let em = note_released(em, s);
+          let em = note_released(em, root_of(em, b.c));
           match width_of(b.ty) {
             None -> Some(line(em, bytes_concat_all([b"ply_dec(ctx, ", as_word(b), b");"]))),
             Some(n) -> { let em = note_tok(em, n);
@@ -965,11 +967,11 @@ fn note_tok(em: Em, w: Int) -> Em =
       toks: push(em.toks, w), alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused }
   }
 
-fn note_released(em: Em, slot: Int) -> Em =
+fn note_released(em: Em, root: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
     consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
-    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, slot), toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused }
+    builtins: em.builtins, met: em.met, fields: em.fields, released: push(em.released, root), toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused }
 
 fn count_of(reads: List<Int>, slot: Int) -> Int =
   fold(reads, 0, |acc: Int, s: Int| if s == slot { acc + 1 } else { acc })
@@ -1173,7 +1175,9 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       None -> Some(refused(em, b"a block with no tail")),
       Some(t) -> match stmts(em, bl.stmts, params, 0) {
         None -> None,
-        Some(after) -> match expr(after, t, params) {
+        // The statements are not tails and cleared the flag; the block's tail is one when the
+        // block is.
+        Some(after) -> match expr(withtail(after, em.tail), t, params) {
           None -> None,
           Some(o) -> Some(bind_keeping(o.em, o.v.k, o.v.ty, o.v.c)),
         },
@@ -1782,7 +1786,8 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
                 let done = line(line(o.em, bytes_concat_all([ans, b" = ", as_word(o.v), b";"])),
                                 bytes_concat_all([flag, b" = 1;"]));
                 let closed = line(outdent(line(outdent(done), b"}")), b"}");
-                arms(rescope(closed, em.conv), xs, params, i + 1, subj, ans, flag)
+                // The next arm is a tail when this one was: the body's own nodes cleared the flag.
+                arms(withtail(rescope(closed, em.conv), em.tail), xs, params, i + 1, subj, ans, flag)
               },
             }
           },
