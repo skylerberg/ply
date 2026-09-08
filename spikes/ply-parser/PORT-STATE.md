@@ -259,8 +259,9 @@ A `handle` with a clause that binds `resume` and calls it off the tail is no lon
 the body becomes a nullary closure over every slot it reads that the enclosing scope binds, a
 parameter included, at the same slot numbers so nothing in it is renumbered, handed to
 `rt_handle_detached_p` with the clause table, in which the resume column says `2` for such a
-clause. The runtime resumes such a body as often as the clause asks. The port also refuses `secret_of_string` as the reference
-does; it had compiled it, which whole mode would have shipped.
+clause. The runtime resumes such a body as often as the clause asks. The port compiles `secret_of_string`, as the reference now does: a
+credential is a bridged value inside an entry, and the runtime's memo is what keeps one from
+outliving it.
 
 The port emits itself. Its own sources joined both differentials: the lowering one, where nine
 disagreements were two bugs in the update recognition, a record literal not recognised as an

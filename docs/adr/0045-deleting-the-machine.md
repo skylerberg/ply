@@ -1,6 +1,6 @@
 # ADR 0045 — Deleting the machine
 
-**Accepted, and the second stage is built.** ADR 0042 placed this fifth, after the effects and the runtime,
+**Accepted, and the second and third stages are built.** ADR 0042 placed this fifth, after the effects and the runtime,
 and ADR 0044 built the runtime's four stages: stacks, `simulate`, `resume`
 off the tail and more than once, and the host route with its production
 region. With the chain entered whole the tier now takes every definition the
@@ -40,6 +40,14 @@ found the miscompilation the bootstrap first hit: two bugs in the port's
 update recognition, both in the lowering, which are gone. The second stage
 was taken before the first, since it depended on nothing the facade adds and
 was the riskier of the two.
+
+**Built, third stage:** a credential is a bridged value. The refusal is gone
+from both emitters; the tier's memo, the one place a word outlives its
+entry, refuses to keep a value that holds a handle, a secret among them, and
+the examples' census is whole. With it, a body the port's lowering does not
+reach still reports what it handles, read off its source, since a refused
+handler whose performers compiled would have sent a `perform` past a frame
+the machine held.
 
 ## The inventory
 
@@ -122,12 +130,16 @@ ls -la "$PLY_C_CACHE"/*.c            # the larger unit is the emitter's, with th
 zstd -19 -c "$PLY_C_CACHE"/<emitter>.c | wc -c
 ```
 
-On 2026-09-08 the emitter's unit was twelve megabytes of C and under a
-megabyte compressed with `zstd -19`. It is checked in compressed, and it is
-rewritten only when the snapshot can no longer build the emitter's current
-sources, which a change to the language the emitter is written in causes
-and a change to what it emits does not; the fixpoint test is what says the
-snapshot still serves, and a lagging snapshot that serves is not updated.
+On 2026-09-08 the emitter's unit was twelve megabytes of C and under two
+megabytes compressed with `gzip -9`, which the runtime decompresses without
+a tool beside it. It is checked in compressed and rewritten when the fixpoint
+says so: the emitter built from it emits the emitter's current sources, and
+the emitter built from that emission emits them again, and the two must
+agree; a change that alters what the emitter emits for its own sources, a
+construct newly carried among them, moves the bundle, and a change that does
+not, however large, leaves it. `PLY_C_BOOTSTRAP_REFRESH=1` on the fixpoint
+test writes the new bundle, and only once a third emitter built from it has
+emitted the same thing.
 
 ## The suites
 
@@ -172,9 +184,10 @@ measurement, not adjusted to pass.
    in, the fixpoint test runs in CI, and the producer is built from the
    bundle rather than the reference. Oracle, met: the fixpoint, and the audit
    over both corpora unchanged.
-3. **The credential.** The bridged secret; the refusal removed on both
-   emitters. Oracle: the secrets suite as a Ply test, and the census over
-   the examples losing its last row.
+3. **The credential.** Built. The bridged secret, the memo refusing a handle,
+   the refusal removed on both emitters. Oracle, met in part: the census over
+   the examples has no rows; the secrets suite as a Ply test is the fifth
+   stage's sort.
 4. **The instruments' baselines.** Each instrument run under both engines
    on one tree, the tier's figures registered. Oracle: the registered
    figures reproduce.
