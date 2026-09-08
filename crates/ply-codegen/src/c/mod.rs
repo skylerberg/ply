@@ -26,6 +26,7 @@
 //! | `PLY_INLINE_BUDGET` | the most syntax nodes a callee may have to be inlined | `../opt.rs` |
 //! | `PLY_C_EMITTER` | `ply:<dir>` makes the Ply emitter in `<dir>` this tier's producer, body by body, with this emitter as the fallback (ADR 0042); the driver builds it | `producer.rs` |
 //! | `PLY_C_BOOTSTRAP` | `off` builds the Ply emitter with the reference emitter instead of from `spikes/ply-parser/bootstrap`, the bundle of the C it last emitted for itself; the fixpoint test in `crates/ply-codegen-tests` is what says the bundle serves, and `PLY_C_BOOTSTRAP_REFRESH=1` on that test rewrites it | `bundle.rs` |
+//! | `PLY_TIER_ONLY` | `1` makes this backend the only engine: a test or an entry it does not hold fails with `E0505`, and the machine evaluates nothing (ADR 0045) | `backend.rs` |
 //! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
 //!
 //! Two things a fourteenth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set

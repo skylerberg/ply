@@ -28,6 +28,13 @@ pub trait Compiled {
         Entered::Declined
     }
 
+    /// A definition entered whole with its answer, refusal or failure told apart: what an engine
+    /// with no machine behind it asks, where [`Compiled::enter`] folds a failure into a decline
+    /// for the machine to run again.
+    fn enter_whole(&self, _name: &Symbol, _args: &[Value], _budget: usize) -> Entered {
+        Entered::Declined
+    }
+
     /// The atoms compiled code performed since the last entry, for the machine's trace. A
     /// handled perform is still a perform, and the observed row is a claim the tests make.
     fn take_performed(&self) -> Vec<EffectAtom> {
@@ -58,6 +65,12 @@ pub trait Compiled {
     /// What the host runtime said when the entries ended.
     fn take_teardown(&self) -> Vec<Diagnostic> {
         Vec::new()
+    }
+
+    /// Whether the backend is to be the only engine: a test or an entry it does not hold fails
+    /// rather than falling to the machine.
+    fn tier_only(&self) -> bool {
+        false
     }
 }
 

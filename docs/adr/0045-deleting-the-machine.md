@@ -175,6 +175,21 @@ become the new baselines, with the command beside each; after it, the
 instruments run over the facade. A threshold is re-registered from a
 measurement, not adjusted to pass.
 
+## The switch, which is the fifth stage's first form
+
+Building the second and third stages showed the facade can come after the
+engine: `PLY_TIER_ONLY=1` makes a machine with a backend attached refuse to
+evaluate anything itself. A test root the tier answers is the pass; one it
+refuses, declines or raises in is the failure, with the tier's diagnostic;
+an entry point goes through the backend whole. The three corpora and the
+served example run green under it, which is stage five's oracle taken
+before stage five, and CI runs them so. What the switch does not cover is
+what the facade is for: a bare expression in a scope, the corpus's
+instruments and the prover, which construct machines of their own. The
+first stage's facade is therefore taken consumer by consumer, each switched
+to the tier-only engine with its own oracle, rather than as one wrapping
+pass before any of them.
+
 ## Staging, and the oracle at each stage
 
 1. **The facade with the machine inside it.** `Engine` wraps a `Machine`;

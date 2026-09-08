@@ -104,6 +104,9 @@ pub struct Machine<'a> {
     ctors: FxHashMap<Symbol, usize>,
     ops: OpTable,
     tests: Vec<TestSlot<'a>>,
+    /// The compiled tier is the only engine: a test or an entry the tier does not hold is a
+    /// failure, and nothing is evaluated here. The backend says so when it is attached.
+    tier_only: bool,
     /// Where every cell this engine allocates lives, and the fixture every entry point resets to —
     /// so one seeded fixture serves every test in a run without any of them observing another's
     /// writes.
@@ -245,6 +248,7 @@ impl<'a> Machine<'a> {
             ctors,
             ops,
             tests,
+            tier_only: false,
             regions: TaskRegions::new(),
             region_kinds: crate::region_kind::Kinds::default(),
             trace: Trace::new(),
@@ -422,9 +426,14 @@ impl<'a> Machine<'a> {
     /// entered natively instead of evaluated.
     pub fn set_compiled(&mut self, compiled: Rc<dyn crate::Compiled>) {
         if compiled.describes(self.program) {
+            self.tier_only = compiled.tier_only();
             self.compiled = Some(compiled);
             self.share_host();
         }
+    }
+
+    pub fn set_tier_only(&mut self, tier_only: bool) {
+        self.tier_only = tier_only;
     }
 
     /// Native entries taken and calls declined, over this machine's whole life.
@@ -462,6 +471,14 @@ impl<'a> Machine<'a> {
             .primary(Span::DUMMY, "requested test does not exist"));
         };
         let (module, source) = (slot.module, slot.body);
+        if self.compiled.is_some() {
+            let ordinal = self.tests[..index]
+                .iter()
+                .filter(|t| t.module == module)
+                .count();
+            let name = self.program.modules[module].name.as_symbol().clone();
+            return self.eval_test_in(&name, ordinal);
+        }
         let body = self.lowering.body(source);
         self.drive(body, module).map(|_| ())
     }
@@ -514,17 +531,33 @@ impl<'a> Machine<'a> {
                 Some(Entered::Answered(_)) => {
                     self.compiled_refusals.set(self.compiled_refusals.get() + 1);
                     self.compiled_declines.set(self.compiled_declines.get() + 1);
+                    if self.tier_only {
+                        return Err(err_tier_holds_no_body(&root, source.span));
+                    }
                     None
                 }
                 Some(Entered::Raised(raised)) => {
                     self.compiled_declines.set(self.compiled_declines.get() + 1);
+                    if self.tier_only {
+                        self.record_compiled_atoms();
+                        self.end_entry_point();
+                        return Err(raised);
+                    }
                     Some(raised)
                 }
                 Some(Entered::Declined) | None => {
                     self.compiled_declines.set(self.compiled_declines.get() + 1);
+                    if self.tier_only {
+                        return Err(err_tier_holds_no_body(&root, source.span));
+                    }
                     None
                 }
             }
+        } else if self.tier_only {
+            let root = program.modules[owner]
+                .name
+                .qualify(&Symbol::new(format!("test#{ordinal}")));
+            return Err(err_tier_holds_no_body(&root, source.span));
         } else {
             None
         };
@@ -573,6 +606,25 @@ impl<'a> Machine<'a> {
         let boundary = crate::escape::Boundary::EntryPoint { name };
         for arg in &args {
             crate::escape::check(&boundary, arg, span)?;
+        }
+        if self.tier_only {
+            let Some(backend) = self.compiled.clone() else {
+                return Err(err_tier_holds_no_body(&sym, span));
+            };
+            self.reset();
+            backend.set_seed(self.seed.clone(), self.sim_steps);
+            let entered = backend.enter_whole(&sym, &args, self.max_calls);
+            self.record_compiled_atoms();
+            self.record = backend.simulated();
+            self.end_entry_point();
+            return match entered {
+                Entered::Answered(value) => {
+                    self.compiled_entries.set(self.compiled_entries.get() + 1);
+                    Ok(value)
+                }
+                Entered::Raised(raised) => Err(raised),
+                Entered::Declined => Err(err_tier_holds_no_body(&sym, span)),
+            };
         }
         self.enter(f, args, span)
     }
@@ -2717,6 +2769,16 @@ fn take_args<const N: usize>(
 
 #[cold]
 #[inline(never)]
+/// With the compiled tier as the only engine, a definition it does not hold cannot run.
+fn err_tier_holds_no_body(name: &Symbol, span: Span) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the compiled tier holds no body for `{name}`, and nothing else runs it"),
+    )
+    .primary(span, "refused by the tier, or not compiled")
+    .note("`PLY_C_REFUSALS=1` says why the tier refused it; without `PLY_TIER_ONLY=1` the machine would have run it")
+}
+
 pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
     Diagnostic::error(
         codes::NESTED_SIMULATION,
