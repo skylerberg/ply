@@ -2296,12 +2296,6 @@ impl<'a> Emit<'a> {
                 args.len()
             ));
         }
-        if b == Builtin::SecretOfString {
-            return self.refuse(format!(
-                "`{}`, which would put a credential in the fragment's value arena",
-                b.name()
-            ));
-        }
         // `iterate` over a lambda literal is the loop, emitted in the body rather than called
         // through the runtime: `iterate` *is* the loop in this language (ADR 0022), so a tier that
         // sent it through a callback would be sending every loop through one.

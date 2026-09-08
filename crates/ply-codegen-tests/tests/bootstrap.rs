@@ -104,7 +104,11 @@ fn emit_with(
     source: &'static Source,
     from: Option<&Path>,
     scratch: &Path,
-) -> (String, ply_codegen::c::cache::UnitCache) {
+) -> (
+    String,
+    ply_codegen::c::cache::UnitCache,
+    Vec<ply_codegen::c::Refused>,
+) {
     *FROM.lock().unwrap() = from.map(Path::to_path_buf);
     producer::reset_thread();
     let cache = scratch.join(format!("cache-{}", std::process::id()));
@@ -114,18 +118,7 @@ fn emit_with(
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (text, record, refused) =
         ply_codegen::c::emit_unit_record(source, &refs).expect("the emitter's unit emits");
-    // The credential's refusal, and its callers', are deliberate until ADR 0045's third stage;
-    // anything else refused would leave the emitter built from this emission without part of
-    // itself.
-    let unexpected: Vec<_> = refused
-        .iter()
-        .filter(|r| !(r.construct.contains("credential") || r.construct.contains("secret_step")))
-        .collect();
-    assert!(
-        unexpected.is_empty(),
-        "the emitter refuses part of itself: {unexpected:?}"
-    );
-    (text, record)
+    (text, record, refused)
 }
 
 #[test]
@@ -151,28 +144,49 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     producer::set_whole(true);
 
     // The emitter built from the bundle, or from the reference when there is none, emits itself.
+    // An old bundle's emitter may refuse what the current sources emit; only the emitter built
+    // from a current emission has to refuse nothing of itself.
     let first = have.then(|| bundle.clone());
-    let (c1, r1) = emit_with(source, first.as_deref(), &scratch);
+    let (c1, r1, _) = emit_with(source, first.as_deref(), &scratch);
     let stage = scratch.join("stage1");
     ply_codegen::c::bundle::write(&stage, &c1, &r1, &identity).unwrap();
 
-    // The emitter built from that emission emits itself again, and must emit the same thing.
-    let (c2, r2) = emit_with(source, Some(&stage), &scratch);
-    let same = c1 == c2 && r1.taken == r2.taken && r1.refusals == r2.refusals;
+    // The emitter built from that emission emits itself again.
+    let (c2, r2, refused) = emit_with(source, Some(&stage), &scratch);
+    assert!(
+        refused.is_empty(),
+        "the emitter refuses part of itself: {refused:?}"
+    );
+    let same = |a: &str,
+                ra: &ply_codegen::c::cache::UnitCache,
+                b: &str,
+                rb: &ply_codegen::c::cache::UnitCache| {
+        a == b && ra.taken == rb.taken && ra.refusals == rb.refusals
+    };
+    let differ = |label: &str, a: &str, b: &str| {
+        let pa = scratch.join(format!("{label}-a.c"));
+        let pb = scratch.join(format!("{label}-b.c"));
+        std::fs::write(&pa, a).unwrap();
+        std::fs::write(&pb, b).unwrap();
+        panic!(
+            "the emitter built from one emission and the emitter built from its own emit different C: diff {} {}",
+            pa.display(),
+            pb.display()
+        );
+    };
     if refresh {
+        // A refresh writes the current emitter's own emission, once a third emitter built from it
+        // has emitted the same thing: the bundle written is a fixpoint on the day it is written.
+        let stage2 = scratch.join("stage2");
+        ply_codegen::c::bundle::write(&stage2, &c2, &r2, &identity).unwrap();
+        let (c3, r3, _) = emit_with(source, Some(&stage2), &scratch);
+        if !same(&c2, &r2, &c3, &r3) {
+            differ("refresh", &c2, &c3);
+        }
         ply_codegen::c::bundle::write(&bundle, &c2, &r2, &identity).unwrap();
         eprintln!("bootstrap bundle written to {}", bundle.display());
-    }
-    if !same {
-        let a = scratch.join("first.c");
-        let b = scratch.join("second.c");
-        std::fs::write(&a, &c1).unwrap();
-        std::fs::write(&b, &c2).unwrap();
-        panic!(
-            "the emitter built from the bundle and the emitter built from its emission emit different C: diff {} {}",
-            a.display(),
-            b.display()
-        );
+    } else if !same(&c1, &r1, &c2, &r2) {
+        differ("fixpoint", &c1, &c2);
     }
     if let Some(recorded) = ply_codegen::c::bundle::sources_digest(&bundle)
         && recorded != identity

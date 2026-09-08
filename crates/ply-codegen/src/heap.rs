@@ -1152,7 +1152,11 @@ pub fn world_independent(w: Word) -> bool {
                     }
                 }
                 KIND_BRIDGE => {
-                    if !ply_eval::memo::world_independent(bridged(o)) {
+                    // A credential is a value like any other inside an entry and must not
+                    // outlive it: the memo is the one place a word does.
+                    if crate::rt::holds_a_handle(bridged(o)).is_some()
+                        || !ply_eval::memo::world_independent(bridged(o))
+                    {
                         return false;
                     }
                 }
