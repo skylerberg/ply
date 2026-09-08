@@ -226,12 +226,22 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize, usize) {
         available += expected.len();
         reached += mine.len();
         for (fname, body) in &mine {
-            // A record update is not covered. `rewrite.ply` expands `{..b, f: e}` into a record
-            // that names every field; `ply-syntax` keeps it as a node with `copies` and `sets`,
-            // which `code.rs` lowers to `RecordUpdate`. So the two are lowering different trees
+            // A record update is not covered. `rewrite.ply`'s `expand` turns `{..b, f: e}` into a
+            // record that names every field; `ply_derive::expand_program` leaves the node alone,
+            // and `code.rs` lowers it to `RecordUpdate`. So the two are lowering different trees
             // here, and comparing them would report a difference that is neither one's fault.
             // Excluded by what the *oracle* holds, so a port that started emitting updates would
             // still be compared.
+            //
+            // **And the divergence itself is checked by nothing**, which is the part worth
+            // knowing. The third differential compares the rewrites `Parser::run` applies, which
+            // keep the node -- `reference_dump` writes `erup` for the program above. The fifth
+            // compares the *source* each derivation generates, not the expanded tree. Between them
+            // sits `expand`, where the port desugars and the reference does not, and no comparison
+            // reaches it. This exclusion is the only place that divergence is written down.
+            //
+            // Closing it is one change with two effects: the port lowers updates the way the
+            // reference does, this exclusion goes, and `reached` and `compared` meet.
             if expected
                 .get(fname)
                 .is_some_and(|want| want.contains("upd("))
