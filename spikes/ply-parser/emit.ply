@@ -671,6 +671,11 @@ fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
 // The shape's index in this body's own table, added on first use. A body names
 // the unit's tables by its own positions, which is what makes one body's text
 // comparable at all.
+fn opaque_from_table(em: Em, l: Lit) -> Out = {
+  let o = from_table(em, l);
+  { em: o.em, v: { k: KBoxed, c: o.v.c, ty: TyOpaque } }
+}
+
 fn from_table(em: Em, l: Lit) -> Out = {
   let c = const_of(em, l);
   let o = bind(c.em, KBoxed, bytes_concat_all([b"rt_lit_p(ctx, @@c", num(c.i), b"@@)"]));
@@ -1678,7 +1683,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         else { Some(from_table(em, l)) },
       },
       LUnit -> Some(from_table(em, l)),
-      _ -> Some(refused(em, b"a Float or Decimal literal, which the reference has no path for")),
+      // A `Float` or `Decimal` is a constant the runtime holds, opaque here: every operator over
+      // it is the machine's own, through the runtime. The reference has no path for these.
+      LFloat(_) -> Some(opaque_from_table(em, l)),
+      LDec(_) -> Some(opaque_from_table(em, l)),
+      _ -> Some(refused(em, b"a literal this port does not pool")),
     },
     // A parameter is `pN`; anything else needs the window, which is the next
     // piece of this port.
@@ -1803,6 +1812,13 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           match o.v.k {
             // A width negates wide and narrows back, under the same guard as a subtraction.
             KNum(w) -> narrow(bind(o.em, KInt, bytes_concat_all([b"-(int64_t)(", as_num(o.v, w), b")"])), w, true),
+            // A word of a type this port cannot see may be a `Float` or a `Decimal`: the
+            // machine's own negation, through the runtime.
+            KBoxed -> {
+              let held = owned(o.em, o.v);
+              let out = bind_keeping(held.em, KBoxed, o.v.ty, bytes_concat_all([b"rt_negate_p(ctx, ", held.v.c, b")"]));
+              Some({ em: check(out.em), v: out.v })
+            },
             _ -> {
               // Negation overflows at one input, and the guard runs before the value
               // exists rather than after: code 2, as `rt_arith_p`'s table numbers it.
@@ -2744,14 +2760,20 @@ fn binary_rest(em: Em, op: Bytes, l: V, r: V) -> Option<Out> = {
         // that binding *is* the negation rather than following one.
         Some(bind(check(e.em), KBool,
           if op == b"ne" { bytes_concat_all([b"!(", e.v.c, b")"]) } else { e.v.c }))
-      } else if l.ty == TyOpaque || r.ty == TyOpaque {
-        if is_bitop(op) || is_shift(op) { Some(refused(em, b"a bitwise operator over a Float or Decimal")) } else {
-          // A `Float` or `Decimal` operand: the machine's own operator, through
-          // the runtime, so the body answers what the machine answers.
+      } else if (is_bitop(op) || is_shift(op)) && (l.ty == TyOpaque || r.ty == TyOpaque) {
+        Some(refused(em, b"a bitwise operator over a Float or Decimal"))
+      } else if l.k == KBoxed && r.k == KBoxed && (is_arith(op) || compare_op(op) != None) {
+        {
+          // A `Float` or `Decimal` operand, or two words of a type this port cannot see -- which
+          // may both be `Decimal`s: the machine's own operator, through the runtime, so the body
+          // answers what the machine answers. One operand in a register is an `Int` the checker
+          // vouched for on both sides.
           let lo = owned(em, l);
           let ro = owned(lo.em, r);
+          // The answer's type is the reference's: a comparison answers a `Bool`, an operator
+          // over an opaque left operand answers opaque, and otherwise it takes the right's.
           let o = bind_keeping(ro.em, KBoxed,
-            if compare_op(op) != None { TyOpen } else { TyOpaque },
+            if compare_op(op) != None { TyOpen } else if l.ty == TyOpaque { TyOpaque } else { r.ty },
             bytes_concat_all([b"rt_binary_p(ctx, ", num(binary_code(op)), b", ",
                               lo.v.c, b", ", ro.v.c, b")"]));
           Some({ em: check(o.em), v: o.v })
@@ -3037,6 +3059,9 @@ fn encode_tables(em: Em, owner: Bytes) -> Bytes =
         Some(w) -> bytes_concat_all([b"f ", num(width_index(w)), b" ", num(bits)]),
         None -> b"u",
       },
+      // As written: the driver converts the text by the lexer's own rule.
+      LFloat(x) -> bytes_concat(b"X ", x),
+      LDec(x) -> bytes_concat(b"D ", x),
       _ -> b"u",
     })),
     counted(b"builtins", em.met),

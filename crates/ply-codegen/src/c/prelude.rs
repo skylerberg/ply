@@ -129,6 +129,7 @@ helpers![
     ("rt_no_fuel", 0, false),
     ("rt_no_stack", 0, false),
     ("rt_binary", 3, true),
+    ("rt_negate", 1, true),
     ("rt_arith", 3, true),
     ("rt_lit", 1, true),
     ("rt_no_match", 0, false),
