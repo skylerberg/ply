@@ -21,6 +21,42 @@ pub struct Source {
     /// is kept between runs.
     pub keys: HashMap<String, String>,
     regions: std::sync::OnceLock<ply_eval::region_kind::Regions>,
+    stack_handled: std::sync::OnceLock<StackHandled>,
+}
+
+/// What some handler on the stack could answer, anywhere in this program.
+///
+/// The question a `perform` in a compiled body has to settle is whether it can reach a handler
+/// rather than the host. A handler on the stack resumes, and resuming means capturing the frame
+/// the `perform` is in, which a compiled frame cannot give; the host *returns*, which is a call.
+/// So the compilable `perform` is the one that provably finds no stack handler.
+///
+/// It is a whole-program property and that is what makes it sound against an interpreted caller: a
+/// compiled body can be called from inside an interpreted `handle`, but if the program declares no
+/// handler for the operation, no frame above it can be one.
+#[derive(Default)]
+pub struct StackHandled {
+    /// `effect.op` of every `handle` clause written anywhere, resource ignored -- a clause with a
+    /// resource is counted for every resource, which refuses more than it must and never less.
+    ops: std::collections::HashSet<String>,
+    /// The brand of every `with_cell`, whose operations a cell answers.
+    resources: std::collections::HashSet<Symbol>,
+}
+
+impl StackHandled {
+    /// Whether a `perform` of this operation could find a handler rather than the host.
+    ///
+    /// `task.*` is answered by a `simulate` opening a region rather than by a handler at all, so it
+    /// counts as reachable however the program is written.
+    pub fn could_reach(&self, effect: &str, op: &str, resource: Option<&Symbol>) -> bool {
+        if effect == "task" {
+            return true;
+        }
+        if self.ops.contains(&format!("{effect}.{op}")) {
+            return true;
+        }
+        resource.is_some_and(|r| self.resources.contains(r))
+    }
 }
 
 /// The name a test's root takes: its place among its module's tests, which `ply_eval`'s test
@@ -95,6 +131,7 @@ impl Source {
             test_roots: roots,
             keys: HashMap::new(),
             regions: std::sync::OnceLock::new(),
+            stack_handled: std::sync::OnceLock::new(),
         }
     }
 
@@ -108,6 +145,7 @@ impl Source {
         Source {
             keys,
             regions: std::sync::OnceLock::new(),
+            stack_handled: std::sync::OnceLock::new(),
             ..Source::new(program, resolved, check)
         }
     }
@@ -144,6 +182,24 @@ impl Source {
             .get_or_init(|| ply_eval::region_kind::infer(self.program, self.resolved))
     }
 
+    /// [`StackHandled`] for this program, walked once and kept.
+    pub fn stack_handled(&self) -> &StackHandled {
+        self.stack_handled.get_or_init(|| {
+            let mut out = StackHandled::default();
+            for name in self.functions() {
+                let Some((def, _)) = self.definition(&name) else {
+                    continue;
+                };
+                let params: Vec<Symbol> = def.params.iter().map(|p| p.name.name.clone()).collect();
+                // The *unoptimised* body: inlining can only bring more handlers into a body, never
+                // fewer, and this has to be an answer about the program rather than about one
+                // emitter's settings.
+                walk_handlers(&ply_eval::code::lower_fn(&params, &def.body).code, &mut out);
+            }
+            out
+        })
+    }
+
     pub fn functions(&self) -> Vec<String> {
         let mut out = Vec::new();
         for module in &self.program.modules {
@@ -155,5 +211,86 @@ impl Source {
         }
         out.extend(self.test_roots.iter().cloned());
         out
+    }
+}
+
+/// Every `handle` clause and `with_cell` brand in one lowered body, lambdas and clause bodies
+/// included.
+fn walk_handlers(code: &ply_eval::code::Code, out: &mut StackHandled) {
+    use ply_eval::code::NodeKind as N;
+    match &code.kind {
+        N::Handle { body, clauses, ret } => {
+            for c in clauses.iter() {
+                out.ops
+                    .insert(format!("{}.{}", c.effect.symbol().as_str(), c.op.as_str()));
+            }
+            walk_handlers(body, out);
+            for c in clauses.iter() {
+                walk_handlers(&c.body, out);
+            }
+            if let Some(r) = ret {
+                walk_handlers(&r.body, out);
+            }
+        }
+        N::WithCell {
+            resource,
+            init,
+            body,
+            ..
+        } => {
+            out.resources.insert(resource.clone());
+            walk_handlers(init, out);
+            walk_handlers(body, out);
+        }
+        N::Lit(..) | N::Var { .. } => {}
+        N::Unary { operand, .. } => walk_handlers(operand, out),
+        N::Binary { lhs, rhs, .. } => {
+            walk_handlers(lhs, out);
+            walk_handlers(rhs, out);
+        }
+        N::If {
+            cond,
+            then_branch,
+            else_branch,
+        } => {
+            walk_handlers(cond, out);
+            walk_handlers(then_branch, out);
+            walk_handlers(else_branch, out);
+        }
+        N::Block { stmts, tail } => {
+            for s in stmts.iter() {
+                match s {
+                    ply_eval::code::Stmt::Let { value, .. } => walk_handlers(value, out),
+                    ply_eval::code::Stmt::Expr { code } => walk_handlers(code, out),
+                }
+            }
+            if let Some(t) = tail {
+                walk_handlers(t, out);
+            }
+        }
+        N::Field { base, .. } => walk_handlers(base, out),
+        N::Record { fields } => fields.iter().for_each(|(_, e)| walk_handlers(e, out)),
+        N::RecordUpdate { base, sets, .. } => {
+            walk_handlers(base, out);
+            sets.iter().for_each(|(_, e)| walk_handlers(e, out));
+        }
+        N::List { items } => items.iter().for_each(|i| walk_handlers(i, out)),
+        N::App { func, args } => {
+            walk_handlers(func, out);
+            args.iter().for_each(|a| walk_handlers(a, out));
+        }
+        N::Match { scrutinee, arms } => {
+            walk_handlers(scrutinee, out);
+            for a in arms.iter() {
+                if let Some(g) = &a.guard {
+                    walk_handlers(g, out);
+                }
+                walk_handlers(&a.body, out);
+            }
+        }
+        N::Lambda { body, .. } | N::Simulate { body, .. } | N::WithRegion { body } => {
+            walk_handlers(body, out)
+        }
+        N::Perform { args, .. } => args.iter().for_each(|a| walk_handlers(a, out)),
     }
 }

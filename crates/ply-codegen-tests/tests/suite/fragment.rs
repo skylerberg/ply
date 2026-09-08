@@ -790,3 +790,54 @@ fn what_the_fragment_refuses_the_standard_library_for() {
          be re-read: perform {performed:?}, handle {handled:?}"
     );
 }
+
+/// The criterion ADR 0041's stage 2 rests on: whether a `perform` could find a handler on the
+/// stack rather than the host.
+///
+/// A handler resumes, and resuming captures the frame the `perform` is in, which a compiled frame
+/// cannot give. The host returns, which is a call. So this is the question that decides whether a
+/// `perform` is compilable at all, and it is a whole-program one: a compiled body can be called
+/// from inside an interpreted `handle`, and what makes the answer sound is that a handler the
+/// program does not declare cannot be the frame above.
+#[test]
+fn a_perform_that_could_reach_a_handler_is_told_apart_from_one_that_reaches_the_host() {
+    let (loaded, _) = unit(
+        "\
+pub nondet effect wire {
+  write recv[s](conn: Int) -> Int
+  write send[s](conn: Int, payload: Int) -> Int
+}
+pub fn caught(c: Int) -> Int = handle {
+  wire.recv[link](c)
+} with {
+  wire.recv[link](h) -> h + 1,
+}
+pub fn celled(n: Int) -> Int = with_cell[tally](n) { c -> cell_get(c) }
+",
+    );
+    let src = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check);
+    let handled = src.stack_handled();
+    assert!(
+        handled.could_reach("wire", "recv", None),
+        "`wire.recv` is handled by a clause in this program and was not seen"
+    );
+    assert!(
+        !handled.could_reach("wire", "send", None),
+        "`wire.send` has no clause anywhere here, so it can only reach the host"
+    );
+    // A cell answers the operations on its brand, so a `perform` naming that resource can find one.
+    assert!(
+        handled.could_reach("db", "get", Some(&Symbol::new("tally"))),
+        "`tally` is a cell's brand in this program and was not seen"
+    );
+    assert!(
+        !handled.could_reach("db", "get", Some(&Symbol::new("elsewhere"))),
+        "`elsewhere` brands no cell here"
+    );
+    // A `simulate` answers `task.*` by opening a region rather than through a clause, so it counts
+    // as reachable however the program is written.
+    assert!(
+        handled.could_reach("task", "spawn", None),
+        "`task.*` is answered by a region and must never be taken for a host call"
+    );
+}
