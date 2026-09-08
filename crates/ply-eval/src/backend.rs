@@ -1,7 +1,7 @@
 //! A backend a shipping command can attach, and eight ways of being wrong.
 
 use crate::compiled::Compiled;
-use crate::machine::Machine;
+use crate::evaluator::Machine;
 use crate::value::Value;
 use ply_core::CheckOutput;
 use ply_span::{Span, Symbol};

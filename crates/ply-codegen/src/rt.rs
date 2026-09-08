@@ -1808,7 +1808,7 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     if !c.sims.is_empty() {
         heap::dec(body);
-        let d = ply_eval::machine::err_nested_simulation(Span::DUMMY, Span::DUMMY);
+        let d = ply_eval::err_nested_simulation(Span::DUMMY, Span::DUMMY);
         return c.fail(d);
     }
     let id = ply_eval::SimId(c.entered_sims);
