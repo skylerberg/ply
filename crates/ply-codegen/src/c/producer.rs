@@ -73,15 +73,16 @@ type Bodies = HashMap<String, (String, Tables)>;
 /// The compiled Ply emitter, entered once per module of the program being compiled.
 pub struct PlyProducer {
     native: Native,
-    /// Every body the emitter answered for a module, by program-wide name, filled the first time
-    /// any body of that module is asked for.
-    modules: RefCell<HashMap<String, Bodies>>,
+    /// Every body the emitter answered, by program-wide name, filled the first time any body of a
+    /// program is asked for; keyed on the program's address, since one producer serves a thread.
+    modules: RefCell<HashMap<usize, Bodies>>,
     asked: Cell<u64>,
     answered: Cell<u64>,
 }
 
-/// The entry the emitter is entered through: `emit_bodies_in(module, ctors, builtins, src)`.
-const ENTRY: &str = "emit.emit_bodies_in";
+/// The entry the emitter is entered through: `emit_bodies_all(names, srcs, ctors, builtins)`,
+/// over every module of the program at once, so that it resolves them together.
+const ENTRY: &str = "emit.emit_bodies_all";
 
 impl PlyProducer {
     /// Over a unit that holds the Ply emitter: the front end and `emit.ply`, compiled.
@@ -102,8 +103,8 @@ impl PlyProducer {
         (self.asked.get(), self.answered.get())
     }
 
-    /// The emitter's C for `name`, or nothing: it did not reach the body, or the module it is in
-    /// has no source text to hand the emitter.
+    /// The emitter's C for `name`, or nothing: it did not reach the body, or the program has no
+    /// source texts to hand the emitter.
     pub fn body(
         &self,
         loaded: &Source,
@@ -111,21 +112,22 @@ impl PlyProducer {
         module_index: usize,
     ) -> Option<(String, Tables)> {
         self.asked.set(self.asked.get() + 1);
-        let module = loaded.program.modules.get(module_index)?.name.to_string();
-        if !self.modules.borrow().contains_key(&module) {
-            let bodies = match self.bodies_of(loaded, &module) {
+        loaded.program.modules.get(module_index)?;
+        let program = std::ptr::from_ref(loaded) as usize;
+        if !self.modules.borrow().contains_key(&program) {
+            let bodies = match self.bodies_of(loaded) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("the Ply emitter failed over `{module}`: {e:#}");
+                    eprintln!("the Ply emitter failed over the program: {e:#}");
                     HashMap::new()
                 }
             };
-            self.modules.borrow_mut().insert(module.clone(), bodies);
+            self.modules.borrow_mut().insert(program, bodies);
         }
         let found = self
             .modules
             .borrow()
-            .get(&module)
+            .get(&program)
             .and_then(|m| m.get(name))
             .cloned();
         if found.is_some() {
@@ -134,14 +136,19 @@ impl PlyProducer {
         found
     }
 
-    fn bodies_of(
-        &self,
-        loaded: &Source,
-        module: &str,
-    ) -> Result<HashMap<String, (String, Tables)>> {
-        let Some(text) = loaded.texts.get(module) else {
-            return Ok(HashMap::new());
-        };
+    /// Every body of the program at once: the emitter resolves the modules together, so a call's
+    /// default arguments are filled and every signature is in reach.
+    fn bodies_of(&self, loaded: &Source) -> Result<Bodies> {
+        let mut names = Vec::new();
+        let mut srcs = Vec::new();
+        for m in &loaded.program.modules {
+            let name = m.name.to_string();
+            let Some(text) = loaded.texts.get(&name) else {
+                return Ok(HashMap::new());
+            };
+            names.push(Value::bytes(name.as_bytes()));
+            srcs.push(Value::bytes(text.as_bytes()));
+        }
         let ctors = Value::list(
             loaded
                 .ctors()
@@ -155,12 +162,7 @@ impl PlyProducer {
                 .map(|b| Value::bytes(b.name().as_bytes()))
                 .collect(),
         );
-        let args = [
-            Value::bytes(module.as_bytes()),
-            ctors,
-            builtins,
-            Value::bytes(text.as_bytes()),
-        ];
+        let args = [Value::list(names), Value::list(srcs), ctors, builtins];
         let mut ctx = self.native.context();
         ctx.begin(i64::MAX / 2);
         let layouts: *const crate::heap::Layouts = &self.native.tables().layouts;
