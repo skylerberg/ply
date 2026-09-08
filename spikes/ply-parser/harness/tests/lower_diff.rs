@@ -240,8 +240,19 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize, usize) {
             // sits `expand`, where the port desugars and the reference does not, and no comparison
             // reaches it. This exclusion is the only place that divergence is written down.
             //
-            // Closing it is one change with two effects: the port lowers updates the way the
-            // reference does, this exclusion goes, and `reached` and `compared` meet.
+            // **How to close it, which is not the obvious way.** The reference does not lower a
+            // `RecordUpdate` *expression* either: `code.rs` says one cannot survive the parser,
+            // and `lower_record_update` **recognises** the pattern in a plain record literal --
+            // a literal in which some field is `b.<its own name>` for one slot variable `b`, every
+            // such copy of that same `b`. So the node is recovered from the desugared form, and
+            // recovering it needs no type information at all. The port desugars to exactly that
+            // form, so the same recognition works on it.
+            //
+            // What it does need is the ownership: the base is read *after* every written field and
+            // reads only the copied ones, so `use_base` pushes a whole read plus one per kept
+            // field and answers `Owned` only at the last use. That is the piece to port, and it
+            // closes this exclusion, the 94 bodies it hides, and the field-read ordering the
+            // *emitter* differential sees from the other side.
             if expected
                 .get(fname)
                 .is_some_and(|want| want.contains("upd("))
