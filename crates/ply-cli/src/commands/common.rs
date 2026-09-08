@@ -128,10 +128,18 @@ pub(crate) fn install_producer_from_env() {
     let Ok(spec) = std::env::var("PLY_C_EMITTER") else {
         return;
     };
-    let Some(dir) = spec.strip_prefix("ply:") else {
-        eprintln!("PLY_C_EMITTER is `{spec}`; the one producer is `ply:<dir>`");
-        return;
+    let (dir, whole) = match (spec.strip_prefix("ply:"), spec.strip_prefix("ply-whole:")) {
+        (Some(dir), _) => (dir, false),
+        (_, Some(dir)) => (dir, true),
+        _ => {
+            eprintln!(
+                "PLY_C_EMITTER is `{spec}`; the producers are `ply:<dir>`, which answers bodies \
+                 the reference accepted, and `ply-whole:<dir>`, which answers the unit"
+            );
+            return;
+        }
     };
+    ply_codegen::c::producer::set_whole(whole);
     let dir = std::path::PathBuf::from(dir);
     ply_codegen::c::producer::install(std::sync::Arc::new(move || {
         // The directory's own `.ply` files and the standard library: not a project load, which

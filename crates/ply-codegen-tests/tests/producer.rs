@@ -112,9 +112,12 @@ fn nested(a: Int, b: Int) -> Int = (a + b) * (a - b)
 fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 "#;
 
-#[test]
-fn the_ply_emitter_answers_bodies_and_they_answer_what_the_machine_answers() {
+/// The unit built with the Ply emitter as its producer, and every case's answer checked against
+/// the machine's. In whole mode the reference emits nothing of the program; the port's refusals
+/// are the fixpoint's, and this program has none.
+fn built_and_checked(whole: bool) {
     producer::install(std::sync::Arc::new(emitter));
+    producer::set_whole(whole);
     let loaded = load(&[("m", PROGRAM)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -169,4 +172,14 @@ fn the_ply_emitter_answers_bodies_and_they_answer_what_the_machine_answers() {
             "`{name}{args:?}`: the tier and the machine disagree"
         );
     }
+}
+
+#[test]
+fn the_ply_emitter_answers_bodies_and_they_answer_what_the_machine_answers() {
+    built_and_checked(false);
+}
+
+#[test]
+fn the_chain_entered_whole_answers_what_the_machine_answers() {
+    built_and_checked(true);
 }
