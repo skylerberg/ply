@@ -34,9 +34,12 @@ fn dir() -> PathBuf {
 /// the cache away rather than asking anyone to remember to.
 pub fn key(def_hash: &str, ctors: &str, inlining: (usize, usize)) -> String {
     let mut h = blake3::Hasher::new();
+    // The runtime's helper table is part of the key: a body's C calls the helpers by shape, and
+    // a shape that moved would otherwise be read back from a body emitted against the old one.
     for part in [
         "ply-c-emit-3",
         &exe_stamp(),
+        &super::bundle::runtime_digest(),
         &format!("{}:{}", inlining.0, inlining.1),
         ctors,
         def_hash,
@@ -223,7 +226,13 @@ fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
                 let (ty, bits) = rest.split_once(' ')?;
                 let n: u8 = ty.parse().ok()?;
                 let ty = ply_core::ty::INT_TYPES.iter().find(|t| **t as u8 == n)?;
-                Value::Fixed(ply_eval::Fixed::new(*ty, bits.parse().ok()?))
+                // Written unsigned by the reference and as the wrapped `Int` by the emitter in
+                // Ply, whose integers are signed: one bit pattern either way.
+                let bits: u64 = match bits.parse::<u64>() {
+                    Ok(b) => b,
+                    Err(_) => bits.parse::<i64>().ok()? as u64,
+                };
+                Value::Fixed(ply_eval::Fixed::new(*ty, bits))
             }
             "x" => Value::Float(f64::from_bits(u64::from_str_radix(rest, 16).ok()?)),
             "d" => {
