@@ -208,11 +208,15 @@ fn emit_all(
                     continue;
                 }
                 for op in &tables.performs {
-                    let missing = match handlers.get(op) {
-                        None => Some("nothing in the program".to_string()),
-                        Some(hs) => hs.iter().find(|h| !taken_now.contains(h)).map(|h| {
-                            format!("`{h}`, which handles it and is not in this compiled unit")
-                        }),
+                    let missing = if super::producer::host_served().contains(op) {
+                        Some("the host, which the tier has no route to".to_string())
+                    } else {
+                        match handlers.get(op) {
+                            None => Some("nothing in the program".to_string()),
+                            Some(hs) => hs.iter().find(|h| !taken_now.contains(h)).map(|h| {
+                                format!("`{h}`, which handles it and is not in this compiled unit")
+                            }),
+                        }
                     };
                     if let Some(why) = missing {
                         round.push(Refused {

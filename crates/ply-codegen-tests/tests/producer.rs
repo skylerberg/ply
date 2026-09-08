@@ -312,7 +312,18 @@ effect orphan {
   write poke(n: Int) -> Int
 }
 
+effect served {
+  write ping(n: Int) -> Int
+}
+
 fn performer(n: Int) -> Int / {counter.write} = counter.bump(n)
+
+fn hosted(n: Int) -> Int / {served.write} = served.ping(n)
+
+fn hosting(seed: Int) -> Int =
+  handle { hosted(seed) } with {
+    served.ping(n) -> n + 1,
+  }
 
 fn handler(seed: Int) -> Int =
   handle { performer(seed) } with {
@@ -327,6 +338,8 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
     producer::set_whole(true);
+    // An operation the run's host binding would answer stays the machine's, handler or not.
+    producer::set_host_served(vec!["m.served#ping".to_string()]);
     let loaded = load(&[("m", DROPPED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -357,4 +370,11 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
         "{}",
         reason("m.lonely")
     );
+    assert!(
+        reason("m.hosted").contains("the host"),
+        "{}",
+        reason("m.hosted")
+    );
+    // The handler calls the performer, so the cascade takes it too, naming the performer.
+    assert!(reason("m.hosting").contains("m.hosted"), "{}", reason("m.hosting"));
 }

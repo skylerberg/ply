@@ -16,7 +16,8 @@ library and the examples in that mode. The host route is not built: a
 `perform` no frame answers is refused before it is compiled, by the rule below,
 so nothing reaches the runtime's "no handler" failure from a shipped program.
 What the tier refuses over the shipped corpus now is `simulate`, `task.*`, the
-`Float` and `Decimal` literals the reference never carried, and their callers.
+`Float` and `Decimal` literals the reference never carried, a `perform` of an
+operation the run's host binding would answer, and their callers.
 Two things the building found are in the design below where they belong: a
 name the runtime reads out of the unit's table is written as the placeholder
 the unit resolves, and a produced body's cache key carries the emitter's own
@@ -127,8 +128,11 @@ of the `return` clause when there is one. Four helpers carry it:
   footprint checks, and a span to hang a diagnostic on -- and each of them is a
   field on the frame or the context rather than a reason to refuse. Until it
   is built, the fixpoint refuses a performer of an operation nothing in the
-  program handles, so the runtime's failure for that case is never reached
-  from a shipped program.
+  program handles, and one of every operation the run's host binding would
+  answer -- the driver hands the producer that list when it builds the
+  backend -- so a compiled `perform` never has to reach the host, and the
+  runtime's failure for the unhandled case is the machine's own diagnostic for
+  a compiler defect.
 - Every `perform` records its atom on the context, and the backend hands the
   atoms across the seam after each entry for the machine to record in its
   trace: the observed row is a claim the tests make, and a handled perform is
