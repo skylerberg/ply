@@ -78,6 +78,7 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_perform" => rt::rt_perform as *const (),
             "rt_handle_land" => rt::rt_handle_land as *const (),
             "rt_simulate" => rt::rt_simulate as *const (),
+            "rt_handle_detached" => rt::rt_handle_detached as *const (),
             "rt_region" => rt::rt_region as *const (),
             "rt_region_close" => rt::rt_region_close as *const (),
             "rt_dup" => rt::rt_dup as *const (),
