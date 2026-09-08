@@ -20,6 +20,7 @@ pub struct Source {
     /// its own text and everything it references. Empty when nobody supplied any, and then nothing
     /// is kept between runs.
     pub keys: HashMap<String, String>,
+    regions: std::sync::OnceLock<ply_eval::region_kind::Regions>,
 }
 
 /// The name a test's root takes: its place among its module's tests, which `ply_eval`'s test
@@ -93,6 +94,7 @@ impl Source {
             definitions,
             test_roots: roots,
             keys: HashMap::new(),
+            regions: std::sync::OnceLock::new(),
         }
     }
 
@@ -105,6 +107,7 @@ impl Source {
     ) -> Source {
         Source {
             keys,
+            regions: std::sync::OnceLock::new(),
             ..Source::new(program, resolved, check)
         }
     }
@@ -134,6 +137,13 @@ impl Source {
     }
 
     /// Every function in the program, by program-wide name, in source order.
+    /// The regions this program opens, inferred once and kept. A `with cell` site asks whether it
+    /// opens one, which decides whether a tier with no frame to close it on can carry the site.
+    pub fn regions(&self) -> &ply_eval::region_kind::Regions {
+        self.regions
+            .get_or_init(|| ply_eval::region_kind::infer(self.program, self.resolved))
+    }
+
     pub fn functions(&self) -> Vec<String> {
         let mut out = Vec::new();
         for module in &self.program.modules {

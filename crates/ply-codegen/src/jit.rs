@@ -17,7 +17,7 @@ use cranelift_module::{FuncId, Linkage, Module, default_libcall_names};
 use ply_eval::code::{Arm, Pat, Stmt, lower_fn};
 use ply_eval::rc::Own;
 use ply_eval::{Builtin, Code, NodeKind, Value};
-use ply_span::Symbol;
+use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, IntTy, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
 use std::cell::RefCell;
@@ -129,6 +129,9 @@ struct Helpers {
     list_get: FuncId,
     list_push: FuncId,
     not_a_list: FuncId,
+    cell: FuncId,
+    region: FuncId,
+    region_close: FuncId,
     shift_count: FuncId,
     dup: FuncId,
     dec: FuncId,
@@ -748,6 +751,9 @@ impl Jit {
             list_get: declare(&mut module, "rt_list_get", 3, true)?,
             list_push: declare(&mut module, "rt_list_push", 3, true)?,
             not_a_list: declare(&mut module, "rt_not_a_list", 3, false)?,
+            cell: declare(&mut module, "rt_cell", 2, true)?,
+            region: declare(&mut module, "rt_region", 2, true)?,
+            region_close: declare(&mut module, "rt_region_close", 2, false)?,
             shift_count: declare(&mut module, "rt_shift_count", 2, false)?,
             dup: declare(&mut module, "rt_dup", 2, true)?,
             dec: declare(&mut module, "rt_dec", 2, false)?,
@@ -1385,10 +1391,12 @@ fn admissible_builtin(b: Builtin) -> Result<(), String> {
         ));
     }
     match b {
-        Builtin::CellGet | Builtin::CellSet => Err(format!(
-            "`{}`, which reaches a cell arena compiled code is not given",
-            b.name()
-        )),
+        // `cell_get` and `cell_set` reach the arena the context carries for exactly this, and the
+        // only cell either can be handed is one a `with cell` in the same body opened: a cell is
+        // not a crossable argument, so none arrives from outside. What used to be refused here was
+        // the *hole* rather than the builtin -- a body could take a cell and leave the arena with
+        // slots in it -- and the seam now measures that directly, declining an entry that does not
+        // give back the regions and slots it took.
         Builtin::SecretOfString => Err(format!(
             "`{}`, which would put a credential in the fragment's value arena",
             b.name()
@@ -1780,6 +1788,51 @@ impl Fx<'_, '_> {
                 self.builder.block_params(join)[0]
             }
         }
+    }
+
+    /// `with cell r = init { body }`: a region, a cell in it, and the body in the binder's scope.
+    ///
+    /// A cell is not reached through the handler stack -- `cell_get` and `cell_set` are builtins
+    /// over the value this binds -- so the node is an allocation and a scope, not control.
+    ///
+    /// The close is emitted on the way out only. A body that fails jumps to `failure` and leaves
+    /// the region open, which leaves the arena unbalanced, which is what the seam declines on --
+    /// and a declined entry is answered by the machine, the same fallback a failure already takes.
+    fn with_cell(
+        &mut self,
+        init: &Code,
+        binder: &Symbol,
+        body: &Code,
+        span: Span,
+        scope: &mut Scope,
+    ) -> Result<Val> {
+        let unique = match self.loaded.regions().at(span).map(|r| r.kind) {
+            Some(ply_eval::RegionKind::Unique) => 1,
+            Some(ply_eval::RegionKind::Shared) => 0,
+            None => {
+                return self.refuse("a `with cell` whose region the analysis did not decide");
+            }
+        };
+        let v = self.consumed(init, scope)?;
+        let w = self.boxed(v);
+        let k = self.builder.ins().iconst(types::I64, unique);
+        let region = self.helper(self.jit.helpers.region, &[k]);
+        let cell = self.helper(self.jit.helpers.cell, &[w]);
+        let mut inner = scope.clone();
+        let mark = self.homes.len();
+        // Given a home, as a `let` gives its value one: the binder can be read more than once, and
+        // the home is what the reads take their counts from and what releases the last of them.
+        let cell = self.home(Val {
+            kind: Kind::Boxed,
+            v: cell,
+            ty: 0,
+            home: 0,
+        });
+        inner.push((binder.clone(), cell));
+        let answer = self.consumed(body, &mut inner)?;
+        self.release_homes_from(mark);
+        self.helper_void(self.jit.helpers.region_close, &[region]);
+        Ok(answer)
     }
 
     fn helper(
@@ -2995,7 +3048,9 @@ impl Fx<'_, '_> {
                 self.refuse(format!("`perform {}.{}`", effect.symbol(), op))
             }
             NodeKind::Handle { .. } => self.refuse("a `handle`"),
-            NodeKind::WithCell { .. } => self.refuse("a `with cell`"),
+            NodeKind::WithCell {
+                init, binder, body, ..
+            } => self.with_cell(init, binder, body, code.span, scope),
             NodeKind::Simulate { .. } => self.refuse("a `simulate`"),
             NodeKind::WithRegion { .. } => self.refuse("a `region` block"),
         }

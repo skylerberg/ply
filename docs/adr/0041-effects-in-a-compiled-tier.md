@@ -1,10 +1,11 @@
 # ADR 0041 — Effects in a compiled tier
 
-**Accepted as a staging, not as a build.** Both compiled tiers refuse all four
-effect constructs today, and this record says which of them can be carried as
-*calls*, which cannot be carried without changing the tier's calling convention,
-and why the split falls where it does. It authorises the first two and declines
-the third.
+**Accepted as a staging. Stage 1 is built: both tiers carry `with cell`.** Every
+effect construct was refused when this was written. This record says which of
+them can be carried as *calls*, which cannot be carried without changing the
+tier's calling convention, and why the split falls where it does. It authorises
+the first two, declines the third, and records what building the first one
+taught.
 
 > **What this decides.** That `with cell` and a `perform` that provably reaches a
 > host handler are compiled, because both are calls: they return a value to the
@@ -94,19 +95,36 @@ creates one. `Ctx` already owns the arena that would allocate it, and the region
 kind a site opens is a per-program analysis (`region_kind::infer`), so it is
 known where the unit is built and can be emitted as a constant.
 
-What is left is the one hard part: a region opened at the node has to be closed
-on **every** exit, and a compiled body returns early from any helper that can
-raise. The interpreter closes it with a stack frame, which C has no equivalent
-of, so this has to be reconciled by the context at the end of a failed entry
-rather than by the emitted code.
+**Closing the region on every exit turned out not to be the problem it looked
+like.** A compiled body returns early from any helper that can raise, and there
+is no frame to hang an unwind on, so the close is emitted on the success path
+only. A failed body therefore leaves the region open — and that is *already* the
+condition the seam declines on, so the machine answers the call itself, which is
+what a failure does anyway. The missing close costs a re-run that was happening
+regardless.
+
+What that needs is a seam that measures a **balance** rather than a total. The
+gate it replaced asked whether the entry had touched the arena at all, which no
+body opening a cell can pass; the arena's depth and live-slot count both come
+back down, so a `with cell` that ends is balanced and a region left open is not.
+The gate that used to refuse `cell_get` and `cell_set` outright goes with it:
+the only cell either can be handed is one a `with cell` in the same body opened,
+because a cell is not a crossable argument.
+
+**And the finding that decides where the work goes: the fragment is the
+Cranelift tier's.** A definition enters the compiled set only if `Jit::refusals`
+accepts it, whatever tier will emit it — so implementing a construct in the
+emitted-C tier alone changes nothing. Both tiers gained the node together, and
+anything below has to.
 
 ## The decision
 
 Staged, in this order, each landing behind the differential the tier already
 has:
 
-1. **`with cell`**, whose remaining problem is closing a region on the early
-   returns, not the cell itself. Independent of everything below.
+1. **`with cell`** — **built.** Three runtime helpers, a node in each tier, and
+   a seam that measures the arena's balance instead of refusing anything that
+   touches it. Independent of everything below.
 2. **`perform` under the whole-program criterion**, with the binding threaded
    into `Ctx` and a refusal, naming the handler it found, when the criterion
    fails.
@@ -123,5 +141,11 @@ need the call graph, and if refusals cluster on programs that have a handler
 somewhere, that is the next thing to build rather than stage 3.
 
 That the cascade argument is wrong: if refusing an effectful body turns out to
-cost only that body, the coverage motivation goes with it, and stages 1 and 2
-should be re-priced against what else the tier is refusing.
+cost only that body, the coverage motivation goes with it, and stage 2 should be
+re-priced against what else the tier is refusing.
+
+That the balance is too weak a check. It says the arena was given back; it does
+not by itself say no cell *escaped*, and what stops that is a separate refusal of
+an answer holding one. If a third route out of a compiled body is ever added —
+another handle-shaped value, another way to hand a word to the machine — the two
+have to be re-read together, because neither is sufficient alone.
