@@ -1683,7 +1683,7 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
   let reads = slots_read(body);
   // The reuse tokens come before the prologue, and are named by width rather
   // than numbered, so finding them does not disturb the temporaries.
-  let widths = sorted_widths(widths_released(body, params, reads));
+  let widths = sorted_widths(widths_released(body, params, here, reads));
   let start = fold(widths, { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: 0, owner: name, builtins: builtins, met: [], fields: [], released: [], toks: widths },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
@@ -1709,22 +1709,50 @@ pub fn emit_fn(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: L
 // The record widths this body gives back, by the rule `release_base` applies:
 // a bare variable read at its own last use, read exactly once in the body, whose
 // type says how wide it is.
-fn widths_released(c: Code, params: List<P>, reads: List<Int>) -> List<Int> =
+// A slot's shape, as the pre-pass can know it: seeded from the parameters and
+// extended by every `let`. The emitter learns the same shapes as it goes; this
+// walk has to learn them too, or a release it did not foresee names a reuse
+// token that was never declared.
+pub type Shaped = { slot: Int, ty: Ty }
+
+fn shape_at(env: List<Shaped>, slot: Int) -> Ty =
+  fold(env, TyOpen, |acc: Ty, e: Shaped| if e.slot == slot { e.ty } else { acc })
+
+fn ty_of(env: List<Shaped>, here: List<Def>, c: Code) -> Ty =
+  match c.node {
+    NVar(v) -> match v.slot { Some(s) -> shape_at(env, s), None -> TyOpen },
+    NBlock(b) -> match b.tail { Some(t) -> ty_of(env, here, t), None -> TyOpen },
+    NRecord(r) -> TyRec(map(r.fields, |f: CField| { name: f.name, k: KBoxed })),
+    NApp(a) -> match a.func.node {
+      NVar(fv) -> match fv.slot { Some(_) -> TyOpen, None -> ret_of(here, fv.name).ty },
+      _ -> TyOpen,
+    },
+    NIf(i) -> {
+      let t = ty_of(env, here, i.then_branch);
+      if t == ty_of(env, here, i.else_branch) { t } else { TyOpen }
+    },
+    _ -> TyOpen,
+  }
+
+fn widths_released(c: Code, params: List<P>, here: List<Def>, reads: List<Int>) -> List<Int> = {
+  let env = fold(range(0, len(params)), [], |acc: List<Shaped>, i: Int|
+    match list_at(params, i) { Some(p) -> push(acc, { slot: i, ty: p.ty }), None -> acc });
+  widths_in(c, env, here, reads)
+}
+
+fn widths_in(c: Code, env: List<Shaped>, here: List<Def>, reads: List<Int>) -> List<Int> =
   match c.node {
     NField(f) -> {
-      let inner = widths_released(f.base, params, reads);
+      let inner = widths_in(f.base, env, here, reads);
       match f.base.own {
         Owned -> match f.base.node {
           NVar(v) -> match v.slot {
             None -> inner,
             Some(sl) -> if count_of(reads, sl) != 1 { inner } else {
-              match list_at(params, sl) {
+              match width_of(shape_at(env, sl)) {
                 None -> inner,
-                Some(p) -> match width_of(p.ty) {
-                  None -> inner,
-                  Some(w) -> if fold(inner, false, |acc: Bool, x: Int| acc || x == w) { inner }
-                             else { push(inner, w) },
-                },
+                Some(w) -> if fold(inner, false, |acc: Bool, x: Int| acc || x == w) { inner }
+                           else { push(inner, w) },
               }
             },
           },
@@ -1735,35 +1763,41 @@ fn widths_released(c: Code, params: List<P>, reads: List<Int>) -> List<Int> =
     },
     NRecord(r) -> merge_widths([len(r.fields)],
       fold(r.fields, [], |acc: List<Int>, f: CField|
-        merge_widths(acc, widths_released(f.value, params, reads)))),
-    NUnary(u) -> widths_released(u.operand, params, reads),
-    NBinary(b) -> merge_widths(widths_released(b.lhs, params, reads),
-                               widths_released(b.rhs, params, reads)),
-    NIf(i) -> merge_widths(widths_released(i.cond, params, reads),
-                merge_widths(widths_released(i.then_branch, params, reads),
-                             widths_released(i.else_branch, params, reads))),
-    NBlock(b) -> merge_widths(
-      fold(b.stmts, [], |acc: List<Int>, st: CStmt| merge_widths(acc, match st {
-        CLet(l) -> widths_released(l.value, params, reads),
-        CDo(d) -> widths_released(d.code, params, reads),
-      })),
-      match b.tail { Some(t) -> widths_released(t, params, reads), None -> [] }),
+        merge_widths(acc, widths_in(f.value, env, here, reads)))),
+    NUnary(u) -> widths_in(u.operand, env, here, reads),
+    NBinary(b) -> merge_widths(widths_in(b.lhs, env, here, reads),
+                               widths_in(b.rhs, env, here, reads)),
+    NIf(i) -> merge_widths(widths_in(i.cond, env, here, reads),
+                merge_widths(widths_in(i.then_branch, env, here, reads),
+                             widths_in(i.else_branch, env, here, reads))),
+    // A `let` puts its value's shape in scope for everything after it, which is
+    // what lets a release of a bound record find its width.
+    NBlock(b) -> {
+      let walked = fold(b.stmts, { env: env, ws: [] },
+        |acc: { env: List<Shaped>, ws: List<Int> }, st: CStmt| match st {
+          CLet(l) -> { env: push(acc.env, { slot: l.slot, ty: ty_of(acc.env, here, l.value) }),
+                       ws: merge_widths(acc.ws, widths_in(l.value, acc.env, here, reads)) },
+          CDo(d) -> { env: acc.env, ws: merge_widths(acc.ws, widths_in(d.code, acc.env, here, reads)) },
+        });
+      merge_widths(walked.ws,
+        match b.tail { Some(t) -> widths_in(t, walked.env, here, reads), None -> [] })
+    },
     NList(l) -> fold(l.items, [], |acc: List<Int>, x: Code|
-      merge_widths(acc, widths_released(x, params, reads))),
+      merge_widths(acc, widths_in(x, env, here, reads))),
     // The rest of the walk, so a record built inside a call's argument or a
     // match arm still declares its token. Leaving these out declared no token
     // for `std.http.endless`, which builds one two fields wide inside a call.
-    NApp(a) -> fold(a.args, widths_released(a.func, params, reads), |acc: List<Int>, x: Code|
-      merge_widths(acc, widths_released(x, params, reads))),
-    NMatch(m) -> fold(m.arms, widths_released(m.scrutinee, params, reads),
+    NApp(a) -> fold(a.args, widths_in(a.func, env, here, reads), |acc: List<Int>, x: Code|
+      merge_widths(acc, widths_in(x, env, here, reads))),
+    NMatch(m) -> fold(m.arms, widths_in(m.scrutinee, env, here, reads),
       |acc: List<Int>, ar: CArm| merge_widths(acc, merge_widths(
-        match ar.guard { Some(g) -> widths_released(g, params, reads), None -> [] },
-        widths_released(ar.body, params, reads)))),
-    NCell(c2) -> merge_widths(widths_released(c2.init, params, reads),
-                              widths_released(c2.body, params, reads)),
-    NRegion(r) -> widths_released(r.body, params, reads),
+        match ar.guard { Some(g) -> widths_in(g, env, here, reads), None -> [] },
+        widths_in(ar.body, env, here, reads)))),
+    NCell(c2) -> merge_widths(widths_in(c2.init, env, here, reads),
+                              widths_in(c2.body, env, here, reads)),
+    NRegion(r) -> widths_in(r.body, env, here, reads),
     NPerform(pf) -> fold(pf.args, [], |acc: List<Int>, x: Code|
-      merge_widths(acc, widths_released(x, params, reads))),
+      merge_widths(acc, widths_in(x, env, here, reads))),
     // A lambda's body is a function of its own and declares its own tokens.
     NLambda(_) -> [],
     NSim(_) -> [],
@@ -1842,13 +1876,14 @@ pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, sr
     match it {
       IFn(d) -> {
         let names = map(d.params, |p: Param| p.name.name);
-        // `param_kind_in` -- which resolves a named record type to its fields --
-        // is deliberately not used here yet. It reaches 484 shipped bodies
-        // against 421, and 38 of those then disagree: the reference declares
-        // reuse tokens this port's pre-pass does not foresee, because that pass
-        // can only see the widths a *declaration* gives and the extra shapes put
-        // releases in bodies it never looked at. The resolution is right; the
-        // token pre-pass has to learn the same shapes before it can be turned on.
+        // `param_kind_in` resolves a named record type to its fields, so
+        // `v: Values` would carry what `v: { .. }` does. It is written and not
+        // switched on: it reaches 484 shipped bodies against 421 and 38 then
+        // disagree, and after the token pre-pass was taught the same shapes the
+        // symptom is the other way round -- the port now declares a reuse token
+        // for a body the reference does not release in at all. So the two sides
+        // disagree about *when a release happens*, not about the width, and that
+        // is the rule to find before this is turned on.
         let kinds = map(d.params, |p: Param| param_kind(p.ty));
         let known = fold(kinds, true, |acc: Bool, k: Option<{ k: Kind, ty: Ty }>| acc && k != None);
         match if known { lower_fn(names, d.body) } else { None } {
