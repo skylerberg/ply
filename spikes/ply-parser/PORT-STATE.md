@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **605 of 1282** shipped bodies |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **623 of 1282** shipped bodies |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -68,6 +68,15 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**A refusal carries its reason now.** `Em.refused` holds the first reason a body was refused;
+a refusal poisons the state and emission runs out, so no signature changed. `emit_fn_why`
+reads the reason, `emit_refusals_all` lists every refused body of a program, and the census
+test in `harness/tests/emit_diff.rs` aggregates them by reason over the bodies the reference
+emits. Read that census before choosing what to build next: as this was written it put a
+nullary call of a definition first (the constant table wants the purity the checker
+publishes), then a field read over a shape the port cannot see, then a pattern it cannot
+test, then an operator it does not emit, then a parameter with no written type.
 
 `std.json.float_json` is gone from the gaps: a lambda's emission restarted the body's
 constant and shape tables instead of continuing them, which the tables differential
