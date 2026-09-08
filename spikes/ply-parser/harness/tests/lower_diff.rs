@@ -212,12 +212,12 @@ fn by_name(dump: &str) -> std::collections::BTreeMap<String, String> {
 
 /// What the port covers, over one corpus: every function it lowered agrees with the oracle, and
 /// the share it reached is reported so that a port going backwards is visible.
-fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize) {
+fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize, usize) {
     let project = Project::new(label);
     let texts: Vec<Vec<u8>> = inputs.iter().map(|(_, t)| t.clone()).collect();
     let got = project.dumps(&texts);
     let mut failures: Vec<String> = Vec::new();
-    let (mut reached, mut available) = (0usize, 0usize);
+    let (mut reached, mut available, mut compared) = (0usize, 0usize, 0usize);
     for ((name, text), actual) in inputs.iter().zip(&got) {
         let source = String::from_utf8_lossy(text).to_string();
         let reference = reference_lower_dump(&[("m".to_string(), source)]);
@@ -238,6 +238,7 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize) {
             {
                 continue;
             }
+            compared += 1;
             match expected.get(fname) {
                 None => failures.push(format!(
                     "{label}: `{fname}` in {name} was lowered by the port and not by the oracle"
@@ -250,7 +251,7 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize) {
         }
     }
     println!(
-        "  {label}: {} input(s), {reached} of {available} function(s) lowered, all agreeing",
+        "  {label}: {} input(s), {reached} of {available} function(s) lowered, {compared} compared",
         inputs.len()
     );
     assert!(
@@ -259,7 +260,7 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize) {
         failures.len(),
         failures.join("\n")
     );
-    (reached, available)
+    (reached, available, compared)
 }
 
 fn files_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
@@ -279,19 +280,31 @@ fn files_in(dir: &Path) -> Vec<(String, Vec<u8>)> {
 fn the_lowering_agrees_with_ply_eval_wherever_the_port_reaches() {
     let mut reached = 0usize;
     let mut available = 0usize;
+    let mut compared = 0usize;
     for (label, dir) in [
         ("stdlib", repo_root().join("crates/ply-std/ply")),
         ("examples", repo_root().join("examples")),
         ("fixtures", spike_dir().join("fixtures")),
     ] {
-        let (r, a) = compare(label, &files_in(&dir));
+        let (r, a, c) = compare(label, &files_in(&dir));
         reached += r;
         available += a;
+        compared += c;
     }
     // The assertion that keeps the one above honest: a port that lowered nothing would agree with
     // the oracle on every function it produced, because it would produce none. This is the share,
     // and it is written down so that raising it is a visible change and lowering it is a failure.
-    println!("  the port reaches {reached} of {available} function bodies");
+    // Two numbers, because they are not the same claim. `reached` is what the port lowered;
+    // `compared` is what was checked against the oracle. They differ by the record updates, which
+    // `rewrite.ply` expands and `ply-syntax` keeps as a node -- the two are lowering different
+    // trees there and a difference would be neither one's fault. Printing only the first would
+    // credit the port for bodies nothing verified.
+    println!("  the port reaches {reached} of {available} function bodies, {compared} compared");
+    assert!(
+        compared >= 1073,
+        "the port was compared on {compared} bodies, and it was 1073 when this was written -- \
+         raise this number when the port grows, and never lower it"
+    );
     assert!(
         reached >= 1179,
         "the port lowered {reached} of {available} bodies, and it reached 1179 when this was \
