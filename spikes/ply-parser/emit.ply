@@ -17,7 +17,7 @@
 // `opt.rs`, not of this file.
 
 import spine (num, Ident)
-import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NApp, NRecord, NMatch, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
+import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
 import items (Item, IFn, parse)
 import exprs (Param)
 import types (TypeExpr, TCon, TRecord)
@@ -54,10 +54,13 @@ pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>
                 // else can name. A callee that takes one of these is handed the
                 // count rather than a duplicate of it.
                 made: List<Bytes>,
-                // The definitions of the module being emitted. A bare name that
-                // is not one of them is a builtin or an import, and this port
-                // resolves neither, so it refuses rather than mangling a guess.
-                here: List<Bytes> }
+                // The definitions of the module being emitted, with the kind each
+                // answers. A bare name that is not one of them is a builtin or an
+                // import, and this port resolves neither, so it refuses rather
+                // than mangling a guess.
+                here: List<Def> }
+
+pub type Def = { name: Bytes, ret: Option<Kind> }
 
 // A record this body built, and the values its fields were built from. A later
 // field read of it is that value: it is already in a register, and going to
@@ -153,13 +156,12 @@ fn check(em: Em) -> Em = line(em, b"if (ctx->failed) return 0;")
 
 // A word as the sixty-four bits inside it, which is where integer arithmetic
 // happens. Already-`Int` values are themselves.
-fn as_int(em: Em, v: V) -> Out =
+fn as_int(v: V) -> Bytes =
   match v.k {
-    KInt -> { em: em, v: v },
-    KBool -> { em: em, v: { k: KInt, c: v.c, ty: TyOpen } },
-    KBoxed -> bind(em, KInt,
-      bytes_concat_all([b"(ply_is_imm(", v.c, b") ? ply_imm_value(", v.c,
-                        b") : rt_unbox_int_p(ctx, ", v.c, b"))"])),
+    KInt -> v.c,
+    KBool -> v.c,
+    KBoxed -> bytes_concat_all([b"(ply_is_imm(", v.c, b") ? ply_imm_value(", v.c,
+                                b") : rt_unbox_int_p(ctx, ", v.c, b"))"]),
   }
 
 // The other direction, for a value leaving the body.
@@ -240,6 +242,16 @@ fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
 // The shape's index in this body's own table, added on first use. A body names
 // the unit's tables by its own positions, which is what makes one body's text
 // comparable at all.
+fn opened_to(em: Em, v: V, k: Option<Kind>) -> Out =
+  match k {
+    Some(KInt) -> bind(em, KInt, as_int(v)),
+    Some(KBool) -> bind(em, KBool, as_bool(v)),
+    _ -> { em: em, v: v },
+  }
+
+fn ret_of(here: List<Def>, name: Bytes) -> Option<Kind> =
+  fold(here, None, |acc: Option<Kind>, d: Def| if d.name == name { d.ret } else { acc })
+
 // The helper that answers a builtin directly, where one does. Transcribed from
 // `c/emit.rs`'s table of the same name; a builtin with no entry here is refused
 // rather than sent down the generic path, which needs the unit's builtin table.
@@ -344,11 +356,11 @@ fn field_at(ty: Ty, name: Bytes) -> Option<Int> =
       } else { None },
   }
 
-fn as_bool(em: Em, v: V) -> Out =
+fn as_bool(v: V) -> Bytes =
   match v.k {
-    KBool -> { em: em, v: v },
-    KInt -> { em: em, v: { k: KBool, c: bytes_concat_all([b"((", v.c, b") != 0)"]), ty: TyOpen } },
-    KBoxed -> { em: em, v: { k: KBool, c: bytes_concat_all([b"rt_unbox_bool_p(ctx, ", v.c, b")"]), ty: TyOpen } },
+    KBool -> v.c,
+    KInt -> bytes_concat_all([b"((", v.c, b") != 0)"]),
+    KBoxed -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", v.c, b")"]),
   }
 
 fn as_word(v: V) -> Bytes =
@@ -377,7 +389,8 @@ pub fn covers() -> List<Bytes> =
    b"a field of a record whose shape a parameter's type gives",
    b"a record literal, through this body's reuse token for its width",
    b"a direct call to a definition of the same module",
-   b"the builtins with a runtime helper of their own"]
+   b"the builtins with a runtime helper of their own",
+   b"a match over wildcards, binders and Int literals"]
 
 fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
@@ -411,8 +424,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           Some(l) -> match expr(l.em, b.rhs, params) {
             None -> None,
             Some(r) -> {
-              let a = as_int(r.em, l.v);
-              let bb = as_int(a.em, r.v);
+              let a = { em: r.em, v: { k: KInt, c: as_int(l.v), ty: TyOpen } };
+              let bb = { em: a.em, v: { k: KInt, c: as_int(r.v), ty: TyOpen } };
               match compare_op(b.op) {
                 // `!=` is written as the negation of `==`, which is what the
                 // reference emits: one comparison in the C for the two spellings.
@@ -445,15 +458,14 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       None -> None,
       Some(o) ->
         if u.op == b"not" {
-          let bo = as_bool(o.em, o.v);
-          Some(bind(bo.em, KBool, bytes_concat_all([b"!(", bo.v.c, b")"])))
+          Some(bind(o.em, KBool, bytes_concat_all([b"!(", as_bool(o.v), b")"])))
         } else if u.op == b"neg" {
-          let a = as_int(o.em, o.v);
           // Negation overflows at one input, and the guard runs before the value
           // exists rather than after: code 2, as `rt_arith_p`'s table numbers it.
-          let g = line(a.em, bytes_concat_all([b"if (", a.v.c,
+          let a = as_int(o.v);
+          let g = line(o.em, bytes_concat_all([b"if (", a,
             b" == INT64_MIN) { rt_overflow_p(ctx, 2); return 0; }"]));
-          Some(bind(g, KInt, bytes_concat_all([b"-(", a.v.c, b")"])))
+          Some(bind(g, KInt, bytes_concat_all([b"-(", a, b")"])))
         } else { None },
     },
     // A list: every item boxed into a `Word` local, then the array they are
@@ -488,7 +500,9 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             bytes_concat_all([b"ply_words(", held.v.c, b")[", num(i), b"]"]));
           // The field's own kind, which for this port's shapes is always `Int`:
           // a scalar field is read into a register rather than left as a word.
-          let out = as_int(w.em, w.v);
+          // Bound here, where the reference binds it: a scalar field is read into
+          // a register of its own kind rather than left as a word.
+          let out = bind(w.em, KInt, as_int(w.v));
           Some({ em: release_base(out.em, f.base, b.v, params), v: out.v })
         },
         },
@@ -536,7 +550,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // by the unit's constant table, which is a purity analysis this port does
         // not have. Refused rather than emitted as the call it lowered to.
         None -> if len(a.args) == 0 { None }
-                else if !fold(em.here, false, |acc: Bool, h: Bytes| acc || h == fv.name) {
+                else if !fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
                   // Not a definition of this module: a builtin, or an import this
                   // port cannot resolve. The ones with a helper of their own are
                   // a swap for the call and nothing about ownership changes.
@@ -561,16 +575,37 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               b"ply_", mangle(em.module), b"_", fv.name, b"(ctx",
               fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])),
               b")"]));
-            Some({ em: check(o.em), v: o.v })
+            // The answer is opened to the *callee's* declared type, here rather
+            // than at the caller's return: a body whose own answer is already a
+            // word hands it straight back.
+            Some(opened_to(check(o.em), o.v, ret_of(em.here, fv.name)))
           },
         } },
       },
       _ -> None,
     },
+    // A `match` is arms in order over one flag: each arm runs only if no earlier
+    // one matched, and a body that falls off the end raises rather than answering.
+    NMatch(m) -> match expr(em, m.scrutinee, params) {
+      None -> None,
+      Some(sc) -> {
+        let subj = bind(sc.em, KBoxed, as_word(sc.v));
+        let ans = fresh(subj.em);
+        let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
+        let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
+        match arms(opened, m.arms, params, 0, subj.v, ans.name, flag.name) {
+          None -> None,
+          Some(after) -> Some({
+            em: line(after, bytes_concat_all([b"if (!", flag.name,
+                                              b") { rt_no_match_p(ctx); return 0; }"])),
+            v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
+        }
+      },
+    },
     NIf(i) -> match expr(em, i.cond, params) {
       None -> None,
       Some(cnd) -> {
-        let cv = as_int(cnd.em, cnd.v);
+        let cv = { em: cnd.em, v: { k: KInt, c: as_int(cnd.v), ty: TyOpen } };
         // The join temporary is numbered before either branch is emitted, so
         // its kind cannot be read off a branch's value. Emitting the then
         // branch into a scratch buffer -- one number ahead, to leave room for
@@ -654,6 +689,61 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
     }
   }
 
+// The arms, in order. Each is guarded by the flag rather than by an `else`, so
+// an arm's own test is written at one depth whatever the arm before it did.
+fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, flag: Bytes)
+    -> Option<Em> =
+  if i >= len(xs) { Some(em) } else {
+    match list_at(xs, i) {
+      None -> None,
+      // A guard is a second test after the pattern binds, and this port does not
+      // reach one yet.
+      Some(a) -> if a.guard != None { None } else {
+        match pat_test(a.pat, subj) {
+          None -> None,
+          Some(t) -> {
+            let opened = line(indent(line(em, bytes_concat_all([b"if (!", flag, b") {"]))),
+                              bytes_concat_all([b"if (", t, b") {"]));
+            let inner = indent(opened);
+            let bound = pat_bind(inner, a.pat, subj);
+            match expr(bound, a.body, params) {
+              None -> None,
+              Some(o) -> {
+                let done = line(line(o.em, bytes_concat_all([ans, b" = ", as_word(o.v), b";"])),
+                                bytes_concat_all([flag, b" = 1;"]));
+                let closed = line(outdent(line(outdent(done), b"}")), b"}");
+                arms(rescope(closed, em.conv), xs, params, i + 1, subj, ans, flag)
+              },
+            }
+          },
+        }
+      },
+    }
+  }
+
+// The C condition an arm's pattern is. `1` where the pattern cannot fail.
+fn pat_test(p: CPat, subj: V) -> Option<Bytes> =
+  match p {
+    PxWild -> Some(b"1"),
+    PxVar(_) -> Some(b"1"),
+    PxLit(l) -> match l {
+      LInt(n) -> Some(bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
+                                        b") == INT64_C(", num(n), b") : 0)"])),
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+// What the pattern names, bound to the subject.
+fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
+  match p {
+    PxVar(v) -> match v.slot {
+      None -> em,
+      Some(s) -> { let b = bind(em, KBoxed, subj.c); remember(b.em, s, b.v) },
+    },
+    _ -> em,
+  }
+
 // One arm of an `if`: the value, coerced to the join's kind, assigned. The bind
 // the reference writes here belongs to the block lowering wrapped the branch in.
 fn branch(em: Em, c: Code, params: List<P>, k: Kind, join: Bytes) -> Option<Em> =
@@ -668,7 +758,7 @@ fn branch(em: Em, c: Code, params: List<P>, k: Kind, join: Bytes) -> Option<Em> 
 fn coerce(em: Em, k: Kind, v: V) -> Out =
   match k {
     KBoxed -> { em: em, v: { k: KBoxed, c: as_word(v), ty: v.ty } },
-    _ -> as_int(em, v),
+    _ -> { em: em, v: { k: k, c: as_int(v), ty: TyOpen } },
   }
 
 fn is_arith(op: Bytes) -> Bool =
@@ -755,7 +845,7 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
 
 
 
-pub fn emit_fn(module: Bytes, here: List<Bytes>, name: Bytes, params: List<P>, ret: Option<Kind>, body: Code) -> Option<Bytes> = {
+pub fn emit_fn(module: Bytes, here: List<Def>, name: Bytes, params: List<P>, body: Code) -> Option<Bytes> = {
   let reads = slots_read(body);
   // The reuse tokens come before the prologue, and are named by width rather
   // than numbered, so finding them does not disturb the temporaries.
@@ -764,14 +854,7 @@ pub fn emit_fn(module: Bytes, here: List<Bytes>, name: Bytes, params: List<P>, r
   match expr(prologue(start, params), body, params) {
     None -> None,
     Some(o0) -> {
-      // The answer is coerced to the *declared* return type before it leaves: a
-      // body that ends in a call gets back a word, and a function that says `Int`
-      // opens it and closes it again rather than handing the word straight on.
-      let o = match ret {
-        Some(KInt) -> { let a = as_int(o0.em, o0.v); { em: a.em, v: a.v } },
-        Some(KBool) -> { let a = as_bool(o0.em, o0.v); { em: a.em, v: a.v } },
-        _ -> o0,
-      };
+      let o = o0;
       let sig = bytes_concat_all([b"Word ply_", name, b"(PlyCtx *ctx",
         fold(range(0, len(params)), b"", |acc: Bytes, i: Int|
           bytes_concat_all([acc, b", Word p", num(i)])), b") {\n"]);
@@ -840,7 +923,7 @@ fn merge_widths(a: List<Int>, b: List<Int>) -> List<Int> =
     if fold(acc, false, |seen: Bool, y: Int| seen || y == x) { acc } else { push(acc, x) })
 
 test "a body that answers a literal" {
-  assert_eq(string_of_bytes(match emit_fn(b"m", [], b"m_f", [], None, { own: Borrowed, node: NLit(LInt(7)) }) {
+  assert_eq(string_of_bytes(match emit_fn(b"m", [], b"m_f", [], { own: Borrowed, node: NLit(LInt(7)) }) {
     Some(c) -> c, None -> b"" }),
     "Word ply_m_f(PlyCtx *ctx) {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n  ctx->fuel += 1;\n  return (ply_fits_imm(INT64_C(7)) ? ply_imm(INT64_C(7)) : rt_box_int_p(ctx, INT64_C(7)));\n}\nWord ply_m_f_entry(PlyCtx *ctx, const Word *args) {\n  return ply_m_f(ctx);\n}\n")
 }
@@ -848,7 +931,7 @@ test "a body that answers a literal" {
 test "a form this port does not reach is refused" {
   // A `Str` literal: the reference interns one in the unit's constant table and
   // answers it through `rt_constant`, which is a table this port does not build.
-  assert_eq(match emit_fn(b"m", [], b"m_f", [], None, { own: Borrowed, node: NLit(LStr(b"x")) }) {
+  assert_eq(match emit_fn(b"m", [], b"m_f", [], { own: Borrowed, node: NLit(LStr(b"x")) }) {
     Some(_) -> false, None -> true }, true)
 }
 
@@ -863,8 +946,12 @@ test "a form this port does not reach is refused" {
 pub fn emit_dump_in(module: Bytes, src: Bytes) -> String = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
-  let here = fold(x.module.items, [], |acc: List<Bytes>, it: Item|
-    match it { IFn(d) -> push(acc, d.name.name), _ -> acc });
+  let here = fold(x.module.items, [], |acc: List<Def>, it: Item|
+    match it {
+      IFn(d) -> push(acc, { name: d.name.name,
+                            ret: match param_kind(d.ret) { Some(r) -> Some(r.k), None -> None } }),
+      _ -> acc,
+    });
   string_of_bytes(fold(x.module.items, b"C;1;", |acc: Bytes, it: Item|
     match it {
       IFn(d) -> {
@@ -878,7 +965,6 @@ pub fn emit_dump_in(module: Bytes, src: Bytes) -> String = {
                                      { name: match list_at(names, i) { Some(n) -> n, None -> b"" },
                                        k: match list_at(kinds, i) { Some(Some(p)) -> p.k, _ -> KInt },
                                        ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen } }),
-                                   match param_kind(d.ret) { Some(r) -> Some(r.k), None -> None },
                                    l.code) {
             None -> acc,
             Some(c) -> bytes_concat_all([acc, b"f:", module, b".", d.name.name, b";", c, b";"]),

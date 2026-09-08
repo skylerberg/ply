@@ -376,6 +376,10 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         // value is already in, and the record is still built because something
         // else might ask for its word.
         "fn mkf(n: Int) -> Int = { z: n, a: 1 }.a\n",
+        // A `match` is arms over one flag, and a body that falls off the end raises.
+        "fn sign(n: Int) -> Int = match n { 0 -> 0, _ -> if n < 0 { n } else { 1 } }\n",
+        "fn bindm(n: Int) -> Int = match n { 1 -> 10, k -> k + 1 }\n",
+        "fn three(n: Int) -> Int = match n { 0 -> 1, 1 -> 2, 2 -> 3, _ -> 0 }\n",
         // Deliberately absent, and worth saying why: a record built in both arms
         // of an `if` is *deferred* by the reference -- neither arm builds one,
         // and the join carries the fields as separate temporaries. A record of
@@ -397,7 +401,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 38, "only {reached} bodies were emitted");
+    assert!(reached >= 41, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
