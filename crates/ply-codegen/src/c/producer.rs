@@ -18,6 +18,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::Value;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// How a thread builds its producer.
@@ -38,6 +39,30 @@ pub fn install(recipe: Recipe) {
 
 pub fn installed() -> bool {
     RECIPE.get().is_some()
+}
+
+static WHOLE: AtomicBool = AtomicBool::new(false);
+
+/// Whether the producer's answer is the unit's: its bodies taken and its refusals dropped by the
+/// fixpoint, with the reference emitter not run at all. ADR 0042's third step.
+pub fn set_whole(whole: bool) {
+    WHOLE.store(whole, Ordering::Relaxed);
+}
+
+pub fn whole() -> bool {
+    mode() == "ply-whole"
+}
+
+/// The producer's mode, as the caches key on it. While the producer's own unit is being built
+/// the reference is the emitter, whatever was asked for: the producer cannot answer for itself.
+pub fn mode() -> &'static str {
+    if !installed() || BUILDING.with(Cell::get) {
+        "ref"
+    } else if WHOLE.load(Ordering::Relaxed) {
+        "ply-whole"
+    } else {
+        "ply"
+    }
 }
 
 /// Runs `f` with this thread's producer, building it first if the recipe is installed and this
@@ -68,7 +93,14 @@ pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
 }
 
 /// What the emitter answered for one module: each body's C and tables, by program-wide name.
-type Bodies = HashMap<String, (String, Tables)>;
+/// What the emitter said about one definition.
+#[derive(Clone)]
+pub enum Answer {
+    Body(String, Tables),
+    Refused(String),
+}
+
+type Bodies = HashMap<String, Answer>;
 
 /// The compiled Ply emitter, entered once per module of the program being compiled.
 pub struct PlyProducer {
@@ -82,7 +114,7 @@ pub struct PlyProducer {
 
 /// The entry the emitter is entered through: `emit_bodies_all(names, srcs, ctors, builtins)`,
 /// over every module of the program at once, so that it resolves them together.
-const ENTRY: &str = "emit.emit_bodies_all";
+const ENTRY: &str = "emit.emit_unit_all";
 
 impl PlyProducer {
     /// Over a unit that holds the Ply emitter: the front end and `emit.ply`, compiled.
@@ -105,12 +137,7 @@ impl PlyProducer {
 
     /// The emitter's C for `name`, or nothing: it did not reach the body, or the program has no
     /// source texts to hand the emitter.
-    pub fn body(
-        &self,
-        loaded: &Source,
-        name: &str,
-        module_index: usize,
-    ) -> Option<(String, Tables)> {
+    pub fn body(&self, loaded: &Source, name: &str, module_index: usize) -> Option<Answer> {
         self.asked.set(self.asked.get() + 1);
         loaded.program.modules.get(module_index)?;
         let program = std::ptr::from_ref(loaded) as usize;
@@ -130,7 +157,7 @@ impl PlyProducer {
             .get(&program)
             .and_then(|m| m.get(name))
             .cloned();
-        if found.is_some() {
+        if matches!(found, Some(Answer::Body(..))) {
             self.answered.set(self.answered.get() + 1);
         }
         found
@@ -205,10 +232,12 @@ fn parse(dump: &str) -> Result<Bodies> {
             .ok_or_else(|| anyhow!("an unterminated frame header"))?;
         let header = &dump[at..line_end];
         let mut parts = header.split(' ');
-        let (Some("body"), Some(name), Some(n), None) =
+        let (Some(kind), Some(name), Some(n), None) =
             (parts.next(), parts.next(), parts.next(), parts.next())
         else {
-            bail!("a frame header that is not `body <name> <n>`: {header:?}");
+            bail!(
+                "a frame header that is not `body <name> <n>` or `refused <name> <n>`: {header:?}"
+            );
         };
         let n: usize = n.parse().context("a frame's length")?;
         let start = line_end + 1;
@@ -217,9 +246,16 @@ fn parse(dump: &str) -> Result<Bodies> {
             bail!("a frame of {n} bytes past the end of the answer");
         }
         let chunk = std::str::from_utf8(&bytes[start..end]).context("a frame that is not UTF-8")?;
-        let (text, tables) = super::cache::decode(chunk)
-            .ok_or_else(|| anyhow!("`{name}`'s frame does not decode as a body"))?;
-        out.insert(name.to_string(), (text, tables));
+        let answer = match kind {
+            "body" => {
+                let (text, tables) = super::cache::decode(chunk)
+                    .ok_or_else(|| anyhow!("`{name}`'s frame does not decode as a body"))?;
+                Answer::Body(text, tables)
+            }
+            "refused" => Answer::Refused(chunk.to_string()),
+            other => bail!("a frame of a kind this seam does not read: {other:?}"),
+        };
+        out.insert(name.to_string(), answer);
         at = end;
     }
     Ok(out)
