@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **487 of 1282** shipped bodies |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **605 of 1282** shipped bodies |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -56,7 +56,7 @@ Ownership and ordering:
 
 ## The named gaps
 
-`emit_diff.rs` asserts the seven by name. Four `std.hash` bodies want the
+`emit_diff.rs` asserts the six by name. Four `std.hash` bodies want the
 *deferred record local*, which is the half of deferring this port does not do: a
 record whose every read is answered from the built table is never materialised,
 and the local it would land in is declared at the top of the body. The other four
@@ -72,6 +72,16 @@ and porting `opt.rs` is what lifts that pin.
 `std.json.float_json` is gone from the gaps: a lambda's emission restarted the body's
 constant and shape tables instead of continuing them, which the tables differential
 below is what caught.
+
+The port emits a **whole program** now (`emit_all_program`): every module parsed, rewritten,
+its derives expanded and then resolved together, so a call's default arguments are filled
+and a callee's declared type is in reach across modules -- which is what the reference's
+emitter sees. That closed `std.http.check_limits` (a default argument's constant) and
+opened the **test roots**: a test is a nullary body named `test#<n>`, and the port emits
+them as the reference does. With an expression statement's value discarded and two `Int`
+literals under an operator folded as the reference folds them, the port went from 487 to
+605 shipped bodies. The census in `emit_diff.rs` says what keeps it out of the rest: field
+reads over shapes it cannot see, lambdas, and updates, in that order.
 
 The port is the C tier's **producer** now, behind `PLY_C_EMITTER=ply:<dir>`
 (`crates/ply-codegen/src/c/producer.rs`). `emit_fn_full` answers the text and the
