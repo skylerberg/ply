@@ -643,12 +643,12 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
     // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
     // more than a body. It has since risen well past that.
     assert!(
-        reached >= 1005,
+        reached >= 1128,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );
     assert!(
-        agreeing >= 1000,
+        agreeing >= 1123,
         "{agreeing} shipped bodies resolve to the reference's C -- raise this when it grows"
     );
     // What disagrees is five `std.hash` bodies. Four want the *deferred record local*, the half
