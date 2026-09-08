@@ -226,39 +226,6 @@ fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize, usize) {
         available += expected.len();
         reached += mine.len();
         for (fname, body) in &mine {
-            // A record update is not covered. `rewrite.ply`'s `expand` turns `{..b, f: e}` into a
-            // record that names every field; `ply_derive::expand_program` leaves the node alone,
-            // and `code.rs` lowers it to `RecordUpdate`. So the two are lowering different trees
-            // here, and comparing them would report a difference that is neither one's fault.
-            // Excluded by what the *oracle* holds, so a port that started emitting updates would
-            // still be compared.
-            //
-            // **And the divergence itself is checked by nothing**, which is the part worth
-            // knowing. The third differential compares the rewrites `Parser::run` applies, which
-            // keep the node -- `reference_dump` writes `erup` for the program above. The fifth
-            // compares the *source* each derivation generates, not the expanded tree. Between them
-            // sits `expand`, where the port desugars and the reference does not, and no comparison
-            // reaches it. This exclusion is the only place that divergence is written down.
-            //
-            // **How to close it, which is not the obvious way.** The reference does not lower a
-            // `RecordUpdate` *expression* either: `code.rs` says one cannot survive the parser,
-            // and `lower_record_update` **recognises** the pattern in a plain record literal --
-            // a literal in which some field is `b.<its own name>` for one slot variable `b`, every
-            // such copy of that same `b`. So the node is recovered from the desugared form, and
-            // recovering it needs no type information at all. The port desugars to exactly that
-            // form, so the same recognition works on it.
-            //
-            // What it does need is the ownership: the base is read *after* every written field and
-            // reads only the copied ones, so `use_base` pushes a whole read plus one per kept
-            // field and answers `Owned` only at the last use. That is the piece to port, and it
-            // closes this exclusion, the 94 bodies it hides, and the field-read ordering the
-            // *emitter* differential sees from the other side.
-            if expected
-                .get(fname)
-                .is_some_and(|want| want.contains("upd("))
-            {
-                continue;
-            }
             compared += 1;
             match expected.get(fname) {
                 None => failures.push(format!(
@@ -316,13 +283,11 @@ fn the_lowering_agrees_with_ply_eval_wherever_the_port_reaches() {
     // the oracle on every function it produced, because it would produce none. This is the share,
     // and it is written down so that raising it is a visible change and lowering it is a failure.
     // Two numbers, because they are not the same claim. `reached` is what the port lowered;
-    // `compared` is what was checked against the oracle. They differ by the record updates, which
-    // `rewrite.ply` expands and `ply-syntax` keeps as a node -- the two are lowering different
-    // trees there and a difference would be neither one's fault. Printing only the first would
-    // credit the port for bodies nothing verified.
+    // `compared` is what was checked against the oracle. They were apart by the record updates,
+    // which nothing verified; they now meet, and the second is the one that means anything.
     println!("  the port reaches {reached} of {available} function bodies, {compared} compared");
     assert!(
-        compared >= 1073,
+        compared >= 1179,
         "the port was compared on {compared} bodies, and it was 1073 when this was written -- \
          raise this number when the port grows, and never lower it"
     );
