@@ -147,6 +147,14 @@ pub(super) fn encode(text: &str, t: &Tables) -> String {
     for c in &t.calls {
         out.push_str(&format!("{c}\n"));
     }
+    out.push_str(&format!("performs {}\n", t.performs.len()));
+    for e in &t.performs {
+        out.push_str(&format!("{e}\n"));
+    }
+    out.push_str(&format!("handles {}\n", t.handles.len()));
+    for e in &t.handles {
+        out.push_str(&format!("{e}\n"));
+    }
     out.push_str("text\n");
     out.push_str(text);
     out
@@ -278,6 +286,14 @@ pub(super) fn decode(s: &str) -> Option<(String, Tables)> {
     let n = count(line(s, &mut at)?, "calls")?;
     for _ in 0..n {
         t.calls.push(line(s, &mut at)?.to_string());
+    }
+    let n = count(line(s, &mut at)?, "performs")?;
+    for _ in 0..n {
+        t.performs.push(line(s, &mut at)?.to_string());
+    }
+    let n = count(line(s, &mut at)?, "handles")?;
+    for _ in 0..n {
+        t.handles.push(line(s, &mut at)?.to_string());
     }
     if line(s, &mut at)? != "text" {
         return None;

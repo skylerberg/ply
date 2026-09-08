@@ -713,6 +713,8 @@ fn resolved(enc: &str) -> String {
             "shapes" => 's',
             "lambdas" => 'l',
             "calls" => 'x',
+            "performs" => 'p',
+            "handles" => 'h',
             other => panic!("a table this encoding does not have: {other}"),
         };
         let mut taken = Vec::with_capacity(n);
@@ -746,6 +748,12 @@ fn resolved(enc: &str) -> String {
     if let Some(calls) = entries.get(&'x') {
         out.push_str("\ncalls: ");
         out.push_str(&calls.join(","));
+    }
+    for (kind, label) in [('p', "performs"), ('h', "handles")] {
+        if let Some(es) = entries.get(&kind) {
+            out.push_str(&format!("\n{label}: "));
+            out.push_str(&es.join(","));
+        }
     }
     out
 }

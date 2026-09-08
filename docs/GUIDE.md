@@ -1768,8 +1768,10 @@ and an edit recompiles one unit. `PLY_C_EMITTER=ply:<dir>` makes the emitter
 written in Ply in `<dir>` the tier's producer, body by body, with the built-in
 emitter answering whatever it does not reach; `PLY_C_EMITTER=ply-whole:<dir>`
 makes its answer the whole unit's, its refusals dropped as the built-in
-emitter's would be and the built-in emitter not run over the program at all.
-`PLY_C_REFUSALS=1` then also says how many bodies it answered.
+emitter's would be and the built-in emitter not run over the program at all;
+that mode also compiles `handle`, `perform` and `with_cell`, which the
+built-in emitter refuses. `PLY_C_REFUSALS=1` then also says how many bodies
+it answered.
 
 A run with a backend attached does use the result cache, in a namespace of its
 own. A stored pass names the engine that earned it, so a backed run selects
