@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1005 of 1282** shipped bodies, 991 resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1005 of 1282** shipped bodies, 1000 resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -63,12 +63,11 @@ bodies disagreeing. It no longer asserts the disagreeing names; the test prints 
 the port emits differently runs under the tier's audit like every other, so a disagreement is
 a slower body or a rule not yet taken, never a silent wrong one -- the audit is the oracle.
 
-Fourteen disagree, and they are one family and one body. The family is the release rule
-below: the reference releases a record -- an update's base, a let-bound one, a parameter
-before the result is built -- where the port does not, and four `std.hash` bodies want the
-*deferred record local* on top of it, the half of deferring this port does not do. The body
-is `std.hash.round`, which reads declared `U32` fields at their width where the port reads
-words.
+Five disagree, all in `std.hash`. Four want the *deferred record local*, the half of
+deferring this port does not do: a record whose every read is answered from the built table
+is never materialised, and the local it would land in is declared at the top of the body.
+`std.hash.round` reads declared `U32` fields at their width where the port reads words; the
+port carries one width and the reference six.
 
 ## What is not started
 
@@ -92,14 +91,14 @@ two shapes agree. `std.http.field_line` read `stop` for `next`. The copy reads a
 rank now, by name when the base's shape is unknown, as the reference does. 842 to 1005
 reached, 991 the reference's C exactly.
 
-**The release family, for the next pass.** Seven named gaps are one rule: the reference
-releases a record -- an update's base, a let-bound one, a parameter before the result is
-built -- where the port does not. Both sides state the same four guards (an owned bare
-variable, at most once per binding, exactly one read of the object unless at the tail). The
-reference keys "at most once" and "one read" on the *C local's root*, charged when a name is
-bound; the port keys them on the *slot*, charged over the whole body. `agreement.memory_step`
-is the smallest case: the reference releases once in each of four `match` arms and the port
-in none. Start there, with `PLY_EMIT_DIFF_SHOW`.
+**The release family closed, and it was the tail flag.** Nine bodies differed on a release the
+reference makes and the port did not, and the four guards were already the same on both
+sides. What differed was position: the port threads "nothing is emitted after this" as a flag
+on its state, and two places dropped it -- a block emitted its tail expression with the flag
+its statements had cleared, and a `match` emitted its second arm with the flag its first
+arm's body had cleared. Both restore the node's own answer now. The once-per-binding guard
+is keyed on the object the local holds rather than on the slot, as the reference keys it,
+so a name each arm binds afresh releases in each arm. 991 to 1000 of 1005.
 
 **`&&` and `||`.** The port emits the short-circuit operators as the reference does, the
 right operand inside the branch: 789 to 842. The three bodies that opened differ on the same
