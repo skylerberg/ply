@@ -413,6 +413,9 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         // value is already in, and the record is still built because something
         // else might ask for its word.
         "fn mkf(n: Int) -> Int = { z: n, a: 1 }.a\n",
+        // A record built in *both* arms: the join carries the fields, not the
+        // word, and a third record is assembled from them after the arms close.
+        "fn two(n: Int) -> { z: Int, a: Int } = if n < 0 { { z: n, a: 0 } } else { { z: 0, a: n } }\n",
         // A `match` is arms over one flag, and a body that falls off the end raises.
         "fn sign(n: Int) -> Int = match n { 0 -> 0, _ -> if n < 0 { n } else { 1 } }\n",
         "fn bindm(n: Int) -> Int = match n { 1 -> 10, k -> k + 1 }\n",
@@ -447,7 +450,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 47, "only {reached} bodies were emitted");
+    assert!(reached >= 48, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
@@ -500,22 +503,19 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
         "  the shipped corpus: the port emits {reached} of the {} bodies the reference does",
         expected.len()
     );
-    // Named, not tolerated. Each of these needs a *deferred* record, and the shape is worth
-    // stating because it is not the one the name suggests. Each branch of the `if` still builds
-    // its record; what the join carries is not the record's *word* but its **fields**, one join
-    // local per field, and a third record is assembled from them after the branches close.
+    // Named, not tolerated. What is left here is the *other* half of deferring a record, and the
+    // half this port does not do.
     //
-    // Two things follow that the port cannot do as it stands. The join locals are numbered
-    // *after* every temporary in both branches and their declarations are written *before* the
-    // `if`, so the branches have to be emitted into buffers before the joins exist. And the
-    // assignment into each join is appended to a branch after that branch's body is finished,
-    // which a linear accumulator cannot write as it goes.
+    // The half it does: a record built in both arms of an `if` joins by its **fields**, one join
+    // local each, and a third record is assembled from them after the arms close. `two` in the
+    // corpus above is that, and it agrees.
     //
-    // `fn two(n: Int) -> { z: Int, a: Int } = if n < 0 { { z: n, a: 0 } } else { { z: 0, a: n } }`
-    // is the smallest program that shows it.
-    //
-    // Asserted as an equality rather than a subset, so a new disagreement fails here and fixing
-    // `deferred` shrinks this list rather than leaving it to rot.
+    // The half it does not: a record whose every read is answered from the built table is never
+    // materialised at all, and the local it *would* land in is declared at the top of the body so
+    // that building it inside a branch still names something the whole body can see. `Word t114 =
+    // 0;` at the top of `padded_words` is that local. It needs the emitter to know, before writing
+    // a record, whether anything will ask for its word -- which is a second pass this port has no
+    // shape for.
     let expected_gaps = ["std.hash.padded_words"];
     assert_eq!(
         differ, expected_gaps,

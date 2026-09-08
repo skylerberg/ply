@@ -137,9 +137,27 @@ fn remember(em: Em, slot: Int, v: V) -> Em =
 fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
   let f = fresh(em);
   let o = line(f.em, bytes_concat_all([ctype(k), b" ", f.name, b" = ", expr, b";"]));
-  { em: if k == KBoxed && answers_owned(expr) { note_made(o, f.name) } else { o },
+  // A binding that is only a rename carries the fields the record was built from
+  // with it. A block binds its tail, so without this the knowledge is lost at
+  // the first one -- which is immediately, since every `if` arm is a block.
+  let kept = match built_of(o, expr) {
+    Some(b) -> remember_built(o, f.name, b.names, b.vals),
+    None -> o,
+  };
+  { em: if k == KBoxed && answers_owned(expr) { note_made(kept, f.name) } else { kept },
     v: { k: k, c: f.name, ty: TyOpen } }
 }
+
+// The same, keeping the shape the value already had. A rename that dropped it
+// would lose a record's field list at the first block boundary, and every `if`
+// arm is a block.
+fn bind_keeping(em: Em, k: Kind, ty: Ty, expr: Bytes) -> Out = {
+  let o = bind(em, k, expr);
+  { em: o.em, v: { k: o.v.k, c: o.v.c, ty: ty } }
+}
+
+fn built_of(em: Em, local: Bytes) -> Option<Built> =
+  fold(em.built, None, |acc: Option<Built>, b: Built| if b.local == local { Some(b) } else { acc })
 
 // A runtime helper hands back a word it owns. A *compiled* call does not count,
 // and the distinction is the reference's: a call's result is duplicated before
@@ -801,7 +819,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         None -> None,
         Some(after) -> match expr(after, t, params) {
           None -> None,
-          Some(o) -> Some(bind(o.em, o.v.k, o.v.c)),
+          Some(o) -> Some(bind_keeping(o.em, o.v.k, o.v.ty, o.v.c)),
         },
       },
     },
@@ -1098,41 +1116,77 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // already untagged and differ on a word, where this one is the runtime's
         // bool unbox rather than the integer's.
         let cv = { em: cnd.em, v: { k: KBool, c: as_bool(cnd.v), ty: TyOpen } };
-        // The join temporary is numbered before either branch is emitted, so
-        // its kind cannot be read off a branch's value. It is *computed* rather
-        // than tried: emitting each branch into a scratch buffer to see answers
-        // the same question and costs two emissions per `if`, which on nested
-        // ones doubles per level -- the corpus stopped finishing at all.
-        {
-          {
-            {
-              // Where the two arms answer different kinds this port refuses,
-              // rather than joining them at a word. The reference reads the
-              // *checker's* type for the join; `kind_of` is structural and does
-              // not always agree with it, and guessing wrong writes the wrong
-              // conversion into both arms. Refusing keeps the bodies where the
-              // two are certain to agree.
-              let kt = kind_of(em, i.then_branch, params);
-              let ke = kind_of(em, i.else_branch, params);
-              if kt != ke { None } else {
-              let jk = kt;
-              let j = fresh(cv.em);
-              let opened = line(
-                line(j.em, bytes_concat_all([ctype(jk), b" ", j.name, b" = 0;"])),
-                bytes_concat_all([b"if (", cv.v.c, b") {"]));
-              match branch(indent(opened), i.then_branch, params, jk, j.name) {
-                None -> None,
-                Some(t) -> {
-                  let mid = line(rescope(outdent(t), cv.em.conv), b"} else {");
-                  match branch(indent(mid), i.else_branch, params, jk, j.name) {
-                    None -> None,
-                    Some(e) -> Some({
-                      em: line(rescope(outdent(e), cv.em.conv), b"}"),
-                      v: { k: jk, c: j.name, ty: TyOpen } }),
-                  }
-                },
-              } }
-            }
+        // Where the two arms answer different kinds this port refuses rather than
+        // joining them at a word. The reference reads the *checker's* type for the
+        // join; `kind_of` is structural and does not always agree with it, and
+        // guessing wrong writes the wrong conversion into both arms.
+        let kt = kind_of(em, i.then_branch, params);
+        let ke = kind_of(em, i.else_branch, params);
+        if kt != ke { None } else {
+          // The join's number is taken *before* either arm and its declaration is
+          // written before the `if`, but the arms are emitted into buffers of
+          // their own first: a record-valued join is not one local but one per
+          // field, numbered after everything in both arms, and there is no way to
+          // know that until both have been written.
+          let j = fresh(cv.em);
+          match arm(blank(j.em), i.then_branch, params) {
+            None -> None,
+            Some(t) -> match arm(rescope(blank(t.em), cv.em.conv), i.else_branch, params) {
+              None -> None,
+              Some(e) -> {
+                // Asked with the *later* table, which holds what both arms built.
+                let shape = shared_shape(e.em, t.v, e.v);
+                match shape {
+                  // Both arms answer a record this body built, of one shape: the
+                  // join carries the *fields* rather than the word, one local
+                  // each, and a third record is assembled from them afterwards.
+                  // The number taken above is spent and never declared.
+                  Some(names) -> {
+                    let n = len(names);
+                    let js = fold(range(0, n), { em: rescope(blank(e.em), cv.em.conv), names: [] },
+                      |acc: { em: Em, names: List<Bytes> }, _i: Int| {
+                        let f = fresh(acc.em);
+                        { em: line(f.em, bytes_concat_all([b"int64_t ", f.name, b" = 0;"])),
+                          names: push(acc.names, f.name) }
+                      });
+                    let tt = joined(e.em, t.text, t.v, names, js.names);
+                    let ee = joined(e.em, e.text, e.v, names, js.names);
+                    let body = bytes_concat_all([
+                      j.em.out, js.em.out, pad(js.em.ind), b"if (", cv.v.c, b") {\n", tt,
+                      pad(js.em.ind), b"} else {\n", ee, pad(js.em.ind), b"}\n"]);
+                    rebuild({ out: body, n: js.em.n, conv: cv.em.conv,
+                              ind: js.em.ind, reads: js.em.reads, shapes: js.em.shapes,
+                              built: js.em.built, module: js.em.module, made: js.em.made,
+                              here: js.em.here, imports: js.em.imports, consts: js.em.consts,
+                              ctors: js.em.ctors, extra: js.em.extra, lambdas: js.em.lambdas,
+                              owner: js.em.owner, builtins: js.em.builtins, met: js.em.met },
+                            names, js.names)
+                  },
+                  None -> {
+                    let decl = line({ out: b"", n: e.em.n, conv: cv.em.conv, ind: e.em.ind,
+                                      reads: e.em.reads, shapes: e.em.shapes, built: e.em.built,
+                                      module: e.em.module, made: e.em.made, here: e.em.here,
+                                      imports: e.em.imports, consts: e.em.consts, ctors: e.em.ctors,
+                                      extra: e.em.extra, lambdas: e.em.lambdas, owner: e.em.owner,
+                                      builtins: e.em.builtins, met: e.em.met },
+                                    bytes_concat_all([ctype(kt), b" ", j.name, b" = 0;"]));
+                    let body = bytes_concat_all([
+                      j.em.out, decl.out, pad(decl.ind), b"if (", cv.v.c, b") {\n",
+                      assigned(t.text, decl.ind, kt, t.v, j.name),
+                      pad(decl.ind), b"} else {\n",
+                      assigned(e.text, decl.ind, kt, e.v, j.name),
+                      pad(decl.ind), b"}\n"]);
+                    Some({ em: { out: body, n: decl.n, conv: cv.em.conv,
+                                 ind: decl.ind, reads: decl.reads, shapes: decl.shapes,
+                                 built: decl.built, module: decl.module, made: decl.made,
+                                 here: decl.here, imports: decl.imports, consts: decl.consts,
+                                 ctors: decl.ctors, extra: decl.extra, lambdas: decl.lambdas,
+                                 owner: decl.owner, builtins: decl.builtins, met: decl.met },
+                           v: { k: kt, c: j.name, ty: TyOpen } })
+                  },
+                }
+              },
+            },
           }
         }
       },
@@ -1277,16 +1331,82 @@ fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
     _ -> em,
   }
 
-// One arm of an `if`: the value, coerced to the join's kind, assigned. The bind
-// the reference writes here belongs to the block lowering wrapped the branch in.
-fn branch(em: Em, c: Code, params: List<P>, k: Kind, join: Bytes) -> Option<Em> =
-  match expr(em, c, params) {
+// One arm of an `if`, into a buffer of its own so that what follows it can still
+// be numbered. The bind the reference writes here belongs to the block lowering
+// wrapped the branch in, so nothing is added.
+fn arm(em: Em, c: Code, params: List<P>) -> Option<{ em: Em, text: Bytes, v: V }> =
+  match expr(indent(em), c, params) {
     None -> None,
-    Some(o) -> {
-      let cv = coerce(o.em, k, o.v);
-      Some(line(cv.em, bytes_concat_all([join, b" = ", cv.v.c, b";"])))
-    },
+    Some(o) -> Some({ em: outdent(o.em), text: o.em.out, v: o.v }),
   }
+
+// The same buffer with the join's assignment on the end.
+fn assigned(text: Bytes, ind: Int, k: Kind, v: V, join: Bytes) -> Bytes =
+  bytes_concat_all([text, pad(ind + 1),
+                    join, b" = ", match k { KBoxed -> as_word(v), _ -> as_int(v) }, b";\n"])
+
+// The same, for a record-valued join: one assignment per field, from the values
+// the record was built out of rather than from the record.
+fn joined(em: Em, text: Bytes, v: V, names: List<Bytes>, js: List<Bytes>) -> Bytes =
+  fold(range(0, len(names)), text, |acc: Bytes, i: Int|
+    bytes_concat_all([acc, pad(em.ind + 1),
+      match list_at(js, i) { Some(x) -> x, None -> b"" }, b" = ",
+      match list_at(names, i) {
+        Some(nm) -> match built_field(em, v.c, nm) { Some(fv) -> as_int(fv), None -> b"0" },
+        None -> b"0",
+      }, b";\n"]))
+
+fn blank(em: Em) -> Em =
+  { out: b"", n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
+    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
+    consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
+    builtins: em.builtins, met: em.met }
+
+fn strip(em: Em) -> Bytes = em.out
+
+// The shape both arms answer, when both answer a record this body built and the
+// two shapes are the same. `None` otherwise, and then the join is one local.
+fn shared_shape(em: Em, a: V, b: V) -> Option<List<Bytes>> =
+  match a.ty {
+    TyRec(na) -> match b.ty {
+      TyRec(nb) -> if same_names(na, nb) && built_field(em, a.c, first_name(na)) != None
+                      && built_field(em, b.c, first_name(na)) != None { Some(sorted_names(na)) }
+                   else { None },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+fn first_name(ns: List<Bytes>) -> Bytes = match list_at(ns, 0) { Some(n) -> n, None -> b"" }
+
+// The record's names in the order the shape holds them, which is by name.
+fn sorted_names(ns: List<Bytes>) -> List<Bytes> =
+  fold(range(0, len(ns)), [], |acc: List<Bytes>, i: Int|
+    fold(ns, acc, |a2: List<Bytes>, n: Bytes| if rank_of(ns, n) == i { push(a2, n) } else { a2 }))
+
+// The record the join's fields are assembled back into, after the arms close.
+fn rebuild(em: Em, names: List<Bytes>, js: List<Bytes>) -> Option<Out> = {
+  let sh = shape_of(em, names);
+  let n = len(names);
+  let rec = bind(sh.em, KBoxed, b"0");
+  let opened = line(rec.em, bytes_concat_all([b"if (tok", num(n), b") {"]));
+  let took = line(
+    line(indent(opened), bytes_concat_all([rec.v.c, b" = tok", num(n), b"; tok", num(n), b" = 0;"])),
+    bytes_concat_all([b"ply_obj(", rec.v.c, b")->rc = 1; ply_obj(", rec.v.c,
+                      b")->flags = 0; ply_obj(", rec.v.c, b")->len = ", num(n),
+                      b"; ply_obj(", rec.v.c, b")->layout = @@s", num(sh.i), b"@@;"]));
+  let made = line(
+    line(indent(line(outdent(took), b"} else {")),
+         bytes_concat_all([rec.v.c, b" = rt_alloc_p(ctx, 3, ", num(n), b", @@s", num(sh.i),
+                           b"@@, 0);"])),
+    b"if (ctx->failed) return 0;");
+  let closed = line(outdent(made), b"}");
+  Some({ em: fold(range(0, n), closed, |acc: Em, at: Int|
+           line(acc, bytes_concat_all([b"ply_words(", rec.v.c, b")[", num(at), b"] = ",
+             as_word({ k: KInt, c: match list_at(js, at) { Some(x) -> x, None -> b"0" },
+                       ty: TyOpen }), b";"]))),
+         v: { k: KBoxed, c: rec.v.c, ty: TyRec(names) } })
+}
 
 // The kind a node answers, without emitting it.
 //
