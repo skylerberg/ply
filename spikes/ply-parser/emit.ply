@@ -334,6 +334,13 @@ fn opened_to(em: Em, v: V, k: Option<Kind>) -> Out =
 fn ret_of(here: List<Def>, name: Bytes) -> Option<Kind> =
   fold(here, None, |acc: Option<Kind>, d: Def| if d.name == name { d.ret } else { acc })
 
+// The builtins the reference does not simply call: four expanded in place around
+// a load, and the joins, which it fuses over a list literal rather than building
+// the list and joining it.
+fn is_inlined(name: Bytes) -> Bool =
+  name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
+    || name == b"bytes_concat_all" || name == b"bytes_join" || name == b"string_concat_all"
+
 fn is_callback(name: Bytes) -> Bool =
   name == b"map" || name == b"filter" || name == b"fold" || name == b"map_fold"
     || name == b"iterate"
@@ -846,16 +853,34 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                       Some(q) -> from_import(em.imports, q.binder),
                       None -> from_import(em.imports, fv.name),
                     } {
-                      // A builtin with no helper of its own is **not** reached, and
-                      // the generic `rt_builtin_p` path is not what it needs. The
-                      // reference's builtin surface has three tiers, not two: the
-                      // ones with a direct helper, the ones that go through the
-                      // runtime, and the ones it expands *inline* -- `bytes_len`
-                      // is `(int64_t)ply_obj(x)->len`, no call at all. Routing
-                      // every unhelped builtin through the runtime reached 376
-                      // shipped bodies and disagreed on 37 of them, which is what
-                      // said the third tier exists. Porting it needs that list.
-                      None -> None,
+                      // A builtin with no helper of its own goes through the
+                      // runtime, which is the interpreter's own path, under this
+                      // body's own index for it.
+                      //
+                      // Two families are refused instead. The **callback** family
+                      // is fused: handed a literal lambda the reference emits the
+                      // loop into the body and never builds the closure. The
+                      // **inline** family -- `len`, `bytes_len`, `bytes_at`,
+                      // `bytes_u32_le` -- is expanded in place, with a kind test
+                      // and a bounds test around a load, and the runtime call is
+                      // only its slow arm. Emitting a call for either is a wrong
+                      // answer rather than a slow one.
+                      None -> if is_callback(fv.name) || is_inlined(fv.name) { None }
+                        else if !fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == fv.name) { None }
+                        else { match args_owned(em, a.args, params, 0, []) {
+                          None -> None,
+                          Some(w) -> {
+                            let bi = builtin_of(w.em, fv.name);
+                            let arr = fresh(bi.em);
+                            let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
+                              if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
+                              b"};"]));
+                            let o = bind(e, KBoxed, bytes_concat_all([
+                              b"rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)",
+                              arr.name, b", ", num(len(a.args)), b")"]));
+                            Some({ em: check(o.em), v: o.v })
+                          },
+                        } },
                       Some(m) -> match args_one_pass(em, a.args, params, 0, []) {
                         None -> None,
                         Some(w) -> {
