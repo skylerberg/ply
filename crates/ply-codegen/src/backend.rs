@@ -564,6 +564,30 @@ impl ply_eval::Compiled for Bodies {
     fn simulated(&self) -> Option<ply_eval::region::Record> {
         self.ctx.borrow().record.clone()
     }
+
+    fn set_host(
+        &self,
+        binding: std::sync::Arc<ply_eval::HostBinding>,
+        runtime: Option<std::rc::Rc<dyn ply_eval::HostRuntime>>,
+    ) {
+        self.ctx.borrow_mut().set_host(binding, runtime);
+    }
+
+    fn set_declared(&self, declared: Option<ply_core::Footprint>) {
+        self.ctx.borrow_mut().declared = declared;
+    }
+
+    fn set_re_executed(&self, re_executed: bool) {
+        self.ctx.borrow_mut().re_executed = re_executed;
+    }
+
+    fn take_host_use(&self) -> (ply_eval::host::HostUse, u64) {
+        let mut ctx = self.ctx.borrow_mut();
+        (
+            std::mem::take(&mut ctx.host_use),
+            std::mem::take(&mut ctx.host_ops),
+        )
+    }
 }
 
 impl Policed for Bodies {

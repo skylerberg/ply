@@ -290,7 +290,6 @@ fn iterate(
         .filter(|_| !nothing_to_run)
         .filter(|_| held_unit.is_none())
         .map(|spec| {
-            ply_codegen::c::producer::set_host_served(super::common::host_served(&hosts.binding()));
             build_backend(
                 spec,
                 run_program,
