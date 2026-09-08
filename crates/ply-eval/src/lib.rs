@@ -77,6 +77,7 @@ pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use machine::{Machine, Progress};
 pub use rc::{Own, Stats as RcStats};
 pub use region_kind::Regions;
+pub use semantics::strict_binary;
 pub use sim::{
     Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,
     Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed, SimMode, SimTy, Sleep, StepFootprint, Stream, TaskId,

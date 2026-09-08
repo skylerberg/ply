@@ -1,13 +1,13 @@
 //! The compute kernel the compute-kernel record measured, compiled by the shipping code generator.
 
-use ply_codegen::Cranelift;
+use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{ModuleName, Program};
 
 /// Loads `benches/kernel` the way `ply test benches/kernel` loads it: the project's own `.ply`
 /// files, and no standard-library module, because the kernel imports none.
-fn kernel() -> (&'static Program, &'static Cranelift) {
+fn kernel() -> (&'static Program, &'static Unit) {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .and_then(std::path::Path::parent)
@@ -38,12 +38,12 @@ fn kernel() -> (&'static Program, &'static Cranelift) {
     let resolved = ply_syntax::resolve::resolve(&mut ast).expect("the kernel resolves");
     let check = ply_core::check_program(&ast, &resolved).expect("the kernel checks");
     let ast: &'static Program = Box::leak(Box::new(ast));
-    let unit = Cranelift::over(
+    let unit = Unit::over(
         ast,
         Box::leak(Box::new(resolved)),
         Box::leak(Box::new(check)),
     )
-    .expect("this host has a cranelift backend");
+    .expect("this host has a C compiler");
     (ast, unit)
 }
 

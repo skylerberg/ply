@@ -56,7 +56,6 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
     };
     let (name, variant) = match spec.kind {
         ply_eval::BackendKind::Reference => ("reference", ""),
-        ply_eval::BackendKind::Cranelift => ("cranelift", ply_codegen::backend::registry_width()),
         ply_eval::BackendKind::C => ("c", ply_codegen::backend::registry_width()),
     };
     ply_test::Engine::of_backend(name, variant, spec)
@@ -114,38 +113,22 @@ pub fn build_backend(
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
     match spec.kind {
         ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(program, resolved, check)),
-        ply_eval::BackendKind::C => ply_codegen::Cranelift::over_c_keyed(
-            program,
-            resolved,
-            check,
-            emit_keys(program, hashes),
-        )
-        .map(|unit| unit as &'static dyn ply_eval::Provider)
-        .map_err(|error| {
-            Diagnostic::error(
-                codes::BACKEND_UNAVAILABLE,
-                format!("the C backend could not be built: {error:#}"),
-            )
-            .note(
-                "a backend that failed to build would decline every call, so the run is \
+        ply_eval::BackendKind::C => {
+            ply_codegen::Unit::keyed(program, resolved, check, emit_keys(program, hashes))
+                .map(|unit| unit as &'static dyn ply_eval::Provider)
+                .map_err(|error| {
+                    Diagnostic::error(
+                        codes::BACKEND_UNAVAILABLE,
+                        format!("the C backend could not be built: {error:#}"),
+                    )
+                    .note(
+                        "a backend that failed to build would decline every call, so the run is \
                      refused rather than reported green over a seam nothing reached",
-            )
-            .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
-            .note("`--backend reference` needs no code generator and runs anywhere")
-        }),
-        ply_eval::BackendKind::Cranelift => ply_codegen::Cranelift::over(program, resolved, check)
-            .map(|unit| unit as &'static dyn ply_eval::Provider)
-            .map_err(|error| {
-                Diagnostic::error(
-                    codes::BACKEND_UNAVAILABLE,
-                    format!("the cranelift backend could not be built: {error:#}"),
-                )
-                .note(
-                    "a backend that failed to build would decline every call, so the run is \
-                     refused rather than reported green over a seam nothing reached",
-                )
-                .note("`--backend reference` needs no code generator and runs anywhere")
-            }),
+                    )
+                    .note("this tier shells out to `cc`; `PLY_CC` names another compiler")
+                    .note("`--backend reference` needs no code generator and runs anywhere")
+                })
+        }
     }
 }
 
@@ -337,6 +320,14 @@ pub fn plural(n: usize, word: &str) -> String {
     }
 }
 
+/// A worker's stack. The machine's bound on nested calls is `ply_eval::DEFAULT_MAX_CALLS`, and a
+/// compiled body honours the same count on the native stack -- where an unoptimising C compiler
+/// gives every temporary a slot, so a frame can run to kilobytes. The stack has to hold the
+/// budget's worth of the largest frames or the budget is not the bound that fires; a thread's
+/// default two megabytes holds a few thousand. Reserved, not committed: the pages an idle worker
+/// never touches cost nothing.
+const WORKER_STACK: usize = 256 << 20;
+
 /// The worker pool a run installs.
 pub fn build_pool(
     jobs: Option<u32>,
@@ -345,6 +336,7 @@ pub fn build_pool(
     let requested = jobs.unwrap_or(0) as usize;
     match rayon::ThreadPoolBuilder::new()
         .num_threads(requested)
+        .stack_size(WORKER_STACK)
         .build()
     {
         Ok(pool) => {

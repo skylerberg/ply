@@ -51,12 +51,12 @@ first=1
 for size in "${sizes[@]}"; do
   IFS=, read -r m d t <<<"$size"
   dir="$work/m${m}_d${d}_t${t}"
-  for engine in none cranelift; do
+  for engine in none c; do
     echo "==> $size · $engine"
     if [ "$engine" = none ]; then
       out=$("$corpus" bench "$dir" --repeats "$repeats" --json)
     else
-      out=$("$corpus" bench "$dir" --repeats "$repeats" --backend cranelift --json)
+      out=$("$corpus" bench "$dir" --repeats "$repeats" --backend c --json)
     fi
     [ $first -eq 1 ] || echo "    ," >> "$raw"
     first=0
@@ -75,7 +75,7 @@ for size in "${sizes[@]}"; do
   front=$("$ply" test "$dir" --json 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["front_end"]))')
   # What the code generator charges per definition, which is the number ADR 0037's table of loop
   # tiers compares against `benches/c-floor/`'s and which the whole-unit compile otherwise hides.
-  back=$("$ply" test "$dir" --backend cranelift --json 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["backend"]))')
+  back=$("$ply" test "$dir" --backend c --json 2>/dev/null | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["backend"]))')
   echo "    ," >> "$raw"
   printf '    {"size": "%s", "engine": "process", "warm_wall_seconds": %s, "warm_front_end": %s, "backend": %s}\n' \
     "$size" "$best" "$front" "$back" >> "$raw"

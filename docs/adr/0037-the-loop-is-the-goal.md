@@ -40,7 +40,9 @@ and the loop has the property today in one tier and not in the other.
 > **What it does not decide.** That C is the release target — ADR 0021's path
 > already carries that as a direction and this record does not re-take it. Nor
 > which loop tier replaces Cranelift: the candidates are listed with the trade
-> each makes, and what would choose among them is named.
+> each makes, and what would choose among them is named. **ADR 0042 chose**:
+> emitted C is the only tier, and the reading that placed Cranelift in the loop
+> is re-taken there against a tier that keeps its unit between runs.
 
 ## The loop today, checked
 

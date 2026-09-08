@@ -241,9 +241,9 @@ a resource.
 **A code generator ships; the milestone's criteria are still not met, and those
 are two different statements.**
 
-`ply test --backend cranelift` installs a real cranelift JIT from the shipping
-workspace — no feature flag, no second toolchain. It compiles the ADR 0011
-fragment and the machine enters it.
+`ply test --backend c` installs a real code generator from the shipping
+workspace — no feature flag, one toolchain, and a C compiler on the machine. It
+compiles the ADR 0011 fragment and the machine enters it.
 
 **What decides whether that is worth anything is fragment coverage, not backend
 speed.** On a compute kernel, which is almost entirely inside the fragment, it is
@@ -1189,7 +1189,7 @@ for. All three are open in `CONTRIBUTING.md` §"Things known to be broken", item
 9 through 13.
 
 **1. The seam carries one of the machine's two resource bounds.** With the real
-cranelift backend, no mutation, one entry and zero declines:
+backend, no mutation, one entry and zero declines:
 
 ```
 pub fn hog(n: Int) -> Int =

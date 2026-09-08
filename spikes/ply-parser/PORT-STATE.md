@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **484 of 1280** shipped bodies |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **487 of 1282** shipped bodies |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -56,7 +56,7 @@ Ownership and ordering:
 
 ## The named gaps
 
-`emit_diff.rs` asserts the eight by name. Four `std.hash` bodies want the
+`emit_diff.rs` asserts the twelve by name. Four `std.hash` bodies want the
 *deferred record local*, which is the half of deferring this port does not do: a
 record whose every read is answered from the built table is never materialised,
 and the local it would land in is declared at the top of the body. The other four
@@ -66,6 +66,16 @@ have causes written beside them.
 
 The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
+
+## What changed after this was written
+
+ADR 0042 moved the emitter's oracle. The byte-exact differential above stays as
+an instrument, but the port is no longer held to agreeing with `c/emit.rs`'s
+text: it is held to the suite passing under it as the C backend's producer, and
+to the fixpoint of compiling itself. The two switched-off pieces and the named
+gaps are therefore things to *make work*, not things to make byte-identical, and
+the release rules above are the reference emitter's heuristics rather than
+requirements. Read that record before the sections above.
 
 ## Beyond the port
 

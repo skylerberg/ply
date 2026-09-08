@@ -11,15 +11,18 @@ use crate::heap::{
     KIND_LIST, KIND_MAP, KIND_RECORD, KIND_STR, Layouts, Word, bridged, bytes_of, is_unique, obj,
     set_word, str_of, word_at,
 };
-use crate::jit::Entry;
 use crate::list;
 use crate::map;
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_syntax::ast::BinOp;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
+
+/// A compiled function: `extern "C" fn(ctx, args) -> handle`.
+pub type Entry = unsafe extern "C" fn(*mut Ctx, *const i64) -> i64;
 
 pub struct Tables {
     /// The constant pool as values, for a literal rebuilt per evaluation.
@@ -224,6 +227,8 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
 
 /// The failure a compiled function reports by, and the fuel it spends.
 pub const FAILED_OUT_OF_FUEL: i64 = 2;
+/// The prologue found the native stack nearly out before the fuel was.
+pub const FAILED_OUT_OF_STACK: i64 = 3;
 
 #[repr(C)]
 pub struct Ctx {
@@ -231,6 +236,11 @@ pub struct Ctx {
     /// Nested native calls still allowed, counted down on entry to a compiled function and back up
     /// on its normal return.
     pub fuel: i64,
+    /// The lowest stack address a compiled frame may begin at. The machine's bound on nesting is a
+    /// count, and a C frame is not a machine frame: an unoptimising compiler gives one every
+    /// temporary a slot, so a recursion well inside the count can run off a worker thread's stack
+    /// with no diagnostic at all. The prologue compares against this before it spends fuel.
+    pub stack_floor: usize,
     pub heap: Heap,
     /// The objects the entry that just finished allocated, kept because [`Ctx::end`] clears the
     /// log and the number is otherwise gone.
@@ -254,6 +264,7 @@ impl Ctx {
         Ctx {
             failed: 0,
             fuel: 0,
+            stack_floor: 0,
             heap: Heap::new(),
             last_entry: 0,
             unclosed_entries: 0,
@@ -271,6 +282,7 @@ impl Ctx {
         self.cells_baseline = (arena.depth(), arena.live());
         self.failed = 0;
         self.fuel = fuel;
+        self.stack_floor = stack_floor();
         self.diagnostic = None;
         // Every path out of an entry calls `end`, so this is one comparison against an empty log.
         if self.heap.allocated() != 0 {
@@ -463,11 +475,152 @@ pub unsafe extern "C" fn rt_unbox_bool(ctx: *mut Ctx, w: i64) -> i64 {
     }
 }
 
+/// The operator code compiled code hands [`rt_binary`], and the operator it names. One table,
+/// read both ways, so the emitter and the runtime cannot disagree about a number.
+const BINOPS: [BinOp; 17] = [
+    BinOp::Add,
+    BinOp::Sub,
+    BinOp::Mul,
+    BinOp::Div,
+    BinOp::Rem,
+    BinOp::Eq,
+    BinOp::Ne,
+    BinOp::Lt,
+    BinOp::Le,
+    BinOp::Gt,
+    BinOp::Ge,
+    BinOp::Concat,
+    BinOp::BitAnd,
+    BinOp::BitOr,
+    BinOp::BitXor,
+    BinOp::Shl,
+    BinOp::Shr,
+];
+
+pub fn binop_code(op: BinOp) -> i64 {
+    BINOPS
+        .iter()
+        .position(|o| *o == op)
+        .map_or(-1, |i| i as i64)
+}
+
+/// The machine's own operator over two values, for an operand whose type the emitter does not
+/// fix -- a `Float`, a `Decimal` -- so that such a body compiles and answers what the machine
+/// answers rather than being refused with every caller behind it. Takes both.
+pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
+    let ctx = unsafe { &mut *ctx };
+    let Some(op) = usize::try_from(op)
+        .ok()
+        .and_then(|i| BINOPS.get(i).copied())
+    else {
+        return ctx.fail(error("an operator this runtime has no code for"));
+    };
+    let vals = values_taken(ctx, &[a, b]);
+    match ply_eval::strict_binary(
+        op,
+        &vals[0],
+        &vals[1],
+        Span::DUMMY,
+        Span::DUMMY,
+        Span::DUMMY,
+    ) {
+        Ok(v) => ctx.word(&v),
+        Err(d) => ctx.fail(d),
+    }
+}
+
 /// The prologue's refusal: this call would nest past the budget the machine handed the entry.
 pub unsafe extern "C" fn rt_no_fuel(ctx: *mut Ctx) {
     let ctx = unsafe { &mut *ctx };
     let d = error("this call would nest past the machine's own bound on nested calls");
     ctx.fail_with(FAILED_OUT_OF_FUEL, d);
+}
+
+/// The prologue's other refusal: this call would nest past what this thread's stack holds. The
+/// seam declines the entry as it does one out of fuel, and the machine, whose frames are on the
+/// heap, answers with its own bound.
+pub unsafe extern "C" fn rt_no_stack(ctx: *mut Ctx) {
+    let ctx = unsafe { &mut *ctx };
+    let d = error("this call would nest past what the native stack holds");
+    ctx.fail_with(FAILED_OUT_OF_STACK, d);
+}
+
+/// Room kept below the floor for the runtime's own frames under the deepest compiled one, and
+/// for that frame itself: an unoptimising compiler has produced frames past a hundred kilobytes.
+const STACK_MARGIN: usize = 512 * 1024;
+
+/// The floor for the thread this is called on, asked of the platform once per thread.
+///
+/// The main thread's bounds are a `/proc` read on Linux, which is why this is not asked per entry.
+fn stack_floor() -> usize {
+    thread_local! {
+        static FLOOR: usize = stack_floor_of_this_thread();
+    }
+    FLOOR.with(|f| *f)
+}
+
+#[cfg(target_os = "macos")]
+fn stack_floor_of_this_thread() -> usize {
+    unsafe extern "C" {
+        fn pthread_self() -> *mut std::ffi::c_void;
+        fn pthread_get_stackaddr_np(thread: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+        fn pthread_get_stacksize_np(thread: *mut std::ffi::c_void) -> usize;
+    }
+    // The address is the stack's *top*; the region runs down from it.
+    let (top, size) = unsafe {
+        let me = pthread_self();
+        (
+            pthread_get_stackaddr_np(me) as usize,
+            pthread_get_stacksize_np(me),
+        )
+    };
+    top.saturating_sub(size).saturating_add(STACK_MARGIN)
+}
+
+#[cfg(target_os = "linux")]
+fn stack_floor_of_this_thread() -> usize {
+    // `pthread_attr_t` is opaque and at most 56 bytes on the 64-bit libcs this runs on; this is
+    // room for it with its alignment.
+    #[repr(C, align(8))]
+    struct Attr([u8; 64]);
+    unsafe extern "C" {
+        fn pthread_self() -> usize;
+        fn pthread_getattr_np(thread: usize, attr: *mut Attr) -> i32;
+        fn pthread_attr_getstack(
+            attr: *const Attr,
+            addr: *mut *mut std::ffi::c_void,
+            size: *mut usize,
+        ) -> i32;
+        fn pthread_attr_destroy(attr: *mut Attr) -> i32;
+    }
+    let mut attr = Attr([0; 64]);
+    let mut addr: *mut std::ffi::c_void = std::ptr::null_mut();
+    let mut size = 0usize;
+    let bottom = unsafe {
+        if pthread_getattr_np(pthread_self(), &mut attr) != 0 {
+            return fallback_floor();
+        }
+        let ok = pthread_attr_getstack(&attr, &mut addr, &mut size) == 0;
+        pthread_attr_destroy(&mut attr);
+        if !ok {
+            return fallback_floor();
+        }
+        addr as usize
+    };
+    bottom.saturating_add(STACK_MARGIN)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+fn stack_floor_of_this_thread() -> usize {
+    fallback_floor()
+}
+
+/// With no way to ask the platform: assume a spawned thread's default stack below the current
+/// frame, which refuses early on a large stack rather than late on a small one.
+#[cfg(not(target_os = "macos"))]
+fn fallback_floor() -> usize {
+    let here = 0u8;
+    (std::ptr::from_ref(&here) as usize).saturating_sub(1 << 20)
 }
 
 /// Whichever of `checked_mul`, `checked_div` and `checked_rem` the operator was.
@@ -597,7 +750,7 @@ fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
     match ply_eval::builtins::call(b, values, ctx.cells.arena_mut(), Span::DUMMY) {
         Ok(Step::Done(v)) => ctx.word(&v),
-        // Unreachable: `jit::admissible_builtin` refuses every higher-order builtin at compile
+        // Unreachable: the emitter refuses every higher-order builtin at compile
         // time, because answering `Step::Apply` here would need user code run from inside a native
         // frame.
         Ok(_) => {
@@ -2077,71 +2230,4 @@ pub unsafe extern "C" fn rt_bytes_slice(ctx: *mut Ctx, b: i64, s: i64, e: i64) -
 
 pub unsafe extern "C" fn rt_bytes_concat(ctx: *mut Ctx, a: i64, b: i64) -> i64 {
     direct(unsafe { &mut *ctx }, Builtin::BytesConcat, &[a, b])
-}
-
-/// Every symbol the JIT registers, in one place so the compiler and the linker cannot drift.
-pub fn symbols() -> Vec<(&'static str, *const u8)> {
-    vec![
-        ("rt_box_int", rt_box_int as *const u8),
-        ("rt_box_bool", rt_box_bool as *const u8),
-        ("rt_unbox_int", rt_unbox_int as *const u8),
-        ("rt_unbox_bool", rt_unbox_bool as *const u8),
-        ("rt_arith", rt_arith as *const u8),
-        ("rt_overflow", rt_overflow as *const u8),
-        ("rt_not_that_width", rt_not_that_width as *const u8),
-        ("rt_no_match", rt_no_match as *const u8),
-        ("rt_lit", rt_lit as *const u8),
-        ("rt_equal", rt_equal as *const u8),
-        ("rt_concat", rt_concat as *const u8),
-        ("rt_record_fits", rt_record_fits as *const u8),
-        ("rt_record_has", rt_record_has as *const u8),
-        ("rt_builtin", rt_builtin as *const u8),
-        ("rt_ctor", rt_ctor as *const u8),
-        ("rt_list", rt_list as *const u8),
-        ("rt_list_fits", rt_list_fits as *const u8),
-        ("rt_list_at", rt_list_at as *const u8),
-        ("rt_list_rest", rt_list_rest as *const u8),
-        ("rt_ctor_arg", rt_ctor_arg as *const u8),
-        ("rt_map_lookup", rt_map_lookup as *const u8),
-        ("rt_list_index", rt_list_index as *const u8),
-        ("rt_list_lookup", rt_list_lookup as *const u8),
-        ("rt_push", rt_push as *const u8),
-        ("rt_map_insert", rt_map_insert as *const u8),
-        ("rt_map_contains", rt_map_contains as *const u8),
-        ("rt_map_get", rt_map_get as *const u8),
-        ("rt_compare", rt_compare as *const u8),
-        ("rt_byte_of_int", rt_byte_of_int as *const u8),
-        ("rt_bytes_scan", rt_bytes_scan as *const u8),
-        ("rt_bytes_scan_until", rt_bytes_scan_until as *const u8),
-        ("rt_bytes_slice", rt_bytes_slice as *const u8),
-        ("rt_bytes_concat", rt_bytes_concat as *const u8),
-        ("rt_record", rt_record as *const u8),
-        ("rt_record_update", rt_record_update as *const u8),
-        ("rt_field", rt_field as *const u8),
-        ("rt_no_fuel", rt_no_fuel as *const u8),
-        ("rt_closure", rt_closure as *const u8),
-        ("rt_builtin_value", rt_builtin_value as *const u8),
-        ("rt_ctor_value", rt_ctor_value as *const u8),
-        ("rt_call", rt_call as *const u8),
-        ("rt_map", rt_map as *const u8),
-        ("rt_filter", rt_filter as *const u8),
-        ("rt_fold", rt_fold as *const u8),
-        ("rt_map_fold", rt_map_fold as *const u8),
-        ("rt_iterate", rt_iterate as *const u8),
-        ("rt_iterate_bad", rt_iterate_bad as *const u8),
-        ("rt_bytes_join", rt_bytes_join as *const u8),
-        ("rt_list_get", rt_list_get as *const u8),
-        ("rt_list_push", rt_list_push as *const u8),
-        ("rt_not_a_list", rt_not_a_list as *const u8),
-        ("rt_bad_range", rt_bad_range as *const u8),
-        ("rt_shift_count", rt_shift_count as *const u8),
-        ("rt_cell", rt_cell as *const u8),
-        ("rt_region", rt_region as *const u8),
-        ("rt_region_close", rt_region_close as *const u8),
-        ("rt_dup", rt_dup as *const u8),
-        ("rt_dec", rt_dec as *const u8),
-        ("rt_alloc", rt_alloc as *const u8),
-        ("rt_reset", rt_reset as *const u8),
-        ("rt_constant", rt_constant as *const u8),
-    ]
 }

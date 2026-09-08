@@ -26,6 +26,11 @@ fn the_prelude_agrees_with_the_layouts_it_mirrors() {
         "PlyCtx.failed"
     );
     assert_eq!(std::mem::offset_of!(crate::rt::Ctx, fuel), 8, "PlyCtx.fuel");
+    assert_eq!(
+        std::mem::offset_of!(crate::rt::Ctx, stack_floor),
+        16,
+        "PlyCtx.stack_floor"
+    );
     assert!(PRELUDE.contains("#define PLY_HEADER 16"));
 }
 
@@ -57,7 +62,7 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
     let probe = lib
         .symbol("ply_probe")
         .expect("the unit exports `ply_probe`");
-    let probe: crate::jit::Entry = unsafe { std::mem::transmute(probe) };
+    let probe: crate::rt::Entry = unsafe { std::mem::transmute(probe) };
     let args = [crate::heap::imm(20), crate::heap::imm(22)];
     let answer = unsafe { probe(std::ptr::null_mut(), args.as_ptr()) };
     assert_eq!(crate::heap::imm_value(answer), 42);
@@ -92,7 +97,7 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
         ("m.shaped", vec![4], 45),
     ];
     for (name, args, want) in cases {
-        let entry: crate::jit::Entry = native
+        let entry: crate::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
@@ -152,9 +157,7 @@ pub mod tests_support {
         ))))
     }
 
-    pub fn with_refusals(
-        text: &str,
-    ) -> Option<(&'static Source, Native, Vec<crate::jit::Refused>)> {
+    pub fn with_refusals(text: &str) -> Option<(&'static Source, Native, Vec<super::Refused>)> {
         let mut sources = ply_span::SourceMap::new();
         let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
         let id = sources.add("m.ply", owned.to_string());
@@ -169,7 +172,7 @@ pub mod tests_support {
         )));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        match crate::c::build(source, &refs, crate::jit::Opts::default()) {
+        match crate::c::build(source, &refs) {
             Ok((native, refused)) => Some((source, native, refused)),
             Err(e) if e.to_string().contains("could not run") => None,
             Err(e) => panic!("{e}"),
@@ -240,7 +243,7 @@ pub fn looped(n: Int) -> Int =
         let want = machine
             .call(name, args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let entry: crate::jit::Entry = native
+        let entry: crate::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
@@ -257,15 +260,14 @@ pub fn looped(n: Int) -> Int =
     }
 }
 
-/// A `U64` past `2^62` is not an immediate: tagging one eats its top bit, and `rt_unbox_int`
-/// raises on it rather than answering. `jit::carried_width` stops below sixty-four for exactly
-/// that reason and this tier has to stop in the same place.
-///
-/// What it must *not* do is stop quietly. A tier that emits a body it cannot get right is worse
-/// than one that declines it, because the seam has an interpreter behind it and no way to know it
-/// is needed. So the property here is a refusal, not an answer.
+/// A `U64` past `2^62` is not an immediate: tagging one eats its top bit, so `carried` stops
+/// below sixty-four and a value of the two widths past it is held as the machine's own value. An
+/// operator over one reaches the machine's operator through the runtime rather than a register,
+/// and the property is that the answer is the machine's -- a tier that emits a body it cannot get
+/// right is worse than one that declines it, because the seam has an interpreter behind it and no
+/// way to know it is needed.
 #[test]
-fn a_width_the_tier_cannot_carry_is_refused_rather_than_answered_wrongly() {
+fn a_width_the_tier_cannot_carry_in_a_register_still_answers_what_the_machine_answers() {
     let source = r#"
 pub fn wide(n: Int) -> Int = {
   let a = u64_of_int(n);
@@ -274,20 +276,42 @@ pub fn wide(n: Int) -> Int = {
 }
 pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 2654435761u32), 7))
 "#;
-    let Some((_, native, refused)) = tests_support::with_refusals(source) else {
+    let Some((source, native, _)) = tests_support::with_refusals(source) else {
         return;
     };
-    assert!(
-        native.entry("m.wide").is_none(),
-        "a body over `U64` must not be compiled by this tier"
-    );
-    assert!(
-        refused.iter().any(|r| r.function == "m.wide"),
-        "the refusal has to be recorded, not silent: {refused:?}"
-    );
-    // And the same shape at a width the tier does carry still compiles, so the rule above is a
-    // line at sixty-four bits and not a retreat from the family.
-    assert!(native.entry("m.narrow").is_some());
+    let mut machine = ply_eval::Machine::new(source.program, source.resolved, source.check);
+    for name in ["m.wide", "m.narrow"] {
+        let entry: crate::rt::Entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        // `-7` is the machine raising -- `u64_of_int` refuses a negative -- and the tier has to
+        // raise with it rather than answer.
+        for n in [0i64, 1, 12_345, 1 << 40, -7] {
+            let want = machine.call(name, vec![ply_eval::Value::Int(n)], ply_span::Span::DUMMY);
+            let mut ctx = native.context();
+            ctx.fuel = 1_000;
+            let layouts_ptr: *const crate::heap::Layouts = &native.tables().layouts;
+            let word = ctx
+                .heap
+                .to_word(unsafe { &*layouts_ptr }, &ply_eval::Value::Int(n));
+            let answer = unsafe { entry(&mut ctx, [word].as_ptr()) };
+            match want {
+                Ok(want) => {
+                    assert_eq!(ctx.failed, 0, "`{name}({n})` raised in the C tier");
+                    let got = crate::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
+                    assert_eq!(
+                        got, want,
+                        "`{name}({n})`: the tier and the machine disagree"
+                    );
+                }
+                Err(d) => assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}({n})` answered where the machine raised: {}",
+                    d.message
+                ),
+            }
+        }
+    }
 }
 
 /// Which shape loses a counted field. Each is one step of a parser's state handling.
@@ -332,7 +356,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let want = machine
             .call("m.probe", args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{which}` raised in the machine: {}", d.message));
-        let entry: crate::jit::Entry = native.entry("m.probe").expect("compiled");
+        let entry: crate::rt::Entry = native.entry("m.probe").expect("compiled");
         let mut ctx = native.context();
         ctx.fuel = 100_000;
         let layouts_ptr: *const crate::heap::Layouts = &native.tables().layouts;
@@ -404,7 +428,7 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
         let want = machine
             .call(name, args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let entry: crate::jit::Entry = native
+        let entry: crate::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
@@ -475,7 +499,7 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
         let want = machine
             .call(name, args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let entry: crate::jit::Entry = native
+        let entry: crate::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
@@ -523,7 +547,7 @@ pub fn alone(n: Int) -> Int = twice(n)
     let all: Vec<&str> = all.iter().map(String::as_str).collect();
 
     let answer = |native: &Native, name: &str, n: i64| -> Option<i64> {
-        let entry: crate::jit::Entry = native.entry(name)?;
+        let entry: crate::rt::Entry = native.entry(name)?;
         let mut ctx = native.context();
         ctx.fuel = 10_000;
         let words = [crate::heap::imm(n)];
@@ -532,7 +556,7 @@ pub fn alone(n: Int) -> Int = twice(n)
         Some(crate::heap::imm_value(w))
     };
 
-    let (wide, _) = crate::c::build(loaded, &all, crate::jit::Opts::default()).expect("builds");
+    let (wide, _) = crate::c::build(loaded, &all).expect("builds");
     assert_eq!(answer(&wide, "m.both", 5), Some(25));
     drop(wide);
 
@@ -540,8 +564,7 @@ pub fn alone(n: Int) -> Int = twice(n)
     // path the digest has to follow: `names` is unchanged, so a digest taken before the filter is
     // the same digest, and the refusals below land under the wider run's key.
     unsafe { std::env::set_var("PLY_C_SKIP", "m.thrice") };
-    let (narrowed, refused) =
-        crate::c::build(loaded, &all, crate::jit::Opts::default()).expect("builds");
+    let (narrowed, refused) = crate::c::build(loaded, &all).expect("builds");
     assert!(
         refused.iter().any(|r| r.function == "m.both"),
         "`m.both` calls a definition this build was not offered: {refused:?}"
@@ -551,8 +574,7 @@ pub fn alone(n: Int) -> Int = twice(n)
 
     unsafe { std::env::remove_var("PLY_C_SKIP") };
     // The one that used to come back wrong.
-    let (again, refused) =
-        crate::c::build(loaded, &all, crate::jit::Opts::default()).expect("builds");
+    let (again, refused) = crate::c::build(loaded, &all).expect("builds");
     assert!(
         refused.is_empty(),
         "the wider build was served the narrower one's refusals: {refused:?}"
@@ -613,8 +635,7 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
         crate::heap::imm_value(w)
     };
 
-    let (built, _) =
-        crate::c::build(loaded, &names, crate::jit::Opts::default()).expect("the first build");
+    let (built, _) = crate::c::build(loaded, &names).expect("the first build");
     let first = (
         ask(&built, "m.both", &[3, 4]),
         ask(&built, "m.tagged", &[7]),
@@ -628,8 +649,7 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
     drop(built);
 
     let reused = super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
-    let (again, _) =
-        crate::c::build(loaded, &names, crate::jit::Opts::default()).expect("the second build");
+    let (again, _) = crate::c::build(loaded, &names).expect("the second build");
     assert_eq!(
         super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed),
         reused + 1,
@@ -681,7 +701,7 @@ pub fn probe(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len
         "something was remembered before the root ever ran"
     );
 
-    let entry: crate::jit::Entry = native.entry("m.probe").expect("`probe` was refused");
+    let entry: crate::rt::Entry = native.entry("m.probe").expect("`probe` was refused");
     let mut ctx = native.context();
     ctx.fuel = 100_000;
     let args = [crate::heap::imm(64)];
@@ -721,7 +741,7 @@ pub fn with_wide(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, wide).i
     };
     let rounds = 500i64;
     let allocations = |name: &str| -> usize {
-        let entry: crate::jit::Entry = native.entry(name).expect("compiled");
+        let entry: crate::rt::Entry = native.entry(name).expect("compiled");
         let mut ctx = native.context();
         ctx.fuel = 1_000_000;
         let before = ctx.heap.allocated();

@@ -11,7 +11,7 @@
 //! declined 0`: one call into compiled code and never back out. So the call below is the same
 //! shape the machine makes, without the machine.
 //!
-//!   ply-arm <project-dir> <c|cranelift>
+//!   ply-arm <project-dir> c
 //!
 //! Prints `k1=<ms> k2=<ms> digest=<hex>`, which is the Rust arm's line exactly.
 
@@ -31,7 +31,7 @@ fn main() {
     let (dir, backend) = match args.as_slice() {
         [_, d, b] => (d.clone(), b.clone()),
         _ => {
-            eprintln!("usage: ply-arm <project-dir> <c|cranelift>");
+            eprintln!("usage: ply-arm <project-dir> c");
             std::process::exit(2);
         }
     };
@@ -43,23 +43,13 @@ fn main() {
     let (names, _refused) =
         ply_codegen::closure(loaded, &loaded.functions()).expect("the fragment closes");
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-
-    // Both tiers hand back the same three things: an entry by name, the tables the runtime reads
-    // against, and a context wired to them.
-    let code: Code = match backend.as_str() {
-        "c" => Code::C(
-            ply_codegen::c::build(loaded, &refs, ply_codegen::Opts::default())
-                .expect("the C tier builds")
-                .0,
-        ),
-        "cranelift" => {
-            Code::Jit(ply_codegen::Jit::compile(loaded, &refs).expect("the in-process tier builds"))
-        }
-        other => {
-            eprintln!("unknown backend `{other}`");
-            std::process::exit(2);
-        }
-    };
+    if backend != "c" {
+        eprintln!("unknown backend `{backend}`");
+        std::process::exit(2);
+    }
+    let code = ply_codegen::c::build(loaded, &refs)
+        .expect("the C tier builds")
+        .0;
 
     let mut ctx = code.context();
     let layouts: *const ply_codegen::heap::Layouts = &code.tables().layouts;
@@ -100,37 +90,12 @@ fn main() {
     );
 }
 
-// The same allowance `ply_codegen::backend::Code` makes for the same reason: both variants are
-// held only to keep the pages their entries point into alive, and there is one of them.
-#[allow(clippy::large_enum_variant)]
-enum Code {
-    Jit(ply_codegen::Unit),
-    C(ply_codegen::c::Native),
-}
-
-impl Code {
-    fn entry(&self, name: &str) -> Option<ply_codegen::jit::Entry> {
-        match self {
-            Code::Jit(u) => u.entry(name),
-            Code::C(n) => n.entry(name),
-        }
-    }
-    fn tables(&self) -> &std::rc::Rc<ply_codegen::rt::Tables> {
-        match self {
-            Code::Jit(u) => u.tables(),
-            Code::C(n) => n.tables(),
-        }
-    }
-    fn context(&self) -> ply_codegen::rt::Ctx {
-        match self {
-            Code::Jit(u) => u.context(),
-            Code::C(n) => n.context(),
-        }
-    }
-}
-
-/// One call into compiled code, the way the seam makes it and with nothing else in the way.
-fn call(code: &Code, ctx: &mut ply_codegen::rt::Ctx, name: &str, args: &[i64]) -> i64 {
+fn call(
+    code: &ply_codegen::c::Native,
+    ctx: &mut ply_codegen::rt::Ctx,
+    name: &str,
+    args: &[i64],
+) -> i64 {
     let entry = code
         .entry(name)
         .unwrap_or_else(|| panic!("`{name}` was not compiled by this tier"));
