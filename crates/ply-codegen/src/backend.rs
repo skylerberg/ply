@@ -554,6 +554,16 @@ impl ply_eval::Compiled for Bodies {
     fn take_performed(&self) -> Vec<ply_core::ty::EffectAtom> {
         std::mem::take(&mut self.ctx.borrow_mut().performed)
     }
+
+    fn set_seed(&self, seed: ply_eval::Seed, steps: u32) {
+        let mut ctx = self.ctx.borrow_mut();
+        ctx.seed = seed;
+        ctx.sim_steps = steps.max(1);
+    }
+
+    fn simulated(&self) -> Option<ply_eval::region::Record> {
+        self.ctx.borrow().record.clone()
+    }
 }
 
 impl Policed for Bodies {

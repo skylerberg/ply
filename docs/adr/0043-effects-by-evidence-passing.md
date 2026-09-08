@@ -15,9 +15,10 @@ them, the reference none; they compile with the chain entered whole
 library and the examples in that mode. The host route is not built: a
 `perform` no frame answers is refused before it is compiled, by the rule below,
 so nothing reaches the runtime's "no handler" failure from a shipped program.
-What the tier refuses over the shipped corpus now is `simulate`, `task.*`, a
-`perform` of an operation the run's host binding would answer, a `resume`
-called off the tail, and their callers. The `Float` and `Decimal` literals the
+What the tier refuses over the shipped corpus now is a `perform` of an
+operation the run's host binding would answer, a `resume` called off the tail,
+and their callers; `simulate` and `task.*` were refused when this was written
+and are ADR 0044's first stage, built. The `Float` and `Decimal` literals the
 reference never carried are constants the runtime holds, and compiling their
 bodies found the rule the inline `Int` arithmetic had wrong on both sides: an
 operator over two words of a type the emitter cannot see goes through the

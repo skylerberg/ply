@@ -133,7 +133,9 @@ mod arch {
             std::ptr::write_bytes(frame, 0, FRAME / 8);
             frame.write(arg);
             frame.add(1).write(entry);
-            frame.add(11).write(ply_stack_trampoline as unsafe extern "C" fn() as usize);
+            frame
+                .add(11)
+                .write(ply_stack_trampoline as unsafe extern "C" fn() as usize);
         }
         sp
     }
@@ -182,7 +184,9 @@ mod arch {
             std::ptr::write_bytes(frame, 0, FRAME / 8);
             frame.add(3).write(entry);
             frame.add(4).write(arg);
-            frame.add(6).write(ply_stack_trampoline as unsafe extern "C" fn() as usize);
+            frame
+                .add(6)
+                .write(ply_stack_trampoline as unsafe extern "C" fn() as usize);
         }
         sp
     }

@@ -392,12 +392,7 @@ impl<K: Clone, B> Scheduler<K, B> {
     }
 
     /// Blocks the current task on a host token.
-    pub fn park_on_host(
-        &mut self,
-        k: K,
-        pending: Pending,
-        span: Span,
-    ) -> Result<(), Diagnostic> {
+    pub fn park_on_host(&mut self, k: K, pending: Pending, span: Span) -> Result<(), Diagnostic> {
         if self.policy != Policy::Host {
             return Err(err_host_in_simulation(span, &pending, self.span));
         }
@@ -553,12 +548,7 @@ impl<K: Clone, B> Scheduler<K, B> {
 
     /// Blocks the current task until virtual time reaches `deadline`, which the region's [`Clock`]
     /// has already registered a timer for.
-    pub fn sleep_until(
-        &mut self,
-        k: K,
-        deadline: i64,
-        span: Span,
-    ) -> Result<(), Diagnostic> {
+    pub fn sleep_until(&mut self, k: K, deadline: i64, span: Span) -> Result<(), Diagnostic> {
         if self.policy != Policy::Seeded {
             return Err(Diagnostic::error(
                 codes::INTERNAL_ERROR,
@@ -924,12 +914,12 @@ fn err_unknown_task(span: Span, task: TaskId) -> Diagnostic {
 mod tests {
     use super::*;
     use crate::arena::Slot;
+    use crate::cont::Continuation;
     use crate::cont::{Prompt, Stack};
     use crate::sim::{Answer, Handlers, signature};
     use ply_core::{EffectAtom, Resource};
     use ply_span::Symbol;
     use ply_syntax::ast::Mode;
-    use crate::cont::Continuation;
     use std::rc::Rc;
 
     type Sched = Scheduler<Continuation, Value>;
@@ -1081,8 +1071,7 @@ mod tests {
                             }
                             Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                             Act::Spawn(index) => {
-                                let id =
-                                    sched.spawn(Value::Int(index as i64), Span::DUMMY, None);
+                                let id = sched.spawn(Value::Int(index as i64), Span::DUMMY, None);
                                 while script.len() <= id.0 as usize {
                                     script.push(0);
                                     pc.push(0);

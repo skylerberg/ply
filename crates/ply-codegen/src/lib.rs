@@ -15,6 +15,7 @@ pub mod list;
 pub mod map;
 pub mod opt;
 pub mod rt;
+pub mod simulate;
 pub mod source;
 pub mod stack;
 

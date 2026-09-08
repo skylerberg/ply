@@ -240,6 +240,19 @@ pub struct HandlerFrame {
     clauses: Vec<FrameClause>,
     /// The `return` clause's closure, or zero.
     ret: Word,
+    /// A `simulate` region's frame: it answers `task`, `clock`, `random` and `sim` through the
+    /// scheduler and has no clauses of its own.
+    simulate: bool,
+}
+
+impl HandlerFrame {
+    fn simulate() -> HandlerFrame {
+        HandlerFrame {
+            clauses: Vec::new(),
+            ret: 0,
+            simulate: true,
+        }
+    }
 }
 
 /// One clause: its effect and resource under their program-wide names, the operation, the
@@ -302,6 +315,15 @@ pub struct Ctx {
     /// Every atom a compiled `perform` performed since the entry began, for the machine's trace:
     /// the observed row is a claim the tests make, and a handled perform is still a perform.
     pub performed: Vec<EffectAtom>,
+    /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
+    pub(crate) sims: Vec<crate::simulate::Simulation>,
+    /// The seed the driver set, and the step budget, for the regions this entry opens.
+    pub(crate) seed: ply_eval::Seed,
+    pub(crate) sim_steps: u32,
+    pub(crate) trail: ply_eval::region::Trail,
+    /// What the entry's regions did, for the search, once the last one has completed.
+    pub record: Option<ply_eval::region::Record>,
+    entered_sims: u32,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     unwind: Option<(usize, Word)>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
@@ -326,6 +348,12 @@ impl Ctx {
             builtin_calls: 0,
             handlers: Vec::new(),
             performed: Vec::new(),
+            sims: Vec::new(),
+            seed: ply_eval::Seed::default(),
+            sim_steps: ply_eval::sim::DEFAULT_STEPS,
+            trail: ply_eval::region::Trail::new(ply_eval::Seed::default()),
+            record: None,
+            entered_sims: 0,
             unwind: None,
             resumed: None,
         }
@@ -341,6 +369,10 @@ impl Ctx {
         self.diagnostic = None;
         self.handlers.clear();
         self.performed.clear();
+        self.sims.clear();
+        self.trail = ply_eval::region::Trail::new(self.seed.clone());
+        self.record = None;
+        self.entered_sims = 0;
         self.unwind = None;
         self.resumed = None;
         // Every path out of an entry calls `end`, so this is one comparison against an empty log.
@@ -393,7 +425,7 @@ impl Ctx {
         self.tables.nullaries[index as usize]
     }
 
-    fn fail(&mut self, d: Diagnostic) -> i64 {
+    pub(crate) fn fail(&mut self, d: Diagnostic) -> i64 {
         self.fail_with(1, d)
     }
 
@@ -412,11 +444,11 @@ impl Ctx {
     }
 
     /// The interpreter value a word denotes, for a builtin or an error message.
-    fn value(&self, w: Word) -> Value {
+    pub(crate) fn value(&self, w: Word) -> Value {
         Heap::to_value(&self.tables.layouts, w)
     }
 
-    fn word(&mut self, v: &Value) -> Word {
+    pub(crate) fn word(&mut self, v: &Value) -> Word {
         let tables = Rc::clone(&self.tables);
         self.heap.to_word(&tables.layouts, v)
     }
@@ -436,7 +468,7 @@ fn args_of<'a>(ptr: *const i64, n: i64) -> &'a [Word] {
 }
 
 /// The arguments a builtin consumes, as the values it reads: each word released once copied.
-fn values_taken(ctx: &mut Ctx, args: &[Word]) -> Vec<Value> {
+pub(crate) fn values_taken(ctx: &mut Ctx, args: &[Word]) -> Vec<Value> {
     let mut out = ply_eval::argv::take(args.len());
     for w in args {
         out.push(ctx.value(*w));
@@ -481,6 +513,9 @@ pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let v = ctx.value(init);
     heap::dec(init);
+    if !ctx.sims.is_empty() {
+        ctx.trail.record_access(ply_eval::sim::Access::Alloc);
+    }
     let slot = ctx.cells.alloc_cell(v);
     ctx.heap.bridge(Value::Cell(slot))
 }
@@ -820,6 +855,11 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
     let b = ctx.tables.builtins[index as usize];
     let args = args_of(args, n);
     ctx.builtin_calls += 1;
+    if !ctx.sims.is_empty()
+        && let Some(access) = crate::simulate::cell_access(ctx, b, args)
+    {
+        ctx.trail.record_access(access);
+    }
     if let Some(w) = native_builtin(ctx, b, args) {
         return w;
     }
@@ -1425,7 +1465,11 @@ pub unsafe extern "C" fn rt_handle_push(
             resumes: w[4] != 0,
         })
         .collect();
-    c.handlers.push(HandlerFrame { clauses, ret });
+    c.handlers.push(HandlerFrame {
+        clauses,
+        ret,
+        simulate: false,
+    });
     (c.handlers.len() - 1) as i64
 }
 
@@ -1472,19 +1516,39 @@ pub unsafe extern "C" fn rt_perform(
     let effect = c.tables.fields[effect as usize].clone();
     let op = c.tables.fields[op as usize].clone();
     let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
-    c.performed.push(EffectAtom::new(
+    let atom = EffectAtom::new(
         effect.clone(),
         resource
             .clone()
             .map_or(Resource::Singleton, Resource::Named),
         if mode != 0 { Mode::Write } else { Mode::Read },
-    ));
-    let found = c.handlers.iter().enumerate().rev().find_map(|(i, f)| {
-        f.clauses
+    );
+    if !c.sims.is_empty() {
+        c.trail
+            .record_access(ply_eval::sim::Access::Atom(atom.clone()));
+    }
+    c.performed.push(atom);
+    let mut found = None;
+    for (i, f) in c.handlers.iter().enumerate().rev() {
+        if f.simulate {
+            if effect.as_str() == "sim" && op.as_str() == "seed" {
+                let root = c.seed.root as i64;
+                return c.word(&Value::Int(root));
+            }
+            if ply_eval::sim::is_scheduled(effect.as_str(), op.as_str()) {
+                return unsafe { crate::simulate::perform(ctx, &effect, &op, args_of(args, n)) };
+            }
+            continue;
+        }
+        if let Some(cl) = f
+            .clauses
             .iter()
             .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
-            .map(|cl| (i, cl.closure, cl.resumes))
-    });
+        {
+            found = Some((i, cl.closure, cl.resumes));
+            break;
+        }
+    }
     let Some((depth, closure, resumes)) = found else {
         // The machine's own diagnostic for an operation nothing handles: a performer of one
         // the host would answer is never compiled, so this is the case the machine calls a
@@ -1522,6 +1586,42 @@ pub unsafe extern "C" fn rt_perform(
 /// `rt_handle_land(ctx, depth, value)`: the `handle` at `depth` is over. Its frame and any above
 /// are popped; an unwind to it is caught and its value answered; any other failure passes; and
 /// a body that completed answers `value` through the `return` clause when there is one.
+/// `simulate { body }`: `body` is a nullary closure, run as the root task of a region whose
+/// scheduler the runtime drives on this stack. Answers what the body answered, or fails with
+/// the region's failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    if !c.sims.is_empty() {
+        heap::dec(body);
+        let d = ply_eval::machine::err_nested_simulation(Span::DUMMY, Span::DUMMY);
+        return c.fail(d);
+    }
+    let id = ply_eval::SimId(c.entered_sims);
+    c.entered_sims += 1;
+    c.trail.enter(Span::DUMMY);
+    let depth = c.handlers.len();
+    c.handlers.push(HandlerFrame::simulate());
+    let sim = crate::simulate::Simulation::new(
+        id,
+        c.seed.root,
+        c.trail.drawn(),
+        c.sim_steps,
+        depth,
+        c.stack_floor,
+        body,
+    );
+    c.sims.push(sim);
+    let r = unsafe { crate::simulate::run(ctx) };
+    let c = unsafe { &mut *ctx };
+    for f in c.handlers.split_off(depth) {
+        drop_frame(f);
+    }
+    c.sims.pop();
+    c.record = Some(c.trail.record());
+    r
+}
+
 pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     let depth = depth as usize;
@@ -1625,7 +1725,7 @@ pub unsafe extern "C" fn rt_call(ctx: *mut Ctx, callee: i64, args: *const i64, n
 /// Reads the callee and takes the arguments. A native closure is entered directly; a builtin or
 /// a constructor is the interpreter's own; an interpreted closure cannot be here, because the
 /// seam carries no function.
-fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
+pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
     let c = unsafe { &mut *ctx };
     match heap::kind(callee) {
         KIND_CLOSURE => {
