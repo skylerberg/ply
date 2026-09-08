@@ -27,8 +27,13 @@ import patterns (Lit, LInt, LFixed, LBool, LStr, LBytes, LFloat, LDec, LUnit, LB
 // The C type a value is held in, and what the emitter knows about it. `Boxed` is
 // a `Word`; `Int` is the untagged sixty-four bits inside one.
 pub type Kind = | KBoxed | KInt | KBool
+  // The one width this port carries, and only because `bytes_u32_le` answers it.
+  // A width is held in its own unsigned C type and cast where the signedness
+  // matters, because signed overflow is undefined in C.
+  | KU32
 
-pub fn ctype(k: Kind) -> Bytes = match k { KBoxed -> b"int64_t", KInt -> b"int64_t", KBool -> b"int64_t" }
+pub fn ctype(k: Kind) -> Bytes =
+  match k { KU32 -> b"uint32_t", _ -> b"int64_t" }
 
 // One emitted value: the kind it is held at, and the C expression naming it.
 pub type V = { k: Kind, c: Bytes, ty: Ty }
@@ -207,6 +212,7 @@ fn as_int(v: V) -> Bytes =
   match v.k {
     KInt -> v.c,
     KBool -> v.c,
+    KU32 -> bytes_concat_all([b"(int64_t)(", v.c, b")"]),
     KBoxed -> bytes_concat_all([b"(ply_is_imm(", v.c, b") ? ply_imm_value(", v.c,
                                 b") : rt_unbox_int_p(ctx, ", v.c, b"))"]),
   }
@@ -431,7 +437,8 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
 // through a `memcpy` and answers a `U32`, which is a width this port has no kind
 // for.
 fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
-  if name == b"bytes_at" && len(args) == 2 { inline_at(em, args, params) }
+  if name == b"bytes_at" && len(args) == 2 { inline_at(em, args, params, false) }
+  else if name == b"bytes_u32_le" && len(args) == 2 { inline_at(em, args, params, true) }
   else if len(args) != 1 { None }
   else if name != b"len" && name != b"bytes_len" { None }
   else { match list_at(args, 0) {
@@ -452,7 +459,11 @@ fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<
     },
   } }
 
-fn inline_at(em: Em, args: List<Code>, params: List<P>) -> Option<Out> =
+// `bytes_at` and `bytes_u32_le` share everything but their width: one byte read
+// with a bounds test, or four read through a `memcpy` -- which is how a C
+// compiler is told to emit an unaligned load, and lowers to one instruction
+// rather than a call.
+fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool) -> Option<Out> =
   match list_at(args, 0) {
     None -> None,
     Some(b0) -> match list_at(args, 1) {
@@ -464,14 +475,23 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>) -> Option<Out> =
           Some(iv) -> {
             let t = bind(iv.em, KBoxed, as_word(bv.v));
             let idx = bind(t.em, KInt, as_int(iv.v));
-            let bi = builtin_of(idx.em, b"bytes_at");
+            let bi = builtin_of(idx.em, if wide { b"bytes_u32_le" } else { b"bytes_at" });
             let g = line(bi.em, bytes_concat_all([
-              b"if ((uint64_t)", idx.v.c, b" >= (uint64_t)ply_obj(", t.v.c,
+              b"if ((uint64_t)", idx.v.c, if wide { b" + 4 > " } else { b" >= " },
+              b"(uint64_t)ply_obj(", t.v.c,
               b")->len) { Word a[2]; a[0] = ", t.v.c, b"; ply_inc(a[0]); a[1] = ply_imm(",
               idx.v.c, b"); rt_builtin_p(ctx, @@b", num(bi.i),
               b"@@, (Word)(intptr_t)a, 2); return 0; }"]));
-            Some(bind(g, KInt, bytes_concat_all([
-              b"(int64_t)((unsigned char *)ply_words(", t.v.c, b"))[", idx.v.c, b"]"])))
+            if wide {
+              let w = fresh(g);
+              Some({ em: line(w.em, bytes_concat_all([
+                       b"uint32_t ", w.name, b"; memcpy(&", w.name,
+                       b", (unsigned char *)ply_words(", t.v.c, b") + ", idx.v.c, b", 4);"])),
+                     v: { k: KU32, c: bytes_concat_all([b"ply_le32(", w.name, b")"]), ty: TyOpen } })
+            } else {
+              Some(bind(g, KInt, bytes_concat_all([
+                b"(int64_t)((unsigned char *)ply_words(", t.v.c, b"))[", idx.v.c, b"]"])))
+            }
           },
         } },
       },
@@ -695,6 +715,7 @@ fn field_at(ty: Ty, name: Bytes) -> Option<Int> =
 fn as_bool(v: V) -> Bytes =
   match v.k {
     KBool -> v.c,
+    KU32 -> bytes_concat_all([b"((", v.c, b") != 0)"]),
     KInt -> bytes_concat_all([b"((", v.c, b") != 0)"]),
     KBoxed -> bytes_concat_all([b"rt_unbox_bool_p(ctx, ", v.c, b")"]),
   }
@@ -702,6 +723,9 @@ fn as_bool(v: V) -> Bytes =
 fn as_word(v: V) -> Bytes =
   match v.k {
     KBoxed -> v.c,
+    // Either way it widens to the word the immediate carries; the C type the
+    // value is held in is what decides whether that is a sign or a zero extension.
+    KU32 -> bytes_concat_all([b"ply_imm((int64_t)", v.c, b")"]),
     // A `Bool` leaves as one of the two immortal words the runtime holds for it.
     KBool -> bytes_concat_all([b"(", v.c, b" ? ply_true : ply_false)"]),
     KInt -> bytes_concat_all([b"(ply_fits_imm(", v.c, b") ? ply_imm(", v.c,
