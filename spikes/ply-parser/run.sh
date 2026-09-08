@@ -114,6 +114,33 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-hash.log || {
   exit 1
 }
 
+echo
+echo "==> the seventh differential: code.ply's lowering against ply_eval::code"
+# The first comparison for a stage *after* the front end. It compares only what the port claims to
+# lower -- `lower` answers `None` for a node kind it has not reached -- and asserts the share it
+# reaches, so a port that quietly lowered nothing would fail rather than agree with itself.
+PLY_BIN="$root/target/release/ply" cargo test --test lower_diff -- --nocapture --test-threads=2 |
+  grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
+
+echo
+echo "==> the oracle for the stage after that: the C a body emits"
+# Not a differential either -- the Ply emitter is not written. What it checks is that the oracle it
+# will be compared against is usable, and it records the one coupling a first attempt would
+# otherwise spend a day on: `emit_body` optimises before it lowers, so `1 + 2` reaches the emitter
+# as `3`.
+cargo test --test emit -- --nocapture
+
+echo
+echo "==> what compiling effects would have to carry, and the corpus for it"
+cargo test --manifest-path "$here/harness/Cargo.toml" --test effects -- --nocapture
+
+echo
+echo "==> the eighth differential: emit.ply's C against crates/ply-codegen's,"
+echo "    on shapes chosen per node and then on the shipped corpus"
+PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=2 |
+  grep -E "agreeing|^test result|^error|panicked" || true
+
+
 if [ "${1:-}" = "--arm" ]; then
   echo
   echo "==> arming it: twenty-two corruptions of the Ply parser, each seen to go red"

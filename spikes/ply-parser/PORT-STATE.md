@@ -1,0 +1,79 @@
+# The Ply front end's port to Ply: where it stands, and what is next
+
+Written at the end of a long working session. `README.md` says what the spike is;
+this says what the *port of the C emitter* has and has not, so the next pass
+starts from the findings rather than rediscovering them.
+
+## The two instruments, and what they say
+
+Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
+
+| | |
+| --- | --- |
+| `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **484 of 1280** shipped bodies |
+
+`reached` and `compared` were apart for most of this work, by the record updates
+the lowering excluded. They now meet: the exclusion is gone.
+
+The emitter differential pins the reference's inlining at **zero** and passes it
+explicitly. What is compared is the *emitter*; the inliner is a stage of its own
+and this port does not have it.
+
+## Two pieces written and switched off, with what they cost
+
+Both are in `emit.ply`, both reached by deleting a `None ->` and restoring the
+body recorded beside it.
+
+- **`field_of`** — the runtime's field read by name, for a base whose shape is
+  not known. Reaches **565**, with **24** disagreeing.
+- The **generic** half of the shape work is on. What is left of the 24 is *not*
+  about releases, which is the change from earlier in the session: the reference
+  reads at an offset where the port asks by name, from a shape it has and this
+  port does not.
+
+## The rules the corpus taught, all recorded at their site
+
+Releases, in the order they were found. Each was a real difference:
+
+1. A release counts how many times the tree reads **any** name for the object,
+   not how many times one slot is read.
+2. A field whose own kind is a **word** does not release its base -- and the
+   generic read, which answers a word, does not either.
+3. An update emits its own build, out of the base's memory, released first.
+4. An update at the **tail** releases its base however often the body reads it.
+5. An arm reached through a scrutinee is **still a tail**.
+6. The record an update builds is the body's own.
+
+Ownership and ordering:
+
+- A compiled call takes **one** pass over its arguments; a builtin takes **two**;
+  `map` and `filter` take one. Each is wrong in the others' place.
+- An aggregate's items are held as they are evaluated; a call's are not.
+- Parameters are opened at entry, in declaration order, whatever the body reads.
+- The unit's tables are the **unit's**: a lambda's constants, shapes and builtins
+  keep counting from what the function that builds it met.
+
+## The named gaps
+
+`emit_diff.rs` asserts the eight by name. Four `std.hash` bodies want the
+*deferred record local*, which is the half of deferring this port does not do: a
+record whose every read is answered from the built table is never materialised,
+and the local it would land in is declared at the top of the body. The other four
+have causes written beside them.
+
+## What is not started
+
+The **inliner**. The differential pins inlining at zero precisely because of it,
+and porting `opt.rs` is what lifts that pin.
+
+## Beyond the port
+
+`docs/adr/0041-effects-in-a-compiled-tier.md` carries the effects work: `with
+cell` ships in both tiers, `perform`'s whole-program criterion is built
+(`Source::stack_handled`), and answering a `perform` needs a decision about the
+seam rather than more code -- `Compiled::enter` takes `&self` with the machine
+already borrowed.
+
+The evaluator is not started, and the thing to settle before it is what oracle it
+is held to. Every error found here was found by a byte-exact one.
