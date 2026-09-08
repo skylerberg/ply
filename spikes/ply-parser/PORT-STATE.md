@@ -117,10 +117,10 @@ which this port has not read yet and refuses; `map_fold` is a helper. `len`, `by
 field in the fast arm and the runtime's call in the slow one, which is where a value of the
 wrong kind is caught; `bytes_concat_all` over a written list joins without building it and
 over anything else is the call; `bytes_join` and `string_concat_all` were never inlined by the
-reference and are calls. One thing was found and not taken: the reference's kind-tested arm
-for `bytes_u32_le` reads one byte wide, so the port refuses that shape rather than write
-it. No shipped body reaches it. 1128 to 1173 reached; `std.hash.blake3` opened and joined
-the widths family. The census leads with an `if` whose arms answer different kinds.
+reference and are calls. One thing was found in the reference on the way: its kind-tested arm
+for `bytes_u32_le` read one byte wide. The reference was corrected to go through the runtime
+for that shape, and the port does the same. 1128 to 1173 reached; `std.hash.blake3` opened
+and joined the widths family. The census leads with an `if` whose arms answer different kinds.
 
 **A closure captures a parameter the prologue did not open.** A record or list parameter is
 never in the window -- it is read as its own word where the read is -- and a capture looked
