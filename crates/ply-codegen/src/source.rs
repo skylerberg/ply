@@ -20,6 +20,9 @@ pub struct Source {
     /// its own text and everything it references. Empty when nobody supplied any, and then nothing
     /// is kept between runs.
     pub keys: HashMap<String, String>,
+    /// Each module's source text, by module name, when the caller has it: what a second emitter
+    /// is handed, since it reads the program from its text. Empty otherwise.
+    pub texts: HashMap<String, String>,
     regions: std::sync::OnceLock<ply_eval::region_kind::Regions>,
     stack_handled: std::sync::OnceLock<StackHandled>,
 }
@@ -130,6 +133,7 @@ impl Source {
             definitions,
             test_roots: roots,
             keys: HashMap::new(),
+            texts: HashMap::new(),
             regions: std::sync::OnceLock::new(),
             stack_handled: std::sync::OnceLock::new(),
         }
@@ -148,6 +152,12 @@ impl Source {
             stack_handled: std::sync::OnceLock::new(),
             ..Source::new(program, resolved, check)
         }
+    }
+
+    /// The same source, with each module's text.
+    pub fn with_texts(mut self, texts: HashMap<String, String>) -> Source {
+        self.texts = texts;
+        self
     }
 
     /// The definition a program-wide name denotes, and the index of the module its bare names

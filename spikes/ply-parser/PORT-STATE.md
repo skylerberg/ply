@@ -56,7 +56,7 @@ Ownership and ordering:
 
 ## The named gaps
 
-`emit_diff.rs` asserts the eight by name. Four `std.hash` bodies want the
+`emit_diff.rs` asserts the seven by name. Four `std.hash` bodies want the
 *deferred record local*, which is the half of deferring this port does not do: a
 record whose every read is answered from the built table is never materialised,
 and the local it would land in is declared at the top of the body. The other four
@@ -68,6 +68,16 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+`std.json.float_json` is gone from the gaps: a lambda's emission restarted the body's
+constant and shape tables instead of continuing them, which the tables differential
+below is what caught.
+
+The port is the C tier's **producer** now, behind `PLY_C_EMITTER=ply:<dir>`
+(`crates/ply-codegen/src/c/producer.rs`). `emit_fn_full` answers the text and the
+tables a body names, `emit_bodies_in` frames every body of a module by length,
+and the tier reads that where it reaches and emits the rest itself. The third
+emitter differential holds the tables to the reference's wherever the text agrees.
 
 The port reads **opaque** operands now: a written `Float` or `Decimal` is `TyOpaque`, a
 builtin over an opaque argument answers opaque, opacity survives a `let`, and an operator

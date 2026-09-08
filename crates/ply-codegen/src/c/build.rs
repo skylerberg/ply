@@ -86,6 +86,30 @@ pub fn emit_body(loaded: &'static Source, name: &str, how: crate::opt::Inlining)
     Ok(text)
 }
 
+/// The same body with its tables, in the encoding the cache keeps a body in: what a second
+/// emitter has to produce to stand in for this one, and what a differential over the two compares.
+pub fn emit_body_encoded(
+    loaded: &'static Source,
+    name: &str,
+    how: crate::opt::Inlining,
+) -> Result<String> {
+    let ctors = loaded.ctors();
+    let ctors_digest = super::cache::ctors_digest(&ctors);
+    let names: Vec<String> = loaded.functions();
+    let offered: Vec<&str> = names.iter().map(String::as_str).collect();
+    let fragment = super::cache::fragment_digest(&offered);
+    let mut unit = Unit::new(ctors, names.clone());
+    let (text, tables) = emit_one(
+        loaded,
+        &mut unit,
+        name,
+        &ctors_digest,
+        (how.budget, how.depth),
+        &fragment,
+    )?;
+    Ok(super::cache::encode(&text, &tables))
+}
+
 /// The definitions actually offered, after the two bisecting instruments, and the digest a refusal
 /// is cached against. Both callers need the same answer: a refusal is cached against this digest,
 /// so an instrument that narrows the offered set has to move it.
@@ -206,6 +230,9 @@ fn emit_all(
             taken.len(),
             offered.len()
         );
+        if let Some((asked, answered)) = super::producer::with_current(|p| p.counts()) {
+            eprintln!("ply emitter answered {answered} of {asked} bodies asked of it");
+        }
     }
     if std::env::var("PLY_C_SPLIT").is_ok() {
         use std::sync::atomic::Ordering::Relaxed;
@@ -456,10 +483,11 @@ pub(super) fn emit_one(
     // two definitions that say the same thing share one -- and an emitted body carries its own
     // mangled name, so serving one for the other puts two definitions of the same symbol in the
     // unit. `lexer.hex1` and `lexer.hex2` are that pair, and the C compiler said so.
-    let key = loaded
-        .keys
-        .get(name)
-        .map(|h| super::cache::key(&format!("{name}\0{h}"), ctors_digest, inlining));
+    let produced = super::producer::installed();
+    let key = loaded.keys.get(name).map(|h| {
+        let who = if produced { "\0ply" } else { "" };
+        super::cache::key(&format!("{name}\0{h}{who}"), ctors_digest, inlining)
+    });
     let refusal = loaded.keys.get(name).map(|h| {
         super::cache::refusal_key(&format!("{name}\0{h}"), ctors_digest, inlining, fragment)
     });
@@ -570,6 +598,25 @@ pub(super) fn emit_one(
     // The lambdas this body defines, as functions beside it. Part of the body's text, so they
     // are cached and restored with it, and their placeholders are resolved with it.
     out.push_str(&e.lambda_defs());
+    // The second emitter's body stands in for this one where it reaches, and only for a body
+    // this emitter accepts: the refusals are this emitter's, the code that runs is the other's.
+    // A body naming a definition the unit does not hold would not link, so it is refused here
+    // as this emitter refuses one, and the fixpoint drops it.
+    if let Some(Some((text, tables))) =
+        super::producer::with_current(|p| p.body(loaded, name, module_index))
+    {
+        if let Some(missing) = tables.calls.iter().find(|c| !unit.functions.contains(c)) {
+            return Err(Refused {
+                function: name.to_string(),
+                construct: format!("`{missing}`, which is not in this compiled unit"),
+            }
+            .into());
+        }
+        if let Some(k) = &key {
+            super::cache::write(k, &text, &tables);
+        }
+        return Ok((text, tables));
+    }
     if let Some(k) = &key {
         super::cache::write(k, &out, &e.tables);
     }

@@ -360,8 +360,15 @@ fn once(root: &Path, backend: Option<&str>) -> Result<(Timings, Shape)> {
     let started = Instant::now();
     let provider = match &spec {
         Some(spec) if !selection.to_run.is_empty() => Some(
-            ply_cli::commands::common::build_backend(spec, &program, &resolved, &check, &hashes)
-                .map_err(|d| anyhow::anyhow!("building the backend: {}", d.message))?,
+            ply_cli::commands::common::build_backend(
+                spec,
+                &program,
+                &resolved,
+                &check,
+                &hashes,
+                Default::default(),
+            )
+            .map_err(|d| anyhow::anyhow!("building the backend: {}", d.message))?,
         ),
         _ => None,
     };
