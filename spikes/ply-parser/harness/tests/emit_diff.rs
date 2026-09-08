@@ -458,7 +458,7 @@ fn backend_args() -> Vec<String> {
     match std::env::var("PLY_BACKEND").as_deref() {
         Ok("none") => Vec::new(),
         Ok(other) => vec!["--backend".to_string(), other.to_string()],
-        Err(_) => vec!["--backend".to_string(), "cranelift".to_string()],
+        Err(_) => vec!["--backend".to_string(), "c".to_string()],
     }
 }
 
@@ -538,8 +538,16 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // skipped a sub-expression the reference emitted; `std.db.collect_tuple` and
     // `std.http.absorb` release an update's base where the port does not; `std.http.check_limits`
     // emits a constant the port does not reach.
+    //
+    // And four where the port is *wrong* rather than different, which is the gap to close first
+    // under ADR 0042's oracle: an operator over a `Float` or `Decimal` operand. The reference reads
+    // the checker's type, sees one it does not fix, and reaches the machine's own operator through
+    // `rt_binary_p`; this port cannot see that type yet and emits an `Int` comparison.
     let expected_gaps = [
         "std.db.collect_tuple",
+        "std.db.decimal_cmp",
+        "std.db.decimal_scale_of",
+        "std.db.float_cmp",
         "std.hash.first8",
         "std.hash.full_words",
         "std.hash.padded_words",
@@ -547,6 +555,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
         "std.http.absorb",
         "std.http.check_limits",
         "std.json.float_json",
+        "desk.item_line",
     ];
     assert_eq!(
         differ, expected_gaps,

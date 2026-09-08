@@ -27,11 +27,12 @@ typedef struct {
 #define PLY_HEADER 16
 #define PLY_FLAT 1
 
-/* `Ctx`, whose first two fields compiled code reads and writes directly. The rest is opaque: a
-   pointer to it is all the runtime's helpers want. */
+/* `Ctx`, whose first three fields compiled code reads directly. The rest is opaque: a pointer to
+   it is all the runtime's helpers want. */
 typedef struct {
   int64_t failed;
   int64_t fuel;
+  uintptr_t stack_floor;
 } PlyCtx;
 
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
@@ -126,6 +127,8 @@ helpers![
     ("rt_unbox_int", 1, true),
     ("rt_unbox_bool", 1, true),
     ("rt_no_fuel", 0, false),
+    ("rt_no_stack", 0, false),
+    ("rt_binary", 3, true),
     ("rt_arith", 3, true),
     ("rt_lit", 1, true),
     ("rt_no_match", 0, false),
@@ -190,14 +193,13 @@ pub fn runtime_decls() -> String {
             pointer_name(h.name)
         ));
     }
-    // `heap::dec`, with the counted case inline and a call only for the release itself, which is
-    // the shape the in-process tier emits around its own `rt_dec` too.
+    // `heap::dec`, with the counted case inline and a call only for the release itself.
     //
     // `rt_dec` is `release_last`: it frees *unconditionally*, because it is the `rc == 1` case a
-    // caller has already established. Cranelift establishes it -- it emits the count test and
-    // calls the helper only on the branch where the count is one. This tier called it bare, so
-    // every release freed an object whatever else was holding it, and `fold(xs, 0, add) + len(xs)`
-    // read a freed list. Three lines of Ply, and it had been in the tier from its first commit.
+    // caller has already established, and the count test below is what establishes it. This tier
+    // once called it bare, so every release freed an object whatever else was holding it, and
+    // `fold(xs, 0, add) + len(xs)` read a freed list. Three lines of Ply, and it had been in the
+    // tier from its first commit.
     out.push_str(
         "\nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
          \x20 if (ply_is_imm(w) || w == 0) return;\n\

@@ -1,4 +1,4 @@
-//! A cranelift code generator behind `ply test --backend cranelift`.
+//! The compiled tier behind `ply test --backend c`: the machine's lowered `Code` emitted as C.
 
 // `Value` is `Arc` in five of its variants and a `Value` is not `Send`, so every construction of
 // one trips `arc_with_non_send_sync`. The runtime's helpers and the heap's accessors take the
@@ -11,14 +11,12 @@
 pub mod backend;
 pub mod c;
 pub mod heap;
-pub mod jit;
 pub mod list;
 pub mod map;
 pub mod opt;
 pub mod rt;
 pub mod source;
 
-pub use backend::{Bodies, Closed, Cranelift, Declines, closure};
-pub use c::{Profile, select_profile};
-pub use jit::{Jit, Opts, Refused, Unit};
+pub use backend::{Bodies, Closed, Declines, Unit, closure};
+pub use c::{Profile, Refused, select_profile};
 pub use source::{Source, test_root_name};

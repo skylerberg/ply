@@ -217,8 +217,8 @@ fn the_parses_allocation_sites_are_ranked_under_both_engines() {
     parse_once(&mut interpreter);
     let interpreted = capture(|| parse_once(&mut interpreter));
 
-    let unit = ply_codegen::Cranelift::over(loaded.program, loaded.resolved, loaded.check)
-        .expect("this host has a cranelift backend");
+    let unit = ply_codegen::Unit::over(loaded.program, loaded.resolved, loaded.check)
+        .expect("this host has a C compiler");
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
     let mut compiled = Machine::new(loaded.program, loaded.resolved, loaded.check);
     compiled.set_compiled(backend);

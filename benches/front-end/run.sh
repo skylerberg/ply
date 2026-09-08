@@ -65,8 +65,8 @@ run_arm() {                       # $1 label, $2... command; prints "user wall"
 arm_cmd() {                       # $1 arm -> the command, as words on stdout
   case "$1" in
     none|null) echo "$ply test $dir --no-cache --filter row:" ;;
-    narrow)    echo "env PLY_CODEGEN_REGISTER=narrow $ply test $dir --no-cache --filter row: --backend cranelift" ;;
-    wide)      echo "$ply test $dir --no-cache --filter row: --backend cranelift" ;;
+    narrow)    echo "env PLY_CODEGEN_REGISTER=narrow $ply test $dir --no-cache --filter row: --backend c" ;;
+    wide)      echo "$ply test $dir --no-cache --filter row: --backend c" ;;
     floor)     echo "$ply test $dir --no-cache --filter row:nothing-matches" ;;
   esac
 }

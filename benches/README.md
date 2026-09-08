@@ -4,7 +4,7 @@
 > the crate was a third code generator with a runtime of its own, and its own
 > deletion condition was met. Its hazard suite is
 > `crates/ply-codegen-tests/tests/suite/hazards.rs` now, over the shipping tier, and
-> `benches/kernel/` is measured by `ply test benches/kernel --backend cranelift|c`.
+> `benches/kernel/` is measured by `ply test benches/kernel --backend c`.
 
 
 `ply-corpus` generates a synthetic Ply project of a given size and reports where
@@ -642,7 +642,7 @@ assumption must be tested before anything is built. This is that test.
 ```
 # `crates/ply-codegen-spike` is deleted; the command below is the one that took the
 # reading and is kept for provenance, not to be run. `benches/kernel/` is now measured
-# by `ply test benches/kernel --backend cranelift|c`.
+# by `ply test benches/kernel --backend c`.
 ./crates/ply-codegen-spike/target/release/mcts \
     --dir benches/kernel --iterations 100 --inner 3 --repeats 21 \
     --out benches/adr0018-mcts.json

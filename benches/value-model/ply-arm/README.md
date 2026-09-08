@@ -5,7 +5,7 @@ directly, the minimum over repeats.
 
 ```sh
 cargo build --release -p ply-arm          # from the repository root
-./target/release/ply-arm <project-dir> <c|cranelift>
+./target/release/ply-arm <project-dir> c
 # k1=0.176 k2=29.703 digest=68d647e6...
 ```
 

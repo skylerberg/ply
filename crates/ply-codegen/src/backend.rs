@@ -1,13 +1,13 @@
 //! The machine entering natively compiled code, from a command a user runs.
 
-use crate::jit::{Entry, Jit, Opts, Unit};
+use crate::rt::Entry;
 use crate::source::Source;
 use anyhow::{Context, Result, bail};
 use ply_eval::{Compilation, Counters, Entered, Policed, Provider, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::{Program, TypeExpr};
 use std::cell::{Cell, RefCell};
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 use std::rc::Rc;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -59,80 +59,49 @@ impl Declines {
     }
 }
 
-/// One run's cranelift backend: the program it answers for, the set of definitions it compiles, and
+/// One run's compiled unit: the program it answers for, the set of definitions it compiles, and
 /// the counters every worker's backend adds to.
-/// Which code generator a unit's bodies come out of. The fragment, the refusals and the registry
-/// above this are the same either way.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tier {
-    /// Cranelift, in process, compiled at attach.
-    Jit,
-    /// C, emitted and handed to `cc` — one process and one link per unit.
-    C,
-}
-
-pub struct Cranelift {
-    tier: Tier,
+pub struct Unit {
     /// The address of the `Program` the machine is running, for `Compiled::describes`.
     origin: usize,
     source: &'static Source,
-    /// The set the fragment compiles as one unit, closed under calls.
+    /// The set the emitter compiles as one unit, closed under calls.
     compiled: Vec<String>,
     /// The subset of `compiled` whose whole signature is `Int` or `Bool`, which is the only part
     /// the machine can ever be offered.
     members: BTreeSet<Symbol>,
-    /// Definitions the fragment refused, with the construct that refused each — the ranking the compute-kernel record's roadmap is read off.
+    /// Definitions the emitter refused, with the construct that refused each.
     refusals: Vec<(String, String)>,
     counters: Counters,
-    /// Nanoseconds the fixpoint below took: whole-program, paid once, and the half that does
-    /// **not** scale with the worker count.
+    /// Nanoseconds the pre-flight build took: whole-program, paid once, and the half that does
+    /// **not** scale with the worker count, since every worker after it reads the unit back.
     analysis_nanos: u64,
-    /// Nanoseconds workers have spent inside cranelift, and how many have paid it.
+    /// Nanoseconds workers have spent building their unit, and how many have paid it.
     codegen_nanos: AtomicU64,
     compiles: AtomicU64,
-    /// Workers whose compile failed after the pre-flight in [`Cranelift::over`] succeeded.
+    /// Workers whose build failed after the pre-flight in [`Unit::over`] succeeded.
     poisoned: AtomicU64,
 }
 
-impl Cranelift {
+impl Unit {
     /// The compiled fragment of `program`, or the reason there is none.
     pub fn over(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
-    ) -> Result<&'static Cranelift> {
-        Cranelift::tiered(program, resolved, check, Tier::Jit, HashMap::new())
+    ) -> Result<&'static Unit> {
+        Unit::keyed(program, resolved, check, HashMap::new())
     }
 
-    /// The same fragment through the C tier: emitted as C and handed to `cc` (ADR 0040). The
-    /// analysis above it is identical, which is the point — one code generator's *decisions*,
-    /// two code generators' output.
-    pub fn over_c(
-        program: &Program,
-        resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_core::CheckOutput,
-    ) -> Result<&'static Cranelift> {
-        Cranelift::tiered(program, resolved, check, Tier::C, HashMap::new())
-    }
-
-    /// The same, told what each definition's code is a function of, so that emitted bodies can be
-    /// kept between runs. Without the keys nothing is kept and everything is emitted afresh.
-    pub fn over_c_keyed(
+    /// The same, told what each definition's code is a function of, so that emitted bodies and
+    /// the built unit can be kept between runs. Without the keys nothing is kept and everything
+    /// is emitted afresh.
+    pub fn keyed(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
         keys: HashMap<String, String>,
-    ) -> Result<&'static Cranelift> {
-        Cranelift::tiered(program, resolved, check, Tier::C, keys)
-    }
-
-    fn tiered(
-        program: &Program,
-        resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_core::CheckOutput,
-        tier: Tier,
-        keys: HashMap<String, String>,
-    ) -> Result<&'static Cranelift> {
+    ) -> Result<&'static Unit> {
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
         let origin = std::ptr::from_ref(program) as usize;
@@ -144,6 +113,9 @@ impl Cranelift {
             Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
         let candidates = source.functions();
         let started = std::time::Instant::now();
+        // The pre-flight is the analysis: the emitter's fixpoint over every function is what
+        // decides the compiled set, and the unit it leaves in the cache is the one every worker
+        // reads back. It is also the reason this function is fallible.
         let (compiled, refusals) = closure(source, &candidates)?;
         let members: BTreeSet<Symbol> = compiled
             .iter()
@@ -151,8 +123,7 @@ impl Cranelift {
             .map(Symbol::new)
             .collect();
         let analysis_nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-        let unit = Cranelift {
-            tier,
+        let unit = Unit {
             origin,
             source,
             compiled,
@@ -164,14 +135,7 @@ impl Cranelift {
             compiles: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
         };
-        // The pre-flight, and it is the reason this function is fallible.
-        let leaked: &'static Cranelift = Box::leak(Box::new(unit));
-        if !leaked.members.is_empty() {
-            leaked
-                .build()
-                .context("compiling the cranelift fragment of this program")?;
-        }
-        Ok(leaked)
+        Ok(Box::leak(Box::new(unit)))
     }
 
     /// The bodies this unit builds, as the concrete type rather than behind `dyn Compiled`.
@@ -183,12 +147,12 @@ impl Cranelift {
         self.build().map(Rc::new)
     }
 
-    /// The definitions the fragment compiles, closed under calls.
+    /// The definitions the emitter compiles, closed under calls.
     pub fn compiled(&self) -> &[String] {
         &self.compiled
     }
 
-    /// What the fragment refused and the construct that refused it.
+    /// What the emitter refused and the construct that refused it.
     pub fn refusals(&self) -> &[(String, String)] {
         &self.refusals
     }
@@ -207,30 +171,22 @@ impl Cranelift {
     }
 
     fn build(&'static self) -> Result<Bodies> {
-        let names: Vec<&str> = self.compiled.iter().map(String::as_str).collect();
+        // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
+        // worker reads that unit back rather than emitting it again.
+        let candidates = self.source.functions();
+        let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let started = std::time::Instant::now();
-        let code = match self.tier {
-            Tier::Jit => Code::Jit(Jit::compile(self.source, &names)?),
-            Tier::C => {
-                let (native, _refused) =
-                    crate::c::build(self.source, &names, crate::jit::Opts::default())?;
-                Code::C(native)
-            }
-        };
+        let (native, _refused) = crate::c::build(self.source, &names)?;
         self.codegen_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
         );
         self.compiles.fetch_add(1, Ordering::Relaxed);
-        Bodies::new(self, code)
-    }
-
-    pub fn tier(&self) -> Tier {
-        self.tier
+        Bodies::new(self, native)
     }
 }
 
-impl Provider for Cranelift {
+impl Provider for Unit {
     /// One worker's compiled backend.
     fn attach(&'static self, spec: &ply_eval::BackendSpec) -> Rc<dyn ply_eval::Compiled> {
         if self.members.is_empty() {
@@ -247,10 +203,7 @@ impl Provider for Cranelift {
     }
 
     fn name(&self) -> &'static str {
-        match self.tier {
-            Tier::Jit => "cranelift",
-            Tier::C => "c",
-        }
+        "c"
     }
 
     /// The registry width, because it decides which definitions run natively at all: a pass earned
@@ -268,7 +221,7 @@ impl Provider for Cranelift {
     }
 
     fn compilation(&self) -> Option<Compilation> {
-        Some(Cranelift::compilation(self))
+        Some(Unit::compilation(self))
     }
 
     fn unbuilt(&self) -> u64 {
@@ -278,7 +231,7 @@ impl Provider for Cranelift {
 
 /// A worker whose compile failed: it declines everything and is counted.
 struct Absent {
-    unit: &'static Cranelift,
+    unit: &'static Unit,
 }
 
 impl ply_eval::Compiled for Absent {
@@ -311,51 +264,10 @@ impl Policed for Absent {
 }
 
 /// One worker's compiled bodies, offered to a `Machine` through `ply_eval::Compiled`.
-/// One unit's code, whichever tier produced it. Both are kept only to hold the pages the entries
-/// point into alive.
-#[allow(clippy::large_enum_variant)]
-pub enum Code {
-    Jit(Unit),
-    C(crate::c::Native),
-}
-
-impl Code {
-    fn entry(&self, name: &str) -> Option<crate::jit::Entry> {
-        match self {
-            Code::Jit(u) => u.entry(name),
-            Code::C(n) => n.entry(name),
-        }
-    }
-    fn arity(&self, name: &str) -> Option<usize> {
-        match self {
-            Code::Jit(u) => u.arity(name),
-            Code::C(n) => n.arity(name),
-        }
-    }
-    fn constant_index(&self, name: &str) -> Option<usize> {
-        match self {
-            Code::Jit(u) => u.constant_index(name),
-            Code::C(n) => n.constant_index(name),
-        }
-    }
-    fn tables(&self) -> &std::rc::Rc<crate::rt::Tables> {
-        match self {
-            Code::Jit(u) => u.tables(),
-            Code::C(n) => n.tables(),
-        }
-    }
-    fn context(&self) -> crate::rt::Ctx {
-        match self {
-            Code::Jit(u) => u.context(),
-            Code::C(n) => n.context(),
-        }
-    }
-}
-
 pub struct Bodies {
-    unit: &'static Cranelift,
+    unit: &'static Unit,
     /// Kept alive because every [`Entry`] below points into its executable pages.
-    _code: Code,
+    _code: crate::c::Native,
     admitted: HashMap<Symbol, Admitted>,
     /// One context for every entry, and the `RefCell` is the proof rather than a comment:
     /// [`crate::rt::Ctx::slots`] is a bump arena with no pop, so an entry that began inside another
@@ -364,10 +276,16 @@ pub struct Bodies {
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
+    /// The fuel an entry was handed when the native stack refused its dive. Every offer with no
+    /// more -- every call nested below that one, and a backend told to ignore its budget hands the
+    /// same fuel at every depth -- is declined without entering until the machine unwinds above
+    /// it, because the machine re-offers each call it evaluates and a refused dive repeated once
+    /// per level is the whole recursion squared.
+    floor: Cell<Option<usize>>,
 }
 
 impl Bodies {
-    fn new(unit: &'static Cranelift, code: Code) -> Result<Bodies> {
+    fn new(unit: &'static Unit, code: crate::c::Native) -> Result<Bodies> {
         if let Some(what) = code.tables().retains_a_handle() {
             bail!(
                 "the constant pool holds {what}, which must not outlive the call that made it; \
@@ -377,12 +295,6 @@ impl Bodies {
         let mut admitted = HashMap::new();
         for name in &unit.members {
             let Some(entry) = code.entry(name.as_str()) else {
-                // The C tier decides its own fragment on top of the shared analysis, so a name
-                // the Cranelift emitter would take can still be refused here. It is simply not
-                // offered; the seam declines and the machine answers.
-                if matches!(unit.tier, Tier::C) {
-                    continue;
-                }
                 bail!("`{name}` was admitted and not compiled");
             };
             let Some(arity) = code.arity(name.as_str()) else {
@@ -429,6 +341,7 @@ impl Bodies {
             ctx,
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
+            floor: Cell::new(None),
         })
     }
 
@@ -478,6 +391,12 @@ impl Bodies {
         };
         if admitted.arity != args.len() {
             return self.decline(|d| d.arity += 1);
+        }
+        if let Some(at) = self.floor.get() {
+            if fuel <= at {
+                return self.decline(|d| d.out_of_fuel += 1);
+            }
+            self.floor.set(None);
         }
         let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
             return self.decline(|d| d.reentered += 1);
@@ -532,7 +451,11 @@ impl Bodies {
             // The fragment's diagnostic is `RUNTIME_ERROR` at `Span::DUMMY`; the machine is about
             // to evaluate the same definition and raise the real one, and a test root carries
             // this one only to name what raised when the machine then passes.
-            let out_of_fuel = ctx.failed == crate::rt::FAILED_OUT_OF_FUEL;
+            let out_of_stack = ctx.failed == crate::rt::FAILED_OUT_OF_STACK;
+            if out_of_stack {
+                self.floor.set(Some(fuel));
+            }
+            let out_of_fuel = out_of_stack || ctx.failed == crate::rt::FAILED_OUT_OF_FUEL;
             let raised = if out_of_fuel {
                 None
             } else {
@@ -677,41 +600,26 @@ fn scalar_signature(source: &Source, name: &str) -> bool {
     def.params.iter().all(|p| scalar(p.ty.as_ref())) && scalar(def.ret.as_ref())
 }
 
-/// The largest subset of `candidates` the fragment compiles **as one unit**, and every function
+/// The largest subset of `candidates` the emitter compiles **as one unit**, and every function
 /// that was dropped with the reason.
 ///
-/// Public so that a measurement can compile the same set the tier does. `Jit::compile` fails on
-/// the first definition outside the fragment, which is right for a caller that has already chosen
-/// one and wrong for a caller that has not.
+/// Public so that a measurement can compile the same set the tier does. The set is the emitter's
+/// fixpoint: emit everything, drop what refused, go round again, because dropping a body refuses
+/// the ones that call it. Running it builds the unit, so a worker offered the same candidates
+/// reads it back rather than paying it again.
 pub fn closure(source: &'static Source, candidates: &[String]) -> Result<Closed> {
-    let mut set: Vec<String> = candidates.to_vec();
-    let mut lost: Vec<(String, String)> = Vec::new();
-    loop {
-        if set.is_empty() {
-            break;
-        }
-        let names: Vec<&str> = set.iter().map(|s| s.as_str()).collect();
-        let refusals = Jit::refusals(source, &names, Opts::default())?;
-        if refusals.is_empty() {
-            break;
-        }
-        let refused: HashSet<&str> = refusals.iter().map(|r| r.function.as_str()).collect();
-        for r in &refusals {
-            lost.push((r.function.clone(), r.construct.clone()));
-        }
-        let before = set.len();
-        set.retain(|n| !refused.contains(n.as_str()));
-        if set.len() == before {
-            bail!(
-                "the fragment refused {} function(s) and named none of the ones it was given: {:?}",
-                refusals.len(),
-                refusals
-                    .iter()
-                    .map(|r| r.function.as_str())
-                    .collect::<Vec<_>>()
-            );
-        }
-    }
+    let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
+    let (native, refused) =
+        crate::c::build(source, &names).context("compiling the fragment of this program")?;
+    let set: Vec<String> = candidates
+        .iter()
+        .filter(|name| native.entry(name).is_some())
+        .cloned()
+        .collect();
+    let lost = refused
+        .into_iter()
+        .map(|r| (r.function, r.construct))
+        .collect();
     Ok((set, lost))
 }
 

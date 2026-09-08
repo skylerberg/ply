@@ -298,12 +298,12 @@ fn the_lowering_agrees_with_ply_eval_wherever_the_port_reaches() {
     );
 }
 
-/// `--backend` for every `ply` this differential runs: `cranelift` unless `PLY_BACKEND` names
+/// `--backend` for every `ply` this differential runs: `c` unless `PLY_BACKEND` names
 /// another, and nothing at all for `none`.
 fn backend_args() -> Vec<String> {
     match std::env::var("PLY_BACKEND").as_deref() {
         Ok("none") => Vec::new(),
         Ok(other) => vec!["--backend".to_string(), other.to_string()],
-        Err(_) => vec!["--backend".to_string(), "cranelift".to_string()],
+        Err(_) => vec!["--backend".to_string(), "c".to_string()],
     }
 }
