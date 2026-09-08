@@ -21,6 +21,7 @@ import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, N
 import items (Module, Derived, Item, IFn, ITest, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
 import resolve (Mod, Source, Resolved_, Failed, resolve_modules)
 import derive (expand_derives)
+import infer (pure_definitions)
 import exprs (Param)
 import types (TypeExpr, TCon, TRecord)
 import rewrite (expand)
@@ -88,7 +89,9 @@ pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>
                 // lambda's own code goes here and is written after the function
                 // that built the closure, which is where the reference puts it.
                 extra: Bytes,
-                lambdas: Int,
+                // The symbols this body's code table names: each lambda's entry, and each pure
+                // nullary definition's entry a constant is asked for.
+                lambdas: List<Bytes>,
                 // The name the sub-functions are numbered under, which is the
                 // *named* function's, not an enclosing lambda's.
                 owner: Bytes,
@@ -145,7 +148,9 @@ pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>
 // well as the kind: a call whose answer is a record of known fields is where a
 // later field read gets its offset, and dropping it here is what sent those
 // reads through the runtime.
-pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty }
+// `pure` is the checker's word: an empty footprint and no constraint, which is what lets a
+// nullary call be answered from the constant table.
+pub type Def = { name: Bytes, ret: Option<Kind>, ret_ty: Ty, pure: Bool }
 
 // A name another module exports and this one brought in by name. An imported
 // name lowers to a bare global, indistinguishable from a builtin, so the module's
@@ -309,6 +314,16 @@ fn poison(em: Em, why: Bytes) -> Em =
 
 fn refused(em: Em, why: Bytes) -> Out =
   { em: poison(em, why), v: { k: KBoxed, c: b"0", ty: TyOpen } }
+
+// The index a symbol takes in this body's code table, added on first use.
+fn lambda_of(em: Em, sym: Bytes) -> { em: Em, i: Int } =
+  match fold(range(0, len(em.lambdas)), None, |acc: Option<Int>, i: Int|
+          match list_at(em.lambdas, i) { Some(x) -> if x == sym { Some(i) } else { acc }, None -> acc }) {
+    Some(i) -> { em: em, i: i },
+    None -> { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
+                    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports, consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: push(em.lambdas, sym), owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks, alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused },
+              i: len(em.lambdas) },
+  }
 
 fn note_call(em: Em, full: Bytes) -> Em =
   { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
@@ -544,6 +559,24 @@ fn opened_to(em: Em, v: V, d: { k: Option<Kind>, ty: Ty }) -> Out =
 fn ret_of(here: List<Def>, name: Bytes) -> { k: Option<Kind>, ty: Ty } =
   fold(here, { k: None, ty: TyOpen }, |acc: { k: Option<Kind>, ty: Ty }, d: Def|
     if d.name == name { { k: d.ret, ty: d.ret_ty } } else { acc })
+
+// A nullary name the constant table answers: a definition of this module or of an imported one,
+// published pure, whose declared return is a word. The program-wide name and the type it answers.
+fn constant_of(em: Em, name: Bytes) -> Option<{ full: Bytes, ty: Ty }> =
+  if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == name) {
+    if is_pure(em.here, name) && ret_of(em.here, name).k == Some(KBoxed)
+    { Some({ full: bytes_concat_all([em.module, b".", name]), ty: ret_of(em.here, name).ty }) } else { None }
+  } else {
+    let callee = match qualified(name) { Some(q) -> q.name, None -> name };
+    match match qualified(name) { Some(q) -> from_import(em.imports, q.binder), None -> from_import(em.imports, name) } {
+      None -> None,
+      Some(imp) -> if is_pure(imp.defs, callee) && ret_of(imp.defs, callee).k == Some(KBoxed)
+        { Some({ full: bytes_concat_all([imp.module, b".", callee]), ty: ret_of(imp.defs, callee).ty }) } else { None },
+    }
+  }
+
+fn is_pure(here: List<Def>, name: Bytes) -> Bool =
+  fold(here, false, |acc: Bool, d: Def| if d.name == name { d.pure } else { acc })
 
 // The builtins the reference does not simply call: four expanded in place around
 // a load, and the joins, which it fuses over a list literal rather than building
@@ -811,7 +844,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
   // after what the body met, and what the body met stays in the table the lambda hands back.
   let start = { out: b"", n: 0, conv: window, ind: 0, reads: reads, shapes: em.shapes, built: [],
                 module: em.module, made: [], here: em.here, imports: em.imports, consts: em.consts,
-                ctors: em.ctors, extra: b"", lambdas: 0, owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: [], alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused };
+                ctors: em.ctors, extra: b"", lambdas: [], owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: [], alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused };
   match expr(start, l.body, []) {
     None -> None,
     Some(o) -> Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, calls: o.em.calls, refused: o.em.refused,
@@ -1146,7 +1179,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       match caps_owned(em, l.caps, 0, []) {
         None -> None,
         Some(w) -> {
-          let idx = w.em.lambdas;
+          // Numbered among this body's lambdas; the code table holds constants' entries too.
+          let prefix = bytes_concat_all([b"ply_", em.owner, b"_lambda"]);
+          let idx = fold(w.em.lambdas, 0, |acc: Int, sym: Bytes|
+            if bytes_len(sym) >= bytes_len(prefix) && bytes_slice(sym, 0, bytes_len(prefix)) == prefix { acc + 1 } else { acc });
           let sub = bytes_concat_all([em.owner, b"_lambda", num(idx)]);
           match emit_lambda(w.em, sub, l) {
             None -> None,
@@ -1157,10 +1193,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
               let grown = { out: e.out, n: e.n, conv: e.conv, ind: e.ind, reads: e.reads,
                             shapes: sub_out.shapes, built: e.built, module: e.module, made: e.made,
                             here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
-                            extra: bytes_concat(e.extra, sub_out.text), lambdas: idx + 1,
+                            extra: bytes_concat(e.extra, sub_out.text), lambdas: e.lambdas,
                             owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: e.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused };
-              let o = bind(grown, KBoxed, bytes_concat_all([
-                b"rt_closure_p(ctx, @@l", num(idx), b"@@, ", num(l.params),
+              // The closure names its code by the entry's place in the body's table.
+              let entry = lambda_of(grown, bytes_concat_all([b"ply_", sub, b"_entry"]));
+              let o = bind(entry.em, KBoxed, bytes_concat_all([
+                b"rt_closure_p(ctx, @@l", num(entry.i), b"@@, ", num(l.params),
                 b", (Word)(intptr_t)", arr.name, b", ", num(len(l.caps)), b")"]));
               Some({ em: check(o.em), v: o.v })
             },
@@ -1404,8 +1442,19 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // A nullary call is not a call on the other side: a pure one is answered
         // by the unit's constant table, which is a purity analysis this port does
         // not have. Refused rather than emitted as the call it lowered to.
-        if len(a.args) == 0 && (fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) || from_import(em.imports, fv.name) != None || (match qualified(fv.name) { Some(q) -> from_import(em.imports, q.binder) != None, None -> false })) {
-          Some(refused(em, bytes_concat(b"a nullary call, which needs the purity analysis: ", fv.name))) }
+        // A pure nullary definition whose answer is a word is asked of the runtime's constant
+        // table rather than called: the unit remembers it, as the machine's memo does.
+        if len(a.args) == 0 && constant_of(em, fv.name) != None {
+          match constant_of(em, fv.name) {
+            None -> None,
+            Some(k) -> {
+              let noted = note_call(em, k.full);
+              let l = lambda_of(noted, bytes_concat_all([b"ply_", mangle(k.full), b"_entry"]));
+              let held = bind(l.em, KBoxed, bytes_concat_all([b"rt_constant_p(ctx, @@l", num(l.i), b"@@)"]));
+              Some({ em: check(held.em), v: { k: KBoxed, c: held.v.c, ty: k.ty } })
+            },
+          }
+        }
                 else if !fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
                   // Not a definition of this module: a builtin, or an import this
                   // port cannot resolve. The ones with a helper of their own are
@@ -1656,11 +1705,8 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
         CLet(l) -> match expr(notail(em), l.value, params) {
           None -> None,
           Some(o) -> {
-            // An opaque value held in a local is still one. The reference keeps the
-            // whole type across a `let`; this port's shape rules are not ready for a
-            // kept record type -- keeping one reaches bodies whose declared widths
-            // and update releases it then gets wrong -- so only opacity is kept.
-            let b = bind_keeping(o.em, o.v.k, if o.v.ty == TyOpaque { TyOpaque } else { TyOpen }, o.v.c);
+            // The type stays with the binding, as the reference keeps it.
+            let b = bind_keeping(o.em, o.v.k, o.v.ty, o.v.c);
             stmts(remember(b.em, l.slot, b.v), xs, params, i + 1)
           },
         },
@@ -2043,7 +2089,9 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
     // record and what it does with a list, a `Bytes` or a type of the program's
     // own.
     Some(TCon(c)) ->
-      if c.name.module != None { None }
+      // A type of another module is a word whose shape this port cannot see; the reference
+      // resolves it through the checker, and a field read of one is the next thing to reach.
+      if c.name.module != None { Some({ k: KBoxed, ty: TyOpen }) }
       else if c.name.name.name == b"Int" && len(c.args) == 0 { Some({ k: KInt, ty: TyOpen }) }
       else if c.name.name.name == b"Bool" && len(c.args) == 0 { Some({ k: KBool, ty: TyOpen }) }
       // The two the inline builtins ask about: with the kind known there is no
@@ -2084,7 +2132,7 @@ pub fn emit_fn_full(module: Bytes, here: List<Def>, imports: List<Imported>, cto
   let reads = slots_read(body);
   // The reuse tokens come before the prologue, and are named by width rather
   // than numbered, so finding them does not disturb the temporaries.
-  let start = fold([], { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: 0, owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None },
+  let start = fold([], { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
     None -> None,
@@ -2113,7 +2161,7 @@ pub fn emit_fn_full(module: Bytes, here: List<Def>, imports: List<Imported>, cto
 // Why a body was refused, or nothing when it was emitted: the same walk, read for its reason.
 pub fn emit_fn_why(module: Bytes, here: List<Def>, imports: List<Imported>, ctors: List<Bytes>, builtins: List<Bytes>, name: Bytes, params: List<P>, body: Code) -> Option<Bytes> = {
   let reads = slots_read(body);
-  let start = fold([], { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: 0, owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None },
+  let start = fold([], { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [], module: module, made: [], here: here, imports: imports, consts: [], ctors: ctors, extra: b"", lambdas: [], owner: name, builtins: builtins, met: [], fields: [], released: [], toks: [], alias: [], by_root: [], tail: true, calls: [], refused: None },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
     None -> Some(b"refused without a reason"),
@@ -2135,9 +2183,7 @@ fn encode_tables(em: Em, owner: Bytes) -> Bytes =
     counted(b"fields", em.fields),
     // A shape's fields in the checker's order, which is what the unit interns a shape by.
     counted(b"shapes", map(em.shapes, |names: List<Bytes>| bytes_join(sorted_names(names), b" "))),
-    // A lambda is named by its entry, which is what a closure is built over.
-    counted(b"lambdas", map(range(0, em.lambdas), |i: Int|
-      bytes_concat_all([b"ply_", owner, b"_lambda", num(i), b"_entry"]))),
+    counted(b"lambdas", em.lambdas),
     counted(b"calls", em.calls)])
 
 fn counted(what: Bytes, xs: List<Bytes>) -> Bytes =
@@ -2296,11 +2342,11 @@ test "a form this port does not reach is refused" {
 fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes) -> List<Emitted> = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
-  emit_module(module, x.module, ctors, builtins, [])
+  emit_module(module, x.module, ctors, builtins, [], [])
 }
 
 // Every definition of a module, with its declared return as the emitter reads it.
-fn defs_in(m: Module) -> List<Def> = {
+fn defs_in(module: Bytes, m: Module, pure: List<Bytes>) -> List<Def> = {
   let aliases = fold(m.items, [], |acc: List<{ name: Bytes, ty: TypeExpr }>, it: Item|
     match it {
       IType(t) -> match t.body {
@@ -2313,7 +2359,8 @@ fn defs_in(m: Module) -> List<Def> = {
     match it {
       IFn(d) -> push(acc, { name: d.name.name,
                             ret: match param_kind_in(aliases, d.ret) { Some(r) -> Some(r.k), None -> None },
-                            ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen } }),
+                            ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen },
+                            pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])) }),
       _ -> acc,
     })
 }
@@ -2334,16 +2381,19 @@ fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<By
     match resolve_modules(map(parsed, |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }|
                                { name: p.name, module: p.module, derived: p.derived })) {
       Failed(_) -> [],
-      Resolved_(x) -> {
-        let program = map(x.mods, |m: Mod| { module: m.name, defs: defs_in(m.module) });
-        fold(x.mods, [], |acc: List<Emitted>, m: Mod|
-          fold(emit_module(m.name, m.module, ctors, builtins, program), acc, |a: List<Emitted>, e: Emitted| push(a, e)))
+      Resolved_(x) -> match pure_definitions(x.r, x.mods) {
+        None -> [],
+        Some(pure) -> {
+          let program = map(x.mods, |m: Mod| { module: m.name, defs: defs_in(m.name, m.module, pure) });
+          fold(x.mods, [], |acc: List<Emitted>, m: Mod|
+            fold(emit_module(m.name, m.module, ctors, builtins, program, pure), acc, |a: List<Emitted>, e: Emitted| push(a, e)))
+        },
       },
     }
   }
 }
 
-fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>, program: List<ModDefs>) -> List<Emitted> = {
+fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>, program: List<ModDefs>, pure: List<Bytes>) -> List<Emitted> = {
   let x = { module: x_module };
   let defs_of = |path: Bytes| fold(program, [], |acc: List<Def>, md: ModDefs| if md.module == path { md.defs } else { acc });
   let imports = fold(x.module.imports, [], |acc: List<Imported>, im: ImportDecl|
@@ -2376,7 +2426,8 @@ fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: Li
     match it {
       IFn(d) -> push(acc, { name: d.name.name,
                             ret: match param_kind_in(aliases, d.ret) { Some(r) -> Some(r.k), None -> None },
-                            ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen } }),
+                            ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen },
+                            pure: fold(pure, false, |acc: Bool, n: Bytes| acc || n == bytes_concat_all([module, b".", d.name.name])) }),
       _ -> acc,
     });
   let walked = fold(x.module.items, { out: [], tests: 0 }, |acc: { out: List<Emitted>, tests: Int }, it: Item|

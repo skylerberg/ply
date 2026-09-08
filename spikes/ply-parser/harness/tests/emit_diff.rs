@@ -651,21 +651,26 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     //
     // `std.router.name_fault` was here for the same reason and is gone: recognising a record
     // update in the lowering was the refusal it was a symptom of.
-    // Six, in two groups.
+    // Nine, in three groups.
     //
     // Four `std.hash` bodies want the *other* half of deferring, above: a record whose every read
     // is answered from the built table is never materialised, and the local it would land in is
     // declared at the top of the body. `Word t81 = 0;` is that local.
     //
-    // The other two are single bodies with one cause, not yet run down: `std.db.collect_tuple`
-    // and `std.http.absorb` release an update's base where the port does not.
+    // Four release an update's base -- or a let-bound record's -- where the port does not:
+    // `agreement.memory_step`, `std.db.collect_tuple`, `std.http.absorb` and
+    // `std.http.method_not_allowed`. `std.hash.round` reads declared `U32` fields at their width
+    // where the port reads words; the port carries one width and the reference six.
     let expected_gaps = [
+        "agreement.memory_step",
         "std.db.collect_tuple",
         "std.hash.first8",
         "std.hash.full_words",
         "std.hash.padded_words",
         "std.hash.permute",
+        "std.hash.round",
         "std.http.absorb",
+        "std.http.method_not_allowed",
     ];
     assert_eq!(
         differ, expected_gaps,
@@ -676,7 +681,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
     // more than a body. It has since risen well past that.
     assert!(
-        reached >= 623,
+        reached >= 789,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );
@@ -814,12 +819,15 @@ fn the_ports_tables_agree_with_the_references_wherever_its_text_does() {
     assert_eq!(
         text_differ,
         [
+            "agreement.memory_step",
             "std.db.collect_tuple",
             "std.hash.first8",
             "std.hash.full_words",
             "std.hash.padded_words",
             "std.hash.permute",
+            "std.hash.round",
             "std.http.absorb",
+            "std.http.method_not_allowed",
         ],
         "the bodies whose text differs through the frame are not the text differential's gaps"
     );
