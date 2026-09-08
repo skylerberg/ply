@@ -1,15 +1,19 @@
 //! The interpreted front end (ADR 0047): one evaluator walks the lowered `code` the compiled
 //! front end lowers to C, over the shared runtime, with no C compiler in the path.
 //!
-//! It reuses the leaf semantics the machine and the tier already share — `strict_binary`,
-//! `apply_unary`, `lit_matches`, `ctor_value`, and `builtins::{call, advance}` — so a body it
-//! evaluates answers what the compiled code answers by construction. It carries the first-order
-//! language, `with_cell`, and tail-resumptive `handle`/`perform`, recording each performed atom
-//! so its footprint matches the machine's. Where it reaches a construct it does not yet carry —
-//! a clause that binds `resume`, a `simulate`, a region's tasks — it **declines**, exactly as the
-//! emitter port refuses a form it has not reached, and `--audit-backend` compares only what it
-//! enters. The declined constructs' continuations live on the tier's stacks (ADR 0044); they are
-//! the next increment.
+//! It reuses the leaf semantics the compiled tier shares — `strict_binary`, `apply_unary`,
+//! `lit_matches`, `ctor_value`, and `builtins::{call, advance}` — so a body it evaluates answers
+//! what the compiled code answers by construction. It carries the first-order language,
+//! `with_cell`, and tail-resumptive `handle`/`perform`, recording each performed atom so its
+//! footprint matches the tier's. Where it reaches a construct it does not carry — a clause that
+//! binds `resume`, a `simulate`, a region's tasks — it **declines**, and the caller (`Machine`
+//! and the `combined` audit) runs it on the compiled front end instead, whose continuations live
+//! on the tier's stacks (ADR 0044).
+//!
+//! The eval walk lives on [`Core`], which owns its per-run state as plain fields and borrows the
+//! program tables. Both the `interp` [`Provider`] (over a `RefCell<Core>`, so its `Compiled`
+//! methods stay `&self`) and [`crate::Machine`] (which embeds a `Core` and threads it by `&mut`,
+//! so `cells()` can hand out `&Arena`) evaluate through the one `Core`.
 
 use crate::backend::{Counters, Offers, Policed, Provider, Spec, wrap};
 use crate::code::{
@@ -18,7 +22,7 @@ use crate::code::{
 use crate::compiled::{Compiled, Entered};
 use crate::semantics::{ctor_value, lit_matches, strict_binary};
 use crate::value::{Closure, ClosureKind, Fields, Value};
-use crate::{Builtin, TaskRegions};
+use crate::{Arena, Builtin, TaskRegions};
 use ply_core::CheckOutput;
 use ply_core::ty::EffectAtom;
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -33,58 +37,72 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 /// A body the interpreter can enter: its parameters and where its bare names resolve.
-struct Def {
+struct Def<'p> {
     params: Vec<Symbol>,
-    body: &'static Expr,
+    body: &'p Expr,
     module: usize,
 }
 
-/// The interpreter over one program, built like `Fragment`: the program, its resolution and its
-/// check, leaked to `'static` so a closure it makes can outlive the borrow that made it.
-pub struct Interpreter {
+/// The interpreter's program tables: the definitions, tests, constructors and effect operations
+/// of one program, with the name resolution behind them. Built either borrowing the program
+/// (`borrow`, for an engine that lives as long as the borrow) or leaked to `'static` (`over`, for
+/// a `Provider` a backend shares across threads).
+pub struct Interpreter<'p> {
     origin: usize,
-    program: &'static Program,
-    resolved: &'static Resolved,
-    defs: FxHashMap<Symbol, Def>,
-    tests: FxHashMap<Symbol, (&'static Expr, usize)>,
+    program: &'p Program,
+    resolved: &'p Resolved,
+    defs: FxHashMap<Symbol, Def<'p>>,
+    tests: FxHashMap<Symbol, (&'p Expr, usize)>,
     ctors: FxHashMap<Symbol, usize>,
     ops: crate::semantics::OpTable,
     members: BTreeSet<Symbol>,
     counters: Counters,
 }
 
-impl Interpreter {
+impl Interpreter<'static> {
     pub fn over(
         program: &Program,
         resolved: &Resolved,
         check: &CheckOutput,
-    ) -> &'static Interpreter {
+    ) -> &'static Interpreter<'static> {
         let origin = std::ptr::from_ref(program) as usize;
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static Resolved = Box::leak(Box::new(resolved.clone()));
         let check: &'static CheckOutput = Box::leak(Box::new(check.clone()));
-        Interpreter::build(origin, program, resolved, check)
+        Box::leak(Box::new(Interpreter::build(origin, program, resolved, check)))
     }
 
     pub fn over_static(
         program: &'static Program,
         resolved: &'static Resolved,
         check: &'static CheckOutput,
-    ) -> &'static Interpreter {
-        Interpreter::build(
+    ) -> &'static Interpreter<'static> {
+        Box::leak(Box::new(Interpreter::build(
             std::ptr::from_ref(program) as usize,
             program,
             resolved,
             check,
-        )
+        )))
+    }
+}
+
+impl<'p> Interpreter<'p> {
+    /// Build the tables borrowing the program, for an engine whose life is the borrow's.
+    pub fn borrow(
+        program: &'p Program,
+        resolved: &'p Resolved,
+        check: &'p CheckOutput,
+    ) -> Interpreter<'p> {
+        let origin = std::ptr::from_ref(program) as usize;
+        Interpreter::build(origin, program, resolved, check)
     }
 
     fn build(
         origin: usize,
-        program: &'static Program,
-        resolved: &'static Resolved,
-        _check: &'static CheckOutput,
-    ) -> &'static Interpreter {
+        program: &'p Program,
+        resolved: &'p Resolved,
+        _check: &'p CheckOutput,
+    ) -> Interpreter<'p> {
         let mut defs = FxHashMap::default();
         let mut tests = FxHashMap::default();
         let mut ctors: FxHashMap<Symbol, usize> =
@@ -134,7 +152,7 @@ impl Interpreter {
                 }
             }
         }
-        Box::leak(Box::new(Interpreter {
+        Interpreter {
             origin,
             program,
             resolved,
@@ -144,7 +162,7 @@ impl Interpreter {
             ops,
             members,
             counters: Counters::default(),
-        }))
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -154,13 +172,15 @@ impl Interpreter {
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
     }
+}
 
+impl Interpreter<'static> {
     pub fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
         wrap(Rc::new(Interp::new(self)), spec)
     }
 }
 
-impl Provider for Interpreter {
+impl Provider for Interpreter<'static> {
     fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
         Interpreter::attach(self, spec)
     }
@@ -178,47 +198,84 @@ impl Provider for Interpreter {
     }
 }
 
-/// One attached interpreter: the shared program tables, a private cell/region arena reset per
-/// entry, and the caches a run fills.
-pub struct Interp {
-    home: &'static Interpreter,
-    lowering: Lowering<'static>,
-    arena: RefCell<TaskRegions>,
-    globals: RefCell<FxHashMap<GlobalKey, Value>>,
-    lowered: RefCell<FxHashMap<Symbol, Lowered>>,
-    handlers: RefCell<Vec<HandlerFrame>>,
-    performed: RefCell<Vec<EffectAtom>>,
+/// The eval walk and the per-run state it mutates: a cell/region arena reset per entry, the
+/// caches a run fills, and the active handler stack. Borrows the program [`Interpreter`] tables.
+pub struct Core<'p> {
+    lowering: Lowering<'p>,
+    regions: TaskRegions,
+    globals: FxHashMap<GlobalKey, Value>,
+    lowered: FxHashMap<Symbol, Lowered>,
+    handlers: Vec<HandlerFrame>,
+    performed: Vec<EffectAtom>,
 }
 
-impl Interp {
-    fn new(home: &'static Interpreter) -> Interp {
-        Interp {
-            home,
-            lowering: Lowering::for_program(home.program),
-            arena: RefCell::new(TaskRegions::new()),
-            globals: RefCell::new(FxHashMap::default()),
-            lowered: RefCell::new(FxHashMap::default()),
-            handlers: RefCell::new(Vec::new()),
-            performed: RefCell::new(Vec::new()),
+impl<'p> Core<'p> {
+    pub fn new(program: &'p Program) -> Core<'p> {
+        Core {
+            lowering: Lowering::for_program(program),
+            regions: TaskRegions::new(),
+            globals: FxHashMap::default(),
+            lowered: FxHashMap::default(),
+            handlers: Vec::new(),
+            performed: Vec::new(),
         }
     }
 
-    fn reset(&self) {
-        *self.arena.borrow_mut() = TaskRegions::new();
-        self.handlers.borrow_mut().clear();
-        self.performed.borrow_mut().clear();
+    pub fn regions(&self) -> &TaskRegions {
+        &self.regions
     }
 
-    fn enter_root(
-        &self,
+    pub fn cells(&self) -> &Arena {
+        self.regions.arena()
+    }
+
+    pub fn cells_mut(&mut self) -> &mut Arena {
+        self.regions.arena_mut()
+    }
+
+    pub fn set_regions(&mut self, regions: TaskRegions) {
+        self.regions = regions;
+    }
+
+    pub fn take_performed(&mut self) -> Vec<EffectAtom> {
+        std::mem::take(&mut self.performed)
+    }
+}
+
+/// The eval walk over one entry point: the program tables and the mutable [`Core`] state as
+/// disjoint borrows, so an engine can own both an [`Interpreter`] and its `Core` and still walk
+/// without a self-referential struct.
+pub struct Run<'p, 'x> {
+    home: &'x Interpreter<'p>,
+    st: &'x mut Core<'p>,
+}
+
+impl<'p, 'x> Run<'p, 'x> {
+    pub fn new(home: &'x Interpreter<'p>, st: &'x mut Core<'p>) -> Run<'p, 'x> {
+        Run { home, st }
+    }
+
+    /// Restore the world for a fresh entry point: the arena the entry resets to, and the handler
+    /// stack and performed atoms it starts empty. The name and lowering caches are program-level
+    /// and kept.
+    fn reset_run(&mut self) {
+        self.st.regions.reset();
+        self.st.handlers.clear();
+        self.st.performed.clear();
+    }
+
+    /// Enter a test or whole definition as an entry point: reset, seed the window with the
+    /// arguments, and walk the lowered body under a fresh recursion budget.
+    pub fn enter_root(
+        &mut self,
         params: code::Params,
-        body: &'static Expr,
+        body: &'p Expr,
         module: usize,
         args: Vec<Value>,
         budget: usize,
     ) -> Entered {
-        self.reset();
-        let lowered = self.lowering.of(&params, body);
+        self.reset_run();
+        let lowered = self.st.lowering.of(&params, body);
         let mut window = vec![None; lowered.size as usize];
         for (i, v) in args.into_iter().enumerate() {
             window[i] = Some(v);
@@ -235,7 +292,7 @@ impl Interp {
     }
 
     fn eval(
-        &self,
+        &mut self,
         code: &Code,
         window: &mut Vec<Option<Value>>,
         module: usize,
@@ -245,7 +302,7 @@ impl Interp {
     }
 
     fn eval_node(
-        &self,
+        &mut self,
         code: &Code,
         window: &mut Vec<Option<Value>>,
         module: usize,
@@ -264,7 +321,7 @@ impl Interp {
 
             NodeKind::Unary { op, operand } => {
                 let v = self.eval(operand, window, module, calls)?;
-                crate::machine::apply_unary(*op, &v, operand.span, span).map_err(Bail::Fail)
+                crate::semantics::apply_unary(*op, &v, operand.span, span).map_err(Bail::Fail)
             }
 
             NodeKind::Binary { op, lhs, rhs } => {
@@ -274,7 +331,7 @@ impl Interp {
                     let lb = l
                         .as_bool(lhs.span, "a Boolean operator")
                         .map_err(Bail::Fail)?;
-                    if crate::machine::short_circuits(*op, lb) {
+                    if crate::semantics::short_circuits(*op, lb) {
                         return Ok(Value::Bool(lb));
                     }
                     let r = self.eval(rhs, window, module, calls)?;
@@ -413,13 +470,9 @@ impl Interp {
 
             NodeKind::Handle { body, clauses, ret } => {
                 let frame = self.handler_frame(clauses, ret, window, module)?;
-                self.handlers.borrow_mut().push(frame);
+                self.st.handlers.push(frame);
                 let outcome = self.eval(body, window, module, calls);
-                let frame = self
-                    .handlers
-                    .borrow_mut()
-                    .pop()
-                    .expect("the frame this handle pushed");
+                let frame = self.st.handlers.pop().expect("the frame this handle pushed");
                 let value = outcome?;
                 match &frame.ret {
                     None => Ok(value),
@@ -451,7 +504,7 @@ impl Interp {
                 if let Some(atom) =
                     crate::handler::performed_atom(&effect_g, resource.as_ref(), decl)
                 {
-                    self.performed.borrow_mut().push(atom);
+                    self.st.performed.push(atom);
                 }
                 self.perform(&effect_g, op, resource, vals, calls, span)
             }
@@ -464,7 +517,7 @@ impl Interp {
                 ..
             } => {
                 let initial = self.eval(init, window, module, calls)?;
-                let cell = self.arena.borrow_mut().alloc_cell(initial);
+                let cell = self.st.regions.alloc_cell(initial);
                 let _ = binder;
                 if let Some(s) = slot {
                     window[*s as usize] = Some(Value::Cell(cell));
@@ -472,13 +525,14 @@ impl Interp {
                 self.eval(body, window, module, calls)
             }
 
-            // A region's tasks interleave on the tier's stacks; the scheduler is the next increment.
+            // A region's tasks interleave on the tier's stacks; the caller runs these on the
+            // compiled front end.
             NodeKind::WithRegion { .. } | NodeKind::Simulate { .. } => Err(Bail::Decline),
         }
     }
 
     fn apply(
-        &self,
+        &mut self,
         callee: &Value,
         args: Vec<Value>,
         span: Span,
@@ -509,11 +563,9 @@ impl Interp {
                 for (j, dst) in captures.dst.iter().enumerate() {
                     window[*dst as usize] = Some(captured[j].clone());
                 }
-                let lowered = Lowered {
-                    code: body.clone(),
-                    size: *size,
-                };
-                self.eval(&lowered.code, &mut window, *module, calls)
+                let body = body.clone();
+                let module = *module;
+                self.eval(&body, &mut window, module, calls)
             }
             ClosureKind::Fn { .. } => Err(Bail::Decline),
             ClosureKind::Ctor { name, arity: n } => {
@@ -528,16 +580,14 @@ impl Interp {
     }
 
     fn call_builtin(
-        &self,
+        &mut self,
         b: Builtin,
         args: Vec<Value>,
         span: Span,
         calls: Calls,
     ) -> Result<Value, Bail> {
-        let mut step = {
-            let mut arena = self.arena.borrow_mut();
-            crate::builtins::call(b, args, arena.arena_mut(), span).map_err(Bail::Fail)?
-        };
+        let mut step =
+            crate::builtins::call(b, args, self.st.regions.arena_mut(), span).map_err(Bail::Fail)?;
         loop {
             match step {
                 crate::builtins::Step::Done(v) => return Ok(v),
@@ -554,7 +604,7 @@ impl Interp {
     }
 
     fn match_arms(
-        &self,
+        &mut self,
         scrutinee: &Value,
         arms: &Rc<Vec<Arm>>,
         window: &mut Vec<Option<Value>>,
@@ -579,7 +629,7 @@ impl Interp {
         )))
     }
 
-    /// The machine's `match_pattern`, writing binders into the interpreter's window.
+    /// Match a pattern, writing binders into the window.
     fn bind(
         &self,
         pat: &Pat,
@@ -689,7 +739,7 @@ impl Interp {
     /// A handler's clauses and its `return` arm, with each body's free variables captured from the
     /// scope the `handle` was written in — the tail-resumptive subset. A clause that binds
     /// `resume` is carried but declined when performed, since its continuation lives on the tier's
-    /// stacks (the next increment).
+    /// stacks.
     fn handler_frame(
         &self,
         clauses: &Rc<Vec<Clause>>,
@@ -729,7 +779,7 @@ impl Interp {
     /// Search the active handlers from the innermost out for a clause that answers this operation,
     /// and run it below its own frame so a `perform` in the clause sees only the outer handlers.
     fn perform(
-        &self,
+        &mut self,
         effect: &Symbol,
         op: &Symbol,
         resource: &Option<Symbol>,
@@ -738,9 +788,8 @@ impl Interp {
         span: Span,
     ) -> Result<Value, Bail> {
         let found = {
-            let handlers = self.handlers.borrow();
             let mut hit = None;
-            'outer: for (i, frame) in handlers.iter().enumerate().rev() {
+            'outer: for (i, frame) in self.st.handlers.iter().enumerate().rev() {
                 for c in &frame.clauses {
                     if c.effect == *effect && c.op == *op && c.resource == *resource {
                         if c.resumes {
@@ -765,7 +814,7 @@ impl Interp {
             )));
         }
         // Run the clause with the handlers below its own frame in scope.
-        let saved: Vec<HandlerFrame> = self.handlers.borrow_mut().split_off(depth);
+        let saved: Vec<HandlerFrame> = self.st.handlers.split_off(depth);
         let out = self.run_clause(
             &c.params,
             &c.body,
@@ -776,14 +825,14 @@ impl Interp {
             args,
             calls,
         );
-        self.handlers.borrow_mut().extend(saved);
+        self.st.handlers.extend(saved);
         out
     }
 
     /// Evaluate a clause or `return` body in a fresh window: its parameters, then its captures.
     #[allow(clippy::too_many_arguments)]
     fn run_clause(
-        &self,
+        &mut self,
         params: &[Symbol],
         body: &Code,
         size: u32,
@@ -809,34 +858,36 @@ impl Interp {
             .unwrap_or_else(|| q.symbol().clone())
     }
 
-    fn lookup(&self, q: &QName, module: usize) -> Result<Value, Bail> {
+    fn lookup(&mut self, q: &QName, module: usize) -> Result<Value, Bail> {
         let key = (
             module,
             q.module.as_ref().map(|m| m.name.clone()),
             q.name.name.clone(),
         );
-        if let Some(v) = self.globals.borrow().get(&key) {
+        if let Some(v) = self.st.globals.get(&key) {
             return Ok(v.clone());
         }
         let value = self.resolve(q, module)?;
-        self.globals.borrow_mut().insert(key, value.clone());
+        self.st.globals.insert(key, value.clone());
         Ok(value)
     }
 
-    fn resolve(&self, q: &QName, module: usize) -> Result<Value, Bail> {
+    fn resolve(&mut self, q: &QName, module: usize) -> Result<Value, Bail> {
         if let Some(name) = self.global(module, Namespace::Value, q)
-            && let Some(def) = self.home.defs.get(&name)
+            && self.home.defs.contains_key(&name)
         {
-            let lowered = self.lowered_body(&name, def);
+            let lowered = self.lowered_body(&name);
+            let params = self.home.defs[&name].params.clone();
+            let def_module = self.home.defs[&name].module;
             return Ok(Value::Closure(Arc::new(Closure {
                 name: Some(name.clone()),
                 kind: ClosureKind::Code {
-                    params: Rc::new(def.params.clone()),
+                    params: Rc::new(params),
                     size: lowered.size,
                     body: lowered.code,
                     captures: code::no_captures(),
                     captured: code::no_captured(),
-                    module: def.module,
+                    module: def_module,
                 },
             })));
         }
@@ -853,15 +904,14 @@ impl Interp {
         Err(Bail::Fail(crate::semantics::err_unknown_name(q)))
     }
 
-    fn lowered_body(&self, name: &Symbol, def: &Def) -> Lowered {
-        if let Some(l) = self.lowered.borrow().get(name) {
+    fn lowered_body(&mut self, name: &Symbol) -> Lowered {
+        if let Some(l) = self.st.lowered.get(name) {
             return l.clone();
         }
+        let def = &self.home.defs[name];
         let params: code::Params = Rc::new(def.params.clone());
-        let lowered = self.lowering.of(&params, def.body);
-        self.lowered
-            .borrow_mut()
-            .insert(name.clone(), lowered.clone());
+        let lowered = self.st.lowering.of(&params, def.body);
+        self.st.lowered.insert(name.clone(), lowered.clone());
         lowered
     }
 
@@ -893,9 +943,22 @@ impl Interp {
     }
 }
 
-/// A per-entry recursion depth, capped as the machine caps nested calls (`stack.calls()` against
-/// `max_calls`): counted on each closure application and unwound by the native stack, so a
-/// sequential loop of ten thousand calls stays shallow while unbounded recursion is refused.
+/// One attached interpreter as a `Provider`: the eval `Core` behind a `RefCell`, so the
+/// `Compiled` seam's `&self` methods can drive its `&mut` walk.
+pub struct Interp {
+    home: &'static Interpreter<'static>,
+    core: RefCell<Core<'static>>,
+}
+
+impl Interp {
+    fn new(home: &'static Interpreter<'static>) -> Interp {
+        Interp {
+            home,
+            core: RefCell::new(Core::new(home.program)),
+        }
+    }
+}
+
 #[derive(Clone)]
 struct HandlerFrame {
     clauses: Vec<HandlerClause>,
@@ -926,6 +989,9 @@ struct RetArm {
     module: usize,
 }
 
+/// A per-entry recursion depth, capped as the tier caps nested calls: counted on each closure
+/// application and unwound by the native stack, so a sequential loop of ten thousand calls stays
+/// shallow while unbounded recursion is refused.
 #[derive(Clone, Copy)]
 struct Calls {
     depth: usize,
@@ -983,7 +1049,7 @@ impl Compiled for Interp {
     }
 
     fn take_performed(&self) -> Vec<EffectAtom> {
-        std::mem::take(&mut self.performed.borrow_mut())
+        self.core.borrow_mut().take_performed()
     }
 
     fn enter_test(&self, name: &Symbol, budget: usize) -> Entered {
@@ -991,13 +1057,27 @@ impl Compiled for Interp {
         let Some((body, module)) = self.home.tests.get(name) else {
             return Entered::Declined;
         };
-        self.enter_root(Rc::new(Vec::new()), body, *module, Vec::new(), budget)
+        let mut core = self.core.borrow_mut();
+        Run::new(self.home, &mut core).enter_root(
+            Rc::new(Vec::new()),
+            body,
+            *module,
+            Vec::new(),
+            budget,
+        )
     }
 
     fn enter_whole(&self, name: &Symbol, args: &[Value], budget: usize) -> Entered {
         self.home.counters.note_offer(args);
         if let Some((body, module)) = self.home.tests.get(name) {
-            return self.enter_root(Rc::new(Vec::new()), body, *module, args.to_vec(), budget);
+            let mut core = self.core.borrow_mut();
+            return Run::new(self.home, &mut core).enter_root(
+                Rc::new(Vec::new()),
+                body,
+                *module,
+                args.to_vec(),
+                budget,
+            );
         }
         let Some(def) = self.home.defs.get(name) else {
             return Entered::Declined;
@@ -1006,7 +1086,8 @@ impl Compiled for Interp {
             return Entered::Declined;
         }
         let (params, body, module) = (Rc::new(def.params.clone()), def.body, def.module);
-        self.enter_root(params, body, module, args.to_vec(), budget)
+        let mut core = self.core.borrow_mut();
+        Run::new(self.home, &mut core).enter_root(params, body, module, args.to_vec(), budget)
     }
 }
 

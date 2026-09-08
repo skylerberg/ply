@@ -10,7 +10,7 @@
 use crate::handler::OpDecl;
 use crate::value::{Closure, ClosureKind, Decimal, Fixed, Value, type_error, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{BinOp, Ident, Lit, Mode, QName};
+use ply_syntax::ast::{BinOp, Ident, Lit, Mode, QName, UnOp};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -539,6 +539,48 @@ pub(crate) fn err_overflow(span: Span, what: &str, a: i64, b: i64) -> Diagnostic
 
 fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }
+}
+
+pub(crate) fn apply_unary(
+    op: UnOp,
+    value: &Value,
+    operand_span: Span,
+    span: Span,
+) -> Result<Value, Diagnostic> {
+    match op {
+        // `-0.0` is a `Float` distinct from `0.0` and negation is how a program reaches it, so this
+        // arm is not decoration.
+        UnOp::Neg => match value {
+            Value::Float(f) => Ok(Value::Float(-f)),
+            Value::Decimal(d) => Ok(Value::Decimal(-*d)),
+            // Checked at the operand's own width, so `-x` at an unsigned type is an overflow for
+            // every `x` but zero — which is what the type says and not a special case.
+            Value::Fixed(f) => match Fixed::of(f.ty, -f.value()) {
+                Some(n) => Ok(Value::Fixed(n)),
+                None => Err(err_fixed_overflow(span, "negation", *f, *f)),
+            },
+            _ => {
+                let i = value.as_int(operand_span, "negation")?;
+                match i.checked_neg() {
+                    Some(n) => Ok(Value::Int(n)),
+                    None => Err(err_overflow(span, "negation", i, 0)),
+                }
+            }
+        },
+        UnOp::Not => Ok(Value::Bool(!value.as_bool(operand_span, "`!`")?)),
+        // Every bit of the two's-complement pattern flipped, so `~0` is `-1` at `Int` and the
+        // largest value at an unsigned type.
+        UnOp::BitNot => match value {
+            Value::Fixed(f) => Ok(Value::Fixed(Fixed::new(f.ty, !f.bits()))),
+            _ => Ok(Value::Int(!value.as_int(operand_span, "`~`")?)),
+        },
+    }
+}
+
+/// `||` is decided by a `true` left operand and `&&` by a `false` one; anything else has to
+/// evaluate the right.
+pub(crate) fn short_circuits(op: BinOp, lhs: bool) -> bool {
+    lhs == matches!(op, BinOp::Or)
 }
 
 #[cfg(test)]
