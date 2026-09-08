@@ -334,6 +334,11 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn nt(b: Bool) -> Bool = !b\n",
         "fn ntc(a: Int, b: Int) -> Bool = !(a < b)\n",
         "fn negif(a: Int, b: Int) -> Int = if a < b { -a } else { -b }\n",
+        // A field is read at its place among the record's names *sorted*, which
+        // is the checker's order rather than the declaration's: `.z` below is 1.
+        "fn fz(r: { z: Int, a: Int }) -> Int = r.z\n",
+        "fn fa(r: { z: Int, a: Int }) -> Int = r.a\n",
+        "fn f2(r: { z: Int, a: Int }) -> Int = r.z + r.a\n",
     ];
     let inputs: Vec<(String, Vec<u8>)> = programs
         .iter()
@@ -346,7 +351,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 32, "only {reached} bodies were emitted");
+    assert!(reached >= 35, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
