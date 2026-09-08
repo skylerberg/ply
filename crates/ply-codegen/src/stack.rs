@@ -279,11 +279,15 @@ mod tests {
         #[repr(align(16))]
         struct Aligned([u8; 16]);
         let a = Aligned([0; 16]);
-        std::hint::black_box(&a) as *const Aligned as usize
+        std::hint::black_box(&a.0) as *const [u8; 16] as usize
     }
 
     extern "C" fn count_to(n: usize) {
-        assert_eq!(aligned_local() % 16, 0, "the task was entered off the ABI's alignment");
+        assert_eq!(
+            aligned_local() % 16,
+            0,
+            "the task was entered off the ABI's alignment"
+        );
         for i in 1..=n {
             let local = i * 10;
             with(|p| p.log.push(local));
