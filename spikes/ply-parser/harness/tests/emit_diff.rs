@@ -491,10 +491,14 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
                 continue;
             };
             reached += 1;
+            // `PLY_EMIT_DIFF_SHOW=a.b,c.d` prints the named bodies from both sides, agreeing or
+            // not; without it the first disagreement is printed.
+            let show =
+                std::env::var("PLY_EMIT_DIFF_SHOW").is_ok_and(|s| s.split(',').any(|n| n == name));
+            if show || (want != &body && differ.is_empty()) {
+                println!("--- {name}, reference\n{want}\n--- {name}, port\n{body}");
+            }
             if want != &body {
-                if differ.is_empty() {
-                    println!("--- {name}, reference\n{want}\n--- {name}, port\n{body}");
-                }
                 differ.push(name);
             }
         }
@@ -503,6 +507,19 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
         "  the shipped corpus: the port emits {reached} of the {} bodies the reference does",
         expected.len()
     );
+    // `PLY_EMIT_DIFF_LIST=1` prints every body the port reached, one per line, so two runs can
+    // be diffed for what one change reached or lost.
+    if std::env::var("PLY_EMIT_DIFF_LIST").is_ok() {
+        let mut names: Vec<String> = dumps
+            .iter()
+            .flat_map(|d| by_name(d).into_keys())
+            .filter(|n| expected.contains_key(n))
+            .collect();
+        names.sort();
+        for n in names {
+            println!("reached {n}");
+        }
+    }
     // Named, not tolerated. What is left here is the *other* half of deferring a record, and the
     // half this port does not do.
     //
@@ -538,16 +555,8 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // skipped a sub-expression the reference emitted; `std.db.collect_tuple` and
     // `std.http.absorb` release an update's base where the port does not; `std.http.check_limits`
     // emits a constant the port does not reach.
-    //
-    // And four where the port is *wrong* rather than different, which is the gap to close first
-    // under ADR 0042's oracle: an operator over a `Float` or `Decimal` operand. The reference reads
-    // the checker's type, sees one it does not fix, and reaches the machine's own operator through
-    // `rt_binary_p`; this port cannot see that type yet and emits an `Int` comparison.
     let expected_gaps = [
         "std.db.collect_tuple",
-        "std.db.decimal_cmp",
-        "std.db.decimal_scale_of",
-        "std.db.float_cmp",
         "std.hash.first8",
         "std.hash.full_words",
         "std.hash.padded_words",
@@ -555,7 +564,6 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
         "std.http.absorb",
         "std.http.check_limits",
         "std.json.float_json",
-        "desk.item_line",
     ];
     assert_eq!(
         differ, expected_gaps,
@@ -566,7 +574,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
     // more than a body. It has since risen well past that.
     assert!(
-        reached >= 484,
+        reached >= 487,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );

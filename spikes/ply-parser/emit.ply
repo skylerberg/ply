@@ -40,7 +40,9 @@ pub type V = { k: Kind, c: Bytes, ty: Ty }
 
 // What the emitter knows about a value's shape. Only records need more than the
 // kind, and only so that a field name can become the index it is read at.
-pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList
+// `TyOpaque` is a `Float` or a `Decimal`: a value an operator cannot read as an `Int`, so an
+// operator over one reaches the machine's own operator through the runtime instead.
+pub type Ty = | TyOpen | TyRec(List<FieldTy>) | TyBytes | TyList | TyOpaque
 
 // A record's fields, in the order they were written. The *kind* matters as much
 // as the name: a scalar field is read into a register of its own kind and a
@@ -718,14 +720,27 @@ fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
 // *compiled* call is the other way round -- `args_one_pass` below -- and the
 // corpus says so at `std.json.b64_three` and `std.db.in_failed_txn`, one of
 // each.
+// `opaque` says whether any argument is a `Float` or `Decimal`: a builtin's answer over one
+// stays opaque, so an operator downstream reaches the runtime rather than reading it as an `Int`.
 fn args_owned(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes> }> =
+  match args_owned_typed(em, xs, params, i, acc) {
+    None -> None,
+    Some(w) -> Some({ em: w.em, names: w.names }),
+  }
+
+fn args_owned_typed(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
+    -> Option<{ em: Em, names: List<Bytes>, opaque: Bool }> =
   match args_evaled(em, xs, params, i, []) {
     None -> None,
-    Some(e) -> Some(fold(e.vals, { em: e.em, names: acc }, |a: { em: Em, names: List<Bytes> }, v: V| {
-      let w = owned(a.em, v);
-      { em: w.em, names: push(a.names, w.v.c) }
-    })),
+    Some(e) -> {
+      let opaque = fold(e.vals, false, |acc2: Bool, v: V| acc2 || v.ty == TyOpaque);
+      Some(fold(e.vals, { em: e.em, names: acc, opaque: opaque },
+        |a: { em: Em, names: List<Bytes>, opaque: Bool }, v: V| {
+          let w = owned(a.em, v);
+          { em: w.em, names: push(a.names, w.v.c), opaque: a.opaque }
+        }))
+    },
   }
 
 // The slots a lambda copies in, each held once more for the closure.
@@ -922,6 +937,14 @@ fn as_word(v: V) -> Bytes =
 fn arith_code(op: Bytes) -> Int =
   if op == b"mul" { 0 } else if op == b"div" { 1 } else { 2 }
 
+// The runtime's numbering of the operators `rt_binary` takes, in the order the
+// runtime's own table lists them.
+fn binary_code(op: Bytes) -> Int =
+  if op == b"add" { 0 } else if op == b"sub" { 1 } else if op == b"mul" { 2 }
+  else if op == b"div" { 3 } else if op == b"rem" { 4 } else if op == b"eq" { 5 }
+  else if op == b"ne" { 6 } else if op == b"lt" { 7 } else if op == b"le" { 8 }
+  else if op == b"gt" { 9 } else { 10 }
+
 fn is_add_or_sub(op: Bytes) -> Bool = op == b"add" || op == b"sub"
 
 pub fn covers() -> List<Bytes> =
@@ -1021,6 +1044,16 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 // that binding *is* the negation rather than following one.
                 Some(bind(check(e.em), KBool,
                   if b.op == b"ne" { bytes_concat_all([b"!(", e.v.c, b")"]) } else { e.v.c }))
+              } else if l.v.ty == TyOpaque || r.v.ty == TyOpaque {
+                // A `Float` or `Decimal` operand: the machine's own operator, through
+                // the runtime, so the body answers what the machine answers.
+                let lo = owned(r.em, l.v);
+                let ro = owned(lo.em, r.v);
+                let o = bind_keeping(ro.em, KBoxed,
+                  if compare_op(b.op) != None { TyOpen } else { TyOpaque },
+                  bytes_concat_all([b"rt_binary_p(ctx, ", num(binary_code(b.op)), b", ",
+                                    lo.v.c, b", ", ro.v.c, b")"]));
+                Some({ em: check(o.em), v: o.v })
               } else { match compare_op(b.op) {
                 // `!=` is written as the negation of `==`, which is what the
                 // reference emits: one comparison in the C for the two spellings.
@@ -1365,7 +1398,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         Some(o) -> Some(o),
                         None -> if is_callback(fv.name) || is_inlined(fv.name) { None }
                         else if !fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == fv.name) { None }
-                        else { match args_owned(em, a.args, params, 0, []) {
+                        else { match args_owned_typed(em, a.args, params, 0, []) {
                           None -> None,
                           Some(w) -> {
                             let bi = builtin_of(w.em, fv.name);
@@ -1373,7 +1406,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
                               if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") },
                               b"};"]));
-                            let o = bind(e, KBoxed, bytes_concat_all([
+                            let o = bind_keeping(e, KBoxed, if w.opaque { TyOpaque } else { TyOpen },
+                              bytes_concat_all([
                               b"rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)",
                               arr.name, b", ", num(len(a.args)), b")"]));
                             Some({ em: check(o.em), v: o.v })
@@ -1457,10 +1491,17 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // Where the two arms answer different kinds this port refuses rather than
         // joining them at a word. The reference reads the *checker's* type for the
         // join; `kind_of` is structural and does not always agree with it, and
-        // guessing wrong writes the wrong conversion into both arms.
-        let kt = kind_of(em, i.then_branch, params);
-        let ke = kind_of(em, i.else_branch, params);
-        if kt != ke { None } else {
+        // guessing wrong writes the wrong conversion into both arms. The one join
+        // it does take is a word one arm answers because it is opaque: there the
+        // structural answer is the checker's, and the other arm is boxed into it.
+        let kt0 = kind_of(em, i.then_branch, params);
+        let ke0 = kind_of(em, i.else_branch, params);
+        let join = if kt0 == ke0 { Some(kt0) }
+                   else if (kt0 == KBoxed && opaque_of(em, i.then_branch))
+                        || (ke0 == KBoxed && opaque_of(em, i.else_branch)) { Some(KBoxed) }
+                   else { None };
+        let kt = match join { Some(x) -> x, None -> KBoxed };
+        if join == None { None } else {
           // The join's number is taken *before* either arm and its declaration is
           // written before the `if`, but the arms are emitted into buffers of
           // their own first: a record-valued join is not one local but one per
@@ -1574,7 +1615,11 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
         CLet(l) -> match expr(notail(em), l.value, params) {
           None -> None,
           Some(o) -> {
-            let b = bind(o.em, o.v.k, o.v.c);
+            // An opaque value held in a local is still one. The reference keeps the
+            // whole type across a `let`; this port's shape rules are not ready for a
+            // kept record type -- keeping one reaches bodies whose declared widths
+            // and update releases it then gets wrong -- so only opacity is kept.
+            let b = bind_keeping(o.em, o.v.k, if o.v.ty == TyOpaque { TyOpaque } else { TyOpen }, o.v.c);
             stmts(remember(b.em, l.slot, b.v), xs, params, i + 1)
           },
         },
@@ -1767,12 +1812,40 @@ fn kind_of(em: Em, c: Code, params: List<P>) -> Kind =
     },
     NUnary(u) -> if u.op == b"not" { KBool } else { KInt },
     NBinary(b) -> if compare_op(b.op) != None { KBool }
-                  else if is_arith(b.op) { KInt } else { KBoxed },
+                  else if is_arith(b.op) {
+                    if opaque_of(em, b.lhs) || opaque_of(em, b.rhs) { KBoxed } else { KInt }
+                  } else { KBoxed },
     NIf(i) -> join_kind(kind_of(em, i.then_branch, params),
                         kind_of(em, i.else_branch, params)),
     NBlock(b) -> match b.tail { Some(t) -> kind_of(em, t, params), None -> KBoxed },
     NField(_) -> KInt,
     _ -> KBoxed,
+  }
+
+// Whether a node answers a `Float` or `Decimal`, without emitting it: what the
+// emission's typing says, read structurally, so a join can be known first.
+fn opaque_of(em: Em, c: Code) -> Bool =
+  match c.node {
+    NVar(v) -> match v.slot {
+      None -> false,
+      Some(s) -> match conv_of(em, s) { Some(x) -> x.ty == TyOpaque, None -> false },
+    },
+    NBinary(b) -> is_arith(b.op) && (opaque_of(em, b.lhs) || opaque_of(em, b.rhs)),
+    NBlock(b) -> match b.tail { Some(t) -> opaque_of(em, t), None -> false },
+    NApp(a) -> match a.func.node {
+      NVar(fv) -> match fv.slot {
+        Some(_) -> false,
+        // A definition of this module answers its declared type; a builtin answers
+        // opaque over an opaque argument.
+        None -> if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) {
+                  ret_of(em.here, fv.name).ty == TyOpaque
+                } else {
+                  fold(a.args, false, |acc: Bool, x: Code| acc || opaque_of(em, x))
+                },
+      },
+      _ -> false,
+    },
+    _ -> false,
   }
 
 // Where two arms disagree the join is a word, and each is converted into it.
@@ -1891,6 +1964,8 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
       // test to make and the read is a load.
       else if c.name.name.name == b"Bytes" && len(c.args) == 0 { Some({ k: KBoxed, ty: TyBytes }) }
       else if c.name.name.name == b"List" && len(c.args) == 1 { Some({ k: KBoxed, ty: TyList }) }
+      else if (c.name.name.name == b"Float" || c.name.name.name == b"Decimal") && len(c.args) == 0 {
+        Some({ k: KBoxed, ty: TyOpaque }) }
       else { Some({ k: KBoxed, ty: TyOpen }) },
     // The field *order* is the checker's, not the declaration's: a record written
     // `{ z: Int, a: Int }` reads `.z` at index 1. Sorting by name here is what

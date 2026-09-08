@@ -56,7 +56,7 @@ Ownership and ordering:
 
 ## The named gaps
 
-`emit_diff.rs` asserts the twelve by name. Four `std.hash` bodies want the
+`emit_diff.rs` asserts the eight by name. Four `std.hash` bodies want the
 *deferred record local*, which is the half of deferring this port does not do: a
 record whose every read is answered from the built table is never materialised,
 and the local it would land in is declared at the top of the body. The other four
@@ -68,6 +68,15 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+The port reads **opaque** operands now: a written `Float` or `Decimal` is `TyOpaque`, a
+builtin over an opaque argument answers opaque, opacity survives a `let`, and an operator
+over one goes through `rt_binary_p` -- the machine's own operator -- as the reference does.
+An `if` whose one arm is opaque joins at a word; every other join of differing kinds is
+still refused. What is deliberately *not* kept across a `let` is the rest of a value's
+type: the reference keeps it whole, and keeping a record type here reaches two more bodies
+(`std.hash.round`, `std.http.method_not_allowed`) that then differ on declared `U32` field
+widths and on an update's release -- the next two shapes to run down.
 
 ADR 0042 moved the emitter's oracle. The byte-exact differential above stays as
 an instrument, but the port is no longer held to agreeing with `c/emit.rs`'s
