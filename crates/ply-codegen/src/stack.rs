@@ -171,10 +171,13 @@ mod arch {
         )
     }
 
+    /// Where the first switch into a fresh stack lands, with the stack pointer eight past a
+    /// sixteen-byte boundary as after a call; the `and` puts it on the boundary so that the call
+    /// below enters `entry` as the ABI requires.
     #[unsafe(naked)]
     #[unsafe(no_mangle)]
     pub unsafe extern "C" fn ply_stack_trampoline() {
-        naked_asm!("mov rdi, rbx", "call r12", "ud2")
+        naked_asm!("and rsp, -16", "mov rdi, rbx", "call r12", "ud2")
     }
 
     pub unsafe fn lay_out(top: usize, entry: usize, arg: usize) -> usize {
@@ -269,7 +272,18 @@ mod tests {
         unsafe { switch(&mut *main, task) };
     }
 
+    /// The address of a sixteen-byte-aligned local, which is aligned only if the frame was
+    /// entered as the ABI requires; a trampoline that enters off by a word is caught here.
+    #[inline(never)]
+    fn aligned_local() -> usize {
+        #[repr(align(16))]
+        struct Aligned([u8; 16]);
+        let a = Aligned([0; 16]);
+        std::hint::black_box(&a) as *const Aligned as usize
+    }
+
     extern "C" fn count_to(n: usize) {
+        assert_eq!(aligned_local() % 16, 0, "the task was entered off the ABI's alignment");
         for i in 1..=n {
             let local = i * 10;
             with(|p| p.log.push(local));
