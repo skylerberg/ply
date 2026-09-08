@@ -119,7 +119,7 @@ echo "==> the seventh differential: code.ply's lowering against ply_eval::code"
 # The first comparison for a stage *after* the front end. It compares only what the port claims to
 # lower -- `lower` answers `None` for a node kind it has not reached -- and asserts the share it
 # reaches, so a port that quietly lowered nothing would fail rather than agree with itself.
-PLY_BIN="$root/target/release/ply" cargo test --test lower_diff -- --nocapture --test-threads=2 |
+PLY_C_EMITTER="ply-whole:$here" PLY_BIN="$root/target/release/ply" cargo test --test lower_diff -- --nocapture --test-threads=2 |
   grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
 
 echo
@@ -137,7 +137,7 @@ cargo test --manifest-path "$here/harness/Cargo.toml" --test effects -- --nocapt
 echo
 echo "==> the eighth differential: emit.ply's C against crates/ply-codegen's,"
 echo "    on shapes chosen per node and then on the shipped corpus"
-PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=1 |
+PLY_C_EMITTER="ply-whole:$here" PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=1 |
   tee /tmp/ply-parser-emit.log | grep -E "agreeing|^test result|^error|panicked"
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-emit.log || {
   echo "the emitter differential is red or ran nothing -- see the log above" >&2

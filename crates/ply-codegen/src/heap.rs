@@ -437,6 +437,16 @@ const LARGEST_CHUNK: usize = 64 << 20;
 pub const HEAP_CUR: usize = 0;
 pub const HEAP_END: usize = 8;
 
+/// What every heap made from here on reuses by default: unset, a release build reuses and a
+/// debug build does not, so that a read of a dead object in a debug build finds the marker
+/// rather than whatever took the block. A test whose workload allocates past what a runner
+/// holds turns it on, and gives up that detection for its run.
+static REUSE_BY_DEFAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+
+pub fn reuse_by_default(on: bool) {
+    REUSE_BY_DEFAULT.store(u8::from(on), std::sync::atomic::Ordering::Relaxed);
+}
+
 impl Heap {
     pub fn new() -> Heap {
         Heap {
@@ -451,7 +461,11 @@ impl Heap {
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
-            reuse: !cfg!(debug_assertions),
+            reuse: match REUSE_BY_DEFAULT.load(std::sync::atomic::Ordering::Relaxed) {
+                0 => false,
+                1 => true,
+                _ => !cfg!(debug_assertions),
+            },
         }
     }
 
