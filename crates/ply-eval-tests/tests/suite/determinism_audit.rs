@@ -793,7 +793,10 @@ test "the second region's shape depends on what the first raced to" {
 /// across the seam that binds them instead.
 #[test]
 fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
-    let source = include_str!("../../../ply-eval/src/machine.rs");
+    let source = concat!(
+        include_str!("../../../ply-eval/src/interp.rs"),
+        include_str!("../../../ply-eval/src/evaluator.rs"),
+    );
     let body = source
         .split_once("mod tests")
         .map(|(body, _)| body)

@@ -842,7 +842,7 @@ impl Continuation {
         self.frames
     }
 
-    /// [`crate::machine::Machine::host_ops`] when this continuation was captured.
+    /// [`crate::evaluator::Machine::host_ops`] when this continuation was captured.
     pub fn born(&self) -> u64 {
         self.born
     }

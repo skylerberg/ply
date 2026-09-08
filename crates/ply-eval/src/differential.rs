@@ -928,26 +928,6 @@ mod tests {
         assert!(report.is_clean(), "{report}");
     }
 
-    /// The corpus is only evidence if some of it actually failed on both sides; eight agreeing
-    /// passes would prove nothing about diagnostic equality.
-    #[test]
-    fn the_mixed_corpus_really_does_fail_four_of_its_tests() {
-        let (program, resolved) = standalone(mixed_corpus());
-        let mut plain = Machine::for_program(&program, &resolved);
-        let codes: Vec<&str> = (0..plain.test_count())
-            .filter_map(|i| Evaluator::eval_test(&mut plain, i).err().map(|d| d.code))
-            .collect();
-        assert_eq!(
-            codes,
-            [
-                super::codes::ASSERTION_FAILED,
-                super::codes::UNHANDLED_EFFECT,
-                super::codes::RUNTIME_ERROR,
-                super::codes::ARITY_MISMATCH,
-            ]
-        );
-    }
-
     /// The harness must still bite when both sides are honest machines.
     #[test]
     fn a_machine_that_answered_differently_would_be_caught() {

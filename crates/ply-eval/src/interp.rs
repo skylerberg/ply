@@ -598,7 +598,34 @@ impl<'p, 'x> Run<'p, 'x> {
                 let module = *module;
                 self.eval(&body, &mut window, module, calls)
             }
-            ClosureKind::Fn { .. } => Err(Bail::Decline),
+            ClosureKind::Fn {
+                params,
+                body,
+                bindings,
+                module,
+            } => {
+                if params.len() != args.len() {
+                    return Err(Bail::Fail(arity(span, closure, params.len(), args.len())));
+                }
+                let calls = calls.deeper(span)?;
+                // The bindings the closure carries are lowered as leading parameters, so their
+                // occurrences resolve to slots ahead of the closure's own parameters.
+                let combined: Vec<Symbol> = bindings
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .chain(params.iter().cloned())
+                    .collect();
+                let lowered = crate::code::lower_fn(&combined, body);
+                let mut window = vec![None; lowered.size as usize];
+                for (i, (_, v)) in bindings.iter().enumerate() {
+                    window[i] = Some(v.clone());
+                }
+                for (i, v) in args.into_iter().enumerate() {
+                    window[bindings.len() + i] = Some(v);
+                }
+                let module = *module;
+                self.eval(&lowered.code, &mut window, module, calls)
+            }
             ClosureKind::Ctor { name, arity: n } => {
                 if *n != args.len() {
                     return Err(Bail::Fail(arity(span, closure, *n, args.len())));
