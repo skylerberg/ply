@@ -48,6 +48,7 @@ impl Provider for Combined {
             interp: self.interp.attach(spec),
             compiled: self.unit.attach(spec),
             last: Cell::new(Ran::Neither),
+            audit: std::env::var("PLY_COMBINED_AUDIT").is_ok(),
         })
     }
 
@@ -61,6 +62,27 @@ impl Provider for Combined {
 
     fn offers(&self) -> Offers {
         self.unit.offers()
+    }
+}
+
+/// The two front ends must answer a body the same way; a difference is the oracle firing.
+fn disagree(name: &Symbol, interp: &Entered, compiled: &Entered) -> Option<Diagnostic> {
+    use ply_span::codes;
+    let same = match (interp, compiled) {
+        (Entered::Answered(a), Entered::Answered(b)) => {
+            ply_eval::values_equal(a, b, ply_span::Span::DUMMY).unwrap_or(false)
+        }
+        (Entered::Raised(_), Entered::Raised(_)) => true,
+        (Entered::Declined, Entered::Declined) => true,
+        _ => false,
+    };
+    if same {
+        None
+    } else {
+        Some(Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!("the interpreted and compiled front ends disagree on `{name}`"),
+        ))
     }
 }
 
@@ -79,33 +101,42 @@ struct Pair {
     interp: Rc<dyn Compiled>,
     compiled: Rc<dyn Compiled>,
     last: Cell<Ran>,
+    /// `PLY_COMBINED_AUDIT`: run a body both ways and compare, the oracle that replaces
+    /// pairing against the machine once the machine is gone.
+    audit: bool,
 }
 
 impl Pair {
     fn route_test(&self, name: &Symbol, budget: usize) -> Entered {
-        match self.interp.enter_test(name, budget) {
-            Entered::Declined => {
-                self.last.set(Ran::Compiled);
-                self.compiled.enter_test(name, budget)
-            }
-            entered => {
-                self.last.set(Ran::Interp);
-                entered
+        let interp = self.interp.enter_test(name, budget);
+        if let Entered::Declined = interp {
+            self.last.set(Ran::Compiled);
+            return self.compiled.enter_test(name, budget);
+        }
+        self.last.set(Ran::Interp);
+        if self.audit {
+            let compiled = self.compiled.enter_test(name, budget);
+            if let Some(d) = disagree(name, &interp, &compiled) {
+                return Entered::Raised(d);
             }
         }
+        interp
     }
 
     fn route_whole(&self, name: &Symbol, args: &[Value], budget: usize) -> Entered {
-        match self.interp.enter_whole(name, args, budget) {
-            Entered::Declined => {
-                self.last.set(Ran::Compiled);
-                self.compiled.enter_whole(name, args, budget)
-            }
-            entered => {
-                self.last.set(Ran::Interp);
-                entered
+        let interp = self.interp.enter_whole(name, args, budget);
+        if let Entered::Declined = interp {
+            self.last.set(Ran::Compiled);
+            return self.compiled.enter_whole(name, args, budget);
+        }
+        self.last.set(Ran::Interp);
+        if self.audit {
+            let compiled = self.compiled.enter_whole(name, args, budget);
+            if let Some(d) = disagree(name, &interp, &compiled) {
+                return Entered::Raised(d);
             }
         }
+        interp
     }
 
     fn ran(&self) -> &Rc<dyn Compiled> {

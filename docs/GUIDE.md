@@ -1777,7 +1777,9 @@ binds `resume`, `simulate` and a region's tasks, whose continuations live on
 the tier's stacks and are its next increment. `combined` is the two front
 ends together: it interprets what `interp` carries and compiles — through
 `c` — what `interp` declines, so between them they answer every body with no
-machine, which is what makes the machine deletable. `c` is the code
+machine, which is what makes the machine deletable; `PLY_COMBINED_AUDIT=1` runs a body
+both ways and fails on any disagreement, the oracle that replaces pairing
+against the machine once the machine is gone. `c` is the code
 generator: it emits the fragment as C,
 hands it to `cc`, and loads the result. Its bodies carry symbols, so a sampling
 profiler and a disassembler can both read what a definition became.
