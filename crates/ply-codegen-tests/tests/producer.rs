@@ -62,6 +62,28 @@ fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
 
 /// The emitter: every `.ply` under `spikes/ply-parser` and the standard library it imports,
 /// compiled by the reference and loaded.
+/// The emitter's identity, for the cache keys: the digest of the same files the recipe reads.
+fn emitter_identity() -> String {
+    let dir = repo().join("spikes/ply-parser");
+    let mut modules = Vec::new();
+    for e in std::fs::read_dir(&dir)
+        .expect("the emitter's directory")
+        .flatten()
+    {
+        let p = e.path();
+        if p.extension().is_some_and(|x| x == "ply") {
+            modules.push((
+                p.file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+                std::fs::read_to_string(&p).expect("the emitter is readable"),
+            ));
+        }
+    }
+    producer::digest_of(&modules)
+}
+
 fn emitter() -> Result<PlyProducer, String> {
     let dir = repo().join("spikes/ply-parser");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
@@ -115,8 +137,12 @@ fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 /// The unit built with the Ply emitter as its producer, and every case's answer checked against
 /// the machine's. In whole mode the reference emits nothing of the program; the port's refusals
 /// are the fixpoint's, and this program has none.
+/// The producer's mode is a process-wide flag, so the tests that set it take turns.
+static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn built_and_checked(whole: bool) {
-    producer::install(std::sync::Arc::new(emitter));
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
     producer::set_whole(whole);
     let loaded = load(&[("m", PROGRAM)], false);
     let source: &'static Source = Box::leak(Box::new(
@@ -179,7 +205,156 @@ fn the_ply_emitter_answers_bodies_and_they_answer_what_the_machine_answers() {
     built_and_checked(false);
 }
 
+/// Effects by evidence passing (ADR 0043): a tail-resumptive handler with a `return` clause, a
+/// perform two calls deep, a handler installed inside another's body, and the zero-shot
+/// `resume` that unwinds. The reference refuses every body here; only the chain entered whole
+/// compiles them, and the machine is the oracle.
+const EFFECTS: &str = r#"
+effect counter {
+  write bump(n: Int) -> Int
+  read peek() -> Int
+}
+
+effect abort {
+  write stop(code: Int) -> Int
+}
+
+fn twice(n: Int) -> Int / {counter.write} = counter.bump(n) + counter.bump(n)
+
+fn counted(seed: Int) -> Int =
+  handle { twice(seed) + counter.peek() } with {
+    counter.bump(n) -> n * 10,
+    counter.peek() -> 7,
+    return x -> x + 1,
+  }
+
+fn nested(seed: Int) -> Int =
+  handle {
+    handle { counter.bump(seed) } with { counter.bump(n) -> n + 100 }
+      + counter.bump(seed)
+  } with {
+    counter.bump(n) -> n + 1,
+  }
+
+fn guarded(n: Int) -> Int =
+  handle {
+    if n > 10 { abort.stop(n) } else { n * 2 }
+  } with {
+    abort.stop(code) resume k -> 0 - code,
+    return x -> x + 1000,
+  }
+"#;
+
+#[test]
+fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", EFFECTS)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let cases: Vec<(&str, Vec<Value>)> = vec![
+        ("m.counted", vec![Value::Int(3)]),
+        ("m.nested", vec![Value::Int(5)]),
+        ("m.guarded", vec![Value::Int(4)]),
+        ("m.guarded", vec![Value::Int(40)]),
+    ];
+    for (name, args) in cases {
+        let want = machine
+            .call(name, args.clone(), Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(
+            ctx.failed,
+            0,
+            "`{name}{args:?}` raised in the C tier: {:?}",
+            ctx.diagnostic.as_ref().map(|d| d.message.clone())
+        );
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        ctx.end();
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the machine disagree"
+        );
+    }
+}
+
 #[test]
 fn the_chain_entered_whole_answers_what_the_machine_answers() {
     built_and_checked(true);
+}
+
+/// The per-operation rule (ADR 0043): a compiled `perform` searches the compiled frames, which
+/// is complete only while every body handling the operation is compiled. A handler the unit
+/// refuses drops its performers with it, and an operation nothing handles is refused too.
+const DROPPED: &str = r#"
+effect counter {
+  write bump(n: Int) -> Int
+}
+
+effect orphan {
+  write poke(n: Int) -> Int
+}
+
+fn performer(n: Int) -> Int / {counter.write} = counter.bump(n)
+
+fn handler(seed: Int) -> Int =
+  handle { performer(seed) } with {
+    counter.bump(n) -> if 1.5 > 1.0 { n } else { 0 },
+  }
+
+fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
+"#;
+
+#[test]
+fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", DROPPED)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (_native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    let reason = |name: &str| {
+        refused
+            .iter()
+            .find(|r| r.function == name)
+            .map(|r| r.construct.clone())
+            .unwrap_or_else(|| panic!("`{name}` was taken; refusals: {refused:?}"))
+    };
+    assert!(
+        reason("m.handler").contains("Float"),
+        "{}",
+        reason("m.handler")
+    );
+    assert!(
+        reason("m.performer").contains("m.handler")
+            && reason("m.performer").contains("counter#bump"),
+        "{}",
+        reason("m.performer")
+    );
+    assert!(
+        reason("m.lonely").contains("nothing in the program"),
+        "{}",
+        reason("m.lonely")
+    );
 }

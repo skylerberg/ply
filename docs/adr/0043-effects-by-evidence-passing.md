@@ -1,9 +1,26 @@
 # ADR 0043 — Effects by evidence passing in the compiled tier
 
-**Proposed.** ADR 0042 ordered the self-hosting work and placed effects fourth:
-`handle` in the compiled tier is to be re-priced against evidence passing
-before anything else on the evaluator is started. This record is that pricing,
-and the design the tier takes if it holds. It does not start the fifth step.
+**Accepted, and the first three stages are built.** ADR 0042 ordered the
+self-hosting work and placed effects fourth: `handle` in the compiled tier is
+to be re-priced against evidence passing before anything else on the evaluator
+is started. This record is that pricing and the design the tier took. It does
+not start the fifth step.
+
+**Built:** the runtime's handler frames, `handle` with tail-resumptive clauses
+and a `return` clause, the zero-shot `resume` as an unwind, `with cell`, the
+per-operation rule in the unit's fixpoint, and the performed atoms crossing the
+seam into the machine's trace. The emitter written in Ply carries every one of
+them, the reference none; they compile with the chain entered whole
+(`PLY_C_EMITTER=ply-whole:<dir>`), and the audit is green over the standard
+library and the examples in that mode. The host route is not built: a
+`perform` no frame answers is refused before it is compiled, by the rule below,
+so nothing reaches the runtime's "no handler" failure from a shipped program.
+What the tier refuses over the shipped corpus now is `simulate`, `task.*`, the
+`Float` and `Decimal` literals the reference never carried, and their callers.
+Two things the building found are in the design below where they belong: a
+name the runtime reads out of the unit's table is written as the placeholder
+the unit resolves, and a produced body's cache key carries the emitter's own
+identity.
 
 > **What this decides.** That a handler in the compiled tier is a *frame the
 > runtime keeps*, installed by the `handle` site and searched by the `perform`
@@ -108,7 +125,15 @@ of the `return` clause when there is one. Four helpers carry it:
   CLI installs when it builds the backend. ADR 0041 §"What it costs" is the
   inventory of what that route needs -- the binding, the hermetic and
   footprint checks, and a span to hang a diagnostic on -- and each of them is a
-  field on the frame or the context rather than a reason to refuse.
+  field on the frame or the context rather than a reason to refuse. Until it
+  is built, the fixpoint refuses a performer of an operation nothing in the
+  program handles, so the runtime's failure for that case is never reached
+  from a shipped program.
+- Every `perform` records its atom on the context, and the backend hands the
+  atoms across the seam after each entry for the machine to record in its
+  trace: the observed row is a claim the tests make, and a handled perform is
+  still a perform. Three tests in the standard library said so before the
+  seam carried them.
 
 `simulate` is not carried and neither is a `task.*` operation; a body holding
 either stays the machine's until the fifth step.
