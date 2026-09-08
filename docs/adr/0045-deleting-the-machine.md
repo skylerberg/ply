@@ -1,6 +1,6 @@
 # ADR 0045 — Deleting the machine
 
-**Proposed.** ADR 0042 placed this fifth, after the effects and the runtime,
+**Accepted, and the second stage is built.** ADR 0042 placed this fifth, after the effects and the runtime,
 and ADR 0044 built the runtime's four stages: stacks, `simulate`, `resume`
 off the tail and more than once, and the host route with its production
 region. With the chain entered whole the tier now takes every definition the
@@ -30,6 +30,16 @@ without a day on which nothing checks the language.
 > still need the checker's diagnostics. The per-definition object and link
 > ADR 0037 describes, which is the loop's cost and not the machine's
 > existence. Whether the scheduler and the search are later written in Ply.
+
+**Built, second stage:** the bundle in `spikes/ply-parser/bootstrap/` and the
+fixpoint test, `crates/ply-codegen-tests/tests/bootstrap.rs`. The CLI builds
+the emitter from the bundle and no longer needs the reference to do it. On
+the way the emitter's own sources joined the lowering differential and the
+resolved-C ratchet, and the audit of the emitter's own tests under the tier
+found the miscompilation the bootstrap first hit: two bugs in the port's
+update recognition, both in the lowering, which are gone. The second stage
+was taken before the first, since it depended on nothing the facade adds and
+was the riskier of the two.
 
 ## The inventory
 
@@ -158,9 +168,9 @@ measurement, not adjusted to pass.
 1. **The facade with the machine inside it.** `Engine` wraps a `Machine`;
    every consumer in the table is switched to the facade. Oracle: the whole
    workspace suite and the CLI's, unchanged, since nothing runs differently.
-2. **The snapshot and the fixpoint.** The bootstrap snapshot is checked in,
-   the fixpoint test runs in CI, and the producer is built from the
-   snapshot rather than the reference. Oracle: the fixpoint, and the audit
+2. **The snapshot and the fixpoint.** Built. The bootstrap bundle is checked
+   in, the fixpoint test runs in CI, and the producer is built from the
+   bundle rather than the reference. Oracle, met: the fixpoint, and the audit
    over both corpora unchanged.
 3. **The credential.** The bridged secret; the refusal removed on both
    emitters. Oracle: the secrets suite as a Ply test, and the census over

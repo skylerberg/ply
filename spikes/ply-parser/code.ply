@@ -90,7 +90,11 @@ pub type CRet = { size: Int, caps: List<Cap>, body: Code }
 
 // The slot a `let` writes, which is what the ownership pass drops when it walks
 // backwards past the binder.
-pub type CStmt = | CLet({ name: Bytes, slot: Int, value: Code }) | CDo({ code: Code })
+pub type CStmt =
+  | CLet({ name: Bytes, slot: Int, value: Code })
+  // `let <pattern> = e`: the value is bound as a whole and the pattern's names read out of it.
+  | CLetPat({ pat: CPat, value: Code })
+  | CDo({ code: Code })
 
 // --- the dump ---------------------------------------------------------------
 //
@@ -185,6 +189,7 @@ fn dump_node(n: Node) -> Bytes =
                         fold(b.stmts, b"", |acc: Bytes, s: CStmt|
                           bytes_concat(acc, match s {
                             CLet(l) -> bytes_concat_all([b"let(v:", l.name, b":", num(l.slot), b",", dump(l.value), b"),"]),
+                            CLetPat(l) -> bytes_concat_all([b"let(", dump_pat(l.pat), b",", dump(l.value), b"),"]),
                             CDo(d) -> bytes_concat_all([b"do(", dump(d.code), b"),"]),
                           })),
                         match b.tail { Some(t) -> dump(t), None -> b"-" },
@@ -611,113 +616,133 @@ fn field_name(fs: List<RecField>, i: Int) -> Bytes =
 // `RecordUpdate` expression does not survive either parser, so neither side has
 // one to lower.
 fn as_update(fields: List<RecField>, st: Stack) -> Option<{ code: Code, st: Stack }> = {
-  let slots = fold(fields, [], |acc: List<Int>, f: RecField| match copy_of(f, st) {
-    Some(sl) -> if fold(acc, false, |seen: Bool, x: Int| seen || x == sl) { acc } else { push(acc, sl) },
-    None -> acc,
-  });
-  // A literal that rewrites every field has no copy to name its base. A record
-  // it *projects from* inside a written field dies there just the same, and its
-  // cells are what to reuse, so the first such variable is the base.
-  let picked = if len(slots) == 1 { list_at(slots, 0) }
-               else if len(slots) == 0 {
-                 fold(fields, None, |acc: Option<Int>, f: RecField|
-                   match acc { Some(_) -> acc, None -> projected_slot(f.value, st) })
-               } else { None };
-  match picked {
-    None -> None,
-    Some(_) -> {
-    match picked {
+  // A copy is a field written as `b.<its own name>` for a bare variable `b` in scope. One such
+  // variable names the base; two different ones make this a plain literal.
+  let copies = fold(fields, { names: [], bad: false }, |acc: { names: List<Bytes>, bad: Bool }, f: RecField|
+    match copy_base(f, st) {
+      None -> acc,
+      Some(n) -> if len(acc.names) == 0 { { names: [n], bad: acc.bad } }
+                 else if nth_bytes(acc.names, 0) == n { acc }
+                 else { { names: acc.names, bad: true } },
+    });
+  if copies.bad { None } else {
+    // A literal that rewrites every field has no copy to name its base, but a record it projects
+    // from inside a written field dies there just the same, and its cells are what to reuse.
+    let base = if len(copies.names) == 1 { list_at(copies.names, 0) }
+               else { fold(fields, None, |acc: Option<Bytes>, f: RecField|
+                        match acc { Some(_) -> acc, None -> if copy_base(f, st) != None { None } else { projected_var(f.value, st, []) } }) };
+    match base {
       None -> None,
-      Some(sl) -> {
-        let copies = fold(fields, [], |acc: List<Bytes>, f: RecField|
-          match copy_of(f, st) { Some(_) -> push(acc, f.name.name), None -> acc });
-        let sets = filter(fields, |f: RecField| copy_of(f, st) == None);
-        match lower_seq(map(sets, |f: RecField| f.value), st) {
+      Some(name) -> {
+        // The fields are walked in order, as the reference's slot pass walks them: a copy
+        // resolves the base where the copy stands, a written field is lowered, and the capture a
+        // lambda between an occurrence and its binding needs is numbered where the occurrence is.
+        let walked = fold(fields, Some({ codes: [], st: st }), |acc: Option<Seq>, f: RecField|
+          match acc {
+            None -> None,
+            Some(a) -> if copy_base(f, st) == Some(name) { Some({ codes: a.codes, st: resolve(a.st, name).st }) }
+                       else { match lower_in(f.value, a.st) {
+                         None -> None,
+                         Some(o) -> Some({ codes: push(a.codes, o.code), st: o.st }),
+                       } },
+          });
+        match walked {
           None -> None,
-          Some(r) -> Some({
-            code: { own: Borrowed, node: NUpd({
-              base: { own: Borrowed, node: NVar({ name: base_name(fields, st), slot: Some(sl) }) },
-              copies: copies,
-              sets: map(range(0, len(sets)), |i: Int|
-                { name: match list_at(sets, i) { Some(f) -> f.name.name, None -> b"" },
-                  value: nth(r.codes, i) }) }) },
-            st: r.st })
+          Some(o) -> match resolve(o.st, name).slot {
+            None -> None,
+            Some(sl) -> {
+              let copied = fold(fields, [], |acc: List<Bytes>, f: RecField|
+                match copy_base(f, st) { Some(n) -> if n == name { push(acc, f.name.name) } else { acc }, None -> acc });
+              let sets = filter(fields, |f: RecField| copy_base(f, st) != Some(name));
+              Some({
+                code: { own: Borrowed, node: NUpd({
+                  base: { own: Borrowed, node: NVar({ name: name, slot: Some(sl) }) },
+                  copies: copied,
+                  sets: map(range(0, len(sets)), |i: Int|
+                    { name: match list_at(sets, i) { Some(f) -> f.name.name, None -> b"" },
+                      value: nth(o.codes, i) }) }) },
+                st: o.st })
+            },
+          },
         }
       },
     }
-    },
   }
 }
 
-// The first bare slot variable a field read projects from, anywhere inside `e`
-// and not through a barrier of its own.
-fn projected_slot(e: Expr, st: Stack) -> Option<Int> =
-  match e {
-    EField(x) -> match x.base {
-      EVar(v) -> if v.name.module != None { None } else { resolve(st, v.name.name.name).slot },
-      _ -> projected_slot(x.base, st),
-    },
-    EApp(x) -> fold(x.args, projected_slot(x.func, st), |acc: Option<Int>, a: Expr|
-      match acc { Some(_) -> acc, None -> projected_slot(a, st) }),
-    EBinary(x) -> match projected_slot(x.lhs, st) {
-      Some(v) -> Some(v), None -> projected_slot(x.rhs, st),
-    },
-    EUnary(x) -> projected_slot(x.operand, st),
-    ERecord(x) -> fold(x.fields, None, |acc: Option<Int>, f: RecField|
-      match acc { Some(_) -> acc, None -> projected_slot(f.value, st) }),
-    EList(x) -> fold(x.items, None, |acc: Option<Int>, i: Expr|
-      match acc { Some(_) -> acc, None -> projected_slot(i, st) }),
-    _ -> None,
-  }
-
-// The slot a field copies from, when the field is `b.<its own name>` for a bare
-// variable `b` that resolves to one.
-fn copy_of(f: RecField, st: Stack) -> Option<Int> =
+// The bare in-scope variable a field copies from, when the field is `b.<its own name>`.
+fn copy_base(f: RecField, st: Stack) -> Option<Bytes> =
   match f.value {
     EField(x) -> if x.field.name != f.name.name { None } else {
       match x.base {
-        EVar(v) -> if v.name.module != None { None } else { resolve(st, v.name.name.name).slot },
+        EVar(v) -> if v.name.module != None { None }
+                   else { match st_depth(st, v.name.name.name) { Some(_) -> Some(v.name.name.name), None -> None } },
         _ -> None,
       }
     },
     _ -> None,
   }
 
-// The base's own name: from a copy where there is one, and otherwise from the
-// projection that named it.
-fn base_name(fields: List<RecField>, st: Stack) -> Bytes = {
-  let from_copy = fold(fields, b"", |acc: Bytes, f: RecField| match copy_of(f, st) {
-    None -> acc,
-    Some(_) -> match f.value {
-      EField(x) -> match x.base { EVar(v) -> v.name.name.name, _ -> acc },
-      _ -> acc,
+// The first in-scope variable a field read projects from anywhere inside `e`, walking as the
+// reference walks and not through a barrier of its own; a name `e` binds itself is dead by the
+// time the base is read, so it is never the base.
+fn projected_var(e: Expr, st: Stack, inner: List<Bytes>) -> Option<Bytes> = {
+  let first = |xs: List<Expr>| fold(xs, None, |acc: Option<Bytes>, x: Expr|
+    match acc { Some(_) -> acc, None -> projected_var(x, st, inner) });
+  match e {
+    EField(x) -> match x.base {
+      EVar(v) -> if v.name.module == None && !has_bytes(inner, v.name.name.name) && st_depth(st, v.name.name.name) != None
+                 { Some(v.name.name.name) } else { projected_var(x.base, st, inner) },
+      _ -> projected_var(x.base, st, inner),
     },
-  });
-  if from_copy != b"" { from_copy } else {
-    fold(fields, b"", |acc: Bytes, f: RecField|
-      if acc != b"" { acc } else { match projected_name(f.value, st) { Some(n) -> n, None -> acc } })
+    EUnary(x) -> projected_var(x.operand, st, inner),
+    EBinary(x) -> first([x.lhs, x.rhs]),
+    EApp(x) -> first(push_front(x.args, x.func)),
+    EIf(x) -> first([x.cond, x.then_branch, x.else_branch]),
+    EMatch(x) -> projected_var(x.scrutinee, st, inner),
+    EBlock(x) -> {
+      let walked = fold(x.stmts, { found: None, inner: inner }, |acc: { found: Option<Bytes>, inner: List<Bytes> }, s: Stmt|
+        match acc.found {
+          Some(_) -> acc,
+          None -> match s {
+            SLet(l) -> { found: projected_var(l.value, st, acc.inner), inner: pat_binders(l.pat, acc.inner) },
+            SExpr(v) -> { found: projected_var(v, st, acc.inner), inner: acc.inner },
+          },
+        });
+      match walked.found {
+        Some(n) -> Some(n),
+        None -> match x.tail { Some(t) -> projected_var(t, st, walked.inner), None -> None },
+      }
+    },
+    ERecord(x) -> first(map(x.fields, |f: RecField| f.value)),
+    ERecordUpdate(x) -> first(push_front(map(x.fields, |f: RecField| f.value), x.base)),
+    ETry(x) -> projected_var(x.operand, st, inner),
+    EList(x) -> first(x.items),
+    EPerform(x) -> first(x.args),
+    EHandle(x) -> projected_var(x.body, st, inner),
+    EWithCell(x) -> match projected_var(x.init, st, inner) {
+      Some(n) -> Some(n),
+      None -> projected_var(x.body, st, push(inner, x.binder.name)),
+    },
+    EWithRegion(x) -> projected_var(x.body, st, inner),
+    _ -> None,
   }
 }
 
-fn projected_name(e: Expr, st: Stack) -> Option<Bytes> =
-  match e {
-    EField(x) -> match x.base {
-      EVar(v) -> if v.name.module != None { None }
-                 else { match resolve(st, v.name.name.name).slot {
-                   Some(_) -> Some(v.name.name.name), None -> None } },
-      _ -> projected_name(x.base, st),
+fn push_front(xs: List<Expr>, x: Expr) -> List<Expr> = fold(xs, [x], |acc: List<Expr>, y: Expr| push(acc, y))
+
+fn has_bytes(xs: List<Bytes>, x: Bytes) -> Bool = fold(xs, false, |acc: Bool, y: Bytes| acc || y == x)
+
+fn pat_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
+  match p {
+    PVar(v) -> push(out, v.name.name),
+    PCtor(c) -> fold(c.args, out, |acc: List<Bytes>, a: Pattern| pat_binders(a, acc)),
+    PRecord(r) -> fold(r.fields, out, |acc: List<Bytes>, f: { name: Ident, pat: Pattern }| pat_binders(f.pat, acc)),
+    PList(l) -> {
+      let items = fold(l.items, out, |acc: List<Bytes>, a: Pattern| pat_binders(a, acc));
+      match l.rest { Some(r) -> pat_binders(r, items), None -> items }
     },
-    EApp(x) -> fold(x.args, projected_name(x.func, st), |acc: Option<Bytes>, a: Expr|
-      match acc { Some(_) -> acc, None -> projected_name(a, st) }),
-    EBinary(x) -> match projected_name(x.lhs, st) {
-      Some(v) -> Some(v), None -> projected_name(x.rhs, st),
-    },
-    EUnary(x) -> projected_name(x.operand, st),
-    ERecord(x) -> fold(x.fields, None, |acc: Option<Bytes>, f: RecField|
-      match acc { Some(_) -> acc, None -> projected_name(f.value, st) }),
-    EList(x) -> fold(x.items, None, |acc: Option<Bytes>, i: Expr|
-      match acc { Some(_) -> acc, None -> projected_name(i, st) }),
-    _ -> None,
+    _ -> out,
   }
 
 fn nth(cs: List<Code>, i: Int) -> Code =
@@ -766,7 +791,13 @@ fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> 
             None -> { stmts: acc.stmts, st: acc.st, ok: false },
           },
           SLet(l) -> match binder_of(l.pat) {
-            None -> { stmts: acc.stmts, st: acc.st, ok: false },
+            None -> match lower_in(l.value, acc.st) {
+              None -> { stmts: acc.stmts, st: acc.st, ok: false },
+              Some(o) -> {
+                let p = lower_pat(l.pat, o.st);
+                { stmts: push(acc.stmts, CLetPat({ pat: p.pat, value: o.code })), st: p.st, ok: true }
+              },
+            },
             Some(name) -> match lower_in(l.value, acc.st) {
               None -> { stmts: acc.stmts, st: acc.st, ok: false },
               Some(o) -> {
@@ -860,7 +891,7 @@ fn qname_text(q: QName) -> Bytes =
 
 // The slots a pattern binds, which the ownership pass drops when it walks back
 // past the arm that binds them.
-fn pat_slots(p: CPat) -> List<Int> =
+pub fn pat_slots(p: CPat) -> List<Int> =
   match p {
     PxWild -> [],
     PxVar(v) -> match v.slot { Some(s) -> [s], None -> [] },
@@ -1109,6 +1140,12 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
             CLet(l) -> { let m = mark(l.value, live_drop(acc.live, l.slot), live_drop(acc.livew, l.slot), live_drop_f(acc.livef, l.slot));
                          { codes: push(acc.codes, CLet({ name: l.name, slot: l.slot, value: m.code })),
                            live: m.live, livew: m.livew, livef: m.livef } },
+            CLetPat(l) -> {
+              let dropped = fold(pat_slots(l.pat), { l: acc.live, w: acc.livew, f: acc.livef },
+                |x: Dropped, sl: Int| { l: live_drop(x.l, sl), w: live_drop(x.w, sl), f: live_drop_f(x.f, sl) });
+              let m = mark(l.value, dropped.l, dropped.w, dropped.f);
+              { codes: push(acc.codes, CLetPat({ pat: l.pat, value: m.code })),
+                live: m.live, livew: m.livew, livef: m.livef } },
           });
       { code: { own: Borrowed, node: NBlock({ stmts: rev_stmts(walked.codes),
                                               tail: match b.tail { None -> None, Some(_) -> Some(after.code) } }) },
