@@ -125,10 +125,13 @@ has:
 1. **`with cell`** — **built.** Three runtime helpers, a node in each tier, and
    a seam that measures the arena's balance instead of refusing anything that
    touches it. Independent of everything below.
-2. **`perform` under the whole-program criterion**, with the binding threaded
-   into `Ctx` and a refusal, naming the handler it found, when the criterion
-   fails. This is where the definitions are: a dozen directly and most of
-   `http`'s cascade behind them. Both tiers, since the fragment is Cranelift's.
+2. **`perform` under the whole-program criterion.** The criterion itself is
+   built -- `Source::stack_handled` walks every definition's lowered body and
+   answers whether an operation could find a handler rather than the host, which
+   is what makes the host case a call. What is not built is answering it, for
+   the reason above: the first step is a decision about the seam, not a helper.
+   This is where the definitions are, a dozen directly and most of `http`'s
+   cascade behind them, and it is both tiers, since the fragment is Cranelift's.
 3. **`handle`** — **not taken.** Reopen it when a body containing one is what a
    measurement shows the tier losing, and price the state-machine transform
    against the interpreter before writing any of it.
