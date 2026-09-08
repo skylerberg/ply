@@ -527,22 +527,26 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     //
     // `std.router.name_fault` was here for the same reason and is gone: recognising a record
     // update in the lowering was the refusal it was a symptom of.
-    // The six after the first three are all one thing: an update whose base is a parameter of a
-    // *named* record type. The emission needs the base's shape -- to know each copied field's
-    // kind, and the width the released record's cells are reused at -- and the resolution that
-    // gives it is written and switched off in `emit.ply`. With it these six agree and 58 more
-    // bodies are reached, at the cost of 17 others: down from 38 as the release rules were found,
-    // and four of the thirteen are an extra count this port takes where the reference does not.
+    // Eight, in two groups.
+    //
+    // Four `std.hash` bodies want the *other* half of deferring, above: a record whose every read
+    // is answered from the built table is never materialised, and the local it would land in is
+    // declared at the top of the body. `Word t81 = 0;` is that local.
+    //
+    // The other four are single bodies with causes of their own, none yet run down:
+    // `std.json.float_json` has a per-body table index that has drifted, which means the port
+    // skipped a sub-expression the reference emitted; `std.db.collect_tuple` and
+    // `std.http.absorb` release an update's base where the port does not; `std.http.check_limits`
+    // emits a constant the port does not reach.
     let expected_gaps = [
+        "std.db.collect_tuple",
+        "std.hash.first8",
         "std.hash.full_words",
         "std.hash.padded_words",
-        "std.http.phased",
+        "std.hash.permute",
+        "std.http.absorb",
+        "std.http.check_limits",
         "std.json.float_json",
-        "std.router.name_fault",
-        "desk.cancelled",
-        "store.disabled",
-        "store.settled",
-        "store.shelved",
     ];
     assert_eq!(
         differ, expected_gaps,
@@ -553,7 +557,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
     // more than a body. It has since risen well past that.
     assert!(
-        reached >= 426,
+        reached >= 484,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );
