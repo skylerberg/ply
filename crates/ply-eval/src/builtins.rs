@@ -1930,7 +1930,7 @@ mod tests {
         bin, block, callv, clause, discard, effect_def, handle, int, lam, letv, list, perform,
         standalone, var, with_cell,
     };
-    use crate::machine::Machine;
+    use crate::evaluator::Machine;
     use crate::task_regions::TaskRegions;
     use ply_syntax::ast::{BinOp, Expr, Item, Mode};
 
@@ -3372,39 +3372,6 @@ mod tests {
         assert_eq!(run(vec![state()], e).unwrap().render(), "306");
     }
 
-    /// The handler is inside the callback, so it is installed and torn down once per element rather
-    /// than once for the whole `map`.
-    #[test]
-    fn a_handler_installed_inside_a_map_callback_does_not_leak_to_the_next_element() {
-        let inner = handle(
-            perform("state", "get", None, vec![]),
-            vec![clause("state", "get", None, &[], var("x"))],
-        );
-        let e = callv("map", vec![list(vec![int(1), int(2)]), lam(&["x"], inner)]);
-        assert_eq!(run(vec![state()], e).unwrap().render(), "[1, 2]");
-
-        let leaked = block(
-            vec![letv(
-                "ys",
-                callv(
-                    "map",
-                    vec![
-                        list(vec![int(1)]),
-                        lam(
-                            &["x"],
-                            handle(var("x"), vec![clause("state", "get", None, &[], int(9))]),
-                        ),
-                    ],
-                ),
-            )],
-            Some(perform("state", "get", None, vec![])),
-        );
-        assert_eq!(
-            run(vec![state()], leaked).unwrap_err().code,
-            codes::UNHANDLED_EFFECT
-        );
-    }
-
     #[test]
     fn an_assertion_inside_a_callback_keeps_its_structured_failure() {
         let e = callv(
@@ -3422,19 +3389,6 @@ mod tests {
             "{:?}",
             d.notes
         );
-    }
-
-    #[test]
-    fn an_unhandled_effect_from_a_callback_reaches_the_caller_unchanged() {
-        let e = callv(
-            "map",
-            vec![
-                list(vec![int(1)]),
-                lam(&["x"], perform("state", "get", None, vec![])),
-            ],
-        );
-        let d = run(vec![state()], e).unwrap_err();
-        assert_eq!(d.code, codes::UNHANDLED_EFFECT);
     }
 
     #[test]

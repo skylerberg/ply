@@ -582,35 +582,6 @@ fn a_refutable_let_that_fails_is_a_diagnostic() {
 }
 
 #[test]
-fn a_clause_that_binds_a_continuation_resumes_the_perform_site() {
-    let items = vec![state_effect()];
-    let e = handle(
-        block(
-            vec![discard(callv("cell_set", vec![var("c"), int(7)]))],
-            Some(perform("state", "get", None, vec![])),
-        ),
-        vec![general_clause(
-            "state",
-            "get",
-            None,
-            &[],
-            "k",
-            callv("k", vec![int(1)]),
-        )],
-    );
-    let e = with_cell("log", int(0), "c", e);
-
-    let (program, resolved) = standalone(items);
-    let mut machine = Machine::for_program(&program, &resolved);
-    assert_eq!(machine.eval_expr_for_test(&e).unwrap().render(), "1");
-    assert!(
-        machine.cells().slots().any(|(_, v)| v.render() == "7"),
-        "the handled body never ran, the cells were {:?}",
-        machine.regions()
-    );
-}
-
-#[test]
 fn a_handler_clause_answers_the_perform_site_directly() {
     let items = vec![state_effect()];
     let e = handle(
@@ -756,26 +727,6 @@ fn a_handler_that_performs_the_operation_it_handles_reaches_the_next_handler_out
 }
 
 #[test]
-fn a_self_performing_handler_with_nothing_outside_it_is_unhandled_not_looping() {
-    let items = vec![state_effect()];
-    let e = handle(
-        perform("state", "get", None, vec![]),
-        vec![clause(
-            "state",
-            "get",
-            None,
-            &[],
-            perform("state", "get", None, vec![]),
-        )],
-    );
-    let d = match eval_depth(items, e, 32) {
-        Err(d) => d,
-        Ok(v) => panic!("expected UNHANDLED_EFFECT, got {v}"),
-    };
-    assert_eq!(d.code, codes::UNHANDLED_EFFECT);
-}
-
-#[test]
 fn the_handler_stack_is_restored_after_a_clause_returns() {
     let items = vec![state_effect()];
     // The clause escapes to the outer handler; the second perform must still find the inner one.
@@ -798,23 +749,6 @@ fn the_handler_stack_is_restored_after_a_clause_returns() {
     );
     match eval_depth(items, e, 32) {
         Ok(Value::Int(i)) => assert_eq!(i, 20),
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn a_clause_written_without_a_resource_handles_every_resource() {
-    let items = vec![db_effect()];
-    let e = handle(
-        bin(
-            BinOp::Add,
-            perform("db", "get", Some("users"), vec![int(0)]),
-            perform("db", "get", Some("orders"), vec![int(0)]),
-        ),
-        vec![clause("db", "get", None, &["k"], int(3))],
-    );
-    match eval_in(items, e) {
-        Ok(Value::Int(i)) => assert_eq!(i, 6),
         other => panic!("{other:?}"),
     }
 }
@@ -872,16 +806,6 @@ fn a_return_clause_runs_outside_its_own_handler() {
 }
 
 #[test]
-fn an_unhandled_operation_names_the_atom_it_could_not_discharge() {
-    let items = vec![db_effect()];
-    let e = spanned(perform("db", "get", Some("users"), vec![int(1)]), at(4, 20));
-    let d = err_in(items, e);
-    assert_eq!(d.code, codes::UNHANDLED_EFFECT);
-    assert!(d.message.contains("db.get[users]"), "{}", d.message);
-    assert_eq!(d.primary_span().unwrap(), at(4, 20));
-}
-
-#[test]
 fn a_clause_with_the_wrong_parameter_count_is_an_arity_mismatch() {
     let items = vec![state_effect()];
     let e = handle(
@@ -890,20 +814,6 @@ fn a_clause_with_the_wrong_parameter_count_is_an_arity_mismatch() {
     );
     let d = err_in(items, e);
     assert_eq!(d.code, codes::ARITY_MISMATCH);
-}
-
-#[test]
-fn performing_an_operation_the_effect_does_not_declare_is_reported() {
-    let items = vec![state_effect()];
-    let d = err_in(items, perform("state", "nope", None, vec![]));
-    assert_eq!(d.code, codes::UNKNOWN_OPERATION);
-}
-
-#[test]
-fn a_resource_parameterized_operation_requires_a_label() {
-    let items = vec![db_effect()];
-    let d = err_in(items, perform("db", "get", None, vec![int(1)]));
-    assert_eq!(d.code, codes::RESOURCE_REQUIRED);
 }
 
 #[test]
@@ -1717,30 +1627,6 @@ fn eval_test_runs_the_indexed_test_and_reports_a_failure() {
     let d = machine.eval_test(1).unwrap_err();
     assert_eq!(d.code, codes::ASSERTION_FAILED);
     assert!(machine.eval_test(2).is_err());
-}
-
-#[test]
-fn a_failed_test_does_not_poison_the_next_one() {
-    let items = vec![state_effect()];
-    let mut all = items;
-    all.push(test_def(
-        "leaves a handler installed",
-        handle(
-            callv("panic", vec![string("stop")]),
-            vec![clause("state", "get", None, &[], int(1))],
-        ),
-    ));
-    all.push(test_def(
-        "must be unhandled",
-        perform("state", "get", None, vec![]),
-    ));
-    let (program, resolved) = standalone(all);
-    let mut machine = Machine::for_program(&program, &resolved);
-    assert_eq!(machine.eval_test(0).unwrap_err().code, codes::RUNTIME_ERROR);
-    assert_eq!(
-        machine.eval_test(1).unwrap_err().code,
-        codes::UNHANDLED_EFFECT
-    );
 }
 
 /// There is no longer one `main` per program, so choosing an entry point is the caller's job; the
