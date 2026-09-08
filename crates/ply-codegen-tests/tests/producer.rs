@@ -376,5 +376,9 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
         reason("m.hosted")
     );
     // The handler calls the performer, so the cascade takes it too, naming the performer.
-    assert!(reason("m.hosting").contains("m.hosted"), "{}", reason("m.hosting"));
+    assert!(
+        reason("m.hosting").contains("m.hosted"),
+        "{}",
+        reason("m.hosting")
+    );
 }
