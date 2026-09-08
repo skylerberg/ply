@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1005 of 1282** shipped bodies, 1000 resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1096 of 1282** shipped bodies, 1091 resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -75,6 +75,17 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**Every pattern the reference tests, this port tests.** A pattern's test can now emit the
+reads it needs -- `pat_test` answers the state beside the condition -- so a constructor's
+argument with a test of its own is read into a local under the test built so far, as the
+reference does; a record pattern is `rt_record_fits_p` and one `rt_record_has_p` per field
+through the body's field table; a list pattern is `rt_list_fits_p` and `rt_list_at_p`, with a
+refutable `..rest` refused on both sides; a `Bool` or a fixed-width literal is a word
+comparison. Binding follows the same shapes. 1005 to 1096 reached, every new body the
+reference's C exactly. The census now leads with a capture the port has not bound, then a
+callback or inline builtin outside its fused shape, then an `if` whose arms answer different
+kinds.
 
 **A field's type travels, and an update's copy reads the base's rank.** A field read over a
 shape the port cannot see is the runtime's read by name through the body's field table, as the
