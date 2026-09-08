@@ -138,7 +138,11 @@ The entry that emits the emitter's own sources is the workload the gates
 were waiting on. Through the refreshed bundle the port's own tests run
 tier-only in under a gigabyte, the bootstrap fixpoint test runs in under a
 gigabyte and under a minute, and the port's own-sources ratchet in under
-three, so all three run in CI again. One thing stood between the fixpoint
+three, so all three run in CI again. The harness's differentials run the
+port with the tier attached, and `run.sh` now names the bundle as the
+producer for them: with the reference producing, the port ran as C that
+released nothing, over its own sources, which is the memory the runner
+could not hold. One thing stood between the fixpoint
 and a runner even so: a debug build's heap never reuses a dead block, so
 that a read of one finds the marker, and that entry allocates two hundred
 million objects. `heap::reuse_by_default` turns reuse on for a process, the
