@@ -447,7 +447,16 @@ impl Bodies {
         // which this struct owns and outlives the call; `ctx` is the context that unit's own
         // `Ctx::new` built, borrowed uniquely here; and `handles` is `MAX_ARITY` wide against an
         // arity this registration refused to exceed.
-        let out = unsafe { (admitted.entry)(&mut *ctx as *mut crate::rt::Ctx, handles.as_ptr()) };
+        let mut out =
+            unsafe { (admitted.entry)(&mut *ctx as *mut crate::rt::Ctx, handles.as_ptr()) };
+        if ctx.sims.last().is_some_and(|sim| sim.is_production()) {
+            out = unsafe { crate::simulate::finish_root(&mut *ctx as *mut crate::rt::Ctx, out) };
+        }
+        if let Some(rt) = ctx.runtime.clone()
+            && let Err(d) = rt.end_entry_point(ctx.id)
+        {
+            ctx.teardown.push(d);
+        }
 
         if ctx.failed != 0 {
             // The fragment's diagnostic is `RUNTIME_ERROR` at `Span::DUMMY`; the machine is about
@@ -563,6 +572,34 @@ impl ply_eval::Compiled for Bodies {
 
     fn simulated(&self) -> Option<ply_eval::region::Record> {
         self.ctx.borrow().record.clone()
+    }
+
+    fn set_host(
+        &self,
+        binding: std::sync::Arc<ply_eval::HostBinding>,
+        runtime: Option<std::rc::Rc<dyn ply_eval::HostRuntime>>,
+    ) {
+        self.ctx.borrow_mut().set_host(binding, runtime);
+    }
+
+    fn set_declared(&self, declared: Option<ply_core::Footprint>) {
+        self.ctx.borrow_mut().declared = declared;
+    }
+
+    fn set_re_executed(&self, re_executed: bool) {
+        self.ctx.borrow_mut().re_executed = re_executed;
+    }
+
+    fn take_host_use(&self) -> (ply_eval::host::HostUse, u64) {
+        let mut ctx = self.ctx.borrow_mut();
+        (
+            std::mem::take(&mut ctx.host_use),
+            std::mem::take(&mut ctx.host_ops),
+        )
+    }
+
+    fn take_teardown(&self) -> Vec<ply_span::Diagnostic> {
+        std::mem::take(&mut self.ctx.borrow_mut().teardown)
     }
 }
 

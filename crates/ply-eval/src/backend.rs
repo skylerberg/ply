@@ -657,6 +657,30 @@ impl Compiled for Mutant {
         self.inner.simulated()
     }
 
+    fn set_host(
+        &self,
+        binding: std::sync::Arc<crate::host::HostBinding>,
+        runtime: Option<std::rc::Rc<dyn crate::host::HostRuntime>>,
+    ) {
+        self.inner.set_host(binding, runtime);
+    }
+
+    fn set_declared(&self, declared: Option<ply_core::Footprint>) {
+        self.inner.set_declared(declared);
+    }
+
+    fn set_re_executed(&self, re_executed: bool) {
+        self.inner.set_re_executed(re_executed);
+    }
+
+    fn take_host_use(&self) -> (crate::host::HostUse, u64) {
+        self.inner.take_host_use()
+    }
+
+    fn take_teardown(&self) -> Vec<ply_span::Diagnostic> {
+        self.inner.take_teardown()
+    }
+
     /// A corruption is a wrong answer at the seam, and a test entered whole hands the seam
     /// nothing to corrupt: a mutant leaves every test to the machine, where each call crosses.
     fn enter_test(&self, _name: &Symbol, _budget: usize) -> crate::compiled::Entered {
