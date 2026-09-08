@@ -2770,6 +2770,11 @@ impl<'a> Emit<'a> {
             (Builtin::Len, 1) => (crate::heap::KIND_LIST, 1, vals[0].ty == CTy::List),
             _ => return Ok(None),
         };
+        // The kind-tested arm below reads one byte; `bytes_u32_le` over bytes the declaration
+        // does not fix goes through the runtime instead, which reads four.
+        if b == Builtin::BytesU32Le && !known {
+            return Ok(None);
+        }
         // With the type known there is no kind to test and no slow path to keep: an index out of
         // range raises, as the builtin does, and everything else is a load. This is the input path
         // of every byte-oriented kernel — `block_words` reads sixty-four bytes per block — and the
