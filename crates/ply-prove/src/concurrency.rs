@@ -103,13 +103,22 @@ impl BodyRun {
 
 /// The one way to build a [`BodyRun`]: from the machine that just ran the body.
 pub fn body_run(machine: &Machine<'_>, value: Result<Value, Diagnostic>, span: Span) -> BodyRun {
+    body_run_recorded(machine.simulated(), value, span)
+}
+
+/// The same over what a compiled unit recorded of the run.
+pub fn body_run_recorded(
+    record: Option<&ply_eval::region::Record>,
+    value: Result<Value, Diagnostic>,
+    span: Span,
+) -> BodyRun {
     let (outcome, raised) = match value {
         Ok(Value::Bool(true)) => (Ok(()), false),
         Ok(Value::Bool(false)) => (Err(body_was_false(span)), false),
         Ok(other) => (Err(body_was_not_boolean(&other, span)), true),
         Err(diagnostic) => (Err(diagnostic), true),
     };
-    let record = machine.simulated();
+    let observed = record.is_some();
     BodyRun {
         interleaving: match record {
             Some(record) => record.interleaving(&outcome),
@@ -120,7 +129,7 @@ pub fn body_run(machine: &Machine<'_>, value: Result<Value, Diagnostic>, span: S
                 Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
             },
         },
-        observed: record.is_some(),
+        observed,
         raised,
     }
 }

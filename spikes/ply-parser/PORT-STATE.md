@@ -281,7 +281,9 @@ memory went: the tier released nothing within an entry. ADR 0046 built the relea
 carries the machine's ownership rule under `Em.release`, on for everything the producer emits
 and off for `emit_bodies_reference`, which is the text `emit_diff.rs` still compares against
 the reference. The three places release departs from the reference's order, and the two the
-reference had wrong, are in that record.
+reference had wrong, are in that record. `emit_module` also emits a program's laws and spec
+clauses as roots, named as `crates/ply-codegen/src/source.rs` names them, which is what
+`ply prove --backend` enters.
 
 ## Beyond the port
 

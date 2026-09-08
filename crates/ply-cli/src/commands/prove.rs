@@ -123,6 +123,12 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             .as_ref()
             .map(|f| f as &(dyn Fn() -> std::rc::Rc<dyn ply_eval::host::HostRuntime> + Sync)),
     });
+    let backend = match super::common::prover_backend(args.backend.as_ref(), &loaded) {
+        Ok(backend) => backend,
+        Err(diagnostic) => {
+            return report_bind_error("prove", &[diagnostic], &loaded.sources, args.json, style);
+        }
+    };
     let (engine, engine_warning) = crate::engine::of(
         &loaded.program,
         &loaded.resolved,
@@ -130,6 +136,7 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
         loaded.complete,
         obligations.len(),
         hosting,
+        backend,
     );
     warnings.extend(engine_warning);
     let (pool, _workers) = build_pool(args.jobs, &mut warnings);

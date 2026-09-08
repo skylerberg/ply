@@ -1,8 +1,11 @@
 //! The program a unit compiles out of, in the three pieces the machine already holds.
 
 use ply_core::CheckOutput;
-use ply_span::Symbol;
-use ply_syntax::ast::{FnDef, Generics, Ident, Item, Program, TestDef, Visibility};
+use ply_span::{Span, Symbol};
+use ply_syntax::ast::{
+    Expr, FnDef, Generics, Ident, Item, Param, Program, QName, SpecKind, TestDef, TypeExpr,
+    Visibility,
+};
 use ply_syntax::resolve::Resolved;
 use std::collections::HashMap;
 
@@ -14,6 +17,8 @@ pub struct Source {
     /// Every definition by program-wide name, with the index of its module: the code generator
     /// asks for one at each name it resolves.
     definitions: HashMap<String, (&'static FnDef, usize)>,
+    /// The laws' and clauses' propositions, as roots the judge enters.
+    spec_roots: Vec<String>,
     /// The tests, as the program-wide names of the roots synthesized for them.
     test_roots: Vec<String>,
     /// What each definition's emitted code is a function of, when the caller knows: its hash over
@@ -68,6 +73,76 @@ pub fn test_root_name(ordinal: usize) -> Symbol {
     Symbol::new(format!("test#{ordinal}"))
 }
 
+/// A law's guard or body as a root: `law#<ordinal>.guard`, `law#<ordinal>.body`, the ordinal its
+/// place among the module's laws and the binders its parameters (ADR 0045 §"The facade").
+pub fn law_root_name(ordinal: usize, part: &str) -> Symbol {
+    Symbol::new(format!("law#{ordinal}.{part}"))
+}
+
+/// A definition's `requires` or `ensures` clause as a root: `<owner>#requires#<k>` over the
+/// owner's parameters, `<owner>#ensures#<k>` over them and then `result`.
+pub fn clause_root_name(owner: &Symbol, kind: &str, ordinal: usize) -> Symbol {
+    Symbol::new(format!("{owner}#{kind}#{ordinal}"))
+}
+
+/// Whether `name` is one of the roots above rather than a written definition or a test.
+pub fn is_spec_root(name: &str) -> bool {
+    let local = name.rsplit('.').next().unwrap_or(name);
+    name.contains(".law#") || local.contains("#requires#") || local.contains("#ensures#")
+}
+
+fn bool_type(span: Span) -> TypeExpr {
+    TypeExpr::Con {
+        name: QName::bare(Ident {
+            name: Symbol::new("Bool"),
+            span,
+        }),
+        args: Vec::new(),
+        span,
+    }
+}
+
+/// A proposition over bound names as a definition answering `Bool`, so the unit compiles it
+/// like any other and the judge enters it with the names' values as arguments.
+fn proposition_as_definition(name: &Symbol, params: Vec<Param>, body: &Expr, span: Span) -> FnDef {
+    FnDef {
+        vis: Visibility::Private,
+        name: Ident {
+            name: name.clone(),
+            span,
+        },
+        generics: Generics {
+            types: Vec::new(),
+            effects: Vec::new(),
+        },
+        params,
+        ret: Some(bool_type(span)),
+        effects: None,
+        constraints: Vec::new(),
+        derived: None,
+        spec: Vec::new(),
+        reuse: None,
+        body: body.clone(),
+        span,
+    }
+}
+
+/// The owner's parameters as a proposition's, when every one has a written type; a clause over
+/// an unannotated parameter has no root, and the judge evaluates it as before.
+fn typed_params(def: &FnDef) -> Option<Vec<Param>> {
+    def.params
+        .iter()
+        .map(|p| {
+            p.ty.as_ref().map(|ty| Param {
+                name: p.name.clone(),
+                ty: Some(ty.clone()),
+                default: None,
+                span: p.span,
+            })
+        })
+        .collect()
+}
+
 /// A test's body as a nullary definition, so the fragment compiles it like any other.
 fn test_as_definition(test: &TestDef, name: &Symbol) -> FnDef {
     FnDef {
@@ -101,8 +176,10 @@ impl Source {
     ) -> Source {
         let mut definitions = HashMap::new();
         let mut roots = Vec::new();
+        let mut spec_roots = Vec::new();
         for (index, module) in program.modules.iter().enumerate() {
             let mut ordinal = 0;
+            let mut law_ordinal = 0;
             for item in &module.items {
                 match item {
                     Item::Fn(def) => {
@@ -122,7 +199,69 @@ impl Source {
                         roots.push(qualified);
                         ordinal += 1;
                     }
+                    Item::Law(law) => {
+                        let params: Vec<Param> = law
+                            .binders
+                            .iter()
+                            .map(|b| Param {
+                                name: b.name.clone(),
+                                ty: Some(b.ty.clone()),
+                                default: None,
+                                span: b.span,
+                            })
+                            .collect();
+                        let parts = [("guard", law.guard.as_ref()), ("body", Some(&law.body))];
+                        for (part, expr) in parts {
+                            let Some(expr) = expr else { continue };
+                            let name = law_root_name(law_ordinal, part);
+                            let def: &'static FnDef = Box::leak(Box::new(
+                                proposition_as_definition(&name, params.clone(), expr, law.span),
+                            ));
+                            let qualified = module.name.qualify(&name).to_string();
+                            definitions.insert(qualified.clone(), (def, index));
+                            spec_roots.push(qualified);
+                        }
+                        law_ordinal += 1;
+                    }
                     _ => {}
+                }
+                if let Item::Fn(def) = item
+                    && let Some(params) = typed_params(def)
+                {
+                    let mut counts = (0usize, 0usize);
+                    for clause in &def.spec {
+                        let (kind, ordinal, params) = match clause.kind {
+                            SpecKind::Requires => {
+                                counts.0 += 1;
+                                ("requires", counts.0 - 1, params.clone())
+                            }
+                            SpecKind::Ensures => {
+                                counts.1 += 1;
+                                let Some(ret) = &def.ret else { continue };
+                                let mut with_result = params.clone();
+                                with_result.push(Param {
+                                    name: Ident {
+                                        name: Symbol::new("result"),
+                                        span: def.span,
+                                    },
+                                    ty: Some(ret.clone()),
+                                    default: None,
+                                    span: def.span,
+                                });
+                                ("ensures", counts.1 - 1, with_result)
+                            }
+                        };
+                        let name = clause_root_name(&def.name.name, kind, ordinal);
+                        let root: &'static FnDef = Box::leak(Box::new(proposition_as_definition(
+                            &name,
+                            params,
+                            &clause.expr,
+                            clause.span,
+                        )));
+                        let qualified = module.name.qualify(&name).to_string();
+                        definitions.insert(qualified.clone(), (root, index));
+                        spec_roots.push(qualified);
+                    }
                 }
             }
         }
@@ -132,6 +271,7 @@ impl Source {
             check,
             definitions,
             test_roots: roots,
+            spec_roots,
             keys: HashMap::new(),
             texts: HashMap::new(),
             regions: std::sync::OnceLock::new(),
@@ -220,6 +360,7 @@ impl Source {
             }
         }
         out.extend(self.test_roots.iter().cloned());
+        out.extend(self.spec_roots.iter().cloned());
         out
     }
 }
