@@ -290,7 +290,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
         &offered,
         &ctors_digest,
         inlining,
-        super::producer::installed(),
+        super::producer::mode(),
     );
     // A unit entry that will not reconstruct is a reason to build one, never to fail.
     if let Some(k) = &unit_key
@@ -489,13 +489,23 @@ pub(super) fn emit_one(
     // two definitions that say the same thing share one -- and an emitted body carries its own
     // mangled name, so serving one for the other puts two definitions of the same symbol in the
     // unit. `lexer.hex1` and `lexer.hex2` are that pair, and the C compiler said so.
-    let produced = super::producer::installed();
-    let key = loaded.keys.get(name).map(|h| {
-        let who = if produced { "\0ply" } else { "" };
-        super::cache::key(&format!("{name}\0{h}{who}"), ctors_digest, inlining)
-    });
+    let mode = super::producer::mode();
+    let whole = mode == "ply-whole";
+    let who = if mode == "ref" { "" } else { "\0ply" };
+    let key = loaded
+        .keys
+        .get(name)
+        .map(|h| super::cache::key(&format!("{name}\0{h}{who}"), ctors_digest, inlining));
+    // A refusal is the port's own in whole mode and the reference's otherwise; the two are not
+    // served to each other.
     let refusal = loaded.keys.get(name).map(|h| {
-        super::cache::refusal_key(&format!("{name}\0{h}"), ctors_digest, inlining, fragment)
+        let who = if whole { "\0ply-whole" } else { "" };
+        super::cache::refusal_key(
+            &format!("{name}\0{h}{who}"),
+            ctors_digest,
+            inlining,
+            fragment,
+        )
     });
     if let Some(k) = &refusal
         && let Some(reason) = super::cache::read_refusal(k)
@@ -519,6 +529,41 @@ pub(super) fn emit_one(
         }
         .into());
     };
+    // The chain entered whole: the port's answer is the unit's, and the reference is not run.
+    if whole {
+        let answer =
+            super::producer::with_current(|p| p.body(loaded, name, module_index)).flatten();
+        return match answer {
+            Some(super::producer::Answer::Body(text, tables)) => {
+                if let Some(missing) = tables.calls.iter().find(|c| !unit.functions.contains(c)) {
+                    return Err(Refused {
+                        function: name.to_string(),
+                        construct: format!("`{missing}`, which is not in this compiled unit"),
+                    }
+                    .into());
+                }
+                if let Some(k) = &key {
+                    super::cache::write(k, &text, &tables);
+                }
+                Ok((text, tables))
+            }
+            Some(super::producer::Answer::Refused(why)) => {
+                if let Some(k) = &refusal {
+                    super::cache::write_refusal(k, &why);
+                }
+                Err(Refused {
+                    function: name.to_string(),
+                    construct: why,
+                }
+                .into())
+            }
+            None => Err(Refused {
+                function: name.to_string(),
+                construct: "which the Ply emitter did not answer".to_string(),
+            }
+            .into()),
+        };
+    }
     let t0 = std::time::Instant::now();
     // The tuple the key was taken over, rather than the constant: two derivations of the same
     // setting are two chances for the cache to be keyed on one and the body emitted at the other.
@@ -608,7 +653,7 @@ pub(super) fn emit_one(
     // this emitter accepts: the refusals are this emitter's, the code that runs is the other's.
     // A body naming a definition the unit does not hold would not link, so it is refused here
     // as this emitter refuses one, and the fixpoint drops it.
-    if let Some(Some((text, tables))) =
+    if let Some(Some(super::producer::Answer::Body(text, tables))) =
         super::producer::with_current(|p| p.body(loaded, name, module_index))
     {
         if let Some(missing) = tables.calls.iter().find(|c| !unit.functions.contains(c)) {
