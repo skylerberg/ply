@@ -1769,9 +1769,12 @@ The flag takes a value. `reference` is a nested machine over the same fragment,
 which is what the seam is checked against rather than a way to go faster.
 `interp` is the interpreted front end (ADR 0047): it walks the same lowered
 code the `c` tier compiles, over the same runtime, with no C compiler in the
-path, and answers what the machine answers on every body it reaches while
-declining — for the machine to run — the effect constructs whose continuations
-live on the tier's stacks, which are its next increment. `c` is the code
+path, and answers what the machine answers on every body it reaches. It
+carries the first-order language, `with_cell`, and a `handle`/`perform` whose
+clauses are tail-resumptive (the common case), recording each performed atom
+so its footprint matches; it declines — for the machine to run — a clause that
+binds `resume`, `simulate` and a region's tasks, whose continuations live on
+the tier's stacks and are its next increment. `c` is the code
 generator: it emits the fragment as C,
 hands it to `cc`, and loads the result. Its bodies carry symbols, so a sampling
 profiler and a disassembler can both read what a definition became.

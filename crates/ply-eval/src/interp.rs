@@ -3,19 +3,24 @@
 //!
 //! It reuses the leaf semantics the machine and the tier already share — `strict_binary`,
 //! `apply_unary`, `lit_matches`, `ctor_value`, and `builtins::{call, advance}` — so a body it
-//! evaluates answers what the compiled code answers by construction. Where it reaches a node it
-//! does not yet carry — a `perform`, a `handle`, a `simulate`, a `with cell`/`with region`, a
-//! continuation resumed — it **declines**, exactly as the emitter port refuses a form it has not
-//! reached, and `--audit-backend` compares only what it enters. The declined nodes are the ones
-//! whose continuations live on the tier's stacks (ADR 0044); they are the next increment.
+//! evaluates answers what the compiled code answers by construction. It carries the first-order
+//! language, `with_cell`, and tail-resumptive `handle`/`perform`, recording each performed atom
+//! so its footprint matches the machine's. Where it reaches a construct it does not yet carry —
+//! a clause that binds `resume`, a `simulate`, a region's tasks — it **declines**, exactly as the
+//! emitter port refuses a form it has not reached, and `--audit-backend` compares only what it
+//! enters. The declined constructs' continuations live on the tier's stacks (ADR 0044); they are
+//! the next increment.
 
 use crate::backend::{Counters, Offers, Policed, Provider, Spec, wrap};
-use crate::code::{self, Arm, Captures, Code, Lowered, Lowering, NodeKind, Pat, Stmt};
+use crate::code::{
+    self, Arm, Captures, Clause, Code, Lowered, Lowering, NodeKind, Pat, ReturnArm, Stmt,
+};
 use crate::compiled::{Compiled, Entered};
 use crate::semantics::{ctor_value, lit_matches, strict_binary};
 use crate::value::{Closure, ClosureKind, Fields, Value};
 use crate::{Builtin, TaskRegions};
 use ply_core::CheckOutput;
+use ply_core::ty::EffectAtom;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, Item, Program, QName};
 use ply_syntax::resolve::{Namespace, Resolved};
@@ -43,6 +48,7 @@ pub struct Interpreter {
     defs: FxHashMap<Symbol, Def>,
     tests: FxHashMap<Symbol, (&'static Expr, usize)>,
     ctors: FxHashMap<Symbol, usize>,
+    ops: crate::semantics::OpTable,
     members: BTreeSet<Symbol>,
     counters: Counters,
 }
@@ -83,6 +89,7 @@ impl Interpreter {
         let mut tests = FxHashMap::default();
         let mut ctors: FxHashMap<Symbol, usize> =
             ply_core::prelude::ctor_arities().into_iter().collect();
+        let mut ops = crate::semantics::OpTable::default();
         let mut members = BTreeSet::new();
         for (module, m) in program.modules.iter().enumerate() {
             let mut ordinal = 0usize;
@@ -115,6 +122,14 @@ impl Interpreter {
                             }
                         }
                     }
+                    Item::Effect(e) => {
+                        for op in &e.ops {
+                            ops.insert(
+                                (m.name.qualify(&e.name.name), op.name.name.clone()),
+                                (op.resource_param, op.mode),
+                            );
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -126,6 +141,7 @@ impl Interpreter {
             defs,
             tests,
             ctors,
+            ops,
             members,
             counters: Counters::default(),
         }))
@@ -170,6 +186,8 @@ pub struct Interp {
     arena: RefCell<TaskRegions>,
     globals: RefCell<FxHashMap<GlobalKey, Value>>,
     lowered: RefCell<FxHashMap<Symbol, Lowered>>,
+    handlers: RefCell<Vec<HandlerFrame>>,
+    performed: RefCell<Vec<EffectAtom>>,
 }
 
 impl Interp {
@@ -180,11 +198,15 @@ impl Interp {
             arena: RefCell::new(TaskRegions::new()),
             globals: RefCell::new(FxHashMap::default()),
             lowered: RefCell::new(FxHashMap::default()),
+            handlers: RefCell::new(Vec::new()),
+            performed: RefCell::new(Vec::new()),
         }
     }
 
     fn reset(&self) {
         *self.arena.borrow_mut() = TaskRegions::new();
+        self.handlers.borrow_mut().clear();
+        self.performed.borrow_mut().clear();
     }
 
     fn enter_root(
@@ -389,12 +411,69 @@ impl Interp {
                 Ok(Value::list(out))
             }
 
-            // The nodes whose continuations live on the tier's stacks: the next increment.
-            NodeKind::Perform { .. }
-            | NodeKind::Handle { .. }
-            | NodeKind::WithCell { .. }
-            | NodeKind::WithRegion { .. }
-            | NodeKind::Simulate { .. } => Err(Bail::Decline),
+            NodeKind::Handle { body, clauses, ret } => {
+                let frame = self.handler_frame(clauses, ret, window, module)?;
+                self.handlers.borrow_mut().push(frame);
+                let outcome = self.eval(body, window, module, calls);
+                let frame = self
+                    .handlers
+                    .borrow_mut()
+                    .pop()
+                    .expect("the frame this handle pushed");
+                let value = outcome?;
+                match &frame.ret {
+                    None => Ok(value),
+                    Some(r) => self.run_clause(
+                        &r.params,
+                        &r.body,
+                        r.size,
+                        &r.captured,
+                        &r.captures,
+                        r.module,
+                        vec![value],
+                        calls,
+                    ),
+                }
+            }
+
+            NodeKind::Perform {
+                effect,
+                op,
+                resource,
+                args,
+            } => {
+                let effect_g = self.effect_name(module, effect);
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args.iter() {
+                    vals.push(self.eval(a, window, module, calls)?);
+                }
+                let decl = crate::semantics::op_decl(&self.home.ops, &effect_g, op);
+                if let Some(atom) =
+                    crate::handler::performed_atom(&effect_g, resource.as_ref(), decl)
+                {
+                    self.performed.borrow_mut().push(atom);
+                }
+                self.perform(&effect_g, op, resource, vals, calls, span)
+            }
+
+            NodeKind::WithCell {
+                init,
+                binder,
+                slot,
+                body,
+                ..
+            } => {
+                let initial = self.eval(init, window, module, calls)?;
+                let cell = self.arena.borrow_mut().alloc_cell(initial);
+                let _ = binder;
+                if let Some(s) = slot {
+                    window[*s as usize] = Some(Value::Cell(cell));
+                }
+                self.eval(body, window, module, calls)
+            }
+
+            // A region's tasks interleave on the tier's stacks; the scheduler is the next increment.
+            NodeKind::WithRegion { .. } | NodeKind::Simulate { .. } => Err(Bail::Decline),
         }
     }
 
@@ -607,6 +686,129 @@ impl Interp {
         Ok(out.into())
     }
 
+    /// A handler's clauses and its `return` arm, with each body's free variables captured from the
+    /// scope the `handle` was written in — the tail-resumptive subset. A clause that binds
+    /// `resume` is carried but declined when performed, since its continuation lives on the tier's
+    /// stacks (the next increment).
+    fn handler_frame(
+        &self,
+        clauses: &Rc<Vec<Clause>>,
+        ret: &Option<Rc<ReturnArm>>,
+        window: &[Option<Value>],
+        module: usize,
+    ) -> Result<HandlerFrame, Bail> {
+        let mut cs = Vec::with_capacity(clauses.len());
+        for c in clauses.iter() {
+            cs.push(HandlerClause {
+                effect: self.effect_name(module, &c.effect),
+                op: c.op.clone(),
+                resource: c.resource.clone(),
+                params: c.params.clone(),
+                resumes: c.resume.is_some(),
+                body: c.body.clone(),
+                size: c.size,
+                captured: self.capture(&c.captures, window)?,
+                captures: c.captures.clone(),
+                module,
+            });
+        }
+        let ret = match ret {
+            None => None,
+            Some(r) => Some(RetArm {
+                params: Rc::new(vec![r.binder.clone()]),
+                body: r.body.clone(),
+                size: r.size,
+                captured: self.capture(&r.captures, window)?,
+                captures: r.captures.clone(),
+                module,
+            }),
+        };
+        Ok(HandlerFrame { clauses: cs, ret })
+    }
+
+    /// Search the active handlers from the innermost out for a clause that answers this operation,
+    /// and run it below its own frame so a `perform` in the clause sees only the outer handlers.
+    fn perform(
+        &self,
+        effect: &Symbol,
+        op: &Symbol,
+        resource: &Option<Symbol>,
+        args: Vec<Value>,
+        calls: Calls,
+        span: Span,
+    ) -> Result<Value, Bail> {
+        let found = {
+            let handlers = self.handlers.borrow();
+            let mut hit = None;
+            'outer: for (i, frame) in handlers.iter().enumerate().rev() {
+                for c in &frame.clauses {
+                    if c.effect == *effect && c.op == *op && c.resource == *resource {
+                        if c.resumes {
+                            return Err(Bail::Decline);
+                        }
+                        hit = Some((i, c.clone()));
+                        break 'outer;
+                    }
+                }
+            }
+            hit
+        };
+        let Some((depth, c)) = found else {
+            return Err(Bail::Decline);
+        };
+        if c.params.len() != args.len() {
+            return Err(Bail::Fail(crate::semantics::arity_error(
+                span,
+                &format!("the handler clause for `{effect}.{op}`"),
+                c.params.len(),
+                args.len(),
+            )));
+        }
+        // Run the clause with the handlers below its own frame in scope.
+        let saved: Vec<HandlerFrame> = self.handlers.borrow_mut().split_off(depth);
+        let out = self.run_clause(
+            &c.params,
+            &c.body,
+            c.size,
+            &c.captured,
+            &c.captures,
+            c.module,
+            args,
+            calls,
+        );
+        self.handlers.borrow_mut().extend(saved);
+        out
+    }
+
+    /// Evaluate a clause or `return` body in a fresh window: its parameters, then its captures.
+    #[allow(clippy::too_many_arguments)]
+    fn run_clause(
+        &self,
+        params: &[Symbol],
+        body: &Code,
+        size: u32,
+        captured: &[Value],
+        captures: &Rc<Captures>,
+        module: usize,
+        args: Vec<Value>,
+        calls: Calls,
+    ) -> Result<Value, Bail> {
+        let _ = params;
+        let mut window = vec![None; size as usize];
+        for (i, v) in args.into_iter().enumerate() {
+            window[i] = Some(v);
+        }
+        for (j, dst) in captures.dst.iter().enumerate() {
+            window[*dst as usize] = Some(captured[j].clone());
+        }
+        self.eval(body, &mut window, module, calls)
+    }
+
+    fn effect_name(&self, module: usize, q: &QName) -> Symbol {
+        self.global(module, Namespace::Effect, q)
+            .unwrap_or_else(|| q.symbol().clone())
+    }
+
     fn lookup(&self, q: &QName, module: usize) -> Result<Value, Bail> {
         let key = (
             module,
@@ -694,6 +896,36 @@ impl Interp {
 /// A per-entry recursion depth, capped as the machine caps nested calls (`stack.calls()` against
 /// `max_calls`): counted on each closure application and unwound by the native stack, so a
 /// sequential loop of ten thousand calls stays shallow while unbounded recursion is refused.
+#[derive(Clone)]
+struct HandlerFrame {
+    clauses: Vec<HandlerClause>,
+    ret: Option<RetArm>,
+}
+
+#[derive(Clone)]
+struct HandlerClause {
+    effect: Symbol,
+    op: Symbol,
+    resource: Option<Symbol>,
+    params: code::Params,
+    resumes: bool,
+    body: Code,
+    size: u32,
+    captured: Rc<[Value]>,
+    captures: Rc<Captures>,
+    module: usize,
+}
+
+#[derive(Clone)]
+struct RetArm {
+    params: code::Params,
+    body: Code,
+    size: u32,
+    captured: Rc<[Value]>,
+    captures: Rc<Captures>,
+    module: usize,
+}
+
 #[derive(Clone, Copy)]
 struct Calls {
     depth: usize,
@@ -748,6 +980,10 @@ impl Compiled for Interp {
 
     fn enter(&self, _name: &Symbol, _args: &[Value], _budget: usize) -> Option<Value> {
         None
+    }
+
+    fn take_performed(&self) -> Vec<EffectAtom> {
+        std::mem::take(&mut self.performed.borrow_mut())
     }
 
     fn enter_test(&self, name: &Symbol, budget: usize) -> Entered {
