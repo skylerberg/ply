@@ -19,8 +19,13 @@ keep=0
 if [ "${1:-}" = "--keep" ]; then keep=1; shift; fi
 work="$(mktemp -d)"
 [ "$keep" -eq 1 ] || trap 'rm -rf "$work"' EXIT
+# Every module with tests of its own, not just the parser's. `code.ply` and
+# `emit.ply` were left out when they were added, so their tests ran only in the
+# CI step that copies the whole directory -- which is where a stale one was
+# found rather than here.
 cp "$here"/lexer.ply "$here"/spine.ply "$here"/types.ply "$here"/patterns.ply \
-   "$here"/exprs.ply "$here"/items.ply "$work/"
+   "$here"/exprs.ply "$here"/items.ply "$here"/rewrite.ply "$here"/code.ply \
+   "$here"/emit.ply "$work/"
 "$ply" test "$work" --no-cache "$@"
 [ "$keep" -eq 1 ] && echo "project kept at $work"
 exit 0
