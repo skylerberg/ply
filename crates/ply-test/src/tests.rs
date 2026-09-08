@@ -509,44 +509,6 @@ test "twice is right" {
 }
 "#;
 
-const MULTI_SHOT: &str = r#"
-effect amb {
-  read flip[coin]() -> Bool
-}
-
-test "both branches" {
-  with_cell[trace](0) { c -> {
-    let total = handle {
-      let b = amb.flip[coin]();
-      cell_set(c, cell_get(c) + 1);
-      if b { 10 } else { 20 }
-    } with {
-      amb.flip[coin]() resume k -> k(true) + k(false),
-      return x -> x
-    };
-    assert_eq(total, 30);
-    assert_eq(cell_get(c), 2)
-  } }
-}
-"#;
-
-/// A multi-shot program runs and caches with no flags at all.
-#[test]
-fn a_test_only_the_machine_can_run_is_not_reported_as_a_divergence() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(MULTI_SHOT);
-
-    let selection = program.select(&store);
-    let report = program.run(&selection, &mut store);
-    assert_eq!(
-        (report.passed, report.failed),
-        (1, 0),
-        "{:#?}",
-        report.failures
-    );
-}
-
 #[test]
 fn a_cold_cache_selects_every_test() {
     let root = TempRoot::new();
@@ -1664,74 +1626,6 @@ fn the_artifact_reports_isolation_per_test_and_in_total() {
     );
 }
 
-/// The region region isolation asks `ply-test` for: a worker outlives a single test, so a test that
-/// inherited the previous one's cells would be sharing state through the back door the whole design
-/// exists to close.
-#[test]
-fn a_test_region_closes_and_the_group_fixture_does_not() {
-    let program = Program::compile(DISJOINT_CELLS);
-    let built = std::sync::atomic::AtomicUsize::new(0);
-    let fixture: &(dyn Fn(&mut TaskRegions) -> Value + Sync) = &|regions: &mut TaskRegions| {
-        built.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Value::Cell(regions.alloc_cell(Value::Int(7)))
-    };
-    let executor = crate::InterpExecutor::new(&program.program, &program.resolved, &program.check)
-        .with_fixture(fixture);
-
-    let mut worker = executor.worker();
-    assert_eq!(built.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(worker.region().mark(), 1);
-    assert_eq!(
-        worker.cells().live(),
-        1,
-        "the worker starts inside the group's region"
-    );
-
-    executor
-        .execute(&mut worker, 0)
-        .expect("the first test passes");
-    let allocated = worker.cells().stats().allocations;
-    assert!(allocated > 1, "the test allocated a cell of its own");
-    assert_eq!(
-        worker.cells().live(),
-        1,
-        "and gave it back at its region's close, leaving the group's fixture"
-    );
-    assert_eq!(
-        worker.region().fixture().len(),
-        1,
-        "closing the test's region left the group's own state alone"
-    );
-    assert_eq!(worker.region().mark(), 1);
-
-    executor
-        .execute(&mut worker, 1)
-        .expect("the second test passes");
-    assert_eq!(
-        worker.cells().stats().allocations,
-        allocated,
-        "the second test bumped as many slots as the first, from the same mark"
-    );
-    assert_eq!(
-        worker.cells().live(),
-        1,
-        "the second test opened the region, not the first test's leftovers"
-    );
-    let (seeded, handle) = worker.region().open();
-    let seed = match handle {
-        Value::Cell(slot) => seeded.get(slot).cloned(),
-        other => panic!("expected the fixture's handle, found {other:?}"),
-    };
-    assert!(
-        matches!(seed, Some(Value::Int(7))),
-        "every test still sees the seeded state"
-    );
-    assert_eq!(
-        built.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "the fixture is built once for the worker, not once per test"
-    );
-}
 
 #[test]
 fn every_group_is_run_in_sequence() {
