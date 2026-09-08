@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1173 of 1282** shipped bodies, 1167 resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1213 of 1282** shipped bodies, 1207 resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -75,6 +75,14 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**An `if` joins on the kinds its arms answered.** The port guessed each arm's kind
+structurally before writing either, and refused where the guesses differed, on the belief
+that the reference read the checker's type for the join. It does not: it writes both arms
+into buffers, joins on the kinds they *answered* -- the same kind, or a word -- and converts
+each arm into the join. The port does the same now, and the structural guess is gone. 1173
+to 1213 reached, every new body the reference's C exactly. The census leads with calling a
+value that is not a name.
 
 **A callback is any callee, and an inline builtin has a slow arm.** `fold` fuses over any
 third argument now, as the reference does: a definition of arity two the body names directly

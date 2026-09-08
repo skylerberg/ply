@@ -1796,20 +1796,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // already untagged and differ on a word, where this one is the runtime's
         // bool unbox rather than the integer's.
         let cv = { em: cnd.em, v: { k: KBool, c: as_bool(cnd.v), ty: TyOpen } };
-        // Where the two arms answer different kinds this port refuses rather than
-        // joining them at a word. The reference reads the *checker's* type for the
-        // join; `kind_of` is structural and does not always agree with it, and
-        // guessing wrong writes the wrong conversion into both arms. The one join
-        // it does take is a word one arm answers because it is opaque: there the
-        // structural answer is the checker's, and the other arm is boxed into it.
-        let kt0 = kind_of(em, i.then_branch, params);
-        let ke0 = kind_of(em, i.else_branch, params);
-        let join = if kt0 == ke0 { Some(kt0) }
-                   else if (kt0 == KBoxed && opaque_of(em, i.then_branch))
-                        || (ke0 == KBoxed && opaque_of(em, i.else_branch)) { Some(KBoxed) }
-                   else { None };
-        let kt = match join { Some(x) -> x, None -> KBoxed };
-        if join == None { Some(refused(em, b"an `if` whose arms answer different kinds")) } else {
+        // The join is the kind both arms *answered*, or a word: the arms are emitted into
+        // buffers first, and the join's local is declared before the `if` in the text but
+        // after both arms in the numbering.
+        {
           // The join's number is taken *before* either arm and its declaration is
           // written before the `if`, but the arms are emitted into buffers of
           // their own first: a record-valued join is not one local but one per
@@ -1851,6 +1841,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             names, js.names)
                   },
                   None -> {
+                    let kt = join_kind(t.v.k, e.v.k);
                     let decl = line({ out: b"", n: e.em.n, conv: cv.em.conv, ind: e.em.ind,
                                       reads: e.em.reads, shapes: e.em.shapes, built: e.em.built,
                                       module: e.em.module, made: e.em.made, here: e.em.here,
@@ -1871,7 +1862,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                  here: decl.here, imports: decl.imports, consts: decl.consts,
                                  ctors: decl.ctors, extra: decl.extra, lambdas: decl.lambdas,
                                  owner: decl.owner, builtins: decl.builtins, met: decl.met, fields: decl.fields, released: decl.released, toks: decl.toks, alias: decl.alias, by_root: decl.by_root, tail: decl.tail, calls: decl.calls, refused: decl.refused },
-                           v: { k: kt, c: j.name, ty: TyOpen } })
+                           v: { k: kt, c: j.name, ty: if t.v.ty == e.v.ty { t.v.ty } else { TyOpen } } })
                   },
                 }
               },
@@ -2119,8 +2110,20 @@ fn arm(em: Em, c: Code, params: List<P>) -> Option<{ em: Em, text: Bytes, v: V }
 
 // The same buffer with the join's assignment on the end.
 fn assigned(text: Bytes, ind: Int, k: Kind, v: V, join: Bytes) -> Bytes =
-  bytes_concat_all([text, pad(ind + 1),
-                    join, b" = ", match k { KBoxed -> as_word(v), _ -> as_int(v) }, b";\n"])
+  bytes_concat_all([text, pad(ind + 1), join, b" = ", as_kind(v, k), b";\n"])
+
+// A value as the kind a join holds it in: the reference's `as_kind`.
+fn as_kind(v: V, k: Kind) -> Bytes =
+  match k {
+    KBoxed -> as_word(v),
+    KInt -> as_int(v),
+    KBool -> as_bool(v),
+    KU32 -> match v.k {
+      KU32 -> v.c,
+      KBoxed -> bytes_concat_all([b"(uint32_t)ply_imm_value(", v.c, b")"]),
+      _ -> bytes_concat_all([b"(uint32_t)(", v.c, b")"]),
+    },
+  }
 
 // The same, for a record-valued join: one assignment per field, from the values
 // the record was built out of rather than from the record.
@@ -2187,30 +2190,6 @@ fn rebuild(em: Em, names: List<Bytes>, js: List<Bytes>) -> Option<Out> = {
          v: { k: KBoxed, c: rec.v.c,
               ty: TyRec(map(names, |n: Bytes| { name: n, k: KInt, ty: TyOpen })) } })
 }
-
-// The kind a node answers, without emitting it.
-//
-// Structural and cheap, which is the point: the join of an `if` has to be known
-// before either arm is written, and answering it by writing one costs an
-// emission per arm and doubles on every nesting level.
-fn kind_of(em: Em, c: Code, params: List<P>) -> Kind =
-  match c.node {
-    NLit(l) -> match l { LInt(_) -> KInt, LBool(_) -> KBool, _ -> KBoxed },
-    NVar(v) -> match v.slot {
-      None -> KBoxed,
-      Some(s) -> match conv_of(em, s) { Some(x) -> x.k, None -> KBoxed },
-    },
-    NUnary(u) -> if u.op == b"not" { KBool } else { KInt },
-    NBinary(b) -> if compare_op(b.op) != None || b.op == b"and" || b.op == b"or" { KBool }
-                  else if is_arith(b.op) {
-                    if opaque_of(em, b.lhs) || opaque_of(em, b.rhs) { KBoxed } else { KInt }
-                  } else { KBoxed },
-    NIf(i) -> join_kind(kind_of(em, i.then_branch, params),
-                        kind_of(em, i.else_branch, params)),
-    NBlock(b) -> match b.tail { Some(t) -> kind_of(em, t, params), None -> KBoxed },
-    NField(_) -> KInt,
-    _ -> KBoxed,
-  }
 
 // The `Int` two literals fold to under an operator, or nothing: the reference's
 // `fold_literals`, rule for rule. Addition, subtraction and multiplication only
