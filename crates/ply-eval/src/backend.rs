@@ -495,6 +495,8 @@ pub enum Kind {
     C,
     /// The interpreted front end (ADR 0047): the tier's lowering walked in process, no C compiler.
     Interp,
+    /// Both front ends (ADR 0047): interpret what the interpreter carries, compile the rest.
+    Combined,
 }
 
 impl Kind {
@@ -503,6 +505,7 @@ impl Kind {
             Kind::Reference => "reference",
             Kind::C => "c",
             Kind::Interp => "interp",
+            Kind::Combined => "combined",
         }
     }
 }
@@ -541,6 +544,12 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
                 ..Spec::honest()
             });
         }
+        "combined" => {
+            return Ok(Spec {
+                kind: Kind::Combined,
+                ..Spec::honest()
+            });
+        }
         "c" => {
             return Ok(Spec {
                 kind: Kind::C,
@@ -552,12 +561,13 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
     let (backend, rest) = match spec.split_once(':') {
         Some(("c", rest)) => (Kind::C, rest),
         Some(("interp", rest)) => (Kind::Interp, rest),
+        Some(("combined", rest)) => (Kind::Combined, rest),
         Some(("reference", rest)) => (Kind::Reference, rest),
         _ => (Kind::Reference, spec),
     };
     let Some(rest) = rest.strip_prefix("wrong:") else {
         return Err(format!(
-            "unknown backend `{spec}`; one of `reference`, `c`, `interp`, or \
+            "unknown backend `{spec}`; one of `reference`, `c`, `interp`, `combined`, or \
              `[<backend>:]wrong:<mutation>` where <mutation> is off-by-one, inverted, stale, \
              wrong-type, unoffered, handle, exceeds-budget[={{k}}] or answers={{int}}, each optionally \
              @<definition>"
