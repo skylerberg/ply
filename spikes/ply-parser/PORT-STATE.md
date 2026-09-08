@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1096 of 1282** shipped bodies, 1091 resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1128 of 1282** shipped bodies, 1123 resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -75,6 +75,14 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**A closure captures a parameter the prologue did not open.** A record or list parameter is
+never in the window -- it is read as its own word where the read is -- and a capture looked
+only in the window, so every closure over such a parameter was refused. The capture reads
+it as a variable read does. A constant named inside a lambda then showed the lambda's code
+table starting empty where the reference continues the body's; it continues now, as the
+lambda's other tables already did. 1096 to 1128 reached, every new body the reference's C
+exactly. The census leads with a callback or inline builtin outside its fused shape.
 
 **Every pattern the reference tests, this port tests.** A pattern's test can now emit the
 reads it needs -- `pat_test` answers the state beside the condition -- so a constructor's
