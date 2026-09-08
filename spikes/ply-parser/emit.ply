@@ -1230,10 +1230,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                                          num(sh.i), b"@@, 0);"])),
                   b"if (ctx->failed) return 0;");
                 let closed = line(outdent(made), b"}");
-                Some({ em: fold(range(0, n), closed, |acc: Em, at: Int|
+                // The record this build made is the body's own, as a literal's is.
+                Some({ em: note_made(fold(range(0, n), closed, |acc: Em, at: Int|
                          line(acc, bytes_concat_all([b"ply_words(", rec.v.c, b")[", num(at),
                            b"] = ", match list_at(filled.ws, at) { Some(x) -> x, None -> b"0" },
-                           b";"]))),
+                           b";"]))), rec.v.c),
                        v: { k: KBoxed, c: rec.v.c,
                             ty: TyRec(map(names, |nm: Bytes| { name: nm, k: KBoxed })) } })
               },
@@ -1851,29 +1852,13 @@ fn prologue(em: Em, params: List<P>) -> Em =
 // the checker, so by the time the reference's emitter sees `v: Values` the type
 // *is* the record and a field of one is read at an offset.
 //
-// **This corrects the note that was here.** It said the reference leaves a named
-// type opaque, on the strength of one body where the port released through a
-// reuse token and the reference did not -- read as "the port knows a width the
-// reference does not". It was the *release* that differed, not the type: once a
-// release counted the object's reads rather than one slot's, the field reads the
-// reference makes at an offset and this port makes by name fell from 65 to five.
-//
-// It is written and still not switched on. With it the port reaches 484 shipped
-// bodies against 426, and what disagrees is down to 13 -- from 38, through the
-// release counting an object's reads, the boxed field that does not release, the
-// update's own emission, the tail position that lets an update release anyway,
-// and restoring that position for an arm reached through a scrutinee. Four of
-// the thirteen are an extra count this port takes where the reference does not,
-// and four are the deferred record local.
-//
-// None of the 30 is about shapes, and none is about offsets either. In
-// `bank.adjusted` the two read the *same* base at different indices -- 0 against
-// 1 over `Account = { name: String, balance: Int }`, whose fields sort to
-// `balance, name`. Both rank them the same way; they reach them in a different
-// **order**. So what is left is the order a body's field reads are emitted in,
-// which is a question about `expand`'s desugaring of a record update against the
-// reference's `RecordUpdate` -- the same divergence the lowering differential
-// excludes, arriving from the other side.
+// It is on. Getting there took five rules about *releases*, each found by the
+// corpus and each recorded where it is made: a release counts an object's reads
+// and not one slot's, a field whose kind is a word does not release its base, an
+// update emits its own build, an update at the tail releases anyway, and an arm
+// reached through a scrutinee is still a tail. The disagreements went 38 to 8
+// over them, and the port reaches 484 shipped bodies against 426.
+
 fn param_kind_in(aliases: List<{ name: Bytes, ty: TypeExpr }>, t: Option<TypeExpr>)
     -> Option<{ k: Kind, ty: Ty }> =
   match t {
@@ -2106,7 +2091,7 @@ pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, sr
       IModule -> push(acc, { name: last_segment(im.path), module: bytes_join_dots(map(im.path, |i: Ident| i.name)) }),
       IAlias(a2) -> push(acc, { name: a2.name, module: bytes_join_dots(map(im.path, |i: Ident| i.name)) }),
     });
-  let _aliases = fold(x.module.items, [], |acc: List<{ name: Bytes, ty: TypeExpr }>, it: Item|
+  let aliases = fold(x.module.items, [], |acc: List<{ name: Bytes, ty: TypeExpr }>, it: Item|
     match it {
       IType(t) -> match t.body {
         TDAlias(u) -> if len(t.params) == 0 { push(acc, { name: t.name.name, ty: u }) } else { acc },
@@ -2117,15 +2102,15 @@ pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, sr
   let here = fold(x.module.items, [], |acc: List<Def>, it: Item|
     match it {
       IFn(d) -> push(acc, { name: d.name.name,
-                            ret: match param_kind(d.ret) { Some(r) -> Some(r.k), None -> None },
-                            ret_ty: match param_kind(d.ret) { Some(r) -> r.ty, None -> TyOpen } }),
+                            ret: match param_kind_in(aliases, d.ret) { Some(r) -> Some(r.k), None -> None },
+                            ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen } }),
       _ -> acc,
     });
   string_of_bytes(fold(x.module.items, b"C;1;", |acc: Bytes, it: Item|
     match it {
       IFn(d) -> {
         let names = map(d.params, |p: Param| p.name.name);
-        let kinds = map(d.params, |p: Param| param_kind(p.ty));
+        let kinds = map(d.params, |p: Param| param_kind_in(aliases, p.ty));
         let known = fold(kinds, true, |acc: Bool, k: Option<{ k: Kind, ty: Ty }>| acc && k != None);
         match if known { lower_fn(names, d.body) } else { None } {
           None -> acc,
