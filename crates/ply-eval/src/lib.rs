@@ -20,6 +20,7 @@ pub mod explore;
 mod frame;
 pub mod handler;
 pub mod host;
+pub mod interp;
 pub mod limit;
 pub mod list;
 pub use list::List;
@@ -78,7 +79,7 @@ pub use machine::{Machine, Progress};
 pub use rc::{Own, Stats as RcStats};
 pub use region::{MachineScheduler, Spawned};
 pub use region_kind::Regions;
-pub use semantics::strict_binary;
+pub use semantics::{ctor_value, lit_matches, strict_binary};
 pub use sim::{
     Access, Answer, Clock, Domain, Exploration, Handlers, Naive, OpSignature, Plan, Race, RaceSite,
     Rand, SEEDED_EFFECTS, SEEDED_OPS, Seed, SimMode, SimTy, Sleep, StepFootprint, Stream, TaskId,
