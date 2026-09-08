@@ -87,32 +87,8 @@ obs="$here/observation-k1-where.txt"
   echo "==> load before: $(uptime)"
   echo
   echo "K1 decomposed, $reps repetitions of one 64 KiB hash unless the row says otherwise."
-  "$ply" test "$dir" --no-cache --jobs 1 --backend cranelift 2>&1 |
+  "$ply" test "$dir" --no-cache --jobs 1 --backend c 2>&1 |
     grep -E "^   ok +probe\." | sed 's/^   ok  */  /'
-  echo
-  echo "What one \`round\` compiles to — eight quarter-rounds, against a dozen instructions each"
-  echo "in the Rust bar:"
-  PLY_CODEGEN_ASM="h.round" "$ply" test "$dir" --no-cache --jobs 1 --backend cranelift \
-    --filter "whole" >/dev/null 2>"$dir/asm.txt" || true
-  python3 - "$dir/asm.txt" <<'PY'
-import sys
-lines = open(sys.argv[1]).read().splitlines()
-size = next((l.split(': ')[1] for l in lines if l.startswith('compiled ')), '?')
-stack_ld = stack_st = heap_ld = heap_st = calls = 0
-for line in lines:
-    s = line.strip()
-    onstack = '[sp' in s or '[fp' in s
-    if s.startswith(('ldr', 'ldp')):
-        stack_ld += onstack; heap_ld += not onstack
-    elif s.startswith(('str', 'stp')):
-        stack_st += onstack; heap_st += not onstack
-    elif s.startswith('blr'):
-        calls += 1
-print(f"  size {size}")
-print(f"  stack traffic (spills)   {stack_ld:>4} loads  {stack_st:>4} stores")
-print(f"  heap traffic (fields)    {heap_ld:>4} loads  {heap_st:>4} stores")
-print(f"  cold helper call sites   {calls:>4}")
-PY
   echo
   echo "==> load after: $(uptime)"
 } | tee "$obs"

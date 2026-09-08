@@ -8,7 +8,7 @@
 //! The fixtures are the spike's, unchanged, and each says in its own header which hazard it exists
 //! for and why the obvious smaller program does not reach it.
 
-use ply_codegen::Cranelift;
+use ply_codegen::Unit;
 use ply_eval::{Machine, Value, compare_answers};
 use ply_span::Span;
 use ply_syntax::ast::{ModuleName, Program};
@@ -78,15 +78,15 @@ fn hazards() -> &'static Loaded {
 /// Two machines over one program: the interpreter as shipped, and the same interpreter with
 /// compiled bodies under it. Every hazard here is a claim about the difference.
 struct Harness {
-    unit: &'static Cranelift,
+    unit: &'static Unit,
     bodies: Rc<ply_codegen::Bodies>,
     machine: Machine<'static>,
     hybrid: Machine<'static>,
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    let unit: &'static Cranelift = Cranelift::over(loaded.program, loaded.resolved, loaded.check)
-        .expect("this host has a cranelift backend");
+    let unit: &'static Unit = Unit::over(loaded.program, loaded.resolved, loaded.check)
+        .expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
     let machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
     let mut hybrid = Machine::new(loaded.program, loaded.resolved, loaded.check);
@@ -125,7 +125,7 @@ impl Harness {
 }
 
 /// Why a definition was refused, if it was.
-fn refusal(unit: &Cranelift, name: &str) -> Option<String> {
+fn refusal(unit: &Unit, name: &str) -> Option<String> {
     unit.refusals()
         .iter()
         .find(|(f, _)| f == name)

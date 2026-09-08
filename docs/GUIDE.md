@@ -1755,15 +1755,16 @@ and the replay command.
 twice — once with it and once without — and fails the run on any disagreement
 (`E0503`). It is off by default because it doubles what a run costs.
 
-The flag always takes a value, and there are three. `reference` is a nested
+The flag always takes a value, and there are two. `reference` is a nested
 machine over the same fragment, which is what the seam is checked against rather
-than a way to go faster. `cranelift` compiles to native code in process, and is
-the one to reach for. `c` emits the same code as C, hands it to `cc`, and loads
-the result — far slower to compile, and not what you want in a loop, but its
-bodies carry symbols, so a sampling profiler and a disassembler can both read
-what a definition became. `PLY_C_KEEP=1` leaves the `.c` and the shared object
-behind for that; `PLY_C_REFUSALS=1` says which definitions the tier declined and
-why, since a definition a tier refuses is left to the machine.
+than a way to go faster. `c` is the code generator: it emits the fragment as C,
+hands it to `cc`, and loads the result. Its bodies carry symbols, so a sampling
+profiler and a disassembler can both read what a definition became.
+`PLY_C_KEEP=1` leaves the `.c` and the shared object behind for that;
+`PLY_C_REFUSALS=1` says which definitions the tier declined and why, since a
+definition the tier refuses is left to the machine. The emitted bodies and the
+built unit are both cached under `PLY_C_CACHE`, so a warm run compiles nothing
+and an edit recompiles one unit.
 
 A run with a backend attached does use the result cache, in a namespace of its
 own. A stored pass names the engine that earned it, so a backed run selects
@@ -3022,7 +3023,7 @@ is `E0127` with exit code 2 (§6.7).
 | `--bisect auto\|always\|never` | attribute a failure to the change that caused it |
 | `--bisect-budget N` | hybrid programs a bisection may evaluate (default 64) |
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
-| `--backend BACKEND` | attach a compiled backend: `reference`, `cranelift` or `c` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
+| `--backend BACKEND` | attach a compiled backend: `reference` or `c` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
 | `--profile PROFILE` | which toolchain the C tier compiles with: `development` (the default — the fastest compiler on the machine, inlining off) or `release` (`cc -O2`, inlining on). Requires `--backend`; the two profiles are required to answer identically, so this decides what a run costs and not what it means |
 | `--audit-backend` | also run each test without the backend and fail on any disagreement |
 | `--host` | bind the real host handlers |

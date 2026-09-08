@@ -90,13 +90,12 @@ build artifact.
 
 > **The compiled loop selects too, and still compiles everything.** What makes
 > this O(change) is the front-end cache keyed by content and a test selected
-> against the definition set it last passed under. Under `--backend cranelift`
-> both now hold: a stored pass names the engine that earned it, so a backed run
-> reads what backed runs proved. What a backed run still pays in full is the
-> compiling — `crates/ply-codegen` persists nothing between runs and builds its
-> unit once per worker — and the process start, since there is no `watch`, no
-> daemon and no server. ADR 0037 carries what that costs and the order to close
-> it in.
+> against the definition set it last passed under. Under `--backend c` both
+> hold: a stored pass names the engine that earned it, so a backed run reads
+> what backed runs proved, and `crates/ply-codegen` keeps each emitted body and
+> the built unit between runs, so a warm backed run compiles nothing. What an
+> edit still pays is one unit's `cc`, proportional to the program rather than
+> the edit; ADR 0037 carries what that costs and the order to close it in.
 
 ## Three ideas
 
@@ -321,11 +320,12 @@ the scalar-signature fragment — not a code generator, and slower than entering
 none — and it exists so that a *wrong* backend can be caught before a fast one
 is argued about:
 `--backend wrong:<mutation>` installs one of eight deliberately wrong backends.
-`cranelift` is a real JIT, compiled into the binary with no feature flag.
+`c` is the code generator: the fragment emitted as C, compiled by the C compiler
+on the machine, and loaded. ADR 0042 records why it is the only one.
 
 **It wins narrowly on the front end and loses on the request path, and that is
 the finding.** On a compute loop, which is almost entirely inside the fragment,
-cranelift is several times faster and enters nearly every call it is offered.
+the code generator is several times faster and enters nearly every call it is offered.
 The parser spike parsing the examples now runs inside one native entry per file
 and beats the interpreter by a fifth (`benches/front-end`), which says the cost
 left is what compiled code does with values rather than what it lowers. On the

@@ -106,8 +106,7 @@ fn artefact(loaded: &'static Loaded) -> ply_codegen::c::Native {
     )));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (native, _refused) = ply_codegen::c::build(source, &refs, ply_codegen::Opts::default())
-        .expect("the front end compiles");
+    let (native, _refused) = ply_codegen::c::build(source, &refs).expect("the front end compiles");
     native
 }
 

@@ -8,8 +8,8 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 ply="${PLY_BIN:-$root/target/release/ply}"
-# Which tier the `ply` arm runs on. `cranelift` is the gate's own; `c` is ADR 0040's.
-backend="${PLY_BACKEND:-cranelift}"
+# Which tier the `ply` arm runs on.
+backend="${PLY_BACKEND:-c}"
 # The C tier compiles under `development` unless told otherwise, and this file exists to measure
 # code rather than to compile it quickly: `development` is `cc -O0` with the inliner off, which is
 # forty times slower on k1 and would move this gate's verdict without moving anything it is a gate

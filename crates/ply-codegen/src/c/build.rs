@@ -1,16 +1,15 @@
 //! Building a unit: which bodies the tier takes, the C it emits for them, and the tables the
 //! runtime reads them against.
 //!
-//! The admitted set is a fixpoint, exactly as the Cranelift tier's is: a body is taken when it
-//! emits *and* every definition it calls is taken, so a set that compiles cannot call out of
-//! itself. The difference from the other tier is only what comes out the end — text, then one
-//! process and one link.
+//! The admitted set is a fixpoint: a body is taken when it emits *and* every definition it calls
+//! is taken, so a set that compiles cannot call out of itself.
 
+use super::Refused;
 use super::emit::{Emit, Unit, mangle};
 use super::load::{Library, compile_and_load};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_decls};
 use crate::heap::{Heap, Word, mark_immortal};
-use crate::jit::{Entry, Opts, Refused};
+use crate::rt::Entry;
 use crate::rt::{Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, bail};
@@ -244,11 +243,7 @@ fn emit_all(
 }
 
 /// Emit, compile and load `names` as one unit, with what it refused.
-pub fn build(
-    loaded: &'static Source,
-    names: &[&str],
-    _opts: Opts,
-) -> Result<(Native, Vec<Refused>)> {
+pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Refused>)> {
     let started = std::time::Instant::now();
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
@@ -268,16 +263,25 @@ pub fn build(
     if let Some(k) = &unit_key
         && let Some(cached) = super::cache::read_unit(k)
         && let Some(lib) = super::load::open_by_key(&cached.object)
-        && let Ok(native) = finish(loaded, lib, cached, ctors.clone())
     {
-        super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if std::env::var("PLY_C_PHASES").is_ok() {
-            eprintln!(
-                "phases: whole unit from cache, {}ms",
-                started.elapsed().as_millis()
-            );
+        let refused: Vec<Refused> = cached
+            .refusals
+            .iter()
+            .map(|(function, construct)| Refused {
+                function: function.clone(),
+                construct: construct.clone(),
+            })
+            .collect();
+        if let Ok(native) = finish(loaded, lib, cached, ctors.clone()) {
+            super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if std::env::var("PLY_C_PHASES").is_ok() {
+                eprintln!(
+                    "phases: whole unit from cache, {}ms",
+                    started.elapsed().as_millis()
+                );
+            }
+            return Ok((native, refused));
         }
-        return Ok((native, Vec::new()));
     }
     let Emitted {
         text,
@@ -301,6 +305,10 @@ pub fn build(
     let built = super::cache::UnitCache {
         object: super::load::object_key(&text),
         taken,
+        refusals: refusals
+            .iter()
+            .map(|r| (r.function.clone(), r.construct.clone()))
+            .collect(),
         shapes: unit.layouts.all_shape_names(),
         consts: unit.consts,
         fields: unit.fields,
@@ -504,8 +512,7 @@ pub(super) fn emit_one(
     e.count_reads(&lowered.code);
     e.mark_tails(&lowered.code);
     // Not `static`: an exported body carries a symbol, and a symbol is what lets a
-    // sampling profiler attribute time to a Ply definition. The Cranelift tier cannot be read
-    // this way at all, which is a real difference between the two and not a small one.
+    // sampling profiler attribute time to a Ply definition.
     let mut head = format!("Word {}(PlyCtx *ctx", mangle(name));
     let declared: Vec<super::emit::CTy> = match loaded
         .check
@@ -533,7 +540,7 @@ pub(super) fn emit_one(
     // The prologue `ply_eval::limit` needs: one nested call spent here and given back on the
     // normal return, so a compiled recursion is bounded by the number the machine bounds an
     // interpreted one by.
-    head.push_str("  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n");
+    head.push_str(super::emit::PROLOGUE);
     let answer = match e.expr(&lowered.code) {
         Ok(answer) => answer,
         Err(err) => {

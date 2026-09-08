@@ -53,8 +53,8 @@ fn load_dir(dir: &str) -> Loaded {
 fn the_census_over_the_parser_spike() {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../spikes/ply-parser");
     let loaded = load_dir(dir);
-    let unit = ply_codegen::Cranelift::over(loaded.program, loaded.resolved, loaded.check)
-        .expect("this host has a cranelift backend");
+    let unit = ply_codegen::Unit::over(loaded.program, loaded.resolved, loaded.check)
+        .expect("this host has a C compiler");
     let functions = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check)
         .functions()
         .len();

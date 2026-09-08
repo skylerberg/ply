@@ -200,12 +200,12 @@ fn a_second_run_selects_nothing_because_the_cache_is_exact() {
 fn a_second_backed_run_selects_nothing() {
     let dir = project(GREEN);
     ply(dir.path())
-        .args(["test", "--backend", "cranelift"])
+        .args(["test", "--backend", "c"])
         .assert()
         .success();
 
     let out = ply(dir.path())
-        .args(["test", "--backend", "cranelift"])
+        .args(["test", "--backend", "c"])
         .output()
         .unwrap();
     assert_eq!(out.status.code(), Some(0));
@@ -221,7 +221,7 @@ fn one_engines_pass_is_never_another_engines() {
     ply(dir.path()).arg("test").assert().success();
 
     let out = ply(dir.path())
-        .args(["test", "--backend", "cranelift"])
+        .args(["test", "--backend", "c"])
         .output()
         .unwrap();
     let text = stdout_of(&out);

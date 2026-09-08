@@ -151,8 +151,10 @@ pub(crate) fn ctor_value(name: &Symbol, arity: usize) -> Value {
         .unwrap_or_else(|_| fresh())
 }
 
+/// The operator over two values, exactly as the machine applies it; a compiled body reaches it
+/// for an operand whose type its emitter does not fix.
 #[inline(never)]
-pub(crate) fn strict_binary(
+pub fn strict_binary(
     op: BinOp,
     l: &Value,
     r: &Value,

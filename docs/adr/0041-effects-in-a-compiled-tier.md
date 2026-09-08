@@ -1,6 +1,7 @@
 # ADR 0041 — Effects in a compiled tier
 
-**Accepted as a staging. Stage 1 is built: both tiers carry `with cell`.** Every
+**Accepted as a staging. Stage 1 is built: the compiled tier carries `with
+cell`.** Every
 effect construct was refused when this was written. This record says which of
 them can be carried as *calls*, which cannot be carried without changing the
 tier's calling convention, and why the split falls where it does. It authorises
@@ -111,11 +112,12 @@ The gate that used to refuse `cell_get` and `cell_set` outright goes with it:
 the only cell either can be handed is one a `with cell` in the same body opened,
 because a cell is not a crossable argument.
 
-**And the finding that decides where the work goes: the fragment is the
-Cranelift tier's.** A definition enters the compiled set only if `Jit::refusals`
-accepts it, whatever tier will emit it — so implementing a construct in the
-emitted-C tier alone changes nothing. Both tiers gained the node together, and
-anything below has to.
+**And the finding that decided where the work went: the fragment was the
+in-process tier's.** A definition entered the compiled set only if that tier's
+dry run accepted it, whatever tier would emit it — so implementing a construct
+in the emitted-C tier alone changed nothing, and `with cell` had to land in
+both. ADR 0042 retired that tier for this reason among others; the compiled set
+is now the emitter's own fixpoint.
 
 ## The decision
 
@@ -131,7 +133,7 @@ has:
    is what makes the host case a call. What is not built is answering it, for
    the reason above: the first step is a decision about the seam, not a helper.
    This is where the definitions are, a dozen directly and most of `http`'s
-   cascade behind them, and it is both tiers, since the fragment is Cranelift's.
+   cascade behind them.
 3. **`handle`** — **not taken.** Reopen it when a body containing one is what a
    measurement shows the tier losing, and price the state-machine transform
    against the interpreter before writing any of it.

@@ -360,8 +360,8 @@ pub struct TestArgs {
     /// Attach a compiled backend to the machine, so a call it accepts is
     /// entered natively instead of evaluated.
     ///
-    /// `cranelift` is a code generator: it compiles the carried fragment
-    /// to machine code at startup and the machine drops into it at the leaves.
+    /// `c` is the code generator: it emits the carried fragment as C, compiles
+    /// it at startup and the machine drops into it at the leaves.
     /// `reference` answers correctly by evaluating the body on a machine of its
     /// own, and is what runs where there is no code generator.
     ///
@@ -618,7 +618,7 @@ pub struct RunArgs {
     pub shutdown: ShutdownOptions,
 
     /// Attach a compiled backend to the machine, as `ply test --backend` does:
-    /// `cranelift`, `reference`, or a `wrong:` corruption. A `.plyx` runs under
+    /// `c`, `reference`, or a `wrong:` corruption. A `.plyx` runs under
     /// it the same way.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,

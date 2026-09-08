@@ -393,7 +393,7 @@ fn a_backend_run_writes_no_pass_the_evaluator_will_read() {
 #[test]
 fn a_backed_run_that_selects_nothing_compiles_nothing() {
     let dir = project(CORPUS);
-    let report = run(dir.path(), Some("cranelift"));
+    let report = run(dir.path(), Some("c"));
     assert!(
         u64_at(&report, &["backend", "fragment"]) > 0,
         "the control did not compile a fragment, so the next assertion proves nothing: {}",
@@ -403,7 +403,7 @@ fn a_backed_run_that_selects_nothing_compiles_nothing() {
     let out = ply(dir.path())
         .arg("test")
         .arg("--backend")
-        .arg("cranelift")
+        .arg("c")
         .arg("--filter")
         .arg("nothing-matches-this")
         .arg("--json")
@@ -464,11 +464,11 @@ fn an_unknown_backend_is_refused_rather_than_ignored() {
 #[test]
 fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
     let dir = project(CORPUS);
-    let report = run(dir.path(), Some("cranelift"));
+    let report = run(dir.path(), Some("c"));
 
     assert_eq!(report["ok"], Value::Bool(true), "{report}");
     assert_eq!(u64_at(&report, &["summary", "failed"]), 0, "{report}");
-    assert_eq!(report["backend"]["name"], "cranelift", "{report}");
+    assert_eq!(report["backend"]["name"], "c", "{report}");
     assert_eq!(u64_at(&report, &["backend", "fired"]), 0, "{report}");
     assert!(
         u64_at(&report, &["backend", "entered"]) > 0,
@@ -504,7 +504,7 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
     // A code generator compiled something, and the report says how much it cost.
     assert!(
         u64_at(&report, &["backend", "units"]) > 0,
-        "no unit was compiled, so `cranelift` installed something that is not a code generator: {}",
+        "no unit was compiled, so `c` installed something that is not a code generator: {}",
         report["backend"]
     );
     let plain = run(dir.path(), Some("reference"));
@@ -518,7 +518,7 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
 #[test]
 fn an_off_by_one_in_compiled_code_is_caught_by_ply_test() {
     let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:off-by-one");
+    let caught = fires_and_is_caught(dir.path(), "c:wrong:off-by-one");
     assert!(
         caught.contains(&"m.double doubles".to_string()),
         "{caught:?}"
@@ -528,20 +528,20 @@ fn an_off_by_one_in_compiled_code_is_caught_by_ply_test() {
 #[test]
 fn an_inverted_comparison_in_compiled_code_is_caught_by_ply_test() {
     let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:inverted");
+    let caught = fires_and_is_caught(dir.path(), "c:wrong:inverted");
     assert!(caught.contains(&"m.even is even".to_string()), "{caught:?}");
 }
 
 #[test]
 fn a_stale_answer_from_compiled_code_is_caught_by_ply_test() {
     let dir = project(CORPUS);
-    fires_and_is_caught(dir.path(), "cranelift:wrong:stale");
+    fires_and_is_caught(dir.path(), "c:wrong:stale");
 }
 
 #[test]
 fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
     let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:wrong-type");
+    let caught = fires_and_is_caught(dir.path(), "c:wrong:wrong-type");
     assert!(
         caught.contains(&"m.double doubles".to_string()),
         "{caught:?}"
@@ -557,7 +557,7 @@ fn a_wrong_kind_from_compiled_code_is_caught_by_ply_test() {
 #[test]
 fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
     let dir = project(CORPUS);
-    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:unoffered");
+    let caught = fires_and_is_caught(dir.path(), "c:wrong:unoffered");
     assert!(
         caught.contains(&"m.a refused body adds one".to_string()),
         "{caught:?}"
@@ -569,7 +569,7 @@ fn an_answer_from_compiled_code_for_a_body_it_lacks_is_caught_by_ply_test() {
 #[test]
 fn compiled_code_that_runs_past_its_budget_is_caught_by_ply_test() {
     let dir = project(DEEP);
-    let control = run(dir.path(), Some("cranelift"));
+    let control = run(dir.path(), Some("c"));
     assert_eq!(u64_at(&control, &["summary", "failed"]), 1, "{control}");
     assert!(
         caught(&control).is_empty(),
@@ -582,14 +582,14 @@ fn compiled_code_that_runs_past_its_budget_is_caught_by_ply_test() {
         control["backend"]
     );
 
-    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:exceeds-budget=4");
+    let caught = fires_and_is_caught(dir.path(), "c:wrong:exceeds-budget=4");
     assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
 }
 
 #[test]
 fn compiled_code_that_ignores_its_budget_is_caught_where_the_body_terminates() {
     let dir = project(DEEP);
-    let caught = fires_and_is_caught(dir.path(), "cranelift:wrong:exceeds-budget");
+    let caught = fires_and_is_caught(dir.path(), "c:wrong:exceeds-budget");
     assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
 }
 
@@ -597,7 +597,7 @@ fn compiled_code_that_ignores_its_budget_is_caught_where_the_body_terminates() {
 #[test]
 fn compiled_code_is_never_offered_a_definition_that_performs() {
     let dir = project(CORPUS);
-    let report = run(dir.path(), Some("cranelift:wrong:answers=99@m.handled"));
+    let report = run(dir.path(), Some("c:wrong:answers=99@m.handled"));
 
     assert_eq!(
         u64_at(&report, &["backend", "offered_target"]),
@@ -615,8 +615,13 @@ fn compiled_code_is_never_offered_a_definition_that_performs() {
 }
 
 /// A recursion with no base case, under a backend that ignores its budget **entirely**.
+///
+/// Over native frames the budget is not the last bound: the compiled prologue also refuses when
+/// the thread's stack is nearly out, and the entry then declines to the machine, whose frames are
+/// on the heap and whose bound raises. So a backend that ignores its budget comes back red rather
+/// than taking the process down, and the assertion is on that -- an orderly exit, not a signal.
 #[test]
-fn the_unbounded_runaway_dies_under_a_code_generator_and_hangs_under_a_tree_walker() {
+fn the_unbounded_runaway_is_stopped_under_a_code_generator_and_hangs_under_a_tree_walker() {
     use std::process::{Command as Raw, Stdio};
     use std::time::{Duration, Instant};
 
@@ -654,8 +659,8 @@ test "a runaway" { assert_eq(spin(0), 0) }
 
     // The control: the honest code generator over the same corpus comes back, and comes back red
     // with the machine's own bound.
-    let honest = arm(dir.path(), "cranelift", Duration::from_secs(60))
-        .expect("the honest code generator finished");
+    let honest =
+        arm(dir.path(), "c", Duration::from_secs(60)).expect("the honest code generator finished");
     assert!(
         !honest.success(),
         "a recursion with no base case passed: {honest:?}"
@@ -670,30 +675,31 @@ test "a runaway" { assert_eq(spin(0), 0) }
         );
     }
 
-    // The corruption, over native frames: it dies, and quickly.
+    // The corruption, over native frames: the stack's floor stops it, and quickly.
     let corrupted = arm(
         dir.path(),
-        "cranelift:wrong:exceeds-budget",
+        "c:wrong:exceeds-budget",
         Duration::from_secs(60),
     )
     .expect(
         "a backend that ignores its budget over a recursion with no base case did not come back \
-         within 60s — under native frames it is supposed to die, and a hang here means the fuel \
-         prologue is being honoured by something that claims not to",
+         within 60s — over native frames the stack floor is supposed to stop it, and a hang here \
+         means neither the floor nor the budget is being honoured",
     );
     assert!(
         !corrupted.success(),
         "a backend that ignored its budget entirely reported success: {corrupted:?}"
     );
-    // **Died, not merely failed**, and the distinction is what stops this passing vacuously.
+    // **Refused, not dead**: the floor turned what used to take the process down into the
+    // machine's own diagnostic.
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
-        assert!(
-            corrupted.signal().is_some(),
-            "the corrupted run ended with an ordinary exit status ({corrupted:?}). Under native \
-             frames ignoring the budget is supposed to take the process down; an orderly exit \
-             means the corruption bit nothing — check that the fragment is not empty"
+        assert_eq!(
+            corrupted.signal(),
+            None,
+            "the corrupted run died by signal ({corrupted:?}): the compiled prologue's stack \
+             floor did not stop a runaway before the thread's stack ran out"
         );
     }
 
@@ -730,7 +736,7 @@ fn a_code_generator_run_reads_no_pass_the_evaluator_earned() {
     let out = ply(dir.path())
         .arg("test")
         .arg("--backend")
-        .arg("cranelift")
+        .arg("c")
         .arg("-j")
         .arg("1")
         .arg("--json")
@@ -763,7 +769,7 @@ fn a_code_generator_run_writes_no_pass() {
     let out = ply(dir.path())
         .arg("test")
         .arg("--backend")
-        .arg("cranelift")
+        .arg("c")
         .arg("-j")
         .arg("1")
         .arg("--json")
@@ -800,7 +806,7 @@ fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
     let dir = project(
         "fn double(x: Int) -> Int = x * 2\nfn main() -> Int = fold(range(0, 10), 0, |acc: Int, i: Int| acc + double(i))\n",
     );
-    for backend in ["cranelift", "reference"] {
+    for backend in ["c", "reference"] {
         let out = ply(dir.path())
             .arg("run")
             .arg("--json")
@@ -841,15 +847,15 @@ fn a_bare_wrong_prefix_still_names_the_reference_backend() {
     assert_eq!(bare["backend"]["name"], "reference", "{bare}");
     let named = run(dir.path(), Some("reference:wrong:off-by-one"));
     assert_eq!(named["backend"]["name"], "reference", "{named}");
-    let generated = run(dir.path(), Some("cranelift:wrong:off-by-one"));
-    assert_eq!(generated["backend"]["name"], "cranelift", "{generated}");
+    let generated = run(dir.path(), Some("c:wrong:off-by-one"));
+    assert_eq!(generated["backend"]["name"], "c", "{generated}");
 }
 
 /// A misspelled backend is refused rather than falling back to one that works.
 #[test]
 fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
     let dir = project(CORPUS);
-    for spec in ["cranelift:reference", "clif", "cranelift:wrong:off-by-two"] {
+    for spec in ["c:reference", "clif", "c:wrong:off-by-two"] {
         let out = ply(dir.path())
             .arg("test")
             .arg("--backend")
@@ -879,7 +885,7 @@ test "doubles" { assert_eq(double(21), 42) }
 test "wrong" { assert_eq(double(21), 41) }
 "#,
     );
-    let report = run(dir.path(), Some("cranelift"));
+    let report = run(dir.path(), Some("c"));
     assert_eq!(u64_at(&report, &["summary", "failed"]), 1, "{report}");
     assert!(
         u64_at(&report, &["backend", "entered"]) > 0,

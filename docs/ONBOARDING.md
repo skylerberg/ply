@@ -77,14 +77,10 @@ Measured cold, into an empty `CARGO_TARGET_DIR`. A cold build prints **157**
 | debug | `cargo build --workspace` | **16.8s** | 16.56s |
 | release | `cargo build --workspace --release` | **58.3s** | 53.85s |
 
-> **cranelift is an unconditional dependency.** `crates/ply-cli` depends on
-> `crates/ply-codegen` with **no feature flag to turn it off**, so a plain build
-> compiles a code generator whether or not you will use one.
->
-> **The version pin is a toolchain decision, not a dependency bump.** cranelift
-> 0.132.3 declares `rust-version = "1.93.0"`, at or below the toolchain this
-> repository already needs; 0.133 and later require 1.94.0. The pins in
-> `crates/ply-codegen/Cargo.toml` are deliberate and say so.
+> **The code generator is an unconditional dependency, and it needs a C
+> compiler at run time.** `crates/ply-cli` depends on `crates/ply-codegen` with
+> no feature flag to turn it off; the generator emits C and shells out to `cc`
+> (or `tcc` when installed), so `--backend c` needs one on `PATH`.
 
 Warm (nothing changed) is **0.11s** debug and **0.15s** release, re-measured;
 this line said 0.25s for both, which is the right order of magnitude and was not
@@ -95,8 +91,8 @@ step, no submodule, no `make`. Three binaries land:
 - `target/{debug,release}/ply-corpus` — the measurement harness
 - `target/release/w6-alloc` — an allocation counter used by one W6 test
 
-The `ply` binary carries a cranelift code generator since 2026-08-31, reachable
-as `ply test --backend cranelift`. It is off unless a run names it: a plain
+The `ply` binary carries a code generator, reachable as
+`ply test --backend c`. It is off unless a run names it: a plain
 `ply test` installs no backend at all, and a run that installs one neither reads
 nor writes the result cache. `ply test --help` has the grammar;
 `docs/adr/0026-a-reachable-backend.md` §4.9 has what it reaches and what it
@@ -651,8 +647,8 @@ purpose: each item moves the number the next one is judged against.
    see §1.
 
 > **The ceiling is fragment coverage, not entry.** This block used to say the
-> interpreter *cannot enter* compiled code; it can, and does — `--backend
-> cranelift` is a real JIT in the shipped binary. What decides whether that is
+> interpreter *cannot enter* compiled code; it can, and does — `--backend c`
+> is a real code generator in the shipped binary. What decides whether that is
 > worth anything is how much of a program falls inside the compiled fragment: on
 > a compute kernel it is most of it and the win is large, on a program built out
 > of the standard library it is a fraction of a percent and compiling costs more

@@ -1,7 +1,7 @@
 //! What the code generator compiles, what it refuses, and that what it answers is what the
 //! interpreter answers.
 
-use ply_codegen::Cranelift;
+use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{ModuleName, Program};
@@ -39,10 +39,10 @@ fn load(source: &str) -> Loaded {
     }
 }
 
-pub fn unit(source: &str) -> (&'static Loaded, &'static Cranelift) {
+pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
-    let unit = Cranelift::over(loaded.program, loaded.resolved, loaded.check)
-        .expect("this host has a cranelift backend");
+    let unit = Unit::over(loaded.program, loaded.resolved, loaded.check)
+        .expect("this host has a C compiler");
     (loaded, unit)
 }
 
@@ -175,7 +175,7 @@ fn read_by_step(acc: Pair, i: Int) -> Int = acc.x + i
 fn lent_to_a_step(n: Int) -> Int = { let p = {x: n, y: 0}; fold(range(0, 3), 0, |acc: Int, i: Int| acc + read_by_step(p, i)) + p.y }
 "#;
 
-pub fn call(unit: &'static Cranelift, name: &str, args: &[Value]) -> Option<Value> {
+pub fn call(unit: &'static Unit, name: &str, args: &[Value]) -> Option<Value> {
     let backend = unit.attach(&ply_eval::BackendSpec::honest());
     backend.enter(&Symbol::new(name), args, 10_000)
 }
@@ -618,16 +618,10 @@ fn the_compiled_set_is_closed_under_calls() {
     let (loaded, unit) = unit(ARITHMETIC);
     let source = ply_codegen::Source::new(loaded.program, loaded.resolved, loaded.check);
     let source: &'static ply_codegen::Source = Box::leak(Box::new(source));
-    let names: Vec<&str> = unit.compiled().iter().map(String::as_str).collect();
-    let refusals = ply_codegen::Jit::refusals(source, &names, ply_codegen::Opts::default())
-        .expect("the set compiles");
+    let (_, refusals) = ply_codegen::closure(source, unit.compiled()).expect("the set compiles");
     assert!(
         refusals.is_empty(),
-        "the fixpoint returned a set that still refuses: {:?}",
-        refusals
-            .iter()
-            .map(|r| (r.function.as_str(), r.construct.as_str()))
-            .collect::<Vec<_>>()
+        "the fixpoint returned a set that still refuses: {refusals:?}"
     );
 }
 
@@ -669,7 +663,7 @@ fn the_census_over_the_standard_library() {
     assert!(functions > 100, "only {functions} functions were offered");
 }
 
-/// `with_cell`, which both tiers carry since ADR 0041.
+/// `with_cell`, carried since ADR 0041.
 ///
 /// A cell is the one effect construct that is not control: it binds a first-class value and its
 /// operations are builtins. What the tiers had to gain is the node that opens one, the region it
@@ -777,9 +771,11 @@ fn what_the_fragment_refuses_the_standard_library_for() {
         "`perform` now costs {} definitions, not 12: {performed:?}",
         performed.len()
     );
+    // Three of these hold a `Decimal` literal of their own and are counted here because the
+    // callee they refuse on is reached first.
     assert!(
-        cascade.len() <= 9,
-        "{} definitions now cascade off a refusal, not 9: {cascade:?}",
+        cascade.len() <= 13,
+        "{} definitions now cascade off a refusal, not 13: {cascade:?}",
         cascade.len()
     );
     // The claim the ceilings are here to keep honest: `perform` is what the library is actually

@@ -30,7 +30,7 @@ open(sys.argv[1], 'w').write(
 PY
 
 for arm in none wide; do
-  flag=""; [ "$arm" = wide ] && flag="--backend cranelift"
+  flag=""; [ "$arm" = wide ] && flag="--backend c"
   ms=$("$ply" test "$dir" --no-cache --jobs 1 --filter "row:" $flag --json 2>/dev/null |
     python3 -c 'import json,sys
 r=json.load(sys.stdin)

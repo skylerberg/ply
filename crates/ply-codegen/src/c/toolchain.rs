@@ -1,10 +1,8 @@
 //! Which C toolchain this tier compiles with, and the inlining that has to go with it.
 //!
-//! The emitted tier's whole advantage over the in-process one is that it does not recompile: a
-//! warm run of the self-hosted front end reads its unit back out of a cache in milliseconds, where
-//! `cranelift-jit` has no object to cache and re-JITs 1400 definitions every time. An *edit*
-//! spends that advantage in one go -- `cc -O2` over the front end's twenty-nine megabytes of C is
-//! about thirty-eight seconds, against Cranelift's flat five and a half.
+//! A warm run of the self-hosted front end reads its unit back out of a cache in milliseconds. An
+//! *edit* spends that in one go -- `cc -O2` over the front end's twenty-nine megabytes of C is
+//! about thirty-eight seconds.
 //!
 //! So there are two things to compile for, and one compiler cannot be both:
 //!

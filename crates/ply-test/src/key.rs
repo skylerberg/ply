@@ -127,7 +127,7 @@ mod tests {
     }
 
     fn backend() -> Engine {
-        Engine::backend("cranelift")
+        Engine::backend("c")
     }
 
     #[test]
@@ -170,7 +170,7 @@ mod tests {
     fn two_backends_are_two_namespaces() {
         let plan = Plan::default();
         assert_ne!(
-            result_key(hash(1), false, &plan, &Engine::backend("cranelift")),
+            result_key(hash(1), false, &plan, &Engine::backend("c")),
             result_key(hash(1), false, &plan, &Engine::backend("reference"))
         );
     }
