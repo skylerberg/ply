@@ -409,11 +409,10 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "type T = | A(Int) | B\nfn nb() -> T = B\n",
         "type T = | A(Int) | B\nfn rd(t: T) -> Int = match t { A(x) -> x, B -> 0 }\n",
         "type P = | P2(Int, Int)\nfn both(a: Int, b: Int) -> Int = match P2(a, b) { P2(x, y) -> x + y }\n",
-        // Lambdas are not here, and the shipped corpus is why: a program small
-        // enough to write one in needs a *caller* that takes it, and calling a
-        // closure value is `rt_call_p`, which this port does not reach -- so the
-        // caller would be refused and this differential requires every body. The
-        // corpus has 275 bodies agreeing with lambdas among them.
+        // A lambda is a closure *and* a function written after the one that
+        // builds it, and calling one through a name is `rt_call_p`. Neither
+        // fuses: `apply` takes the closure as a value.
+        "fn apply(f: (Int) -> Int, n: Int) -> Int = f(n)\nfn mkl(k: Int) -> Int = apply(|x: Int| x + k, k)\n",
         // Deliberately absent, and worth saying why: a record built in both arms
         // of an `if` is *deferred* by the reference -- neither arm builds one,
         // and the join carries the fields as separate temporaries. A record of
@@ -435,7 +434,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 45, "only {reached} bodies were emitted");
+    assert!(reached >= 47, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
@@ -501,7 +500,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
         "the disagreements are not the ones this test knows about"
     );
     assert!(
-        reached >= 275,
+        reached >= 279,
         "the port emitted {reached} shipped bodies -- raise this when it grows, never lower it"
     );
 }
