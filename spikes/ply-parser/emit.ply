@@ -35,7 +35,7 @@ pub type V = { k: Kind, c: Bytes, ty: Ty }
 
 // What the emitter knows about a value's shape. Only records need more than the
 // kind, and only so that a field name can become the index it is read at.
-pub type Ty = | TyOpen | TyRec(List<Bytes>)
+pub type Ty = | TyOpen | TyRec(List<Bytes>) | TyBytes | TyList
 
 // The emitter's state: the lines written so far and the next temporary's number.
 // The lines written so far, the next temporary's number, and the slots whose
@@ -337,6 +337,61 @@ fn ret_of(here: List<Def>, name: Bytes) -> Option<Kind> =
 // The builtins the reference does not simply call: four expanded in place around
 // a load, and the joins, which it fuses over a list literal rather than building
 // the list and joining it.
+// The builtins the reference expands in place where the declaration fixes the
+// kind: with nothing to test, a length is the header's own field and a byte is a
+// bounds test around a load, with the runtime call as the out-of-range arm.
+//
+// `bytes_u32_le` is the fourth of the family and is not here: it reads four bytes
+// through a `memcpy` and answers a `U32`, which is a width this port has no kind
+// for.
+fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
+  if name == b"bytes_at" && len(args) == 2 { inline_at(em, args, params) }
+  else if len(args) != 1 { None }
+  else if name != b"len" && name != b"bytes_len" { None }
+  else { match list_at(args, 0) {
+    None -> None,
+    Some(x) -> match expr(em, x, params) {
+      None -> None,
+      Some(o) -> {
+        let fits = match o.v.ty {
+          TyList -> name == b"len",
+          TyBytes -> name == b"bytes_len",
+          _ -> false,
+        };
+        if !fits { None } else {
+          let t = bind(o.em, KBoxed, as_word(o.v));
+          Some(bind(t.em, KInt, bytes_concat_all([b"(int64_t)ply_obj(", t.v.c, b")->len"])))
+        }
+      },
+    },
+  } }
+
+fn inline_at(em: Em, args: List<Code>, params: List<P>) -> Option<Out> =
+  match list_at(args, 0) {
+    None -> None,
+    Some(b0) -> match list_at(args, 1) {
+      None -> None,
+      Some(i0) -> match expr(em, b0, params) {
+        None -> None,
+        Some(bv) -> if bv.v.ty != TyBytes { None } else { match expr(bv.em, i0, params) {
+          None -> None,
+          Some(iv) -> {
+            let t = bind(iv.em, KBoxed, as_word(bv.v));
+            let idx = bind(t.em, KInt, as_int(iv.v));
+            let bi = builtin_of(idx.em, b"bytes_at");
+            let g = line(bi.em, bytes_concat_all([
+              b"if ((uint64_t)", idx.v.c, b" >= (uint64_t)ply_obj(", t.v.c,
+              b")->len) { Word a[2]; a[0] = ", t.v.c, b"; ply_inc(a[0]); a[1] = ply_imm(",
+              idx.v.c, b"); rt_builtin_p(ctx, @@b", num(bi.i),
+              b"@@, (Word)(intptr_t)a, 2); return 0; }"]));
+            Some(bind(g, KInt, bytes_concat_all([
+              b"(int64_t)((unsigned char *)ply_words(", t.v.c, b"))[", idx.v.c, b"]"])))
+          },
+        } },
+      },
+    },
+  }
+
 fn is_inlined(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
     || name == b"bytes_concat_all" || name == b"bytes_join" || name == b"string_concat_all"
@@ -528,15 +583,15 @@ fn count_of(reads: List<Int>, slot: Int) -> Int =
   fold(reads, 0, |acc: Int, s: Int| if s == slot { acc + 1 } else { acc })
 
 fn width_of(ty: Ty) -> Option<Int> =
-  match ty { TyOpen -> None, TyRec(ns) -> Some(len(ns)) }
+  match ty { TyRec(ns) -> Some(len(ns)), _ -> None }
 
 fn field_at(ty: Ty, name: Bytes) -> Option<Int> =
   match ty {
-    TyOpen -> None,
     TyRec(ns) ->
       if fold(ns, false, |acc: Bool, n: Bytes| acc || n == name) {
         Some(rank_of(ns, name))
       } else { None },
+    _ -> None,
   }
 
 fn as_bool(v: V) -> Bytes =
@@ -865,7 +920,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                       // and a bounds test around a load, and the runtime call is
                       // only its slow arm. Emitting a call for either is a wrong
                       // answer rather than a slow one.
-                      None -> if is_callback(fv.name) || is_inlined(fv.name) { None }
+                      // `len` and `bytes_len` over a value whose kind the
+                      // declaration fixes: no test to make, and the answer is the
+                      // header's own field.
+                      None -> match inline_len(em, fv.name, a.args, params) {
+                        Some(o) -> Some(o),
+                        None -> if is_callback(fv.name) || is_inlined(fv.name) { None }
                         else if !fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == fv.name) { None }
                         else { match args_owned(em, a.args, params, 0, []) {
                           None -> None,
@@ -881,6 +941,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             Some({ em: check(o.em), v: o.v })
                           },
                         } },
+                      },
                       Some(m) -> match args_one_pass(em, a.args, params, 0, []) {
                         None -> None,
                         Some(w) -> {
@@ -1244,6 +1305,10 @@ pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
       if c.name.module != None { None }
       else if c.name.name.name == b"Int" && len(c.args) == 0 { Some({ k: KInt, ty: TyOpen }) }
       else if c.name.name.name == b"Bool" && len(c.args) == 0 { Some({ k: KBool, ty: TyOpen }) }
+      // The two the inline builtins ask about: with the kind known there is no
+      // test to make and the read is a load.
+      else if c.name.name.name == b"Bytes" && len(c.args) == 0 { Some({ k: KBoxed, ty: TyBytes }) }
+      else if c.name.name.name == b"List" && len(c.args) == 1 { Some({ k: KBoxed, ty: TyList }) }
       else { Some({ k: KBoxed, ty: TyOpen }) },
     // The field *order* is the checker's, not the declaration's: a record written
     // `{ z: Int, a: Int }` reads `.z` at index 1. Sorting by name here is what
