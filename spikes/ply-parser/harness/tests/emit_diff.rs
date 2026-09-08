@@ -455,7 +455,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     );
     assert!(differ.is_empty(), "these disagree: {differ:?}");
     assert!(
-        reached >= 36,
+        reached >= 94,
         "the port emitted {reached} shipped bodies -- raise this when it grows, never lower it"
     );
 }
