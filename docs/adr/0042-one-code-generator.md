@@ -133,6 +133,13 @@ behind an instrument that already exists.
    all Ply; entered once from the driver with source bytes in and C text out,
    nothing in Rust reads a Ply value, and the bridge `ply bootstrap` said was
    missing is not needed. The dumps remain what the differentials compare.
+   **Built:** `PLY_C_EMITTER=ply-whole:<dir>` enters the port's front end,
+   lowering and emitter once over the program's source bytes and takes its
+   answer -- every body as C and tables, every refusal as the fixpoint's -- as
+   the unit's, with the reference emitter run only to build the producer
+   itself. The port emits every body the reference emits over the shipped
+   corpus, each resolving to the reference's C, and the audit is green in this
+   mode over the standard library and the examples.
 4. **Effects by evidence passing.** ADR 0041 declined `handle` because carrying
    it meant every effectful function becoming a state machine over a heap
    frame. That is the price of the naive design. The design Ply's own reference
