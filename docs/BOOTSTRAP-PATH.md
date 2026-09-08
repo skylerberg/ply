@@ -413,12 +413,11 @@ What the compiled loop does not have, in the order to take them:
   other unchanged file. An edit in a warm process no longer grows with the
   project, and no longer depends on whether the project has tests that run every
   time.
-- **A compiled-code cache**, which the row demoted. `crates/ply-codegen`
-  persists nothing across runs: no `DefHash -> code`, and `cranelift-jit` rather
-  than `cranelift-object`, so there is no object output for a cache to hold, and
-  `Cranelift::over` builds the whole unit once as a pre-flight and again for
-  every worker that attaches. A warm process removes that cost without
-  serialising anything, so this is only needed if the warm process is not
+- **A compiled-code cache**, which the row demoted and the C tier now has:
+  each emitted body is kept per definition and the built unit per program
+  (`crates/ply-codegen/src/c/cache.rs`), so a warm run compiles nothing and an
+  edit pays one unit's `cc`. A warm process removes even that without
+  serialising anything, so per-definition objects are only needed if the warm process is not
   enough.
 
 The row is taken and it re-ordered these itself. A lever's share of a
@@ -431,7 +430,7 @@ cost went unnoticed until something measured an edit.
 Every language rests on a host it did not write. Rust's is LLVM, libc and the
 kernel, and everything with language content — the front end, the middle, the
 standard library — sits above that line in Rust. Ply's line today is drawn much
-higher: the evaluator, the code generator through Cranelift, the runtime helpers
+higher: the evaluator, the code generator, the runtime helpers
 compiled code calls, the driver and the host effects are all Rust. The path ends
 when that line is where Rust's is: a Ply compiler, written in Ply, emitting C
 whose only external dependencies are a C compiler and the C library, over a
@@ -441,11 +440,10 @@ runtime written in Ply or a thin C shim.
 (ADR 0037). Emitted C is the release tier: `ply build`, distribution, and a
 bootstrap chain anyone can follow with a C compiler alone. The loop's tier is
 whatever makes an edit compile O(change) definitions and a run load what its
-selected tests reach, at a per-definition constant the loop affords. Cranelift
-is that tier today and is a Rust library, so this goal takes it away
-eventually; ADR 0037 lists what could replace it — the same C over
-per-definition objects, a C compiler linked in process, copy-and-patch — with
-the trade each makes, and chooses none until the rows it registers are read.
+selected tests reach, at a per-definition constant the loop affords. ADR 0042
+made emitted C the only tier; ADR 0037 lists what would make it O(change) per
+edit — the same C over per-definition objects, or a C compiler linked in
+process — with the trade each makes.
 
 The route is visible already, which is why it can be written down before it is
 started. The runtime surface compiled code depends on is an enumerated table —

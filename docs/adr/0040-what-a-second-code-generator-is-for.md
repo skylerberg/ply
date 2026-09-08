@@ -28,7 +28,9 @@ runs it against the same gate, the same kernels and the same interpreter.
 >
 > **What it does not decide.** That C is the release target; ADR 0021 and
 > ADR 0037 carry that direction and this record does not re-take it. That
-> Cranelift is replaced; nothing here displaces it.
+> Cranelift is replaced; nothing here displaces it. **ADR 0042 does**, and the
+> placement this record made — the C tier off the loop's path — is superseded
+> there; the measurements and the levers below stand.
 
 ## What was built
 

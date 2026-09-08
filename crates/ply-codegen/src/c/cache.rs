@@ -301,6 +301,9 @@ pub struct UnitCache {
     /// The object the assembled source hashes to, recorded so no source is needed to find it.
     pub object: String,
     pub taken: Vec<String>,
+    /// What the fixpoint dropped and why, so a unit read back reports the same refusals as the
+    /// build that wrote it.
+    pub refusals: Vec<(String, String)>,
     pub consts: Vec<Value>,
     pub fields: Vec<Symbol>,
     pub builtins: Vec<ply_eval::Builtin>,
@@ -320,7 +323,7 @@ pub fn unit_key(
     let mut sorted: Vec<&str> = offered.to_vec();
     sorted.sort_unstable();
     let mut h = blake3::Hasher::new();
-    h.update(b"ply-c-unit-1");
+    h.update(b"ply-c-unit-2");
     for name in sorted {
         // Without a hash for every offered definition there is nothing to notice an edit by, and
         // a unit cache that cannot notice one is a wrong answer rather than a slow one.
@@ -361,6 +364,10 @@ fn encode_unit(u: &UnitCache) -> String {
     for t in &u.taken {
         out.push_str(&format!("{t}\n"));
     }
+    out.push_str(&format!("refused {}\n", u.refusals.len()));
+    for (function, construct) in &u.refusals {
+        out.push_str(&format!("{function}\n{construct}\n"));
+    }
     out.push_str(&encode_tables(
         &u.consts,
         &u.builtins,
@@ -379,10 +386,18 @@ fn decode_unit(s: &str) -> Option<UnitCache> {
     for _ in 0..n {
         taken.push(line(s, &mut at)?.to_string());
     }
+    let n = count(line(s, &mut at)?, "refused")?;
+    let mut refusals = Vec::with_capacity(n);
+    for _ in 0..n {
+        let function = line(s, &mut at)?.to_string();
+        let construct = line(s, &mut at)?.to_string();
+        refusals.push((function, construct));
+    }
     let t = decode_tables(s, &mut at)?;
     Some(UnitCache {
         object,
         taken,
+        refusals,
         consts: t.consts,
         fields: t.fields,
         builtins: t.builtins,

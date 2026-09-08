@@ -393,7 +393,7 @@ fn iterate(
 
 struct BackendView {
     spec: Option<String>,
-    /// Which backend answered — `reference` or `cranelift`.
+    /// Which backend answered — `reference` or `c`.
     name: &'static str,
     /// Definitions the backend had a body for.
     fragment: usize,
@@ -2888,7 +2888,7 @@ test \"stuck\" {
     #[test]
     fn recording_under_an_engine_the_run_did_not_select_against_is_an_escape() {
         let mut report = report_over(vec![recorded_result(Some(Record::Under(vec![])))]);
-        report.engine = ply_test::Engine::backend("cranelift:wide");
+        report.engine = ply_test::Engine::backend("c:wide");
         let escapes = backend_escapes(&report, &ply_test::Engine::Evaluator);
         assert_eq!(escapes.len(), 1, "the disagreement was not reported");
         assert!(
@@ -2897,7 +2897,7 @@ test \"stuck\" {
             escapes[0].message
         );
         assert!(
-            escapes[0].message.contains("cranelift:wide"),
+            escapes[0].message.contains("c:wide"),
             "{}",
             escapes[0].message
         );
@@ -2910,7 +2910,7 @@ test \"stuck\" {
         let mut report = report_over(vec![recorded_result(None)]);
         report.engine = ply_test::Engine::Evaluator;
         assert!(
-            backend_escapes(&report, &ply_test::Engine::backend("cranelift:wide")).is_empty(),
+            backend_escapes(&report, &ply_test::Engine::backend("c:wide")).is_empty(),
             "a run that wrote nothing was reported as writing in the wrong namespace"
         );
     }

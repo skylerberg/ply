@@ -131,7 +131,7 @@ run_arm() {                       # $1 label, $2... command; prints "user wall"
 arm_cmd() {                       # $1 arm -> the command, as words on stdout
   case "$1" in
     none|null) echo "$ply test $dir --no-cache --jobs $workers --filter row:" ;;
-    wide)      echo "$ply test $dir --no-cache --jobs $workers --filter row: --backend cranelift" ;;
+    wide)      echo "$ply test $dir --no-cache --jobs $workers --filter row: --backend c" ;;
     floor)     echo "$ply test $dir --no-cache --jobs $workers --filter row:nothing-matches" ;;
   esac
 }

@@ -17,7 +17,7 @@ unsafe extern "C" {
 const RTLD_NOW: c_int = 2;
 
 /// A loaded unit. Dropping it closes the library, which invalidates every entry taken from it —
-/// which is why `Bodies` keeps one alive for as long as it holds an [`crate::jit::Entry`].
+/// which is why `Bodies` keeps one alive for as long as it holds an [`crate::rt::Entry`].
 pub struct Library {
     handle: *mut c_void,
     /// Kept so a unit that outlives its build directory still names where it came from in a

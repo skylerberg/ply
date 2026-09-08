@@ -1,12 +1,8 @@
-//! A C tier for the compiled fragment: the same `Code` the Cranelift backend lowers, emitted as C
-//! and handed to `cc`.
+//! The compiled tier: the machine's lowered `Code`, emitted as C and handed to `cc`.
 //!
 //! ADR 0037 listed the candidates and `benches/value-model/c-tier/` priced this one on the value
-//! model Ply actually compiles, before it was built, at about one and a half times the Rust bar
-//! where Cranelift was six. What was built reads 2.5 on the integer kernel against Cranelift's
-//! 4.2-4.5, and 3.8 on the state kernel against Cranelift's 1.7 -- so the prediction had the
-//! ordering right on one kernel and does not describe the other. `benches/value-model/` carries
-//! the readings; this line is here because the prediction used to stand in for them.
+//! model Ply actually compiles before it was built; `benches/value-model/` carries what was built
+//! reads against the Rust bar, and ADR 0042 records why it is the only code generator.
 //!
 //! ## The instruments
 //!
@@ -49,6 +45,25 @@ pub use load::Library;
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
 pub use toolchain::{Profile, select as select_profile};
 
+/// What the emitter refused, and where.
+#[derive(Debug)]
+pub struct Refused {
+    pub function: String,
+    pub construct: String,
+}
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "`{}` is outside the compiled fragment: {}",
+            self.function, self.construct
+        )
+    }
+}
+
+impl std::error::Error for Refused {}
+
 /// The addresses the loaded unit binds, in [`HELPERS`]' order, so a helper cannot be declared and
 /// left unbound: the table below and the table there are read together by a test.
 pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
@@ -66,6 +81,8 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_unbox_int" => rt::rt_unbox_int as *const (),
             "rt_unbox_bool" => rt::rt_unbox_bool as *const (),
             "rt_no_fuel" => rt::rt_no_fuel as *const (),
+            "rt_no_stack" => rt::rt_no_stack as *const (),
+            "rt_binary" => rt::rt_binary as *const (),
             "rt_arith" => rt::rt_arith as *const (),
             "rt_lit" => rt::rt_lit as *const (),
             "rt_no_match" => rt::rt_no_match as *const (),

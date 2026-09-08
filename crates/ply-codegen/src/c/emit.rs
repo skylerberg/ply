@@ -1,17 +1,15 @@
 //! The emitter: one `Code` body in, one C function out.
 //!
-//! It reuses the Cranelift tier's whole analysis — `Jit` holds the constant pool, the shapes, the
-//! field and builtin tables and the published signatures, and `Jit::prepare` has already built
-//! them — so this file is the *code* and nothing else, which is ADR 0037's "one code generator
-//! serving both tiers" taken literally.
+//! `Unit` holds the constant pool, the shapes, the field and builtin tables and the published
+//! signatures; this file is the *code*.
 //!
 //! **Ownership is deliberately conservative here and is the first thing to revisit.** A value
 //! passed where a runtime helper takes one is duplicated first, and nothing is ever released: the
 //! entry's arena is recycled whole when the entry ends (`Ctx::end`), so a body that never
-//! decrements leaks only within one entry and can never free something still held. It costs the
-//! token reuse the Cranelift tier has, and it cannot be wrong.
+//! decrements leaks only within one entry and can never free something still held. It costs
+//! token reuse, and it cannot be wrong.
 
-use crate::jit::{Kind, Refused};
+use super::Refused;
 use crate::source::Source;
 use anyhow::Result;
 use ply_eval::code::{Arm, Captures, Pat, Stmt};
@@ -20,6 +18,25 @@ use ply_eval::{Builtin, Code, NodeKind, Value};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, IntTy, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
+
+/// What every compiled function does before its body: spends one unit of the machine's nesting
+/// budget, and refuses when the native stack is nearly out, because a C frame is not a machine
+/// frame and the budget alone cannot see the stack.
+pub(super) const PROLOGUE: &str = "  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  \
+     { char probe; if ((uintptr_t)&probe < ctx->stack_floor) { rt_no_stack_p(ctx); return 0; } }\n  \
+     ctx->fuel -= 1;\n";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Kind {
+    Int,
+    Bool,
+    Boxed,
+    /// A fixed-width integer, held at its own width (ADR 0039). Only the six widths below
+    /// sixty-four appear: a value of one of those always fits the sixty-three bits an immediate
+    /// carries, so boxing one is a shift and an or with no branch and no allocator. `U64` and
+    /// `I64` do not have that property and are left outside the fragment.
+    Num(IntTy),
+}
 
 /// A value the emitted C holds: the C expression naming it, what it means, and what the checker
 /// said its type is — which is how a width survives a record field, and without which `rotr` on a
@@ -41,9 +58,8 @@ impl V {
     }
 }
 
-/// What the emitter keeps of a type the checker published. The Cranelift tier interns the same
-/// thing; here it is carried by value, since a record's field list is short and there is no
-/// module to hold a table for.
+/// What the emitter keeps of a type the checker published, carried by value, since a record's
+/// field list is short and there is no module to hold a table for.
 #[derive(Clone, PartialEq, Debug)]
 pub enum CTy {
     Unknown,
@@ -78,9 +94,8 @@ impl CTy {
                 "Float" | "Decimal" => CTy::Opaque,
                 // A width past sixty-two bits is not an immediate, so carrying one in a register
                 // would need a heap object of its own kind and a test for it -- the cost the
-                // family exists to remove. `jit::carried_width` draws the line in the same place
-                // and for the same reason; a `U64` left in a register here loses its top bit to
-                // the tag on the way into a record.
+                // family exists to remove; a `U64` left in a register here would lose its top
+                // bit to the tag on the way into a record.
                 other => match IntTy::from_name(other) {
                     Some(t) if t.bits() < 64 => CTy::Num(t),
                     Some(_) => CTy::Opaque,
@@ -143,8 +158,8 @@ pub fn ctype(k: Kind) -> &'static str {
 }
 
 /// The unsigned C type of a width, which every operation defined to wrap is computed in.
-/// Whether a value of this width is carried in a register at all. The same line
-/// `jit::carried_width` draws, for the same reason: past sixty-two bits the tag has nowhere to go.
+/// Whether a value of this width is carried in a register at all: past sixty-two bits the tag has
+/// nowhere to go.
 fn carried(t: IntTy) -> bool {
     t.bits() < 64
 }
@@ -165,7 +180,7 @@ pub struct Emit<'a> {
     /// The body's statements, in order.
     pub out: String,
     tmp: usize,
-    /// The bindings in scope, innermost last, as the Cranelift tier keeps them.
+    /// The bindings in scope, innermost last.
     scope: Vec<(Symbol, V)>,
     /// What the unit needs beside the code: constants, shapes, field names, builtins.
     pub unit: &'a mut Unit,
@@ -311,8 +326,7 @@ struct Deferred {
     words: Vec<String>,
 }
 
-/// What an emitted unit accumulates that is not code. It is the Cranelift tier's `Jit` state,
-/// named separately because only these four tables are the C tier's to fill.
+/// What an emitted unit accumulates that is not code.
 pub struct Unit {
     pub consts: Vec<Value>,
     pub fields: Vec<Symbol>,
@@ -779,6 +793,27 @@ impl<'a> Emit<'a> {
         v.k != Kind::Boxed || v.ty != CTy::Opaque
     }
 
+    /// An operator over an operand whose type this emitter does not fix -- a `Float`, a
+    /// `Decimal` -- through the machine's own operator, so the body compiles and answers what the
+    /// machine answers. Every caller of such a body used to be refused with it.
+    fn generic_binary(&mut self, op: BinOp, l: &V, r: &V) -> Result<V> {
+        let a = self.owned(l);
+        let b = self.owned(r);
+        let code = crate::rt::binop_code(op);
+        let ty = match op {
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne => CTy::Bool,
+            _ if l.ty == CTy::Opaque => l.ty.clone(),
+            _ => r.ty.clone(),
+        };
+        let v = self.bind_as(
+            Kind::Boxed,
+            ty,
+            format!("rt_binary_p(ctx, {code}, {a}, {b})"),
+        );
+        self.check();
+        Ok(v)
+    }
+
     fn refuse_unless_int(&self, l: &V, r: &V, what: &str) -> Result<()> {
         if Self::int_like(l) && Self::int_like(r) {
             return Ok(());
@@ -1042,7 +1077,8 @@ impl<'a> Emit<'a> {
             UnOp::BitNot => match v.k {
                 Kind::Num(t) => {
                     let a = self.as_num(&v, t);
-                    Ok(self.bind(Kind::Num(t), format!("({}) ~({a})", "")))
+                    let ty = ctype(Kind::Num(t));
+                    Ok(self.bind(Kind::Num(t), format!("({ty}) ~({a})")))
                 }
                 _ => {
                     let a = self.as_int(&v);
@@ -1126,8 +1162,10 @@ impl<'a> Emit<'a> {
                         let b = self.as_num(&r, t);
                         Ok(self.bind(Kind::Num(t), format!("({a}) {c} ({b})")))
                     }
+                    None if !(Self::int_like(&l) && Self::int_like(&r)) => {
+                        self.generic_binary(op, &l, &r)
+                    }
                     None => {
-                        self.refuse_unless_int(&l, &r, c)?;
                         let a = self.as_int(&l);
                         let b = self.as_int(&r);
                         Ok(self.bind(Kind::Int, format!("({a}) {c} ({b})")))
@@ -1148,8 +1186,10 @@ impl<'a> Emit<'a> {
                         let b = self.as_num(&r, t);
                         Ok(self.bind(Kind::Bool, format!("({a}) {c} ({b})")))
                     }
+                    None if !(Self::int_like(&l) && Self::int_like(&r)) => {
+                        self.generic_binary(op, &l, &r)
+                    }
                     None => {
-                        self.refuse_unless_int(&l, &r, c)?;
                         let a = self.as_int(&l);
                         let b = self.as_int(&r);
                         Ok(self.bind(Kind::Bool, format!("({a}) {c} ({b})")))
@@ -1218,8 +1258,8 @@ impl<'a> Emit<'a> {
                 };
                 self.narrow(&wide, t, matches!(op, BinOp::Sub))
             }
+            None if !(Self::int_like(l) && Self::int_like(r)) => self.generic_binary(op, l, r),
             None => {
-                self.refuse_unless_int(l, r, "arithmetic")?;
                 let a = self.as_int(l);
                 let b = self.as_int(r);
                 match op {
@@ -1675,9 +1715,7 @@ impl<'a> Emit<'a> {
             self.param(name, format!("q{i}"), CTy::Unknown);
         }
         head.push_str(") {\n");
-        head.push_str(
-            "  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n",
-        );
+        head.push_str(PROLOGUE);
         let answer = self.expr(body)?;
         let word = self.word(&answer);
         let mut out = head;
@@ -2238,6 +2276,12 @@ impl<'a> Emit<'a> {
                 args.len()
             ));
         }
+        if b == Builtin::SecretOfString {
+            return self.refuse(format!(
+                "`{}`, which would put a credential in the fragment's value arena",
+                b.name()
+            ));
+        }
         // `iterate` over a lambda literal is the loop, emitted in the body rather than called
         // through the runtime: `iterate` *is* the loop in this language (ADR 0022), so a tier that
         // sent it through a callback would be sending every loop through one.
@@ -2376,7 +2420,7 @@ impl<'a> Emit<'a> {
         // The three the integer kernel reads its input through, inline with a slow path. A hash
         // asks `bytes_at` once per byte --- sixty-five thousand times over this kernel's input ---
         // and each one through the runtime is an argument array, a duplicate, and a dispatch on a
-        // builtin index. The Cranelift tier inlines the same three for the same reason.
+        // builtin index.
         if let Some(v) = self.inline_bytes(b, &vals)? {
             return Ok(v);
         }
@@ -2435,8 +2479,7 @@ impl<'a> Emit<'a> {
     /// call, so neither is duplicated on the way in -- which is what `owned` would do and what
     /// would leak one count per element.
     /// **`map` and `filter` are not fused here, and one attempt at it is recorded rather than
-    /// left to be repeated.** The in-process tier fuses all three -- `jit.rs`'s `fused_loop`, with
-    /// a `Step::Inline` that lowers a lambda literal in the loop's own body -- and this tier sends
+    /// left to be repeated.** This tier sends
     /// `map` and `filter` through `rt_map`/`rt_filter`, which walk the list themselves and enter
     /// each element through `call_value`. Over the self-hosted front end that is 273 `map` sites
     /// and 19 `filter` sites, and `call_value` is the largest item in its profile.

@@ -33,17 +33,16 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # Shard id, then its packages.
 #
-# **Split on dependency weight, not on measured seconds.** Four packages need
-# the heavy half of the graph -- `ply-codegen` and `ply-cli` pull cranelift,
-# `ply-cli` and `ply-corpus` also pull tokio, rustls and a postgres client,
-# `ply-host` pulls the latter three. Everything else builds against about
-# eighty crates instead of about two hundred. That boundary is a property of
+# **Split on dependency weight, not on measured seconds.** Three packages need
+# the heavy half of the graph -- `ply-cli` and `ply-corpus` pull tokio, rustls
+# and a postgres client, `ply-host` pulls the same three. Everything else
+# builds against a far smaller graph. That boundary is a property of
 # the manifests rather than a reading off one runner, so it does not go stale
 # between commits the way the figures below do.
 #
 # It decides the table twice over. A test binary links its whole graph, so the
-# *same* test target costs materially more in a shard that carries cranelift
-# and a TLS stack than in one that does not -- which makes "put the light
+# *same* test target costs materially more in a shard that carries a TLS stack
+# than in one that does not -- which makes "put the light
 # packages where the light graph is" a win on total work even before it is a
 # win on balance. The previous arrangement did the opposite: nine light
 # packages sat in the `cli` shard, linking twelve-odd test binaries against the
@@ -51,7 +50,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 #
 # **The imbalance is compile and linking, not tests.** Balancing on test
 # seconds, which is what earlier revisions of this table did, was measuring the
-# smaller half. So: `cli` keeps only what needs cranelift, `corpus` and
+# smaller half. So: `cli` keeps only what needs the heavy graph, `corpus` and
 # `postgres` are their own graphs, and the light packages sit on the light one.
 #
 # `ply-eval` is a shard of its own because it is the one light package whose
@@ -79,8 +78,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # `crates/ply-cli/tests/suite/backend.rs`, and a partition that could run one
 # without the other would let half of the backend decision s4.5's condition go green alone.
 # It also costs that shard almost nothing to run -- its own suite is 12 tests
-# in ~4.4s -- and the cranelift packages behind it are a build `ply-cli` pays
-# anyway.
+# in ~4.4s.
 #
 # A crate's integration suite is a package of its own, `<crate>-tests`, so that
 # it compiles at `opt-level = 0` while the crate stays at 2 (the root manifest
@@ -121,7 +119,7 @@ POSTGRES_SHARD=postgres
 # compiled seam with no equivalent in the shipping tree. Those tests were about
 # *the spike's* seam, though, which is a demonstration about a program nothing
 # ships. They are ported -- `crates/ply-codegen-tests/tests/suite/hazards.rs`,
-# over `ply_codegen::Cranelift` and the machine it attaches to -- so the tree
+# over `ply_codegen::Unit` and the machine it attaches to -- so the tree
 # gained the coverage rather than kept it. Two of them changed meaning in the
 # port and say so where they stand: this tier runs a higher-order builtin the
 # spike had to refuse, and it registers a `Float` signature the spike declined
