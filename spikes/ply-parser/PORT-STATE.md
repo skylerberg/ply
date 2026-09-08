@@ -67,6 +67,19 @@ and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
 
+**Effects, by evidence passing (ADR 0043).** The port emits `handle`, `perform` and `with cell`,
+none of which the reference emits, so they compile only with the chain entered whole and are
+held to the audit alone. A `handle` site pushes a runtime frame holding each clause as a
+closure, runs its body inline with every failing call landing at the site -- `check` writes a
+`goto` inside a handle body -- and lands through `rt_handle_land`, which pops the frame,
+applies the `return` clause, passes an error on, or catches an unwind aimed at it. A
+`perform` is `rt_perform` over the frames, with the effect, operation and resource named
+through the field table and the operation's mode beside them. A clause that binds `resume` is
+carried only when every use of the binder is a tail call. Effect names resolve program-wide
+through the module's scope, with the prelude's three known by their bare names, and the
+tables gain the operations a body performs and handles, as `effect#op`, for the unit's
+fixpoint. A body's reads inside a clause count in the clause's own window, as a lambda's do.
+
 **The port emits everything the reference emits.** The last four census items closed: a
 lambda inside a lambda is one more of its owner's, its entry interned before its body and its
 text written after its owner's, and it runs in a frame of its own -- fresh alias, release and
