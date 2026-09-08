@@ -1414,6 +1414,11 @@ fn dump_slot(out: &mut String, slot: Option<u32>) {
     }
 }
 
+/// One body's lowered shape, for a probe that wants to see what the emitter is handed.
+pub fn dump_one(out: &mut String, c: &ply_eval::code::Code) {
+    dump_code(out, c)
+}
+
 fn dump_code(out: &mut String, c: &ply_eval::code::Code) {
     use ply_eval::code::NodeKind as N;
     dump_own(out, c.own);
