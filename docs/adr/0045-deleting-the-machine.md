@@ -81,11 +81,10 @@ So the fifth stage has a prerequisite this record did not list: **the tier
 releases within an entry**, transcribing the machine's rule into the
 emitter written in Ply, whose lowering already carries the last-use marks
 the machine acts on and whose lowering differential says they are the
-machine's. Until it is built, the bootstrap fixpoint and the port's ratchet
-over its own sources are `#[ignore]`d in CI and run by hand, and the
-emitter's own tests are not run tier-only there; a served program's entry
-would leak the same way for as long as it served, which is the other reason
-this comes before the deletion and not after it. It is the next record.
+machine's. A served program's entry would leak the same way for as long as
+it served, which is the other reason this comes before the deletion and not
+after it. ADR 0046 built it, and the bootstrap fixpoint, the port's ratchet
+over its own sources and the emitter's own tests tier-only run in CI again.
 
 ## The inventory
 
