@@ -59,7 +59,7 @@ pub(crate) fn decimal_lit(mantissa: i128, scale: u32) -> Decimal {
 /// `Float` matches by IEEE `==`, so a `NaN` pattern matches nothing at all —
 /// including a NaN scrutinee. A pattern that answered otherwise would be a
 /// second equality on the type, and nobody wrote that one down.
-pub(crate) fn lit_matches(lit: &Lit, value: &Value) -> bool {
+pub fn lit_matches(lit: &Lit, value: &Value) -> bool {
     match (lit, value) {
         (Lit::Int(a), Value::Int(b)) => a == b,
         (Lit::Bool(a), Value::Bool(b)) => a == b,
@@ -111,7 +111,7 @@ thread_local! {
 ///
 /// [`Value::builtin`]: crate::value::Value::builtin
 /// [`Value::cmp`]: crate::value::Value
-pub(crate) fn ctor_value(name: &Symbol, arity: usize) -> Value {
+pub fn ctor_value(name: &Symbol, arity: usize) -> Value {
     let fresh = || {
         if arity == 0 {
             Value::ctor(name.clone(), Vec::new())
