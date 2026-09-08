@@ -1765,9 +1765,14 @@ and the replay command.
 twice — once with it and once without — and fails the run on any disagreement
 (`E0503`). It is off by default because it doubles what a run costs.
 
-The flag always takes a value, and there are two. `reference` is a nested
-machine over the same fragment, which is what the seam is checked against rather
-than a way to go faster. `c` is the code generator: it emits the fragment as C,
+The flag takes a value. `reference` is a nested machine over the same fragment,
+which is what the seam is checked against rather than a way to go faster.
+`interp` is the interpreted front end (ADR 0047): it walks the same lowered
+code the `c` tier compiles, over the same runtime, with no C compiler in the
+path, and answers what the machine answers on every body it reaches while
+declining — for the machine to run — the effect constructs whose continuations
+live on the tier's stacks, which are its next increment. `c` is the code
+generator: it emits the fragment as C,
 hands it to `cc`, and loads the result. Its bodies carry symbols, so a sampling
 profiler and a disassembler can both read what a definition became.
 `PLY_C_KEEP=1` leaves the `.c` and the shared object behind for that;
@@ -3076,7 +3081,7 @@ is `E0127` with exit code 2 (§6.7).
 | `--bisect auto\|always\|never` | attribute a failure to the change that caused it |
 | `--bisect-budget N` | hybrid programs a bisection may evaluate (default 64) |
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
-| `--backend BACKEND` | attach a compiled backend: `reference` or `c` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
+| `--backend BACKEND` | attach a compiled backend: `reference`, `interp` or `c` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
 | `--profile PROFILE` | which toolchain the C tier compiles with: `development` (the default — the fastest compiler on the machine, inlining off) or `release` (`cc -O2`, inlining on). Requires `--backend`; the two profiles are required to answer identically, so this decides what a run costs and not what it means |
 | `--audit-backend` | also run each test without the backend and fail on any disagreement |
 | `--host` | bind the real host handlers |
