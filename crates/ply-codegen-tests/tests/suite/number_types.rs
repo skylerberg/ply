@@ -41,6 +41,11 @@ fn eq_u32(a: Int, b: Int) -> Bool = u32_of_int(a) == u32_of_int(b)
 fn from_literal() -> Int = int_of_u32(0x6A09_E667u32)
 fn literal_arithmetic(a: Int) -> Int = int_of_u8(wrap_add(u8_of_int(a), 200u8))
 
+// `bytes_u32_le` over bytes whose kind the emitter cannot see: a value bound by a pattern,
+// whose type the emitter does not read. The read goes through the runtime rather than an
+// inline load.
+fn first_word(x: Bytes) -> Int = match [x] { [b, ..] -> int_of_u32(bytes_u32_le(b, 0)), [] -> 0 }
+
 // A record whose fields are `U32`, which is the shape the integer kernel threads through a round:
 // the widths are held in the fields and the seam never sees one.
 type Quad = { a: U32, b: U32, c: U32, d: U32 }
@@ -101,6 +106,11 @@ fn a_compiled_body_answers_what_the_interpreter_answers_at_each_width() {
             "m.wrap_u32",
             vec![Value::Int(4294967295), Value::Int(2)],
             Value::Int(1),
+        ),
+        (
+            "m.first_word",
+            vec![Value::Bytes(std::sync::Arc::from(&[1u8, 2, 3, 4][..]))],
+            Value::Int(0x0403_0201),
         ),
         (
             "m.mul_u16",
