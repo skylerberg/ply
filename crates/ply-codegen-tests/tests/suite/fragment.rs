@@ -728,3 +728,65 @@ fn a_body_that_opens_a_cell_is_in_the_fragment() {
         );
     }
 }
+
+/// What the fragment refuses the shipped standard library for, split by whether the refusal costs
+/// a *definition* or a test root.
+///
+/// The split is the whole point. A refused test root runs interpreted, which is a test running the
+/// way tests ran before there was a code generator; a refused definition takes every caller in its
+/// unit with it. Counting them together says `handle` is the expensive construct, and counting
+/// them apart says the opposite -- `handle` costs one definition in the whole library and
+/// `perform` costs a dozen, with most of `http` cascading off them.
+///
+/// The ceilings ratchet **down**. Lower one when a construct lands; a rise is a regression and
+/// fails here.
+#[test]
+fn what_the_fragment_refuses_the_standard_library_for() {
+    let (_, unit) = unit("pub fn nothing() -> Int = 1\n");
+    let cost = |what: &str| -> (usize, Vec<String>) {
+        let (tests, defs): (Vec<&String>, Vec<&String>) = unit
+            .refusals()
+            .iter()
+            .filter(|(_, why)| why.contains(what))
+            .map(|(f, _)| f)
+            .partition(|f| f.contains("test#"));
+        (tests.len(), defs.iter().map(|s| (*s).clone()).collect())
+    };
+    for what in [
+        "a `handle`",
+        "perform",
+        "Decimal",
+        "not in this compiled unit",
+    ] {
+        let (tests, defs) = cost(what);
+        println!(
+            "  {what}: {tests} test root(s), {} definition(s) {defs:?}",
+            defs.len()
+        );
+    }
+    let (_, handled) = cost("a `handle`");
+    let (_, performed) = cost("perform");
+    let (_, cascade) = cost("not in this compiled unit");
+    assert!(
+        handled.len() <= 1,
+        "`handle` now costs {} definitions, not 1: {handled:?}",
+        handled.len()
+    );
+    assert!(
+        performed.len() <= 12,
+        "`perform` now costs {} definitions, not 12: {performed:?}",
+        performed.len()
+    );
+    assert!(
+        cascade.len() <= 9,
+        "{} definitions now cascade off a refusal, not 9: {cascade:?}",
+        cascade.len()
+    );
+    // The claim the ceilings are here to keep honest: `perform` is what the library is actually
+    // losing definitions to, and `handle` is not. ADR 0041 stages the work on this.
+    assert!(
+        performed.len() > handled.len(),
+        "`perform` no longer costs more definitions than `handle`, so ADR 0041's staging should \
+         be re-read: perform {performed:?}, handle {handled:?}"
+    );
+}
