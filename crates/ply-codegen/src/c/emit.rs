@@ -17,7 +17,7 @@ use anyhow::Result;
 use ply_eval::code::{Arm, Captures, Pat, Stmt};
 use ply_eval::rc::Own;
 use ply_eval::{Builtin, Code, NodeKind, Value};
-use ply_span::Symbol;
+use ply_span::{Span, Symbol};
 use ply_syntax::ast::{BinOp, IntTy, Lit, QName, UnOp};
 use ply_syntax::resolve::Namespace;
 
@@ -851,6 +851,9 @@ impl<'a> Emit<'a> {
                 let tail = self.tails.contains(&(code as *const Code));
                 self.record_update(base, copies, sets, tail)
             }
+            NodeKind::WithCell {
+                init, binder, body, ..
+            } => self.with_cell(init, binder, body, code.span),
             other => self.refuse(describe(other).to_string()),
         }
     }
@@ -1430,6 +1433,49 @@ impl<'a> Emit<'a> {
             }
         }
         Ok(mark)
+    }
+
+    /// `with cell r = init { body }`.
+    ///
+    /// A cell is not reached through the handler stack: this binds a first-class value, and the
+    /// operations on it are builtins. So the node is a region, an allocation in the arena the
+    /// context already carries, and the body in the binder's scope.
+    ///
+    /// **The close is emitted only on the way out, and that is deliberate.** A body returns early
+    /// from every helper that can raise, and C has no frame to hang an unwind on. A failed entry
+    /// therefore leaves the region open, which leaves the arena unbalanced, which is exactly what
+    /// the seam declines on — and a declined entry is answered by the machine, which is the
+    /// fallback a failure already takes. So the missing close costs a re-run that was happening
+    /// anyway rather than a leak.
+    fn with_cell(&mut self, init: &Code, binder: &Symbol, body: &Code, span: Span) -> Result<V> {
+        let unique = match self.src.regions().at(span).map(|r| r.kind) {
+            Some(ply_eval::RegionKind::Unique) => 1,
+            Some(ply_eval::RegionKind::Shared) => 0,
+            // Every `with_cell[r]` brands a region and the analysis decides its kind. A site the
+            // analysis does not know is one this body should not be guessing for.
+            None => {
+                return self
+                    .refuse("a `with cell` whose region the analysis did not decide".to_string());
+            }
+        };
+        let v = self.expr(init)?;
+        let w = self.word(&v);
+        // `Int`, not `Boxed`: a region id is a number the arena hands back, not a heap word, and
+        // binding it as one had the release discipline free it as an object.
+        let region = self.bind(Kind::Int, format!("rt_region_p(ctx, {unique})"));
+        let made = self.bind(Kind::Boxed, format!("rt_cell_p(ctx, {w})"));
+        // Renamed before it enters scope, exactly as a `let` renames its value. The helper answers
+        // an owned word, so the local it lands in is marked as holding this body's only count --
+        // and a name in scope can be read again, which is precisely what that mark says cannot
+        // happen. The rename leaves the mark on the local nothing names.
+        let cell = self.bind_as(made.k, made.ty.clone(), made.c);
+        let mark = self.scope.len();
+        self.bind_name(binder.clone(), cell);
+        let answer = self.expr(body)?;
+        let held = self.bind_as(answer.k, answer.ty.clone(), answer.c);
+        self.scope.truncate(mark);
+        self.line(format!("rt_region_close_p(ctx, {});", region.c));
+        Ok(held)
     }
 
     fn field(&mut self, base: &Code, name: &Symbol, own: Own) -> Result<V> {

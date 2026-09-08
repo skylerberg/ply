@@ -170,6 +170,9 @@ helpers![
     ("rt_alloc", 4, true),
     ("rt_list_index", 2, true),
     ("rt_nullary", 1, true),
+    ("rt_cell", 1, true),
+    ("rt_region", 1, true),
+    ("rt_region_close", 1, false),
 ];
 
 /// The declarations, the function-pointer table and the exported binder, generated from

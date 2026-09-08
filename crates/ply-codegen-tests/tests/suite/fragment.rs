@@ -668,3 +668,63 @@ fn the_census_over_the_standard_library() {
     );
     assert!(functions > 100, "only {functions} functions were offered");
 }
+
+/// `with_cell`, which both tiers carry since ADR 0041.
+///
+/// A cell is the one effect construct that is not control: it binds a first-class value and its
+/// operations are builtins. What the tiers had to gain is the node that opens one, the region it
+/// brands, and the close on the way out.
+const CELLS: &str = "\
+pub fn tally(n: Int) -> Int = with_cell[t](0) { c -> {
+  cell_set(c, n * 2);
+  cell_set(c, cell_get(c) + 1);
+  cell_get(c)
+} }
+
+pub fn once(n: Int) -> Int = with_cell[t](n) { c -> cell_get(c) + 1 }
+
+pub fn nested(n: Int) -> Int = with_cell[outer](n) { a -> {
+  let inner = with_cell[inner](cell_get(a)) { b -> cell_get(b) * 2 };
+  cell_get(a) + inner
+} }
+
+pub fn unread(n: Int) -> Int = with_cell[t](n) { _c -> n + 1 }
+";
+
+#[test]
+fn a_cell_a_compiled_body_opens_answers_what_the_interpreter_answers() {
+    let (_, unit) = unit(CELLS);
+    let cases: &[(&str, Vec<Value>, Value)] = &[
+        ("m.tally", vec![Value::Int(20)], Value::Int(41)),
+        ("m.once", vec![Value::Int(7)], Value::Int(8)),
+        ("m.nested", vec![Value::Int(5)], Value::Int(15)),
+        ("m.unread", vec![Value::Int(5)], Value::Int(6)),
+    ];
+    for (name, args, want) in cases {
+        let got = call(unit, name, args);
+        assert_eq!(
+            got.as_ref(),
+            Some(want),
+            "`{name}{args:?}` answered {got:?}, not {want:?}"
+        );
+    }
+}
+
+/// The bodies above are compiled rather than answered by a registry miss.
+///
+/// Without this the test beside it would pass over an empty fragment, which is the failure mode
+/// every claim about a code generator has.
+#[test]
+fn a_body_that_opens_a_cell_is_in_the_fragment() {
+    let (_, unit) = unit(CELLS);
+    for name in ["m.tally", "m.once", "m.nested", "m.unread"] {
+        assert!(
+            unit.compiled().iter().any(|c| c == name),
+            "`{name}` was refused: {:?}",
+            unit.refusals()
+                .iter()
+                .find(|(f, _)| f == name)
+                .map(|(_, why)| why)
+        );
+    }
+}
