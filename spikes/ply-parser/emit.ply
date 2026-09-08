@@ -18,7 +18,7 @@
 
 import spine (num, Ident)
 import code (Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
-import items (Item, IFn, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
+import items (Item, IFn, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
 import exprs (Param)
 import types (TypeExpr, TCon, TRecord)
 import rewrite (expand)
@@ -1074,17 +1074,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                 },
               }
             },
-            // The shape is still not known, and after the two changes above it
-            // rarely is: a named record type resolves to its fields, a `let`
-            // keeps the shape of what it binds, and a call's answer takes the
-            // callee's declared one.
-            //
-            // Writing the runtime's read here -- `rt_field_p(ctx, base,
-            // @@f<i>@@, 0)`, kept as `field_of` -- reaches 565 shipped bodies
-            // against 421. Of the 93 that then disagree only five are the read
-            // itself; the rest are a **release** the port writes where the
-            // reference does not, and a rename bound at the wrong kind. Those are
-            // the next two rules, and until they are had this stays refused.
+            // The shape is not known and neither is the offset. `field_of`
+            // writes the runtime's read by name for it.
             None -> None,
           }
         },
@@ -1279,7 +1270,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     NMatch(m) -> match expr(em, m.scrutinee, params) {
       None -> None,
       Some(sc) -> {
-        let subj = bind(sc.em, KBoxed, as_word(sc.v));
+        let subj = bind_keeping(sc.em, KBoxed, sc.v.ty, as_word(sc.v));
         let ans = fresh(subj.em);
         let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
         let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
@@ -1492,9 +1483,11 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<Bytes> =
 // word out of the object, held once more because the object still holds it.
 fn pat_bind(em: Em, p: CPat, subj: V) -> Em =
   match p {
+    // The binder is the subject under another name, and carries its shape: a
+    // `match r { x -> x.f }` reads the field at an offset, not by name.
     PxVar(v) -> match v.slot {
       None -> em,
-      Some(s) -> { let b = bind(em, KBoxed, subj.c); remember(b.em, s, b.v) },
+      Some(s) -> { let b = bind_keeping(em, KBoxed, subj.ty, subj.c); remember(b.em, s, b.v) },
     },
     // **Every** argument is read out and held once more, whether or not the
     // pattern names it: the object still holds it, and the arm's scope is the
@@ -1692,16 +1685,33 @@ fn prologue(em: Em, params: List<P>) -> Em =
 // `Int` and `Bool` are the two the prologue knows how to open. Anything else --
 // a record, a list, a type variable, a missing annotation -- refuses the whole
 // function rather than guessing at a helper.
-// A named type is **not** resolved to the record it stands for, and that is the
-// reference's rule rather than a gap in this one. `CTy::of` maps a structural
-// `Type::Record` and nothing else: a `Type::Con` is opaque whatever it was
-// declared as, so `v: Values` carries no shape on either side.
+// A named type resolves to the record it stands for: an alias is transparent to
+// the checker, so by the time the reference's emitter sees `v: Values` the type
+// *is* the record and a field of one is read at an offset.
 //
-// Resolving it here reads as an improvement and is a divergence. It reaches 484
-// shipped bodies against 421, and the 38 that then disagree all say the same
-// thing: the port releases a record through a reuse token of its width where the
-// reference, not knowing the width, releases it with a plain `ply_dec`. The
-// shape was not missing; it was never there.
+// **This corrects the note that was here.** It said the reference leaves a named
+// type opaque, on the strength of one body where the port released through a
+// reuse token and the reference did not -- read as "the port knows a width the
+// reference does not". It was the *release* that differed, not the type: once a
+// release counted the object's reads rather than one slot's, the field reads the
+// reference makes at an offset and this port makes by name fell from 65 to five.
+//
+// It is written and still not switched on. With it the port reaches 484 shipped
+// bodies against 421, or 565 with the runtime's read by name beside it, and the
+// disagreements that remain are a rename bound at the wrong kind and a release
+// the port makes earlier than the reference does. Neither is about shapes.
+fn param_kind_in(aliases: List<{ name: Bytes, ty: TypeExpr }>, t: Option<TypeExpr>)
+    -> Option<{ k: Kind, ty: Ty }> =
+  match t {
+    Some(TCon(c)) ->
+      if c.name.module != None || len(c.args) != 0 { param_kind(t) }
+      else { match fold(aliases, None, |acc: Option<TypeExpr>, a: { name: Bytes, ty: TypeExpr }|
+                    if a.name == c.name.name.name { Some(a.ty) } else { acc }) {
+        Some(u) -> param_kind(Some(u)),
+        None -> param_kind(t),
+      } },
+    _ -> param_kind(t),
+  }
 
 pub fn param_kind(t: Option<TypeExpr>) -> Option<{ k: Kind, ty: Ty }> =
   match t {
@@ -1917,6 +1927,14 @@ pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, sr
       // the empty name so one table answers both spellings.
       IModule -> push(acc, { name: last_segment(im.path), module: bytes_join_dots(map(im.path, |i: Ident| i.name)) }),
       IAlias(a2) -> push(acc, { name: a2.name, module: bytes_join_dots(map(im.path, |i: Ident| i.name)) }),
+    });
+  let _aliases = fold(x.module.items, [], |acc: List<{ name: Bytes, ty: TypeExpr }>, it: Item|
+    match it {
+      IType(t) -> match t.body {
+        TDAlias(u) -> if len(t.params) == 0 { push(acc, { name: t.name.name, ty: u }) } else { acc },
+        _ -> acc,
+      },
+      _ -> acc,
     });
   let here = fold(x.module.items, [], |acc: List<Def>, it: Item|
     match it {
