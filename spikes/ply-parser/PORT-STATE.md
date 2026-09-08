@@ -67,6 +67,17 @@ and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
 
+**`Float` and `Decimal` literals, and the rule under `Int` arithmetic.** A `Float` or `Decimal`
+literal is a pooled constant the runtime holds, written in the tables as its source text (`X`
+and `D` entries) for the driver to convert by the lexer's rule, and held opaque so every
+operator over it is the machine's own through the runtime. Compiling those bodies found a rule
+both emitters had wrong: the inline `Int` arithmetic took any two words that were not marked
+opaque, and two words of a type the port cannot see may both be `Decimal`s. The inline path
+now needs one operand in a register, which the checker makes an `Int` on both sides; two
+unknown words go through `rt_binary`, and a negation of one through `rt_negate`. The answer
+of a runtime operator takes the reference's type: a `Bool` for a comparison, opaque over an
+opaque left operand, the right operand's otherwise.
+
 **Effects, by evidence passing (ADR 0043).** The port emits `handle`, `perform` and `with cell`,
 none of which the reference emits, so they compile only with the chain entered whole and are
 held to the audit alone. A `handle` site pushes a runtime frame holding each clause as a
