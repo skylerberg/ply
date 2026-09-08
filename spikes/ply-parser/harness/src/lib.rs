@@ -1782,6 +1782,43 @@ pub const INLINING: ply_codegen::opt::Inlining = ply_codegen::opt::Inlining {
     depth: 0,
 };
 
+/// The unit's constructor table for these modules: every constructor's program-wide name, in the
+/// order the tags are assigned.
+///
+/// The port is handed this rather than deriving it. A tag is a position in a table over the *whole*
+/// program -- the prelude's constructors and then each module's, in order -- and the port sees one
+/// module at a time. The reference's emitter is handed the same table by its unit, so passing it is
+/// the analogue rather than a shortcut: what is being compared is still the emitter.
+pub fn reference_ctors(modules: &[(String, String)]) -> Vec<String> {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    for (i, (name, text)) in modules.iter().enumerate() {
+        let (module, _) =
+            ply_syntax::parse_recovering(SourceId(i as u32), ModuleName::from_dotted(name), text);
+        program.modules.push(module);
+    }
+    if !ply_derive::expand_program(&mut program).is_empty() {
+        return Vec::new();
+    }
+    let Ok(resolved) = ply_syntax::resolve::resolve(&mut program) else {
+        return Vec::new();
+    };
+    let Ok(check) = ply_core::check_program(&program, &resolved) else {
+        return Vec::new();
+    };
+    let source = ply_codegen::Source::new(
+        Box::leak(Box::new(program)),
+        Box::leak(Box::new(resolved)),
+        Box::leak(Box::new(check)),
+    );
+    source
+        .ctors()
+        .into_iter()
+        .map(|(n, _)| n.to_string())
+        .collect()
+}
+
 pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
     let mut program = Program {
         modules: Vec::new(),
