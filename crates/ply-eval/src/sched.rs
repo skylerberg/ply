@@ -1,7 +1,7 @@
 //! The deterministic scheduler.
 
 use crate::arena::Pin;
-use crate::cont::{Continuation, Delimiter, SimId};
+use crate::cont::SimId;
 use crate::host::{HostBinding, HostRuntime, Pending};
 use crate::region::Trail;
 use crate::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
@@ -12,25 +12,16 @@ use ply_span::{Diagnostic, Span, codes};
 pub const ROOT: TaskId = TaskId(0);
 
 /// What the machine must do to give a task its step.
-pub enum Resumption {
-    /// Evaluate the region's own body.
+pub enum Resumption<K, B> {
     Enter,
-    /// Apply this closure to no arguments, under the delimiters that were in scope where it was
-    /// spawned.
-    Start {
-        body: Value,
-        over: Vec<Delimiter>,
-        span: Span,
-    },
-    /// Splice this continuation onto the current stack and return `value` into it.
-    Resume { k: Continuation, value: Value },
+    Start { body: B, span: Span },
+    Resume { k: K, value: Value },
 }
 
-/// What [`Scheduler::next`] decided.
-pub enum Turn {
+pub enum Turn<K, B> {
     Run {
         task: TaskId,
-        resumption: Resumption,
+        resumption: Resumption<K, B>,
     },
     /// Every task has finished, so the region delivers its body's value.
     Complete(Value),
@@ -83,22 +74,22 @@ enum Wait {
     },
 }
 
-enum TaskState {
+enum TaskState<K, B> {
     /// Enabled: suspended at a scheduling point with the control that continues it already decided.
-    Ready(Resumption),
+    Ready(Resumption<K, B>),
     /// The machine is executing this task's step right now.
     Running,
     Blocked {
         wait: Wait,
-        k: Continuation,
+        k: K,
     },
     Done(Value),
     /// Raised a diagnostic.
     Failed,
 }
 
-struct Task {
-    state: TaskState,
+struct Task<K, B> {
+    state: TaskState<K, B>,
     /// The `spawn` that created it, or the region for [`ROOT`].
     origin: Span,
     /// This task's claim on the regions that were open at its `spawn`.
@@ -147,11 +138,11 @@ pub fn is_scheduler_bookkeeping(access: &Access) -> bool {
 
 /// The set of runnable tasks of one region, and the enabledness that decides which of them may be
 /// picked.
-pub struct Scheduler {
+pub struct Scheduler<K, B> {
     /// Which of the entry point's regions this is.
     region: SimId,
     /// Indexed by [`TaskId`].
-    tasks: Vec<Task>,
+    tasks: Vec<Task<K, B>>,
     /// One vector clock per task, indexed by [`TaskId`] alongside `tasks`.
     clocks: Vec<Stamp>,
     max_steps: u32,
@@ -168,19 +159,19 @@ pub struct Scheduler {
     failure: Option<Diagnostic>,
 }
 
-impl Scheduler {
+impl<K: Clone, B> Scheduler<K, B> {
     /// The seeded scheduler.
-    pub fn new(region: SimId, span: Span) -> Scheduler {
+    pub fn new(region: SimId, span: Span) -> Scheduler<K, B> {
         Scheduler::rooted(region, span, Policy::Seeded, DEFAULT_STEPS)
     }
 
     /// The production scheduler: this same state machine, choosing by real readiness instead of by
     /// a seed.
-    pub fn production(region: SimId, span: Span, _permit: HostPolicy) -> Scheduler {
+    pub fn production(region: SimId, span: Span, _permit: HostPolicy) -> Scheduler<K, B> {
         Scheduler::rooted(region, span, Policy::Host, u32::MAX)
     }
 
-    fn rooted(region: SimId, span: Span, policy: Policy, max_steps: u32) -> Scheduler {
+    fn rooted(region: SimId, span: Span, policy: Policy, max_steps: u32) -> Scheduler<K, B> {
         Scheduler {
             region,
             tasks: vec![Task {
@@ -202,7 +193,7 @@ impl Scheduler {
     }
 
     /// Opens the region with its root task already **running**.
-    pub fn rooted_running(mut self) -> Result<Scheduler, Diagnostic> {
+    pub fn rooted_running(mut self) -> Result<Scheduler<K, B>, Diagnostic> {
         if self.steps > 0 || self.current.is_some() || self.tasks.len() > 1 {
             return Err(self.internal("a region's root was re-rooted after it had begun"));
         }
@@ -213,7 +204,7 @@ impl Scheduler {
     }
 
     /// Scheduling steps this interleaving may take before it is [`codes::DEADLOCK`].
-    pub fn with_step_budget(mut self, steps: u32) -> Scheduler {
+    pub fn with_step_budget(mut self, steps: u32) -> Scheduler<K, B> {
         self.max_steps = steps.max(1);
         self
     }
@@ -259,7 +250,7 @@ impl Scheduler {
     }
 
     /// Which task runs next, or that the region is over.
-    pub fn next(&mut self, clock: &mut Clock, trail: &mut Trail) -> Result<Turn, Diagnostic> {
+    pub fn next(&mut self, clock: &mut Clock, trail: &mut Trail) -> Result<Turn<K, B>, Diagnostic> {
         self.require(Policy::Seeded)?;
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
@@ -323,7 +314,7 @@ impl Scheduler {
     }
 
     /// Which task runs next under [`Policy::Host`], waiting on `rt` when none can.
-    pub fn next_host(&mut self, rt: &dyn HostRuntime) -> Result<Turn, Diagnostic> {
+    pub fn next_host(&mut self, rt: &dyn HostRuntime) -> Result<Turn<K, B>, Diagnostic> {
         self.require(Policy::Host)?;
         if let Some(failure) = &self.failure {
             return Err(failure.clone());
@@ -403,7 +394,7 @@ impl Scheduler {
     /// Blocks the current task on a host token.
     pub fn park_on_host(
         &mut self,
-        k: Continuation,
+        k: K,
         pending: Pending,
         span: Span,
     ) -> Result<(), Diagnostic> {
@@ -488,21 +479,13 @@ impl Scheduler {
     /// Creates a task and leaves the current one running, because the handle has to reach the
     /// program before its step can end: the caller builds a value from this id and passes it to
     /// [`Scheduler::suspend`].
-    pub fn spawn(
-        &mut self,
-        body: Value,
-        over: Vec<Delimiter>,
-        span: Span,
-        pin: Option<Pin>,
-    ) -> TaskId {
+    pub fn spawn(&mut self, body: B, span: Span, pin: Option<Pin>) -> TaskId {
         let id = TaskId(self.tasks.len() as u32);
         self.tasks.push(Task {
-            state: TaskState::Ready(Resumption::Start { body, over, span }),
+            state: TaskState::Ready(Resumption::Start { body, span }),
             origin: span,
             pin,
         });
-        // Everything the parent had done by the spawn happens before everything the child does, so
-        // the child starts from the parent's clock.
         let inherited = match (self.policy, self.current) {
             (Policy::Seeded, Some(parent)) => self.clocks[parent.0 as usize].clone(),
             _ => Vec::new(),
@@ -511,8 +494,6 @@ impl Scheduler {
         id
     }
 
-    /// Extends every clock to cover a task that did not exist when they were last written, so an
-    /// index is never a length check at a call site.
     fn tick(&mut self, task: usize) {
         let width = self.tasks.len();
         for clock in &mut self.clocks {
@@ -538,7 +519,7 @@ impl Scheduler {
 
     /// Ends the current task's step; it stays enabled and is resumed with `value` whenever the
     /// scheduler picks it again.
-    pub fn suspend(&mut self, k: Continuation, value: Value) -> Result<(), Diagnostic> {
+    pub fn suspend(&mut self, k: K, value: Value) -> Result<(), Diagnostic> {
         let at = self.running()?;
         self.tasks[at].state = TaskState::Ready(Resumption::Resume { k, value });
         self.current = None;
@@ -547,7 +528,7 @@ impl Scheduler {
 
     /// Blocks the current task until `target` finishes, or resumes it immediately with `target`'s
     /// value if it already has.
-    pub fn join(&mut self, k: Continuation, target: TaskId, span: Span) -> Result<(), Diagnostic> {
+    pub fn join(&mut self, k: K, target: TaskId, span: Span) -> Result<(), Diagnostic> {
         let at = self.running()?;
         let Some(task) = self.tasks.get(target.0 as usize) else {
             return Err(err_unknown_task(span, target));
@@ -574,7 +555,7 @@ impl Scheduler {
     /// has already registered a timer for.
     pub fn sleep_until(
         &mut self,
-        k: Continuation,
+        k: K,
         deadline: i64,
         span: Span,
     ) -> Result<(), Diagnostic> {
@@ -948,7 +929,11 @@ mod tests {
     use ply_core::{EffectAtom, Resource};
     use ply_span::Symbol;
     use ply_syntax::ast::Mode;
+    use crate::cont::Continuation;
     use std::rc::Rc;
+
+    type Sched = Scheduler<Continuation, Value>;
+    type Choice = Turn<Continuation, Value>;
 
     /// A continuation is control, and none of the scheduler's decisions look inside one — so a
     /// captured empty segment is a faithful stand-in for a suspended task and lets the state
@@ -987,7 +972,7 @@ mod tests {
 
     /// A scheduler, its clock and the entry point's trail, for the tests that drive the seam by
     /// hand rather than through a program.
-    fn solo(root: u64) -> (Scheduler, Clock, Trail) {
+    fn solo(root: u64) -> (Sched, Clock, Trail) {
         (
             Scheduler::new(SimId(0), Span::DUMMY),
             Clock::new(),
@@ -997,7 +982,7 @@ mod tests {
 
     /// A `Turn` holds control, which has no `Debug` and wants none, so an expected refusal is
     /// unwrapped here rather than through `expect_err`.
-    fn refused(turn: Result<Turn, Diagnostic>, why: &str) -> Diagnostic {
+    fn refused(turn: Result<Choice, Diagnostic>, why: &str) -> Diagnostic {
         match turn {
             Ok(_) => panic!("the scheduler handed out a task: {why}"),
             Err(diagnostic) => diagnostic,
@@ -1096,12 +1081,8 @@ mod tests {
                             }
                             Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                             Act::Spawn(index) => {
-                                let id = sched.spawn(
-                                    Value::Int(index as i64),
-                                    Vec::new(),
-                                    Span::DUMMY,
-                                    None,
-                                );
+                                let id =
+                                    sched.spawn(Value::Int(index as i64), Span::DUMMY, None);
                                 while script.len() <= id.0 as usize {
                                     script.push(0);
                                     pc.push(0);
@@ -1773,7 +1754,7 @@ mod tests {
         }
     }
 
-    fn production() -> Scheduler {
+    fn production() -> Sched {
         let binding = binding();
         let permit = HostPolicy::of(&binding).expect("a bound binding mints a permit");
         Scheduler::production(SimId(0), Span::DUMMY, permit)
@@ -1864,8 +1845,8 @@ mod tests {
             panic!("expected the root's step");
         };
         assert_eq!(task, ROOT);
-        sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
-        sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
+        sched.spawn(Value::Unit, Span::DUMMY, None);
+        sched.spawn(Value::Unit, Span::DUMMY, None);
         sched.suspend(suspended(), Value::Unit).expect("running");
 
         let mut order = Vec::new();
@@ -1889,7 +1870,7 @@ mod tests {
 
         // The opening perform is answered through the same path every later one takes, which is
         // what stops `spawn` meaning two things.
-        let child = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
+        let child = sched.spawn(Value::Unit, Span::DUMMY, None);
         sched
             .suspend(suspended(), Value::Task(child))
             .expect("the root is running");
@@ -1961,8 +1942,8 @@ mod tests {
 
     /// Two tasks each waiting for the other: nothing is enabled, nothing is waiting on the host,
     /// and no virtual clock exists to advance.
-    fn deadlock(sched: &mut Scheduler) {
-        let other = sched.spawn(Value::Unit, Vec::new(), Span::DUMMY, None);
+    fn deadlock(sched: &mut Sched) {
+        let other = sched.spawn(Value::Unit, Span::DUMMY, None);
         sched
             .join(suspended(), other, Span::DUMMY)
             .expect("the root is running");

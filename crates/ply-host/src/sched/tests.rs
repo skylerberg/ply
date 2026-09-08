@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
+type Sched = Scheduler<Continuation, Value>;
+
 /// A continuation is control, and none of the scheduler's decisions look inside one, so a captured
 /// empty segment is a faithful stand-in for a suspended task.
 fn suspended() -> Continuation {
@@ -178,7 +180,7 @@ impl Run {
 }
 
 fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
-    let mut sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
     let mut marks = Vec::new();
     let mut steps = 0u32;
     // Which script each task runs, and how far into it that task has got.
@@ -215,12 +217,7 @@ fn run(program: &Program, rt: &dyn HostRuntime) -> Result<Run, Diagnostic> {
                         }
                         Act::Yield => sched.suspend(suspended(), Value::Unit)?,
                         Act::Spawn(index) => {
-                            let id = sched.spawn(
-                                Value::Int(index as i64),
-                                Vec::new(),
-                                Span::DUMMY,
-                                None,
-                            );
+                            let id = sched.spawn(Value::Int(index as i64), Span::DUMMY, None);
                             while script.len() <= id.0 as usize {
                                 script.push(0);
                                 pc.push(0);
@@ -530,7 +527,7 @@ fn a_task_failing_stops_the_region_and_names_it() {
 #[test]
 fn a_failed_production_region_answers_with_its_failure_forever() {
     let rt = Threads::new();
-    let mut sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
     let Turn::Run { .. } = sched.next_host(&*rt).expect("the root is enabled") else {
         panic!("expected the root's step");
     };
@@ -561,7 +558,7 @@ fn a_join_cycle_deadlocks_rather_than_parking_forever() {
 /// nothing, which is indistinguishable from working.
 #[test]
 fn a_runtime_whose_park_never_resolves_is_named_rather_than_spun_on() {
-    let mut sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
+    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit());
     let Turn::Run { .. } = sched
         .next_host(&NeverResolves)
         .expect("the root is enabled")
@@ -595,7 +592,7 @@ fn a_production_region_spends_a_budget_only_when_one_was_set() {
         .unwrap_or_else(|e| panic!("64 yields is not a livelock: {}", e.message));
     assert_eq!(unbounded.steps, 65);
 
-    let mut sched = Scheduler::production(SimId(0), Span::DUMMY, permit()).with_step_budget(4);
+    let mut sched: Sched = Scheduler::production(SimId(0), Span::DUMMY, permit()).with_step_budget(4);
     let rt = Threads::new();
     for _ in 0..4 {
         let Turn::Run { .. } = sched.next_host(&*rt).expect("within the budget") else {

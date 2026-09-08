@@ -1,7 +1,7 @@
 //! A live `simulate` region, and the trail every region of one entry point writes into.
 
 use crate::code::{Captures, Code};
-use crate::cont::{SimId, Stack};
+use crate::cont::{Continuation, Delimiter, SimId, Stack};
 use crate::explore::{Interleaving, Step, Verdict};
 use crate::sched::{Scheduler, StepRecord};
 use crate::sim::{Access, Domain, Handlers, Seed, Stream};
@@ -17,9 +17,18 @@ pub struct StepSite {
     pub span: Span,
 }
 
+/// What the machine hands the scheduler to start a task: the body to apply and the delimiters
+/// the spawning frame sat under, which the task's stack is installed over.
+pub struct Spawned {
+    pub body: Value,
+    pub over: Vec<Delimiter>,
+}
+
+pub type MachineScheduler = Scheduler<Continuation, Spawned>;
+
 pub struct Region {
     pub id: SimId,
-    pub sched: Scheduler,
+    pub sched: MachineScheduler,
     pub handlers: Handlers,
     /// The stack the region delivers its value onto.
     pub below: Stack,
@@ -73,7 +82,7 @@ impl Region {
     }
 
     /// A region the host binding opened, over a scheduler the caller built and rooted.
-    pub fn production(id: SimId, sched: Scheduler, span: Span) -> Region {
+    pub fn production(id: SimId, sched: MachineScheduler, span: Span) -> Region {
         Region {
             id,
             sched,
