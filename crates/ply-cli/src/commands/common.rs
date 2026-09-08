@@ -57,6 +57,7 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
     let (name, variant) = match spec.kind {
         ply_eval::BackendKind::Reference => ("reference", ""),
         ply_eval::BackendKind::Interp => ("interp", ""),
+        ply_eval::BackendKind::Combined => ("combined", ""),
         ply_eval::BackendKind::C => ("c", ply_codegen::backend::registry_width()),
     };
     ply_test::Engine::of_backend(name, variant, spec)
@@ -304,6 +305,20 @@ pub fn build_backend(
         ply_eval::BackendKind::Interp => Ok(ply_eval::interp::Interpreter::over(
             program, resolved, check,
         ) as &'static dyn ply_eval::Provider),
+        ply_eval::BackendKind::Combined => ply_codegen::combined::Combined::build(
+            program,
+            resolved,
+            check,
+            emit_keys(program, hashes),
+            texts,
+        )
+        .map(|c| c as &'static dyn ply_eval::Provider)
+        .map_err(|error| {
+            Diagnostic::error(
+                codes::BACKEND_UNAVAILABLE,
+                format!("the combined backend could not be built: {error:#}"),
+            )
+        }),
         ply_eval::BackendKind::C => {
             ply_codegen::Unit::keyed(program, resolved, check, emit_keys(program, hashes), texts)
                 .map(|unit| unit as &'static dyn ply_eval::Provider)
