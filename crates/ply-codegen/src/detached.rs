@@ -2,13 +2,17 @@
 //! its own, the clause on the stack that was running when the body stopped, and `k` is a switch
 //! from wherever it is called into the body's stack. When the body stops again the switch comes
 //! back to whoever called `k`, which is what makes the resumed body run inside the clause that
-//! resumed it, as a deep handler's does. One shot: a second resumption is refused until the
-//! record's third stage restores a snapshot.
+//! resumed it, as a deep handler's does. A stop on the body's own stack is captured: the live
+//! range of the stack, the body's frames and the heap objects the range references, held once
+//! more each. Resuming a captured continuation after the body has finished restores the snapshot
+//! in place and runs it again, which is multi-shot resumption; resuming one while a later stop
+//! of the same body is still suspended is refused, since the restore would overwrite the frames
+//! that stop is waiting to return into.
 
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame};
 use crate::stack::{Stack, switch};
-use ply_span::{Diagnostic, codes};
+use ply_span::{Diagnostic, Symbol, codes};
 
 pub struct Detached {
     stack: Option<Stack>,
@@ -25,9 +29,30 @@ pub struct Detached {
     resumer_floor: usize,
     request: Option<Stopped>,
     answer: Word,
+    /// The body's closure and the `return` clause's, owned here rather than by the entry frame
+    /// on the body's stack: that frame comes back with every restored snapshot and would
+    /// release them once per run.
+    body: Word,
     ret: Word,
     starting: Option<Word>,
     state: State,
+    captures: Vec<Capture>,
+    /// The capture the body is suspended at, while it is.
+    live: Option<usize>,
+}
+
+/// What a stop on the body's own stack leaves behind, so the body can be run from it again.
+struct Capture {
+    sp: usize,
+    floor: usize,
+    /// The bytes from `sp` to the top of the body's stack. `None` when the stop came from a stack
+    /// running under the body, a task's, whose region will have ended by the time a second
+    /// resumption could ask for it.
+    bytes: Option<Vec<u8>>,
+    frames: Vec<HandlerFrame>,
+    /// Every word in the snapshot that is a live heap object, held once for the snapshot and
+    /// once more per restore, since the run consumes at most one reference to each.
+    pins: Vec<Word>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -43,6 +68,8 @@ enum Stopped {
     Finished(Word),
     Failed,
 }
+
+const ONE_SHOT: &str = "the region this continuation was captured in has already ended";
 
 /// `rt_handle_detached`: pushes the frame at the bottom of a fresh stack's frames, prepares the
 /// stack, and runs the body until it stops. Answers the handle's value.
@@ -67,37 +94,60 @@ pub(crate) unsafe fn open(ctx: *mut Ctx, clauses: Vec<FrameClause>, ret: Word, b
         resumer_floor: 0,
         request: None,
         answer: 0,
+        body,
         ret,
         starting: Some(body),
         state: State::Fresh,
+        captures: Vec::new(),
+        live: None,
     });
-    unsafe { resume(ctx, id, None) }
+    unsafe { resume(ctx, id, None, None) }
 }
 
 /// Runs the body from where it stopped, with `answer` as what its `perform` gets back, until it
 /// stops again; then the clause it stopped at, or the value it finished with, is this call's
 /// answer.
-pub(crate) unsafe fn resume(ctx: *mut Ctx, id: usize, answer: Option<Word>) -> Word {
+pub(crate) unsafe fn resume(
+    ctx: *mut Ctx,
+    id: usize,
+    capture: Option<usize>,
+    answer: Option<Word>,
+) -> Word {
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
-    match d.state {
-        State::Done => {
-            let dg = Diagnostic::error(
-                codes::RUNTIME_ERROR,
-                "a continuation was resumed after its body finished",
-            )
-            .note("the compiled tier resumes a continuation once; the machine's multi-shot resumption is the record's third stage");
-            return c.fail(dg);
-        }
-        State::Running => {
+    match (&d.state, capture) {
+        (State::Fresh, _) => {}
+        (State::Running, _) => {
             let dg = Diagnostic::error(
                 codes::RUNTIME_ERROR,
                 "a continuation was resumed while its earlier resumption is still running",
             );
             return c.fail(dg);
         }
-        State::Fresh | State::Suspended => {}
+        (State::Suspended, Some(k)) if d.live == Some(k) => {}
+        (State::Suspended, _) => {
+            let dg = Diagnostic::error(
+                codes::RUNTIME_ERROR,
+                "a continuation was resumed while a later stop of its body is still suspended",
+            )
+            .note("the compiled tier runs a body on one stack, and restoring an earlier point would overwrite the frames the later stop waits to return into");
+            return c.fail(dg);
+        }
+        (State::Done, Some(k)) => {
+            if !restore(c, id, k) {
+                let dg = Diagnostic::error(codes::TASK_ESCAPES_SCOPE, ONE_SHOT);
+                return c.fail(dg);
+            }
+        }
+        (State::Done, None) => {
+            let dg = Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                "a finished body was entered again without a capture",
+            );
+            return c.fail(dg);
+        }
     }
+    let d = &mut c.detached[id];
     if let Some(a) = answer {
         d.answer = a;
     }
@@ -121,17 +171,16 @@ pub(crate) unsafe fn resume(ctx: *mut Ctx, id: usize, answer: Option<Word>) -> W
     match d.request.take() {
         Some(Stopped::Performed { closure, mut args }) => {
             d.state = State::Suspended;
-            args.push(token(c, id));
+            let k = capture_stop(c, id);
+            args.push(token(c, id, k));
             call_value(ctx, closure, &args)
         }
         Some(Stopped::Finished(v)) => {
-            d.state = State::Done;
-            d.stack = None;
+            finish(d);
             v
         }
         Some(Stopped::Failed) => {
-            d.state = State::Done;
-            d.stack = None;
+            finish(d);
             0
         }
         None => {
@@ -145,9 +194,103 @@ pub(crate) unsafe fn resume(ctx: *mut Ctx, id: usize, answer: Option<Word>) -> W
     }
 }
 
+/// A body that stopped for good keeps its stack, and the closures a restored run would call
+/// again, only while a snapshot could be restored onto it.
+fn finish(d: &mut Detached) {
+    d.state = State::Done;
+    d.live = None;
+    if d.captures.iter().all(|k| k.bytes.is_none()) {
+        d.stack = None;
+        if d.body != 0 {
+            heap::dec(d.body);
+            d.body = 0;
+        }
+        if d.ret != 0 {
+            heap::dec(d.ret);
+            d.ret = 0;
+        }
+    }
+}
+
+/// Records the stop the body just made and answers its capture's index. The snapshot is taken
+/// only when the stop came from the body's own stack.
+fn capture_stop(c: &mut Ctx, id: usize) -> usize {
+    let d = &c.detached[id];
+    let own = d.saved_current == d.frames;
+    let (sp, floor) = (d.sp, d.saved_floor);
+    let (bytes, frames, pins) = if own {
+        let stack = d.stack.as_ref().expect("a suspended body has a stack");
+        let bytes = stack.live(sp).to_vec();
+        let mut pins = Vec::new();
+        for chunk in bytes.chunks_exact(8) {
+            let w = Word::from_ne_bytes(chunk.try_into().expect("eight bytes"));
+            if c.heap.is_object(w) {
+                heap::inc(w);
+                pins.push(w);
+            }
+        }
+        let frames = crate::rt::clone_frames(&c.stacks[d.frames].list);
+        (Some(bytes), frames, pins)
+    } else {
+        (None, Vec::new(), Vec::new())
+    };
+    let d = &mut c.detached[id];
+    d.captures.push(Capture {
+        sp,
+        floor,
+        bytes,
+        frames,
+        pins,
+    });
+    let k = d.captures.len() - 1;
+    d.live = Some(k);
+    k
+}
+
+/// Puts capture `k`'s snapshot back on the body's stack, so the next switch in runs from it.
+/// `false` when the stop had no snapshot to restore.
+fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
+    let d = &c.detached[id];
+    let Some(bytes) = d.captures[k].bytes.as_ref() else {
+        return false;
+    };
+    let stack = d
+        .stack
+        .as_ref()
+        .expect("a body with a snapshot keeps its stack");
+    unsafe { stack.restore(d.captures[k].sp, bytes) };
+    for w in &d.captures[k].pins {
+        heap::inc(*w);
+    }
+    let frames = crate::rt::clone_frames(&d.captures[k].frames);
+    let (own, sp, floor) = (d.frames, d.captures[k].sp, d.captures[k].floor);
+    for f in std::mem::replace(&mut c.stacks[own].list, frames) {
+        drop_frame(f);
+    }
+    let d = &mut c.detached[id];
+    d.sp = sp;
+    d.saved_current = own;
+    d.saved_floor = floor;
+    d.state = State::Suspended;
+    d.live = Some(k);
+    true
+}
+
 /// From the body's side: the `perform` a clause off the tail answers. Hands the clause and its
 /// arguments to whoever resumed the body and comes back with what `k` was called with.
-pub(crate) unsafe fn stop(ctx: *mut Ctx, id: usize, closure: Word, args: &[Word]) -> Word {
+///
+/// Nothing on the stack below the switch may own memory the heap does not count: the frames
+/// from the body's entry to here come back with every restored snapshot, and a `Vec` or an
+/// `Arc` held across the switch would be released once per restore. `owned` is what the
+/// caller still held; it is dropped here, before the switch.
+pub(crate) unsafe fn stop(
+    ctx: *mut Ctx,
+    id: usize,
+    closure: Word,
+    args: &[Word],
+    owned: (Symbol, Symbol, Option<Symbol>),
+) -> Word {
+    drop(owned);
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
     d.request = Some(Stopped::Performed {
@@ -178,7 +321,6 @@ extern "C" fn entry(arg: usize) {
         (id, body)
     };
     let mut r = call_value(ctx, body, &[]);
-    heap::dec(body);
     let c = unsafe { &mut *ctx };
     let frames = c.detached[id].frames;
     let frame = c.stacks[frames].list.pop();
@@ -202,9 +344,6 @@ extern "C" fn entry(arg: usize) {
     if let Some(f) = frame {
         drop_frame(f);
     }
-    if ret != 0 {
-        heap::dec(ret);
-    }
     let d = &mut c.detached[id];
     d.request = Some(if c.failed != 0 {
         Stopped::Failed
@@ -218,12 +357,17 @@ extern "C" fn entry(arg: usize) {
     std::process::abort();
 }
 
-/// The `k` a clause off the tail is handed: a closure whose entry resumes the body.
-fn token(c: &mut Ctx, id: usize) -> Word {
-    crate::rt::closure_of(c, rt_resume_detached_entry as *const () as usize, id as i64)
+/// The `k` a clause off the tail is handed: a closure whose entry resumes the body from the
+/// capture the stop made.
+fn token(c: &mut Ctx, id: usize, capture: usize) -> Word {
+    crate::rt::closure_of(
+        c,
+        rt_resume_detached_entry as *const () as usize,
+        ((id << 32) | capture) as i64,
+    )
 }
 
 unsafe extern "C" fn rt_resume_detached_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
-    let (id, v) = unsafe { (heap::imm_value(*args), *args.add(1)) };
-    unsafe { resume(ctx, id as usize, Some(v)) }
+    let (packed, v) = unsafe { (heap::imm_value(*args) as usize, *args.add(1)) };
+    unsafe { resume(ctx, packed >> 32, Some(packed & 0xffff_ffff), Some(v)) }
 }
