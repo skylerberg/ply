@@ -331,6 +331,16 @@ fn word_of(em: Em, v: V) -> { em: Em, c: Bytes } =
     _ -> { em: em, c: as_word(v) },
   }
 
+// The reads a body's counts are over: a lambda's body counts in its own window, its captures
+// already charged from outside.
+fn with_reads(em: Em, reads: List<Int>) -> Em =
+  { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: reads, shapes: em.shapes,
+    built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
+    consts: em.consts, ctors: em.ctors, extra: em.extra, lambdas: em.lambdas, owner: em.owner,
+    builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: em.toks,
+    alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused,
+    deferred: em.deferred, rlocals: em.rlocals }
+
 fn with_out(em: Em, out: Bytes) -> Em =
   { out: out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
     built: em.built, module: em.module, made: em.made, here: em.here, imports: em.imports,
@@ -606,6 +616,13 @@ fn release_from(em: Em, base: Code, b: V, params: List<P>, at_tail: Bool) -> Opt
     _ -> Some(em),
   }
 
+fn through_caps(reads: List<Int>, caps: List<Cap>) -> List<Int> =
+  fold(reads, [], |acc: List<Int>, s: Int|
+    match fold(caps, None, |found: Option<Int>, c2: Cap| if c2.dst == s { Some(c2.src) } else { found }) {
+      Some(src) -> push(acc, src),
+      None -> acc,
+    })
+
 // Every slot read in the tree, once per read, lambdas and clause bodies
 // included: a name a barrier copies in is still a read of the object.
 fn slots_read(c: Code) -> List<Int> =
@@ -633,7 +650,10 @@ fn slots_read(c: Code) -> List<Int> =
     NPerform(p) -> all_read(p.args),
     NCell(c2) -> concat(slots_read(c2.init), slots_read(c2.body)),
     NRegion(r) -> slots_read(r.body),
-    NLambda(l) -> concat(map(l.caps, |c2: Cap| c2.src), slots_read(l.body)),
+    // A lambda's body reads in a window of its own: a read of a capture there is a read of
+    // the object it copies, in the enclosing window's numbering, and a read of the lambda's
+    // own parameter is of nothing here. The copy itself is not a read.
+    NLambda(l) -> through_caps(slots_read(l.body), l.caps),
     NSim(x) -> concat(map(x.caps, |c2: Cap| c2.src), slots_read(x.body)),
     NHandle(h) -> concat(slots_read(h.body), concat(
       fold(h.clauses, [], |acc: List<Int>, cl: CClause|
@@ -754,29 +774,38 @@ fn nameable_step(em: Em, f: Code) -> Option<{ full: Bytes, c: Bytes }> =
   match f.node {
     NVar(fv) -> match fv.slot {
       Some(_) -> None,
-      None -> if is_ctor_name(fv.name) { None } else {
-        let target = match qualified(fv.name) {
-          Some(q) -> match from_import(em.imports, q.binder) {
-            Some(imp) -> Some({ module: imp.module, name: q.name, defs: imp.defs }),
-            None -> None,
-          },
-          None -> if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name)
-                  { Some({ module: em.module, name: fv.name, defs: em.here }) }
-                  else { match from_import(em.imports, fv.name) {
-                    Some(imp) -> Some({ module: imp.module, name: fv.name, defs: imp.defs }),
-                    None -> None,
-                  } },
-        };
-        match target {
-          None -> None,
-          Some(t) -> if fold(t.defs, false, |acc: Bool, d: Def| acc || (d.name == t.name && d.arity == 2)) {
-            Some({ full: bytes_concat_all([t.module, b".", t.name]),
-                   c: bytes_concat_all([b"ply_", mangle(t.module), b"_", t.name]) })
-          } else { None },
-        }
+      None -> match def_of(em, fv.name) {
+        Some(d) -> if d.arity == 2 { Some({ full: d.full, c: d.c }) } else { None },
+        None -> None,
       },
     },
     _ -> None,
+  }
+
+// The definition a bare or qualified name resolves to -- of this module, or brought in from
+// another -- with its program-wide name, the C function it became, and its arity.
+fn def_of(em: Em, name: Bytes) -> Option<{ full: Bytes, c: Bytes, arity: Int }> =
+  if is_ctor_name(name) { None } else {
+    let target = match qualified(name) {
+      Some(q) -> match from_import(em.imports, q.binder) {
+        Some(imp) -> Some({ module: imp.module, name: q.name, defs: imp.defs }),
+        None -> None,
+      },
+      None -> if fold(em.here, false, |acc: Bool, h: Def| acc || h.name == name)
+              { Some({ module: em.module, name: name, defs: em.here }) }
+              else { match from_import(em.imports, name) {
+                Some(imp) -> Some({ module: imp.module, name: name, defs: imp.defs }),
+                None -> None,
+              } },
+    };
+    match target {
+      None -> None,
+      Some(t) -> match fold(t.defs, None, |acc: Option<Def>, d: Def| if d.name == t.name { Some(d) } else { acc }) {
+        Some(d) -> Some({ full: bytes_concat_all([t.module, b".", t.name]),
+                          c: bytes_concat_all([b"ply_", mangle(t.module), b"_", t.name]), arity: d.arity }),
+        None -> None,
+      },
+    }
   }
 
 // `iterate` over a one-parameter lambda is the loop the reference emits into the body, which
@@ -787,10 +816,167 @@ fn iterate_call(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Optio
     match list_at(args, 2) {
       None -> None,
       Some(f) -> match f.node {
-        NLambda(l) -> if l.params == 1 { None } else { helper_call(em, b"rt_iterate_p", args, params) },
+        NLambda(l) -> if l.params == 1 { fused_iterate(em, args, l, params) } else { helper_call(em, b"rt_iterate_p", args, params) },
         _ -> helper_call(em, b"rt_iterate_p", args, params),
       },
     }
+  }
+
+// `iterate` over a one-parameter lambda is the loop, emitted into the body rather than called
+// through the runtime: `iterate` *is* the loop in this language, so a tier that sent it through
+// a callback would be sending every loop through one. The lambda's body runs in a window of
+// its own -- its parameter is the state, its captures are the values they copy -- and a body
+// that answers `Stop` or `Continue` directly in every arm is written as the loop's own
+// assignments; any other body is called and its answer's tag is tested.
+fn fused_iterate(em: Em, args: List<Code>, l: { params: Int, size: Int, caps: List<Cap>, body: Code }, params: List<P>) -> Option<Out> =
+  match tag_of(em.ctors, b"Stop", em.module) {
+    None -> Some(refused(em, b"`iterate` with no `Stop` and `Continue` in the program")),
+    Some(stop) -> match tag_of(em.ctors, b"Continue", em.module) {
+      None -> Some(refused(em, b"`iterate` with no `Stop` and `Continue` in the program")),
+      Some(go) -> match list_at(args, 0) {
+        None -> None,
+        Some(seed) -> match list_at(args, 1) {
+          None -> None,
+          Some(budget) -> match expr(notail(em), seed, params) {
+            None -> None,
+            Some(sv) -> {
+              let sw = word_of(sv.em, sv.v);
+              let state = fresh(sw.em);
+              let s1 = line(state.em, bytes_concat_all([b"Word ", state.name, b" = ", sw.c, b";"]));
+              match expr(notail(s1), budget, params) {
+                None -> None,
+                Some(bv) -> {
+                  let bud = as_int(bv.v);
+                  let left = fresh(bv.em);
+                  let s2 = line(left.em, bytes_concat_all([b"int64_t ", left.name, b" = ", bud, b";"]));
+                  let answer = fresh(s2);
+                  let s3 = line(answer.em, bytes_concat_all([b"Word ", answer.name, b" = 0;"]));
+                  let opened = indent(line(s3, b"for (;;) {"));
+                  let guarded = line(line(opened, bytes_concat_all([
+                    b"if (", left.name, b" <= 0) { rt_iterate_bad_p(ctx, 0, ", bud, b"); return 0; }"])),
+                    bytes_concat_all([left.name, b" -= 1;"]));
+                  // The lambda's window: its captures as the values they copy, its parameter as
+                  // the state, held under a name of its own.
+                  match fold(l.caps, Some([]), |acc: Option<List<Conv>>, c: Cap| match acc {
+                      None -> None,
+                      Some(w) -> match conv_of(guarded, c.src) {
+                        Some(v) -> Some(push(w, { slot: c.dst, k: v.k, c: v.c, ty: v.ty })),
+                        None -> match list_at(params, c.src) {
+                          Some(p) -> match p.k {
+                            KBoxed -> Some(push(w, { slot: c.dst, k: KBoxed, c: bytes_concat(b"p", num(c.src)), ty: p.ty })),
+                            _ -> None,
+                          },
+                          None -> None,
+                        },
+                      },
+                    }) {
+                    None -> Some(refused(em, b"a capture this port has not bound")),
+                    Some(window) -> {
+                      // The body's counts are the lambda's own: its parameter's reads are of the
+                      // state, and a capture's were charged to its object outside.
+                      let held = bind_keeping(with_reads(rescope(guarded, window), slots_read(l.body)), KBoxed, sv.v.ty, state.name);
+                      let inner = remember(held.em, 0, held.v);
+                      let body = if fusable_step(inner, l.body) {
+                        emit_step(inner, l.body, state.name, answer.name, stop, go, params)
+                      } else {
+                        match expr(inner, l.body, params) {
+                          None -> None,
+                          Some(r) -> {
+                            let rw = word_of(r.em, r.v);
+                            let sa = bind(rw.em, KBoxed, rw.c);
+                            let k = fresh(sa.em);
+                            let t1 = line(k.em, bytes_concat_all([
+                              b"uint32_t ", k.name, b" = (!ply_is_imm(", sa.v.c, b") && ", sa.v.c, b" != 0 && ply_obj(", sa.v.c,
+                              b")->kind == 4 && ply_obj(", sa.v.c, b")->len == 1) ? ply_obj(", sa.v.c, b")->layout : 0xFFFFFFFFu;"]));
+                            let t2 = line(indent(line(t1, bytes_concat_all([b"if (", k.name, b" == ", num(stop), b"u) {"]))),
+                              bytes_concat_all([answer.name, b" = ply_words(", sa.v.c, b")[0];"]));
+                            let t3 = line(line(t2, bytes_concat_all([b"ply_inc(", answer.name, b");"])), b"break;");
+                            let t4 = line(indent(line(outdent(t3), bytes_concat_all([b"} else if (", k.name, b" == ", num(go), b"u) {"]))),
+                              bytes_concat_all([state.name, b" = ply_words(", sa.v.c, b")[0];"]));
+                            let t5 = line(t4, bytes_concat_all([b"ply_inc(", state.name, b");"]));
+                            let t6 = line(indent(line(outdent(t5), b"} else {")),
+                              bytes_concat_all([b"rt_iterate_bad_p(ctx, 2, ", sa.v.c, b"); return 0;"]));
+                            Some(line(outdent(t6), b"}"))
+                          },
+                        }
+                      };
+                      match body {
+                        None -> None,
+                        Some(done) -> Some({ em: line(outdent(with_reads(rescope(done, guarded.conv), em.reads)), b"}"),
+                                             v: { k: KBoxed, c: answer.name, ty: TyOpen } }),
+                      }
+                    },
+                  }
+                },
+              }
+            },
+          },
+        },
+      },
+    },
+  }
+
+// A step body that answers `Stop` or `Continue` directly in every arm.
+fn fusable_step(em: Em, c: Code) -> Bool =
+  match c.node {
+    NApp(a) -> len(a.args) == 1 && match a.func.node {
+      NVar(fv) -> match fv.slot {
+        Some(_) -> false,
+        None -> is_ctor_name(fv.name) && match tag_of(em.ctors, fv.name, em.module) {
+          Some(t) -> Some(t) == tag_of(em.ctors, b"Stop", em.module) || Some(t) == tag_of(em.ctors, b"Continue", em.module),
+          None -> false,
+        },
+      },
+      _ -> false,
+    },
+    NIf(i) -> fusable_step(em, i.then_branch) && fusable_step(em, i.else_branch),
+    NBlock(b) -> match b.tail { Some(t) -> fusable_step(em, t), None -> false },
+    _ -> false,
+  }
+
+// The loop's own assignments for a step that answers a constructor directly: `Stop(x)` sets the
+// answer and breaks, `Continue(x)` sets the state.
+fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, params: List<P>) -> Option<Em> =
+  match c.node {
+    NApp(a) -> match list_at(a.args, 0) {
+      None -> None,
+      Some(x) -> match expr(notail(em), x, params) {
+        None -> None,
+        Some(v) -> {
+          let w = word_of(v.em, v.v);
+          let which = match a.func.node { NVar(fv) -> tag_of(em.ctors, fv.name, em.module), _ -> None };
+          if which == Some(stop) {
+            Some(line(line(w.em, bytes_concat_all([answer, b" = ", w.c, b";"])), b"break;"))
+          } else {
+            Some(line(w.em, bytes_concat_all([state, b" = ", w.c, b";"])))
+          }
+        },
+      },
+    },
+    NIf(i) -> match expr(notail(em), i.cond, params) {
+      None -> None,
+      Some(cv) -> {
+        let opened = indent(line(cv.em, bytes_concat_all([b"if (", as_bool(cv.v), b") {"])));
+        match emit_step(opened, i.then_branch, state, answer, stop, go, params) {
+          None -> None,
+          Some(t) -> {
+            let els = indent(line(outdent(t), b"} else {"));
+            match emit_step(els, i.else_branch, state, answer, stop, go, params) {
+              None -> None,
+              Some(e) -> Some(line(outdent(e), b"}")),
+            }
+          },
+        }
+      },
+    },
+    NBlock(b) -> match b.tail {
+      None -> None,
+      Some(t) -> match stmts(em, b.stmts, params, 0) {
+        None -> None,
+        Some(after) -> emit_step(rescope(after, after.conv), t, state, answer, stop, go, params),
+      },
+    },
+    _ -> None,
   }
 
 fn helper_call(em: Em, helper: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
@@ -1259,7 +1445,7 @@ fn caps_owned(em: Em, cs: List<Cap>, params: List<P>, i: Int, acc: List<Bytes>)
 // carried back out. Emitting it against a copy numbered a second body's
 // constants and builtins from zero.
 fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>, body: Code })
-    -> Option<{ text: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, refused: Option<Bytes> }> = {
+    -> Option<{ text: Bytes, extra: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>>, fields: List<Bytes>, lambdas: List<Bytes>, calls: List<Bytes>, refused: Option<Bytes> }> = {
   let n = len(l.caps) + l.params;
   let window = fold(range(0, l.params),
     fold(range(0, len(l.caps)), [], |acc: List<Conv>, i: Int|
@@ -1272,15 +1458,19 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
   let reads = slots_read(l.body);
   // The tables are the body's, continued: a lambda's constant or shape takes the next index
   // after what the body met, and what the body met stays in the table the lambda hands back.
+  // Nothing in a lambda's body is a tail: the reference marks a function's tails and does not
+  // descend into a lambda, so an update at the end of one keeps the one-read guard.
   let start = { out: b"", n: 0, conv: window, ind: 0, reads: reads, shapes: em.shapes, built: [],
                 module: em.module, made: [], here: em.here, imports: em.imports, consts: em.consts,
-                ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: b"", builtins: em.builtins, met: em.met, fields: em.fields, released: em.released, toks: [], alias: em.alias, by_root: em.by_root, tail: em.tail, calls: em.calls, refused: em.refused, deferred: [], rlocals: [] };
-  match expr(start, l.body, []) {
+                ctors: em.ctors, extra: b"", lambdas: em.lambdas, owner: em.owner, builtins: em.builtins, met: em.met, fields: em.fields, released: [], toks: [], alias: [], by_root: [], tail: false, calls: em.calls, refused: em.refused, deferred: [], rlocals: [] };
+  let charged = fold(window, start, |acc: Em, w: Conv| charge(acc, w.slot, w.c));
+  match expr(charged, l.body, []) {
     None -> None,
     Some(o0) -> {
       let w = word_of(o0.em, o0.v);
       let o = { em: w.em, v: o0.v };
       Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes, fields: o.em.fields, lambdas: o.em.lambdas, calls: o.em.calls, refused: o.em.refused,
+      extra: o.em.extra,
       text: bytes_concat_all([
       b"Word ply_", name, b"(PlyCtx *ctx",
       fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word q", num(i)])),
@@ -1503,7 +1693,27 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             Some({ em: check(o.em), v: o.v })
           },
         }
-      } else { Some(refused(em, bytes_concat(b"a global that is not a nullary constructor: ", v.name))) },
+      } else { match def_of(em, v.name) {
+        // A definition used as a value: a nullary one is called, and any other is a closure over
+        // its entry with nothing captured. The reference also asks whether the unit took it; a
+        // body naming one the unit does not hold is refused at the seam.
+        Some(d) -> if d.arity == 0 {
+          let o = bind(note_call(em, d.full), KBoxed, bytes_concat_all([d.c, b"(ctx)"]));
+          Some({ em: check(o.em), v: o.v })
+        } else {
+          let l = lambda_of(note_call(em, d.full), bytes_concat_all([d.c, b"_entry"]));
+          let arr = fresh(l.em);
+          let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {0};"]));
+          let o = bind(e, KBoxed, bytes_concat_all([b"rt_closure_p(ctx, @@l", num(l.i), b"@@, ", num(d.arity),
+            b", (Word)(intptr_t)", arr.name, b", 0)"]));
+          Some({ em: note_made(check(o.em), o.v.c), v: o.v })
+        },
+        None -> if fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == v.name) {
+          let bi = builtin_of(em, v.name);
+          let o = bind(bi.em, KBoxed, bytes_concat_all([b"rt_builtin_value_p(ctx, @@b", num(bi.i), b"@@)"]));
+          Some({ em: check(o.em), v: o.v })
+        } else { Some(refused(em, bytes_concat(b"a global this port cannot resolve: ", v.name))) },
+      } },
       Some(s) -> match conv_of(em, s) {
         Some(v) -> Some({ em: em, v: v }),
         // Not in the window: a parameter the prologue did not open, which is a
@@ -1614,9 +1824,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     // the function would be a call to something nothing defines, so the two are
     // one node here.
     //
-    // A lambda inside a lambda is refused: the numbering and the naming are the
-    // owner's, and nothing here has been checked at that depth.
-    NLambda(l) -> if em.owner == b"" { Some(refused(em, b"a lambda inside a lambda")) } else {
+    // A lambda inside a lambda is one more of the owner's: numbered after the one it sits in,
+    // its entry interned before its body as the reference reserves the slot, and its text
+    // written after its owner's.
+    NLambda(l) -> {
       match caps_owned(em, l.caps, params, 0, []) {
         None -> None,
         Some(w) -> {
@@ -1625,20 +1836,20 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           let idx = fold(w.em.lambdas, 0, |acc: Int, sym: Bytes|
             if bytes_len(sym) >= bytes_len(prefix) && bytes_slice(sym, 0, bytes_len(prefix)) == prefix { acc + 1 } else { acc });
           let sub = bytes_concat_all([em.owner, b"_lambda", num(idx)]);
-          match emit_lambda(w.em, sub, l) {
+          // The closure names its code by the entry's place in the body's table.
+          let entry = lambda_of(w.em, bytes_concat_all([b"ply_", sub, b"_entry"]));
+          match emit_lambda(entry.em, sub, l) {
             None -> None,
             Some(sub_out) -> {
-              let arr = fresh(w.em);
+              let arr = fresh(entry.em);
               let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
                 if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
               let grown = { out: e.out, n: e.n, conv: e.conv, ind: e.ind, reads: e.reads,
                             shapes: sub_out.shapes, built: e.built, module: e.module, made: e.made,
                             here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
-                            extra: bytes_concat(e.extra, sub_out.text), lambdas: sub_out.lambdas,
+                            extra: bytes_concat_all([e.extra, sub_out.text, sub_out.extra]), lambdas: sub_out.lambdas,
                             owner: e.owner, builtins: e.builtins, met: sub_out.met, fields: sub_out.fields, released: e.released, toks: e.toks, alias: e.alias, by_root: e.by_root, tail: e.tail, calls: sub_out.calls, refused: sub_out.refused, deferred: e.deferred, rlocals: e.rlocals };
-              // The closure names its code by the entry's place in the body's table.
-              let entry = lambda_of(grown, bytes_concat_all([b"ply_", sub, b"_entry"]));
-              let o = bind(entry.em, KBoxed, bytes_concat_all([
+              let o = bind(grown, KBoxed, bytes_concat_all([
                 b"rt_closure_p(ctx, @@l", num(entry.i), b"@@, ", num(l.params),
                 b", (Word)(intptr_t)", arr.name, b", ", num(len(l.caps)), b")"]));
               Some({ em: check(o.em), v: o.v })
