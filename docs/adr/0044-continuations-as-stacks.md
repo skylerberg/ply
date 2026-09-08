@@ -1,6 +1,6 @@
 # ADR 0044 — Continuations as stacks: the runtime the fifth step leaves
 
-**Accepted, and the first two stages are built.** ADR 0042 placed deleting the
+**Accepted, and the first three stages are built.** ADR 0042 placed deleting the
 machine fifth and ADR 0043 stopped at the line "what the runtime is once the
 machine is gone". This record is that line: what a suspended computation is in
 the compiled tier, how `simulate` and the three effects it answers are served
@@ -44,6 +44,25 @@ refuses it now, and the `desk` example, whose two handlers reach one, returns
 to the machine with every performer they serve. That row of the census is the
 fifth stage's to remove: a runtime with no machine behind it has to hold a
 secret somewhere, and where is a decision that record has not made.
+
+**Built, third stage:** multi-shot by in-place restore. A stop on the body's
+own stack is captured: the live range of the stack, the body's frames, and
+every word in that range that the heap says is one of its live objects, held
+once more each. The heap keeps a bit per eight bytes of each chunk, set where
+an object starts, which is what lets a word on a captured stack be told from
+an integer or a stale address without a stack map; a word that names a live
+object is pinned, and each restore holds it once more, since the restored run
+consumes at most one reference to it. That is the piece the design above did
+not foresee: restoring the bytes keeps every pointer valid, and the counts
+under them are what the pins keep true. Resuming a capture after the body
+finished restores it and runs the body again; resuming one while a later stop
+of the same body is suspended is refused, as the rule above says; a capture
+made under a task has no snapshot, and resuming it after the region ended is
+`E0413`, which is the machine's answer too. The producer test runs the
+language's own multi-shot shapes against the machine: `k(true) + k(false)`,
+`k(1) + k(2) + k(3)`, a string built twice from one argument, a cell shared
+across the resumptions, sibling slot writes that do not leak, and the
+ended-region refusal.
 
 > **What this decides.** That a suspended computation in the compiled tier is
 > **a C stack the runtime owns**, switched to and from with the C library's
@@ -353,9 +372,10 @@ language test written in Ply re-runs only when an edit reaches it.
    producer test that asserted "cannot carry" for a non-tail `resume` now
    asserts a handler refused for another reason cascades, and a test of its own
    drives four shapes of off-tail resumption against the machine.
-3. **Multi-shot by restore.** The snapshot, the in-place restore, the rule and
-   its code. Oracle: the language's multi-shot tests moved to Ply and run by
-   both sides under the audit, `k(true) + k(false)` among them.
+3. **Multi-shot by restore.** Built. The snapshot, the in-place restore, the
+   pins, the rule and its code. Oracle, met: the language's multi-shot shapes
+   as a producer test against the machine, `k(true) + k(false)` among them;
+   moving the machine's suites to Ply is the fifth stage's sort.
 4. **The host route.** The binding on the context, parking under the host
    policy, `E0424` and `E0426` from the runtime. Oracle: the served examples
    under `--host` (`crates/ply-cli/tests/suite`'s `w5_shutdown.rs`,

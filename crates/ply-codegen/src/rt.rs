@@ -310,6 +310,36 @@ impl FrameClause {
     }
 }
 
+/// The frames a captured continuation holds, each closure held once more for the copy.
+pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
+    list.iter()
+        .map(|f| {
+            for cl in &f.clauses {
+                heap::inc(cl.closure);
+            }
+            if f.ret != 0 {
+                heap::inc(f.ret);
+            }
+            HandlerFrame {
+                clauses: f
+                    .clauses
+                    .iter()
+                    .map(|cl| FrameClause {
+                        effect: cl.effect.clone(),
+                        resource: cl.resource.clone(),
+                        op: cl.op.clone(),
+                        closure: cl.closure,
+                        resumes: cl.resumes,
+                    })
+                    .collect(),
+                ret: f.ret,
+                simulate: f.simulate,
+                detached: f.detached,
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn drop_frame(f: HandlerFrame) {
     for c in f.clauses {
         heap::dec(c.closure);

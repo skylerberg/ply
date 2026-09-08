@@ -1771,10 +1771,11 @@ makes its answer the whole unit's, its refusals dropped as the built-in
 emitter's would be and the built-in emitter not run over the program at all;
 that mode also compiles `handle`, `perform`, `with_cell` and `simulate` with
 the `task`, `clock` and `random` operations a region answers, a clause that
-binds `resume` and calls it once anywhere in its body, and holds `Float` and
-`Decimal` literals as constants, all of which the built-in emitter refuses. A
-clause that resumes the same continuation twice fails in that mode with
-`E0502`; the machine runs it.
+binds `resume` and calls it anywhere in its body as often as it likes, and
+holds `Float` and `Decimal` literals as constants, all of which the built-in
+emitter refuses. One shape of resumption is refused at run time in that mode
+with `E0502`: resuming a continuation while a later stop of the same body is
+still suspended, which the machine runs.
 `PLY_C_REFUSALS=1` then also says how many bodies it answered. A simulated test
 the tier takes is scheduled by the runtime over the same seeded scheduler the
 machine drives, so a seed names one interleaving on either engine; under
