@@ -135,8 +135,13 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     let have = ply_codegen::c::bundle::exists(&bundle);
     assert!(
         have || refresh,
-        "no bootstrap bundle at {}; run this test with PLY_C_BOOTSTRAP_REFRESH=1 to write one from the reference",
-        bundle.display()
+        "no bootstrap bundle serves at {}{}; run this test with PLY_C_BOOTSTRAP_REFRESH=1 to write one from the reference",
+        bundle.display(),
+        if ply_codegen::c::bundle::stale_runtime(&bundle) {
+            " (it was emitted against another runtime's helper table)"
+        } else {
+            ""
+        }
     );
     let scratch = std::env::temp_dir().join(format!("ply-bootstrap-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();

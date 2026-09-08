@@ -529,6 +529,14 @@ That sentence is checkable in one grep. "The rename path is safe" is not.
 
 ## Adding things
 
+### A claim about the language
+
+A test of what a program means goes in `tests/lang/` as a `.ply` file with
+`test` items; a claim that a program raises goes in `tests/fixtures/lang/`
+with a `// raises <test> :: <text>` header per failing test (ADR 0045
+§"The suites"). Neither goes in a Rust suite: a Rust test of the machine is
+deleted with the machine.
+
 ### A diagnostic code
 
 `crates/ply-span/src/lib.rs` holds every code as a `pub const` in `codes` **and**
