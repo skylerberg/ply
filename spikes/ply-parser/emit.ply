@@ -337,6 +337,74 @@ fn ret_of(here: List<Def>, name: Bytes) -> Option<Kind> =
 // The builtins the reference does not simply call: four expanded in place around
 // a load, and the joins, which it fuses over a list literal rather than building
 // the list and joining it.
+// `fold(xs, init, |a, x| ..)` with the callback written out: the reference runs
+// the loop itself rather than handing the closure to `rt_fold`, so the closure is
+// built, called once per element, and released at the end.
+//
+// The list is read through `rt_list_at_p` and its length through the *builtin*,
+// not through the inline length beside it -- the fused loop asks the same
+// question a different way, and matching means asking it the reference's way.
+fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
+  if name != b"fold" || len(args) != 3 { None } else {
+    match list_at(args, 2) {
+      None -> None,
+      Some(f) -> match f.node {
+        NLambda(_) -> match list_at(args, 0) {
+          None -> None,
+          Some(xs) -> match list_at(args, 1) {
+            None -> None,
+            Some(init) -> match expr(em, xs, params) {
+              None -> None,
+              Some(lv) -> {
+                let lo = owned(lv.em, lv.v);
+                let arr = fresh(lo.em);
+                let cnt = line(arr.em, bytes_concat_all([
+                  b"Word ", arr.name, b"[1] = {", lo.v.c, b"}; ply_inc(", arr.name, b"[0]);"]));
+                let bi = builtin_of(cnt, b"len");
+                let raw = bind(bi.em, KBoxed, bytes_concat_all([
+                  b"rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)", arr.name, b", 1)"]));
+                let n = bind(check(raw.em), KInt, as_int(raw.v));
+                match expr(n.em, f, params) {
+                  None -> None,
+                  Some(cl) -> {
+                    let co = owned(cl.em, cl.v);
+                    match expr(co.em, init, params) {
+                      None -> None,
+                      Some(iv) -> {
+                        // The accumulator's word, *not* held once more: the loop
+                        // hands it to the closure and takes back what the closure
+                        // answers, so the count it starts with is the one it ends
+                        // with.
+                        let acc = bind_word(iv.em, iv.v);
+                        let i = bind(acc.em, KInt, b"0");
+                        let head = line(i.em, bytes_concat_all([
+                          b"for (; ", i.v.c, b" < ", n.v.c, b"; ", i.v.c, b" += 1) {"]));
+                        let at = bind(indent(head), KBoxed, bytes_concat_all([
+                          b"rt_list_at_p(ctx, ", lo.v.c, b", ", i.v.c, b")"]));
+                        let a2 = fresh(check(at.em));
+                        let call = line(
+                          line(line(a2.em, bytes_concat_all([
+                            b"Word ", a2.name, b"[] = {", acc.v.c, b", ", at.v.c, b"};"])),
+                            bytes_concat_all([b"ply_inc(", co.v.c, b");"])),
+                          bytes_concat_all([acc.v.c, b" = rt_call_p(ctx, ", co.v.c,
+                                            b", (Word)(intptr_t)", a2.name, b", 2);"]));
+                        let done = line(outdent(check(call)), b"}");
+                        Some({ em: line(line(done, bytes_concat_all([b"ply_dec(ctx, ", co.v.c, b");"])),
+                                        bytes_concat_all([b"ply_dec(ctx, ", lo.v.c, b");"])),
+                               v: acc.v })
+                      },
+                    }
+                  },
+                }
+              },
+            },
+          },
+        },
+        _ -> None,
+      },
+    }
+  }
+
 // The builtins the reference expands in place where the declaration fixes the
 // kind: with nothing to test, a length is the header's own field and a byte is a
 // bounds test around a load, with the runtime call as the out-of-range arm.
@@ -923,7 +991,9 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                       // `len` and `bytes_len` over a value whose kind the
                       // declaration fixes: no test to make, and the answer is the
                       // header's own field.
-                      None -> match inline_len(em, fv.name, a.args, params) {
+                      None -> match fused_fold(em, fv.name, a.args, params) {
+                        Some(o) -> Some(o),
+                        None -> match inline_len(em, fv.name, a.args, params) {
                         Some(o) -> Some(o),
                         None -> if is_callback(fv.name) || is_inlined(fv.name) { None }
                         else if !fold(em.builtins, false, |acc: Bool, b2: Bytes| acc || b2 == fv.name) { None }
@@ -941,6 +1011,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                             Some({ em: check(o.em), v: o.v })
                           },
                         } },
+                      },
                       },
                       Some(m) -> match args_one_pass(em, a.args, params, 0, []) {
                         None -> None,
