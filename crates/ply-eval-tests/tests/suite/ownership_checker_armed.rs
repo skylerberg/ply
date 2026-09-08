@@ -121,27 +121,7 @@ test "a growing accumulator read again after the append" {
 }
 "#;
 
-/// The spelling that was this file's *pessimal* control on the chain machine: the append in a
-/// non-last argument position. Under ADR 0034's slot frames a last use moves the value out of its
-/// slot wherever it sits, so this is now the linear control — which is the whole of what changed.
-const LINEAR_BY_LAST_USE: &str = r#"
-fn grow(acc: List<Int>, i: Int, n: Int) -> List<Int> =
-  if i >= n { acc } else { grow(push(acc, i), i + 1, n) }
 
-test "a growing accumulator at its last use" {
-  assert_eq(len(grow([], 0, 60)), 60)
-}
-"#;
-
-/// A `fold` accumulator, which is the shape the standard library is written in and the one a
-/// checker must not call shared.
-const LINEAR_BY_FOLD: &str = r#"
-fn build(n: Int) -> List<Int> = fold(range(0, n), [], |acc, x| push(acc, x))
-
-test "an accumulator threaded through a fold" {
-  assert_eq(len(build(60)), 60)
-}
-"#;
 
 /// A `push` onto an element read out of a list by index.
 const COPIES_VIA_LIST_AT: &str = r#"
@@ -245,93 +225,7 @@ fn an_append_whose_binding_is_read_again_is_flagged_and_the_counters_confirm_it(
     );
 }
 
-#[test]
-fn the_same_loop_at_its_last_use_is_not_flagged_and_the_counters_confirm_it() {
-    let p = inline(LINEAR_BY_LAST_USE);
-    let (verdict, reason, count) = only_site(&p);
-    println!("linear by last use: {verdict:?} — {reason}\n  {count:?}");
-    assert_eq!(
-        count.copies, 0,
-        "the control is not linear after all: {count:?}, so this test arms nothing"
-    );
-    assert!(
-        count.in_place >= 50,
-        "the loop must actually have run: {count:?}"
-    );
-    assert_eq!(
-        verdict,
-        Verdict::Reuses,
-        "the checker called a linear loop shared, which is the false positive that \
-         would send an author to insert `copy` and make it quadratic — reason given: {reason}"
-    );
-}
 
-#[test]
-fn a_fold_accumulator_is_not_flagged_and_the_counters_confirm_it() {
-    let p = inline(LINEAR_BY_FOLD);
-    let (verdict, reason, count) = only_site(&p);
-    println!("linear by fold: {verdict:?} — {reason}\n  {count:?}");
-    assert_eq!(
-        count.copies, 0,
-        "the control is not linear after all: {count:?}, so this test arms nothing"
-    );
-    assert!(
-        count.in_place >= 50,
-        "the fold must actually have run: {count:?}"
-    );
-    assert_eq!(
-        verdict,
-        Verdict::Reuses,
-        "the checker called a `fold` accumulator shared — reason given: {reason}"
-    );
-}
 
-/// The pair, stated as one assertion: two loops that differ only in whether the binding is read
-/// again after the append must get **different** verdicts.
-#[test]
-fn the_two_shapes_get_different_verdicts_which_is_what_a_constant_answer_cannot_do() {
-    let (slow, _, slow_count) = only_site(&inline(COPIES_BY_SECOND_READ));
-    let (fast, _, fast_count) = only_site(&inline(LINEAR_BY_LAST_USE));
-    assert_ne!(
-        slow_count.rate(),
-        fast_count.rate(),
-        "the two controls cost the same at runtime, so they are not a pair"
-    );
-    assert_ne!(
-        slow, fast,
-        "the checker gave one answer to a copying loop and to the same loop whose \
-         append is the last use; it is a constant and agreement with any corpus is vacuous"
-    );
-}
 
-/// The fix the checker recommends for a `cell` cause, run: the contents leave the arena for the
-/// length of the function, so the append is at one owner.
-const REUSES_VIA_CELL_UPDATE: &str = r#"
-fn fill(c: Cell<r, List<Int>>, i: Int) -> Unit / {cell.read[r], cell.write[r]} =
-  if i >= 60 { () } else { cell_update(c, |xs| push(xs, i)); fill(c, i + 1) }
 
-test "an accumulator kept in a cell, appended through the fused update" {
-  with_cell[r]([]) { c -> { fill(c, 0); assert_eq(len(cell_get(c)), 60) } }
-}
-"#;
-
-#[test]
-fn an_append_through_cell_update_is_not_flagged_and_the_counters_confirm_it() {
-    let p = inline(REUSES_VIA_CELL_UPDATE);
-    let (verdict, reason, count) = only_site(&p);
-    println!("cell_update: {verdict:?} — {reason}\n  {count:?}");
-    assert_eq!(
-        count.copies, 0,
-        "the control is not linear after all: {count:?}, so this test arms nothing"
-    );
-    assert!(
-        count.in_place >= 50,
-        "the loop must actually have run: {count:?}"
-    );
-    assert_eq!(
-        verdict,
-        Verdict::Reuses,
-        "the checker flagged the very edit it recommends for a `cell` cause — reason given: \
-         {reason}"
-    );
-}

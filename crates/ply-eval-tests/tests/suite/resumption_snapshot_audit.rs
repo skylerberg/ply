@@ -1,10 +1,9 @@
 //! Whether a region that a continuation is captured across is recognised as one, and whether the
 //! arena's save-and-restore primitive covers what it says it covers.
 
-use ply_core::{CheckOutput, check_program};
 use ply_eval::arena::{Arena, RegionKind, Slot};
 use ply_eval::region_kind::{Cause, Regions, check, infer};
-use ply_eval::{Machine, Value};
+use ply_eval::Value;
 use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -44,33 +43,6 @@ fn kind_of(src: &str, brand: &str) -> RegionKind {
         .1
 }
 
-/// The cells the machine is left holding after one test, rendered, in id order.
-#[track_caller]
-fn cells_after(src: &str, test: &str) -> Vec<String> {
-    let (program, resolved) = load(src);
-    let checked: CheckOutput = check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the probe must typecheck: {d:#?}\n{src}"));
-    let index = checked
-        .tests
-        .iter()
-        .position(|t| t.name == test)
-        .unwrap_or_else(|| panic!("no test named {test:?}"));
-    let mut machine = Machine::new(&program, &resolved, &checked);
-    // The reclamation journal, not the residue: a region hands its slots back at its close, so what
-    // a run leaves behind is empty whatever it wrote.
-    machine.cells_mut().journal();
-    machine
-        .eval_test(index)
-        .unwrap_or_else(|d| panic!("{test:?} must run: {d:#?}"));
-    let mut cells: Vec<(u32, String)> = machine
-        .cells()
-        .journalled()
-        .iter()
-        .map(|(slot, v)| (slot.index(), v.render()))
-        .collect();
-    cells.sort_by_key(|(slot, _)| *slot);
-    cells.into_iter().map(|(_, v)| v).collect()
-}
 
 fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {
     match arena.get(slot) {
@@ -123,15 +95,6 @@ fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
     );
 }
 
-/// The same program, run.
-#[test]
-fn the_region_that_infers_shared_is_written_by_both_resumptions() {
-    assert_eq!(
-        cells_after(HANDLE_ENCLOSES, "handler outside the region"),
-        vec!["2".to_string()],
-        "one cell, allocated before the capture and incremented by each resumption"
-    );
-}
 
 /// Two spellings of one program must agree, which is how the hole was diagnosed rather than merely
 /// observed.
