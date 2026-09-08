@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **1213 of 1282** shipped bodies, 1207 resolving to the reference's C |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **1239 of 1282** shipped bodies, 1233 resolving to the reference's C |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -75,6 +75,12 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**Any callee is a value.** A call whose callee is not a name -- a field holding a function,
+a call's answer -- goes through the runtime as a call of a bound variable already did: the
+callee held once more, then each argument as it is evaluated, then `rt_call`. One function
+serves both. 1213 to 1239 reached, every new body the reference's C exactly. The census
+leads with a `Float`, `Decimal`, fixed-width or unit literal, then a lambda inside a lambda.
 
 **An `if` joins on the kinds its arms answered.** The port guessed each arm's kind
 structurally before writing either, and refused where the guesses differed, on the belief
