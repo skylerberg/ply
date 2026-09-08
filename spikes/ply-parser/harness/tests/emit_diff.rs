@@ -532,8 +532,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     // kind, and the width the released record's cells are reused at -- and the resolution that
     // gives it is written and switched off in `emit.ply`. With it these six agree and 58 more
     // bodies are reached, at the cost of 17 others: down from 38 as the release rules were found,
-    // and seven of the seventeen are one thing again -- an update whose base the port does not
-    // release where the reference does.
+    // and four of the thirteen are an extra count this port takes where the reference does not.
     let expected_gaps = [
         "std.hash.full_words",
         "std.hash.padded_words",
