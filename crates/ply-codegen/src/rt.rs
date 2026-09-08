@@ -243,6 +243,9 @@ pub struct HandlerFrame {
     /// A `simulate` region's frame: it answers `task`, `clock`, `random` and `sim` through the
     /// scheduler and has no clauses of its own.
     simulate: bool,
+    /// The body of a `handle` with a clause that resumes off the tail runs on a stack of its own,
+    /// and this frame sits at the bottom of that stack's frames; the index names the body.
+    detached: Option<usize>,
 }
 
 impl HandlerFrame {
@@ -251,6 +254,16 @@ impl HandlerFrame {
             clauses: Vec::new(),
             ret: 0,
             simulate: true,
+            detached: None,
+        }
+    }
+
+    pub(crate) fn detached(clauses: Vec<FrameClause>, id: usize) -> HandlerFrame {
+        HandlerFrame {
+            clauses,
+            ret: 0,
+            simulate: false,
+            detached: Some(id),
         }
     }
 }
@@ -275,12 +288,14 @@ impl Frames {
 
 /// One clause: its effect and resource under their program-wide names, the operation, the
 /// closure the clause body became, and whether the clause binds `resume`.
-struct FrameClause {
+pub(crate) struct FrameClause {
     effect: Symbol,
     resource: Option<Symbol>,
     op: Symbol,
     closure: Word,
-    resumes: bool,
+    /// 0 for a clause that never resumes, 1 for one that calls `resume` in tail position, 2 for
+    /// one that binds it and calls it elsewhere, which only a detached frame carries.
+    resumes: u8,
 }
 
 impl FrameClause {
@@ -295,7 +310,7 @@ impl FrameClause {
     }
 }
 
-fn drop_frame(f: HandlerFrame) {
+pub(crate) fn drop_frame(f: HandlerFrame) {
     for c in f.clauses {
         heap::dec(c.closure);
     }
@@ -338,6 +353,9 @@ pub struct Ctx {
     pub performed: Vec<EffectAtom>,
     /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
     pub(crate) sims: Vec<crate::simulate::Simulation>,
+    /// The detached bodies this entry has opened, named by index from their frames and tokens.
+    pub(crate) detached: Vec<crate::detached::Detached>,
+    pub(crate) starting_detached: Option<usize>,
     /// The seed the driver set, and the step budget, for the regions this entry opens.
     pub(crate) seed: ply_eval::Seed,
     pub(crate) sim_steps: u32,
@@ -346,7 +364,7 @@ pub struct Ctx {
     pub record: Option<ply_eval::region::Record>,
     entered_sims: u32,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
-    unwind: Option<(usize, usize, Word)>,
+    pub(crate) unwind: Option<(usize, usize, Word)>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
     resumed: Option<Word>,
 }
@@ -371,6 +389,8 @@ impl Ctx {
             current: 0,
             performed: Vec::new(),
             sims: Vec::new(),
+            detached: Vec::new(),
+            starting_detached: None,
             seed: ply_eval::Seed::default(),
             sim_steps: ply_eval::sim::DEFAULT_STEPS,
             trail: ply_eval::region::Trail::new(ply_eval::Seed::default()),
@@ -394,6 +414,8 @@ impl Ctx {
         self.current = 0;
         self.performed.clear();
         self.sims.clear();
+        self.detached.clear();
+        self.starting_detached = None;
         self.trail = ply_eval::region::Trail::new(self.seed.clone());
         self.record = None;
         self.entered_sims = 0;
@@ -1487,25 +1509,47 @@ pub unsafe extern "C" fn rt_handle_push(
     ret: i64,
 ) -> i64 {
     let c = unsafe { &mut *ctx };
+    let clauses = clauses_of(c, clauses, n);
+    let frames = c.frames();
+    frames.push(HandlerFrame {
+        clauses,
+        ret,
+        simulate: false,
+        detached: None,
+    });
+    (frames.len() - 1) as i64
+}
+
+/// The clause table a `handle` site built: five words per clause, names as indices into the
+/// unit's field table.
+fn clauses_of(c: &Ctx, clauses: *const i64, n: i64) -> Vec<FrameClause> {
     let words = args_of(clauses, n * 5);
     let name = |i: i64| c.tables.fields[i as usize].clone();
-    let clauses = words
+    words
         .chunks(5)
         .map(|w| FrameClause {
             effect: name(w[0]),
             resource: (w[1] >= 0).then(|| name(w[1])),
             op: name(w[2]),
             closure: w[3],
-            resumes: w[4] != 0,
+            resumes: w[4] as u8,
         })
-        .collect();
-    let frames = c.frames();
-    frames.push(HandlerFrame {
-        clauses,
-        ret,
-        simulate: false,
-    });
-    (frames.len() - 1) as i64
+        .collect()
+}
+
+/// `handle { body } with { .. }` where a clause resumes off the tail: the body is a nullary
+/// closure run on a stack of its own. Answers the handle's value.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rt_handle_detached(
+    ctx: *mut Ctx,
+    clauses: *const i64,
+    n: i64,
+    ret: i64,
+    body: i64,
+) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let clauses = clauses_of(c, clauses, n);
+    unsafe { crate::detached::open(ctx, clauses, ret, body) }
 }
 
 /// The `k` a clause that binds `resume` is handed: calling it in tail position records the
@@ -1537,20 +1581,21 @@ fn restore_hidden(c: &mut Ctx, hidden: Vec<(usize, Vec<HandlerFrame>)>) {
 }
 
 fn resume_token(c: &mut Ctx, stack: usize, depth: usize) -> Word {
+    closure_of(
+        c,
+        rt_resume_entry as *const () as usize,
+        ((stack << 32) | depth) as i64,
+    )
+}
+
+/// A unary closure over one immediate capture whose entry is a runtime function.
+pub(crate) fn closure_of(c: &mut Ctx, entry: usize, capture: i64) -> Word {
     let o = c
         .heap
         .alloc(KIND_CLOSURE, 0, (1 + CLOSURE_CAPTURES) as u32, 1);
     unsafe {
-        set_word(
-            o,
-            CLOSURE_CODE,
-            rt_resume_entry as *const () as usize as Word,
-        );
-        set_word(
-            o,
-            CLOSURE_CAPTURES,
-            heap::imm(((stack << 32) | depth) as i64),
-        );
+        set_word(o, CLOSURE_CODE, entry as Word);
+        set_word(o, CLOSURE_CAPTURES, heap::imm(capture));
     }
     o as Word
 }
@@ -1607,7 +1652,14 @@ pub unsafe extern "C" fn rt_perform(
                 .iter()
                 .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
             {
-                found = Some((stack, i, cl.closure, cl.resumes));
+                if cl.resumes == 2 {
+                    let id = f
+                        .detached
+                        .expect("a clause off the tail is in a detached frame");
+                    let closure = cl.closure;
+                    return unsafe { crate::detached::stop(ctx, id, closure, args_of(args, n)) };
+                }
+                found = Some((stack, i, cl.closure, cl.resumes != 0));
                 break 'search;
             }
         }

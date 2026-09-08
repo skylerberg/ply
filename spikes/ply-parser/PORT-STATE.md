@@ -255,6 +255,12 @@ nearest region is in the unit, and `task` joined the prelude effects the port re
 reference emits none of it, so the ratchet is unchanged; the instrument for this shape is the
 audit with every simulated test's seeds paired against the machine, green over both corpora.
 
+A `handle` with a clause that binds `resume` and calls it off the tail is no longer refused:
+the body becomes a nullary closure over every slot it reads, at the same slot numbers so nothing
+in it is renumbered, handed to `rt_handle_detached_p` with the clause table, in which the resume
+column says `2` for such a clause. The port also refuses `secret_of_string` as the reference
+does; it had compiled it, which whole mode would have shipped.
+
 ## Beyond the port
 
 `docs/adr/0041-effects-in-a-compiled-tier.md` carries the effects work: `with

@@ -179,6 +179,7 @@ helpers![
     ("rt_perform", 6, true),
     ("rt_handle_land", 2, true),
     ("rt_simulate", 1, true),
+    ("rt_handle_detached", 4, true),
     ("rt_region", 1, true),
     ("rt_region_close", 1, false),
 ];

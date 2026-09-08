@@ -327,7 +327,7 @@ fn hosting(seed: Int) -> Int =
 
 fn handler(seed: Int) -> Int =
   handle { performer(seed) } with {
-    counter.bump(n) resume k -> k(n) + 1,
+    counter.bump(n) -> match secret_of_string("hidden") { _ -> n + 1 },
   }
 
 fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
@@ -355,7 +355,7 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
             .unwrap_or_else(|| panic!("`{name}` was taken; refusals: {refused:?}"))
     };
     assert!(
-        reason("m.handler").contains("cannot carry"),
+        reason("m.handler").contains("credential"),
         "{}",
         reason("m.handler")
     );
@@ -560,6 +560,89 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
         assert_eq!(
             ours.virtual_time, theirs.virtual_time,
             "`{name}{args:?}`: virtual time differs"
+        );
+    }
+}
+
+const RESUMED: &str = r#"
+effect ask {
+  write get(n: Int) -> Int
+}
+
+fn twice(n: Int) -> Int / {ask.write} = ask.get(n) + ask.get(n * 10)
+
+fn later(seed: Int) -> Int =
+  handle { twice(seed) } with {
+    ask.get(n) resume k -> k(n + 1) * 2,
+  }
+
+fn returned(seed: Int) -> Int =
+  handle { twice(seed) } with {
+    ask.get(n) resume k -> k(n) + 1000,
+    return x -> x * 3,
+  }
+
+fn dropped(seed: Int) -> Int =
+  handle { ask.get(seed) + 1 } with {
+    ask.get(n) resume k -> if n > 5 { k(n) } else { 0 - n },
+  }
+
+fn mixed(seed: Int) -> Int =
+  handle { ask.get(seed) + ask.get(seed + 1) } with {
+    ask.get(n) resume k -> { let r = k(n * 2); r + 1 },
+  }
+"#;
+
+/// A clause that resumes off the tail runs the body on a stack of its own, and `k` switches
+/// into it from the clause: the answers are the machine's, including the `return` clause's
+/// place inside `k` and a body dropped without resuming.
+#[test]
+fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", RESUMED)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let cases: Vec<(&str, Vec<Value>)> = vec![
+        ("m.later", vec![Value::Int(3)]),
+        ("m.returned", vec![Value::Int(4)]),
+        ("m.dropped", vec![Value::Int(9)]),
+        ("m.dropped", vec![Value::Int(2)]),
+        ("m.mixed", vec![Value::Int(5)]),
+    ];
+    for (name, args) in cases {
+        let want = machine
+            .call(name, args.clone(), Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(
+            ctx.failed,
+            0,
+            "`{name}{args:?}` raised in the C tier: {:?}",
+            ctx.diagnostic.as_ref().map(|d| d.message.clone())
+        );
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        ctx.end();
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the machine disagree"
         );
     }
 }
