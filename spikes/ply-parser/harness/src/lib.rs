@@ -1772,6 +1772,16 @@ fn lower_hex(bytes: &[u8]) -> String {
 /// Ply implementation builds the right *tree*; this says whether it writes the right *program*.
 /// Placeholders are left as they are (`@@c3@@`, `@@b7@@`) because they are a body's own positions
 /// in the unit's tables, which is what makes one body comparable without the unit around it.
+/// The inlining the emitter differential pins.
+///
+/// Zero and zero: a call is emitted as a call, and what the two sides are compared on is the
+/// *emitter*. The inliner is a stage of its own and the port does not have it; comparing at the
+/// shipped depth would report every inlined call as a disagreement and say nothing about either.
+pub const INLINING: ply_codegen::opt::Inlining = ply_codegen::opt::Inlining {
+    budget: 0,
+    depth: 0,
+};
+
 pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
     let mut program = Program {
         modules: Vec::new(),
@@ -1803,7 +1813,7 @@ pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
     for name in source.functions() {
         // A body the reference refuses is left out, exactly as a body the port has not reached is:
         // what is compared is what both sides produced.
-        if let Ok(text) = ply_codegen::c::emit_body(source, &name) {
+        if let Ok(text) = ply_codegen::c::emit_body(source, &name, INLINING) {
             out.push_str(&format!("f:{name};{text};"));
         }
     }

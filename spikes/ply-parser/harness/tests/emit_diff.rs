@@ -438,6 +438,9 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
             };
             reached += 1;
             if want != &body {
+                if differ.is_empty() {
+                    println!("--- {name}, reference\n{want}\n--- {name}, port\n{body}");
+                }
                 differ.push(name);
             }
         }
@@ -448,7 +451,7 @@ fn the_port_agrees_with_the_reference_over_the_shipped_corpus() {
     );
     assert!(differ.is_empty(), "these disagree: {differ:?}");
     assert!(
-        reached >= 32,
+        reached >= 34,
         "the port emitted {reached} shipped bodies -- raise this when it grows, never lower it"
     );
 }
