@@ -16,7 +16,7 @@ use crate::host::{
 use crate::limit::{self, DEFAULT_MAX_CALLS, NAMED_CALLS, NESTED_CALLS};
 use crate::memo::{Lookup, Memo};
 use crate::rc::Own;
-use crate::region::{self, Region, StepSite, Trail};
+use crate::region::{self, Region, Spawned, StepSite, Trail};
 use crate::sched::{HostPolicy, Policy, Resumption, Scheduler, Turn};
 use crate::semantics::{
     OpTable, arity_error, ctor_value, err_fixed_overflow, err_non_exhaustive, err_not_a_function,
@@ -479,15 +479,19 @@ impl<'a> Machine<'a> {
                 .name
                 .qualify(&Symbol::new(format!("test#{ordinal}")));
             self.reset();
-            let entered = self
-                .compiled
-                .as_ref()
-                .map(|backend| backend.enter_test(&root, self.max_calls));
+            let entered = self.compiled.as_ref().map(|backend| {
+                backend.set_seed(self.seed.clone(), self.sim_steps);
+                backend.enter_test(&root, self.max_calls)
+            });
             match entered {
                 // A test's body answers the unit; anything else is a backend answering wrongly,
                 // which the machine's own run of the body catches as it catches every wrong call.
                 Some(Entered::Answered(Value::Unit)) => {
                     self.record_compiled_atoms();
+                    self.record = self
+                        .compiled
+                        .as_ref()
+                        .and_then(|backend| backend.simulated());
                     self.compiled_entries.set(self.compiled_entries.get() + 1);
                     self.end_entry_point();
                     return Ok(());
@@ -1612,7 +1616,7 @@ impl<'a> Machine<'a> {
                 let over = k.delimiters();
                 let pin = self.regions.pin();
                 let live = region_mut(&mut self.sims, region).expect("the region was just found");
-                let id = live.sched.spawn(body, over, span, pin);
+                let id = live.sched.spawn(Spawned { body, over }, span, pin);
                 live.sched.suspend(k, Value::Task(id))?;
             }
             ("task", "join") => {
@@ -1776,7 +1780,10 @@ impl<'a> Machine<'a> {
                         self.go_eval(body, module);
                         Ok(())
                     }
-                    Resumption::Start { body, over, span } => {
+                    Resumption::Start {
+                        body: Spawned { body, over },
+                        span,
+                    } => {
                         self.stack = install(below, &over);
                         self.apply(body, Vec::new(), span)
                     }
@@ -2691,7 +2698,7 @@ fn take_args<const N: usize>(
 
 #[cold]
 #[inline(never)]
-fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
+pub fn err_nested_simulation(span: Span, outer: Span) -> Diagnostic {
     Diagnostic::error(
         codes::NESTED_SIMULATION,
         "a `simulate` region may not run inside another one",
