@@ -240,18 +240,47 @@ fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
 // The shape's index in this body's own table, added on first use. A body names
 // the unit's tables by its own positions, which is what makes one body's text
 // comparable at all.
-// A call's arguments, left to right, each held once more for the callee.
+// The helper that answers a builtin directly, where one does. Transcribed from
+// `c/emit.rs`'s table of the same name; a builtin with no entry here is refused
+// rather than sent down the generic path, which needs the unit's builtin table.
+fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
+  if name == b"push" && args == 2 { Some(b"rt_push_p") }
+  else if name == b"map_insert" && args == 3 { Some(b"rt_map_insert_p") }
+  else if name == b"map_contains" && args == 2 { Some(b"rt_map_contains_p") }
+  else if name == b"map_get" && args == 2 { Some(b"rt_map_get_p") }
+  else if name == b"compare" && args == 2 { Some(b"rt_compare_p") }
+  else if name == b"byte_of_int" && args == 1 { Some(b"rt_byte_of_int_p") }
+  else if name == b"bytes_concat" && args == 2 { Some(b"rt_bytes_concat_p") }
+  else if name == b"bytes_slice" && args == 3 { Some(b"rt_bytes_slice_p") }
+  else if name == b"bytes_scan" && args == 4 { Some(b"rt_bytes_scan_p") }
+  else if name == b"bytes_scan_until" && args == 4 { Some(b"rt_bytes_scan_until_p") }
+  else if name == b"list_at" && args == 2 { Some(b"rt_list_index_p") }
+  else { None }
+
+// A call's arguments: **every one evaluated first**, and only then each held
+// once more for the callee.
+//
+// Two passes rather than one, and the order is observable: interleaving them
+// puts the duplicate of the first argument between the first argument's own
+// evaluation and the second's, and the reference writes it after both.
 fn args_owned(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes> }> =
-  if i >= len(xs) { Some({ em: em, names: acc }) } else {
+  match args_evaled(em, xs, params, i, []) {
+    None -> None,
+    Some(e) -> Some(fold(e.vals, { em: e.em, names: acc }, |a: { em: Em, names: List<Bytes> }, v: V| {
+      let w = owned(a.em, v);
+      { em: w.em, names: push(a.names, w.v.c) }
+    })),
+  }
+
+fn args_evaled(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<V>)
+    -> Option<{ em: Em, vals: List<V> }> =
+  if i >= len(xs) { Some({ em: em, vals: acc }) } else {
     match list_at(xs, i) {
       None -> None,
       Some(x) -> match expr(em, x, params) {
         None -> None,
-        Some(o) -> {
-          let w = owned(o.em, o.v);
-          args_owned(w.em, xs, params, i + 1, push(acc, w.v.c))
-        },
+        Some(o) -> args_evaled(o.em, xs, params, i + 1, push(acc, o.v)),
       },
     }
   }
@@ -347,7 +376,8 @@ pub fn covers() -> List<Bytes> =
    b"neg and not, and the Bool literals",
    b"a field of a record whose shape a parameter's type gives",
    b"a record literal, through this body's reuse token for its width",
-   b"a direct call to a definition of the same module"]
+   b"a direct call to a definition of the same module",
+   b"the builtins with a runtime helper of their own"]
 
 fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
@@ -506,7 +536,24 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // by the unit's constant table, which is a purity analysis this port does
         // not have. Refused rather than emitted as the call it lowered to.
         None -> if len(a.args) == 0 { None }
-                else if !fold(em.here, false, |acc: Bool, h: Bytes| acc || h == fv.name) { None }
+                else if !fold(em.here, false, |acc: Bool, h: Bytes| acc || h == fv.name) {
+                  // Not a definition of this module: a builtin, or an import this
+                  // port cannot resolve. The ones with a helper of their own are
+                  // a swap for the call and nothing about ownership changes.
+                  match direct_helper(fv.name, len(a.args)) {
+                    None -> None,
+                    Some(h) -> match args_owned(em, a.args, params, 0, []) {
+                      None -> None,
+                      Some(w) -> {
+                        let o = bind(w.em, KBoxed, bytes_concat_all([
+                          h, b"(ctx",
+                          fold(w.names, b"", |acc: Bytes, nm: Bytes|
+                            bytes_concat_all([acc, b", ", nm])), b")"]));
+                        Some({ em: check(o.em), v: o.v })
+                      },
+                    },
+                  }
+                }
                 else { match args_owned(em, a.args, params, 0, []) {
           None -> None,
           Some(w) -> {
@@ -556,6 +603,10 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   }
 
 // The items of a list, left to right, each boxed into its own `Word` local.
+// One pass, and **not** the two an argument list makes. An aggregate's item is
+// held once more as soon as it is evaluated; a call's arguments are all
+// evaluated and only then held. Both orders were tried against the corpus and
+// each is wrong in the other's place.
 fn items(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes>, vals: List<V> }> =
   items_from(em, xs, params, i, acc, [])
