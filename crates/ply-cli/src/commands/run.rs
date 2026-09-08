@@ -431,6 +431,7 @@ pub fn compiled_backend(
         &loaded.resolved,
         &loaded.check,
         &loaded.hashes,
+        super::common::module_texts(&loaded.program, &loaded.sources),
     )?;
     Ok(Some(provider.attach(&spec)))
 }

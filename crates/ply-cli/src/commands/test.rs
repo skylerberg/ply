@@ -289,8 +289,16 @@ fn iterate(
         .as_ref()
         .filter(|_| !nothing_to_run)
         .filter(|_| held_unit.is_none())
-        .map(|spec| build_backend(spec, run_program, run_resolved, &loaded.check, &hashes))
-    {
+        .map(|spec| {
+            build_backend(
+                spec,
+                run_program,
+                run_resolved,
+                &loaded.check,
+                &hashes,
+                super::common::module_texts(run_program, &loaded.sources),
+            )
+        }) {
         None => held_unit,
         Some(Ok(provider)) => {
             // Held for the next iteration, which is what makes a warm loop pay for the edit rather
