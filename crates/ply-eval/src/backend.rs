@@ -649,6 +649,14 @@ impl Compiled for Mutant {
         self.inner.take_performed()
     }
 
+    fn set_seed(&self, seed: crate::sim::Seed, steps: u32) {
+        self.inner.set_seed(seed, steps);
+    }
+
+    fn simulated(&self) -> Option<crate::region::Record> {
+        self.inner.simulated()
+    }
+
     /// A corruption is a wrong answer at the seam, and a test entered whole hands the seam
     /// nothing to corrupt: a mutant leaves every test to the machine, where each call crosses.
     fn enter_test(&self, _name: &Symbol, _budget: usize) -> crate::compiled::Entered {

@@ -1,5 +1,7 @@
 //! Where a natively compiled body may be entered in place of evaluating one.
 
+use crate::region::Record;
+use crate::sim::Seed;
 use crate::value::{Closure, ClosureKind, Value};
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, IntTy, SECRET, TyVar, Type};
@@ -26,6 +28,14 @@ pub trait Compiled {
     /// handled perform is still a perform, and the observed row is a claim the tests make.
     fn take_performed(&self) -> Vec<EffectAtom> {
         Vec::new()
+    }
+
+    /// The seed and step budget the next entry's `simulate` regions run under.
+    fn set_seed(&self, _seed: Seed, _steps: u32) {}
+
+    /// What the last entry's regions did, for the search, if it opened any.
+    fn simulated(&self) -> Option<Record> {
+        None
     }
 }
 

@@ -76,6 +76,7 @@ pub use explore::{
 pub use limit::{DEFAULT_MAX_CALLS, MAX_VALUE_DEPTH};
 pub use machine::{Machine, Progress};
 pub use rc::{Own, Stats as RcStats};
+pub use region::{MachineScheduler, Spawned};
 pub use region_kind::Regions;
 pub use semantics::strict_binary;
 pub use sim::{

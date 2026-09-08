@@ -15,7 +15,9 @@ pub mod list;
 pub mod map;
 pub mod opt;
 pub mod rt;
+pub mod simulate;
 pub mod source;
+pub mod stack;
 
 pub use backend::{Bodies, Closed, Declines, Unit, closure};
 pub use c::{Profile, Refused, select_profile};
