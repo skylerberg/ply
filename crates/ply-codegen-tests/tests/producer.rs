@@ -183,3 +183,71 @@ fn the_ply_emitter_answers_bodies_and_they_answer_what_the_machine_answers() {
 fn the_chain_entered_whole_answers_what_the_machine_answers() {
     built_and_checked(true);
 }
+
+/// `Float` and `Decimal` literals are constants the runtime holds, opaque to the emitted C:
+/// every operator over one is the machine's own through the runtime. Neither crosses the seam,
+/// so each case answers through a conversion that does.
+const NUMERIC: &str = r#"
+fn bigger(bits: Int) -> Bool = float_of_bits(bits) > 1.5
+fn half(bits: Int) -> Int = bits_of_float(float_of_bits(bits) * 0.5)
+fn tenth(n: Int) -> String = decimal_to_string(decimal_of_int(n) * 0.10m)
+fn same(bits: Int) -> Bool = float_of_bits(bits) == 2.5e0
+fn negated(bits: Int) -> Int = bits_of_float(-float_of_bits(bits))
+fn product(a: Int, b: Int) -> String = decimal_to_string(decimal_of_int(a) * decimal_of_int(b))
+fn ordered(a: Int, b: Int) -> Bool = decimal_of_int(a) < decimal_of_int(b)
+"#;
+
+#[test]
+fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does() {
+    producer::install(std::sync::Arc::new(emitter));
+    producer::set_whole(true);
+    let loaded = load(&[("m", NUMERIC)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let two = Value::Int(2.0f64.to_bits() as i64);
+    let three = Value::Int(3.0f64.to_bits() as i64);
+    let cases: Vec<(&str, Vec<Value>)> = vec![
+        ("m.bigger", vec![two.clone()]),
+        ("m.bigger", vec![Value::Int(1.0f64.to_bits() as i64)]),
+        ("m.half", vec![three]),
+        ("m.tenth", vec![Value::Int(7)]),
+        ("m.same", vec![Value::Int(2.5f64.to_bits() as i64)]),
+        ("m.negated", vec![Value::Int(2.0f64.to_bits() as i64)]),
+        ("m.product", vec![Value::Int(6), Value::Int(7)]),
+        ("m.ordered", vec![Value::Int(6), Value::Int(7)]),
+    ];
+    for (name, args) in cases {
+        let want = machine
+            .call(name, args.clone(), Span::DUMMY)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(
+            ctx.failed,
+            0,
+            "`{name}{args:?}` raised in the C tier: {:?}",
+            ctx.diagnostic.as_ref().map(|d| d.message.clone())
+        );
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        ctx.end();
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the machine disagree"
+        );
+    }
+}

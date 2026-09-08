@@ -507,6 +507,29 @@ pub fn binop_code(op: BinOp) -> i64 {
 /// The machine's own operator over two values, for an operand whose type the emitter does not
 /// fix -- a `Float`, a `Decimal` -- so that such a body compiles and answers what the machine
 /// answers rather than being refused with every caller behind it. Takes both.
+/// `rt_negate(ctx, a)`: the machine's own negation of a value whose type the emitter cannot
+/// see -- a `Float` or `Decimal` in a word an `Int` operation would have unboxed.
+pub unsafe extern "C" fn rt_negate(ctx: *mut Ctx, a: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let vals = values_taken(c, &[a]);
+    let answer = match &vals[0] {
+        Value::Float(f) => Value::Float(-f),
+        Value::Decimal(d) => Value::Decimal(-*d),
+        Value::Fixed(f) => match ply_eval::Fixed::of(f.ty, -f.value()) {
+            Some(n) => Value::Fixed(n),
+            None => return c.fail(error("negation overflowed its width")),
+        },
+        other => match other.as_int(Span::DUMMY, "negation") {
+            Ok(i) => match i.checked_neg() {
+                Some(n) => Value::Int(n),
+                None => return c.fail(error("negation overflowed")),
+            },
+            Err(d) => return c.fail(d),
+        },
+    };
+    c.word(&answer)
+}
+
 pub unsafe extern "C" fn rt_binary(ctx: *mut Ctx, op: i64, a: i64, b: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let Some(op) = usize::try_from(op)
