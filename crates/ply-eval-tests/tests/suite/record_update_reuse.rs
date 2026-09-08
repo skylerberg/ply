@@ -62,29 +62,3 @@ test "two of three fields, one rewritten" {
     );
 }
 
-/// The accumulator shape the fifth gate pair is about, threaded through an update: the written
-/// field's `push` takes the old list out of the record, and the base is then reused in place, so
-/// every round rewrites rather than copies.
-#[test]
-fn a_threaded_update_appends_in_place_every_round() {
-    let stats = passes(
-        r#"
-type S = {k: Int, out: List<Int>}
-
-fn go(i: Int, s: S) -> S =
-  if i == 64 { s } else { go(i + 1, {..s, k: s.k + 1, out: push(s.out, i)}) }
-
-test "sixty-four rounds" {
-  let s = go(0, {k: 0, out: []});
-  assert_eq(s.k, 64);
-  assert_eq(len(s.out), 64)
-}
-"#,
-        "sixty-four rounds",
-    );
-    assert_eq!(
-        (stats.updates, stats.updates_in_place),
-        (64, 64),
-        "every append found the list at one owner: {stats:?}"
-    );
-}

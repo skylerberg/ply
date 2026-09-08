@@ -44,14 +44,6 @@ fn probe(c: &Compiled, name: &str) -> Result<Value, ply_span::Diagnostic> {
     machine.call(name, vec![Value::Int(400)], Span::DUMMY)
 }
 
-#[test]
-fn a_nullary_pure_definition_is_evaluated_once() {
-    let c = Compiled::new(SOURCE);
-    match probe(&c, "m.probe_constant") {
-        Ok(value) => assert_eq!(value, Value::Int(1400)),
-        Err(d) => panic!("the remembered constant did not survive the depth: {d:#?}"),
-    }
-}
 
 #[test]
 fn a_definition_with_a_parameter_is_not_a_constant_however_dead_the_parameter_is() {

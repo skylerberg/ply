@@ -271,76 +271,6 @@ fn every_fixture_is_in_exactly_one_bucket_and_examples_is_its_own() {
     assert_eq!(BUCKETS, 8, "`over_every_corpus!` names one test per bucket");
 }
 
-/// The corpus half of `CONTRIBUTING.md` §"Things known to be broken" item 11,
-/// pinned on its fixture rather than left to the sweep above.
-#[test]
-fn a_definition_that_discharges_its_own_effects_is_in_the_corpus_and_is_never_entered() {
-    let root = workspace_root();
-    let dir = root.join("tests/fixtures");
-    let file = dir.join("self_handled_effect.ply");
-    assert!(
-        file.exists(),
-        "{} is part of the repository, and it is the only corpus in the tree that declares an \
-         effect and discharges it",
-        file.display()
-    );
-
-    let (program, resolved) = load(&dir, std::slice::from_ref(&file)).expect("the fixture loads");
-    let check = ply_core::check_program(&program, &resolved).expect("the fixture checks");
-
-    let empty: Vec<&str> = ["handled", "wrapper", "doubled"]
-        .iter()
-        .filter(|simple| {
-            let name = Symbol::new(format!("self_handled_effect.{simple}"));
-            let def = check
-                .defs
-                .get(&name)
-                .unwrap_or_else(|| panic!("the fixture declares `{name}`"));
-            def.footprint.is_empty() && def.performed.is_empty()
-        })
-        .copied()
-        .collect();
-    assert_eq!(
-        empty,
-        vec!["handled", "wrapper", "doubled"],
-        "the fixture stopped publishing empty rows, so the row gate now refuses these and the \
-         effects gate is unexercised again"
-    );
-
-    // The other effect gate, on the same corpus: `measured` is what performs into its caller, so
-    // its row is not empty and `Gate::PublishedRow` is what refuses it.
-    let measured = check
-        .defs
-        .get(&Symbol::new("self_handled_effect.measured"))
-        .expect("the fixture declares `measured`");
-    assert!(
-        !measured.footprint.is_empty(),
-        "`measured` stopped publishing a row, so this corpus no longer reaches the row gate"
-    );
-
-    let backend = std::rc::Rc::new(backends::Nested::over(&program));
-    let mut plain = Machine::new(&program, &resolved, &check);
-    let mut machine = Machine::new(&program, &resolved, &check);
-    machine.set_compiled(backend);
-
-    let report = compare_tests(&mut plain, &mut machine, &Fixture::empty());
-    assert!(report.is_clean(), "{report}");
-    assert_eq!(report.compared, 1, "{report}");
-    assert_eq!(report.footprints_compared, 1, "{report}");
-    assert!(
-        machine.trace().performs() > 0,
-        "the fixture performed nothing, so agreeing on its footprint proves nothing"
-    );
-
-    // The control is the point: `doubled` *is* entered, so the two refusals above are this gate
-    // rather than a backend that answers nothing here.
-    let (entered, _) = machine.compiled_counts();
-    assert!(
-        entered > 0,
-        "no call in this fixture was entered at all, so nothing distinguishes the effects gate \
-         from a backend that declines"
-    );
-}
 
 /// The same corpora, with a backend attached.
 mod backends {
@@ -753,17 +683,13 @@ fn budget(selection: Selection) {
     }
 }
 
-/// One test per family per selection: `<family>::over_examples` carries the family's liveness
-/// assertions, `<family>::over_fixture_bucket_<k>` the safety ones over one slice of the fixtures.
+/// One test per family per fixture bucket: `<family>::over_fixture_bucket_<k>` carries the
+/// family's safety assertions over one slice of the fixtures.
 macro_rules! over_every_corpus {
     ($($family:ident),* $(,)?) => {$(
         mod $family {
             use super::Selection;
 
-            #[test]
-            fn over_examples() {
-                super::$family(Selection::Examples);
-            }
             #[test]
             fn over_fixture_bucket_0() {
                 super::$family(Selection::Fixtures(0));

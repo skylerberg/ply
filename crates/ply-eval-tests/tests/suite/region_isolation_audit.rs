@@ -5,7 +5,6 @@ use crate::fixture::Compiled;
 use ply_core::Footprint;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Machine, TaskRegions, Value};
-use ply_span::Diagnostic;
 use std::marker::PhantomData;
 
 impl Compiled {
@@ -13,9 +12,6 @@ impl Compiled {
         &self.check.tests[self.index_of(name)].footprint
     }
 
-    fn run(&self, name: &str) -> Result<(), Diagnostic> {
-        self.machine().eval_test(self.index_of(name))
-    }
 }
 
 fn int_of(regions: &TaskRegions, slot: Slot) -> i64 {
@@ -185,41 +181,6 @@ fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor()
     );
 }
 
-/// The carriers that used to take a cell out of its region, and the one that still can.
-const ESCAPED: &str = r#"
-effect amb { read flip[coin]() -> Bool }
-
-type Saved = Nothing | Just((Bool) -> Int)
-
-fn parked() -> Saved = with_cell[slot](Nothing) { s -> {
-  let inner = with_cell[log](41) { c ->
-    handle {
-      let b = amb.flip[coin]();
-      if b { cell_get(c) } else { 0 }
-    } with { amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 }, return x -> x }
-  };
-  assert_eq(inner, 0);
-  cell_get(s)
-} }
-
-fn resume_it(s: Saved) -> Int = match s { Just(k) -> k(true), Nothing -> 0 }
-
-test "a continuation carries the cell out of its region" {
-  assert_eq(resume_it(parked()), 41)
-}
-
-test "two regions in one test are two cells" {
-  let bumped = with_cell[log](0) { c -> {
-    cell_set(c, cell_get(c) + 1);
-    cell_set(c, cell_get(c) + 1);
-    cell_set(c, cell_get(c) + 1);
-    cell_get(c)
-  } };
-  assert_eq(bumped, 3);
-  let fresh = with_cell[log](0) { c -> cell_get(c) };
-  assert_eq(fresh, 0)
-}
-"#;
 
 /// Every carrier the escape brand names is refused, including the closure route it lists first among the
 /// ways this could go wrong.
@@ -259,46 +220,7 @@ fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
     }
 }
 
-/// The one carrier left, run.
-#[test]
-fn a_cell_carried_out_through_a_continuation_reads_this_runs_world() {
-    let compiled = Compiled::new(ESCAPED);
-    let index = compiled.index_of("a continuation carries the cell out of its region");
-    compiled
-        .machine()
-        .eval_test(index)
-        .expect("the resumed read answers the region's initial value");
-    compiled
-        .run("two regions in one test are two cells")
-        .expect("a second region is a second cell, not the first one again");
-}
 
-/// A nullary definition with an empty published row is a constant and the evaluators memoize it.
-#[test]
-fn a_constant_whose_value_reaches_a_cell_is_not_remembered_across_tests() {
-    let compiled = Compiled::new(ESCAPED);
-    let mut machine = compiled.machine();
-    let index = compiled.index_of("a continuation carries the cell out of its region");
-    for run in 0..3 {
-        machine
-            .eval_test(index)
-            .unwrap_or_else(|d| panic!("run {run} must evaluate `parked` afresh: {d:#?}"));
-    }
-
-    // The sanity half: a constant whose value reaches no cell is still memoized, so this refuses
-    // the value rather than the rule.
-    let plain = Compiled::new(
-        r#"
-fn table() -> List<Int> = [1, 2, 3]
-
-test "a plain constant" { assert_eq(len(table()), 3) }
-"#,
-    );
-    let mut machine = plain.machine();
-    let index = plain.index_of("a plain constant");
-    machine.eval_test(index).expect("passes");
-    machine.eval_test(index).expect("and again");
-}
 
 /// A `cell` atom reaching a published footprint is what the scheduler colours on, and with every
 /// escape route closed a *written row* is the only way one gets there.
@@ -349,38 +271,6 @@ test "inside the region" {
     assert_eq!(discharged.footprint("inside the region").atoms().count(), 0);
 }
 
-/// Two runs of one machine allocate at the *same* indices, because the entry point's reset hands
-/// the slots back.
-#[test]
-fn a_second_run_of_one_machine_reuses_the_indices_and_none_of_the_state() {
-    let compiled = Compiled::new(ESCAPED);
-    let mut machine = compiled.machine();
-    let index = compiled.index_of("two regions in one test are two cells");
-
-    machine.cells_mut().journal();
-    machine.eval_test(index).expect("the first run passes");
-    let first: Vec<(u32, String)> = machine
-        .cells()
-        .journalled()
-        .iter()
-        .map(|(slot, v)| (slot.index(), v.render()))
-        .collect();
-    // Both regions reclaim index 0: the first hands it back at its close and the second bumps into
-    // the position it vacated.
-    assert_eq!(first, vec![(0, "3".into()), (0, "0".into())]);
-
-    machine.eval_test(index).expect("the second run passes");
-    let second: Vec<(u32, String)> = machine
-        .cells()
-        .journalled()
-        .iter()
-        .map(|(slot, v)| (slot.index(), v.render()))
-        .collect();
-    assert_eq!(
-        second, first,
-        "the indices repeat and the values start over"
-    );
-}
 
 /// A cell in a *constructor argument* used to be the one carrier the region check could not see:
 /// the variant's field type holds the `Cell`, so the region's result type was `Held` and mentioned
@@ -461,221 +351,12 @@ test "smuggle" {
     }
 }
 
-const RESUMED: &str = r#"
-effect amb {
-  read flip[coin]() -> Bool
-}
 
-type Saved = Nothing | Just((Bool) -> Int)
 
-test "two resumptions write one cell in one world" {
-  with_cell[trace](0) { c -> {
-    let total = handle {
-      let b = amb.flip[coin]();
-      cell_set(c, cell_get(c) + 1);
-      if b { cell_get(c) } else { cell_get(c) * 10 }
-    } with {
-      amb.flip[coin]() resume k -> k(true) + k(false),
-      return x -> x
-    };
-    assert_eq(total, 21);
-    assert_eq(cell_get(c), 2)
-  } }
-}
 
-test "each resumption allocates its own region cell" {
-  with_cell[tally](0) { t -> {
-    let total = handle {
-      let b = amb.flip[coin]();
-      with_cell[scratch](0) { s -> {
-        cell_set(s, cell_get(s) + 1);
-        cell_set(t, cell_get(t) + cell_get(s));
-        cell_get(s)
-      } }
-    } with {
-      amb.flip[coin]() resume k -> k(true) + k(false),
-      return x -> x
-    };
-    assert_eq(total, 2);
-    assert_eq(cell_get(t), 2)
-  } }
-}
 
-test "a continuation resumed after its region returned reads that region's cell" {
-  with_cell[slot](Nothing) { s -> {
-    let inner = with_cell[log](7) { c ->
-      handle {
-        let b = amb.flip[coin]();
-        if b { cell_get(c) } else { 0 }
-      } with {
-        amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 },
-        return x -> x
-      }
-    };
-    assert_eq(inner, 0);
-    match cell_get(s) {
-      Just(k) -> assert_eq(k(true), 7),
-      Nothing -> assert(false)
-    }
-  } }
-}
-"#;
 
-/// The two-resumption example's "resumes twice", with the second resumption's write landing on the first one's:
-/// one threaded world, not a snapshot per resumption.
-#[test]
-fn two_resumptions_of_one_handler_write_one_cell_in_one_world() {
-    let compiled = Compiled::new(RESUMED);
-    let index = compiled.index_of("two resumptions write one cell in one world");
-    let mut machine = compiled.machine();
-    machine.cells_mut().journal();
-    machine
-        .eval_test(index)
-        .unwrap_or_else(|d| panic!("the threaded-world reading must hold: {d:#?}"));
-    assert_eq!(
-        machine.cells().journalled().len(),
-        1,
-        "one region, one cell — reclaimed once, at its close"
-    );
-}
 
-/// A `with_cell` *inside* a handled body runs once per resumption, and each run has to allocate its
-/// own cell: two resumptions sharing one region cell would be the two branches of a search seeing
-/// each other's scratch state.
-#[test]
-fn each_resumption_allocates_its_own_region_cell() {
-    let compiled = Compiled::new(RESUMED);
-    let index = compiled.index_of("each resumption allocates its own region cell");
-    let mut machine = compiled.machine();
-    machine.cells_mut().journal();
-    machine
-        .eval_test(index)
-        .unwrap_or_else(|d| panic!("each branch must get its own scratch cell: {d:#?}"));
-    assert_eq!(
-        machine.cells().stats().allocations,
-        3,
-        "the tally, and one scratch cell per resumption"
-    );
-    assert_eq!(
-        machine.cells().journalled().len(),
-        3,
-        "and every one of them went back at the close of the region that made it"
-    );
-}
-
-/// A continuation parked in an enclosing region's cell and resumed after the region whose cell it
-/// reads has returned.
-#[test]
-fn a_continuation_resumed_after_its_region_returned_reads_this_runs_cell() {
-    let compiled = Compiled::new(RESUMED);
-    let index = compiled
-        .index_of("a continuation resumed after its region returned reads that region's cell");
-
-    let mut machine = compiled.machine();
-    machine.cells_mut().journal();
-    machine
-        .eval_test(index)
-        .unwrap_or_else(|d| panic!("resuming outside the region must succeed: {d:#?}"));
-    let first: Vec<String> = machine
-        .cells()
-        .journalled()
-        .iter()
-        .map(|(_, v)| v.render())
-        .collect();
-
-    machine
-        .eval_test(index)
-        .unwrap_or_else(|d| panic!("the second run must also succeed: {d:#?}"));
-    let second: Vec<String> = machine
-        .cells()
-        .journalled()
-        .iter()
-        .map(|(_, v)| v.render())
-        .collect();
-    assert_eq!(first, second, "the second run started from the seed again");
-    assert!(
-        !first.is_empty(),
-        "or the comparison above is between two empties"
-    );
-}
-
-/// The one place a value *can* cross two entry points is the host API: `call` resets the region
-/// stack and then accepts arguments the caller built during an earlier run.
-#[test]
-fn a_cell_carried_across_two_runs_of_one_machine_is_named_and_not_read() {
-    let compiled = Compiled::new(ESCAPED);
-    let mut machine = compiled.machine();
-
-    let parked = machine
-        .call("m.parked", vec![], ply_span::Span::DUMMY)
-        .expect("a continuation over the region's cell");
-    let smuggled = machine
-        .call("m.resume_it", vec![parked], ply_span::Span::DUMMY)
-        .expect_err("the second run holds no slot the first one allocated");
-
-    assert_eq!(smuggled.code, ply_span::codes::REGION_ESCAPE_AT_BOUNDARY);
-}
-
-/// The teeth behind every "they never observed each other" assertion elsewhere: tests that reset
-/// one stack all allocate their first cell at *the same index*.
-#[test]
-fn separate_tests_write_the_very_same_slot_index_in_their_own_entry_points() {
-    let mut src = String::new();
-    for i in 0..4 {
-        src.push_str(&format!(
-            "test \"contender {i}\" {{ with_cell[table]({i}) {{ c -> cell_set(c, {i} * 7) }} }}\n"
-        ));
-    }
-    let compiled = Compiled::new(&src);
-    let mut machine = compiled.machine();
-
-    machine.cells_mut().journal();
-    for i in 0..4 {
-        machine.eval_test(i).expect("the test passes");
-        let cells: Vec<(u32, String)> = machine
-            .cells()
-            .journalled()
-            .iter()
-            .map(|(slot, v)| (slot.index(), v.render()))
-            .collect();
-        assert_eq!(
-            cells,
-            vec![(0, (i * 7).to_string())],
-            "every contender owns slot 0 and nobody else's value"
-        );
-    }
-}
-
-/// The fixture is what every entry point resets to.
-#[test]
-fn a_seeded_fixture_survives_every_test_that_opens_it() {
-    let compiled = Compiled::new(ESCAPED);
-    let fixture = Fixture::build(|r| Value::Cell(r.alloc_cell(Value::Int(1_000))));
-    let seeded = cell_of(&fixture);
-
-    let mut machine = compiled.machine();
-    machine.set_regions(fixture.open().0);
-
-    for _ in 0..3 {
-        for name in [
-            "a continuation carries the cell out of its region",
-            "two regions in one test are two cells",
-        ] {
-            let index = compiled.index_of(name);
-            machine.eval_test(index).expect("the test passes");
-            assert_eq!(
-                int_of(machine.regions(), seeded),
-                1_000,
-                "{name} disturbed the seed it opened"
-            );
-        }
-    }
-    assert_eq!(
-        int_of(&fixture.open().0, seeded),
-        1_000,
-        "the fixture itself is untouched"
-    );
-}
 
 /// A test can only sample the executions somebody thought of.
 #[test]

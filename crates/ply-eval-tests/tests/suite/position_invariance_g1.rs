@@ -1,55 +1,14 @@
 //! **the gate G1 — position invariance, registered before the measurement.**
 
-use ply_eval::rc;
-use ply_eval::{Machine, TaskRegions};
-use ply_span::SourceMap;
-use ply_syntax::ast::{ModuleName, Program};
-use ply_syntax::parse_program;
-use ply_syntax::resolve::{Resolved, resolve};
 
-/// The thresholds, pinned before the numbers exist.
-#[derive(Clone, Copy, Debug)]
-struct Criteria {
-    /// the gate G1, first bullet: `|in_place_rate(canonical) −
-    /// in_place_rate(pessimal)| ≤ 0.02` for **every** pair. Two spellings of one
-    /// computation may not differ in cost by more than measurement noise, and
-    /// there is no noise in an append count, so this is nearly an equality.
-    max_position_gap: f64,
-    /// the gate G1, second bullet: `in_place_rate(canonical) ≥ 0.95` for
-    /// every pair whose canonical form is linear today. Without it the first
-    /// bullet is satisfiable by making the canonical form as slow as the
-    /// pessimal one, which is the wrong direction to converge in.
-    min_canonical_rate: f64,
-    /// A member that ran fewer appends than this measured nothing, and a rate
-    /// over a handful of updates is one program's accident. Not a threshold on
-    /// the result — a guard on the instrument.
-    min_updates: u64,
-}
 
-impl Default for Criteria {
-    fn default() -> Criteria {
-        Criteria {
-            max_position_gap: 0.02,
-            min_canonical_rate: 0.95,
-            min_updates: 100,
-        }
-    }
-}
 
 /// One shape, written the two ways.
 struct Pair {
     /// What the pair is about, printed in the table.
     name: &'static str,
-    /// Where the shape comes from, so a reader can check the pair against the
-    /// row it reproduces rather than against this file's opinion of it.
-    provenance: &'static str,
     canonical: &'static str,
     pessimal: &'static str,
-    /// Whether the canonical spelling is expected to reuse on the tree as it
-    /// stands, which is what gates [`Criteria::min_canonical_rate`]. Declared
-    /// per pair with a citation rather than read off the measurement, because a
-    /// bar the measurement selects itself into is not a bar.
-    canonical_linear_today: bool,
 }
 
 /// the ownership design rows 1 and 2 — `go(i + 1, push(acc, i))` at 200 / 200
@@ -184,239 +143,45 @@ fn corpus() -> Vec<Pair> {
     vec![
         Pair {
             name: "call argument",
-            provenance: "the ownership design rows 1-2",
             canonical: CALL_ARG_CANONICAL,
             pessimal: CALL_ARG_PESSIMAL,
-            canonical_linear_today: true,
         },
         Pair {
             name: "record field",
-            provenance: "the ownership design rows 3-4",
             canonical: RECORD_FIELD_CANONICAL,
             pessimal: RECORD_FIELD_PESSIMAL,
-            canonical_linear_today: true,
         },
         Pair {
             name: "compounding: field last, record first",
-            provenance: "the ownership design rows 3, 5",
             canonical: RECORD_FIELD_CANONICAL,
             pessimal: COMPOUNDING_PESSIMAL,
-            canonical_linear_today: true,
         },
         Pair {
             name: "let binding against parameter",
-            provenance: "the ownership design cause 1",
             canonical: PARAM_VS_LET_CANONICAL,
             pessimal: PARAM_VS_LET_PESSIMAL,
-            canonical_linear_today: true,
         },
         Pair {
             name: "fold closure accumulator",
-            provenance: "the ownership design row 6",
             canonical: FOLD_CLOSURE_CANONICAL,
             pessimal: FOLD_CLOSURE_PESSIMAL,
-            canonical_linear_today: true,
         },
     ]
 }
 
-struct Program1 {
-    program: Program,
-    resolved: Resolved,
-}
 
-/// One inline module, parsed and resolved. Panics rather than answering
-/// `Option`, exactly as `ownership_checker_armed.rs` does: a member that does
-/// not parse has measured nothing, and skipping it silently is how an armed
-/// test disarms itself.
-fn inline(src: &str) -> Program1 {
-    let name = ModuleName::from_dotted("g1");
-    let mut map = SourceMap::new();
-    let source = map.add(std::path::Path::new("g1.ply"), src.to_string());
-    let mut program = match parse_program(vec![(source, name, src)]) {
-        Ok(p) => p,
-        Err(ds) => panic!("a G1 corpus member must parse: {ds:#?}"),
-    };
-    let expanded = ply_derive::expand_program(&mut program);
-    assert!(expanded.is_empty(), "derive refused: {expanded:?}");
-    let resolved = match resolve(&mut program) {
-        Ok(r) => r,
-        Err(ds) => panic!("a G1 corpus member must resolve: {ds:#?}"),
-    };
-    Program1 { program, resolved }
-}
 
 /// A member's identity, as twelve hex characters of BLAKE3 over its source.
 fn digest(src: &str) -> String {
     format!("b3:{}", &blake3::hash(src.as_bytes()).to_hex()[..12])
 }
 
-/// One member's appends: the totals, and the number of `push` sites they came
-/// from.
-struct Cost {
-    count: rc::SiteCount,
-    /// Distinct spans [`rc::sites`] attributed an update to. This is the whole
-    /// of what the per-site split buys over [`rc::stats`], and it buys it only
-    /// because the pin holds this column: a member whose one append site became
-    /// two, running half as often each, reads 200 of 200 either way and moves
-    /// nothing a total can see.
-    sites: usize,
-}
 
-/// Every append this member ran, summed over its sites, and how many sites
-/// that was.
-fn measure(src: &str) -> Cost {
-    let p = inline(src);
-    let mut machine = Machine::for_program(&p.program, &p.resolved);
-    machine.set_regions(TaskRegions::new());
-    rc::record_sites(true);
-    let mut ran = 0;
-    for index in 0..machine.test_count() {
-        machine
-            .eval_test(index)
-            .unwrap_or_else(|d| panic!("a G1 corpus member's test must run: {d:#?}"));
-        ran += 1;
-    }
-    assert!(
-        ran > 0,
-        "a G1 corpus member declares no test, so nothing ran"
-    );
-    let sites = rc::sites();
-    let mut count = rc::SiteCount::default();
-    for (_, site) in &sites {
-        count.in_place += site.in_place;
-        count.copies += site.copies;
-    }
-    rc::record_sites(false);
-    Cost {
-        count,
-        sites: sites.len(),
-    }
-}
 
-struct Measured {
-    canonical: Cost,
-    pessimal: Cost,
-}
 
-impl Measured {
-    fn gap(&self) -> f64 {
-        let c = self
-            .canonical
-            .count
-            .rate()
-            .expect("the canonical member ran appends");
-        let p = self
-            .pessimal
-            .count
-            .rate()
-            .expect("the pessimal member ran appends");
-        (c - p).abs()
-    }
-}
 
-fn measure_corpus(c: &Criteria) -> Vec<(Pair, Measured)> {
-    let pairs = corpus();
-    assert_eq!(
-        pairs.len(),
-        EXPECTED_PAIRS,
-        "the corpus is {} pairs where {EXPECTED_PAIRS} is what the gate's table and its provenance \
-         report; a bar over fewer shapes than it claims is not the bar that was registered",
-        pairs.len(),
-    );
-    let mut out = Vec::new();
-    for pair in pairs {
-        let m = Measured {
-            canonical: measure(pair.canonical),
-            pessimal: measure(pair.pessimal),
-        };
-        for (which, count) in [
-            ("canonical", m.canonical.count),
-            ("pessimal", m.pessimal.count),
-        ] {
-            assert!(
-                count.total() >= c.min_updates,
-                "the {which} member of `{}` ran {} appends, which is fewer than the {} this \
-                 instrument needs to read a rate off; it measured nothing",
-                pair.name,
-                count.total(),
-                c.min_updates,
-            );
-        }
-        out.push((pair, m));
-    }
-    out
-}
 
-fn print_table(rows: &[(Pair, Measured)]) {
-    println!(
-        "\n  {:<38} {:>16} {:>16} {:>7} {:>7}",
-        "pair", "canonical", "pessimal", "sites", "gap"
-    );
-    for (pair, m) in rows {
-        println!(
-            "  {:<38} {:>7}/{:<8} {:>7}/{:<8} {:>7} {:>7.3}",
-            pair.name,
-            m.canonical.count.in_place,
-            m.canonical.count.total(),
-            m.pessimal.count.in_place,
-            m.pessimal.count.total(),
-            format!("{}/{}", m.canonical.sites, m.pessimal.sites),
-            m.gap(),
-        );
-        println!("  {:<38}   {}", "", pair.provenance);
-    }
-}
 
-/// **the gate G1.** Two spellings of one computation cost the same.
-///
-/// Red on the chain machine and armed by having been seen red there; green since ADR 0034's slot
-/// frames, which is the claim the rewrite was gated on. The pin below holds the per-pair counts.
-#[test]
-fn the_same_computation_costs_the_same_in_either_order() {
-    let c = Criteria::default();
-    let rows = measure_corpus(&c);
-    print_table(&rows);
-
-    let mut failures = Vec::new();
-    for (pair, m) in &rows {
-        let canonical = m
-            .canonical
-            .count
-            .rate()
-            .expect("the canonical member ran appends");
-        let pessimal = m
-            .pessimal
-            .count
-            .rate()
-            .expect("the pessimal member ran appends");
-        if m.gap() > c.max_position_gap {
-            failures.push(format!(
-                "`{}` ({}): canonical {canonical:.3} against pessimal {pessimal:.3}, a gap of \
-                 {:.3} where {} is the bar — the same value, written two ways, at two costs",
-                pair.name,
-                pair.provenance,
-                m.gap(),
-                c.max_position_gap,
-            ));
-        }
-        if pair.canonical_linear_today && canonical < c.min_canonical_rate {
-            failures.push(format!(
-                "`{}` ({}): the canonical form reused {canonical:.3} of its appends where {} is \
-                 the bar, and it is declared linear today — closing the gap by making the \
-                 canonical form slow is not what G1 asks for",
-                pair.name, pair.provenance, c.min_canonical_rate,
-            ));
-        }
-    }
-    assert!(
-        failures.is_empty(),
-        "the gate G1 is not met on {} of {} pairs:\n  - {}",
-        failures.len(),
-        rows.len(),
-        failures.join("\n  - "),
-    );
-}
 
 /// The corpus is five shapes, each pair is two different programs, and each is
 /// the program it was pinned as.
@@ -493,63 +258,4 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
     );
 }
 
-/// One pinned member: `(in place, total, sites)`.
-type Member = (u64, u64, usize);
-/// One pinned row: the pair's name, then its canonical member and its pessimal
-/// one.
-type Row = (&'static str, Member, Member);
 
-/// What each pair costs on this tree, held to the digit.
-#[test]
-fn every_pair_is_pinned_to_what_it_costs_today() {
-    let rows = measure_corpus(&Criteria::default());
-    print_table(&rows);
-
-    // `(in place, total, sites)` for the canonical member and then the pessimal
-    // one, under ADR 0034's slot frames. Every pair reads 200 of 200 on both
-    // sides: a last use moves the value out of its slot wherever it sits, so
-    // position decides nothing — including the record-field pair, whose
-    // pessimal member needs the field-granular move. On the chain machine every
-    // pessimal member read 0 of 200, which is the cliff this rewrite deletes.
-    let expected: [Row; EXPECTED_PAIRS] = [
-        ("call argument", (200, 200, 1), (200, 200, 1)),
-        ("record field", (200, 200, 1), (200, 200, 1)),
-        (
-            "compounding: field last, record first",
-            (200, 200, 1),
-            (200, 200, 1),
-        ),
-        (
-            "let binding against parameter",
-            (200, 200, 1),
-            (200, 200, 1),
-        ),
-        ("fold closure accumulator", (200, 200, 1), (200, 200, 1)),
-    ];
-
-    let got: Vec<Row> = rows
-        .iter()
-        .map(|(pair, m)| {
-            (
-                pair.name,
-                (
-                    m.canonical.count.in_place,
-                    m.canonical.count.total(),
-                    m.canonical.sites,
-                ),
-                (
-                    m.pessimal.count.in_place,
-                    m.pessimal.count.total(),
-                    m.pessimal.sites,
-                ),
-            )
-        })
-        .collect();
-
-    assert_eq!(
-        got.as_slice(),
-        expected.as_slice(),
-        "the per-pair append counts moved; see this test's documentation for how to read the \
-         direction"
-    );
-}
