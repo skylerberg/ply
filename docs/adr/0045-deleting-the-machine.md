@@ -227,6 +227,18 @@ first stage's facade is therefore taken consumer by consumer, each switched
 to the tier-only engine with its own oracle, rather than as one wrapping
 pass before any of them.
 
+**Built, the runtime's digest.** A bundle's C calls the runtime's helpers
+by name and shape, and a helper that moves — an argument added — leaves the
+bundle calling the old shape, which no digest of the emitter's sources
+sees: the emitter it builds fails on the first body that reaches the
+helper, and the refresh, which builds its first emitter from the bundle,
+fails with it. `RUNTIME.digest` beside the bundle is the helper table's
+digest; a bundle emitted against another table does not serve, the
+reference builds the producer, and the refresh starts from the reference.
+The same digest is in the key of every cached body, since a body's C calls
+the helpers by shape too: the differential read back bodies emitted a run
+earlier, against the old shape, before it was.
+
 **Built, for the judge and the prover.** §"The facade" said an expression in
 a scope is a definition, and it is: `Source` synthesises one per law guard
 and body and per `requires` and `ensures` clause, named `law#N.guard`,
@@ -238,6 +250,21 @@ root, and the reference emitter refuses them by name. `ply prove` and
 the roots with each case's values, falling back to the machine only where
 the unit does not hold one. Oracle: `ply prove` over both corpora reports the
 same with and without the backend, and CI compares the two.
+
+**Built, the fourth stage's first sort.** `tests/lang/` exists and CI runs it
+three ways — the machine, paired with the tier, tier-only — and nine of the
+suite's files are gone: the bit surface, the byte, list and map builtins,
+the number types, tuples, keyword fields, `min` and `max` and a lambda's
+return, their embedded programs now the corpus's files. What a Ply test
+cannot state, that a program raises with a given text, is a fixture under
+`tests/fixtures/lang/` whose header names the failing tests and the text,
+driven from the CLI suite on both engines; two checker claims about
+footprints go the same way through `ply check --json`. The sort earned its
+place at once: run tier-only, the corpus found the least `Int` literal
+emitted as a constant C cannot write, `bytes_position` with no compiled
+shape, a `U64` literal above the signed range refused, and four
+diagnostics the tier worded differently from the machine, none of which
+the machine-only suite could have shown.
 
 ## Staging, and the oracle at each stage
 

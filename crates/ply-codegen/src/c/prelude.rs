@@ -160,7 +160,7 @@ helpers![
     ("rt_bytes_scan", 4, true),
     ("rt_bytes_scan_until", 4, true),
     ("rt_iterate_bad", 2, false),
-    ("rt_shift_count", 1, false),
+    ("rt_shift_count", 2, false),
     ("rt_ctor", 3, true),
     ("rt_record", 3, true),
     ("rt_field", 3, true),

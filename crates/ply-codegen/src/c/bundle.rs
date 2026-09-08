@@ -14,6 +14,25 @@ use std::path::Path;
 const UNIT: &str = "unit.c.gz";
 const RECORD: &str = "unit.record";
 const SOURCES: &str = "SOURCES.digest";
+const RUNTIME: &str = "RUNTIME.digest";
+
+/// The runtime the bundle's C calls into: every helper's name and shape. A helper that moves
+/// leaves the bundle calling the old shape, which no digest of the emitter's sources sees.
+pub fn runtime_digest() -> String {
+    let mut h = blake3::Hasher::new();
+    for helper in super::prelude::HELPERS {
+        h.update(format!("{} {} {}\n", helper.name, helper.args, helper.answers).as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Whether the bundle was emitted against another runtime than this build's, in which case it
+/// does not serve: [`exists`] answers `false` and the reference builds the producer.
+pub fn stale_runtime(dir: &Path) -> bool {
+    std::fs::read_to_string(dir.join(RUNTIME))
+        .ok()
+        .is_none_or(|s| s.trim() != runtime_digest())
+}
 
 /// Writes the bundle, replacing what was there.
 pub fn write(dir: &Path, text: &str, record: &UnitCache, sources_digest: &str) -> Result<()> {
@@ -23,6 +42,7 @@ pub fn write(dir: &Path, text: &str, record: &UnitCache, sources_digest: &str) -
     std::fs::write(dir.join(UNIT), gz.finish()?)?;
     std::fs::write(dir.join(RECORD), encode_unit(record))?;
     std::fs::write(dir.join(SOURCES), format!("{sources_digest}\n"))?;
+    std::fs::write(dir.join(RUNTIME), format!("{}\n", runtime_digest()))?;
     Ok(())
 }
 
@@ -49,7 +69,7 @@ pub fn sources_digest(dir: &Path) -> Option<String> {
 }
 
 pub fn exists(dir: &Path) -> bool {
-    dir.join(UNIT).is_file() && dir.join(RECORD).is_file()
+    dir.join(UNIT).is_file() && dir.join(RECORD).is_file() && !stale_runtime(dir)
 }
 
 /// Builds `loaded`, the emitter's own program, from the bundle: the bundle's C is compiled and

@@ -1314,9 +1314,12 @@ impl<'a> Emit<'a> {
     fn shift(&mut self, op: BinOp, l: &V, r: &V, width: Option<IntTy>) -> Result<V> {
         let n = self.as_int(r);
         let bound = width.map_or(64, |t| i64::from(t.bits()));
+        let which = width
+            .and_then(|t| ply_syntax::ast::INT_TYPES.iter().position(|x| *x == t))
+            .map_or(-1, |i| i as i64);
         let count = self.bind(Kind::Int, n);
         self.line(format!(
-            "if ((uint64_t){} >= (uint64_t){bound}) {{ rt_shift_count_p(ctx, {}); return 0; }}",
+            "if ((uint64_t){} >= (uint64_t){bound}) {{ rt_shift_count_p(ctx, {}, {which}); return 0; }}",
             count.c, count.c
         ));
         match width {

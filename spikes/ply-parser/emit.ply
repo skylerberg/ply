@@ -1018,6 +1018,71 @@ fn def_of(em: Em, name: Bytes) -> Option<{ full: Bytes, c: Bytes, arity: Int }> 
     }
   }
 
+// `bytes_position(b, from, p)` is a loop over the bytes calling `p` until it answers `true`:
+// through the runtime it suspends at the first call, which a native frame cannot resume, so
+// under release the loop is emitted into the body. The reference calls the runtime, and the
+// reference's text keeps that call.
+fn position_call(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Option<Out> =
+  if !em.release || name != b"bytes_position" || len(args) != 3 { None } else {
+    match tag_of(em, b"Some") {
+      None -> None,
+      Some(some) -> match tag_of(em, b"None") {
+        None -> None,
+        Some(none) -> match list_at(args, 0) {
+          None -> None,
+          Some(b0) -> match list_at(args, 1) {
+            None -> None,
+            Some(f0) -> match list_at(args, 2) {
+              None -> None,
+              Some(p0) -> match expr(notail(em), b0, params) {
+                None -> None,
+                Some(bv) -> {
+                  let bo = owned(bv.em, bv.v);
+                  match expr(notail(bo.em), f0, params) {
+                    None -> None,
+                    Some(fv) -> {
+                      let from = bind(fv.em, KInt, as_int(fv.v));
+                      match expr(notail(from.em), p0, params) {
+                        None -> None,
+                        Some(pv) -> {
+                          let po = owned(pv.em, pv.v);
+                          let bi = builtin_of(po.em, b"bytes_position");
+                          // A start past the end, or bytes that are not bytes: the runtime's own
+                          // call raises the machine's diagnostic before it would suspend.
+                          let guard = line(bi.em, bytes_concat_all([
+                            b"if (ply_is_imm(", bo.v.c, b") || ply_obj(", bo.v.c, b")->kind != 10 || (uint64_t)", from.v.c,
+                            b" > (uint64_t)ply_obj(", bo.v.c, b")->len) { Word a[3]; a[0] = ", bo.v.c, b"; a[1] = ply_imm(", from.v.c,
+                            b"); a[2] = ", po.v.c, b"; rt_builtin_p(ctx, @@b", num(bi.i), b"@@, (Word)(intptr_t)a, 3); return 0; }"]));
+                          let ans = fresh(guard);
+                          let declared = line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = rt_nullary_p(ctx, ", num(none), b");"]));
+                          let i = bind(declared, KInt, from.v.c);
+                          let head = indent(line(i.em, bytes_concat_all([
+                            b"for (; ", i.v.c, b" < (int64_t)ply_obj(", bo.v.c, b")->len; ", i.v.c, b" += 1) {"])));
+                          let arg = fresh(head);
+                          let called = fresh(line(arg.em, bytes_concat_all([
+                            b"Word ", arg.name, b"[] = { ply_imm((int64_t)((unsigned char *)ply_words(", bo.v.c, b"))[", i.v.c, b"]) }; ply_inc(", po.v.c, b");"])));
+                          let asked = line(called.em, bytes_concat_all([
+                            b"Word ", called.name, b" = rt_call_p(ctx, ", po.v.c, b", (Word)(intptr_t)", arg.name, b", 1);"]));
+                          let hit = line(indent(line(check(asked), bytes_concat_all([b"if (rt_unbox_bool_p(ctx, ", called.name, b")) {"]))),
+                            bytes_concat_all([b"Word w[] = { ply_imm(", i.v.c, b") }; ", ans.name, b" = rt_ctor_p(ctx, ", num(some), b", (Word)(intptr_t)w, 1);"]));
+                          let stopped = line(outdent(line(check(hit), b"break;")), b"}");
+                          let done = line(outdent(stopped), b"}");
+                          let freed = line(line(done, bytes_concat_all([b"ply_dec(ctx, ", po.v.c, b");"])),
+                                           bytes_concat_all([b"ply_dec(ctx, ", bo.v.c, b");"]));
+                          Some({ em: note_holder(freed, ans.name), v: { k: KBoxed, c: ans.name, ty: TyOpen } })
+                        },
+                      }
+                    },
+                  }
+                },
+              },
+            },
+          },
+        },
+      },
+    }
+  }
+
 // `iterate` over a one-parameter lambda is the loop the reference emits into the body, which
 // this port has not read; over anything else it is the runtime's helper, as the reference
 // calls it.
@@ -1390,8 +1455,8 @@ fn width_builtin(em: Em, name: Bytes, args: List<Code>, params: List<P>) -> Opti
           } else { match of_int_width(name) {
             Some(t) -> if carried(t) {
               let held = bind(e.em, KInt, as_int(v0));
-              let g = line(held.em, bytes_concat_all([b"if (", held.v.c, b" < INT64_C(", num(width_min(t)), b") || ",
-                held.v.c, b" > INT64_C(", num(width_max(t)), b")) { rt_not_that_width_p(ctx, ", num(width_index(t)), b", ",
+              let g = line(held.em, bytes_concat_all([b"if (", held.v.c, b" < ", int_lit(width_min(t)), b" || ",
+                held.v.c, b" > ", int_lit(width_max(t)), b") { rt_not_that_width_p(ctx, ", num(width_index(t)), b", ",
                 held.v.c, b"); return 0; }"]));
               Some(bind(g, KNum(t), bytes_concat_all([b"(", ctype(KNum(t)), b")", held.v.c])))
             } else { Some(builtin_call(e.em, name, e.vals)) },
@@ -1902,7 +1967,7 @@ pub fn covers() -> List<Bytes> =
 fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
     NLit(l) -> match l {
-      LInt(n) -> Some({ em: em, v: { k: KInt, c: bytes_concat_all([b"INT64_C(", num(n), b")"]), ty: TyOpen } }),
+      LInt(n) -> Some({ em: em, v: { k: KInt, c: int_lit(n), ty: TyOpen } }),
       // A `Bool` is C's own 1 and 0 until something asks for its word.
       LBool(b) -> Some({ em: em, v: { k: KBool, c: if b { b"1" } else { b"0" }, ty: TyOpen } }),
       // Anything the tag cannot hold is built once and read from the unit's
@@ -1915,8 +1980,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         None -> Some(refused(em, b"a fixed-width literal of no known width")),
         Some(w) -> if carried(w) {
           Some({ em: em, v: { k: KNum(w), c: bytes_concat_all([b"((", ctype(KNum(w)), b")", num(bits), b")"]), ty: TyOpen } })
-        } else if bits < 0 { Some(refused(em, b"a sixty-four-bit literal above the signed range")) }
-        else { Some(from_table(em, l)) },
+        } else { Some(from_table(em, l)) },
       },
       LUnit -> Some(from_table(em, l)),
       // A `Float` or `Decimal` is a constant the runtime holds, opaque here: every operator over
@@ -1976,7 +2040,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       // Two `Int` literals under an operator are one literal: the reference folds them before
       // it lowers, checked, so an overflow is left for the runtime to raise.
       match lit_int(c) {
-        Some(n) -> Some({ em: em, v: { k: KInt, c: bytes_concat_all([b"INT64_C(", num(n), b")"]), ty: TyOpen } }),
+        Some(n) -> Some({ em: em, v: { k: KInt, c: int_lit(n), ty: TyOpen } }),
         None ->
       // `&&` and `||` short-circuit, so the right operand is emitted inside the branch.
       if b.op == b"and" || b.op == b"or" {
@@ -2053,7 +2117,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         } else if u.op == b"neg" {
           match o.v.k {
             // A width negates wide and narrows back, under the same guard as a subtraction.
-            KNum(w) -> narrow(bind(o.em, KInt, bytes_concat_all([b"-(int64_t)(", as_num(o.v, w), b")"])), w, true),
+            KNum(w) -> narrow(bind(o.em, KInt, bytes_concat_all([b"-(int64_t)(", as_num(o.v, w), b")"])), w, 2),
             // A word of a type this port cannot see may be a `Float` or a `Decimal`: the
             // machine's own negation, through the runtime.
             KBoxed -> {
@@ -2374,6 +2438,8 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         Some(o) -> Some(o),
                         None -> match iterate_call(em, fv.name, a.args, params) {
                         Some(o) -> Some(o),
+                        None -> match position_call(em, fv.name, a.args, params) {
+                        Some(o) -> Some(o),
                         None -> match width_builtin(em, fv.name, a.args, params) {
                         Some(o) -> Some(o),
                         None -> match inline_len(em, fv.name, a.args, params) {
@@ -2384,6 +2450,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                           None -> None,
                           Some(e) -> Some(builtin_call(e.em, fv.name, e.vals)),
                         } } },
+                      },
                       },
                       },
                       },
@@ -2921,9 +2988,9 @@ fn pat_test(p: CPat, subj: V, em: Em) -> Option<{ em: Em, c: Bytes }> =
     PxVar(_) -> Some({ em: em, c: b"1" }),
     PxLit(l) -> match l {
       LInt(n) -> Some({ em: em, c: bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
-                                        b") == INT64_C(", num(n), b") : 0)"]) }),
+                                        b") == ", int_lit(n), b" : 0)"]) }),
       LFixed(_, bits) -> Some({ em: em, c: bytes_concat_all([b"(ply_is_imm(", subj.c, b") ? ply_imm_value(", subj.c,
-                                        b") == INT64_C(", num(bits), b") : 0)"]) }),
+                                        b") == ", int_lit(bits), b" : 0)"]) }),
       LBool(b) -> Some({ em: em, c: bytes_concat_all([b"(", subj.c, b" == ", if b { b"ply_true" } else { b"ply_false" }, b")"]) }),
       _ -> None,
     },
@@ -3131,6 +3198,12 @@ fn rebuild(em: Em, names: List<Bytes>, js: List<V>) -> Option<Out> =
 // The `Int` two literals fold to under an operator, or nothing: the reference's
 // `fold_literals`, rule for rule. Addition, subtraction and multiplication only
 // when they do not overflow; a shift only by a count the width holds.
+// `INT64_C(-9223372036854775808)` is not a constant C can write -- the digits are an
+// unsigned literal and the minus is applied to it, so `1 << 63 < 0` came out false -- and the
+// least `Int` is named instead.
+fn int_lit(n: Int) -> Bytes =
+  if n == 0 - 9223372036854775807 - 1 { b"INT64_MIN" } else { bytes_concat_all([b"INT64_C(", num(n), b")"]) }
+
 fn lit_int(c: Code) -> Option<Int> =
   match c.node {
     NLit(l) -> match l { LInt(n) -> Some(n), _ -> None },
@@ -3218,10 +3291,11 @@ fn is_shift(op: Bytes) -> Bool = op == b"shl" || op == b"shr" || op == b"ushr"
 fn bitop_c(op: Bytes) -> Bytes = if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else { b"^" }
 
 // A wide result narrowed to a width, under the overflow guard: the reference's `narrow`.
-fn narrow(wide: Out, w: Width, sub: Bool) -> Option<Out> = {
-  let g = line(wide.em, bytes_concat_all([b"if (", wide.v.c, b" < INT64_C(", num(width_min(w)),
-    b") || ", wide.v.c, b" > INT64_C(", num(width_max(w)), b")) { rt_overflow_p(ctx, ",
-    if sub { b"1" } else { b"0" }, b"); return 0; }"]));
+// `code` is `rt_overflow_p`'s: 0 an addition, 1 a subtraction, 2 a negation.
+fn narrow(wide: Out, w: Width, code: Int) -> Option<Out> = {
+  let g = line(wide.em, bytes_concat_all([b"if (", wide.v.c, b" < ", int_lit(width_min(w)),
+    b" || ", wide.v.c, b" > ", int_lit(width_max(w)), b") { rt_overflow_p(ctx, ",
+    num(code), b"); return 0; }"]));
   Some(bind(g, KNum(w), bytes_concat_all([b"(", ctype(KNum(w)), b")", wide.v.c])))
 }
 
@@ -3230,8 +3304,9 @@ fn narrow(wide: Out, w: Width, sub: Bool) -> Option<Out> = {
 fn shift(em: Em, op: Bytes, l: V, r: V, width: Option<Width>) -> Out = {
   let bound = match width { Some(t) -> t.bits, None -> 64 };
   let count = bind(em, KInt, as_int(r));
+  let which = match width { Some(t) -> num(width_index(t)), None -> b"-1" };
   let g = line(count.em, bytes_concat_all([b"if ((uint64_t)", count.v.c, b" >= (uint64_t)", num(bound),
-    b") { rt_shift_count_p(ctx, ", count.v.c, b"); return 0; }"]));
+    b") { rt_shift_count_p(ctx, ", count.v.c, b", ", which, b"); return 0; }"]));
   match width {
     Some(t) -> {
       let a = as_num(l, t);
@@ -3263,7 +3338,7 @@ fn width_binary(em: Em, op: Bytes, l: V, r: V, t: Width) -> Option<Out> = {
         let w = bind(em, KInt, bytes_concat_all([b"rt_arith_p(ctx, ", num(arith_code(op)), b", (int64_t)(", a, b"), (int64_t)(", bb, b"))"]));
         { em: check(w.em), v: w.v }
       };
-    narrow(wide, t, op == b"sub")
+    narrow(wide, t, if op == b"sub" { 1 } else { 0 })
   }
   else if is_bitop(op) { Some(bind(em, KNum(t), bytes_concat_all([b"(", a, b") ", bitop_c(op), b" (", bb, b")"]))) }
   else if is_shift(op) { Some(shift(em, op, l, r, Some(t))) }
