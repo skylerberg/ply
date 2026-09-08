@@ -677,6 +677,10 @@ impl Compiled for Mutant {
         self.inner.take_host_use()
     }
 
+    fn take_teardown(&self) -> Vec<ply_span::Diagnostic> {
+        self.inner.take_teardown()
+    }
+
     /// A corruption is a wrong answer at the seam, and a test entered whole hands the seam
     /// nothing to corrupt: a mutant leaves every test to the machine, where each call crosses.
     fn enter_test(&self, _name: &Symbol, _budget: usize) -> crate::compiled::Entered {

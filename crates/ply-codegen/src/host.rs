@@ -4,7 +4,7 @@
 //! policy opens for a `task` operation outside any `simulate`; the fixpoint leaves such a
 //! performer to the machine.
 
-use crate::heap::Word;
+use crate::heap::{self, Word};
 use crate::rt::{Ctx, values_taken};
 use ply_eval::handler::err_unhandled;
 use ply_eval::host::{
@@ -16,7 +16,7 @@ use ply_eval::machine::{
     err_no_runtime, err_secret_to_host, err_unenumerated_atom,
 };
 use ply_eval::sim::TASK_OPS;
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Span, Symbol};
 use std::sync::Arc;
 
 pub unsafe fn perform(
@@ -32,7 +32,7 @@ pub unsafe fn perform(
     let operation = operation_label(effect, op, resource);
     let binding = Arc::clone(&c.binding);
     let would = binding.would_serve(effect, op, resource);
-    if would.is_some() && !c.sims.is_empty() {
+    if would.is_some() && crate::simulate::innermost_is_seeded(c) {
         return c.fail(err_host_in_simulation(span, &operation, Span::DUMMY));
     }
     let Some(bound) = binding.resolve(effect, op, resource) else {
@@ -55,13 +55,14 @@ pub unsafe fn perform(
         };
         return c.fail(d);
     };
+    // A `task` operation the binding serves opens the production region with the performer's
+    // stack as the root task, and is answered by its scheduler.
     if effect.as_str() == "task" && TASK_OPS.contains(&op.as_str()) {
-        let d = Diagnostic::error(
-            codes::INTERNAL_ERROR,
-            format!("`{operation}` reached the compiled tier outside a region"),
-        )
-        .note("a production region is the machine's, and the unit refuses a performer of a task operation no region answers");
-        return c.fail(d);
+        let words: Vec<Word> = values.iter().map(|v| c.word(v)).collect();
+        if !unsafe { crate::simulate::open_production(ctx, effect, op) } {
+            return 0;
+        }
+        return unsafe { crate::simulate::perform(ctx, effect, op, &words) };
     }
     let atom = bound.atom.clone();
     let declaration = bound.op.clone();
@@ -101,7 +102,7 @@ pub unsafe fn perform(
             args: &values,
             span,
             machine: c.id,
-            task: None,
+            task: crate::simulate::running_task_of_production(c),
             declared: c.declared.as_ref(),
         };
         match &runtime {
@@ -129,12 +130,23 @@ pub unsafe fn perform(
             value
         }
         HostAnswer::Pending(pending) => {
-            let Some(rt) = runtime else {
-                return c.fail(err_no_runtime(span, &operation, pending, declaration.path));
-            };
-            match rt.block_on(pending) {
-                Ok(value) => value,
-                Err(d) => return c.fail(d),
+            if crate::simulate::running_task_of_production(c).is_some() {
+                let w = unsafe { crate::simulate::park(ctx, pending) };
+                let c = unsafe { &mut *ctx };
+                if c.failed != 0 {
+                    return 0;
+                }
+                let value = c.value(w);
+                heap::dec(w);
+                value
+            } else {
+                let Some(rt) = runtime else {
+                    return c.fail(err_no_runtime(span, &operation, pending, declaration.path));
+                };
+                match rt.block_on(pending) {
+                    Ok(value) => value,
+                    Err(d) => return c.fail(d),
+                }
             }
         }
     };

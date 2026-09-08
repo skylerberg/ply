@@ -1,4 +1,5 @@
-//! `simulate` in the compiled tier: a frame the runtime serves, driving the scheduler over stacks.
+//! A region in the compiled tier: `simulate`, a frame the runtime serves, and the production
+//! region the host policy opens; both drive the scheduler over stacks.
 //!
 //! The body runs as the root task on a stack of its own, and every task the region spawns gets
 //! one. A `perform` of an operation the region answers — `task`, `clock`, `random` — hands the
@@ -6,11 +7,18 @@
 //! the loop below applies it, asks the scheduler who runs next, and switches to that task. The
 //! scheduler is the machine's, instantiated over a saved stack pointer where the machine has a
 //! continuation, so a plan chooses the same interleaving on both sides.
+//!
+//! A production region is opened by a `task` operation outside any `simulate` when the binding
+//! permits one: the stack that performed it becomes the root task, and the loop runs on a stack
+//! of its own, scheduling against the host runtime. The root finishes when its entry returns to
+//! the backend, which then lets the loop drain the other tasks before answering.
 
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, call_value, values_taken};
 use crate::stack::{Stack, switch};
-use ply_eval::sched::{Resumption, Scheduler, Turn};
+use ply_eval::host::Pending;
+use ply_eval::machine::Unbound;
+use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, Turn};
 use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, signature};
 use ply_eval::{SimId, Value};
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -23,7 +31,8 @@ pub struct Simulation {
     /// The stack [`rt_simulate`] was called on, which the loop runs on.
     scheduler_sp: usize,
     running: Option<TaskId>,
-    request: Option<Request>,
+    /// What the task named asked when it last gave control back, until the loop applies it.
+    request: Option<(TaskId, Request)>,
     /// What the task being switched to gets back from the `perform` it stopped at.
     answer: Word,
     /// The stack the region was entered on, whose frames every task's chain to.
@@ -32,12 +41,21 @@ pub struct Simulation {
     /// The closure the task being started runs, read by its entry on the new stack.
     starting: Option<Word>,
     root: Word,
+    policy: Policy,
+    /// A production region's loop runs here rather than on the stack that opened the region,
+    /// since that stack is the root task.
+    loop_stack: Option<Stack>,
+    /// The loop returned, with the region's answer or its failure in place; nothing may switch
+    /// into its stack again.
+    loop_done: bool,
 }
 
 #[derive(Default)]
 struct TaskStack {
+    /// Owned by a spawned task; a production region's root runs on the stack that opened it.
     stack: Option<Stack>,
     frames: usize,
+    floor: usize,
     sp: usize,
 }
 
@@ -46,6 +64,7 @@ enum Request {
     Join(TaskId),
     Yield,
     Seeded(&'static OpSignature, Vec<Value>),
+    Park(Pending),
     Finished(Word),
     Failed,
 }
@@ -72,17 +91,138 @@ impl Simulation {
             floor_below,
             starting: None,
             root,
+            policy: Policy::Seeded,
+            loop_stack: None,
+            loop_done: false,
         }
+    }
+
+    pub fn is_production(&self) -> bool {
+        self.policy == Policy::Host
     }
 }
 
-/// The region's loop, on the stack that entered it. Returns the body's answer, or zero with the
-/// context failed.
+/// Opens the production region a `task` operation outside any `simulate` asks for, with the
+/// performer's stack as the root task. `false` with the context failed when the binding permits
+/// none.
+pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bool {
+    let c = unsafe { &mut *ctx };
+    let Some(permit) = HostPolicy::of(&c.binding) else {
+        let operation = ply_eval::host::operation_label(effect, op, None);
+        let path = c
+            .binding
+            .would_serve(effect, op, None)
+            .unwrap_or("ply_host::sched::spawn");
+        c.fail(ply_eval::host::err_hermetic(Span::DUMMY, &operation, path));
+        return false;
+    };
+    let id = SimId(c.entered_sims);
+    c.entered_sims += 1;
+    let sched = match Scheduler::production(id, Span::DUMMY, permit).rooted_running() {
+        Ok(sched) => sched,
+        Err(d) => {
+            c.fail(d);
+            return false;
+        }
+    };
+    let loop_stack = Stack::new();
+    let scheduler_sp = loop_stack.prepare(loop_entry, ctx as usize);
+    let loop_frames = c.open_stack(None);
+    let root = TaskStack {
+        stack: None,
+        frames: c.current,
+        floor: c.stack_floor,
+        sp: 0,
+    };
+    c.sims.push(Simulation {
+        sched,
+        handlers: Handlers::at(0, 0),
+        tasks: vec![root],
+        scheduler_sp,
+        running: Some(ROOT),
+        request: None,
+        answer: 0,
+        stack: loop_frames,
+        floor_below: loop_stack.floor(),
+        starting: None,
+        root: 0,
+        policy: Policy::Host,
+        loop_stack: Some(loop_stack),
+        loop_done: false,
+    });
+    true
+}
+
+/// A production region's loop, on its own stack: runs the scheduler until the region completes
+/// and hands the answer back to the root, which is waiting in the backend.
+extern "C" fn loop_entry(arg: usize) {
+    let ctx = arg as *mut Ctx;
+    let r = unsafe { run(ctx) };
+    let c = unsafe { &mut *ctx };
+    let sim = c.sims.last_mut().expect("a region is running");
+    sim.answer = r;
+    sim.loop_done = true;
+    let to = sim.tasks[ROOT.0 as usize].sp;
+    let from = &mut sim.scheduler_sp as *mut usize;
+    unsafe { switch(&mut *from, to) };
+    std::process::abort();
+}
+
+/// From the backend, once a production region's root entry has returned with `value`: the root
+/// is finished, the loop drains the other tasks, and the region's answer comes back.
+pub unsafe fn finish_root(ctx: *mut Ctx, value: Word) -> Word {
+    let c = unsafe { &mut *ctx };
+    let sim = c.sims.last_mut().expect("a region is running");
+    if sim.loop_done {
+        let sim = c.sims.pop().expect("the region that just failed");
+        c.current = sim.tasks[ROOT.0 as usize].frames;
+        c.stack_floor = sim.tasks[ROOT.0 as usize].floor;
+        return value;
+    }
+    sim.request = Some((
+        ROOT,
+        if c.failed != 0 {
+            Request::Failed
+        } else {
+            Request::Finished(value)
+        },
+    ));
+    let to = sim.scheduler_sp;
+    let from = &mut sim.tasks[ROOT.0 as usize].sp as *mut usize;
+    unsafe { switch(&mut *from, to) };
+    let c = unsafe { &mut *ctx };
+    let sim = c.sims.pop().expect("the region that just completed");
+    c.current = sim.tasks[ROOT.0 as usize].frames;
+    c.stack_floor = sim.tasks[ROOT.0 as usize].floor;
+    drop(sim.loop_stack);
+    sim.answer
+}
+
+/// The region's loop: on the stack that entered a `simulate`, on its own stack for a production
+/// region. Returns the body's answer, or zero with the context failed. A request left by the
+/// task that gave control back, the root's opening `spawn` included, is applied before the
+/// scheduler is asked.
 pub unsafe fn run(ctx: *mut Ctx) -> Word {
     loop {
         let c = unsafe { &mut *ctx };
         let sim = c.sims.last_mut().expect("a region is running");
-        let turn = sim.sched.next(sim.handlers.clock_mut(), &mut c.trail);
+        if let Some((task, request)) = sim.request.take() {
+            match unsafe { apply(ctx, task, request) } {
+                Ok(()) => {}
+                Err(Some(d)) => return c.fail(d),
+                Err(None) => return 0,
+            }
+        }
+        let c = unsafe { &mut *ctx };
+        let runtime = c.runtime.clone();
+        let sim = c.sims.last_mut().expect("a region is running");
+        let turn = match sim.policy {
+            Policy::Seeded => sim.sched.next(sim.handlers.clock_mut(), &mut c.trail),
+            Policy::Host => match &runtime {
+                Some(rt) => sim.sched.next_host(rt.as_ref()),
+                None => sim.sched.next_host(&Unbound),
+            },
+        };
         let (task, resumption) = match turn {
             Err(d) => return c.fail(d),
             Ok(Turn::Complete(value)) => {
@@ -107,7 +247,7 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
         let c = unsafe { &mut *ctx };
         let sim = c.sims.last_mut().expect("a region is running");
         let slot = &mut sim.tasks[at];
-        c.stack_floor = slot.stack.as_ref().expect("a task has a stack").floor();
+        c.stack_floor = slot.floor;
         c.current = slot.frames;
         sim.running = Some(task);
         let from = &mut sim.scheduler_sp as *mut usize;
@@ -121,59 +261,58 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
         if sim.sched.records_steps() {
             c.trail.end_step(Span::DUMMY);
         }
-        let k = sim.tasks[at].sp;
-        let applied = match sim.request.take() {
-            Some(Request::Spawn(closure)) => {
-                let id = sim.sched.spawn(closure, Span::DUMMY, None);
-                sim.tasks.push(TaskStack::default());
-                sim.sched.suspend(k, Value::Task(id))
-            }
-            Some(Request::Join(target)) => sim.sched.join(k, target, Span::DUMMY),
-            Some(Request::Yield) => sim.sched.suspend(k, Value::Unit),
-            Some(Request::Seeded(sig, args)) => {
-                match sim.handlers.dispatch(sig, task, &args, Span::DUMMY) {
-                    Ok(Answer::Value(value)) => {
-                        if let Some(access) = sig.step_access() {
-                            c.trail.record_access(access);
-                        }
-                        sim.sched.suspend(k, value)
-                    }
-                    Ok(Answer::Sleeping { deadline }) => {
-                        sim.sched.sleep_until(k, deadline, Span::DUMMY)
-                    }
-                    Err(d) => Err(d),
-                }
-            }
-            Some(Request::Finished(word)) => {
-                sim.tasks[at].stack = None;
-                let value = c.value(word);
-                heap::dec(word);
-                let sim = c.sims.last_mut().expect("a region is running");
-                sim.sched.finish(value)
-            }
-            Some(Request::Failed) => {
-                sim.tasks[at].stack = None;
-                if c.failed == FAILED_UNWIND {
-                    return 0;
-                }
-                let failure = c.diagnostic.take().unwrap_or_else(|| {
-                    Diagnostic::error(codes::INTERNAL_ERROR, "a task failed without a diagnostic")
-                });
-                let seed = c.trail.seed().clone();
-                let sim = c.sims.last_mut().expect("a region is running");
-                let failure = sim.sched.fail(failure, &seed);
-                c.failed = 0;
-                return c.fail(failure);
-            }
-            None => Err(Diagnostic::error(
-                codes::INTERNAL_ERROR,
-                "a task gave control back to the scheduler without a request",
-            )),
-        };
-        if let Err(d) = applied {
-            return c.fail(d);
-        }
     }
+}
+
+/// Applies what `task` asked when it gave control back. `Err(None)` when the context is already
+/// failed with what the loop should return.
+unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Option<Diagnostic>> {
+    let c = unsafe { &mut *ctx };
+    let sim = c.sims.last_mut().expect("a region is running");
+    let at = task.0 as usize;
+    let k = sim.tasks[at].sp;
+    let applied = match request {
+        Request::Spawn(closure) => {
+            let id = sim.sched.spawn(closure, Span::DUMMY, None);
+            sim.tasks.push(TaskStack::default());
+            sim.sched.suspend(k, Value::Task(id))
+        }
+        Request::Join(target) => sim.sched.join(k, target, Span::DUMMY),
+        Request::Yield => sim.sched.suspend(k, Value::Unit),
+        Request::Park(pending) => sim.sched.park_on_host(k, pending, Span::DUMMY),
+        Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, Span::DUMMY) {
+            Ok(Answer::Value(value)) => {
+                if let Some(access) = sig.step_access() {
+                    c.trail.record_access(access);
+                }
+                sim.sched.suspend(k, value)
+            }
+            Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, Span::DUMMY),
+            Err(d) => Err(d),
+        },
+        Request::Finished(word) => {
+            sim.tasks[at].stack = None;
+            let value = c.value(word);
+            heap::dec(word);
+            let sim = c.sims.last_mut().expect("a region is running");
+            sim.sched.finish(value)
+        }
+        Request::Failed => {
+            sim.tasks[at].stack = None;
+            if c.failed == FAILED_UNWIND {
+                return Err(None);
+            }
+            let failure = c.diagnostic.take().unwrap_or_else(|| {
+                Diagnostic::error(codes::INTERNAL_ERROR, "a task failed without a diagnostic")
+            });
+            let seed = c.trail.seed().clone();
+            let sim = c.sims.last_mut().expect("a region is running");
+            let failure = sim.sched.fail(failure, &seed);
+            c.failed = 0;
+            return Err(Some(failure));
+        }
+    };
+    applied.map_err(Some)
 }
 
 unsafe fn start(ctx: *mut Ctx, at: usize, closure: Word) -> usize {
@@ -184,9 +323,11 @@ unsafe fn start(ctx: *mut Ctx, at: usize, closure: Word) -> usize {
     let parent = sim.stack;
     let frames = c.open_stack(Some(parent));
     let sim = c.sims.last_mut().expect("a region is running");
+    let floor = stack.floor();
     sim.tasks[at] = TaskStack {
         stack: Some(stack),
         frames,
+        floor,
         sp,
     };
     sim.starting = Some(closure);
@@ -207,11 +348,15 @@ extern "C" fn task_entry(arg: usize) {
     heap::dec(closure);
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
-    sim.request = Some(if c.failed != 0 {
-        Request::Failed
-    } else {
-        Request::Finished(r)
-    });
+    let me = TaskId(at as u32);
+    sim.request = Some((
+        me,
+        if c.failed != 0 {
+            Request::Failed
+        } else {
+            Request::Finished(r)
+        },
+    ));
     let from = &mut sim.tasks[at].sp as *mut usize;
     let to = sim.scheduler_sp;
     unsafe { switch(&mut *from, to) };
@@ -253,13 +398,50 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
         );
         return c.fail(d);
     };
-    sim.request = Some(request);
+    sim.request = Some((task, request));
     let from = &mut sim.tasks[task.0 as usize].sp as *mut usize;
     let to = sim.scheduler_sp;
     unsafe { switch(&mut *from, to) };
     let c = unsafe { &mut *ctx };
     let sim = c.sims.last_mut().expect("a region is running");
     std::mem::take(&mut sim.answer)
+}
+
+/// From a task of a production region: parks it on the host's pending answer and comes back
+/// with the value the runtime resolved it to.
+pub unsafe fn park(ctx: *mut Ctx, pending: Pending) -> Word {
+    let c = unsafe { &mut *ctx };
+    let sim = c.sims.last_mut().expect("a region is running");
+    let Some(task) = sim.running else {
+        let d = Diagnostic::error(
+            codes::INTERNAL_ERROR,
+            "a pending host answer arrived while no task was running",
+        );
+        return c.fail(d);
+    };
+    sim.request = Some((task, Request::Park(pending)));
+    let from = &mut sim.tasks[task.0 as usize].sp as *mut usize;
+    let to = sim.scheduler_sp;
+    unsafe { switch(&mut *from, to) };
+    let c = unsafe { &mut *ctx };
+    let sim = c.sims.last_mut().expect("a region is running");
+    std::mem::take(&mut sim.answer)
+}
+
+/// Whether the innermost region is a production one with a task running, so that a host
+/// answer parks rather than blocks, and the request names the task.
+pub fn running_task_of_production(c: &Ctx) -> Option<TaskId> {
+    let sim = c.sims.last()?;
+    if sim.policy != Policy::Host {
+        return None;
+    }
+    sim.running
+}
+
+pub fn innermost_is_seeded(c: &Ctx) -> bool {
+    c.sims
+        .last()
+        .is_some_and(|sim| sim.policy == Policy::Seeded)
 }
 
 /// The access a cell builtin makes, for the running step's footprint.

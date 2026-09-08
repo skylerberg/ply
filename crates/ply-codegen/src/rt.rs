@@ -382,17 +382,27 @@ pub struct Ctx {
     /// the observed row is a claim the tests make, and a handled perform is still a perform.
     pub performed: Vec<EffectAtom>,
     /// The regions live in this entry, innermost last; the checker forbids nesting, so at most one.
-    pub(crate) sims: Vec<crate::simulate::Simulation>,
+    pub sims: Vec<crate::simulate::Simulation>,
     /// The detached bodies this entry has opened, named by index from their frames and tokens.
     pub(crate) detached: Vec<crate::detached::Detached>,
     pub(crate) starting_detached: Option<usize>,
+    /// The host boundary: what a `perform` nothing on the stack answers reaches.
+    pub(crate) binding: Arc<ply_eval::HostBinding>,
+    pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
+    pub(crate) declared: Option<ply_core::Footprint>,
+    pub(crate) re_executed: bool,
+    pub(crate) host_use: ply_eval::host::HostUse,
+    pub(crate) host_ops: u64,
+    pub(crate) id: ply_eval::host::MachineId,
+    /// What the host runtime said when an entry ended, for the machine's teardown warnings.
+    pub(crate) teardown: Vec<Diagnostic>,
     /// The seed the driver set, and the step budget, for the regions this entry opens.
     pub(crate) seed: ply_eval::Seed,
     pub(crate) sim_steps: u32,
     pub(crate) trail: ply_eval::region::Trail,
     /// What the entry's regions did, for the search, once the last one has completed.
     pub record: Option<ply_eval::region::Record>,
-    entered_sims: u32,
+    pub(crate) entered_sims: u32,
     /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
     pub(crate) unwind: Option<(usize, usize, Word)>,
     /// The value a clause handed to `resume` in tail position, read back when the clause returns.
@@ -421,6 +431,14 @@ impl Ctx {
             sims: Vec::new(),
             detached: Vec::new(),
             starting_detached: None,
+            binding: Arc::new(ply_eval::HostBinding::hermetic()),
+            runtime: None,
+            declared: None,
+            re_executed: false,
+            host_use: ply_eval::host::HostUse::default(),
+            host_ops: 0,
+            id: ply_eval::host::MachineId::next(),
+            teardown: Vec::new(),
             seed: ply_eval::Seed::default(),
             sim_steps: ply_eval::sim::DEFAULT_STEPS,
             trail: ply_eval::region::Trail::new(ply_eval::Seed::default()),
@@ -499,6 +517,15 @@ impl Ctx {
     /// The singleton a nullary constructor is.
     pub fn nullary(&self, index: u32) -> Word {
         self.tables.nullaries[index as usize]
+    }
+
+    pub fn set_host(
+        &mut self,
+        binding: Arc<ply_eval::HostBinding>,
+        runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
+    ) {
+        self.binding = binding;
+        self.runtime = runtime;
     }
 
     pub(crate) fn frames(&mut self) -> &mut Vec<HandlerFrame> {
@@ -1710,12 +1737,17 @@ pub unsafe extern "C" fn rt_perform(
         }
     }
     let Some((stack, depth, closure, resumes)) = found else {
-        // The machine's own diagnostic for an operation nothing handles: a performer of one
-        // the host would answer is never compiled, so this is the case the machine calls a
-        // compiler defect too.
-        let d = ply_eval::handler::err_unhandled(Span::DUMMY, &effect, &op, resource.as_ref())
-            .primary(Span::DUMMY, "in compiled code");
-        return c.fail(d);
+        // A `task` operation inside the production region already open is the scheduler's;
+        // outside one it goes to the host route, which opens the region the binding permits.
+        if effect.as_str() == "task"
+            && ply_eval::sim::TASK_OPS.contains(&op.as_str())
+            && c.sims.last().is_some_and(|sim| sim.is_production())
+        {
+            return unsafe { crate::simulate::perform(ctx, &effect, &op, args_of(args, n)) };
+        }
+        return unsafe {
+            crate::host::perform(ctx, &effect, &op, resource.as_ref(), args_of(args, n))
+        };
     };
     let mut call_args: Vec<Word> = args_of(args, n).to_vec();
     // The clause runs outside the handler: the frame and everything above it, in this stack and

@@ -1777,7 +1777,9 @@ emitter refuses. One shape of resumption is refused at run time in that mode
 with `E0502`: resuming a continuation while a later stop of the same body is
 still suspended, which the machine runs. A `perform` no handler answers
 reaches the host binding from compiled code with the checks and codes of §7.8
-and §15; a `task` operation outside any `simulate` is left to the machine.
+and §15, and a `task` operation outside any `simulate` opens the production
+region the binding permits, scheduled against the host runtime as the
+machine's is.
 `PLY_C_REFUSALS=1` then also says how many bodies it answered. A simulated test
 the tier takes is scheduled by the runtime over the same seeded scheduler the
 machine drives, so a seed names one interleaving on either engine; under

@@ -1,6 +1,6 @@
 # ADR 0044 — Continuations as stacks: the runtime the fifth step leaves
 
-**Accepted; the first three stages are built, and the fourth without its production region.** ADR 0042 placed deleting the
+**Accepted, and the first four stages are built.** ADR 0042 placed deleting the
 machine fifth and ADR 0043 stopped at the line "what the runtime is once the
 machine is gone". This record is that line: what a suspended computation is in
 the compiled tier, how `simulate` and the three effects it answers are served
@@ -69,7 +69,7 @@ body's entry to the stop come back with every restored snapshot, so a `Vec`
 or an `Arc` a Rust frame held across the switch would be released once per
 restore; the `perform` moves what it owns into the stop, which drops it first.
 
-**Built, fourth stage, without the production region:** a `perform` no frame
+**Built, fourth stage:** a `perform` no frame
 answers reaches the binding the context carries
 (`crates/ply-codegen/src/host.rs`), through the machine's checks in the
 machine's order: the simulation exclusion, the hermetic, withheld and
@@ -80,11 +80,20 @@ The machine shares its binding, reactor, declared footprint and re-execution
 flag with the backend whenever any of them is set, and takes the host use and
 the linear-operation count back after a compiled entry. The fixpoint no
 longer refuses a performer for what the host would answer, nor for an
-operation nothing in the program handles; it refuses only a `task` operation
-no region answers, because the production region the host policy opens for
-one is not built, and stays the machine's. The producer test binds a Rust
-handler on both engines and drives a served operation and a hermetic one,
-with the machine's answer and the machine's code.
+operation nothing in the program handles. A `task` operation outside any
+`simulate` that the binding serves opens the production region: the stack
+that performed it becomes the root task, the loop runs on a stack of its
+own against the host runtime, a pending answer inside the region parks the
+task until the reactor resolves it, and when the root's entry returns to the
+backend the loop drains the other tasks before the region answers. One
+ordering the loop had to learn from the machine's `run_scheduled`: the
+request a task leaves when it gives control back, the root's opening `spawn`
+included, is applied before the scheduler is asked, since the scheduler
+refuses to choose while a task is still running. The producer tests bind Rust
+handlers on both engines and drive a served operation, a hermetic one, a
+region that spawns and joins, a region whose root and task both park on
+pending answers, and a hermetic refusal of a region, each with the machine's
+answer or the machine's code.
 
 > **What this decides.** That a suspended computation in the compiled tier is
 > **a C stack the runtime owns**, switched to and from with the C library's
@@ -398,13 +407,12 @@ language test written in Ply re-runs only when an edit reaches it.
    pins, the rule and its code. Oracle, met: the language's multi-shot shapes
    as a producer test against the machine, `k(true) + k(false)` among them;
    moving the machine's suites to Ply is the fifth stage's sort.
-4. **The host route.** Built without its production region: the binding on
-   the context, the checks, a pending answer waited on the reactor. What is
-   left is the region the host policy opens for a `task` operation outside
-   any `simulate`, which a served program's `serve` loop is, and which the
-   fixpoint leaves to the machine until it is built over stacks. Oracle so
-   far: the producer test with a bound handler; the served examples under
-   `--host` with the tier holding `http.serve` is the region's oracle.
+4. **The host route.** Built: the binding on the context, the checks, a
+   pending answer waited on the reactor or parked in a production region,
+   and the region itself over stacks. Oracle, met in part: the producer tests
+   with bound handlers and a reactor; the served examples under `--host` with
+   the tier holding their `serve` loops is the oracle the fifth stage's
+   deletion runs, since it is the CLI's host suite that drives them.
 5. **Delete the machine**, by the table above, and sort the suites. Oracle:
    `c tier took N of N` over both corpora with nothing to fall back to, the
    workspace builds without the removed modules, and CI's wall clock measured
