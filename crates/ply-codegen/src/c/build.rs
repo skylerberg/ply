@@ -407,7 +407,41 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
 /// as they are, its `functions` is the taken set, and its `Layouts` is `ctors` plus the shapes
 /// interned in id order. Nothing else is in a `Unit`, which is why a recording of those is
 /// faithful; if a field is ever added to one, it has to be added here too or the ids move.
-fn finish(
+/// The unit's C and its record, emitted and not compiled: what a bootstrap bundle holds, and
+/// what the fixpoint compares.
+pub fn emit_unit_record(
+    loaded: &'static Source,
+    names: &[&str],
+) -> Result<(String, super::cache::UnitCache, Vec<Refused>)> {
+    let ctors = loaded.ctors();
+    let ctors_digest = super::cache::ctors_digest(&ctors);
+    let (offered, fragment) = offered_set(names);
+    let how = super::toolchain::Profile::current().inlining().overridden();
+    let inlining = (how.budget, how.depth);
+    let Emitted {
+        text,
+        mut unit,
+        taken,
+        refusals,
+    } = emit_all(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
+    let _ = constants_of(loaded, &mut unit);
+    let record = super::cache::UnitCache {
+        object: super::load::object_key(&text),
+        taken,
+        refusals: refusals
+            .iter()
+            .map(|r| (r.function.clone(), r.construct.clone()))
+            .collect(),
+        shapes: unit.layouts.all_shape_names(),
+        consts: unit.consts,
+        fields: unit.fields,
+        builtins: unit.builtins,
+        lambdas: unit.lambdas,
+    };
+    Ok((text, record, refusals))
+}
+
+pub(super) fn finish(
     loaded: &'static Source,
     lib: Library,
     cached: super::cache::UnitCache,

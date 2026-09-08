@@ -1780,7 +1780,13 @@ reaches the host binding from compiled code with the checks and codes of §7.8
 and §15, and a `task` operation outside any `simulate` opens the production
 region the binding permits, scheduled against the host runtime as the
 machine's is.
-`PLY_C_REFUSALS=1` then also says how many bodies it answered. A simulated test
+`PLY_C_REFUSALS=1` then also says how many bodies it answered. The emitter in
+`<dir>` is built from `<dir>/bootstrap`, the C it last emitted for itself,
+when that directory holds one, and by the built-in emitter otherwise or when
+`PLY_C_BOOTSTRAP=off` asks for it. `PLY_TIER_ONLY=1` with a backend attached
+makes the tier the only engine: a test or an entry point runs compiled or
+fails with `E0505` naming the body the tier does not hold, and the machine
+evaluates nothing. It is how the run behaves once the machine is gone. A simulated test
 the tier takes is scheduled by the runtime over the same seeded scheduler the
 machine drives, so a seed names one interleaving on either engine; under
 `--audit-backend` every seed the tier ran is run again on the machine alone and

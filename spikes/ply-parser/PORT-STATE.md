@@ -259,8 +259,26 @@ A `handle` with a clause that binds `resume` and calls it off the tail is no lon
 the body becomes a nullary closure over every slot it reads that the enclosing scope binds, a
 parameter included, at the same slot numbers so nothing in it is renumbered, handed to
 `rt_handle_detached_p` with the clause table, in which the resume column says `2` for such a
-clause. The runtime resumes such a body as often as the clause asks. The port also refuses `secret_of_string` as the reference
-does; it had compiled it, which whole mode would have shipped.
+clause. The runtime resumes such a body as often as the clause asks. The port compiles `secret_of_string`, as the reference now does: a
+credential is a bridged value inside an entry, and the runtime's memo is what keeps one from
+outliving it.
+
+The port emits itself. Its own sources joined both differentials: the lowering one, where nine
+disagreements were two bugs in the update recognition, a record literal not recognised as an
+update of a local it projects from and an update's base resolved on a stack that was thrown
+away, which lost a lambda its capture; and the resolved-C one, where the port's own bodies are a
+ratchet of their own with floors and not yet an emptiness. The audit of the port's own tests
+under the tier is green. `spikes/ply-parser/bootstrap/` is the C the port emitted for itself,
+compressed, with the unit's record and the digest of the sources it came from; the CLI builds
+the producer from it rather than with the reference, `PLY_C_BOOTSTRAP=off` asks for the
+reference again, and `PLY_C_BOOTSTRAP_REFRESH=1 cargo test -p ply-codegen-tests --test bootstrap`
+rewrites the bundle from the fixpoint's own emission. The fixpoint test is the check: the emitter
+built from the bundle emits, for its sources, C that builds an emitter that emits the same C.
+
+The port's output is now built as lines joined once per body and frames joined once per dump,
+which the measurement in ADR 0045 §"What the fixpoint measured" showed was not where the
+memory went: the tier releases nothing within an entry, and precise release is the work that
+record names next.
 
 ## Beyond the port
 

@@ -1,6 +1,6 @@
 # ADR 0045 — Deleting the machine
 
-**Proposed.** ADR 0042 placed this fifth, after the effects and the runtime,
+**Accepted, and the second and third stages are built.** ADR 0042 placed this fifth, after the effects and the runtime,
 and ADR 0044 built the runtime's four stages: stacks, `simulate`, `resume`
 off the tail and more than once, and the host route with its production
 region. With the chain entered whole the tier now takes every definition the
@@ -30,6 +30,62 @@ without a day on which nothing checks the language.
 > still need the checker's diagnostics. The per-definition object and link
 > ADR 0037 describes, which is the loop's cost and not the machine's
 > existence. Whether the scheduler and the search are later written in Ply.
+
+**Built, second stage:** the bundle in `spikes/ply-parser/bootstrap/` and the
+fixpoint test, `crates/ply-codegen-tests/tests/bootstrap.rs`. The CLI builds
+the emitter from the bundle and no longer needs the reference to do it. On
+the way the emitter's own sources joined the lowering differential and the
+resolved-C ratchet, and the audit of the emitter's own tests under the tier
+found the miscompilation the bootstrap first hit: two bugs in the port's
+update recognition, both in the lowering, which are gone. The second stage
+was taken before the first, since it depended on nothing the facade adds and
+was the riskier of the two.
+
+**Built, third stage:** a credential is a bridged value. The refusal is gone
+from both emitters; the tier's memo, the one place a word outlives its
+entry, refuses to keep a value that holds a handle, a secret among them, and
+the examples' census is whole. With it, a body the port's lowering does not
+reach still reports what it handles, read off its source, since a refused
+handler whose performers compiled would have sent a `perform` past a frame
+the machine held.
+
+## What the fixpoint measured, and the work it names
+
+The compiled tier releases nothing inside an entry: the reference emitter's
+own header calls its ownership deliberately conservative, a value passed to
+a helper is duplicated first and never released, and the entry's arena is
+recycled whole when the entry ends. A test is an entry and a request is an
+entry, so nothing shipped had noticed. The emitter emitting a program is one
+entry too, and the measurement is what the bootstrap forced:
+
+```sh
+PLY_C_PHASES=1 PLY_C_CACHE=$(mktemp -d) PLY_C_EMITTER=ply-whole:spikes/ply-parser \
+  /usr/bin/time -l ./target/release/ply test crates/ply-std/ply --backend c --no-cache 2>&1 \
+  | grep -E 'maximum resident|^entry: [0-9]{6,}|live at end'
+```
+
+On 2026-09-08 the producer's one entry over the standard library allocated
+twenty-five million objects, recycled four million, reserved five gigabytes
+of chunks and ended with twenty million still counted, three gigabytes of
+them byte strings, where its answer is one string of four megabytes; over
+the emitter's own sources the run peaked at seventeen gigabytes, which is
+what a CI runner cannot hold, and each of six small programs run with the
+tier as the only engine leaked one object per iteration: a temporary passed
+to a builtin, an old record, a matched constructor, a parameter the callee
+never released. Making the emitter's two quadratic concatenations linear
+moved none of it. This is not the emitter's bug and not the port's: the
+machine moves a binding out of its slot at its last use and truncates the
+window at an activation's end, and the tier's emitted C does neither.
+
+So the fifth stage has a prerequisite this record did not list: **the tier
+releases within an entry**, transcribing the machine's rule into the
+emitter written in Ply, whose lowering already carries the last-use marks
+the machine acts on and whose lowering differential says they are the
+machine's. Until it is built, the bootstrap fixpoint and the port's ratchet
+over its own sources are `#[ignore]`d in CI and run by hand, and the
+emitter's own tests are not run tier-only there; a served program's entry
+would leak the same way for as long as it served, which is the other reason
+this comes before the deletion and not after it. It is the next record.
 
 ## The inventory
 
@@ -112,12 +168,16 @@ ls -la "$PLY_C_CACHE"/*.c            # the larger unit is the emitter's, with th
 zstd -19 -c "$PLY_C_CACHE"/<emitter>.c | wc -c
 ```
 
-On 2026-09-08 the emitter's unit was twelve megabytes of C and under a
-megabyte compressed with `zstd -19`. It is checked in compressed, and it is
-rewritten only when the snapshot can no longer build the emitter's current
-sources, which a change to the language the emitter is written in causes
-and a change to what it emits does not; the fixpoint test is what says the
-snapshot still serves, and a lagging snapshot that serves is not updated.
+On 2026-09-08 the emitter's unit was twelve megabytes of C and under two
+megabytes compressed with `gzip -9`, which the runtime decompresses without
+a tool beside it. It is checked in compressed and rewritten when the fixpoint
+says so: the emitter built from it emits the emitter's current sources, and
+the emitter built from that emission emits them again, and the two must
+agree; a change that alters what the emitter emits for its own sources, a
+construct newly carried among them, moves the bundle, and a change that does
+not, however large, leaves it. `PLY_C_BOOTSTRAP_REFRESH=1` on the fixpoint
+test writes the new bundle, and only once a third emitter built from it has
+emitted the same thing.
 
 ## The suites
 
@@ -153,18 +213,34 @@ become the new baselines, with the command beside each; after it, the
 instruments run over the facade. A threshold is re-registered from a
 measurement, not adjusted to pass.
 
+## The switch, which is the fifth stage's first form
+
+Building the second and third stages showed the facade can come after the
+engine: `PLY_TIER_ONLY=1` makes a machine with a backend attached refuse to
+evaluate anything itself. A test root the tier answers is the pass; one it
+refuses, declines or raises in is the failure, with the tier's diagnostic;
+an entry point goes through the backend whole. The three corpora and the
+served example run green under it, which is stage five's oracle taken
+before stage five, and CI runs them so. What the switch does not cover is
+what the facade is for: a bare expression in a scope, the corpus's
+instruments and the prover, which construct machines of their own. The
+first stage's facade is therefore taken consumer by consumer, each switched
+to the tier-only engine with its own oracle, rather than as one wrapping
+pass before any of them.
+
 ## Staging, and the oracle at each stage
 
 1. **The facade with the machine inside it.** `Engine` wraps a `Machine`;
    every consumer in the table is switched to the facade. Oracle: the whole
    workspace suite and the CLI's, unchanged, since nothing runs differently.
-2. **The snapshot and the fixpoint.** The bootstrap snapshot is checked in,
-   the fixpoint test runs in CI, and the producer is built from the
-   snapshot rather than the reference. Oracle: the fixpoint, and the audit
+2. **The snapshot and the fixpoint.** Built. The bootstrap bundle is checked
+   in, the fixpoint test runs in CI, and the producer is built from the
+   bundle rather than the reference. Oracle, met: the fixpoint, and the audit
    over both corpora unchanged.
-3. **The credential.** The bridged secret; the refusal removed on both
-   emitters. Oracle: the secrets suite as a Ply test, and the census over
-   the examples losing its last row.
+3. **The credential.** Built. The bridged secret, the memo refusing a handle,
+   the refusal removed on both emitters. Oracle, met in part: the census over
+   the examples has no rows; the secrets suite as a Ply test is the fifth
+   stage's sort.
 4. **The instruments' baselines.** Each instrument run under both engines
    on one tree, the tier's figures registered. Oracle: the registered
    figures reproduce.
