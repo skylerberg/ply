@@ -141,7 +141,7 @@ pub fn write(key: &str, text: &str, tables: &Tables) {
 }
 
 /// One body as lines: the tables it names, then its text.
-fn encode(text: &str, t: &Tables) -> String {
+pub(super) fn encode(text: &str, t: &Tables) -> String {
     let mut out = encode_tables(&t.consts, &t.builtins, &t.fields, &t.shapes, &t.lambdas);
     out.push_str(&format!("calls {}\n", t.calls.len()));
     for c in &t.calls {
@@ -249,7 +249,7 @@ fn line<'a>(s: &'a str, at: &mut usize) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-fn decode(s: &str) -> Option<(String, Tables)> {
+pub(super) fn decode(s: &str) -> Option<(String, Tables)> {
     let mut at = 0usize;
     let mut t = decode_tables(s, &mut at)?;
     let n = count(line(s, &mut at)?, "calls")?;

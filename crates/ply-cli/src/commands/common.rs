@@ -104,17 +104,105 @@ pub(crate) fn emit_keys(
     keys
 }
 
+/// Each module's source text by name: what a second emitter reads the program from.
+pub(crate) fn module_texts(
+    program: &ply_syntax::ast::Program,
+    sources: &SourceMap,
+) -> std::collections::HashMap<String, String> {
+    program
+        .modules
+        .iter()
+        .filter_map(|m| {
+            sources
+                .get(m.source)
+                .map(|f| (m.name.to_string(), f.text.to_string()))
+        })
+        .collect()
+}
+
+/// `PLY_C_EMITTER=ply:<dir>` makes the Ply emitter in `<dir>` the C tier's producer (ADR 0042).
+/// The recipe loads that directory as a project of its own -- the front end, `emit.ply` and
+/// the standard library they import -- and compiles it with the reference emitter; a worker
+/// thread builds its own copy from the same recipe, since a loaded unit does not cross threads.
+pub(crate) fn install_producer_from_env() {
+    let Ok(spec) = std::env::var("PLY_C_EMITTER") else {
+        return;
+    };
+    let Some(dir) = spec.strip_prefix("ply:") else {
+        eprintln!("PLY_C_EMITTER is `{spec}`; the one producer is `ply:<dir>`");
+        return;
+    };
+    let dir = std::path::PathBuf::from(dir);
+    ply_codegen::c::producer::install(std::sync::Arc::new(move || {
+        // The directory's own `.ply` files and the standard library: not a project load, which
+        // would sweep in fixtures and probes that sit beside the emitter on purpose.
+        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+            .map_err(|e| format!("{}: {e}", dir.display()))?
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+            .collect();
+        files.sort();
+        let mut sources = SourceMap::new();
+        let mut inputs = Vec::new();
+        for (module, text) in ply_std::sources() {
+            let module = ply_syntax::ast::ModuleName::from_dotted(module);
+            let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
+            inputs.push((id, module, text));
+        }
+        for path in &files {
+            let stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| format!("{}: not a module name", path.display()))?;
+            let text: &'static str = Box::leak(
+                std::fs::read_to_string(path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?
+                    .into_boxed_str(),
+            );
+            let id = sources.add(path.clone(), text.to_string());
+            inputs.push((id, ply_syntax::ast::ModuleName::from_dotted(stem), text));
+        }
+        let first = |ds: Vec<Diagnostic>| {
+            ds.first()
+                .map(|d| d.message.clone())
+                .unwrap_or_else(|| "no diagnostic".to_string())
+        };
+        let mut ast = ply_syntax::parse_program(inputs).map_err(first)?;
+        let expanded = ply_derive::expand_program(&mut ast);
+        if !expanded.is_empty() {
+            return Err(first(expanded));
+        }
+        let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
+        let check = ply_core::check_program(&ast, &resolved).map_err(first)?;
+        let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
+        let resolved = Box::leak(Box::new(resolved));
+        let check = Box::leak(Box::new(check));
+        let hashes = ply_hash::hash_program(program, resolved, check).map_err(first)?;
+        let keys = emit_keys(program, &hashes);
+        let source: &'static ply_codegen::Source = Box::leak(Box::new(ply_codegen::Source::keyed(
+            program, resolved, check, keys,
+        )));
+        let names: Vec<String> = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (native, _refused) =
+            ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?;
+        ply_codegen::c::producer::PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+    }));
+}
+
 pub fn build_backend(
     spec: &ply_eval::BackendSpec,
     program: &ply_syntax::ast::Program,
     resolved: &ply_syntax::resolve::Resolved,
     check: &ply_core::CheckOutput,
     hashes: &ply_hash::HashOutput,
+    texts: std::collections::HashMap<String, String>,
 ) -> Result<&'static dyn ply_eval::Provider, Diagnostic> {
+    install_producer_from_env();
     match spec.kind {
         ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(program, resolved, check)),
         ply_eval::BackendKind::C => {
-            ply_codegen::Unit::keyed(program, resolved, check, emit_keys(program, hashes))
+            ply_codegen::Unit::keyed(program, resolved, check, emit_keys(program, hashes), texts)
                 .map(|unit| unit as &'static dyn ply_eval::Provider)
                 .map_err(|error| {
                     Diagnostic::error(

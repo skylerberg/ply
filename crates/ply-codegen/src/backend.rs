@@ -90,7 +90,7 @@ impl Unit {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
     ) -> Result<&'static Unit> {
-        Unit::keyed(program, resolved, check, HashMap::new())
+        Unit::keyed(program, resolved, check, HashMap::new(), HashMap::new())
     }
 
     /// The same, told what each definition's code is a function of, so that emitted bodies and
@@ -101,6 +101,7 @@ impl Unit {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
         keys: HashMap<String, String>,
+        texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
@@ -109,8 +110,9 @@ impl Unit {
         let resolved: &'static ply_syntax::resolve::Resolved =
             Box::leak(Box::new(resolved.clone()));
         let check: &'static ply_core::CheckOutput = Box::leak(Box::new(check.clone()));
-        let source: &'static Source =
-            Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
+        let source: &'static Source = Box::leak(Box::new(
+            Source::keyed(program, resolved, check, keys).with_texts(texts),
+        ));
         let candidates = source.functions();
         let started = std::time::Instant::now();
         // The pre-flight is the analysis: the emitter's fixpoint over every function is what
