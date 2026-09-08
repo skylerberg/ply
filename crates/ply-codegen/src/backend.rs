@@ -461,7 +461,14 @@ impl Bodies {
             let raised = if out_of_fuel {
                 None
             } else {
-                ctx.diagnostic.take()
+                ctx.diagnostic.take().or_else(|| {
+                    (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
+                        ply_span::Diagnostic::error(
+                            ply_span::codes::RUNTIME_ERROR,
+                            "a `handle` clause unwound past the compiled fragment's entry",
+                        )
+                    })
+                })
             };
             ctx.end();
             drop(ctx);
@@ -542,6 +549,10 @@ impl ply_eval::Compiled for Bodies {
             Run::Raised(raised) => Entered::Raised(raised),
             Run::Declined => Entered::Declined,
         }
+    }
+
+    fn take_performed(&self) -> Vec<ply_core::ty::EffectAtom> {
+        std::mem::take(&mut self.ctx.borrow_mut().performed)
     }
 }
 

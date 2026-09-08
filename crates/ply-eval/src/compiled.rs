@@ -2,7 +2,7 @@
 
 use crate::value::{Closure, ClosureKind, Value};
 use ply_core::CheckOutput;
-use ply_core::ty::{IntTy, SECRET, TyVar, Type};
+use ply_core::ty::{EffectAtom, IntTy, SECRET, TyVar, Type};
 use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::Program;
 use rustc_hash::FxHashMap;
@@ -20,6 +20,12 @@ pub trait Compiled {
     /// test the backend fails and the machine passes is a disagreement, not a decline.
     fn enter_test(&self, _name: &Symbol, _budget: usize) -> Entered {
         Entered::Declined
+    }
+
+    /// The atoms compiled code performed since the last entry, for the machine's trace. A
+    /// handled perform is still a perform, and the observed row is a claim the tests make.
+    fn take_performed(&self) -> Vec<EffectAtom> {
+        Vec::new()
     }
 }
 

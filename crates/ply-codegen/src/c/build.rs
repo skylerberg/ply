@@ -195,6 +195,35 @@ fn emit_all(
                 },
             }
         }
+        // A compiled `perform` searches the compiled handler frames, which is complete for an
+        // operation only while every body handling it is compiled (ADR 0043). A performer of an
+        // operation whose handler was dropped, or that nothing in the program handles, goes with
+        // it.
+        if super::producer::whole() {
+            let handlers =
+                super::producer::with_current(|p| p.handlers_of(loaded)).unwrap_or_default();
+            let taken_now = taken.clone();
+            for (name, _, tables) in &emitted {
+                if round.iter().any(|r| r.function == *name) {
+                    continue;
+                }
+                for op in &tables.performs {
+                    let missing = match handlers.get(op) {
+                        None => Some("nothing in the program".to_string()),
+                        Some(hs) => hs.iter().find(|h| !taken_now.contains(h)).map(|h| {
+                            format!("`{h}`, which handles it and is not in this compiled unit")
+                        }),
+                    };
+                    if let Some(why) = missing {
+                        round.push(Refused {
+                            function: name.clone(),
+                            construct: format!("a `perform` of `{op}` answered by {why}"),
+                        });
+                        break;
+                    }
+                }
+            }
+        }
         if round.is_empty() {
             break emitted;
         }
@@ -290,7 +319,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
         &offered,
         &ctors_digest,
         inlining,
-        super::producer::mode(),
+        &super::producer::who(),
     );
     // A unit entry that will not reconstruct is a reason to build one, never to fail.
     if let Some(k) = &unit_key
@@ -491,7 +520,11 @@ pub(super) fn emit_one(
     // unit. `lexer.hex1` and `lexer.hex2` are that pair, and the C compiler said so.
     let mode = super::producer::mode();
     let whole = mode == "ply-whole";
-    let who = if mode == "ref" { "" } else { "\0ply" };
+    let who = if mode == "ref" {
+        String::new()
+    } else {
+        format!("\0ply\0{}", super::producer::identity())
+    };
     let key = loaded
         .keys
         .get(name)
@@ -499,7 +532,11 @@ pub(super) fn emit_one(
     // A refusal is the port's own in whole mode and the reference's otherwise; the two are not
     // served to each other.
     let refusal = loaded.keys.get(name).map(|h| {
-        let who = if whole { "\0ply-whole" } else { "" };
+        let who = if whole {
+            format!("\0ply-whole\0{}", super::producer::identity())
+        } else {
+            String::new()
+        };
         super::cache::refusal_key(
             &format!("{name}\0{h}{who}"),
             ctors_digest,
@@ -547,7 +584,7 @@ pub(super) fn emit_one(
                 }
                 Ok((text, tables))
             }
-            Some(super::producer::Answer::Refused(why)) => {
+            Some(super::producer::Answer::Refused(why, _)) => {
                 if let Some(k) = &refusal {
                     super::cache::write_refusal(k, &why);
                 }

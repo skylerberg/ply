@@ -13,9 +13,10 @@ use crate::heap::{
 };
 use crate::list;
 use crate::map;
+use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::BinOp;
+use ply_syntax::ast::{BinOp, Mode};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -229,6 +230,48 @@ pub(crate) fn holds_a_handle(value: &Value) -> Option<&'static str> {
 pub const FAILED_OUT_OF_FUEL: i64 = 2;
 /// The prologue found the native stack nearly out before the fuel was.
 pub const FAILED_OUT_OF_STACK: i64 = 3;
+/// A clause that bound `resume` answered without calling it: the fragment is unwinding to the
+/// `handle` the clause belongs to, and `Ctx::unwind` names it and carries the value.
+pub const FAILED_UNWIND: i64 = 4;
+
+/// One installed handler: the frame a `handle` site pushes and a `perform` searches, innermost
+/// out. ADR 0043.
+pub struct HandlerFrame {
+    clauses: Vec<FrameClause>,
+    /// The `return` clause's closure, or zero.
+    ret: Word,
+}
+
+/// One clause: its effect and resource under their program-wide names, the operation, the
+/// closure the clause body became, and whether the clause binds `resume`.
+struct FrameClause {
+    effect: Symbol,
+    resource: Option<Symbol>,
+    op: Symbol,
+    closure: Word,
+    resumes: bool,
+}
+
+impl FrameClause {
+    fn answers(&self, effect: &Symbol, op: &Symbol, resource: Option<&Symbol>) -> bool {
+        self.effect == *effect
+            && self.op == *op
+            && match (&self.resource, resource) {
+                (None, _) => true,
+                (Some(mine), Some(theirs)) => mine == theirs,
+                (Some(_), None) => false,
+            }
+    }
+}
+
+fn drop_frame(f: HandlerFrame) {
+    for c in f.clauses {
+        heap::dec(c.closure);
+    }
+    if f.ret != 0 {
+        heap::dec(f.ret);
+    }
+}
 
 #[repr(C)]
 pub struct Ctx {
@@ -255,6 +298,14 @@ pub struct Ctx {
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
     pub builtin_calls: u64,
+    pub handlers: Vec<HandlerFrame>,
+    /// Every atom a compiled `perform` performed since the entry began, for the machine's trace:
+    /// the observed row is a claim the tests make, and a handled perform is still a perform.
+    pub performed: Vec<EffectAtom>,
+    /// Where an unwind is going and what it carries: the frame's depth and the clause's value.
+    unwind: Option<(usize, Word)>,
+    /// The value a clause handed to `resume` in tail position, read back when the clause returns.
+    resumed: Option<Word>,
 }
 
 impl Ctx {
@@ -273,6 +324,10 @@ impl Ctx {
             cells_baseline: baseline,
             diagnostic: None,
             builtin_calls: 0,
+            handlers: Vec::new(),
+            performed: Vec::new(),
+            unwind: None,
+            resumed: None,
         }
     }
 
@@ -284,6 +339,10 @@ impl Ctx {
         self.fuel = fuel;
         self.stack_floor = stack_floor();
         self.diagnostic = None;
+        self.handlers.clear();
+        self.performed.clear();
+        self.unwind = None;
+        self.resumed = None;
         // Every path out of an entry calls `end`, so this is one comparison against an empty log.
         if self.heap.allocated() != 0 {
             self.unclosed_entries += 1;
@@ -1320,6 +1379,166 @@ pub unsafe extern "C" fn rt_closure(
 }
 
 /// A builtin used as a value: the interpreter's own closure kind for it.
+/// `rt_handle_push(ctx, clauses, n, ret)`: install a handler and answer its depth. `clauses` is
+/// `n` entries of five words: the effect's, resource's and operation's field-table indices
+/// (the resource's negative for none), the clause closure, and whether the clause binds
+/// `resume`. The closures and `ret` are taken, and released when the frame is popped.
+pub unsafe extern "C" fn rt_handle_push(
+    ctx: *mut Ctx,
+    clauses: *const i64,
+    n: i64,
+    ret: i64,
+) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let words = args_of(clauses, n * 5);
+    let name = |i: i64| c.tables.fields[i as usize].clone();
+    let clauses = words
+        .chunks(5)
+        .map(|w| FrameClause {
+            effect: name(w[0]),
+            resource: (w[1] >= 0).then(|| name(w[1])),
+            op: name(w[2]),
+            closure: w[3],
+            resumes: w[4] != 0,
+        })
+        .collect();
+    c.handlers.push(HandlerFrame { clauses, ret });
+    (c.handlers.len() - 1) as i64
+}
+
+/// The `k` a clause that binds `resume` is handed: calling it in tail position records the
+/// value, which `rt_perform` then answers to the performer.
+unsafe extern "C" fn rt_resume_entry(ctx: *mut Ctx, args: *const i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let v = unsafe { *args.add(1) };
+    c.resumed = Some(v);
+    v
+}
+
+fn resume_token(c: &mut Ctx, depth: usize) -> Word {
+    let o = c
+        .heap
+        .alloc(KIND_CLOSURE, 0, (1 + CLOSURE_CAPTURES) as u32, 1);
+    unsafe {
+        set_word(
+            o,
+            CLOSURE_CODE,
+            rt_resume_entry as *const () as usize as Word,
+        );
+        set_word(o, CLOSURE_CAPTURES, heap::imm(depth as i64));
+    }
+    o as Word
+}
+
+/// `rt_perform(ctx, effect, op, resource, mode, args, n)`: the atom is recorded for the
+/// machine's trace, then the innermost frame with a clause for the operation answers. A
+/// tail-resumptive clause is called on the performer's stack with the frames from its own
+/// upward set aside, and its value is the perform's. A clause that binds `resume` is handed
+/// the token above; if it answers without calling it, the fragment unwinds to the clause's
+/// `handle` with that value.
+pub unsafe extern "C" fn rt_perform(
+    ctx: *mut Ctx,
+    effect: i64,
+    op: i64,
+    resource: i64,
+    mode: i64,
+    args: *const i64,
+    n: i64,
+) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let effect = c.tables.fields[effect as usize].clone();
+    let op = c.tables.fields[op as usize].clone();
+    let resource = (resource >= 0).then(|| c.tables.fields[resource as usize].clone());
+    c.performed.push(EffectAtom::new(
+        effect.clone(),
+        resource
+            .clone()
+            .map_or(Resource::Singleton, Resource::Named),
+        if mode != 0 { Mode::Write } else { Mode::Read },
+    ));
+    let found = c.handlers.iter().enumerate().rev().find_map(|(i, f)| {
+        f.clauses
+            .iter()
+            .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
+            .map(|cl| (i, cl.closure, cl.resumes))
+    });
+    let Some((depth, closure, resumes)) = found else {
+        let d = error(format!(
+            "`{effect}.{op}` reached no handler in the compiled fragment"
+        ));
+        return c.fail(d);
+    };
+    let mut call_args: Vec<Word> = args_of(args, n).to_vec();
+    let above = c.handlers.split_off(depth);
+    if resumes {
+        let k = resume_token(c, depth);
+        call_args.push(k);
+        c.resumed = None;
+    }
+    let r = call_value(ctx, closure, &call_args);
+    let c = unsafe { &mut *ctx };
+    c.handlers.extend(above);
+    if c.failed != 0 {
+        return 0;
+    }
+    if !resumes {
+        return r;
+    }
+    match c.resumed.take() {
+        Some(v) => v,
+        None => {
+            c.unwind = Some((depth, r));
+            c.failed = FAILED_UNWIND;
+            0
+        }
+    }
+}
+
+/// `rt_handle_land(ctx, depth, value)`: the `handle` at `depth` is over. Its frame and any above
+/// are popped; an unwind to it is caught and its value answered; any other failure passes; and
+/// a body that completed answers `value` through the `return` clause when there is one.
+pub unsafe extern "C" fn rt_handle_land(ctx: *mut Ctx, depth: i64, value: i64) -> i64 {
+    let c = unsafe { &mut *ctx };
+    let depth = depth as usize;
+    let mut popped = c.handlers.split_off(depth);
+    let mine = if popped.is_empty() {
+        None
+    } else {
+        Some(popped.remove(0))
+    };
+    for f in popped {
+        drop_frame(f);
+    }
+    if c.failed == FAILED_UNWIND
+        && let Some((target, v)) = c.unwind.take()
+    {
+        if target == depth {
+            c.failed = 0;
+            if let Some(f) = mine {
+                drop_frame(f);
+            }
+            return v;
+        }
+        c.unwind = Some((target, v));
+    }
+    if c.failed != 0 {
+        if let Some(f) = mine {
+            drop_frame(f);
+        }
+        return 0;
+    }
+    let Some(f) = mine else {
+        return value;
+    };
+    let r = if f.ret != 0 {
+        call_value(ctx, f.ret, &[value])
+    } else {
+        value
+    };
+    drop_frame(f);
+    r
+}
+
 pub unsafe extern "C" fn rt_builtin_value(ctx: *mut Ctx, index: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
     let b = ctx.tables.builtins[index as usize];

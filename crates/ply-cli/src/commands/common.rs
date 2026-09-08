@@ -141,61 +141,84 @@ pub(crate) fn install_producer_from_env() {
     };
     ply_codegen::c::producer::set_whole(whole);
     let dir = std::path::PathBuf::from(dir);
-    ply_codegen::c::producer::install(std::sync::Arc::new(move || {
-        // The directory's own `.ply` files and the standard library: not a project load, which
-        // would sweep in fixtures and probes that sit beside the emitter on purpose.
-        let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
-            .map_err(|e| format!("{}: {e}", dir.display()))?
-            .filter_map(|e| e.ok().map(|e| e.path()))
-            .filter(|p| p.extension().is_some_and(|e| e == "ply"))
-            .collect();
-        files.sort();
-        let mut sources = SourceMap::new();
-        let mut inputs = Vec::new();
-        for (module, text) in ply_std::sources() {
-            let module = ply_syntax::ast::ModuleName::from_dotted(module);
-            let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
-            inputs.push((id, module, text));
+    let identity = {
+        let mut modules = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.extension().is_some_and(|x| x == "ply")
+                    && let Ok(text) = std::fs::read_to_string(&p)
+                {
+                    modules.push((
+                        p.file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string(),
+                        text,
+                    ));
+                }
+            }
         }
-        for path in &files {
-            let stem = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .ok_or_else(|| format!("{}: not a module name", path.display()))?;
-            let text: &'static str = Box::leak(
-                std::fs::read_to_string(path)
-                    .map_err(|e| format!("{}: {e}", path.display()))?
-                    .into_boxed_str(),
-            );
-            let id = sources.add(path.clone(), text.to_string());
-            inputs.push((id, ply_syntax::ast::ModuleName::from_dotted(stem), text));
-        }
-        let first = |ds: Vec<Diagnostic>| {
-            ds.first()
-                .map(|d| d.message.clone())
-                .unwrap_or_else(|| "no diagnostic".to_string())
-        };
-        let mut ast = ply_syntax::parse_program(inputs).map_err(first)?;
-        let expanded = ply_derive::expand_program(&mut ast);
-        if !expanded.is_empty() {
-            return Err(first(expanded));
-        }
-        let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
-        let check = ply_core::check_program(&ast, &resolved).map_err(first)?;
-        let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
-        let resolved = Box::leak(Box::new(resolved));
-        let check = Box::leak(Box::new(check));
-        let hashes = ply_hash::hash_program(program, resolved, check).map_err(first)?;
-        let keys = emit_keys(program, &hashes);
-        let source: &'static ply_codegen::Source = Box::leak(Box::new(ply_codegen::Source::keyed(
-            program, resolved, check, keys,
-        )));
-        let names: Vec<String> = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        let (native, _refused) =
-            ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?;
-        ply_codegen::c::producer::PlyProducer::new(native).map_err(|e| format!("{e:#}"))
-    }));
+        ply_codegen::c::producer::digest_of(&modules)
+    };
+    ply_codegen::c::producer::install(
+        std::sync::Arc::new(move || {
+            // The directory's own `.ply` files and the standard library: not a project load, which
+            // would sweep in fixtures and probes that sit beside the emitter on purpose.
+            let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(&dir)
+                .map_err(|e| format!("{}: {e}", dir.display()))?
+                .filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+                .collect();
+            files.sort();
+            let mut sources = SourceMap::new();
+            let mut inputs = Vec::new();
+            for (module, text) in ply_std::sources() {
+                let module = ply_syntax::ast::ModuleName::from_dotted(module);
+                let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
+                inputs.push((id, module, text));
+            }
+            for path in &files {
+                let stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .ok_or_else(|| format!("{}: not a module name", path.display()))?;
+                let text: &'static str = Box::leak(
+                    std::fs::read_to_string(path)
+                        .map_err(|e| format!("{}: {e}", path.display()))?
+                        .into_boxed_str(),
+                );
+                let id = sources.add(path.clone(), text.to_string());
+                inputs.push((id, ply_syntax::ast::ModuleName::from_dotted(stem), text));
+            }
+            let first = |ds: Vec<Diagnostic>| {
+                ds.first()
+                    .map(|d| d.message.clone())
+                    .unwrap_or_else(|| "no diagnostic".to_string())
+            };
+            let mut ast = ply_syntax::parse_program(inputs).map_err(first)?;
+            let expanded = ply_derive::expand_program(&mut ast);
+            if !expanded.is_empty() {
+                return Err(first(expanded));
+            }
+            let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
+            let check = ply_core::check_program(&ast, &resolved).map_err(first)?;
+            let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
+            let resolved = Box::leak(Box::new(resolved));
+            let check = Box::leak(Box::new(check));
+            let hashes = ply_hash::hash_program(program, resolved, check).map_err(first)?;
+            let keys = emit_keys(program, &hashes);
+            let source: &'static ply_codegen::Source = Box::leak(Box::new(
+                ply_codegen::Source::keyed(program, resolved, check, keys),
+            ));
+            let names: Vec<String> = source.functions();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            let (native, _refused) =
+                ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?;
+            ply_codegen::c::producer::PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+        }),
+        identity,
+    );
 }
 
 pub fn build_backend(
