@@ -285,7 +285,13 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     // that already had the answer. Sharing the built unit in process is not open to us --
     // `ply_eval::Value` holds `Rc`, so nothing containing one crosses a rayon worker -- so it is
     // shared through the same file system the objects are.
-    let unit_key = super::cache::unit_key(&loaded.keys, &offered, &ctors_digest, inlining);
+    let unit_key = super::cache::unit_key(
+        &loaded.keys,
+        &offered,
+        &ctors_digest,
+        inlining,
+        super::producer::installed(),
+    );
     // A unit entry that will not reconstruct is a reason to build one, never to fail.
     if let Some(k) = &unit_key
         && let Some(cached) = super::cache::read_unit(k)

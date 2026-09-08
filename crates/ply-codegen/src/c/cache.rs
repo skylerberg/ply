@@ -319,11 +319,15 @@ pub fn unit_key(
     offered: &[&str],
     ctors: &str,
     inlining: (usize, usize),
+    producer: bool,
 ) -> Option<String> {
     let mut sorted: Vec<&str> = offered.to_vec();
     sorted.sort_unstable();
     let mut h = blake3::Hasher::new();
     h.update(b"ply-c-unit-2");
+    // Which emitter filled the unit: a unit the reference emitted must not be served to a run
+    // that asked the Ply emitter to, or that run measures nothing.
+    h.update(if producer { b"ply" } else { b"ref" });
     for name in sorted {
         // Without a hash for every offered definition there is nothing to notice an edit by, and
         // a unit cache that cannot notice one is a wrong answer rather than a slow one.
