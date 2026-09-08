@@ -25,6 +25,9 @@ use std::sync::{Arc, OnceLock};
 pub type Recipe = Arc<dyn Fn() -> Result<PlyProducer, String> + Send + Sync>;
 
 static RECIPE: OnceLock<Recipe> = OnceLock::new();
+/// A digest of the emitter's own sources, folded into every cache key a produced body or unit
+/// is kept under: a body the last version of the emitter wrote is not this version's.
+static IDENTITY: OnceLock<String> = OnceLock::new();
 
 thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
@@ -33,8 +36,27 @@ thread_local! {
 
 /// Installs the recipe every thread's producer is built from. The first installation wins; a
 /// second is ignored, because a run has one emitter.
-pub fn install(recipe: Recipe) {
+pub fn install(recipe: Recipe, identity: String) {
+    let _ = IDENTITY.set(identity);
     let _ = RECIPE.set(recipe);
+}
+
+pub fn identity() -> &'static str {
+    IDENTITY.get().map_or("", String::as_str)
+}
+
+/// The identity of an emitter given as its modules' sources, in any order.
+pub fn digest_of(modules: &[(String, String)]) -> String {
+    let mut sorted: Vec<&(String, String)> = modules.iter().collect();
+    sorted.sort();
+    let mut h = blake3::Hasher::new();
+    for (name, text) in sorted {
+        h.update(name.as_bytes());
+        h.update(&[0]);
+        h.update(text.as_bytes());
+        h.update(&[0]);
+    }
+    h.finalize().to_hex()[..16].to_string()
 }
 
 pub fn installed() -> bool {
@@ -42,6 +64,18 @@ pub fn installed() -> bool {
 }
 
 static WHOLE: AtomicBool = AtomicBool::new(false);
+/// The operations the run's host binding would answer, as `effect#op`. A compiled `perform`
+/// has no route to the host (ADR 0043's third stage is not built), so a performer of one of
+/// these stays the machine's, whatever the binding does with it.
+static HOST_SERVED: OnceLock<Vec<String>> = OnceLock::new();
+
+pub fn set_host_served(ops: Vec<String>) {
+    let _ = HOST_SERVED.set(ops);
+}
+
+pub fn host_served() -> &'static [String] {
+    HOST_SERVED.get().map_or(&[], Vec::as_slice)
+}
 
 /// Whether the producer's answer is the unit's: its bodies taken and its refusals dropped by the
 /// fixpoint, with the reference emitter not run at all. ADR 0042's third step.
@@ -62,6 +96,16 @@ pub fn mode() -> &'static str {
         "ply-whole"
     } else {
         "ply"
+    }
+}
+
+/// The mode with the emitter's identity, as the caches key on it.
+pub fn who() -> String {
+    let mode = mode();
+    if mode == "ref" {
+        mode.to_string()
+    } else {
+        format!("{mode}\0{}", identity())
     }
 }
 
@@ -97,7 +141,8 @@ pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
 #[derive(Clone)]
 pub enum Answer {
     Body(String, Tables),
-    Refused(String),
+    /// The reason, and the operations the body would have handled, as `effect#op`.
+    Refused(String, Vec<String>),
 }
 
 type Bodies = HashMap<String, Answer>;
@@ -165,6 +210,25 @@ impl PlyProducer {
 
     /// Every body of the program at once: the emitter resolves the modules together, so a call's
     /// default arguments are filled and every signature is in reach.
+    /// Every body of the program that handles each operation, answered or refused: the unit's
+    /// fixpoint drops a performer while any of its operation's handlers is not taken.
+    pub fn handlers_of(&self, loaded: &Source) -> HashMap<String, Vec<String>> {
+        let program = std::ptr::from_ref(loaded) as usize;
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
+        if let Some(bodies) = self.modules.borrow().get(&program) {
+            for (name, answer) in bodies {
+                let handled = match answer {
+                    Answer::Body(_, tables) => &tables.handles,
+                    Answer::Refused(_, handles) => handles,
+                };
+                for op in handled {
+                    out.entry(op.clone()).or_default().push(name.clone());
+                }
+            }
+        }
+        out
+    }
+
     fn bodies_of(&self, loaded: &Source) -> Result<Bodies> {
         let mut names = Vec::new();
         let mut srcs = Vec::new();
@@ -252,7 +316,17 @@ fn parse(dump: &str) -> Result<Bodies> {
                     .ok_or_else(|| anyhow!("`{name}`'s frame does not decode as a body"))?;
                 Answer::Body(text, tables)
             }
-            "refused" => Answer::Refused(chunk.to_string()),
+            "refused" => {
+                let (why, handles) = chunk.split_once("\nhandles ").unwrap_or((chunk, ""));
+                Answer::Refused(
+                    why.to_string(),
+                    handles
+                        .split(' ')
+                        .filter(|h| !h.is_empty())
+                        .map(str::to_string)
+                        .collect(),
+                )
+            }
             other => bail!("a frame of a kind this seam does not read: {other:?}"),
         };
         out.insert(name.to_string(), answer);

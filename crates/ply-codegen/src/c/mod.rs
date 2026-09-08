@@ -74,6 +74,9 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
     for h in HELPERS {
         let p = match h.name {
             "rt_cell" => rt::rt_cell as *const (),
+            "rt_handle_push" => rt::rt_handle_push as *const (),
+            "rt_perform" => rt::rt_perform as *const (),
+            "rt_handle_land" => rt::rt_handle_land as *const (),
             "rt_region" => rt::rt_region as *const (),
             "rt_region_close" => rt::rt_region_close as *const (),
             "rt_dup" => rt::rt_dup as *const (),

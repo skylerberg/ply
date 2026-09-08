@@ -175,6 +175,9 @@ helpers![
     ("rt_list_index", 2, true),
     ("rt_nullary", 1, true),
     ("rt_cell", 1, true),
+    ("rt_handle_push", 3, true),
+    ("rt_perform", 6, true),
+    ("rt_handle_land", 2, true),
     ("rt_region", 1, true),
     ("rt_region_close", 1, false),
 ];

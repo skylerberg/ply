@@ -269,6 +269,11 @@ pub struct Tables {
     /// names its code by an index into the unit's table of them, and the body's own text writes
     /// its own position, which `resolve` rewrites into the unit's.
     pub lambdas: Vec<String>,
+    /// The effects this body performs and the effects it handles, under their program-wide
+    /// names. A compiled `perform` is sound only while every handler of its effect is compiled,
+    /// and the unit's fixpoint decides that from these (ADR 0043).
+    pub performs: Vec<String>,
+    pub handles: Vec<String>,
 }
 
 impl Tables {
