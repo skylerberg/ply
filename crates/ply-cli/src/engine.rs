@@ -14,6 +14,7 @@ use ply_prove::{
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, LawDef, Program, SpecKind};
 use ply_syntax::resolve::Resolved;
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -26,6 +27,7 @@ pub fn of<'a>(
     complete: bool,
     obligations: usize,
     hosting: Option<Hosting<'a>>,
+    backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
 ) -> (
     Box<dyn ply_test::obligation::Discharger + 'a>,
     Option<Diagnostic>,
@@ -43,7 +45,7 @@ pub fn of<'a>(
         Some(hosting) => prover.with_hosting(hosting),
         None => prover,
     };
-    (Box::new(prover), None)
+    (Box::new(prover.with_backend(backend)), None)
 }
 
 fn incomplete() -> Diagnostic {
@@ -65,6 +67,8 @@ enum Claim<'a> {
     },
     Law {
         module: usize,
+        /// Its place among the module's laws, which names its roots.
+        ordinal: usize,
         def: &'a LawDef,
     },
 }
@@ -110,9 +114,12 @@ pub struct Prover<'a> {
     /// Built once.
     ctx: prove::Context<'a>,
     defs: HashMap<Symbol, (usize, &'a FnDef)>,
-    laws: HashMap<Symbol, (usize, &'a LawDef)>,
+    laws: HashMap<Symbol, (usize, usize, &'a LawDef)>,
     /// What a `law/host` is discharged against.
     hosting: Option<Hosting<'a>>,
+    /// A compiled unit holding the laws' and clauses' roots (ADR 0045 §"The facade"): a
+    /// proposition it holds is entered there rather than evaluated.
+    backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
     /// This program's region kinds, for the reason `ctx` is built once: the analysis behind them is
     /// whole-program, and `machine()` is called per obligation.
     region_kinds: ply_eval::region_kind::Kinds,
@@ -129,6 +136,7 @@ impl<'a> Prover<'a> {
         let mut defs = HashMap::new();
         let mut laws = HashMap::new();
         for (index, module) in program.modules.iter().enumerate() {
+            let mut ordinal = 0;
             for item in &module.items {
                 match item {
                     Item::Fn(def) => {
@@ -137,8 +145,9 @@ impl<'a> Prover<'a> {
                     Item::Law(def) => {
                         laws.insert(
                             module.name.qualify(&Symbol::new(&def.name)),
-                            (index, &**def),
+                            (index, ordinal, &**def),
                         );
+                        ordinal += 1;
                     }
                     _ => {}
                 }
@@ -153,7 +162,78 @@ impl<'a> Prover<'a> {
             defs,
             laws,
             hosting: None,
+            backend: None,
             region_kinds: ply_eval::region_kind::Kinds::default(),
+        }
+    }
+
+    pub fn with_backend(
+        mut self,
+        backend: Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>,
+    ) -> Prover<'a> {
+        self.backend = backend;
+        self
+    }
+
+    /// The unit attached on this thread, once: an obligation is discharged on a pool thread, and
+    /// attaching reads the unit back rather than emitting it again.
+    fn compiled(&self) -> Option<Rc<dyn ply_eval::Compiled>> {
+        thread_local! {
+            static ATTACHED: RefCell<Vec<(usize, Rc<dyn ply_eval::Compiled>)>> =
+                const { RefCell::new(Vec::new()) };
+        }
+        let (provider, spec) = self.backend.as_ref()?;
+        let key = std::ptr::from_ref(*provider).cast::<()>() as usize;
+        ATTACHED.with(|attached| {
+            if let Some((_, c)) = attached.borrow().iter().find(|(k, _)| *k == key) {
+                return Some(Rc::clone(c));
+            }
+            let c = provider.attach(spec);
+            attached.borrow_mut().push((key, Rc::clone(&c)));
+            Some(c)
+        })
+    }
+
+    /// A proposition's roots: the guards' and the body's program-wide names in the unit.
+    fn roots(&self, obligation: &Obligation, claim: &Claim<'a>) -> (Vec<Symbol>, Option<Symbol>) {
+        let module = &self.program.modules[claim.module()].name;
+        match claim {
+            Claim::Ensures { def, .. } => {
+                let ObligationKind::Ensures { index } = obligation.kind else {
+                    return (Vec::new(), None);
+                };
+                let requires = def
+                    .spec
+                    .iter()
+                    .filter(|c| c.kind == SpecKind::Requires)
+                    .count();
+                let guards = (0..requires)
+                    .map(|k| {
+                        module.qualify(&ply_codegen::clause_root_name(
+                            &def.name.name,
+                            "requires",
+                            k,
+                        ))
+                    })
+                    .collect();
+                let body = module.qualify(&ply_codegen::clause_root_name(
+                    &def.name.name,
+                    "ensures",
+                    index,
+                ));
+                (guards, Some(body))
+            }
+            Claim::Law { ordinal, def, .. } => {
+                let guards = def
+                    .guard
+                    .iter()
+                    .map(|_| module.qualify(&ply_codegen::law_root_name(*ordinal, "guard")))
+                    .collect();
+                (
+                    guards,
+                    Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "body"))),
+                )
+            }
         }
     }
 
@@ -180,8 +260,12 @@ impl<'a> Prover<'a> {
                 })
             }
             ObligationKind::Law => {
-                let &(module, def) = self.laws.get(&obligation.owner)?;
-                Some(Claim::Law { module, def })
+                let &(module, ordinal, def) = self.laws.get(&obligation.owner)?;
+                Some(Claim::Law {
+                    module,
+                    ordinal,
+                    def,
+                })
             }
         }
     }
@@ -517,8 +601,12 @@ impl<'a> Prover<'a> {
                 });
             }
         }
+        let (guard_roots, body_root) = self.roots(obligation, claim);
         Ok(Cases {
             machine: self.machine(),
+            compiled: self.compiled(),
+            guard_roots,
+            body_root,
             module: claim.module(),
             binders: obligation.generated().to_vec(),
             guards: claim.guards(),
@@ -628,6 +716,8 @@ impl<'a> Prover<'a> {
 
         let mut search = Search {
             prover: self,
+            compiled: self.compiled(),
+            body_root: cases.body_root.clone(),
             module: claim.module(),
             body: claim.body(),
             binders: obligation.generated().to_vec(),
@@ -843,6 +933,9 @@ fn bindings_of(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
 /// How a tuple of binder values is judged: guard first, always.
 struct Cases<'a> {
     machine: Machine<'a>,
+    compiled: Option<Rc<dyn ply_eval::Compiled>>,
+    guard_roots: Vec<Symbol>,
+    body_root: Option<Symbol>,
     module: usize,
     binders: Vec<LawBinder>,
     guards: Vec<&'a Expr>,
@@ -878,8 +971,11 @@ impl Cases<'_> {
 impl Judge for Cases<'_> {
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         let scope = self.scope(values);
-        for guard in &self.guards {
-            let value = self.machine.eval_expr_in(guard, self.module, &scope)?;
+        for (i, guard) in self.guards.iter().enumerate() {
+            let value = match entered(self.compiled.as_ref(), self.guard_roots.get(i), values) {
+                Some(answer) => answer?,
+                None => self.machine.eval_expr_in(guard, self.module, &scope)?,
+            };
             if !self.boolean(value)? {
                 return Ok(false);
             }
@@ -889,20 +985,42 @@ impl Judge for Cases<'_> {
 
     fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         let mut scope = self.scope(values);
+        let mut args = values.to_vec();
         if let (Some(name), Some(result)) = (&self.call, &self.result) {
             let returned = self
                 .machine
                 .call(name.as_str(), values.to_vec(), self.span)?;
-            scope.push((result.clone(), returned));
+            scope.push((result.clone(), returned.clone()));
+            args.push(returned);
         }
-        let value = self.machine.eval_expr_in(self.body, self.module, &scope)?;
+        let value = match entered(self.compiled.as_ref(), self.body_root.as_ref(), &args) {
+            Some(answer) => answer?,
+            None => self.machine.eval_expr_in(self.body, self.module, &scope)?,
+        };
         self.boolean(value)
+    }
+}
+
+/// A proposition entered in the unit: its answer, what it raised, or `None` where the unit does
+/// not hold the root and the judge evaluates it as before.
+fn entered(
+    compiled: Option<&Rc<dyn ply_eval::Compiled>>,
+    root: Option<&Symbol>,
+    args: &[Value],
+) -> Option<Result<Value, Diagnostic>> {
+    let (compiled, root) = (compiled?, root?);
+    match compiled.enter_whole(root, args, DEFAULT_MAX_CALLS) {
+        ply_eval::Entered::Answered(value) => Some(Ok(value)),
+        ply_eval::Entered::Raised(raised) => Some(Err(raised)),
+        ply_eval::Entered::Declined => None,
     }
 }
 
 /// One law body, run at a point of its value domain under a seed the interleaving search chooses.
 struct Search<'a, 'p> {
     prover: &'p Prover<'a>,
+    compiled: Option<Rc<dyn ply_eval::Compiled>>,
+    body_root: Option<Symbol>,
     module: usize,
     body: &'a Expr,
     binders: Vec<LawBinder>,
@@ -921,6 +1039,20 @@ impl LawSearch for Search<'_, '_> {
             .zip(&values)
             .map(|(binder, value)| (binder.name.clone(), value.clone()))
             .collect();
+        if let (Some(compiled), Some(root)) = (&self.compiled, &self.body_root) {
+            compiled.set_seed(seed.clone(), self.steps);
+            match compiled.enter_whole(root, &values, DEFAULT_MAX_CALLS) {
+                ply_eval::Entered::Answered(value) => {
+                    let record = compiled.simulated();
+                    return concurrency::body_run_recorded(record.as_ref(), Ok(value), self.span);
+                }
+                ply_eval::Entered::Raised(raised) => {
+                    let record = compiled.simulated();
+                    return concurrency::body_run_recorded(record.as_ref(), Err(raised), self.span);
+                }
+                ply_eval::Entered::Declined => {}
+            }
+        }
         let mut machine = self.prover.machine();
         machine.set_seed(seed.clone(), self.steps);
         let value = machine.eval_expr_in(self.body, self.module, &scope);

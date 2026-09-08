@@ -1791,7 +1791,9 @@ emitter in `<dir>` releases what a body holds as the machine does (ADR 0046):
 a value moves out of its binding at its last use and is let go at the close
 of the block that declared it, so an entry ends holding its answer and a loop
 runs in the memory of one iteration; `PLY_C_PHASES=1` prints what an entry
-allocated, recycled and left live. A simulated test
+allocated, recycled and left live. The unit also holds every law's guard and
+body and every `requires` and `ensures` clause as a root (§11.5), which is
+what `ply prove --backend` enters. A simulated test
 the tier takes is scheduled by the runtime over the same seeded scheduler the
 machine drives, so a seed names one interleaving on either engine; under
 `--audit-backend` every seed the tier ran is run again on the machine alone and
@@ -2118,6 +2120,15 @@ Two failure codes: `E0419` an obligation refuted by a counterexample (the
 program's fault, attributed like any other failure), and `E0420` a guard that
 admits no values, which is always a defect in the spec — reporting it `proved`
 would turn a typo into a proof of everything.
+
+`--backend BACKEND` attaches a compiled backend, as `ply test --backend`
+does (§17). A law's guard and body and a definition's `requires` and
+`ensures` clauses are then roots of the compiled unit — `law#N.guard`,
+`law#N.body`, `f#requires#K`, `f#ensures#K` under the module's name, over the
+binders or the parameters and then `result` — and the prover enters them
+with each case's values rather than evaluating the expression. A root the
+unit does not hold is evaluated as before. The report is the same either
+way; CI runs `ply prove examples` both ways and compares.
 
 ### 11.6 `ply review`
 
@@ -3082,14 +3093,15 @@ is a test-time activity — so the flag chooses which one rather than how many.
 ### `ply prove [path]`
 
 `--filter`, `--jobs`, `--no-cache`, `--no-incremental`, `--explain`, `--std`,
-`--host`, `--prove-cases`, `--prove-roots`, `--prove-budget`,
-`--shrink-budget`, the simulation flags, the host flags, `--json`. §11.5.
+`--host`, `--backend BACKEND`, `--prove-cases`, `--prove-roots`,
+`--prove-budget`, `--shrink-budget`, the simulation flags, the host flags,
+`--json`. §11.5.
 
 ### `ply review [path]`
 
 `--changed` (the default; naming it is how a script says what it meant),
-`--accept`, `--no-cache`, `--no-incremental`, `--std`, the prove and simulation
-flags, `--json`. §11.6.
+`--accept`, `--no-cache`, `--no-incremental`, `--std`, `--backend BACKEND`, the
+prove and simulation flags, `--json`. §11.6.
 
 ### `ply build [path]`
 

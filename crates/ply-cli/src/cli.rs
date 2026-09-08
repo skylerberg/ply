@@ -514,6 +514,14 @@ pub struct ProveArgs {
     #[arg(long)]
     pub host: bool,
 
+    /// Attach a compiled backend, so that a law's guard and body and a
+    /// definition's `requires` and `ensures` clauses are entered as roots of
+    /// the compiled unit rather than evaluated; `c` or `reference`, as
+    /// `ply test --backend` takes it. A root the unit does not hold is
+    /// evaluated as before.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
+
     #[command(flatten)]
     pub tls: TlsOptions,
 
@@ -570,6 +578,10 @@ pub struct ReviewArgs {
     /// declare. Off by default: a project reviews what it wrote.
     #[arg(long)]
     pub std: bool,
+
+    /// Attach a compiled backend, as `ply prove --backend` does.
+    #[arg(long, value_name = "BACKEND")]
+    pub backend: Option<String>,
 
     #[command(flatten)]
     pub prove: ProveOptions,

@@ -1062,3 +1062,91 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
         ctx.end();
     }
 }
+
+const PROPOSITIONS: &str = r#"
+type Account = { name: String, balance: Int }
+fn adjusted(account: Account, amount: Int) -> Account
+  requires amount > -1000 && amount < 1000
+  ensures result.balance == account.balance + amount
+= { name: account.name, balance: account.balance + amount }
+law "zero moves nothing" forall (account: Account) where account.balance > 0 {
+  adjusted(account, 0) == account
+}
+"#;
+
+/// ADR 0045 §"The facade": a law's guard and body and a definition's clauses are roots of the
+/// unit, entered with the bound names' values and answering `Bool`.
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
+    let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
+    producer::install(std::sync::Arc::new(emitter), emitter_identity());
+    producer::set_whole(true);
+    let loaded = load(&[("m", PROPOSITIONS)], false);
+    let source: &'static Source = Box::leak(Box::new(
+        Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
+    ));
+    let names: Vec<String> = source.functions();
+    for root in [
+        "m.law#0.guard",
+        "m.law#0.body",
+        "m.adjusted#requires#0",
+        "m.adjusted#ensures#0",
+    ] {
+        assert!(
+            names.contains(&root.to_string()),
+            "{root} is not offered: {names:?}"
+        );
+    }
+    let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
+    assert!(refused.is_empty(), "{refused:?}");
+    let account = |balance: i64| {
+        Value::Record(std::sync::Arc::new(ply_eval::Fields::from_unsorted(vec![
+            (ply_span::Symbol::new("name"), Value::str("a")),
+            (ply_span::Symbol::new("balance"), Value::Int(balance)),
+        ])))
+    };
+    let cases: Vec<(&str, Vec<Value>, bool)> = vec![
+        (
+            "m.adjusted#requires#0",
+            vec![account(1), Value::Int(5)],
+            true,
+        ),
+        (
+            "m.adjusted#requires#0",
+            vec![account(1), Value::Int(5000)],
+            false,
+        ),
+        (
+            "m.adjusted#ensures#0",
+            vec![account(1), Value::Int(5), account(6)],
+            true,
+        ),
+        (
+            "m.adjusted#ensures#0",
+            vec![account(1), Value::Int(5), account(7)],
+            false,
+        ),
+        ("m.law#0.guard", vec![account(1)], true),
+        ("m.law#0.guard", vec![account(0)], false),
+        ("m.law#0.body", vec![account(3)], true),
+    ];
+    for (name, args, want) in cases {
+        let entry = native
+            .entry(name)
+            .unwrap_or_else(|| panic!("`{name}` was not compiled"));
+        let mut ctx = native.context();
+        ctx.begin(10_000);
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
+        let words: Vec<i64> = args
+            .iter()
+            .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
+            .collect();
+        let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
+        assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        ctx.end();
+        assert_eq!(got, Value::Bool(want), "`{name}{args:?}`");
+    }
+}

@@ -76,15 +76,52 @@ pub(crate) fn emit_keys(
     use ply_syntax::ast::Item;
     let mut keys = std::collections::HashMap::new();
     let mut test_at = 0;
+    let mut law_at = 0;
     for module in &program.modules {
         let mut ordinal = 0;
+        let mut law_ordinal = 0;
         for item in &module.items {
             match item {
                 Item::Fn(def) => {
                     let name = module.name.qualify(&def.name.name).to_string();
                     if let Some(h) = hashes.defs.get(&ply_span::Symbol::new(&name)) {
+                        // A clause's root is keyed by its owner's hash, which covers the clause.
+                        let (mut requires, mut ensures) = (0, 0);
+                        for clause in &def.spec {
+                            let (kind, k) = match clause.kind {
+                                ply_syntax::ast::SpecKind::Requires => {
+                                    requires += 1;
+                                    ("requires", requires - 1)
+                                }
+                                ply_syntax::ast::SpecKind::Ensures => {
+                                    ensures += 1;
+                                    ("ensures", ensures - 1)
+                                }
+                            };
+                            let root = module
+                                .name
+                                .qualify(&ply_codegen::clause_root_name(&def.name.name, kind, k))
+                                .to_string();
+                            keys.insert(root, format!("{}#{kind}#{k}", h.to_hex()));
+                        }
                         keys.insert(name, h.to_hex());
                     }
+                }
+                Item::Law(law) => {
+                    if let Some(h) = hashes.laws.get(law_at) {
+                        for part in ["guard", "body"] {
+                            if part == "guard" && law.guard.is_none() {
+                                continue;
+                            }
+                            let root = module
+                                .name
+                                .qualify(&ply_codegen::law_root_name(law_ordinal, part))
+                                .to_string();
+                            keys.insert(root, format!("{}#{part}", h.to_hex()));
+                        }
+                    }
+                    law_ordinal += 1;
+                    law_at += 1;
                 }
                 Item::Test(_) => {
                     let name = module
@@ -118,6 +155,26 @@ pub(crate) fn module_texts(
                 .map(|f| (m.name.to_string(), f.text.to_string()))
         })
         .collect()
+}
+
+/// The backend `ply prove` and `ply review` attach for a program's propositions (ADR 0045
+/// §"The facade"): the unit over the whole program, its laws' and clauses' roots included.
+pub(crate) fn prover_backend(
+    flag: Option<&String>,
+    loaded: &crate::load::Loaded,
+) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
+    let Some(spec) = backend_spec(flag)? else {
+        return Ok(None);
+    };
+    let provider = build_backend(
+        &spec,
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        &loaded.hashes,
+        module_texts(&loaded.program, &loaded.sources),
+    )?;
+    Ok(Some((provider, spec)))
 }
 
 /// `PLY_C_EMITTER=ply:<dir>` makes the Ply emitter in `<dir>` the C tier's producer (ADR 0042).
