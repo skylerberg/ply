@@ -48,7 +48,17 @@ pub type Ty = | TyOpen | TyRec(List<Bytes>)
 // `reads` is every slot read anywhere in the body, once per read. The release
 // rule counts over the whole body rather than over what has been emitted: the
 // emitter does not visit reads in the order the lowering marked them.
-pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int> }
+pub type Em = { out: Bytes, n: Int, conv: List<Conv>, ind: Int, reads: List<Int>,
+                shapes: List<List<Bytes>>, built: List<Built> }
+
+// A record this body built, and the values its fields were built from. A later
+// field read of it is that value: it is already in a register, and going to
+// memory for it would be the store, the load and the tag that building the
+// record in the first place is trying to avoid.
+//
+// Sound because the values are locals of this body, and a record that leaves the
+// body leaves through a name this table has no entry for.
+pub type Built = { local: Bytes, names: List<Bytes>, vals: List<V> }
 
 pub type Conv = { slot: Int, k: Kind, c: Bytes, ty: Ty }
 
@@ -59,21 +69,21 @@ pub type P = { name: Bytes, k: Kind, ty: Ty }
 pub type Out = { em: Em, v: V }
 
 fn line(em: Em, text: Bytes) -> Em =
-  { out: bytes_concat_all([em.out, pad(em.ind), text, b"\n"]), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads }
+  { out: bytes_concat_all([em.out, pad(em.ind), text, b"\n"]), n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built }
 
 fn pad(ind: Int) -> Bytes = if ind <= 0 { b"  " } else { bytes_concat(b"  ", pad(ind - 1)) }
 
-fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads }
+fn indent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind + 1, reads: em.reads, shapes: em.shapes, built: em.built }
 
-fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads }
+fn outdent(em: Em) -> Em = { out: em.out, n: em.n, conv: em.conv, ind: em.ind - 1, reads: em.reads, shapes: em.shapes, built: em.built }
 
 // A branch leaves the enclosing scope with the temporaries it unboxed: they are
 // declared inside the C block and are gone at the brace. `conv` goes back to
 // what it was, or a later read names a dead variable.
-fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads }
+fn rescope(em: Em, conv: List<Conv>) -> Em = { out: em.out, n: em.n, conv: conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built }
 
 fn fresh(em: Em) -> { em: Em, name: Bytes } =
-  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads }, name: bytes_concat(b"t", num(em.n + 1)) }
+  { em: { out: em.out, n: em.n + 1, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built }, name: bytes_concat(b"t", num(em.n + 1)) }
 
 // The last entry wins: a `let` may shadow a slot an enclosing scope filled.
 fn conv_of(em: Em, slot: Int) -> Option<V> =
@@ -81,7 +91,7 @@ fn conv_of(em: Em, slot: Int) -> Option<V> =
     if c.slot == slot { Some({ k: c.k, c: c.c, ty: c.ty }) } else { acc })
 
 fn remember(em: Em, slot: Int, v: V) -> Em =
-  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, k: v.k, c: v.c, ty: v.ty }), ind: em.ind, reads: em.reads }
+  { out: em.out, n: em.n, conv: push(em.conv, { slot: slot, k: v.k, c: v.c, ty: v.ty }), ind: em.ind, reads: em.reads, shapes: em.shapes, built: em.built }
 
 // A binding, which is what every intermediate value is: `<type> tN = <expr>;`.
 fn bind(em: Em, k: Kind, expr: Bytes) -> Out = {
@@ -188,6 +198,53 @@ fn all_read(xs: List<Code>) -> List<Int> =
 fn concat(a: List<Int>, b: List<Int>) -> List<Int> =
   fold(b, a, |acc: List<Int>, x: Int| push(acc, x))
 
+// The shape's index in this body's own table, added on first use. A body names
+// the unit's tables by its own positions, which is what makes one body's text
+// comparable at all.
+fn built_field(em: Em, local: Bytes, name: Bytes) -> Option<V> =
+  fold(em.built, None, |acc: Option<V>, b: Built|
+    if b.local != local { acc } else {
+      fold(range(0, len(b.names)), acc, |inner: Option<V>, i: Int|
+        match list_at(b.names, i) {
+          Some(n) -> if n == name { list_at(b.vals, i) } else { inner },
+          None -> inner,
+        })
+    })
+
+fn remember_built(em: Em, local: Bytes, names: List<Bytes>, vals: List<V>) -> Em =
+  { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads, shapes: em.shapes,
+    built: push(em.built, { local: local, names: names, vals: vals }) }
+
+fn shape_of(em: Em, names: List<Bytes>) -> { em: Em, i: Int } =
+  match fold(range(0, len(em.shapes)), None, |acc: Option<Int>, i: Int|
+          match list_at(em.shapes, i) {
+            Some(sh) -> if same_names(sh, names) { Some(i) } else { acc },
+            None -> acc,
+          }) {
+    Some(i) -> { em: em, i: i },
+    None -> { em: { out: em.out, n: em.n, conv: em.conv, ind: em.ind, reads: em.reads,
+                    shapes: push(em.shapes, names), built: em.built },
+              i: len(em.shapes) },
+  }
+
+fn same_names(a: List<Bytes>, b: List<Bytes>) -> Bool =
+  len(a) == len(b) && fold(a, true, |acc: Bool, x: Bytes|
+    acc && fold(b, false, |seen: Bool, y: Bytes| seen || y == x))
+
+// The word of the field whose name sorts at `at`, since the values were built in
+// the order they were written and the record holds them in the shape's order.
+fn word_at_rank(names: List<Bytes>, words: List<Bytes>, at: Int) -> Bytes =
+  fold(range(0, len(names)), b"", |acc: Bytes, i: Int|
+    match list_at(names, i) {
+      None -> acc,
+      Some(nm) -> if rank_of(names, nm) == at {
+        match list_at(words, i) { Some(w) -> w, None -> acc }
+      } else { acc },
+    })
+
+fn rank_of(names: List<Bytes>, name: Bytes) -> Int =
+  fold(names, 0, |acc: Int, n: Bytes| if compare(n, name) == Less { acc + 1 } else { acc })
+
 fn count_of(reads: List<Int>, slot: Int) -> Int =
   fold(reads, 0, |acc: Int, s: Int| if s == slot { acc + 1 } else { acc })
 
@@ -199,8 +256,7 @@ fn field_at(ty: Ty, name: Bytes) -> Option<Int> =
     TyOpen -> None,
     TyRec(ns) ->
       if fold(ns, false, |acc: Bool, n: Bytes| acc || n == name) {
-        Some(fold(ns, 0, |acc: Int, n: Bytes|
-          if compare(n, name) == Less { acc + 1 } else { acc }))
+        Some(rank_of(ns, name))
       } else { None },
   }
 
@@ -234,7 +290,8 @@ pub fn covers() -> List<Bytes> =
    b"a block, and the `let`s in it",
    b"a list of values",
    b"neg and not, and the Bool literals",
-   b"a field of a record whose shape a parameter's type gives"]
+   b"a field of a record whose shape a parameter's type gives",
+   b"a record literal, through this body's reuse token for its width"]
 
 fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
   match c.node {
@@ -332,7 +389,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     // than read at a guessed offset.
     NField(f) -> match expr(em, f.base, params) {
       None -> None,
-      Some(b) -> match field_at(b.v.ty, f.field) {
+      Some(b) -> match built_field(b.em, b.v.c, f.field) {
+        // Built in this body: the value is already in a register, and asking for
+        // the word here is what would force a record into memory that nothing
+        // else ever looks at.
+        Some(v) -> Some({ em: release_base(b.em, f.base, b.v, params), v: v }),
+        None -> match field_at(b.v.ty, f.field) {
         None -> None,
         Some(i) -> {
           let held = bind(b.em, KBoxed, as_word(b.v));
@@ -343,7 +405,39 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           let out = as_int(w.em, w.v);
           Some({ em: release_base(out.em, f.base, b.v, params), v: out.v })
         },
+        },
       },
+    },
+    // A record: values in the order they are written, assembled in the order the
+    // shape holds them, which is by name. The memory comes from a reuse token of
+    // this width when the body has one and from the allocator when it does not.
+    NRecord(r) -> {
+      let names = map(r.fields, |f: CField| f.name);
+      match items(em, map(r.fields, |f: CField| f.value), params, 0, []) {
+        None -> None,
+        Some(w) -> {
+          let sh = shape_of(w.em, names);
+          let n = len(names);
+          let rec = bind(sh.em, KBoxed, b"0");
+          let opened = line(rec.em, bytes_concat_all([b"if (tok", num(n), b") {"]));
+          let took = line(
+            line(indent(opened), bytes_concat_all([rec.v.c, b" = tok", num(n), b"; tok", num(n), b" = 0;"])),
+            bytes_concat_all([b"ply_obj(", rec.v.c, b")->rc = 1; ply_obj(", rec.v.c,
+                              b")->flags = 0; ply_obj(", rec.v.c, b")->len = ", num(n),
+                              b"; ply_obj(", rec.v.c, b")->layout = @@s", num(sh.i), b"@@;"]));
+          let made = line(
+            line(indent(line(outdent(took), b"} else {")),
+                 bytes_concat_all([rec.v.c, b" = rt_alloc_p(ctx, 3, ", num(n), b", @@s", num(sh.i),
+                                   b"@@, 0);"])),
+            b"if (ctx->failed) return 0;");
+          let closed = line(outdent(made), b"}");
+          let filled = fold(range(0, n), closed, |acc: Em, at: Int|
+                   line(acc, bytes_concat_all([b"ply_words(", rec.v.c, b")[", num(at), b"] = ",
+                     word_at_rank(names, w.names, at), b";"])));
+          Some({ em: remember_built(filled, rec.v.c, names, w.vals),
+                 v: { k: KBoxed, c: rec.v.c, ty: TyRec(names) } })
+        },
+      }
     },
     NIf(i) -> match expr(em, i.cond, params) {
       None -> None,
@@ -353,7 +447,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
         // its kind cannot be read off a branch's value. Emitting the then
         // branch into a scratch buffer -- one number ahead, to leave room for
         // the join itself -- answers the kind without writing anything.
-        match expr({ out: b"", n: cv.em.n + 1, conv: cv.em.conv, ind: cv.em.ind + 1, reads: cv.em.reads },
+        match expr({ out: b"", n: cv.em.n + 1, conv: cv.em.conv, ind: cv.em.ind + 1, reads: cv.em.reads, shapes: cv.em.shapes, built: cv.em.built },
                    i.then_branch, params) {
           None -> None,
           Some(peek) -> {
@@ -382,15 +476,19 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
 
 // The items of a list, left to right, each boxed into its own `Word` local.
 fn items(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
-    -> Option<{ em: Em, names: List<Bytes> }> =
-  if i >= len(xs) { Some({ em: em, names: acc }) } else {
+    -> Option<{ em: Em, names: List<Bytes>, vals: List<V> }> =
+  items_from(em, xs, params, i, acc, [])
+
+fn items_from(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>, vs: List<V>)
+    -> Option<{ em: Em, names: List<Bytes>, vals: List<V> }> =
+  if i >= len(xs) { Some({ em: em, names: acc, vals: vs }) } else {
     match list_at(xs, i) {
       None -> None,
       Some(x) -> match expr(em, x, params) {
         None -> None,
         Some(o) -> {
           let w = bind_word(o.em, o.v);
-          items(w.em, xs, params, i + 1, push(acc, w.v.c))
+          items_from(w.em, xs, params, i + 1, push(acc, w.v.c), push(vs, o.v))
         },
       },
     }
@@ -529,7 +627,7 @@ pub fn emit_fn(name: Bytes, params: List<P>, body: Code) -> Option<Bytes> = {
   let reads = slots_read(body);
   // The reuse tokens come before the prologue, and are named by width rather
   // than numbered, so finding them does not disturb the temporaries.
-  let start = fold(widths_released(body, params, reads), { out: b"", n: 0, conv: [], ind: 0, reads: reads },
+  let start = fold(widths_released(body, params, reads), { out: b"", n: 0, conv: [], ind: 0, reads: reads, shapes: [], built: [] },
     |acc: Em, w: Int| line(acc, bytes_concat_all([b"Word tok", num(w), b" = 0;"])));
   match expr(prologue(start, params), body, params) {
     None -> None,
@@ -577,6 +675,9 @@ fn widths_released(c: Code, params: List<P>, reads: List<Int>) -> List<Int> =
         _ -> inner,
       }
     },
+    NRecord(r) -> merge_widths([len(r.fields)],
+      fold(r.fields, [], |acc: List<Int>, f: CField|
+        merge_widths(acc, widths_released(f.value, params, reads)))),
     NUnary(u) -> widths_released(u.operand, params, reads),
     NBinary(b) -> merge_widths(widths_released(b.lhs, params, reads),
                                widths_released(b.rhs, params, reads)),

@@ -339,6 +339,23 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn fz(r: { z: Int, a: Int }) -> Int = r.z\n",
         "fn fa(r: { z: Int, a: Int }) -> Int = r.a\n",
         "fn f2(r: { z: Int, a: Int }) -> Int = r.z + r.a\n",
+        // A record is built in the order its fields are written and assembled in
+        // the order the shape holds them, which is by name.
+        "fn mk(n: Int) -> { z: Int, a: Int } = { z: n, a: 1 }\n",
+        "fn mk1(n: Int) -> { only: Int } = { only: n + 1 }\n",
+        // Built here and read here: the read is answered from the register the
+        // value is already in, and the record is still built because something
+        // else might ask for its word.
+        "fn mkf(n: Int) -> Int = { z: n, a: 1 }.a\n",
+        // Deliberately absent, and worth saying why: a record built in both arms
+        // of an `if` is *deferred* by the reference -- neither arm builds one,
+        // and the join carries the fields as separate temporaries. A record of
+        // immediates whose every read is answered from the built table is never
+        // looked at, so building it is an allocation and a row of stores nothing
+        // observes. That is `deferred` and `record_locals` in `c/emit.rs`, and
+        // this port does not reach them:
+        //   fn two(n: Int) -> { z: Int, a: Int } =
+        //     if n < 0 { { z: n, a: 0 } } else { { z: 0, a: n } }
     ];
     let inputs: Vec<(String, Vec<u8>)> = programs
         .iter()
@@ -351,7 +368,7 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         reached, available,
         "the port emitted {reached} of the {available} bodies the reference did"
     );
-    assert!(reached >= 35, "only {reached} bodies were emitted");
+    assert!(reached >= 38, "only {reached} bodies were emitted");
 }
 
 /// `--backend` for every `ply` this differential runs.
