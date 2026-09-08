@@ -275,6 +275,11 @@ reference again, and `PLY_C_BOOTSTRAP_REFRESH=1 cargo test -p ply-codegen-tests 
 rewrites the bundle from the fixpoint's own emission. The fixpoint test is the check: the emitter
 built from the bundle emits, for its sources, C that builds an emitter that emits the same C.
 
+The port's output is now built as lines joined once per body and frames joined once per dump,
+which the measurement in ADR 0045 §"What the fixpoint measured" showed was not where the
+memory went: the tier releases nothing within an entry, and precise release is the work that
+record names next.
+
 ## Beyond the port
 
 `docs/adr/0041-effects-in-a-compiled-tier.md` carries the effects work: `with

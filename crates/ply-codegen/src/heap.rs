@@ -348,6 +348,10 @@ pub struct Heap {
     /// it ever held. Filled only while `reuse` is set, which a release build does and a debug
     /// build does not, so the tests keep reading a stale word as a dead header.
     free: Vec<Vec<*mut Obj>>,
+    /// Dead objects past the small classes, by the power of two their block was rounded up to:
+    /// a program that builds a large string by appending would otherwise keep every version it
+    /// let go until the entry ends.
+    large: Vec<Vec<*mut Obj>>,
     reuse: bool,
 }
 
@@ -402,10 +406,16 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
         if size == usize::MAX {
             return;
         }
-        let class = Heap::object_size(size) / 8;
-        if class >= REUSE_CLASSES {
+        let object = Heap::object_size(size);
+        if let Some(class) = Heap::large_class(object) {
+            let large = &mut (*heap).large;
+            if large.len() <= class {
+                large.resize_with(class + 1, Vec::new);
+            }
+            large[class].push(o);
             return;
         }
+        let class = object / 8;
         let free = &mut (*heap).free;
         if free.len() <= class {
             free.resize_with(class + 1, Vec::new);
@@ -440,6 +450,7 @@ impl Heap {
             count: 0,
             recycled: 0,
             free: Vec::new(),
+            large: Vec::new(),
             reuse: !cfg!(debug_assertions),
         }
     }
@@ -458,6 +469,48 @@ impl Heap {
     }
 
     /// How many objects have been allocated since the last reset.
+    /// Every object still counted at this moment, tallied by kind: what an entry holds at its
+    /// end is what it leaked or what its answer needs, and the tally says which.
+    pub fn live_by_kind(&self) -> Vec<(u8, usize, usize)> {
+        let mut tally: std::collections::BTreeMap<u8, (usize, usize)> = Default::default();
+        for (i, (base, cap)) in self.chunks.iter().enumerate() {
+            let limit = if i == self.chunk {
+                self.cur as usize
+            } else {
+                *base as usize + *cap
+            };
+            let bits = &self.starts[i];
+            for (word, bitmap) in bits.iter().enumerate() {
+                if *bitmap == 0 {
+                    continue;
+                }
+                for b in 0..64 {
+                    if bitmap & (1u64 << b) == 0 {
+                        continue;
+                    }
+                    let address = *base as usize + (word * 64 + b) * 8;
+                    if address >= limit {
+                        break;
+                    }
+                    let o = address as *mut Obj;
+                    let (kind, rc, size) = unsafe { ((*o).kind, (*o).rc, payload_bytes(o)) };
+                    if kind == KIND_DEAD || rc == 0 {
+                        continue;
+                    }
+                    let e = tally.entry(kind).or_insert((0, 0));
+                    e.0 += 1;
+                    e.1 += size;
+                }
+            }
+        }
+        tally.into_iter().map(|(k, (n, b))| (k, n, b)).collect()
+    }
+
+    /// The bytes the entry's chunks reserve, whatever is live in them.
+    pub fn chunk_bytes(&self) -> usize {
+        self.chunks.iter().map(|(_, cap)| *cap).sum()
+    }
+
     pub fn allocated(&self) -> usize {
         self.count
     }
@@ -505,6 +558,22 @@ impl Heap {
         (HEADER + payload_bytes.max(8) + 7) & !7
     }
 
+    /// The bytes a block takes: an object's size in the small classes, and the next power of two
+    /// past them, so a dead block serves any later object that rounds to the same power.
+    fn block_size(payload_bytes: usize) -> usize {
+        let size = Heap::object_size(payload_bytes);
+        match Heap::large_class(size) {
+            Some(class) => 1 << class,
+            None => size,
+        }
+    }
+
+    /// The power-of-two class of a block past the small classes.
+    fn large_class(size: usize) -> Option<usize> {
+        (size / 8 >= REUSE_CLASSES)
+            .then(|| usize::BITS as usize - (size - 1).leading_zeros() as usize)
+    }
+
     pub(crate) fn raw_alloc(
         &mut self,
         kind: u8,
@@ -513,9 +582,12 @@ impl Heap {
         layout: u32,
         payload_bytes: usize,
     ) -> *mut Obj {
-        let size = Heap::object_size(payload_bytes);
+        let size = Heap::block_size(payload_bytes);
         // A dead object of this class, if the entry has one, before the bump pointer moves.
-        let recycled = self.free.get_mut(size / 8).and_then(Vec::pop);
+        let recycled = match Heap::large_class(size) {
+            Some(class) => self.large.get_mut(class).and_then(Vec::pop),
+            None => self.free.get_mut(size / 8).and_then(Vec::pop),
+        };
         let p = match recycled {
             Some(p) => {
                 self.recycled += 1;
@@ -756,6 +828,9 @@ impl Heap {
         self.count = 0;
         self.recycled = 0;
         for class in &mut self.free {
+            class.clear();
+        }
+        for class in &mut self.large {
             class.clear();
         }
         for bits in &mut self.starts {

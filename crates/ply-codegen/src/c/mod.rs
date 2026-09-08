@@ -17,7 +17,7 @@
 //! | `PLY_C_REFUSALS` | print what the tier refused and why, and how much of the offered set it took | `build.rs` |
 //! | `PLY_C_DUMP` | print one body's emitted C by name, or `*` for the unit's size and its largest bodies | `build.rs` |
 //! | `PLY_C_SPLIT` | print where the emit's time went: optimise-and-lower against emit | `build.rs` |
-//! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache | `build.rs` |
+//! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache; and at every entry's end what it allocated, recycled and still held, by kind | `build.rs`, `rt.rs` |
 //! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
 //! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |
 //! | `PLY_C_PROFILE` | `development` (the default) picks the fast toolchain and the inlining that survives it -- `tcc` if installed, else `cc -O0`, at depth 0; `release` is `cc -O2` at depth 3. Overrides the CLI's `--profile`, so that a bench script pins one without a command line. The compiler and the depth are one choice, not two: read `toolchain.rs` before separating them | `toolchain.rs` |

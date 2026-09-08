@@ -49,6 +49,44 @@ reach still reports what it handles, read off its source, since a refused
 handler whose performers compiled would have sent a `perform` past a frame
 the machine held.
 
+## What the fixpoint measured, and the work it names
+
+The compiled tier releases nothing inside an entry: the reference emitter's
+own header calls its ownership deliberately conservative, a value passed to
+a helper is duplicated first and never released, and the entry's arena is
+recycled whole when the entry ends. A test is an entry and a request is an
+entry, so nothing shipped had noticed. The emitter emitting a program is one
+entry too, and the measurement is what the bootstrap forced:
+
+```sh
+PLY_C_PHASES=1 PLY_C_CACHE=$(mktemp -d) PLY_C_EMITTER=ply-whole:spikes/ply-parser \
+  /usr/bin/time -l ./target/release/ply test crates/ply-std/ply --backend c --no-cache 2>&1 \
+  | grep -E 'maximum resident|^entry: [0-9]{6,}|live at end'
+```
+
+On 2026-09-08 the producer's one entry over the standard library allocated
+twenty-five million objects, recycled four million, reserved five gigabytes
+of chunks and ended with twenty million still counted, three gigabytes of
+them byte strings, where its answer is one string of four megabytes; over
+the emitter's own sources the run peaked at seventeen gigabytes, which is
+what a CI runner cannot hold, and each of six small programs run with the
+tier as the only engine leaked one object per iteration: a temporary passed
+to a builtin, an old record, a matched constructor, a parameter the callee
+never released. Making the emitter's two quadratic concatenations linear
+moved none of it. This is not the emitter's bug and not the port's: the
+machine moves a binding out of its slot at its last use and truncates the
+window at an activation's end, and the tier's emitted C does neither.
+
+So the fifth stage has a prerequisite this record did not list: **the tier
+releases within an entry**, transcribing the machine's rule into the
+emitter written in Ply, whose lowering already carries the last-use marks
+the machine acts on and whose lowering differential says they are the
+machine's. Until it is built, the bootstrap fixpoint and the port's ratchet
+over its own sources are `#[ignore]`d in CI and run by hand, and the
+emitter's own tests are not run tier-only there; a served program's entry
+would leak the same way for as long as it served, which is the other reason
+this comes before the deletion and not after it. It is the next record.
+
 ## The inventory
 
 The command, and what it names:
