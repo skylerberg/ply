@@ -464,9 +464,11 @@ fn is_inlined(name: Bytes) -> Bool =
   name == b"len" || name == b"bytes_len" || name == b"bytes_at" || name == b"bytes_u32_le"
     || name == b"bytes_concat_all" || name == b"bytes_join" || name == b"string_concat_all"
 
+// The ones the reference does not answer with a plain call to the runtime.
+// `fold` is fused where its callback is written out, and `map_fold` and
+// `iterate` are shapes this port has not read.
 fn is_callback(name: Bytes) -> Bool =
-  name == b"map" || name == b"filter" || name == b"fold" || name == b"map_fold"
-    || name == b"iterate"
+  name == b"fold" || name == b"map_fold" || name == b"iterate"
 
 // The index a builtin takes in this body's own table, added on first use. Two
 // calls of one builtin share it, which is what the reference's table does and
@@ -501,6 +503,11 @@ fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
   else if name == b"bytes_scan" && args == 4 { Some(b"rt_bytes_scan_p") }
   else if name == b"bytes_scan_until" && args == 4 { Some(b"rt_bytes_scan_until_p") }
   else if name == b"list_at" && args == 2 { Some(b"rt_list_index_p") }
+  // `map` and `filter` hand the closure to the runtime, which walks the list.
+  // `fold` does **not**: it is fused into the body, and `fused_fold` is why it is
+  // absent here.
+  else if name == b"map" && args == 2 { Some(b"rt_map_p") }
+  else if name == b"filter" && args == 2 { Some(b"rt_filter_p") }
   // `map`, `filter` and `fold` are deliberately absent, and it is not an
   // oversight in the table they were copied from. Handed a *literal* lambda the
   // reference does not call a helper at all: it fuses the loop into the body and
@@ -546,8 +553,12 @@ fn caps_owned(em: Em, cs: List<Cap>, i: Int, acc: List<Bytes>)
 // A lambda's own function. Its C parameters are the captures first and then its
 // own, all words: it has no declared types, so nothing is opened at entry the
 // way a named function's `Int` is.
+// The tables are the *unit's*, not the body's, so what the lambda meets keeps
+// counting from what the function that builds it met, and what it adds is
+// carried back out. Emitting it against a copy numbered a second body's
+// constants and builtins from zero.
 fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>, body: Code })
-    -> Option<Bytes> = {
+    -> Option<{ text: Bytes, met: List<Bytes>, consts: List<Lit>, shapes: List<List<Bytes>> }> = {
   let n = len(l.caps) + l.params;
   let window = fold(range(0, l.params),
     fold(range(0, len(l.caps)), [], |acc: List<Conv>, i: Int|
@@ -563,7 +574,8 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
                 ctors: em.ctors, extra: b"", lambdas: 0, owner: b"", builtins: em.builtins, met: em.met };
   match expr(start, l.body, []) {
     None -> None,
-    Some(o) -> Some(bytes_concat_all([
+    Some(o) -> Some({ met: o.em.met, consts: o.em.consts, shapes: o.em.shapes,
+      text: bytes_concat_all([
       b"Word ply_", name, b"(PlyCtx *ctx",
       fold(range(0, n), b"", |acc: Bytes, i: Int| bytes_concat_all([acc, b", Word q", num(i)])),
       b") {\n  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); return 0; }\n  ctx->fuel -= 1;\n",
@@ -571,7 +583,7 @@ fn emit_lambda(em: Em, name: Bytes, l: { params: Int, size: Int, caps: List<Cap>
       b"  ctx->fuel += 1;\n  return ", as_word(o.v), b";\n}\n",
       b"Word ply_", name, b"_entry(PlyCtx *ctx, const Word *args) {\n  return ply_", name,
       b"(ctx", fold(range(0, n), b"", |acc: Bytes, i: Int|
-        bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"])),
+        bytes_concat_all([acc, b", args[", num(i), b"]"])), b");\n}\n"]) }),
   }
 }
 
@@ -822,15 +834,15 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
           let sub = bytes_concat_all([em.owner, b"_lambda", num(idx)]);
           match emit_lambda(w.em, sub, l) {
             None -> None,
-            Some(fn_text) -> {
+            Some(sub_out) -> {
               let arr = fresh(w.em);
               let e = line(arr.em, bytes_concat_all([b"Word ", arr.name, b"[] = {",
                 if len(w.names) == 0 { b"0" } else { bytes_join(w.names, b", ") }, b"};"]));
               let grown = { out: e.out, n: e.n, conv: e.conv, ind: e.ind, reads: e.reads,
-                            shapes: e.shapes, built: e.built, module: e.module, made: e.made,
-                            here: e.here, imports: e.imports, consts: e.consts, ctors: e.ctors,
-                            extra: bytes_concat(e.extra, fn_text), lambdas: idx + 1,
-                            owner: e.owner, builtins: e.builtins, met: e.met };
+                            shapes: sub_out.shapes, built: e.built, module: e.module, made: e.made,
+                            here: e.here, imports: e.imports, consts: sub_out.consts, ctors: e.ctors,
+                            extra: bytes_concat(e.extra, sub_out.text), lambdas: idx + 1,
+                            owner: e.owner, builtins: e.builtins, met: sub_out.met };
               let o = bind(grown, KBoxed, bytes_concat_all([
                 b"rt_closure_p(ctx, @@l", num(idx), b"@@, ", num(l.params),
                 b", (Word)(intptr_t)", arr.name, b", ", num(len(l.caps)), b")"]));
@@ -1028,7 +1040,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                         },
                       },
                     },
-                    Some(h) -> match args_owned(em, a.args, params, 0, []) {
+                    // Two passes, except for the two that take a closure: those
+                    // hold the list before the closure is built, where the rest
+                    // evaluate everything and only then hold any of it.
+                    Some(h) -> match (if fv.name == b"map" || fv.name == b"filter" {
+                                        args_one_pass(em, a.args, params, 0, [])
+                                      } else { args_owned(em, a.args, params, 0, []) }) {
                       None -> None,
                       Some(w) -> {
                         let o = bind(w.em, KBoxed, bytes_concat_all([
