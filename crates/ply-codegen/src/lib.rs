@@ -10,7 +10,6 @@
 
 pub mod backend;
 pub mod c;
-pub mod combined;
 pub mod detached;
 pub mod heap;
 pub mod host;

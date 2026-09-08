@@ -15,11 +15,11 @@
 //! methods stay `&self`) and [`crate::Machine`] (which embeds a `Core` and threads it by `&mut`,
 //! so `cells()` can hand out `&Arena`) evaluate through the one `Core`.
 
-use crate::backend::{Counters, Offers, Policed, Provider, Spec, wrap};
+use crate::backend::Counters;
 use crate::code::{
     self, Arm, Captures, Clause, Code, Lowered, Lowering, NodeKind, Pat, ReturnArm, Stmt,
 };
-use crate::compiled::{Compiled, Entered};
+use crate::compiled::Entered;
 use crate::semantics::{ctor_value, lit_matches, strict_binary};
 use crate::value::{Closure, ClosureKind, Fields, Value};
 use crate::{Arena, Builtin, TaskRegions};
@@ -29,7 +29,6 @@ use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Expr, Item, Program, QName};
 use ply_syntax::resolve::{Namespace, Resolved};
 use rustc_hash::FxHashMap;
-use std::cell::RefCell;
 use std::collections::BTreeSet;
 type GlobalKey = (usize, Option<Symbol>, Symbol);
 
@@ -164,30 +163,6 @@ impl<'p> Interpreter<'p> {
 
     pub fn is_empty(&self) -> bool {
         self.members.is_empty()
-    }
-}
-
-impl Interpreter<'static> {
-    pub fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
-        wrap(Rc::new(Interp::new(self)), spec)
-    }
-}
-
-impl Provider for Interpreter<'static> {
-    fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
-        Interpreter::attach(self, spec)
-    }
-
-    fn name(&self) -> &'static str {
-        "interp"
-    }
-
-    fn len(&self) -> usize {
-        Interpreter::len(self)
-    }
-
-    fn offers(&self) -> Offers {
-        self.counters.offers()
     }
 }
 
@@ -1003,20 +978,6 @@ impl<'p, 'x> Run<'p, 'x> {
 
 /// One attached interpreter as a `Provider`: the eval `Core` behind a `RefCell`, so the
 /// `Compiled` seam's `&self` methods can drive its `&mut` walk.
-pub struct Interp {
-    home: &'static Interpreter<'static>,
-    core: RefCell<Core<'static>>,
-}
-
-impl Interp {
-    fn new(home: &'static Interpreter<'static>) -> Interp {
-        Interp {
-            home,
-            core: RefCell::new(Core::new(home.program)),
-        }
-    }
-}
-
 #[derive(Clone)]
 struct HandlerFrame {
     clauses: Vec<HandlerClause>,
@@ -1077,76 +1038,6 @@ impl Calls {
 enum Bail {
     Decline,
     Fail(Diagnostic),
-}
-
-impl Policed for Interp {
-    fn counters(&self) -> &'static Counters {
-        &self.home.counters
-    }
-
-    fn holds(&self, name: &Symbol) -> bool {
-        self.home.members.contains(name)
-    }
-
-    fn answer(&self, _name: &Symbol, _args: &[Value], _budget: usize) -> Option<Value> {
-        None
-    }
-
-    fn run_with_fuel(&self, _name: &Symbol, _args: &[Value], _fuel: usize) -> Option<Value> {
-        None
-    }
-}
-
-impl Compiled for Interp {
-    fn describes(&self, program: &Program) -> bool {
-        self.home.origin == std::ptr::from_ref(program) as usize
-    }
-
-    fn enter(&self, _name: &Symbol, _args: &[Value], _budget: usize) -> Option<Value> {
-        None
-    }
-
-    fn take_performed(&self) -> Vec<EffectAtom> {
-        self.core.borrow_mut().take_performed()
-    }
-
-    fn enter_test(&self, name: &Symbol, budget: usize) -> Entered {
-        self.home.counters.note_offer(&[]);
-        let Some((body, module)) = self.home.tests.get(name) else {
-            return Entered::Declined;
-        };
-        let mut core = self.core.borrow_mut();
-        Run::new(self.home, &mut core).enter_root(
-            Rc::new(Vec::new()),
-            body,
-            *module,
-            Vec::new(),
-            budget,
-        )
-    }
-
-    fn enter_whole(&self, name: &Symbol, args: &[Value], budget: usize) -> Entered {
-        self.home.counters.note_offer(args);
-        if let Some((body, module)) = self.home.tests.get(name) {
-            let mut core = self.core.borrow_mut();
-            return Run::new(self.home, &mut core).enter_root(
-                Rc::new(Vec::new()),
-                body,
-                *module,
-                args.to_vec(),
-                budget,
-            );
-        }
-        let Some(def) = self.home.defs.get(name) else {
-            return Entered::Declined;
-        };
-        if def.params.len() != args.len() {
-            return Entered::Declined;
-        }
-        let (params, body, module) = (Rc::new(def.params.clone()), def.body, def.module);
-        let mut core = self.core.borrow_mut();
-        Run::new(self.home, &mut core).enter_root(params, body, module, args.to_vec(), budget)
-    }
 }
 
 fn err_released(name: &Symbol, span: Span) -> Diagnostic {
