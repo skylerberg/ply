@@ -187,6 +187,20 @@ the question allows it. A count does not depend on what else the machine is
 doing, which is why the allocation-attribution suites are worth their weight and
 the timing suites need a job of their own.
 
+**A phase between two differentials, compared by neither.** The parser spike's
+third comparison covers the rewrites `Parser::run` applies and its fifth covers
+the *source* each derivation generates. Between them sits `rewrite.ply`'s
+`expand`, and nothing compares the tree it produces against
+`ply_derive::expand_program`'s. One divergence is known to live there: `expand`
+turns `{..b, f: e}` into a record naming every field where the reference keeps a
+node with copies and sets. It surfaces only as an exclusion in the *lowering*
+differential, which is where it is written down.
+
+That exclusion is also why that differential reports two numbers. A skipped body
+still counted as lowered, so the headline credited the port for bodies nothing
+verified; it now prints what it reached and what it compared, with a floor on
+each.
+
 **By-hand obligations the suite does not carry:** `./spikes/ply-parser/run.sh
 --arm`, which is the evidence that spike's differential can go red at all, and
 `crates/ply-codegen-spike`'s agreement corpus. Both are recorded in
