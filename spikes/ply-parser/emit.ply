@@ -18,7 +18,9 @@
 
 import spine (num, Ident)
 import code (hex, Code, Node, NLit, NVar, NBinary, NIf, NBlock, NList, NUnary, NField, NUpd, NApp, NRecord, NMatch, CPat, PxWild, PxVar, PxLit, PxCtor, PxRecord, PxList, NPerform, NCell, NRegion, NLambda, NSim, NHandle, CStmt, CLet, CDo, CField, CArm, Cap, CClause, CRet, Own, Borrowed, Owned, OwnedField, lower_fn)
-import items (Item, IFn, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
+import items (Module, Derived, Item, IFn, ITest, IType, TypeDefBody, TDAlias, parse, ImportDecl, ImportKind, INames, IModule, IAlias)
+import resolve (Mod, Source, Resolved_, Failed, resolve_modules)
+import derive (expand_derives)
 import exprs (Param)
 import types (TypeExpr, TCon, TRecord)
 import rewrite (expand)
@@ -1015,6 +1017,11 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
       },
     },
     NBinary(b) ->
+      // Two `Int` literals under an operator are one literal: the reference folds them before
+      // it lowers, checked, so an overflow is left for the runtime to raise.
+      match lit_int(c) {
+        Some(n) -> Some({ em: em, v: { k: KInt, c: bytes_concat_all([b"INT64_C(", num(n), b")"]), ty: TyOpen } }),
+        None ->
       // `++` joins two values the runtime knows how to join, and takes both.
       if b.op == b"concat" {
         match expr(notail(em), b.lhs, params) {
@@ -1077,7 +1084,7 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
             },
           },
         }
-      },
+      } },
     // Lowering wraps every `if` branch and every `{ }` body in one of these. A
     // block binds its tail even when it holds no statements, which is why an
     // `if` branch shows a rename the branch itself did not ask for.
@@ -1634,7 +1641,7 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
         },
         CDo(d) -> match expr(notail(em), d.code, params) {
           None -> None,
-          Some(o) -> stmts(o.em, xs, params, i + 1),
+          Some(o) -> stmts(line(o.em, bytes_concat_all([b"(void)(", as_word(o.v), b");"])), xs, params, i + 1),
         },
       },
     }
@@ -1829,6 +1836,51 @@ fn kind_of(em: Em, c: Code, params: List<P>) -> Kind =
     NBlock(b) -> match b.tail { Some(t) -> kind_of(em, t, params), None -> KBoxed },
     NField(_) -> KInt,
     _ -> KBoxed,
+  }
+
+// The `Int` two literals fold to under an operator, or nothing: the reference's
+// `fold_literals`, rule for rule. Addition, subtraction and multiplication only
+// when they do not overflow; a shift only by a count the width holds.
+fn lit_int(c: Code) -> Option<Int> =
+  match c.node {
+    NLit(l) -> match l { LInt(n) -> Some(n), _ -> None },
+    NBinary(b) -> match lit_int(b.lhs) {
+      None -> None,
+      Some(a) -> match lit_int(b.rhs) {
+        None -> None,
+        Some(x) ->
+          if b.op == b"add" { checked_add(a, x) }
+          else if b.op == b"sub" { checked_sub(a, x) }
+          else if b.op == b"mul" { checked_mul(a, x) }
+          else if b.op == b"bitand" { Some(a & x) }
+          else if b.op == b"bitor" { Some(a | x) }
+          else if b.op == b"bitxor" { Some(a ^ x) }
+          else if b.op == b"shl" && x >= 0 && x < 64 { Some(a << x) }
+          else if b.op == b"shr" && x >= 0 && x < 64 { Some(a >> x) }
+          else if b.op == b"ushr" && x >= 0 && x < 64 { Some(a >>> x) }
+          else { None },
+      },
+    },
+    _ -> None,
+  }
+
+fn checked_add(a: Int, b: Int) -> Option<Int> = {
+  let s = wrap_add(a, b);
+  if (a >= 0) == (b >= 0) && (s >= 0) != (a >= 0) { None } else { Some(s) }
+}
+
+fn checked_sub(a: Int, b: Int) -> Option<Int> = {
+  let s = wrap_sub(a, b);
+  if (a >= 0) != (b >= 0) && (s >= 0) != (a >= 0) { None } else { Some(s) }
+}
+
+fn checked_mul(a: Int, b: Int) -> Option<Int> =
+  if a == 0 || b == 0 { Some(0) }
+  else if a == -1 { checked_sub(0, b) }
+  else if b == -1 { checked_sub(0, a) }
+  else {
+    let p = wrap_mul(a, b);
+    if p / a == b && p % a == 0 { Some(p) } else { None }
   }
 
 // Whether a node answers a `Float` or `Decimal`, without emitting it: what the
@@ -2203,9 +2255,38 @@ test "a form this port does not reach is refused" {
 
 // The module's own name, so a dump over many modules names each body the way the
 // reference names it -- `std.hash.round`, not `m.round`.
+// One module's bodies, as it was parsed and rewritten but with no defaults filled: what the
+// per-module differential compares.
 fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes) -> List<Emitted> = {
   let r = parse(src);
   let x = expand(r.node, r.p.uses_sets, r.p.diags);
+  emit_module(module, x.module, ctors, builtins)
+}
+
+// Every module of a program, resolved together first -- so a call's default arguments are
+// filled and every `derive` is expanded, which is what the reference's emitter sees -- and then
+// emitted one module at a time. A program that does not resolve emits nothing: a body emitted
+// against unfilled calls would be wrong rather than partial.
+fn emit_all_program(sources: List<Source>, ctors: List<Bytes>, builtins: List<Bytes>) -> List<Emitted> = {
+  let parsed = map(range(0, len(sources)), |i: Int| {
+    let s = match list_at(sources, i) { Some(x) -> x, None -> { name: b"", src: b"" } };
+    let r = parse(s.src);
+    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let d = expand_derives(i, x.module);
+    { name: s.name, module: d.module, derived: d.derived, bad: len(d.diags) > 0 }
+  });
+  if fold(parsed, false, |acc: Bool, p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }| acc || p.bad) { [] } else {
+    match resolve_modules(map(parsed, |p: { name: Bytes, module: Module, derived: List<Derived>, bad: Bool }|
+                               { name: p.name, module: p.module, derived: p.derived })) {
+      Failed(_) -> [],
+      Resolved_(x) -> fold(x.mods, [], |acc: List<Emitted>, m: Mod|
+        fold(emit_module(m.name, m.module, ctors, builtins), acc, |a: List<Emitted>, e: Emitted| push(a, e))),
+    }
+  }
+}
+
+fn emit_module(module: Bytes, x_module: Module, ctors: List<Bytes>, builtins: List<Bytes>) -> List<Emitted> = {
+  let x = { module: x_module };
   let imports = fold(x.module.imports, [], |acc: List<Imported>, im: ImportDecl|
     match im.kind {
       INames(ns) -> {
@@ -2233,7 +2314,7 @@ fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: By
                             ret_ty: match param_kind_in(aliases, d.ret) { Some(r) -> r.ty, None -> TyOpen } }),
       _ -> acc,
     });
-  fold(x.module.items, [], |acc: List<Emitted>, it: Item|
+  let walked = fold(x.module.items, { out: [], tests: 0 }, |acc: { out: List<Emitted>, tests: Int }, it: Item|
     match it {
       IFn(d) -> {
         let names = map(d.params, |p: Param| p.name.name);
@@ -2248,12 +2329,26 @@ fn emit_all_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: By
                                        ty: match list_at(kinds, i) { Some(Some(p)) -> p.ty, _ -> TyOpen } }),
                                    l.code) {
             None -> acc,
-            Some(c) -> push(acc, { name: bytes_concat_all([module, b".", d.name.name]), text: c.text, tables: c.tables }),
+            Some(c) -> { out: push(acc.out, { name: bytes_concat_all([module, b".", d.name.name]), text: c.text, tables: c.tables }), tests: acc.tests },
+          },
+        }
+      },
+      // A test is a root the machine enters whole: a nullary body named by its place
+      // among the module's tests, as the reference names it.
+      ITest(t) -> {
+        let root = bytes_concat_all([b"test_", num(acc.tests)]);
+        let next = { out: acc.out, tests: acc.tests + 1 };
+        match lower_fn([], t.body) {
+          None -> next,
+          Some(l) -> match emit_fn_full(module, here, imports, ctors, builtins, bytes_concat_all([mangle(module), b"_", root]), [], l.code) {
+            None -> next,
+            Some(c) -> { out: push(acc.out, { name: bytes_concat_all([module, b".test#", num(acc.tests)]), text: c.text, tables: c.tables }), tests: acc.tests + 1 },
           },
         }
       },
       _ -> acc,
-    })
+    });
+  walked.out
 }
 
 // One emitted definition: its program-wide name, its C, and its tables encoded.
@@ -2263,6 +2358,23 @@ pub type Emitted = { name: Bytes, text: Bytes, tables: Bytes }
 pub fn emit_dump_in(module: Bytes, ctors: List<Bytes>, builtins: List<Bytes>, src: Bytes) -> String =
   string_of_bytes(fold(emit_all_in(module, ctors, builtins, src), b"C;1;", |acc: Bytes, e: Emitted|
     bytes_concat_all([acc, b"f:", e.name, b";", e.text, b";"])))
+
+// The differential's rendering over a whole program, resolved together.
+pub fn emit_dump_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
+  string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins), b"C;1;", |acc: Bytes, e: Emitted|
+    bytes_concat_all([acc, b"f:", e.name, b";", e.text, b";"])))
+
+// The producer's rendering over a whole program, resolved together.
+pub fn emit_bodies_all(names: List<Bytes>, srcs: List<Bytes>, ctors: List<Bytes>, builtins: List<Bytes>) -> String =
+  string_of_bytes(fold(emit_all_program(zip_sources(names, srcs), ctors, builtins), b"", |acc: Bytes, e: Emitted| {
+    let enc = bytes_concat_all([e.tables, b"text\n", e.text]);
+    bytes_concat_all([acc, b"body ", e.name, b" ", num(bytes_len(enc)), b"\n", enc])
+  }))
+
+fn zip_sources(names: List<Bytes>, srcs: List<Bytes>) -> List<Source> =
+  map(range(0, len(names)), |i: Int|
+    { name: match list_at(names, i) { Some(n) -> n, None -> b"" },
+      src: match list_at(srcs, i) { Some(t) -> t, None -> b"" } })
 
 // The producer's rendering, framed by length so no byte of a body is a delimiter:
 // `body <name> <n>\n` and then exactly `n` bytes -- the tables in the cache's

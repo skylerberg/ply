@@ -23,9 +23,9 @@ work="$(mktemp -d)"
 # `emit.ply` were left out when they were added, so their tests ran only in the
 # CI step that copies the whole directory -- which is where a stale one was
 # found rather than here.
-cp "$here"/lexer.ply "$here"/spine.ply "$here"/types.ply "$here"/patterns.ply \
-   "$here"/exprs.ply "$here"/items.ply "$here"/rewrite.ply "$here"/code.ply \
-   "$here"/emit.ply "$work/"
+# Every module: the emitter resolves a program before it emits, so it imports the resolver and
+# what the resolver imports, and a project holding less does not check.
+cp "$here"/*.ply "$work/"
 "$ply" test "$work" --no-cache "$@"
 [ "$keep" -eq 1 ] && echo "project kept at $work"
 exit 0
