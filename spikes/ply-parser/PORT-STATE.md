@@ -11,7 +11,7 @@ Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
 | | |
 | --- | --- |
 | `lower_diff.rs` | the port reaches **1179 of 1200** bodies, **1179 compared** |
-| `emit_diff.rs` | 48 of 48 hand-written bodies; **789 of 1282** shipped bodies |
+| `emit_diff.rs` | 48 of 48 hand-written bodies; **842 of 1282** shipped bodies |
 
 `reached` and `compared` were apart for most of this work, by the record updates
 the lowering excluded. They now meet: the exclusion is gone.
@@ -56,7 +56,7 @@ Ownership and ordering:
 
 ## The named gaps
 
-`emit_diff.rs` asserts the nine by name. Four `std.hash` bodies want the
+`emit_diff.rs` asserts the twelve by name. Four `std.hash` bodies want the
 *deferred record local*, which is the half of deferring this port does not do: a
 record whose every read is answered from the built table is never materialised,
 and the local it would land in is declared at the top of the body. The other four
@@ -68,6 +68,19 @@ The **inliner**. The differential pins inlining at zero precisely because of it,
 and porting `opt.rs` is what lifts that pin.
 
 ## What changed after this was written
+
+**The release family, for the next pass.** Seven named gaps are one rule: the reference
+releases a record -- an update's base, a let-bound one, a parameter before the result is
+built -- where the port does not. Both sides state the same four guards (an owned bare
+variable, at most once per binding, exactly one read of the object unless at the tail). The
+reference keys "at most once" and "one read" on the *C local's root*, charged when a name is
+bound; the port keys them on the *slot*, charged over the whole body. `agreement.memory_step`
+is the smallest case: the reference releases once in each of four `match` arms and the port
+in none. Start there, with `PLY_EMIT_DIFF_SHOW`.
+
+**`&&` and `||`.** The port emits the short-circuit operators as the reference does, the
+right operand inside the branch: 789 to 842. The three bodies that opened differ on the same
+release rule as the others in the named gaps -- seven now, one family, the next pass.
 
 **The constant table.** A pure nullary definition answering a word is asked of
 `rt_constant` as the reference asks it; purity is the checker's word, through
