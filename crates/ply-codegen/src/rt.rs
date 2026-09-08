@@ -1687,7 +1687,18 @@ pub unsafe extern "C" fn rt_perform(
                         .detached
                         .expect("a clause off the tail is in a detached frame");
                     let closure = cl.closure;
-                    return unsafe { crate::detached::stop(ctx, id, closure, args_of(args, n)) };
+                    // The names are moved in and dropped before the switch: this frame comes
+                    // back with every restored snapshot, and a local that owned heap memory
+                    // across the switch would be released once per restore.
+                    return unsafe {
+                        crate::detached::stop(
+                            ctx,
+                            id,
+                            closure,
+                            args_of(args, n),
+                            (effect, op, resource),
+                        )
+                    };
                 }
                 found = Some((stack, i, cl.closure, cl.resumes != 0));
                 break 'search;

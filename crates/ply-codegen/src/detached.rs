@@ -12,7 +12,7 @@
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, FrameClause, HandlerFrame, call_value, drop_frame};
 use crate::stack::{Stack, switch};
-use ply_span::{Diagnostic, codes};
+use ply_span::{Diagnostic, Symbol, codes};
 
 pub struct Detached {
     stack: Option<Stack>,
@@ -278,7 +278,19 @@ fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
 
 /// From the body's side: the `perform` a clause off the tail answers. Hands the clause and its
 /// arguments to whoever resumed the body and comes back with what `k` was called with.
-pub(crate) unsafe fn stop(ctx: *mut Ctx, id: usize, closure: Word, args: &[Word]) -> Word {
+///
+/// Nothing on the stack below the switch may own memory the heap does not count: the frames
+/// from the body's entry to here come back with every restored snapshot, and a `Vec` or an
+/// `Arc` held across the switch would be released once per restore. `owned` is what the
+/// caller still held; it is dropped here, before the switch.
+pub(crate) unsafe fn stop(
+    ctx: *mut Ctx,
+    id: usize,
+    closure: Word,
+    args: &[Word],
+    owned: (Symbol, Symbol, Option<Symbol>),
+) -> Word {
+    drop(owned);
     let c = unsafe { &mut *ctx };
     let d = &mut c.detached[id];
     d.request = Some(Stopped::Performed {
