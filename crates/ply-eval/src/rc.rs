@@ -190,13 +190,6 @@ pub fn reset() {
     let _ = SEEN.try_with(|c| c.borrow_mut().clear());
 }
 
-pub(crate) fn note_take(moved: bool) {
-    bump(|s| {
-        s.takes_attempted += 1;
-        s.takes_moved += u64::from(moved);
-    });
-}
-
 /// [`note_update`], with the number of elements the update had to copy.
 pub(crate) fn note_update_of(in_place: bool, copied: usize, span: Span) {
     bump(|s| {
