@@ -16,8 +16,8 @@
 use crate::heap::{self, Word};
 use crate::rt::{Ctx, FAILED_UNWIND, call_value, values_taken};
 use crate::stack::{Stack, switch};
-use ply_eval::host::Pending;
 use ply_eval::Unbound;
+use ply_eval::host::Pending;
 use ply_eval::sched::{HostPolicy, Policy, ROOT, Resumption, Scheduler, Turn};
 use ply_eval::sim::{Access, Answer, Handlers, OpSignature, TaskId, signature};
 use ply_eval::{SimId, Value};

@@ -271,7 +271,6 @@ fn every_fixture_is_in_exactly_one_bucket_and_examples_is_its_own() {
     assert_eq!(BUCKETS, 8, "`over_every_corpus!` names one test per bucket");
 }
 
-
 /// The same corpora, with a backend attached.
 mod backends {
     use ply_eval::{Compiled, Machine, Value};

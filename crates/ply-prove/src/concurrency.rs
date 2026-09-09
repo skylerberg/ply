@@ -1139,5 +1139,4 @@ mod tests {
         };
         assert!(!pure.is_concurrency_law());
     }
-
 }

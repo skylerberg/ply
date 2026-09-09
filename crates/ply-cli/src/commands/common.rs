@@ -232,15 +232,12 @@ fn find_emitter_dir() -> Option<std::path::PathBuf> {
     // executable's own directory, since a `ply` invoked from elsewhere (a test's temp project) is
     // still `<repo>/target/**/ply`, under the `spikes/` it needs. A shipped binary finds neither
     // and falls through to the reference emitter until the bundle is embedded (ADR 0048).
-    std::env::current_dir()
-        .ok()
-        .and_then(search)
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-                .and_then(search)
-        })
+    std::env::current_dir().ok().and_then(search).or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .and_then(search)
+    })
 }
 
 pub(crate) fn install_producer_from_env() {

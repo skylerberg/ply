@@ -112,7 +112,13 @@ fn run(
             .with_search(Search::default())
             .with_hosts(hosting),
     );
-    ply_test::run_with(&selection, &compiled.check, &compiled.hashes, store, &executor)
+    ply_test::run_with(
+        &selection,
+        &compiled.check,
+        &compiled.hashes,
+        store,
+        &executor,
+    )
 }
 
 fn reason(compiled: &Compiled, store: &Store, name: &str) -> Reason {

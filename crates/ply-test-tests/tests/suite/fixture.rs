@@ -56,7 +56,12 @@ impl Compiled {
             .collect();
         let texts = sources
             .iter()
-            .map(|(name, src)| (ModuleName::from_dotted(name).to_string(), (*src).to_string()))
+            .map(|(name, src)| {
+                (
+                    ModuleName::from_dotted(name).to_string(),
+                    (*src).to_string(),
+                )
+            })
             .collect();
         Compiled::of(
             ply_syntax::parse_program(inputs)

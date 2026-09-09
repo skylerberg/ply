@@ -1,9 +1,9 @@
 //! Whether a region that a continuation is captured across is recognised as one, and whether the
 //! arena's save-and-restore primitive covers what it says it covers.
 
+use ply_eval::Value;
 use ply_eval::arena::{Arena, RegionKind, Slot};
 use ply_eval::region_kind::{Cause, Regions, check, infer};
-use ply_eval::Value;
 use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -42,7 +42,6 @@ fn kind_of(src: &str, brand: &str) -> RegionKind {
         .unwrap_or_else(|| panic!("no region branded `{brand}`\n{src}"))
         .1
 }
-
 
 fn int_at(arena: &Arena, slot: Slot) -> Option<i64> {
     match arena.get(slot) {
@@ -94,7 +93,6 @@ fn a_handle_enclosing_the_region_does_not_hide_the_capture() {
         site.cause
     );
 }
-
 
 /// Two spellings of one program must agree, which is how the hole was diagnosed rather than merely
 /// observed.

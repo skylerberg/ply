@@ -332,4 +332,3 @@ fn every_resolved_slot_names_its_own_variable() {
         "the corpus resolved only {total} variables, which is too few to be checking anything"
     );
 }
-

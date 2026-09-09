@@ -50,7 +50,12 @@ impl Compiled {
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
         let texts = sources
             .iter()
-            .map(|(name, src)| (ModuleName::from_dotted(name).to_string(), (*src).to_string()))
+            .map(|(name, src)| {
+                (
+                    ModuleName::from_dotted(name).to_string(),
+                    (*src).to_string(),
+                )
+            })
             .collect();
         Compiled {
             program,

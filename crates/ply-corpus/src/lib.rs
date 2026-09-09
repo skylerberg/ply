@@ -44,7 +44,9 @@ pub fn on_deep_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
             .spawn_scoped(scope, f)
             .expect("a deep-stack thread")
             .join()
-            .unwrap_or_else(|_| std::panic::resume_unwind(Box::new("the deep-stack thread panicked")))
+            .unwrap_or_else(|_| {
+                std::panic::resume_unwind(Box::new("the deep-stack thread panicked"))
+            })
     })
 }
 

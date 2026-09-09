@@ -111,7 +111,13 @@ fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>
             .with_search(Search::default())
             .with_hosts(hosting),
     );
-    ply_test::run_with(&selection, &compiled.check, &compiled.hashes, store, &executor)
+    ply_test::run_with(
+        &selection,
+        &compiled.check,
+        &compiled.hashes,
+        store,
+        &executor,
+    )
 }
 
 /// Two tests, one resource, both declared `read`, and a handler that writes.

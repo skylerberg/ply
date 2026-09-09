@@ -61,4 +61,3 @@ test "two of three fields, one rewritten" {
         "two of three fields, one rewritten",
     );
 }
-

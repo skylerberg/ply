@@ -459,7 +459,12 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
             std::sync::Arc::clone(&hermetic),
             Err("E0303"),
         ),
-        ("m.ticking", vec![], std::sync::Arc::clone(&bound), Err("E0303")),
+        (
+            "m.ticking",
+            vec![],
+            std::sync::Arc::clone(&bound),
+            Err("E0303"),
+        ),
         (
             "m.ticking",
             vec![],
@@ -489,10 +494,16 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-                assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
+                assert_eq!(
+                    got, want,
+                    "`{name}{args:?}`: the tier and the golden disagree"
+                );
             }
             Err(code) => {
-                assert_ne!(ctx.failed, 0, "`{name}{args:?}` did not refuse in the C tier");
+                assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}{args:?}` did not refuse in the C tier"
+                );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
                 assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
@@ -623,10 +634,34 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
     // ADR 0048 retired the interpreter oracle; these pin the tier's schedule as a regression
     // guard (the corpus validates the mechanism end-to-end).
     let cases: Vec<(&str, Vec<Value>, Value, i64, &str)> = vec![
-        ("m.ordered", vec![Value::Int(3)], Value::Int(6012), 6, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0), TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#),
-        ("m.timed", vec![Value::Int(1500)], Value::Int(1500), 1500, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#),
-        ("m.drawn", vec![Value::Int(100)], Value::Int(366), 0, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#),
-        ("m.racing", vec![Value::Int(5)], Value::Int(60), 0, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }})"]"#),
+        (
+            "m.ordered",
+            vec![Value::Int(3)],
+            Value::Int(6012),
+            6,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0), TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+        ),
+        (
+            "m.timed",
+            vec![Value::Int(1500)],
+            Value::Int(1500),
+            1500,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+        ),
+        (
+            "m.drawn",
+            vec![Value::Int(100)],
+            Value::Int(366),
+            0,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+        ),
+        (
+            "m.racing",
+            vec![Value::Int(5)],
+            Value::Int(60),
+            0,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }})"]"#,
+        ),
     ];
     for (name, args, want, want_time, want_shape) in cases {
         let entry = native
@@ -660,7 +695,10 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
                 })
                 .collect()
         };
-        assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the golden disagree"
+        );
         assert_eq!(
             format!("{:?}", shape(&ours)),
             want_shape,
@@ -747,7 +785,10 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
-        assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
+        assert_eq!(
+            got, want,
+            "`{name}{args:?}`: the tier and the golden disagree"
+        );
     }
 }
 
@@ -871,10 +912,16 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-                assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
+                assert_eq!(
+                    got, want,
+                    "`{name}{args:?}`: the tier and the golden disagree"
+                );
             }
             Err(code) => {
-                assert_ne!(ctx.failed, 0, "`{name}{args:?}` did not refuse in the C tier");
+                assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}{args:?}` did not refuse in the C tier"
+                );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
                 assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
@@ -1035,10 +1082,16 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-                assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
+                assert_eq!(
+                    got, want,
+                    "`{name}{args:?}`: the tier and the golden disagree"
+                );
             }
             Err(code) => {
-                assert_ne!(ctx.failed, 0, "`{name}{args:?}` did not refuse in the C tier");
+                assert_ne!(
+                    ctx.failed, 0,
+                    "`{name}{args:?}` did not refuse in the C tier"
+                );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
                 assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }

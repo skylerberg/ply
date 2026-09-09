@@ -64,5 +64,3 @@ test "through a tail-resumptive one" { assert_eq(discharges(1), 2) }
         "the shape every handler in `examples/` is written in still discharges"
     );
 }
-
-

@@ -70,7 +70,10 @@ impl Interpreter<'static> {
         resolved: &'static Resolved,
         check: &'static CheckOutput,
     ) -> &'static Interpreter<'static> {
-        { let _ = check; Box::leak(Box::new(Interpreter::build(program, resolved))) }
+        {
+            let _ = check;
+            Box::leak(Box::new(Interpreter::build(program, resolved)))
+        }
     }
 }
 
@@ -465,7 +468,11 @@ impl<'p, 'x> Run<'p, 'x> {
                 let frame = self.handler_frame(clauses, ret, window, module)?;
                 self.st.handlers.push(frame);
                 let outcome = self.eval(body, window, module, calls);
-                let frame = self.st.handlers.pop().expect("the frame this handle pushed");
+                let frame = self
+                    .st
+                    .handlers
+                    .pop()
+                    .expect("the frame this handle pushed");
                 let value = outcome?;
                 match &frame.ret {
                     None => Ok(value),
@@ -606,8 +613,8 @@ impl<'p, 'x> Run<'p, 'x> {
         span: Span,
         calls: Calls,
     ) -> Result<Value, Bail> {
-        let mut step =
-            crate::builtins::call(b, args, self.st.regions.arena_mut(), span).map_err(Bail::Fail)?;
+        let mut step = crate::builtins::call(b, args, self.st.regions.arena_mut(), span)
+            .map_err(Bail::Fail)?;
         loop {
             match step {
                 crate::builtins::Step::Done(v) => return Ok(v),
@@ -1017,7 +1024,9 @@ impl<'a> Pure<'a> {
             )
             .primary(span, "not defined in this program"));
         };
-        answer(Run::new(&self.interp, &mut self.core).enter_root(params, body, module, args, budget))
+        answer(
+            Run::new(&self.interp, &mut self.core).enter_root(params, body, module, args, budget),
+        )
     }
 }
 

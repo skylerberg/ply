@@ -136,9 +136,6 @@ fn a_region_in_a_law_body_reports_its_escape() {
     );
 }
 
-
-
-
 /// The asymmetry that pays for the three above, and the reason it is a decision rather than an
 /// oversight: `with_region` is new syntax with no program depending on the loose rule, so the
 /// identical escape is a compile error that names the task.
@@ -162,9 +159,6 @@ pub fn attack() -> Int = simulate {
         escape.message
     );
 }
-
-
-
 
 /// The shapes `region_reclamation_audit` does not walk.
 #[test]
@@ -206,7 +200,6 @@ fn no_region_reaching_a_capture_indirectly_is_inferred_unique() {
         );
     }
 }
-
 
 /// Why a wrong answer from the inference is survivable, stated as a property of the allocator
 /// rather than as a hope: [`Arena::close`] never reads the region's kind.
