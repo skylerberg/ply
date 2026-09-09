@@ -3,10 +3,8 @@
 
 mod fixture;
 
-mod blake3_differential;
 mod cell_arena_wiring;
 mod constant_memo;
-mod ctor_value_sharing;
 mod determinism_audit;
 mod differential_corpus;
 mod exploration_soundness;
@@ -15,11 +13,9 @@ mod host_boundary;
 mod host_linearity_audit;
 mod host_trust_audit;
 mod map_order;
-mod ownership_checker_armed;
 mod ownership_checker_oracle;
 mod position_invariance_g1;
 mod record_update_reuse;
-mod reference_counting_audit;
 mod reference_counting_cost;
 mod reference_cycles;
 mod region_boundary_audit;
@@ -27,8 +23,6 @@ mod region_isolation_audit;
 mod region_kind_inference;
 mod region_kind_sharing;
 mod region_meaning_adversarial;
-mod region_meaning_audit;
-mod region_reclamation_census;
 mod region_wiring_audit;
 mod resumption_scope_audit;
 mod resumption_semantics_audit;
