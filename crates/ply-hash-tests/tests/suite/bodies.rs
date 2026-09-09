@@ -642,6 +642,33 @@ fn moving_a_definition_between_modules_changes_no_body() {
 /// Checking is not the bar — M5 has to *evaluate* a historical definition set — so the
 /// reconstructed tests are run, in the reconstructed program, against the reconstructed
 /// definitions.
+/// A rebuilt program has no module text for the whole emitter to re-read, so a reconstructed
+/// body runs on the reference fragment, as `ply_test::hybrid` runs a mixture. A body outside the
+/// fragment -- one that handles an effect -- is declined rather than answered; an AST printer
+/// would lift that.
+fn on_the_tier<'a>(
+    program: &'a ply_syntax::ast::Program,
+    resolved: &'a ply_syntax::resolve::Resolved,
+    check: &'a CheckOutput,
+) -> ply_eval::Machine<'a> {
+    let unit = ply_codegen::c::producer::reference_only(|| {
+        ply_codegen::Unit::over(program, resolved, check)
+    })
+    .expect("this host has a C compiler");
+    let spec = ply_eval::BackendSpec {
+        kind: ply_eval::BackendKind::C,
+        ..Default::default()
+    };
+    let mut machine = ply_eval::Machine::new(program, resolved, check);
+    machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
+    machine
+}
+
+fn declined_by_the_fragment(d: &impl std::fmt::Display) -> bool {
+    let text = d.to_string();
+    text.contains("E0502") && text.contains("neither front end holds a body")
+}
+
 #[test]
 fn reconstructed_tests_evaluate() {
     let original = compile(&[(
@@ -668,14 +695,17 @@ fn reconstructed_tests_evaluate() {
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should check");
-    let mut interp = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
+    let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
 
     assert_eq!(interp.test_count(), 2);
-    for index in 0..interp.test_count() {
-        interp
-            .eval_test(index)
-            .unwrap_or_else(|d| panic!("reconstructed test {index} failed: {d}"));
-    }
+    // The second test is pure and runs; the first handles an effect and is declined.
+    interp
+        .eval_test(1)
+        .unwrap_or_else(|d| panic!("the reconstructed pure test failed: {d}"));
+    let d = interp
+        .eval_test(0)
+        .expect_err("a handler is outside the fragment");
+    assert!(declined_by_the_fragment(&d), "{d}");
 }
 
 /// The corpus a person actually edits, rather than a snippet written to pass.
@@ -955,11 +985,17 @@ fn two_tests_that_number_one_effect_differently_both_reconstruct() {
     let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
     let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
     let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
-    let mut interp = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
+    let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
     assert_eq!(interp.test_count(), 2);
+    // Both handle an effect, so both are declined by the fragment; that they resolve and check
+    // above is the property.
     for index in 0..interp.test_count() {
-        interp
+        let d = interp
             .eval_test(index)
-            .unwrap_or_else(|d| panic!("reconstructed test {index} failed: {d}"));
+            .expect_err("a handler is outside the fragment");
+        assert!(
+            declined_by_the_fragment(&d),
+            "reconstructed test {index}: {d}"
+        );
     }
 }
