@@ -1677,6 +1677,40 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
         "`evaluate`, the same flag over a `.plyx`: the artifact's verified definitions run \
          under the backend, and an artifact run has no result cache either.",
     ),
+    (
+        "crates/ply-cli/src/engine.rs",
+        "`Engine::machine`, attaching what the command resolved: the default tier under \
+         tier-only (ADR 0048), or what `--backend` names. `Engine::of_backend` keys an \
+         honest spec as `Evaluator`, so a pass the tier writes is the default run's own \
+         namespace and a spec that is wrong on purpose keeps `c/wrong:..`. \
+         `the_default_tier_and_backend_c_are_one_engine` and \
+         `a_corrupt_backend_neither_reads_nor_writes_the_cache` in \
+         crates/ply-cli/tests/suite/cli.rs, each seen to fail.",
+    ),
+    (
+        "crates/ply-corpus/src/lib.rs",
+        "`tier_machine` and `run_on_tier`, the corpus's measurement routes, over the honest \
+         spec: `run_on_tier` records under `Evaluator` as `ply test` does, and `tier_machine` \
+         answers the calls a harness times and records nothing. \
+         `w6_request_cost::entering_the_machine_allocates_a_bounded_amount` in \
+         crates/ply-corpus-tests/tests/allocation was seen to fail when the route \
+         declined instead of attaching.",
+    ),
+    (
+        "crates/ply-corpus/src/w3.rs",
+        "the W3 harness's in-process machine over the desk service, honest spec, no result \
+         cache: it prices a request and records nothing a later run reads. \
+         `w6_request_cost::a_request_allocates_where_the_ladder_says_its_time_goes` runs it \
+         and was seen to fail.",
+    ),
+    (
+        "crates/ply-test/src/hybrid.rs",
+        "the bisection's trial machine over a mixture, a reconstructed AST with no text: the \
+         reference fragment only, which emits the C the whole tier ran for an effect-free \
+         program, and a pass is recorded under `Engine::Evaluator` by `result_key`. \
+         `hybrid::one_culprit_among_five_edits_is_named_within_the_logarithmic_budget` in \
+         crates/ply-test-tests/tests/suite runs it and was seen to fail.",
+    ),
 ];
 
 /// A backend installed by a route the cache rule does not know about.

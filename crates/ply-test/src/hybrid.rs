@@ -236,7 +236,8 @@ impl Hybrid for BodyHybrid<'_> {
             .tests
             .first()
             // `Engine::Evaluator` whatever the run around this one installed: the trial below
-            // builds a bare `Machine`, so what it proves is the evaluator's claim and belongs in
+            // runs the reference fragment, which emits the C the whole tier ran for an
+            // effect-free mixture, so what it proves is the evaluator's claim and belongs in
             // the evaluator's namespace.
             .map(|hash| result_key(*hash, seeded, &self.plan, &Engine::Evaluator));
         if let Some(hash) = hash

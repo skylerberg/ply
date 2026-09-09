@@ -125,6 +125,23 @@ pub mod tests_support {
         with_refusals(text).map(|(s, n, _)| (s, n))
     }
 
+    /// A machine over `source` with the default tier attached, so what the reference fragment
+    /// answers is checked against what the whole emitter answers.
+    pub fn machine(source: &'static Source, text: &str) -> ply_eval::Machine<'static> {
+        crate::c::producer::ensure_default();
+        let texts = std::collections::HashMap::from([("m".to_string(), text.to_string())]);
+        let unit =
+            crate::Unit::over_with_texts(source.program, source.resolved, source.check, texts)
+                .expect("this host has a C compiler");
+        let mut machine = ply_eval::Machine::new(source.program, source.resolved, source.check);
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
+        machine
+    }
+
     /// The same, with a key per definition so the emit cache is live.
     ///
     /// The key has to move when the text does. A name alone is stable and distinct, which is all
@@ -172,7 +189,7 @@ pub mod tests_support {
         )));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        match crate::c::build(source, &refs) {
+        match crate::c::producer::reference_only(|| crate::c::build(source, &refs)) {
             Ok((native, refused)) => Some((source, native, refused)),
             Err(e) if e.to_string().contains("could not run") => None,
             Err(e) => panic!("{e}"),
@@ -216,7 +233,7 @@ pub fn looped(n: Int) -> Int =
     let Some((loaded, native)) = tests_support::unit(source) else {
         return;
     };
-    let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut machine = tests_support::machine(loaded, source);
     let cases: &[(&str, Vec<ply_eval::Value>)] = &[
         ("m.mixed", vec![ply_eval::Value::Int(0xDEAD_BEEF)]),
         ("m.mixed", vec![ply_eval::Value::Int(0)]),
@@ -276,10 +293,10 @@ pub fn wide(n: Int) -> Int = {
 }
 pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 2654435761u32), 7))
 "#;
-    let Some((source, native, _)) = tests_support::with_refusals(source) else {
+    let Some((loaded, native, _)) = tests_support::with_refusals(source) else {
         return;
     };
-    let mut machine = ply_eval::Machine::new(source.program, source.resolved, source.check);
+    let mut machine = tests_support::machine(loaded, source);
     for name in ["m.wide", "m.narrow"] {
         let entry: crate::rt::Entry = native
             .entry(name)
@@ -351,7 +368,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let Some((loaded, native)) = tests_support::unit(&source) else {
             return;
         };
-        let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+        let mut machine = tests_support::machine(loaded, &source);
         let args = vec![ply_eval::Value::Int(4)];
         let want = machine
             .call("m.probe", args.clone(), ply_span::Span::DUMMY)
@@ -418,7 +435,7 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
         refused.is_empty(),
         "nothing here is outside the fragment: {refused:?}"
     );
-    let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut machine = tests_support::machine(loaded, source);
     let cases: &[(&str, Vec<ply_eval::Value>)] = &[
         ("m.round", vec![ply_eval::Value::Int(7)]),
         ("m.eof", vec![]),
@@ -480,7 +497,7 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
     );
     let list =
         |xs: &[i64]| ply_eval::Value::list(xs.iter().map(|n| ply_eval::Value::Int(*n)).collect());
-    let mut machine = ply_eval::Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut machine = tests_support::machine(loaded, source);
     let cases: &[(&str, Vec<ply_eval::Value>)] = &[
         ("m.twice", vec![list(&[1, 2, 3])]),
         ("m.and_len", vec![list(&[1, 2, 3])]),
@@ -556,7 +573,8 @@ pub fn alone(n: Int) -> Int = twice(n)
         Some(crate::heap::imm_value(w))
     };
 
-    let (wide, _) = crate::c::build(loaded, &all).expect("builds");
+    let (wide, _) =
+        crate::c::producer::reference_only(|| crate::c::build(loaded, &all)).expect("builds");
     assert_eq!(answer(&wide, "m.both", 5), Some(25));
     drop(wide);
 
@@ -564,7 +582,8 @@ pub fn alone(n: Int) -> Int = twice(n)
     // path the digest has to follow: `names` is unchanged, so a digest taken before the filter is
     // the same digest, and the refusals below land under the wider run's key.
     unsafe { std::env::set_var("PLY_C_SKIP", "m.thrice") };
-    let (narrowed, refused) = crate::c::build(loaded, &all).expect("builds");
+    let (narrowed, refused) =
+        crate::c::producer::reference_only(|| crate::c::build(loaded, &all)).expect("builds");
     assert!(
         refused.iter().any(|r| r.function == "m.both"),
         "`m.both` calls a definition this build was not offered: {refused:?}"
@@ -574,7 +593,8 @@ pub fn alone(n: Int) -> Int = twice(n)
 
     unsafe { std::env::remove_var("PLY_C_SKIP") };
     // The one that used to come back wrong.
-    let (again, refused) = crate::c::build(loaded, &all).expect("builds");
+    let (again, refused) =
+        crate::c::producer::reference_only(|| crate::c::build(loaded, &all)).expect("builds");
     assert!(
         refused.is_empty(),
         "the wider build was served the narrower one's refusals: {refused:?}"
@@ -635,7 +655,8 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
         crate::heap::imm_value(w)
     };
 
-    let (built, _) = crate::c::build(loaded, &names).expect("the first build");
+    let (built, _) = crate::c::producer::reference_only(|| crate::c::build(loaded, &names))
+        .expect("the first build");
     let first = (
         ask(&built, "m.both", &[3, 4]),
         ask(&built, "m.tagged", &[7]),
@@ -649,7 +670,8 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
     drop(built);
 
     let reused = super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
-    let (again, _) = crate::c::build(loaded, &names).expect("the second build");
+    let (again, _) = crate::c::producer::reference_only(|| crate::c::build(loaded, &names))
+        .expect("the second build");
     assert_eq!(
         super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed),
         reused + 1,
