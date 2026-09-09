@@ -1016,6 +1016,113 @@ fn two_mains_are_reported_rather_than_resolved_by_load_order() {
     assert_eq!(v["entry"], "two.main");
 }
 
+// --- tasks under --host -----------------------------------------------------
+
+const SPAWN_UNDER_A_HANDLER: &str = "\
+effect note {
+  read say() -> Int
+}
+
+fn work() -> Int / {note.read} = note.say()
+
+fn main() -> Int / {task.write} =
+  handle {
+    let t = task.spawn(|| work());
+    task.join(t)
+  } with {
+    note.say() -> 41,
+  }
+";
+
+const A_TASK_FAILS_UNDER_HANDLERS: &str = "\
+effect note {
+  read say() -> Int
+}
+effect other {
+  read what() -> Int
+}
+
+fn work() -> Int / {other.read} = other.what()
+
+fn main() -> Int / {task.write, other.read} =
+  handle {
+    handle {
+      let t = task.spawn(|| work());
+      task.join(t)
+    } with {
+      note.say() -> 42,
+    }
+  } with {
+    note.say() -> 41,
+  }
+";
+
+const A_TASK_REACHES_A_CLAUSE_THAT_BINDS_RESUME: &str = "\
+effect ask {
+  read q() -> Int
+}
+
+fn work() -> Int / {ask.read} = ask.q()
+
+test \"a task cannot reach a clause that binds resume\" {
+  let r = simulate {
+    handle {
+      let t = task.spawn(|| work());
+      task.join(t)
+    } with {
+      ask.q() resume k -> k(1) + k(2),
+    }
+  };
+  assert_eq(r, 3)
+}
+";
+
+/// The production region is opened by the first `task.spawn`, on the stack that holds the
+/// handlers `main` installed before it: a task performs against those.
+#[test]
+fn a_task_under_host_performs_against_the_handlers_around_its_spawn() {
+    let dir = project(SPAWN_UNDER_A_HANDLER);
+    let out = ply(dir.path()).args(["run", "--host"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let text = stdout_of(&out);
+    assert_eq!(
+        text.lines().last().map(str::trim),
+        Some("41"),
+        "got:\n{text}"
+    );
+}
+
+/// When the region's loop ends on a task's failure it resumes the root directly, and the root
+/// unwinds its own handlers on its own stack rather than the loop's.
+#[test]
+fn a_task_that_fails_under_host_is_reported_rather_than_aborting_the_process() {
+    let dir = project(A_TASK_FAILS_UNDER_HANDLERS);
+    let out = ply(dir.path()).args(["run", "--host"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("E0303"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+}
+
+/// A clause that binds `resume` would capture the spawner's continuation, not the task's.
+#[test]
+fn a_task_reaching_a_clause_that_binds_resume_is_refused_with_a_diagnostic() {
+    let dir = project(A_TASK_REACHES_A_CLAUSE_THAT_BINDS_RESUME);
+    let out = ply(dir.path())
+        .args(["test", "--no-cache"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("resumes off the tail"), "{text}");
+    assert!(!text.contains("panicked"), "{text}");
+}
+
 // --- hosts ------------------------------------------------------------------
 
 #[test]

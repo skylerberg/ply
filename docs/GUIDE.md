@@ -1939,6 +1939,15 @@ progress — nothing enabled and no timer that can fire, or a spent step budget 
 is `E0414 deadlock`. A `simulate` inside a `simulate`, lexically or through a
 call, is `E0416`.
 
+**A task performs against the handlers that enclosed its `task.spawn`**, as they
+stood at the spawn: a `handle` around the spawn answers the task's operations
+whether it sits inside or outside the region, and whatever the spawner does
+afterwards — leaving that `handle` before the task runs changes nothing the
+task sees. The one clause a task cannot reach is one that binds `resume`
+(§7.7): the continuation it would capture is the spawner's body rather than the
+task's, so performing that operation from a task is `E0502` rather than a
+wrong capture.
+
 ### 10.3 The search, and why it is a proof
 
 Two tasks whose footprints do not conflict **commute**, so exploring both orders

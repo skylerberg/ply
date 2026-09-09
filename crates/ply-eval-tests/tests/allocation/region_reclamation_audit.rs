@@ -426,7 +426,7 @@ fn a_capture_across_a_unique_region_is_named_rather_than_freed() {
 
 #[test]
 fn a_capture_outside_every_region_has_nothing_to_pin() {
-    let mut arena = Arena::new();
+    let mut arena: Arena = Arena::new();
     assert!(arena.pin().is_none());
     assert_eq!(arena.stats().pins_taken, 0);
 }
