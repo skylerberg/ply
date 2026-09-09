@@ -172,6 +172,29 @@ pub fn run_on_tier(
     ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
 }
 
+/// The default tier attached to a machine over `loaded`'s program: what the commands build
+/// inline, for a test that makes a machine of its own.
+#[cfg(test)]
+pub(crate) fn attach_tier(
+    machine: &mut ply_eval::Machine<'_>,
+    loaded: &crate::load::Loaded,
+) -> Result<(), Diagnostic> {
+    let Some(spec) = backend_spec(None)? else {
+        return Ok(());
+    };
+    let texts = module_texts(&loaded.program, &loaded.sources);
+    let provider = build_backend(
+        &spec,
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        &loaded.hashes,
+        texts,
+    )?;
+    machine.set_compiled(provider.attach(&spec));
+    Ok(())
+}
+
 /// Each module's source text by name: what a second emitter reads the program from.
 pub(crate) fn module_texts(
     program: &ply_syntax::ast::Program,
