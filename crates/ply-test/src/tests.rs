@@ -671,26 +671,6 @@ fn renaming_a_definition_selects_nothing() {
     );
 }
 
-const NONDETERMINISTIC: &str = r#"
-nondet effect wall {
-  read now() -> Int
-}
-
-fn tick() -> Int / {wall.read} = wall.now()
-
-test "pure arithmetic" {
-  assert_eq(1 + 1, 2)
-}
-
-test/nondet "the clock advances" {
-  handle {
-    assert(tick() > 0)
-  } with {
-    wall.now() -> 7,
-  }
-}
-"#;
-
 #[test]
 fn a_stored_failure_is_never_trusted() {
     let root = TempRoot::new();
@@ -1301,13 +1281,6 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
         crate::Verdict::NotAttempted(crate::Skipped::Panicked)
     );
 }
-
-const RUNAWAY: &str = r#"
-fn step(n: Int) -> Int = n + 1
-fn spin(n: Int) -> Int = spin(step(n))
-
-test "spins" { assert_eq(spin(0), 0) }
-"#;
 
 #[test]
 fn the_json_report_carries_the_diagnostic_and_the_suspects() {
