@@ -851,17 +851,6 @@ impl Continuation {
         self.resumes.get()
     }
 
-    /// Counts this resumption and decides whether it may proceed, answering the ordinal of the
-    /// refused resumption when it may not.
-    pub(crate) fn admit(&self, host_ops: u64) -> Result<(), u32> {
-        let resumes = self.resumes.get().saturating_add(1);
-        self.resumes.set(resumes);
-        if resumes > 1 && host_ops > self.born {
-            return Err(resumes);
-        }
-        Ok(())
-    }
-
     /// What splicing this back costs against the call budget: a resumption re-installs the calls
     /// the capture cut away.
     pub fn calls(&self) -> usize {

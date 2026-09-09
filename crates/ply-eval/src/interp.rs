@@ -15,7 +15,6 @@
 //! methods stay `&self`) and [`crate::Machine`] (which embeds a `Core` and threads it by `&mut`,
 //! so `cells()` can hand out `&Arena`) evaluate through the one `Core`.
 
-use crate::backend::Counters;
 use crate::code::{
     self, Arm, Captures, Clause, Code, Lowered, Lowering, NodeKind, Pat, ReturnArm, Stmt,
 };
@@ -47,15 +46,11 @@ struct Def<'p> {
 /// (`borrow`, for an engine that lives as long as the borrow) or leaked to `'static` (`over`, for
 /// a `Provider` a backend shares across threads).
 pub struct Interpreter<'p> {
-    origin: usize,
-    program: &'p Program,
     resolved: &'p Resolved,
     defs: FxHashMap<Symbol, Def<'p>>,
-    tests: FxHashMap<Symbol, (&'p Expr, usize)>,
     ctors: FxHashMap<Symbol, usize>,
     ops: crate::semantics::OpTable,
     members: BTreeSet<Symbol>,
-    counters: Counters,
 }
 
 impl Interpreter<'static> {
@@ -64,11 +59,10 @@ impl Interpreter<'static> {
         resolved: &Resolved,
         check: &CheckOutput,
     ) -> &'static Interpreter<'static> {
-        let origin = std::ptr::from_ref(program) as usize;
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static Resolved = Box::leak(Box::new(resolved.clone()));
         let _ = check;
-        Box::leak(Box::new(Interpreter::build(origin, program, resolved)))
+        Box::leak(Box::new(Interpreter::build(program, resolved)))
     }
 
     pub fn over_static(
@@ -76,15 +70,14 @@ impl Interpreter<'static> {
         resolved: &'static Resolved,
         check: &'static CheckOutput,
     ) -> &'static Interpreter<'static> {
-        { let _ = check; Box::leak(Box::new(Interpreter::build(std::ptr::from_ref(program) as usize, program, resolved))) }
+        { let _ = check; Box::leak(Box::new(Interpreter::build(program, resolved))) }
     }
 }
 
 impl<'p> Interpreter<'p> {
     /// Build the tables borrowing the program, for an engine whose life is the borrow's.
     pub fn borrow(program: &'p Program, resolved: &'p Resolved) -> Interpreter<'p> {
-        let origin = std::ptr::from_ref(program) as usize;
-        Interpreter::build(origin, program, resolved)
+        Interpreter::build(program, resolved)
     }
 
     /// The parameters, body and home module of a definition, for an engine entering it whole.
@@ -94,9 +87,8 @@ impl<'p> Interpreter<'p> {
             .map(|d| (Rc::new(d.params.clone()), d.body, d.module))
     }
 
-    fn build(origin: usize, program: &'p Program, resolved: &'p Resolved) -> Interpreter<'p> {
+    fn build(program: &'p Program, resolved: &'p Resolved) -> Interpreter<'p> {
         let mut defs = FxHashMap::default();
-        let mut tests = FxHashMap::default();
         let mut ctors: FxHashMap<Symbol, usize> =
             ply_core::prelude::ctor_arities().into_iter().collect();
         let mut ops = crate::semantics::OpTable::default();
@@ -119,9 +111,8 @@ impl<'p> Interpreter<'p> {
                         );
                         members.insert(name);
                     }
-                    Item::Test(test) => {
+                    Item::Test(_) => {
                         let name = m.name.qualify(&Symbol::new(format!("test#{ordinal}")));
-                        tests.insert(name.clone(), (&test.body, module));
                         members.insert(name);
                         ordinal += 1;
                     }
@@ -145,15 +136,11 @@ impl<'p> Interpreter<'p> {
             }
         }
         Interpreter {
-            origin,
-            program,
             resolved,
             defs,
-            tests,
             ctors,
             ops,
             members,
-            counters: Counters::default(),
         }
     }
 
