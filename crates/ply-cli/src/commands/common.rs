@@ -521,8 +521,10 @@ pub fn materialise_schema(
         .defs
         .values()
         .find(|d| d.name.as_str() == name)?;
-    ply_eval::Machine::new(&loaded.program, &loaded.resolved, &loaded.check)
-        .call(name, Vec::new(), def.span)
+    // A `--db-schema` function is a pure const the tooling reads before the run; the pure applier
+    // evaluates it without a compiled tier (ADR 0048), as `--config-schema` does.
+    ply_eval::interp::Pure::new(&loaded.program, &loaded.resolved)
+        .call(name, Vec::new(), def.span, 10_000)
         .ok()
         .as_ref()
         .and_then(crate::db::schema::shape_of)
