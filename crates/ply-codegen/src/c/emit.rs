@@ -1484,6 +1484,17 @@ impl<'a> Emit<'a> {
                         _ => {
                             let w = self.word(&v);
                             let held = self.bind(Kind::Boxed, w);
+                            // A refutable `let` binds only when the value matches its pattern:
+                            // `let Circle(r) = s` on a `Tri` must raise, not read a field that is
+                            // not there. `bind_pattern` reads fields without testing the tag (it is
+                            // sound only for an irrefutable pattern), so the test guards it — the
+                            // same tag check a `match` arm makes, raising `rt_no_match` on failure.
+                            if !self.irrefutable_pat(pat) {
+                                let test = self.test(pat, &held)?;
+                                self.line(format!(
+                                    "if (!({test})) {{ rt_no_match_p(ctx); return 0; }}"
+                                ));
+                            }
                             self.bind_pattern(pat, &held)?;
                         }
                     }
