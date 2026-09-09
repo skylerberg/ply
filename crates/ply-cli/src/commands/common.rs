@@ -190,10 +190,11 @@ pub(crate) fn module_texts(
 
 /// The backend `ply prove` and `ply review` attach for a program's propositions (ADR 0045
 /// §"The facade"): the unit over the whole program, its laws' and clauses' roots included.
-pub(crate) fn prover_backend(
+pub fn prover_backend(
     flag: Option<&String>,
     loaded: &crate::load::Loaded,
 ) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
+    ply_codegen::c::producer::ensure_default();
     let Some(spec) = backend_spec(flag)? else {
         return Ok(None);
     };

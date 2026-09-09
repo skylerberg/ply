@@ -274,6 +274,12 @@ impl<'a> Prover<'a> {
         let mut machine =
             Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        // The compiled tier is the evaluator (ADR 0048): an obligation's owner is called through
+        // the machine to produce the `result` its `ensures` speaks of, so the machine must hold the
+        // same tier its propositions are entered on, or that call declines with no body.
+        if let Some((provider, spec)) = self.backend.as_ref() {
+            machine.set_compiled(provider.attach(spec));
+        }
         machine
     }
 

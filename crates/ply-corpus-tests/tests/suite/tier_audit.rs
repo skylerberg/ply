@@ -32,7 +32,12 @@ fn every_proof_a_generated_corpus_produces_survives_a_wide_sample() {
         let loaded = load(&root).expect("a generated corpus compiles");
         let hashes = loaded.hashes.clone();
         let collected = obligations::collect(&loaded.program, &loaded.check, &hashes);
-        let prover = Prover::new(&loaded.program, &loaded.resolved, &loaded.check);
+        // The prover samples generated functions on the compiled tier (ADR 0048) — the only
+        // evaluator — so it is given one, as `ply prove` gives its own prover one.
+        let backend = ply_cli::commands::common::prover_backend(None, &loaded)
+            .expect("the corpus compiles to a tier");
+        let prover =
+            Prover::new(&loaded.program, &loaded.resolved, &loaded.check).with_backend(backend);
         for obligation in &collected.obligations {
             if prover
                 .discharge_with(obligation, &ProvePlan::default())
