@@ -306,6 +306,9 @@ pub struct PlyProducer {
     modules: RefCell<HashMap<usize, Bodies>>,
     asked: Cell<u64>,
     answered: Cell<u64>,
+    /// Why the emitter raised over a program, by the program's address: a unit built over its
+    /// silence would cache the failure as the program's bodies.
+    failed: RefCell<HashMap<usize, String>>,
 }
 
 /// The entry the emitter is entered through: `emit_bodies_all(names, srcs, ctors, builtins)`,
@@ -323,7 +326,14 @@ impl PlyProducer {
             modules: RefCell::new(HashMap::new()),
             asked: Cell::new(0),
             answered: Cell::new(0),
+            failed: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Why the emitter raised over `loaded`, when it did.
+    pub fn failure(&self, loaded: &Source) -> Option<String> {
+        let program = std::ptr::from_ref(loaded) as usize;
+        self.failed.borrow().get(&program).cloned()
     }
 
     /// Bodies asked for and bodies answered, over this thread's life.
@@ -341,7 +351,7 @@ impl PlyProducer {
             let bodies = match self.bodies_of(loaded) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("the Ply emitter failed over the program: {e:#}");
+                    self.failed.borrow_mut().insert(program, format!("{e:#}"));
                     HashMap::new()
                 }
             };

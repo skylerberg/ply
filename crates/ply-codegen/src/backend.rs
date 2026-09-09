@@ -281,7 +281,8 @@ impl Provider for Unit {
         }
         match self.build() {
             Ok(bodies) => ply_eval::backend::wrap(Rc::new(bodies), spec),
-            Err(_) => {
+            Err(e) => {
+                eprintln!("the C tier built no unit for this program: {e:#}");
                 self.poisoned.fetch_add(1, Ordering::Relaxed);
                 ply_eval::backend::wrap(Rc::new(Absent { unit: self }), spec)
             }
