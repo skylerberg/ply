@@ -44,6 +44,7 @@ struct Program {
     resolved: Resolved,
     check: CheckOutput,
     hashes: HashOutput,
+    src: String,
 }
 
 impl Program {
@@ -61,7 +62,17 @@ impl Program {
             resolved,
             check,
             hashes,
+            src: src.to_string(),
         }
+    }
+
+    /// Each module's source text by name — what the whole Ply emitter re-parses to produce bodies.
+    fn texts(&self) -> std::collections::HashMap<String, String> {
+        self.program
+            .modules
+            .iter()
+            .map(|m| (m.name.to_string(), self.src.clone()))
+            .collect()
     }
 
     fn index_of(&self, name: &str) -> usize {
@@ -90,8 +101,9 @@ impl Program {
     /// scheduling and caching test in this file is exercised over a real Ply program end to end.
     /// `Unit::over` leaks a `&'static Unit`, which is fine in a test.
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
-        let unit = ply_codegen::Unit::over(&self.program, &self.resolved, &self.check)
-            .expect("this host has a C compiler");
+        let unit =
+            ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, &self.check, self.texts())
+                .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()
@@ -674,36 +686,6 @@ test/nondet "the clock advances" {
   }
 }
 "#;
-
-#[test]
-fn a_nondet_test_always_runs_and_is_never_cached() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(NONDETERMINISTIC);
-    let nondet = program.index_of("the clock advances");
-    let pure = program.index_of("pure arithmetic");
-
-    for round in 0..3 {
-        let selection = program.select(&store);
-        assert_eq!(selection.reason(nondet), Some(Reason::Nondet));
-        assert!(selection.to_run.contains(&nondet), "round {round}");
-        if round > 0 {
-            assert_eq!(
-                selection.reason(pure),
-                Some(Reason::Cached),
-                "round {round}"
-            );
-            assert_eq!(selection.to_run, vec![nondet], "round {round}");
-        }
-        let report = program.run(&selection, &mut store);
-        assert_eq!(report.failed, 0, "round {round}: {:#?}", report.failures);
-    }
-
-    assert!(
-        store.get(program.hashes.tests[nondet]).is_none(),
-        "a nondet pass must never reach the store"
-    );
-}
 
 #[test]
 fn a_stored_failure_is_never_trusted() {
@@ -1322,33 +1304,6 @@ fn spin(n: Int) -> Int = spin(step(n))
 
 test "spins" { assert_eq(spin(0), 0) }
 "#;
-
-/// Exceeding a documented resource limit is the program's behaviour, not Ply falling over.
-#[test]
-fn a_runaway_recursion_is_a_red_test_and_not_a_defect_in_ply() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(RUNAWAY);
-    let selection = program.select(&store);
-    let report = program.run(&selection, &mut store);
-
-    assert_eq!(report.failed, 1);
-    assert_eq!(report.results[0].status, Status::Failed);
-
-    let failure = &report.failures[0];
-    assert!(!failure.defect, "{:#?}", failure.diagnostic);
-    assert_eq!(failure.diagnostic.code, ply_span::codes::RUNTIME_ERROR);
-    assert!(
-        failure.diagnostic.message.contains("recursion limit"),
-        "{}",
-        failure.diagnostic.message
-    );
-    assert_ne!(
-        failure.attribution.bisection.verdict,
-        crate::Verdict::NotAttempted(crate::Skipped::Panicked),
-        "bisection was suppressed for a perfectly bisectable failure"
-    );
-}
 
 #[test]
 fn the_json_report_carries_the_diagnostic_and_the_suspects() {

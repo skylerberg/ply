@@ -93,10 +93,23 @@ impl Unit {
         // The keys make a test or a law a root the unit compiles (ADR 0045/0048); without them the
         // tier holds no `test#N` to enter. `over` derives them so a caller that has no hashes of
         // its own — a test, `Unit::over` at large — still gets a unit that runs the language.
+        Unit::over_with_texts(program, resolved, check, HashMap::new())
+    }
+
+    /// `over` with the program's module source texts, which the whole Ply emitter re-parses to
+    /// produce bodies (it is a front end, not an AST consumer): without them its `bodies_of`
+    /// returns nothing and the tier holds no body. A test that wants the full language on the tier
+    /// passes `texts` here; `over` (no texts) gets the reference emitter's fragment.
+    pub fn over_with_texts(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        check: &ply_core::CheckOutput,
+        texts: HashMap<String, String>,
+    ) -> Result<&'static Unit> {
         let keys = ply_hash::hash_program(program, resolved, check)
             .map(|hashes| crate::source::emit_keys(program, &hashes))
             .unwrap_or_default();
-        Unit::keyed(program, resolved, check, keys, HashMap::new())
+        Unit::keyed(program, resolved, check, keys, texts)
     }
 
     /// The same, told what each definition's code is a function of, so that emitted bodies and
@@ -109,9 +122,6 @@ impl Unit {
         keys: HashMap<String, String>,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
-        // Tier-only (ADR 0048): the whole Ply emitter is the default producer, since the reference
-        // emitter is a fragment. A caller that already installed one (e.g. `PLY_C_EMITTER`) keeps it.
-        crate::c::producer::ensure_default();
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
         let origin = std::ptr::from_ref(program) as usize;
