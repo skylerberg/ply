@@ -3033,6 +3033,15 @@ carries a line number. It is off, and a flag, because it is a disclosure
 decision — and it changes the digest, so "was this built with sources" is
 answerable from the digest alone.
 
+An artifact always carries the compiled unit the Ply emitter produced over its
+definitions — the C and the record the runtime rebuilds its tables from — so
+`ply run app.plyx` enters the program as it was built, effects included, and
+re-parses nothing. The unit is tied to the runtime that built it: one built under
+another `ply` is left aside with a warning, and the run falls back to the pure
+fragment the reference emitter rebuilds from the bodies alone, from which no
+`perform` reaches the host. `ply build` reports, as a warning, any definition the
+emitter refused, since that one is entered from nothing at run time.
+
 `--config-schema` and `--db-schema` on `ply build` ship those functions' closures
 too, so the deployed artifact keeps the start-up refusals: a schema function is
 nullary and nothing in the entry point's closure calls it, so without the flag it

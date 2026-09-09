@@ -11,7 +11,7 @@ use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
 use ply_core::DefInfo;
 use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 
 pub fn execute(args: &BuildArgs, style: Style) -> i32 {
@@ -85,9 +85,10 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
             "definitions": built.artifact.bodies.len(),
             "names": built.artifact.names.len(),
             "sources": built.artifact.has_sources(),
+            "unit": built.artifact.has_unit(),
             "artifact_bytes": bytes.len(),
             "binary_bytes": binary_bytes(),
-            "diagnostics": Value::Array(Vec::new()),
+            "diagnostics": diagnostics_json(&built.warnings, &loaded.sources),
         }));
         return EXIT_OK;
     }
@@ -106,6 +107,7 @@ pub fn execute(args: &BuildArgs, style: Style) -> i32 {
         human(bytes.len() as u64),
         out.display(),
     );
+    print_diagnostics(&built.warnings, &loaded.sources, style);
     // The ratio incremental transfer was decided against on.
     match binary_bytes() {
         Some(n) => println!(

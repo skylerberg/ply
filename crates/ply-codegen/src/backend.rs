@@ -70,6 +70,17 @@ pub struct Unit {
     compiles: AtomicU64,
     /// Workers whose build failed after the pre-flight in [`Unit::over`] succeeded.
     poisoned: AtomicU64,
+    /// A unit produced elsewhere that this one loads rather than builds.
+    embedded: Option<Embedded>,
+}
+
+/// What an artifact carries of its compiled unit: the C, the record `finish` rebuilds the tables
+/// from as `cache::encode_unit` writes it, and the constructor table it was emitted against. The
+/// record stays encoded here because a decoded one holds `Value`s, which do not cross threads.
+pub struct Embedded {
+    pub text: String,
+    pub record: String,
+    pub ctors: Vec<(Symbol, usize)>,
 }
 
 impl Unit {
@@ -144,8 +155,57 @@ impl Unit {
             codegen_nanos: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
+            embedded: None,
         };
         Ok(Box::leak(Box::new(unit)))
+    }
+
+    /// A unit produced elsewhere, which is what an artifact carries: its definitions are the ones
+    /// the record says it took, and nothing here asks a producer for anything.
+    pub fn embedded(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        check: &ply_core::CheckOutput,
+        embedded: Embedded,
+    ) -> Result<&'static Unit> {
+        let record = crate::c::cache::decode_unit(&embedded.record)
+            .ok_or_else(|| anyhow::anyhow!("the embedded unit's record does not decode"))?;
+        let origin = std::ptr::from_ref(program) as usize;
+        let program: &'static Program = Box::leak(Box::new(program.clone()));
+        let resolved: &'static ply_syntax::resolve::Resolved =
+            Box::leak(Box::new(resolved.clone()));
+        let check: &'static ply_core::CheckOutput = Box::leak(Box::new(check.clone()));
+        let source: &'static Source = Box::leak(Box::new(Source::new(program, resolved, check)));
+        let compiled = record.taken.clone();
+        let members: BTreeSet<Symbol> = compiled
+            .iter()
+            .filter(|name| registers(source, name))
+            .map(Symbol::new)
+            .collect();
+        let unit = Unit {
+            origin,
+            source,
+            compiled,
+            members,
+            refusals: record.refusals.clone(),
+            counters: Counters::default(),
+            analysis_nanos: 0,
+            codegen_nanos: AtomicU64::new(0),
+            compiles: AtomicU64::new(0),
+            poisoned: AtomicU64::new(0),
+            embedded: Some(embedded),
+        };
+        Ok(Box::leak(Box::new(unit)))
+    }
+
+    /// The whole unit over `names`, produced and not compiled: what `ply build` embeds.
+    pub fn produce(&'static self, names: &[&str]) -> Result<crate::c::Produced> {
+        crate::c::produce(self.source, names)
+    }
+
+    /// The constructor table a unit over this program is emitted against.
+    pub fn ctors(&self) -> Vec<(Symbol, usize)> {
+        self.source.ctors()
     }
 
     /// The bodies this unit builds, as the concrete type rather than behind `dyn Compiled`.
@@ -181,12 +241,28 @@ impl Unit {
     }
 
     fn build(&'static self) -> Result<Bodies> {
-        // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
-        // worker reads that unit back rather than emitting it again.
-        let candidates = self.source.functions();
-        let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let started = std::time::Instant::now();
-        let (native, _refused) = crate::c::build(self.source, &names)?;
+        let native = match &self.embedded {
+            Some(embedded) => {
+                let record = crate::c::cache::decode_unit(&embedded.record)
+                    .ok_or_else(|| anyhow::anyhow!("the embedded unit's record does not decode"))?;
+                crate::c::load_unit(
+                    self.source,
+                    &embedded.text,
+                    record,
+                    embedded.ctors.clone(),
+                    "artifact",
+                )?
+                .0
+            }
+            // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
+            // worker reads that unit back rather than emitting it again.
+            None => {
+                let candidates = self.source.functions();
+                let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
+                crate::c::build(self.source, &names)?.0
+            }
+        };
         self.codegen_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,

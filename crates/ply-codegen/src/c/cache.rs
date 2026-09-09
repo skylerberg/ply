@@ -411,7 +411,7 @@ pub fn write_unit(key: &str, u: &UnitCache) {
     }
 }
 
-pub(super) fn encode_unit(u: &UnitCache) -> String {
+pub fn encode_unit(u: &UnitCache) -> String {
     let mut out = format!("object {}\n", u.object);
     out.push_str(&format!("taken {}\n", u.taken.len()));
     for t in &u.taken {
@@ -431,7 +431,7 @@ pub(super) fn encode_unit(u: &UnitCache) -> String {
     out
 }
 
-pub(super) fn decode_unit(s: &str) -> Option<UnitCache> {
+pub fn decode_unit(s: &str) -> Option<UnitCache> {
     let mut at = 0usize;
     let object = line(s, &mut at)?.strip_prefix("object ")?.to_string();
     let n = count(line(s, &mut at)?, "taken")?;

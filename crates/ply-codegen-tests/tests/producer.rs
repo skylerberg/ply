@@ -306,9 +306,10 @@ fn the_chain_entered_whole_answers_what_the_machine_answers() {
     built_and_checked(true);
 }
 
-/// The per-operation rule (ADR 0043): a compiled `perform` searches the compiled frames, which
-/// is complete only while every body handling the operation is compiled. A handler the unit
-/// refuses drops its performers with it, and an operation nothing handles is refused too.
+/// The per-operation rule (ADR 0043) under tier-only: a compiled `perform` searches the compiled
+/// frames, which is complete because nothing outside the unit runs. A handler the unit refuses
+/// cannot be on the stack, so its performer compiles, and a `perform` no compiled handler answers
+/// reaches the host binding from the runtime -- as one nothing in the program handles does.
 const DROPPED: &str = r#"
 effect counter {
   write bump(n: Int) -> Int
@@ -340,7 +341,7 @@ fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
 "#;
 
 #[test]
-fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
+fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
     producer::set_whole(true);
@@ -364,16 +365,10 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
         "{}",
         reason("m.handler")
     );
-    assert!(
-        reason("m.performer").contains("m.handler")
-            && reason("m.performer").contains("counter#bump"),
-        "{}",
-        reason("m.performer")
-    );
     // A `perform` no handler in the program answers is compiled: it reaches the host binding
     // from the runtime, with the machine's checks, and an unbound one fails there as the
     // machine fails it.
-    for taken in ["m.lonely", "m.hosted", "m.hosting"] {
+    for taken in ["m.performer", "m.lonely", "m.hosted", "m.hosting"] {
         assert!(
             !refused.iter().any(|r| r.function == taken),
             "`{taken}` was refused: {refused:?}"
