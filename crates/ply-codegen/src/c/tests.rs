@@ -116,6 +116,21 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
 
 /// Loading a module the way the tests need it: parse, resolve, check, then build a unit over
 /// every function in it. `None` on a machine with no C compiler, which this tier is not for.
+/// Process-wide state a build reads or writes, which a test binary shares between its threads.
+///
+/// Two kinds. `PLY_C_CACHE` and `PLY_C_SKIP` are read from the environment on whichever thread
+/// reaches them -- rayon workers included -- so a test that changes one changes it under every
+/// build running beside it. `cache::UNITS_REUSED` is a counter every build adds to, so a test
+/// that reads it before and after its own build is measuring the whole binary.
+///
+/// Under `cargo nextest` neither can bite, because each test is its own process; under
+/// `cargo test` every test in this binary shares one, and both did -- a build picked up another
+/// test's cache directory and failed to `dlopen` what it had just written.
+///
+/// So: a test that changes the environment, or counts what a build did, takes [`CONFIG`] for
+/// writing; every other build here takes it for reading.
+pub(super) static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
 pub mod tests_support {
     use crate::c::Native;
     use crate::source::Source;
@@ -130,9 +145,11 @@ pub mod tests_support {
     pub fn machine(source: &'static Source, text: &str) -> ply_eval::Machine<'static> {
         crate::c::producer::ensure_default();
         let texts = std::collections::HashMap::from([("m".to_string(), text.to_string())]);
-        let unit =
+        let unit = {
+            let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
             crate::Unit::over_with_texts(source.program, source.resolved, source.check, texts)
-                .expect("this host has a C compiler");
+                .expect("this host has a C compiler")
+        };
         let mut machine = ply_eval::Machine::new(source.program, source.resolved, source.check);
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
@@ -189,6 +206,7 @@ pub mod tests_support {
         )));
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
         match crate::c::producer::reference_only(|| crate::c::build(source, &refs)) {
             Ok((native, refused)) => Some((source, native, refused)),
             Err(e) if e.to_string().contains("could not run") => None,
@@ -554,7 +572,10 @@ pub fn alone(n: Int) -> Int = twice(n)
 "#;
     let dir = std::env::temp_dir().join(format!("ply-c-poison-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    // Safe here and only here: `cargo nextest` gives each test its own process.
+    // The whole test holds `CONFIG` for writing: this run needs a cache of its own, and the
+    // variable that gives it one is read by every build in the process.
+    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
+    let restore = std::env::var("PLY_C_CACHE").ok();
     unsafe { std::env::set_var("PLY_C_CACHE", &dir) };
 
     let Some(loaded) = tests_support::keyed(source) else {
@@ -601,6 +622,14 @@ pub fn alone(n: Int) -> Int = twice(n)
     );
     assert_eq!(answer(&again, "m.both", 5), Some(25));
     let _ = std::fs::remove_dir_all(&dir);
+    // Put the shared cache back before the write lock goes, so the builds waiting on it read the
+    // directory the rest of this binary uses.
+    unsafe {
+        match &restore {
+            Some(had) => std::env::set_var("PLY_C_CACHE", had),
+            None => std::env::remove_var("PLY_C_CACHE"),
+        }
+    }
 }
 
 /// A unit built once is put back together, not built again.
@@ -655,6 +684,8 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
         crate::heap::imm_value(w)
     };
 
+    // Writing: `UNITS_REUSED` below counts every build in the process, not just these two.
+    let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
     let (built, _) = crate::c::producer::reference_only(|| crate::c::build(loaded, &names))
         .expect("the first build");
     let first = (

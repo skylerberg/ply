@@ -599,25 +599,19 @@ pub(super) fn emit_one(
     // two definitions that say the same thing share one -- and an emitted body carries its own
     // mangled name, so serving one for the other puts two definitions of the same symbol in the
     // unit. `lexer.hex1` and `lexer.hex2` are that pair, and the C compiler said so.
-    let mode = super::producer::mode();
-    let whole = mode == "ply-whole";
-    let who = if mode == "ref" {
-        String::new()
-    } else {
+    let produced = super::producer::mode() != "ref";
+    let who = if produced {
         format!("\0ply\0{}", super::producer::identity())
+    } else {
+        String::new()
     };
     let key = loaded
         .keys
         .get(name)
         .map(|h| super::cache::key(&format!("{name}\0{h}{who}"), ctors_digest, inlining));
-    // A refusal is the port's own in whole mode and the reference's otherwise; the two are not
-    // served to each other.
+    // A refusal is the producer's own where one is installed and the reference's otherwise; the
+    // two are not served to each other, which is what `who` keeps apart.
     let refusal = loaded.keys.get(name).map(|h| {
-        let who = if whole {
-            format!("\0ply-whole\0{}", super::producer::identity())
-        } else {
-            String::new()
-        };
         super::cache::refusal_key(
             &format!("{name}\0{h}{who}"),
             ctors_digest,
@@ -648,7 +642,7 @@ pub(super) fn emit_one(
         .into());
     };
     // The chain entered whole: the port's answer is the unit's, and the reference is not run.
-    if whole {
+    if produced {
         let answer =
             super::producer::with_current(|p| p.body(loaded, name, module_index)).flatten();
         return match answer {
@@ -775,25 +769,6 @@ pub(super) fn emit_one(
     // The lambdas this body defines, as functions beside it. Part of the body's text, so they
     // are cached and restored with it, and their placeholders are resolved with it.
     out.push_str(&e.lambda_defs());
-    // The second emitter's body stands in for this one where it reaches, and only for a body
-    // this emitter accepts: the refusals are this emitter's, the code that runs is the other's.
-    // A body naming a definition the unit does not hold would not link, so it is refused here
-    // as this emitter refuses one, and the fixpoint drops it.
-    if let Some(Some(super::producer::Answer::Body(text, tables))) =
-        super::producer::with_current(|p| p.body(loaded, name, module_index))
-    {
-        if let Some(missing) = tables.calls.iter().find(|c| !unit.functions.contains(c)) {
-            return Err(Refused {
-                function: name.to_string(),
-                construct: format!("`{missing}`, which is not in this compiled unit"),
-            }
-            .into());
-        }
-        if let Some(k) = &key {
-            super::cache::write(k, &text, &tables);
-        }
-        return Ok((text, tables));
-    }
     if let Some(k) = &key {
         super::cache::write(k, &out, &e.tables);
     }

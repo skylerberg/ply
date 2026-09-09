@@ -143,15 +143,14 @@ fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 "#;
 
 /// The unit built with the Ply emitter as its producer, and every case's answer checked against
-/// the machine's. In whole mode the reference emits nothing of the program; the port's refusals
-/// are the fixpoint's, and this program has none.
+/// the machine's. The reference emits nothing of the program; the port's refusals are the
+/// fixpoint's, and this program has none.
 /// The producer's mode is a process-wide flag, so the tests that set it take turns.
 static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn built_and_checked(whole: bool) {
+fn built_and_checked() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(whole);
     let loaded = load(&[("m", PROGRAM)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -208,11 +207,6 @@ fn built_and_checked(whole: bool) {
     }
 }
 
-#[test]
-fn the_ply_emitter_answers_bodies_and_they_answer_what_the_machine_answers() {
-    built_and_checked(false);
-}
-
 /// Effects by evidence passing (ADR 0043): a tail-resumptive handler with a `return` clause, a
 /// perform two calls deep, a handler installed inside another's body, and the zero-shot
 /// `resume` that unwinds. The reference refuses every body here; only the chain entered whole
@@ -257,7 +251,6 @@ fn guarded(n: Int) -> Int =
 fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", EFFECTS)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -311,7 +304,7 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
 
 #[test]
 fn the_chain_entered_whole_answers_what_the_machine_answers() {
-    built_and_checked(true);
+    built_and_checked();
 }
 
 /// The per-operation rule (ADR 0043) under tier-only: a compiled `perform` searches the compiled
@@ -352,7 +345,6 @@ fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
 fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", DROPPED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -416,7 +408,6 @@ impl ply_eval::HostHandler for Doubler {
 fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", HOSTED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -528,7 +519,6 @@ fn ordered(a: Int, b: Int) -> Bool = decimal_of_int(a) < decimal_of_int(b)
 fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", NUMERIC)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -620,7 +610,6 @@ fn racing(n: Int) -> Int =
 fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", SIMULATED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -745,7 +734,6 @@ fn mixed(seed: Int) -> Int =
 fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", RESUMED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -865,7 +853,6 @@ fn across(seed: Int) -> Int =
 fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", MULTISHOT)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -984,7 +971,6 @@ impl ply_eval::HostRuntime for Reactor {
 fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", PRODUCTION)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -1111,7 +1097,6 @@ law "zero moves nothing" forall (account: Account) where account.balance > 0 {
 fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", PROPOSITIONS)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),

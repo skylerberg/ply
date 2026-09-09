@@ -18,7 +18,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::Value;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// How a thread builds its producer.
@@ -80,7 +79,6 @@ pub fn ensure_default() {
         return;
     };
     let identity = digest_of(&emitter_modules(&dir));
-    set_whole(true);
     install(Arc::new(move || build_default(&dir)), identity);
 }
 
@@ -206,24 +204,17 @@ pub fn installed() -> bool {
     RECIPE.get().is_some()
 }
 
-static WHOLE: AtomicBool = AtomicBool::new(false);
-/// Whether the producer's answer is the unit's: its bodies taken and its refusals dropped by the
-/// fixpoint, with the reference emitter not run at all. ADR 0042's third step.
-pub fn set_whole(whole: bool) {
-    WHOLE.store(whole, Ordering::Relaxed);
-}
-
-pub fn whole() -> bool {
-    mode() == "ply-whole"
-}
-
 /// The producer's mode, as the caches key on it. While the producer's own unit is being built
 /// the reference is the emitter, whatever was asked for: the producer cannot answer for itself.
+///
+/// There were two producing modes while ADR 0042 was being walked: body-by-body, where the
+/// reference emitted and the port stood in for the bodies the reference had already accepted,
+/// and the whole unit. Under tier-only (ADR 0048) the reference is a fragment that refuses
+/// `perform`, so body-by-body could only ever offer what the fragment already covered -- less
+/// than the fragment alone, since it added no body and could refuse one. The unit is the mode.
 pub fn mode() -> &'static str {
     if !installed() || BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         "ref"
-    } else if WHOLE.load(Ordering::Relaxed) {
-        "ply-whole"
     } else {
         "ply"
     }
