@@ -48,6 +48,8 @@ pub struct Simulation {
     /// The loop returned, with the region's answer or its failure in place; nothing may switch
     /// into its stack again.
     loop_done: bool,
+    /// Where the region was opened, for a diagnostic that names it.
+    pub(crate) site: Span,
 }
 
 #[derive(Default)]
@@ -70,17 +72,19 @@ enum Request {
 }
 
 impl Simulation {
+    /// A seeded region over `sched`, opened at `site`.
     pub fn new(
-        id: SimId,
+        sched: Scheduler<usize, Word>,
+        site: Span,
         root_seed: u64,
         drawn: u64,
-        steps: u32,
         stack: usize,
         floor_below: usize,
         root: Word,
     ) -> Simulation {
         Simulation {
-            sched: Scheduler::new(id, Span::DUMMY).with_step_budget(steps),
+            sched,
+            site,
             handlers: Handlers::at(root_seed, drawn),
             tasks: vec![TaskStack::default()],
             scheduler_sp: 0,
@@ -113,12 +117,12 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
             .binding
             .would_serve(effect, op, None)
             .unwrap_or("ply_host::sched::spawn");
-        c.fail(ply_eval::host::err_hermetic(Span::DUMMY, &operation, path));
+        c.fail(ply_eval::host::err_hermetic(c.site(), &operation, path));
         return false;
     };
     let id = SimId(c.entered_sims);
     c.entered_sims += 1;
-    let sched = match Scheduler::production(id, Span::DUMMY, permit).rooted_running() {
+    let sched = match Scheduler::production(id, c.site(), permit).rooted_running() {
         Ok(sched) => sched,
         Err(d) => {
             c.fail(d);
@@ -134,6 +138,7 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
         floor: c.stack_floor,
         sp: 0,
     };
+    let site = c.site();
     c.sims.push(Simulation {
         sched,
         handlers: Handlers::at(0, 0),
@@ -149,6 +154,7 @@ pub unsafe fn open_production(ctx: *mut Ctx, effect: &Symbol, op: &Symbol) -> bo
         policy: Policy::Host,
         loop_stack: Some(loop_stack),
         loop_done: false,
+        site,
     });
     true
 }
@@ -254,12 +260,13 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
         unsafe { switch(&mut *from, sp) };
 
         let c = unsafe { &mut *ctx };
+        let site = c.site();
         let sim = c.sims.last_mut().expect("a region is running");
         sim.running = None;
         c.current = sim.stack;
         c.stack_floor = sim.floor_below;
         if sim.sched.records_steps() {
-            c.trail.end_step(Span::DUMMY);
+            c.trail.end_step(site);
         }
     }
 }
@@ -268,26 +275,27 @@ pub unsafe fn run(ctx: *mut Ctx) -> Word {
 /// failed with what the loop should return.
 unsafe fn apply(ctx: *mut Ctx, task: TaskId, request: Request) -> Result<(), Option<Diagnostic>> {
     let c = unsafe { &mut *ctx };
+    let site = c.site();
     let sim = c.sims.last_mut().expect("a region is running");
     let at = task.0 as usize;
     let k = sim.tasks[at].sp;
     let applied = match request {
         Request::Spawn(closure) => {
-            let id = sim.sched.spawn(closure, Span::DUMMY, None);
+            let id = sim.sched.spawn(closure, site, None);
             sim.tasks.push(TaskStack::default());
             sim.sched.suspend(k, Value::Task(id))
         }
-        Request::Join(target) => sim.sched.join(k, target, Span::DUMMY),
+        Request::Join(target) => sim.sched.join(k, target, site),
         Request::Yield => sim.sched.suspend(k, Value::Unit),
-        Request::Park(pending) => sim.sched.park_on_host(k, pending, Span::DUMMY),
-        Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, Span::DUMMY) {
+        Request::Park(pending) => sim.sched.park_on_host(k, pending, site),
+        Request::Seeded(sig, args) => match sim.handlers.dispatch(sig, task, &args, site) {
             Ok(Answer::Value(value)) => {
                 if let Some(access) = sig.step_access() {
                     c.trail.record_access(access);
                 }
                 sim.sched.suspend(k, value)
             }
-            Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, Span::DUMMY),
+            Ok(Answer::Sleeping { deadline }) => sim.sched.sleep_until(k, deadline, site),
             Err(d) => Err(d),
         },
         Request::Finished(word) => {
@@ -372,7 +380,7 @@ pub unsafe fn perform(ctx: *mut Ctx, effect: &Symbol, op: &Symbol, args: &[Word]
         ("task", "join") => {
             let handle = c.value(args[0]);
             heap::dec(args[0]);
-            match handle.as_task(Span::DUMMY, "`task.join`") {
+            match handle.as_task(c.site(), "`task.join`") {
                 Ok(target) => Request::Join(target),
                 Err(d) => return c.fail(d),
             }
