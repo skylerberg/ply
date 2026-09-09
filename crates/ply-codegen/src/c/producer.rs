@@ -361,25 +361,6 @@ impl PlyProducer {
 
     /// Every body of the program at once: the emitter resolves the modules together, so a call's
     /// default arguments are filled and every signature is in reach.
-    /// Every body of the program that handles each operation, answered or refused: the unit's
-    /// fixpoint drops a performer while any of its operation's handlers is not taken.
-    pub fn handlers_of(&self, loaded: &Source) -> HashMap<String, Vec<String>> {
-        let program = std::ptr::from_ref(loaded) as usize;
-        let mut out: HashMap<String, Vec<String>> = HashMap::new();
-        if let Some(bodies) = self.modules.borrow().get(&program) {
-            for (name, answer) in bodies {
-                let handled = match answer {
-                    Answer::Body(_, tables) => &tables.handles,
-                    Answer::Refused(_, handles) => handles,
-                };
-                for op in handled {
-                    out.entry(op.clone()).or_default().push(name.clone());
-                }
-            }
-        }
-        out
-    }
-
     fn bodies_of(&self, loaded: &Source) -> Result<Bodies> {
         let mut names = Vec::new();
         let mut srcs = Vec::new();
