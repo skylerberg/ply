@@ -133,6 +133,7 @@ helpers![
     ("rt_arith", 3, true),
     ("rt_lit", 1, true),
     ("rt_no_match", 0, false),
+    ("rt_let_no_match", 0, false),
     ("rt_overflow", 1, false),
     ("rt_not_that_width", 2, false),
     ("rt_equal", 2, true),

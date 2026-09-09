@@ -1492,7 +1492,7 @@ impl<'a> Emit<'a> {
                             if !self.irrefutable_pat(pat) {
                                 let test = self.test(pat, &held)?;
                                 self.line(format!(
-                                    "if (!({test})) {{ rt_no_match_p(ctx); return 0; }}"
+                                    "if (!({test})) {{ rt_let_no_match_p(ctx); return 0; }}"
                                 ));
                             }
                             self.bind_pattern(pat, &held)?;

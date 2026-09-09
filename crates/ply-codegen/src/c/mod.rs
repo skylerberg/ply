@@ -97,6 +97,7 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_arith" => rt::rt_arith as *const (),
             "rt_lit" => rt::rt_lit as *const (),
             "rt_no_match" => rt::rt_no_match as *const (),
+            "rt_let_no_match" => rt::rt_let_no_match as *const (),
             "rt_overflow" => rt::rt_overflow as *const (),
             "rt_not_that_width" => rt::rt_not_that_width as *const (),
             "rt_equal" => rt::rt_equal as *const (),

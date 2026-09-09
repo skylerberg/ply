@@ -913,6 +913,13 @@ pub unsafe extern "C" fn rt_no_match(ctx: *mut Ctx) {
     ctx.fail(d);
 }
 
+/// A refutable `let` whose pattern did not match the value bound to it.
+pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
+    let ctx = unsafe { &mut *ctx };
+    let d = error("`let` pattern did not match the bound value");
+    ctx.fail(d);
+}
+
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = match what {
