@@ -41,6 +41,129 @@ pub fn install(recipe: Recipe, identity: String) {
     let _ = RECIPE.set(recipe);
 }
 
+/// The self-hosted Ply emitter's source directory, found by walking up from the working directory
+/// for `spikes/ply-parser/emit.ply`. `None` when it is not on disk.
+fn find_emitter_dir() -> Option<std::path::PathBuf> {
+    let mut cur = std::env::current_dir().ok()?;
+    loop {
+        let candidate = cur.join("spikes/ply-parser");
+        if candidate.join("emit.ply").is_file() {
+            return Some(candidate);
+        }
+        if !cur.pop() {
+            return None;
+        }
+    }
+}
+
+/// Install the whole self-hosted Ply emitter as the producer when none is installed and its source
+/// is on disk (ADR 0048: under tier-only the Rust reference emitter is a fragment, so the language
+/// runs only when the Ply emitter produces). Called by [`crate::Unit`] so every consumer — the CLI,
+/// the harness, the tests — gets the complete tier by default. A shipped binary with no
+/// `spikes/ply-parser` keeps the reference emitter until the bundle is embedded.
+pub fn ensure_default() {
+    if installed() {
+        return;
+    }
+    let Some(dir) = find_emitter_dir() else {
+        return;
+    };
+    let identity = digest_of(&emitter_modules(&dir));
+    set_whole(true);
+    install(Arc::new(move || build_default(&dir)), identity);
+}
+
+/// The emitter's modules — the standard library and the directory's own `.ply` files — as
+/// `(name, text)` pairs, for the identity digest.
+fn emitter_modules(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut modules: Vec<(String, String)> = ply_std::sources()
+        .map(|(m, t)| (m.to_string(), t.to_string()))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "ply")
+                && let Ok(text) = std::fs::read_to_string(&p)
+            {
+                modules.push((
+                    p.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+                    text,
+                ));
+            }
+        }
+    }
+    modules
+}
+
+/// Build the whole Ply emitter as a producer: load its `.ply` source and the standard library,
+/// check them, and build the native emitter from the bootstrap bundle (or, when
+/// `PLY_C_BOOTSTRAP=off` or no bundle is present, with the reference emitter).
+fn build_default(dir: &std::path::Path) -> Result<PlyProducer, String> {
+    use ply_span::SourceId;
+    let mut inputs = Vec::new();
+    for (module, text) in ply_std::sources() {
+        let text: &'static str = Box::leak(text.to_string().into_boxed_str());
+        inputs.push((
+            SourceId(inputs.len() as u32),
+            ply_syntax::ast::ModuleName::from_dotted(module),
+            text,
+        ));
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+        .collect();
+    files.sort();
+    for path in &files {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("{}: not a module name", path.display()))?;
+        let text: &'static str = Box::leak(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .into_boxed_str(),
+        );
+        inputs.push((
+            SourceId(inputs.len() as u32),
+            ply_syntax::ast::ModuleName::from_dotted(stem),
+            text,
+        ));
+    }
+    let first = |ds: Vec<ply_span::Diagnostic>| {
+        ds.first()
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| "no diagnostic".to_string())
+    };
+    let mut ast = ply_syntax::parse_program(inputs).map_err(first)?;
+    let expanded = ply_derive::expand_program(&mut ast);
+    if !expanded.is_empty() {
+        return Err(first(expanded));
+    }
+    let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
+    let check = ply_core::check_program(&ast, &resolved).map_err(first)?;
+    let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
+    let resolved = Box::leak(Box::new(resolved));
+    let check = Box::leak(Box::new(check));
+    let keys = ply_hash::hash_program(program, resolved, check)
+        .map(|h| crate::source::emit_keys(program, &h))
+        .unwrap_or_default();
+    let source: &'static Source =
+        Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
+    let bundle = dir.join("bootstrap");
+    let from_bundle = super::bundle::exists(&bundle)
+        && std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off");
+    let (native, _refused) = if from_bundle {
+        super::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?
+    } else {
+        let names: Vec<String> = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        super::build(source, &refs).map_err(|e| format!("{e:#}"))?
+    };
+    PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+}
+
 /// Forgets this thread's producer, so the recipe builds it again on the next ask: the fixpoint
 /// test builds the emitter twice in one process, from two bundles.
 pub fn reset_thread() {
