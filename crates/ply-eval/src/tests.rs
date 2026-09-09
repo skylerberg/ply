@@ -1607,47 +1607,6 @@ fn assert_eq_distinguishes_constructors_with_equal_payloads() {
 }
 
 #[test]
-fn eval_test_runs_the_indexed_test_and_reports_a_failure() {
-    let m = module(vec![
-        fn_def("two", &[], int(2)),
-        test_def(
-            "passes",
-            callv("assert_eq", vec![callv("two", vec![]), int(2)]),
-        ),
-        test_def(
-            "fails",
-            callv("assert_eq", vec![callv("two", vec![]), int(3)]),
-        ),
-    ]);
-    let (program, resolved) = standalone_module(m);
-    let mut machine = Machine::for_program(&program, &resolved);
-    assert_eq!(machine.test_count(), 2);
-    assert_eq!(machine.test_name(1), Some("fails"));
-    assert!(machine.eval_test(0).is_ok());
-    let d = machine.eval_test(1).unwrap_err();
-    assert_eq!(d.code, codes::ASSERTION_FAILED);
-    assert!(machine.eval_test(2).is_err());
-}
-
-/// There is no longer one `main` per program, so choosing an entry point is the caller's job; the
-/// evaluator only answers to a program-wide name.
-#[test]
-fn call_invokes_a_definition_by_its_program_wide_name() {
-    let (program, resolved) =
-        standalone(vec![fn_def("main", &[], bin(BinOp::Add, int(1), int(2)))]);
-    let mut machine = Machine::for_program(&program, &resolved);
-    assert_eq!(
-        machine.call("main", Vec::new(), sp()).unwrap().render(),
-        "3"
-    );
-
-    let (empty, resolved) = standalone(Vec::new());
-    let mut machine = Machine::for_program(&empty, &resolved);
-    let d = machine.call("main", Vec::new(), sp()).unwrap_err();
-    assert_eq!(d.code, codes::UNKNOWN_NAME);
-}
-
-#[test]
 fn values_render_readably_for_a_report_reader() {
     assert_eq!(eval(unit()).unwrap().render(), "()");
     assert_eq!(Value::str("a\"b\nc").render(), "\"a\\\"b\\nc\"");

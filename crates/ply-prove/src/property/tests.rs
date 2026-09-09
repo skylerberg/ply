@@ -1,7 +1,8 @@
 use super::*;
 use crate::{DEFAULT_SHRINK_BUDGET, MIN_PROPERTY_CASES, Tier};
 use ply_core::{CheckOutput, EffectAtom, Resource, RowVar};
-use ply_eval::Machine;
+use ply_eval::DEFAULT_MAX_CALLS;
+use ply_eval::interp::Pure;
 use ply_span::SourceId;
 use ply_syntax::ast::{Mode, Program};
 use ply_syntax::resolve::Resolved;
@@ -33,8 +34,8 @@ impl Fixture {
         TypeWorld::new(self.check.ctors.values())
     }
 
-    fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
+    fn pure(&self) -> Pure<'_> {
+        Pure::new(&self.program, &self.resolved)
     }
 }
 
@@ -387,13 +388,13 @@ fn a_generated_function_is_total_pure_and_deterministic() {
     let mut applied = 0;
     for f in draw(&ty, &world, 40) {
         for x in [-3i64, 0, 1, 7, i64::MAX] {
-            let mut machine = fixture.machine();
+            let mut machine = fixture.pure();
             let first = machine
-                .call("apply1", vec![f.clone(), Value::Int(x)], Span::DUMMY)
+                .call("apply1", vec![f.clone(), Value::Int(x)], Span::DUMMY, DEFAULT_MAX_CALLS)
                 .unwrap_or_else(|d| panic!("a generated function must be total: {d:?}"));
-            let mut machine = fixture.machine();
+            let mut machine = fixture.pure();
             let second = machine
-                .call("apply1", vec![f.clone(), Value::Int(x)], Span::DUMMY)
+                .call("apply1", vec![f.clone(), Value::Int(x)], Span::DUMMY, DEFAULT_MAX_CALLS)
                 .expect("a generated function must be total");
             assert_eq!(first.render(), second.render());
             assert!(matches!(first, Value::Int(_)));
@@ -414,9 +415,9 @@ fn a_generated_function_over_a_compound_argument_applies() {
     };
     for f in draw(&ty, &world, 24) {
         for x in ["", "a", "hello"] {
-            let mut machine = fixture.machine();
+            let mut machine = fixture.pure();
             let answer = machine
-                .call("apply_str", vec![f.clone(), Value::str(x)], Span::DUMMY)
+                .call("apply_str", vec![f.clone(), Value::str(x)], Span::DUMMY, DEFAULT_MAX_CALLS)
                 .unwrap_or_else(|d| panic!("a generated function must be total: {d:?}"));
             assert!(matches!(answer, Value::Bool(_)));
         }
