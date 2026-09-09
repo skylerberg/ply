@@ -191,7 +191,7 @@ pub fn reset() {
 }
 
 /// [`note_update`], with the number of elements the update had to copy.
-pub(crate) fn note_update_of(in_place: bool, copied: usize, span: Span) {
+pub fn note_update_of(in_place: bool, copied: usize, span: Span) {
     bump(|s| {
         s.updates += 1;
         s.updates_in_place += u64::from(in_place);

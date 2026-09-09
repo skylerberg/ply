@@ -223,6 +223,13 @@ impl Heap {
     pub fn list_push(&mut self, xs: Word, x: Word) -> Word {
         let mut o = obj(xs);
         let n = tail_len(o);
+        // The machine's reuse counters, which `ply run --json` reports.
+        let in_place = is_unique(xs);
+        ply_eval::rc::note_update_of(
+            in_place,
+            if in_place { 0 } else { n },
+            ply_span::Span::DUMMY,
+        );
         if !is_unique(xs) || (n == cap(o) && n < WIDTH) {
             let room = if n == cap(o) {
                 (cap(o) * 2).min(WIDTH)
