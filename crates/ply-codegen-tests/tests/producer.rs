@@ -8,7 +8,7 @@
 
 use ply_codegen::Source;
 use ply_codegen::c::producer::{self, PlyProducer};
-use ply_eval::{Machine, Value};
+use ply_eval::Value;
 use ply_span::Span;
 use ply_syntax::ast::{ModuleName, Program};
 use std::collections::HashMap;
@@ -160,7 +160,7 @@ fn built_and_checked(whole: bool) {
     );
     println!("  the Ply emitter answered {answered} of {asked} bodies");
 
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
     let cases: Vec<(&str, Vec<Value>)> = vec![
         ("m.double", vec![Value::Int(21)]),
         ("m.add", vec![Value::Int(40), Value::Int(2)]),
@@ -176,9 +176,9 @@ fn built_and_checked(whole: bool) {
         ("m.sum_to", vec![Value::Int(100)]),
     ];
     for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let want = oracle
+            .call(name, args.clone(), Span::DUMMY, 10_000)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message));
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -258,17 +258,23 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.counted", vec![Value::Int(3)]),
-        ("m.nested", vec![Value::Int(5)]),
-        ("m.guarded", vec![Value::Int(4)]),
-        ("m.guarded", vec![Value::Int(40)]),
+    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
+    // ADR 0048 retired the interpreter oracle. `counted` and `nested` are tail-resumptive, so the
+    // pure applier still answers them; `guarded`'s named zero-shot `resume` it declines, so that
+    // case pins the tier's answer as a regression guard (the corpus validates the mechanism).
+    let cases: Vec<(&str, Vec<Value>, Option<Value>)> = vec![
+        ("m.counted", vec![Value::Int(3)], None),
+        ("m.nested", vec![Value::Int(5)], None),
+        ("m.guarded", vec![Value::Int(4)], Some(Value::Int(1008))),
+        ("m.guarded", vec![Value::Int(40)], Some(Value::Int(-40))),
     ];
-    for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+    for (name, args, golden) in cases {
+        let want = match golden {
+            Some(v) => v,
+            None => oracle
+                .call(name, args.clone(), Span::DUMMY, 10_000)
+                .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message)),
+        };
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -290,7 +296,7 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
         ctx.end();
         assert_eq!(
             got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
+            "`{name}{args:?}`: the tier and the oracle disagree"
         );
     }
 }
@@ -432,24 +438,36 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     );
     let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
-    let cases: Vec<(&str, Vec<Value>, std::sync::Arc<ply_eval::HostBinding>)> = vec![
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end). Under tier-only, a user effect performed by
+    // a compiled root resolves to no host row, so every case here refuses at the host boundary.
+    let cases: Vec<(
+        &str,
+        Vec<Value>,
+        std::sync::Arc<ply_eval::HostBinding>,
+        Result<Value, &str>,
+    )> = vec![
         (
             "m.hosted",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&bound),
+            Err("E0303"),
         ),
         (
             "m.hosted",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&hermetic),
+            Err("E0303"),
         ),
-        ("m.ticking", vec![], std::sync::Arc::clone(&bound)),
-        ("m.ticking", vec![], std::sync::Arc::clone(&hermetic)),
+        ("m.ticking", vec![], std::sync::Arc::clone(&bound), Err("E0303")),
+        (
+            "m.ticking",
+            vec![],
+            std::sync::Arc::clone(&hermetic),
+            Err("E0303"),
+        ),
     ];
-    for (name, args, binding) in cases {
-        let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-        machine.set_host_binding(std::sync::Arc::clone(&binding));
-        let want = machine.call(name, args.clone(), Span::DUMMY);
+    for (name, args, binding, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -471,23 +489,12 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-                assert_eq!(
-                    got, want,
-                    "`{name}{args:?}`: the tier and the machine disagree"
-                );
+                assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
             }
-            Err(theirs) => {
-                assert_ne!(
-                    ctx.failed, 0,
-                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
-                    theirs.message
-                );
+            Err(code) => {
+                assert_ne!(ctx.failed, 0, "`{name}{args:?}` did not refuse in the C tier");
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
-                assert_eq!(
-                    ours.code, theirs.code,
-                    "`{name}{args:?}`: {} vs {}",
-                    ours.message, theirs.message
-                );
+                assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
         }
         ctx.end();
@@ -521,7 +528,7 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
     let two = Value::Int(2.0f64.to_bits() as i64);
     let three = Value::Int(3.0f64.to_bits() as i64);
     let cases: Vec<(&str, Vec<Value>)> = vec![
@@ -535,9 +542,9 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
         ("m.ordered", vec![Value::Int(6), Value::Int(7)]),
     ];
     for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let want = oracle
+            .call(name, args.clone(), Span::DUMMY, 10_000)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message));
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -613,21 +620,15 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.ordered", vec![Value::Int(3)]),
-        ("m.timed", vec![Value::Int(1500)]),
-        ("m.drawn", vec![Value::Int(100)]),
-        ("m.racing", vec![Value::Int(5)]),
+    // ADR 0048 retired the interpreter oracle; these pin the tier's schedule as a regression
+    // guard (the corpus validates the mechanism end-to-end).
+    let cases: Vec<(&str, Vec<Value>, Value, i64, &str)> = vec![
+        ("m.ordered", vec![Value::Int(3)], Value::Int(6012), 6, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0), TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#),
+        ("m.timed", vec![Value::Int(1500)], Value::Int(1500), 1500, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#),
+        ("m.drawn", vec![Value::Int(100)], Value::Int(366), 0, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#),
+        ("m.racing", vec![Value::Int(5)], Value::Int(60), 0, r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }})"]"#),
     ];
-    for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let theirs = machine
-            .simulated()
-            .expect("the machine ran a region")
-            .clone();
+    for (name, args, want, want_time, want_shape) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -648,10 +649,6 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         let ours = ctx.record.clone().expect("the tier ran a region");
         ctx.end();
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
-        );
         let shape = |r: &ply_eval::region::Record| -> Vec<String> {
             r.steps
                 .iter()
@@ -663,13 +660,14 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
                 })
                 .collect()
         };
+        assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
         assert_eq!(
-            shape(&ours),
-            shape(&theirs),
-            "`{name}{args:?}`: the schedules differ"
+            format!("{:?}", shape(&ours)),
+            want_shape,
+            "`{name}{args:?}`: the schedule differs"
         );
         assert_eq!(
-            ours.virtual_time, theirs.virtual_time,
+            ours.virtual_time, want_time,
             "`{name}{args:?}`: virtual time differs"
         );
     }
@@ -720,18 +718,16 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.later", vec![Value::Int(3)]),
-        ("m.returned", vec![Value::Int(4)]),
-        ("m.dropped", vec![Value::Int(9)]),
-        ("m.dropped", vec![Value::Int(2)]),
-        ("m.mixed", vec![Value::Int(5)]),
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end).
+    let cases: Vec<(&str, Vec<Value>, Value)> = vec![
+        ("m.later", vec![Value::Int(3)], Value::Int(140)),
+        ("m.returned", vec![Value::Int(4)], Value::Int(2132)),
+        ("m.dropped", vec![Value::Int(9)], Value::Int(10)),
+        ("m.dropped", vec![Value::Int(2)], Value::Int(-2)),
+        ("m.mixed", vec![Value::Int(5)], Value::Int(24)),
     ];
-    for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+    for (name, args, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -751,10 +747,7 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
         );
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
-        );
+        assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
     }
 }
 
@@ -842,17 +835,22 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.both", vec![Value::Int(3)]),
-        ("m.thrice", vec![Value::Int(7)]),
-        ("m.joined", vec![Value::Str("a".into())]),
-        ("m.shared", vec![Value::Int(0)]),
-        ("m.siblings", vec![Value::Int(1)]),
-        ("m.across", vec![Value::Int(0)]),
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end). `across` captures a continuation under a
+    // task whose region has ended by the second resumption, so the tier refuses it.
+    let cases: Vec<(&str, Vec<Value>, Result<Value, &str>)> = vec![
+        ("m.both", vec![Value::Int(3)], Ok(Value::Int(303))),
+        ("m.thrice", vec![Value::Int(7)], Ok(Value::Int(42))),
+        (
+            "m.joined",
+            vec![Value::Str("a".into())],
+            Ok(Value::Str("abdacd".into())),
+        ),
+        ("m.shared", vec![Value::Int(0)], Ok(Value::Int(30002))),
+        ("m.siblings", vec![Value::Int(1)], Ok(Value::Int(33))),
+        ("m.across", vec![Value::Int(0)], Err("E0413")),
     ];
-    for (name, args) in cases {
-        let want = machine.call(name, args.clone(), Span::DUMMY);
+    for (name, args, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -873,23 +871,12 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-                assert_eq!(
-                    got, want,
-                    "`{name}{args:?}`: the tier and the machine disagree"
-                );
+                assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
             }
-            Err(theirs) => {
-                assert_ne!(
-                    ctx.failed, 0,
-                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
-                    theirs.message
-                );
+            Err(code) => {
+                assert_ne!(ctx.failed, 0, "`{name}{args:?}` did not refuse in the C tier");
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
-                assert_eq!(
-                    ours.code, theirs.code,
-                    "`{name}{args:?}`: {} vs {}",
-                    ours.message, theirs.message
-                );
+                assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
         }
         ctx.end();
@@ -994,28 +981,36 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     }
     let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
-    let cases: Vec<(&str, Vec<Value>, std::sync::Arc<ply_eval::HostBinding>)> = vec![
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end). A bound `spawned` opens its production
+    // region and answers; `parked`'s `slow.fetch` resolves to no host row, and a hermetic binding
+    // refuses the region, so both of those refuse at the host boundary.
+    let cases: Vec<(
+        &str,
+        Vec<Value>,
+        std::sync::Arc<ply_eval::HostBinding>,
+        Result<Value, &str>,
+    )> = vec![
         (
             "m.spawned",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&bound),
+            Ok(Value::Int(9)),
         ),
         (
             "m.parked",
             vec![Value::Int(2)],
             std::sync::Arc::clone(&bound),
+            Err("E0303"),
         ),
         (
             "m.spawned",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&hermetic),
+            Err("E0303"),
         ),
     ];
-    for (name, args, binding) in cases {
-        let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-        machine.set_host_binding(std::sync::Arc::clone(&binding));
-        machine.set_host_runtime(std::rc::Rc::new(Reactor));
-        let want = machine.call(name, args.clone(), Span::DUMMY);
+    for (name, args, binding, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -1040,23 +1035,12 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
                     ctx.diagnostic.as_ref().map(|d| d.message.clone())
                 );
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
-                assert_eq!(
-                    got, want,
-                    "`{name}{args:?}`: the tier and the machine disagree"
-                );
+                assert_eq!(got, want, "`{name}{args:?}`: the tier and the golden disagree");
             }
-            Err(theirs) => {
-                assert_ne!(
-                    ctx.failed, 0,
-                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
-                    theirs.message
-                );
+            Err(code) => {
+                assert_ne!(ctx.failed, 0, "`{name}{args:?}` did not refuse in the C tier");
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
-                assert_eq!(
-                    ours.code, theirs.code,
-                    "`{name}{args:?}`: {} vs {}",
-                    ours.message, theirs.message
-                );
+                assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
         }
         ctx.end();
