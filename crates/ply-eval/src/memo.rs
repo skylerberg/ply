@@ -67,7 +67,7 @@ mod tests {
     #[test]
     fn a_constant_is_judged_by_its_leaves_however_deep_they_lie() {
         assert!(world_independent(&nested(2_000, Value::Unit)));
-        let mut regions = crate::TaskRegions::new();
+        let mut regions: crate::TaskRegions = crate::TaskRegions::new();
         let cell = Value::Cell(regions.alloc_cell(Value::Unit));
         assert!(!world_independent(&nested(2_000, cell)));
     }

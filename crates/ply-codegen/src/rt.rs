@@ -14,6 +14,8 @@ use crate::heap::{
 use crate::list;
 use crate::map;
 use ply_core::ty::{EffectAtom, Resource};
+use ply_eval::arena::Slot;
+use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::{BinOp, Mode};
@@ -352,6 +354,44 @@ pub(crate) fn drop_frame(f: HandlerFrame) {
     }
 }
 
+/// A heap word a cell holds: the arena's value type on the tier, so that a cell's contents never
+/// cross the seam. A clone is a count and a drop gives one back, which is why the arena is dropped
+/// before the heap that owns the words.
+pub struct Held(pub Word);
+
+impl Held {
+    fn into_word(self) -> Word {
+        let w = self.0;
+        std::mem::forget(self);
+        w
+    }
+}
+
+impl Clone for Held {
+    fn clone(&self) -> Held {
+        heap::inc(self.0);
+        Held(self.0)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        heap::dec(self.0);
+    }
+}
+
+impl Default for Held {
+    fn default() -> Held {
+        Held(heap::unit())
+    }
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Held({:#x})", self.0)
+    }
+}
+
 #[repr(C)]
 pub struct Ctx {
     pub failed: i64,
@@ -368,17 +408,20 @@ pub struct Ctx {
     pub site_module: i64,
     pub site_start: i64,
     pub site_end: i64,
+    /// The cells, holding heap words: declared before the heap, so their counts go back first.
+    cells: ply_eval::TaskRegions<Held>,
+    /// The arena's `(depth, live)` at the start of the entry now running, so [`Ctx::cells_balanced`]
+    /// can ask whether the body gave back everything it took rather than whether it took anything.
+    cells_baseline: (usize, usize),
+    /// The arena `ply_eval::builtins::call` insists on, which nothing reaching it uses: the cell
+    /// builtins are the tier's own.
+    scratch: ply_eval::Arena,
     pub heap: Heap,
     /// The objects the entry that just finished allocated, kept because [`Ctx::end`] clears the
     /// log and the number is otherwise gone.
     last_entry: usize,
     unclosed_entries: u64,
     pub tables: Rc<Tables>,
-    /// The arena `ply_eval::builtins::call` insists on.
-    cells: ply_eval::TaskRegions,
-    /// The arena's `(depth, live)` at the start of the entry now running, so [`Ctx::cells_balanced`]
-    /// can ask whether the body gave back everything it took rather than whether it took anything.
-    cells_baseline: (usize, usize),
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
     pub builtin_calls: u64,
@@ -436,6 +479,7 @@ impl Ctx {
             tables,
             cells,
             cells_baseline: baseline,
+            scratch: ply_eval::Arena::new(),
             diagnostic: None,
             builtin_calls: 0,
             stacks: vec![Frames::under(None)],
@@ -687,12 +731,10 @@ pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
 /// The emitter refuses a site that opens a *region*, which is the part a C frame cannot carry.
 pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    let v = ctx.value(init);
-    heap::dec(init);
     if !ctx.sims.is_empty() {
         ctx.trail.record_access(ply_eval::sim::Access::Alloc);
     }
-    let slot = ctx.cells.alloc_cell(v);
+    let slot = ctx.cells.alloc_cell(Held(init));
     ctx.heap.bridge(Value::Cell(slot))
 }
 
@@ -1057,7 +1099,7 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
 fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
     let site = ctx.site();
-    match ply_eval::builtins::call(b, values, ctx.cells.arena_mut(), site) {
+    match ply_eval::builtins::call(b, values, &mut ctx.scratch, site) {
         Ok(Step::Done(v)) => ctx.word(&v),
         // Unreachable: the emitter refuses every higher-order builtin at compile
         // time, because answering `Step::Apply` here would need user code run from inside a native
@@ -1108,6 +1150,33 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
 
 /// The builtins answered over words, when their arguments have the native kinds; `None` hands the
 /// call to the interpreter's implementation.
+/// The cell a word names, when it is one.
+fn cell_of(w: Word) -> Option<Slot> {
+    if heap::kind(w) != crate::heap::KIND_BRIDGE {
+        return None;
+    }
+    match unsafe { crate::heap::bridged(obj(w)) } {
+        Value::Cell(slot) => Some(*slot),
+        _ => None,
+    }
+}
+
+/// The cell's contents, as a count of its own.
+fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
+    let site = ctx.site();
+    let arena = ctx.cells.arena();
+    if arena.is_taken(slot) {
+        return Err(cell_in_update(site, slot, what));
+    }
+    match arena.get(slot) {
+        Some(held) => {
+            heap::inc(held.0);
+            Ok(held.0)
+        }
+        None => Err(no_such_cell(site, slot)),
+    }
+}
+
 /// A key the heap's maps order: anything but a closure or a bridged value, which the generic path
 /// refuses with the machine's own diagnostic.
 fn map_key(k: Word) -> bool {
@@ -1167,6 +1236,57 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             let out = ctx.heap.map_remove(&ctx.tables.layouts, *m, *k);
             heap::dec(*k);
             Some(out)
+        }
+        // The cells: the tier's own, over heap words, so a cell's contents never cross the seam.
+        (Builtin::CellGet, [c]) => {
+            let slot = cell_of(*c)?;
+            let answer = match cell_read(ctx, slot, "cell_get") {
+                Ok(w) => w,
+                Err(d) => ctx.fail(d),
+            };
+            heap::dec(*c);
+            Some(answer)
+        }
+        (Builtin::CellSet, [c, v]) => {
+            let slot = cell_of(*c)?;
+            let site = ctx.site();
+            if ctx.cells.arena().is_taken(slot) {
+                heap::dec(*v);
+                heap::dec(*c);
+                return Some(ctx.fail(cell_in_update(site, slot, "cell_set")));
+            }
+            if heap::reaches_cell(*v, slot) {
+                ply_eval::rc::note_cell_cycle(slot, site);
+            }
+            let stored = ctx.cells.arena_mut().set(slot, Held(*v));
+            heap::dec(*c);
+            if !stored {
+                return Some(ctx.fail(no_such_cell(site, slot)));
+            }
+            Some(heap::unit())
+        }
+        (Builtin::CellUpdate, [c, f]) => {
+            let slot = cell_of(*c)?;
+            let site = ctx.site();
+            if ctx.cells.arena().is_taken(slot) {
+                heap::dec(*f);
+                heap::dec(*c);
+                return Some(ctx.fail(cell_in_update(site, slot, "cell_update")));
+            }
+            let Some(current) = ctx.cells.arena_mut().take(slot) else {
+                heap::dec(*f);
+                heap::dec(*c);
+                return Some(ctx.fail(no_such_cell(site, slot)));
+            };
+            let updated = call_value(std::ptr::from_mut(ctx), *f, &[current.into_word()]);
+            let held = if ctx.failed != 0 {
+                Held::default()
+            } else {
+                Held(updated)
+            };
+            ctx.cells.arena_mut().put_back(slot, held);
+            heap::dec(*c);
+            Some(if ctx.failed != 0 { 0 } else { heap::unit() })
         }
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
             let o = obj(*xs);
@@ -2118,7 +2238,7 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                     let values = values_taken(c, args);
                     c.builtin_calls += 1;
                     let site = c.site();
-                    match ply_eval::builtins::call(b, values, c.cells.arena_mut(), site) {
+                    match ply_eval::builtins::call(b, values, &mut c.scratch, site) {
                         Ok(Step::Done(v)) => c.word(&v),
                         Ok(_) => {
                             let d = error(format!(

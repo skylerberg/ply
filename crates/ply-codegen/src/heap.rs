@@ -1256,6 +1256,61 @@ pub fn world_independent(w: Word) -> bool {
     true
 }
 
+/// Whether `w` reaches cell `slot`: the tier's side of the cycle check a `cell_set` makes, within
+/// the same walk budget the interpreter's has.
+pub fn reaches_cell(w: Word, slot: ply_eval::arena::Slot) -> bool {
+    let mut budget = 256usize;
+    let mut pending = vec![w];
+    while let Some(w) = pending.pop() {
+        if is_imm(w) {
+            continue;
+        }
+        if budget == 0 {
+            return false;
+        }
+        budget -= 1;
+        let o = obj(w);
+        unsafe {
+            match (*o).kind {
+                KIND_RECORD | KIND_CTOR | KIND_LEAF | KIND_BRANCH => {
+                    for i in 0..(*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                KIND_LIST => pending.extend(list::children(o)),
+                KIND_MAP => {
+                    let r = word_at(o, 0);
+                    if r != 0 {
+                        pending.push(r);
+                    }
+                }
+                KIND_MLEAF | KIND_MBRANCH => {
+                    pending.extend(map::child_words(o).map(|i| word_at(o, i)));
+                }
+                KIND_CLOSURE => {
+                    for i in CLOSURE_CAPTURES..(*o).len as usize {
+                        pending.push(word_at(o, i));
+                    }
+                }
+                KIND_BRIDGE => match bridged(o) {
+                    Value::Cell(s) => {
+                        if *s == slot {
+                            return true;
+                        }
+                    }
+                    v => {
+                        if ply_eval::rc::value_reaches_cell(v, slot) {
+                            return true;
+                        }
+                    }
+                },
+                _ => {}
+            }
+        }
+    }
+    false
+}
+
 /// Whether one holder alone has `w`: what lets an update write in place.
 pub fn is_unique(w: Word) -> bool {
     !is_imm(w) && unsafe { (*obj(w)).rc == 1 }

@@ -11,32 +11,32 @@ use std::rc::Rc;
 const FLOOR: usize = 2;
 
 /// One task's region stack.
-pub struct TaskRegions {
-    arena: Arena,
+pub struct TaskRegions<V = Value> {
+    arena: Arena<V>,
     /// Where the fixture lives.
     root: RegionId,
     /// Where an entry point allocates.
     entry: RegionId,
     /// The fixture as it was seeded, shared with the [`Fixture`] it came from so that opening one
     /// copies slots and not values.
-    base: Rc<Vec<Value>>,
+    base: Rc<Vec<V>>,
     /// The slots holding `base`, so a reset can write the seed back through the very identities the
     /// handle names.
     base_slots: Vec<Slot>,
 }
 
-impl Default for TaskRegions {
-    fn default() -> TaskRegions {
+impl<V: Clone + Default> Default for TaskRegions<V> {
+    fn default() -> TaskRegions<V> {
         TaskRegions::new()
     }
 }
 
-impl TaskRegions {
-    pub fn new() -> TaskRegions {
+impl<V: Clone + Default> TaskRegions<V> {
+    pub fn new() -> TaskRegions<V> {
         TaskRegions::from_values(Rc::new(Vec::new()))
     }
 
-    fn from_values(base: Rc<Vec<Value>>) -> TaskRegions {
+    fn from_values(base: Rc<Vec<V>>) -> TaskRegions<V> {
         let mut arena = Arena::new();
         // Both `shared`: a continuation may be captured across either and resumed after it, so
         // neither may hand its slots back at a lexical close.
@@ -59,18 +59,18 @@ impl TaskRegions {
         }
     }
 
-    pub fn arena(&self) -> &Arena {
+    pub fn arena(&self) -> &Arena<V> {
         &self.arena
     }
 
-    pub fn arena_mut(&mut self) -> &mut Arena {
+    pub fn arena_mut(&mut self) -> &mut Arena<V> {
         &mut self.arena
     }
 
     /// Makes everything the stack currently holds the fixture: what [`TaskRegions::reset`] goes
     /// back to.
     pub fn seal(&mut self) {
-        let base: Vec<Value> = self.arena.slots().map(|(_, v)| v.clone()).collect();
+        let base: Vec<V> = self.arena.slots().map(|(_, v)| v.clone()).collect();
         *self = TaskRegions::from_values(Rc::new(base));
     }
 
@@ -127,28 +127,28 @@ impl TaskRegions {
     }
 
     /// Allocates in the innermost open region.
-    pub fn alloc_cell(&mut self, value: Value) -> Slot {
+    pub fn alloc_cell(&mut self, value: V) -> Slot {
         self.arena
             .alloc(value)
             .expect("a task's entry region is open for the whole of a run")
     }
 }
 
-impl Deref for TaskRegions {
-    type Target = Arena;
+impl<V: Clone + Default> Deref for TaskRegions<V> {
+    type Target = Arena<V>;
 
-    fn deref(&self) -> &Arena {
+    fn deref(&self) -> &Arena<V> {
         &self.arena
     }
 }
 
-impl DerefMut for TaskRegions {
-    fn deref_mut(&mut self) -> &mut Arena {
+impl<V: Clone + Default> DerefMut for TaskRegions<V> {
+    fn deref_mut(&mut self) -> &mut Arena<V> {
         &mut self.arena
     }
 }
 
-impl fmt::Debug for TaskRegions {
+impl<V: Clone + Default + fmt::Debug> fmt::Debug for TaskRegions<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_map()
             .entries(self.arena.slots().map(|(s, v)| (s.to_string(), v)))
@@ -236,7 +236,7 @@ mod tests {
 
     #[test]
     fn a_fresh_stack_can_allocate_because_its_entry_region_is_open() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         let slot = regions.alloc_cell(Value::Int(1));
         assert_eq!(int_of(&regions, slot), 1);
         assert_eq!(
@@ -248,7 +248,7 @@ mod tests {
 
     #[test]
     fn a_reset_discards_what_the_entry_point_allocated() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         let scratch = regions.alloc_cell(Value::Int(1));
 
         regions.reset();
@@ -302,7 +302,7 @@ mod tests {
 
     #[test]
     fn sealing_makes_the_current_extent_the_thing_a_reset_goes_back_to() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         let kept = regions.alloc_cell(Value::Int(5));
         regions.seal();
         let scratch = regions.alloc_cell(Value::Int(6));
@@ -317,7 +317,7 @@ mod tests {
     /// A region abandoned by a handler that discarded its continuation leaves a scope open.
     #[test]
     fn a_reset_closes_a_region_the_last_entry_point_abandoned() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         regions.open_region(RegionKind::Unique, Span::DUMMY);
         regions.alloc_cell(Value::Int(1));
         assert_eq!(regions.depth(), 3);
@@ -336,7 +336,7 @@ mod tests {
     /// and resumed after its lexical close still reads the cell.
     #[test]
     fn a_shared_regions_close_keeps_the_slots_a_live_continuation_can_reach() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         let id = regions.open_region(RegionKind::Shared, Span::DUMMY);
         let cell = regions.alloc_cell(Value::Int(1));
         let pin = regions.pin().expect("a program region is open");
@@ -354,7 +354,7 @@ mod tests {
     /// continuation that could reach the region has died, its close reclaims.
     #[test]
     fn a_shared_region_no_continuation_outlives_still_reclaims_at_its_close() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         let id = regions.open_region(RegionKind::Shared, Span::DUMMY);
         let cell = regions.alloc_cell(Value::Int(1));
         drop(regions.pin().expect("a program region is open"));
@@ -367,7 +367,7 @@ mod tests {
 
     #[test]
     fn a_unique_region_hands_its_slots_back_at_its_close() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         let outer = regions.alloc_cell(Value::Int(1));
         let id = regions.open_region(RegionKind::Unique, Span::DUMMY);
         let inner = regions.alloc_cell(Value::Int(2));
@@ -384,7 +384,7 @@ mod tests {
     /// defer.
     #[test]
     fn no_pin_is_taken_outside_every_program_region() {
-        let mut regions = TaskRegions::new();
+        let mut regions: TaskRegions = TaskRegions::new();
         assert!(regions.pin().is_none());
         let id = regions.open_region(RegionKind::Shared, Span::DUMMY);
         assert!(regions.pin().is_some());
