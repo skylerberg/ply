@@ -14,6 +14,14 @@ use ply_syntax::ast::{ModuleName, Program};
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+/// A root, its arguments, the binding it runs under, and what it answers or refuses with.
+type HostCase = (
+    &'static str,
+    Vec<Value>,
+    std::sync::Arc<ply_eval::HostBinding>,
+    Result<Value, &'static str>,
+);
+
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
@@ -436,12 +444,7 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
     // (the corpus validates the mechanism end-to-end). Under tier-only, a user effect performed by
     // a compiled root resolves to no host row, so every case here refuses at the host boundary.
-    let cases: Vec<(
-        &str,
-        Vec<Value>,
-        std::sync::Arc<ply_eval::HostBinding>,
-        Result<Value, &str>,
-    )> = vec![
+    let cases: Vec<HostCase> = vec![
         (
             "m.hosted",
             vec![Value::Int(4)],
@@ -1027,12 +1030,7 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     // (the corpus validates the mechanism end-to-end). A bound `spawned` opens its production
     // region and answers; `parked`'s `slow.fetch` resolves to no host row, and a hermetic binding
     // refuses the region, so both of those refuse at the host boundary.
-    let cases: Vec<(
-        &str,
-        Vec<Value>,
-        std::sync::Arc<ply_eval::HostBinding>,
-        Result<Value, &str>,
-    )> = vec![
+    let cases: Vec<HostCase> = vec![
         (
             "m.spawned",
             vec![Value::Int(4)],
