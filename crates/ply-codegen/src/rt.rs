@@ -345,6 +345,19 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
         .collect()
 }
 
+/// A spawned task's view of the handlers around its spawn: copies, so the task performs against
+/// what enclosed the spawn whatever the spawner does next. None of them names a detached body --
+/// a clause off the tail would capture the spawner's stack, and `rt_perform` refuses it.
+pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
+    clone_frames(list)
+        .into_iter()
+        .map(|f| HandlerFrame {
+            detached: None,
+            ..f
+        })
+        .collect()
+}
+
 pub(crate) fn drop_frame(f: HandlerFrame) {
     for c in f.clauses {
         heap::dec(c.closure);
@@ -1177,15 +1190,6 @@ fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
     }
 }
 
-/// A key the heap's maps order: anything but a closure or a bridged value, which the generic path
-/// refuses with the machine's own diagnostic.
-fn map_key(k: Word) -> bool {
-    !matches!(
-        heap::kind(k),
-        crate::heap::KIND_CLOSURE | crate::heap::KIND_BRIDGE
-    )
-}
-
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
         (Builtin::Len, [xs]) if heap::kind(*xs) == KIND_LIST => {
@@ -1195,47 +1199,6 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
             Some(ctx.heap.list_push(*xs, *x))
-        }
-        // The map family on the heap's own maps: through the generic path each call converted the
-        // whole map to an interpreter value and back, which was most of what a request allocated.
-        (Builtin::MapLen, [m]) if heap::kind(*m) == crate::heap::KIND_MAP => {
-            let n = map::len(obj(*m)) as i64;
-            heap::dec(*m);
-            Some(heap::imm(n))
-        }
-        (Builtin::MapContains, [m, k])
-            if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) =>
-        {
-            let found = map::get(&ctx.tables.layouts, obj(*m), *k).is_some();
-            heap::dec(*m);
-            heap::dec(*k);
-            Some(crate::heap::bool(found))
-        }
-        (Builtin::MapGet, [m, k]) if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) => {
-            let some = ctx.tables.layouts.some?;
-            let none = ctx.tables.layouts.none?;
-            let answer = match map::get(&ctx.tables.layouts, obj(*m), *k) {
-                Some(v) => {
-                    heap::inc(v);
-                    let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
-                    unsafe { set_word(c, 0, v) };
-                    c as Word
-                }
-                None => ctx.nullary(none),
-            };
-            heap::dec(*m);
-            heap::dec(*k);
-            Some(answer)
-        }
-        (Builtin::MapInsert, [m, k, v])
-            if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) =>
-        {
-            Some(ctx.heap.map_insert(&ctx.tables.layouts, *m, *k, *v))
-        }
-        (Builtin::MapRemove, [m, k]) if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) => {
-            let out = ctx.heap.map_remove(&ctx.tables.layouts, *m, *k);
-            heap::dec(*k);
-            Some(out)
         }
         // The cells: the tier's own, over heap words, so a cell's contents never cross the seam.
         (Builtin::CellGet, [c]) => {
@@ -1933,6 +1896,7 @@ pub unsafe extern "C" fn rt_perform(
     }
     c.performed.push(atom);
     let mut found = None;
+    let mut inherited_off_tail = false;
     let mut stack = c.current;
     'search: loop {
         for (i, f) in c.stacks[stack].list.iter().enumerate().rev() {
@@ -1954,9 +1918,10 @@ pub unsafe extern "C" fn rt_perform(
                 .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
             {
                 if cl.resumes == 2 {
-                    let id = f
-                        .detached
-                        .expect("a clause off the tail is in a detached frame");
+                    let Some(id) = f.detached else {
+                        inherited_off_tail = true;
+                        break 'search;
+                    };
                     let closure = cl.closure;
                     // The names are moved in and dropped before the switch: this frame comes
                     // back with every restored snapshot, and a local that owned heap memory
@@ -1979,6 +1944,20 @@ pub unsafe extern "C" fn rt_perform(
             Some(p) => stack = p,
             None => break,
         }
+    }
+    if inherited_off_tail {
+        let d = Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!(
+                "`{effect}.{op}` was performed in a task, and its handler resumes off the tail"
+            ),
+        )
+        .primary(c.site(), "performed here")
+        .note(
+            "the clause would capture the continuation of the body the task was spawned in, which \
+             is not the task's own: handle the operation inside the task, or resume on the tail",
+        );
+        return c.fail(d);
     }
     let Some((stack, depth, closure, resumes)) = found else {
         // A `task` operation inside the production region already open is the scheduler's;
