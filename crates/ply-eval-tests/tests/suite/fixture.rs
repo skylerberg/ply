@@ -6,7 +6,7 @@
 //! most of them want.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::Machine;
+use ply_eval::{Machine, Provider};
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
@@ -72,6 +72,20 @@ impl Compiled {
 
     pub fn machine(&self) -> Machine<'_> {
         Machine::new(&self.program, &self.resolved, &self.check)
+    }
+
+    /// A machine running on a real compiled tier — the only evaluator under tier-only, and the one
+    /// whose boundary defences the host suites exist to exercise.
+    pub fn machine_on_tier(&self) -> Machine<'_> {
+        let mut m = Machine::new(&self.program, &self.resolved, &self.check);
+        let unit = ply_codegen::Unit::over(&self.program, &self.resolved, &self.check)
+            .expect("this host has a C compiler");
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        m.set_compiled(unit.attach(&spec));
+        m
     }
 
     pub fn index_of(&self, name: &str) -> usize {
