@@ -123,14 +123,20 @@ fn entering_the_machine_allocates_a_bounded_amount() {
     let constant = loaded
         .full("w6_const")
         .expect("the driver declares w6_const");
-    loaded
-        .pure_call(&constant, Vec::new(), 8)
-        .expect("the driver runs");
+    // The unit is built outside the charge: the boundary's cost is the entry, not the build.
+    let mut machine = loaded.machine();
+    for _ in 0..8 {
+        machine
+            .call(&constant, Vec::new(), ply_span::Span::DUMMY)
+            .expect("the driver runs");
+    }
     const N: u32 = 1_000;
     let (_, allocs, _) = charge(|| {
-        loaded
-            .pure_call(&constant, Vec::new(), N)
-            .expect("the driver runs")
+        for _ in 0..N {
+            machine
+                .call(&constant, Vec::new(), ply_span::Span::DUMMY)
+                .expect("the driver runs");
+        }
     });
     let per_call = allocs as f64 / N as f64;
     println!("  Machine::call on a constant: {per_call:.1} allocations");

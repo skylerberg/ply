@@ -313,6 +313,11 @@ fn produce_in(
         taken,
         refusals,
     } = emit_all(loaded, offered, fragment, ctors, ctors_digest, inlining)?;
+    // An emitter that raised answered nothing, and a unit over that silence would be cached as
+    // the program's bodies: the failure is the answer, and the next run asks again.
+    if let Some(why) = super::producer::with_current(|p| p.failure(loaded)).flatten() {
+        bail!("the Ply emitter failed over the program: {why}");
+    }
     // For its effect on the code table, whose rows are recorded just below: `finish` reads the
     // same slots back out of the table this completes.
     let _ = constants_of(loaded, &mut unit);

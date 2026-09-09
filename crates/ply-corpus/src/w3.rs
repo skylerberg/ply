@@ -308,6 +308,8 @@ pub struct Loaded {
     /// Each module's source text by `m.name.to_string()`: what the whole Ply emitter re-parses to
     /// produce bodies, since under tier-only (ADR 0048) every machine here runs on a compiled tier.
     texts: HashMap<String, String>,
+    /// The unit over the program, built once: every machine over this program attaches it.
+    unit: std::sync::OnceLock<&'static ply_codegen::Unit>,
 }
 
 impl Loaded {
@@ -345,6 +347,7 @@ impl Loaded {
             check,
             region_kinds: ply_eval::region_kind::Kinds::default(),
             texts,
+            unit: std::sync::OnceLock::new(),
         })
     }
 
@@ -365,13 +368,15 @@ impl Loaded {
         ply_codegen::c::producer::ensure_default();
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
-        let unit = ply_codegen::Unit::over_with_texts(
-            &self.program,
-            &self.resolved,
-            &self.check,
-            self.texts.clone(),
-        )
-        .expect("this host has a C compiler");
+        let unit = *self.unit.get_or_init(|| {
+            ply_codegen::Unit::over_with_texts(
+                &self.program,
+                &self.resolved,
+                &self.check,
+                self.texts.clone(),
+            )
+            .expect("this host has a C compiler")
+        });
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()
