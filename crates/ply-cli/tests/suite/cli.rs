@@ -213,10 +213,10 @@ fn a_second_backed_run_selects_nothing() {
     assert!(text.contains("selected 0 of 2 (2 cached)"), "got:\n{text}");
 }
 
-/// And the reason it may: a `Pass` names the engine that earned it. Neither run may read the
-/// other's, so the first run on each engine executes whatever the other already passed.
+/// Under tier-only the default run and `--backend c` are one engine: a pass either earns, the
+/// other reads. A backend wrong on purpose stays in a namespace of its own (below).
 #[test]
-fn one_engines_pass_is_never_another_engines() {
+fn the_default_tier_and_backend_c_are_one_engine() {
     let dir = project(GREEN);
     ply(dir.path()).arg("test").assert().success();
 
@@ -226,8 +226,8 @@ fn one_engines_pass_is_never_another_engines() {
         .unwrap();
     let text = stdout_of(&out);
     assert!(
-        text.contains("selected 2 of 2 (0 cached)"),
-        "a backed run read the evaluator's passes:\n{text}"
+        text.contains("selected 0 of 2 (2 cached)"),
+        "`--backend c` did not read the default tier's passes:\n{text}"
     );
 
     // And back the other way, over a cache the backed run has now written to.
