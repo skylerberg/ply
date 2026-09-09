@@ -490,6 +490,7 @@ pub(super) fn finish(
     }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
+    tables.sources = loaded.program.modules.iter().map(|m| m.source).collect();
     Ok(Native {
         lib,
         entries,
@@ -878,5 +879,6 @@ fn tables_of(unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
         memo_values: Default::default(),
         memo_words: Default::default(),
         calls: Default::default(),
+        sources: Vec::new(),
     }
 }

@@ -194,45 +194,22 @@ impl<'a> Prover<'a> {
         })
     }
 
-    /// A proposition's roots: the guards' and the body's program-wide names in the unit.
-    fn roots(&self, obligation: &Obligation, claim: &Claim<'a>) -> (Vec<Symbol>, Option<Symbol>) {
+    /// A proposition's body root: its program-wide name in the unit.
+    fn body_root(&self, obligation: &Obligation, claim: &Claim<'a>) -> Option<Symbol> {
         let module = &self.program.modules[claim.module()].name;
         match claim {
             Claim::Ensures { def, .. } => {
                 let ObligationKind::Ensures { index } = obligation.kind else {
-                    return (Vec::new(), None);
+                    return None;
                 };
-                let requires = def
-                    .spec
-                    .iter()
-                    .filter(|c| c.kind == SpecKind::Requires)
-                    .count();
-                let guards = (0..requires)
-                    .map(|k| {
-                        module.qualify(&ply_codegen::clause_root_name(
-                            &def.name.name,
-                            "requires",
-                            k,
-                        ))
-                    })
-                    .collect();
-                let body = module.qualify(&ply_codegen::clause_root_name(
+                Some(module.qualify(&ply_codegen::clause_root_name(
                     &def.name.name,
                     "ensures",
                     index,
-                ));
-                (guards, Some(body))
+                )))
             }
-            Claim::Law { ordinal, def, .. } => {
-                let guards = def
-                    .guard
-                    .iter()
-                    .map(|_| module.qualify(&ply_codegen::law_root_name(*ordinal, "guard")))
-                    .collect();
-                (
-                    guards,
-                    Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "body"))),
-                )
+            Claim::Law { ordinal, .. } => {
+                Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "body")))
             }
         }
     }
@@ -607,11 +584,9 @@ impl<'a> Prover<'a> {
                 });
             }
         }
-        let (guard_roots, body_root) = self.roots(obligation, claim);
+        let body_root = self.body_root(obligation, claim);
         Ok(Cases {
             machine: self.machine(),
-            compiled: self.compiled(),
-            guard_roots,
             body_root,
             module: claim.module(),
             binders: obligation.generated().to_vec(),
@@ -939,8 +914,6 @@ fn bindings_of(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
 /// How a tuple of binder values is judged: guard first, always.
 struct Cases<'a> {
     machine: Machine<'a>,
-    compiled: Option<Rc<dyn ply_eval::Compiled>>,
-    guard_roots: Vec<Symbol>,
     body_root: Option<Symbol>,
     module: usize,
     binders: Vec<LawBinder>,
@@ -1003,21 +976,6 @@ impl Judge for Cases<'_> {
         // function and stays on the tier.
         let value = self.machine.eval_expr_in(self.body, self.module, &scope)?;
         self.boolean(value)
-    }
-}
-
-/// A proposition entered in the unit: its answer, what it raised, or `None` where the unit does
-/// not hold the root and the judge evaluates it as before.
-fn entered(
-    compiled: Option<&Rc<dyn ply_eval::Compiled>>,
-    root: Option<&Symbol>,
-    args: &[Value],
-) -> Option<Result<Value, Diagnostic>> {
-    let (compiled, root) = (compiled?, root?);
-    match compiled.enter_whole(root, args, DEFAULT_MAX_CALLS) {
-        ply_eval::Entered::Answered(value) => Some(Ok(value)),
-        ply_eval::Entered::Raised(raised) => Some(Err(raised)),
-        ply_eval::Entered::Declined => None,
     }
 }
 

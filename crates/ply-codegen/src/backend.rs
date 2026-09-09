@@ -475,10 +475,13 @@ impl Bodies {
                 // the tier's own to report. The count is the budget this entry was handed, which is
                 // the language's `DEFAULT_MAX_CALLS`; a native-stack floor tripped inside that
                 // budget still reports the budget, because that is the bound the program overran.
-                Some(ply_span::Diagnostic::error(
-                    ply_span::codes::RUNTIME_ERROR,
-                    format!("recursion limit of {fuel} nested calls exceeded"),
-                ))
+                Some(
+                    ply_span::Diagnostic::error(
+                        ply_span::codes::RUNTIME_ERROR,
+                        format!("recursion limit of {fuel} nested calls exceeded"),
+                    )
+                    .primary(ctx.site(), "the call that overran it"),
+                )
             } else {
                 ctx.diagnostic.take().or_else(|| {
                     (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {

@@ -662,6 +662,24 @@ impl<'a> Emit<'a> {
     }
 
     /// The check after any helper that can raise: a body that failed answers nothing.
+    /// Stores where the body is before a call that can fail, so what the runtime raises is placed:
+    /// the span's own source names the module, so a site is right even where expansion crossed one.
+    fn site(&mut self, span: Span) {
+        if span == Span::DUMMY {
+            return;
+        }
+        let Some(m) = self
+            .src
+            .program
+            .modules
+            .iter()
+            .position(|md| md.source == span.source)
+        else {
+            return;
+        };
+        self.line(format!("PLY_SITE(ctx, {m}, {}, {});", span.start, span.end));
+    }
+
     fn check(&mut self) {
         self.line("if (ctx->failed) return 0;");
     }
@@ -876,8 +894,8 @@ impl<'a> Emit<'a> {
         match &code.kind {
             NodeKind::Lit(lit, value) => self.literal(lit, value),
             NodeKind::Var { name, .. } => self.var(name, code.own),
-            NodeKind::Unary { op, operand } => self.unary(*op, operand),
-            NodeKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs),
+            NodeKind::Unary { op, operand } => self.unary(*op, operand, code.span),
+            NodeKind::Binary { op, lhs, rhs } => self.binary(*op, lhs, rhs, code.span),
             NodeKind::If {
                 cond,
                 then_branch,
@@ -887,8 +905,8 @@ impl<'a> Emit<'a> {
             NodeKind::Field { base, field } => self.field(base, &field.name, code.own),
             NodeKind::Record { fields } => self.record(fields),
             NodeKind::List { items } => self.list(items),
-            NodeKind::App { func, args } => self.app(func, args),
-            NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms),
+            NodeKind::App { func, args } => self.app(func, args, code.span),
+            NodeKind::Match { scrutinee, arms } => self.match_expr(scrutinee, arms, code.span),
             NodeKind::Lambda {
                 params,
                 body,
@@ -1080,8 +1098,11 @@ impl<'a> Emit<'a> {
         None
     }
 
-    fn unary(&mut self, op: UnOp, operand: &Code) -> Result<V> {
+    fn unary(&mut self, op: UnOp, operand: &Code, span: Span) -> Result<V> {
         let v = self.expr(operand)?;
+        if matches!(op, UnOp::Neg) {
+            self.site(span);
+        }
         match op {
             UnOp::Not => {
                 let b = self.as_bool(&v);
@@ -1135,7 +1156,7 @@ impl<'a> Emit<'a> {
         Ok(self.bind(Kind::Num(t), format!("({}){a}", ctype(Kind::Num(t)))))
     }
 
-    fn binary(&mut self, op: BinOp, lhs: &Code, rhs: &Code) -> Result<V> {
+    fn binary(&mut self, op: BinOp, lhs: &Code, rhs: &Code, span: Span) -> Result<V> {
         // `&&` and `||` short-circuit, so the right operand is emitted inside the branch.
         if matches!(op, BinOp::And | BinOp::Or) {
             let l = self.expr(lhs)?;
@@ -1162,6 +1183,19 @@ impl<'a> Emit<'a> {
         }
         let l = self.expr(lhs)?;
         let r = self.expr(rhs)?;
+        if matches!(
+            op,
+            BinOp::Add
+                | BinOp::Sub
+                | BinOp::Mul
+                | BinOp::Div
+                | BinOp::Rem
+                | BinOp::Shl
+                | BinOp::Shr
+                | BinOp::Ushr
+        ) {
+            self.site(span);
+        }
         let width = match (l.k, r.k) {
             (Kind::Num(t), _) | (_, Kind::Num(t)) => Some(t),
             _ => None,
@@ -1469,7 +1503,7 @@ impl<'a> Emit<'a> {
         let mark = self.scope.len();
         for s in stmts {
             match s {
-                Stmt::Let { pat, value, .. } => {
+                Stmt::Let { pat, value, span } => {
                     let v = self.expr(value)?;
                     match pat {
                         Pat::Var { name, .. } => {
@@ -1491,6 +1525,7 @@ impl<'a> Emit<'a> {
                             // same tag check a `match` arm makes, raising `rt_no_match` on failure.
                             if !self.irrefutable_pat(pat) {
                                 let test = self.test(pat, &held)?;
+                                self.site(*span);
                                 self.line(format!(
                                     "if (!({test})) {{ rt_let_no_match_p(ctx); return 0; }}"
                                 ));
@@ -1536,6 +1571,7 @@ impl<'a> Emit<'a> {
         let w = self.word(&v);
         // `Int`, not `Boxed`: a region id is a number the arena hands back, not a heap word, and
         // binding it as one had the release discipline free it as an object.
+        self.site(span);
         let region = self.bind(Kind::Int, format!("rt_region_p(ctx, {unique})"));
         let made = self.bind(Kind::Boxed, format!("rt_cell_p(ctx, {w})"));
         // Renamed before it enters scope, exactly as a `let` renames its value. The helper answers
@@ -2168,7 +2204,7 @@ impl<'a> Emit<'a> {
         Ok(self.made_here(v))
     }
 
-    fn app(&mut self, func: &Code, args: &[Code]) -> Result<V> {
+    fn app(&mut self, func: &Code, args: &[Code], span: Span) -> Result<V> {
         if let NodeKind::Var { name: q, .. } = &func.kind {
             let bare = q.symbol().as_str().to_string();
             if let Some(full) = self.resolve_q(q) {
@@ -2216,6 +2252,7 @@ impl<'a> Emit<'a> {
                     if ws.is_empty() { "" } else { ", " },
                     ws.join(", ")
                 );
+                self.site(span);
                 let held = self.bind(Kind::Boxed, call);
                 self.check();
                 let kind = ret.kind();
@@ -2236,7 +2273,7 @@ impl<'a> Emit<'a> {
             if q.is_bare()
                 && let Some(b) = Builtin::from_name(q.symbol())
             {
-                return self.builtin_call(b, args);
+                return self.builtin_call(b, args, span);
             }
             // A constructor applied to arguments.
             if let Some((i, arity)) = self.ctor_of(q) {
@@ -2290,6 +2327,7 @@ impl<'a> Emit<'a> {
                 ws.join(", ")
             }
         ));
+        self.site(span);
         let v = self.bind(
             Kind::Boxed,
             format!(
@@ -2301,7 +2339,7 @@ impl<'a> Emit<'a> {
         Ok(v)
     }
 
-    fn builtin_call(&mut self, b: Builtin, args: &[Code]) -> Result<V> {
+    fn builtin_call(&mut self, b: Builtin, args: &[Code], span: Span) -> Result<V> {
         let (lo, hi) = b.arity();
         if args.len() < lo || args.len() > hi {
             return self.refuse(format!(
@@ -2317,7 +2355,7 @@ impl<'a> Emit<'a> {
             && args.len() == 3
             && matches!(&args[2].kind, NodeKind::Lambda { params, .. } if params.len() == 1)
         {
-            return self.fused_iterate(&args[0], &args[1], &args[2]);
+            return self.fused_iterate(&args[0], &args[1], &args[2], span);
         }
         // `fold` over a list is the other loop this language writes, and a tier that refuses it
         // does not merely fall back: the fold runs interpreted and crosses the seam into whatever
@@ -2325,7 +2363,7 @@ impl<'a> Emit<'a> {
         // two hundred thousand that is quadratic, and it is why the record kernel took ninety
         // seconds on this tier while the interpreter alone took less than one.
         if b == Builtin::Fold && args.len() == 3 {
-            return self.fused_fold(&args[0], &args[1], &args[2]);
+            return self.fused_fold(&args[0], &args[1], &args[2], span);
         }
         // `bytes_concat_all([a, b, ..])` joins the pieces without building the list. The runtime
         // has `rt_bytes_join` for exactly this and this tier declared it, bound it and never
@@ -2390,6 +2428,7 @@ impl<'a> Emit<'a> {
         for a in args {
             vals.push(self.expr(a)?);
         }
+        self.site(span);
         // The scalar family, inline: this is why the tier is worth having.
         if args.len() == 2
             && matches!(
@@ -2527,7 +2566,7 @@ impl<'a> Emit<'a> {
     /// A next attempt needs the release keyed on the object rather than the name -- `root` is the
     /// existing spelling of that -- and a corpus that reaches it, which is the harder half: the
     /// front end and `examples/` both pass with the bug in.
-    fn fused_fold(&mut self, items: &Code, init: &Code, f: &Code) -> Result<V> {
+    fn fused_fold(&mut self, items: &Code, init: &Code, f: &Code, span: Span) -> Result<V> {
         let xs = self.expr(items)?;
         // A count of the loop's own, because the loop releases at the end. `rt_list_at` reads the
         // list rather than taking it, so one count covers every element -- but the fold had been
@@ -2583,6 +2622,7 @@ impl<'a> Emit<'a> {
             }
             None => self.step_call(f, acc.clone(), x.c.clone())?,
         };
+        self.site(span);
         self.line(format!("{acc} = {call};"));
         self.check();
         self.depth -= 1;
@@ -2630,7 +2670,7 @@ impl<'a> Emit<'a> {
         }
     }
 
-    fn fused_iterate(&mut self, seed: &Code, budget: &Code, step: &Code) -> Result<V> {
+    fn fused_iterate(&mut self, seed: &Code, budget: &Code, step: &Code, span: Span) -> Result<V> {
         let (Some(stop), Some(go)) = (self.unit.layouts.stop, self.unit.layouts.go) else {
             return self.refuse("`iterate` with no `Stop` and `Continue` in the program");
         };
@@ -2654,6 +2694,7 @@ impl<'a> Emit<'a> {
         self.line(format!("Word {answer} = 0;"));
         self.line("for (;;) {");
         self.depth += 1;
+        self.site(span);
         self.line(format!(
             "if ({left} <= 0) {{ rt_iterate_bad_p(ctx, 0, {bud}); return 0; }}"
         ));
@@ -2694,6 +2735,7 @@ impl<'a> Emit<'a> {
         self.depth -= 1;
         self.line("} else {");
         self.depth += 1;
+        self.site(span);
         self.line(format!(
             "rt_iterate_bad_p(ctx, 2, {}); return 0;",
             step_answer.c
@@ -2911,7 +2953,7 @@ impl<'a> Emit<'a> {
         }))
     }
 
-    fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm]) -> Result<V> {
+    fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], span: Span) -> Result<V> {
         let s = self.expr(scrutinee)?;
         let sw = self.word(&s);
         let held = self.bind(Kind::Boxed, sw);
@@ -2940,6 +2982,7 @@ impl<'a> Emit<'a> {
             self.depth -= 1;
             self.line("}");
         }
+        self.site(span);
         self.line(format!("if (!{done}) {{ rt_no_match_p(ctx); return 0; }}"));
         Ok(V::boxed(out))
     }
