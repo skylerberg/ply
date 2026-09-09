@@ -1350,11 +1350,11 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
                         Some(d) -> line(note_call(site(check(at.em), span), d.full), bytes_concat_all([
                           acc.v.c, b" = ", d.c, b"(ctx, ", acc.v.c, b", ", at.v.c, b");"])),
                         None -> {
-                          let a2 = fresh(site(check(at.em), span));
+                          let a2 = fresh(check(at.em));
                           line(
-                            line(line(a2.em, bytes_concat_all([
+                            site(line(line(a2.em, bytes_concat_all([
                               b"Word ", a2.name, b"[] = {", acc.v.c, b", ", at.v.c, b"};"])),
-                              bytes_concat_all([b"ply_inc(", co.v.c, b");"])),
+                              bytes_concat_all([b"ply_inc(", co.v.c, b");"])), span),
                             bytes_concat_all([acc.v.c, b" = rt_call_p(ctx, ", co.v.c,
                                               b", (Word)(intptr_t)", a2.name, b", 2);"]))
                         },
@@ -1387,14 +1387,15 @@ fn fused_fold(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span
 fn inline_len(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   if name == b"bytes_at" && len(args) == 2 { inline_at(em, args, params, false, span) }
   else if name == b"bytes_u32_le" && len(args) == 2 { inline_at(em, args, params, true, span) }
-  else if name == b"bytes_concat_all" && len(args) == 1 { inline_join(em, args, params) }
+  else if name == b"bytes_concat_all" && len(args) == 1 { inline_join(em, args, params, span) }
   else if len(args) != 1 { None }
   else if name != b"len" && name != b"bytes_len" { None }
   else { match list_at(args, 0) {
     None -> None,
     Some(x) -> match expr(notail(em), x, params) {
       None -> None,
-      Some(o) -> {
+      Some(o0) -> {
+        let o = { em: site(o0.em, span), v: o0.v };
         let fits = match o.v.ty {
           TyList -> name == b"len",
           TyBytes -> name == b"bytes_len",
@@ -1434,9 +1435,10 @@ fn width_builtin(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: S
   if !((is_wrap(name) && len(args) == 2) || ((of_int_width(name) != None || int_of_width(name) != None) && len(args) == 1)) { None } else {
     match args_evaled(em, args, params, 0, []) {
       None -> None,
-      Some(e) -> match list_at(e.vals, 0) {
+      Some(e0) -> match list_at(e0.vals, 0) {
         None -> None,
-        Some(v0) ->
+        Some(v0) -> {
+          let e = { em: site(e0.em, span), vals: e0.vals };
           if is_wrap(name) {
             match v0.k {
               KNum(t) -> match list_at(e.vals, 1) {
@@ -1457,21 +1459,22 @@ fn width_builtin(em: Em, name: Bytes, args: List<Code>, params: List<P>, span: S
                   }
                 },
               },
-              _ -> Some(builtin_call(site(e.em, span), name, e.vals)),
+              _ -> Some(builtin_call(e.em, name, e.vals)),
             }
           } else { match of_int_width(name) {
             Some(t) -> if carried(t) {
               let held = bind(e.em, KInt, as_int(v0));
-              let g = line(site(held.em, span), bytes_concat_all([b"if (", held.v.c, b" < ", int_lit(width_min(t)), b" || ",
+              let g = line(held.em, bytes_concat_all([b"if (", held.v.c, b" < ", int_lit(width_min(t)), b" || ",
                 held.v.c, b" > ", int_lit(width_max(t)), b") { rt_not_that_width_p(ctx, ", num(width_index(t)), b", ",
                 held.v.c, b"); return 0; }"]));
               Some(bind(g, KNum(t), bytes_concat_all([b"(", ctype(KNum(t)), b")", held.v.c])))
-            } else { Some(builtin_call(site(e.em, span), name, e.vals)) },
+            } else { Some(builtin_call(e.em, name, e.vals)) },
             None -> match int_of_width(name) {
-              Some(t) -> if carried(t) { Some(bind(e.em, KInt, as_int(v0))) } else { Some(builtin_call(site(e.em, span), name, e.vals)) },
+              Some(t) -> if carried(t) { Some(bind(e.em, KInt, as_int(v0))) } else { Some(builtin_call(e.em, name, e.vals)) },
               None -> None,
             },
-          } },
+          } }
+        },
       },
     }
   }
@@ -1523,7 +1526,7 @@ fn kind_tested(em: Em, name: Bytes, v: V, index: Option<V>) -> Out = {
 
 // `bytes_concat_all([a, b, ..])` joins the pieces without building the list; over anything
 // else it is the runtime's call.
-fn inline_join(em: Em, args: List<Code>, params: List<P>) -> Option<Out> =
+fn inline_join(em: Em, args: List<Code>, params: List<P>, span: Span) -> Option<Out> =
   match list_at(args, 0) {
     None -> None,
     Some(x) -> match x.node {
@@ -1540,7 +1543,7 @@ fn inline_join(em: Em, args: List<Code>, params: List<P>) -> Option<Out> =
       },
       _ -> match expr(notail(em), x, params) {
         None -> None,
-        Some(o) -> Some(builtin_call(o.em, b"bytes_concat_all", [o.v])),
+        Some(o) -> Some(builtin_call(site(o.em, span), b"bytes_concat_all", [o.v])),
       },
     },
   }
@@ -1560,14 +1563,16 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool, span: Span) 
           None -> None,
           // The kind-tested arm reads one byte; `bytes_u32_le` over bytes the declaration does
           // not fix is the runtime's call, which reads four.
-          Some(iv) -> if bv.v.ty != TyBytes {
-            if wide { Some(builtin_call(site(iv.em, span), b"bytes_u32_le", [bv.v, iv.v])) }
-            else { Some(kind_tested(site(iv.em, span), b"bytes_at", bv.v, Some(iv.v))) }
+          Some(iv0) -> {
+            let iv = { em: site(iv0.em, span), v: iv0.v };
+            if bv.v.ty != TyBytes {
+            if wide { Some(builtin_call(iv.em, b"bytes_u32_le", [bv.v, iv.v])) }
+            else { Some(kind_tested(iv.em, b"bytes_at", bv.v, Some(iv.v))) }
           } else {
             let t = bind(iv.em, KBoxed, as_word(bv.v));
             let idx = bind(t.em, KInt, as_int(iv.v));
             let bi = builtin_of(idx.em, if wide { b"bytes_u32_le" } else { b"bytes_at" });
-            let g = line(site(bi.em, span), bytes_concat_all([
+            let g = line(bi.em, bytes_concat_all([
               b"if ((uint64_t)", idx.v.c, if wide { b" + 4 > " } else { b" >= " },
               b"(uint64_t)ply_obj(", t.v.c,
               b")->len) { Word a[2]; a[0] = ", t.v.c, b"; ply_inc(a[0]); a[1] = ply_imm(",
@@ -1583,6 +1588,7 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool, span: Span) 
               Some(bind(g, KInt, bytes_concat_all([
                 b"(int64_t)((unsigned char *)ply_words(", t.v.c, b"))[", idx.v.c, b"]"])))
             }
+          }
           },
         },
       },
@@ -1656,6 +1662,19 @@ fn direct_helper(name: Bytes, args: Int) -> Option<Bytes> =
 // each.
 // `opaque` says whether any argument is a `Float` or `Decimal`: a builtin's answer over one
 // stays opaque, so an operator downstream reaches the runtime rather than reading it as an `Int`.
+// A builtin's arguments for a helper of its own: evaluated, the site stored, then each held
+// once more -- the reference's order, which stores the site before it holds anything.
+fn args_owned_at(em: Em, xs: List<Code>, params: List<P>, span: Span)
+    -> Option<{ em: Em, names: List<Bytes> }> =
+  match args_evaled(em, xs, params, 0, []) {
+    None -> None,
+    Some(e) -> Some(fold(e.vals, { em: site(e.em, span), names: [] },
+      |a: { em: Em, names: List<Bytes> }, v: V| {
+        let w = owned(a.em, v);
+        { em: w.em, names: push(a.names, w.v.c) }
+      })),
+  }
+
 fn args_owned(em: Em, xs: List<Code>, params: List<P>, i: Int, acc: List<Bytes>)
     -> Option<{ em: Em, names: List<Bytes> }> =
   match args_owned_typed(em, xs, params, i, acc) {
@@ -2482,10 +2501,12 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
                     // evaluate everything and only then hold any of it.
                     Some(h) -> match (if fv.name == b"map" || fv.name == b"filter" {
                                         args_one_pass(em, a.args, params, 0, [])
-                                      } else { args_owned(em, a.args, params, 0, []) }) {
+                                      } else if fv.name == b"map_fold" {
+                                        args_owned(em, a.args, params, 0, [])
+                                      } else { args_owned_at(em, a.args, params, c.span) }) {
                       None -> None,
                       Some(w) -> {
-                        let o = bind(site(w.em, c.span), KBoxed, bytes_concat_all([
+                        let o = bind(w.em, KBoxed, bytes_concat_all([
                           h, b"(ctx",
                           fold(w.names, b"", |acc: Bytes, nm: Bytes|
                             bytes_concat_all([acc, b", ", nm])), b")"]));
