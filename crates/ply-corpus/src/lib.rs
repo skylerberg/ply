@@ -29,6 +29,25 @@ use ply_eval::Plan;
 use ply_store::Store;
 use std::path::Path;
 
+/// Runs `f` on a thread with a stack deep enough for the tier's longest legal recursion.
+///
+/// The compiled tier recurses on the native C stack (ADR 0048), where the interpreter recursed on
+/// the heap, and the language's call limit is `ply_eval::limit::DEFAULT_MAX_CALLS`. A benchmark
+/// that drives a loop written as tail recursion that deep needs the room the CLI's own worker pool
+/// gives it (`ply-cli`'s `WORKER_STACK`); a 2 MiB `cargo test` thread overflows first and the tier
+/// raises its recursion limit early. This is the harness's equivalent of that pool.
+pub fn on_deep_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    const DEEP_STACK: usize = 256 << 20;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DEEP_STACK)
+            .spawn_scoped(scope, f)
+            .expect("a deep-stack thread")
+            .join()
+            .unwrap_or_else(|_| std::panic::resume_unwind(Box::new("the deep-stack thread panicked")))
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Verified {
     pub definitions: usize,

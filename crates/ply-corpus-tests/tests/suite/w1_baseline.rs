@@ -46,16 +46,14 @@ fn the_reconstructed_parser_passes_every_test_the_shipped_one_does() {
         selection.total
     );
 
-    let report = ply_test::run(
+    // Under tier-only (ADR 0048) the reconstruction runs on a compiled tier, which the whole Ply
+    // emitter produces from the module source texts — hello.ply serves over host effects the
+    // reference fragment does not carry, so the texts are what make the twin comparison honest.
+    let report = ply_cli::commands::common::run_on_tier(
+        &loaded,
         &selection,
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        &loaded.hashes,
-        &mut store,
-        false,
-        ply_test::Search::of(&selection),
         ply_test::Hosting::hermetic(),
+        &mut store,
     );
 
     assert_eq!(
