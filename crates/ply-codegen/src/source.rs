@@ -105,8 +105,16 @@ pub fn emit_keys(
                 Item::Fn(def) => {
                     let name = module.name.qualify(&def.name.name).to_string();
                     if let Some(h) = hashes.defs.get(&Symbol::new(&name)) {
+                        // **A clause is keyed by its own hash, not by its owner's.** A definition's
+                        // hash is over its normalized body, which a spec is erased from, so editing
+                        // `ensures result == x + 1` into `ensures result == x + 3` leaves the
+                        // owner's hash where it was -- and the clause root compiled from the old
+                        // sentence was served back, so the prover judged the edited spec by the
+                        // proposition it replaced. `HashOutput::specs` runs parallel to `def.spec`
+                        // and covers the clause's own bytes.
+                        let clauses = hashes.specs.get(&Symbol::new(&name));
                         let (mut requires, mut ensures) = (0, 0);
-                        for clause in &def.spec {
+                        for (i, clause) in def.spec.iter().enumerate() {
                             let (kind, k) = match clause.kind {
                                 ply_syntax::ast::SpecKind::Requires => {
                                     requires += 1;
@@ -121,7 +129,8 @@ pub fn emit_keys(
                                 .name
                                 .qualify(&clause_root_name(&def.name.name, kind, k))
                                 .to_string();
-                            keys.insert(root, format!("{}#{kind}#{k}", h.to_hex()));
+                            let own = clauses.and_then(|cs| cs.get(i)).unwrap_or(h);
+                            keys.insert(root, format!("{}#{kind}#{k}", own.to_hex()));
                         }
                         keys.insert(name, h.to_hex());
                     }
