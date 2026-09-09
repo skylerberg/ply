@@ -1098,7 +1098,7 @@ pub fn report(
         denominators: w6::Denominators {
             floor_taken_on: format!(
                 "a Rust accept/read/write/close replaying the same {}-byte /items response over plaintext, over \
-  connections carrying {PER_CONN} requests, with no interpreter, no TLS and no database under it",
+  connections carrying {PER_CONN} requests, with no Ply, no TLS and no database under it",
                 stack.items_response_bytes
             ),
             total_taken_on: format!(
@@ -1189,18 +1189,20 @@ const LEVER_PROSE: [(&str, &str, &str); 7] = [
     ),
     (
         "the frame push",
-        "the control-stack design's four heap allocations per frame push, paid per node the machine suspends inside.",
-        "A cheaper frame representation touches capture, splice and every frame kind.",
+        "One heap allocation per handler frame pushed, paid per `handle` entered rather than per node \
+  suspended inside.",
+        "A cheaper frame representation touches every handler entry and every capture.",
     ),
     (
         "Env::lookup",
-        "`crates/ply-eval/src/env.rs` walks an `Rc` chain linearly, so a variable reference costs \
-  O(scope depth). No depth sweep was run.",
-        "An indexed environment touches capture, splice and every frame kind.",
+        "The interpreter's `Env::lookup` walked an `Rc` chain, so a variable reference cost O(scope \
+  depth); the compiled tier binds a variable to a C local, and there is no depth left to sweep.",
+        "Nothing left to touch: the lever is spent.",
     ),
     (
         "boxing on hot paths",
-        "Where a `Value::Int` per element survives, counted per request rather than guessed at.",
+        "Where a heap-allocated integer per element survives -- the tier keeps small integers \
+  immediate -- counted per request rather than guessed at.",
         "Unboxing or arena-allocating `Value` touches every builtin and every engine.",
     ),
     (
@@ -1230,9 +1232,10 @@ fn limits(
 ) -> Vec<w6::Limit> {
     let mut limits = vec![w6::Limit {
         what: "One machine is one core".to_string(),
-        why: "A Value holds Rc and a continuation is Rc<Vec<Segment>>, so a Ply task cannot move \
-       between OS threads. Throughput scales by processes, not by threads, and every runtime \
-       this would be compared against scales by threads."
+        why: "A heap word is reference-counted without atomics and a task is a coroutine on one \
+       machine's stacks, so a Ply task cannot move between OS threads. Throughput scales by \
+       processes, not by threads, and every runtime this would be compared against scales by \
+       threads."
             .to_string(),
         evidence: None,
     }];
@@ -1242,7 +1245,7 @@ fn limits(
             total.per_request_micros / stack.items_floor_micros
         ),
  why: "The floor is a Rust accept/read/write/close replaying the response the service answers. \
-       It has no interpreter under it — and, on the /items row, no TLS and no database either, \
+       It has no Ply under it — and, on the /items row, no TLS and no database either, \
        so the multiple is stated with what each side did."
             .to_string(),
         evidence: Some(match health_plain {
@@ -1314,8 +1317,8 @@ fn limits(
     if let Some((allocs, bytes)) = levers.allocations {
         limits.push(w6::Limit {
             what: "A request allocates far more times than it writes bytes".to_string(),
- why: "Value is boxed, a frame push is four heap allocations, and every intermediate Bytes is an \
-       Arc<[u8]>."
+ why: "Every string, list and record a request builds is a heap object, and each value that \
+       crosses the host boundary is bridged."
                 .to_string(),
             evidence: Some(format!(
  "One /health request allocates {allocs:.0} times and {:.3} MB to produce a {}-byte response.",
@@ -1329,13 +1332,10 @@ fn limits(
 
 fn not_measured(stack: &InProcess, levers: &Levers) -> Vec<String> {
     let mut out = vec![
- "Anything the codegen spike's fragment does not reach. The spike compiles no perform, no \
-  handler-stack walk, no host boundary, no continuation capture, no closure and no derived \
-  codec, and it frees its values in an arena rather than reference-counting them. Projecting its \
-  k onto the whole interpreter share assumes a coverage it did not demonstrate."
-            .to_string(),
- "What a partially-covering backend is worth. The spike's `solo, trampolined` variant is one \
-  point on that curve; no variant compiles a whole request path."
+ "Anything the reference fragment (`--backend reference`) would answer differently: every rung \
+  is taken on the whole emitter, which compiles performs, handlers, host calls and \
+  continuations; the fragment is the oracle and the cc-free fallback, and no row here is taken \
+  on it."
             .to_string(),
  "Rungs 1-6 are taken on /health, not /items: a pure call to the /items handler needs a store, \
   and the only one available in process is std.db's memory engine, whose SQL scanner is on no \
@@ -1347,7 +1347,7 @@ fn not_measured(stack: &InProcess, levers: &Levers) -> Vec<String> {
  "Multi-core throughput, deliberately: one machine is one core and a process-per-core number \
   would measure an operating system."
             .to_string(),
-        "Env::lookup's depth sweep, and the writes and copies a response makes.".to_string(),
+        "The writes and copies a response makes.".to_string(),
         format!(
             "The ladder's rungs and total are taken on the {} accept loop rather than the \
              task-per-connection one the performance verdict section 1.6 pins, and the reason is measured rather \
