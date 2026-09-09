@@ -31,11 +31,6 @@ pub struct Declines {
     pub not_compiled: u64,
     /// It compiled the name and the call had the wrong number of arguments.
     pub arity: u64,
-    /// The body ran and failed — an overflow, a division by zero, a `match` with no arm, a type the
-    /// fragment's `Int` lowering could not unbox.
-    pub failed: u64,
-    /// The body would have nested past the budget the machine handed it.
-    pub out_of_fuel: u64,
     /// An entry arrived while another was running.
     pub reentered: u64,
     /// A builtin allocated in the fragment's private arena, which means the compile-time refusal of
@@ -49,13 +44,7 @@ pub struct Declines {
 
 impl Declines {
     pub fn total(&self) -> u64 {
-        self.not_compiled
-            + self.arity
-            + self.failed
-            + self.out_of_fuel
-            + self.reentered
-            + self.touched_cells
-            + self.answer
+        self.not_compiled + self.arity + self.reentered + self.touched_cells + self.answer
     }
 }
 
@@ -494,13 +483,8 @@ impl Bodies {
             };
             ctx.end();
             drop(ctx);
-            self.decline(|d| {
-                if out_of_fuel {
-                    d.out_of_fuel += 1;
-                } else {
-                    d.failed += 1;
-                }
-            });
+            // The entry ran and raised: an answer about the program, not a decline.
+            self.entered.set(self.entered.get() + 1);
             return match raised {
                 Some(raised) => Run::Raised(raised),
                 None => Run::Declined,
@@ -582,18 +566,27 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
+    // An entry that arrives while another is running finds the context borrowed: `run` declines
+    // it, so there is nothing to seed, take or read for it.
     fn take_performed(&self) -> Vec<ply_core::ty::EffectAtom> {
-        std::mem::take(&mut self.ctx.borrow_mut().performed)
+        self.ctx
+            .try_borrow_mut()
+            .map(|mut ctx| std::mem::take(&mut ctx.performed))
+            .unwrap_or_default()
     }
 
     fn set_seed(&self, seed: ply_eval::Seed, steps: u32) {
-        let mut ctx = self.ctx.borrow_mut();
-        ctx.seed = seed;
-        ctx.sim_steps = steps.max(1);
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.seed = seed;
+            ctx.sim_steps = steps.max(1);
+        }
     }
 
     fn simulated(&self) -> Option<ply_eval::region::Record> {
-        self.ctx.borrow().record.clone()
+        self.ctx
+            .try_borrow()
+            .ok()
+            .and_then(|ctx| ctx.record.clone())
     }
 
     fn set_host(
@@ -601,19 +594,27 @@ impl ply_eval::Compiled for Bodies {
         binding: std::sync::Arc<ply_eval::HostBinding>,
         runtime: Option<std::rc::Rc<dyn ply_eval::HostRuntime>>,
     ) {
-        self.ctx.borrow_mut().set_host(binding, runtime);
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.set_host(binding, runtime);
+        }
     }
 
     fn set_declared(&self, declared: Option<ply_core::Footprint>) {
-        self.ctx.borrow_mut().declared = declared;
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.declared = declared;
+        }
     }
 
     fn set_re_executed(&self, re_executed: bool) {
-        self.ctx.borrow_mut().re_executed = re_executed;
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.re_executed = re_executed;
+        }
     }
 
     fn take_host_use(&self) -> (ply_eval::host::HostUse, u64) {
-        let mut ctx = self.ctx.borrow_mut();
+        let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
+            return Default::default();
+        };
         (
             std::mem::take(&mut ctx.host_use),
             std::mem::take(&mut ctx.host_ops),
@@ -621,7 +622,10 @@ impl ply_eval::Compiled for Bodies {
     }
 
     fn take_teardown(&self) -> Vec<ply_span::Diagnostic> {
-        std::mem::take(&mut self.ctx.borrow_mut().teardown)
+        self.ctx
+            .try_borrow_mut()
+            .map(|mut ctx| std::mem::take(&mut ctx.teardown))
+            .unwrap_or_default()
     }
 
     fn tier_only(&self) -> bool {
