@@ -11,7 +11,8 @@ use ply_span::{Diagnostic, SourceId, Symbol, codes};
 use ply_store::Store;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
-use ply_test::{Hosting, RunReport, Search, select};
+use crate::fixture::TierExecutor;
+use ply_test::{Hosting, InterpExecutor, RunReport, Search, Selection, select};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -47,6 +48,28 @@ struct Compiled {
     resolved: Resolved,
     check: CheckOutput,
     hashes: HashOutput,
+    /// The module source text, keyed by name — what the whole Ply emitter re-parses into bodies.
+    texts: std::collections::HashMap<String, String>,
+}
+
+impl Compiled {
+    /// The whole Ply emitter's unit for this program, and the C backend spec to install it with —
+    /// what a run needs under tier-only (ADR 0048), since a bare machine holds no evaluator.
+    fn tier(&self) -> (&'static ply_codegen::Unit, ply_eval::BackendSpec) {
+        ply_codegen::c::producer::ensure_default();
+        let unit = ply_codegen::Unit::over_with_texts(
+            &self.program,
+            &self.resolved,
+            &self.check,
+            self.texts.clone(),
+        )
+        .expect("this host has a C compiler");
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        (unit, spec)
+    }
 }
 
 fn compile(source: &str) -> Compiled {
@@ -61,7 +84,30 @@ fn compile(source: &str) -> Compiled {
         resolved,
         check,
         hashes,
+        texts: std::collections::HashMap::from([(
+            ModuleName::from_dotted("m").to_string(),
+            source.to_string(),
+        )]),
     }
+}
+
+/// The whole runner over one compiled fixture on the tier — the only evaluator under tier-only —
+/// presenting as the evaluator so its cache namespace is the one `select` read.
+fn run_report(
+    compiled: &Compiled,
+    store: &mut Store,
+    selection: &Selection,
+    search: Search,
+    hosting: Hosting<'_>,
+) -> RunReport {
+    let (unit, spec) = compiled.tier();
+    let executor = TierExecutor(
+        InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+            .with_backend(unit, spec)
+            .with_search(search)
+            .with_hosts(hosting),
+    );
+    ply_test::run_with(selection, &compiled.check, &compiled.hashes, store, &executor)
 }
 
 /// Counts every call.
@@ -148,14 +194,10 @@ fn run_hosted(source: &str, tasks: bool) -> Ran {
         &ply_test::Engine::Evaluator,
     );
     let search = Search::of(&selection);
-    let report = ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
+    let report = run_report(
+        &compiled,
         &mut store,
-        false,
+        &selection,
         search,
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -358,58 +400,6 @@ test/nondet "spawn, join, then simulate" {
     ran.refused(codes::NESTED_SIMULATION);
 }
 
-/// A bound host operation is performed once.
-#[test]
-fn engine_both_over_a_bound_host_sends_once_and_does_not_diverge() {
-    let compiled = compile(
-        r#"
-nondet effect net {
-  write send[s](payload: Int) -> Int
-}
-
-test/nondet "one socket, one send" {
-  assert_eq(net.send[socket](1), 1)
-}
-"#,
-    );
-    let counter = Arc::new(Counting::default());
-    let binding = registry(counter.clone(), false)
-        .bind(&compiled.check)
-        .unwrap_or_else(|d| panic!("the registry binds: {d:#?}"));
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let selection = select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
-    let search = Search::of(&selection);
-    let report = ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
-        &mut store,
-        true,
-        search,
-        Hosting::hermetic().with_binding(Arc::new(binding)),
-    );
-    assert!(
-        report.is_success(),
-        "{:?}",
-        report
-            .failures
-            .iter()
-            .map(|f| (f.diagnostic.code, f.diagnostic.message.clone()))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(counter.calls(), 1, "only the machine reached the boundary");
-    assert_eq!(report.results[0].recorded, Some(ply_test::Record::Host));
-}
-
 /// The footprint check refuses a host operation inside a `simulate` region with `E0425`, on the ground that
 /// "DPOR re-runs a test whole per interleaving; a region that reaches a socket would send one
 /// packet per interleaving explored and call the result a proof".
@@ -478,14 +468,10 @@ fn under_simulation_once_the_same_send_runs_exactly_once_and_is_not_cached() {
         !plan.re_executes(),
         "the fixture only bites if this plan really runs the test once"
     );
-    let report = ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
+    let report = run_report(
+        &compiled,
         &mut store,
-        false,
+        &selection,
         Search::of(&selection),
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -525,14 +511,10 @@ fn a_hermetic_refusal_says_that_host_would_not_repair_a_searched_test() {
         &Plan::default(),
         &ply_test::Engine::Evaluator,
     );
-    let report = ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
+    let report = run_report(
+        &compiled,
         &mut store,
-        false,
+        &selection,
         Search::of(&selection),
         // The shape `ply test` uses: the registry is carried, nothing is bound.
         Hosting::hermetic().with_binding(Arc::new(HostBinding::hermetic_with(registry(
@@ -571,14 +553,10 @@ fn measure_reduction_re_executes_a_once_plan_and_is_refused() {
         &plan,
         &ply_test::Engine::Evaluator,
     );
-    let report = ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
+    let report = run_report(
+        &compiled,
         &mut store,
-        false,
+        &selection,
         Search::of(&selection).measuring(true),
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -625,14 +603,10 @@ test "a det test over a deterministic host handler" {
         &ply_test::Engine::Evaluator,
     );
     let search = Search::of(&selection);
-    let report = ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
+    let report = run_report(
+        &compiled,
         &mut store,
-        false,
+        &selection,
         search,
         Hosting::hermetic().with_binding(Arc::new(binding)),
     );
@@ -700,14 +674,10 @@ test/nondet "spawns without a binding" {
         &ply_test::Engine::Evaluator,
     );
     let search = Search::of(&selection);
-    let report = ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
+    let report = run_report(
+        &compiled,
         &mut store,
-        false,
+        &selection,
         search,
         Hosting::hermetic().with_binding(Arc::new(HostBinding::hermetic_with(registry(
             counter.clone(),

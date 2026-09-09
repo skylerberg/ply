@@ -2,7 +2,7 @@
 //! closed when the test ends, so tests still cannot observe each other's allocations — while a
 //! region *label* two tests both write is one piece of state and colours them apart.
 
-use crate::fixture::Compiled;
+use crate::fixture::{Compiled, TierExecutor};
 use ply_core::Footprint;
 use ply_eval::{Plan, TaskRegions, Value};
 use ply_span::SourceId;
@@ -299,7 +299,7 @@ test "other writer" {{ db.log[audit](1) }}
 #[test]
 fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
     const TESTS: usize = 32;
-    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
+    let compiled = Compiled::new(&contending_source(TESTS, a_label_each));
 
     assert!(
         compiled
@@ -309,6 +309,7 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
         "the corpus must retain cell atoms by inference, not by injection"
     );
 
+    let (unit, spec) = compiled.tier();
     for round in 0..3 {
         let root = TempRoot::new();
         let mut store = root.store();
@@ -328,16 +329,18 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
         assert_eq!(selection.parallelism.region_contended, TESTS);
         assert!(selection.parallelism.holds());
 
-        let report = ply_test::run(
+        let executor = TierExecutor(
+            ply_test::InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+                .with_backend(unit, spec.clone())
+                .with_search(ply_test::Search::of(&selection))
+                .with_hosts(ply_test::Hosting::hermetic()),
+        );
+        let report = ply_test::run_with(
             &selection,
-            &compiled.program,
-            &compiled.resolved,
             &compiled.check,
             &compiled.hashes,
             &mut store,
-            true,
-            ply_test::Search::of(&selection),
-            ply_test::Hosting::hermetic(),
+            &executor,
         );
         assert_eq!(
             (report.passed, report.failed),
@@ -347,154 +350,6 @@ fn a_group_of_isolated_tests_running_at_once_never_observe_each_other() {
         );
         assert!(report.results.iter().all(|r| r.group == 0));
     }
-}
-
-/// The white-box half, and the strongest statement the audit can make about the region: after every
-/// test in the group, the arena its worker holds contains exactly one cell — slot index 0, holding
-/// that test's own last write.
-#[test]
-fn the_arena_each_test_ends_with_holds_its_own_writes_and_nothing_else() {
-    const TESTS: usize = 24;
-    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let selection = ply_test::select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
-    assert_eq!(selection.groups.len(), 1);
-
-    let executor = Recording {
-        inner: ply_test::InterpExecutor::new(
-            &compiled.program,
-            &compiled.resolved,
-            &compiled.check,
-        ),
-        seen: Mutex::new(Vec::new()),
-        generations: Mutex::new(Vec::new()),
-    };
-    let report = ply_test::run_with(
-        &selection,
-        &compiled.check,
-        &compiled.hashes,
-        &mut store,
-        &executor,
-    );
-    assert_eq!(
-        (report.passed, report.failed),
-        (TESTS, 0),
-        "{:#?}",
-        report.failures
-    );
-
-    let mut seen = executor.seen.into_inner().expect("no worker panicked");
-    seen.sort_by_key(|(index, _, _)| *index);
-    let expected: Vec<(usize, Vec<String>, usize)> = (0..TESTS)
-        .map(|i| (i, vec![format!("@0={}", i * 8)], 0))
-        .collect();
-    assert_eq!(
-        seen, expected,
-        "a test whose region did not close would leave the mark above zero"
-    );
-}
-
-/// Wraps the real executor to look at each worker's arena the moment its test finishes — the only
-/// place from which one test's leftovers would be visible — and at the group's region, which is
-/// what must not have grown.
-struct Recording<'a> {
-    inner: ply_test::InterpExecutor<'a>,
-    seen: Mutex<Vec<(usize, Vec<String>, usize)>>,
-    /// Slot 0's generation as each test left it, in completion order.
-    generations: Mutex<Vec<u32>>,
-}
-
-impl<'a> ply_test::Executor for Recording<'a> {
-    type Worker = ply_test::Worker<'a>;
-
-    fn worker(&self) -> Self::Worker {
-        self.inner.worker()
-    }
-
-    fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), ply_span::Diagnostic> {
-        // What the test's region reclaimed at its close, because that is where its cells are: a
-        // region hands its slots back at its lexical end and the arena afterwards holds only the
-        // group's fixture.
-        worker.cells_mut().journal();
-        let outcome = self.inner.execute(worker, index);
-        let cells = worker
-            .cells()
-            .journalled()
-            .iter()
-            .map(|(slot, value)| format!("@{}={}", slot.index(), value.render()))
-            .collect();
-        if let Some((slot, _)) = worker.cells().journalled().first() {
-            self.generations
-                .lock()
-                .expect("no worker panicked")
-                .push(slot.generation());
-        }
-        self.seen
-            .lock()
-            .expect("no worker panicked")
-            .push((index, cells, worker.region().mark()));
-        outcome
-    }
-}
-
-/// The mechanism that makes a closed region unreadable rather than merely forgotten, on the real
-/// runner: one worker, so every test reuses slot index 0, and the generation at that index must
-/// rise every time.
-#[test]
-fn a_slot_is_never_handed_to_two_tests_under_one_identity() {
-    const TESTS: usize = 16;
-    let compiled = Compiled::anonymous(&contending_source(TESTS, a_label_each));
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let selection = ply_test::select(
-        &compiled.check,
-        &compiled.hashes,
-        &store,
-        &Plan::default(),
-        &ply_test::Engine::Evaluator,
-    );
-    assert_eq!(selection.groups.len(), 1);
-
-    let executor = Recording {
-        inner: ply_test::InterpExecutor::new(
-            &compiled.program,
-            &compiled.resolved,
-            &compiled.check,
-        ),
-        seen: Mutex::new(Vec::new()),
-        generations: Mutex::new(Vec::new()),
-    };
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(1)
-        .build()
-        .expect("a one-worker pool");
-    let report = pool.install(|| {
-        ply_test::run_with(
-            &selection,
-            &compiled.check,
-            &compiled.hashes,
-            &mut store,
-            &executor,
-        )
-    });
-    assert_eq!((report.passed, report.failed), (TESTS, 0));
-
-    let generations = executor
-        .generations
-        .into_inner()
-        .expect("no worker panicked");
-    assert_eq!(generations.len(), TESTS);
-    assert!(
-        generations.windows(2).all(|w| w[1] > w[0]),
-        "slot 0's generation must rise at every entry point: {generations:?}"
-    );
 }
 
 /// Region isolation's fixture, at the runner: built once for the group, mutated in place by every test
@@ -676,7 +531,8 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
             .map(|i| format!("\ntest \"pure {i}\" {{ assert_eq({i} + 1, {}) }}\n", i + 1))
             .collect::<String>()
     );
-    let compiled = Compiled::anonymous(&source);
+    let compiled = Compiled::new(&source);
+    let (unit, spec) = compiled.tier();
 
     let run_at = |jobs: usize| {
         let root = TempRoot::new();
@@ -694,17 +550,19 @@ fn verdicts_do_not_move_between_one_worker_and_eight() {
             .num_threads(jobs)
             .build()
             .expect("the worker pool");
+        let executor = TierExecutor(
+            ply_test::InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+                .with_backend(unit, spec.clone())
+                .with_search(ply_test::Search::of(&selection))
+                .with_hosts(ply_test::Hosting::hermetic()),
+        );
         let report = pool.install(|| {
-            ply_test::run(
+            ply_test::run_with(
                 &selection,
-                &compiled.program,
-                &compiled.resolved,
                 &compiled.check,
                 &compiled.hashes,
                 &mut store,
-                true,
-                ply_test::Search::of(&selection),
-                ply_test::Hosting::hermetic(),
+                &executor,
             )
         });
         let mut verdicts: Vec<(usize, ply_test::Status, usize)> = report

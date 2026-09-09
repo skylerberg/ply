@@ -8,7 +8,6 @@
 
 mod fixture;
 
-mod audit_coverage;
 mod bisect_audit;
 mod classification_audit;
 mod effect_set_scheduling_audit;

@@ -297,12 +297,6 @@ pub struct Bodies {
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
-    /// The fuel an entry was handed when the native stack refused its dive. Every offer with no
-    /// more -- every call nested below that one, and a backend told to ignore its budget hands the
-    /// same fuel at every depth -- is declined without entering until the machine unwinds above
-    /// it, because the machine re-offers each call it evaluates and a refused dive repeated once
-    /// per level is the whole recursion squared.
-    floor: Cell<Option<usize>>,
     /// `PLY_TIER_ONLY=1`: this backend is the only engine, and the machine evaluates nothing.
     tier_only: bool,
 }
@@ -364,7 +358,6 @@ impl Bodies {
             ctx,
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
-            floor: Cell::new(None),
             tier_only: std::env::var("PLY_TIER_ONLY").is_ok_and(|v| v == "1"),
         })
     }
@@ -415,12 +408,6 @@ impl Bodies {
         };
         if admitted.arity != args.len() {
             return self.decline(|d| d.arity += 1);
-        }
-        if let Some(at) = self.floor.get() {
-            if fuel <= at {
-                return self.decline(|d| d.out_of_fuel += 1);
-            }
-            self.floor.set(None);
         }
         let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
             return self.decline(|d| d.reentered += 1);
@@ -481,16 +468,17 @@ impl Bodies {
         }
 
         if ctx.failed != 0 {
-            // The fragment's diagnostic is `RUNTIME_ERROR` at `Span::DUMMY`; the machine is about
-            // to evaluate the same definition and raise the real one, and a test root carries
-            // this one only to name what raised when the machine then passes.
             let out_of_stack = ctx.failed == crate::rt::FAILED_OUT_OF_STACK;
-            if out_of_stack {
-                self.floor.set(Some(fuel));
-            }
             let out_of_fuel = out_of_stack || ctx.failed == crate::rt::FAILED_OUT_OF_FUEL;
             let raised = if out_of_fuel {
-                None
+                // Tier-only (ADR 0048): no machine follows to raise the real one, so the limit is
+                // the tier's own to report. The count is the budget this entry was handed, which is
+                // the language's `DEFAULT_MAX_CALLS`; a native-stack floor tripped inside that
+                // budget still reports the budget, because that is the bound the program overran.
+                Some(ply_span::Diagnostic::error(
+                    ply_span::codes::RUNTIME_ERROR,
+                    format!("recursion limit of {fuel} nested calls exceeded"),
+                ))
             } else {
                 ctx.diagnostic.take().or_else(|| {
                     (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
