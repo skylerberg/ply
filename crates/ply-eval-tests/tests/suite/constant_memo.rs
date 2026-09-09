@@ -44,7 +44,6 @@ fn probe(c: &Compiled, name: &str) -> Result<Value, ply_span::Diagnostic> {
     machine.call(name, vec![Value::Int(400)], Span::DUMMY)
 }
 
-
 #[test]
 fn a_definition_with_a_parameter_is_not_a_constant_however_dead_the_parameter_is() {
     let c = Compiled::new(SOURCE);

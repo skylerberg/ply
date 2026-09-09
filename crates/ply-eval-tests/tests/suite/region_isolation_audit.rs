@@ -11,7 +11,6 @@ impl Compiled {
     fn footprint(&self, name: &str) -> &Footprint {
         &self.check.tests[self.index_of(name)].footprint
     }
-
 }
 
 fn int_of(regions: &TaskRegions, slot: Slot) -> i64 {
@@ -181,7 +180,6 @@ fn a_slot_from_a_reclaimed_entry_point_reads_nothing_rather_than_its_successor()
     );
 }
 
-
 /// Every carrier the escape brand names is refused, including the closure route it lists first among the
 /// ways this could go wrong.
 #[test]
@@ -219,8 +217,6 @@ fn every_closure_shaped_carrier_out_of_a_region_is_refused() {
         );
     }
 }
-
-
 
 /// A `cell` atom reaching a published footprint is what the scheduler colours on, and with every
 /// escape route closed a *written row* is the only way one gets there.
@@ -270,7 +266,6 @@ test "inside the region" {
     );
     assert_eq!(discharged.footprint("inside the region").atoms().count(), 0);
 }
-
 
 /// A cell in a *constructor argument* used to be the one carrier the region check could not see:
 /// the variant's field type holds the `Cell`, so the region's result type was `Held` and mentioned
@@ -350,13 +345,6 @@ test "smuggle" {
         );
     }
 }
-
-
-
-
-
-
-
 
 /// A test can only sample the executions somebody thought of.
 #[test]

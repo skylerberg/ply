@@ -10,16 +10,16 @@
 //! corpus — are unchanged. It records each entry point's performed atoms into a [`Trace`] so its
 //! footprint reads the same whichever front end ran the body.
 
+use crate::arena::RegionKind;
 use crate::compiled::{Compiled, Entered};
+use crate::host::{HostBinding, HostRuntime, HostUse, MachineId, Pending};
 use crate::interp::{Core, Interpreter, Run};
+use crate::limit::DEFAULT_MAX_CALLS;
 use crate::region;
 use crate::sim::{DEFAULT_STEPS, Seed};
 use crate::trace::Trace;
 use crate::value::Value;
 use crate::{Arena, TaskRegions, code};
-use crate::arena::RegionKind;
-use crate::host::{HostBinding, HostRuntime, HostUse, MachineId, Pending};
-use crate::limit::DEFAULT_MAX_CALLS;
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_span::{Diagnostic, Span, Symbol, codes};
@@ -460,7 +460,12 @@ impl<'a> Machine<'a> {
         self.call(name, args, span)
     }
 
-    fn tier_call(&mut self, sym: &Symbol, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
+    fn tier_call(
+        &mut self,
+        sym: &Symbol,
+        args: Vec<Value>,
+        span: Span,
+    ) -> Result<Value, Diagnostic> {
         let Some(backend) = self.compiled.clone() else {
             return Err(err_no_front_end(sym, span));
         };
@@ -529,8 +534,13 @@ fn err_no_front_end(name: &Symbol, span: Span) -> Diagnostic {
         codes::RUNTIME_ERROR,
         format!("neither front end holds a body for `{name}`"),
     )
-    .primary(span, "the interpreter declined it and the compiled tier has no body for it")
-    .note("attach the compiled tier, or the construct this body uses is one no front end carries yet")
+    .primary(
+        span,
+        "the interpreter declined it and the compiled tier has no body for it",
+    )
+    .note(
+        "attach the compiled tier, or the construct this body uses is one no front end carries yet",
+    )
 }
 
 /// A `simulate` region entered inside another one.

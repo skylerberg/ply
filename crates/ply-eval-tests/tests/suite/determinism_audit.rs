@@ -58,13 +58,11 @@ impl Compiled {
         self.transcript_of(0, seed)
     }
 
-
     /// The interleaving as [`explore`] consumes it, for the tests that drive a whole search rather
     /// than one run.
     fn interleaving_at(&self, index: usize, seed: &Seed) -> Interleaving {
         self.run_at(index, seed).0
     }
-
 
     /// One run, with both of the things a search wants from it: what it interleaved, and the world
     /// it left behind.
@@ -225,7 +223,6 @@ const SHAPE_NAMES: [&str; 4] = [
     "two tasks drawing from one stream",
 ];
 
-
 /// The same, over a wide seed range and every fixture shape, so that a dependence on something the
 /// seed does not name has many chances to show.
 #[test]
@@ -240,8 +237,6 @@ fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
         }
     }
 }
-
-
 
 /// A run must be a function of the *definition set*, not of the source text.
 #[test]
@@ -323,8 +318,6 @@ fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
         }
     }
 }
-
-
 
 /// Two `simulate` regions in one test, in sequence.
 const TWO_REGIONS: &str = r#"

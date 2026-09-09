@@ -101,9 +101,13 @@ impl Program {
     /// scheduling and caching test in this file is exercised over a real Ply program end to end.
     /// `Unit::over` leaks a `&'static Unit`, which is fine in a test.
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
-        let unit =
-            ply_codegen::Unit::over_with_texts(&self.program, &self.resolved, &self.check, self.texts())
-                .expect("this host has a C compiler");
+        let unit = ply_codegen::Unit::over_with_texts(
+            &self.program,
+            &self.resolved,
+            &self.check,
+            self.texts(),
+        )
+        .expect("this host has a C compiler");
         let spec = ply_eval::BackendSpec {
             kind: ply_eval::BackendKind::C,
             ..Default::default()
@@ -1627,7 +1631,6 @@ fn the_artifact_reports_isolation_per_test_and_in_total() {
         "{summary:#?}"
     );
 }
-
 
 #[test]
 fn every_group_is_run_in_sequence() {

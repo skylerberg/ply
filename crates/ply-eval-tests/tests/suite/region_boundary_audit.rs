@@ -92,8 +92,6 @@ test/nondet "the answer comes back" {
 }
 "#;
 
-
-
 /// The obvious extension of the open route — the same constructor erasure carrying a **cell inside
 /// a closure** rather than a continuation — and it does not exist.
 #[test]
@@ -116,7 +114,6 @@ fn boxed() -> Boxed = with_cell[log](41) { c -> Wrap(|| cell_get(c)) }
         "the region is named: {d:#?}"
     );
 }
-
 
 /// A bare slot, which is what the check has to catch when no constructor is involved at all.
 #[test]
@@ -146,7 +143,6 @@ fn data_still_crosses_the_entry_point() {
     );
 }
 
-
 /// The reason the entry-point check is load-bearing rather than belt-and-braces, stated over the
 /// allocator: a reset restores the fixture's generations, so a slot taken out of an earlier run
 /// resolves afterwards.
@@ -167,15 +163,6 @@ fn an_entry_point_reset_leaves_an_earlier_runs_slot_resolvable() {
         "a reset restores generations, so nothing downstream reports a smuggled slot"
     );
 }
-
-
-
-
-
-
-
-
-
 
 /// `E0449` is the machine's verdict about its own memory, so a handler may not mint it: `attribute`
 /// rewrites a reserved code to `E0502` and adds the note naming the handler.
@@ -316,4 +303,3 @@ fn a_law_cannot_quantify_over_a_record_that_reaches_a_region() {
         "a record holding a cell must be refused where the law is written: {diags:#?}"
     );
 }
-

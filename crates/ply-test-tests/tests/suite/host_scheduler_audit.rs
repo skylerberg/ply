@@ -1,5 +1,6 @@
 //! Adversarial audit of the scheduler split, and of what re-execution does to a host operation.
 
+use crate::fixture::TierExecutor;
 use ply_core::CheckOutput;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -11,7 +12,6 @@ use ply_span::{Diagnostic, SourceId, Symbol, codes};
 use ply_store::Store;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
-use crate::fixture::TierExecutor;
 use ply_test::{Hosting, InterpExecutor, RunReport, Search, Selection, select};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -107,7 +107,13 @@ fn run_report(
             .with_search(search)
             .with_hosts(hosting),
     );
-    ply_test::run_with(selection, &compiled.check, &compiled.hashes, store, &executor)
+    ply_test::run_with(
+        selection,
+        &compiled.check,
+        &compiled.hashes,
+        store,
+        &executor,
+    )
 }
 
 /// Counts every call.

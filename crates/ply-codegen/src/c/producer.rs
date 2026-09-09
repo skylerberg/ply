@@ -59,15 +59,12 @@ fn find_emitter_dir() -> Option<std::path::PathBuf> {
             }
         }
     }
-    std::env::current_dir()
-        .ok()
-        .and_then(search)
-        .or_else(|| {
-            std::env::current_exe()
-                .ok()
-                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-                .and_then(search)
-        })
+    std::env::current_dir().ok().and_then(search).or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .and_then(search)
+    })
 }
 
 /// Install the whole self-hosted Ply emitter as the producer when none is installed and its source
@@ -100,7 +97,10 @@ fn emitter_modules(dir: &std::path::Path) -> Vec<(String, String)> {
                 && let Ok(text) = std::fs::read_to_string(&p)
             {
                 modules.push((
-                    p.file_stem().unwrap_or_default().to_string_lossy().into_owned(),
+                    p.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
                     text,
                 ));
             }
@@ -166,8 +166,8 @@ fn build_default(dir: &std::path::Path) -> Result<PlyProducer, String> {
     let source: &'static Source =
         Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
     let bundle = dir.join("bootstrap");
-    let from_bundle = super::bundle::exists(&bundle)
-        && std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off");
+    let from_bundle =
+        super::bundle::exists(&bundle) && std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off");
     let (native, _refused) = if from_bundle {
         super::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?
     } else {

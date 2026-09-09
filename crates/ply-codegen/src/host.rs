@@ -11,11 +11,11 @@ use ply_eval::host::{
     HostAnswer, HostRequest, attribute, err_blocking_answered_inline, err_hermetic,
     err_host_in_search, err_withheld, operation_label,
 };
+use ply_eval::sim::TASK_OPS;
 use ply_eval::{
     Unbound, carries_secret, check_host_answer, err_footprint_escape, err_host_in_simulation,
     err_no_runtime, err_secret_to_host, err_unenumerated_atom,
 };
-use ply_eval::sim::TASK_OPS;
 use ply_span::{Span, Symbol};
 use std::sync::Arc;
 

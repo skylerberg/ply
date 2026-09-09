@@ -1,8 +1,5 @@
 //! **the gate G1 — position invariance, registered before the measurement.**
 
-
-
-
 /// One shape, written the two ways.
 struct Pair {
     /// What the pair is about, printed in the table.
@@ -169,19 +166,10 @@ fn corpus() -> Vec<Pair> {
     ]
 }
 
-
-
 /// A member's identity, as twelve hex characters of BLAKE3 over its source.
 fn digest(src: &str) -> String {
     format!("b3:{}", &blake3::hash(src.as_bytes()).to_hex()[..12])
 }
-
-
-
-
-
-
-
 
 /// The corpus is five shapes, each pair is two different programs, and each is
 /// the program it was pinned as.
@@ -257,5 +245,3 @@ fn the_corpus_is_the_five_shapes_it_says_it_is() {
          documentation"
     );
 }
-
-

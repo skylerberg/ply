@@ -390,11 +390,21 @@ fn a_generated_function_is_total_pure_and_deterministic() {
         for x in [-3i64, 0, 1, 7, i64::MAX] {
             let mut machine = fixture.pure();
             let first = machine
-                .call("apply1", vec![f.clone(), Value::Int(x)], Span::DUMMY, DEFAULT_MAX_CALLS)
+                .call(
+                    "apply1",
+                    vec![f.clone(), Value::Int(x)],
+                    Span::DUMMY,
+                    DEFAULT_MAX_CALLS,
+                )
                 .unwrap_or_else(|d| panic!("a generated function must be total: {d:?}"));
             let mut machine = fixture.pure();
             let second = machine
-                .call("apply1", vec![f.clone(), Value::Int(x)], Span::DUMMY, DEFAULT_MAX_CALLS)
+                .call(
+                    "apply1",
+                    vec![f.clone(), Value::Int(x)],
+                    Span::DUMMY,
+                    DEFAULT_MAX_CALLS,
+                )
                 .expect("a generated function must be total");
             assert_eq!(first.render(), second.render());
             assert!(matches!(first, Value::Int(_)));
@@ -417,7 +427,12 @@ fn a_generated_function_over_a_compound_argument_applies() {
         for x in ["", "a", "hello"] {
             let mut machine = fixture.pure();
             let answer = machine
-                .call("apply_str", vec![f.clone(), Value::str(x)], Span::DUMMY, DEFAULT_MAX_CALLS)
+                .call(
+                    "apply_str",
+                    vec![f.clone(), Value::str(x)],
+                    Span::DUMMY,
+                    DEFAULT_MAX_CALLS,
+                )
                 .unwrap_or_else(|d| panic!("a generated function must be total: {d:?}"));
             assert!(matches!(answer, Value::Bool(_)));
         }
