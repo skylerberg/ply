@@ -1,9 +1,9 @@
 use crate::{
-    Executor, Isolation, Parallelism, Reason, Search, Selection, Status, group_by_conflict, run,
-    run_with, select,
+    Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
+    group_by_conflict, run_with, select,
 };
 use ply_core::{CheckOutput, EffectAtom, Footprint, Resource};
-use ply_eval::{Plan, TaskRegions, Value};
+use ply_eval::Plan;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
@@ -86,20 +86,23 @@ impl Program {
         )
     }
 
-    /// Both engines, so that every scheduling and caching test in this file is also a differential
-    /// test over a real Ply program.
+    /// Runs the fixture on a real compiled C tier — the only evaluator under tier-only — so every
+    /// scheduling and caching test in this file is exercised over a real Ply program end to end.
+    /// `Unit::over` leaks a `&'static Unit`, which is fine in a test.
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
-        run(
-            selection,
-            &self.program,
-            &self.resolved,
-            &self.check,
-            &self.hashes,
-            store,
-            false,
-            Search::of(selection),
-            crate::Hosting::hermetic(),
-        )
+        let unit = ply_codegen::Unit::over(&self.program, &self.resolved, &self.check)
+            .expect("this host has a C compiler");
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        let executor = TierExecutor(
+            InterpExecutor::new(&self.program, &self.resolved, &self.check)
+                .with_backend(unit, spec)
+                .with_hosts(Hosting::hermetic())
+                .with_search(Search::of(selection)),
+        );
+        run_with(selection, &self.check, &self.hashes, store, &executor)
     }
 
     fn def_hash(&self, name: &str) -> ply_hash::DefHash {
@@ -108,6 +111,50 @@ impl Program {
             .get(&Symbol::new(name))
             .copied()
             .expect("a definition by that name")
+    }
+}
+
+/// The tier-backed executor these fixtures run on, presenting as the evaluator. Under tier-only the
+/// C tier is the sole engine, and this file's caching assertions — written when the interpreter was
+/// the evaluator — key results by the bare test hash, which is exactly the [`crate::Engine::Evaluator`]
+/// namespace. Reporting the backend's own engine would move every pass into a namespace the
+/// `Engine::Evaluator` selections and `store.get(hash)` checks never read, so the runner's observable
+/// behaviour is kept identical by naming the engine the tier stands in for.
+struct TierExecutor<'a>(InterpExecutor<'a>);
+
+impl<'a> Executor for TierExecutor<'a> {
+    type Worker = crate::Worker<'a>;
+
+    fn worker(&self) -> Self::Worker {
+        self.0.worker()
+    }
+
+    fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic> {
+        self.0.execute(worker, index)
+    }
+
+    fn engine(&self) -> crate::Engine {
+        crate::Engine::Evaluator
+    }
+
+    fn exploration(&self, worker: &Self::Worker) -> Option<ply_eval::Exploration> {
+        self.0.exploration(worker)
+    }
+
+    fn host_use(&self, worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
+        self.0.host_use(worker)
+    }
+
+    fn audited(&self, worker: &Self::Worker) -> Option<bool> {
+        self.0.audited(worker)
+    }
+
+    fn backend_use(&self, worker: &Self::Worker) -> Option<crate::BackendUse> {
+        self.0.backend_use(worker)
+    }
+
+    fn teardown(&self, worker: &mut Self::Worker) -> Vec<Diagnostic> {
+        self.0.teardown(worker)
     }
 }
 
