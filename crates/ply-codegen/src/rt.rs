@@ -1108,6 +1108,15 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
 
 /// The builtins answered over words, when their arguments have the native kinds; `None` hands the
 /// call to the interpreter's implementation.
+/// A key the heap's maps order: anything but a closure or a bridged value, which the generic path
+/// refuses with the machine's own diagnostic.
+fn map_key(k: Word) -> bool {
+    !matches!(
+        heap::kind(k),
+        crate::heap::KIND_CLOSURE | crate::heap::KIND_BRIDGE
+    )
+}
+
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
         (Builtin::Len, [xs]) if heap::kind(*xs) == KIND_LIST => {
@@ -1117,6 +1126,47 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
             Some(ctx.heap.list_push(*xs, *x))
+        }
+        // The map family on the heap's own maps: through the generic path each call converted the
+        // whole map to an interpreter value and back, which was most of what a request allocated.
+        (Builtin::MapLen, [m]) if heap::kind(*m) == crate::heap::KIND_MAP => {
+            let n = map::len(obj(*m)) as i64;
+            heap::dec(*m);
+            Some(heap::imm(n))
+        }
+        (Builtin::MapContains, [m, k])
+            if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) =>
+        {
+            let found = map::get(&ctx.tables.layouts, obj(*m), *k).is_some();
+            heap::dec(*m);
+            heap::dec(*k);
+            Some(crate::heap::bool(found))
+        }
+        (Builtin::MapGet, [m, k]) if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) => {
+            let some = ctx.tables.layouts.some?;
+            let none = ctx.tables.layouts.none?;
+            let answer = match map::get(&ctx.tables.layouts, obj(*m), *k) {
+                Some(v) => {
+                    heap::inc(v);
+                    let c = ctx.heap.alloc(KIND_CTOR, 0, 1, some);
+                    unsafe { set_word(c, 0, v) };
+                    c as Word
+                }
+                None => ctx.nullary(none),
+            };
+            heap::dec(*m);
+            heap::dec(*k);
+            Some(answer)
+        }
+        (Builtin::MapInsert, [m, k, v])
+            if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) =>
+        {
+            Some(ctx.heap.map_insert(&ctx.tables.layouts, *m, *k, *v))
+        }
+        (Builtin::MapRemove, [m, k]) if heap::kind(*m) == crate::heap::KIND_MAP && map_key(*k) => {
+            let out = ctx.heap.map_remove(&ctx.tables.layouts, *m, *k);
+            heap::dec(*k);
+            Some(out)
         }
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
             let o = obj(*xs);
@@ -2473,7 +2523,10 @@ pub unsafe extern "C" fn rt_record_update(
     }
     let o = obj(base);
     let shape = shape as u32;
-    if unsafe { (*o).layout } == shape && is_unique(base) {
+    let in_place = unsafe { (*o).layout } == shape && is_unique(base);
+    let width = ctx.tables.layouts.shape_width(shape);
+    ply_eval::rc::note_update_of(in_place, if in_place { 0 } else { width }, ctx.site());
+    if in_place {
         for (w, at) in written.iter().zip(offsets) {
             unsafe {
                 heap::dec(word_at(o, *at as usize));
