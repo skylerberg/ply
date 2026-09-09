@@ -145,6 +145,33 @@ pub(crate) fn emit_keys(
     keys
 }
 
+/// Runs `selection` on a compiled tier — the only evaluator under tier-only (ADR 0048) — built by
+/// the whole Ply emitter from `loaded`'s module source texts, over the program the runner works on
+/// (`to_run`). The reusable form of what the `test` command builds inline, for the callers that
+/// reached for `ply_test::run` when the interpreter needed no backend and now decline every test
+/// without one.
+pub fn run_on_tier(
+    loaded: &crate::load::Loaded,
+    selection: &ply_test::Selection,
+    hosting: ply_test::Hosting<'_>,
+    store: &mut ply_store::Store,
+) -> ply_test::RunReport {
+    ply_codegen::c::producer::ensure_default();
+    let (program, resolved) = loaded.to_run();
+    let texts = module_texts(program, &loaded.sources);
+    let unit = ply_codegen::Unit::over_with_texts(program, resolved, &loaded.check, texts)
+        .expect("this host has a C compiler");
+    let spec = ply_eval::BackendSpec {
+        kind: ply_eval::BackendKind::C,
+        ..Default::default()
+    };
+    let executor = ply_test::InterpExecutor::new(program, resolved, &loaded.check)
+        .with_backend(unit, spec)
+        .with_search(ply_test::Search::of(selection))
+        .with_hosts(hosting);
+    ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
+}
+
 /// Each module's source text by name: what a second emitter reads the program from.
 pub(crate) fn module_texts(
     program: &ply_syntax::ast::Program,
