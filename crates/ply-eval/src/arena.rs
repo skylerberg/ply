@@ -206,25 +206,27 @@ pub struct Stats {
     pub closes_deferred: u64,
     /// Slots handed back late, after the last continuation that could reach them died.
     pub slots_reclaimed_late: u64,
+    /// The size of one stored value, which the arena's type decides.
+    pub element: usize,
 }
 
 impl Stats {
     /// Bytes the arena holds from the global allocator: the chunks' value storage and their
     /// generation storage.
     pub fn bytes_reserved(&self) -> usize {
-        self.chunks_allocated * CHUNK * (std::mem::size_of::<Value>() + std::mem::size_of::<u32>())
+        self.chunks_allocated * CHUNK * (self.element + std::mem::size_of::<u32>())
     }
 }
 
 /// A region's extent as it stood at some earlier point, and the scopes that were open there.
-pub struct Snapshot {
+pub struct Snapshot<V = Value> {
     region: RegionId,
     /// The bump pointer at the snapshot's floor — where restoring truncates to.
     base: usize,
     /// The bump pointer when the snapshot was taken.
     top: usize,
     /// `values[i]` and `generations[i]` belong to index `base + i`.
-    values: Vec<Value>,
+    values: Vec<V>,
     generations: Vec<u32>,
     /// The scopes at and above the snapshot's floor, innermost last.
     scopes: Vec<Scope>,
@@ -232,7 +234,7 @@ pub struct Snapshot {
     depth: usize,
 }
 
-impl Snapshot {
+impl<V> Snapshot<V> {
     /// The region the snapshot is rooted at: the one whose close would discard it, and the
     /// outermost one it covers.
     pub fn region(&self) -> RegionId {
@@ -255,7 +257,7 @@ impl Snapshot {
     }
 }
 
-impl fmt::Debug for Snapshot {
+impl<V> fmt::Debug for Snapshot<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -269,9 +271,11 @@ impl fmt::Debug for Snapshot {
 }
 
 /// A bump arena whose scopes are regions.
-pub struct Arena {
+/// The arena over whatever a cell holds: the interpreter's values by default, and the tier's
+/// heap words on the tier, so that a cell's contents never cross the seam.
+pub struct Arena<V = Value> {
     /// `chunks[c][o]` is the value at index `c * CHUNK + o`.
-    chunks: Vec<Vec<Value>>,
+    chunks: Vec<Vec<V>>,
     /// Parallel to `chunks`, and **never truncated**: a physical position's generation only rises,
     /// so a slot from a closed region cannot match the value now living at its index.
     generations: Vec<Vec<u32>>,
@@ -286,20 +290,20 @@ pub struct Arena {
     stats: Stats,
     /// Every slot a close has reclaimed, in the order it was reclaimed, and `None` when nothing
     /// asked for one.
-    journal: Option<Vec<(Slot, Value)>>,
+    journal: Option<Vec<(Slot, V)>>,
     /// Slots whose contents a `cell_update` has taken out and not yet put back. A read or write
     /// of one in the meantime is refused rather than answered with the placeholder.
     taken: Vec<Slot>,
 }
 
-impl Default for Arena {
-    fn default() -> Arena {
+impl<V: Clone + Default> Default for Arena<V> {
+    fn default() -> Arena<V> {
         Arena::new()
     }
 }
 
-impl Arena {
-    pub fn new() -> Arena {
+impl<V: Clone + Default> Arena<V> {
+    pub fn new() -> Arena<V> {
         Arena {
             chunks: Vec::new(),
             generations: Vec::new(),
@@ -308,7 +312,10 @@ impl Arena {
             pins: Vec::new(),
             retained: Vec::new(),
             next_region: 0,
-            stats: Stats::default(),
+            stats: Stats {
+                element: std::mem::size_of::<V>(),
+                ..Stats::default()
+            },
             journal: None,
             taken: Vec::new(),
         }
@@ -320,7 +327,7 @@ impl Arena {
     }
 
     /// What every close has reclaimed since [`Arena::journal`], in order.
-    pub fn journalled(&self) -> &[(Slot, Value)] {
+    pub fn journalled(&self) -> &[(Slot, V)] {
         self.journal.as_deref().unwrap_or(&[])
     }
 
@@ -390,7 +397,7 @@ impl Arena {
     }
 
     /// Allocates in the innermost open region.
-    pub fn alloc(&mut self, value: Value) -> Option<Slot> {
+    pub fn alloc(&mut self, value: V) -> Option<Slot> {
         if self.scopes.is_empty() || self.live > u32::MAX as usize {
             return None;
         }
@@ -414,14 +421,14 @@ impl Arena {
         })
     }
 
-    pub fn get(&self, slot: Slot) -> Option<&Value> {
+    pub fn get(&self, slot: Slot) -> Option<&V> {
         let index = self.resolve(slot)?;
         self.chunks[chunk_of(index)].get(offset_of(index))
     }
 
     /// `false` when the slot's region has closed, which the caller must report with [`stale_slot`]
     /// rather than ignore.
-    pub fn set(&mut self, slot: Slot, value: Value) -> bool {
+    pub fn set(&mut self, slot: Slot, value: V) -> bool {
         let Some(index) = self.resolve(slot) else {
             return false;
         };
@@ -440,21 +447,20 @@ impl Arena {
 
     /// Moves the slot's contents out for a `cell_update`, leaving the slot marked as taken so
     /// that nothing reads the placeholder. `None` when the slot is stale or already taken.
-    pub fn take(&mut self, slot: Slot) -> Option<Value> {
+    pub fn take(&mut self, slot: Slot) -> Option<V> {
         if self.is_taken(slot) {
             return None;
         }
         let index = self.resolve(slot)?;
         self.taken.push(slot);
-        Some(std::mem::replace(
+        Some(std::mem::take(
             &mut self.chunks[chunk_of(index)][offset_of(index)],
-            Value::Unit,
         ))
     }
 
     /// Stores a `cell_update`'s answer and clears the mark. `false` when the slot's region has
     /// closed in the meantime; the mark is cleared either way.
-    pub fn put_back(&mut self, slot: Slot, value: Value) -> bool {
+    pub fn put_back(&mut self, slot: Slot, value: V) -> bool {
         self.taken.retain(|s| *s != slot);
         self.set(slot, value)
     }
@@ -632,7 +638,7 @@ impl Arena {
     }
 
     /// The extent of `region` and of everything nested inside it, as it stands now.
-    pub fn snapshot(&mut self, region: RegionId) -> Option<Snapshot> {
+    pub fn snapshot(&mut self, region: RegionId) -> Option<Snapshot<V>> {
         let at = self.scope(region)?;
         if self.scopes[at].kind == RegionKind::Unique {
             return None;
@@ -641,7 +647,7 @@ impl Arena {
     }
 
     /// Every region open at this point — the snapshot a continuation capture has to take.
-    pub fn snapshot_open(&mut self) -> Result<Option<Snapshot>, RegionId> {
+    pub fn snapshot_open(&mut self) -> Result<Option<Snapshot<V>>, RegionId> {
         if let Some(scope) = self
             .scopes
             .iter()
@@ -656,7 +662,7 @@ impl Arena {
         Ok(Some(self.snapshot_from(0)))
     }
 
-    fn snapshot_from(&mut self, at: usize) -> Snapshot {
+    fn snapshot_from(&mut self, at: usize) -> Snapshot<V> {
         let base = self.scopes[at].mark;
         let region = self.scopes[at].id;
         let mut values = Vec::with_capacity(self.live - base);
@@ -680,7 +686,7 @@ impl Arena {
     }
 
     /// Re-installs a snapshot: the covered slots and the scopes that were open over them.
-    pub fn restore(&mut self, snapshot: &Snapshot) -> bool {
+    pub fn restore(&mut self, snapshot: &Snapshot<V>) -> bool {
         // The region must still be open *at the depth it was taken from*.
         if self.scopes.get(snapshot.depth).map(|s| s.id) != Some(snapshot.region) {
             return false;
@@ -711,7 +717,7 @@ impl Arena {
     }
 
     /// Ascending by index — the order a differential comparison and a rendered artifact both need.
-    pub fn slots(&self) -> impl Iterator<Item = (Slot, &Value)> {
+    pub fn slots(&self) -> impl Iterator<Item = (Slot, &V)> {
         (0..self.live).map(move |index| {
             let (c, o) = (chunk_of(index), offset_of(index));
             (
@@ -768,7 +774,7 @@ impl Arena {
     }
 }
 
-impl fmt::Debug for Arena {
+impl<V: Clone + Default> fmt::Debug for Arena<V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
@@ -836,7 +842,7 @@ mod tests {
 
     #[test]
     fn allocation_is_a_bump_and_close_gives_the_slots_back() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Unique, Span::DUMMY);
         for i in 0..64 {
             arena.alloc(Value::Int(i));
@@ -855,7 +861,7 @@ mod tests {
     /// `Arc` payload's refcount says.
     #[test]
     fn closing_a_region_drops_the_values_it_held() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let (arc, value) = payload(1);
         let r = arena.open(RegionKind::Unique, Span::DUMMY);
         arena.alloc(value);
@@ -873,7 +879,7 @@ mod tests {
     /// The point of a bump arena: the second region through costs the allocator nothing.
     #[test]
     fn a_second_region_of_the_same_size_allocates_nothing() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         for _ in 0..4 {
             let r = arena.open(RegionKind::Unique, Span::DUMMY);
             for i in 0..1_000 {
@@ -901,7 +907,7 @@ mod tests {
 
     #[test]
     fn a_slot_from_a_closed_region_reads_nothing_rather_than_the_value_after_it() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let first = arena.open(RegionKind::Unique, Span::DUMMY);
         let stale = arena.alloc(Value::Int(1)).expect("inside a region");
         arena.close(first);
@@ -922,14 +928,14 @@ mod tests {
 
     #[test]
     fn allocating_outside_every_region_is_refused() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         assert!(arena.alloc(Value::Int(1)).is_none());
         assert_eq!(arena.stats().allocations, 0);
     }
 
     #[test]
     fn an_inner_region_reads_and_writes_an_outer_regions_values() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Unique, Span::DUMMY);
         let a = arena.alloc(Value::Int(1)).expect("inside a region");
 
@@ -948,7 +954,7 @@ mod tests {
 
     #[test]
     fn closing_an_outer_region_closes_the_inner_regions_still_open_inside_it() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Unique, Span::DUMMY);
         arena.alloc(Value::Int(1));
         let mid = arena.open(RegionKind::Shared, Span::DUMMY);
@@ -967,7 +973,7 @@ mod tests {
 
     #[test]
     fn closing_a_region_twice_is_not_a_second_free() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Unique, Span::DUMMY);
         let kept = arena.alloc(Value::Int(7)).expect("inside a region");
         let inner = arena.open(RegionKind::Unique, Span::DUMMY);
@@ -983,7 +989,7 @@ mod tests {
 
     #[test]
     fn nesting_deeper_than_one_chunk_keeps_every_level_addressable() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let mut regions = Vec::new();
         let mut slots = Vec::new();
         for level in 0..32 {
@@ -1012,7 +1018,7 @@ mod tests {
 
     #[test]
     fn a_unique_region_refuses_to_be_snapshotted() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Unique, Span::DUMMY);
         arena.alloc(Value::Int(1));
         assert!(arena.snapshot(r).is_none());
@@ -1025,7 +1031,7 @@ mod tests {
     /// readable through it.
     #[test]
     fn a_restore_undoes_every_write_and_every_allocation_since_the_snapshot() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         let c = arena.alloc(Value::Int(0)).expect("inside a region");
 
@@ -1051,7 +1057,7 @@ mod tests {
     /// physical position.
     #[test]
     fn allocations_either_side_of_a_restore_are_different_slots() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         arena.alloc(Value::Int(0));
         let at_capture = arena.snapshot(r).expect("a shared region snapshots");
@@ -1071,7 +1077,7 @@ mod tests {
     /// reads `None` where it left a value.
     #[test]
     fn a_restore_keeps_the_slots_the_capture_was_holding() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         let held: Vec<Slot> = (0..300)
             .map(|i| arena.alloc(Value::Int(i)).expect("inside a region"))
@@ -1093,7 +1099,7 @@ mod tests {
     /// its mark.
     #[test]
     fn a_snapshot_covers_the_regions_nested_inside_the_one_it_names() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Shared, Span::DUMMY);
         let a = arena.alloc(Value::Int(1)).expect("inside a region");
         let inner = arena.open(RegionKind::Unique, Span::DUMMY);
@@ -1118,7 +1124,7 @@ mod tests {
     /// resumption reads it.
     #[test]
     fn a_snapshot_of_the_inner_region_leaves_the_enclosing_regions_writes_in_place() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Shared, Span::DUMMY);
         let x = arena.alloc(Value::Int(0)).expect("inside a region");
         let inner = arena.open(RegionKind::Shared, Span::DUMMY);
@@ -1156,7 +1162,7 @@ mod tests {
     /// The cost, stated as the number it actually is rather than the one the region-kind rule advertised.
     #[test]
     fn covering_every_open_region_costs_the_whole_live_arena() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Shared, Span::DUMMY);
         for i in 0..1_000 {
             arena.alloc(Value::Int(i));
@@ -1179,7 +1185,7 @@ mod tests {
     /// capture path has to be told which region so it can name it.
     #[test]
     fn a_capture_across_a_unique_region_is_refused_and_names_it() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Shared, Span::DUMMY);
         arena.alloc(Value::Int(1));
         let unique = arena.open(RegionKind::Unique, Span::DUMMY);
@@ -1202,7 +1208,7 @@ mod tests {
 
     #[test]
     fn a_capture_outside_every_region_has_nothing_to_snapshot() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         assert!(arena.snapshot_open().expect("nothing is unique").is_none());
         assert_eq!(arena.stats().snapshots, 0);
     }
@@ -1210,7 +1216,7 @@ mod tests {
     /// A restore restores the arena's state, not a bump range.
     #[test]
     fn a_restore_brings_a_closed_regions_scope_back_with_its_slots() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         arena.alloc(Value::Int(1));
         let inner = arena.open(RegionKind::Shared, Span::DUMMY);
@@ -1244,7 +1250,7 @@ mod tests {
     /// after the restore.
     #[test]
     fn a_region_opened_after_the_snapshot_does_not_survive_the_restore() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         arena.alloc(Value::Int(1));
 
@@ -1276,7 +1282,7 @@ mod tests {
     /// and `snapshot` subtract under.
     #[test]
     fn no_sequence_of_restores_strands_a_regions_mark_above_the_bump_pointer() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let root = arena.open(RegionKind::Shared, Span::DUMMY);
         let mut snaps = Vec::new();
         for round in 0..6 {
@@ -1303,7 +1309,7 @@ mod tests {
     /// region, and nothing per allocation.
     #[test]
     fn a_snapshot_copies_the_regions_slots_and_no_others() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let outer = arena.open(RegionKind::Shared, Span::DUMMY);
         for i in 0..500 {
             arena.alloc(Value::Int(i));
@@ -1327,7 +1333,7 @@ mod tests {
     #[test]
     fn snapshot_cost_is_linear_in_the_regions_size() {
         for size in [0usize, 1, 100, 1_000, 10_000] {
-            let mut arena = Arena::new();
+            let mut arena: Arena = Arena::new();
             let r = arena.open(RegionKind::Shared, Span::DUMMY);
             for i in 0..size {
                 arena.alloc(Value::Int(i as i64));
@@ -1345,7 +1351,7 @@ mod tests {
     /// slots point at.
     #[test]
     fn a_snapshot_shares_payloads_rather_than_deep_copying_them() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         let mut kept = Vec::new();
         for i in 0..64 {
@@ -1377,7 +1383,7 @@ mod tests {
     /// and its arena is freed as if nothing had been saved.
     #[test]
     fn a_snapshot_that_is_never_restored_costs_only_itself() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let (arc, value) = payload(1);
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         arena.alloc(value);
@@ -1393,7 +1399,7 @@ mod tests {
 
     #[test]
     fn restoring_into_a_closed_region_is_refused() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         arena.alloc(Value::Int(1));
         let snap = arena.snapshot(r).expect("a shared region snapshots");
@@ -1405,7 +1411,7 @@ mod tests {
 
     #[test]
     fn slots_iterate_in_ascending_index_order() {
-        let mut arena = Arena::new();
+        let mut arena: Arena = Arena::new();
         let r = arena.open(RegionKind::Unique, Span::DUMMY);
         for i in 0..600 {
             arena.alloc(Value::Int(i));

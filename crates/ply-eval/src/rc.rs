@@ -222,10 +222,22 @@ pub fn take_cycles() -> Vec<Diagnostic> {
 
 /// A cell that reaches itself, which nothing will ever reclaim.
 pub(crate) fn cell_cycle(slot: Slot, value: &Value, span: Span) -> Option<Diagnostic> {
-    let mut budget = CYCLE_WALK_BUDGET;
-    if !reaches_cell(value, slot, 0, &mut budget) {
+    if !value_reaches_cell(value, slot) {
         return None;
     }
+    note_cell_cycle(slot, span)
+}
+
+/// Whether `v` reaches cell `slot`, within the walk's budget: what the tier asks of a bridged value
+/// inside a heap word.
+pub fn value_reaches_cell(v: &Value, slot: Slot) -> bool {
+    let mut budget = CYCLE_WALK_BUDGET;
+    reaches_cell(v, slot, 0, &mut budget)
+}
+
+/// A cell made to contain itself, once the walk -- the interpreter's or the tier's -- has found the
+/// cycle: counted, and warned about once per site.
+pub fn note_cell_cycle(slot: Slot, span: Span) -> Option<Diagnostic> {
     bump(|s| s.cycles += 1);
     // One cycle, one warning.
     let seen = SEEN
