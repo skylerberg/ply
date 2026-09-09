@@ -196,7 +196,7 @@ pub(crate) fn attach_tier(
 }
 
 /// Each module's source text by name: what a second emitter reads the program from.
-pub(crate) fn module_texts(
+pub fn module_texts(
     program: &ply_syntax::ast::Program,
     sources: &SourceMap,
 ) -> std::collections::HashMap<String, String> {
