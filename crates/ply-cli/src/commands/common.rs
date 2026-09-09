@@ -217,16 +217,30 @@ pub fn prover_backend(
 /// `spikes/ply-parser/emit.ply`. `None` when it is not on disk — a shipped binary, until the
 /// bundle is embedded (ADR 0048).
 fn find_emitter_dir() -> Option<std::path::PathBuf> {
-    let mut cur = std::env::current_dir().ok()?;
-    loop {
-        let candidate = cur.join("spikes/ply-parser");
-        if candidate.join("emit.ply").is_file() {
-            return Some(candidate);
-        }
-        if !cur.pop() {
-            return None;
+    fn search(mut cur: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        loop {
+            let candidate = cur.join("spikes/ply-parser");
+            if candidate.join("emit.ply").is_file() {
+                return Some(candidate);
+            }
+            if !cur.pop() {
+                return None;
+            }
         }
     }
+    // The working directory first — a developer runs `ply` from the repository — then the
+    // executable's own directory, since a `ply` invoked from elsewhere (a test's temp project) is
+    // still `<repo>/target/**/ply`, under the `spikes/` it needs. A shipped binary finds neither
+    // and falls through to the reference emitter until the bundle is embedded (ADR 0048).
+    std::env::current_dir()
+        .ok()
+        .and_then(search)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+                .and_then(search)
+        })
 }
 
 pub(crate) fn install_producer_from_env() {

@@ -148,9 +148,10 @@ measurement is confounded until the earlier one has moved.
    not five times, so the next lever is what compiled code does with values
    (step 4), not what it lowers.
 4. **What compiled code does with values — landed, at parity.**
-   `front_end_alloc_sites` (in `ply-codegen-tests`) attributes one parse's
-   allocations by site under both engines, the way `w6_alloc_sites` attributes
-   a request's. It first read the compiled parse at several times the
+   `front_end_alloc_sites` attributed one parse's allocations by site under both
+   engines, the way `w6_alloc_sites` attributes a request's — retired with the
+   interpreter under ADR 0048, its parity reached and nothing left to compare
+   the compiled arm against. It first read the compiled parse at several times the
    interpreted one, because the arena handed every value to a helper as a
    shared handle and none of the last-use ownership ADR 0034 gave the machine
    reached compiled code. Now it does: a borrowed local is duplicated only
