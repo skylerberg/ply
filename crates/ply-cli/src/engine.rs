@@ -977,11 +977,12 @@ impl Cases<'_> {
 impl Judge for Cases<'_> {
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         let scope = self.scope(values);
-        for (i, guard) in self.guards.iter().enumerate() {
-            let value = match entered(self.compiled.as_ref(), self.guard_roots.get(i), values) {
-                Some(answer) => answer?,
-                None => self.machine.eval_expr_in(guard, self.module, &scope)?,
-            };
+        for guard in self.guards.iter() {
+            // On the Core, not the compiled root: a proposition may apply a generated closure (a
+            // law over `f: (Int) -> Int`), which the tier cannot — it compiles named bodies ahead
+            // and has no machine to run a synthesized closure on (ADR 0048). The Core interprets
+            // named functions too, so it loses nothing for a first-order guard.
+            let value = self.machine.eval_expr_in(guard, self.module, &scope)?;
             if !self.boolean(value)? {
                 return Ok(false);
             }
@@ -991,18 +992,16 @@ impl Judge for Cases<'_> {
 
     fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         let mut scope = self.scope(values);
-        let mut args = values.to_vec();
         if let (Some(name), Some(result)) = (&self.call, &self.result) {
             let returned = self
                 .machine
                 .call(name.as_str(), values.to_vec(), self.span)?;
-            scope.push((result.clone(), returned.clone()));
-            args.push(returned);
+            scope.push((result.clone(), returned));
         }
-        let value = match entered(self.compiled.as_ref(), self.body_root.as_ref(), &args) {
-            Some(answer) => answer?,
-            None => self.machine.eval_expr_in(self.body, self.module, &scope)?,
-        };
+        // On the Core, for the same reason as the guard: the proposition may apply a generated
+        // closure, which only the interpreted evaluator can (ADR 0048). The owner above is a named
+        // function and stays on the tier.
+        let value = self.machine.eval_expr_in(self.body, self.module, &scope)?;
         self.boolean(value)
     }
 }
