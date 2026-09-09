@@ -57,10 +57,11 @@ impl Checked {
     }
 
     fn machine(&self) -> Machine<'_> {
-        Machine::new(
+        crate::tier_machine(
             &self.loaded.program,
             &self.loaded.resolved,
             &self.loaded.check,
+            &self.loaded.sources,
         )
     }
 
@@ -735,16 +736,11 @@ fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Durati
     );
     let plan = ply_cli::commands::test::Plan::new(selection, &loaded.check, None, false);
     let selection = plan.selection;
-    let report = ply_test::run(
+    let report = ply_cli::commands::common::run_on_tier(
+        loaded,
         &selection,
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        &loaded.hashes,
-        store,
-        false,
-        ply_test::Search::of(&selection),
         ply_test::Hosting::hermetic(),
+        store,
     );
     if report.failed > 0 {
         bail!(

@@ -45,9 +45,14 @@ pub struct Program {
     program: ply_syntax::ast::Program,
     resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
+    sources: ply_span::SourceMap,
 }
 
 impl Program {
+    fn machine(&self) -> Machine<'_> {
+        crate::tier_machine(&self.program, &self.resolved, &self.check, &self.sources)
+    }
+
     pub fn parse() -> Result<Program> {
         let path = "bench.ply";
         let mut sources = ply_span::SourceMap::new();
@@ -76,6 +81,7 @@ impl Program {
             program,
             resolved,
             check,
+            sources,
         })
     }
 
@@ -100,7 +106,7 @@ impl Program {
     /// run on.
     fn call_pure(&self, simple: &str, n: i64) -> Result<(Duration, Value)> {
         let name = self.full(simple)?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         let started = Instant::now();
         let value = machine
             .call(&name, vec![Value::Int(n)], Span::DUMMY)
@@ -121,7 +127,7 @@ impl Program {
         let binding = registry
             .bind(&self.check)
             .map_err(|d| diagnostics("binding the trace sink", &d))?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         machine.set_host_binding(Arc::new(binding));
         machine.set_host_runtime(host.runtime());
         if let Some(declared) = self.footprint(simple) {

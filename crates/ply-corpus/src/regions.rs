@@ -383,10 +383,11 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     let setup = (0..3)
         .map(|_| {
             let started = Instant::now();
-            std::hint::black_box(ply_eval::Machine::new(
+            std::hint::black_box(crate::tier_machine(
                 &loaded.program,
                 &loaded.resolved,
                 &loaded.check,
+                &loaded.sources,
             ));
             started.elapsed()
         })
