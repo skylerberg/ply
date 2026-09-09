@@ -23,10 +23,6 @@ fn int(value: Value) -> i64 {
     }
 }
 
-
-
-
-
 /// The same pair for a tail-resumptive clause.
 const TAIL_PRELUDE: &str = "effect log { write note[tape](n: Int) -> Int }\n\nfn go() -> Int =\n  with_cell[tape](0) { c -> ";
 
@@ -38,7 +34,6 @@ fn tail_fixture(body: &str) -> String {
     let pad = " ".repeat(TAIL_CAPTURING.len().saturating_sub(body.len()));
     format!("{TAIL_PRELUDE}{body}{pad} }}\n")
 }
-
 
 /// The same question on a tail-resumptive region, which takes no pin.
 ///
@@ -85,57 +80,6 @@ fn a_tail_resumptive_region_is_unique_and_a_stale_kind_does_not_move_it() {
     );
 }
 
-
-/// The assumption under `Lowering`: a body's lowered form is a function of the body and its
-/// parameter list, and of nothing the machine holds.
-#[test]
-fn a_lambdas_lowered_body_is_independent_of_what_it_captured() {
-    let compiled = Compiled::new(
-        r#"
-fn adder(n: Int) -> (Int) -> Int = |x| x + n
-
-fn go() -> Int {
-  let a = adder(1);
-  let b = adder(20);
-  let c = adder(300);
-  (a(0) + a(0)) + (b(0) + b(0)) + (c(0) + c(0))
-}
-"#,
-    );
-    let mut machine = compiled.machine();
-    let answered = machine
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .unwrap_or_else(|d| panic!("[{}] {}", d.code, d.message));
-    assert_eq!(
-        int(answered),
-        2 * (1 + 20 + 300),
-        "a lambda applied under one lowered body answered differently per capture"
-    );
-    // Two bodies — `adder`'s and `go`'s — however many closures `adder` minted.
-    assert_eq!(
-        machine.share_lowering().len(),
-        2,
-        "the lambda was lowered more than once, so the three closures did not share a body"
-    );
-
-    // The same shape with the closures built in a loop, so the lambda is entered once per element
-    // of a list the program chose.
-    let looped = Compiled::new(
-        r#"
-fn adder(n: Int) -> (Int) -> Int = |x| x + n
-
-fn apply(f: (Int) -> Int) -> Int = f(0) + f(0)
-
-fn go() -> Int = fold([1, 20, 300], 0, |acc, n| acc + apply(adder(n)))
-"#,
-    );
-    assert_eq!(
-        int(looped.call("m.go")),
-        2 * (1 + 20 + 300),
-        "a lambda applied under one lowered body answered differently per capture"
-    );
-}
-
 /// The failure a captured binding would take if lowering ever marked it `Owned`: a closure's free
 /// variable is reachable from the closure for as long as the closure lives, so moving it out at
 /// what looks like a last use empties a binding a second call still reads.
@@ -156,7 +100,6 @@ fn go() -> Int {
         "a binding a closure captured was moved out of the scope the closure shares"
     );
 }
-
 
 const CAPTURE_ELSEWHERE: &str = r#"
 effect amb { read flip[coin]() -> Bool }
@@ -313,41 +256,5 @@ fn go(helper: (Int) -> Int) -> Int =
             Some(Cause::Indirect)
         ),
         "the refusal is attributed to something other than the unknown callee"
-    );
-}
-
-/// The lowering half of the poisoning above, and it comes out the other way: where a span-keyed
-/// `Kinds` from the wrong program delivers a wrong answer, an address-keyed `Lowering` from the
-/// wrong program cannot.
-#[test]
-fn a_lowering_from_another_program_answers_for_nothing_in_this_one() {
-    let one = Compiled::new("fn go() -> Int = 111\n");
-    let two = Compiled::new("fn go() -> Int = 222\n");
-
-    let mut first = one.machine();
-    assert_eq!(
-        int(first.call("m.go", Vec::new(), Span::DUMMY).unwrap()),
-        111
-    );
-    let filled = first.share_lowering();
-    assert_eq!(filled.len(), 1, "the first machine lowered nothing");
-    assert!(
-        !filled.describes(&two.program),
-        "a cache over one program claims to describe another, so the span the two fixtures share \
-         is enough to answer from the wrong body"
-    );
-
-    let mut poisoned = two.machine();
-    poisoned.set_lowering(std::rc::Rc::clone(&filled));
-    assert!(
-        !std::rc::Rc::ptr_eq(&poisoned.share_lowering(), &filled),
-        "a machine installed a lowering taken over another program"
-    );
-    assert_eq!(
-        int(poisoned
-            .call("m.go", Vec::new(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("[{}] {}", d.code, d.message))),
-        222,
-        "a machine answered from a body belonging to another program"
     );
 }

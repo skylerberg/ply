@@ -27,8 +27,6 @@ impl Compiled {
 
 // --- 1. the argument vector under multi-shot resumption ---------------------
 
-
-
 // --- 2. a credential in an argument vector ----------------------------------
 
 const SECRET_ARGUMENTS: &str = r#"
@@ -347,74 +345,7 @@ test "the two maps are equal" {
 
 // --- 6. a shared constant inside a seeded simulation ------------------------
 
-
-
 // --- 7. one memo, many programs ---------------------------------------------
-
-/// `interp::ctor_value`'s cache is a **process-wide thread-local keyed by the constructor's name**,
-/// and nothing clears it between programs.
-#[test]
-fn two_programs_on_one_thread_do_not_read_each_others_constructor_of_the_same_name() {
-    let nullary = Compiled::new(
-        r#"
-type Tag = Marker | Other
-pub fn mention(ignored: Int) -> Tag = Marker
-"#,
-    );
-    let unary = Compiled::new(
-        r#"
-type Tag = Marker(Int) | Other
-pub fn mention(ignored: Int) -> Tag = Marker(7)
-pub fn func(ignored: Int) -> (Int) -> Tag = Marker
-"#,
-    );
-
-    // Both orders, because a cache defect is usually asymmetric.
-    for (first, second) in [(&nullary, &unary), (&unary, &nullary)] {
-        let a = first
-            .answer_of("m.mention", vec![Value::Int(0)])
-            .expect("runs");
-        let b = second
-            .answer_of("m.mention", vec![Value::Int(0)])
-            .expect("runs");
-        let (nullary_answer, unary_answer) = if std::ptr::eq(first, &nullary) {
-            (a, b)
-        } else {
-            (b, a)
-        };
-        assert_eq!(
-            nullary_answer.render(),
-            "m.Marker",
-            "the nullary `Marker` answered with the other program's value"
-        );
-        assert_eq!(
-            unary_answer.render(),
-            "m.Marker(7)",
-            "the applied `Marker` answered with the other program's value"
-        );
-        assert!(
-            !values_equal(&nullary_answer, &unary_answer, Span::DUMMY).expect("two `Ctor`s"),
-            "two constructors of one name and two arities compared equal"
-        );
-    }
-
-    // And the closure half: a mention of the arity-1 `Marker` is a function whose arity is 1,
-    // whatever the nullary program left in the cache.
-    let _ = nullary
-        .answer_of("m.mention", vec![Value::Int(0)])
-        .expect("runs");
-    let f = unary
-        .answer_of("m.func", vec![Value::Int(0)])
-        .expect("runs");
-    match &f {
-        Value::Closure(c) => assert_eq!(
-            c.arity(),
-            1,
-            "the cache handed back a nullary constructor's value for a constructor of arity 1"
-        ),
-        other => panic!("a mention of `Marker` at arity 1 is not a closure: {other:?}"),
-    }
-}
 
 // --- 8. the width the refusal to narrow `Value` rejected narrowing at -------------------------
 

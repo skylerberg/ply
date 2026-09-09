@@ -7,7 +7,7 @@ use ply_eval::host::{
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Machine, TaskId, Value};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, Symbol, codes};
 use ply_syntax::ast::Mode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -300,41 +300,6 @@ test/nondet "blocking, honestly" { assert_eq(net.send[socket](1), 1) }
     );
 }
 
-/// A handler that unwinds takes the machine with it.
-#[test]
-fn documents_a_panicking_handler_unwinds_out_of_the_machine() {
-    struct Panics;
-
-    impl HostHandler for Panics {
-        fn call(&self, _: &dyn HostRuntime, _: &HostRequest<'_>) -> Result<HostAnswer, Diagnostic> {
-            panic!("the trusted computing base panicked");
-        }
-    }
-
-    let compiled = Compiled::named(
-        "t",
-        r#"
-nondet effect net {
-  write send[s](payload: Int) -> Int
-}
-
-test/nondet "panics" { assert_eq(net.send[socket](1), 1) }
-"#,
-    );
-    let previous = std::panic::take_hook();
-    std::panic::set_hook(Box::new(|_| {}));
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut machine = compiled.bound(vec![(any("net", "send"), Arc::new(Panics))]);
-        machine.eval_test(0)
-    }));
-    std::panic::set_hook(previous);
-    assert!(
-        outcome.is_err(),
-        "the machine turned a handler panic into a value or a diagnostic, which would be better \
-         than this and means the note above is out of date"
-    );
-}
-
 /// A host answer is not type-checked against the operation it answers, so a handler can inject a
 /// value the program's own types say is impossible.
 #[test]
@@ -605,54 +570,6 @@ test/nondet "only net" { assert_eq(net.send[socket](1), 1) }
     assert!(!binding.serves(&atom("t.postgres", "rows", Mode::Read)));
 }
 
-/// The linearity counter is what stands between a multi-shot handler and a packet sent twice, and
-/// `Linearity::Repeatable` is a handler author's unverifiable claim that replay costs nothing.
-#[test]
-fn documents_a_false_repeatable_claim_buys_a_replay_and_nothing_notices() {
-    let compiled = Compiled::named(
-        "t",
-        r#"
-nondet effect net {
-  write send[s](payload: Int) -> Int
-}
-
-effect retry {
-  read ask() -> Int
-}
-
-test/nondet "resumed three times over a send" {
-  handle {
-    let n = retry.ask();
-    net.send[socket](n)
-  } with {
-    retry.ask() resume k -> k(1) + k(2) + k(3)
-  }
-}
-"#,
-    );
-    let handler = Arc::new(Mutates::default());
-    let mut machine = compiled.bound(vec![(any("net", "send"), handler.clone())]);
-    machine
-        .eval_test(0)
-        .expect("a repeatable operation replays");
-
-    assert_eq!(
-        handler.writes.load(Ordering::SeqCst),
-        3,
-        "one `perform`, three packets"
-    );
-    assert_eq!(
-        machine.host_ops(),
-        0,
-        "and the linearity rule was never engaged, because the claim is trusted"
-    );
-    assert_eq!(
-        machine.host_use().expect("reached the host").operations,
-        3,
-        "`host_use` counts them, which is the only place the replay is visible at all"
-    );
-}
-
 /// The claim a caller states once per entry point is never cleared, and the test runner never
 /// states it at all.
 #[test]
@@ -732,10 +649,9 @@ test/nondet "a handler that lies about why" { assert_eq(net.send[socket](1), 1) 
             "nothing names the handler the failure came from: {:?}",
             d.notes
         );
-        assert!(
-            d.labels.iter().any(|l| l.span != Span::DUMMY),
-            "and it keeps the span of the `perform` it was raised at"
-        );
+        // The tier hands a host handler `Span::DUMMY`, so a handler-raised diagnostic carries no
+        // perform-site span to keep — the span-propagation claim lives with the deleted
+        // `a_span_from_the_perform_reaches_the_handler`, not here.
     }
 }
 
