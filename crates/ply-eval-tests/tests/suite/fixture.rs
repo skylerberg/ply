@@ -70,13 +70,9 @@ impl Compiled {
         check_program(&program, &resolved).err().unwrap_or_default()
     }
 
+    /// A machine running on a real compiled tier — the only evaluator under tier-only (ADR 0048).
+    /// Every eval-test that runs a program uses it, since a bare machine holds no evaluator.
     pub fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
-    }
-
-    /// A machine running on a real compiled tier — the only evaluator under tier-only, and the one
-    /// whose boundary defences the host suites exist to exercise.
-    pub fn machine_on_tier(&self) -> Machine<'_> {
         let mut m = Machine::new(&self.program, &self.resolved, &self.check);
         let unit = ply_codegen::Unit::over(&self.program, &self.resolved, &self.check)
             .expect("this host has a C compiler");
@@ -86,6 +82,10 @@ impl Compiled {
         };
         m.set_compiled(unit.attach(&spec));
         m
+    }
+
+    pub fn machine_on_tier(&self) -> Machine<'_> {
+        self.machine()
     }
 
     pub fn index_of(&self, name: &str) -> usize {

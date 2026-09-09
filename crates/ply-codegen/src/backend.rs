@@ -90,7 +90,13 @@ impl Unit {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
     ) -> Result<&'static Unit> {
-        Unit::keyed(program, resolved, check, HashMap::new(), HashMap::new())
+        // The keys make a test or a law a root the unit compiles (ADR 0045/0048); without them the
+        // tier holds no `test#N` to enter. `over` derives them so a caller that has no hashes of
+        // its own — a test, `Unit::over` at large — still gets a unit that runs the language.
+        let keys = ply_hash::hash_program(program, resolved, check)
+            .map(|hashes| crate::source::emit_keys(program, &hashes))
+            .unwrap_or_default();
+        Unit::keyed(program, resolved, check, keys, HashMap::new())
     }
 
     /// The same, told what each definition's code is a function of, so that emitted bodies and
@@ -103,6 +109,9 @@ impl Unit {
         keys: HashMap<String, String>,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
+        // Tier-only (ADR 0048): the whole Ply emitter is the default producer, since the reference
+        // emitter is a fragment. A caller that already installed one (e.g. `PLY_C_EMITTER`) keeps it.
+        crate::c::producer::ensure_default();
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
         let origin = std::ptr::from_ref(program) as usize;
