@@ -21,7 +21,7 @@ import patterns (Pattern, PWild, PVar, PLit, PCtor, PRecord, PList, PBad, Lit, L
 import exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, EApp, EIf, EBlock, EList,
               ERecord, EField, ELambda, EMatch, EPerform, EHandle, EWithCell,
               EWithRegion, ESimulate, EBad, ERecordUpdate, ETry, Stmt, SLet, SExpr,
-              RecField)
+              RecField, expr_span)
 import items (Module, Item, IFn, parse)
 import rewrite (expand)
 
@@ -33,7 +33,7 @@ pub fn own_tag(o: Own) -> Bytes =
   match o { Borrowed -> b"b", Owned -> b"o", OwnedField -> b"f" }
 
 // One lowered node: what it is, and how the read that produced it takes it.
-pub type Code = { own: Own, node: Node }
+pub type Code = { own: Own, node: Node, span: Span }
 
 pub type Node =
   | NLit(Lit)
@@ -93,7 +93,7 @@ pub type CRet = { size: Int, caps: List<Cap>, body: Code }
 pub type CStmt =
   | CLet({ name: Bytes, slot: Int, value: Code })
   // `let <pattern> = e`: the value is bound as a whole and the pattern's names read out of it.
-  | CLetPat({ pat: CPat, value: Code })
+  | CLetPat({ span: Span, pat: CPat, value: Code })
   | CDo({ code: Code })
 
 // --- the dump ---------------------------------------------------------------
@@ -381,7 +381,7 @@ type Out = { code: Code, st: Stack }
 
 fn lower_in(e: Expr, st: Stack) -> Option<Out> =
   match e {
-    ELit(x) -> Some({ code: { own: Borrowed, node: NLit(x.lit) }, st: st }),
+    ELit(x) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NLit(x.lit) }, st: st }),
     // `ERecordUpdate` is not lowered, and neither is it in the reference: it is
     // expanded away before lowering on both sides. What the reference does that
     // this port does not is *recognise* the result -- `lower_record_update` takes
@@ -394,7 +394,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
       // A qualified name is a global under the spelling it was written with, and
       // never a slot: a module binder cannot be shadowed by a local.
       Some(m) -> Some({
-        code: { own: Borrowed,
+        code: { own: Borrowed, span: expr_span(e),
                 node: NVar({ name: bytes_concat_all([m.name, b"::", x.name.name.name]),
                              slot: None }) },
         st: st }),
@@ -403,18 +403,18 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         // `resolve` answers the innermost slot, threading a capture through
         // every barrier between the occurrence and the binding on the way.
         let r = resolve(st, name);
-        Some({ code: { own: Borrowed, node: NVar({ name: name, slot: r.slot }) }, st: r.st })
+        Some({ code: { own: Borrowed, span: expr_span(e), node: NVar({ name: name, slot: r.slot }) }, st: r.st })
       },
     },
     EUnary(x) -> match lower_in(x.operand, st) {
-      Some(o) -> Some({ code: { own: Borrowed, node: NUnary({ op: x.op, operand: o.code }) }, st: o.st }),
+      Some(o) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NUnary({ op: x.op, operand: o.code }) }, st: o.st }),
       None -> None,
     },
     EBinary(x) -> match lower_in(x.lhs, st) {
       None -> None,
       Some(l) -> match lower_in(x.rhs, l.st) {
         None -> None,
-        Some(r) -> Some({ code: { own: Borrowed, node: NBinary({ op: x.op, lhs: l.code, rhs: r.code }) }, st: r.st }),
+        Some(r) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NBinary({ op: x.op, lhs: l.code, rhs: r.code }) }, st: r.st }),
       },
     },
     EIf(x) -> match lower_in(x.cond, st) {
@@ -423,16 +423,16 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         None -> None,
         Some(t) -> match lower_in(x.else_branch, t.st) {
           None -> None,
-          Some(el) -> Some({ code: { own: Borrowed, node: NIf({ cond: c.code, then_branch: t.code, else_branch: el.code }) }, st: el.st }),
+          Some(el) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NIf({ cond: c.code, then_branch: t.code, else_branch: el.code }) }, st: el.st }),
         },
       },
     },
     EField(x) -> match lower_in(x.base, st) {
-      Some(b) -> Some({ code: { own: Borrowed, node: NField({ base: b.code, field: x.field.name }) }, st: b.st }),
+      Some(b) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NField({ base: b.code, field: x.field.name }) }, st: b.st }),
       None -> None,
     },
     EList(x) -> match lower_seq(x.items, st) {
-      Some(r) -> Some({ code: { own: Borrowed, node: NList({ items: r.codes }) }, st: r.st }),
+      Some(r) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NList({ items: r.codes }) }, st: r.st }),
       None -> None,
     },
     ERecord(x) -> match as_update(x.fields, st) {
@@ -441,7 +441,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
       match lower_seq(map(x.fields, |fd: RecField| fd.value), st) {
         None -> None,
         Some(r) -> Some({
-          code: { own: Borrowed, node: NRecord({
+          code: { own: Borrowed, span: expr_span(e), node: NRecord({
             fields: map(range(0, len(x.fields)), |i: Int|
               { name: field_name(x.fields, i), value: nth(r.codes, i) }) }) },
           st: r.st,
@@ -453,7 +453,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         match lower_in(x.func, st) {
           None -> None,
           Some(fu) -> match lower_seq(x.args, fu.st) {
-            Some(r) -> Some({ code: { own: Borrowed, node: NApp({ func: fu.code, args: r.codes }) }, st: r.st }),
+            Some(r) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NApp({ func: fu.code, args: r.codes }) }, st: r.st }),
             None -> None,
           },
         }
@@ -479,7 +479,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
               }
             });
         if !walked.ok { None } else {
-          Some({ code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: walked.arms }) },
+          Some({ code: { own: Borrowed, span: expr_span(e), node: NMatch({ scrutinee: sc.code, arms: walked.arms }) },
                  st: unscope_st(walked.st, depth) })
         }
       },
@@ -487,13 +487,13 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
     // The effect forms that open no barrier of their own. `handle` and
     // `simulate` do, and are not here.
     EWithRegion(x) -> match lower_in(x.body, st) {
-      Some(b) -> Some({ code: { own: Borrowed, node: NRegion({ body: b.code }) }, st: b.st }),
+      Some(b) -> Some({ code: { own: Borrowed, span: expr_span(e), node: NRegion({ body: b.code }) }, st: b.st }),
       None -> None,
     },
     EPerform(x) -> match lower_seq(x.args, st) {
       None -> None,
       Some(r) -> Some({
-        code: { own: Borrowed, node: NPerform({
+        code: { own: Borrowed, span: expr_span(e), node: NPerform({
           effect: qname_text(x.eff), op: x.op.name,
           resource: match x.resource { Some(id) -> id.name, None -> b"" },
           args: r.codes }) },
@@ -509,7 +509,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
         match lower_in(x.body, inner) {
           None -> None,
           Some(b) -> Some({
-            code: { own: Borrowed, node: NCell({
+            code: { own: Borrowed, span: expr_span(e), node: NCell({
               resource: x.resource.name, binder: x.binder.name,
               slot: slot_in(st_top(inner), x.binder.name), init: i.code, body: b.code }) },
             st: unscope_st(b.st, depth) }),
@@ -544,7 +544,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
       None -> None,
       Some(b) -> {
         let inner = st_top(b.st);
-        Some({ code: { own: Borrowed, node: NSim({ size: len(inner.names), caps: inner.caps,
+        Some({ code: { own: Borrowed, span: expr_span(e), node: NSim({ size: len(inner.names), caps: inner.caps,
                                                    body: mark(b.code, [], [], []).code }) },
                st: st_pop(b.st) })
       },
@@ -579,7 +579,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
             });
         if !cls.ok { None } else {
           match x.ret {
-            None -> Some({ code: { own: Borrowed, node: NHandle({ body: b.code, clauses: cls.clauses,
+            None -> Some({ code: { own: Borrowed, span: expr_span(e), node: NHandle({ body: b.code, clauses: cls.clauses,
                                                                   ret: None }) },
                            st: cls.st }),
             Some(r) -> {
@@ -588,7 +588,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
                 None -> None,
                 Some(rb) -> {
                   let f = st_top(rb.st);
-                  Some({ code: { own: Borrowed, node: NHandle({
+                  Some({ code: { own: Borrowed, span: expr_span(e), node: NHandle({
                            body: b.code, clauses: cls.clauses,
                            ret: Some({ size: len(f.names), caps: f.caps,
                                        body: mark(rb.code, [], [], []).code }) }) },
@@ -655,8 +655,8 @@ fn as_update(fields: List<RecField>, st: Stack) -> Option<{ code: Code, st: Stac
                 match copy_base(f, st) { Some(n) -> if n == name { push(acc, f.name.name) } else { acc }, None -> acc });
               let sets = filter(fields, |f: RecField| copy_base(f, st) != Some(name));
               Some({
-                code: { own: Borrowed, node: NUpd({
-                  base: { own: Borrowed, node: NVar({ name: name, slot: Some(sl) }) },
+                code: { own: Borrowed, span: dummy_span(), node: NUpd({
+                  base: { own: Borrowed, span: dummy_span(), node: NVar({ name: name, slot: Some(sl) }) },
                   copies: copied,
                   sets: map(range(0, len(sets)), |i: Int|
                     { name: match list_at(sets, i) { Some(f) -> f.name.name, None -> b"" },
@@ -746,7 +746,7 @@ fn pat_binders(p: Pattern, out: List<Bytes>) -> List<Bytes> =
   }
 
 fn nth(cs: List<Code>, i: Int) -> Code =
-  match list_at(cs, i) { Some(c) -> c, None -> { own: Borrowed, node: NLit(LUnit) } }
+  match list_at(cs, i) { Some(c) -> c, None -> { own: Borrowed, span: dummy_span(), node: NLit(LUnit) } }
 
 type Seq = { codes: List<Code>, st: Stack }
 
@@ -768,7 +768,7 @@ fn lower_seq(xs: List<Expr>, st: Stack) -> Option<Seq> =
 // the barriers below.
 fn lam_of(params: List<Bytes>, b: Out) -> Out = {
   let inner = st_top(b.st);
-  { code: { own: Borrowed, node: NLambda({ params: len(params), size: len(inner.names),
+  { code: { own: Borrowed, span: dummy_span(), node: NLambda({ params: len(params), size: len(inner.names),
                                            caps: inner.caps,
                                            body: mark(b.code, [], [], []).code }) },
     st: st_pop(b.st) }
@@ -795,7 +795,7 @@ fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> 
               None -> { stmts: acc.stmts, st: acc.st, ok: false },
               Some(o) -> {
                 let p = lower_pat(l.pat, o.st);
-                { stmts: push(acc.stmts, CLetPat({ pat: p.pat, value: o.code })), st: p.st, ok: true }
+                { stmts: push(acc.stmts, CLetPat({ span: l.span, pat: p.pat, value: o.code })), st: p.st, ok: true }
               },
             },
             Some(name) -> match lower_in(l.value, acc.st) {
@@ -811,11 +811,11 @@ fn lower_block(stmts: List<Stmt>, tail: Option<Expr>, st: Stack) -> Option<Out> 
       });
   if !walked.ok { None } else {
     match tail {
-      None -> Some({ code: { own: Borrowed, node: NBlock({ stmts: walked.stmts, tail: None }) },
+      None -> Some({ code: { own: Borrowed, span: dummy_span(), node: NBlock({ stmts: walked.stmts, tail: None }) },
                      st: unscope_st(walked.st, depth) }),
       Some(t) -> match lower_in(t, walked.st) {
         None -> None,
-        Some(o) -> Some({ code: { own: Borrowed, node: NBlock({ stmts: walked.stmts, tail: Some(o.code) }) },
+        Some(o) -> Some({ code: { own: Borrowed, span: dummy_span(), node: NBlock({ stmts: walked.stmts, tail: Some(o.code) }) },
                           st: unscope_st(o.st, depth) }),
       },
     }
@@ -962,7 +962,7 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
     NVar(v) -> match v.slot {
       None -> { code: c, live: live, livew: livew, livef: livef },
       Some(s) -> {
-        code: { own: if live_has(live, s) { Borrowed } else { Owned }, node: c.node },
+        code: { own: if live_has(live, s) { Borrowed } else { Owned }, node: c.node, span: c.span },
         live: live_add(live, s),
         // A bare read is a read of the *whole* record, which is what stops a
         // later projection being taken in place.
@@ -975,7 +975,7 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
     NUpd(u) -> {
       let s = match base_slot(u.base) { Some(x) -> x, None -> -1 };
       let owned = s >= 0 && !live_has(live, s);
-      let base = { own: if owned { Owned } else { Borrowed }, node: u.base.node };
+      let base = { own: if owned { Owned } else { Borrowed }, node: u.base.node, span: u.base.span };
       let after = if s < 0 { { live: live, livew: livew, livef: livef } } else {
         // The base's read is **not** a whole read: it takes only the copied
         // fields, so a projection of an uncopied one earlier may still be taken
@@ -985,7 +985,7 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
             push(acc, { slot: s, field: n })) }
       };
       let r = mark_seq(map(u.sets, |f: CField| f.value), after.live, after.livew, after.livef);
-      { code: { own: Borrowed, node: NUpd({ base: base, copies: u.copies,
+      { code: { own: Borrowed, span: c.span, node: NUpd({ base: base, copies: u.copies,
           sets: map(range(0, len(u.sets)), |i: Int|
             { name: match list_at(u.sets, i) { Some(f) -> f.name, None -> b"" },
               value: nth(r.codes, i) }) }) },
@@ -993,12 +993,12 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
     },
     NUnary(u) -> {
       let o = mark(u.operand, live, livew, livef);
-      { code: { own: Borrowed, node: NUnary({ op: u.op, operand: o.code }) }, live: o.live, livew: o.livew, livef: o.livef }
+      { code: { own: Borrowed, span: c.span, node: NUnary({ op: u.op, operand: o.code }) }, live: o.live, livew: o.livew, livef: o.livef }
     },
     NBinary(b) -> {
       let r = mark(b.rhs, live, livew, livef);
       let l = mark(b.lhs, r.live, r.livew, r.livef);
-      { code: { own: Borrowed, node: NBinary({ op: b.op, lhs: l.code, rhs: r.code }) },
+      { code: { own: Borrowed, span: c.span, node: NBinary({ op: b.op, lhs: l.code, rhs: r.code }) },
         live: l.live, livew: l.livew, livef: l.livef }
     },
     // The one mark a slot-keyed live set cannot make. A projection whose base is
@@ -1016,17 +1016,17 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
     NField(fd) -> match base_slot(fd.base) {
       None -> {
         let b = mark(fd.base, live, livew, livef);
-        { code: { own: Borrowed, node: NField({ base: b.code, field: fd.field }) },
+        { code: { own: Borrowed, span: c.span, node: NField({ base: b.code, field: fd.field }) },
           live: b.live, livew: b.livew, livef: b.livef }
       },
       Some(s) -> {
-        let base = { own: if live_has(live, s) { Borrowed } else { Owned }, node: fd.base.node };
+        let base = { own: if live_has(live, s) { Borrowed } else { Owned }, node: fd.base.node, span: fd.base.span };
         let own =
           if !live_has(live, s) { Borrowed }
           else if live_has(livew, s) { Borrowed }
           else if fuse_has(livef, s, fd.field) { Borrowed }
           else { OwnedField };
-        { code: { own: own, node: NField({ base: base, field: fd.field }) },
+        { code: { own: own, span: c.span, node: NField({ base: base, field: fd.field }) },
           live: live_add(live, s),
           livew: livew,
           livef: fuse_add(livef, s, fd.field) }
@@ -1048,7 +1048,7 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
             livef: fuse_union(acc.livef, after.f) }
         });
       let sc = mark(m.scrutinee, marked.live, marked.livew, marked.livef);
-      { code: { own: Borrowed, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
+      { code: { own: Borrowed, span: c.span, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
         live: sc.live, livew: sc.livew, livef: sc.livef }
     },
     // A lambda's body is its own barrier and its marks were settled when it was
@@ -1056,7 +1056,7 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
     // this barrier, at the point the closure is made.
     NLambda(l) -> {
       let w = mark_caps(l.caps, live, livew);
-      { code: { own: Borrowed, node: NLambda({ params: l.params, size: l.size,
+      { code: { own: Borrowed, span: c.span, node: NLambda({ params: l.params, size: l.size,
                                                caps: w.caps, body: l.body }) },
         live: w.live, livew: w.livew, livef: livef }
     },
@@ -1064,7 +1064,7 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
     // is entered, exactly as a lambda's are.
     NSim(sm) -> {
       let w = mark_caps(sm.caps, live, livew);
-      { code: { own: Borrowed, node: NSim({ size: sm.size, caps: w.caps, body: sm.body }) },
+      { code: { own: Borrowed, span: c.span, node: NSim({ size: sm.size, caps: w.caps, body: sm.body }) },
         live: w.live, livew: w.livew, livef: livef }
     },
     NHandle(h) -> {
@@ -1075,29 +1075,29 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
         });
       let marked = map(h.clauses, |c: CClause| c);
       let b = mark(h.body, cls.live, cls.livew, livef);
-      { code: { own: Borrowed, node: NHandle({ body: b.code, clauses: marked, ret: h.ret }) },
+      { code: { own: Borrowed, span: c.span, node: NHandle({ body: b.code, clauses: marked, ret: h.ret }) },
         live: b.live, livew: b.livew, livef: b.livef }
     },
     NRegion(r) -> {
       let b = mark(r.body, live, livew, livef);
-      { code: { own: Borrowed, node: NRegion({ body: b.code }) },
+      { code: { own: Borrowed, span: c.span, node: NRegion({ body: b.code }) },
         live: b.live, livew: b.livew, livef: b.livef }
     },
     NPerform(p) -> {
       let r = mark_seq(p.args, live, livew, livef);
-      { code: { own: Borrowed, node: NPerform({ effect: p.effect, op: p.op, resource: p.resource,
+      { code: { own: Borrowed, span: c.span, node: NPerform({ effect: p.effect, op: p.op, resource: p.resource,
                                                 args: r.codes }) },
         live: r.live, livew: r.livew, livef: r.livef }
     },
     // The binder dies at the `with_cell`, as a `let`'s does at its `let`.
-    NCell(c) -> {
-      let b = mark(c.body, live, livew, livef);
-      let after = match c.slot {
+    NCell(cl) -> {
+      let b = mark(cl.body, live, livew, livef);
+      let after = match cl.slot {
         None -> { l: b.live, w: b.livew, f: b.livef },
         Some(s) -> { l: live_drop(b.live, s), w: live_drop(b.livew, s), f: live_drop_f(b.livef, s) },
       };
-      let i = mark(c.init, after.l, after.w, after.f);
-      { code: { own: Borrowed, node: NCell({ resource: c.resource, binder: c.binder, slot: c.slot,
+      let i = mark(cl.init, after.l, after.w, after.f);
+      { code: { own: Borrowed, span: c.span, node: NCell({ resource: cl.resource, binder: cl.binder, slot: cl.slot,
                                              init: i.code, body: b.code }) },
         live: i.live, livew: i.livew, livef: i.livef }
     },
@@ -1106,28 +1106,28 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
       let e = mark(i.else_branch, live, livew, livef);
       let cnd = mark(i.cond, live_union(t.live, e.live), live_union(t.livew, e.livew),
                      fuse_union(t.livef, e.livef));
-      { code: { own: Borrowed, node: NIf({ cond: cnd.code, then_branch: t.code, else_branch: e.code }) },
+      { code: { own: Borrowed, span: c.span, node: NIf({ cond: cnd.code, then_branch: t.code, else_branch: e.code }) },
         live: cnd.live, livew: cnd.livew, livef: cnd.livef }
     },
     NList(l) -> {
       let r = mark_seq(l.items, live, livew, livef);
-      { code: { own: Borrowed, node: NList({ items: r.codes }) }, live: r.live, livew: r.livew, livef: r.livef }
+      { code: { own: Borrowed, span: c.span, node: NList({ items: r.codes }) }, live: r.live, livew: r.livew, livef: r.livef }
     },
     NRecord(rc) -> {
       let r = mark_seq(map(rc.fields, |fd: CField| fd.value), live, livew, livef);
-      { code: { own: Borrowed, node: NRecord({ fields: map(range(0, len(rc.fields)), |i: Int|
+      { code: { own: Borrowed, span: c.span, node: NRecord({ fields: map(range(0, len(rc.fields)), |i: Int|
           { name: cfield_name(rc.fields, i), value: nth(r.codes, i) }) }) },
         live: r.live, livew: r.livew, livef: r.livef }
     },
     NApp(a) -> {
       let args = mark_seq(a.args, live, livew, livef);
       let fu = mark(a.func, args.live, args.livew, args.livef);
-      { code: { own: Borrowed, node: NApp({ func: fu.code, args: args.codes }) },
+      { code: { own: Borrowed, span: c.span, node: NApp({ func: fu.code, args: args.codes }) },
         live: fu.live, livew: fu.livew, livef: fu.livef }
     },
     NBlock(b) -> {
       let after = match b.tail {
-        None -> { code: { own: Borrowed, node: NLit(LUnit) }, live: live, livew: livew, livef: livef },
+        None -> { code: { own: Borrowed, span: dummy_span(), node: NLit(LUnit) }, live: live, livew: livew, livef: livef },
         Some(t) -> mark(t, live, livew, livef),
       };
       let walked = fold(rev_stmts(b.stmts), { codes: [], live: after.live, livew: after.livew, livef: after.livef },
@@ -1144,10 +1144,10 @@ pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -
               let dropped = fold(pat_slots(l.pat), { l: acc.live, w: acc.livew, f: acc.livef },
                 |x: Dropped, sl: Int| { l: live_drop(x.l, sl), w: live_drop(x.w, sl), f: live_drop_f(x.f, sl) });
               let m = mark(l.value, dropped.l, dropped.w, dropped.f);
-              { codes: push(acc.codes, CLetPat({ pat: l.pat, value: m.code })),
+              { codes: push(acc.codes, CLetPat({ span: l.span, pat: l.pat, value: m.code })),
                 live: m.live, livew: m.livew, livef: m.livef } },
           });
-      { code: { own: Borrowed, node: NBlock({ stmts: rev_stmts(walked.codes),
+      { code: { own: Borrowed, span: c.span, node: NBlock({ stmts: rev_stmts(walked.codes),
                                               tail: match b.tail { None -> None, Some(_) -> Some(after.code) } }) },
         live: walked.live, livew: walked.livew, livef: walked.livef }
     },
@@ -1198,7 +1198,7 @@ fn rev_caps(xs: List<Cap>) -> List<Cap> =
 
 fn rev_stmts(xs: List<CStmt>) -> List<CStmt> =
   map(range(0, len(xs)), |i: Int|
-    match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> CDo({ code: { own: Borrowed, node: NLit(LUnit) } }) })
+    match list_at(xs, len(xs) - 1 - i) { Some(x) -> x, None -> CDo({ code: { own: Borrowed, span: dummy_span(), node: NLit(LUnit) } }) })
 
 // --- the differential's entry -----------------------------------------------
 //

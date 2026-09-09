@@ -27,13 +27,18 @@ typedef struct {
 #define PLY_HEADER 16
 #define PLY_FLAT 1
 
-/* `Ctx`, whose first three fields compiled code reads directly. The rest is opaque: a pointer to
-   it is all the runtime's helpers want. */
+/* `Ctx`, whose first six fields compiled code reads and writes directly. The rest is opaque: a
+   pointer to it is all the runtime's helpers want. */
 typedef struct {
   int64_t failed;
   int64_t fuel;
   uintptr_t stack_floor;
+  int64_t site_module;
+  int64_t site_start;
+  int64_t site_end;
 } PlyCtx;
+/* Where the body is, stored before a call that can fail so what the runtime raises is placed. */
+#define PLY_SITE(ctx, m, s, e) ((ctx)->site_module = (m), (ctx)->site_start = (s), (ctx)->site_end = (e))
 
 static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
 static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }

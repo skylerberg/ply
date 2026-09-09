@@ -15,7 +15,7 @@ use crate::list;
 use crate::map;
 use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::{BinOp, Mode};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -61,6 +61,9 @@ pub struct Tables {
     /// The answers of roots called with nothing but memo words, by the root and the words:
     /// a pure function of remembered inputs, remembered in turn, up to a bound.
     pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
+    /// Each module's source by the index a site names, in program order. Filled from the program
+    /// at load and never cached: a `SourceId` is assigned per load.
+    pub sources: Vec<SourceId>,
 }
 
 /// How many calls of roots over memo words a unit remembers; past it, a call is run and
@@ -360,6 +363,11 @@ pub struct Ctx {
     /// temporary a slot, so a recursion well inside the count can run off a worker thread's stack
     /// with no diagnostic at all. The prologue compares against this before it spends fuel.
     pub stack_floor: usize,
+    /// Where the body is -- the module index, start and end a body stores before a call that can
+    /// fail -- so what the runtime raises is placed. The module is `-1` until a body stores one.
+    pub site_module: i64,
+    pub site_start: i64,
+    pub site_end: i64,
     pub heap: Heap,
     /// The objects the entry that just finished allocated, kept because [`Ctx::end`] clears the
     /// log and the number is otherwise gone.
@@ -417,6 +425,9 @@ impl Ctx {
             failed: 0,
             fuel: 0,
             stack_floor: 0,
+            site_module: -1,
+            site_start: 0,
+            site_end: 0,
             heap: Heap::new(),
             last_entry: 0,
             unclosed_entries: 0,
@@ -456,6 +467,7 @@ impl Ctx {
         self.failed = 0;
         self.fuel = fuel;
         self.stack_floor = stack_floor();
+        self.site_module = -1;
         self.diagnostic = None;
         self.stacks.clear();
         self.stacks.push(Frames::under(None));
@@ -564,9 +576,39 @@ impl Ctx {
             self.failed = code;
         }
         if self.diagnostic.is_none() {
-            self.diagnostic = Some(d);
+            self.diagnostic = Some(self.placed(d));
         }
         0
+    }
+
+    /// The span the body last stored, or `Span::DUMMY` before any has.
+    pub fn site(&self) -> Span {
+        usize::try_from(self.site_module)
+            .ok()
+            .and_then(|m| self.tables.sources.get(m))
+            .map_or(Span::DUMMY, |s| {
+                Span::new(*s, self.site_start as u32, self.site_end as u32)
+            })
+    }
+
+    /// `d` anchored at the site when it names no place of its own: the runtime's helpers raise
+    /// with `Span::DUMMY`, and where the body was is the site it stored before the call.
+    fn placed(&self, mut d: Diagnostic) -> Diagnostic {
+        let site = self.site();
+        if site == Span::DUMMY {
+            return d;
+        }
+        let at = d
+            .labels
+            .iter()
+            .position(|l| l.primary)
+            .or_else(|| (!d.labels.is_empty()).then_some(0));
+        match at {
+            Some(i) if d.labels[i].span == Span::DUMMY => d.labels[i].span = site,
+            Some(_) => {}
+            None => d = d.primary(site, "here"),
+        }
+        d
     }
 
     pub fn take_failure(&mut self) -> Option<Diagnostic> {
@@ -1010,7 +1052,8 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
 /// when no native path does. Takes the arguments.
 fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
-    match ply_eval::builtins::call(b, values, ctx.cells.arena_mut(), Span::DUMMY) {
+    let site = ctx.site();
+    match ply_eval::builtins::call(b, values, ctx.cells.arena_mut(), site) {
         Ok(Step::Done(v)) => ctx.word(&v),
         // Unreachable: the emitter refuses every higher-order builtin at compile
         // time, because answering `Step::Apply` here would need user code run from inside a native
@@ -2018,7 +2061,8 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                     let b = *b;
                     let values = values_taken(c, args);
                     c.builtin_calls += 1;
-                    match ply_eval::builtins::call(b, values, c.cells.arena_mut(), Span::DUMMY) {
+                    let site = c.site();
+                    match ply_eval::builtins::call(b, values, c.cells.arena_mut(), site) {
                         Ok(Step::Done(v)) => c.word(&v),
                         Ok(_) => {
                             let d = error(format!(

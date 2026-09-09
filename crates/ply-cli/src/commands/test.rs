@@ -1783,10 +1783,6 @@ fn failure_json(
             .diagnostic
             .primary_span()
             .filter(|s| *s != Span::DUMMY)
-            // The compiled tier raises with `Span::DUMMY` (it carries no perform/assert-site span
-            // yet, ADR 0048), so a failure would report no location; the failing test's own span
-            // names where to look until the tier threads its sites.
-            .or_else(|| test.map(|t| t.span))
             .map_or(Value::Null, |s| location_json(sources, s)),
     );
     object.insert(
