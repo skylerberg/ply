@@ -535,7 +535,7 @@ fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
 }
 
 /// A test body is a root the code generator enters whole, and a failing one is still a failure:
-/// the backend declines it and the machine raises the diagnostic.
+/// the tier raises the diagnostic, which is an entry and not a decline.
 #[test]
 fn a_test_body_is_entered_whole_and_a_failing_one_still_fails() {
     let dir = project(
@@ -549,14 +549,16 @@ test "wrong" { assert_eq(double(21), 41) }
     );
     let report = run(dir.path(), Some("c"));
     assert_eq!(u64_at(&report, &["summary", "failed"]), 1, "{report}");
-    assert!(
-        u64_at(&report, &["backend", "entered"]) > 0,
-        "the passing test's body was not entered: {}",
+    assert_eq!(
+        u64_at(&report, &["backend", "entered"]),
+        2,
+        "both bodies are entered, and the failing one raises: {}",
         report["backend"]
     );
-    assert!(
-        u64_at(&report, &["backend", "declined"]) > 0,
-        "the failing test's body was not declined back to the machine: {}",
+    assert_eq!(
+        u64_at(&report, &["backend", "declined"]),
+        0,
+        "a raised failure is a verdict, not a decline: {}",
         report["backend"]
     );
 }

@@ -1,19 +1,12 @@
 //! Fixed-width integers under the backend: that a compiled body answers what the interpreter
 //! answers at each width, and that a signature naming one is declined rather than answered wrongly.
 
-use crate::fragment::{Loaded, call, unit};
-use ply_eval::{Machine, Value};
+use crate::fragment::{call, unit, whole};
+use ply_eval::Value;
 
 /// What the interpreter answers, which is the only thing the compiled answer is checked against:
 /// a constant written here by hand would be checking my arithmetic rather than the two engines'
 /// agreement.
-fn interpreted(loaded: &'static Loaded, name: &str, args: &[Value]) -> Option<Value> {
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    machine
-        .call(name, args.to_vec(), ply_span::Span::DUMMY)
-        .ok()
-}
-
 /// Every operation the family has, wrapped so the *signature* is `Int`: a fixed width may not
 /// cross the seam (ADR 0039), so the widths live inside the bodies and the answers come back as
 /// `Int`s. That is exactly the shape `std.hash` has.
@@ -88,8 +81,9 @@ fn boxed(n: Int) -> Word = {w: u32_of_int(n)}
 "#;
 
 #[test]
-fn a_compiled_body_answers_what_the_interpreter_answers_at_each_width() {
+fn the_two_emitters_answer_the_same_at_each_width() {
     let (loaded, unit) = unit(WIDTHS);
+    let whole_unit = whole(loaded);
     let cases: &[(&str, Vec<Value>, Value)] = &[
         // Checked at the type's own width, and the sum is the type's.
         (
@@ -214,12 +208,12 @@ fn a_compiled_body_answers_what_the_interpreter_answers_at_each_width() {
         );
         assert_eq!(
             got,
-            interpreted(loaded, name, args),
+            call(whole_unit, name, args),
             "`{name}{args:?}`: the two engines disagree"
         );
     }
     // Two whose answers are not worth writing out by hand — a record of widths threaded through a
-    // body, and a loop over them — checked against the interpreter alone, which is the property
+    // body, and a loop over them — checked against the whole emitter alone, which is the property
     // that matters for both.
     for (name, args) in [
         ("m.round_trip", vec![Value::Int(0xDEAD_BEEF)]),
@@ -231,7 +225,7 @@ fn a_compiled_body_answers_what_the_interpreter_answers_at_each_width() {
         assert!(got.is_some(), "`{name}` was declined");
         assert_eq!(
             got,
-            interpreted(loaded, name, &args),
+            call(whole_unit, name, &args),
             "`{name}{args:?}`: the two engines disagree"
         );
     }

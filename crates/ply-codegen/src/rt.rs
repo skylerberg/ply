@@ -401,6 +401,8 @@ pub struct Ctx {
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_eval::host::HostUse,
     pub(crate) host_ops: u64,
+    /// The last at-most-once host operation this entry performed, for `E0426`.
+    pub(crate) last_linear: Option<crate::host::HostMark>,
     pub(crate) id: ply_eval::host::MachineId,
     /// What the host runtime said when an entry ended, for the machine's teardown warnings.
     pub(crate) teardown: Vec<Diagnostic>,
@@ -448,6 +450,7 @@ impl Ctx {
             re_executed: false,
             host_use: ply_eval::host::HostUse::default(),
             host_ops: 0,
+            last_linear: None,
             id: ply_eval::host::MachineId::next(),
             teardown: Vec::new(),
             seed: ply_eval::Seed::default(),
@@ -468,6 +471,7 @@ impl Ctx {
         self.fuel = fuel;
         self.stack_floor = stack_floor();
         self.site_module = -1;
+        self.last_linear = None;
         self.diagnostic = None;
         self.stacks.clear();
         self.stacks.push(Frames::under(None));

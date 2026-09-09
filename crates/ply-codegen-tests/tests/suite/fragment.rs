@@ -5,11 +5,14 @@ use ply_codegen::Unit;
 use ply_eval::{Provider, Value};
 use ply_span::Symbol;
 use ply_syntax::ast::{ModuleName, Program};
+use std::collections::HashMap;
 
 pub struct Loaded {
     pub program: &'static Program,
     pub resolved: &'static ply_syntax::resolve::Resolved,
     pub check: &'static ply_core::CheckOutput,
+    /// Each module's text by name: what the whole Ply emitter re-parses to produce.
+    pub texts: HashMap<String, String>,
 }
 
 /// The shipped standard library plus `source` as a module named `m`.
@@ -36,14 +39,37 @@ fn load(source: &str) -> Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
         check: Box::leak(Box::new(check)),
+        texts: owned
+            .iter()
+            .map(|(module, text)| (module.to_string(), (*text).to_string()))
+            .collect(),
     }
 }
 
+/// The program under the reference emitter -- the fragment, which these tests are about. Built
+/// here, so the fragment is what answers whatever producer is installed when it is entered.
 pub fn unit(source: &str) -> (&'static Loaded, &'static Unit) {
     let loaded: &'static Loaded = Box::leak(Box::new(load(source)));
-    let unit = Unit::over(loaded.program, loaded.resolved, loaded.check)
-        .expect("this host has a C compiler");
+    let unit = ply_codegen::c::producer::reference_only(|| {
+        let unit = Unit::over(loaded.program, loaded.resolved, loaded.check)
+            .expect("this host has a C compiler");
+        let _ = unit.bodies();
+        unit
+    });
     (loaded, unit)
+}
+
+/// The same program under the whole Ply emitter, which re-parses the module texts to produce.
+pub fn whole(loaded: &'static Loaded) -> &'static Unit {
+    let unit = Unit::over_with_texts(
+        loaded.program,
+        loaded.resolved,
+        loaded.check,
+        loaded.texts.clone(),
+    )
+    .expect("this host has a C compiler");
+    let _ = unit.bodies();
+    unit
 }
 
 /// Arithmetic, comparison, `if`, `let`, a `match` on literals, recursion, and a call between two

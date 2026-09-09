@@ -7,11 +7,16 @@
 //!
 //! The fixtures are the spike's, unchanged, and each says in its own header which hazard it exists
 //! for and why the obvious smaller program does not reach it.
+//!
+//! Under tier-only (ADR 0048) there is no interpreter to compare against. The reference emitter,
+//! which is the fragment, is the oracle, and the whole Ply emitter is the engine under test: each
+//! hazard is a claim that the two agree.
 
 use ply_codegen::Unit;
 use ply_eval::{Machine, Value, compare_answers};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -25,6 +30,8 @@ pub struct Loaded {
     pub program: &'static Program,
     pub resolved: &'static ply_syntax::resolve::Resolved,
     pub check: &'static ply_core::CheckOutput,
+    /// Each module's text by name: what the whole Ply emitter re-parses to produce.
+    pub texts: HashMap<String, String>,
 }
 
 /// Every `.ply` under `dir` as a module named after its stem, plus the shipped standard library.
@@ -57,6 +64,10 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         let id = sources.add(path.clone(), text.to_string());
         inputs.push((id, ModuleName::from_dotted(stem), text));
     }
+    let texts: HashMap<String, String> = inputs
+        .iter()
+        .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
+        .collect();
     let mut ast = ply_syntax::parse_program(inputs).map_err(|d| d.to_vec())?;
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
@@ -66,6 +77,7 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
         check: Box::leak(Box::new(check)),
+        texts,
     })
 }
 
@@ -75,27 +87,37 @@ fn hazards() -> &'static Loaded {
     ))
 }
 
-/// Two machines over one program: the interpreter as shipped, and the same interpreter with
-/// compiled bodies under it. Every hazard here is a claim about the difference.
+/// Two tiers over one program: the reference emitter, which is the fragment and the oracle, and
+/// the whole Ply emitter under test. Every hazard here is a claim that they agree.
 struct Harness {
     unit: &'static Unit,
     bodies: Rc<ply_codegen::Bodies>,
-    machine: Machine<'static>,
-    hybrid: Machine<'static>,
+    reference: Machine<'static>,
+    whole: Machine<'static>,
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    let unit: &'static Unit = Unit::over(loaded.program, loaded.resolved, loaded.check)
-        .expect("this host has a C compiler");
+    let unit: &'static Unit = Unit::over_with_texts(
+        loaded.program,
+        loaded.resolved,
+        loaded.check,
+        loaded.texts.clone(),
+    )
+    .expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
-    let machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let mut hybrid = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    hybrid.set_compiled(bodies.clone());
+    let oracle = ply_codegen::c::producer::reference_only(|| {
+        Unit::over(loaded.program, loaded.resolved, loaded.check).and_then(|unit| unit.bodies())
+    })
+    .expect("the reference emitter builds the fragment");
+    let mut reference = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    reference.set_compiled(oracle);
+    let mut whole = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    whole.set_compiled(bodies.clone());
     Harness {
         unit,
         bodies,
-        machine,
-        hybrid,
+        reference,
+        whole,
     }
 }
 
@@ -103,14 +125,14 @@ impl Harness {
     /// Both engines over one call, compared on the value and -- on a raise -- the code, the
     /// message, every label with its span, and the notes. `None` is agreement.
     fn agree(&mut self, name: &str, args: &[Value]) -> Option<String> {
-        let expected = self.machine.call(name, args.to_vec(), Span::DUMMY);
-        let actual = self.hybrid.call(name, args.to_vec(), Span::DUMMY);
-        compare_answers(&self.machine, &self.hybrid, name, &expected, &actual)
-            .map(|d| format!("with a backend attached, {d}"))
+        let expected = self.reference.call(name, args.to_vec(), Span::DUMMY);
+        let actual = self.whole.call(name, args.to_vec(), Span::DUMMY);
+        compare_answers(&self.reference, &self.whole, name, &expected, &actual)
+            .map(|d| format!("the whole emitter against the reference, {d}"))
     }
 
     fn run(&mut self, name: &str, args: &[Value]) -> Value {
-        self.hybrid
+        self.whole
             .call(name, args.to_vec(), Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{name}` raised: {}", d.message))
     }
@@ -319,7 +341,7 @@ fn a_failed_entry_does_not_poison_the_one_after_it() {
         ("pure.mix", vec![Value::Int(i64::MAX), Value::Int(1)]),
         ("pure.share", vec![Value::Int(1), Value::Int(0)]),
     ] {
-        let _ = h.hybrid.call(name, args, Span::DUMMY);
+        let _ = h.whole.call(name, args, Span::DUMMY);
         assert_eq!(h.run("pure.seeded", &[]), Value::Int(80));
         assert_eq!(h.run("pure.step", &[Value::Int(5)]), Value::Int(16));
     }
@@ -344,13 +366,13 @@ fn a_native_body_runs_under_a_live_handler_stack() {
 fn an_interpreted_recursion_entering_compiled_code_at_every_depth_is_bounded() {
     let mut h = harness(hazards());
     let deep = Value::Int(1_000_000);
-    let expected = h.machine.call(
+    let expected = h.reference.call(
         "deep.countdown",
         vec![deep.clone(), Value::Int(0)],
         Span::DUMMY,
     );
     let actual = h
-        .hybrid
+        .whole
         .call("deep.countdown", vec![deep, Value::Int(0)], Span::DUMMY);
     assert!(
         expected.is_err(),
@@ -381,10 +403,10 @@ fn a_compiled_recursion_that_outruns_its_budget_is_the_machines_diagnostic() {
 // -- the guard nothing else can reach ----------------------------------------
 
 /// `Ctx` is one flat frame, so an entry arriving while another runs would alias the outer one's
-/// words. The guard declines, the interpreter answers for itself, and the provider is not left
-/// broken by having declined.
+/// words. The guard declines and the call reports it -- under tier-only nothing else serves the
+/// entry -- and the provider is not left broken by having declined.
 #[test]
-fn an_entry_that_arrives_while_another_is_running_declines_and_the_machine_answers() {
+fn an_entry_that_arrives_while_another_is_running_is_declined_and_reported() {
     let mut h = harness(hazards());
     // Warm first, so the count below is this call and not the compilation behind it.
     assert_eq!(h.run("pure.step", &[Value::Int(5)]), Value::Int(16));
@@ -393,7 +415,7 @@ fn an_entry_that_arrives_while_another_is_running_declines_and_the_machine_answe
     let bodies = Rc::clone(&h.bodies);
     let before = h.entered();
     let inside =
-        bodies.while_entered(|| h.hybrid.call("pure.step", vec![Value::Int(5)], Span::DUMMY));
+        bodies.while_entered(|| h.whole.call("pure.step", vec![Value::Int(5)], Span::DUMMY));
     assert_eq!(
         h.entered(),
         before,
@@ -405,10 +427,11 @@ fn an_entry_that_arrives_while_another_is_running_declines_and_the_machine_answe
         "the offer was declined for some reason other than reentrancy: {:?}",
         h.bodies.declines()
     );
+    let declined = inside.expect_err("a reentrant entry is declined, not served");
     assert_eq!(
-        inside.expect("the interpreter answers for itself"),
-        Value::Int(16),
-        "the interpreter did not answer while the backend was busy"
+        declined.code,
+        ply_span::codes::RUNTIME_ERROR,
+        "the decline arrived as something other than a runtime error: {declined}"
     );
 
     let after = h.run("pure.step", &[Value::Int(5)]);

@@ -371,8 +371,9 @@ impl<'a> Machine<'a> {
                 self.compiled_declines.set(self.compiled_declines.get() + 1);
                 Err(err_no_front_end(&root, span))
             }
+            // The tier ran it and it raised: an entry, and the verdict.
             Entered::Raised(raised) => {
-                self.compiled_declines.set(self.compiled_declines.get() + 1);
+                self.compiled_entries.set(self.compiled_entries.get() + 1);
                 Err(raised)
             }
             Entered::Declined => {
@@ -479,7 +480,10 @@ impl<'a> Machine<'a> {
                 self.compiled_entries.set(self.compiled_entries.get() + 1);
                 Ok(value)
             }
-            Entered::Raised(raised) => Err(raised),
+            Entered::Raised(raised) => {
+                self.compiled_entries.set(self.compiled_entries.get() + 1);
+                Err(raised)
+            }
             Entered::Declined => Err(err_no_front_end(sym, span)),
         }
     }
