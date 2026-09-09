@@ -232,7 +232,8 @@ pub fn prover_backend(
     Ok(Some((provider, spec)))
 }
 
-/// `PLY_C_EMITTER=ply:<dir>` makes the Ply emitter in `<dir>` the C tier's producer (ADR 0042).
+/// `PLY_C_EMITTER=ply:<dir>` produces with the Ply emitter in `<dir>` rather than the one beside
+/// the binary: a working copy, for a change to the emitter that has not been bootstrapped yet.
 /// The recipe loads that directory as a project of its own -- the front end, `emit.ply` and
 /// the standard library they import -- and compiles it with the reference emitter; a worker
 /// thread builds its own copy from the same recipe, since a loaded unit does not cross threads.
@@ -269,19 +270,15 @@ pub(crate) fn install_producer_from_env() {
     }
     // The self-hosted Ply emitter is the tier's producer, and under tier-only (ADR 0048) it is the
     // default: the Rust reference emitter is a fragment that declines `perform`/`handle`/`simulate`,
-    // so the whole language runs only when the Ply emitter produces. `PLY_C_EMITTER` still overrides
-    // — `ply:<dir>` for body-by-body, `ply-whole:<dir>` for the unit.
-    let (dir, whole) = match std::env::var("PLY_C_EMITTER") {
-        Ok(spec) => match (
-            spec.strip_prefix("ply:").map(str::to_string),
-            spec.strip_prefix("ply-whole:").map(str::to_string),
-        ) {
-            (Some(dir), _) => (std::path::PathBuf::from(dir), false),
-            (_, Some(dir)) => (std::path::PathBuf::from(dir), true),
-            _ => {
+    // so the whole language runs only when the Ply emitter produces. `PLY_C_EMITTER=ply:<dir>`
+    // still points it at a working copy.
+    let dir = match std::env::var("PLY_C_EMITTER") {
+        Ok(spec) => match spec.strip_prefix("ply:") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => {
                 eprintln!(
-                    "PLY_C_EMITTER is `{spec}`; the producers are `ply:<dir>`, which answers \
-                     bodies the reference accepted, and `ply-whole:<dir>`, which answers the unit"
+                    "PLY_C_EMITTER is `{spec}`; the spelling is `ply:<dir>`, the directory the \
+                     emitter's own `.ply` sources are in"
                 );
                 return;
             }
@@ -290,11 +287,10 @@ pub(crate) fn install_producer_from_env() {
         // with no `spikes/ply-parser` on disk falls through to the reference emitter until the
         // bundle is embedded (ADR 0048's follow-up).
         Err(_) => match find_emitter_dir() {
-            Some(dir) => (dir, true),
+            Some(dir) => dir,
             None => return,
         },
     };
-    ply_codegen::c::producer::set_whole(whole);
     let identity = {
         let mut modules = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {

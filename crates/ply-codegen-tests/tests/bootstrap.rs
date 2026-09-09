@@ -152,7 +152,6 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         }),
         identity.clone(),
     );
-    producer::set_whole(true);
 
     // The emitter built from the bundle, or from the reference when there is none, emits itself.
     // An old bundle's emitter may refuse what the current sources emit; only the emitter built
