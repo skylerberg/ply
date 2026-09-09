@@ -337,27 +337,8 @@ impl<'a> Machine<'a> {
             .note("run `ply cache clear`, or pass `--no-incremental`"));
         };
         self.begin_entry();
-        // The interpreted front end first; a body it declines runs on the compiled one.
-        let entered = Run::new(&self.interp, &mut self.core).enter_root(
-            Rc::new(Vec::new()),
-            body,
-            owner,
-            Vec::new(),
-            self.max_calls,
-        );
-        match entered {
-            Entered::Answered(_) => {
-                self.record_core_atoms();
-                self.end_entry_point();
-                Ok(())
-            }
-            Entered::Raised(d) => {
-                self.record_core_atoms();
-                self.end_entry_point();
-                Err(d)
-            }
-            Entered::Declined => self.tier_test(owner, ordinal, label, body.span),
-        }
+        // Tier-only: the compiled tier runs the language, so a test is entered on it directly.
+        self.tier_test(owner, ordinal, label, body.span)
     }
 
     /// A test the interpreter declined, run on the compiled front end, which is the authority: its
@@ -458,50 +439,14 @@ impl<'a> Machine<'a> {
     /// `name` is the program-wide name — `app.main`, not `main`.
     pub fn call(&mut self, name: &str, args: Vec<Value>, span: Span) -> Result<Value, Diagnostic> {
         let sym = Symbol::new(name);
-        let def = self.interp.def(&sym);
-        if def.is_none() && !self.has_tier_body(&sym) {
-            return Err(Diagnostic::error(
-                codes::UNKNOWN_NAME,
-                format!("no definition named `{name}`"),
-            )
-            .primary(span, "not defined in this program")
-            .note("this name is program-wide: `store.orders.place`, not `place`"));
-        }
         // Before the run resets, so a refusal leaves the previous run's arena alone.
         let boundary = crate::escape::Boundary::EntryPoint { name };
         for arg in &args {
             crate::escape::check(&boundary, arg, span)?;
         }
         self.begin_entry();
-        if let Some((params, body, module)) = def {
-            let entered = Run::new(&self.interp, &mut self.core).enter_root(
-                params,
-                body,
-                module,
-                args.clone(),
-                self.max_calls,
-            );
-            match entered {
-                Entered::Answered(v) => {
-                    self.record_core_atoms();
-                    self.end_entry_point();
-                    return Ok(v);
-                }
-                Entered::Raised(d) => {
-                    self.record_core_atoms();
-                    self.end_entry_point();
-                    return Err(d);
-                }
-                Entered::Declined => {}
-            }
-        }
+        // Tier-only: an entry point is run on the compiled tier.
         self.tier_call(&sym, args, span)
-    }
-
-    /// Whether the compiled front end could answer a name the interpreter has no definition for.
-    /// Whether it actually holds the body is decided when it is entered.
-    fn has_tier_body(&self, _name: &Symbol) -> bool {
-        self.compiled.is_some()
     }
 
     /// The same call a nested engine is handed mid-run; the entry-point escape check is the same

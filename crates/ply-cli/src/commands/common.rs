@@ -11,7 +11,11 @@ pub const IND: &str = "   ";
 /// `--backend`'s value as a spec, or the diagnostic that refuses it.
 pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpec>, Diagnostic> {
     let Some(spec) = flag else {
-        return Ok(None);
+        // Tier-only: the compiled tier is the default (and only) evaluator of the language.
+        return Ok(Some(ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..ply_eval::BackendSpec::default()
+        }));
     };
     ply_eval::backend::parse(spec).map(Some).map_err(|message| {
         Diagnostic::error(codes::BACKEND_UNAVAILABLE, message).note(

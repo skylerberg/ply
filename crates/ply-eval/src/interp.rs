@@ -976,8 +976,79 @@ impl<'p, 'x> Run<'p, 'x> {
     }
 }
 
-/// One attached interpreter as a `Provider`: the eval `Core` behind a `RefCell`, so the
-/// `Compiled` seam's `&self` methods can drive its `&mut` walk.
+/// The pure applier: an [`Interpreter`] and a [`Core`] over one program, used to evaluate an
+/// ad-hoc expression that has no compiled body — a const the tooling reads, a `law` body, and the
+/// generated function values higher-order property testing applies. It is the tier that runs the
+/// language; this is the interpreter kept only for expressions the tier never compiled. It carries
+/// the pure first-order language, local `with_cell`, and tail-resumptive `handle`/`perform` — never
+/// `simulate`, regions, or multi-shot `resume`, which a law never uses.
+pub struct Pure<'a> {
+    interp: Interpreter<'a>,
+    core: Core<'a>,
+}
+
+impl<'a> Pure<'a> {
+    pub fn new(program: &'a Program, resolved: &'a Resolved) -> Pure<'a> {
+        Pure {
+            interp: Interpreter::borrow(program, resolved),
+            core: Core::new(program),
+        }
+    }
+
+    /// Evaluate `e` in `module` with `bindings` bound as its leading parameters — a law body over
+    /// its generated binders.
+    pub fn eval_expr_in(
+        &mut self,
+        e: &'a Expr,
+        bindings: &[(Symbol, Value)],
+        module: usize,
+        budget: usize,
+    ) -> Result<Value, Diagnostic> {
+        answer(Run::new(&self.interp, &mut self.core).enter_expr_in(e, bindings, module, budget))
+    }
+
+    /// Evaluate an expression of unknown provenance, lowered afresh in module 0.
+    pub fn eval_expr(&mut self, e: &Expr, budget: usize) -> Result<Value, Diagnostic> {
+        let lowered = crate::code::lower(e);
+        answer(Run::new(&self.interp, &mut self.core).enter_lowered(lowered, 0, &[], budget))
+    }
+
+    /// Enter a definition whole — the program-wide name, `store.orders.place` not `place` — for a
+    /// const the tooling reads or a helper that applies a generated closure.
+    pub fn call(
+        &mut self,
+        name: &str,
+        args: Vec<Value>,
+        span: Span,
+        budget: usize,
+    ) -> Result<Value, Diagnostic> {
+        let sym = Symbol::new(name);
+        let Some((params, body, module)) = self.interp.def(&sym) else {
+            return Err(Diagnostic::error(
+                codes::UNKNOWN_NAME,
+                format!("no definition named `{name}`"),
+            )
+            .primary(span, "not defined in this program"));
+        };
+        answer(Run::new(&self.interp, &mut self.core).enter_root(params, body, module, args, budget))
+    }
+}
+
+/// Turn an [`Entered`] into a `Result`, where a `Declined` is a pure-evaluator refusal rather than
+/// a fall-through to a tier — the pure applier has no tier to fall to.
+fn answer(entered: Entered) -> Result<Value, Diagnostic> {
+    match entered {
+        Entered::Answered(v) => Ok(v),
+        Entered::Raised(d) => Err(d),
+        Entered::Declined => Err(Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            "this expression uses `simulate`, a region, or a multi-shot resume, which the pure \
+             evaluator does not carry",
+        )
+        .note("law bodies and generated values are expected to be pure and first-order")),
+    }
+}
+
 #[derive(Clone)]
 struct HandlerFrame {
     clauses: Vec<HandlerClause>,

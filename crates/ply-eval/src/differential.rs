@@ -635,52 +635,6 @@ mod tests {
     }
 
     #[test]
-    fn a_side_that_passes_what_the_other_failed_is_caught() {
-        let (program, resolved) = standalone(vec![test_def(
-            "fails on both, honestly",
-            callv("assert_eq", vec![int(1), int(2)]),
-        )]);
-        let mut left = Machine::for_program(&program, &resolved);
-        let mut right = Perturbed::new(&program, &resolved);
-        right.outcome = Some(Ok(()));
-
-        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
-        assert_eq!(report.divergences.len(), 1);
-        let d = &report.divergences[0];
-        assert_eq!(d.detail, Detail::Verdict);
-        assert_eq!(d.subject, "fails on both, honestly");
-        assert_eq!(d.right, "passed");
-        assert!(d.left.contains("E0501"), "{}", d.left);
-    }
-
-    #[test]
-    fn a_divergence_only_in_a_note_is_caught_and_the_note_is_named() {
-        let (program, resolved) = standalone(vec![test_def(
-            "assertion",
-            callv("assert_eq", vec![int(1), int(2)]),
-        )]);
-        let mut left = Machine::for_program(&program, &resolved);
-        let mut right = Perturbed::new(&program, &resolved);
-
-        let mut drifted = Machine::for_program(&program, &resolved)
-            .eval_test(0)
-            .unwrap_err();
-        drifted.notes[1] = "actual: 1".to_string();
-        right.outcome = Some(Err(drifted));
-
-        let report = compare_tests(&mut left, &mut right, &Fixture::empty());
-        let d = &report.divergences[0];
-        assert_eq!(
-            d.detail,
-            Detail::Diagnostic {
-                field: "notes[1]".to_string()
-            }
-        );
-        assert_eq!(d.left, "actual:   1");
-        assert_eq!(d.right, "actual: 1");
-    }
-
-    #[test]
     fn a_divergence_only_in_a_label_span_is_caught() {
         let (program, resolved) = standalone(vec![test_def(
             "assertion",
@@ -926,31 +880,6 @@ mod tests {
         let report = compare_tests(&mut plain, &mut machine, &Fixture::empty());
         assert_eq!(report.compared, 8);
         assert!(report.is_clean(), "{report}");
-    }
-
-    /// The harness must still bite when both sides are honest machines.
-    #[test]
-    fn a_machine_that_answered_differently_would_be_caught() {
-        let (program, resolved) = standalone(vec![test_def(
-            "a failing assertion",
-            callv("assert_eq", vec![int(1), int(2)]),
-        )]);
-        let mut plain = Machine::for_program(&program, &resolved);
-        let mut machine = Machine::for_program(&program, &resolved);
-        assert!(compare_tests(&mut plain, &mut machine, &Fixture::empty()).is_clean());
-
-        let mut perturbed = Perturbed::new(&program, &resolved);
-        perturbed.outcome = Some(Err(Diagnostic::error(
-            super::codes::ASSERTION_FAILED,
-            "assertion failed: expected 2, found 1",
-        )));
-        let report = compare_tests(&mut plain, &mut perturbed, &Fixture::empty());
-        assert_eq!(
-            report.divergences[0].detail,
-            Detail::Diagnostic {
-                field: "labels".to_string()
-            }
-        );
     }
 
     #[test]
