@@ -214,6 +214,29 @@ impl<'a> Prover<'a> {
         }
     }
 
+    /// Each guard's own compiled root, in the order [`Claim::guards`] returns them: a law's
+    /// `where` clause, or a definition's `requires` clauses. `source.rs` numbers them the same
+    /// way, so the two lists line up position by position.
+    fn guard_roots(&self, claim: &Claim<'a>) -> Vec<Option<Symbol>> {
+        let module = &self.program.modules[claim.module()].name;
+        match claim {
+            Claim::Ensures { def, .. } => (0..claim.guards().len())
+                .map(|k| {
+                    Some(module.qualify(&ply_codegen::clause_root_name(
+                        &def.name.name,
+                        "requires",
+                        k,
+                    )))
+                })
+                .collect(),
+            Claim::Law { ordinal, .. } => claim
+                .guards()
+                .iter()
+                .map(|_| Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "guard"))))
+                .collect(),
+        }
+    }
+
     /// Bind the host, so that a `law/host` is attempted rather than reported as a gap.
     pub fn with_hosting(mut self, hosting: Hosting<'a>) -> Prover<'a> {
         self.hosting = Some(hosting);
@@ -587,6 +610,8 @@ impl<'a> Prover<'a> {
         let body_root = self.body_root(obligation, claim);
         Ok(Cases {
             machine: self.machine(),
+            compiled: self.compiled(),
+            guard_roots: self.guard_roots(claim),
             body_root,
             module: claim.module(),
             binders: obligation.generated().to_vec(),
@@ -914,6 +939,8 @@ fn bindings_of(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
 /// How a tuple of binder values is judged: guard first, always.
 struct Cases<'a> {
     machine: Machine<'a>,
+    compiled: Option<Rc<dyn ply_eval::Compiled>>,
+    guard_roots: Vec<Option<Symbol>>,
     body_root: Option<Symbol>,
     module: usize,
     binders: Vec<LawBinder>,
@@ -926,6 +953,30 @@ struct Cases<'a> {
 }
 
 impl Cases<'_> {
+    /// The proposition entered on the tier, or `None` for the Core to answer.
+    ///
+    /// `None` covers three cases and treats them alike, because the Core is the answer to all
+    /// three: no backend, no compiled root, and a root the tier declined. That last is the one
+    /// that matters -- a proposition may apply a closure the property generator made, and the
+    /// tier compiles named bodies ahead and has nothing to run a synthesized closure on.
+    ///
+    /// Trying the tier first is not an optimisation. The Core is the pure applier of ADR 0048: it
+    /// declines a handler clause that binds `resume`, so a law reaching one -- `std.db`'s
+    /// `transaction`, whose `db.rollback` clause is the zero-shot case -- is *unattempted* rather
+    /// than judged. `desk`'s "a placement the shelf cannot cover leaves no row behind" is that
+    /// law, and it was being reported as a gap.
+    fn on_tier(&self, root: &Option<Symbol>, args: &[Value]) -> Option<Result<Value, Diagnostic>> {
+        let (compiled, root) = (self.compiled.as_ref()?, root.as_ref()?);
+        if args.iter().any(carries_a_closure) {
+            return None;
+        }
+        match compiled.enter_whole(root, args, DEFAULT_MAX_CALLS) {
+            ply_eval::Entered::Answered(value) => Some(Ok(value)),
+            ply_eval::Entered::Raised(d) => Some(Err(d)),
+            ply_eval::Entered::Declined => None,
+        }
+    }
+
     fn scope(&self, values: &[Value]) -> Vec<(Symbol, Value)> {
         self.binders
             .iter()
@@ -950,12 +1001,13 @@ impl Cases<'_> {
 impl Judge for Cases<'_> {
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         let scope = self.scope(values);
-        for guard in self.guards.iter() {
-            // On the Core, not the compiled root: a proposition may apply a generated closure (a
-            // law over `f: (Int) -> Int`), which the tier cannot — it compiles named bodies ahead
-            // and has no machine to run a synthesized closure on (ADR 0048). The Core interprets
-            // named functions too, so it loses nothing for a first-order guard.
-            let value = self.machine.eval_expr_in(guard, self.module, &scope)?;
+        let empty = None;
+        for (i, guard) in self.guards.iter().enumerate() {
+            let root = self.guard_roots.get(i).unwrap_or(&empty);
+            let value = match self.on_tier(root, values) {
+                Some(answered) => answered?,
+                None => self.machine.eval_expr_in(guard, self.module, &scope)?,
+            };
             if !self.boolean(value)? {
                 return Ok(false);
             }
@@ -971,11 +1023,34 @@ impl Judge for Cases<'_> {
                 .call(name.as_str(), values.to_vec(), self.span)?;
             scope.push((result.clone(), returned));
         }
-        // On the Core, for the same reason as the guard: the proposition may apply a generated
-        // closure, which only the interpreted evaluator can (ADR 0048). The owner above is a named
-        // function and stays on the tier.
-        let value = self.machine.eval_expr_in(self.body, self.module, &scope)?;
+        // The compiled root takes the scope in the order it was built: a law's binders, or an
+        // owner's parameters and then `result`, which is how `source.rs` gives it its parameters.
+        let args: Vec<Value> = scope.iter().map(|(_, v)| v.clone()).collect();
+        let value = match self.on_tier(&self.body_root, &args) {
+            Some(answered) => answered?,
+            None => self.machine.eval_expr_in(self.body, self.module, &scope)?,
+        };
         self.boolean(value)
+    }
+}
+
+/// Whether a generated value holds a closure anywhere inside it.
+///
+/// A closure the property generator synthesized has no compiled body, so the tier cannot apply
+/// it -- and unlike a construct it has never seen, it does not *decline* one: the word it makes
+/// of a bridged closure is a word, and what comes back is not the answer the proposition asked
+/// for. So the check is on the way in, not on the way out.
+fn carries_a_closure(v: &Value) -> bool {
+    match v {
+        Value::Closure(_) | Value::Continuation(_) => true,
+        Value::List(items) => items.iter().any(carries_a_closure),
+        Value::Map(entries) => entries
+            .iter()
+            .any(|(k, v)| carries_a_closure(k) || carries_a_closure(v)),
+        Value::Record(fields) => fields.values().any(carries_a_closure),
+        Value::Ctor { args, .. } => args.iter().any(carries_a_closure),
+        Value::Secret(inner) => carries_a_closure(inner),
+        _ => false,
     }
 }
 

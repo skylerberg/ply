@@ -65,85 +65,13 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
     ply_test::Engine::of_backend(name, variant, spec)
 }
 
-/// The run's backend, built once over a checked program, or the diagnostic that refuses it.
-/// What each definition's emitted code is a function of: its own hash, which the hasher builds
-/// over its text with every referent's hash spliced in -- so it moves when anything the emitter
-/// would inline moves, which is what an inlining emitter's cache has to be keyed on.
+/// The cache key each keyable root is kept under.
 ///
-/// A test's root is a definition here like any other, named the way `ply_codegen` names it.
-/// `HashOutput::tests` is parallel to the program's tests walked module by module in load order,
-/// which `driver::test_hashes_of` already relies on and says so.
-pub(crate) fn emit_keys(
-    program: &ply_syntax::ast::Program,
-    hashes: &ply_hash::HashOutput,
-) -> std::collections::HashMap<String, String> {
-    use ply_syntax::ast::Item;
-    let mut keys = std::collections::HashMap::new();
-    let mut test_at = 0;
-    let mut law_at = 0;
-    for module in &program.modules {
-        let mut ordinal = 0;
-        let mut law_ordinal = 0;
-        for item in &module.items {
-            match item {
-                Item::Fn(def) => {
-                    let name = module.name.qualify(&def.name.name).to_string();
-                    if let Some(h) = hashes.defs.get(&ply_span::Symbol::new(&name)) {
-                        // A clause's root is keyed by its owner's hash, which covers the clause.
-                        let (mut requires, mut ensures) = (0, 0);
-                        for clause in &def.spec {
-                            let (kind, k) = match clause.kind {
-                                ply_syntax::ast::SpecKind::Requires => {
-                                    requires += 1;
-                                    ("requires", requires - 1)
-                                }
-                                ply_syntax::ast::SpecKind::Ensures => {
-                                    ensures += 1;
-                                    ("ensures", ensures - 1)
-                                }
-                            };
-                            let root = module
-                                .name
-                                .qualify(&ply_codegen::clause_root_name(&def.name.name, kind, k))
-                                .to_string();
-                            keys.insert(root, format!("{}#{kind}#{k}", h.to_hex()));
-                        }
-                        keys.insert(name, h.to_hex());
-                    }
-                }
-                Item::Law(law) => {
-                    if let Some(h) = hashes.laws.get(law_at) {
-                        for part in ["guard", "body"] {
-                            if part == "guard" && law.guard.is_none() {
-                                continue;
-                            }
-                            let root = module
-                                .name
-                                .qualify(&ply_codegen::law_root_name(law_ordinal, part))
-                                .to_string();
-                            keys.insert(root, format!("{}#{part}", h.to_hex()));
-                        }
-                    }
-                    law_ordinal += 1;
-                    law_at += 1;
-                }
-                Item::Test(_) => {
-                    let name = module
-                        .name
-                        .qualify(&ply_codegen::test_root_name(ordinal))
-                        .to_string();
-                    if let Some(h) = hashes.tests.get(test_at) {
-                        keys.insert(name, h.to_hex());
-                    }
-                    ordinal += 1;
-                    test_at += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    keys
-}
+/// One definition of these keys, in `ply_codegen`: they decide what the emitter caches *and*, under
+/// tier-only, what the unit holds as a root, so a second copy that drifted from the first would
+/// quietly change both. This crate had one, and its comment claimed a spec clause is keyed by its
+/// owner's hash "which covers the clause" -- which is not true, and cost the prover a judgement.
+pub(crate) use ply_codegen::emit_keys;
 
 /// Runs `selection` on a compiled tier — the only evaluator under tier-only (ADR 0048) — built by
 /// the whole Ply emitter from `loaded`'s module source texts, over the program the runner works on
