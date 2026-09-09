@@ -1862,20 +1862,22 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     if !c.sims.is_empty() {
         heap::dec(body);
-        let d = ply_eval::err_nested_simulation(Span::DUMMY, Span::DUMMY);
+        let outer = c.sims.last().map_or(Span::DUMMY, |sim| sim.site);
+        let d = ply_eval::err_nested_simulation(c.site(), outer);
         return c.fail(d);
     }
     let id = ply_eval::SimId(c.entered_sims);
     c.entered_sims += 1;
-    c.trail.enter(Span::DUMMY);
+    let site = c.site();
+    c.trail.enter(site);
     let stack = c.current;
     let depth = c.frames().len();
     c.frames().push(HandlerFrame::simulate());
     let sim = crate::simulate::Simulation::new(
-        id,
+        ply_eval::sched::Scheduler::new(id, site).with_step_budget(c.sim_steps),
+        site,
         c.seed.root,
         c.trail.drawn(),
-        c.sim_steps,
         stack,
         c.stack_floor,
         body,
