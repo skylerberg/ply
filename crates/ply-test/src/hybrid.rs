@@ -4,7 +4,7 @@ use crate::bisect::{DefKey, Delta, Hybrid, Trial, Unresolved};
 use crate::key::{Engine, result_key};
 use crate::schedule::is_seeded;
 use crate::sim::seed_run;
-use ply_eval::{Plan, Seed};
+use ply_eval::{Plan, Provider, Seed};
 use ply_hash::body::{BodySet, StoredBody, reconstruct_relinked};
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Symbol};
@@ -252,9 +252,24 @@ impl Hybrid for BodyHybrid<'_> {
             // Hermetic, always, whatever the run around it was configured with: a search asks this
             // question up to `Budget::max_trials` times, and a binding threaded in here would
             // answer each of them with a real packet.
-            let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
-            seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-            machine.eval_test(index)
+            //
+            // A mixture is a reconstructed AST with no source text, so the whole Ply emitter — a
+            // front end that re-parses source — cannot produce its bodies. The reference emits from
+            // the AST directly, and for the effect-free programs a mixture reconstructs it emits the
+            // identical C, so the failure a mixture reproduces is the one the whole tier saw. An
+            // effectful mixture the reference cannot emit declines, and the trial is `Inconclusive`.
+            ply_codegen::c::producer::reference_only(|| {
+                let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
+                let unit = ply_codegen::Unit::over(&rebuilt.program, &resolved, &check)
+                    .expect("this host has a C compiler");
+                let spec = ply_eval::BackendSpec {
+                    kind: ply_eval::BackendKind::C,
+                    ..Default::default()
+                };
+                machine.set_compiled(unit.attach(&spec));
+                seed_run(&mut machine, &plan.seeds()[0], plan.steps);
+                machine.eval_test(index)
+            })
         }));
         match outcome {
             Ok(Ok(())) => {

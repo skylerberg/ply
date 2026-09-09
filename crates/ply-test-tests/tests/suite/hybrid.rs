@@ -2,6 +2,7 @@
 //! checking it, and running the failing test against it.
 
 use ply_core::CheckOutput;
+use ply_eval::Provider;
 use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
 use ply_span::{SourceId, Symbol};
@@ -25,6 +26,8 @@ struct Compiled {
     check: CheckOutput,
     hashes: HashOutput,
     bodies: BodySet,
+    /// The module source text, keyed by name — what the whole Ply emitter re-parses into bodies.
+    texts: std::collections::HashMap<String, String>,
 }
 
 impl Compiled {
@@ -43,6 +46,10 @@ impl Compiled {
             check,
             hashes,
             bodies,
+            texts: std::collections::HashMap::from([(
+                ModuleName::from_dotted("m").to_string(),
+                src.to_string(),
+            )]),
         }
     }
 
@@ -73,7 +80,20 @@ impl Compiled {
     /// against.
     fn failure(&self, key: &str) -> ply_span::Diagnostic {
         let index = self.test_index(key);
+        ply_codegen::c::producer::ensure_default();
         let mut machine = ply_eval::Machine::new(&self.program, &self.resolved, &self.check);
+        let unit = ply_codegen::Unit::over_with_texts(
+            &self.program,
+            &self.resolved,
+            &self.check,
+            self.texts.clone(),
+        )
+        .expect("this host has a C compiler");
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        machine.set_compiled(unit.attach(&spec));
         machine
             .eval_test(index)
             .expect_err("the fixture must fail as written")

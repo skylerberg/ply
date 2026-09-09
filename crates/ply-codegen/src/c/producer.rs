@@ -32,6 +32,7 @@ static IDENTITY: OnceLock<String> = OnceLock::new();
 thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
     static BUILDING: Cell<bool> = const { Cell::new(false) };
+    static REFERENCE_ONLY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Installs the recipe every thread's producer is built from. The first installation wins; a
@@ -206,13 +207,29 @@ pub fn whole() -> bool {
 /// The producer's mode, as the caches key on it. While the producer's own unit is being built
 /// the reference is the emitter, whatever was asked for: the producer cannot answer for itself.
 pub fn mode() -> &'static str {
-    if !installed() || BUILDING.with(Cell::get) {
+    if !installed() || BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         "ref"
     } else if WHOLE.load(Ordering::Relaxed) {
         "ply-whole"
     } else {
         "ply"
     }
+}
+
+/// Runs `f` with the reference emitter forced, whatever producer is installed: [`mode`] answers
+/// `ref` and the producer is not consulted or built. The bisection's mixtures are reconstructed
+/// ASTs with no source text, which the whole Ply emitter — a front end — cannot re-parse; the
+/// reference is an AST consumer and emits the identical C for the effect-free programs a mixture
+/// reconstructs. The thread-local is restored on unwind, so a panicking mixture leaves no residue.
+pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            REFERENCE_ONLY.with(|c| c.set(self.0));
+        }
+    }
+    let _guard = Guard(REFERENCE_ONLY.with(|c| c.replace(true)));
+    f()
 }
 
 /// The mode with the emitter's identity, as the caches key on it.
@@ -235,7 +252,7 @@ pub fn building() -> bool {
 
 pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
     let recipe = RECIPE.get()?;
-    if BUILDING.with(Cell::get) {
+    if BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         return None;
     }
     MINE.with(|mine| {

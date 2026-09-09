@@ -1,7 +1,7 @@
 //! What a lying host handler does to the **runner** — scheduling, the cache and the failure
 //! artifact.
 
-use crate::fixture::Compiled;
+use crate::fixture::{Compiled, TierExecutor};
 use ply_core::ty::Resource;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -10,7 +10,7 @@ use ply_eval::host::{
 use ply_eval::{Plan, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
-use ply_test::{Hosting, Record, RunReport, Search, select};
+use ply_test::{Hosting, InterpExecutor, Record, RunReport, Search, select};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -92,12 +92,7 @@ fn bind(compiled: &Compiled, entries: Vec<(HostOp, Arc<dyn HostHandler>)>) -> Ar
     )
 }
 
-fn run_with(
-    compiled: &Compiled,
-    store: &mut Store,
-    binding: Option<&Arc<HostBinding>>,
-    audit_backend: bool,
-) -> RunReport {
+fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>>) -> RunReport {
     let selection = select(
         &compiled.check,
         &compiled.hashes,
@@ -109,21 +104,14 @@ fn run_with(
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
     };
-    ply_test::run(
-        &selection,
-        &compiled.program,
-        &compiled.resolved,
-        &compiled.check,
-        &compiled.hashes,
-        store,
-        audit_backend,
-        Search::default(),
-        hosting,
-    )
-}
-
-fn run(compiled: &Compiled, store: &mut Store, binding: Option<&Arc<HostBinding>>) -> RunReport {
-    run_with(compiled, store, binding, false)
+    let (unit, spec) = compiled.tier();
+    let executor = TierExecutor(
+        InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+            .with_backend(unit, spec)
+            .with_search(Search::default())
+            .with_hosts(hosting),
+    );
+    ply_test::run_with(&selection, &compiled.check, &compiled.hashes, store, &executor)
 }
 
 /// Two tests, one resource, both declared `read`, and a handler that writes.
@@ -337,45 +325,6 @@ fn the_same_det_test_is_refused_hermetically() {
         ply_span::codes::UNHANDLED_EFFECT,
         "a binding carrying no registry cannot tell a hermetic refusal from a front-end bug"
     );
-}
-
-/// `--audit-backend` runs a second machine beside the first, and a host handler is not a
-/// handler.
-#[test]
-fn auditing_a_backend_over_a_host_handler_calls_the_handler_once() {
-    let compiled = Compiled::new(DET_REACHES_HOST);
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let calls = Arc::new(AtomicUsize::new(0));
-    let binding = bind(
-        &compiled,
-        vec![registration(
-            "disk",
-            "peek",
-            "log",
-            Determinism::Deterministic,
-            &calls,
-            99,
-        )],
-    );
-
-    let report = run_with(&compiled, &mut store, Some(&binding), true);
-    assert_eq!(
-        report.failed,
-        0,
-        "{:?}",
-        report
-            .failures
-            .iter()
-            .map(|f| (f.diagnostic.code, f.diagnostic.message.clone()))
-            .collect::<Vec<_>>()
-    );
-    assert_eq!(
-        calls.load(Ordering::SeqCst),
-        1,
-        "auditing a backend must not perform the operation twice"
-    );
-    assert_eq!(report.results[0].recorded, Some(Record::Host));
 }
 
 /// A `handle` discharges an **atom**, and an atom names no operation.
