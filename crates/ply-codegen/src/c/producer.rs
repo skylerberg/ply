@@ -42,19 +42,32 @@ pub fn install(recipe: Recipe, identity: String) {
     let _ = RECIPE.set(recipe);
 }
 
-/// The self-hosted Ply emitter's source directory, found by walking up from the working directory
-/// for `spikes/ply-parser/emit.ply`. `None` when it is not on disk.
+/// The self-hosted Ply emitter's source directory, found by walking up for
+/// `spikes/ply-parser/emit.ply` — from the working directory first, then from the executable's own
+/// location, since a `ply` invoked with its CWD elsewhere (a test's temp project) is still
+/// `<repo>/target/**/ply`, under the `spikes/` it needs. `None` when it is on neither path — a
+/// shipped binary, until the bundle is embedded.
 fn find_emitter_dir() -> Option<std::path::PathBuf> {
-    let mut cur = std::env::current_dir().ok()?;
-    loop {
-        let candidate = cur.join("spikes/ply-parser");
-        if candidate.join("emit.ply").is_file() {
-            return Some(candidate);
-        }
-        if !cur.pop() {
-            return None;
+    fn search(mut cur: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        loop {
+            let candidate = cur.join("spikes/ply-parser");
+            if candidate.join("emit.ply").is_file() {
+                return Some(candidate);
+            }
+            if !cur.pop() {
+                return None;
+            }
         }
     }
+    std::env::current_dir()
+        .ok()
+        .and_then(search)
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+                .and_then(search)
+        })
 }
 
 /// Install the whole self-hosted Ply emitter as the producer when none is installed and its source
