@@ -1009,29 +1009,36 @@ fn evaluate(
     use ply_eval::Machine;
 
     let name = opened.entry.as_str();
-    let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
-    if let Some(spec) = crate::commands::common::backend_spec(backend)? {
-        // No hashes here, so nothing is kept between runs: an artefact is opened once and the
-        // emit is not the cost that matters.
-        let provider = crate::commands::common::build_backend(
-            &spec,
-            &opened.program,
-            &opened.resolved,
-            &opened.check,
-            &Default::default(),
-            Default::default(),
-        )?;
-        machine.set_compiled(provider.attach(&spec));
-    }
-    machine.set_host_binding(hosts.binding());
-    if let Some(runtime) = hosts.runtime() {
-        machine.set_host_runtime(runtime);
-    }
-    if let Some(declared) = declared {
-        machine.set_declared_footprint(declared.clone());
-    }
-    ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-    machine.call(name, Vec::new(), span)
+    // A decoded artifact is an AST with no source text, so the whole Ply emitter — a front end
+    // that re-parses source — cannot produce its bodies; the reference emitter emits from the AST
+    // directly, as it does for a bisection's reconstructed program (ADR 0048). A `perform` the
+    // reference cannot compile declines, so an artifact that reaches the host runs only when it was
+    // built with its sources (a re-parse path, not this one).
+    ply_codegen::c::producer::reference_only(|| {
+        let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+        if let Some(spec) = crate::commands::common::backend_spec(backend)? {
+            // No hashes here, so nothing is kept between runs: an artefact is opened once and the
+            // emit is not the cost that matters.
+            let provider = crate::commands::common::build_backend(
+                &spec,
+                &opened.program,
+                &opened.resolved,
+                &opened.check,
+                &Default::default(),
+                Default::default(),
+            )?;
+            machine.set_compiled(provider.attach(&spec));
+        }
+        machine.set_host_binding(hosts.binding());
+        if let Some(runtime) = hosts.runtime() {
+            machine.set_host_runtime(runtime);
+        }
+        if let Some(declared) = declared {
+            machine.set_declared_footprint(declared.clone());
+        }
+        ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
+        machine.call(name, Vec::new(), span)
+    })
 }
 
 // --- diagnostics -------------------------------------------------------------
