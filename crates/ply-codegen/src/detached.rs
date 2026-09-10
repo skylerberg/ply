@@ -53,6 +53,9 @@ struct Capture {
     /// Every word in the snapshot that is a live heap object, held once for the snapshot and
     /// once more per restore, since the run consumes at most one reference to each.
     pins: Vec<Word>,
+    /// The entry's count of at-most-once host operations when this stop was captured.
+    born: u64,
+    resumes: u32,
 }
 
 #[derive(PartialEq, Eq)]
@@ -124,7 +127,11 @@ pub(crate) unsafe fn resume(
             );
             return c.fail(dg);
         }
-        (State::Suspended, Some(k)) if d.live == Some(k) => {}
+        (State::Suspended, Some(k)) if d.live == Some(k) => {
+            if let Some(dg) = replayed(c, id, k) {
+                return c.fail(dg);
+            }
+        }
         (State::Suspended, _) => {
             let dg = Diagnostic::error(
                 codes::RUNTIME_ERROR,
@@ -134,6 +141,9 @@ pub(crate) unsafe fn resume(
             return c.fail(dg);
         }
         (State::Done, Some(k)) => {
+            if let Some(dg) = replayed(c, id, k) {
+                return c.fail(dg);
+            }
             if !restore(c, id, k) {
                 let dg = Diagnostic::error(codes::TASK_ESCAPES_SCOPE, ONE_SHOT);
                 return c.fail(dg);
@@ -234,6 +244,7 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
     } else {
         (None, Vec::new(), Vec::new())
     };
+    let born = c.host_ops;
     let d = &mut c.detached[id];
     d.captures.push(Capture {
         sp,
@@ -241,6 +252,8 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
         bytes,
         frames,
         pins,
+        born,
+        resumes: 0,
     });
     let k = d.captures.len() - 1;
     d.live = Some(k);
@@ -249,6 +262,24 @@ fn capture_stop(c: &mut Ctx, id: usize) -> usize {
 
 /// Puts capture `k`'s snapshot back on the body's stack, so the next switch in runs from it.
 /// `false` when the stop had no snapshot to restore.
+/// Counts a resumption of capture `k`, and for a second one across an at-most-once host operation
+/// answers the `E0426` refusing it: replaying that control would perform the operation again.
+fn replayed(c: &mut Ctx, id: usize, k: usize) -> Option<Diagnostic> {
+    let host_ops = c.host_ops;
+    let cap = &mut c.detached[id].captures[k];
+    cap.resumes = cap.resumes.saturating_add(1);
+    if cap.resumes > 1 && host_ops > cap.born {
+        let resumes = cap.resumes;
+        let site = c.site();
+        return Some(crate::host::err_continuation_resumed(
+            site,
+            resumes,
+            c.last_linear.as_ref(),
+        ));
+    }
+    None
+}
+
 fn restore(c: &mut Ctx, id: usize, k: usize) -> bool {
     let d = &c.detached[id];
     let Some(bytes) = d.captures[k].bytes.as_ref() else {

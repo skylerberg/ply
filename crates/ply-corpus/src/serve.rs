@@ -422,6 +422,7 @@ struct Program {
     /// One answer about this program's regions for every rung below, rather than one per rung's
     /// machine.
     region_kinds: ply_eval::region_kind::Kinds,
+    sources: ply_span::SourceMap,
 }
 
 impl Program {
@@ -455,11 +456,13 @@ impl Program {
             resolved,
             check,
             region_kinds: ply_eval::region_kind::Kinds::default(),
+            sources,
         })
     }
 
     fn machine(&self) -> Machine<'_> {
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine =
+            crate::tier_machine(&self.program, &self.resolved, &self.check, &self.sources);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
         machine
     }

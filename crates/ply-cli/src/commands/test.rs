@@ -1782,6 +1782,7 @@ fn failure_json(
         failure
             .diagnostic
             .primary_span()
+            .filter(|s| *s != Span::DUMMY)
             .map_or(Value::Null, |s| location_json(sources, s)),
     );
     object.insert(
@@ -1915,16 +1916,11 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
     }
 
     fn run(loaded: &Loaded, selection: &Selection, store: &mut Store) -> RunReport {
-        ply_test::run(
+        crate::commands::common::run_on_tier(
+            loaded,
             selection,
-            &loaded.program,
-            &loaded.resolved,
-            &loaded.check,
-            &loaded.hashes().unwrap(),
-            store,
-            false,
-            ply_test::Search::of(selection),
             ply_test::Hosting::hermetic(),
+            store,
         )
     }
 

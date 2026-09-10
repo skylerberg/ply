@@ -40,17 +40,20 @@ impl Engine {
     /// selects tests, since selection decides whether a provider is worth building at all — gets
     /// the answer the run will give.
     pub fn of_backend(name: &str, variant: &str, spec: &ply_eval::BackendSpec) -> Engine {
+        // Tier-only (ADR 0048): the honest tier is the evaluator, whatever it is called, and its
+        // passes are the evaluator's own. A backend that is wrong on purpose gets a namespace of
+        // its own, so that a corrupted run can never write where an honest one reads even if a
+        // caller hands it a real store. The command refuses it a store at all; this is the belt
+        // to that pair of braces.
+        if spec.mutation == ply_eval::backend::Mutation::None && spec.target.is_none() {
+            return Engine::Evaluator;
+        }
         let mut tag = name.to_string();
         if !variant.is_empty() {
             tag.push(':');
             tag.push_str(variant);
         }
-        // A backend that is wrong on purpose gets a namespace of its own, so that a corrupted run
-        // can never write where an honest one reads even if a caller hands it a real store. The
-        // command refuses it a store at all; this is the belt to that pair of braces.
-        if spec.mutation != ply_eval::backend::Mutation::None || spec.target.is_some() {
-            tag.push_str(&format!("/wrong:{:?}:{:?}", spec.mutation, spec.target));
-        }
+        tag.push_str(&format!("/wrong:{:?}:{:?}", spec.mutation, spec.target));
         Engine::Backend(tag)
     }
 

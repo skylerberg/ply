@@ -196,37 +196,11 @@ fn emit_all(
             }
         }
         // A compiled `perform` searches the compiled handler frames, which is complete for an
-        // operation only while every body handling it is compiled (ADR 0043). A performer of an
-        // operation whose handler was dropped, or that nothing in the program handles, goes with
-        // it.
-        if super::producer::whole() {
-            let handlers =
-                super::producer::with_current(|p| p.handlers_of(loaded)).unwrap_or_default();
-            let taken_now = taken.clone();
-            for (name, _, tables) in &emitted {
-                if round.iter().any(|r| r.function == *name) {
-                    continue;
-                }
-                for op in &tables.performs {
-                    // A `perform` no handler in the program answers reaches the host binding
-                    // from the runtime, with the machine's checks, and a `task` operation
-                    // outside any region opens the production region the binding permits.
-                    let missing = match handlers.get(op) {
-                        None => None,
-                        Some(hs) => hs.iter().find(|h| !taken_now.contains(h)).map(|h| {
-                            format!("`{h}`, which handles it and is not in this compiled unit")
-                        }),
-                    };
-                    if let Some(why) = missing {
-                        round.push(Refused {
-                            function: name.clone(),
-                            construct: format!("a `perform` of `{op}` answered by {why}"),
-                        });
-                        break;
-                    }
-                }
-            }
-        }
+        // operation while every body handling it that can run is compiled (ADR 0043). Under
+        // tier-only nothing outside the unit runs, so a handler outside it -- a test's, when a unit
+        // is offered an artifact's closure -- is never on the stack, and the performer compiles.
+        // A `perform` no compiled handler answers reaches the host binding from the runtime, with
+        // the machine's checks.
         if round.is_empty() {
             break emitted;
         }
@@ -302,6 +276,98 @@ fn emit_all(
 }
 
 /// Emit, compile and load `names` as one unit, with what it refused.
+/// The whole unit as C and the record `finish` rebuilds its tables from, without compiling it:
+/// what an artifact embeds, so that it runs from its own definitions with no source to re-parse.
+pub struct Produced {
+    pub text: String,
+    pub record: super::cache::UnitCache,
+    pub refused: Vec<Refused>,
+}
+
+pub fn produce(loaded: &'static Source, names: &[&str]) -> Result<Produced> {
+    let ctors = loaded.ctors();
+    let ctors_digest = super::cache::ctors_digest(&ctors);
+    let (offered, fragment) = offered_set(names);
+    let how = super::toolchain::Profile::current().inlining().overridden();
+    produce_in(
+        loaded,
+        &offered,
+        &fragment,
+        &ctors,
+        &ctors_digest,
+        (how.budget, how.depth),
+    )
+}
+
+fn produce_in(
+    loaded: &'static Source,
+    offered: &[&str],
+    fragment: &str,
+    ctors: &[(Symbol, usize)],
+    ctors_digest: &str,
+    inlining: (usize, usize),
+) -> Result<Produced> {
+    let Emitted {
+        text,
+        mut unit,
+        taken,
+        refusals,
+    } = emit_all(loaded, offered, fragment, ctors, ctors_digest, inlining)?;
+    // An emitter that raised answered nothing, and a unit over that silence would be cached as
+    // the program's bodies: the failure is the answer, and the next run asks again.
+    if let Some(why) = super::producer::with_current(|p| p.failure(loaded)).flatten() {
+        bail!("the Ply emitter failed over the program: {why}");
+    }
+    // For its effect on the code table, whose rows are recorded just below: `finish` reads the
+    // same slots back out of the table this completes.
+    let _ = constants_of(loaded, &mut unit);
+    // Everything about the unit that is not the object: what a worker would otherwise emit
+    // twenty-nine megabytes of C to rediscover. Recording it here, and building this run's
+    // `Native` out of it, keeps the cached door honest -- the two doors are one path, so a unit
+    // that will not reconstruct fails every test rather than only a warm one.
+    let record = super::cache::UnitCache {
+        object: super::load::object_key(&text),
+        taken,
+        refusals: refusals
+            .iter()
+            .map(|r| (r.function.clone(), r.construct.clone()))
+            .collect(),
+        shapes: unit.layouts.all_shape_names(),
+        consts: unit.consts,
+        fields: unit.fields,
+        builtins: unit.builtins,
+        lambdas: unit.lambdas,
+    };
+    Ok(Produced {
+        text,
+        record,
+        refused: refusals,
+    })
+}
+
+/// A unit produced elsewhere -- the bootstrap bundle's, or an artifact's -- compiled and finished
+/// against `loaded`, with the constructor table it was emitted against rather than the program's
+/// own, so the tags baked into its C still name its shapes.
+pub fn load_unit(
+    loaded: &'static Source,
+    text: &str,
+    record: super::cache::UnitCache,
+    ctors: Vec<(Symbol, usize)>,
+    stem: &str,
+) -> Result<(Native, Vec<Refused>)> {
+    let refused = record
+        .refusals
+        .iter()
+        .map(|(function, construct)| Refused {
+            function: function.clone(),
+            construct: construct.clone(),
+        })
+        .collect();
+    let lib = compile_and_load(text, stem)?;
+    let native = finish(loaded, lib, record, ctors)?;
+    Ok((native, refused))
+}
+
 pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Refused>)> {
     let started = std::time::Instant::now();
     let ctors = loaded.ctors();
@@ -348,42 +414,19 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
             return Ok((native, refused));
         }
     }
-    let Emitted {
+    let Produced {
         text,
-        mut unit,
-        taken,
-        refusals,
-    } = emit_all(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
+        record,
+        refused: refusals,
+    } = produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
     let t_emit = started.elapsed();
     let t_assemble = started.elapsed();
     let lib = compile_and_load(&text, "unit")?;
     let t_cc = started.elapsed();
-
-    // For its effect on the code table, whose rows are recorded just below: `finish` reads the
-    // same slots back out of the table this completes.
-    let _ = constants_of(loaded, &mut unit);
-
-    // Everything about the unit that is not the object: what a worker would otherwise emit
-    // twenty-nine megabytes of C to rediscover. Recording it *here*, and then going on to build
-    // this run's `Native` out of it, is what keeps the cached door honest -- the two doors are one
-    // path, so a unit that will not reconstruct fails every test rather than only a warm one.
-    let built = super::cache::UnitCache {
-        object: super::load::object_key(&text),
-        taken,
-        refusals: refusals
-            .iter()
-            .map(|r| (r.function.clone(), r.construct.clone()))
-            .collect(),
-        shapes: unit.layouts.all_shape_names(),
-        consts: unit.consts,
-        fields: unit.fields,
-        builtins: unit.builtins,
-        lambdas: unit.lambdas,
-    };
     if let Some(k) = &unit_key {
-        super::cache::write_unit(k, &built);
+        super::cache::write_unit(k, &record);
     }
-    let native = finish(loaded, lib, built, ctors)?;
+    let native = finish(loaded, lib, record, ctors)?;
     if std::env::var("PLY_C_PHASES").is_ok() {
         eprintln!(
             "phases: emit+resolve {}ms, assemble {}ms, cc+load {}ms, tables {}ms, source {}MB",
@@ -490,6 +533,7 @@ pub(super) fn finish(
     }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
+    tables.sources = loaded.program.modules.iter().map(|m| m.source).collect();
     Ok(Native {
         lib,
         entries,
@@ -555,25 +599,19 @@ pub(super) fn emit_one(
     // two definitions that say the same thing share one -- and an emitted body carries its own
     // mangled name, so serving one for the other puts two definitions of the same symbol in the
     // unit. `lexer.hex1` and `lexer.hex2` are that pair, and the C compiler said so.
-    let mode = super::producer::mode();
-    let whole = mode == "ply-whole";
-    let who = if mode == "ref" {
-        String::new()
-    } else {
+    let produced = super::producer::mode() != "ref";
+    let who = if produced {
         format!("\0ply\0{}", super::producer::identity())
+    } else {
+        String::new()
     };
     let key = loaded
         .keys
         .get(name)
         .map(|h| super::cache::key(&format!("{name}\0{h}{who}"), ctors_digest, inlining));
-    // A refusal is the port's own in whole mode and the reference's otherwise; the two are not
-    // served to each other.
+    // A refusal is the producer's own where one is installed and the reference's otherwise; the
+    // two are not served to each other, which is what `who` keeps apart.
     let refusal = loaded.keys.get(name).map(|h| {
-        let who = if whole {
-            format!("\0ply-whole\0{}", super::producer::identity())
-        } else {
-            String::new()
-        };
         super::cache::refusal_key(
             &format!("{name}\0{h}{who}"),
             ctors_digest,
@@ -604,7 +642,7 @@ pub(super) fn emit_one(
         .into());
     };
     // The chain entered whole: the port's answer is the unit's, and the reference is not run.
-    if whole {
+    if produced {
         let answer =
             super::producer::with_current(|p| p.body(loaded, name, module_index)).flatten();
         return match answer {
@@ -731,25 +769,6 @@ pub(super) fn emit_one(
     // The lambdas this body defines, as functions beside it. Part of the body's text, so they
     // are cached and restored with it, and their placeholders are resolved with it.
     out.push_str(&e.lambda_defs());
-    // The second emitter's body stands in for this one where it reaches, and only for a body
-    // this emitter accepts: the refusals are this emitter's, the code that runs is the other's.
-    // A body naming a definition the unit does not hold would not link, so it is refused here
-    // as this emitter refuses one, and the fixpoint drops it.
-    if let Some(Some(super::producer::Answer::Body(text, tables))) =
-        super::producer::with_current(|p| p.body(loaded, name, module_index))
-    {
-        if let Some(missing) = tables.calls.iter().find(|c| !unit.functions.contains(c)) {
-            return Err(Refused {
-                function: name.to_string(),
-                construct: format!("`{missing}`, which is not in this compiled unit"),
-            }
-            .into());
-        }
-        if let Some(k) = &key {
-            super::cache::write(k, &text, &tables);
-        }
-        return Ok((text, tables));
-    }
     if let Some(k) = &key {
         super::cache::write(k, &out, &e.tables);
     }
@@ -878,5 +897,6 @@ fn tables_of(unit: Unit, ctors: &[(Symbol, usize)]) -> Tables {
         memo_values: Default::default(),
         memo_words: Default::default(),
         calls: Default::default(),
+        sources: Vec::new(),
     }
 }

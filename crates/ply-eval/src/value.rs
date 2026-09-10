@@ -140,7 +140,7 @@ impl<'a> IntoIterator for &'a Fields {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub enum Value {
     Int(i64),
     /// A fixed-width integer, and which of the eight it is. The type is carried on the value
@@ -158,6 +158,7 @@ pub enum Value {
     /// shared buffer, which W3's streaming bodies want and W1 does not, and it would put a type
     /// carrying its own refcount semantics into the enum the hygiene rules are written against.
     Bytes(Arc<[u8]>),
+    #[default]
     Unit,
     List(List),
     /// Iterated in ascending key order by [`Value::cmp`], always.

@@ -10,7 +10,6 @@
 
 pub mod backend;
 pub mod c;
-pub mod combined;
 pub mod detached;
 pub mod heap;
 pub mod host;
@@ -22,6 +21,8 @@ pub mod simulate;
 pub mod source;
 pub mod stack;
 
-pub use backend::{Bodies, Closed, Declines, Unit, closure};
+pub use backend::{Bodies, Closed, Declines, Embedded, Unit, closure};
 pub use c::{Profile, Refused, select_profile};
-pub use source::{Source, clause_root_name, is_spec_root, law_root_name, test_root_name};
+pub use source::{
+    Source, clause_root_name, emit_keys, is_spec_root, law_root_name, test_root_name,
+};

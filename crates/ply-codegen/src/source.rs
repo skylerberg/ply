@@ -85,6 +85,87 @@ pub fn clause_root_name(owner: &Symbol, kind: &str, ordinal: usize) -> Symbol {
     Symbol::new(format!("{owner}#{kind}#{ordinal}"))
 }
 
+/// The cache key each keyable root — a definition, its spec clauses, a test, a law's guard and
+/// body — is kept under, keyed by its hash. Under tier-only these keys are also what make a test
+/// or a law a ROOT the unit compiles (ADR 0045 §"The facade"); without them a `Unit` would not
+/// hold `test#N` and the tier could not enter it.
+pub fn emit_keys(
+    program: &ply_syntax::ast::Program,
+    hashes: &ply_hash::HashOutput,
+) -> std::collections::HashMap<String, String> {
+    use ply_syntax::ast::Item;
+    let mut keys = std::collections::HashMap::new();
+    let mut test_at = 0;
+    let mut law_at = 0;
+    for module in &program.modules {
+        let mut ordinal = 0;
+        let mut law_ordinal = 0;
+        for item in &module.items {
+            match item {
+                Item::Fn(def) => {
+                    let name = module.name.qualify(&def.name.name).to_string();
+                    if let Some(h) = hashes.defs.get(&Symbol::new(&name)) {
+                        // **A clause is keyed by its own hash, not by its owner's.** A definition's
+                        // hash is over its normalized body, which a spec is erased from, so editing
+                        // `ensures result == x + 1` into `ensures result == x + 3` leaves the
+                        // owner's hash where it was -- and the clause root compiled from the old
+                        // sentence was served back, so the prover judged the edited spec by the
+                        // proposition it replaced. `HashOutput::specs` runs parallel to `def.spec`
+                        // and covers the clause's own bytes.
+                        let clauses = hashes.specs.get(&Symbol::new(&name));
+                        let (mut requires, mut ensures) = (0, 0);
+                        for (i, clause) in def.spec.iter().enumerate() {
+                            let (kind, k) = match clause.kind {
+                                ply_syntax::ast::SpecKind::Requires => {
+                                    requires += 1;
+                                    ("requires", requires - 1)
+                                }
+                                ply_syntax::ast::SpecKind::Ensures => {
+                                    ensures += 1;
+                                    ("ensures", ensures - 1)
+                                }
+                            };
+                            let root = module
+                                .name
+                                .qualify(&clause_root_name(&def.name.name, kind, k))
+                                .to_string();
+                            let own = clauses.and_then(|cs| cs.get(i)).unwrap_or(h);
+                            keys.insert(root, format!("{}#{kind}#{k}", own.to_hex()));
+                        }
+                        keys.insert(name, h.to_hex());
+                    }
+                }
+                Item::Law(law) => {
+                    if let Some(h) = hashes.laws.get(law_at) {
+                        for part in ["guard", "body"] {
+                            if part == "guard" && law.guard.is_none() {
+                                continue;
+                            }
+                            let root = module
+                                .name
+                                .qualify(&law_root_name(law_ordinal, part))
+                                .to_string();
+                            keys.insert(root, format!("{}#{part}", h.to_hex()));
+                        }
+                    }
+                    law_ordinal += 1;
+                    law_at += 1;
+                }
+                Item::Test(_) => {
+                    let name = module.name.qualify(&test_root_name(ordinal)).to_string();
+                    if let Some(h) = hashes.tests.get(test_at) {
+                        keys.insert(name, h.to_hex());
+                    }
+                    ordinal += 1;
+                    test_at += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    keys
+}
+
 /// Whether `name` is one of the roots above rather than a written definition or a test.
 pub fn is_spec_root(name: &str) -> bool {
     let local = name.rsplit('.').next().unwrap_or(name);

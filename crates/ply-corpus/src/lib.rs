@@ -29,6 +29,73 @@ use ply_eval::Plan;
 use ply_store::Store;
 use std::path::Path;
 
+/// The honest default tier: what every run here evaluates on under tier-only (ADR 0048), since a
+/// bare machine has no front end and declines everything.
+pub(crate) fn honest() -> ply_eval::BackendSpec {
+    ply_eval::BackendSpec {
+        kind: ply_eval::BackendKind::C,
+        ..Default::default()
+    }
+}
+
+/// A machine over the program with the default tier attached, produced from the module texts
+/// `sources` holds.
+pub fn tier_machine<'a>(
+    program: &'a ply_syntax::ast::Program,
+    resolved: &'a ply_syntax::resolve::Resolved,
+    check: &'a ply_core::CheckOutput,
+    sources: &ply_span::SourceMap,
+) -> ply_eval::Machine<'a> {
+    ply_codegen::c::producer::ensure_default();
+    let texts = ply_cli::commands::common::module_texts(program, sources);
+    let unit = ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
+        .expect("this host has a C compiler");
+    let mut machine = ply_eval::Machine::new(program, resolved, check);
+    machine.set_compiled(ply_eval::Provider::attach(unit, &honest()));
+    machine
+}
+
+/// The selected tests run on the default tier.
+pub fn run_on_tier(
+    front: &pipeline::Front,
+    selection: &ply_test::Selection,
+    store: &mut Store,
+    search: ply_test::Search,
+    hosting: ply_test::Hosting<'_>,
+) -> ply_test::RunReport {
+    ply_codegen::c::producer::ensure_default();
+    let texts = ply_cli::commands::common::module_texts(&front.program, &front.sources);
+    let unit =
+        ply_codegen::Unit::over_with_texts(&front.program, &front.resolved, &front.check, texts)
+            .expect("this host has a C compiler");
+    let executor = ply_test::InterpExecutor::new(&front.program, &front.resolved, &front.check)
+        .with_backend(unit, honest())
+        .with_search(search)
+        .with_hosts(hosting);
+    ply_test::run_with(selection, &front.check, &front.hashes, store, &executor)
+}
+
+/// Runs `f` on a thread with a stack deep enough for the tier's longest legal recursion.
+///
+/// The compiled tier recurses on the native C stack (ADR 0048), where the interpreter recursed on
+/// the heap, and the language's call limit is `ply_eval::limit::DEFAULT_MAX_CALLS`. A benchmark
+/// that drives a loop written as tail recursion that deep needs the room the CLI's own worker pool
+/// gives it (`ply-cli`'s `WORKER_STACK`); a 2 MiB `cargo test` thread overflows first and the tier
+/// raises its recursion limit early. This is the harness's equivalent of that pool.
+pub fn on_deep_stack<R: Send>(f: impl FnOnce() -> R + Send) -> R {
+    const DEEP_STACK: usize = 256 << 20;
+    std::thread::scope(|scope| {
+        std::thread::Builder::new()
+            .stack_size(DEEP_STACK)
+            .spawn_scoped(scope, f)
+            .expect("a deep-stack thread")
+            .join()
+            .unwrap_or_else(|_| {
+                std::panic::resume_unwind(Box::new("the deep-stack thread panicked"))
+            })
+    })
+}
+
 #[derive(Clone, Debug)]
 pub struct Verified {
     pub definitions: usize,
@@ -55,14 +122,10 @@ pub fn verify(root: &Path) -> Result<Verified> {
         &Plan::default(),
         &ply_test::Engine::Evaluator,
     );
-    let report = ply_test::run(
+    let report = run_on_tier(
+        &front,
         &selection,
-        &front.program,
-        &front.resolved,
-        &front.check,
-        &front.hashes,
         &mut store,
-        false,
         ply_test::Search::of(&selection),
         ply_test::Hosting::hermetic(),
     );

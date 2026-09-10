@@ -69,16 +69,6 @@ pub(crate) fn drain_the_free_list() {
     });
 }
 
-/// Buffers currently parked in every class.
-#[cfg(test)]
-pub(crate) fn kept() -> [usize; CLASSES] {
-    FREE.try_with(|free| {
-        let free = free.borrow();
-        std::array::from_fn(|class| free[class].len())
-    })
-    .unwrap_or([0; CLASSES])
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -194,46 +194,46 @@ impl<'a> Prover<'a> {
         })
     }
 
-    /// A proposition's roots: the guards' and the body's program-wide names in the unit.
-    fn roots(&self, obligation: &Obligation, claim: &Claim<'a>) -> (Vec<Symbol>, Option<Symbol>) {
+    /// A proposition's body root: its program-wide name in the unit.
+    fn body_root(&self, obligation: &Obligation, claim: &Claim<'a>) -> Option<Symbol> {
         let module = &self.program.modules[claim.module()].name;
         match claim {
             Claim::Ensures { def, .. } => {
                 let ObligationKind::Ensures { index } = obligation.kind else {
-                    return (Vec::new(), None);
+                    return None;
                 };
-                let requires = def
-                    .spec
-                    .iter()
-                    .filter(|c| c.kind == SpecKind::Requires)
-                    .count();
-                let guards = (0..requires)
-                    .map(|k| {
-                        module.qualify(&ply_codegen::clause_root_name(
-                            &def.name.name,
-                            "requires",
-                            k,
-                        ))
-                    })
-                    .collect();
-                let body = module.qualify(&ply_codegen::clause_root_name(
+                Some(module.qualify(&ply_codegen::clause_root_name(
                     &def.name.name,
                     "ensures",
                     index,
-                ));
-                (guards, Some(body))
+                )))
             }
-            Claim::Law { ordinal, def, .. } => {
-                let guards = def
-                    .guard
-                    .iter()
-                    .map(|_| module.qualify(&ply_codegen::law_root_name(*ordinal, "guard")))
-                    .collect();
-                (
-                    guards,
-                    Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "body"))),
-                )
+            Claim::Law { ordinal, .. } => {
+                Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "body")))
             }
+        }
+    }
+
+    /// Each guard's own compiled root, in the order [`Claim::guards`] returns them: a law's
+    /// `where` clause, or a definition's `requires` clauses. `source.rs` numbers them the same
+    /// way, so the two lists line up position by position.
+    fn guard_roots(&self, claim: &Claim<'a>) -> Vec<Option<Symbol>> {
+        let module = &self.program.modules[claim.module()].name;
+        match claim {
+            Claim::Ensures { def, .. } => (0..claim.guards().len())
+                .map(|k| {
+                    Some(module.qualify(&ply_codegen::clause_root_name(
+                        &def.name.name,
+                        "requires",
+                        k,
+                    )))
+                })
+                .collect(),
+            Claim::Law { ordinal, .. } => claim
+                .guards()
+                .iter()
+                .map(|_| Some(module.qualify(&ply_codegen::law_root_name(*ordinal, "guard"))))
+                .collect(),
         }
     }
 
@@ -274,6 +274,12 @@ impl<'a> Prover<'a> {
         let mut machine =
             Machine::new(self.program, self.resolved, self.check).with_max_calls(DEFAULT_MAX_CALLS);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        // The compiled tier is the evaluator (ADR 0048): an obligation's owner is called through
+        // the machine to produce the `result` its `ensures` speaks of, so the machine must hold the
+        // same tier its propositions are entered on, or that call declines with no body.
+        if let Some((provider, spec)) = self.backend.as_ref() {
+            machine.set_compiled(provider.attach(spec));
+        }
         machine
     }
 
@@ -601,11 +607,11 @@ impl<'a> Prover<'a> {
                 });
             }
         }
-        let (guard_roots, body_root) = self.roots(obligation, claim);
+        let body_root = self.body_root(obligation, claim);
         Ok(Cases {
             machine: self.machine(),
             compiled: self.compiled(),
-            guard_roots,
+            guard_roots: self.guard_roots(claim),
             body_root,
             module: claim.module(),
             binders: obligation.generated().to_vec(),
@@ -934,7 +940,7 @@ fn bindings_of(binders: &[LawBinder], values: &[Value]) -> Vec<Binding> {
 struct Cases<'a> {
     machine: Machine<'a>,
     compiled: Option<Rc<dyn ply_eval::Compiled>>,
-    guard_roots: Vec<Symbol>,
+    guard_roots: Vec<Option<Symbol>>,
     body_root: Option<Symbol>,
     module: usize,
     binders: Vec<LawBinder>,
@@ -947,6 +953,30 @@ struct Cases<'a> {
 }
 
 impl Cases<'_> {
+    /// The proposition entered on the tier, or `None` for the Core to answer.
+    ///
+    /// `None` covers three cases and treats them alike, because the Core is the answer to all
+    /// three: no backend, no compiled root, and a root the tier declined. That last is the one
+    /// that matters -- a proposition may apply a closure the property generator made, and the
+    /// tier compiles named bodies ahead and has nothing to run a synthesized closure on.
+    ///
+    /// Trying the tier first is not an optimisation. The Core is the pure applier of ADR 0048: it
+    /// declines a handler clause that binds `resume`, so a law reaching one -- `std.db`'s
+    /// `transaction`, whose `db.rollback` clause is the zero-shot case -- is *unattempted* rather
+    /// than judged. `desk`'s "a placement the shelf cannot cover leaves no row behind" is that
+    /// law, and it was being reported as a gap.
+    fn on_tier(&self, root: &Option<Symbol>, args: &[Value]) -> Option<Result<Value, Diagnostic>> {
+        let (compiled, root) = (self.compiled.as_ref()?, root.as_ref()?);
+        if args.iter().any(carries_a_closure) {
+            return None;
+        }
+        match compiled.enter_whole(root, args, DEFAULT_MAX_CALLS) {
+            ply_eval::Entered::Answered(value) => Some(Ok(value)),
+            ply_eval::Entered::Raised(d) => Some(Err(d)),
+            ply_eval::Entered::Declined => None,
+        }
+    }
+
     fn scope(&self, values: &[Value]) -> Vec<(Symbol, Value)> {
         self.binders
             .iter()
@@ -971,9 +1001,11 @@ impl Cases<'_> {
 impl Judge for Cases<'_> {
     fn guard(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         let scope = self.scope(values);
+        let empty = None;
         for (i, guard) in self.guards.iter().enumerate() {
-            let value = match entered(self.compiled.as_ref(), self.guard_roots.get(i), values) {
-                Some(answer) => answer?,
+            let root = self.guard_roots.get(i).unwrap_or(&empty);
+            let value = match self.on_tier(root, values) {
+                Some(answered) => answered?,
                 None => self.machine.eval_expr_in(guard, self.module, &scope)?,
             };
             if !self.boolean(value)? {
@@ -985,34 +1017,40 @@ impl Judge for Cases<'_> {
 
     fn body(&mut self, values: &[Value]) -> Result<bool, Diagnostic> {
         let mut scope = self.scope(values);
-        let mut args = values.to_vec();
         if let (Some(name), Some(result)) = (&self.call, &self.result) {
             let returned = self
                 .machine
                 .call(name.as_str(), values.to_vec(), self.span)?;
-            scope.push((result.clone(), returned.clone()));
-            args.push(returned);
+            scope.push((result.clone(), returned));
         }
-        let value = match entered(self.compiled.as_ref(), self.body_root.as_ref(), &args) {
-            Some(answer) => answer?,
+        // The compiled root takes the scope in the order it was built: a law's binders, or an
+        // owner's parameters and then `result`, which is how `source.rs` gives it its parameters.
+        let args: Vec<Value> = scope.iter().map(|(_, v)| v.clone()).collect();
+        let value = match self.on_tier(&self.body_root, &args) {
+            Some(answered) => answered?,
             None => self.machine.eval_expr_in(self.body, self.module, &scope)?,
         };
         self.boolean(value)
     }
 }
 
-/// A proposition entered in the unit: its answer, what it raised, or `None` where the unit does
-/// not hold the root and the judge evaluates it as before.
-fn entered(
-    compiled: Option<&Rc<dyn ply_eval::Compiled>>,
-    root: Option<&Symbol>,
-    args: &[Value],
-) -> Option<Result<Value, Diagnostic>> {
-    let (compiled, root) = (compiled?, root?);
-    match compiled.enter_whole(root, args, DEFAULT_MAX_CALLS) {
-        ply_eval::Entered::Answered(value) => Some(Ok(value)),
-        ply_eval::Entered::Raised(raised) => Some(Err(raised)),
-        ply_eval::Entered::Declined => None,
+/// Whether a generated value holds a closure anywhere inside it.
+///
+/// A closure the property generator synthesized has no compiled body, so the tier cannot apply
+/// it -- and unlike a construct it has never seen, it does not *decline* one: the word it makes
+/// of a bridged closure is a word, and what comes back is not the answer the proposition asked
+/// for. So the check is on the way in, not on the way out.
+fn carries_a_closure(v: &Value) -> bool {
+    match v {
+        Value::Closure(_) | Value::Continuation(_) => true,
+        Value::List(items) => items.iter().any(carries_a_closure),
+        Value::Map(entries) => entries
+            .iter()
+            .any(|(k, v)| carries_a_closure(k) || carries_a_closure(v)),
+        Value::Record(fields) => fields.values().any(carries_a_closure),
+        Value::Ctor { args, .. } => args.iter().any(carries_a_closure),
+        Value::Secret(inner) => carries_a_closure(inner),
+        _ => false,
     }
 }
 

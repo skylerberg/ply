@@ -37,9 +37,7 @@ pub fn stale_runtime(dir: &Path) -> bool {
 /// Writes the bundle, replacing what was there.
 pub fn write(dir: &Path, text: &str, record: &UnitCache, sources_digest: &str) -> Result<()> {
     std::fs::create_dir_all(dir).with_context(|| dir.display().to_string())?;
-    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
-    gz.write_all(text.as_bytes())?;
-    std::fs::write(dir.join(UNIT), gz.finish()?)?;
+    std::fs::write(dir.join(UNIT), pack(text)?)?;
     std::fs::write(dir.join(RECORD), encode_unit(record))?;
     std::fs::write(dir.join(SOURCES), format!("{sources_digest}\n"))?;
     std::fs::write(dir.join(RUNTIME), format!("{}\n", runtime_digest()))?;
@@ -50,8 +48,19 @@ pub fn write(dir: &Path, text: &str, record: &UnitCache, sources_digest: &str) -
 pub fn text(dir: &Path) -> Result<String> {
     let bytes =
         std::fs::read(dir.join(UNIT)).with_context(|| dir.join(UNIT).display().to_string())?;
+    unpack(&bytes)
+}
+
+/// A unit's C compressed, as the bundle stores it and as an artifact embeds it.
+pub fn pack(text: &str) -> Result<Vec<u8>> {
+    let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+    gz.write_all(text.as_bytes())?;
+    Ok(gz.finish()?)
+}
+
+pub fn unpack(bytes: &[u8]) -> Result<String> {
     let mut out = String::new();
-    flate2::read::GzDecoder::new(&bytes[..]).read_to_string(&mut out)?;
+    flate2::read::GzDecoder::new(bytes).read_to_string(&mut out)?;
     Ok(out)
 }
 
@@ -77,15 +86,5 @@ pub fn exists(dir: &Path) -> bool {
 pub fn build(loaded: &'static Source, dir: &Path) -> Result<(Native, Vec<Refused>)> {
     let text = text(dir)?;
     let record = record(dir)?;
-    let refused = record
-        .refusals
-        .iter()
-        .map(|(function, construct)| Refused {
-            function: function.clone(),
-            construct: construct.clone(),
-        })
-        .collect();
-    let lib = super::load::compile_and_load(&text, "bootstrap")?;
-    let native = super::build::finish(loaded, lib, record, loaded.ctors())?;
-    Ok((native, refused))
+    super::build::load_unit(loaded, &text, record, loaded.ctors(), "bootstrap")
 }

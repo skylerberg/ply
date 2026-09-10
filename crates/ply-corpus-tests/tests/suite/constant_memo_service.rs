@@ -123,28 +123,31 @@ fn what_the_route_table_costs_to_rebuild() {
     let loaded = w6_run::program(&repo()).expect("the ladder's driver loads");
     let bench = loaded.full("w6_bench").expect("the driver is present");
     let iterations = 2000u32;
-    let mode = |m: i64| -> f64 {
-        let mut best = f64::MAX;
-        for _ in 0..7 {
-            let taken = loaded
-                .pure_call(
-                    &bench,
-                    vec![
-                        ply_eval::Value::Int(m),
-                        ply_eval::Value::Int(iterations as i64),
-                    ],
-                    1,
-                )
-                .expect("the driver runs")
-                .0;
-            best = best.min(taken.as_secs_f64() * 1e6 / iterations as f64);
-        }
-        best
-    };
-    let empty = mode(0);
-    let table = mode(5);
-    let routed = mode(3);
-    let hoisted = mode(4);
+    // Each rung runs its loop `iterations` deep as tail recursion, which the tier compiles to that
+    // many native C frames (ADR 0048); a `cargo test` thread's 2 MiB stack overflows well before
+    // the language's call limit, so the loop runs on a deep stack, as the CLI's own worker pool
+    // would give it.
+    let (empty, table, routed, hoisted) = ply_corpus::on_deep_stack(|| {
+        let mode = |m: i64| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..7 {
+                let taken = loaded
+                    .pure_call(
+                        &bench,
+                        vec![
+                            ply_eval::Value::Int(m),
+                            ply_eval::Value::Int(iterations as i64),
+                        ],
+                        1,
+                    )
+                    .expect("the driver runs")
+                    .0;
+                best = best.min(taken.as_secs_f64() * 1e6 / iterations as f64);
+            }
+            best
+        };
+        (mode(0), mode(5), mode(3), mode(4))
+    });
     println!(
         "table(): {:.2}us per build over the empty loop; routing rung {routed:.1}us against \
          {hoisted:.1}us with the table hoisted — {:.2}us for the rebuild",

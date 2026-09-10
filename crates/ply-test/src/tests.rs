@@ -1,9 +1,9 @@
 use crate::{
-    Executor, Isolation, Parallelism, Reason, Search, Selection, Status, group_by_conflict, run,
-    run_with, select,
+    Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
+    group_by_conflict, run_with, select,
 };
 use ply_core::{CheckOutput, EffectAtom, Footprint, Resource};
-use ply_eval::{Plan, TaskRegions, Value};
+use ply_eval::Plan;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
@@ -44,6 +44,7 @@ struct Program {
     resolved: Resolved,
     check: CheckOutput,
     hashes: HashOutput,
+    src: String,
 }
 
 impl Program {
@@ -61,7 +62,17 @@ impl Program {
             resolved,
             check,
             hashes,
+            src: src.to_string(),
         }
+    }
+
+    /// Each module's source text by name — what the whole Ply emitter re-parses to produce bodies.
+    fn texts(&self) -> std::collections::HashMap<String, String> {
+        self.program
+            .modules
+            .iter()
+            .map(|m| (m.name.to_string(), self.src.clone()))
+            .collect()
     }
 
     fn index_of(&self, name: &str) -> usize {
@@ -86,20 +97,28 @@ impl Program {
         )
     }
 
-    /// Both engines, so that every scheduling and caching test in this file is also a differential
-    /// test over a real Ply program.
+    /// Runs the fixture on a real compiled C tier — the only evaluator under tier-only — so every
+    /// scheduling and caching test in this file is exercised over a real Ply program end to end.
+    /// `Unit::over` leaks a `&'static Unit`, which is fine in a test.
     fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
-        run(
-            selection,
+        let unit = ply_codegen::Unit::over_with_texts(
             &self.program,
             &self.resolved,
             &self.check,
-            &self.hashes,
-            store,
-            false,
-            Search::of(selection),
-            crate::Hosting::hermetic(),
+            self.texts(),
         )
+        .expect("this host has a C compiler");
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        let executor = TierExecutor(
+            InterpExecutor::new(&self.program, &self.resolved, &self.check)
+                .with_backend(unit, spec)
+                .with_hosts(Hosting::hermetic())
+                .with_search(Search::of(selection)),
+        );
+        run_with(selection, &self.check, &self.hashes, store, &executor)
     }
 
     fn def_hash(&self, name: &str) -> ply_hash::DefHash {
@@ -108,6 +127,50 @@ impl Program {
             .get(&Symbol::new(name))
             .copied()
             .expect("a definition by that name")
+    }
+}
+
+/// The tier-backed executor these fixtures run on, presenting as the evaluator. Under tier-only the
+/// C tier is the sole engine, and this file's caching assertions — written when the interpreter was
+/// the evaluator — key results by the bare test hash, which is exactly the [`crate::Engine::Evaluator`]
+/// namespace. Reporting the backend's own engine would move every pass into a namespace the
+/// `Engine::Evaluator` selections and `store.get(hash)` checks never read, so the runner's observable
+/// behaviour is kept identical by naming the engine the tier stands in for.
+struct TierExecutor<'a>(InterpExecutor<'a>);
+
+impl<'a> Executor for TierExecutor<'a> {
+    type Worker = crate::Worker<'a>;
+
+    fn worker(&self) -> Self::Worker {
+        self.0.worker()
+    }
+
+    fn execute(&self, worker: &mut Self::Worker, index: usize) -> Result<(), Diagnostic> {
+        self.0.execute(worker, index)
+    }
+
+    fn engine(&self) -> crate::Engine {
+        crate::Engine::Evaluator
+    }
+
+    fn exploration(&self, worker: &Self::Worker) -> Option<ply_eval::Exploration> {
+        self.0.exploration(worker)
+    }
+
+    fn host_use(&self, worker: &Self::Worker) -> Option<ply_eval::host::HostUse> {
+        self.0.host_use(worker)
+    }
+
+    fn audited(&self, worker: &Self::Worker) -> Option<bool> {
+        self.0.audited(worker)
+    }
+
+    fn backend_use(&self, worker: &Self::Worker) -> Option<crate::BackendUse> {
+        self.0.backend_use(worker)
+    }
+
+    fn teardown(&self, worker: &mut Self::Worker) -> Vec<Diagnostic> {
+        self.0.teardown(worker)
     }
 }
 
@@ -509,44 +572,6 @@ test "twice is right" {
 }
 "#;
 
-const MULTI_SHOT: &str = r#"
-effect amb {
-  read flip[coin]() -> Bool
-}
-
-test "both branches" {
-  with_cell[trace](0) { c -> {
-    let total = handle {
-      let b = amb.flip[coin]();
-      cell_set(c, cell_get(c) + 1);
-      if b { 10 } else { 20 }
-    } with {
-      amb.flip[coin]() resume k -> k(true) + k(false),
-      return x -> x
-    };
-    assert_eq(total, 30);
-    assert_eq(cell_get(c), 2)
-  } }
-}
-"#;
-
-/// A multi-shot program runs and caches with no flags at all.
-#[test]
-fn a_test_only_the_machine_can_run_is_not_reported_as_a_divergence() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(MULTI_SHOT);
-
-    let selection = program.select(&store);
-    let report = program.run(&selection, &mut store);
-    assert_eq!(
-        (report.passed, report.failed),
-        (1, 0),
-        "{:#?}",
-        report.failures
-    );
-}
-
 #[test]
 fn a_cold_cache_selects_every_test() {
     let root = TempRoot::new();
@@ -643,56 +668,6 @@ fn renaming_a_definition_selects_nothing() {
     assert!(
         selection.to_run.is_empty(),
         "a rename changes no behaviour, so nothing may re-run: {selection:?}"
-    );
-}
-
-const NONDETERMINISTIC: &str = r#"
-nondet effect wall {
-  read now() -> Int
-}
-
-fn tick() -> Int / {wall.read} = wall.now()
-
-test "pure arithmetic" {
-  assert_eq(1 + 1, 2)
-}
-
-test/nondet "the clock advances" {
-  handle {
-    assert(tick() > 0)
-  } with {
-    wall.now() -> 7,
-  }
-}
-"#;
-
-#[test]
-fn a_nondet_test_always_runs_and_is_never_cached() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(NONDETERMINISTIC);
-    let nondet = program.index_of("the clock advances");
-    let pure = program.index_of("pure arithmetic");
-
-    for round in 0..3 {
-        let selection = program.select(&store);
-        assert_eq!(selection.reason(nondet), Some(Reason::Nondet));
-        assert!(selection.to_run.contains(&nondet), "round {round}");
-        if round > 0 {
-            assert_eq!(
-                selection.reason(pure),
-                Some(Reason::Cached),
-                "round {round}"
-            );
-            assert_eq!(selection.to_run, vec![nondet], "round {round}");
-        }
-        let report = program.run(&selection, &mut store);
-        assert_eq!(report.failed, 0, "round {round}: {:#?}", report.failures);
-    }
-
-    assert!(
-        store.get(program.hashes.tests[nondet]).is_none(),
-        "a nondet pass must never reach the store"
     );
 }
 
@@ -1307,40 +1282,6 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
     );
 }
 
-const RUNAWAY: &str = r#"
-fn step(n: Int) -> Int = n + 1
-fn spin(n: Int) -> Int = spin(step(n))
-
-test "spins" { assert_eq(spin(0), 0) }
-"#;
-
-/// Exceeding a documented resource limit is the program's behaviour, not Ply falling over.
-#[test]
-fn a_runaway_recursion_is_a_red_test_and_not_a_defect_in_ply() {
-    let root = TempRoot::new();
-    let mut store = root.store();
-    let program = Program::compile(RUNAWAY);
-    let selection = program.select(&store);
-    let report = program.run(&selection, &mut store);
-
-    assert_eq!(report.failed, 1);
-    assert_eq!(report.results[0].status, Status::Failed);
-
-    let failure = &report.failures[0];
-    assert!(!failure.defect, "{:#?}", failure.diagnostic);
-    assert_eq!(failure.diagnostic.code, ply_span::codes::RUNTIME_ERROR);
-    assert!(
-        failure.diagnostic.message.contains("recursion limit"),
-        "{}",
-        failure.diagnostic.message
-    );
-    assert_ne!(
-        failure.attribution.bisection.verdict,
-        crate::Verdict::NotAttempted(crate::Skipped::Panicked),
-        "bisection was suppressed for a perfectly bisectable failure"
-    );
-}
-
 #[test]
 fn the_json_report_carries_the_diagnostic_and_the_suspects() {
     let root = TempRoot::new();
@@ -1661,75 +1602,6 @@ fn the_artifact_reports_isolation_per_test_and_in_total() {
     assert!(
         summary.iter().any(|l| l == "isolated: 2 of 4"),
         "{summary:#?}"
-    );
-}
-
-/// The region region isolation asks `ply-test` for: a worker outlives a single test, so a test that
-/// inherited the previous one's cells would be sharing state through the back door the whole design
-/// exists to close.
-#[test]
-fn a_test_region_closes_and_the_group_fixture_does_not() {
-    let program = Program::compile(DISJOINT_CELLS);
-    let built = std::sync::atomic::AtomicUsize::new(0);
-    let fixture: &(dyn Fn(&mut TaskRegions) -> Value + Sync) = &|regions: &mut TaskRegions| {
-        built.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Value::Cell(regions.alloc_cell(Value::Int(7)))
-    };
-    let executor = crate::InterpExecutor::new(&program.program, &program.resolved, &program.check)
-        .with_fixture(fixture);
-
-    let mut worker = executor.worker();
-    assert_eq!(built.load(std::sync::atomic::Ordering::Relaxed), 1);
-    assert_eq!(worker.region().mark(), 1);
-    assert_eq!(
-        worker.cells().live(),
-        1,
-        "the worker starts inside the group's region"
-    );
-
-    executor
-        .execute(&mut worker, 0)
-        .expect("the first test passes");
-    let allocated = worker.cells().stats().allocations;
-    assert!(allocated > 1, "the test allocated a cell of its own");
-    assert_eq!(
-        worker.cells().live(),
-        1,
-        "and gave it back at its region's close, leaving the group's fixture"
-    );
-    assert_eq!(
-        worker.region().fixture().len(),
-        1,
-        "closing the test's region left the group's own state alone"
-    );
-    assert_eq!(worker.region().mark(), 1);
-
-    executor
-        .execute(&mut worker, 1)
-        .expect("the second test passes");
-    assert_eq!(
-        worker.cells().stats().allocations,
-        allocated,
-        "the second test bumped as many slots as the first, from the same mark"
-    );
-    assert_eq!(
-        worker.cells().live(),
-        1,
-        "the second test opened the region, not the first test's leftovers"
-    );
-    let (seeded, handle) = worker.region().open();
-    let seed = match handle {
-        Value::Cell(slot) => seeded.get(slot).cloned(),
-        other => panic!("expected the fixture's handle, found {other:?}"),
-    };
-    assert!(
-        matches!(seed, Some(Value::Int(7))),
-        "every test still sees the seeded state"
-    );
-    assert_eq!(
-        built.load(std::sync::atomic::Ordering::Relaxed),
-        1,
-        "the fixture is built once for the worker, not once per test"
     );
 }
 

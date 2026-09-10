@@ -1789,7 +1789,7 @@ definition the tier refuses is left to the machine. The emitted bodies and the
 built unit are both cached under `PLY_C_CACHE`, so a warm run compiles nothing
 and an edit recompiles one unit. `PLY_C_EMITTER=ply:<dir>` makes the emitter
 written in Ply in `<dir>` the tier's producer, body by body, with the built-in
-emitter answering whatever it does not reach; `PLY_C_EMITTER=ply-whole:<dir>`
+emitter answering whatever it does not reach; `PLY_C_EMITTER=ply:<dir>`
 makes its answer the whole unit's, its refusals dropped as the built-in
 emitter's would be and the built-in emitter not run over the program at all;
 that mode also compiles `handle`, `perform`, `with_cell` and `simulate` with
@@ -1938,6 +1938,15 @@ because the machine was busy. `examples/timeout.ply` is built on this.
 progress — nothing enabled and no timer that can fire, or a spent step budget —
 is `E0414 deadlock`. A `simulate` inside a `simulate`, lexically or through a
 call, is `E0416`.
+
+**A task performs against the handlers that enclosed its `task.spawn`**, as they
+stood at the spawn: a `handle` around the spawn answers the task's operations
+whether it sits inside or outside the region, and whatever the spawner does
+afterwards — leaving that `handle` before the task runs changes nothing the
+task sees. The one clause a task cannot reach is one that binds `resume`
+(§7.7): the continuation it would capture is the spawner's body rather than the
+task's, so performing that operation from a task is `E0502` rather than a
+wrong capture.
 
 ### 10.3 The search, and why it is a proof
 
@@ -3032,6 +3041,15 @@ $ ply run app.plyx --host           # run it out of its own definitions
 carries a line number. It is off, and a flag, because it is a disclosure
 decision — and it changes the digest, so "was this built with sources" is
 answerable from the digest alone.
+
+An artifact always carries the compiled unit the Ply emitter produced over its
+definitions — the C and the record the runtime rebuilds its tables from — so
+`ply run app.plyx` enters the program as it was built, effects included, and
+re-parses nothing. The unit is tied to the runtime that built it: one built under
+another `ply` is left aside with a warning, and the run falls back to the pure
+fragment the reference emitter rebuilds from the bodies alone, from which no
+`perform` reaches the host. `ply build` reports, as a warning, any definition the
+emitter refused, since that one is entered from nothing at run time.
 
 `--config-schema` and `--db-schema` on `ply build` ship those functions' closures
 too, so the deployed artifact keeps the start-up refusals: a schema function is

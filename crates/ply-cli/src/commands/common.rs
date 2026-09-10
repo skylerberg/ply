@@ -11,7 +11,11 @@ pub const IND: &str = "   ";
 /// `--backend`'s value as a spec, or the diagnostic that refuses it.
 pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpec>, Diagnostic> {
     let Some(spec) = flag else {
-        return Ok(None);
+        // Tier-only: the compiled tier is the default (and only) evaluator of the language.
+        return Ok(Some(ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..ply_eval::BackendSpec::default()
+        }));
     };
     ply_eval::backend::parse(spec).map(Some).map_err(|message| {
         Diagnostic::error(codes::BACKEND_UNAVAILABLE, message).note(
@@ -56,95 +60,71 @@ pub fn engine_of(spec: Option<&ply_eval::BackendSpec>) -> ply_test::Engine {
     };
     let (name, variant) = match spec.kind {
         ply_eval::BackendKind::Reference => ("reference", ""),
-        ply_eval::BackendKind::Interp => ("interp", ""),
-        ply_eval::BackendKind::Combined => ("combined", ""),
         ply_eval::BackendKind::C => ("c", ply_codegen::backend::registry_width()),
     };
     ply_test::Engine::of_backend(name, variant, spec)
 }
 
-/// The run's backend, built once over a checked program, or the diagnostic that refuses it.
-/// What each definition's emitted code is a function of: its own hash, which the hasher builds
-/// over its text with every referent's hash spliced in -- so it moves when anything the emitter
-/// would inline moves, which is what an inlining emitter's cache has to be keyed on.
+/// The cache key each keyable root is kept under.
 ///
-/// A test's root is a definition here like any other, named the way `ply_codegen` names it.
-/// `HashOutput::tests` is parallel to the program's tests walked module by module in load order,
-/// which `driver::test_hashes_of` already relies on and says so.
-pub(crate) fn emit_keys(
-    program: &ply_syntax::ast::Program,
-    hashes: &ply_hash::HashOutput,
-) -> std::collections::HashMap<String, String> {
-    use ply_syntax::ast::Item;
-    let mut keys = std::collections::HashMap::new();
-    let mut test_at = 0;
-    let mut law_at = 0;
-    for module in &program.modules {
-        let mut ordinal = 0;
-        let mut law_ordinal = 0;
-        for item in &module.items {
-            match item {
-                Item::Fn(def) => {
-                    let name = module.name.qualify(&def.name.name).to_string();
-                    if let Some(h) = hashes.defs.get(&ply_span::Symbol::new(&name)) {
-                        // A clause's root is keyed by its owner's hash, which covers the clause.
-                        let (mut requires, mut ensures) = (0, 0);
-                        for clause in &def.spec {
-                            let (kind, k) = match clause.kind {
-                                ply_syntax::ast::SpecKind::Requires => {
-                                    requires += 1;
-                                    ("requires", requires - 1)
-                                }
-                                ply_syntax::ast::SpecKind::Ensures => {
-                                    ensures += 1;
-                                    ("ensures", ensures - 1)
-                                }
-                            };
-                            let root = module
-                                .name
-                                .qualify(&ply_codegen::clause_root_name(&def.name.name, kind, k))
-                                .to_string();
-                            keys.insert(root, format!("{}#{kind}#{k}", h.to_hex()));
-                        }
-                        keys.insert(name, h.to_hex());
-                    }
-                }
-                Item::Law(law) => {
-                    if let Some(h) = hashes.laws.get(law_at) {
-                        for part in ["guard", "body"] {
-                            if part == "guard" && law.guard.is_none() {
-                                continue;
-                            }
-                            let root = module
-                                .name
-                                .qualify(&ply_codegen::law_root_name(law_ordinal, part))
-                                .to_string();
-                            keys.insert(root, format!("{}#{part}", h.to_hex()));
-                        }
-                    }
-                    law_ordinal += 1;
-                    law_at += 1;
-                }
-                Item::Test(_) => {
-                    let name = module
-                        .name
-                        .qualify(&ply_codegen::test_root_name(ordinal))
-                        .to_string();
-                    if let Some(h) = hashes.tests.get(test_at) {
-                        keys.insert(name, h.to_hex());
-                    }
-                    ordinal += 1;
-                    test_at += 1;
-                }
-                _ => {}
-            }
-        }
-    }
-    keys
+/// One definition of these keys, in `ply_codegen`: they decide what the emitter caches *and*, under
+/// tier-only, what the unit holds as a root, so a second copy that drifted from the first would
+/// quietly change both. This crate had one, and its comment claimed a spec clause is keyed by its
+/// owner's hash "which covers the clause" -- which is not true, and cost the prover a judgement.
+pub(crate) use ply_codegen::emit_keys;
+
+/// Runs `selection` on a compiled tier — the only evaluator under tier-only (ADR 0048) — built by
+/// the whole Ply emitter from `loaded`'s module source texts, over the program the runner works on
+/// (`to_run`). The reusable form of what the `test` command builds inline, for the callers that
+/// reached for `ply_test::run` when the interpreter needed no backend and now decline every test
+/// without one.
+pub fn run_on_tier(
+    loaded: &crate::load::Loaded,
+    selection: &ply_test::Selection,
+    hosting: ply_test::Hosting<'_>,
+    store: &mut ply_store::Store,
+) -> ply_test::RunReport {
+    ply_codegen::c::producer::ensure_default();
+    let (program, resolved) = loaded.to_run();
+    let texts = module_texts(program, &loaded.sources);
+    let unit = ply_codegen::Unit::over_with_texts(program, resolved, &loaded.check, texts)
+        .expect("this host has a C compiler");
+    let spec = ply_eval::BackendSpec {
+        kind: ply_eval::BackendKind::C,
+        ..Default::default()
+    };
+    let executor = ply_test::InterpExecutor::new(program, resolved, &loaded.check)
+        .with_backend(unit, spec)
+        .with_search(ply_test::Search::of(selection))
+        .with_hosts(hosting);
+    ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
+}
+
+/// The default tier attached to a machine over `loaded`'s program: what the commands build
+/// inline, for a test that makes a machine of its own.
+#[cfg(test)]
+pub(crate) fn attach_tier(
+    machine: &mut ply_eval::Machine<'_>,
+    loaded: &crate::load::Loaded,
+) -> Result<(), Diagnostic> {
+    let Some(spec) = backend_spec(None)? else {
+        return Ok(());
+    };
+    let texts = module_texts(&loaded.program, &loaded.sources);
+    let provider = build_backend(
+        &spec,
+        &loaded.program,
+        &loaded.resolved,
+        &loaded.check,
+        &loaded.hashes,
+        texts,
+    )?;
+    machine.set_compiled(provider.attach(&spec));
+    Ok(())
 }
 
 /// Each module's source text by name: what a second emitter reads the program from.
-pub(crate) fn module_texts(
+pub fn module_texts(
     program: &ply_syntax::ast::Program,
     sources: &SourceMap,
 ) -> std::collections::HashMap<String, String> {
@@ -161,10 +141,11 @@ pub(crate) fn module_texts(
 
 /// The backend `ply prove` and `ply review` attach for a program's propositions (ADR 0045
 /// §"The facade"): the unit over the whole program, its laws' and clauses' roots included.
-pub(crate) fn prover_backend(
+pub fn prover_backend(
     flag: Option<&String>,
     loaded: &crate::load::Loaded,
 ) -> Result<Option<(&'static dyn ply_eval::Provider, ply_eval::BackendSpec)>, Diagnostic> {
+    ply_codegen::c::producer::ensure_default();
     let Some(spec) = backend_spec(flag)? else {
         return Ok(None);
     };
@@ -179,27 +160,65 @@ pub(crate) fn prover_backend(
     Ok(Some((provider, spec)))
 }
 
-/// `PLY_C_EMITTER=ply:<dir>` makes the Ply emitter in `<dir>` the C tier's producer (ADR 0042).
+/// `PLY_C_EMITTER=ply:<dir>` produces with the Ply emitter in `<dir>` rather than the one beside
+/// the binary: a working copy, for a change to the emitter that has not been bootstrapped yet.
 /// The recipe loads that directory as a project of its own -- the front end, `emit.ply` and
 /// the standard library they import -- and compiles it with the reference emitter; a worker
 /// thread builds its own copy from the same recipe, since a loaded unit does not cross threads.
-pub(crate) fn install_producer_from_env() {
-    let Ok(spec) = std::env::var("PLY_C_EMITTER") else {
-        return;
-    };
-    let (dir, whole) = match (spec.strip_prefix("ply:"), spec.strip_prefix("ply-whole:")) {
-        (Some(dir), _) => (dir, false),
-        (_, Some(dir)) => (dir, true),
-        _ => {
-            eprintln!(
-                "PLY_C_EMITTER is `{spec}`; the producers are `ply:<dir>`, which answers bodies \
-                 the reference accepted, and `ply-whole:<dir>`, which answers the unit"
-            );
-            return;
+/// The self-hosted Ply emitter's directory, found by walking up from the working directory for
+/// `spikes/ply-parser/emit.ply`. `None` when it is not on disk — a shipped binary, until the
+/// bundle is embedded (ADR 0048).
+fn find_emitter_dir() -> Option<std::path::PathBuf> {
+    fn search(mut cur: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        loop {
+            let candidate = cur.join("spikes/ply-parser");
+            if candidate.join("emit.ply").is_file() {
+                return Some(candidate);
+            }
+            if !cur.pop() {
+                return None;
+            }
         }
+    }
+    // The working directory first — a developer runs `ply` from the repository — then the
+    // executable's own directory, since a `ply` invoked from elsewhere (a test's temp project) is
+    // still `<repo>/target/**/ply`, under the `spikes/` it needs. A shipped binary finds neither
+    // and falls through to the reference emitter until the bundle is embedded (ADR 0048).
+    std::env::current_dir().ok().and_then(search).or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .and_then(search)
+    })
+}
+
+pub(crate) fn install_producer_from_env() {
+    if ply_codegen::c::producer::installed() {
+        return;
+    }
+    // The self-hosted Ply emitter is the tier's producer, and under tier-only (ADR 0048) it is the
+    // default: the Rust reference emitter is a fragment that declines `perform`/`handle`/`simulate`,
+    // so the whole language runs only when the Ply emitter produces. `PLY_C_EMITTER=ply:<dir>`
+    // still points it at a working copy.
+    let dir = match std::env::var("PLY_C_EMITTER") {
+        Ok(spec) => match spec.strip_prefix("ply:") {
+            Some(dir) => std::path::PathBuf::from(dir),
+            None => {
+                eprintln!(
+                    "PLY_C_EMITTER is `{spec}`; the spelling is `ply:<dir>`, the directory the \
+                     emitter's own `.ply` sources are in"
+                );
+                return;
+            }
+        },
+        // No override: the whole Ply emitter, found relative to the repository. A shipped binary
+        // with no `spikes/ply-parser` on disk falls through to the reference emitter until the
+        // bundle is embedded (ADR 0048's follow-up).
+        Err(_) => match find_emitter_dir() {
+            Some(dir) => dir,
+            None => return,
+        },
     };
-    ply_codegen::c::producer::set_whole(whole);
-    let dir = std::path::PathBuf::from(dir);
     let identity = {
         let mut modules = Vec::new();
         if let Ok(entries) = std::fs::read_dir(&dir) {
@@ -302,23 +321,6 @@ pub fn build_backend(
     install_producer_from_env();
     match spec.kind {
         ply_eval::BackendKind::Reference => Ok(ply_eval::Fragment::over(program, resolved, check)),
-        ply_eval::BackendKind::Interp => Ok(ply_eval::interp::Interpreter::over(
-            program, resolved, check,
-        ) as &'static dyn ply_eval::Provider),
-        ply_eval::BackendKind::Combined => ply_codegen::combined::Combined::build(
-            program,
-            resolved,
-            check,
-            emit_keys(program, hashes),
-            texts,
-        )
-        .map(|c| c as &'static dyn ply_eval::Provider)
-        .map_err(|error| {
-            Diagnostic::error(
-                codes::BACKEND_UNAVAILABLE,
-                format!("the combined backend could not be built: {error:#}"),
-            )
-        }),
         ply_eval::BackendKind::C => {
             ply_codegen::Unit::keyed(program, resolved, check, emit_keys(program, hashes), texts)
                 .map(|unit| unit as &'static dyn ply_eval::Provider)
@@ -463,8 +465,10 @@ pub fn materialise_schema(
         .defs
         .values()
         .find(|d| d.name.as_str() == name)?;
-    ply_eval::Machine::new(&loaded.program, &loaded.resolved, &loaded.check)
-        .call(name, Vec::new(), def.span)
+    // A `--db-schema` function is a pure const the tooling reads before the run; the pure applier
+    // evaluates it without a compiled tier (ADR 0048), as `--config-schema` does.
+    ply_eval::interp::Pure::new(&loaded.program, &loaded.resolved)
+        .call(name, Vec::new(), def.span, 10_000)
         .ok()
         .as_ref()
         .and_then(crate::db::schema::shape_of)

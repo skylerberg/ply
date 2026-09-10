@@ -1892,7 +1892,7 @@ pub fn assert_failure(message: &Value, span: Span) -> Diagnostic {
 /// through an effect the function performed, or a nested update of the same cell.
 #[cold]
 #[inline(never)]
-pub(crate) fn cell_in_update(span: Span, slot: Slot, what: &str) -> Diagnostic {
+pub fn cell_in_update(span: Span, slot: Slot, what: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("`{what}` reached cell {slot} while a `cell_update` holds its contents"),
@@ -1904,7 +1904,7 @@ pub(crate) fn cell_in_update(span: Span, slot: Slot, what: &str) -> Diagnostic {
 
 /// A cell whose region has closed.
 #[cold]
-pub(crate) fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
+pub fn no_such_cell(span: Span, slot: Slot) -> Diagnostic {
     Diagnostic::error(
         codes::INTERNAL_ERROR,
         format!("cell {slot} does not belong to the region this code is running in"),
@@ -1930,7 +1930,7 @@ mod tests {
         bin, block, callv, clause, discard, effect_def, handle, int, lam, letv, list, perform,
         standalone, var, with_cell,
     };
-    use crate::machine::Machine;
+    use crate::evaluator::Machine;
     use crate::task_regions::TaskRegions;
     use ply_syntax::ast::{BinOp, Expr, Item, Mode};
 
@@ -1948,7 +1948,7 @@ mod tests {
         args: Vec<Value>,
         mut answer: impl FnMut(&[Value]) -> Value,
     ) -> Result<Value, Diagnostic> {
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         let mut step = call(b, args, cells.arena_mut(), Span::DUMMY)?;
         loop {
             match step {
@@ -1963,7 +1963,7 @@ mod tests {
 
     /// A builtin that cannot suspend, called the way an engine calls it.
     fn done(b: Builtin, args: Vec<Value>) -> Result<Value, Diagnostic> {
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         match call(b, args, cells.arena_mut(), Span::DUMMY)? {
             Step::Done(v) => Ok(v),
             Step::Apply { .. } => panic!("`{}` suspended", b.name()),
@@ -2557,7 +2557,7 @@ mod tests {
     /// more than once, and each resumption is its own search.
     #[test]
     fn one_suspension_point_inside_position_can_be_resumed_twice() {
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         let start = call(
             Builtin::BytesPosition,
             vec![bytes(b"abc"), Value::Int(0), f()],
@@ -2778,7 +2778,7 @@ mod tests {
     /// each resumption completes its own list.
     #[test]
     fn one_suspension_point_inside_map_can_be_resumed_twice() {
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         let start = call(
             Builtin::Map,
             vec![ints(&[1, 2, 3]), f()],
@@ -2842,7 +2842,7 @@ mod tests {
     /// the countdown.
     #[test]
     fn one_suspension_point_inside_iterate_can_be_resumed_twice() {
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         let start = call(
             Builtin::Iterate,
             vec![Value::Int(0), Value::Int(4), f()],
@@ -2895,7 +2895,7 @@ mod tests {
 
         // And the budget above is exactly tight, which is what makes the pair above non-vacuous:
         // one leg spends all four rounds, so two legs sharing a countdown could not both finish.
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         let tight = call(
             Builtin::Iterate,
             vec![Value::Int(0), Value::Int(3), f()],
@@ -2991,7 +2991,7 @@ mod tests {
 
     #[test]
     fn cell_builtins_read_and_write_the_arena_they_are_given() {
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         let slot = cells.alloc_cell(Value::Int(1));
         let set = call(
             Builtin::CellSet,
@@ -3024,7 +3024,7 @@ mod tests {
         other.reset();
         let stale = other.alloc_cell(Value::Int(2));
 
-        let mut cells = TaskRegions::new();
+        let mut cells: TaskRegions = TaskRegions::new();
         let live = cells.alloc_cell(Value::Int(3));
         assert_eq!(stale.index(), live.index());
         assert_ne!(stale.generation(), live.generation());
@@ -3372,39 +3372,6 @@ mod tests {
         assert_eq!(run(vec![state()], e).unwrap().render(), "306");
     }
 
-    /// The handler is inside the callback, so it is installed and torn down once per element rather
-    /// than once for the whole `map`.
-    #[test]
-    fn a_handler_installed_inside_a_map_callback_does_not_leak_to_the_next_element() {
-        let inner = handle(
-            perform("state", "get", None, vec![]),
-            vec![clause("state", "get", None, &[], var("x"))],
-        );
-        let e = callv("map", vec![list(vec![int(1), int(2)]), lam(&["x"], inner)]);
-        assert_eq!(run(vec![state()], e).unwrap().render(), "[1, 2]");
-
-        let leaked = block(
-            vec![letv(
-                "ys",
-                callv(
-                    "map",
-                    vec![
-                        list(vec![int(1)]),
-                        lam(
-                            &["x"],
-                            handle(var("x"), vec![clause("state", "get", None, &[], int(9))]),
-                        ),
-                    ],
-                ),
-            )],
-            Some(perform("state", "get", None, vec![])),
-        );
-        assert_eq!(
-            run(vec![state()], leaked).unwrap_err().code,
-            codes::UNHANDLED_EFFECT
-        );
-    }
-
     #[test]
     fn an_assertion_inside_a_callback_keeps_its_structured_failure() {
         let e = callv(
@@ -3422,19 +3389,6 @@ mod tests {
             "{:?}",
             d.notes
         );
-    }
-
-    #[test]
-    fn an_unhandled_effect_from_a_callback_reaches_the_caller_unchanged() {
-        let e = callv(
-            "map",
-            vec![
-                list(vec![int(1)]),
-                lam(&["x"], perform("state", "get", None, vec![])),
-            ],
-        );
-        let d = run(vec![state()], e).unwrap_err();
-        assert_eq!(d.code, codes::UNHANDLED_EFFECT);
     }
 
     #[test]

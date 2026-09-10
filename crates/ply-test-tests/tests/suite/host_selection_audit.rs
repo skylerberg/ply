@@ -1,6 +1,6 @@
 //! What decides whether a host-backed test runs at all.
 
-use crate::fixture::Compiled;
+use crate::fixture::{Compiled, TierExecutor};
 use ply_core::ty::Resource;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
@@ -9,7 +9,7 @@ use ply_eval::host::{
 use ply_eval::{Plan, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
-use ply_test::{Hosting, Reason, Search, select};
+use ply_test::{Hosting, InterpExecutor, Reason, Search, select};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,16 +105,19 @@ fn run(
         Some(binding) => Hosting::hermetic().with_binding(Arc::clone(binding)),
         None => Hosting::hermetic(),
     };
-    ply_test::run(
+    let (unit, spec) = compiled.tier();
+    let executor = TierExecutor(
+        InterpExecutor::new(&compiled.program, &compiled.resolved, &compiled.check)
+            .with_backend(unit, spec)
+            .with_search(Search::default())
+            .with_hosts(hosting),
+    );
+    ply_test::run_with(
         &selection,
-        &compiled.program,
-        &compiled.resolved,
         &compiled.check,
         &compiled.hashes,
         store,
-        false,
-        Search::default(),
-        hosting,
+        &executor,
     )
 }
 

@@ -280,9 +280,10 @@ fn a_flipped_bit_in_a_body_is_e0443_naming_the_definition() {
     let artifact = artifact_of(dir.path());
     let mut bytes = artifact.encode();
 
-    // The first record starts past the header and three descriptors; its payload starts past the
-    // 32-byte key and the length prefix.
-    let record = 188 + 24 * 3;
+    // The first record starts past the header and the section descriptors; its payload starts
+    // past the 32-byte key and the length prefix.
+    let sections = u32::from_le_bytes(bytes[180..184].try_into().unwrap()) as usize;
+    let record = 188 + 24 * sections;
     bytes[record + 36] ^= 0x40;
     let path = dir.path().join("bad.plyx");
     std::fs::write(&path, &bytes).unwrap();
@@ -984,4 +985,34 @@ fn a_build_schema_that_names_nothing_is_refused_at_build_time() {
         String::from_utf8_lossy(&out.stderr).to_string() + &String::from_utf8_lossy(&out.stdout);
     assert!(text.contains(codes::UNKNOWN_NAME), "{text}");
     assert!(!dir.path().join("x.plyx").exists());
+}
+
+/// A unit built for another runtime is left aside with a warning, and the run still answers from
+/// the pure fragment.
+#[test]
+fn a_unit_built_for_another_runtime_is_left_aside_with_a_warning() {
+    let dir = project("fn main() -> Int = 6 * 7\n");
+    let mut artifact = artifact_of(dir.path());
+    let unit = artifact
+        .unit
+        .as_mut()
+        .expect("an artifact carries its unit");
+    unit.runtime = "another runtime".to_string();
+    write_artifact(&dir.path().join("m.plyx"), &artifact);
+
+    let out = ply(dir.path()).args(["run", "m.plyx"]).output().unwrap();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("built for another runtime"), "{text}");
+    let v = json_of(
+        &ply(dir.path())
+            .args(["run", "m.plyx", "--json"])
+            .output()
+            .unwrap(),
+    );
+    assert_eq!(v["value"], "42", "{v}");
 }

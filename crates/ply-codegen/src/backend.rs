@@ -31,11 +31,6 @@ pub struct Declines {
     pub not_compiled: u64,
     /// It compiled the name and the call had the wrong number of arguments.
     pub arity: u64,
-    /// The body ran and failed — an overflow, a division by zero, a `match` with no arm, a type the
-    /// fragment's `Int` lowering could not unbox.
-    pub failed: u64,
-    /// The body would have nested past the budget the machine handed it.
-    pub out_of_fuel: u64,
     /// An entry arrived while another was running.
     pub reentered: u64,
     /// A builtin allocated in the fragment's private arena, which means the compile-time refusal of
@@ -49,13 +44,7 @@ pub struct Declines {
 
 impl Declines {
     pub fn total(&self) -> u64 {
-        self.not_compiled
-            + self.arity
-            + self.failed
-            + self.out_of_fuel
-            + self.reentered
-            + self.touched_cells
-            + self.answer
+        self.not_compiled + self.arity + self.reentered + self.touched_cells + self.answer
     }
 }
 
@@ -81,6 +70,17 @@ pub struct Unit {
     compiles: AtomicU64,
     /// Workers whose build failed after the pre-flight in [`Unit::over`] succeeded.
     poisoned: AtomicU64,
+    /// A unit produced elsewhere that this one loads rather than builds.
+    embedded: Option<Embedded>,
+}
+
+/// What an artifact carries of its compiled unit: the C, the record `finish` rebuilds the tables
+/// from as `cache::encode_unit` writes it, and the constructor table it was emitted against. The
+/// record stays encoded here because a decoded one holds `Value`s, which do not cross threads.
+pub struct Embedded {
+    pub text: String,
+    pub record: String,
+    pub ctors: Vec<(Symbol, usize)>,
 }
 
 impl Unit {
@@ -90,7 +90,26 @@ impl Unit {
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
     ) -> Result<&'static Unit> {
-        Unit::keyed(program, resolved, check, HashMap::new(), HashMap::new())
+        // The keys make a test or a law a root the unit compiles (ADR 0045/0048); without them the
+        // tier holds no `test#N` to enter. `over` derives them so a caller that has no hashes of
+        // its own — a test, `Unit::over` at large — still gets a unit that runs the language.
+        Unit::over_with_texts(program, resolved, check, HashMap::new())
+    }
+
+    /// `over` with the program's module source texts, which the whole Ply emitter re-parses to
+    /// produce bodies (it is a front end, not an AST consumer): without them its `bodies_of`
+    /// returns nothing and the tier holds no body. A test that wants the full language on the tier
+    /// passes `texts` here; `over` (no texts) gets the reference emitter's fragment.
+    pub fn over_with_texts(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        check: &ply_core::CheckOutput,
+        texts: HashMap<String, String>,
+    ) -> Result<&'static Unit> {
+        let keys = ply_hash::hash_program(program, resolved, check)
+            .map(|hashes| crate::source::emit_keys(program, &hashes))
+            .unwrap_or_default();
+        Unit::keyed(program, resolved, check, keys, texts)
     }
 
     /// The same, told what each definition's code is a function of, so that emitted bodies and
@@ -136,8 +155,57 @@ impl Unit {
             codegen_nanos: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
+            embedded: None,
         };
         Ok(Box::leak(Box::new(unit)))
+    }
+
+    /// A unit produced elsewhere, which is what an artifact carries: its definitions are the ones
+    /// the record says it took, and nothing here asks a producer for anything.
+    pub fn embedded(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        check: &ply_core::CheckOutput,
+        embedded: Embedded,
+    ) -> Result<&'static Unit> {
+        let record = crate::c::cache::decode_unit(&embedded.record)
+            .ok_or_else(|| anyhow::anyhow!("the embedded unit's record does not decode"))?;
+        let origin = std::ptr::from_ref(program) as usize;
+        let program: &'static Program = Box::leak(Box::new(program.clone()));
+        let resolved: &'static ply_syntax::resolve::Resolved =
+            Box::leak(Box::new(resolved.clone()));
+        let check: &'static ply_core::CheckOutput = Box::leak(Box::new(check.clone()));
+        let source: &'static Source = Box::leak(Box::new(Source::new(program, resolved, check)));
+        let compiled = record.taken.clone();
+        let members: BTreeSet<Symbol> = compiled
+            .iter()
+            .filter(|name| registers(source, name))
+            .map(Symbol::new)
+            .collect();
+        let unit = Unit {
+            origin,
+            source,
+            compiled,
+            members,
+            refusals: record.refusals.clone(),
+            counters: Counters::default(),
+            analysis_nanos: 0,
+            codegen_nanos: AtomicU64::new(0),
+            compiles: AtomicU64::new(0),
+            poisoned: AtomicU64::new(0),
+            embedded: Some(embedded),
+        };
+        Ok(Box::leak(Box::new(unit)))
+    }
+
+    /// The whole unit over `names`, produced and not compiled: what `ply build` embeds.
+    pub fn produce(&'static self, names: &[&str]) -> Result<crate::c::Produced> {
+        crate::c::produce(self.source, names)
+    }
+
+    /// The constructor table a unit over this program is emitted against.
+    pub fn ctors(&self) -> Vec<(Symbol, usize)> {
+        self.source.ctors()
     }
 
     /// The bodies this unit builds, as the concrete type rather than behind `dyn Compiled`.
@@ -173,12 +241,28 @@ impl Unit {
     }
 
     fn build(&'static self) -> Result<Bodies> {
-        // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
-        // worker reads that unit back rather than emitting it again.
-        let candidates = self.source.functions();
-        let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
         let started = std::time::Instant::now();
-        let (native, _refused) = crate::c::build(self.source, &names)?;
+        let native = match &self.embedded {
+            Some(embedded) => {
+                let record = crate::c::cache::decode_unit(&embedded.record)
+                    .ok_or_else(|| anyhow::anyhow!("the embedded unit's record does not decode"))?;
+                crate::c::load_unit(
+                    self.source,
+                    &embedded.text,
+                    record,
+                    embedded.ctors.clone(),
+                    "artifact",
+                )?
+                .0
+            }
+            // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
+            // worker reads that unit back rather than emitting it again.
+            None => {
+                let candidates = self.source.functions();
+                let names: Vec<&str> = candidates.iter().map(String::as_str).collect();
+                crate::c::build(self.source, &names)?.0
+            }
+        };
         self.codegen_nanos.fetch_add(
             u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX),
             Ordering::Relaxed,
@@ -197,7 +281,8 @@ impl Provider for Unit {
         }
         match self.build() {
             Ok(bodies) => ply_eval::backend::wrap(Rc::new(bodies), spec),
-            Err(_) => {
+            Err(e) => {
+                eprintln!("the C tier built no unit for this program: {e:#}");
                 self.poisoned.fetch_add(1, Ordering::Relaxed);
                 ply_eval::backend::wrap(Rc::new(Absent { unit: self }), spec)
             }
@@ -278,12 +363,6 @@ pub struct Bodies {
     ctx: RefCell<crate::rt::Ctx>,
     entered: Cell<u64>,
     declines: Cell<Declines>,
-    /// The fuel an entry was handed when the native stack refused its dive. Every offer with no
-    /// more -- every call nested below that one, and a backend told to ignore its budget hands the
-    /// same fuel at every depth -- is declined without entering until the machine unwinds above
-    /// it, because the machine re-offers each call it evaluates and a refused dive repeated once
-    /// per level is the whole recursion squared.
-    floor: Cell<Option<usize>>,
     /// `PLY_TIER_ONLY=1`: this backend is the only engine, and the machine evaluates nothing.
     tier_only: bool,
 }
@@ -345,7 +424,6 @@ impl Bodies {
             ctx,
             entered: Cell::new(0),
             declines: Cell::new(Declines::default()),
-            floor: Cell::new(None),
             tier_only: std::env::var("PLY_TIER_ONLY").is_ok_and(|v| v == "1"),
         })
     }
@@ -396,12 +474,6 @@ impl Bodies {
         };
         if admitted.arity != args.len() {
             return self.decline(|d| d.arity += 1);
-        }
-        if let Some(at) = self.floor.get() {
-            if fuel <= at {
-                return self.decline(|d| d.out_of_fuel += 1);
-            }
-            self.floor.set(None);
         }
         let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
             return self.decline(|d| d.reentered += 1);
@@ -462,16 +534,20 @@ impl Bodies {
         }
 
         if ctx.failed != 0 {
-            // The fragment's diagnostic is `RUNTIME_ERROR` at `Span::DUMMY`; the machine is about
-            // to evaluate the same definition and raise the real one, and a test root carries
-            // this one only to name what raised when the machine then passes.
             let out_of_stack = ctx.failed == crate::rt::FAILED_OUT_OF_STACK;
-            if out_of_stack {
-                self.floor.set(Some(fuel));
-            }
             let out_of_fuel = out_of_stack || ctx.failed == crate::rt::FAILED_OUT_OF_FUEL;
             let raised = if out_of_fuel {
-                None
+                // Tier-only (ADR 0048): no machine follows to raise the real one, so the limit is
+                // the tier's own to report. The count is the budget this entry was handed, which is
+                // the language's `DEFAULT_MAX_CALLS`; a native-stack floor tripped inside that
+                // budget still reports the budget, because that is the bound the program overran.
+                Some(
+                    ply_span::Diagnostic::error(
+                        ply_span::codes::RUNTIME_ERROR,
+                        format!("recursion limit of {fuel} nested calls exceeded"),
+                    )
+                    .primary(ctx.site(), "the call that overran it"),
+                )
             } else {
                 ctx.diagnostic.take().or_else(|| {
                     (ctx.failed == crate::rt::FAILED_UNWIND).then(|| {
@@ -484,13 +560,8 @@ impl Bodies {
             };
             ctx.end();
             drop(ctx);
-            self.decline(|d| {
-                if out_of_fuel {
-                    d.out_of_fuel += 1;
-                } else {
-                    d.failed += 1;
-                }
-            });
+            // The entry ran and raised: an answer about the program, not a decline.
+            self.entered.set(self.entered.get() + 1);
             return match raised {
                 Some(raised) => Run::Raised(raised),
                 None => Run::Declined,
@@ -572,18 +643,27 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
+    // An entry that arrives while another is running finds the context borrowed: `run` declines
+    // it, so there is nothing to seed, take or read for it.
     fn take_performed(&self) -> Vec<ply_core::ty::EffectAtom> {
-        std::mem::take(&mut self.ctx.borrow_mut().performed)
+        self.ctx
+            .try_borrow_mut()
+            .map(|mut ctx| std::mem::take(&mut ctx.performed))
+            .unwrap_or_default()
     }
 
     fn set_seed(&self, seed: ply_eval::Seed, steps: u32) {
-        let mut ctx = self.ctx.borrow_mut();
-        ctx.seed = seed;
-        ctx.sim_steps = steps.max(1);
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.seed = seed;
+            ctx.sim_steps = steps.max(1);
+        }
     }
 
     fn simulated(&self) -> Option<ply_eval::region::Record> {
-        self.ctx.borrow().record.clone()
+        self.ctx
+            .try_borrow()
+            .ok()
+            .and_then(|ctx| ctx.record.clone())
     }
 
     fn set_host(
@@ -591,19 +671,27 @@ impl ply_eval::Compiled for Bodies {
         binding: std::sync::Arc<ply_eval::HostBinding>,
         runtime: Option<std::rc::Rc<dyn ply_eval::HostRuntime>>,
     ) {
-        self.ctx.borrow_mut().set_host(binding, runtime);
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.set_host(binding, runtime);
+        }
     }
 
     fn set_declared(&self, declared: Option<ply_core::Footprint>) {
-        self.ctx.borrow_mut().declared = declared;
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.declared = declared;
+        }
     }
 
     fn set_re_executed(&self, re_executed: bool) {
-        self.ctx.borrow_mut().re_executed = re_executed;
+        if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
+            ctx.re_executed = re_executed;
+        }
     }
 
     fn take_host_use(&self) -> (ply_eval::host::HostUse, u64) {
-        let mut ctx = self.ctx.borrow_mut();
+        let Ok(mut ctx) = self.ctx.try_borrow_mut() else {
+            return Default::default();
+        };
         (
             std::mem::take(&mut ctx.host_use),
             std::mem::take(&mut ctx.host_ops),
@@ -611,7 +699,10 @@ impl ply_eval::Compiled for Bodies {
     }
 
     fn take_teardown(&self) -> Vec<ply_span::Diagnostic> {
-        std::mem::take(&mut self.ctx.borrow_mut().teardown)
+        self.ctx
+            .try_borrow_mut()
+            .map(|mut ctx| std::mem::take(&mut ctx.teardown))
+            .unwrap_or_default()
     }
 
     fn tier_only(&self) -> bool {

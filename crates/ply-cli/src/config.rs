@@ -384,8 +384,11 @@ pub mod schema {
             .values()
             .find(|d| d.name.as_str() == name)
             .ok_or_else(|| unknown(check, name))?;
-        let value = ply_eval::Machine::new(program, resolved, check)
-            .call(name, Vec::new(), def.span)
+        // A schema function is checked pure and first-order above (its footprint must be empty),
+        // and reading a const the tooling needs before anything is bound is exactly what the pure
+        // applier is for (ADR 0048) — no compiled tier to stand up for one nullary call.
+        let value = ply_eval::interp::Pure::new(program, resolved)
+            .call(name, Vec::new(), def.span, 10_000)
             .map_err(|failure| {
                 Diagnostic::error(
                     codes::CONFIG_UNAVAILABLE,

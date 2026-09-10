@@ -18,7 +18,6 @@ use anyhow::{Context, Result, anyhow, bail};
 use ply_eval::Value;
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 
 /// How a thread builds its producer.
@@ -32,6 +31,7 @@ static IDENTITY: OnceLock<String> = OnceLock::new();
 thread_local! {
     static MINE: RefCell<Option<Result<PlyProducer, String>>> = const { RefCell::new(None) };
     static BUILDING: Cell<bool> = const { Cell::new(false) };
+    static REFERENCE_ONLY: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Installs the recipe every thread's producer is built from. The first installation wins; a
@@ -39,6 +39,141 @@ thread_local! {
 pub fn install(recipe: Recipe, identity: String) {
     let _ = IDENTITY.set(identity);
     let _ = RECIPE.set(recipe);
+}
+
+/// The self-hosted Ply emitter's source directory, found by walking up for
+/// `spikes/ply-parser/emit.ply` — from the working directory first, then from the executable's own
+/// location, since a `ply` invoked with its CWD elsewhere (a test's temp project) is still
+/// `<repo>/target/**/ply`, under the `spikes/` it needs. `None` when it is on neither path — a
+/// shipped binary, until the bundle is embedded.
+fn find_emitter_dir() -> Option<std::path::PathBuf> {
+    fn search(mut cur: std::path::PathBuf) -> Option<std::path::PathBuf> {
+        loop {
+            let candidate = cur.join("spikes/ply-parser");
+            if candidate.join("emit.ply").is_file() {
+                return Some(candidate);
+            }
+            if !cur.pop() {
+                return None;
+            }
+        }
+    }
+    std::env::current_dir().ok().and_then(search).or_else(|| {
+        std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
+            .and_then(search)
+    })
+}
+
+/// Install the whole self-hosted Ply emitter as the producer when none is installed and its source
+/// is on disk (ADR 0048: under tier-only the Rust reference emitter is a fragment, so the language
+/// runs only when the Ply emitter produces). Called by [`crate::Unit`] so every consumer — the CLI,
+/// the harness, the tests — gets the complete tier by default. A shipped binary with no
+/// `spikes/ply-parser` keeps the reference emitter until the bundle is embedded.
+pub fn ensure_default() {
+    if installed() {
+        return;
+    }
+    let Some(dir) = find_emitter_dir() else {
+        return;
+    };
+    let identity = digest_of(&emitter_modules(&dir));
+    install(Arc::new(move || build_default(&dir)), identity);
+}
+
+/// The emitter's modules — the standard library and the directory's own `.ply` files — as
+/// `(name, text)` pairs, for the identity digest.
+fn emitter_modules(dir: &std::path::Path) -> Vec<(String, String)> {
+    let mut modules: Vec<(String, String)> = ply_std::sources()
+        .map(|(m, t)| (m.to_string(), t.to_string()))
+        .collect();
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.extension().is_some_and(|x| x == "ply")
+                && let Ok(text) = std::fs::read_to_string(&p)
+            {
+                modules.push((
+                    p.file_stem()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .into_owned(),
+                    text,
+                ));
+            }
+        }
+    }
+    modules
+}
+
+/// Build the whole Ply emitter as a producer: load its `.ply` source and the standard library,
+/// check them, and build the native emitter from the bootstrap bundle (or, when
+/// `PLY_C_BOOTSTRAP=off` or no bundle is present, with the reference emitter).
+fn build_default(dir: &std::path::Path) -> Result<PlyProducer, String> {
+    use ply_span::SourceId;
+    let mut inputs = Vec::new();
+    for (module, text) in ply_std::sources() {
+        let text: &'static str = Box::leak(text.to_string().into_boxed_str());
+        inputs.push((
+            SourceId(inputs.len() as u32),
+            ply_syntax::ast::ModuleName::from_dotted(module),
+            text,
+        ));
+    }
+    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| format!("{}: {e}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+        .collect();
+    files.sort();
+    for path in &files {
+        let stem = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("{}: not a module name", path.display()))?;
+        let text: &'static str = Box::leak(
+            std::fs::read_to_string(path)
+                .map_err(|e| format!("{}: {e}", path.display()))?
+                .into_boxed_str(),
+        );
+        inputs.push((
+            SourceId(inputs.len() as u32),
+            ply_syntax::ast::ModuleName::from_dotted(stem),
+            text,
+        ));
+    }
+    let first = |ds: Vec<ply_span::Diagnostic>| {
+        ds.first()
+            .map(|d| d.message.clone())
+            .unwrap_or_else(|| "no diagnostic".to_string())
+    };
+    let mut ast = ply_syntax::parse_program(inputs).map_err(first)?;
+    let expanded = ply_derive::expand_program(&mut ast);
+    if !expanded.is_empty() {
+        return Err(first(expanded));
+    }
+    let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(first)?;
+    let check = ply_core::check_program(&ast, &resolved).map_err(first)?;
+    let program: &'static ply_syntax::ast::Program = Box::leak(Box::new(ast));
+    let resolved = Box::leak(Box::new(resolved));
+    let check = Box::leak(Box::new(check));
+    let keys = ply_hash::hash_program(program, resolved, check)
+        .map(|h| crate::source::emit_keys(program, &h))
+        .unwrap_or_default();
+    let source: &'static Source =
+        Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
+    let bundle = dir.join("bootstrap");
+    let from_bundle =
+        super::bundle::exists(&bundle) && std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off");
+    let (native, _refused) = if from_bundle {
+        super::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?
+    } else {
+        let names: Vec<String> = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        super::build(source, &refs).map_err(|e| format!("{e:#}"))?
+    };
+    PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
 
 /// Forgets this thread's producer, so the recipe builds it again on the next ask: the fixpoint
@@ -69,27 +204,36 @@ pub fn installed() -> bool {
     RECIPE.get().is_some()
 }
 
-static WHOLE: AtomicBool = AtomicBool::new(false);
-/// Whether the producer's answer is the unit's: its bodies taken and its refusals dropped by the
-/// fixpoint, with the reference emitter not run at all. ADR 0042's third step.
-pub fn set_whole(whole: bool) {
-    WHOLE.store(whole, Ordering::Relaxed);
-}
-
-pub fn whole() -> bool {
-    mode() == "ply-whole"
-}
-
 /// The producer's mode, as the caches key on it. While the producer's own unit is being built
 /// the reference is the emitter, whatever was asked for: the producer cannot answer for itself.
+///
+/// There were two producing modes while ADR 0042 was being walked: body-by-body, where the
+/// reference emitted and the port stood in for the bodies the reference had already accepted,
+/// and the whole unit. Under tier-only (ADR 0048) the reference is a fragment that refuses
+/// `perform`, so body-by-body could only ever offer what the fragment already covered -- less
+/// than the fragment alone, since it added no body and could refuse one. The unit is the mode.
 pub fn mode() -> &'static str {
-    if !installed() || BUILDING.with(Cell::get) {
+    if !installed() || BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         "ref"
-    } else if WHOLE.load(Ordering::Relaxed) {
-        "ply-whole"
     } else {
         "ply"
     }
+}
+
+/// Runs `f` with the reference emitter forced, whatever producer is installed: [`mode`] answers
+/// `ref` and the producer is not consulted or built. The bisection's mixtures are reconstructed
+/// ASTs with no source text, which the whole Ply emitter — a front end — cannot re-parse; the
+/// reference is an AST consumer and emits the identical C for the effect-free programs a mixture
+/// reconstructs. The thread-local is restored on unwind, so a panicking mixture leaves no residue.
+pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
+    struct Guard(bool);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            REFERENCE_ONLY.with(|c| c.set(self.0));
+        }
+    }
+    let _guard = Guard(REFERENCE_ONLY.with(|c| c.replace(true)));
+    f()
 }
 
 /// The mode with the emitter's identity, as the caches key on it.
@@ -112,7 +256,7 @@ pub fn building() -> bool {
 
 pub fn with_current<T>(f: impl FnOnce(&PlyProducer) -> T) -> Option<T> {
     let recipe = RECIPE.get()?;
-    if BUILDING.with(Cell::get) {
+    if BUILDING.with(Cell::get) || REFERENCE_ONLY.with(Cell::get) {
         return None;
     }
     MINE.with(|mine| {
@@ -153,6 +297,9 @@ pub struct PlyProducer {
     modules: RefCell<HashMap<usize, Bodies>>,
     asked: Cell<u64>,
     answered: Cell<u64>,
+    /// Why the emitter raised over a program, by the program's address: a unit built over its
+    /// silence would cache the failure as the program's bodies.
+    failed: RefCell<HashMap<usize, String>>,
 }
 
 /// The entry the emitter is entered through: `emit_bodies_all(names, srcs, ctors, builtins)`,
@@ -170,7 +317,14 @@ impl PlyProducer {
             modules: RefCell::new(HashMap::new()),
             asked: Cell::new(0),
             answered: Cell::new(0),
+            failed: RefCell::new(HashMap::new()),
         })
+    }
+
+    /// Why the emitter raised over `loaded`, when it did.
+    pub fn failure(&self, loaded: &Source) -> Option<String> {
+        let program = std::ptr::from_ref(loaded) as usize;
+        self.failed.borrow().get(&program).cloned()
     }
 
     /// Bodies asked for and bodies answered, over this thread's life.
@@ -188,7 +342,7 @@ impl PlyProducer {
             let bodies = match self.bodies_of(loaded) {
                 Ok(b) => b,
                 Err(e) => {
-                    eprintln!("the Ply emitter failed over the program: {e:#}");
+                    self.failed.borrow_mut().insert(program, format!("{e:#}"));
                     HashMap::new()
                 }
             };
@@ -208,25 +362,6 @@ impl PlyProducer {
 
     /// Every body of the program at once: the emitter resolves the modules together, so a call's
     /// default arguments are filled and every signature is in reach.
-    /// Every body of the program that handles each operation, answered or refused: the unit's
-    /// fixpoint drops a performer while any of its operation's handlers is not taken.
-    pub fn handlers_of(&self, loaded: &Source) -> HashMap<String, Vec<String>> {
-        let program = std::ptr::from_ref(loaded) as usize;
-        let mut out: HashMap<String, Vec<String>> = HashMap::new();
-        if let Some(bodies) = self.modules.borrow().get(&program) {
-            for (name, answer) in bodies {
-                let handled = match answer {
-                    Answer::Body(_, tables) => &tables.handles,
-                    Answer::Refused(_, handles) => handles,
-                };
-                for op in handled {
-                    out.entry(op.clone()).or_default().push(name.clone());
-                }
-            }
-        }
-        out
-    }
-
     fn bodies_of(&self, loaded: &Source) -> Result<Bodies> {
         let mut names = Vec::new();
         let mut srcs = Vec::new();

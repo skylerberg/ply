@@ -3,7 +3,7 @@
 use anyhow::{Context, Result, bail};
 use ply_core::CheckOutput;
 use ply_core::ty::Footprint;
-use ply_eval::{Machine, Value};
+use ply_eval::{Machine, Provider, Value};
 use ply_hash::DefHash;
 use ply_host::tcp::{Net, SimNet};
 use ply_span::{Span, Symbol};
@@ -11,7 +11,7 @@ use ply_syntax::ast::ModuleName;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::Serialize;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
@@ -305,6 +305,11 @@ pub struct Loaded {
     /// This program's region kinds, shared by every machine below rather than inferred once per
     /// machine.
     region_kinds: ply_eval::region_kind::Kinds,
+    /// Each module's source text by `m.name.to_string()`: what the whole Ply emitter re-parses to
+    /// produce bodies, since under tier-only (ADR 0048) every machine here runs on a compiled tier.
+    texts: HashMap<String, String>,
+    /// The unit over the program, built once: every machine over this program attaches it.
+    unit: std::sync::OnceLock<&'static ply_codegen::Unit>,
 }
 
 impl Loaded {
@@ -322,6 +327,10 @@ impl Loaded {
             let id = sources.add(ply_std::pseudo_path(module), source.to_string());
             inputs.push((id, module.clone(), source));
         }
+        let texts = inputs
+            .iter()
+            .map(|(_, name, source)| (name.to_string(), (*source).to_string()))
+            .collect();
         let mut program = ply_syntax::parse_program(inputs)
             .map_err(|d| diagnostics("parsing the service", &d))?;
         let expanded = ply_derive::expand_program(&mut program);
@@ -337,6 +346,8 @@ impl Loaded {
             resolved,
             check,
             region_kinds: ply_eval::region_kind::Kinds::default(),
+            texts,
+            unit: std::sync::OnceLock::new(),
         })
     }
 
@@ -350,10 +361,27 @@ impl Loaded {
     }
 
     /// A machine over this program, holding this program's region kinds rather than inferring its
-    /// own.
+    /// own. Under tier-only (ADR 0048) the machine's evaluator is a compiled tier, which the whole
+    /// Ply emitter — installed by [`ply_codegen::c::producer::ensure_default`] — produces from the
+    /// module source texts.
     pub fn machine(&self) -> Machine<'_> {
+        ply_codegen::c::producer::ensure_default();
         let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
         machine.share_region_kinds(ply_eval::region_kind::Kinds::clone(&self.region_kinds));
+        let unit = *self.unit.get_or_init(|| {
+            ply_codegen::Unit::over_with_texts(
+                &self.program,
+                &self.resolved,
+                &self.check,
+                self.texts.clone(),
+            )
+            .expect("this host has a C compiler")
+        });
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        machine.set_compiled(unit.attach(&spec));
         machine
     }
 

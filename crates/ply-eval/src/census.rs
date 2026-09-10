@@ -1,6 +1,5 @@
 //! A count of what the compiled seam is offered and what refuses it.
 
-use crate::compiled::Gate;
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -130,43 +129,6 @@ pub(crate) const LADDER: [(&str, &[&str], bool); 7] = [
 fn cell() -> &'static Mutex<Counts> {
     static C: OnceLock<Mutex<Counts>> = OnceLock::new();
     C.get_or_init(|| Mutex::new(Counts::default()))
-}
-
-pub(crate) fn gate_name(gate: Gate) -> &'static str {
-    match gate {
-        Gate::NotLoweredCode => "NotLoweredCode",
-        Gate::ArgumentShape => "ArgumentShape",
-        Gate::ArgumentType => "ArgumentType",
-        Gate::AnswerType => "AnswerType",
-        Gate::SimulateRegion => "SimulateRegion",
-        Gate::Anonymous => "Anonymous",
-        Gate::PublishedRow => "PublishedRow",
-        Gate::InternalEffects => "InternalEffects",
-        Gate::Budget => "Budget",
-    }
-}
-
-pub(crate) fn value_kind(v: &crate::value::Value) -> &'static str {
-    use crate::value::Value::*;
-    match v {
-        Int(_) => "Int",
-        Fixed(f) => f.ty.name(),
-        Bool(_) => "Bool",
-        Float(_) => "Float",
-        Decimal(_) => "Decimal",
-        Str(_) => "Str",
-        Bytes(_) => "Bytes",
-        Unit => "Unit",
-        List(_) => "List",
-        Map(_) => "Map",
-        Record(_) => "Record",
-        Ctor { .. } => "Ctor",
-        Closure(_) => "Closure",
-        Cell(_) => "Cell",
-        Task(_) => "Task",
-        Continuation(_) => "Continuation",
-        Secret(_) => "Secret",
-    }
 }
 
 pub(crate) fn with<F: FnOnce(&mut Counts)>(f: F) {
@@ -304,42 +266,6 @@ fn pct(a: u64, b: u64) -> f64 {
     }
 }
 
-/// Whether a declared type's runtime values are all inside `allowed`.
-pub(crate) fn type_carries(ty: &ply_core::ty::Type, allowed: &[&str]) -> bool {
-    use ply_core::ty::Type;
-    let has = |k: &str| allowed.contains(&k);
-    match ty {
-        Type::Var(_) => false,
-        Type::Fn { .. } => false,
-        Type::Record(fields) => has("Record") && fields.values().all(|t| type_carries(t, allowed)),
-        Type::Con(name, args) => {
-            let head = match name.as_str() {
-                "Int" => "Int",
-                "Bool" => "Bool",
-                "Float" => "Float",
-                "Decimal" => "Decimal",
-                "String" => "Str",
-                "Bytes" => "Bytes",
-                "Unit" => "Unit",
-                "List" => "List",
-                "Map" => "Map",
-                // Not nominal types, whatever their shape says.
-                "Cell" | ply_core::prelude::TASK_TYPE | ply_core::ty::SECRET => return false,
-                _ => {
-                    return has("Record")
-                        && has("Ctor")
-                        && args.iter().all(|t| type_carries(t, allowed));
-                }
-            };
-            has(head) && args.iter().all(|t| type_carries(t, allowed))
-        }
-    }
-}
-
-pub(crate) fn kind_in(v: &crate::value::Value, allowed: &[&str]) -> bool {
-    allowed.contains(&value_kind(v))
-}
-
 /// The budget a deep argument test walks under, in `Value` nodes visited per argument.
 pub fn deep_budget() -> u32 {
     static B: OnceLock<u32> = OnceLock::new();
@@ -349,64 +275,4 @@ pub fn deep_budget() -> u32 {
             .and_then(|v| v.parse().ok())
             .unwrap_or(256)
     })
-}
-
-/// The same question asked soundly: is every value reachable from `v` inside `allowed`?
-pub(crate) fn kind_in_deep(v: &crate::value::Value, allowed: &[&str]) -> bool {
-    let mut fuel = deep_budget();
-    walk(v, allowed, &mut fuel)
-}
-
-/// What refused a deep walk: the kind of the first value outside `allowed`, or `"<budget>"` if the
-/// walk ran out of fuel first.
-pub(crate) fn deep_blocker(v: &crate::value::Value, allowed: &[&str]) -> Option<&'static str> {
-    let mut fuel = deep_budget();
-    blocker(v, allowed, &mut fuel)
-}
-
-fn blocker(v: &crate::value::Value, allowed: &[&str], fuel: &mut u32) -> Option<&'static str> {
-    use crate::value::Value::*;
-    if *fuel == 0 {
-        return Some("<budget>");
-    }
-    *fuel -= 1;
-    if !allowed.contains(&value_kind(v)) {
-        return Some(value_kind(v));
-    }
-    let mut children: Vec<&crate::value::Value> = Vec::new();
-    match v {
-        List(items) => children.extend(items.iter()),
-        Map(m) => {
-            for (k, x) in m.iter() {
-                children.push(k);
-                children.push(x);
-            }
-        }
-        Record(fields) => children.extend(fields.values()),
-        Ctor { args, .. } => children.extend(args.iter()),
-        Secret(inner) => children.push(inner),
-        _ => {}
-    }
-    children.into_iter().find_map(|c| blocker(c, allowed, fuel))
-}
-
-fn walk(v: &crate::value::Value, allowed: &[&str], fuel: &mut u32) -> bool {
-    use crate::value::Value::*;
-    if *fuel == 0 {
-        return false;
-    }
-    *fuel -= 1;
-    if !allowed.contains(&value_kind(v)) {
-        return false;
-    }
-    match v {
-        List(items) => items.iter().all(|x| walk(x, allowed, fuel)),
-        Map(m) => m
-            .iter()
-            .all(|(k, x)| walk(k, allowed, fuel) && walk(x, allowed, fuel)),
-        Record(fields) => fields.values().all(|x| walk(x, allowed, fuel)),
-        Ctor { args, .. } => args.iter().all(|x| walk(x, allowed, fuel)),
-        Secret(inner) => walk(inner, allowed, fuel),
-        _ => true,
-    }
 }

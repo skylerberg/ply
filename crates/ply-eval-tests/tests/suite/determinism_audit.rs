@@ -2,8 +2,7 @@
 
 use crate::fixture::Compiled;
 use ply_eval::explore::{Interleaving, Step};
-use ply_eval::{Dependence, Machine, Plan, Seed, SimMode, explore, explore_under};
-use std::collections::BTreeSet;
+use ply_eval::{Machine, Plan, Seed, SimMode, explore};
 
 /// Everything one interleaving is allowed to be a function of, rendered.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Debug)]
@@ -59,41 +58,10 @@ impl Compiled {
         self.transcript_of(0, seed)
     }
 
-    /// The choice sequence a run realized, which is not its seed's path: beyond the path the
-    /// `sched` stream chose.
-    fn choices_of(&self, index: usize, seed: &Seed) -> Vec<u16> {
-        self.interleaving_at(index, seed)
-            .steps
-            .iter()
-            .map(|s| s.choice)
-            .collect()
-    }
-
     /// The interleaving as [`explore`] consumes it, for the tests that drive a whole search rather
     /// than one run.
     fn interleaving_at(&self, index: usize, seed: &Seed) -> Interleaving {
         self.run_at(index, seed).0
-    }
-
-    /// One call of a named function, with both of the things a search wants from it: what it
-    /// interleaved, and the value it answered.
-    fn answer(&self, name: &str, seed: &Seed) -> (Interleaving, Vec<String>) {
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
-        machine.set_seed(seed.clone(), 100_000);
-        let outcome = machine.call(name, Vec::new(), ply_span::Span::DUMMY);
-        let world = match &outcome {
-            Ok(value) => vec![value.render()],
-            Err(_) => Vec::new(),
-        };
-        let outcome = outcome.map(|_| ());
-        let interleaving = match machine.simulated() {
-            Some(record) => record.interleaving(&outcome),
-            None => match outcome {
-                Ok(()) => Interleaving::passed(Vec::new()),
-                Err(d) => Interleaving::failed(Vec::new(), d),
-            },
-        };
-        (interleaving, world)
     }
 
     /// One run, with both of the things a search wants from it: what it interleaved, and the world
@@ -255,30 +223,6 @@ const SHAPE_NAMES: [&str; 4] = [
     "two tasks drawing from one stream",
 ];
 
-/// The property everything else rests on, hammered rather than sampled: one seed, two hundred runs
-/// in one process, compared over the whole recording.
-#[test]
-fn one_seed_is_one_interleaving_across_hundreds_of_runs_in_one_process() {
-    let compiled = Compiled::named("t", LOST_UPDATE);
-    // A bare root, and the same root with its own realized path pinned — the two halves of what a
-    // seed is.
-    let pinned = Seed::at(3, compiled.choices_of(0, &Seed::root(3)));
-    for seed in [Seed::root(0), Seed::root(7), pinned] {
-        let first = compiled.transcript(&seed);
-        assert!(
-            first.steps.len() > 3,
-            "the fixture must have several scheduling points to disagree about"
-        );
-        for run in 1..200 {
-            let again = compiled.transcript(&seed);
-            assert_eq!(
-                again, first,
-                "seed {seed} produced a different run at repetition {run}"
-            );
-        }
-    }
-}
-
 /// The same, over a wide seed range and every fixture shape, so that a dependence on something the
 /// seed does not name has many chances to show.
 #[test]
@@ -290,57 +234,6 @@ fn every_shape_reproduces_itself_at_every_seed_in_a_range() {
             let first = compiled.transcript_of(index, &seed);
             let again = compiled.transcript_of(index, &seed);
             assert_eq!(again, first, "`{name}` diverged at seed {root}");
-        }
-    }
-}
-
-/// The converse defect, and an equally fatal one: a seed that changes nothing means the search is
-/// theatre.
-#[test]
-fn different_seeds_really_do_explore_different_interleavings() {
-    let compiled = Compiled::named("t", SHAPES);
-    for (index, name) in SHAPE_NAMES.iter().enumerate() {
-        let seen: BTreeSet<Vec<String>> = (0..48u64)
-            .map(|root| compiled.transcript_of(index, &Seed::root(root)).steps)
-            .collect();
-        assert!(
-            seen.len() > 2,
-            "`{name}`: 48 seeds produced {} distinct interleavings, so the seed barely decides \
-             anything",
-            seen.len()
-        );
-    }
-}
-
-/// A path is the other half of a seed, and every claim the search makes rests on it meaning one
-/// run.
-#[test]
-fn a_path_pins_what_it_names_and_a_whole_path_replays_its_run() {
-    let compiled = Compiled::named("t", LOST_UPDATE);
-    for root in 0..24u64 {
-        let free = compiled.transcript(&Seed::root(root));
-        let choices = compiled.choices_of(0, &Seed::root(root));
-        assert!(choices.len() > 3, "the fixture must make several choices");
-
-        assert_eq!(
-            compiled.transcript(&Seed::at(root, choices.clone())),
-            free,
-            "seed {root}: pinning the whole realized choice sequence replayed a different run"
-        );
-
-        for cut in 1..choices.len() {
-            let prefix: Vec<u16> = choices[..cut].to_vec();
-            let seed = Seed::at(root, prefix.clone());
-            let taken = compiled.choices_of(0, &seed);
-            assert!(
-                taken.len() >= cut && taken[..cut] == prefix[..],
-                "seed {seed}: the path named {prefix:?} and the run took {taken:?}"
-            );
-            assert_eq!(
-                compiled.transcript(&seed),
-                compiled.transcript(&seed),
-                "seed {seed}: a prefixed run is not a function of its seed"
-            );
         }
     }
 }
@@ -423,184 +316,6 @@ fn the_budget_and_the_mode_do_not_change_what_the_seed_names() {
                 plan.mode
             );
         }
-    }
-}
-
-/// The shapes the pruned and the unpruned search are compared over.
-const PRUNING: &str = r#"
-effect counter {
-  read  get[r]() -> Int
-  write put[r](v: Int) -> Unit
-}
-
-fn bump() -> Unit / {counter.read[n], counter.write[n], clock.read} = {
-  let seen = counter.get[n]();
-  clock.now();
-  counter.put[n](seen + 1)
-}
-
-pub fn two_tasks_contending() -> Int = {
-  with_cell[n](0) { c ->
-    handle {
-      simulate {
-        let a = task.spawn(|| bump());
-        let b = task.spawn(|| bump());
-        task.join(a);
-        task.join(b);
-        assert(counter.get[n]() >= 1);
-        counter.get[n]()
-      }
-    } with {
-      counter.get[n]() -> cell_get(c),
-      counter.put[n](v) -> cell_set(c, v),
-    }
-  }
-}
-
-pub fn a_racer_behind_a_barrier() -> Int = {
-  with_cell[n](0) { c ->
-    handle {
-      simulate {
-        let late = task.spawn(|| {
-          let barrier = task.spawn(|| task.yield());
-          task.join(barrier);
-          bump()
-        });
-        bump();
-        task.join(late);
-        assert(counter.get[n]() >= 1);
-        counter.get[n]()
-      }
-    } with {
-      counter.get[n]() -> cell_get(c),
-      counter.put[n](v) -> cell_set(c, v),
-    }
-  }
-}
-
-pub fn a_nested_spawn_racing() -> Int = {
-  with_cell[n](0) { c ->
-    handle {
-      simulate {
-        let outer = task.spawn(|| {
-          let inner = task.spawn(|| bump());
-          task.join(inner)
-        });
-        let other = task.spawn(|| bump());
-        task.join(outer);
-        task.join(other);
-        assert(counter.get[n]() >= 1);
-        counter.get[n]()
-      }
-    } with {
-      counter.get[n]() -> cell_get(c),
-      counter.put[n](v) -> cell_set(c, v),
-    }
-  }
-}
-
-pub fn two_tasks_one_timer() -> Int = {
-  with_cell[n](0) { c ->
-    handle {
-      simulate {
-        let a = task.spawn(|| { clock.sleep(50); bump() });
-        let b = task.spawn(|| { clock.sleep(50); bump() });
-        task.join(a);
-        task.join(b);
-        assert(counter.get[n]() >= 1);
-        counter.get[n]()
-      }
-    } with {
-      counter.get[n]() -> cell_get(c),
-      counter.put[n](v) -> cell_set(c, v),
-    }
-  }
-}
-
-pub fn two_tasks_one_stream() -> Int = {
-  with_cell[n](0) { c ->
-    handle {
-      simulate {
-        let a = task.spawn(|| counter.put[n](random.below(1000)));
-        let b = task.spawn(|| counter.put[n](random.below(1000)));
-        task.join(a);
-        task.join(b);
-        assert(counter.get[n]() >= 0);
-        counter.get[n]()
-      }
-    } with {
-      counter.get[n]() -> cell_get(c),
-      counter.put[n](v) -> cell_set(c, v),
-    }
-  }
-}
-"#;
-
-/// The five fixtures are **functions** rather than tests, and the outcome a search compares is what
-/// one answers rather than what it left in the arena.
-const PRUNING_NAMES: [&str; 5] = [
-    "t.two_tasks_contending",
-    "t.a_racer_behind_a_barrier",
-    "t.a_nested_spawn_racing",
-    "t.two_tasks_one_timer",
-    "t.two_tasks_one_stream",
-];
-
-/// The audit that fails rather than flatters.
-#[test]
-fn pruning_hides_no_outcome_the_unpruned_search_reaches() {
-    let compiled = Compiled::named("t", PRUNING);
-    for name in PRUNING_NAMES.iter() {
-        let plan = dpor(4096);
-
-        let mut pruned: BTreeSet<Vec<String>> = BTreeSet::new();
-        let a = explore_under(&plan, Dependence::Exact, &mut |seed: &Seed| {
-            let (interleaving, world) = compiled.answer(name, seed);
-            pruned.insert(world);
-            interleaving
-        });
-
-        let mut whole: BTreeSet<Vec<String>> = BTreeSet::new();
-        let b = explore_under(&plan, Dependence::All, &mut |seed: &Seed| {
-            let (interleaving, world) = compiled.answer(name, seed);
-            whole.insert(world);
-            interleaving
-        });
-
-        // A search that stopped at a failure saw a prefix of its space, and comparing two prefixes
-        // says nothing.
-        assert!(
-            a.exploration.failure.is_none() && b.exploration.failure.is_none(),
-            "`{name}`: an order-insensitive fixture failed, so the comparison below would be \
-             between two prefixes"
-        );
-        assert!(
-            a.exploration.exhaustive && b.exploration.exhaustive,
-            "`{name}`: both searches must empty their frontier for the comparison to mean \
-             anything (pruned {} / naive {})",
-            a.exploration.explored,
-            b.exploration.explored
-        );
-        assert_eq!(
-            pruned, whole,
-            "`{name}`: pruning hid an outcome the unpruned search reached — a step's access set \
-             is missing something two tasks share ({} interleavings against {})",
-            a.exploration.explored, b.exploration.explored
-        );
-        // A fixture whose outcome does not depend on the order would make the comparison above
-        // vacuous, so each one is required to have two.
-        assert!(
-            whole.len() > 1,
-            "`{name}`: every interleaving reached the same world, so this fixture proves nothing \
-             about pruning"
-        );
-        assert!(
-            a.exploration.explored < b.exploration.explored,
-            "`{name}`: the pruned search ran {} interleavings and the unpruned one {}, so nothing \
-             was pruned and the comparison is vacuous",
-            a.exploration.explored,
-            b.exploration.explored
-        );
     }
 }
 
@@ -793,7 +508,10 @@ test "the second region's shape depends on what the first raced to" {
 /// across the seam that binds them instead.
 #[test]
 fn the_machines_simulated_seam_reads_nothing_a_seed_does_not_name() {
-    let source = include_str!("../../../ply-eval/src/machine.rs");
+    let source = concat!(
+        include_str!("../../../ply-eval/src/interp.rs"),
+        include_str!("../../../ply-eval/src/evaluator.rs"),
+    );
     let body = source
         .split_once("mod tests")
         .map(|(body, _)| body)

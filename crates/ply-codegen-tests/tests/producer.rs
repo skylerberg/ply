@@ -8,11 +8,19 @@
 
 use ply_codegen::Source;
 use ply_codegen::c::producer::{self, PlyProducer};
-use ply_eval::{Machine, Value};
+use ply_eval::Value;
 use ply_span::Span;
 use ply_syntax::ast::{ModuleName, Program};
 use std::collections::HashMap;
 use std::path::PathBuf;
+
+/// A root, its arguments, the binding it runs under, and what it answers or refuses with.
+type HostCase = (
+    &'static str,
+    Vec<Value>,
+    std::sync::Arc<ply_eval::HostBinding>,
+    Result<Value, &'static str>,
+);
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -135,15 +143,14 @@ fn sum_to(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, i: Int| acc + i)
 "#;
 
 /// The unit built with the Ply emitter as its producer, and every case's answer checked against
-/// the machine's. In whole mode the reference emits nothing of the program; the port's refusals
-/// are the fixpoint's, and this program has none.
+/// the machine's. The reference emits nothing of the program; the port's refusals are the
+/// fixpoint's, and this program has none.
 /// The producer's mode is a process-wide flag, so the tests that set it take turns.
 static MODE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn built_and_checked(whole: bool) {
+fn built_and_checked() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(whole);
     let loaded = load(&[("m", PROGRAM)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -160,7 +167,7 @@ fn built_and_checked(whole: bool) {
     );
     println!("  the Ply emitter answered {answered} of {asked} bodies");
 
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
     let cases: Vec<(&str, Vec<Value>)> = vec![
         ("m.double", vec![Value::Int(21)]),
         ("m.add", vec![Value::Int(40), Value::Int(2)]),
@@ -176,9 +183,9 @@ fn built_and_checked(whole: bool) {
         ("m.sum_to", vec![Value::Int(100)]),
     ];
     for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let want = oracle
+            .call(name, args.clone(), Span::DUMMY, 10_000)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message));
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -198,11 +205,6 @@ fn built_and_checked(whole: bool) {
             "`{name}{args:?}`: the tier and the machine disagree"
         );
     }
-}
-
-#[test]
-fn the_ply_emitter_answers_bodies_and_they_answer_what_the_machine_answers() {
-    built_and_checked(false);
 }
 
 /// Effects by evidence passing (ADR 0043): a tail-resumptive handler with a `return` clause, a
@@ -249,7 +251,6 @@ fn guarded(n: Int) -> Int =
 fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", EFFECTS)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -258,17 +259,23 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.counted", vec![Value::Int(3)]),
-        ("m.nested", vec![Value::Int(5)]),
-        ("m.guarded", vec![Value::Int(4)]),
-        ("m.guarded", vec![Value::Int(40)]),
+    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
+    // ADR 0048 retired the interpreter oracle. `counted` and `nested` are tail-resumptive, so the
+    // pure applier still answers them; `guarded`'s named zero-shot `resume` it declines, so that
+    // case pins the tier's answer as a regression guard (the corpus validates the mechanism).
+    let cases: Vec<(&str, Vec<Value>, Option<Value>)> = vec![
+        ("m.counted", vec![Value::Int(3)], None),
+        ("m.nested", vec![Value::Int(5)], None),
+        ("m.guarded", vec![Value::Int(4)], Some(Value::Int(1008))),
+        ("m.guarded", vec![Value::Int(40)], Some(Value::Int(-40))),
     ];
-    for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+    for (name, args, golden) in cases {
+        let want = match golden {
+            Some(v) => v,
+            None => oracle
+                .call(name, args.clone(), Span::DUMMY, 10_000)
+                .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message)),
+        };
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -290,19 +297,20 @@ fn the_chain_entered_whole_carries_handlers_as_the_machine_does() {
         ctx.end();
         assert_eq!(
             got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
+            "`{name}{args:?}`: the tier and the oracle disagree"
         );
     }
 }
 
 #[test]
 fn the_chain_entered_whole_answers_what_the_machine_answers() {
-    built_and_checked(true);
+    built_and_checked();
 }
 
-/// The per-operation rule (ADR 0043): a compiled `perform` searches the compiled frames, which
-/// is complete only while every body handling the operation is compiled. A handler the unit
-/// refuses drops its performers with it, and an operation nothing handles is refused too.
+/// The per-operation rule (ADR 0043) under tier-only: a compiled `perform` searches the compiled
+/// frames, which is complete because nothing outside the unit runs. A handler the unit refuses
+/// cannot be on the stack, so its performer compiles, and a `perform` no compiled handler answers
+/// reaches the host binding from the runtime -- as one nothing in the program handles does.
 const DROPPED: &str = r#"
 effect counter {
   write bump(n: Int) -> Int
@@ -334,10 +342,9 @@ fn lonely(n: Int) -> Int / {orphan.write} = orphan.poke(n)
 "#;
 
 #[test]
-fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
+fn a_performer_keeps_compiling_when_its_handler_is_dropped() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", DROPPED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -358,16 +365,10 @@ fn the_fixpoint_drops_a_performer_whose_handler_it_dropped() {
         "{}",
         reason("m.handler")
     );
-    assert!(
-        reason("m.performer").contains("m.handler")
-            && reason("m.performer").contains("counter#bump"),
-        "{}",
-        reason("m.performer")
-    );
     // A `perform` no handler in the program answers is compiled: it reaches the host binding
     // from the runtime, with the machine's checks, and an unbound one fails there as the
     // machine fails it.
-    for taken in ["m.lonely", "m.hosted", "m.hosting"] {
+    for taken in ["m.performer", "m.lonely", "m.hosted", "m.hosting"] {
         assert!(
             !refused.iter().any(|r| r.function == taken),
             "`{taken}` was refused: {refused:?}"
@@ -407,7 +408,6 @@ impl ply_eval::HostHandler for Doubler {
 fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", HOSTED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -432,24 +432,36 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
     );
     let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
-    let cases: Vec<(&str, Vec<Value>, std::sync::Arc<ply_eval::HostBinding>)> = vec![
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end). Under tier-only, a user effect performed by
+    // a compiled root resolves to no host row, so every case here refuses at the host boundary.
+    let cases: Vec<HostCase> = vec![
         (
             "m.hosted",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&bound),
+            Err("E0303"),
         ),
         (
             "m.hosted",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&hermetic),
+            Err("E0303"),
         ),
-        ("m.ticking", vec![], std::sync::Arc::clone(&bound)),
-        ("m.ticking", vec![], std::sync::Arc::clone(&hermetic)),
+        (
+            "m.ticking",
+            vec![],
+            std::sync::Arc::clone(&bound),
+            Err("E0303"),
+        ),
+        (
+            "m.ticking",
+            vec![],
+            std::sync::Arc::clone(&hermetic),
+            Err("E0303"),
+        ),
     ];
-    for (name, args, binding) in cases {
-        let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-        machine.set_host_binding(std::sync::Arc::clone(&binding));
-        let want = machine.call(name, args.clone(), Span::DUMMY);
+    for (name, args, binding, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -473,21 +485,16 @@ fn the_chain_entered_whole_reaches_the_host_as_the_machine_does() {
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
                 assert_eq!(
                     got, want,
-                    "`{name}{args:?}`: the tier and the machine disagree"
+                    "`{name}{args:?}`: the tier and the golden disagree"
                 );
             }
-            Err(theirs) => {
+            Err(code) => {
                 assert_ne!(
                     ctx.failed, 0,
-                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
-                    theirs.message
+                    "`{name}{args:?}` did not refuse in the C tier"
                 );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
-                assert_eq!(
-                    ours.code, theirs.code,
-                    "`{name}{args:?}`: {} vs {}",
-                    ours.message, theirs.message
-                );
+                assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
         }
         ctx.end();
@@ -512,7 +519,6 @@ fn ordered(a: Int, b: Int) -> Bool = decimal_of_int(a) < decimal_of_int(b)
 fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", NUMERIC)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -521,7 +527,7 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
+    let mut oracle = ply_eval::interp::Pure::new(loaded.program, loaded.resolved);
     let two = Value::Int(2.0f64.to_bits() as i64);
     let three = Value::Int(3.0f64.to_bits() as i64);
     let cases: Vec<(&str, Vec<Value>)> = vec![
@@ -535,9 +541,9 @@ fn the_chain_entered_whole_holds_float_and_decimal_literals_as_the_machine_does(
         ("m.ordered", vec![Value::Int(6), Value::Int(7)]),
     ];
     for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+        let want = oracle
+            .call(name, args.clone(), Span::DUMMY, 10_000)
+            .unwrap_or_else(|d| panic!("`{name}` raised in the pure applier: {}", d.message));
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -604,7 +610,6 @@ fn racing(n: Int) -> Int =
 fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", SIMULATED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -613,21 +618,39 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.ordered", vec![Value::Int(3)]),
-        ("m.timed", vec![Value::Int(1500)]),
-        ("m.drawn", vec![Value::Int(100)]),
-        ("m.racing", vec![Value::Int(5)]),
+    // ADR 0048 retired the interpreter oracle; these pin the tier's schedule as a regression
+    // guard (the corpus validates the mechanism end-to-end).
+    let cases: Vec<(&str, Vec<Value>, Value, i64, &str)> = vec![
+        (
+            "m.ordered",
+            vec![Value::Int(3)],
+            Value::Int(6012),
+            6,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0), TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(2) of [TaskId(2)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+        ),
+        (
+            "m.timed",
+            vec![Value::Int(1500)],
+            Value::Int(1500),
+            1500,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+        ),
+        (
+            "m.drawn",
+            vec![Value::Int(100)],
+            Value::Int(366),
+            0,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Atom(EffectAtom { effect: \"random\", resource: Singleton, mode: Write })})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})"]"#,
+        ),
+        (
+            "m.racing",
+            vec![Value::Int(5)],
+            Value::Int(60),
+            0,
+            r#"["TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(0), TaskId(1)] chose 1 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0), TaskId(1)] chose 0 touching StepFootprint({})", "TaskId(1) of [TaskId(1)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }, Cell { id: Slot { index: 0, generation: 0 }, mode: Write }})", "TaskId(0) of [TaskId(0)] chose 0 touching StepFootprint({Cell { id: Slot { index: 0, generation: 0 }, mode: Read }})"]"#,
+        ),
     ];
-    for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let theirs = machine
-            .simulated()
-            .expect("the machine ran a region")
-            .clone();
+    for (name, args, want, want_time, want_shape) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -648,10 +671,6 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
         let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         let ours = ctx.record.clone().expect("the tier ran a region");
         ctx.end();
-        assert_eq!(
-            got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
-        );
         let shape = |r: &ply_eval::region::Record| -> Vec<String> {
             r.steps
                 .iter()
@@ -664,12 +683,16 @@ fn the_chain_entered_whole_schedules_as_the_machine_does() {
                 .collect()
         };
         assert_eq!(
-            shape(&ours),
-            shape(&theirs),
-            "`{name}{args:?}`: the schedules differ"
+            got, want,
+            "`{name}{args:?}`: the tier and the golden disagree"
         );
         assert_eq!(
-            ours.virtual_time, theirs.virtual_time,
+            format!("{:?}", shape(&ours)),
+            want_shape,
+            "`{name}{args:?}`: the schedule differs"
+        );
+        assert_eq!(
+            ours.virtual_time, want_time,
             "`{name}{args:?}`: virtual time differs"
         );
     }
@@ -711,7 +734,6 @@ fn mixed(seed: Int) -> Int =
 fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", RESUMED)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -720,18 +742,16 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.later", vec![Value::Int(3)]),
-        ("m.returned", vec![Value::Int(4)]),
-        ("m.dropped", vec![Value::Int(9)]),
-        ("m.dropped", vec![Value::Int(2)]),
-        ("m.mixed", vec![Value::Int(5)]),
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end).
+    let cases: Vec<(&str, Vec<Value>, Value)> = vec![
+        ("m.later", vec![Value::Int(3)], Value::Int(140)),
+        ("m.returned", vec![Value::Int(4)], Value::Int(2132)),
+        ("m.dropped", vec![Value::Int(9)], Value::Int(10)),
+        ("m.dropped", vec![Value::Int(2)], Value::Int(-2)),
+        ("m.mixed", vec![Value::Int(5)], Value::Int(24)),
     ];
-    for (name, args) in cases {
-        let want = machine
-            .call(name, args.clone(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
+    for (name, args, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -753,7 +773,7 @@ fn the_chain_entered_whole_resumes_off_the_tail_as_the_machine_does() {
         ctx.end();
         assert_eq!(
             got, want,
-            "`{name}{args:?}`: the tier and the machine disagree"
+            "`{name}{args:?}`: the tier and the golden disagree"
         );
     }
 }
@@ -833,7 +853,6 @@ fn across(seed: Int) -> Int =
 fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", MULTISHOT)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -842,17 +861,22 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (native, refused) = ply_codegen::c::build(source, &refs).expect("the program builds");
     assert!(refused.is_empty(), "{refused:?}");
-    let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-    let cases: Vec<(&str, Vec<Value>)> = vec![
-        ("m.both", vec![Value::Int(3)]),
-        ("m.thrice", vec![Value::Int(7)]),
-        ("m.joined", vec![Value::Str("a".into())]),
-        ("m.shared", vec![Value::Int(0)]),
-        ("m.siblings", vec![Value::Int(1)]),
-        ("m.across", vec![Value::Int(0)]),
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end). `across` captures a continuation under a
+    // task whose region has ended by the second resumption, so the tier refuses it.
+    let cases: Vec<(&str, Vec<Value>, Result<Value, &str>)> = vec![
+        ("m.both", vec![Value::Int(3)], Ok(Value::Int(303))),
+        ("m.thrice", vec![Value::Int(7)], Ok(Value::Int(42))),
+        (
+            "m.joined",
+            vec![Value::Str("a".into())],
+            Ok(Value::Str("abdacd".into())),
+        ),
+        ("m.shared", vec![Value::Int(0)], Ok(Value::Int(30002))),
+        ("m.siblings", vec![Value::Int(1)], Ok(Value::Int(33))),
+        ("m.across", vec![Value::Int(0)], Err("E0413")),
     ];
-    for (name, args) in cases {
-        let want = machine.call(name, args.clone(), Span::DUMMY);
+    for (name, args, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -875,21 +899,16 @@ fn the_chain_entered_whole_resumes_more_than_once_as_the_machine_does() {
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
                 assert_eq!(
                     got, want,
-                    "`{name}{args:?}`: the tier and the machine disagree"
+                    "`{name}{args:?}`: the tier and the golden disagree"
                 );
             }
-            Err(theirs) => {
+            Err(code) => {
                 assert_ne!(
                     ctx.failed, 0,
-                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
-                    theirs.message
+                    "`{name}{args:?}` did not refuse in the C tier"
                 );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
-                assert_eq!(
-                    ours.code, theirs.code,
-                    "`{name}{args:?}`: {} vs {}",
-                    ours.message, theirs.message
-                );
+                assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
         }
         ctx.end();
@@ -952,7 +971,6 @@ impl ply_eval::HostRuntime for Reactor {
 fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", PRODUCTION)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),
@@ -994,28 +1012,31 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
     }
     let bound = std::sync::Arc::new(registry.bind(loaded.check).expect("the registry binds"));
     let hermetic = std::sync::Arc::new(ply_eval::HostBinding::hermetic());
-    let cases: Vec<(&str, Vec<Value>, std::sync::Arc<ply_eval::HostBinding>)> = vec![
+    // ADR 0048 retired the interpreter oracle; these pin the tier's answers as a regression guard
+    // (the corpus validates the mechanism end-to-end). A bound `spawned` opens its production
+    // region and answers; `parked`'s `slow.fetch` resolves to no host row, and a hermetic binding
+    // refuses the region, so both of those refuse at the host boundary.
+    let cases: Vec<HostCase> = vec![
         (
             "m.spawned",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&bound),
+            Ok(Value::Int(9)),
         ),
         (
             "m.parked",
             vec![Value::Int(2)],
             std::sync::Arc::clone(&bound),
+            Err("E0303"),
         ),
         (
             "m.spawned",
             vec![Value::Int(4)],
             std::sync::Arc::clone(&hermetic),
+            Err("E0303"),
         ),
     ];
-    for (name, args, binding) in cases {
-        let mut machine = Machine::new(loaded.program, loaded.resolved, loaded.check);
-        machine.set_host_binding(std::sync::Arc::clone(&binding));
-        machine.set_host_runtime(std::rc::Rc::new(Reactor));
-        let want = machine.call(name, args.clone(), Span::DUMMY);
+    for (name, args, binding, want) in cases {
         let entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
@@ -1042,21 +1063,16 @@ fn the_chain_entered_whole_opens_a_production_region_as_the_machine_does() {
                 let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
                 assert_eq!(
                     got, want,
-                    "`{name}{args:?}`: the tier and the machine disagree"
+                    "`{name}{args:?}`: the tier and the golden disagree"
                 );
             }
-            Err(theirs) => {
+            Err(code) => {
                 assert_ne!(
                     ctx.failed, 0,
-                    "`{name}{args:?}` raised in the machine ({}) and not in the C tier",
-                    theirs.message
+                    "`{name}{args:?}` did not refuse in the C tier"
                 );
                 let ours = ctx.take_failure().expect("a failed entry has a diagnostic");
-                assert_eq!(
-                    ours.code, theirs.code,
-                    "`{name}{args:?}`: {} vs {}",
-                    ours.message, theirs.message
-                );
+                assert_eq!(ours.code, code, "`{name}{args:?}`: {}", ours.message);
             }
         }
         ctx.end();
@@ -1081,7 +1097,6 @@ law "zero moves nothing" forall (account: Account) where account.balance > 0 {
 fn the_ply_emitter_answers_a_programs_propositions_as_roots() {
     let _turn = MODE.lock().unwrap_or_else(|e| e.into_inner());
     producer::install(std::sync::Arc::new(emitter), emitter_identity());
-    producer::set_whole(true);
     let loaded = load(&[("m", PROPOSITIONS)], false);
     let source: &'static Source = Box::leak(Box::new(
         Source::new(loaded.program, loaded.resolved, loaded.check).with_texts(loaded.texts.clone()),

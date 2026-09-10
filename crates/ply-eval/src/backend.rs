@@ -1,7 +1,7 @@
 //! A backend a shipping command can attach, and eight ways of being wrong.
 
 use crate::compiled::Compiled;
-use crate::machine::Machine;
+use crate::evaluator::Machine;
 use crate::value::Value;
 use ply_core::CheckOutput;
 use ply_span::{Span, Symbol};
@@ -491,12 +491,9 @@ pub enum Kind {
     /// [`Reference`]: a nested machine over the carried-signature fragment.
     #[default]
     Reference,
-    /// `ply_codegen::c`: the same fragment emitted as C and handed to `cc`.
+    /// `ply_codegen::c`: the same fragment emitted as C and handed to `cc` — under tier-only, the
+    /// one evaluator.
     C,
-    /// The interpreted front end (ADR 0047): the tier's lowering walked in process, no C compiler.
-    Interp,
-    /// Both front ends (ADR 0047): interpret what the interpreter carries, compile the rest.
-    Combined,
 }
 
 impl Kind {
@@ -504,8 +501,6 @@ impl Kind {
         match self {
             Kind::Reference => "reference",
             Kind::C => "c",
-            Kind::Interp => "interp",
-            Kind::Combined => "combined",
         }
     }
 }
@@ -538,18 +533,6 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
     // A bare backend name, honest.
     match spec {
         "reference" => return Ok(Spec::honest()),
-        "interp" => {
-            return Ok(Spec {
-                kind: Kind::Interp,
-                ..Spec::honest()
-            });
-        }
-        "combined" => {
-            return Ok(Spec {
-                kind: Kind::Combined,
-                ..Spec::honest()
-            });
-        }
         "c" => {
             return Ok(Spec {
                 kind: Kind::C,
@@ -560,14 +543,12 @@ pub fn parse(spec: &str) -> Result<Spec, String> {
     }
     let (backend, rest) = match spec.split_once(':') {
         Some(("c", rest)) => (Kind::C, rest),
-        Some(("interp", rest)) => (Kind::Interp, rest),
-        Some(("combined", rest)) => (Kind::Combined, rest),
         Some(("reference", rest)) => (Kind::Reference, rest),
         _ => (Kind::Reference, spec),
     };
     let Some(rest) = rest.strip_prefix("wrong:") else {
         return Err(format!(
-            "unknown backend `{spec}`; one of `reference`, `c`, `interp`, `combined`, or \
+            "unknown backend `{spec}`; one of `reference`, `c`, or \
              `[<backend>:]wrong:<mutation>` where <mutation> is off-by-one, inverted, stale, \
              wrong-type, unoffered, handle, exceeds-budget[={{k}}] or answers={{int}}, each optionally \
              @<definition>"

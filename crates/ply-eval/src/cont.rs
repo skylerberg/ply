@@ -842,24 +842,13 @@ impl Continuation {
         self.frames
     }
 
-    /// [`crate::machine::Machine::host_ops`] when this continuation was captured.
+    /// [`crate::evaluator::Machine::host_ops`] when this continuation was captured.
     pub fn born(&self) -> u64 {
         self.born
     }
 
     pub fn resumes(&self) -> u32 {
         self.resumes.get()
-    }
-
-    /// Counts this resumption and decides whether it may proceed, answering the ordinal of the
-    /// refused resumption when it may not.
-    pub(crate) fn admit(&self, host_ops: u64) -> Result<(), u32> {
-        let resumes = self.resumes.get().saturating_add(1);
-        self.resumes.set(resumes);
-        if resumes > 1 && host_ops > self.born {
-            return Err(resumes);
-        }
-        Ok(())
     }
 
     /// What splicing this back costs against the call budget: a resumption re-installs the calls

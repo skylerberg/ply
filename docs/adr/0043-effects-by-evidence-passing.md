@@ -11,7 +11,7 @@ and a `return` clause, the zero-shot `resume` as an unwind, `with cell`, the
 per-operation rule in the unit's fixpoint, and the performed atoms crossing the
 seam into the machine's trace. The emitter written in Ply carries every one of
 them, the reference none; they compile with the chain entered whole
-(`PLY_C_EMITTER=ply-whole:<dir>`), and the audit is green over the standard
+(`PLY_C_EMITTER=ply:<dir>`), and the audit is green over the standard
 library and the examples in that mode. The host route was not built
 when this was written, and a `perform` no frame answered was refused before it
 was compiled, by a rule the fixpoint carried; ADR 0044 built the route and
@@ -148,7 +148,7 @@ either stays the machine's until the fifth step.
 The emitter written in Ply is the one that grows: the reference is being
 retired and ADR 0042 holds the port to behaviour, so a construct the reference
 refuses and the port emits is compared by the audit alone, and only the chain
-entered whole (`PLY_C_EMITTER=ply-whole:<dir>`) compiles it.
+entered whole (`PLY_C_EMITTER=ply:<dir>`) compiles it.
 
 - `handle`: each clause body and the `return` body become functions of their
   own, as lambdas do, closed over what they capture; the site pushes the frame,

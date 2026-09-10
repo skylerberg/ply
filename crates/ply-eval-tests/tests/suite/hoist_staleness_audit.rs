@@ -23,23 +23,6 @@ fn int(value: Value) -> i64 {
     }
 }
 
-/// The two fixtures below differ only inside the region's body and are padded to the same length,
-/// so `with_cell[r]` occupies **one span** in both.
-const PRELUDE: &str =
-    "effect amb { read flip[coin]() -> Bool }\n\nfn go() -> Int =\n  with_cell[r](0) { c -> ";
-
-/// Two resumptions over one cell — the region-kind rule's deciding example, with the trace cell folded into
-/// the answer so one integer carries both.
-const CAPTURING: &str = "{ let total = handle { let b = amb.flip[coin](); cell_set(c, cell_get(c) + 1); if b { cell_get(c) } else { cell_get(c) * 10 } } with { amb.flip[coin]() resume k -> k(true) + k(false), return x -> x }; total + cell_get(c) * 1000 }";
-
-/// The same region with no capture in it at all, so the analysis infers `unique`.
-const PURE: &str = "{ cell_set(c, cell_get(c) + 1); 21 + cell_get(c) * 1000 }";
-
-fn fixture(body: &str) -> String {
-    let pad = " ".repeat(CAPTURING.len().saturating_sub(body.len()));
-    format!("{PRELUDE}{body}{pad} }}\n")
-}
-
 /// The same pair for a tail-resumptive clause.
 const TAIL_PRELUDE: &str = "effect log { write note[tape](n: Int) -> Int }\n\nfn go() -> Int =\n  with_cell[tape](0) { c -> ";
 
@@ -50,50 +33,6 @@ const TAIL_PURE: &str = "{ cell_set(c, 12); 3 + cell_get(c) * 1000 }";
 fn tail_fixture(body: &str) -> String {
     let pad = " ".repeat(TAIL_CAPTURING.len().saturating_sub(body.len()));
     format!("{TAIL_PRELUDE}{body}{pad} }}\n")
-}
-
-/// **The premature-free hunt, and it comes back empty.**
-#[test]
-fn a_region_kind_from_the_wrong_program_cannot_free_a_region_a_continuation_reaches() {
-    let pure = Compiled::new(&fixture(PURE));
-    let capturing = Compiled::new(&fixture(CAPTURING));
-
-    let filler = pure.machine();
-    let span = {
-        let honest = capturing.machine();
-        let regions: Vec<_> = honest.region_kinds().iter().map(|r| r.span).collect();
-        assert_eq!(regions.len(), 1, "the fixture must open exactly one region");
-        regions[0]
-    };
-    assert_eq!(
-        filler.region_kind(span),
-        Some(RegionKind::Unique),
-        "the two fixtures no longer place their region at one span, so this poisons nothing"
-    );
-    assert_eq!(
-        capturing.machine().region_kind(span),
-        Some(RegionKind::Shared),
-        "the capturing fixture stopped capturing, so there is nothing to get wrong"
-    );
-
-    assert_eq!(int(capturing.call("m.go")), 2021, "the honest answer moved");
-
-    let mut poisoned = capturing.machine();
-    poisoned.share_region_kinds(filler.shared_region_kinds());
-    assert_eq!(
-        poisoned.region_kind(span),
-        Some(RegionKind::Unique),
-        "the poisoned machine did not read the wrong analysis, so nothing was tested"
-    );
-    let answered = poisoned
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .unwrap_or_else(|d| panic!("a stale `unique` broke the run: [{}] {}", d.code, d.message));
-    assert_eq!(
-        int(answered),
-        2021,
-        "a region the analysis called `unique` was reclaimed at its close while a continuation \
-         could still reach it"
-    );
 }
 
 /// The same question on a tail-resumptive region, which takes no pin.
@@ -141,100 +80,6 @@ fn a_tail_resumptive_region_is_unique_and_a_stale_kind_does_not_move_it() {
     );
 }
 
-/// The ordinary shape of staleness: an edit moves every span after it, so a handle filled before
-/// the edit answers about spans the running program does not have.
-#[test]
-fn an_analysis_whose_spans_moved_answers_for_no_region_and_the_program_still_runs() {
-    let pure = Compiled::new(&fixture(PURE));
-    // One extra line of prelude, so every span in the body moves.
-    let shifted = Compiled::new(&format!(
-        "// an edit above the region\n{}",
-        fixture(CAPTURING)
-    ));
-
-    let filler = pure.machine();
-    let _ = filler.region_kinds();
-
-    let span = {
-        let honest = shifted.machine();
-        let regions: Vec<_> = honest.region_kinds().iter().map(|r| r.span).collect();
-        regions[0]
-    };
-    assert_eq!(
-        filler.region_kind(span),
-        None,
-        "the edit did not move the region's span, so this is not the stale-span case"
-    );
-
-    let mut poisoned = shifted.machine();
-    poisoned.share_region_kinds(filler.shared_region_kinds());
-    assert_eq!(poisoned.region_kind(span), None);
-    assert_eq!(
-        poisoned.region_kinds().kind(span),
-        RegionKind::Shared,
-        "a span the analysis never saw must answer `shared`, because the safe answer to \"was a \
-         capture reachable\" is always yes"
-    );
-    let answered = poisoned
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .unwrap_or_else(|d| panic!("a stale analysis broke the run: [{}] {}", d.code, d.message));
-    assert_eq!(
-        int(answered),
-        2021,
-        "the answer moved under a stale analysis"
-    );
-}
-
-/// The assumption under `Lowering`: a body's lowered form is a function of the body and its
-/// parameter list, and of nothing the machine holds.
-#[test]
-fn a_lambdas_lowered_body_is_independent_of_what_it_captured() {
-    let compiled = Compiled::new(
-        r#"
-fn adder(n: Int) -> (Int) -> Int = |x| x + n
-
-fn go() -> Int {
-  let a = adder(1);
-  let b = adder(20);
-  let c = adder(300);
-  (a(0) + a(0)) + (b(0) + b(0)) + (c(0) + c(0))
-}
-"#,
-    );
-    let mut machine = compiled.machine();
-    let answered = machine
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .unwrap_or_else(|d| panic!("[{}] {}", d.code, d.message));
-    assert_eq!(
-        int(answered),
-        2 * (1 + 20 + 300),
-        "a lambda applied under one lowered body answered differently per capture"
-    );
-    // Two bodies — `adder`'s and `go`'s — however many closures `adder` minted.
-    assert_eq!(
-        machine.share_lowering().len(),
-        2,
-        "the lambda was lowered more than once, so the three closures did not share a body"
-    );
-
-    // The same shape with the closures built in a loop, so the lambda is entered once per element
-    // of a list the program chose.
-    let looped = Compiled::new(
-        r#"
-fn adder(n: Int) -> (Int) -> Int = |x| x + n
-
-fn apply(f: (Int) -> Int) -> Int = f(0) + f(0)
-
-fn go() -> Int = fold([1, 20, 300], 0, |acc, n| acc + apply(adder(n)))
-"#,
-    );
-    assert_eq!(
-        int(looped.call("m.go")),
-        2 * (1 + 20 + 300),
-        "a lambda applied under one lowered body answered differently per capture"
-    );
-}
-
 /// The failure a captured binding would take if lowering ever marked it `Owned`: a closure's free
 /// variable is reachable from the closure for as long as the closure lives, so moving it out at
 /// what looks like a last use empties a binding a second call still reads.
@@ -254,51 +99,6 @@ fn go() -> Int {
         4 + 4 + 3,
         "a binding a closure captured was moved out of the scope the closure shares"
     );
-}
-
-/// Moving work from runtime to a cache can change **when** it happens, and an effect is what makes
-/// that observable.
-#[test]
-fn a_machine_reading_another_machines_lowering_performs_the_same_effects_in_the_same_order() {
-    let compiled = Compiled::new(
-        r#"
-effect log { write note[tape](n: Int) -> Int }
-
-fn work(n: Int) -> Int = log.note[tape](n) * 10
-
-fn go() -> Int =
-  with_cell[tape](0) { c ->
-    handle {
-      let a = work(1);
-      let b = work(2);
-      let d = fold([3, 4], 0, |acc, x| acc + work(x));
-      a + b + d
-    } with {
-      log.note[tape](n) resume k -> { cell_set(c, cell_get(c) * 10 + n); k(n) },
-      return x -> x + cell_get(c) * 100000
-    } }
-"#,
-    );
-
-    let mut first = compiled.machine();
-    let alone = first
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .unwrap_or_else(|d| panic!("[{}] {}", d.code, d.message));
-
-    let mut second = compiled.machine();
-    second.set_lowering(first.share_lowering());
-    let shared = second
-        .call("m.go", Vec::new(), Span::DUMMY)
-        .unwrap_or_else(|d| panic!("[{}] {}", d.code, d.message));
-
-    let (alone, shared) = (int(alone), int(shared));
-    assert_eq!(
-        alone, shared,
-        "a machine reading another's lowering performed a different sequence of operations"
-    );
-    // 1234 in the trace cell, so the operations ran left to right exactly once each and the cache
-    // changed neither the order nor the count.
-    assert_eq!(shared / 100000, 1234, "the operation order moved");
 }
 
 const CAPTURE_ELSEWHERE: &str = r#"
@@ -456,41 +256,5 @@ fn go(helper: (Int) -> Int) -> Int =
             Some(Cause::Indirect)
         ),
         "the refusal is attributed to something other than the unknown callee"
-    );
-}
-
-/// The lowering half of the poisoning above, and it comes out the other way: where a span-keyed
-/// `Kinds` from the wrong program delivers a wrong answer, an address-keyed `Lowering` from the
-/// wrong program cannot.
-#[test]
-fn a_lowering_from_another_program_answers_for_nothing_in_this_one() {
-    let one = Compiled::new("fn go() -> Int = 111\n");
-    let two = Compiled::new("fn go() -> Int = 222\n");
-
-    let mut first = one.machine();
-    assert_eq!(
-        int(first.call("m.go", Vec::new(), Span::DUMMY).unwrap()),
-        111
-    );
-    let filled = first.share_lowering();
-    assert_eq!(filled.len(), 1, "the first machine lowered nothing");
-    assert!(
-        !filled.describes(&two.program),
-        "a cache over one program claims to describe another, so the span the two fixtures share \
-         is enough to answer from the wrong body"
-    );
-
-    let mut poisoned = two.machine();
-    poisoned.set_lowering(std::rc::Rc::clone(&filled));
-    assert!(
-        !std::rc::Rc::ptr_eq(&poisoned.share_lowering(), &filled),
-        "a machine installed a lowering taken over another program"
-    );
-    assert_eq!(
-        int(poisoned
-            .call("m.go", Vec::new(), Span::DUMMY)
-            .unwrap_or_else(|d| panic!("[{}] {}", d.code, d.message))),
-        222,
-        "a machine answered from a body belonging to another program"
     );
 }

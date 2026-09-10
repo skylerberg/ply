@@ -33,7 +33,7 @@ fn failures(dir: &Path, tier_only: bool) -> Vec<Value> {
     if tier_only {
         cmd.args(["--backend", "c"]).env("PLY_TIER_ONLY", "1").env(
             "PLY_C_EMITTER",
-            format!("ply-whole:{}", repo("spikes/ply-parser").display()),
+            format!("ply:{}", repo("spikes/ply-parser").display()),
         );
     }
     let out = cmd.output().unwrap();

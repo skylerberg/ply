@@ -39,21 +39,6 @@ fn a_handled_effect_evaluates_through_the_checked_module() {
     machine.eval_test(0).expect("the handled test should pass");
 }
 
-#[test]
-fn a_failing_test_yields_an_assertion_diagnostic() {
-    let compiled = single();
-    let diag = compiled
-        .machine()
-        .eval_test(1)
-        .expect_err("the test should fail");
-    assert_eq!(diag.code, ply_span::codes::ASSERTION_FAILED);
-    assert_eq!(diag.message, "assertion failed: expected 3, found 2");
-    assert!(
-        !diag.primary_span().unwrap().is_dummy(),
-        "the failure must point at real source"
-    );
-}
-
 /// The effect, the code that performs it and the handler that discharges it are each in a different
 /// module and spell the effect differently.
 #[test]

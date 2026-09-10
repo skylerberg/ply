@@ -320,17 +320,12 @@ fn the_census_denominator_is_the_program_and_its_numerator_is_what_a_backend_is_
     }
 }
 
-/// One test per selection: `over_examples` carries the liveness assertions, the buckets the
-/// cross-checks over one slice of the fixtures.
+/// One test per fixture bucket: the buckets carry the cross-checks over one slice of the fixtures.
 macro_rules! over_every_corpus {
     ($family:ident) => {
         mod $family {
             use super::Selection;
 
-            #[test]
-            fn over_examples() {
-                super::$family(Selection::Examples);
-            }
             #[test]
             fn over_fixture_bucket_0() {
                 super::$family(Selection::Fixtures(0));

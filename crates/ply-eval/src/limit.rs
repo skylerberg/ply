@@ -1,6 +1,6 @@
 //! The bound on runaway recursion.
 
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, Span, codes};
 
 /// The most nested calls a program may hold at once.
 pub const DEFAULT_MAX_CALLS: usize = 10_000;
@@ -14,69 +14,6 @@ pub(crate) fn grow<R>(f: impl FnOnce() -> R) -> R {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)
-}
-
-/// How many of the innermost calls the diagnostic names.
-pub(crate) const NAMED_CALLS: usize = 6;
-
-/// The message keeps the phrase "recursion limit", and names the innermost calls — the actual
-/// recursion path.
-pub(crate) fn err_recursion_limit(
-    span: Span,
-    what: &str,
-    max: usize,
-    innermost: &[Option<Symbol>],
-) -> Diagnostic {
-    let mut diag = Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("recursion limit of {max} {what} exceeded"),
-    )
-    .primary(span, "this call is too deeply nested")
-    .note("check for a recursive call that never reaches its base case");
-
-    let named: Vec<String> = innermost
-        .iter()
-        .take(NAMED_CALLS)
-        .map(|name| match name {
-            Some(n) => format!("`{n}`"),
-            None => "an anonymous function".to_string(),
-        })
-        .collect();
-    if !named.is_empty() {
-        diag = diag.note(format!("innermost calls: {}", named.join(" from ")));
-    }
-    diag
-}
-
-/// A machine ran out of the frame ceiling it was asked for.
-pub(crate) fn err_frame_ceiling(
-    span: Span,
-    max: usize,
-    max_calls: usize,
-    innermost: &[Option<Symbol>],
-) -> Diagnostic {
-    let mut diag = Diagnostic::error(
-        codes::RUNTIME_ERROR,
-        format!("this engine's ceiling of {max} {PENDING_FRAMES} was reached"),
-    )
-    .primary(span, "evaluating this ran the machine out of frames")
-    .note(format!(
-        "a frame ceiling is a resource guard on the control-stack machine's own heap, not a \
-         bound on the program: the program's bound is {max_calls} {NESTED_CALLS}"
-    ));
-
-    let named: Vec<String> = innermost
-        .iter()
-        .take(NAMED_CALLS)
-        .map(|name| match name {
-            Some(n) => format!("`{n}`"),
-            None => "an anonymous function".to_string(),
-        })
-        .collect();
-    if !named.is_empty() {
-        diag = diag.note(format!("innermost calls: {}", named.join(" from ")));
-    }
-    diag
 }
 
 /// An `iterate` whose step never answered `Stop`.
@@ -110,6 +47,4 @@ pub(crate) fn err_value_depth(span: Span, max: usize) -> Diagnostic {
 }
 
 /// What each bound counts, in the message.
-pub(crate) const NESTED_CALLS: &str = "nested calls";
-pub(crate) const PENDING_FRAMES: &str = "pending frames";
 pub(crate) const NESTED_VALUES: &str = "nested values";
