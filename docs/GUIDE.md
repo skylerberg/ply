@@ -1789,7 +1789,7 @@ definition the tier refuses is left to the machine. The emitted bodies and the
 built unit are both cached under `PLY_C_CACHE`, so a warm run compiles nothing
 and an edit recompiles one unit. `PLY_C_EMITTER=ply:<dir>` makes the emitter
 written in Ply in `<dir>` the tier's producer, body by body, with the built-in
-emitter answering whatever it does not reach; `PLY_C_EMITTER=ply-whole:<dir>`
+emitter answering whatever it does not reach; `PLY_C_EMITTER=ply:<dir>`
 makes its answer the whole unit's, its refusals dropped as the built-in
 emitter's would be and the built-in emitter not run over the program at all;
 that mode also compiles `handle`, `perform`, `with_cell` and `simulate` with
