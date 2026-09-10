@@ -66,8 +66,12 @@ fn compiler() -> String {
 /// One process and one link for the whole unit, which is the shape `benches/c-floor/` found is a
 /// constant rather than an exponent — and the opposite of the per-definition image it refused.
 /// Where compiled units are kept between runs. `PLY_C_CACHE` names another directory; the default
-/// is under the system's temporary directory, which is swept by the OS rather than growing without
-/// bound.
+/// is under the system's temporary directory.
+///
+/// **Nothing about that directory bounds it**, which this comment used to claim: an entry is keyed
+/// by its content, so a changed definition writes a new one beside the old rather than replacing
+/// it, and the system's own sweep runs on a schedule measured in days. `super::sweep` is what
+/// bounds it, at the start of a build, and `PLY_C_CACHE_MAX` is the bound.
 pub(super) fn cache_dir() -> std::path::PathBuf {
     std::env::var("PLY_C_CACHE")
         .map(std::path::PathBuf::from)
@@ -146,6 +150,10 @@ pub(super) fn which(cc: &str) -> Option<std::path::PathBuf> {
 }
 
 pub fn compile_and_load(source: &str, stem: &str) -> Result<Library> {
+    // The other place the cache is written, and the one that writes the large files. A run that
+    // only loads a bootstrap bundle never reaches `build`, and would otherwise add an object per
+    // run to a directory nothing swept. `sweep::once` is what makes calling it twice free.
+    super::sweep::once();
     let level = opt_level();
     let ext = ext();
     // A unit already compiled from this source, by this compiler, on these flags is this object:

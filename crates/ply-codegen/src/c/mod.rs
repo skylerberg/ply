@@ -19,6 +19,7 @@
 //! | `PLY_C_SPLIT` | print where the emit's time went: optimise-and-lower against emit | `build.rs` |
 //! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache; and at every entry's end what it allocated, recycled and still held, by kind | `build.rs`, `rt.rs` |
 //! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
+//! | `PLY_C_CACHE_MAX` | how many bytes that directory may hold. The sweep runs at the start of a build, oldest entry first; `0` is no bound | `sweep.rs` |
 //! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |
 //! | `PLY_C_PROFILE` | `development` (the default) picks the fast toolchain and the inlining that survives it -- `tcc` if installed, else `cc -O0`, at depth 0; `release` is `cc -O2` at depth 3. Overrides the CLI's `--profile`, so that a bench script pins one without a command line. The compiler and the depth are one choice, not two: read `toolchain.rs` before separating them | `toolchain.rs` |
 //! | `PLY_CC` | the C compiler to shell out to, overriding the profile's | `load.rs` |
@@ -29,7 +30,7 @@
 //! | `PLY_TIER_ONLY` | `1` makes this backend the only engine: a test or an entry it does not hold fails with `E0505`, and the machine evaluates nothing (ADR 0045) | `backend.rs` |
 //! | `PLY_INLINE_DEPTH` | how many times a callee's own calls are inlined in turn. This is what the unit's size follows; the budget barely moves it | `../opt.rs` |
 //!
-//! Two things a fourteenth would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
+//! Two things the next one added here would have to know. `PLY_C_ONLY` and `PLY_C_SKIP` narrow the offered set
 //! **before** its digest is taken, because a refusal is cached against that digest -- filtering
 //! after it served a narrowed run's refusals back to an unfiltered one and built a unit neither
 //! run would produce. And anything that changes an emitted body has to reach the cache key:
@@ -43,6 +44,7 @@ mod emit;
 mod load;
 mod prelude;
 pub mod producer;
+mod sweep;
 mod toolchain;
 
 pub use build::{

@@ -369,6 +369,10 @@ pub fn load_unit(
 }
 
 pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Refused>)> {
+    // Before the build rather than after it, and once in the process: what this bounds is what the
+    // cache is left holding, and a build that starts by making room needs no second pass over a
+    // directory it has just filled.
+    super::sweep::once();
     let started = std::time::Instant::now();
     let ctors = loaded.ctors();
     let ctors_digest = super::cache::ctors_digest(&ctors);
