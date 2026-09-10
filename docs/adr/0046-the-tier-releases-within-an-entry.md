@@ -104,17 +104,17 @@ The oracle is the audit that pairs every test with the machine, run with
 the emitter in release mode producing the unit:
 
 ```sh
-PLY_C_EMITTER=ply-whole:spikes/ply-parser ./target/release/ply test examples --backend c --audit-backend --no-cache
-PLY_C_EMITTER=ply-whole:spikes/ply-parser ./target/release/ply test crates/ply-std/ply --backend c --audit-backend --no-cache
-PLY_TIER_ONLY=1 PLY_C_EMITTER=ply-whole:spikes/ply-parser ./target/release/ply test examples --backend c --no-cache
-PLY_TIER_ONLY=1 PLY_C_EMITTER=ply-whole:spikes/ply-parser ./target/release/ply test crates/ply-std/ply --backend c --no-cache
+PLY_C_EMITTER=ply-whole:crates/ply-compiler ./target/release/ply test examples --backend c --audit-backend --no-cache
+PLY_C_EMITTER=ply-whole:crates/ply-compiler ./target/release/ply test crates/ply-std/ply --backend c --audit-backend --no-cache
+PLY_TIER_ONLY=1 PLY_C_EMITTER=ply-whole:crates/ply-compiler ./target/release/ply test examples --backend c --no-cache
+PLY_TIER_ONLY=1 PLY_C_EMITTER=ply-whole:crates/ply-compiler ./target/release/ply test crates/ply-std/ply --backend c --no-cache
 ```
 
 All four are green. `crates/ply-codegen/src/heap.rs` refuses to read a word
 whose object died, and under the audit that refusal is what turned each
 ownership defect into a named failure rather than a wrong answer; it
 caught the double release above and the two-pass hazard. The ratchet
-`spikes/ply-parser/harness/tests/emit_diff.rs` compares the port's
+`crates/ply-compiler-diff/tests/emit_diff.rs` compares the port's
 reference mode, which is unchanged, and the port's own tests pass under both
 engines.
 
@@ -122,7 +122,7 @@ The measurement is `PLY_C_PHASES=1`, which prints what an entry allocated,
 recycled and left live, by kind:
 
 ```sh
-PLY_C_PHASES=1 PLY_TIER_ONLY=1 PLY_C_EMITTER=ply-whole:spikes/ply-parser ./target/release/ply run --backend c f.ply
+PLY_C_PHASES=1 PLY_TIER_ONLY=1 PLY_C_EMITTER=ply-whole:crates/ply-compiler ./target/release/ply run --backend c f.ply
 ```
 
 For the fold over fifty thousand records that ADR 0045 measured, the entry

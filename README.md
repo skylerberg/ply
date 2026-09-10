@@ -439,8 +439,8 @@ drifted — the ones that say something about what the language does rather than
 about how many tests exist.
 
 A few tests are marked `ignored`. They are timing benchmarks you run on purpose
-rather than gates — the ones in `ply-corpus`'s `http_cost` tests and
-`interp::tests::a_cached_mention_against_the_allocation_it_replaces` in
+rather than gates — the ones in `ply-corpus-tests`'s `http_cost` tests and
+`semantics::tests::a_cached_mention_against_the_allocation_it_replaces` in
 `ply-eval`'s lib tests — plus one doc-test, which is not a benchmark. Each
 benchmark prints the command that runs it. `docs/ONBOARDING.md` §2 has the wall
 clock and its spread, which is wide: readings on this one command have ranged
@@ -480,5 +480,5 @@ MIT OR Apache-2.0 — the texts are [`LICENSE-MIT`](LICENSE-MIT) and
 [`LICENSE-APACHE`](LICENSE-APACHE) at the repository root, added 2026-08-27. Until
 then neither file existed, and this line and `Cargo.toml:22` declared a licence the
 repository did not ship; `CONTRIBUTING.md` §"Things known to be broken" item 7 is
-where that was recorded. The thirteen workspace members inherit the expression with
+where that was recorded. Every workspace member inherits the expression with
 `license.workspace = true`.

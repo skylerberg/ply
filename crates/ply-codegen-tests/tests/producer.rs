@@ -68,11 +68,11 @@ fn load(modules: &[(&str, &str)], with_std: bool) -> &'static Loaded {
     }))
 }
 
-/// The emitter: every `.ply` under `spikes/ply-parser` and the standard library it imports,
+/// The emitter: `ply-compiler`'s modules and the standard library they import,
 /// compiled by the reference and loaded.
 /// The emitter's identity, for the cache keys: the digest of the same files the recipe reads.
 fn emitter_identity() -> String {
-    let dir = repo().join("spikes/ply-parser");
+    let dir = repo().join("crates/ply-compiler/ply");
     let mut modules = Vec::new();
     for e in std::fs::read_dir(&dir)
         .expect("the emitter's directory")
@@ -93,7 +93,7 @@ fn emitter_identity() -> String {
 }
 
 fn emitter() -> Result<PlyProducer, String> {
-    let dir = repo().join("spikes/ply-parser");
+    let dir = repo().join("crates/ply-compiler/ply");
     let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
         .map_err(|e| format!("{}: {e}", dir.display()))?
         .filter_map(|e| e.ok().map(|e| e.path()))

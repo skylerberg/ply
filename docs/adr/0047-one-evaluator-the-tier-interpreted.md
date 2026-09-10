@@ -43,7 +43,7 @@ remove, and it is the part that has to be re-derived every time an effect's
 semantics move.
 
 The interpreter removes the second model rather than the second evaluator.
-It is a Rust transcription of what `spikes/ply-parser/emit.ply` emits, node
+It is a Rust transcription of what `crates/ply-compiler/ply/emit.ply` emits, node
 for node, but producing `Word`s in the runtime's heap through the `rt_*`
 helpers instead of C text: a `Binary` does what the emitted arithmetic
 does, a `Perform` calls `rt_perform`, a `Handle` pushes a frame with
