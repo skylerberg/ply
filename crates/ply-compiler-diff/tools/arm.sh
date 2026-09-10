@@ -23,6 +23,7 @@ here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 crate="$(cd "$here/.." && pwd)"
 root="$(cd "$crate/../.." && pwd)"
 
+
 echo "==> building target/release/ply (the harness shells out to it)"
 cargo build --manifest-path "$root/Cargo.toml" --release -p ply-cli --bin ply
 
