@@ -20,6 +20,14 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 
+# The harness declares its own `[workspace]`, so cargo would give it a target
+# directory of its own -- measured at **2.3 GB** beside the workspace's own
+# release build, the object cache and the toolchain, on a hosted runner whose
+# disk is the smallest thing about it. This job was killed twice with the runner
+# reporting a shutdown signal, which is what a full disk looks like from inside.
+# One target directory, shared: the package names differ, so nothing collides.
+export CARGO_TARGET_DIR="$root/target"
+
 echo "==> building target/release/ply (the harness shells out to it)"
 cargo build --manifest-path "$root/Cargo.toml" --release -p ply-cli --bin ply
 
@@ -119,7 +127,7 @@ echo "==> the seventh differential: code.ply's lowering against ply_eval::code"
 # The first comparison for a stage *after* the front end. It compares only what the port claims to
 # lower -- `lower` answers `None` for a node kind it has not reached -- and asserts the share it
 # reaches, so a port that quietly lowered nothing would fail rather than agree with itself.
-PLY_C_EMITTER="ply-whole:$here" PLY_BIN="$root/target/release/ply" cargo test --test lower_diff -- --nocapture --test-threads=2 |
+PLY_C_EMITTER="ply:$here" PLY_BIN="$root/target/release/ply" cargo test --test lower_diff -- --nocapture --test-threads=2 |
   grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
 
 echo
@@ -137,7 +145,7 @@ cargo test --manifest-path "$here/harness/Cargo.toml" --test effects -- --nocapt
 echo
 echo "==> the eighth differential: emit.ply's C against crates/ply-codegen's,"
 echo "    on shapes chosen per node and then on the shipped corpus"
-PLY_C_EMITTER="ply-whole:$here" PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=1 |
+PLY_C_EMITTER="ply:$here" PLY_BIN="$root/target/release/ply" cargo test --test emit_diff -- --nocapture --test-threads=1 |
   tee /tmp/ply-parser-emit.log | grep -E "agreeing|^test result|^error|panicked"
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-emit.log || {
   echo "the emitter differential is red or ran nothing -- see the log above" >&2

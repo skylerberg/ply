@@ -133,7 +133,7 @@ behind an instrument that already exists.
    all Ply; entered once from the driver with source bytes in and C text out,
    nothing in Rust reads a Ply value, and the bridge `ply bootstrap` said was
    missing is not needed. The dumps remain what the differentials compare.
-   **Built:** `PLY_C_EMITTER=ply-whole:<dir>` enters the port's front end,
+   **Built:** `PLY_C_EMITTER=ply:<dir>` enters the port's front end,
    lowering and emitter once over the program's source bytes and takes its
    answer -- every body as C and tables, every refusal as the fixpoint's -- as
    the unit's, with the reference emitter run only to build the producer
