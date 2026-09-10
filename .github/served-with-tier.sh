@@ -19,7 +19,7 @@ grep -q "^fn port() -> Int = $port\$" "$dir/hello.ply" || {
 # Two connections: the probe below that waits for the listener is the first, answered as a
 # peer that says nothing, and the request is the second, after which the example exits.
 cd "$dir"
-PLY_C_CACHE="$dir/cache" PLY_C_EMITTER="ply:$root/crates/ply-compiler" PLY_C_REFUSALS=1 \
+PLY_C_CACHE="$dir/cache" PLY_C_REFUSALS=1 \
   "$bin" run --host --backend c > out.txt 2> err.txt &
 pid=$!
 for _ in $(seq 1 300); do
