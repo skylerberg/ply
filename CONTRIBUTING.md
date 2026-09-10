@@ -131,8 +131,7 @@ warnings`, the whole test suite, `examples/same-tests.sh`, and the spikes.
 **Most of why it exists is the gates**, not the suite. A gate that returns a
 *passing* result when its dependency is absent is the thing a human is least
 likely to notice, so CI forces each open and **fails when it finds the notice a
-skipped test prints**. `PLY_PG_URL`, `cluster::available()`, `#![cfg(unix)]` and
-`crates/ply-codegen-spike` are asserted that way. `PLY_TEST_DB` has no notice —
+skipped test prints**. `PLY_PG_URL`, `cluster::available()` and `#![cfg(unix)]` are asserted that way. `PLY_TEST_DB` has no notice —
 those tests print nothing whatsoever when they skip — so it is pre-flighted
 instead, with `test -n` and a live `SELECT 1`.
 
@@ -153,23 +152,21 @@ than when the last shard does.
 member is in no shard, in two shards, or named and absent from the tree — a
 partition is a chance to lose a package silently, and a package nothing builds
 is this repository's most expensive defect class. The same check covers
-`spikes/`, which was added after `spikes/ply-parser` sat in **no CI job at all**
+the workspace, which `crates/ply-compiler` joined after sitting in **no CI job at all**
 while its differential went red for two days, and `.config/nextest.toml`, which
 must name exactly the wall-clock tests the script's table names: each shard
 runs those last and alone and asserts, by exact name, that each one in its
 packages ran.
 
-Two things CI deliberately does not run, both recorded in §"Things known to be
-broken": `./spikes/ply-parser/run.sh --arm`, and
-`crates/ply-codegen-spike`'s agreement corpus.
+One thing CI deliberately does not run, recorded in §"Things known to be
+broken": `./crates/ply-compiler-diff/tools/arm.sh --arm`.
 ### The suite proves less than it looks like it proves
 
 Green is weaker than it looks, for two separate reasons.
 
 **Gates.** Several suites pass *without running* when a dependency is absent —
-`PLY_PG_URL`, `PLY_TEST_DB`, postgres binaries on `PATH`, `#![cfg(unix)]`, and
-`crates/ply-codegen-spike`, which declares its own `[workspace]` and is therefore
-compiled by nothing in `--workspace`. `docs/ONBOARDING.md` §2 has the table and
+`PLY_PG_URL`, `PLY_TEST_DB`, postgres binaries on `PATH`, and `#![cfg(unix)]`.
+`docs/ONBOARDING.md` §2 has the table and
 how CI forces each open. The worst is `PLY_TEST_DB`: it prints nothing at all
 when unset, so a green run is indistinguishable from a run against a database.
 
@@ -201,10 +198,9 @@ still counted as lowered, so the headline credited the port for bodies nothing
 verified; it now prints what it reached and what it compared, with a floor on
 each.
 
-**By-hand obligations the suite does not carry:** `./spikes/ply-parser/run.sh
---arm`, which is the evidence that spike's differential can go red at all, and
-`crates/ply-codegen-spike`'s agreement corpus. Both are recorded in
-§"Things known to be broken".
+**By-hand obligations the suite does not carry:**
+`./crates/ply-compiler-diff/tools/arm.sh --arm`, which is the evidence the
+differentials can go red at all. It is recorded in §"Things known to be broken".
 ## Before you open a change
 
 1. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets`,
@@ -801,12 +797,12 @@ made them.
 5. `examples/serve.sh` misdescribed what `--db-schema` refuses.
 6. `PLY_PG_URL` was set by nothing, so the live postgres tests passed without running. CI sets it.
 7. No `LICENSE`/`LICENSE-APACHE` file existed although the manifest declared `MIT OR Apache-2.0`.
-16. `spikes/ply-lexer/run.sh` reached no test because its harness did not compile past the tokens ADR 0028 and ADR 0033 added. It runs now, its lexer lexes them, and CI has a job for it (`lexer-spike`).
+16. `crates/ply-compiler-diff/run.sh` reached no test because its harness did not compile past the tokens ADR 0028 and ADR 0033 added. It runs now, its lexer lexes them, and CI has a job for it (`lexer-spike`).
 9. The compiled-entry seam carried one of the machine's two resource bounds, so a backend answered where the machine raises.
 10. The two engines disagreed on the recursion bound for deeply pending bodies, with no backend involved.
 11. A definition that discharged its own effects published an empty row, so the seam's purity gate cleared it.
 12. Every entry into the spike's backend cost O(the *previous* entry's peak arena).
-17. `spikes/ply-parser` was in no CI job and its differential was red.
+17. `crates/ply-compiler` was in no CI job and its differential was red.
 18. `crates/ply-codegen-spike`'s agreement corpus was red and its suite green, because no test ran the command: the spike's boundary handed the leaf kinds the machine's seam admits to bodies compiled over `Int` and `Bool`. The boundary checks the kind now, and the suite runs the command. The shape to notice stands: a green suite over a harness whose purpose is a differential the suite never invokes is a green result over space nothing exercises.
 
 ## Style

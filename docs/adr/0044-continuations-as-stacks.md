@@ -127,7 +127,7 @@ shipped corpus. The command is the measurement; the classes are the design's
 input:
 
 ```sh
-PLY_C_CACHE=$(mktemp -d) PLY_C_EMITTER=ply-whole:spikes/ply-parser PLY_C_REFUSALS=1 \
+PLY_C_CACHE=$(mktemp -d) PLY_C_EMITTER=ply-whole:crates/ply-compiler PLY_C_REFUSALS=1 \
   ./target/release/ply test examples --backend c --audit-backend --no-cache 2>&1 \
   | grep "c tier refused" | grep -E "task|not emit|answered by|credential"
 ```
@@ -225,9 +225,9 @@ The probe that decided it, and the cost:
 
 ```sh
 # a coroutine on its own stack, suspended, snapshotted, resumed, restored, resumed again
-cc -w -o /tmp/uctx spikes/ucontext/uctx.c && /tmp/uctx
+cc -w -o /tmp/uctx probes/ucontext/uctx.c && /tmp/uctx
 # a switch there and back, and the memcpy a snapshot is
-cc -O2 -w -o /tmp/uctx_bench spikes/ucontext/uctx_bench.c && /tmp/uctx_bench
+cc -O2 -w -o /tmp/uctx_bench probes/ucontext/uctx_bench.c && /tmp/uctx_bench
 ```
 
 On macOS arm64 the library's functions are deprecated and present, the probe
@@ -279,7 +279,7 @@ second shot sees the first shot's stack.
 **Why in place and not into a fresh stack.** An emitted frame holds pointers
 into itself: the argument array a call passes to `rt_perform_p`, `rt_call_p`
 or `rt_builtin_p` is a local array whose address crosses into the runtime
-(`spikes/ply-parser/emit.ply`, the `(Word)(intptr_t)arr` forms). A snapshot
+(`crates/ply-compiler/ply/emit.ply`, the `(Word)(intptr_t)arr` forms). A snapshot
 restored at a different address would leave every such pointer dangling in
 frames that are about to run; restored where it was taken, every one is
 valid. The alternative is an emitter that never passes stack addresses, which

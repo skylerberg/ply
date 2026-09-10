@@ -9,7 +9,7 @@ set -euo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../.." && pwd)"
 ply="${PLY_BIN:-$root/target/release/ply}"
-spike="$root/spikes/ply-parser"
+spike="$root/crates/ply-compiler"
 raw="$here/raw.txt"
 
 load1() { uptime | sed 's/.*load averages*: *//' | awk -F'[ ,]+' '{print $1}'; }

@@ -410,7 +410,7 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
 /// carries its own name -- so a cache keyed on the hash alone serves one body for both and the
 /// unit holds two definitions of one symbol and none of the other.
 ///
-/// `spikes/ply-parser/lexer.ply` has that pair (`hex1` and `hex2`) and the C compiler is what
+/// `crates/ply-compiler/ply/lexer.ply` has that pair (`hex1` and `hex2`) and the C compiler is what
 /// noticed. This is the five-line version, and it fails without the name in the key.
 #[test]
 fn two_definitions_that_say_the_same_thing_get_their_own_bodies() {
