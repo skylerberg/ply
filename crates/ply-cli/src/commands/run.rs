@@ -559,7 +559,9 @@ mod tests {
     fn eval(l: &Loaded) -> Result<String, Diagnostic> {
         let entry = entry_point(l)?;
         let (name, span) = (entry.name.clone(), entry.span);
-        Machine::new(&l.program, &l.resolved, &l.check)
+        let mut machine = Machine::new(&l.program, &l.resolved, &l.check);
+        crate::commands::common::attach_tier(&mut machine, l)?;
+        machine
             .call(name.as_str(), Vec::new(), span)
             .map(|v| v.to_string())
     }

@@ -105,6 +105,14 @@ pub struct Front {
 }
 
 impl Front {
+    /// A machine over the program with the default tier attached.
+    pub fn machine(&self) -> ply_eval::Machine<'_> {
+        let mut machine =
+            crate::tier_machine(&self.program, &self.resolved, &self.check, &self.sources);
+        machine.share_region_kinds(self.shared_region_kinds());
+        machine
+    }
+
     pub fn shared_region_kinds(&self) -> ply_eval::region_kind::Kinds {
         ply_eval::region_kind::Kinds::clone(&self.region_kinds)
     }

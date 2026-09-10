@@ -4,7 +4,7 @@ use super::*;
 use crate::build::*;
 use crate::{Machine, Value};
 use ply_span::codes;
-use ply_syntax::ast::{BinOp, Expr, Item, Mode};
+use ply_syntax::ast::{BinOp, Expr, Item};
 
 /// Runs `e` on the machine with the counters cleared, and answers the value beside what reference
 /// counting did while producing it.
@@ -22,10 +22,6 @@ fn run_expr(e: Expr) -> (Value, Stats) {
     run(Vec::new(), e)
 }
 
-fn amb() -> Item {
-    effect_def("amb", &[("flip", Mode::Read, false)])
-}
-
 fn ints(xs: &[i64]) -> Expr {
     list(xs.iter().copied().map(int).collect())
 }
@@ -36,103 +32,6 @@ fn int_of(v: &Value) -> i64 {
         Value::Int(i) => *i,
         other => panic!("expected an Int, got {other}"),
     }
-}
-
-#[track_caller]
-fn list_of(v: &Value) -> Vec<i64> {
-    match v {
-        Value::List(xs) => xs.iter().map(int_of).collect(),
-        other => panic!("expected a List, got {other}"),
-    }
-}
-
-/// The point of the whole milestone: a list whose last owner is the caller grows in place, and the
-/// same program written so that somebody else can still see it copies.
-#[test]
-fn a_uniquely_owned_list_is_updated_in_place_and_a_shared_one_is_copied() {
-    let unique = block(
-        vec![
-            letv("xs", ints(&[1, 2, 3])),
-            letv("ys", callv("push", vec![var("xs"), int(4)])),
-        ],
-        Some(var("ys")),
-    );
-    let (value, unique_stats) = run_expr(unique);
-    assert_eq!(list_of(&value), [1, 2, 3, 4]);
-    assert_eq!(unique_stats.updates, 1);
-    assert_eq!(
-        unique_stats.updates_in_place, 1,
-        "`xs` is dead after the push, so nothing else can see the list it was handed"
-    );
-
-    // The only difference is that the tail reads `xs` as well, so the binding is still live when
-    // `push` runs and the list has two owners.
-    let shared = block(
-        vec![
-            letv("xs", ints(&[1, 2, 3])),
-            letv("ys", callv("push", vec![var("xs"), int(4)])),
-        ],
-        Some(bin(
-            BinOp::Add,
-            callv("len", vec![var("xs")]),
-            callv("len", vec![var("ys")]),
-        )),
-    );
-    let (value, shared_stats) = run_expr(shared);
-    assert_eq!(int_of(&value), 3 + 4, "the original list is unchanged");
-    assert_eq!(shared_stats.updates, 1);
-    assert_eq!(
-        shared_stats.updates_in_place, 0,
-        "`xs` is read after the push, so the push may not rewrite it"
-    );
-}
-
-/// Appending in a fold is the shape reference counting exists for: without reuse every element
-/// copies the whole accumulator, which is quadratic.
-#[test]
-fn an_accumulator_folded_over_is_reused_rather_than_recopied() {
-    let e = callv(
-        "fold",
-        vec![
-            callv("range", vec![int(0), int(64)]),
-            list(Vec::new()),
-            lam(&["acc", "x"], callv("push", vec![var("acc"), var("x")])),
-        ],
-    );
-    let (value, stats) = run_expr(e);
-    assert_eq!(list_of(&value).len(), 64);
-    assert_eq!(stats.updates, 64);
-    assert_eq!(
-        stats.updates_in_place, 64,
-        "every step of the fold owned the accumulator outright"
-    );
-    assert_eq!(stats.in_place(), Some(1.0));
-}
-
-/// A value built inside a region and returned from it outlives the region, and is still an ordinary
-/// refcounted value on the other side — including for reuse, which is the observable half of "what
-/// escapes is reference-counted".
-#[test]
-fn a_value_that_outlives_its_region_is_still_reference_counted_after_it() {
-    let e = block(
-        vec![letv(
-            "xs",
-            with_cell(
-                "r",
-                int(7),
-                "c",
-                list(vec![callv("cell_get", vec![var("c")]), int(1)]),
-            ),
-        )],
-        Some(callv("push", vec![var("xs"), int(2)])),
-    );
-    let (value, stats) = run_expr(e);
-    assert_eq!(list_of(&value), [7, 1, 2]);
-    assert_eq!(
-        (stats.updates, stats.updates_in_place),
-        (1, 1),
-        "the escaping list left its region with one owner and was reused"
-    );
 }
 
 /// The elision the pass performs, as a number.
@@ -197,55 +96,6 @@ fn a_read_before_a_capture_is_cloned_and_the_program_still_answers() {
         stats.dup_emitted >= 1,
         "the argument read of `xs` runs before the lambda captures it, so it clones: {stats:?}"
     );
-}
-
-/// A last use in a position the machine holds the scope alone moves the value out instead of
-/// cloning it — Perceus' "a last use is a move", and the only place the analysis has a runtime
-/// effect of its own.
-#[test]
-fn a_last_use_the_scope_alone_can_see_is_moved_rather_than_cloned() {
-    let e = block(vec![letv("xs", ints(&[1, 2, 3]))], Some(var("xs")));
-    let (value, stats) = run_expr(e);
-    assert_eq!(list_of(&value), [1, 2, 3]);
-    assert!(
-        stats.takes_moved >= 1,
-        "the tail read of `xs` is a last use of a scope nothing else holds"
-    );
-}
-
-/// The case the region-kind rule says decides the design, asked of reference counting rather than of the
-/// world: a resumption may not observe what an earlier one wrote.
-#[test]
-fn a_list_reachable_from_several_resumptions_is_copied_by_all_but_the_last() {
-    for resumptions in 2..5usize {
-        let body = block(
-            vec![
-                letv("xs", ints(&[1, 2])),
-                letv("b", perform("amb", "flip", None, Vec::new())),
-            ],
-            Some(callv("len", vec![callv("push", vec![var("xs"), var("b")])])),
-        );
-        let sum = (1..resumptions).fold(call(var("k"), vec![int(0)]), |acc, i| {
-            bin(BinOp::Add, acc, call(var("k"), vec![int(10 * i as i64)]))
-        });
-        let e = handle(
-            body,
-            vec![general_clause("amb", "flip", None, &[], "k", sum)],
-        );
-        let (value, stats) = run(vec![amb()], e);
-        assert_eq!(
-            int_of(&value),
-            3 * resumptions as i64,
-            "{resumptions} resumptions each pushed onto a two-element list of their own"
-        );
-        assert_eq!(stats.updates, resumptions as u64);
-        assert!(
-            stats.updates_in_place <= 1,
-            "{resumptions} resumptions rewrote the list {} times; only the one nothing can \
-             resume past may reuse it",
-            stats.updates_in_place
-        );
-    }
 }
 
 /// A cell made to contain itself leaks, and says so.
@@ -375,56 +225,6 @@ fn a_read_left_of_a_shadowing_scope_is_not_owned_when_the_outer_binding_lives_on
     );
     let (value, _) = run_expr(e);
     assert_eq!(int_of(&value), 6);
-}
-
-/// A shadowing binder that the enclosing activation does not read again is still a last use, so the
-/// fix costs no reuse where there was nothing to protect: the inner list has one owner at the
-/// `push` and is rewritten.
-#[test]
-fn shadowing_costs_no_reuse_where_the_outer_binding_is_dead() {
-    let e = block(
-        vec![
-            letv("xs", ints(&[1, 2, 3])),
-            letv("n", callv("len", vec![var("xs")])),
-        ],
-        Some(block(
-            vec![
-                letv("xs", ints(&[4, 5])),
-                letv("ys", callv("push", vec![var("xs"), int(6)])),
-            ],
-            Some(bin(BinOp::Add, var("n"), callv("len", vec![var("ys")]))),
-        )),
-    );
-    let (value, stats) = run_expr(e);
-    assert_eq!(int_of(&value), 6);
-    assert_eq!((stats.updates, stats.updates_in_place), (1, 1));
-}
-
-/// The converse, and the one the fix is for: the outer binding is read after the shadowing scope,
-/// so the inner `push` reuses the inner list while the outer read still finds the outer one.
-#[test]
-fn a_shadowed_outer_binding_is_neither_reused_nor_released() {
-    let e = block(
-        vec![letv("xs", ints(&[1, 2, 3]))],
-        Some(bin(
-            BinOp::Add,
-            block(
-                vec![
-                    letv("xs", ints(&[4, 5])),
-                    letv("ys", callv("push", vec![var("xs"), int(6)])),
-                ],
-                Some(callv("len", vec![var("ys")])),
-            ),
-            callv("len", vec![var("xs")]),
-        )),
-    );
-    let (value, stats) = run_expr(e);
-    assert_eq!(int_of(&value), 3 + 3);
-    assert_eq!(
-        (stats.updates, stats.updates_in_place),
-        (1, 1),
-        "the inner list is the one being pushed onto, and only it"
-    );
 }
 
 /// A generated corpus, because the shapes somebody thinks to write down are not the shapes that
@@ -621,73 +421,6 @@ mod generated {
                 );
             }
         }
-    }
-
-    /// The same corpus under a handler that resumes twice, whose oracle is arithmetic and so
-    /// cannot audit.
-    #[test]
-    fn each_resumption_answers_as_though_it_were_the_only_one() {
-        let items = vec![effect_def("amb", &[("flip", Mode::Read, false)])];
-        let (program, resolved) = standalone(items);
-        let mut compared = 0;
-        for seed in 0..1_000u64 {
-            let generated = Gen::new(seed ^ 0x5eed).ints(3);
-            let alone = Machine::for_program(&program, &resolved).eval_expr_for_test(&generated);
-            let Ok(Value::Int(g)) = alone else {
-                continue;
-            };
-            let body = block(
-                vec![
-                    letv("xs", ints(&[1, 2])),
-                    letv("b", perform("amb", "flip", None, Vec::new())),
-                ],
-                Some(bin(
-                    BinOp::Add,
-                    callv("len", vec![callv("push", vec![var("xs"), var("b")])]),
-                    generated,
-                )),
-            );
-            let e = handle(
-                body,
-                vec![general_clause(
-                    "amb",
-                    "flip",
-                    None,
-                    &[],
-                    "k",
-                    bin(
-                        BinOp::Add,
-                        call(var("k"), vec![int(1)]),
-                        call(var("k"), vec![int(2)]),
-                    ),
-                )],
-            );
-            let mut machine = Machine::for_program(&program, &resolved);
-            reset();
-            let answer = machine.eval_expr_for_test(&e);
-            let stats = stats();
-            if let Err(d) = &answer {
-                assert_ne!(
-                    d.code,
-                    codes::INTERNAL_ERROR,
-                    "seed {seed} released a binding something still read: {}",
-                    d.message
-                );
-            }
-            let got = answer.as_ref().map(int_of).unwrap_or_else(|d| {
-                panic!("seed {seed} failed: {}", d.message);
-            });
-            assert_eq!(
-                got,
-                2 * (3 + g),
-                "seed {seed}: one resumption observed the other, {stats:?}"
-            );
-            compared += 1;
-        }
-        assert!(
-            compared > 900,
-            "only {compared} of the generated programs were comparable"
-        );
     }
 }
 

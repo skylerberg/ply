@@ -168,7 +168,7 @@ declare -a KNOWN_OUTSIDE=(
 DEFERRED=(
   "ply-eval-tests:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
   "ply-eval-tests:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
-  "ply-eval-tests:suite:simulation::a_long_sleep_is_a_jump"
+  "ply-cli:suite:cli::a_simulated_sleep_is_a_jump_rather_than_a_wait"
   "ply-test-tests:suite:region_fixture_cost::a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
   "ply-test-tests:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"
   "ply-test-tests:suite:region_fixture_cost::a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"

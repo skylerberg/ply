@@ -11,13 +11,52 @@ use ply_eval::host::{
     HostAnswer, HostRequest, attribute, err_blocking_answered_inline, err_hermetic,
     err_host_in_search, err_withheld, operation_label,
 };
-use ply_eval::machine::{
+use ply_eval::sim::TASK_OPS;
+use ply_eval::{
     Unbound, carries_secret, check_host_answer, err_footprint_escape, err_host_in_simulation,
     err_no_runtime, err_secret_to_host, err_unenumerated_atom,
 };
-use ply_eval::sim::TASK_OPS;
-use ply_span::{Span, Symbol};
+use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::sync::Arc;
+
+/// An at-most-once host operation an entry performed: what a second resumption across it would
+/// replay.
+pub(crate) struct HostMark {
+    operation: String,
+    path: &'static str,
+    span: Span,
+}
+
+/// `E0426` -- a second resumption across an at-most-once host operation.
+#[cold]
+#[inline(never)]
+pub(crate) fn err_continuation_resumed(
+    span: Span,
+    resumes: u32,
+    last: Option<&HostMark>,
+) -> Diagnostic {
+    let mut diagnostic = Diagnostic::error(
+        codes::HOST_CONTINUATION_RESUMED,
+        "this continuation is resumed again across a host operation",
+    )
+    .primary(span, format!("resumption {resumes} of one continuation"));
+    if let Some(mark) = last {
+        if mark.span != Span::DUMMY {
+            diagnostic = diagnostic.secondary(
+                mark.span,
+                format!("`{}` was performed here, after the capture", mark.operation),
+            );
+        }
+        diagnostic = diagnostic.note(format!(
+            "`{}` is registered `at-most-once`, so replaying this control would perform it again",
+            mark.path
+        ));
+    }
+    diagnostic
+        .note("multi-shot resumption stays available for pure and in-memory handlers; the restriction is on the boundary, not on the feature")
+        .note("resume at most once across a host operation, or -- only if replaying it really changes nothing outside the program -- register the operation `Linearity::Repeatable`")
+        .note("the rule is conservative: it refuses when any at-most-once host operation happened after the capture, including in another task")
+}
 
 pub unsafe fn perform(
     ctx: *mut Ctx,
@@ -27,7 +66,7 @@ pub unsafe fn perform(
     args: &[Word],
 ) -> Word {
     let c = unsafe { &mut *ctx };
-    let span = Span::DUMMY;
+    let span = c.site();
     let values = values_taken(c, args);
     let operation = operation_label(effect, op, resource);
     let binding = Arc::clone(&c.binding);
@@ -113,6 +152,11 @@ pub unsafe fn perform(
     c.host_use.record(&atom);
     if declaration.linearity.is_linear() {
         c.host_ops = c.host_ops.saturating_add(1);
+        c.last_linear = Some(HostMark {
+            operation: operation.clone(),
+            path: declaration.path,
+            span,
+        });
     }
     let answer = match answered {
         Ok(answer) => answer,

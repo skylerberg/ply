@@ -6,15 +6,19 @@
 //! most of them want.
 
 use ply_core::{CheckOutput, check_program};
-use ply_eval::Machine;
+use ply_eval::{Machine, Provider};
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
+use std::collections::HashMap;
 
 pub struct Compiled {
     pub program: Program,
     pub resolved: Resolved,
     pub check: CheckOutput,
+    /// Each module's source text, keyed by `m.name.to_string()` — what the whole Ply emitter
+    /// re-parses to produce bodies, since it is a front end rather than an AST consumer.
+    pub texts: HashMap<String, String>,
 }
 
 impl Compiled {
@@ -44,10 +48,20 @@ impl Compiled {
             resolve(&mut program).unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let check = check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        let texts = sources
+            .iter()
+            .map(|(name, src)| {
+                (
+                    ModuleName::from_dotted(name).to_string(),
+                    (*src).to_string(),
+                )
+            })
+            .collect();
         Compiled {
             program,
             resolved,
             check,
+            texts,
         }
     }
 
@@ -70,8 +84,32 @@ impl Compiled {
         check_program(&program, &resolved).err().unwrap_or_default()
     }
 
+    /// A machine running on a real compiled tier — the only evaluator under tier-only (ADR 0048).
+    /// Every eval-test that runs a program uses it, since a bare machine holds no evaluator.
+    ///
+    /// The unit is built with the module source texts so the whole Ply emitter — installed by
+    /// [`ply_codegen::c::producer::ensure_default`] — can re-parse them into bodies; `Unit::over`
+    /// alone gets only the reference fragment, which holds no `perform`/`handle`/`simulate`.
     pub fn machine(&self) -> Machine<'_> {
-        Machine::new(&self.program, &self.resolved, &self.check)
+        ply_codegen::c::producer::ensure_default();
+        let mut m = Machine::new(&self.program, &self.resolved, &self.check);
+        let unit = ply_codegen::Unit::over_with_texts(
+            &self.program,
+            &self.resolved,
+            &self.check,
+            self.texts.clone(),
+        )
+        .expect("this host has a C compiler");
+        let spec = ply_eval::BackendSpec {
+            kind: ply_eval::BackendKind::C,
+            ..Default::default()
+        };
+        m.set_compiled(unit.attach(&spec));
+        m
+    }
+
+    pub fn machine_on_tier(&self) -> Machine<'_> {
+        self.machine()
     }
 
     pub fn index_of(&self, name: &str) -> usize {

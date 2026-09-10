@@ -84,10 +84,18 @@ fn scrub(value: &Value) -> Value {
             fields
                 .iter()
                 .filter(|(k, _)| {
+                    // `*_nanos` are the compiled tier's analysis and codegen wall-clocks (ADR
+                    // 0048); like every duration they vary run to run, and a determinism claim is
+                    // about the program's result, not what compiling it cost.
                     !(k.contains("duration")
                         || k.ends_with("_ms")
+                        || k.ends_with("_nanos")
                         || k == &"front_end"
                         || k == &"workers"
+                        // The tier builds a unit per worker (a backend does not cross threads), so
+                        // `units` counts compiles and scales with `--jobs`; it is a compile
+                        // artifact, not a scheduling decision the result turns on.
+                        || k == &"units"
                         || k == &"elapsed")
                 })
                 .map(|(k, v)| (k.clone(), scrub(v)))

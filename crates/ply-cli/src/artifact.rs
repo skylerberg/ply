@@ -25,6 +25,7 @@ const DIGEST_DOMAIN: &[u8] = b"ply.program.1";
 
 /// Bit 0 of `flags`: the `SOURCES` section is present.
 const FLAG_SOURCES: u32 = 1;
+const FLAG_UNIT: u32 = 2;
 
 const HEADER_LEN: usize = 188;
 const DESCRIPTOR_LEN: usize = 24;
@@ -44,8 +45,21 @@ const KIND_BODIES: u32 = 1;
 const KIND_NAMES: u32 = 2;
 const KIND_STRINGS: u32 = 3;
 const KIND_SOURCES: u32 = 4;
+const KIND_UNIT: u32 = 5;
 
 /// A checked program, identified by a digest.
+/// The compiled unit the Ply emitter produced over an artifact's definitions: the C (compressed),
+/// the record the runtime rebuilds its tables from, and the constructor table it was emitted
+/// against. `runtime` is the digest of the runtime's helper table the C was emitted for; a unit
+/// built for another is left aside.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct EmbeddedUnit {
+    pub runtime: String,
+    pub ctors: Vec<(String, u32)>,
+    pub text: Vec<u8>,
+    pub record: String,
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Artifact {
     pub frontend: [u8; 32],
@@ -60,11 +74,17 @@ pub struct Artifact {
     /// Source text, keyed by the path that names the module, relative to the project root so that
     /// two builds from two roots agree.
     pub sources: Vec<(String, String)>,
+    /// The compiled unit over these definitions, when the emitter produced one at build.
+    pub unit: Option<EmbeddedUnit>,
 }
 
 impl Artifact {
     pub fn has_sources(&self) -> bool {
         !self.sources.is_empty()
+    }
+
+    pub fn has_unit(&self) -> bool {
+        self.unit.is_some()
     }
 
     /// The program-wide name the entry point was built under.
@@ -125,12 +145,31 @@ impl Artifact {
             }
             sections.push((KIND_SOURCES, self.sources.len() as u32, payload));
         }
+        if let Some(unit) = &self.unit {
+            fn put(payload: &mut Vec<u8>, bytes: &[u8]) {
+                payload.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                payload.extend_from_slice(bytes);
+            }
+            let mut payload = Vec::new();
+            put(&mut payload, unit.runtime.as_bytes());
+            payload.extend_from_slice(&(unit.ctors.len() as u32).to_le_bytes());
+            for (name, arity) in &unit.ctors {
+                put(&mut payload, name.as_bytes());
+                payload.extend_from_slice(&arity.to_le_bytes());
+            }
+            put(&mut payload, &unit.text);
+            put(&mut payload, unit.record.as_bytes());
+            sections.push((KIND_UNIT, 1, payload));
+        }
 
         let table = HEADER_LEN + DESCRIPTOR_LEN * sections.len();
         let mut out = vec![0u8; table];
         out[..8].copy_from_slice(MAGIC);
         out[OFF_FORMAT..OFF_FORMAT + 4].copy_from_slice(&ARTIFACT_FORMAT.to_le_bytes());
-        let flags = if self.has_sources() { FLAG_SOURCES } else { 0 };
+        let mut flags = if self.has_sources() { FLAG_SOURCES } else { 0 };
+        if self.has_unit() {
+            flags |= FLAG_UNIT;
+        }
         out[OFF_FLAGS..OFF_FLAGS + 4].copy_from_slice(&flags.to_le_bytes());
         out[OFF_FRONTEND..OFF_FRONTEND + 32].copy_from_slice(&self.frontend);
         out[OFF_RUNTIME..OFF_RUNTIME + 32].copy_from_slice(&self.runtime);
@@ -192,6 +231,8 @@ pub struct Built {
     pub startup: Vec<Symbol>,
     /// Definition name to everything it reaches, restricted to the artifact.
     pub closure: BTreeMap<String, BTreeSet<String>>,
+    /// What the build could not do and did without, the compiled unit first among them.
+    pub warnings: Vec<Diagnostic>,
 }
 
 /// The transitive closure of the entry point **and of the run's start-up definitions**, and nothing
@@ -223,6 +264,7 @@ pub fn build(
         bodies: BTreeMap::new(),
         names: Vec::new(),
         sources: Vec::new(),
+        unit: None,
     };
 
     let mut absent: Vec<Symbol> = Vec::new();
@@ -249,16 +291,97 @@ pub fn build(
     if sources {
         out.sources = embedded_sources(loaded);
     }
+    let names: Vec<&str> = out.names.iter().map(|(n, _)| n.as_str()).collect();
+    let (unit, warnings) = embedded_unit(loaded, &names);
+    out.unit = unit;
 
     Ok(Built {
         artifact: out,
         entry_name: entry.name.clone(),
         startup: startup.iter().map(|d| d.name.clone()).collect(),
         closure: restricted_closure(&hashes, &reachable),
+        warnings,
     })
 }
 
 /// Every project file, keyed by its path relative to the project root.
+/// The whole unit over the artifact's definitions, produced by the Ply emitter and embedded so
+/// that `ply run` enters the program as it was built rather than rebuilding what it can from
+/// bodies alone: a `perform` the reference fragment cannot compile runs from an artifact only
+/// this way. A production that fails leaves the artifact without one, and says so.
+fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<Diagnostic>) {
+    ply_codegen::c::producer::ensure_default();
+    // Definitions only: the closure also names the effect and resource declarations it reaches,
+    // which no emitter is offered.
+    let names: Vec<&str> = names
+        .iter()
+        .copied()
+        .filter(|name| loaded.check.defs.contains_key(&Symbol::new(name)))
+        .collect();
+    let texts = crate::commands::common::module_texts(&loaded.program, &loaded.sources);
+    let produced =
+        ply_codegen::Unit::over_with_texts(&loaded.program, &loaded.resolved, &loaded.check, texts)
+            .and_then(|unit| unit.produce(&names).map(|produced| (unit, produced)))
+            .and_then(|(unit, produced)| {
+                let text = ply_codegen::c::bundle::pack(&produced.text)?;
+                Ok((unit, produced, text))
+            });
+    match produced {
+        Ok((unit, produced, text)) => {
+            let mut warnings = Vec::new();
+            if !produced.refused.is_empty() {
+                let listed: Vec<String> = produced
+                    .refused
+                    .iter()
+                    .map(|r| format!("`{}` ({})", r.function, r.construct))
+                    .collect();
+                warnings.push(
+                    Diagnostic::warning(
+                        codes::BACKEND_UNAVAILABLE,
+                        format!(
+                            "the emitter refused {} of the artifact's definitions, which will not run from it: {}",
+                            listed.len(),
+                            listed.join(", ")
+                        ),
+                    )
+                    .note("a refused definition is entered from nothing at run time; make it one the emitter compiles"),
+                );
+            }
+            let unit = EmbeddedUnit {
+                runtime: ply_codegen::c::bundle::runtime_digest(),
+                ctors: unit
+                    .ctors()
+                    .iter()
+                    .map(|(name, arity)| (name.to_string(), *arity as u32))
+                    .collect(),
+                text,
+                record: ply_codegen::c::cache::encode_unit(&produced.record),
+            };
+            (Some(unit), warnings)
+        }
+        Err(e) => (
+            None,
+            vec![
+                Diagnostic::warning(
+                    codes::BACKEND_UNAVAILABLE,
+                    format!("no compiled unit could be produced for the artifact: {e:#}"),
+                )
+                .note("the artifact runs the pure fragment the reference emitter rebuilds from its bodies; a `perform` in it will not reach the host"),
+            ],
+        ),
+    }
+}
+
+/// The artifact's unit was emitted for another runtime's helper table.
+fn stale_unit() -> Diagnostic {
+    Diagnostic::warning(
+        codes::ARTIFACT_VERSION,
+        "the artifact's compiled unit was built for another runtime and is left aside",
+    )
+    .note("the run enters the pure fragment the reference emitter rebuilds from the artifact's bodies; a `perform` in it will not reach the host")
+    .note("rebuild the artifact with this `ply` to carry a unit it can enter")
+}
+
 fn embedded_sources(loaded: &Loaded) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for file in loaded.sources.files() {
@@ -400,6 +523,7 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
         bodies: BTreeMap::new(),
         names: Vec::new(),
         sources: Vec::new(),
+        unit: None,
     };
 
     let (records, offset, len) = *payloads
@@ -477,6 +601,48 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
                 format!("the source section has {} bytes nothing claims", end - at),
             ));
         }
+    }
+
+    if let Some(&(_, offset, len)) = payloads.get(&KIND_UNIT) {
+        let end = offset + len;
+        let mut at = offset;
+        let runtime_len = r.u32(at)? as usize;
+        let runtime = std::str::from_utf8(r.slice(at + 4, runtime_len)?)
+            .map_err(|_| invalid(path, "the unit's runtime digest is not valid UTF-8"))?
+            .to_string();
+        at += 4 + runtime_len;
+        let n = r.u32(at)? as usize;
+        at += 4;
+        let mut ctors = Vec::with_capacity(n);
+        for _ in 0..n {
+            let name_len = r.u32(at)? as usize;
+            let name = std::str::from_utf8(r.slice(at + 4, name_len)?)
+                .map_err(|_| invalid(path, "a unit constructor name is not valid UTF-8"))?
+                .to_string();
+            let arity = r.u32(at + 4 + name_len)?;
+            ctors.push((name, arity));
+            at += 8 + name_len;
+        }
+        let text_len = r.u32(at)? as usize;
+        let text = r.slice(at + 4, text_len)?.to_vec();
+        at += 4 + text_len;
+        let record_len = r.u32(at)? as usize;
+        let record = std::str::from_utf8(r.slice(at + 4, record_len)?)
+            .map_err(|_| invalid(path, "the unit's record is not valid UTF-8"))?
+            .to_string();
+        at += 4 + record_len;
+        if at != end {
+            return Err(invalid(
+                path,
+                format!("the unit section has {} bytes nothing claims", end - at),
+            ));
+        }
+        out.unit = Some(EmbeddedUnit {
+            runtime,
+            ctors,
+            text,
+            record,
+        });
     }
 
     let computed = digest_of(bytes).ok_or_else(|| truncated(path, 0, OFF_SECTIONS, bytes.len()))?;
@@ -808,13 +974,21 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         EXIT_COMPILE_ERROR
     };
 
-    let (artifact, warnings) = match read(&args.path) {
+    let (artifact, mut warnings) = match read(&args.path) {
         Ok(pair) => pair,
         Err(diagnostic) => return refuse(std::slice::from_ref(&diagnostic)),
     };
     let opened = match open(&artifact, &args.path) {
         Ok(opened) => opened,
         Err(diagnostics) => return refuse(&diagnostics),
+    };
+    let unit = match &artifact.unit {
+        Some(unit) if unit.runtime == ply_codegen::c::bundle::runtime_digest() => Some(unit),
+        Some(_) => {
+            warnings.push(stale_unit());
+            None
+        }
+        None => None,
     };
 
     let db = match args.db.resolve(args.host) {
@@ -882,13 +1056,18 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         println!(
             "{IND}{}",
             style.dim(&format!(
-                "program {} · {} definitions · {}",
+                "program {} · {} definitions · {} · {}",
                 artifact.digest_short(),
                 artifact.bodies.len(),
                 if opened.located {
                     "sources embedded"
                 } else {
                     "no sources: failures carry no line number"
+                },
+                if unit.is_some() {
+                    "compiled unit embedded"
+                } else {
+                    "no compiled unit: the pure fragment only"
                 }
             ))
         );
@@ -924,6 +1103,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         &hosts,
         declared.as_ref(),
         args.backend.as_ref(),
+        unit,
     );
 
     // the teardown order's pinned order, on the machine's own thread and never from a signal handler:
@@ -1005,33 +1185,69 @@ fn evaluate(
     hosts: &crate::hosts::Hosts,
     declared: Option<&ply_core::ty::Footprint>,
     backend: Option<&String>,
+    unit: Option<&EmbeddedUnit>,
 ) -> Result<ply_eval::Value, Diagnostic> {
     use ply_eval::Machine;
 
     let name = opened.entry.as_str();
-    let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
-    if let Some(spec) = crate::commands::common::backend_spec(backend)? {
-        // No hashes here, so nothing is kept between runs: an artefact is opened once and the
-        // emit is not the cost that matters.
-        let provider = crate::commands::common::build_backend(
-            &spec,
-            &opened.program,
-            &opened.resolved,
-            &opened.check,
-            &Default::default(),
-            Default::default(),
-        )?;
-        machine.set_compiled(provider.attach(&spec));
+    let configure = |machine: &mut Machine<'_>| {
+        machine.set_host_binding(hosts.binding());
+        if let Some(runtime) = hosts.runtime() {
+            machine.set_host_runtime(runtime);
+        }
+        if let Some(declared) = declared {
+            machine.set_declared_footprint(declared.clone());
+        }
+        ply_test::sim::seed_run(machine, &plan.seeds()[0], plan.steps);
+    };
+    // The unit the artifact carries is entered as it was built: no producer is asked, and a
+    // `perform` in it runs.
+    if let (Some(unit), Some(spec)) = (unit, crate::commands::common::backend_spec(backend)?) {
+        let unit_error = |e: &dyn std::fmt::Display| {
+            Diagnostic::error(
+                codes::ARTIFACT_INVALID,
+                format!("the artifact's compiled unit could not be entered: {e:#}"),
+            )
+        };
+        let embedded = ply_codegen::Embedded {
+            text: ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?,
+            record: unit.record.clone(),
+            ctors: unit
+                .ctors
+                .iter()
+                .map(|(name, arity)| (Symbol::new(name), *arity as usize))
+                .collect(),
+        };
+        let provider =
+            ply_codegen::Unit::embedded(&opened.program, &opened.resolved, &opened.check, embedded)
+                .map_err(|e| unit_error(&e))?;
+        let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+        machine.set_compiled(ply_eval::Provider::attach(provider, &spec));
+        configure(&mut machine);
+        return machine.call(name, Vec::new(), span);
     }
-    machine.set_host_binding(hosts.binding());
-    if let Some(runtime) = hosts.runtime() {
-        machine.set_host_runtime(runtime);
-    }
-    if let Some(declared) = declared {
-        machine.set_declared_footprint(declared.clone());
-    }
-    ply_test::sim::seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-    machine.call(name, Vec::new(), span)
+    // Without a unit, a decoded artifact is an AST with no source text, so the whole Ply emitter
+    // -- a front end that re-parses source -- cannot produce its bodies; the reference emitter
+    // emits from the AST directly, as it does for a bisection's reconstructed program (ADR 0048).
+    // A `perform` the reference cannot compile declines.
+    ply_codegen::c::producer::reference_only(|| {
+        let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+        if let Some(spec) = crate::commands::common::backend_spec(backend)? {
+            // No hashes here, so nothing is kept between runs: an artefact is opened once and the
+            // emit is not the cost that matters.
+            let provider = crate::commands::common::build_backend(
+                &spec,
+                &opened.program,
+                &opened.resolved,
+                &opened.check,
+                &Default::default(),
+                Default::default(),
+            )?;
+            machine.set_compiled(provider.attach(&spec));
+        }
+        configure(&mut machine);
+        machine.call(name, Vec::new(), span)
+    })
 }
 
 // --- diagnostics -------------------------------------------------------------
@@ -1128,7 +1344,23 @@ mod tests {
             bodies,
             names,
             sources: Vec::new(),
+            unit: None,
         }
+    }
+
+    #[test]
+    fn an_embedded_unit_survives_encoding() {
+        let mut artifact = sample();
+        artifact.unit = Some(EmbeddedUnit {
+            runtime: "rt-digest".to_string(),
+            ctors: vec![("m.Colour".to_string(), 0), ("m.Pair".to_string(), 2)],
+            text: vec![1, 2, 3, 4],
+            record: "record".to_string(),
+        });
+        let bytes = artifact.encode();
+        let (decoded, _) = decode(&bytes, Path::new("x.plyx")).expect("decodes");
+        assert_eq!(decoded.unit, artifact.unit);
+        assert_ne!(sample().encode(), bytes, "the unit is in the digest");
     }
 
     #[test]

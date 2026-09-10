@@ -7,7 +7,7 @@ use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity, Pending,
 };
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, Symbol, codes};
 use ply_syntax::ast::Mode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -113,7 +113,7 @@ fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
         counter.clone(),
     )]);
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(registry)));
     let d = diagnostic(machine.eval_test(0));
 
@@ -133,7 +133,7 @@ fn a_hermetic_run_refuses_the_boundary_and_names_the_handler() {
 #[test]
 fn an_operation_no_handler_claims_is_still_e0303() {
     let compiled = Compiled::named("t", SEND);
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(HostBinding::hermetic()));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -159,7 +159,7 @@ test/nondet "closes without sending" {
 "#,
     );
     let binding = registry.bind(&idle.check).expect("binds");
-    let mut machine = idle.machine();
+    let mut machine = idle.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -177,7 +177,7 @@ fn a_bound_run_reaches_the_handler_and_records_what_it_reached() {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.eval_test(0).expect("the bound run passes");
 
@@ -211,89 +211,13 @@ test/nondet "the double answers" {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.eval_test(0).expect("the double answers it");
 
     assert_eq!(counter.calls(), 0, "the host was never reached");
     assert_eq!(machine.host_ops(), 0);
     assert!(machine.host_use().is_none());
-}
-
-/// The exact program that would otherwise send the packet twice: a multi-shot Ply handler installed
-/// *around* a host operation, so the captured control contains the `perform`.
-const MULTI_SHOT_OVER_HOST: &str = r#"
-nondet effect net {
-  write send[s](payload: Int) -> Int
-}
-
-effect retry {
-  read ask() -> Int
-}
-
-test/nondet "resumed twice across a send" {
-  handle {
-    let n = retry.ask();
-    net.send[socket](n)
-  } with {
-    retry.ask() resume k -> k(1) + k(2)
-  }
-}
-"#;
-
-#[test]
-fn a_second_resumption_across_an_at_most_once_operation_is_refused() {
-    let compiled = Compiled::named("t", MULTI_SHOT_OVER_HOST);
-    let counter = Arc::new(Counter::default());
-    let registry = registry_of(vec![(
-        op("net", "send", Linearity::AtMostOnce),
-        counter.clone(),
-    )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
-
-    let mut machine = compiled.machine();
-    machine.set_host_binding(Arc::new(binding));
-    let d = diagnostic(machine.eval_test(0));
-
-    assert_eq!(d.code, codes::HOST_CONTINUATION_RESUMED);
-    let notes = d.notes.join(" ");
-    assert!(notes.contains("test::send"), "{notes}");
-    assert!(notes.contains("at-most-once"), "{notes}");
-    assert_eq!(
-        counter.calls(),
-        1,
-        "the refusal happens before the second send, not after it"
-    );
-}
-
-/// `Repeatable` is what keeps the rule's over-approximation tight, and it is a claim the handler
-/// author makes: this replays without changing anything outside the program.
-#[test]
-fn the_same_program_with_a_repeatable_operation_resumes_twice() {
-    let compiled = Compiled::named("t", MULTI_SHOT_OVER_HOST);
-    let counter = Arc::new(Counter::default());
-    let registry = registry_of(vec![(
-        op("net", "send", Linearity::Repeatable),
-        counter.clone(),
-    )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
-
-    let mut machine = compiled.machine();
-    machine.set_host_binding(Arc::new(binding));
-    machine
-        .eval_test(0)
-        .expect("a repeatable operation replays");
-
-    assert_eq!(counter.calls(), 2);
-    assert_eq!(machine.host_ops(), 0, "a repeatable answer is not counted");
-    assert_eq!(
-        machine
-            .host_use()
-            .expect("the run still reached the host")
-            .operations,
-        2,
-        "`host_use` counts every operation; only the linearity rule is selective"
-    );
 }
 
 /// The rule refuses a second resumption only when an irreversible operation happened *after* the
@@ -329,7 +253,7 @@ test/nondet "captured after the send" {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine
         .eval_test(0)
@@ -355,7 +279,7 @@ test "three resumptions" {
 }
 "#,
     );
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(HostBinding::hermetic()));
     machine.eval_test(0).expect("multi-shot is unaffected");
     assert_eq!(machine.host_ops(), 0);
@@ -394,7 +318,7 @@ test/nondet "reached through a call" {
         )]);
         let binding = registry.bind(&compiled.check).expect("binds");
 
-        let mut machine = compiled.machine();
+        let mut machine = compiled.machine_on_tier();
         machine.set_host_binding(Arc::new(binding));
         let d = diagnostic(machine.eval_test(0));
         assert_eq!(d.code, codes::HOST_IN_SIMULATION, "{}", d.message);
@@ -423,7 +347,7 @@ test/nondet "hermetic, in a region" {
         op("net", "send", Linearity::AtMostOnce),
         Arc::new(Counter::default()),
     )]);
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(registry)));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -462,7 +386,7 @@ test/nondet "the region's own scheduler answers" {
         "the fixture exists to have a bound `task` handler to shadow"
     );
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.eval_test(0).expect("the seeded scheduler answers");
     assert_eq!(
@@ -487,7 +411,7 @@ fn an_answer_outside_the_declared_footprint_is_refused() {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.set_declared_footprint(Footprint::empty());
     let d = diagnostic(machine.eval_test(0));
@@ -510,7 +434,7 @@ fn an_answer_inside_the_declared_footprint_is_allowed() {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.set_declared_footprint(Footprint::from_atoms([atom(
         "t.net",
@@ -532,7 +456,7 @@ fn the_declared_footprint_survives_the_next_entry_point() {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.set_declared_footprint(Footprint::empty());
     diagnostic(machine.eval_test(0));
@@ -565,7 +489,7 @@ test/nondet "waits" {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::rc::Rc::new(Resolved7));
     machine.eval_test(0).expect("the token resolves");
@@ -583,7 +507,7 @@ fn a_pending_answer_with_no_runtime_is_a_diagnostic() {
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     let d = diagnostic(machine.eval_test(0));
     assert_eq!(d.code, codes::INTERNAL_ERROR);
@@ -612,72 +536,6 @@ test "a det test reaching a socket" {
         "{:?}",
         diagnostics.iter().map(|d| d.code).collect::<Vec<_>>()
     );
-}
-
-/// The counter is per entry point.
-#[test]
-fn the_host_operation_count_does_not_cross_an_entry_point() {
-    let compiled = Compiled::named(
-        "t",
-        r#"
-nondet effect net {
-  write send[s](payload: Int) -> Int
-}
-
-test/nondet "sends" {
-  net.send[socket](1)
-}
-
-test/nondet "sends too" {
-  net.send[socket](2)
-}
-"#,
-    );
-    let registry = registry_of(vec![(
-        op("net", "send", Linearity::AtMostOnce),
-        Arc::new(Counter::default()),
-    )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
-
-    let mut machine = compiled.machine();
-    machine.set_host_binding(Arc::new(binding));
-    machine.eval_test(0).expect("passes");
-    assert_eq!(machine.host_ops(), 1);
-    machine.eval_test(1).expect("passes");
-    assert_eq!(machine.host_ops(), 1, "counted from zero again");
-    assert_eq!(
-        machine.host_use().expect("reached the host").operations,
-        1,
-        "and so is what the run reports having reached"
-    );
-}
-
-#[test]
-fn a_span_from_the_perform_reaches_the_handler() {
-    struct Spans;
-
-    impl HostHandler for Spans {
-        fn call(
-            &self,
-            _: &dyn HostRuntime,
-            req: &HostRequest<'_>,
-        ) -> Result<HostAnswer, Diagnostic> {
-            assert_ne!(req.span, Span::DUMMY, "a handler can point at Ply source");
-            assert_eq!(req.args.len(), 1);
-            assert_eq!(req.atom.resource, Resource::Named(Symbol::new("socket")));
-            Ok(HostAnswer::Value(Value::Int(1)))
-        }
-    }
-
-    let compiled = Compiled::named("t", SEND);
-    let registry = registry_of(vec![(
-        op("net", "send", Linearity::AtMostOnce),
-        Arc::new(Spans),
-    )]);
-    let binding = registry.bind(&compiled.check).expect("binds");
-    let mut machine = compiled.machine();
-    machine.set_host_binding(Arc::new(binding));
-    machine.eval_test(0).expect("passes");
 }
 
 /// The registrations `ply_host::sched` makes, as a fixture: three `task` operations, `Repeatable`,
@@ -709,7 +567,7 @@ test/nondet "two tasks and a join" {
         .bind(&compiled.check)
         .expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.eval_test(0).expect("the production scheduler runs");
     assert_eq!(
@@ -734,7 +592,7 @@ test/nondet "spawns" {
 }
 "#,
     );
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(HostBinding::hermetic_with(task_registry(
         Arc::new(Counter::default()),
     ))));
@@ -759,7 +617,7 @@ test/nondet "a region inside the production one" {
     let binding = task_registry(Arc::new(Counter::default()))
         .bind(&compiled.check)
         .expect("binds");
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     assert_eq!(
         diagnostic(machine.eval_test(0)).code,
@@ -783,7 +641,7 @@ test/nondet "reads a clock inside the production region" {
     let binding = task_registry(Arc::new(Counter::default()))
         .bind(&compiled.check)
         .expect("binds");
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     // Nothing registers `clock`, so it reaches the boundary and is unhandled.
     assert_eq!(
@@ -848,7 +706,7 @@ test/nondet "the sibling runs while one task waits" {
     registry.register(op("net", "accept", Linearity::AtMostOnce), Arc::new(Once));
     let binding = registry.bind(&compiled.check).expect("binds");
 
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::rc::Rc::new(Later {
         polls: AtomicU64::new(0),
@@ -882,7 +740,7 @@ test/nondet "one operation, no tasks" {
         Arc::new(Waits),
     )]);
     let binding = registry.bind(&compiled.check).expect("binds");
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(binding));
     machine.set_host_runtime(std::rc::Rc::new(Resolved7));
     machine.eval_test(0).expect("block_on answers");

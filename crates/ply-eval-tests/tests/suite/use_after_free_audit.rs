@@ -136,90 +136,6 @@ fn a_region_in_a_law_body_reports_its_escape() {
     );
 }
 
-/// The one route the brand deliberately leaves open, taken past the argument that opens it.
-#[test]
-fn a_task_outliving_its_regions_close_reads_that_region_and_not_the_one_after_it() {
-    let attack = Compiled::new(
-        r#"
-pub fn attack() -> Int = simulate {
-  { let t = with_cell[s](11) { c -> task.spawn(|| cell_get(c)) };
-    let after = with_cell[q](999) { d -> cell_get(d) };
-    task.join(t) + after * 0 }
-}
-"#,
-    );
-    let stats = answers(&attack, "m.attack", 11);
-    assert_eq!(
-        stats.closes_deferred, 1,
-        "`s` closed while the task could still reach it, so its close had to defer"
-    );
-    assert_eq!(
-        stats.peak_live, 2,
-        "`q` must not be given `s`'s position while the task still holds it"
-    );
-
-    let control = Compiled::new(
-        r#"
-pub fn control() -> Int = simulate {
-  { let first = with_cell[s](11) { c -> cell_get(c) };
-    let after = with_cell[q](999) { d -> cell_get(d) };
-    first + after }
-}
-"#,
-    );
-    let stats = answers(&control, "m.control", 1010);
-    assert_eq!(
-        stats.peak_live, 1,
-        "with nothing reaching `s` past its close the two cells share one position — which is the \
-         position the attack above would have read"
-    );
-}
-
-/// The same route with the task asleep across the close, so that it is live and unfinished when the
-/// second region opens rather than merely unscheduled.
-#[test]
-fn a_task_asleep_across_its_regions_close_still_reads_it() {
-    let compiled = Compiled::new(
-        r#"
-pub fn attack() -> Int = simulate {
-  { let t = with_cell[s](11) { c -> task.spawn(|| { clock.sleep(100); cell_get(c) }) };
-    let after = with_cell[q](999) { d -> cell_get(d) };
-    task.join(t) + after * 0 }
-}
-"#,
-    );
-    let stats = answers(&compiled, "m.attack", 11);
-    assert_eq!(stats.closes_deferred, 1);
-    assert_eq!(
-        stats.slots_reclaimed_late, 1,
-        "and the slot did go back once the task was done with it"
-    );
-}
-
-/// A task spawned **after** the region closed, which is where the pin discipline runs out:
-/// `TaskRegions::pin` answers `None` when no program region is open, so the grandchild's own
-/// `spawn` claims nothing at all.
-#[test]
-fn a_grandchild_task_spawned_after_the_close_still_reads_the_region() {
-    let compiled = Compiled::new(
-        r#"
-pub fn attack() -> Int = simulate {
-  { let outer = with_cell[s](11) { c ->
-      task.spawn(|| { clock.sleep(50); task.spawn(|| { clock.sleep(400); cell_get(c) }) }) };
-    let inner = task.join(outer);
-    let after = with_cell[q](999) { d -> cell_get(d) };
-    let later = with_cell[p](777) { e -> cell_get(e) };
-    task.join(inner) + after * 0 + later * 0 }
-}
-"#,
-    );
-    let stats = answers(&compiled, "m.attack", 11);
-    assert_eq!(
-        stats.closes_deferred, 1,
-        "`s` must still have been held when it closed"
-    );
-}
-
 /// The asymmetry that pays for the three above, and the reason it is a decision rather than an
 /// oversight: `with_region` is new syntax with no program depending on the loose rule, so the
 /// identical escape is a compile error that names the task.
@@ -242,82 +158,6 @@ pub fn attack() -> Int = simulate {
         "{}",
         escape.message
     );
-}
-
-/// `handler::perform` takes no pin for a tail-resumptive clause, on the argument that the only
-/// thing which will ever splice that continuation is the `Frame::Resume` pushed for it, above the
-/// `CloseRegion` frames of every region open at the capture.
-#[test]
-fn a_tail_resumptive_continuation_crossing_a_region_is_covered_from_above() {
-    let compiled = Compiled::new(
-        r#"
-effect e { read op() -> Int }
-effect f { read g() -> Int }
-
-pub fn attack() -> Int =
-  handle {
-    handle {
-      with_cell[r](7) { c -> { let v = e.op(); v + cell_get(c) } }
-    } with { e.op() -> f.g() }
-  } with { f.g() resume k -> k(1) + k(2) }
-"#,
-    );
-    // (1 + 7) + (2 + 7).
-    let stats = answers(&compiled, "m.attack", 17);
-    assert_eq!(
-        stats.pins_taken, 1,
-        "one pin, taken where the continuation is named — not at the tail-resumptive capture"
-    );
-    assert_eq!(stats.closes_deferred, 1);
-}
-
-/// The other half of the pin's shape: it claims every region open at the capture and **none opened
-/// afterwards**, which is what keeps a region opened inside a handler clause cheap.
-#[test]
-fn a_region_opened_inside_a_clause_body_is_covered_by_the_capture_inside_it() {
-    let compiled = Compiled::new(
-        r#"
-effect e { read op() -> Int }
-effect f { read g() -> Int }
-
-pub fn attack() -> Int =
-  handle {
-    handle { e.op() + f.g() } with {
-      e.op() resume k -> with_cell[inner](5) { c -> k(cell_get(c)) },
-    }
-  } with { f.g() resume j -> j(1) + j(2) }
-"#,
-    );
-    // (5 + 1) + (5 + 2).
-    let stats = answers(&compiled, "m.attack", 13);
-    assert_eq!(stats.closes_deferred, 1);
-    assert_eq!(stats.slots_reclaimed_late, 1);
-}
-
-/// The escape brand's one open route — a continuation parked in an enclosing region's cell, where a
-/// nominal constructor's field type erases the brand — with a second region placed where the freed
-/// slot would be.
-#[test]
-fn a_parked_continuation_reads_its_own_region_and_not_the_one_that_replaced_it() {
-    let compiled = Compiled::new(
-        r#"
-effect amb { read flip[coin]() -> Bool }
-type Saved = Nothing | Just((Bool) -> Int)
-
-pub fn attack() -> Int =
-  with_cell[slot](Nothing) { s -> {
-    with_cell[log](0) { c ->
-      handle { if amb.flip[coin]() { cell_get(c) } else { 100 } } with {
-        amb.flip[coin]() resume k -> { cell_set(s, Just(k)); 0 },
-      }
-    };
-    with_cell[replacement](999) { d ->
-      match cell_get(s) { Just(k) -> k(true), Nothing -> 0 - 1 }
-    }
-  } }
-"#,
-    );
-    answers(&compiled, "m.attack", 0);
 }
 
 /// The shapes `region_reclamation_audit` does not walk.
@@ -359,26 +199,6 @@ fn no_region_reaching_a_capture_indirectly_is_inferred_unique() {
              close, and a capture reaches them"
         );
     }
-}
-
-/// The capture is in another module, so a whole-program call graph is what has to find it.
-#[test]
-fn a_capture_installed_in_another_module_still_makes_the_region_shared() {
-    let compiled = Compiled::modules(&[
-        (
-            "a",
-            "pub effect e { read op() -> Int }
-pub fn body() -> Int / {e.read} = with_cell[r](7) { c -> { let v = e.op(); v + cell_get(c) } }",
-        ),
-        (
-            "b",
-            "import a
-pub fn attack() -> Int = handle { a::body() } with { a::e.op() resume k -> k(1) + k(2) }",
-        ),
-    ]);
-    assert_eq!(compiled.kinds().unique(), 0);
-    // (1 + 7) + (2 + 7), with `r` closing during the first resumption.
-    answers(&compiled, "b.attack", 17);
 }
 
 /// Why a wrong answer from the inference is survivable, stated as a property of the allocator

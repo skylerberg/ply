@@ -5,7 +5,7 @@ use anyhow::{Context, Result, bail};
 use ply_core::Footprint;
 use ply_eval::arena::Slot;
 use ply_eval::cont::{Frame, Prompt, Stack};
-use ply_eval::{Evaluator, Fixture, Machine, Value};
+use ply_eval::{Evaluator, Fixture, Value};
 use ply_span::{SourceId, SourceMap, Span};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::parse_program;
@@ -91,9 +91,7 @@ fn lower_every_test_body(front: &Front, repeats: usize) -> Duration {
 
 fn one_pass(front: &Front, repeats: usize) -> Result<Pass> {
     fn build<'a>(front: &'a Front) -> Box<dyn Evaluator + 'a> {
-        let mut machine = Machine::new(&front.program, &front.resolved, &front.check);
-        machine.share_region_kinds(front.shared_region_kinds());
-        Box::new(machine)
+        Box::new(front.machine())
     }
 
     let setup = best_of(repeats, || {
@@ -294,19 +292,29 @@ test "the shapes all evaluate" {
 }
 "#;
 
-fn load(name: &str, src: &str) -> Result<(Program, Resolved)> {
+fn load(
+    name: &str,
+    src: &str,
+) -> Result<(
+    Program,
+    Resolved,
+    ply_core::CheckOutput,
+    ply_span::SourceMap,
+)> {
     let mut map = SourceMap::new();
     let id: SourceId = map.add(format!("{name}.ply"), src.to_string());
     let mut program = parse_program([(id, ModuleName::from_dotted(name), src)])
         .map_err(|ds| anyhow::anyhow!("the measurement program must parse: {ds:#?}"))?;
     let resolved =
         resolve(&mut program).map_err(|ds| anyhow::anyhow!("it must also resolve: {ds:#?}"))?;
-    Ok((program, resolved))
+    let check = ply_core::check_program(&program, &resolved)
+        .map_err(|ds| anyhow::anyhow!("it must also check: {ds:#?}"))?;
+    Ok((program, resolved, check, map))
 }
 
 pub fn multi_shot(repeats: usize) -> Result<MultiShot> {
-    let (program, resolved) = load("multishot", MULTISHOT_SRC)?;
-    let mut machine = Machine::for_program(&program, &resolved);
+    let (program, resolved, check, sources) = load("multishot", MULTISHOT_SRC)?;
+    let mut machine = crate::tier_machine(&program, &resolved, &check, &sources);
 
     let mut rows: Vec<Resumptions> = Vec::new();
     for (count, name) in [(0usize, "r0"), (1, "r1"), (2, "r2"), (4, "r4")] {

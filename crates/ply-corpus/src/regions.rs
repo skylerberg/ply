@@ -353,16 +353,11 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
             .context("building the worker pool")?;
         let started = Instant::now();
         let report = pool.install(|| {
-            ply_test::run(
+            ply_cli::commands::common::run_on_tier(
+                &loaded,
                 &plan.selection,
-                &loaded.program,
-                &loaded.resolved,
-                &loaded.check,
-                &hashes,
-                &mut store,
-                false,
-                ply_test::Search::of(&plan.selection),
                 ply_test::Hosting::hermetic(),
+                &mut store,
             )
         });
         let wall = started.elapsed().as_secs_f64() * 1000.0;
@@ -388,10 +383,11 @@ pub fn measure(root: &Path, jobs: usize, std_tests: bool) -> Result<Corpus> {
     let setup = (0..3)
         .map(|_| {
             let started = Instant::now();
-            std::hint::black_box(ply_eval::Machine::new(
+            std::hint::black_box(crate::tier_machine(
                 &loaded.program,
                 &loaded.resolved,
                 &loaded.check,
+                &loaded.sources,
             ));
             started.elapsed()
         })

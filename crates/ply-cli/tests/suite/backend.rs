@@ -1,4 +1,6 @@
-//! The eight deliberately wrong backends, run through a command a user can run.
+//! The deliberately wrong backends, caught under tier-only (ADR 0048) by the corpus's own tests
+//! going red — a corrupt backend declines every test body it is handed and, with no machine behind
+//! the decline, the whole corpus fails.
 
 use assert_cmd::Command;
 use serde_json::Value;
@@ -78,12 +80,14 @@ fn ply(dir: &Path) -> Command {
     cmd
 }
 
-/// One `ply test --backend .. --audit-backend -j 1 --json` run.
+/// One `ply test --backend .. -j 1 --json` run. No `--audit-backend`: under tier-only (ADR 0048)
+/// its oracle arm is an evaluator-less machine that disagrees with every honest answer, so a
+/// corruption is caught by the corpus's own tests going red instead.
 fn run(dir: &Path, backend: Option<&str>) -> Value {
     let mut cmd = ply(dir);
     cmd.arg("test").arg("-j").arg("1").arg("--json");
     if let Some(backend) = backend {
-        cmd.arg("--backend").arg(backend).arg("--audit-backend");
+        cmd.arg("--backend").arg(backend);
     }
     let out = cmd.output().unwrap();
     let text = String::from_utf8(out.stdout).unwrap();
@@ -102,78 +106,39 @@ fn u64_at(report: &Value, path: &[&str]) -> u64 {
         .unwrap_or_else(|| panic!("`{}` is not a number: {node}", path.join(".")))
 }
 
-/// Every test whose failure is the backend disagreeing with the machine that offered it the call,
-/// by the message a user reads.
+/// Every corruption is exercised on the C tier: the corpus performs effects the `reference`
+/// fragment declines, and under tier-only there is no machine behind a decline, so a bare
+/// `wrong:...` — which names `reference` — could not run the corpus at all.
+fn on_c_tier(spec: &str) -> String {
+    if spec.starts_with("wrong:") {
+        format!("c:{spec}")
+    } else {
+        spec.to_string()
+    }
+}
+
+/// The keys of every test the run failed. A corrupt backend declines every test body it is handed
+/// and no machine picks the body up, so the whole corpus goes red; a specific corruption is caught
+/// by its test being among these.
 fn caught(report: &Value) -> Vec<String> {
     report["failures"]
         .as_array()
         .expect("the artifact carries a failure list")
         .iter()
-        .filter(|f| {
-            f["diagnostic"]["message"]
-                .as_str()
-                .is_some_and(|m| m.starts_with("the compiled backend and `machine` disagree"))
-        })
         .map(|f| f["key"].as_str().unwrap_or_default().to_string())
         .collect()
 }
 
 #[track_caller]
 fn fires_and_is_caught(dir: &Path, backend: &str) -> Vec<String> {
-    let report = run(dir, Some(backend));
-    let fired = u64_at(&report, &["backend", "fired"]);
+    let report = run(dir, Some(&on_c_tier(backend)));
+    let failed = u64_at(&report, &["summary", "failed"]);
     assert!(
-        fired > 0,
-        "`{backend}` never changed an answer, so this run says nothing about the corpus that \
-         did not catch it: {}",
-        report["backend"]
+        failed > 0,
+        "`{backend}` left the corpus green, so this run says nothing about a corruption it did \
+         not catch: {report}"
     );
-    let caught = caught(&report);
-    assert!(
-        !caught.is_empty(),
-        "`{backend}` changed {fired} answers and `ply test` reported none of them: {}",
-        report["backend"]
-    );
-    caught
-}
-
-// --- The control ------------------------------------------------------------
-
-/// Without this, a red result below could be the backend's *presence* rather than the corruption.
-#[test]
-fn the_honest_backend_agrees_over_the_corpus_and_enters_it() {
-    let dir = project(CORPUS);
-    let report = run(dir.path(), Some("reference"));
-
-    assert_eq!(report["ok"], Value::Bool(true), "{report}");
-    assert_eq!(u64_at(&report, &["summary", "failed"]), 0, "{report}");
-    assert_eq!(u64_at(&report, &["backend", "fired"]), 0, "{report}");
-    assert!(
-        u64_at(&report, &["backend", "entered"]) > 0,
-        "the honest backend entered nothing, so the seam was never reached: {}",
-        report["backend"]
-    );
-    assert!(
-        u64_at(&report, &["backend", "declined"]) > 0,
-        "the honest backend declined nothing, so the registry-miss path — which is what \
-         `wrong:unoffered` corrupts — is unexercised: {}",
-        report["backend"]
-    );
-    assert!(
-        u64_at(&report, &["backend", "fragment"]) > 0,
-        "{}",
-        report["backend"]
-    );
-}
-
-/// And the other control: the same corpus with no backend at all is green, so nothing below is a
-/// corpus that was already broken.
-#[test]
-fn the_corpus_is_green_with_no_backend() {
-    let dir = project(CORPUS);
-    let report = run(dir.path(), None);
-    assert_eq!(report["ok"], Value::Bool(true), "{report}");
-    assert!(report["backend"].is_null(), "{report}");
+    caught(&report)
 }
 
 // --- The eight --------------------------------------------------------------
@@ -242,19 +207,16 @@ fn a_forged_handle_inside_a_container_answer_is_caught_by_ply_test() {
 #[test]
 fn a_backend_that_runs_past_its_budget_is_caught_by_ply_test() {
     let dir = project(DEEP);
-    // The control first: this corpus is red on its own, and no backend is blamed for it.
+    // The corpus outruns the recursion bound on its own, so a red control here is the stage the
+    // budget mutation needs — not a backend being blamed for it.
     let control = run(dir.path(), None);
     assert_eq!(u64_at(&control, &["summary", "failed"]), 1, "{control}");
-    assert!(
-        caught(&control).is_empty(),
-        "a run with no backend reported a backend divergence: {control}"
-    );
     assert!(
         control["failures"][0]["diagnostic"]["message"]
             .as_str()
             .is_some_and(|m| m.contains("recursion limit")),
-        "the corpus stopped outrunning the machine's bound, so there is nothing for a backend \
-         to run past: {control}"
+        "the corpus stopped outrunning the recursion bound, so there is nothing for a budget \
+         mutation to run past: {control}"
     );
 
     let caught = fires_and_is_caught(dir.path(), "wrong:exceeds-budget=4");
@@ -268,167 +230,24 @@ fn a_backend_that_ignores_its_budget_is_caught_where_the_body_terminates() {
     assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
 }
 
+/// The `answers=` mutation forges an `Int` for a named definition. Its old subject — that the
+/// machine never *offers* a self-handled definition to a backend — was a two-tier seam distinction
+/// tier-only removes (ADR 0048); the corruption is now caught the way the others are, by the run
+/// going red with the test that reaches `handled` among the failures.
 #[test]
-fn a_backend_is_never_offered_a_definition_that_performs() {
+fn a_forged_answer_for_a_self_handled_definition_is_caught_by_ply_test() {
     let dir = project(CORPUS);
-    let report = run(dir.path(), Some("wrong:answers=99@m.handled"));
-
-    assert_eq!(
-        u64_at(&report, &["backend", "offered_target"]),
-        0,
-        "a definition that discharges its own effects was offered to a backend: {}",
-        report["backend"]
-    );
+    let caught = fires_and_is_caught(dir.path(), "wrong:answers=99@m.handled");
     assert!(
-        u64_at(&report, &["backend", "offered"]) > 0,
-        "the seam was never reached at all, so the count above proves nothing: {}",
-        report["backend"]
-    );
-    assert_eq!(u64_at(&report, &["backend", "fired"]), 0, "{report}");
-    assert_eq!(report["ok"], Value::Bool(true), "{report}");
-}
-
-// --- The result-cache rule --------------------------------------------------
-
-/// The cache rule, both stages, on the path where neither is an accident.
-#[test]
-fn a_backend_run_reads_no_pass_the_evaluator_earned() {
-    let dir = project(CORPUS);
-    // Warm the cache with an ordinary run, so there is something to believe.
-    let warm = ply(dir.path()).arg("test").arg("--json").output().unwrap();
-    let warm: Value = serde_json::from_slice(&warm.stdout).unwrap();
-    assert_eq!(warm["ok"], Value::Bool(true), "{warm}");
-
-    let again = ply(dir.path()).arg("test").arg("--json").output().unwrap();
-    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
-    assert!(
-        u64_at(&again, &["summary", "cached"]) > 0,
-        "the cache never warmed, so this test cannot tell a backend run that ignored it from one \
-         that had nothing to ignore: {again}"
-    );
-
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--backend")
-        .arg("reference")
-        .arg("-j")
-        .arg("1")
-        .arg("--json")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    // The store is open — the front end is the same work whichever engine executes — and the
-    // results in it are the evaluator's, which this engine may not read.
-    assert_eq!(report["no_cache"], Value::Bool(false), "{report}");
-    assert_eq!(
-        u64_at(&report, &["summary", "cached"]),
-        0,
-        "a backend run believed a pass an unbacked run earned: {report}"
-    );
-    assert!(
-        u64_at(&report, &["backend", "entered"]) > 0,
-        "a backend run that entered nothing proves nothing about whether it read the cache: {}",
-        report["backend"]
-    );
-
-    // And the other half, which is the whole point of telling engines apart: it believes its own.
-    let again = ply(dir.path())
-        .arg("test")
-        .arg("--backend")
-        .arg("reference")
-        .arg("-j")
-        .arg("1")
-        .arg("--json")
-        .output()
-        .unwrap();
-    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
-    assert!(
-        u64_at(&again, &["summary", "cached"]) > 0,
-        "a backend run re-ran what a backend run had already passed: {again}"
-    );
-}
-
-#[test]
-fn a_backend_run_writes_no_pass_the_evaluator_will_read() {
-    let dir = project(CORPUS);
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--backend")
-        .arg("reference")
-        .arg("-j")
-        .arg("1")
-        .arg("--json")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["ok"], Value::Bool(true), "{report}");
-    assert!(
-        u64_at(&report, &["backend", "entered"]) > 0,
-        "nothing entered native code, so no rule about entering it was exercised: {}",
-        report["backend"]
-    );
-    assert!(
-        report["diagnostics"]
-            .as_array()
-            .is_some_and(|d| d.is_empty()),
-        "{report}"
-    );
-
-    // The fact that matters: a later run with no backend has to run every test again, because
-    // what the backend run left behind is in the backend's namespace and not the evaluator's.
-    let plain = ply(dir.path()).arg("test").arg("--json").output().unwrap();
-    let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
-    assert_eq!(
-        u64_at(&plain, &["summary", "cached"]),
-        0,
-        "a run with no backend believed a pass a backend run recorded: {plain}"
-    );
-    // Every test in `CORPUS`, counted so a test that silently stopped running would show here.
-    assert_eq!(u64_at(&plain, &["summary", "passed"]), 9, "{plain}");
-}
-
-/// A unit compiled to enter nothing is the whole project's compile spent on an empty selection,
-/// and `benches/marginal-change/` prices that at about half of a backed run. A run that selected no
-/// test builds none.
-#[test]
-fn a_backed_run_that_selects_nothing_compiles_nothing() {
-    let dir = project(CORPUS);
-    let report = run(dir.path(), Some("c"));
-    assert!(
-        u64_at(&report, &["backend", "fragment"]) > 0,
-        "the control did not compile a fragment, so the next assertion proves nothing: {}",
-        report["backend"]
-    );
-
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--backend")
-        .arg("c")
-        .arg("--filter")
-        .arg("nothing-matches-this")
-        .arg("--json")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["ok"], Value::Bool(true), "{report}");
-    assert_eq!(
-        u64_at(&report, &["backend", "fragment"]),
-        0,
-        "a run that selected no test compiled a fragment anyway: {}",
-        report["backend"]
-    );
-    assert!(
-        report["diagnostics"]
-            .as_array()
-            .is_some_and(|d| d.is_empty()),
-        "a run that built no backend reported a disagreement about which engine it was: {report}"
+        caught.contains(&"m.a self handled effect still answers".to_string()),
+        "{caught:?}"
     );
 }
 
 // --- The flag itself --------------------------------------------------------
 
-/// A flag that is accepted and does nothing is `CONTRIBUTING.md` §"The one rule"'s defect shape, so
-/// the engine that cannot host a backend refuses it rather than ignoring it.
+/// `--audit-backend` is accepted only alongside `--backend`; on its own it is a flag that would do
+/// nothing, which `CONTRIBUTING.md` §"The one rule" calls a defect, so the CLI refuses it.
 #[test]
 fn auditing_a_backend_that_was_not_asked_for_is_refused() {
     let dir = project(CORPUS);
@@ -475,10 +294,12 @@ fn the_honest_code_generator_agrees_over_the_corpus_and_enters_it() {
         "the code generator entered nothing, so the seam was never reached: {}",
         report["backend"]
     );
-    assert!(
-        u64_at(&report, &["backend", "declined"]) > 0,
-        "the code generator declined nothing, so the registry-miss path — which is what \
-         `wrong:unoffered` corrupts — is unexercised: {}",
+    // Under tier-only the C tier carries the whole language, so it declines nothing — the
+    // registry-miss path the two-tier world exercised here is gone (ADR 0048).
+    assert_eq!(
+        u64_at(&report, &["backend", "declined"]),
+        0,
+        "{}",
         report["backend"]
     );
     assert!(
@@ -572,14 +393,12 @@ fn compiled_code_that_runs_past_its_budget_is_caught_by_ply_test() {
     let control = run(dir.path(), Some("c"));
     assert_eq!(u64_at(&control, &["summary", "failed"]), 1, "{control}");
     assert!(
-        caught(&control).is_empty(),
-        "the honest code generator was blamed for a corpus that is red on its own: {control}"
-    );
-    assert!(
-        u64_at(&control, &["backend", "declined"]) > 0,
-        "the honest code generator never declined, so the budget it is about to ignore was never \
-         honoured either: {}",
-        control["backend"]
+        control["failures"][0]["diagnostic"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("recursion limit")),
+        "the honest code generator honours the recursion bound and declines with it, so a red \
+         control here is the corpus outrunning the bound rather than the generator misbehaving: \
+         {control}"
     );
 
     let caught = fires_and_is_caught(dir.path(), "c:wrong:exceeds-budget=4");
@@ -593,210 +412,16 @@ fn compiled_code_that_ignores_its_budget_is_caught_where_the_body_terminates() {
     assert_eq!(caught, vec!["m.a ladder past the machine's bound"]);
 }
 
-/// Accepting a call the machine must never offer, over the code generator.
+/// The compiled counterpart of the forged-answer mutation; its old offer-protection subject is a
+/// two-tier distinction tier-only removes (ADR 0048), so it too is caught by the run going red.
 #[test]
-fn compiled_code_is_never_offered_a_definition_that_performs() {
+fn compiled_code_forging_an_answer_for_a_self_handled_definition_is_caught_by_ply_test() {
     let dir = project(CORPUS);
-    let report = run(dir.path(), Some("c:wrong:answers=99@m.handled"));
-
-    assert_eq!(
-        u64_at(&report, &["backend", "offered_target"]),
-        0,
-        "a definition that discharges its own effects was offered to a backend: {}",
-        report["backend"]
-    );
+    let caught = fires_and_is_caught(dir.path(), "c:wrong:answers=99@m.handled");
     assert!(
-        u64_at(&report, &["backend", "offered"]) > 0,
-        "the seam was never reached at all, so the count above proves nothing: {}",
-        report["backend"]
+        caught.contains(&"m.a self handled effect still answers".to_string()),
+        "{caught:?}"
     );
-    assert_eq!(u64_at(&report, &["backend", "fired"]), 0, "{report}");
-    assert_eq!(report["ok"], Value::Bool(true), "{report}");
-}
-
-/// A recursion with no base case, under a backend that ignores its budget **entirely**.
-///
-/// Over native frames the budget is not the last bound: the compiled prologue also refuses when
-/// the thread's stack is nearly out, and the entry then declines to the machine, whose frames are
-/// on the heap and whose bound raises. So a backend that ignores its budget comes back red rather
-/// than taking the process down, and the assertion is on that -- an orderly exit, not a signal.
-#[test]
-fn the_unbounded_runaway_is_stopped_under_a_code_generator_and_hangs_under_a_tree_walker() {
-    use std::process::{Command as Raw, Stdio};
-    use std::time::{Duration, Instant};
-
-    const SPIN: &str = r#"
-fn spin(n: Int) -> Int = 1 + spin(n + 1)
-
-test "a runaway" { assert_eq(spin(0), 0) }
-"#;
-    let dir = project(SPIN);
-
-    /// Runs one arm as a child and reports whether it ended, and how.
-    fn arm(dir: &Path, backend: &str, limit: Duration) -> Option<std::process::ExitStatus> {
-        let mut child = Raw::new(assert_cmd::cargo::cargo_bin("ply"))
-            .args(["test", "-j", "1", "--color", "never", "--audit-backend"])
-            .arg("--backend")
-            .arg(backend)
-            .current_dir(dir)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("the `ply` binary runs");
-        let deadline = Instant::now() + limit;
-        loop {
-            if let Some(status) = child.try_wait().expect("the child is waitable") {
-                return Some(status);
-            }
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                return None;
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    // The control: the honest code generator over the same corpus comes back, and comes back red
-    // with the machine's own bound.
-    let honest =
-        arm(dir.path(), "c", Duration::from_secs(60)).expect("the honest code generator finished");
-    assert!(
-        !honest.success(),
-        "a recursion with no base case passed: {honest:?}"
-    );
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            honest.signal(),
-            None,
-            "the honest code generator died by signal on a corpus it should refuse politely"
-        );
-    }
-
-    // The corruption, over native frames: the stack's floor stops it, and quickly.
-    let corrupted = arm(
-        dir.path(),
-        "c:wrong:exceeds-budget",
-        Duration::from_secs(60),
-    )
-    .expect(
-        "a backend that ignores its budget over a recursion with no base case did not come back \
-         within 60s — over native frames the stack floor is supposed to stop it, and a hang here \
-         means neither the floor nor the budget is being honoured",
-    );
-    assert!(
-        !corrupted.success(),
-        "a backend that ignored its budget entirely reported success: {corrupted:?}"
-    );
-    // **Refused, not dead**: the floor turned what used to take the process down into the
-    // machine's own diagnostic.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        assert_eq!(
-            corrupted.signal(),
-            None,
-            "the corrupted run died by signal ({corrupted:?}): the compiled prologue's stack \
-             floor did not stop a runaway before the thread's stack ran out"
-        );
-    }
-
-    // And the other arm, so that the contrast is asserted rather than recalled: the same corruption
-    // over heap-grown frames does NOT come back.
-    assert!(
-        arm(dir.path(), "wrong:exceeds-budget", Duration::from_secs(10)).is_none(),
-        "`reference`'s unbounded runaway now terminates. That is a change in `Reference` and \
-         it makes the backend authorisation's account of why this configuration lived nowhere obsolete — \
-         update that section rather than this assertion"
-    );
-}
-
-// --- The result-cache rule, over the code generator --------------------------
-
-/// The cache rule again, on the backend that arrived after it was written.
-#[test]
-fn a_code_generator_run_reads_no_pass_the_evaluator_earned() {
-    let dir = project(CORPUS);
-    let warm = ply(dir.path()).arg("test").arg("--json").output().unwrap();
-    let warm: Value = serde_json::from_slice(&warm.stdout).unwrap();
-    assert_eq!(warm["ok"], Value::Bool(true), "{warm}");
-
-    let again = ply(dir.path()).arg("test").arg("--json").output().unwrap();
-    let again: Value = serde_json::from_slice(&again.stdout).unwrap();
-    assert!(
-        u64_at(&again, &["summary", "cached"]) > 0,
-        "the cache never warmed, so this test cannot tell a backend run that ignored it from one \
-         that had nothing to ignore: {again}"
-    );
-
-    // No `--audit-backend`, deliberately, so `--backend` is the only thing that could bypass the
-    // installed on that path would be cache-safe for a reason that has nothing to do with backends.
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--backend")
-        .arg("c")
-        .arg("-j")
-        .arg("1")
-        .arg("--json")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["no_cache"], Value::Bool(false), "{report}");
-    assert_eq!(
-        u64_at(&report, &["summary", "cached"]),
-        0,
-        "a code generator run believed a pass an unbacked run earned: {report}"
-    );
-    assert!(
-        u64_at(&report, &["backend", "entered"]) > 0,
-        "nothing entered native code, so no rule about entering it was exercised: {}",
-        report["backend"]
-    );
-    assert!(
-        report["diagnostics"]
-            .as_array()
-            .is_some_and(|d| d.is_empty()),
-        "{report}"
-    );
-}
-
-/// The write half, in a project of its own **because the read half warms the cache**.
-#[test]
-fn a_code_generator_run_writes_no_pass() {
-    let dir = project(CORPUS);
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--backend")
-        .arg("c")
-        .arg("-j")
-        .arg("1")
-        .arg("--json")
-        .output()
-        .unwrap();
-    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["ok"], Value::Bool(true), "{report}");
-    assert!(
-        u64_at(&report, &["backend", "entered"]) > 0,
-        "nothing entered native code, so no rule about entering it was exercised: {}",
-        report["backend"]
-    );
-
-    // A later run with no backend has to run every test again, because the code generator run left
-    // nothing behind.
-    let plain = ply(dir.path()).arg("test").arg("--json").output().unwrap();
-    let plain: Value = serde_json::from_slice(&plain.stdout).unwrap();
-    assert_eq!(
-        u64_at(&plain, &["summary", "cached"]),
-        0,
-        "a run with no backend believed a pass a code generator run recorded: {plain}"
-    );
-    // Derived from the corpus rather than written down: this read `5` and went stale the moment two
-    // tests were added to `CORPUS`, failing a test whose subject — the cache rule above — was still
-    // holding.
-    let in_corpus = CORPUS.matches("test \"").count() as u64;
-    assert_eq!(u64_at(&plain, &["summary", "passed"]), in_corpus, "{plain}");
 }
 
 /// `ply run --backend` attaches the backend to the program's `main` as `ply test` does to a test,
@@ -806,22 +431,19 @@ fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
     let dir = project(
         "fn double(x: Int) -> Int = x * 2\nfn main() -> Int = fold(range(0, 10), 0, |acc: Int, i: Int| acc + double(i))\n",
     );
-    for backend in ["c", "reference"] {
-        let out = ply(dir.path())
-            .arg("run")
-            .arg("--json")
-            .arg("--backend")
-            .arg(backend)
-            .output()
-            .unwrap();
-        let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-        assert_eq!(
-            report["value"],
-            Value::String("90".into()),
-            "{backend}: {report}"
-        );
-        assert!(out.status.success(), "{backend}: {report}");
-    }
+    // Only the C tier is offered here: under tier-only `reference` is a fragment with no machine
+    // behind it, so it declines `main` and cannot run the program at all (ADR 0048).
+    let out = ply(dir.path())
+        .arg("run")
+        .arg("--json")
+        .arg("--backend")
+        .arg("c")
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["value"], Value::String("90".into()), "{report}");
+    assert!(out.status.success(), "{report}");
+
     let out = ply(dir.path())
         .arg("run")
         .arg("--json")
@@ -834,6 +456,46 @@ fn run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse() {
     assert!(
         text.contains(ply_span::codes::BACKEND_UNAVAILABLE),
         "{text}"
+    );
+}
+
+// --- The compile laziness ---------------------------------------------------
+
+/// A unit compiled to enter nothing is the whole project's compile spent on an empty selection,
+/// and `benches/marginal-change/` prices that at about half of a backed run. A run that selected no
+/// test builds none.
+#[test]
+fn a_backed_run_that_selects_nothing_compiles_nothing() {
+    let dir = project(CORPUS);
+    let report = run(dir.path(), Some("c"));
+    assert!(
+        u64_at(&report, &["backend", "fragment"]) > 0,
+        "the control did not compile a fragment, so the next assertion proves nothing: {}",
+        report["backend"]
+    );
+
+    let out = ply(dir.path())
+        .arg("test")
+        .arg("--backend")
+        .arg("c")
+        .arg("--filter")
+        .arg("nothing-matches-this")
+        .arg("--json")
+        .output()
+        .unwrap();
+    let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(report["ok"], Value::Bool(true), "{report}");
+    assert_eq!(
+        u64_at(&report, &["backend", "fragment"]),
+        0,
+        "a run that selected no test compiled a fragment anyway: {}",
+        report["backend"]
+    );
+    assert!(
+        report["diagnostics"]
+            .as_array()
+            .is_some_and(|d| d.is_empty()),
+        "a run that built no backend reported a disagreement about which engine it was: {report}"
     );
 }
 
@@ -873,7 +535,7 @@ fn a_backend_name_that_is_not_a_spelling_of_anything_is_refused() {
 }
 
 /// A test body is a root the code generator enters whole, and a failing one is still a failure:
-/// the backend declines it and the machine raises the diagnostic.
+/// the tier raises the diagnostic, which is an entry and not a decline.
 #[test]
 fn a_test_body_is_entered_whole_and_a_failing_one_still_fails() {
     let dir = project(
@@ -887,14 +549,36 @@ test "wrong" { assert_eq(double(21), 41) }
     );
     let report = run(dir.path(), Some("c"));
     assert_eq!(u64_at(&report, &["summary", "failed"]), 1, "{report}");
-    assert!(
-        u64_at(&report, &["backend", "entered"]) > 0,
-        "the passing test's body was not entered: {}",
+    assert_eq!(
+        u64_at(&report, &["backend", "entered"]),
+        2,
+        "both bodies are entered, and the failing one raises: {}",
         report["backend"]
     );
-    assert!(
-        u64_at(&report, &["backend", "declined"]) > 0,
-        "the failing test's body was not declined back to the machine: {}",
+    assert_eq!(
+        u64_at(&report, &["backend", "declined"]),
+        0,
+        "a raised failure is a verdict, not a decline: {}",
         report["backend"]
     );
 }
+
+// --- Removed under tier-only (ADR 0048) -------------------------------------
+//
+// The following tests are deleted because their premise is the interpreter-vs-backend separation
+// that tier-only removes:
+//
+// * `the_honest_backend_agrees_over_the_corpus_and_enters_it` — `reference` is a fragment with no
+//   machine behind it, so it declines the corpus's effects and runs it red rather than green; the
+//   honest-`c` control above is now the only honest backend that runs the corpus.
+// * `the_corpus_is_green_with_no_backend` — the C tier is always the evaluator, so there is no
+//   "no backend" run and `report["backend"]` is never null.
+// * `a_backend_run_reads_no_pass_the_evaluator_earned`,
+//   `a_backend_run_writes_no_pass_the_evaluator_will_read`,
+//   `a_code_generator_run_reads_no_pass_the_evaluator_earned`,
+//   `a_code_generator_run_writes_no_pass` — the result cache is no longer namespaced by engine;
+//   the backend IS the evaluator, so there is no evaluator-earned pass a backend run must refuse.
+// * `the_unbounded_runaway_is_stopped_under_a_code_generator_and_hangs_under_a_tree_walker` — there
+//   is no tree-walker arm to contrast, and a corrupt backend now declines the test body outright
+//   (no body) rather than running past its budget over native frames, so the stack-floor vs
+//   heap-frame contrast no longer exists.

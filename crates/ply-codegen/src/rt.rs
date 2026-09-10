@@ -14,8 +14,10 @@ use crate::heap::{
 use crate::list;
 use crate::map;
 use ply_core::ty::{EffectAtom, Resource};
+use ply_eval::arena::Slot;
+use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
-use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::{BinOp, Mode};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -61,6 +63,9 @@ pub struct Tables {
     /// The answers of roots called with nothing but memo words, by the root and the words:
     /// a pure function of remembered inputs, remembered in turn, up to a bound.
     pub calls: RefCell<HashMap<(Symbol, Vec<Word>), Word>>,
+    /// Each module's source by the index a site names, in program order. Filled from the program
+    /// at load and never cached: a `SourceId` is assigned per load.
+    pub sources: Vec<SourceId>,
 }
 
 /// How many calls of roots over memo words a unit remembers; past it, a call is run and
@@ -340,12 +345,63 @@ pub(crate) fn clone_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
         .collect()
 }
 
+/// A spawned task's view of the handlers around its spawn: copies, so the task performs against
+/// what enclosed the spawn whatever the spawner does next. None of them names a detached body --
+/// a clause off the tail would capture the spawner's stack, and `rt_perform` refuses it.
+pub(crate) fn inherit_frames(list: &[HandlerFrame]) -> Vec<HandlerFrame> {
+    clone_frames(list)
+        .into_iter()
+        .map(|f| HandlerFrame {
+            detached: None,
+            ..f
+        })
+        .collect()
+}
+
 pub(crate) fn drop_frame(f: HandlerFrame) {
     for c in f.clauses {
         heap::dec(c.closure);
     }
     if f.ret != 0 {
         heap::dec(f.ret);
+    }
+}
+
+/// A heap word a cell holds: the arena's value type on the tier, so that a cell's contents never
+/// cross the seam. A clone is a count and a drop gives one back, which is why the arena is dropped
+/// before the heap that owns the words.
+pub struct Held(pub Word);
+
+impl Held {
+    fn into_word(self) -> Word {
+        let w = self.0;
+        std::mem::forget(self);
+        w
+    }
+}
+
+impl Clone for Held {
+    fn clone(&self) -> Held {
+        heap::inc(self.0);
+        Held(self.0)
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        heap::dec(self.0);
+    }
+}
+
+impl Default for Held {
+    fn default() -> Held {
+        Held(heap::unit())
+    }
+}
+
+impl std::fmt::Debug for Held {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Held({:#x})", self.0)
     }
 }
 
@@ -360,17 +416,25 @@ pub struct Ctx {
     /// temporary a slot, so a recursion well inside the count can run off a worker thread's stack
     /// with no diagnostic at all. The prologue compares against this before it spends fuel.
     pub stack_floor: usize,
+    /// Where the body is -- the module index, start and end a body stores before a call that can
+    /// fail -- so what the runtime raises is placed. The module is `-1` until a body stores one.
+    pub site_module: i64,
+    pub site_start: i64,
+    pub site_end: i64,
+    /// The cells, holding heap words: declared before the heap, so their counts go back first.
+    cells: ply_eval::TaskRegions<Held>,
+    /// The arena's `(depth, live)` at the start of the entry now running, so [`Ctx::cells_balanced`]
+    /// can ask whether the body gave back everything it took rather than whether it took anything.
+    cells_baseline: (usize, usize),
+    /// The arena `ply_eval::builtins::call` insists on, which nothing reaching it uses: the cell
+    /// builtins are the tier's own.
+    scratch: ply_eval::Arena,
     pub heap: Heap,
     /// The objects the entry that just finished allocated, kept because [`Ctx::end`] clears the
     /// log and the number is otherwise gone.
     last_entry: usize,
     unclosed_entries: u64,
     pub tables: Rc<Tables>,
-    /// The arena `ply_eval::builtins::call` insists on.
-    cells: ply_eval::TaskRegions,
-    /// The arena's `(depth, live)` at the start of the entry now running, so [`Ctx::cells_balanced`]
-    /// can ask whether the body gave back everything it took rather than whether it took anything.
-    cells_baseline: (usize, usize),
     /// Why the last entry failed.
     pub diagnostic: Option<Diagnostic>,
     pub builtin_calls: u64,
@@ -393,6 +457,8 @@ pub struct Ctx {
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_eval::host::HostUse,
     pub(crate) host_ops: u64,
+    /// The last at-most-once host operation this entry performed, for `E0426`.
+    pub(crate) last_linear: Option<crate::host::HostMark>,
     pub(crate) id: ply_eval::host::MachineId,
     /// What the host runtime said when an entry ended, for the machine's teardown warnings.
     pub(crate) teardown: Vec<Diagnostic>,
@@ -417,12 +483,16 @@ impl Ctx {
             failed: 0,
             fuel: 0,
             stack_floor: 0,
+            site_module: -1,
+            site_start: 0,
+            site_end: 0,
             heap: Heap::new(),
             last_entry: 0,
             unclosed_entries: 0,
             tables,
             cells,
             cells_baseline: baseline,
+            scratch: ply_eval::Arena::new(),
             diagnostic: None,
             builtin_calls: 0,
             stacks: vec![Frames::under(None)],
@@ -437,6 +507,7 @@ impl Ctx {
             re_executed: false,
             host_use: ply_eval::host::HostUse::default(),
             host_ops: 0,
+            last_linear: None,
             id: ply_eval::host::MachineId::next(),
             teardown: Vec::new(),
             seed: ply_eval::Seed::default(),
@@ -456,6 +527,8 @@ impl Ctx {
         self.failed = 0;
         self.fuel = fuel;
         self.stack_floor = stack_floor();
+        self.site_module = -1;
+        self.last_linear = None;
         self.diagnostic = None;
         self.stacks.clear();
         self.stacks.push(Frames::under(None));
@@ -564,9 +637,39 @@ impl Ctx {
             self.failed = code;
         }
         if self.diagnostic.is_none() {
-            self.diagnostic = Some(d);
+            self.diagnostic = Some(self.placed(d));
         }
         0
+    }
+
+    /// The span the body last stored, or `Span::DUMMY` before any has.
+    pub fn site(&self) -> Span {
+        usize::try_from(self.site_module)
+            .ok()
+            .and_then(|m| self.tables.sources.get(m))
+            .map_or(Span::DUMMY, |s| {
+                Span::new(*s, self.site_start as u32, self.site_end as u32)
+            })
+    }
+
+    /// `d` anchored at the site when it names no place of its own: the runtime's helpers raise
+    /// with `Span::DUMMY`, and where the body was is the site it stored before the call.
+    fn placed(&self, mut d: Diagnostic) -> Diagnostic {
+        let site = self.site();
+        if site == Span::DUMMY {
+            return d;
+        }
+        let at = d
+            .labels
+            .iter()
+            .position(|l| l.primary)
+            .or_else(|| (!d.labels.is_empty()).then_some(0));
+        match at {
+            Some(i) if d.labels[i].span == Span::DUMMY => d.labels[i].span = site,
+            Some(_) => {}
+            None => d = d.primary(site, "here"),
+        }
+        d
     }
 
     pub fn take_failure(&mut self) -> Option<Diagnostic> {
@@ -641,12 +744,10 @@ pub unsafe extern "C" fn rt_region_close(ctx: *mut Ctx, region: i64) {
 /// The emitter refuses a site that opens a *region*, which is the part a C frame cannot carry.
 pub unsafe extern "C" fn rt_cell(ctx: *mut Ctx, init: i64) -> i64 {
     let ctx = unsafe { &mut *ctx };
-    let v = ctx.value(init);
-    heap::dec(init);
     if !ctx.sims.is_empty() {
         ctx.trail.record_access(ply_eval::sim::Access::Alloc);
     }
-    let slot = ctx.cells.alloc_cell(v);
+    let slot = ctx.cells.alloc_cell(Held(init));
     ctx.heap.bridge(Value::Cell(slot))
 }
 
@@ -913,6 +1014,13 @@ pub unsafe extern "C" fn rt_no_match(ctx: *mut Ctx) {
     ctx.fail(d);
 }
 
+/// A refutable `let` whose pattern did not match the value bound to it.
+pub unsafe extern "C" fn rt_let_no_match(ctx: *mut Ctx) {
+    let ctx = unsafe { &mut *ctx };
+    let d = error("`let` pattern did not match the bound value");
+    ctx.fail(d);
+}
+
 pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
     let ctx = unsafe { &mut *ctx };
     let name = match what {
@@ -1003,7 +1111,8 @@ pub unsafe extern "C" fn rt_builtin(ctx: *mut Ctx, index: i64, args: *const i64,
 /// when no native path does. Takes the arguments.
 fn builtin_over_values(ctx: &mut Ctx, b: Builtin, args: &[Word]) -> Word {
     let values = values_taken(ctx, args);
-    match ply_eval::builtins::call(b, values, ctx.cells.arena_mut(), Span::DUMMY) {
+    let site = ctx.site();
+    match ply_eval::builtins::call(b, values, &mut ctx.scratch, site) {
         Ok(Step::Done(v)) => ctx.word(&v),
         // Unreachable: the emitter refuses every higher-order builtin at compile
         // time, because answering `Step::Apply` here would need user code run from inside a native
@@ -1054,6 +1163,33 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
 
 /// The builtins answered over words, when their arguments have the native kinds; `None` hands the
 /// call to the interpreter's implementation.
+/// The cell a word names, when it is one.
+fn cell_of(w: Word) -> Option<Slot> {
+    if heap::kind(w) != crate::heap::KIND_BRIDGE {
+        return None;
+    }
+    match unsafe { crate::heap::bridged(obj(w)) } {
+        Value::Cell(slot) => Some(*slot),
+        _ => None,
+    }
+}
+
+/// The cell's contents, as a count of its own.
+fn cell_read(ctx: &Ctx, slot: Slot, what: &str) -> Result<Word, Diagnostic> {
+    let site = ctx.site();
+    let arena = ctx.cells.arena();
+    if arena.is_taken(slot) {
+        return Err(cell_in_update(site, slot, what));
+    }
+    match arena.get(slot) {
+        Some(held) => {
+            heap::inc(held.0);
+            Ok(held.0)
+        }
+        None => Err(no_such_cell(site, slot)),
+    }
+}
+
 fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> {
     match (which, args) {
         (Builtin::Len, [xs]) if heap::kind(*xs) == KIND_LIST => {
@@ -1063,6 +1199,57 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
         }
         (Builtin::Push, [xs, x]) if heap::kind(*xs) == KIND_LIST => {
             Some(ctx.heap.list_push(*xs, *x))
+        }
+        // The cells: the tier's own, over heap words, so a cell's contents never cross the seam.
+        (Builtin::CellGet, [c]) => {
+            let slot = cell_of(*c)?;
+            let answer = match cell_read(ctx, slot, "cell_get") {
+                Ok(w) => w,
+                Err(d) => ctx.fail(d),
+            };
+            heap::dec(*c);
+            Some(answer)
+        }
+        (Builtin::CellSet, [c, v]) => {
+            let slot = cell_of(*c)?;
+            let site = ctx.site();
+            if ctx.cells.arena().is_taken(slot) {
+                heap::dec(*v);
+                heap::dec(*c);
+                return Some(ctx.fail(cell_in_update(site, slot, "cell_set")));
+            }
+            if heap::reaches_cell(*v, slot) {
+                ply_eval::rc::note_cell_cycle(slot, site);
+            }
+            let stored = ctx.cells.arena_mut().set(slot, Held(*v));
+            heap::dec(*c);
+            if !stored {
+                return Some(ctx.fail(no_such_cell(site, slot)));
+            }
+            Some(heap::unit())
+        }
+        (Builtin::CellUpdate, [c, f]) => {
+            let slot = cell_of(*c)?;
+            let site = ctx.site();
+            if ctx.cells.arena().is_taken(slot) {
+                heap::dec(*f);
+                heap::dec(*c);
+                return Some(ctx.fail(cell_in_update(site, slot, "cell_update")));
+            }
+            let Some(current) = ctx.cells.arena_mut().take(slot) else {
+                heap::dec(*f);
+                heap::dec(*c);
+                return Some(ctx.fail(no_such_cell(site, slot)));
+            };
+            let updated = call_value(std::ptr::from_mut(ctx), *f, &[current.into_word()]);
+            let held = if ctx.failed != 0 {
+                Held::default()
+            } else {
+                Held(updated)
+            };
+            ctx.cells.arena_mut().put_back(slot, held);
+            heap::dec(*c);
+            Some(if ctx.failed != 0 { 0 } else { heap::unit() })
         }
         (Builtin::ListAt, [xs, i]) if heap::kind(*xs) == KIND_LIST => {
             let o = obj(*xs);
@@ -1709,6 +1896,7 @@ pub unsafe extern "C" fn rt_perform(
     }
     c.performed.push(atom);
     let mut found = None;
+    let mut inherited_off_tail = false;
     let mut stack = c.current;
     'search: loop {
         for (i, f) in c.stacks[stack].list.iter().enumerate().rev() {
@@ -1730,9 +1918,10 @@ pub unsafe extern "C" fn rt_perform(
                 .find(|cl| cl.answers(&effect, &op, resource.as_ref()))
             {
                 if cl.resumes == 2 {
-                    let id = f
-                        .detached
-                        .expect("a clause off the tail is in a detached frame");
+                    let Some(id) = f.detached else {
+                        inherited_off_tail = true;
+                        break 'search;
+                    };
                     let closure = cl.closure;
                     // The names are moved in and dropped before the switch: this frame comes
                     // back with every restored snapshot, and a local that owned heap memory
@@ -1755,6 +1944,20 @@ pub unsafe extern "C" fn rt_perform(
             Some(p) => stack = p,
             None => break,
         }
+    }
+    if inherited_off_tail {
+        let d = Diagnostic::error(
+            codes::RUNTIME_ERROR,
+            format!(
+                "`{effect}.{op}` was performed in a task, and its handler resumes off the tail"
+            ),
+        )
+        .primary(c.site(), "performed here")
+        .note(
+            "the clause would capture the continuation of the body the task was spawned in, which \
+             is not the task's own: handle the operation inside the task, or resume on the tail",
+        );
+        return c.fail(d);
     }
     let Some((stack, depth, closure, resumes)) = found else {
         // A `task` operation inside the production region already open is the scheduler's;
@@ -1808,20 +2011,22 @@ pub unsafe extern "C" fn rt_simulate(ctx: *mut Ctx, body: i64) -> i64 {
     let c = unsafe { &mut *ctx };
     if !c.sims.is_empty() {
         heap::dec(body);
-        let d = ply_eval::machine::err_nested_simulation(Span::DUMMY, Span::DUMMY);
+        let outer = c.sims.last().map_or(Span::DUMMY, |sim| sim.site);
+        let d = ply_eval::err_nested_simulation(c.site(), outer);
         return c.fail(d);
     }
     let id = ply_eval::SimId(c.entered_sims);
     c.entered_sims += 1;
-    c.trail.enter(Span::DUMMY);
+    let site = c.site();
+    c.trail.enter(site);
     let stack = c.current;
     let depth = c.frames().len();
     c.frames().push(HandlerFrame::simulate());
     let sim = crate::simulate::Simulation::new(
-        id,
+        ply_eval::sched::Scheduler::new(id, site).with_step_budget(c.sim_steps),
+        site,
         c.seed.root,
         c.trail.drawn(),
-        c.sim_steps,
         stack,
         c.stack_floor,
         body,
@@ -2011,7 +2216,8 @@ pub(crate) fn call_value(ctx: *mut Ctx, callee: Word, args: &[Word]) -> i64 {
                     let b = *b;
                     let values = values_taken(c, args);
                     c.builtin_calls += 1;
-                    match ply_eval::builtins::call(b, values, c.cells.arena_mut(), Span::DUMMY) {
+                    let site = c.site();
+                    match ply_eval::builtins::call(b, values, &mut c.scratch, site) {
                         Ok(Step::Done(v)) => c.word(&v),
                         Ok(_) => {
                             let d = error(format!(
@@ -2416,7 +2622,10 @@ pub unsafe extern "C" fn rt_record_update(
     }
     let o = obj(base);
     let shape = shape as u32;
-    if unsafe { (*o).layout } == shape && is_unique(base) {
+    let in_place = unsafe { (*o).layout } == shape && is_unique(base);
+    let width = ctx.tables.layouts.shape_width(shape);
+    ply_eval::rc::note_update_of(in_place, if in_place { 0 } else { width }, ctx.site());
+    if in_place {
         for (w, at) in written.iter().zip(offsets) {
             unsafe {
                 heap::dec(word_at(o, *at as usize));

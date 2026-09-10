@@ -417,6 +417,16 @@ pub trait Executor: Sync {
         Engine::Evaluator
     }
 
+    /// Whether this run's pass may stand as the bisection baseline a later failure is compared
+    /// against. The baseline is keyed by the test's name, not by an engine, so only the
+    /// authoritative evaluator may write one. Under tier-only (ADR 0048) the tier IS the
+    /// evaluator, so a run that is not auditing a second backend against it is authoritative —
+    /// which the `engine().is_evaluator()` default cannot see, since the tier reports its own
+    /// backend name rather than `Evaluator`.
+    fn writes_baseline(&self) -> bool {
+        self.engine().is_evaluator()
+    }
+
     /// What the search the last [`Executor::execute`] performed did, read off the worker that
     /// performed it.
     fn exploration(&self, _worker: &Self::Worker) -> Option<Exploration> {
@@ -907,6 +917,13 @@ impl<'a> Executor for InterpExecutor<'a> {
         Engine::of_backend(provider.name(), &provider.variant(), spec)
     }
 
+    fn writes_baseline(&self) -> bool {
+        // A non-audit run's evaluator is its attached tier (ADR 0048): its pass is the authoritative
+        // baseline a later failure is bisected against. Under `--audit-backend` the backend is being
+        // checked against an oracle rather than trusted as the evaluator, so it writes none.
+        !self.audit_backend
+    }
+
     fn worker(&self) -> Worker<'a> {
         let backend = self.backend();
         let mut worker = Worker::in_region(
@@ -1336,6 +1353,7 @@ pub fn run_with<E: Executor>(
     let started = Instant::now();
     let mut warnings = Vec::new();
     let engine = executor.engine();
+    let writes_baseline = executor.writes_baseline();
 
     let changed = changed_definitions(hashes, store);
 
@@ -1437,7 +1455,7 @@ pub fn run_with<E: Executor>(
                     // engine can qualify, and `diagnose_failures` re-runs every hybrid on the
                     // evaluator, so a baseline another engine earned would be a claim this record
                     // does not make.
-                    if record.is_written() && engine.is_evaluator() {
+                    if record.is_written() && writes_baseline {
                         let (closure, decls) = closure_hashes(hashes, &test.key);
                         store.put_pass_record(
                             test.key.clone(),

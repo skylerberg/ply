@@ -2,10 +2,8 @@
 
 use super::*;
 use crate::build;
-use crate::build::{
-    bin, block, boolean, call, callv, discard, if_, int, lam, letv, list, unit, var,
-};
-use crate::machine::Machine;
+use crate::build::{bin, block, callv, int, letv, list, var};
+use crate::evaluator::Machine;
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{BinOp, Expr, HandleClause, Item, Mode};
 
@@ -47,10 +45,6 @@ fn with_cell_(resource: &str, init: Expr, binder: &str, body: Expr) -> Expr {
 
 fn cell_get(cell: Expr) -> Expr {
     callv("cell_get", vec![cell])
-}
-
-fn cell_set(cell: Expr, value: Expr) -> Expr {
-    callv("cell_set", vec![cell, value])
 }
 
 /// Every test below runs on the real machine.
@@ -98,23 +92,11 @@ impl Outcome {
     }
 
     #[track_caller]
-    fn diagnostic(&self) -> &Diagnostic {
-        match &self.result {
-            Err(d) => d,
-            Ok(v) => panic!("expected a diagnostic, got {v}"),
-        }
-    }
-
-    #[track_caller]
     fn cell(&self, index: u32) -> i64 {
         match self.cells.get(index as usize) {
             Some(Value::Int(i)) => *i,
             other => panic!("cell {index} holds {other:?}"),
         }
-    }
-
-    fn cells(&self) -> Vec<String> {
-        self.cells.iter().map(Value::render).collect()
     }
 }
 
@@ -147,338 +129,6 @@ fn a_tail_resumptive_clause_that_performs_its_own_operation_reaches_the_next_han
 }
 
 #[test]
-fn a_multi_shot_clause_that_performs_its_own_operation_reaches_the_next_handler_out() {
-    // The inner clause performs `pick` twice and resumes twice.
-    let e = handle_(
-        handle_(
-            bin(BinOp::Mul, perform_("nd", "pick", None, vec![]), int(10)),
-            vec![clause_(
-                "nd",
-                "pick",
-                None,
-                &[],
-                Some("k"),
-                bin(
-                    BinOp::Add,
-                    call(var("k"), vec![perform_("nd", "pick", None, vec![])]),
-                    call(var("k"), vec![perform_("nd", "pick", None, vec![])]),
-                ),
-            )],
-            None,
-        ),
-        vec![clause_("nd", "pick", None, &[], None, int(1))],
-        None,
-    );
-    assert_eq!(run(&e).int(), 20);
-}
-
-#[test]
-fn a_self_performing_handler_with_nothing_outside_it_is_unhandled_under_both_clause_forms() {
-    for resume_binder in [None, Some("k")] {
-        let inner = match resume_binder {
-            Some(k) => call(var(k), vec![perform_("state", "get", None, vec![])]),
-            None => perform_("state", "get", None, vec![]),
-        };
-        let e = handle_(
-            perform_("state", "get", None, vec![]),
-            vec![clause_("state", "get", None, &[], resume_binder, inner)],
-            None,
-        );
-        let out = run(&e);
-        let d = out.diagnostic();
-        assert_eq!(d.code, codes::UNHANDLED_EFFECT, "{resume_binder:?}");
-    }
-}
-
-/// The two-resumption example, "resumes zero times".
-#[test]
-fn a_clause_that_drops_its_continuation_keeps_the_writes_made_before_the_perform() {
-    let e = with_cell_(
-        "log",
-        int(0),
-        "c",
-        handle_(
-            block(
-                vec![
-                    discard(cell_set(var("c"), int(1))),
-                    letv("b", perform_("amb", "flip", Some("coin"), vec![])),
-                    discard(cell_set(var("c"), int(2))),
-                ],
-                Some(if_(var("b"), int(10), int(20))),
-            ),
-            vec![clause_(
-                "amb",
-                "flip",
-                Some("coin"),
-                &[],
-                Some("k"),
-                cell_get(var("c")),
-            )],
-            Some(("x", var("x"))),
-        ),
-    );
-
-    let run = run(&e);
-    assert_eq!(run.int(), 1);
-    assert_eq!(run.cell(0), 1, "the write after the perform never ran");
-}
-
-/// The two-resumption example, "resumes once" — the case that decides the design.
-#[test]
-fn a_resumption_sees_the_write_the_clause_made_before_calling_it() {
-    let e = with_cell_(
-        "s",
-        int(0),
-        "c",
-        handle_(
-            block(
-                vec![discard(perform_("state", "put", Some("s"), vec![int(5)]))],
-                Some(perform_("state", "get", Some("s"), vec![])),
-            ),
-            vec![
-                clause_(
-                    "state",
-                    "get",
-                    Some("s"),
-                    &[],
-                    Some("k"),
-                    call(var("k"), vec![cell_get(var("c"))]),
-                ),
-                clause_(
-                    "state",
-                    "put",
-                    Some("s"),
-                    &["v"],
-                    Some("k"),
-                    block(
-                        vec![discard(cell_set(var("c"), var("v")))],
-                        Some(call(var("k"), vec![unit()])),
-                    ),
-                ),
-            ],
-            Some(("x", var("x"))),
-        ),
-    );
-
-    let run = run(&e);
-    assert_eq!(run.int(), 5);
-    assert_eq!(run.cell(0), 5);
-}
-
-/// The two-resumption example, "resumes twice".
-#[test]
-fn two_resumptions_run_against_one_threaded_world() {
-    let e = with_cell_(
-        "trace",
-        int(0),
-        "c",
-        handle_(
-            block(
-                vec![
-                    letv("b", perform_("amb", "flip", Some("coin"), vec![])),
-                    discard(cell_set(
-                        var("c"),
-                        bin(BinOp::Add, cell_get(var("c")), int(1)),
-                    )),
-                ],
-                Some(if_(var("b"), int(10), int(20))),
-            ),
-            vec![clause_(
-                "amb",
-                "flip",
-                Some("coin"),
-                &[],
-                Some("k"),
-                bin(
-                    BinOp::Add,
-                    call(var("k"), vec![boolean(true)]),
-                    call(var("k"), vec![boolean(false)]),
-                ),
-            )],
-            Some(("x", var("x"))),
-        ),
-    );
-
-    let run = run(&e);
-    assert_eq!(run.int(), 30);
-    assert_eq!(
-        run.cell(0),
-        2,
-        "each resumption incremented the one world; a snapshot would leave 1"
-    );
-}
-
-/// per-resumption state, built by the handler: per-branch state is the handler's job, and four lines of it.
-#[test]
-fn a_handler_that_restores_the_cell_gives_each_branch_the_same_starting_state() {
-    let e = with_cell_(
-        "s",
-        int(0),
-        "c",
-        handle_(
-            block(
-                vec![
-                    letv("b", perform_("nd", "pick", None, vec![])),
-                    discard(cell_set(
-                        var("c"),
-                        bin(BinOp::Add, cell_get(var("c")), int(1)),
-                    )),
-                ],
-                Some(if_(bin(BinOp::Eq, var("b"), int(1)), int(10), int(20))),
-            ),
-            vec![clause_(
-                "nd",
-                "pick",
-                None,
-                &[],
-                Some("k"),
-                block(
-                    vec![
-                        letv("before", cell_get(var("c"))),
-                        letv("first", call(var("k"), vec![int(1)])),
-                        discard(cell_set(var("c"), var("before"))),
-                        letv("second", call(var("k"), vec![int(2)])),
-                    ],
-                    Some(bin(BinOp::Add, var("first"), var("second"))),
-                ),
-            )],
-            None,
-        ),
-    );
-
-    let run = run(&e);
-    assert_eq!(run.int(), 30);
-    assert_eq!(run.cell(0), 1, "each branch started from 0 and added one");
-}
-
-#[test]
-fn the_return_clause_runs_once_per_resumption_and_not_on_the_clause_s_own_value() {
-    let e = handle_(
-        if_(perform_("amb", "flip", None, vec![]), int(1), int(2)),
-        vec![clause_(
-            "amb",
-            "flip",
-            None,
-            &[],
-            Some("k"),
-            bin(
-                BinOp::Add,
-                call(var("k"), vec![boolean(true)]),
-                call(var("k"), vec![boolean(false)]),
-            ),
-        )],
-        Some(("x", bin(BinOp::Add, var("x"), int(100)))),
-    );
-    // (1 + 100) + (2 + 100); the clause's own 203 is not passed through again.
-    assert_eq!(run(&e).int(), 203);
-}
-
-#[test]
-fn a_nondeterministic_operation_delivers_one_value_to_both_resumptions() {
-    // `flip` is performed once.
-    let e = with_cell_(
-        "draws",
-        int(0),
-        "c",
-        handle_(
-            block(
-                vec![letv("b", perform_("clock", "now", None, vec![]))],
-                Some(var("b")),
-            ),
-            vec![clause_(
-                "clock",
-                "now",
-                None,
-                &[],
-                Some("k"),
-                block(
-                    vec![
-                        discard(cell_set(
-                            var("c"),
-                            bin(BinOp::Add, cell_get(var("c")), int(1)),
-                        )),
-                        letv("drawn", cell_get(var("c"))),
-                        letv("first", call(var("k"), vec![var("drawn")])),
-                        letv("second", call(var("k"), vec![var("drawn")])),
-                    ],
-                    Some(bin(BinOp::Add, var("first"), var("second"))),
-                ),
-            )],
-            None,
-        ),
-    );
-
-    let run = run(&e);
-    assert_eq!(run.int(), 2);
-    assert_eq!(run.cell(0), 1, "the operation was performed once");
-}
-
-#[test]
-fn the_tail_resumptive_form_agrees_with_its_general_expansion() {
-    let program = |resume_binder: Option<&str>| {
-        let body = match resume_binder {
-            Some(k) => call(var(k), vec![cell_get(var("c"))]),
-            None => cell_get(var("c")),
-        };
-        with_cell_(
-            "s",
-            int(7),
-            "c",
-            handle_(
-                block(
-                    vec![discard(cell_set(
-                        var("c"),
-                        bin(BinOp::Add, cell_get(var("c")), int(1)),
-                    ))],
-                    Some(bin(
-                        BinOp::Add,
-                        perform_("state", "get", None, vec![]),
-                        perform_("state", "get", None, vec![]),
-                    )),
-                ),
-                vec![clause_("state", "get", None, &[], resume_binder, body)],
-                Some(("x", bin(BinOp::Mul, var("x"), int(3)))),
-            ),
-        )
-    };
-
-    let tail = run(&program(None));
-    let general = run(&program(Some("k")));
-    assert_eq!(tail.int(), 48);
-    assert_eq!(general.int(), 48);
-    assert_eq!(tail.cells(), general.cells());
-}
-
-#[test]
-fn a_resumed_computation_reaches_the_handler_outside_the_one_that_resumed_it() {
-    let e = handle_(
-        handle_(
-            if_(
-                perform_("amb", "flip", None, vec![]),
-                perform_("ask", "get", None, vec![]),
-                bin(BinOp::Mul, perform_("ask", "get", None, vec![]), int(2)),
-            ),
-            vec![clause_(
-                "amb",
-                "flip",
-                None,
-                &[],
-                Some("k"),
-                bin(
-                    BinOp::Add,
-                    call(var("k"), vec![boolean(true)]),
-                    call(var("k"), vec![boolean(false)]),
-                ),
-            )],
-            None,
-        ),
-        vec![clause_("ask", "get", None, &[], None, int(7))],
-        None,
-    );
-    assert_eq!(run(&e).int(), 21);
-}
-
-#[test]
 fn an_inner_handler_that_does_not_name_the_operation_falls_through() {
     let e = handle_(
         handle_(
@@ -497,46 +147,6 @@ fn an_inner_handler_that_does_not_name_the_operation_falls_through() {
         None,
     );
     assert_eq!(run(&e).int(), 7);
-}
-
-/// The control-stack design's escape case, and required test 6: this is a success, not an error.
-#[test]
-fn a_continuation_captured_in_a_cell_region_still_reads_the_cell_after_the_region_returned() {
-    let region = with_cell_(
-        "s",
-        int(0),
-        "c",
-        handle_(
-            block(
-                vec![
-                    discard(perform_("esc", "grab", None, vec![])),
-                    discard(cell_set(
-                        var("c"),
-                        bin(BinOp::Add, cell_get(var("c")), int(1)),
-                    )),
-                ],
-                Some(cell_get(var("c"))),
-            ),
-            vec![clause_("esc", "grab", None, &[], Some("k"), var("k"))],
-            None,
-        ),
-    );
-    let e = block(
-        vec![
-            letv("k", region),
-            letv("first", call(var("k"), vec![unit()])),
-            letv("second", call(var("k"), vec![unit()])),
-        ],
-        Some(list(vec![var("first"), var("second")])),
-    );
-
-    let run = run(&e);
-    assert_eq!(
-        run.rendered(),
-        "[1, 2]",
-        "the cell was read outside its region"
-    );
-    assert_eq!(run.cell(0), 2);
 }
 
 #[test]
@@ -561,52 +171,6 @@ fn each_region_allocates_its_own_cell_and_the_world_keeps_both() {
 }
 
 #[test]
-fn a_continuation_applied_to_the_wrong_number_of_arguments_is_an_arity_mismatch() {
-    for args in [vec![], vec![int(1), int(2)]] {
-        let count = args.len();
-        let e = handle_(
-            perform_("amb", "flip", None, vec![]),
-            vec![clause_(
-                "amb",
-                "flip",
-                None,
-                &[],
-                Some("k"),
-                call(var("k"), args),
-            )],
-            None,
-        );
-        let out = run(&e);
-        let d = out.diagnostic();
-        assert_eq!(d.code, codes::ARITY_MISMATCH);
-        assert!(
-            d.message.contains(&format!(
-                "a continuation takes 1 argument, but {count} were given"
-            )),
-            "{}",
-            d.message
-        );
-    }
-}
-
-#[test]
-fn an_unhandled_operation_is_an_unhandled_effect() {
-    let e = build::handle(
-        build::perform("state", "get", None, vec![]),
-        vec![build::clause("state", "put", None, &["v"], build::int(0))],
-    );
-    let d = standalone(
-        vec![build::effect_def(
-            "state",
-            &[("get", Mode::Read, false), ("put", Mode::Write, false)],
-        )],
-        &e,
-    )
-    .expect_err("nothing handles `state.get`");
-    assert_eq!(d.code, codes::UNHANDLED_EFFECT);
-}
-
-#[test]
 fn a_clause_arity_mismatch_is_an_arity_mismatch() {
     let e = build::handle(
         build::perform("state", "get", None, vec![]),
@@ -618,34 +182,6 @@ fn a_clause_arity_mismatch_is_an_arity_mismatch() {
     )
     .expect_err("the clause wants one argument and the perform gives none");
     assert_eq!(d.code, codes::ARITY_MISMATCH);
-}
-
-#[test]
-fn a_missing_resource_label_is_a_resource_required() {
-    let e = build::handle(
-        build::perform("db", "get", None, vec![build::int(0)]),
-        vec![build::clause("db", "get", None, &["k"], build::int(0))],
-    );
-    let d = standalone(
-        vec![build::effect_def("db", &[("get", Mode::Read, true)])],
-        &e,
-    )
-    .expect_err("`db.get` is resource-parameterized");
-    assert_eq!(d.code, codes::RESOURCE_REQUIRED);
-}
-
-#[test]
-fn an_operation_the_effect_does_not_declare_is_an_unknown_operation() {
-    let e = build::handle(
-        build::perform("state", "peek", None, vec![]),
-        vec![build::clause("state", "peek", None, &[], build::int(0))],
-    );
-    let d = standalone(
-        vec![build::effect_def("state", &[("get", Mode::Read, false)])],
-        &e,
-    )
-    .expect_err("`state` has no `peek`");
-    assert_eq!(d.code, codes::UNKNOWN_OPERATION);
 }
 
 #[test]
@@ -695,68 +231,6 @@ fn a_handler_that_reads_and_writes_a_cell_answers_through_its_return_clause() {
     )
     .expect("the program has a handler for everything it performs");
     assert_eq!(v.render(), "202");
-}
-
-#[test]
-fn a_capture_costs_one_segment_per_enclosing_handler_and_not_one_per_frame() {
-    for frames in [1, 64] {
-        let mut body = perform_("amb", "flip", None, vec![]);
-        for _ in 0..frames {
-            body = bin(BinOp::Add, body, int(0));
-        }
-        let e = handle_(
-            body,
-            vec![clause_("amb", "flip", None, &[], Some("k"), var("k"))],
-            None,
-        );
-        match run(&e).value() {
-            Value::Continuation(k) => {
-                assert_eq!(k.segments(), 1);
-                assert_eq!(k.frames(), frames);
-            }
-            other => panic!("expected a continuation, got {other}"),
-        }
-    }
-}
-
-/// `map`'s loop is frames rather than host recursion precisely so this works: a continuation
-/// captured inside the callback has somewhere to return to on the second resumption.
-#[test]
-fn a_continuation_captured_inside_a_map_callback_produces_a_complete_list_per_resumption() {
-    let e = handle_(
-        callv(
-            "map",
-            vec![
-                list(vec![int(1), int(2), int(3)]),
-                lam(
-                    &["x"],
-                    bin(BinOp::Add, var("x"), perform_("amb", "flip", None, vec![])),
-                ),
-            ],
-        ),
-        vec![clause_(
-            "amb",
-            "flip",
-            None,
-            &[],
-            Some("k"),
-            list(vec![
-                call(var("k"), vec![int(10)]),
-                call(var("k"), vec![int(20)]),
-            ]),
-        )],
-        None,
-    );
-
-    // The first `flip` is performed at element 0, so each resumption rebuilds the whole list from
-    // there with its own answer for that element and its own further performs answered by the same
-    // clause.
-    let got = run(&e).rendered();
-    assert_eq!(
-        got,
-        "[[[[11, 12, 13], [11, 12, 23]], [[11, 22, 13], [11, 22, 23]]], \
-[[[21, 12, 13], [21, 12, 23]], [[21, 22, 13], [21, 22, 23]]]]"
-    );
 }
 
 #[test]

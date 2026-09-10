@@ -593,12 +593,12 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
     // so it refuses rather than write the wrong conversion into both. A correct refusal is worth
     // more than a body. It has since risen well past that.
     assert!(
-        reached >= 1282,
+        reached >= 1284,
         "the port emitted {reached} shipped bodies -- raise this when it grows, and lower it only \
          for a refusal that is more correct than what it replaces"
     );
     assert!(
-        agreeing >= 1282,
+        agreeing >= 1284,
         "{agreeing} shipped bodies resolve to the reference's C -- raise this when it grows"
     );
     // Nothing disagrees. Raise this only for a body that is right by the audit and slower on
@@ -619,11 +619,11 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
 fn the_port_resolves_its_own_sources_to_the_references_c() {
     let (reached, agreeing, differ) = resolved_against_reference("emitter", emitter_sources());
     assert!(
-        reached >= 2494,
+        reached >= 2529,
         "the port emitted {reached} of its own bodies -- raise this when it grows"
     );
     assert!(
-        agreeing >= 2261,
+        agreeing >= 2289,
         "{agreeing} of the port's own bodies resolve to the reference's C -- raise this when it \
          grows, and never lower it"
     );

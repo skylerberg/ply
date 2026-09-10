@@ -347,21 +347,6 @@ pub fn tcon(name: &str) -> TypeExpr {
     }
 }
 
-/// A type constructor applied to arguments: `List<Int>`, `Map<String, Int>`.
-pub fn tapp(name: &str, args: Vec<TypeExpr>) -> TypeExpr {
-    TypeExpr::Con {
-        name: qname(name),
-        args,
-        span: sp(),
-    }
-}
-
-/// A type parameter, bound by the enclosing definition's `<..>` rather than by
-/// any module. Only [`fn_def_poly`] binds one.
-pub fn tvar(name: &str) -> TypeExpr {
-    TypeExpr::Var(id(name))
-}
-
 /// A definition with **no** written signature, which the checker now rejects
 /// with E0126 MISSING_SIGNATURE. For hashing and evaluation fixtures only —
 /// neither reads a written type, and neither runs the checker. A fixture that
@@ -401,27 +386,6 @@ pub fn fn_def_sig(name: &str, params: &[(&str, TypeExpr)], ret: TypeExpr, body: 
         body,
         span: sp(),
     }))
-}
-
-/// [`fn_def_sig`] with `generics` bound, so a parameter can be written at a
-/// [`tvar`].
-///
-/// A signature the checker cannot suggest — `fn head(xs) = len(xs)` publishes
-/// `<a>(List<a>) -> Int` — has to be written at the same generality it was
-/// inferred at, because a `Type::Var` is what `compiled`'s argument gate refuses
-/// and a monomorphic `List<Int>` in its place would be carried instead.
-pub fn fn_def_poly(
-    name: &str,
-    generics: &[&str],
-    params: &[(&str, TypeExpr)],
-    ret: TypeExpr,
-    body: Expr,
-) -> Item {
-    let Item::Fn(mut def) = fn_def_sig(name, params, ret, body) else {
-        unreachable!("`fn_def_sig` builds an `Item::Fn`")
-    };
-    def.generics.types = generics.iter().map(|g| id(g)).collect();
-    Item::Fn(def)
 }
 
 pub fn test_def(name: &str, body: Expr) -> Item {

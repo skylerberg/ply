@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Runs test 0 and answers its diagnostic, if any.
 fn run(source: &str) -> Result<(), Diagnostic> {
     let compiled = Compiled::named("t", source);
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.eval_test(0)
 }
 
@@ -306,7 +306,7 @@ fn bound(compiled: &Compiled, handler: Arc<Counter>, secrets: bool) -> HostBindi
 fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
     let compiled = Compiled::named("t", SEND);
     let handler = Arc::new(Counter::default());
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
 
     let d = machine.eval_test(0).expect_err("E0439");
@@ -332,7 +332,7 @@ fn a_secret_reaching_a_handler_that_does_not_declare_one_is_e0439() {
 fn a_secret_nested_in_an_argument_is_found() {
     let compiled = Compiled::named("t", SEND_NESTED);
     let handler = Arc::new(Counter::default());
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
 
     let d = machine.eval_test(0).expect_err("E0439");
@@ -346,7 +346,7 @@ fn a_secret_nested_in_an_argument_is_found() {
 fn an_operation_that_declares_secrets_receives_one() {
     let compiled = Compiled::named("t", SEND);
     let handler = Arc::new(Counter::default());
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), true)));
 
     machine.eval_test(0).expect("the handler answers");
@@ -361,7 +361,7 @@ fn an_operation_that_declares_secrets_receives_one() {
 fn an_argument_with_no_secret_reaches_the_handler_as_before() {
     let compiled = Compiled::named("t", SEND_PLAIN);
     let handler = Arc::new(Counter::default());
-    let mut machine = compiled.machine();
+    let mut machine = compiled.machine_on_tier();
     machine.set_host_binding(Arc::new(bound(&compiled, handler.clone(), false)));
 
     machine.eval_test(0).expect("the handler answers");

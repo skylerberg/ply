@@ -213,10 +213,10 @@ fn a_second_backed_run_selects_nothing() {
     assert!(text.contains("selected 0 of 2 (2 cached)"), "got:\n{text}");
 }
 
-/// And the reason it may: a `Pass` names the engine that earned it. Neither run may read the
-/// other's, so the first run on each engine executes whatever the other already passed.
+/// Under tier-only the default run and `--backend c` are one engine: a pass either earns, the
+/// other reads. A backend wrong on purpose stays in a namespace of its own (below).
 #[test]
-fn one_engines_pass_is_never_another_engines() {
+fn the_default_tier_and_backend_c_are_one_engine() {
     let dir = project(GREEN);
     ply(dir.path()).arg("test").assert().success();
 
@@ -226,8 +226,8 @@ fn one_engines_pass_is_never_another_engines() {
         .unwrap();
     let text = stdout_of(&out);
     assert!(
-        text.contains("selected 2 of 2 (0 cached)"),
-        "a backed run read the evaluator's passes:\n{text}"
+        text.contains("selected 0 of 2 (2 cached)"),
+        "`--backend c` did not read the default tier's passes:\n{text}"
     );
 
     // And back the other way, over a cache the backed run has now written to.
@@ -1014,6 +1014,153 @@ fn two_mains_are_reported_rather_than_resolved_by_load_order() {
     );
     assert_eq!(v["value"], "2");
     assert_eq!(v["entry"], "two.main");
+}
+
+// --- simulated time ---------------------------------------------------------
+
+/// Ten minutes of it, which no runner will spend on a test.
+const SLEEPER: &str = "\
+fn nap() -> Int / {clock.write, clock.read} = {
+  clock.sleep(600_000_000_000);
+  clock.now()
+}
+
+test \"ten simulated minutes cost no wall clock\" {
+  simulate { assert_eq(nap(), 600_000_000_000) }
+}
+";
+
+/// `clock.sleep` moves a region's virtual time and waits for nothing: the whole reason a test can
+/// assert a retry backoff, and the property a real sleep in the runtime would quietly take away.
+/// The bound is wall clock, so this test is in `.github/ci-shards.sh`'s `DEFERRED` table and runs
+/// with the rest of the suite finished.
+#[test]
+fn a_simulated_sleep_is_a_jump_rather_than_a_wait() {
+    let dir = project(SLEEPER);
+    let started = std::time::Instant::now();
+    let out = ply(dir.path())
+        .args(["test", "--no-cache"])
+        .output()
+        .unwrap();
+    let elapsed = started.elapsed();
+    let text = format!(
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{text}");
+    assert!(
+        elapsed < std::time::Duration::from_secs(60),
+        "the run took {elapsed:?}, so the ten simulated minutes were waited out rather than \
+         jumped over -- compiling the unit is the only wall clock this should spend:\n{text}"
+    );
+}
+
+// --- tasks under --host -----------------------------------------------------
+
+const SPAWN_UNDER_A_HANDLER: &str = "\
+effect note {
+  read say() -> Int
+}
+
+fn work() -> Int / {note.read} = note.say()
+
+fn main() -> Int / {task.write} =
+  handle {
+    let t = task.spawn(|| work());
+    task.join(t)
+  } with {
+    note.say() -> 41,
+  }
+";
+
+const A_TASK_FAILS_UNDER_HANDLERS: &str = "\
+effect note {
+  read say() -> Int
+}
+effect other {
+  read what() -> Int
+}
+
+fn work() -> Int / {other.read} = other.what()
+
+fn main() -> Int / {task.write, other.read} =
+  handle {
+    handle {
+      let t = task.spawn(|| work());
+      task.join(t)
+    } with {
+      note.say() -> 42,
+    }
+  } with {
+    note.say() -> 41,
+  }
+";
+
+const A_TASK_REACHES_A_CLAUSE_THAT_BINDS_RESUME: &str = "\
+effect ask {
+  read q() -> Int
+}
+
+fn work() -> Int / {ask.read} = ask.q()
+
+test \"a task cannot reach a clause that binds resume\" {
+  let r = simulate {
+    handle {
+      let t = task.spawn(|| work());
+      task.join(t)
+    } with {
+      ask.q() resume k -> k(1) + k(2),
+    }
+  };
+  assert_eq(r, 3)
+}
+";
+
+/// The production region is opened by the first `task.spawn`, on the stack that holds the
+/// handlers `main` installed before it: a task performs against those.
+#[test]
+fn a_task_under_host_performs_against_the_handlers_around_its_spawn() {
+    let dir = project(SPAWN_UNDER_A_HANDLER);
+    let out = ply(dir.path()).args(["run", "--host"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let text = stdout_of(&out);
+    assert_eq!(
+        text.lines().last().map(str::trim),
+        Some("41"),
+        "got:\n{text}"
+    );
+}
+
+/// When the region's loop ends on a task's failure it resumes the root directly, and the root
+/// unwinds its own handlers on its own stack rather than the loop's.
+#[test]
+fn a_task_that_fails_under_host_is_reported_rather_than_aborting_the_process() {
+    let dir = project(A_TASK_FAILS_UNDER_HANDLERS);
+    let out = ply(dir.path()).args(["run", "--host"]).output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.contains("E0303"), "{err}");
+    assert!(!err.contains("panicked"), "{err}");
+}
+
+/// A clause that binds `resume` would capture the spawner's continuation, not the task's.
+#[test]
+fn a_task_reaching_a_clause_that_binds_resume_is_refused_with_a_diagnostic() {
+    let dir = project(A_TASK_REACHES_A_CLAUSE_THAT_BINDS_RESUME);
+    let out = ply(dir.path())
+        .args(["test", "--no-cache"])
+        .output()
+        .unwrap();
+    let text = format!(
+        "{}{}",
+        stdout_of(&out),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_ne!(out.status.code(), Some(0), "{text}");
+    assert!(text.contains("resumes off the tail"), "{text}");
+    assert!(!text.contains("panicked"), "{text}");
 }
 
 // --- hosts ------------------------------------------------------------------

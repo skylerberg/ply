@@ -45,9 +45,14 @@ pub struct Program {
     program: ply_syntax::ast::Program,
     resolved: ply_syntax::resolve::Resolved,
     check: CheckOutput,
+    sources: ply_span::SourceMap,
 }
 
 impl Program {
+    fn machine(&self) -> Machine<'_> {
+        crate::tier_machine(&self.program, &self.resolved, &self.check, &self.sources)
+    }
+
     pub fn parse() -> Result<Program> {
         Program::parse_source("bench.ply", BENCH)
     }
@@ -79,6 +84,7 @@ impl Program {
             program,
             resolved,
             check,
+            sources,
         })
     }
 
@@ -103,7 +109,7 @@ impl Program {
     /// restated here.
     pub fn ddl(&self) -> Result<Vec<String>> {
         let name = self.full("ddl")?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         let value = machine
             .call(&name, vec![], Span::DUMMY)
             .map_err(|d| anyhow::anyhow!("`ddl` raised: {}", d.message))?;
@@ -122,7 +128,7 @@ impl Program {
     /// One call of one entry point over a hermetic machine — no host at all.
     fn call_pure(&self, simple: &str, args: Vec<Value>) -> Result<(Duration, Value)> {
         let name = self.full(simple)?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         let started = Instant::now();
         let value = machine
             .call(&name, args, Span::DUMMY)
@@ -141,7 +147,7 @@ impl Program {
         let binding = self
             .binding(host)
             .map_err(|d| diagnostics("binding the database", &d))?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         machine.set_host_binding(Arc::new(binding));
         machine.set_host_runtime(host.runtime());
         if let Some(declared) = self.footprint(simple) {
@@ -167,7 +173,7 @@ impl Program {
         let binding = self
             .binding(host)
             .map_err(|d| diagnostics("binding the database", &d))?;
-        let mut machine = Machine::new(&self.program, &self.resolved, &self.check);
+        let mut machine = self.machine();
         machine.set_host_binding(Arc::new(binding));
         machine.set_host_runtime(host.runtime());
         if let Some(declared) = self.footprint(simple) {
