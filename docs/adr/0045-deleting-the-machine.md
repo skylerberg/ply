@@ -59,7 +59,7 @@ entry, so nothing shipped had noticed. The emitter emitting a program is one
 entry too, and the measurement is what the bootstrap forced:
 
 ```sh
-PLY_C_PHASES=1 PLY_C_CACHE=$(mktemp -d) PLY_C_EMITTER=ply-whole:crates/ply-compiler \
+PLY_C_PHASES=1 PLY_C_CACHE=$(mktemp -d) \
   /usr/bin/time -l ./target/release/ply test crates/ply-std/ply --backend c --no-cache 2>&1 \
   | grep -E 'maximum resident|^entry: [0-9]{6,}|live at end'
 ```
@@ -161,7 +161,7 @@ The snapshot's size was measured before this was accepted, since a large
 file checked in and rewritten often is a cost the tree would carry forever:
 
 ```sh
-PLY_C_CACHE=$(mktemp -d) PLY_C_KEEP=1 PLY_C_EMITTER=ply-whole:crates/ply-compiler \
+PLY_C_CACHE=$(mktemp -d) PLY_C_KEEP=1 \
   ./target/release/ply test crates/ply-std/ply --backend c --no-cache >/dev/null 2>&1
 ls -la "$PLY_C_CACHE"/*.c            # the larger unit is the emitter's, with the library it uses
 zstd -19 -c "$PLY_C_CACHE"/<emitter>.c | wc -c
