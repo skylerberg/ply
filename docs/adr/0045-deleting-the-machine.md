@@ -31,7 +31,7 @@ without a day on which nothing checks the language.
 > ADR 0037 describes, which is the loop's cost and not the machine's
 > existence. Whether the scheduler and the search are later written in Ply.
 
-**Built, second stage:** the bundle in `spikes/ply-parser/bootstrap/` and the
+**Built, second stage:** the bundle in `crates/ply-compiler/bootstrap/` and the
 fixpoint test, `crates/ply-codegen-tests/tests/bootstrap.rs`. The CLI builds
 the emitter from the bundle and no longer needs the reference to do it. On
 the way the emitter's own sources joined the lowering differential and the
@@ -59,7 +59,7 @@ entry, so nothing shipped had noticed. The emitter emitting a program is one
 entry too, and the measurement is what the bootstrap forced:
 
 ```sh
-PLY_C_PHASES=1 PLY_C_CACHE=$(mktemp -d) PLY_C_EMITTER=ply:spikes/ply-parser \
+PLY_C_PHASES=1 PLY_C_CACHE=$(mktemp -d) \
   /usr/bin/time -l ./target/release/ply test crates/ply-std/ply --backend c --no-cache 2>&1 \
   | grep -E 'maximum resident|^entry: [0-9]{6,}|live at end'
 ```
@@ -147,7 +147,7 @@ says the tier keeps the same promise.
 The producer's unit is built by the reference emitter today, never by
 itself. With the reference gone, the emitter written in Ply is built from a
 checked-in snapshot of the C it emitted for its own sources under the last
-reference build: `spikes/ply-parser/bootstrap/*.c`, produced by the command
+reference build: `crates/ply-compiler/bootstrap/*.c`, produced by the command
 that emits a unit and kept with the digest of the sources it was emitted
 from. A change to the emitter's sources rebuilds the emitter with the
 snapshot's binary, then re-emits the snapshot with the new binary, and a
@@ -161,7 +161,7 @@ The snapshot's size was measured before this was accepted, since a large
 file checked in and rewritten often is a cost the tree would carry forever:
 
 ```sh
-PLY_C_CACHE=$(mktemp -d) PLY_C_KEEP=1 PLY_C_EMITTER=ply:spikes/ply-parser \
+PLY_C_CACHE=$(mktemp -d) PLY_C_KEEP=1 \
   ./target/release/ply test crates/ply-std/ply --backend c --no-cache >/dev/null 2>&1
 ls -la "$PLY_C_CACHE"/*.c            # the larger unit is the emitter's, with the library it uses
 zstd -19 -c "$PLY_C_CACHE"/<emitter>.c | wc -c

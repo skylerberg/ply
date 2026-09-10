@@ -41,108 +41,105 @@ pub fn install(recipe: Recipe, identity: String) {
     let _ = RECIPE.set(recipe);
 }
 
-/// The self-hosted Ply emitter's source directory, found by walking up for
-/// `spikes/ply-parser/emit.ply` — from the working directory first, then from the executable's own
-/// location, since a `ply` invoked with its CWD elsewhere (a test's temp project) is still
-/// `<repo>/target/**/ply`, under the `spikes/` it needs. `None` when it is on neither path — a
-/// shipped binary, until the bundle is embedded.
-fn find_emitter_dir() -> Option<std::path::PathBuf> {
-    fn search(mut cur: std::path::PathBuf) -> Option<std::path::PathBuf> {
-        loop {
-            let candidate = cur.join("spikes/ply-parser");
-            if candidate.join("emit.ply").is_file() {
-                return Some(candidate);
-            }
-            if !cur.pop() {
-                return None;
-            }
-        }
-    }
-    std::env::current_dir().ok().and_then(search).or_else(|| {
-        std::env::current_exe()
-            .ok()
-            .and_then(|exe| exe.parent().map(std::path::Path::to_path_buf))
-            .and_then(search)
-    })
+/// Where the emitter's own source comes from.
+///
+/// [`Sources::Embedded`] is `ply-compiler`, which this binary carries: no file system, so a
+/// shipped `ply` compiles through the self-hosted emitter wherever it is run from. A directory is
+/// a working copy, which `PLY_C_EMITTER=ply:<dir>` names -- the way to run a change to the emitter
+/// before it has been bootstrapped into the bundle.
+#[derive(Clone, Debug)]
+pub enum Sources {
+    Embedded,
+    Directory(std::path::PathBuf),
 }
 
-/// Install the whole self-hosted Ply emitter as the producer when none is installed and its source
-/// is on disk (ADR 0048: under tier-only the Rust reference emitter is a fragment, so the language
-/// runs only when the Ply emitter produces). Called by [`crate::Unit`] so every consumer — the CLI,
-/// the harness, the tests — gets the complete tier by default. A shipped binary with no
-/// `spikes/ply-parser` keeps the reference emitter until the bundle is embedded.
+/// Install the self-hosted Ply emitter as the producer when none is installed: the working copy
+/// `PLY_C_EMITTER=ply:<dir>` names, or the one this binary carries.
+///
+/// Every consumer -- the CLI, the corpus, the tests -- calls this, so the override is read in one
+/// place rather than wired through each of them. Under tier-only (ADR 0048) the Rust reference
+/// emitter is a fragment, so the language runs only when this produces.
 pub fn ensure_default() {
+    install_sources(match std::env::var("PLY_C_EMITTER") {
+        Ok(spec) => match spec.strip_prefix("ply:") {
+            Some(dir) => Sources::Directory(std::path::PathBuf::from(dir)),
+            None => {
+                eprintln!(
+                    "PLY_C_EMITTER is `{spec}`; the spelling is `ply:<dir>`, the directory the \
+                     emitter's own `.ply` sources are in"
+                );
+                Sources::Embedded
+            }
+        },
+        Err(_) => Sources::Embedded,
+    });
+}
+
+/// The same, from a working copy on disk.
+pub fn install_sources(src: Sources) {
     if installed() {
         return;
     }
-    let Some(dir) = find_emitter_dir() else {
-        return;
-    };
-    let identity = digest_of(&emitter_modules(&dir));
-    install(Arc::new(move || build_default(&dir)), identity);
+    let identity = digest_of(&modules_of(&src));
+    install(Arc::new(move || build_from(&src)), identity);
 }
 
-/// The emitter's modules — the standard library and the directory's own `.ply` files — as
-/// `(name, text)` pairs, for the identity digest.
-fn emitter_modules(dir: &std::path::Path) -> Vec<(String, String)> {
+/// The emitter's modules -- the standard library, then the emitter's own -- as `(name, text)`
+/// pairs, for the identity digest and for the parse.
+///
+/// **The order is the identity**, and it is `ply_compiler::MODULES`'s: a directory walk is not
+/// ordered, and this digest keys every body the emitter produces, so reading a working copy sorts
+/// what it finds into the same order the embedded list is in.
+fn modules_of(src: &Sources) -> Vec<(String, String)> {
     let mut modules: Vec<(String, String)> = ply_std::sources()
         .map(|(m, t)| (m.to_string(), t.to_string()))
         .collect();
-    if let Ok(entries) = std::fs::read_dir(dir) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().is_some_and(|x| x == "ply")
-                && let Ok(text) = std::fs::read_to_string(&p)
-            {
-                modules.push((
-                    p.file_stem()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .into_owned(),
-                    text,
-                ));
+    match src {
+        Sources::Embedded => {
+            modules.extend(ply_compiler::sources().map(|(m, t)| (m.to_string(), t.to_string())))
+        }
+        Sources::Directory(dir) => {
+            let mut found: Vec<(String, String)> = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(dir) {
+                for e in entries.flatten() {
+                    let p = e.path();
+                    if p.extension().is_some_and(|x| x == "ply")
+                        && let Ok(text) = std::fs::read_to_string(&p)
+                    {
+                        found.push((
+                            p.file_stem()
+                                .unwrap_or_default()
+                                .to_string_lossy()
+                                .into_owned(),
+                            text,
+                        ));
+                    }
+                }
             }
+            found.sort();
+            modules.extend(found);
         }
     }
     modules
 }
 
-/// Build the whole Ply emitter as a producer: load its `.ply` source and the standard library,
-/// check them, and build the native emitter from the bootstrap bundle (or, when
-/// `PLY_C_BOOTSTRAP=off` or no bundle is present, with the reference emitter).
-fn build_default(dir: &std::path::Path) -> Result<PlyProducer, String> {
+/// Build the emitter as a producer: parse and check its modules, then build the native emitter
+/// from the bootstrap bundle -- or, when `PLY_C_BOOTSTRAP=off` or the bundle does not serve, with
+/// the reference emitter, which is how a bundle is refreshed.
+fn build_from(src: &Sources) -> Result<PlyProducer, String> {
     use ply_span::SourceId;
-    let mut inputs = Vec::new();
-    for (module, text) in ply_std::sources() {
-        let text: &'static str = Box::leak(text.to_string().into_boxed_str());
-        inputs.push((
-            SourceId(inputs.len() as u32),
-            ply_syntax::ast::ModuleName::from_dotted(module),
-            text,
-        ));
-    }
-    let mut files: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
-        .map_err(|e| format!("{}: {e}", dir.display()))?
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "ply"))
+    let inputs: Vec<_> = modules_of(src)
+        .into_iter()
+        .enumerate()
+        .map(|(i, (module, text))| {
+            let text: &'static str = Box::leak(text.into_boxed_str());
+            (
+                SourceId(i as u32),
+                ply_syntax::ast::ModuleName::from_dotted(&module),
+                text,
+            )
+        })
         .collect();
-    files.sort();
-    for path in &files {
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| format!("{}: not a module name", path.display()))?;
-        let text: &'static str = Box::leak(
-            std::fs::read_to_string(path)
-                .map_err(|e| format!("{}: {e}", path.display()))?
-                .into_boxed_str(),
-        );
-        inputs.push((
-            SourceId(inputs.len() as u32),
-            ply_syntax::ast::ModuleName::from_dotted(stem),
-            text,
-        ));
-    }
     let first = |ds: Vec<ply_span::Diagnostic>| {
         ds.first()
             .map(|d| d.message.clone())
@@ -163,21 +160,20 @@ fn build_default(dir: &std::path::Path) -> Result<PlyProducer, String> {
         .unwrap_or_default();
     let source: &'static Source =
         Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
-    let bundle = dir.join("bootstrap");
-    let from_bundle =
-        super::bundle::exists(&bundle) && std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off");
-    let (native, _refused) = if from_bundle {
-        super::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?
-    } else {
-        let names: Vec<String> = source.functions();
-        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-        super::build(source, &refs).map_err(|e| format!("{e:#}"))?
+    let bundle = (std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off"))
+        .then(|| super::bundle::of(src))
+        .flatten();
+    let (native, _refused) = match bundle {
+        Some(bundle) => super::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?,
+        None => {
+            let names: Vec<String> = source.functions();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            super::build(source, &refs).map_err(|e| format!("{e:#}"))?
+        }
     };
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
 
-/// Forgets this thread's producer, so the recipe builds it again on the next ask: the fixpoint
-/// test builds the emitter twice in one process, from two bundles.
 pub fn reset_thread() {
     MINE.with(|mine| *mine.borrow_mut() = None);
 }

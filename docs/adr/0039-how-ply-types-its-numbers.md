@@ -321,7 +321,7 @@ Lean both have for exactly this reason.
   interned constant node, so two occurrences of `5u32` are one term, but `+` at
   `U32` is not the integer `+` the linear arithmetic reasons about. It could not
   be: the operation raises where the integer one answers.
-- **`spikes/ply-parser` does not know the suffix or the new prelude names.** Its
+- **`crates/ply-compiler` does not know the suffix or the new prelude names.** Its
   differential is corpus-driven and no corpus input carries one, so it is green
   and will stay green until somebody writes a suffixed literal into the corpus.
   That is a latent divergence, recorded here rather than discovered later, and

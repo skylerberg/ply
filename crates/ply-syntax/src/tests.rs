@@ -3598,7 +3598,7 @@ fn an_omitted_argument_is_filled_with_the_default() {
     assert_eq!(dump_expr(&b.body), "(call greet \"ada\" \"hey\")");
 }
 
-/// **`parse_unexpanded` is for one spike, and this is what keeps it there.**
+/// **`parse_unexpanded` is for one caller, and this is what keeps it there.**
 #[test]
 fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -3607,11 +3607,18 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
         .expect("the crate lives two levels below the repository root");
     let crates = root.join("crates");
 
-    // Where the name is allowed: the definition, and this test.
+    // Where the name is allowed: the definition, this test, and the one caller it exists for --
+    // the differential, which compares the self-hosted parser's tree against this one before the
+    // rewrites run, and so must be handed the tree that still holds `Try` and `RecordUpdate`.
+    //
+    // That caller was outside `crates/` while it was a spike, so this walk did not see it and the
+    // list did not have to name it. It is `crates/ply-compiler-diff` now, and naming it is the
+    // point: the rule is one caller, not none.
     let allowed = [
         crates.join("ply-syntax/src/parser.rs"),
         crates.join("ply-syntax/src/lib.rs"),
         crates.join("ply-syntax/src/tests.rs"),
+        crates.join("ply-compiler-diff/src/lib.rs"),
     ];
 
     fn collect_rs(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
@@ -3658,7 +3665,7 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     }
     assert!(
         saw_the_definition,
-        // ASCII only, and not by preference: `spikes/ply-parser/mine-fixtures.py` mines every
+        // ASCII only, and not by preference: `crates/ply-compiler-diff/tools/mine-fixtures.py` mines every
         // string literal in this file into its fixture bundle and asserts each is printable ASCII,
         // so an em dash here stops the corpus generator with a bare `AssertionError`.
         "no file under {} names `parse_unexpanded`, so either it has been renamed or this \
@@ -3670,14 +3677,14 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
         offenders.is_empty(),
         "`parse_unexpanded` hands out a tree holding `ExprKind::Try` and \
          `ExprKind::RecordUpdate`, which every crate downstream of `ply-syntax` treats as \
-         `unreachable!()`. It exists for `spikes/ply-parser` and for nothing else. \
+         `unreachable!()`. It exists for `crates/ply-compiler` and for nothing else. \
          These files name it: {offenders:?}"
     );
 }
 
 /// A field position has no other reading, so a keyword names a field in a type, a literal, a
 /// pattern, after `.` and in an update — `{ nondet: Bool }` is the AST this compiler's own
-/// parser is a port of (`spikes/ply-parser/GAPS-items.md` §P3).
+/// parser is a port of (`crates/ply-compiler/GAPS-items.md` §P3).
 #[test]
 fn a_keyword_names_a_field_wherever_a_field_is_named() {
     assert_eq!(
