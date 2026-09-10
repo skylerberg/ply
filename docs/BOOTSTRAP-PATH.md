@@ -27,8 +27,8 @@ path is for, and §"The loop, which is what the path is for" carries them.
 - **Expressiveness.** A lexer and a recursive-descent parser written in Ply agree
   with `crates/ply-syntax` on the reference corpus, tree and diagnostics, byte
   for byte; the inputs they disagree on are the ones written in syntax that
-  postdates the port (`spikes/ply-parser/GAPS.md` §11R). CI runs the differential
-  on every push (`.github/workflows/ci.yml`, job `spikes/ply-parser`), every
+  postdates the port (`crates/ply-compiler/GAPS.md` §11R). CI runs the differential
+  on every push (`cargo test -p ply-compiler-diff`, in the `compiler` shard), every
   phase of it under the compiled backend through `ply run --backend`, which is
   what keeps that job at the build's length rather than the interpreter's.
 - **The call ceiling.** `iterate` gives a parser the reference's own shape —
@@ -49,8 +49,8 @@ path is for, and §"The loop, which is what the path is for" carries them.
 **The blocker is throughput, and it is the only one.** Lexing plus parsing in
 Ply costs more than an order of magnitude what the whole six-phase Rust front
 end costs on identical input in one sitting, and four of the six phases are
-unwritten. `spikes/ply-parser/GAPS.md` §13 and §13R hold the series and
-`spikes/ply-parser/measure-multiplier.sh` re-takes it. ADR 0021 §"The critical
+unwritten. `crates/ply-compiler/GAPS.md` §13 and §13R hold the series and
+`crates/ply-compiler-diff/tools/measure-multiplier.sh` re-takes it. ADR 0021 §"The critical
 path" locates the cost: interpreter dispatch dominates builtin bodies by roughly
 twenty to one, so compilation removes the right half — and a fifth of executed
 work is map, record and list machinery that no amount of compiling reaches.
@@ -172,7 +172,7 @@ measurement is confounded until the earlier one has moved.
    engines; argument order cannot be changed under effects, so that is the
    spike's to hoist into a `let`. What the row must say next is time, and the
    census no longer says where it goes.
-5. **The language tax the spike priced.** In `spikes/ply-parser/GAPS.md`'s
+5. **The language tax the spike priced.** In `crates/ply-compiler/GAPS.md`'s
    order: tuples (§3 — **landed** as sugar over positional records, `(a, b)` is
    `{_0: a, _1: b}` in a type, a value and a pattern), `const` (§5 — the value of a nullary pure definition is
    already memoised at run time by `ply-eval::memo`, so what remains is the
@@ -197,8 +197,8 @@ measurement is confounded until the earlier one has moved.
 6. **The other four phases, behind the differential.** Resolve, inference,
    effect inference and hashing, each ported the way the parser was: a reference
    dumper on the Rust side, a corpus, and mutations that prove the comparison
-   can go red (`spikes/ply-parser/arm-*.sh`). **Resolve is ported**
-   (`spikes/ply-parser/resolve.ply`, `GAPS.md` §15): the tables, the load
+   can go red (`crates/ply-compiler/arm-*.sh`). **Resolve is ported**
+   (`crates/ply-compiler/ply/resolve.ply`, `GAPS.md` §15): the tables, the load
    order, the diagnostics and the whole defaults pass agree with the reference
    over the standard library, every example with it, every program the
    reference's own tests build and a hand-written bundle of the error paths;
@@ -281,7 +281,8 @@ measurement is confounded until the earlier one has moved.
 8. **Repair the oracles as they are needed.** The lexer spike's harness did not
    compile past the tokens ADR 0028 and ADR 0033 added, and its lexer knew
    neither them nor hex literals; both are repaired, the differential is green
-   over the corpus and the standard library, and CI runs it (`lexer-spike`).
+   over the corpus and the standard library, and CI runs it
+   (`ply-compiler-diff`'s `lexer_agreement`).
    `CONTRIBUTING.md` item 18 is closed: the codegen spike's agreement corpus
    was red because its boundary handed the leaf kinds the machine's seam
    admits to bodies compiled over `Int` and `Bool`, and green under `cargo

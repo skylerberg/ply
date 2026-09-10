@@ -2,7 +2,7 @@
 //! sources, and the bundle serves as long as it is a fixpoint: the emitter built from it emits,
 //! for those sources, C that builds an emitter that emits the same C. ADR 0045's second stage.
 //!
-//! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `spikes/ply-parser/bootstrap` with the fixpoint's own
+//! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-compiler/bootstrap` with the fixpoint's own
 //! emission, which is how the bundle is refreshed after a change the old one cannot build; with
 //! no bundle at all, the refresh builds the first emitter with the reference.
 
@@ -20,24 +20,18 @@ fn repo() -> PathBuf {
         .to_path_buf()
 }
 
+/// Where the emitter's sources live in the tree, for the `SourceMap` a diagnostic would point at.
+fn ply_compiler_dir() -> String {
+    repo().join("crates/ply-compiler").display().to_string()
+}
+
 /// The emitter's own program, the standard library alongside, keyed as the CLI keys it.
 fn emitter_source() -> (&'static Source, String) {
-    let dir = repo().join("spikes/ply-parser");
-    let mut files: Vec<PathBuf> = std::fs::read_dir(&dir)
-        .expect("the emitter's directory is readable")
-        .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().is_some_and(|e| e == "ply"))
-        .collect();
-    files.sort();
-    let modules: Vec<(String, String)> = files
-        .iter()
-        .map(|p| {
-            let name = p.file_name().unwrap().to_string_lossy().to_string();
-            (
-                name,
-                std::fs::read_to_string(p).expect("the emitter is readable"),
-            )
-        })
+    // The embedded compiler, in the order `ply_compiler::MODULES` is in, so the identity this
+    // writes into the bundle is the one the producer computes when it reads it back.
+    let modules: Vec<(String, String)> = ply_std::sources()
+        .chain(ply_compiler::sources())
+        .map(|(m, t)| (m.to_string(), t.to_string()))
         .collect();
     let identity = producer::digest_of(&modules);
     let mut sources = ply_span::SourceMap::new();
@@ -49,18 +43,12 @@ fn emitter_source() -> (&'static Source, String) {
         let id = sources.add(ply_std::pseudo_path(&module), text.to_string());
         inputs.push((id, module, text));
     }
-    for path in &files {
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .expect("a module name");
-        let text: &'static str = Box::leak(
-            std::fs::read_to_string(path)
-                .expect("the emitter is readable")
-                .into_boxed_str(),
-        );
+    for (stem, text) in ply_compiler::sources() {
         texts.insert(stem.to_string(), text.to_string());
-        let id = sources.add(path.clone(), text.to_string());
+        let id = sources.add(
+            PathBuf::from(format!("{}/ply/{stem}.ply", ply_compiler_dir())),
+            text.to_string(),
+        );
         inputs.push((id, ply_syntax::ast::ModuleName::from_dotted(stem), text));
     }
     let mut ast = ply_syntax::parse_program(inputs).expect("the emitter parses");
@@ -87,8 +75,10 @@ fn emitter_source() -> (&'static Source, String) {
 static FROM: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProducer, String> {
-    let (native, _) = match from {
-        Some(dir) => ply_codegen::c::bundle::build(source, dir).map_err(|e| format!("{e:#}"))?,
+    let (native, _) = match from.and_then(ply_codegen::c::bundle::from_dir) {
+        Some(bundle) => {
+            ply_codegen::c::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?
+        }
         None => {
             let names: Vec<String> = source.functions();
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -130,7 +120,7 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     // have. This test is not that check's oracle -- the audits are -- so it reuses.
     ply_codegen::heap::reuse_by_default(true);
     let (source, identity) = emitter_source();
-    let bundle = repo().join("spikes/ply-parser/bootstrap");
+    let bundle = PathBuf::from(ply_compiler::bootstrap::DIR);
     let refresh = std::env::var("PLY_C_BOOTSTRAP_REFRESH").is_ok();
     let have = ply_codegen::c::bundle::exists(&bundle);
     assert!(

@@ -33,7 +33,7 @@ unit, plus a few the type fragment does not fix. The command is the measurement:
 PLY_C_CACHE=$(mktemp -d) PLY_C_REFUSALS=1 ply test examples/desk.ply --backend c --no-cache
 ```
 
-`spikes/ply-parser/harness/tests/effects.rs` is the other half — the census of
+`crates/ply-compiler-diff/tests/effects.rs` is the other half — the census of
 how many shipped bodies reach each construct, printed by the spike's `run.sh`.
 It is a small share of bodies, and `handle` is the rarest of the three that
 appear at all.

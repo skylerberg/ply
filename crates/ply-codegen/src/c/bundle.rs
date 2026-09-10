@@ -44,11 +44,47 @@ pub fn write(dir: &Path, text: &str, record: &UnitCache, sources_digest: &str) -
     Ok(())
 }
 
-/// The unit's C as the bundle holds it.
-pub fn text(dir: &Path) -> Result<String> {
-    let bytes =
-        std::fs::read(dir.join(UNIT)).with_context(|| dir.join(UNIT).display().to_string())?;
-    unpack(&bytes)
+/// A bundle that serves: its C, its record, and the digest of the sources it came from.
+///
+/// The embedded one is `ply-compiler`'s, which the binary carries; a directory is a working copy's
+/// own `bootstrap/`, refreshed in place by the fixpoint test.
+pub struct Bundle {
+    unit: std::borrow::Cow<'static, [u8]>,
+    record: String,
+    sources: Option<String>,
+}
+
+/// The bundle for `src`, or `None` when there is none that serves this runtime.
+pub fn of(src: &super::producer::Sources) -> Option<Bundle> {
+    match src {
+        super::producer::Sources::Embedded => {
+            (ply_compiler::bootstrap::RUNTIME.trim() == runtime_digest()).then(|| Bundle {
+                unit: std::borrow::Cow::Borrowed(ply_compiler::bootstrap::UNIT),
+                record: ply_compiler::bootstrap::RECORD.to_string(),
+                sources: Some(ply_compiler::bootstrap::SOURCES.trim().to_string()),
+            })
+        }
+        super::producer::Sources::Directory(dir) => from_dir(&dir.join("bootstrap")),
+    }
+}
+
+/// The bundle a directory holds, when it holds one that serves.
+pub fn from_dir(dir: &Path) -> Option<Bundle> {
+    if stale_runtime(dir) {
+        return None;
+    }
+    Some(Bundle {
+        unit: std::borrow::Cow::Owned(std::fs::read(dir.join(UNIT)).ok()?),
+        record: std::fs::read_to_string(dir.join(RECORD)).ok()?,
+        sources: sources_digest(dir),
+    })
+}
+
+impl Bundle {
+    /// The digest of the emitter sources this was emitted from.
+    pub fn sources_digest(&self) -> Option<&str> {
+        self.sources.as_deref()
+    }
 }
 
 /// A unit's C compressed, as the bundle stores it and as an artifact embeds it.
@@ -70,6 +106,11 @@ pub fn record(dir: &Path) -> Result<UnitCache> {
     decode_unit(&s).ok_or_else(|| anyhow!("{} does not decode", dir.join(RECORD).display()))
 }
 
+/// The unit's C as a bundle holds it.
+pub fn text_of(bundle: &Bundle) -> Result<String> {
+    unpack(&bundle.unit)
+}
+
 /// The digest of the emitter sources the bundle was emitted from.
 pub fn sources_digest(dir: &Path) -> Option<String> {
     std::fs::read_to_string(dir.join(SOURCES))
@@ -83,8 +124,9 @@ pub fn exists(dir: &Path) -> bool {
 
 /// Builds `loaded`, the emitter's own program, from the bundle: the bundle's C is compiled and
 /// loaded, and its record stands in for what emitting would have recorded. Nothing is emitted.
-pub fn build(loaded: &'static Source, dir: &Path) -> Result<(Native, Vec<Refused>)> {
-    let text = text(dir)?;
-    let record = record(dir)?;
+pub fn build(loaded: &'static Source, bundle: &Bundle) -> Result<(Native, Vec<Refused>)> {
+    let text = text_of(bundle)?;
+    let record = decode_unit(&bundle.record)
+        .ok_or_else(|| anyhow!("the bootstrap bundle's record does not decode"))?;
     super::build::load_unit(loaded, &text, record, loaded.ctors(), "bootstrap")
 }
