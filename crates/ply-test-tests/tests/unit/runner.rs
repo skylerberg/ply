@@ -1,7 +1,3 @@
-use crate::{
-    Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
-    group_by_conflict, run_with, select,
-};
 use ply_core::{CheckOutput, EffectAtom, Footprint, Resource};
 use ply_eval::Plan;
 use ply_hash::HashOutput;
@@ -9,6 +5,10 @@ use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
 use ply_syntax::ast::Mode;
 use ply_syntax::resolve::Resolved;
+use ply_test::{
+    Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
+    group_by_conflict, run_with, select,
+};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -93,14 +93,14 @@ impl Program {
             &self.hashes,
             store,
             plan,
-            &crate::Engine::Evaluator,
+            &ply_test::Engine::Evaluator,
         )
     }
 
     /// Runs the fixture on a real compiled C tier — the only evaluator under tier-only — so every
     /// scheduling and caching test in this file is exercised over a real Ply program end to end.
     /// `Unit::over` leaks a `&'static Unit`, which is fine in a test.
-    fn run(&self, selection: &Selection, store: &mut Store) -> crate::RunReport {
+    fn run(&self, selection: &Selection, store: &mut Store) -> ply_test::RunReport {
         let unit = ply_codegen::Unit::over_with_texts(
             &self.program,
             &self.resolved,
@@ -132,14 +132,14 @@ impl Program {
 
 /// The tier-backed executor these fixtures run on, presenting as the evaluator. Under tier-only the
 /// C tier is the sole engine, and this file's caching assertions — written when the interpreter was
-/// the evaluator — key results by the bare test hash, which is exactly the [`crate::Engine::Evaluator`]
+/// the evaluator — key results by the bare test hash, which is exactly the [`ply_test::Engine::Evaluator`]
 /// namespace. Reporting the backend's own engine would move every pass into a namespace the
 /// `Engine::Evaluator` selections and `store.get(hash)` checks never read, so the runner's observable
 /// behaviour is kept identical by naming the engine the tier stands in for.
 struct TierExecutor<'a>(InterpExecutor<'a>);
 
 impl<'a> Executor for TierExecutor<'a> {
-    type Worker = crate::Worker<'a>;
+    type Worker = ply_test::Worker<'a>;
 
     fn worker(&self) -> Self::Worker {
         self.0.worker()
@@ -149,8 +149,8 @@ impl<'a> Executor for TierExecutor<'a> {
         self.0.execute(worker, index)
     }
 
-    fn engine(&self) -> crate::Engine {
-        crate::Engine::Evaluator
+    fn engine(&self) -> ply_test::Engine {
+        ply_test::Engine::Evaluator
     }
 
     fn exploration(&self, worker: &Self::Worker) -> Option<ply_eval::Exploration> {
@@ -161,7 +161,7 @@ impl<'a> Executor for TierExecutor<'a> {
         self.0.host_use(worker)
     }
 
-    fn backend_use(&self, worker: &Self::Worker) -> Option<crate::BackendUse> {
+    fn backend_use(&self, worker: &Self::Worker) -> Option<ply_test::BackendUse> {
         self.0.backend_use(worker)
     }
 
@@ -210,7 +210,7 @@ fn colours_in_source_order(tests: &[(usize, Footprint)]) -> usize {
 /// and never a resource two of them reach.
 fn assert_groups_are_conflict_free(groups: &[Vec<usize>], tests: &[(usize, Footprint)]) {
     let footprint = |index: usize| {
-        crate::shared_footprint(
+        ply_test::shared_footprint(
             &tests
                 .iter()
                 .find(|(i, _)| *i == index)
@@ -376,17 +376,17 @@ fn cells(resources: &[&str]) -> Footprint {
 }
 
 fn seeds() -> Footprint {
-    Footprint::from_atoms([atom(crate::SIM_EFFECT, None, Mode::Read)])
+    Footprint::from_atoms([atom(ply_test::SIM_EFFECT, None, Mode::Read)])
 }
 
 #[test]
 fn a_cell_atom_is_region_scoped_and_a_db_atom_is_not() {
-    assert!(crate::is_region_scoped(&atom(
+    assert!(ply_test::is_region_scoped(&atom(
         "cell",
         Some("users"),
         Mode::Write
     )));
-    assert!(!crate::is_region_scoped(&atom(
+    assert!(!ply_test::is_region_scoped(&atom(
         "db",
         Some("users"),
         Mode::Write
@@ -394,24 +394,24 @@ fn a_cell_atom_is_region_scoped_and_a_db_atom_is_not() {
 
     // A user effect is module-qualified and `cell` is a reserved name, so the one effect the report
     // names cannot be impersonated.
-    assert!(!crate::is_region_scoped(&atom(
+    assert!(!ply_test::is_region_scoped(&atom(
         "m.cell",
         Some("users"),
         Mode::Write
     )));
 
-    assert!(crate::region_isolated(&Footprint::empty()));
-    assert!(crate::region_isolated(&seeds()));
+    assert!(ply_test::region_isolated(&Footprint::empty()));
+    assert!(ply_test::region_isolated(&seeds()));
     assert!(
-        !crate::region_isolated(&cells(&["users", "orders"])),
+        !ply_test::region_isolated(&cells(&["users", "orders"])),
         "a region label names state a sibling test can write; only the fork hid that"
     );
 
     let mixed = cells(&["users"]).union(&writes(&["orders"]));
-    assert_eq!(crate::shared_footprint(&mixed), mixed);
-    assert!(!crate::contends_only_over_regions(&mixed));
-    assert!(crate::contends_only_over_regions(&cells(&["users"])));
-    assert!(!crate::contends_only_over_regions(&Footprint::empty()));
+    assert_eq!(ply_test::shared_footprint(&mixed), mixed);
+    assert!(!ply_test::contends_only_over_regions(&mixed));
+    assert!(ply_test::contends_only_over_regions(&cells(&["users"])));
+    assert!(!ply_test::contends_only_over_regions(&Footprint::empty()));
 }
 
 /// What region isolation costs, at the smallest size that has it: three tests over two labels colour
@@ -492,7 +492,7 @@ fn every_region_isolated_test_lands_in_group_zero() {
     let groups = group_by_conflict(&tests);
     assert_eq!(groups.len(), 2);
     for (i, footprint) in &tests {
-        if crate::region_isolated(footprint) {
+        if ply_test::region_isolated(footprint) {
             assert!(groups[0].contains(i), "test {i} is free but not in group 0");
         }
     }
@@ -528,7 +528,7 @@ fn adding_region_isolated_tests_does_not_change_the_group_count() {
             "every test is still scheduled exactly once"
         );
 
-        let p = crate::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
+        let p = ply_test::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
         assert_eq!(p.isolated, n);
         assert_eq!(p.shared, 3);
         assert_eq!(p.shared_groups, baseline);
@@ -540,12 +540,12 @@ fn adding_region_isolated_tests_does_not_change_the_group_count() {
 fn a_selection_of_only_isolated_tests_needs_one_group_and_no_shared_ones() {
     let tests: Vec<(usize, Footprint)> = (0..4).map(|i| (i, seeds())).collect();
     let groups = group_by_conflict(&tests);
-    let p = crate::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
+    let p = ply_test::parallelism(tests.iter().map(|(_, f)| f), &tests, &groups);
     assert_eq!((p.total, p.isolated, p.shared), (4, 4, 0));
     assert_eq!((p.groups, p.shared_groups), (1, 0));
     assert!(p.holds(), "{p:?}");
 
-    let empty = crate::parallelism(std::iter::empty(), &[], &[]);
+    let empty = ply_test::parallelism(std::iter::empty(), &[], &[]);
     assert_eq!((empty.groups, empty.shared_groups), (0, 0));
     assert!(empty.holds(), "{empty:?}");
 }
@@ -1274,7 +1274,7 @@ fn an_internal_error_is_a_defect_in_ply_rather_than_a_red_test() {
     assert!(failure.defect);
     assert_eq!(
         failure.attribution.bisection.verdict,
-        crate::Verdict::NotAttempted(crate::Skipped::Panicked)
+        ply_test::Verdict::NotAttempted(ply_test::Skipped::Panicked)
     );
 }
 
@@ -1558,7 +1558,7 @@ fn the_artifact_reports_isolation_per_test_and_in_total() {
 
     for (index, test) in program.check.tests.iter().enumerate() {
         let reported = json["tests"][index]["isolation"].as_str().unwrap();
-        let expected = if crate::region_isolated(&test.footprint) {
+        let expected = if ply_test::region_isolated(&test.footprint) {
             "region"
         } else {
             "shared"
@@ -1675,9 +1675,9 @@ fn a_run_that_did_not_bisect_says_so_rather_than_naming_nobody() {
     let bisection = &report.failures[0].attribution.bisection;
     assert_eq!(
         bisection.verdict,
-        crate::Verdict::NotAttempted(crate::Skipped::NotRequested)
+        ply_test::Verdict::NotAttempted(ply_test::Skipped::NotRequested)
     );
-    assert_eq!(bisection.confidence, crate::Confidence::None);
+    assert_eq!(bisection.confidence, ply_test::Confidence::None);
     assert!(bisection.culprits().is_empty());
     assert!(!bisection.is_conclusive());
 }
@@ -1698,14 +1698,14 @@ fn a_nondet_failure_is_marked_unbisectable_at_the_point_it_fails() {
     assert_eq!(report.failed, 1);
     assert_eq!(
         report.failures[0].attribution.bisection.verdict,
-        crate::Verdict::NotAttempted(crate::Skipped::Nondet)
+        ply_test::Verdict::NotAttempted(ply_test::Skipped::Nondet)
     );
 }
 
 #[test]
 fn resolving_an_attribution_ranks_the_culprit_first_and_marks_what_ran() {
-    use crate::bisect::{Bisection, Confidence, SearchStats, Verdict};
-    use crate::slice::{CausalSlice, Entered, Frame};
+    use ply_test::bisect::{Bisection, Confidence, SearchStats, Verdict};
+    use ply_test::slice::{CausalSlice, Entered, Frame};
 
     let hashes = HashOutput::default();
     let names = [
@@ -1713,7 +1713,7 @@ fn resolving_an_attribution_ranks_the_culprit_first_and_marks_what_ran() {
         Symbol::new("m.debit"),
         Symbol::new("m.settle"),
     ];
-    let mut attribution = crate::Attribution::from_suspects(&names, &hashes);
+    let mut attribution = ply_test::Attribution::from_suspects(&names, &hashes);
 
     let frame = |name: &str| Frame {
         name: Symbol::new(name),
@@ -1764,14 +1764,14 @@ fn resolving_an_attribution_ranks_the_culprit_first_and_marks_what_ran() {
 #[test]
 fn a_culprit_outside_the_suspect_set_is_added_rather_than_dropped() {
     let mut attribution =
-        crate::Attribution::from_suspects(&[Symbol::new("m.a")], &HashOutput::default());
+        ply_test::Attribution::from_suspects(&[Symbol::new("m.a")], &HashOutput::default());
     attribution.resolve(
-        crate::Bisection {
-            verdict: crate::Verdict::Bisected,
-            confidence: crate::Confidence::Minimal,
+        ply_test::Bisection {
+            verdict: ply_test::Verdict::Bisected,
+            confidence: ply_test::Confidence::Minimal,
             groups: vec![vec![Symbol::new("m.z")]],
             reason: String::new(),
-            search: crate::SearchStats::default(),
+            search: ply_test::SearchStats::default(),
         },
         None,
     );
@@ -1794,13 +1794,13 @@ fn the_summary_leads_with_the_culprit_and_the_artifact_carries_the_verdict() {
     let mut report = program.run(&selection, &mut store);
 
     report.failures[0].attribution.resolve(
-        crate::Bisection {
-            verdict: crate::Verdict::Bisected,
-            confidence: crate::Confidence::Minimal,
+        ply_test::Bisection {
+            verdict: ply_test::Verdict::Bisected,
+            confidence: ply_test::Confidence::Minimal,
             groups: vec![vec![Symbol::new("debit")]],
             reason: "narrowed 2 changed definitions to debit in 2 runs (1 answered from the cache)"
                 .into(),
-            search: crate::SearchStats {
+            search: ply_test::SearchStats {
                 evaluated: 2,
                 cached: 1,
                 ..Default::default()
@@ -1824,7 +1824,7 @@ fn the_summary_leads_with_the_culprit_and_the_artifact_carries_the_verdict() {
     );
 
     let json = report.to_json();
-    assert_eq!(json["schema_version"], crate::report::SCHEMA_VERSION);
+    assert_eq!(json["schema_version"], ply_test::report::SCHEMA_VERSION);
     let failure = &json["failures"][0];
     assert_eq!(failure["culprit"]["verdict"], "bisected");
     assert_eq!(failure["culprit"]["confidence"], "minimal");
@@ -1943,7 +1943,7 @@ fn make_seeded(program: &mut Program, name: &str) -> usize {
         program.check.tests[index]
             .footprint
             .union(&Footprint::from_atoms([atom(
-                crate::SIM_EFFECT,
+                ply_test::SIM_EFFECT,
                 None,
                 Mode::Read,
             )]));
@@ -1978,7 +1978,7 @@ fn a_seeded_test_is_never_written_under_its_bare_hash() {
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none(), "the bare hash must stay empty");
     assert!(
-        passed(&store, crate::sim_key(hash, &plan)),
+        passed(&store, ply_test::sim_key(hash, &plan)),
         "the plan key is where the claim lives"
     );
     // Every other test is unaffected: nothing about the existing cache changes for a test whose row
@@ -2099,16 +2099,16 @@ fn a_dpor_search_never_narrows_and_writes_no_per_root_key() {
     for root in &plan.roots {
         assert!(
             store
-                .get(crate::seed_key(
+                .get(ply_test::seed_key(
                     hash,
                     &Seed::root(*root),
-                    &crate::Engine::Evaluator
+                    &ply_test::Engine::Evaluator
                 ))
                 .is_none(),
             "root {root} is not a standalone claim under dpor"
         );
     }
-    assert!(passed(&store, crate::sim_key(hash, &plan)));
+    assert!(passed(&store, ply_test::sim_key(hash, &plan)));
 
     let wider = Plan {
         roots: vec![0, 1, 2, 3, 4],
@@ -2151,11 +2151,11 @@ fn an_exhausted_search_reports_green_writes_nothing_and_re_runs() {
         .expect("reported");
     assert!(result.passed());
     assert!(result.green_but_uncached());
-    assert_eq!(result.recorded, Some(crate::Record::Exhausted));
+    assert_eq!(result.recorded, Some(ply_test::Record::Exhausted));
 
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(crate::sim_key(hash, &plan)).is_none());
+    assert!(store.get(ply_test::sim_key(hash, &plan)).is_none());
     assert_eq!(program.select_under(&store, &plan).to_run, vec![seeded]);
     assert!(report.simulation.line().unwrap().contains("not cached"));
 }
@@ -2184,14 +2184,14 @@ fn a_simulated_failure_is_never_cached_under_any_key() {
     assert_eq!(report.failed, 1);
     let hash = program.hashes.tests[seeded];
     assert!(store.get(hash).is_none());
-    assert!(store.get(crate::sim_key(hash, &plan)).is_none());
+    assert!(store.get(ply_test::sim_key(hash, &plan)).is_none());
     for root in &plan.roots {
         assert!(
             store
-                .get(crate::seed_key(
+                .get(ply_test::seed_key(
                     hash,
                     &Seed::root(*root),
-                    &crate::Engine::Evaluator
+                    &ply_test::Engine::Evaluator
                 ))
                 .is_none()
         );
@@ -2311,7 +2311,7 @@ fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
     assert_eq!(report.failed, 0);
     assert!(
         store
-            .get(crate::sim_key(program.hashes.tests[seeded], &plan))
+            .get(ply_test::sim_key(program.hashes.tests[seeded], &plan))
             .is_none()
     );
     assert_eq!(
@@ -2320,7 +2320,7 @@ fn a_seeded_test_with_no_observed_search_warns_and_is_not_cached() {
             .iter()
             .find(|r| r.index == seeded)
             .and_then(|r| r.recorded.clone()),
-        Some(crate::Record::Unobserved)
+        Some(ply_test::Record::Unobserved)
     );
     assert_eq!(report.warnings.len(), 1);
     assert!(report.warnings[0].message.contains("reported no search"));

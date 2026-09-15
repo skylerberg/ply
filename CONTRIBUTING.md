@@ -718,7 +718,7 @@ original ones and the gaps are where closures used to be.
     consumer reading `Assertion::kind` to tell a runaway recursion from a failed
     `assert_eq` cannot, and the four tests that do tell them apart
     (`ply-cli-tests/tests/suite/failure_classification_audit.rs`, `ply-test-tests/tests/suite/hybrid.rs`,
-    `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`) all match the rendered
+    `ply-test-tests/tests/unit/runner.rs`, `ply-eval/src/tests.rs`) all match the rendered
     string instead. `limit.rs`'s doc is corrected in place; the code gap is
     **not** fixed, because deciding whether the fix is to construct the variant
     or to delete it is a `ply-test` design call and this change was in
