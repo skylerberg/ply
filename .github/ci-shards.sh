@@ -138,8 +138,8 @@ DEFERRED=(
   "ply-corpus-tests:unit:measure::every_resumption_costs_about_what_the_first_one_did"
   "ply-corpus-tests:unit:measure::capture_and_resume_are_flat_in_the_frames_they_move"
   "ply-corpus-tests:unit:measure::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real"
-  "ply-store:lib:tests::opening_a_ten_thousand_definition_cache_is_under_the_budget"
-  "ply-store:lib:tests::a_baseline_for_every_test_does_not_slow_the_open"
+  "ply-store-tests:unit:store::opening_a_ten_thousand_definition_cache_is_under_the_budget"
+  "ply-store-tests:unit:store::a_baseline_for_every_test_does_not_slow_the_open"
   "ply-cli-tests:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
   "ply-corpus-tests:unit:payload::the_map_rows_survive_subtracting_the_fold_around_them"
 )
