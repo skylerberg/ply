@@ -127,7 +127,9 @@ declare -a KNOWN_OUTSIDE=(
 # another row here — `payload::the_map_rows_survive_subtracting_the_fold_around_them` is
 # the most recent, and it is the third survey's blind spot: it subtracts a scaffold from a
 # measurement and asserts the remainder is positive, so contention does not slow it down, it
-# makes the answer negative.
+# makes the answer negative. `watch_reruns_on_a_save…` is the fourth survey's:
+# it gives `--watch` a fixed window to notice a save and run again, and a first
+# run that took five seconds beside eleven other partitions left no window.
 DEFERRED=(
   "ply-eval-tests:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
   "ply-eval-tests:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
@@ -143,6 +145,7 @@ DEFERRED=(
   "ply-store-tests:unit:store::a_baseline_for_every_test_does_not_slow_the_open"
   "ply-cli-tests:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
   "ply-corpus-tests:unit:payload::the_map_rows_survive_subtracting_the_fold_around_them"
+  "ply-cli-tests:suite:cli::watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had"
 )
 
 # Tests that fail on a property of the *tree* rather than of a run, as
