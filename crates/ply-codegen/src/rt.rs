@@ -548,10 +548,12 @@ impl Ctx {
             self.end();
         }
         heap::enter(&mut self.heap);
+        heap::poison::enter(&raw const self.site_module);
     }
 
     /// The other end of [`Ctx::begin`]: the entry gives back what it used.
     pub fn end(&mut self) {
+        heap::poison::leave();
         heap::leave();
         self.last_entry = self.heap.allocated();
         if std::env::var("PLY_C_PHASES").is_ok() {
