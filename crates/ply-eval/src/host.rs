@@ -1039,6 +1039,3 @@ fn simple_name(name: &str) -> &str {
 fn shared_prefix(a: &str, b: &str) -> usize {
     a.bytes().zip(b.bytes()).take_while(|(x, y)| x == y).count()
 }
-
-#[cfg(test)]
-mod tests;
