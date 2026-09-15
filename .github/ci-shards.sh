@@ -43,13 +43,14 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # How many jobs the partitioned tests are cut across. nextest's `slice:m/n`
 # deals tests round-robin after the filters, so tests of one binary spread
-# across partitions rather than landing in one. Raise it when the slowest
-# partition's run outlasts its slowest test by much; lower it when the
-# per-job overhead -- checkout, a C compiler, the archive -- is most of a leg,
-# or when the jobs after `build` outnumber what the account runs at once and
-# queue: with five solo jobs, fourteen partitions queued for longer than the
-# four fewer saved; with two, twelve fit.
-PARTITIONS=12
+# across partitions rather than landing in one.
+#
+# A runner arrives for each job about eight seconds after the last, so the
+# last partition starts some 8n seconds after `build` finishes, and each runs
+# the suite's remaining work over n plus half a minute of setup. That is
+# smallest near the square root of the work in seconds over eight: with the
+# suite at some five hundred seconds after #263, eight.
+PARTITIONS=8
 
 # Tests that get a runner of their own, as `id:package:target:test`. Each runs
 # the emitter over the compiler's own sources and, by `.config/nextest.toml`,
