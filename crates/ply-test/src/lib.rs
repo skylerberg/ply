@@ -767,7 +767,7 @@ impl<'a> InterpExecutor<'a> {
                         Err(diagnostic) => Interleaving::failed(Vec::new(), diagnostic),
                     }
                 }
-            };
+            }
         };
 
         let explored = if self.search.measure_reduction {
