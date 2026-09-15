@@ -6,11 +6,6 @@ pub mod graph;
 pub mod interface;
 pub mod normalize;
 
-#[cfg(test)]
-mod numerics;
-#[cfg(test)]
-mod tests;
-
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, Symbol};
 use ply_syntax::ast::{Module, Program, SpecKind};
@@ -56,7 +51,7 @@ impl DefHash {
         Some(DefHash(out))
     }
 
-    fn of(bytes: &[u8]) -> DefHash {
+    pub fn of(bytes: &[u8]) -> DefHash {
         DefHash(*blake3::hash(bytes).as_bytes())
     }
 }
