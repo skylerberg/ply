@@ -82,10 +82,15 @@ it holds plus the bound, never what it ever held. The record first said
 reuse everywhere with no-reuse as an explicit mode; the quarantine keeps the
 net the suites run under without a switch, so no test has to know it is
 there. The switch and every call to it are gone; `Heap::set_quarantine(0)`
-is what a test of the recycling itself asks for. The bound was first tens
-of megabytes; ADR 0050 §1b's profile put the heap's `dismantle` at a
-quarter of the compiled compiler's time with the oldest block touched cold
-on every eviction, and the bound is a short count that stays in cache.
+is what a test of the recycling itself asks for. The quarantine was first a
+queue threaded through the dead blocks themselves, bounded by tens of
+megabytes; ADR 0050 §1b's profile put the heap's `dismantle` at a quarter
+of the compiled compiler's time with the oldest block touched cold on every
+eviction, and the memory of the emitter over its own sources grew with how
+soon a block left, which said a stale read of a quarantined block's first
+word was being acted on. The queue is now a ring of a thousand slots carved
+from the entry's own chunk: a quarantined block keeps its header and its
+payload exactly as it died, and the ring stays in cache.
 
 ### 3. The emitter's inner loops, held to the hasher — measured, and the premise was wrong
 

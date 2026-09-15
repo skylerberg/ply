@@ -353,15 +353,21 @@ pub struct Heap {
     /// let go until the entry ends.
     large: Vec<Vec<*mut Obj>>,
     /// Dead blocks held back from the free lists, oldest first, so that a read through a stale
-    /// word finds a dead header for a while yet rather than whatever took the block. The queue
-    /// is threaded through the dead blocks themselves -- the next pointer in the first payload
-    /// word, the block's size in the header's `layout` -- so holding one costs nothing the
-    /// allocation counts would see. `quarantine` bounds it in blocks; at zero a dead block is
-    /// reusable at once.
-    held_head: *mut Obj,
-    held_tail: *mut Obj,
+    /// word finds a dead header, and the payload as it was left, for a while yet rather than
+    /// whatever took the block. A ring of `quarantine` slots carved from the entry's own chunk,
+    /// so holding a block writes nothing into it and costs nothing the allocation counts see;
+    /// at zero a dead block is reusable at once.
+    ring: *mut Held,
+    ring_head: usize,
     held: usize,
     quarantine: usize,
+}
+
+/// One quarantined block and the size class it goes back to.
+#[derive(Clone, Copy)]
+struct Held {
+    block: *mut Obj,
+    object: usize,
 }
 
 /// How many dead blocks a heap holds back before recycling the oldest: a debug build keeps the
@@ -430,31 +436,22 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             heap.free_list(object).push(o);
             return;
         }
-        (*o).layout = object as u32;
-        *held_next(o) = std::ptr::null_mut();
-        if heap.held_tail.is_null() {
-            heap.held_head = o;
-        } else {
-            *held_next(heap.held_tail) = o;
+        if heap.ring.is_null() {
+            heap.ring = heap.carve(heap.quarantine * std::mem::size_of::<Held>()) as *mut Held;
+            heap.ring_head = 0;
+            heap.held = 0;
         }
-        heap.held_tail = o;
-        heap.held += 1;
-        while heap.held > heap.quarantine {
-            let old = heap.held_head;
-            heap.held_head = *held_next(old);
-            if heap.held_head.is_null() {
-                heap.held_tail = std::ptr::null_mut();
-            }
+        let cap = heap.quarantine;
+        if heap.held == cap {
+            let oldest = *heap.ring.add(heap.ring_head);
+            heap.ring_head = (heap.ring_head + 1) % cap;
             heap.held -= 1;
-            let bytes = (*old).layout as usize;
-            heap.free_list(bytes).push(old);
+            heap.free_list(oldest.object).push(oldest.block);
         }
+        let at = (heap.ring_head + heap.held) % cap;
+        *heap.ring.add(at) = Held { block: o, object };
+        heap.held += 1;
     }
-}
-
-/// The quarantine's link through a dead block: its first payload word, which every block has.
-unsafe fn held_next(o: *mut Obj) -> *mut *mut Obj {
-    unsafe { (o as *mut u8).add(HEADER) as *mut *mut Obj }
 }
 
 impl Default for Heap {
@@ -484,8 +481,8 @@ impl Heap {
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
-            held_head: std::ptr::null_mut(),
-            held_tail: std::ptr::null_mut(),
+            ring: std::ptr::null_mut(),
+            ring_head: 0,
             held: 0,
             quarantine: QUARANTINE,
         }
@@ -623,6 +620,18 @@ impl Heap {
     fn large_class(size: usize) -> Option<usize> {
         (size / 8 >= REUSE_CLASSES)
             .then(|| usize::BITS as usize - (size - 1).leading_zeros() as usize)
+    }
+
+    /// `bytes` of the entry's chunk memory, word-aligned, for the heap's own use: outside the
+    /// object count and the start bits, and given back with the chunks at the entry's end.
+    fn carve(&mut self, bytes: usize) -> *mut u8 {
+        let size = (bytes + 7) & !7;
+        if (self.end as usize).wrapping_sub(self.cur as usize) < size || self.cur.is_null() {
+            self.grow(size);
+        }
+        let p = self.cur;
+        self.cur = unsafe { self.cur.add(size) };
+        p
     }
 
     pub(crate) fn raw_alloc(
@@ -889,8 +898,10 @@ impl Heap {
         for class in &mut self.large {
             class.clear();
         }
-        self.held_head = std::ptr::null_mut();
-        self.held_tail = std::ptr::null_mut();
+        // The ring was carved from the first chunk, which the bump pointer has just been put
+        // back to; it is carved again the next time a block dies.
+        self.ring = std::ptr::null_mut();
+        self.ring_head = 0;
         self.held = 0;
         for bits in &mut self.starts {
             bits.fill(0);
