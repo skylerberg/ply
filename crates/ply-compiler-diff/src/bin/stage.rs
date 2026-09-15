@@ -15,7 +15,6 @@ fn main() {
         }
     };
     ply_codegen::c::producer::ensure_default();
-    ply_codegen::heap::reuse_by_default(true);
 
     let mut modules: Vec<(String, String)> = ply_std::sources()
         .map(|(m, t)| (m.to_string(), t.to_string()))

@@ -108,10 +108,6 @@ fn emit_with(source: &'static Source, from: Option<&Path>, scratch: &Path) -> Pr
 // (ADR 0046) it runs in a runner's memory. The refresh is the same test.
 #[test]
 fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
-    // The emitter emitting its sources allocates two hundred million objects; a debug heap that
-    // never reuses a dead block, so that a read of one is caught, would need a runner it cannot
-    // have. This test is not that check's oracle -- the audits are -- so it reuses.
-    ply_codegen::heap::reuse_by_default(true);
     let (source, identity) = emitter_source();
     let bundle = PathBuf::from(ply_compiler::bootstrap::DIR);
     let refresh = std::env::var("PLY_C_BOOTSTRAP_REFRESH").is_ok();

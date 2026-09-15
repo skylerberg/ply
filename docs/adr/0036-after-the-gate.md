@@ -109,10 +109,11 @@ goes back to its heap's free list for its size class, from the header its
 allocation site wrote, and an allocation of that class takes it before the
 bump pointer moves; a bridged object does not, because its slot is on the
 heap's drop log and a second bridged value in the same slot would be dropped
-twice at the entry's end. A release build reuses; a debug build does not, so
-every suite still reads a stale word as a dead header rather than as someone
-else's object — the net the counts are checked under — while the examples
-under the audit, the kernels and the front-end row run the reuse. A
+twice at the entry's end. Every build reuses; a debug build holds a dead block
+in a bounded quarantine first, oldest out, so every suite still reads a stale
+word as a dead header rather than as someone else's object — the net the
+counts are checked under — at a bounded cost, while the examples under the
+audit, the kernels and the front-end row run the reuse at once. A
 five-million-step churn of one record holds its memory flat where it grew by
 the step before.
 
