@@ -9,7 +9,7 @@
 > | --- | --- | --- | --- |
 > | `cluster::available()` | `crates/ply-host-tests/tests/support/cluster.rs:38` | no `initdb`/`postgres` on the machine | yes, on stderr of a passing test |
 > | `PLY_PG_URL` | `crates/ply-host/src/db/scope/tests/live.rs:101` | the variable is unset — nothing sets it on a stock local checkout, and **CI sets it** | yes, on stderr of a passing test |
-> | `#![cfg(unix)]` | `crates/ply-cli/tests/suite/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
+> | `#![cfg(unix)]` | `crates/ply-cli-tests/tests/suite/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
 > | `PLY_TEST_DB` | `crates/ply-host/src/db/pool/tests.rs:25` | the variable is unset | **no — nothing is printed at all, on either stream** |
 >
 > **This table describes a stock local checkout, not CI.** All five gates are
@@ -385,7 +385,7 @@ ambient is what the previous eight milestones exist to remove.
   read; a `--config-schema` verified at start-up so a missing credential is a
   refusal rather than a 3am 500 — a `required` key nothing supplies is `E0441`
   before anything is bound (`crates/ply-cli/src/config.rs`, asserted by
-  `crates/ply-cli/tests/suite/config_cli.rs:265`). *This line used to read "verified
+  `crates/ply-cli-tests/tests/suite/config_cli.rs:265`). *This line used to read "verified
   at start-up, exactly as W4 verifies a database schema". The comparison was
   wrong in the direction that flatters: `--config-schema` really is verified,
   and `--db-schema` is not — it evaluates the program's `Schema` function and
@@ -883,11 +883,11 @@ Re-run rather than assumed. Every row is a command whose output was read.
 The remaining invariants are asserted by the suite rather than re-run by hand,
 and each has a name to grep for rather than a claim to take:
 `ply-hash-tests/tests/suite/modules.rs::moving_a_definition_between_modules_changes_no_hash`,
-`ply-cli/tests/suite/cli.rs::moving_a_definition_between_modules_re_runs_nothing`,
+`ply-cli-tests/tests/suite/cli.rs::moving_a_definition_between_modules_re_runs_nothing`,
 `ply-test-tests/tests/suite/hybrid.rs::a_regression_that_introduces_runaway_recursion_is_bisected_to_its_culprit`,
 `ply-eval-tests/tests/suite/secrets.rs`, and — for `E0412` on an unsimulated nondeterministic
 effect in a `det` test —
-`ply-cli/tests/suite/cli.rs:570 a_nondet_test_in_a_det_test_is_a_compile_error`, which
+`ply-cli-tests/tests/suite/cli.rs:570 a_nondet_test_in_a_det_test_is_a_compile_error`, which
 runs `ply test --json` on a two-line project and asserts exit code 2 with
 `diagnostics[0].code == "E0412"`. The suite is green above, which is what makes
 those citations rather than promises.

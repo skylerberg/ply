@@ -267,7 +267,7 @@ slope for neither tier.
 1. **Done.** A result names the engine that earned it, the front-end cache is
    read whatever executes, and a backend that is wrong on purpose still gets no
    store. `one_engines_pass_is_never_another_engines` and
-   `a_second_backed_run_selects_nothing` in `crates/ply-cli/tests/suite/cli.rs`
+   `a_second_backed_run_selects_nothing` in `crates/ply-cli-tests/tests/suite/cli.rs`
    hold the two halves, and `armed.rs` fails if a new route to a backend
    forgets either.
 2. **Done, and it decided item 3.** `benches/marginal-change/` is the row:

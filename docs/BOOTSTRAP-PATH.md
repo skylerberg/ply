@@ -374,7 +374,7 @@ selected against the definition set it last passed under, which
 function and declaration in its closure, so a test re-runs only when something
 it reaches moved. Selecting nothing after a rename is an invariant the suite
 asserts rather than a heuristic:
-`crates/ply-cli/tests/suite/cli.rs renaming_a_definition_re_runs_nothing`. And
+`crates/ply-cli-tests/tests/suite/cli.rs renaming_a_definition_re_runs_nothing`. And
 it is measured: `ply-corpus bench` applies a rename, a leaf edit and a hub edit
 and times nine phases after each, and `ply-corpus sweep` takes that at each of
 several sizes.
@@ -388,7 +388,7 @@ What the compiled loop does not have, in the order to take them:
   against what backed runs proved and neither engine reads the other's; the
   front-end cache is read whatever executes; and a backend that is wrong on
   purpose still gets no store, since a run that skipped a test is not evidence.
-  `crates/ply-cli/tests/suite/cli.rs` holds both halves, and
+  `crates/ply-cli-tests/tests/suite/cli.rs` holds both halves, and
   `armed.rs::a_shipping_command_that_installs_a_backend_must_also_bypass_the_cache`
   fails if a new route to a backend forgets either.
 - **The row under `--backend`, fitted — taken.** `benches/marginal-change/`

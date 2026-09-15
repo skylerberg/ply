@@ -6,7 +6,7 @@ fn run(src: &str) -> serde_json::Value {
     let dir = tempfile::tempdir().expect("a temp dir");
     let file = dir.path().join("m.ply");
     std::fs::write(&file, src).expect("write");
-    let out = Command::new(env!("CARGO_BIN_EXE_ply"))
+    let out = Command::new(assert_cmd::cargo::cargo_bin("ply"))
         .args(["run", "--json"])
         .arg(&file)
         .output()
