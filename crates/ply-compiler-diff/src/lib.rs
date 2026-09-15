@@ -2031,11 +2031,6 @@ pub mod port {
     /// returned. A raise, a missing entry or a non-string answer is the harness's own failure and
     /// panics with the reason.
     pub fn call(name: &str, args: &[Value]) -> String {
-        static REUSING: std::sync::Once = std::sync::Once::new();
-        // Emitting the compiler's own sources allocates two hundred million objects, and a debug
-        // heap that never reuses a block would need a runner it cannot have. This harness is not
-        // that check's oracle -- the audits are -- so, as the fixpoint test does, it reuses.
-        REUSING.call_once(|| ply_codegen::heap::reuse_by_default(true));
         ply_codegen::c::producer::ensure_default();
         match ply_codegen::c::producer::call(name, args) {
             Ok(Value::Str(ref s)) => s.to_string(),
