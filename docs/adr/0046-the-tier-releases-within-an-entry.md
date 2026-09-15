@@ -147,8 +147,8 @@ and a runner even so: a debug build's heap kept every dead block until the
 entry's end, so that a read of one found the marker, and that entry
 allocates two hundred million objects. The net is now a bounded quarantine
 (`heap::QUARANTINE`): a dead block waits its turn behind a fixed number of
-bytes of others before it is reused, so a stale read still finds the marker
-for a while and no entry needs a runner larger than what it holds. Nothing
+others before it is reused, so a stale read still finds the marker for a
+while and no entry needs a runner larger than what it holds. Nothing
 switches it off, and no test has to know it is there.
 
 ## What would make this wrong
