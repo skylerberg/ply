@@ -36,10 +36,10 @@ the compiled compiler's own running time, so how the emitter represents and
 reaches values is the suite's tail. The
 bundle's load record exists because a unit cannot say what it exports, and
 every consumer that wants to skip the front end will need the same trick until
-the unit can. The deferred table is mostly timing tests over allocation and
-resumption, which will stay flaky until what they measure is cheap. Tuning the
-jobs again would shuffle the same seconds; ADR 0042's programme says to change
-the thing the seconds come from.
+the unit can. The deferred table was mostly timing tests over allocation and
+resumption, which flaked whatever the jobs did, because a duration is not a
+claim about the code. Tuning the jobs again would shuffle the same seconds;
+ADR 0042's programme says to change the thing the seconds come from.
 
 ## The language and compiler
 
@@ -196,17 +196,32 @@ needs a server, so it runs in `test-postgres` against that job's, and the
 fresh-program cost instrument moved beside the binary it measures, in
 `build-ply`. The job and `.github/served-with-tier.sh` are gone.
 
-### 7. The deferred table empties
+### 7. The deferred table empties — done
 
-`DEFERRED` in `ci-shards.sh` holds the tests that run only in `gates`, on
-`main`, because they were slow or flaked under a loaded runner. A deferred
-test is a test no PR reruns. Most of them are timing claims about
-allocation, resumption and fixture cost.
+`DEFERRED` in `ci-shards.sh` held the fourteen tests that ran only in
+`gates`, last and alone, because each passed or failed on how much CPU a
+loaded runner gave it rather than on what the code does. Most were timing
+claims about allocation, resumption and fixture cost, and a survey of them
+found that every claim worth keeping already had a count beside it.
 
-**Fix.** Each entry is either rewritten to assert a count rather than a
-clock, the way the watch test was rewritten to be event-driven, or deleted
-with the claim it armed removed from the prose. The table ends empty and the
-`gates` job keeps only the tree checks.
+**Built.** The table is gone, with the `deferred` commands, the nextest
+override that serialized it and the `verify` check that held the two
+together; `gates` runs the shutdown suite and the tree checks. Seven of the
+fourteen keep their claim as a count and lose their clock: a snapshot's cost
+is `slots_copied` at every tenfold of region size, a fixture open is what it
+allocates plus that nothing a test wrote reaches the fixture, a capture of a
+hundred thousand frames moves one segment, the store's two opens assert that
+an entry and a baseline still answer, the group ladder keeps its arithmetic
+and drops the reading it was taken from, and the empty group region asserts
+its mark. The simulated sleep keeps its program and takes its bound from a
+`slow-timeout` on that test in `.config/nextest.toml`, which kills the process
+rather than reading a clock in the test. Six were ratios of one wall clock to
+another with no count behind them — the fixture-against-rebuild and
+discard-cost tables, the resumption and rebuild ratios, the router's escapes
+and the map rows' subtraction — and were deleted. The prose that leaned on
+them now says what it is: ADR 0017's fixture cost, ROADMAP.md's per-test
+figure and its `Store::open` row, and README.md's open time are measurements
+the records took, and no test asserts them.
 
 ### 8. The build job's link time
 

@@ -85,9 +85,10 @@ to think with.
 > `ply-corpus measure` is the harness that separates the two. See
 > `benches/README.md`.
 
-Opening a content-addressed store of ten thousand definitions costs single-digit
-milliseconds, which is what lets the cache sit in the inner loop rather than be a
-build artifact.
+Opening a content-addressed store of ten thousand definitions decodes nothing,
+and took single-digit milliseconds when it was measured (`ROADMAP.md`'s table;
+no test asserts the time), which is what lets the cache sit in the inner loop
+rather than be a build artifact.
 
 > **The compiled loop selects too, and still compiles everything.** What makes
 > this O(change) is the front-end cache keyed by content and a test selected
@@ -441,10 +442,10 @@ clock and its spread, which is wide: readings on this one command have ranged
 from three minutes to twenty-nine, and the high ones describe a loaded machine
 rather than the tree.
 
-And `ignored` is not the whole of the timing-sensitive suite —
-`ply-eval-tests/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
-asserts on a wall-clock growth ratio and runs by default, and it failed for us on
-a machine that was busy compiling something else. On a quiet machine it passes.
+A timing claim in the suite is asserted as a count — allocations, bytes, copies,
+frames, entries — or not at all: a count does not depend on what else the
+machine is doing, and a duration does. The durations live in the benchmarks
+above, in `benches/` and in the ADRs, and nothing fails when they move.
 
 Read [DESIGN.md](DESIGN.md) for the language and the reasoning,
 [ROADMAP.md](ROADMAP.md) for what is built and what each milestone decided,

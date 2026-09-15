@@ -261,12 +261,13 @@ close will *find* rather than a decision about whether one happens. Every
 `shared` region reclaims at its close on every run, because no continuation
 captured across one ever outlives it there.
 
-**Region-scoped fixture cost**, measured the way forking's was **so "cheap"
-stays a fact rather than becoming a slogan**: opening a large fixture and
-writing one cell costs a fraction of a millisecond per test, against a fork's
-nanosecond. **This is the price section 6 says is paid, and it is paid per test
-rather than per group** — and it is a projection about a construct that is still
-not writable in Ply.
+**Region-scoped fixture cost**, measured the way forking's was: opening a large
+fixture and writing one cell costs a fraction of a millisecond per test, against
+a fork's nanosecond. That is a measurement this record took and no suite test
+asserts; what the suite asserts is the count — an open charged for the fixture,
+a reset that allocates nothing. **This is the price section 6 says is paid, and
+it is paid per test rather than per group** — and it is a projection about a
+construct that is still not writable in Ply.
 
 **The oracle for "meaning did not move" is not the two-engine comparison**, and
 the size of the hole is stated rather than implied. The tree-walker refuses

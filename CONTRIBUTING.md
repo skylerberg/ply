@@ -107,10 +107,8 @@ the machine idles. Install it once with `cargo install cargo-nextest --locked`
 or from <https://nexte.st/docs/installation/pre-built-binaries/>; CI pins the
 version in `.github/workflows/ci.yml`. `cargo test --workspace` still works and
 is what runs doctests, of which there are none today. `.config/nextest.toml` is
-the configuration: the wall-clock tests `.github/ci-shards.sh` names run last
-and alone, with every test thread and their printed measurement shown, so a
-run's tail is fourteen short tests one at a time rather than a ratio taken
-under contention.
+the configuration: the long tests start first, and the two that need a runner
+to themselves take every test thread after everything else.
 
 **No test count here, and no wall clock to the decisecond.** Both change on
 commits that have nothing to do with either, nothing in the tree checks them, and
@@ -154,13 +152,12 @@ than when the last job does.
 running everything is too slow and one runner per package group was bounded by
 its longest tests. `build` archives every workspace member's tests with `cargo
 nextest archive --workspace`; the partitions each run a slice of it, the tests
-that must run alone get a runner each, and the wall-clock tests, the shutdown
-suite and the tree checks run in a job that asserts, by exact name, that each
-one ran. `.github/ci-shards.sh` holds those tables and `verify` fails when a
-name in them is not defined where the table says, when a crate under `crates/`
-is no member, or when `.config/nextest.toml` does not name exactly the
-wall-clock tests — a table is a chance to lose a test silently, and a crate
-nothing builds is this repository's most expensive defect class:
+that must run alone get a runner each, and the shutdown suite and the tree
+checks run in a job that asserts, by exact name, that each one ran.
+`.github/ci-shards.sh` holds those tables and `verify` fails when a name in
+them is not defined where the table says or when a crate under `crates/` is no
+member — a table is a chance to lose a test silently, and a crate nothing
+builds is this repository's most expensive defect class:
 `crates/ply-compiler` sat in **no CI job at all** while its differential went
 red for two days.
 
@@ -176,19 +173,15 @@ Green is weaker than it looks, for two separate reasons.
 how CI forces each open. The worst is `PLY_TEST_DB`: it prints nothing at all
 when unset, so a green run is indistinguishable from a run against a database.
 
-**Wall-clock assertions.** Some tests assert on elapsed time and run by default.
-`.github/ci-shards.sh`'s `DEFERRED` table lists them, CI runs each alone and
-single-threaded, and the partitions skip them. **That table is maintained by
-running the suite, not by surveying the tree** — two surveys declared themselves
-complete and each was proved wrong within the hour by a run going red on a test
-neither had found. One of them reads no Rust clock at all: it parses milliseconds
-out of `ply test`'s own output, so no timing vocabulary appears in it.
-
-If you add a test that asserts on elapsed time, add it there too — and prefer
-asserting on a **count** (allocations, copies, entries) over a duration wherever
-the question allows it. A count does not depend on what else the machine is
-doing, which is why the allocation-attribution suites are worth their weight and
-the timing suites need a job of their own.
+**Performance.** Green proves no figure. A timing claim is asserted as a
+**count** (allocations, copies, entries, frames) or not at all: a count does not
+depend on what else the machine is doing, which is why the
+allocation-attribution suites are worth their weight and a ratio or a budget
+read off a clock is not. The durations are measurements — `benches/`, the ADRs,
+the `ignored` benchmarks — and nothing fails when they move. If you add a test
+whose question is "how long", assert the count behind it; where the only bound
+is on the process, a simulated sleep that must not be waited out,
+`.config/nextest.toml` carries a `slow-timeout` for that test.
 
 **A phase between two differentials, compared by neither.** The parser spike's
 third comparison covers the rewrites `Parser::run` applies and its fifth covers
