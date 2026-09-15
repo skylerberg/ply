@@ -642,19 +642,18 @@ fn moving_a_definition_between_modules_changes_no_body() {
 /// Checking is not the bar — M5 has to *evaluate* a historical definition set — so the
 /// reconstructed tests are run, in the reconstructed program, against the reconstructed
 /// definitions.
-/// A rebuilt program has no module text for the whole emitter to re-read, so a reconstructed
-/// body runs on the reference fragment, as `ply_test::hybrid` runs a mixture. A body outside the
-/// fragment -- one that handles an effect -- is declined rather than answered; an AST printer
-/// would lift that.
+/// A rebuilt program is an AST with no text, and the whole emitter reads text: it is handed the
+/// program printed back to source, as `ply_test::hybrid` hands it a mixture.
 fn on_the_tier<'a>(
     program: &'a ply_syntax::ast::Program,
     resolved: &'a ply_syntax::resolve::Resolved,
     check: &'a CheckOutput,
 ) -> ply_eval::Machine<'a> {
-    let unit = ply_codegen::c::producer::reference_only(|| {
-        ply_codegen::Unit::over(program, resolved, check)
-    })
-    .expect("this host has a C compiler");
+    ply_codegen::c::producer::ensure_default();
+    let texts: std::collections::HashMap<String, String> =
+        ply_syntax::print::program(program).into_iter().collect();
+    let unit = ply_codegen::Unit::over_with_texts(program, resolved, check, texts)
+        .expect("this host has a C compiler");
     let spec = ply_eval::BackendSpec {
         kind: ply_eval::BackendKind::C,
         ..Default::default()
@@ -662,11 +661,6 @@ fn on_the_tier<'a>(
     let mut machine = ply_eval::Machine::new(program, resolved, check);
     machine.set_compiled(ply_eval::Provider::attach(unit, &spec));
     machine
-}
-
-fn declined_by_the_fragment(d: &impl std::fmt::Display) -> bool {
-    let text = d.to_string();
-    text.contains("E0502") && text.contains("neither front end holds a body")
 }
 
 #[test]
@@ -698,14 +692,64 @@ fn reconstructed_tests_evaluate() {
     let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
 
     assert_eq!(interp.test_count(), 2);
-    // The second test is pure and runs; the first handles an effect and is declined.
-    interp
-        .eval_test(1)
-        .unwrap_or_else(|d| panic!("the reconstructed pure test failed: {d}"));
-    let d = interp
-        .eval_test(0)
-        .expect_err("a handler is outside the fragment");
-    assert!(declined_by_the_fragment(&d), "{d}");
+    for index in 0..interp.test_count() {
+        interp
+            .eval_test(index)
+            .unwrap_or_else(|d| panic!("reconstructed test {index} failed: {d}"));
+    }
+}
+
+/// The printer is what hands a reconstructed program to the whole emitter, so the source it
+/// writes has to *be* that program: every definition, test and law hashes to what it hashed as
+/// before it was printed. Over the same corpus `the_examples_reconstruct` walks.
+#[test]
+fn a_reconstructed_program_prints_to_the_source_it_hashes_as() {
+    let mut files: Vec<(String, String)> = Vec::new();
+    for entry in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/../../examples")).unwrap()
+    {
+        let path = entry.unwrap().path();
+        if path.extension().is_some_and(|e| e == "ply") {
+            let stem = path.file_stem().unwrap().to_str().unwrap().to_string();
+            files.push((stem, std::fs::read_to_string(&path).unwrap()));
+        }
+    }
+    files.sort();
+    let mut borrowed: Vec<(&str, &str)> = files
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    for (name, source) in ply_std::sources() {
+        borrowed.push((name, source));
+    }
+    let original = compile(&borrowed);
+    let mut rebuilt = reconstruct(&original.bodies).expect("bodies should reconstruct");
+    let resolved = ply_syntax::resolve(&mut rebuilt.program).expect("it should resolve");
+    let (before, _) =
+        hash_program_with_bodies(&rebuilt.program, &resolved).expect("it should hash");
+
+    let texts = ply_syntax::print::program(&rebuilt.program);
+    let printed: Vec<(&str, &str)> = texts
+        .iter()
+        .map(|(name, text)| (name.as_str(), text.as_str()))
+        .collect();
+    let after = compile(&printed).hashes;
+
+    let hex = |h: &IndexMap<Symbol, DefHash>| -> BTreeMap<String, String> {
+        h.iter().map(|(n, h)| (n.to_string(), h.to_hex())).collect()
+    };
+    assert_eq!(
+        hex(&after.defs),
+        hex(&before.defs),
+        "a definition hashes differently once printed"
+    );
+    assert_eq!(
+        after.tests, before.tests,
+        "a test hashes differently once printed"
+    );
+    assert_eq!(
+        after.laws, before.laws,
+        "a law hashes differently once printed"
+    );
 }
 
 /// The corpus a person actually edits, rather than a snippet written to pass.
@@ -987,15 +1031,9 @@ fn two_tests_that_number_one_effect_differently_both_reconstruct() {
     let check = check_program(&rebuilt.program, &resolved).expect("it should typecheck");
     let mut interp = on_the_tier(&rebuilt.program, &resolved, &check);
     assert_eq!(interp.test_count(), 2);
-    // Both handle an effect, so both are declined by the fragment; that they resolve and check
-    // above is the property.
     for index in 0..interp.test_count() {
-        let d = interp
+        interp
             .eval_test(index)
-            .expect_err("a handler is outside the fragment");
-        assert!(
-            declined_by_the_fragment(&d),
-            "reconstructed test {index}: {d}"
-        );
+            .unwrap_or_else(|d| panic!("reconstructed test {index} failed: {d}"));
     }
 }
