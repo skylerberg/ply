@@ -78,20 +78,35 @@ does not hold, as `bytes_at` does: a write past the end is a defect, not a
 lookup that may miss. It is a builtin rather than a library function
 because the trie's path copy is not expressible from outside the trie.
 
-**Built when.** It exists in every place a builtin lives: the evaluator's
-`Builtin` and its arity and purity tables, the pure interpreter, the
-persistent list in `ply-eval`, the trie in `ply-codegen` with `rt_list_set`
-appended to the helper table, the Rust emitter's builtin-to-helper
-mapping, the Ply emitter's, the Ply checker's builtin type table, the
-prelude's published signature, `docs/GUIDE.md` §13, a `tests/lang/lists`
-program that states it on both tiers, and the builtin unit tests that walk
-every builtin. Then every `set_at` in `crates/ply-compiler/ply` calls it,
-and the bundle is refreshed from the tree by the fixpoint test. The
-measures are the emit-diff own-sources solo's time and the hash
-differential's, read from the run before and the run after, and
-`profile.yml` on both tests after; the record says what moved. If the solo
-does not move, the record says so and the builtin stays, since a
-logarithmic update is right whatever it measures.
+**Built.** It exists in every place a builtin lives: the evaluator's
+`Builtin` and its arity table, the persistent list in `ply-eval`, the trie
+in `ply-codegen` with `rt_list_set` appended to the helper table, the Rust
+emitter's builtin-to-helper mapping, the Ply emitter's, the Ply checker's
+builtin type table, the prelude's published signature, `docs/GUIDE.md` §6,
+§13 and §19, a `tests/lang/lists` program on both tiers with its raising
+fixture, and the tests that walk every builtin. It took two pull requests,
+because the bootstrap bundle has to know a builtin before the compiler's
+own sources may use it: the first added it everywhere and left `set_at`
+alone, and its refresh was the first to start from a bundle emitted against
+an older helper table, which is §1a's measure met; the second made each
+module's `set_at` answer `list_set`.
+
+**Measured.** The emit-diff own-sources solo's test step read 66 s on the
+run that landed it against 71 to 106 s over the four runs of `main` before,
+a band too wide for one reading to settle, and the record leans on the
+profile instead. `profile.yml` on the hash differential read 18.2 s against
+19.9 s before, with the hasher's `set_at` gone from the profile and its
+`at` halved. On the emitter over its own sources it read 77 s, with the
+heap's `dismantle` at a quarter of the time where it had been a twentieth:
+ADR 0049 item 2's quarantine, a queue threaded through the dead blocks and
+bounded by tens of megabytes, was touching its oldest block cold on every
+eviction. Two forms were then read on their own branches: a ring of a
+thousand slots kept outside the blocks ran the same test in 64 s but held
+fifteen gigabytes where the queue had held two, and no quarantine at all,
+immediate reuse in every build, ran it in 62 s in 730 MB, the memory the
+test had before any quarantine existed. Why a shorter quarantine holds more
+memory the readings did not say. The quarantine is gone; every build reuses
+at once, and ADR 0049 item 2 says so in place.
 
 ## 2. The goldens the differentials need before the reference goes
 
