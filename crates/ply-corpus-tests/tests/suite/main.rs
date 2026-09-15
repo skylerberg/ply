@@ -11,5 +11,6 @@ mod http_cost;
 mod region_isolation_cost;
 mod region_kind_hoisted;
 mod tier_audit;
+mod unit;
 mod w1_baseline;
 mod w6_report_integrity;

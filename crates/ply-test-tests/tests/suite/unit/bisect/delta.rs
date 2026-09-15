@@ -345,7 +345,7 @@ fn a_classifier_with_no_evidence_calls_everything_edited() {
 /// The witness is what makes a private copy of the hashing algorithm safe.
 #[test]
 fn the_renormalizer_reproduces_every_hash_ply_hash_published() {
-    for src in [CHAIN, include_str!("../../../../../examples/ledger.ply")] {
+    for src in [CHAIN, include_str!("../../../../../../examples/ledger.ply")] {
         let compiled = Compiled::new(src);
         let renormalizer = compiled.renormalizer();
         assert_eq!(

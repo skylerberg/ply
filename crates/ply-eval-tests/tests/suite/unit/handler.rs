@@ -1,7 +1,7 @@
 //! Effect handlers end to end, on the machine that runs them.
 
-use crate::build;
-use crate::build::{bin, block, callv, int, letv, list, var};
+use crate::unit::build;
+use crate::unit::build::{bin, block, callv, int, letv, list, var};
 use ply_eval::Value;
 use ply_eval::evaluator::Machine;
 use ply_eval::handler::*;
