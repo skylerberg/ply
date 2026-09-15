@@ -280,39 +280,33 @@ fn watch_reruns_on_a_save_and_keeps_the_front_end_it_already_had() {
         .spawn()
         .unwrap();
 
+    // One JSON object per iteration, concatenated; the reader hands each over as it lands, so the
+    // save below happens after the first iteration has reported rather than at a guessed moment
+    // inside it -- a save the watcher sees while it is still running the tree it already holds
+    // is not a change to notice.
     let stdout = child.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        use std::io::Read;
-        let mut text = String::new();
-        let mut stdout = stdout;
-        let _ = stdout.read_to_string(&mut text);
-        let _ = tx.send(text);
+        for report in serde_json::Deserializer::from_reader(stdout).into_iter::<Value>() {
+            let Ok(report) = report else { break };
+            if tx.send(report).is_err() {
+                break;
+            }
+        }
     });
-
-    // Let the first iteration land, then save the module byte for byte as it already is — the
-    // common case in a loop, and the one that must not cost a front end. The waits are budgets
-    // rather than measurements: nothing here asserts on elapsed time, only on how many iterations
-    // happened and what each of them said.
-    std::thread::sleep(std::time::Duration::from_secs(2));
+    let window = std::time::Duration::from_secs(60);
+    let first = rx
+        .recv_timeout(window)
+        .expect("`--watch` reported its first iteration");
+    // Save the module byte for byte as it already is -- the common case in a loop, and the one
+    // that must not cost a front end.
     std::fs::write(dir.path().join("m.ply"), GREEN).unwrap();
-    std::thread::sleep(std::time::Duration::from_secs(5));
+    let second = rx
+        .recv_timeout(window)
+        .expect("`--watch` ran again when the tree moved");
     let _ = child.kill();
     let _ = child.wait();
-    let text = rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
-    let mut reports = Vec::new();
-    // One JSON object per iteration, concatenated; `into_iter` over the stream splits them.
-    for report in serde_json::Deserializer::from_str(&text).into_iter::<Value>() {
-        match report {
-            Ok(v) => reports.push(v),
-            Err(_) => break,
-        }
-    }
-    assert!(
-        reports.len() >= 2,
-        "`--watch` did not run again when the tree moved; it emitted {} report(s):\n{text}",
-        reports.len()
-    );
+    let reports = [first, second];
     for (i, report) in reports.iter().enumerate() {
         assert_eq!(report["ok"], Value::Bool(true), "iteration {i}: {report}");
     }
