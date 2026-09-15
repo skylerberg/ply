@@ -80,13 +80,23 @@ fn emitter_source() -> (&'static Source, String) {
 static FROM: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProducer, String> {
+    let from_reference = || {
+        let names: Vec<String> = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))
+    };
     let (native, _) = match from.and_then(ply_codegen::c::bundle::from_dir) {
-        Some(bundle) => ply_codegen::c::bundle::build(&bundle).map_err(|e| format!("{e:#}"))?,
-        None => {
-            let names: Vec<String> = source.functions();
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            ply_codegen::c::build(source, &refs).map_err(|e| format!("{e:#}"))?
-        }
+        Some(bundle) => match ply_codegen::c::bundle::build(&bundle) {
+            Ok(built) => built,
+            // The one thing the reference still builds the emitter for: a bundle whose helper
+            // table this runtime's does not start with, which is how such a refresh begins.
+            Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some() => {
+                eprintln!("{e:#}; the reference builds the emitter");
+                from_reference()?
+            }
+            Err(e) => return Err(format!("{e:#}")),
+        },
+        None => from_reference()?,
     };
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
@@ -114,13 +124,8 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     let have = ply_codegen::c::bundle::exists(&bundle);
     assert!(
         have || refresh,
-        "no bootstrap bundle serves at {}{}; run this test with PLY_C_BOOTSTRAP_REFRESH=1 to write one from the reference",
-        bundle.display(),
-        if ply_codegen::c::bundle::stale_runtime(&bundle) {
-            " (it was emitted against another runtime's helper table)"
-        } else {
-            ""
-        }
+        "no bootstrap bundle at {}; run this test with PLY_C_BOOTSTRAP_REFRESH=1 to write one from the reference",
+        bundle.display()
     );
     if have && !refresh {
         let current = ply_codegen::c::bundle::from_dir(&bundle).expect("the bundle serves");

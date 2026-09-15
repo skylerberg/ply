@@ -49,9 +49,9 @@ pub mod sweep;
 pub mod toolchain;
 
 pub use build::{
-    Native, Produced, build, emit_body, emit_body_encoded, emit_one, load_unit, produce,
+    Native, Produced, build, emit_body, emit_body_encoded, emit_one, load_unit, produce, served,
 };
-pub use exports::Exports;
+pub use exports::{Exports, Unserved};
 pub use load::{Library, compile_and_load};
 pub use prelude::{HELPERS, PRELUDE, pointer_name, runtime_decls};
 pub use toolchain::{Profile, select as select_profile};

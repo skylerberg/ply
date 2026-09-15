@@ -336,6 +336,7 @@ fn describe(
     // same slots back out of the table this completes.
     let _ = constants_of(&constants, &mut unit);
     Exports {
+        helpers: super::exports::runtime_helpers(),
         ctors: ctors.to_vec(),
         taken: arities,
         constants,
@@ -367,6 +368,17 @@ pub fn load_unit(
     let refused = refused_of(&exports);
     let native = finish(lib, exports, sources)?;
     Ok((native, refused))
+}
+
+/// Whether a unit produced elsewhere serves this runtime: it compiles, its table reads back, and
+/// the runtime's helper table starts with its own. The refusal is an [`Unserved`] a caller can
+/// tell from a unit that is broken.
+pub fn served(text: &str, stem: &str) -> Result<()> {
+    let lib = compile_and_load(text, stem)?;
+    match Exports::read(&lib)?.unserved() {
+        Some(why) => Err(why.into()),
+        None => Ok(()),
+    }
 }
 
 fn refused_of(exports: &Exports) -> Vec<Refused> {
@@ -469,7 +481,13 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
 /// is faithful; if a field is ever added to one, it has to be added to `Exports` too or the ids
 /// move.
 fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Result<Native> {
+    // Before anything is bound: the C reads the first `n` positions of the table it is handed, so
+    // the table has to start with the one it was emitted against.
+    if let Some(why) = exports.unserved() {
+        return Err(why.into());
+    }
     let Exports {
+        helpers: _,
         ctors,
         taken,
         constants,

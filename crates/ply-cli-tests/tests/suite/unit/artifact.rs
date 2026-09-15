@@ -38,7 +38,6 @@ fn sample() -> Artifact {
 fn an_embedded_unit_survives_encoding() {
     let mut artifact = sample();
     artifact.unit = Some(EmbeddedUnit {
-        runtime: "rt-digest".to_string(),
         text: vec![1, 2, 3, 4],
     });
     let bytes = artifact.encode();

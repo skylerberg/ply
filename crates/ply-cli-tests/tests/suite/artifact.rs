@@ -988,7 +988,9 @@ fn a_build_schema_that_names_nothing_is_refused_at_build_time() {
 }
 
 /// A unit built for another runtime is left aside with a warning, and the run still answers from
-/// the pure fragment.
+/// the pure fragment. "Another runtime" is one whose helper table does not start with the unit's:
+/// the unit's own table, carried in its C, is rewritten so its first helper takes one argument
+/// more than this runtime's does.
 #[test]
 fn a_unit_built_for_another_runtime_is_left_aside_with_a_warning() {
     let dir = project("fn main() -> Int = 6 * 7\n");
@@ -997,7 +999,25 @@ fn a_unit_built_for_another_runtime_is_left_aside_with_a_warning() {
         .unit
         .as_mut()
         .expect("an artifact carries its unit");
-    unit.runtime = "another runtime".to_string();
+    let text = ply_codegen::c::bundle::unpack(&unit.text).unwrap();
+    let first = &ply_codegen::c::HELPERS[0];
+    let line = format!(
+        "\"{} {} {}\\n\"\n",
+        first.name,
+        first.args,
+        u8::from(first.answers)
+    );
+    assert_eq!(
+        text.matches(&line).count(),
+        1,
+        "the unit's table names its first helper once"
+    );
+    let foreign = line.replacen(
+        &format!(" {} ", first.args),
+        &format!(" {} ", first.args + 1),
+        1,
+    );
+    unit.text = ply_codegen::c::bundle::pack(&text.replacen(&line, &foreign, 1)).unwrap();
     write_artifact(&dir.path().join("m.plyx"), &artifact);
 
     let out = ply(dir.path()).args(["run", "m.plyx"]).output().unwrap();
