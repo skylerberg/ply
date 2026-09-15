@@ -1,7 +1,12 @@
-use super::*;
 use ply_eval::Value;
+use ply_host::db::stmt::Answer;
+use ply_host::db::types::{Datum, DbError, Json, Param};
+use ply_host::db::value::*;
+use ply_span::{Span, Symbol, codes};
 use rust_decimal::Decimal;
+use std::collections::BTreeMap;
 use std::str::FromStr;
+use std::sync::Arc;
 
 fn dec(s: &str) -> Decimal {
     Decimal::from_str(s).expect("a decimal")
@@ -9,11 +14,11 @@ fn dec(s: &str) -> Decimal {
 
 /// A `std.db` constructor as a `Value` carries one: **qualified**.
 fn ctor(name: &str, args: Vec<Value>) -> Value {
-    Value::ctor(super::ctor(crate::db::MODULE, name), args)
+    Value::ctor(ply_host::db::value::ctor(ply_host::db::MODULE, name), args)
 }
 
 fn json_ctor(name: &str, args: Vec<Value>) -> Value {
-    Value::ctor(super::ctor(JSON_MODULE, name), args)
+    Value::ctor(ply_host::db::value::ctor(JSON_MODULE, name), args)
 }
 
 #[test]
@@ -140,7 +145,7 @@ fn a_row_is_a_map_so_two_column_orders_are_one_value() {
 
 /// The name a `Value::Ctor` must carry: `std.db`'s own, qualified.
 fn qualified(name: &str) -> String {
-    format!("{}.{name}", crate::db::MODULE)
+    format!("{}.{name}", ply_host::db::MODULE)
 }
 
 #[test]
@@ -203,7 +208,7 @@ fn an_answer_is_one_of_three_shapes() {
 
 #[test]
 fn isolation_and_access_decode_to_the_levels_the_scope_table_names() {
-    use crate::db::scope::{Access, Isolation};
+    use ply_host::db::scope::{Access, Isolation};
     assert_eq!(
         isolation(&ctor("ReadCommitted", vec![]), Span::DUMMY).expect("decodes"),
         Isolation::ReadCommitted

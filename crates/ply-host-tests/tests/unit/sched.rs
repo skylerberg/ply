@@ -1,10 +1,14 @@
 //! The production scheduler, driven exactly as the machine drives it, against a host runtime backed
 //! by real threads.
 
-use super::*;
+use ply_eval::sched::{HostPolicy, Scheduler};
 use ply_eval::sched::{Policy, ROOT, Resumption, Turn};
+use ply_eval::sim::TASK_OPS;
 use ply_eval::{Continuation, HostRegistry, Pending, Prompt, Stack, TaskId, Value};
+use ply_eval::{HostBinding, HostRequest, HostRuntime, SimId};
+use ply_host::sched::*;
 use ply_span::SourceId;
+use ply_span::{Diagnostic, Span, Symbol, codes};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;

@@ -176,7 +176,7 @@ fn load_one(spec: &CredentialSpec) -> Result<Credential, Diagnostic> {
 }
 
 /// The provider, installed explicitly on each builder.
-fn provider() -> Arc<CryptoProvider> {
+pub fn provider() -> Arc<CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
 
@@ -386,16 +386,18 @@ impl Session {
 // --- Counting what went wrong ----------------------------------------------
 
 const REASON_CONFIGURATION: &str = "the listener's TLS configuration would not start a session";
-const REASON_NOT_TLS: &str = "the peer did not speak TLS, or a record was corrupt";
-const REASON_VERSION: &str = "no TLS version in common (this listener offers TLS 1.3 and TLS 1.2)";
-const REASON_PARAMETERS: &str = "no cipher suite, key exchange group or signature scheme in common";
-const REASON_ALPN: &str = "no application protocol in common (this listener offers http/1.1)";
-const REASON_ALERT: &str = "the peer sent a fatal alert and gave up";
-const REASON_MISBEHAVED: &str = "the peer sent a TLS message the protocol does not allow";
-const REASON_CERTIFICATE: &str = "the peer's certificate was refused";
-const REASON_GONE: &str = "the peer went away mid-handshake";
-const REASON_TRANSPORT: &str = "the connection failed mid-handshake";
-const REASON_OTHER: &str = "the TLS session failed";
+pub const REASON_NOT_TLS: &str = "the peer did not speak TLS, or a record was corrupt";
+pub const REASON_VERSION: &str =
+    "no TLS version in common (this listener offers TLS 1.3 and TLS 1.2)";
+pub const REASON_PARAMETERS: &str =
+    "no cipher suite, key exchange group or signature scheme in common";
+pub const REASON_ALPN: &str = "no application protocol in common (this listener offers http/1.1)";
+pub const REASON_ALERT: &str = "the peer sent a fatal alert and gave up";
+pub const REASON_MISBEHAVED: &str = "the peer sent a TLS message the protocol does not allow";
+pub const REASON_CERTIFICATE: &str = "the peer's certificate was refused";
+pub const REASON_GONE: &str = "the peer went away mid-handshake";
+pub const REASON_TRANSPORT: &str = "the connection failed mid-handshake";
+pub const REASON_OTHER: &str = "the TLS session failed";
 
 /// A deadline that expired, which is not an ending.
 fn expired(error: &io::Error) -> bool {
@@ -406,7 +408,7 @@ fn expired(error: &io::Error) -> bool {
 }
 
 /// Why a handshake was refused, as one of a **fixed** set of strings.
-fn reason(handshaking: bool, error: &io::Error) -> &'static str {
+pub fn reason(handshaking: bool, error: &io::Error) -> &'static str {
     if !handshaking {
         return REASON_TRANSPORT;
     }
@@ -460,11 +462,11 @@ struct Counts {
 }
 
 impl Handshakes {
-    fn completed(&self) {
+    pub fn completed(&self) {
         lock(&self.counts).completed += 1;
     }
 
-    fn refused(&self, reason: &'static str) {
+    pub fn refused(&self, reason: &'static str) {
         *lock(&self.counts).refused.entry(reason).or_default() += 1;
     }
 
@@ -591,6 +593,3 @@ fn err_duplicate(name: &str) -> Diagnostic {
     .note("a credential name selects one certificate and one key, so a repeat is two answers to one question")
     .note("give them different names, or pass only the one this run should serve")
 }
-
-#[cfg(test)]
-mod tests;

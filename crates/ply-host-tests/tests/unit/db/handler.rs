@@ -1,14 +1,19 @@
-use super::*;
-use crate::db::stmt::Answer;
-use crate::db::types::Datum;
+use ply_core::ty::Resource;
 use ply_core::ty::{EffectAtom, Footprint};
 use ply_eval::Value;
 use ply_eval::host::{Determinism, HostOp, Linearity};
+use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime};
+use ply_host::db::handler::*;
+use ply_host::db::stmt::Answer;
+use ply_host::db::types::Datum;
+use ply_host::db::{Op, value};
 use ply_span::Symbol;
+use ply_span::{Diagnostic, Span, codes};
+use std::sync::Arc;
 
 /// A `std.db` constructor, qualified as a `Value` carries one.
 fn ctor(name: &str, args: Vec<Value>) -> Value {
-    Value::ctor(format!("{}.{name}", crate::db::MODULE), args)
+    Value::ctor(format!("{}.{name}", ply_host::db::MODULE), args)
 }
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -45,20 +50,20 @@ impl Driver for Counting {
 
     fn begin(
         &self,
-        level: crate::db::scope::Isolation,
-        _: crate::db::scope::Access,
-        _: crate::db::scope::Owner,
+        level: ply_host::db::scope::Isolation,
+        _: ply_host::db::scope::Access,
+        _: ply_host::db::scope::Owner,
         _: Span,
     ) -> Result<HostAnswer, Diagnostic> {
         self.begins.fetch_add(1, Ordering::Relaxed);
         Ok(HostAnswer::Value(Value::str(level.as_str())))
     }
 
-    fn commit(&self, _: crate::db::scope::Owner, _: Span) -> Result<HostAnswer, Diagnostic> {
+    fn commit(&self, _: ply_host::db::scope::Owner, _: Span) -> Result<HostAnswer, Diagnostic> {
         Ok(HostAnswer::Value(Value::Unit))
     }
 
-    fn abort(&self, _: crate::db::scope::Owner, _: Span) -> Result<HostAnswer, Diagnostic> {
+    fn abort(&self, _: ply_host::db::scope::Owner, _: Span) -> Result<HostAnswer, Diagnostic> {
         Ok(HostAnswer::Value(Value::Unit))
     }
 }
@@ -107,11 +112,11 @@ fn perform_declared(
     let handler = Operation {
         op,
         driver: Arc::clone(driver) as Arc<dyn Driver>,
-        cache: Arc::new(crate::db::stmt::Cache::default()),
+        cache: Arc::new(ply_host::db::stmt::Cache::default()),
     };
     let declaration = declaration(op);
     let atom = EffectAtom::new(
-        Symbol::new(crate::db::EFFECT),
+        Symbol::new(ply_host::db::EFFECT),
         Resource::Named(Symbol::new(at)),
         ply_syntax::ast::Mode::Read,
     );
@@ -162,7 +167,7 @@ fn a_join_outside_the_declared_row_is_refused_before_the_statement_runs() {
     };
     let atom = |table: &str| {
         EffectAtom::new(
-            Symbol::new(crate::db::EFFECT),
+            Symbol::new(ply_host::db::EFFECT),
             Resource::Named(Symbol::new(table)),
             ply_syntax::ast::Mode::Read,
         )

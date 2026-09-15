@@ -90,7 +90,7 @@ impl Op {
     }
 
     /// The registration.
-    fn declaration(self, net: &dyn Net) -> HostOp {
+    pub fn declaration(self, net: &dyn Net) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
@@ -408,6 +408,3 @@ fn no_connection_scripted(span: Span) -> Diagnostic {
     .primary(span, "this accept would wait forever")
     .note("script another connection, or stop accepting after the ones there are")
 }
-
-#[cfg(test)]
-mod tests;

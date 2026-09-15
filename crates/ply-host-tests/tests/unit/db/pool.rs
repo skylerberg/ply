@@ -1,8 +1,11 @@
 //! What the pool has to get right, tested against a real server.
 
-use super::*;
+use ply_host::db::pool::*;
 use ply_span::Span;
+use ply_span::codes;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 /// The database this run may touch, or `None`.
 fn url() -> Option<String> {
@@ -248,7 +251,7 @@ fn acquiring_never_blocks_the_thread_that_asked() {
 
     // More outstanding operations than W1's blocking pool has threads.
     let started = std::time::Instant::now();
-    let pending: Vec<_> = (0..crate::tcp::MAX_BLOCKING_OPERATIONS * 2)
+    let pending: Vec<_> = (0..ply_host::tcp::MAX_BLOCKING_OPERATIONS * 2)
         .map(|_| {
             reactor
                 .borrow(span(), "`db.query`", simple("select 1"))

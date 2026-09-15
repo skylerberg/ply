@@ -279,6 +279,3 @@ fn unmapped(what: &str, ty: &tokio_postgres::types::Type, span: Span) -> Diagnos
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-#[cfg(test)]
-mod tests;
