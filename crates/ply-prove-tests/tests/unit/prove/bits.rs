@@ -1,7 +1,7 @@
 //! What the bit operators may and may not do to the `proved` tier.
 
-use super::tests::{attempt_for_test, fixture, not_proved, proof};
-use super::{Blocker, Decision};
+use super::{attempt_for_test, fixture, not_proved, proof};
+use ply_prove::prove::{Blocker, Decision};
 
 const BITS: &str = r#"
 law "a mask is a function" forall (x: Int, y: Int) { x & y == x & y }

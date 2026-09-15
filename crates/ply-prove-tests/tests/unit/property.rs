@@ -1,11 +1,19 @@
-use super::*;
-use crate::{DEFAULT_SHRINK_BUDGET, MIN_PROPERTY_CASES, Tier};
-use ply_core::{CheckOutput, EffectAtom, Resource, RowVar};
-use ply_eval::DEFAULT_MAX_CALLS;
+use ply_core::{CheckOutput, EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type, prelude};
 use ply_eval::interp::Pure;
-use ply_span::SourceId;
+use ply_eval::{DEFAULT_MAX_CALLS, Value};
+use ply_hash::DefHash;
+use ply_prove::property::{
+    EDGE_CASES, EDGE_INTS, GenStream, Judge, TypeWorld, Ungeneratable, draw_cases, generatable,
+    generate, run_property,
+};
+use ply_prove::{
+    DEFAULT_SHRINK_BUDGET, Discharge, Evidence, GEN_DEPTH, Gap, MIN_PROPERTY_CASES, ProvePlan,
+    Tier, VacuityKind,
+};
+use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_syntax::ast::{Mode, Program};
 use ply_syntax::resolve::Resolved;
+use std::collections::BTreeSet;
 
 /// A compiled fixture, so the generator is exercised against the type information the checker
 /// really produces rather than against a hand-built approximation of it.

@@ -1,8 +1,16 @@
 //! Every rule gets a true instance that is proved and a false instance that is **not**.
 
-use super::*;
-use crate::Rule;
+mod arith;
+mod bits;
+mod egraph;
+mod numerics;
+mod term;
+
 use ply_core::{CheckOutput, LawBinder, TyVar, Type};
+use ply_prove::prove::{
+    Blocker, Context, Decision, Goal, Limits, Proof, Reason, decide, decide_and_diagnose,
+};
+use ply_prove::{Rule, UNFOLD_DEPTH};
 use ply_span::{SourceId, Span, Symbol};
 use ply_syntax::ast::{Expr, Item, LawDef, Program, TypeExpr};
 use ply_syntax::resolve::Resolved;
@@ -10,13 +18,13 @@ use std::collections::BTreeMap;
 
 const SRC: SourceId = SourceId(0);
 
-pub(super) struct Fixture {
+struct Fixture {
     program: Program,
     resolved: Resolved,
     check: CheckOutput,
 }
 
-pub(super) fn fixture(source: &str) -> Fixture {
+fn fixture(source: &str) -> Fixture {
     let module = match ply_syntax::parse(SRC, source) {
         Ok(module) => module,
         Err(diagnostics) => panic!("parse: {:?}", messages(&diagnostics)),
@@ -42,11 +50,11 @@ fn messages(diagnostics: &[ply_span::Diagnostic]) -> Vec<String> {
 }
 
 impl Fixture {
-    pub(super) fn context(&self) -> Context<'_> {
+    fn context(&self) -> Context<'_> {
         Context::new(&self.program, &self.resolved, &self.check)
     }
 
-    pub(super) fn law(&self, label: &str) -> &LawDef {
+    fn law(&self, label: &str) -> &LawDef {
         self.program.modules[0]
             .items
             .iter()
@@ -84,7 +92,7 @@ fn resolve_type(ty: &TypeExpr, vars: &mut BTreeMap<Symbol, TyVar>) -> Type {
     }
 }
 
-pub(super) fn binders(law: &LawDef) -> Vec<LawBinder> {
+fn binders(law: &LawDef) -> Vec<LawBinder> {
     let mut vars = BTreeMap::new();
     law.binders
         .iter()
@@ -120,7 +128,7 @@ fn attempt_with(fixture: &Fixture, label: &str, limits: &Limits) -> Decision {
 
 /// [`decide_and_diagnose`] over a law, so a test can assert *why* an attempt was
 /// refused rather than only that it was.
-pub(super) fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
+fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Blocker>) {
     let ctx = f.context();
     let law = f.law(label);
     let binders = binders(law);
@@ -139,7 +147,7 @@ pub(super) fn attempt_for_test(f: &Fixture, label: &str) -> (Decision, Vec<Block
 }
 
 #[track_caller]
-pub(super) fn proof(fixture: &Fixture, label: &str) -> Proof {
+fn proof(fixture: &Fixture, label: &str) -> Proof {
     match attempt(fixture, label) {
         Decision::Proved(proof) => proof,
         other => panic!("`{label}` was expected to be proved, got {other:?}"),
@@ -147,7 +155,7 @@ pub(super) fn proof(fixture: &Fixture, label: &str) -> Proof {
 }
 
 #[track_caller]
-pub(super) fn not_proved(fixture: &Fixture, label: &str) {
+fn not_proved(fixture: &Fixture, label: &str) {
     if let Decision::Proved(proof) = attempt(fixture, label) {
         panic!("`{label}` must not be proved, but got a certificate: {proof:?}");
     }
@@ -571,7 +579,7 @@ fn a_non_recursive_definition_unfolds_to_the_stated_depth() {
         })
         .max()
         .expect("an unfolding");
-    assert!(deepest <= crate::UNFOLD_DEPTH, "{deepest}");
+    assert!(deepest <= UNFOLD_DEPTH, "{deepest}");
     not_proved(&f, "four unfoldings do not");
 }
 
