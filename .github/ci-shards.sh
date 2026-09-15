@@ -47,25 +47,26 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # partition's run outlasts its slowest test by much; lower it when the
 # per-job overhead -- checkout, a C compiler, the archive -- is most of a leg,
 # or when the jobs after `build` outnumber what the account runs at once and
-# queue: fourteen partitions queued for longer than the four fewer saved.
-PARTITIONS=10
+# queue: with five solo jobs, fourteen partitions queued for longer than the
+# four fewer saved; with two, twelve fit.
+PARTITIONS=12
 
-# Tests that get a runner of their own, as `id:package:target:test`. Each is
-# the longest thing in its binary and, by `.config/nextest.toml`, runs with
-# every test thread and nothing beside it -- so inside one job they would run
-# one after another, and the job would be their sum. On separate runners each
-# is its own wall clock. `verify` fails when a name here is not defined where
-# the table says, and every solo job asserts that it ran exactly one test.
+# Tests that get a runner of their own, as `id:package:target:test`. Each runs
+# the emitter over the compiler's own sources and, by `.config/nextest.toml`,
+# with every test thread and nothing beside it -- so in a partition it would
+# be that partition's whole floor. `verify` fails when a name here is not
+# defined where the table says, and every solo job asserts that it ran exactly
+# one test.
 #
 # A test of one of these binaries that is *not* named here still runs, in a
 # partition, alone within it: the override in `.config/nextest.toml` is on the
-# binary. Naming it here only moves it to a runner of its own.
+# binary. Naming it here only moves it to a runner of its own, which is worth a
+# job once it is the longest thing a partition would hold; the other emitter
+# differentials came down to seconds when they stopped spawning `ply` (#244)
+# and went back to the partitions.
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
   "emit-diff-own-sources:ply-compiler-diff:emit_diff:the_port_resolves_its_own_sources_to_the_references_c"
-  "emit-diff-census:ply-compiler-diff:emit_diff:the_census_of_what_keeps_the_port_out"
-  "emit-diff-corpus:ply-compiler-diff:emit_diff:the_port_resolves_to_the_references_c_over_the_shipped_corpus"
-  "emit-diff-agreement:ply-compiler-diff:emit_diff:the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches"
 )
 
 # The packages whose tests need a postgres server and cluster binaries. They
