@@ -275,7 +275,15 @@ fn the_port_resolves_to_the_references_c_over_the_shipped_corpus() {
 /// corpus reached.
 #[test]
 fn the_port_resolves_its_own_sources_to_the_references_c() {
-    let (reached, agreeing, differ) = resolved_against_reference("emitter", emitter_sources());
+    let sources = emitter_sources();
+    let lines: usize = sources.iter().map(|(_, text)| text.lines().count()).sum();
+    ply_codegen::c::producer::reset_census();
+    let (reached, agreeing, differ) = resolved_against_reference("emitter", sources);
+    // What emitting its own sources cost the compiled compiler, held to the census file: the
+    // value model's measure, read here where the work is already done (ADR 0051 §2).
+    if let Err(report) = ply_compiler_diff::census::hold("emitter-over-own-sources", lines) {
+        panic!("{report}");
+    }
     assert!(
         reached >= 2525,
         "the port emitted {reached} of its own bodies -- raise this when it grows, and lower it \

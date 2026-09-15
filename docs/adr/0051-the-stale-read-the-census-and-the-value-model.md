@@ -62,16 +62,29 @@ three are the compiled compiler's cost in the units the value model is
 about; resident memory of the harness process, which also runs the
 reference and holds both emitted units as text, is not.
 
-**Built when.** The runtime keeps the last entry's census where a test can
-read it, and the own-sources solo and the hash differential over the
-standard library read theirs after the comparison they already make and
-hold them to `benches/compiled-compiler.json` within a band the record
-fixes: allocations and recycled counts do not vary with a machine, so the
-band is narrow; chunk bytes vary with chunk growth and the band is wider.
-The file is written from a runner's reading, and the record says what the
-figures are per source line of the compiler and the standard library
-together, against what rustc, clang and a lean compiler take for the same
-lines, as magnitudes.
+**Built.** `ply_codegen::c::producer::census()` accumulates, per thread,
+what the compiled compiler's entries allocated and recycled and the most
+chunk bytes one held; the own-sources solo and the hash differential's
+first part read theirs after the comparison they already make and hold
+them to `benches/compiled-compiler.json`, within one per cent on the
+counts and a quarter on the bytes. The file was written from a runner's
+first reading, and a change to the value model is held to it from here.
+
+**Measured, 2026-09-15.** The emitter over its own sources, one entry over
+the compiler's and the standard library's twenty-eight thousand lines:
+two hundred million objects allocated, ninety-eight per cent of them
+recycled within the entry, and 334 MB of chunks at the end. That is seven
+thousand objects and twelve kilobytes of chunk per source line. The hasher
+over the standard library and half the examples, seven entries of some
+nine and a half thousand lines each: fifty-five million objects, ninety-four
+per cent recycled, 32 MB of chunks, about eight hundred objects per line
+per entry. For the same lines, as magnitudes, rustc and clang are in the
+low hundreds of objects and a few kilobytes per line, and a lean compiler
+in the tens of objects and under a kilobyte; the emitter is an order of
+magnitude past the heavy ones and two past the lean, in objects, and the
+recycling is what keeps the chunks to hundreds of megabytes rather than
+gigabytes. The allocation count, not the resident memory, is the figure
+the value model is held to.
 
 ## 3. The value model, measured
 
