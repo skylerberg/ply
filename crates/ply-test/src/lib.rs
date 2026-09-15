@@ -12,9 +12,6 @@ pub mod schedule;
 pub mod sim;
 pub mod slice;
 
-#[cfg(test)]
-mod tests;
-
 use ply_core::{CheckOutput, Footprint};
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};

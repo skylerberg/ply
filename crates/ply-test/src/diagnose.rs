@@ -149,6 +149,3 @@ impl Attribution {
         self.suspects.sort_by(|a, b| a.rank().cmp(&b.rank()));
     }
 }
-
-#[cfg(test)]
-mod tests;

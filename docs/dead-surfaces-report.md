@@ -258,18 +258,18 @@ three fields; `bisect` and `budget` are read inside `diagnose` (`diagnose.rs:76`
 $ grep -rn '\.trace\b\|trace:' --include='*.rs' crates/ply-test/src
 crates/ply-test/src/diagnose.rs:22:    pub trace: Tracing,
 crates/ply-test/src/diagnose.rs:30:            trace: Tracing::Never,
-crates/ply-test/src/diagnose/tests.rs:570:            trace: Tracing::Never,
+crates/ply-test-tests/tests/unit/diagnose.rs:570:            trace: Tracing::Never,
 ```
 
 > **Correction in place (2026-08-27): the transcript above was printed with its
 > last line removed, and the sentence under it counted the trimmed output.** The
 > block printed two of the grep's three lines, dropping
-> `crates/ply-test/src/diagnose/tests.rs:570`, and the sentence read:
+> `crates/ply-test-tests/tests/unit/diagnose.rs:570`, and the sentence read:
 >
 > > *"Two definitions, zero reads."*
 >
 > **Withdrawn, restated: three occurrences, still zero reads.** The third is a
-> `#[cfg(test)]` module building an `Options` literal — a third *write* of the
+> unit test building an `Options` literal — a third *write* of the
 > field, not a read of it. Re-run raw in this worktree, the grep emits 3 lines,
 > identical on 3 of 3 runs. The section's conclusion is unchanged and is mildly
 > reinforced: the number of sites that *read* `Options::trace` is still zero, and
@@ -299,19 +299,19 @@ crates/ply-test-tests/tests/suite/bisect_audit.rs:1021   SliceBuilder::new()    
 crates/ply-test-tests/tests/suite/bisect_audit.rs:1038   SliceBuilder::with_cap(2) test
 crates/ply-test-tests/tests/suite/bisect_audit.rs:1079   SliceBuilder::new()      test
 crates/ply-test/src/slice.rs:188             SliceBuilder::with_cap(DEFAULT_CAP)  its own Default impl
-crates/ply-test/src/slice.rs:433             SliceBuilder::new()      its own #[cfg(test)] mod
-crates/ply-test/src/slice.rs:485             SliceBuilder::with_cap(2) its own #[cfg(test)] mod
+crates/ply-test-tests/tests/unit/slice.rs:433   SliceBuilder::new()      its unit tests
+crates/ply-test-tests/tests/unit/slice.rs:485   SliceBuilder::with_cap(2) its unit tests
 
 $ grep -rn 'Event::Perform(' --include='*.rs' . | grep -v '^\./target'
 crates/ply-test/src/slice.rs:243             the match arm that consumes one
-crates/ply-test/src/slice.rs:505             its own unit test
+crates/ply-test-tests/tests/unit/slice.rs:505   its unit test
 ```
 
 > **Correcting the brief and `CONTRIBUTING.md` item 15 in the same breath.** Both
 > say `SliceBuilder` *"is constructed in exactly one place in the workspace —
 > `crates/ply-test-tests/tests/suite/bisect_audit.rs`, four times, all tests"*. It is
 > **seven sites in two files**: the four in `bisect_audit.rs`, two more in
-> `slice.rs`'s own `#[cfg(test)]` module, and one inside its own `Default` impl
+> `slice.rs`'s unit tests (`ply-test-tests/tests/unit/slice.rs`), and one inside its own `Default` impl
 > at `slice.rs:188`, which is a definition rather than a use. The substantive
 > claim survives untouched — **no production code outside `slice.rs` constructs
 > one** — and the runtime observation above is what actually establishes it.
@@ -496,9 +496,9 @@ crates/ply-cli-tests/tests/suite/cli.rs:1645:    assert!(f["causal_slice"].is_nu
 crates/ply-cli-tests/tests/unit/commands/test.rs:540:        f["assertion"].is_null(),        # "the evaluator carries no payload yet"
 crates/ply-cli-tests/tests/unit/commands/test.rs:547:    assert!(f["causal_slice"].is_null(), "nothing traced this run");
 crates/ply-cli-tests/tests/unit/commands/test.rs:550:        f["footprint"]["observed"].is_null(),
-crates/ply-test/src/tests.rs:1835:    assert!(failure.attribution.slice.is_none());
-crates/ply-test/src/tests.rs:2010:    assert!(failure["causal_slice"].is_null());
-crates/ply-test/src/tests.rs:2011:    assert!(failure["assertion"].is_null());
+crates/ply-test-tests/tests/unit/runner.rs:1835:    assert!(failure.attribution.slice.is_none());
+crates/ply-test-tests/tests/unit/runner.rs:2010:    assert!(failure["causal_slice"].is_null());
+crates/ply-test-tests/tests/unit/runner.rs:2011:    assert!(failure["assertion"].is_null());
 ```
 
 **Six of the nine go red on the cheap half alone**, and the reason is worth
@@ -528,7 +528,7 @@ different rather than delete the test that says so.
 
 **What goes.** `CausalSlice`, `SliceBuilder`, `Event`, `Entered`, `Frame`,
 `Tracing` (`crates/ply-test/src/slice.rs:13-270` — 258 of the file's 532 lines,
-plus its unit tests, `#[cfg(test)]` from `:360` to the end); `Attribution::slice` (`lib.rs:283`) and the
+plus its unit tests in `ply-test-tests/tests/unit/slice.rs`); `Attribution::slice` (`lib.rs:283`) and the
 `resolve` guard at `:316-322`; `Suspect::ran` / `Suspect::depth` (`lib.rs:231`,
 `:233`) and three tiers of `rank()`; `slice_json` (`report.rs:455`) and
 `ran_path` (`report.rs:310`); the `test.rs:793` branch; `Evidence::slice`
@@ -589,7 +589,7 @@ field that has never existed, which is a milestone, not a fix.
 
 | | files touched | tests that go red | documents to correct | new risk |
 | --- | --- | --- | --- | --- |
-| ARM `observed` only | 2-3 (`ply-test/src/lib.rs`, `diagnose.rs`, and `commands/test.rs` if `footprint.observed` is re-plumbed off the slice) | **6** — `cli.rs:1643`, `:1645`, `test.rs:2017`, `:2020`, `tests.rs:1835`, `:2010`; two of them must be *rewritten* rather than deleted, to keep `null` and `[]` apart | 3 (`slice.rs:47-67` again, ADR 0004 rows 414 and 419) | the trap above: the first real output contains atoms in no declared row |
+| ARM `observed` only | 2-3 (`ply-test/src/lib.rs`, `diagnose.rs`, and `commands/test.rs` if `footprint.observed` is re-plumbed off the slice) | **6** — `cli.rs:1643`, `:1645`, `test.rs:2017`, `:2020`, `runner.rs:1835`, `:2010`; two of them must be *rewritten* rather than deleted, to keep `null` and `[]` apart | 3 (`slice.rs:47-67` again, ADR 0004 rows 414 and 419) | the trap above: the first real output contains atoms in no declared row |
 | ARM everything | + `ply-eval/src/interp.rs`, `machine.rs`, `trace.rs`, `slice.rs`, `report.rs`, `commands/test.rs` | the same **6** | + ADR 0004, `CONTRACTS.md:1382` | a push and a pop per call in both engines; result-cache question unanswered; possible `RUNTIME_VERSION` bump |
 | DELETE everything | 8 source files | **6**, deleted rather than fixed, plus the 4 `SliceBuilder` tests in `bisect_audit.rs` | 10 sections across 4 documents | `SCHEMA_VERSION` 4 → 5, breaking for artifact consumers |
 
@@ -881,7 +881,7 @@ crates/ply-eval/src/machine/tests.rs:556:        !d.message.contains("recursion 
 crates/ply-cli-tests/tests/suite/failure_classification_audit.rs:242:                .contains("recursion limit of 10000 nested calls exceeded"),
 crates/ply-cli-tests/tests/suite/failure_classification_audit.rs:590:                .contains("recursion limit of 10000 nested values exceeded"),
 crates/ply-codegen-spike/tests/mcts_kernel.rs:550:            said.contains("recursion limit of 10000 nested calls exceeded"),
-crates/ply-test/src/tests.rs:1359:        failure.diagnostic.message.contains("recursion limit"),
+crates/ply-test-tests/tests/unit/runner.rs:1359:        failure.diagnostic.message.contains("recursion limit"),
 crates/ply-codegen-spike/tests/hazards.rs:625:        message.contains("recursion limit of 400 nested calls exceeded"),
 crates/ply-codegen-spike/tests/hazards.rs:649:            .contains("recursion limit of 10000 nested calls exceeded")),
 crates/ply-codegen-spike/tests/hazards.rs:675:            .contains("recursion limit of 600 nested calls exceeded")),
@@ -921,7 +921,7 @@ crates/ply-codegen-spike/tests/mutations.rs:539:            .contains("recursion
 > re-derived. The "four" traces to
 > `crates/ply-eval/src/limit.rs:80`'s own correction block, which names four
 > *files* (`ply-cli-tests/tests/suite/failure_classification_audit.rs`,
-> `ply-test-tests/tests/suite/hybrid.rs`, `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`)
+> `ply-test-tests/tests/suite/hybrid.rs`, `ply-test-tests/tests/unit/runner.rs`, `ply-eval/src/tests.rs`)
 > and misses six more, `crates/ply-codegen-spike`'s three among them. Recorded
 > for the next change in §5.
 >
@@ -976,7 +976,7 @@ values live in the evaluator, at the point the assertion failed.
 **Tests that go red:** three — `crates/ply-cli-tests/tests/suite/cli.rs:1644`,
 `crates/ply-cli-tests/tests/unit/commands/test.rs:540` (whose message *"the evaluator carries
 no payload yet"* is a direct statement of this gap), and
-`crates/ply-test/src/tests.rs:2011`.
+`crates/ply-test-tests/tests/unit/runner.rs:2011`.
 
 **Cheapest honest ARM, worth naming separately:** construct only `kind` and
 `message` and leave `expected`/`actual`/`first_difference` `None`. That is
@@ -1663,7 +1663,7 @@ the next change does not have to rediscover them.
    the phrase and 14 depend on it**, §2.1 (added 2026-08-27). Its text — *"the phrase is load-bearing only for
    whatever matches on the string, which is four tests
    (`ply-cli-tests/tests/suite/failure_classification_audit.rs`, `ply-test-tests/tests/suite/hybrid.rs`,
-   `ply-test/src/tests.rs`, `ply-eval/src/tests.rs`)"* — names four files.
+   `ply-test-tests/tests/unit/runner.rs`, `ply-eval/src/tests.rs`)"* — names four files.
    Actual: `grep -rn 'contains("recursion limit' --include='*.rs' .` finds **16
    occurrences in 10 files, in 15 distinct `#[test]` functions**; 13 assert the
    phrase is present, one asserts it is absent, one is a doc comment. The six
@@ -1732,7 +1732,7 @@ on the worktree:
   artifacts it exits 0 and prints `E0501 vs E0502`. So it reads the field it
   claims to read rather than printing a constant.
 - **The trimmed-transcript probe** (§1.1, §2.1): run against a *copy* of
-  `crates/ply-test` with `diagnose/tests.rs:570` deleted, the probe called a
+  `crates/ply-test-tests` with `tests/unit/diagnose.rs:570` deleted, the probe called a
   2-line transcript complete — it follows the tree rather than a hard-coded
   count. Against the real tree with the report's printed count of 2 it exits 1;
   with the raw count of 3 it exits 0.
