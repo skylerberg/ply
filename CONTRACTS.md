@@ -7269,8 +7269,8 @@ build time.
 
 ```
 header   0  magic        8    b"PLYPROG1"
-         8  format       u32  ARTIFACT_FORMAT = 1
-        12  flags        u32  bit 0: sources embedded
+         8  format       u32  ARTIFACT_FORMAT = 2
+        12  flags        u32  bit 0: sources embedded; bit 1: unit embedded
         16  frontend     32   blake3(FRONTEND_VERSION)
         48  runtime      32   blake3(RUNTIME_VERSION)
         80  body_enc     u32  BODY_ENCODING
@@ -7288,6 +7288,7 @@ header   0  magic        8    b"PLYPROG1"
 | 2 | `NAMES` | `{ name_off u32, name_len u32, hash [32] }` | name bytes |
 | 3 | `STRINGS` | the name blob | — |
 | 4 | `SOURCES` | present iff flag bit 0 | path |
+| 5 | `UNIT` | present iff flag bit 1: `{ runtime_len u32, runtime, text_len u32, text }`, the compiled unit's C gzipped, which carries its own tables (`ply_codegen::c::Exports`), and the digest of the runtime helper table it was emitted for | — |
 
 A target verifies **everything**, and each check answers a different question:
 every body against its own key — `blake3(bytes)`, or
@@ -7451,7 +7452,8 @@ and `stopping`, `HostOp::secrets`, `end_entry_point` closing spans; a cached
 `0.5.0`**: no new normalization tag (a `Secret<String>` in a signature is
 `Type::Con`, which already encodes by name), and no existing obligation's
 discharge can change, because `Secret` is a new type no law could have mentioned.
-`ARTIFACT_FORMAT` is `1`. That `BODY_ENCODING` stays is a **required test**, not
+`ARTIFACT_FORMAT` is `2`: the unit section carries the C alone, since the unit
+describes itself. That `BODY_ENCODING` stays is a **required test**, not
 an observation: the whole W4 corpus normalizes byte-for-byte identically, and the
 front-end cache is discarded on the `FRONTEND_VERSION` bump while the **result
 cache is untouched**, so no test re-runs for a reason other than a source edit.

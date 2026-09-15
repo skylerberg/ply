@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The generation of the container below.
-pub const ARTIFACT_FORMAT: u32 = 1;
+pub const ARTIFACT_FORMAT: u32 = 2;
 
 /// The extension `ply run` recognises, and the reason it does not have to guess.
 pub const EXTENSION: &str = "plyx";
@@ -47,18 +47,17 @@ const KIND_STRINGS: u32 = 3;
 const KIND_SOURCES: u32 = 4;
 const KIND_UNIT: u32 = 5;
 
-/// A checked program, identified by a digest.
-/// The compiled unit the Ply emitter produced over an artifact's definitions: the C (compressed),
-/// the record the runtime rebuilds its tables from, and the constructor table it was emitted
-/// against. `runtime` is the digest of the runtime's helper table the C was emitted for; a unit
-/// built for another is left aside.
+/// The compiled unit the Ply emitter produced over an artifact's definitions: its C, compressed,
+/// which carries its own tables and constructor table (`ply_codegen::c::Exports`). `runtime` is
+/// the digest of the runtime's helper table the C was emitted for; a unit built for another is
+/// left aside.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddedUnit {
     pub runtime: String,
-    pub ctors: Vec<(String, u32)>,
     pub text: Vec<u8>,
-    pub record: String,
 }
+
+/// A checked program, identified by a digest.
 
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Artifact {
@@ -152,13 +151,7 @@ impl Artifact {
             }
             let mut payload = Vec::new();
             put(&mut payload, unit.runtime.as_bytes());
-            payload.extend_from_slice(&(unit.ctors.len() as u32).to_le_bytes());
-            for (name, arity) in &unit.ctors {
-                put(&mut payload, name.as_bytes());
-                payload.extend_from_slice(&arity.to_le_bytes());
-            }
             put(&mut payload, &unit.text);
-            put(&mut payload, unit.record.as_bytes());
             sections.push((KIND_UNIT, 1, payload));
         }
 
@@ -321,13 +314,13 @@ fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
     let texts = crate::commands::common::module_texts(&loaded.program, &loaded.sources);
     let produced =
         ply_codegen::Unit::over_with_texts(&loaded.program, &loaded.resolved, &loaded.check, texts)
-            .and_then(|unit| unit.produce(&names).map(|produced| (unit, produced)))
-            .and_then(|(unit, produced)| {
+            .and_then(|unit| unit.produce(&names))
+            .and_then(|produced| {
                 let text = ply_codegen::c::bundle::pack(&produced.text)?;
-                Ok((unit, produced, text))
+                Ok((produced, text))
             });
     match produced {
-        Ok((unit, produced, text)) => {
+        Ok((produced, text)) => {
             let mut warnings = Vec::new();
             if !produced.refused.is_empty() {
                 let listed: Vec<String> = produced
@@ -349,13 +342,7 @@ fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
             }
             let unit = EmbeddedUnit {
                 runtime: ply_codegen::c::bundle::runtime_digest(),
-                ctors: unit
-                    .ctors()
-                    .iter()
-                    .map(|(name, arity)| (name.to_string(), *arity as u32))
-                    .collect(),
                 text,
-                record: ply_codegen::c::cache::encode_unit(&produced.record),
             };
             (Some(unit), warnings)
         }
@@ -611,38 +598,16 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
             .map_err(|_| invalid(path, "the unit's runtime digest is not valid UTF-8"))?
             .to_string();
         at += 4 + runtime_len;
-        let n = r.u32(at)? as usize;
-        at += 4;
-        let mut ctors = Vec::with_capacity(n);
-        for _ in 0..n {
-            let name_len = r.u32(at)? as usize;
-            let name = std::str::from_utf8(r.slice(at + 4, name_len)?)
-                .map_err(|_| invalid(path, "a unit constructor name is not valid UTF-8"))?
-                .to_string();
-            let arity = r.u32(at + 4 + name_len)?;
-            ctors.push((name, arity));
-            at += 8 + name_len;
-        }
         let text_len = r.u32(at)? as usize;
         let text = r.slice(at + 4, text_len)?.to_vec();
         at += 4 + text_len;
-        let record_len = r.u32(at)? as usize;
-        let record = std::str::from_utf8(r.slice(at + 4, record_len)?)
-            .map_err(|_| invalid(path, "the unit's record is not valid UTF-8"))?
-            .to_string();
-        at += 4 + record_len;
         if at != end {
             return Err(invalid(
                 path,
                 format!("the unit section has {} bytes nothing claims", end - at),
             ));
         }
-        out.unit = Some(EmbeddedUnit {
-            runtime,
-            ctors,
-            text,
-            record,
-        });
+        out.unit = Some(EmbeddedUnit { runtime, text });
     }
 
     let computed = digest_of(bytes).ok_or_else(|| truncated(path, 0, OFF_SECTIONS, bytes.len()))?;
@@ -1209,17 +1174,9 @@ fn evaluate(
                 format!("the artifact's compiled unit could not be entered: {e:#}"),
             )
         };
-        let embedded = ply_codegen::Embedded {
-            text: ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?,
-            record: unit.record.clone(),
-            ctors: unit
-                .ctors
-                .iter()
-                .map(|(name, arity)| (Symbol::new(name), *arity as usize))
-                .collect(),
-        };
+        let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
         let provider =
-            ply_codegen::Unit::embedded(&opened.program, &opened.resolved, &opened.check, embedded)
+            ply_codegen::Unit::embedded(&opened.program, &opened.resolved, &opened.check, text)
                 .map_err(|e| unit_error(&e))?;
         let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
         machine.set_compiled(ply_eval::Provider::attach(provider, &spec));
