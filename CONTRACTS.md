@@ -7978,7 +7978,7 @@ the_fixtures_produce_the_codes_they_are_named_for`.
 `chunk_trailers` writes `{..state.limits, max_header_bytes:
 state.limits.max_trailer_bytes}`. **Every limit it does not deliberately replace
 is copied from the limit of the same name**, which is asserted on the parsed tree
-at `crates/ply-cli/tests/suite/stdlib.rs
+at `crates/ply-cli-tests/tests/suite/stdlib.rs
 chunk_trailers_copies_every_limit_it_does_not_replace` — a test that goes red on
 a mispairing while `ply check` stays green, because all thirteen `Limits` fields
 are `Int`. The same assertion covers the three converted test helpers

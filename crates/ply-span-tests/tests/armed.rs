@@ -1659,7 +1659,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          twice: `run_with` records under `Executor::engine`, so a pass goes into the \
          installed backend's namespace and never the evaluator's, and `cache_bypassed` \
          reads the spec so a backend that is wrong on purpose gets no store in either \
-         direction. crates/ply-cli/tests/suite/cli.rs holds both — \
+         direction. crates/ply-cli-tests/tests/suite/cli.rs holds both — \
          `one_engines_pass_is_never_another_engines` and \
          `a_corrupt_backend_neither_reads_nor_writes_the_cache` — each seen to fail.",
     ),
@@ -1669,7 +1669,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          `main`. `ply run` has no result cache: nothing it answers is a `Pass`, nothing is \
          read before `main` and nothing is recorded after it, so neither half of the rule \
          has a route to break. `run_attaches_a_backend_to_main_and_refuses_a_spec_it_cannot_parse` \
-         in crates/ply-cli/tests/suite/backend.rs runs `main` under both backends and was \
+         in crates/ply-cli-tests/tests/suite/backend.rs runs `main` under both backends and was \
          seen to fail, on the seam memo walking a scalar answer for parts.",
     ),
     (
@@ -1685,7 +1685,7 @@ const BACKEND_INSTALLERS: &[(&str, &str)] = &[
          namespace and a spec that is wrong on purpose keeps `c/wrong:..`. \
          `the_default_tier_and_backend_c_are_one_engine` and \
          `a_corrupt_backend_neither_reads_nor_writes_the_cache` in \
-         crates/ply-cli/tests/suite/cli.rs, each seen to fail.",
+         crates/ply-cli-tests/tests/suite/cli.rs, each seen to fail.",
     ),
     (
         "crates/ply-corpus/src/lib.rs",
