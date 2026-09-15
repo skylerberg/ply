@@ -64,21 +64,24 @@ the fixpoint compares the C, table included. A unit can now be linked
 against with none of its sources present, which is the first piece of
 separate compilation.
 
-### 2. The heap reuses in every profile
+### 2. The heap reuses in every profile — done, as a bounded quarantine
 
-`crates/ply-codegen/src/heap.rs` reuses dead blocks in a release build and
-not in a debug one, so that a read of a dead object in a debug build finds
+`crates/ply-codegen/src/heap.rs` reused dead blocks in a release build and
+not in a debug one, so that a read of a dead object in a debug build found
 the marker. The consequence: a debug `ply`, or a debug test binary, entering
-the compiler over a large input allocates without bound and is killed by the
-runner. A run's worth of CI jobs died that way before it was understood, and
-the workaround is `heap::reuse_by_default(true)` at the top of every test that
-enters the bundle, which is a thing a contributor has to know.
+the compiler over a large input allocated without bound and was killed by
+the runner. A run's worth of CI jobs died that way before it was understood,
+and the workaround was `heap::reuse_by_default(true)` at the top of every
+test that enters the bundle, which is a thing a contributor had to know.
 
-**Fix.** Reuse is the default in every profile. No-reuse becomes an explicit
-mode, `PLY_HEAP_NO_REUSE` or a `Heap` constructor the use-after-free tests
-call, and the `reuse_by_default` switch and every call to it are deleted.
-The debug build's marker check is kept where it is armed: the tests that
-exercise release itself.
+**Built.** Every build reuses. A debug build holds a dead block in a
+quarantine first, oldest out, bounded by `heap::QUARANTINE` bytes, so a
+stale read still finds the marker for a while and an entry's memory is what
+it holds plus the bound, never what it ever held. The record first said
+reuse everywhere with no-reuse as an explicit mode; the quarantine keeps the
+net the suites run under without a switch, so no test has to know it is
+there. The switch and every call to it are gone; `Heap::set_quarantine(0)`
+is what a test of the recycling itself asks for.
 
 ### 3. The emitter's inner loops, held to the hasher
 

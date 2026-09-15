@@ -12,10 +12,11 @@
 //!
 //! Every object an entry allocates is logged, and [`Heap::end`] releases the log: a count that
 //! reaches zero dismantles its object then and there — its children let go, a bridged value
-//! dropped — and in a release build its memory goes back to the entry's free list for its size
-//! class, so an entry's memory is bounded by what it holds; in a debug build the memory waits
-//! for the end of the entry instead, so a stale reference reads a `DEAD` header rather than
-//! someone else's object, which is the net the suites run under.
+//! dropped — and its memory goes back to the entry's free list for its size class, so an
+//! entry's memory is bounded by what it holds. A debug build holds a dead block back in a
+//! bounded quarantine first, oldest out, so a stale reference reads a `DEAD` header for a while
+//! rather than someone else's object: the net the suites run under, at a cost of the quarantine
+//! and never of everything the entry ever held.
 
 use crate::list;
 use crate::map;
@@ -345,15 +346,26 @@ pub struct Heap {
     recycled: usize,
     /// Dead objects by size class, for an allocation of that class to take before the bump
     /// pointer moves: what keeps an entry's memory bounded by what it holds rather than by what
-    /// it ever held. Filled only while `reuse` is set, which a release build does and a debug
-    /// build does not, so the tests keep reading a stale word as a dead header.
+    /// it ever held.
     free: Vec<Vec<*mut Obj>>,
     /// Dead objects past the small classes, by the power of two their block was rounded up to:
     /// a program that builds a large string by appending would otherwise keep every version it
     /// let go until the entry ends.
     large: Vec<Vec<*mut Obj>>,
-    reuse: bool,
+    /// Dead blocks held back from the free lists, oldest first, with each one's block size, so
+    /// that a read through a stale word finds a dead header for a while yet rather than whatever
+    /// took the block. `quarantine` bounds it in bytes; at zero a dead block is reusable at once.
+    held: std::collections::VecDeque<(*mut Obj, usize)>,
+    held_bytes: usize,
+    quarantine: usize,
 }
+
+/// How many bytes of dead blocks a heap holds back before recycling the oldest: a debug build
+/// keeps the net, a release build keeps nothing. Bounded, because a heap that kept every dead
+/// block until the entry's end needed a runner nothing here can have -- the emitter emitting its
+/// own sources allocates two hundred million objects in one entry -- and every test that entered
+/// it had to know to switch the net off.
+pub const QUARANTINE: usize = if cfg!(debug_assertions) { 64 << 20 } else { 0 };
 
 /// The size classes a dead object is kept in, in words; anything larger goes back only at the
 /// entry's end.
@@ -399,7 +411,7 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
         return;
     }
     unsafe {
-        if !(*heap).reuse || (*o).kind == KIND_BRIDGE {
+        if (*o).kind == KIND_BRIDGE {
             return;
         }
         let size = payload_bytes(o);
@@ -407,20 +419,19 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             return;
         }
         let object = Heap::object_size(size);
-        if let Some(class) = Heap::large_class(object) {
-            let large = &mut (*heap).large;
-            if large.len() <= class {
-                large.resize_with(class + 1, Vec::new);
-            }
-            large[class].push(o);
+        let heap = &mut *heap;
+        if heap.quarantine == 0 {
+            heap.free_list(object).push(o);
             return;
         }
-        let class = object / 8;
-        let free = &mut (*heap).free;
-        if free.len() <= class {
-            free.resize_with(class + 1, Vec::new);
+        heap.held.push_back((o, object));
+        heap.held_bytes += object;
+        while heap.held_bytes > heap.quarantine
+            && let Some((old, bytes)) = heap.held.pop_front()
+        {
+            heap.held_bytes -= bytes;
+            heap.free_list(bytes).push(old);
         }
-        free[class].push(o);
     }
 }
 
@@ -437,16 +448,6 @@ const LARGEST_CHUNK: usize = 64 << 20;
 pub const HEAP_CUR: usize = 0;
 pub const HEAP_END: usize = 8;
 
-/// What every heap made from here on reuses by default: unset, a release build reuses and a
-/// debug build does not, so that a read of a dead object in a debug build finds the marker
-/// rather than whatever took the block. A test whose workload allocates past what a runner
-/// holds turns it on, and gives up that detection for its run.
-static REUSE_BY_DEFAULT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
-
-pub fn reuse_by_default(on: bool) {
-    REUSE_BY_DEFAULT.store(u8::from(on), std::sync::atomic::Ordering::Relaxed);
-}
-
 impl Heap {
     pub fn new() -> Heap {
         Heap {
@@ -461,18 +462,29 @@ impl Heap {
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
-            reuse: match REUSE_BY_DEFAULT.load(std::sync::atomic::Ordering::Relaxed) {
-                0 => false,
-                1 => true,
-                _ => !cfg!(debug_assertions),
-            },
+            held: std::collections::VecDeque::new(),
+            held_bytes: 0,
+            quarantine: QUARANTINE,
         }
     }
 
-    /// Whether dead objects are reused within an entry: on in a release build, off in a debug
-    /// one, and set here by a test that exercises the reuse itself.
-    pub fn set_reuse(&mut self, reuse: bool) {
-        self.reuse = reuse;
+    /// How many bytes of dead blocks this heap holds back before recycling the oldest; zero
+    /// recycles at once, which is what a test of the recycling itself asks for.
+    pub fn set_quarantine(&mut self, bytes: usize) {
+        self.quarantine = bytes;
+    }
+
+    /// The free list a dead block of `object` bytes goes to: its size class, or the power of two
+    /// past the small classes.
+    fn free_list(&mut self, object: usize) -> &mut Vec<*mut Obj> {
+        let (lists, class) = match Heap::large_class(object) {
+            Some(class) => (&mut self.large, class),
+            None => (&mut self.free, object / 8),
+        };
+        if lists.len() <= class {
+            lists.resize_with(class + 1, Vec::new);
+        }
+        &mut lists[class]
     }
 
     /// A heap whose entries never end: what outlives every entry lives here.
@@ -852,6 +864,8 @@ impl Heap {
         for class in &mut self.large {
             class.clear();
         }
+        self.held.clear();
+        self.held_bytes = 0;
         for bits in &mut self.starts {
             bits.fill(0);
         }

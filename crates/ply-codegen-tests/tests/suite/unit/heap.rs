@@ -45,7 +45,7 @@ fn two_byte_strings_compare_in_byte_order_at_every_length() {
 #[test]
 fn a_flat_record_is_released_without_a_walk_and_loses_the_flag_when_it_gains_a_count() {
     let mut h = Heap::new();
-    h.set_reuse(true);
+    h.set_quarantine(0);
     let o = h.alloc(KIND_RECORD, FLAT, 2, 0);
     unsafe {
         set_word(o, 0, imm(1));
@@ -190,7 +190,7 @@ fn the_last_holder_dismantles_and_the_memory_waits_for_the_end() {
 #[test]
 fn a_dead_object_is_reused_by_the_next_of_its_class_within_an_entry() {
     let mut h = Heap::new();
-    h.set_reuse(true);
+    h.set_quarantine(0);
     enter(&mut h);
     let l = layouts();
     let first = h.to_word(&l, &Value::list(vec![Value::Int(1), Value::Int(2)]));
