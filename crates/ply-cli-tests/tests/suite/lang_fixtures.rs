@@ -160,3 +160,9 @@ fn the_byte_builtins_raises_are_the_same_on_both_engines() {
     check("bytes_raise", false);
     check("bytes_raise", true);
 }
+
+#[test]
+fn the_list_update_raises_are_the_same_on_both_engines() {
+    check("lists_raise", false);
+    check("lists_raise", true);
+}

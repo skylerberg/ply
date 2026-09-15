@@ -1008,9 +1008,11 @@ impl Walk<'_, '_> {
             };
         };
         match b {
-            // Each builds a fresh `Vec` and hands it back; `push`'s two arms both answer a list
-            // nothing else has seen.
-            Builtin::Push | Builtin::Map | Builtin::Filter | Builtin::Range => Owner::Fresh,
+            // Each builds a fresh `Vec` and hands it back; `push`'s two arms, and `list_set`'s,
+            // both answer a list nothing else has seen.
+            Builtin::Push | Builtin::ListSet | Builtin::Map | Builtin::Filter | Builtin::Range => {
+                Owner::Fresh
+            }
             Builtin::CellGet => Owner::Blocked(Why::new(
                 Cause::Cell,
                 "`cell_get` answers a clone the region's arena still holds — the append cannot \
