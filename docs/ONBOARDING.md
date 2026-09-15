@@ -155,14 +155,14 @@ on a quiet machine and has been seen to fail on one busy compiling something
 else. **If it is your only failure, re-run before you believe it.**
 
 Several more assert a performance figure the same way. `.github/ci-shards.sh`'s
-`DEFERRED` table is the list, and it is maintained by *running the shards*, not
+`DEFERRED` table is the list, and it is maintained by *running the suite*, not
 by surveying the tree — two surveys declared themselves complete and each was
-proved wrong within the hour by a shard going red on a test neither had found.
+proved wrong within the hour by a run going red on a test neither had found.
 One of them reads no Rust clock at all; it parses milliseconds out of `ply
 test`'s own output, so no timing vocabulary appears in it.
 
-CI runs every deferred test alone, single-threaded, on its own runner, and the
-parallel shards skip them. If you add a test that asserts on elapsed time, add
+CI runs every deferred test alone, single-threaded, after everything else in
+its job, and the partitions skip them. If you add a test that asserts on elapsed time, add
 it to that table too — and prefer asserting on a *count* (allocations, copies,
 passes) over a duration wherever the question allows it, because a count does
 not depend on what else the machine is doing.

@@ -5,7 +5,7 @@
 set -euo pipefail
 
 root=$(cd "$(dirname "$0")/.." && pwd)
-bin=${1:-$root/target/release/ply}
+bin=${1:-${PLY_BIN:-$root/target/release/ply}}
 dir=$(mktemp -d)
 trap 'rm -rf "$dir"' EXIT
 

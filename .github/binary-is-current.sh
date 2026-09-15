@@ -2,7 +2,7 @@
 #
 # Is the binary I am about to measure with built from the tree I am looking at?
 #
-#   .github/binary-is-current.sh                    # target/release/ply
+#   .github/binary-is-current.sh                    # target/release/ply, or $PLY_BIN
 #   .github/binary-is-current.sh target/debug/ply target/release/ply-corpus
 #   .github/binary-is-current.sh --self-test        # watch the check go red
 #
@@ -213,7 +213,7 @@ verdict_for() {                      # 0 current, 1 stale, 2 unanswerable
 # the stdlib, and the mtime arm writes a dep-info of its own under a scratch
 # directory.
 run_self_test() {
-  local bin="$root/target/release/ply" tmp rc=0 out arc
+  local bin="${PLY_BIN:-$root/target/release/ply}" tmp rc=0 out arc
   [ -x "$bin" ] || { echo "self-test needs $(rel "$bin"); build it first" >&2; exit 2; }
   tmp=$(mktemp -d)
 
@@ -300,7 +300,7 @@ if [ "$self_test" -eq 1 ]; then
   exit $?
 fi
 
-if [ ${#targets[@]} -eq 0 ]; then targets=("target/release/ply"); fi
+if [ ${#targets[@]} -eq 0 ]; then targets=("${PLY_BIN:-target/release/ply}"); fi
 
 status=0
 for t in "${targets[@]}"; do
