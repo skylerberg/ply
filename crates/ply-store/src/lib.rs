@@ -5,17 +5,14 @@
 mod binary;
 mod bodies;
 mod canonical;
-mod codec;
-mod diag;
-mod disk;
+pub mod codec;
+pub mod diag;
+pub mod disk;
 pub mod frontend;
 mod idx;
 pub mod obligations;
 pub mod reviews;
-mod schema;
-
-#[cfg(test)]
-mod tests;
+pub mod schema;
 
 use anyhow::Context;
 use ply_hash::DefHash;

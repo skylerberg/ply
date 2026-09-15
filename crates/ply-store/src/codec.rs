@@ -342,7 +342,7 @@ fn get_symbols(r: &mut Reader, what: &'static str) -> Decoded<Vec<ply_span::Symb
 
 /// The witness comes first so that [`peek_names`] can identify which definition an entry belongs to
 /// without decoding a scheme it is about to discard.
-pub(crate) fn encode_def(def: &CachedDef) -> Vec<u8> {
+pub fn encode_def(def: &CachedDef) -> Vec<u8> {
     let mut w = Writer::new();
     w.tag(tag::CACHED_DEF);
     put_names(&mut w, &def.names);
@@ -384,7 +384,7 @@ pub(crate) fn decode_def(bytes: &[u8]) -> Decoded<CachedDef> {
     })
 }
 
-pub(crate) fn encode_decl(decl: &CachedDecl) -> Vec<u8> {
+pub fn encode_decl(decl: &CachedDecl) -> Vec<u8> {
     let mut w = Writer::new();
     w.tag(tag::CACHED_DECL);
     put_names(&mut w, &decl.names);
@@ -486,7 +486,7 @@ pub(crate) fn decode_decl(bytes: &[u8]) -> Decoded<CachedDecl> {
     Ok(CachedDecl { body, names })
 }
 
-pub(crate) fn encode_body(body: &DefBody) -> Vec<u8> {
+pub fn encode_body(body: &DefBody) -> Vec<u8> {
     let mut w = Writer::new();
     w.tag(tag::DEF_BODY);
     w.u32(body.encoding());
@@ -524,7 +524,7 @@ fn get_kind(r: &mut Reader) -> Decoded<DefKind> {
     }
 }
 
-pub(crate) fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
+pub fn encode_fingerprint(f: &SourceFingerprint) -> Vec<u8> {
     let mut w = Writer::new();
     w.tag(tag::FINGERPRINT);
     w.content_hash(f.content_hash);

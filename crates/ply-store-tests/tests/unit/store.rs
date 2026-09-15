@@ -1,6 +1,8 @@
-use super::*;
-use ply_span::{Severity, Span, codes as span_codes};
+use ply_hash::DefHash;
+use ply_span::{Diagnostic, Severity, Span, Symbol, codes as span_codes};
+use ply_store::*;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A unique directory under the system temp dir, removed on drop.
@@ -1441,7 +1443,7 @@ fn corrupt_pass_records_warn_and_do_not_claim_the_test_never_passed() {
     let warning = warnings
         .first()
         .expect("an unreadable baseline has to be reported");
-    assert_eq!(warning.code, crate::codes::CACHE_CORRUPT);
+    assert_eq!(warning.code, ply_store::codes::CACHE_CORRUPT);
     assert!(
         warning.message.contains("pass records"),
         "the failing file has to be named: {}",
@@ -2128,25 +2130,27 @@ fn the_front_end_entry_encoding_is_pinned() {
     let found: Vec<(&str, String)> = vec![
         (
             "fingerprint",
-            digest(&crate::codec::encode_fingerprint(&pin_fingerprint())),
+            digest(&ply_store::codec::encode_fingerprint(&pin_fingerprint())),
         ),
         (
             "def",
-            digest(&crate::codec::encode_def(&pin_def().canonicalized())),
+            digest(&ply_store::codec::encode_def(&pin_def().canonicalized())),
         ),
         (
             "type declaration",
-            digest(&crate::codec::encode_decl(&pin_type_decl().canonicalized())),
+            digest(&ply_store::codec::encode_decl(
+                &pin_type_decl().canonicalized(),
+            )),
         ),
         (
             "effect declaration",
-            digest(&crate::codec::encode_decl(
+            digest(&ply_store::codec::encode_decl(
                 &pin_effect_decl().canonicalized(),
             )),
         ),
         (
             "body",
-            digest(&crate::codec::encode_body(&body(&[0x20, 0xca, 0xfe]))),
+            digest(&ply_store::codec::encode_body(&body(&[0x20, 0xca, 0xfe]))),
         ),
     ];
     let pinned = [
