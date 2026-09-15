@@ -130,14 +130,26 @@ fn build_from(src: &Sources) -> Result<PlyProducer, String> {
     let bundle = (std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off"))
         .then(|| super::bundle::of(src))
         .flatten();
+    let from_reference = || -> Result<(super::Native, Vec<super::Refused>), String> {
+        let source = front_end(src)?;
+        let names: Vec<String> = source.functions();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        super::build(source, &refs).map_err(|e| format!("{e:#}"))
+    };
     let (native, _refused) = match bundle {
-        Some(bundle) => super::bundle::build(&bundle).map_err(|e| format!("{e:#}"))?,
-        None => {
-            let source = front_end(src)?;
-            let names: Vec<String> = source.functions();
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            super::build(source, &refs).map_err(|e| format!("{e:#}"))?
-        }
+        Some(bundle) => match super::bundle::build(&bundle) {
+            Ok(built) => built,
+            // A bundle emitted against a helper table this runtime's does not start with is
+            // the one thing the reference still builds the emitter for, so a refresh can start.
+            Err(e) if e.downcast_ref::<super::exports::Unserved>().is_some() => {
+                eprintln!(
+                    "the bootstrap bundle does not serve: {e:#}; the reference builds the emitter"
+                );
+                from_reference()?
+            }
+            Err(e) => return Err(format!("{e:#}")),
+        },
+        None => from_reference()?,
     };
     PlyProducer::new(native).map_err(|e| format!("{e:#}"))
 }
