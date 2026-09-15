@@ -1026,28 +1026,21 @@ test \"ten simulated minutes cost no wall clock\" {
 
 /// `clock.sleep` moves a region's virtual time and waits for nothing: the whole reason a test can
 /// assert a retry backoff, and the property a real sleep in the runtime would quietly take away.
-/// The bound is wall clock, so this test is in `.github/ci-shards.sh`'s `DEFERRED` table and runs
-/// with the rest of the suite finished.
+/// The program asserts the jump; that the ten minutes were not waited out is a `slow-timeout` on
+/// this test in `.config/nextest.toml`, which kills the process rather than reading a clock here.
 #[test]
 fn a_simulated_sleep_is_a_jump_rather_than_a_wait() {
     let dir = project(SLEEPER);
-    let started = std::time::Instant::now();
     let out = ply(dir.path())
         .args(["test", "--no-cache"])
         .output()
         .unwrap();
-    let elapsed = started.elapsed();
     let text = format!(
         "{}{}",
         stdout_of(&out),
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.status.code(), Some(0), "{text}");
-    assert!(
-        elapsed < std::time::Duration::from_secs(60),
-        "the run took {elapsed:?}, so the ten simulated minutes were waited out rather than \
-         jumped over -- compiling the unit is the only wall clock this should spend:\n{text}"
-    );
 }
 
 // --- tasks under --host -----------------------------------------------------

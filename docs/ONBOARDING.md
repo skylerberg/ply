@@ -147,25 +147,20 @@ something the environment may not have, make the absent case *loud*. A skip
 notice on stderr is the minimum; a CI step that fails when it finds that notice
 is what actually holds. Asserting the test count does not substitute — a gated
 test returns early and passes, so the count is right with nothing behind it.
-### Some tests assert on a wall clock and run by default
+### A timing claim is a count, or it is not asserted
 
-`ply-eval-tests/tests/allocation/region_arena_cost.rs::snapshot_cost_as_a_function_of_region_size`
-asserts on a timing growth ratio and is **not** in the `ignored` set. It passes
-on a quiet machine and has been seen to fail on one busy compiling something
-else. **If it is your only failure, re-run before you believe it.**
+A timing claim in the suite is asserted as a count — allocations, bytes,
+copies, frames, entries — or not at all. A count does not depend on what else
+the machine is doing; a duration does, and a ratio or a budget read off a clock
+passes or fails on the load rather than on the code. The benchmarks that do
+read a clock are `ignored`, run on purpose, and print rather than assert;
+`README.md` names them.
 
-Several more assert a performance figure the same way. `.github/ci-shards.sh`'s
-`DEFERRED` table is the list, and it is maintained by *running the suite*, not
-by surveying the tree — two surveys declared themselves complete and each was
-proved wrong within the hour by a run going red on a test neither had found.
-One of them reads no Rust clock at all; it parses milliseconds out of `ply
-test`'s own output, so no timing vocabulary appears in it.
-
-CI runs every deferred test alone, single-threaded, after everything else in
-its job, and the partitions skip them. If you add a test that asserts on elapsed time, add
-it to that table too — and prefer asserting on a *count* (allocations, copies,
-passes) over a duration wherever the question allows it, because a count does
-not depend on what else the machine is doing.
+If you add a test whose question is "how long", ask for the count behind it —
+what was allocated, copied or decoded — and assert that. Where the only bound
+is on the process, a simulated sleep that must not be waited out,
+`.config/nextest.toml` carries a `slow-timeout` for that test, so nextest kills
+the run rather than the test reading a clock.
 ## 3. Run the examples
 
 All four commands below were run and their output is what is shown.
