@@ -175,19 +175,23 @@ command rather than one sentence.
 
 ## The suite
 
-### 6. `examples/same-tests.sh` becomes tests
+### 6. `examples/same-tests.sh` becomes tests — done
 
-The `same-tests` job is the longest downstream job and it is serial: the
+The `same-tests` job was the longest downstream job and it was serial: the
 script plus the named steps around it in `ci.yml`, each a shell assertion
-over the release `ply`. A step cannot be partitioned, retried alone, filtered by name
-or run under nextest's timeout. Each already has the shape of a test in
-`ply-cli-tests` or `ply-corpus-tests`.
+over the release `ply`. A step cannot be partitioned, retried alone,
+filtered by name or run under nextest's timeout.
 
-**Fix.** Each step becomes a named test over the built `ply`, the script
-keeps only its database management, and the job is deleted; the tests
-partition with everything else. The fresh-program cost instrument stays as
-the one step that is a measurement rather than an assertion, or moves into
-`probes/`.
+**Built.** The steps are `ply-cli-tests`' `corpus` module, eight tests over
+the `ply` the suite already drives: examples on the code generator, the
+whole emitter over examples, the compiler's own tests with the tier as the
+only engine, the language corpus on both tiers, examples and the standard
+library tier-only, the propositions judged, the served example with the
+tier holding its accept loop, and the long input hashed. The compiler's own
+tests run alone, as a third `solo` entry. `examples/same-tests.sh` itself
+needs a server, so it runs in `test-postgres` against that job's, and the
+fresh-program cost instrument moved beside the binary it measures, in
+`build-ply`. The job and `.github/served-with-tier.sh` are gone.
 
 ### 7. The deferred table empties
 
