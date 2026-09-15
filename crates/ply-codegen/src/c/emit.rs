@@ -902,7 +902,7 @@ impl<'a> Emit<'a> {
                 else_branch,
             } => self.if_expr(cond, then_branch, else_branch),
             NodeKind::Block { stmts, tail } => self.block(stmts, tail.as_ref()),
-            NodeKind::Field { base, field } => self.field(base, &field.name, code.own),
+            NodeKind::Field { base, field } => self.field(base, &field.name),
             NodeKind::Record { fields } => self.record(fields),
             NodeKind::List { items } => self.list(items),
             NodeKind::App { func, args } => self.app(func, args, code.span),
@@ -1588,8 +1588,7 @@ impl<'a> Emit<'a> {
         Ok(held)
     }
 
-    fn field(&mut self, base: &Code, name: &Symbol, own: Own) -> Result<V> {
-        let _ = own;
+    fn field(&mut self, base: &Code, name: &Symbol) -> Result<V> {
         let b = self.expr(base)?;
         let field_ty = b.ty.field(name).cloned().unwrap_or(CTy::Unknown);
         let at = b.ty.offset(name);
@@ -1628,24 +1627,9 @@ impl<'a> Emit<'a> {
         // the first field read.
         let kind = field_ty.kind();
         if kind == Kind::Boxed {
-            // ADR 0034's in-place field take is *not* here, and the reason is recorded rather
-            // than left to be rediscovered.
-            //
-            // It read a field marked `Own::OwnedField`, moved its count out of the record and
-            // wrote `unit` where it had been, so the next record of that shape could reuse the
-            // memory. That is correct only where nothing reads the field again, and the emitter
-            // cannot tell: the lowering marks the last use *in its own order*, and a field is read
-            // by more than `Field` nodes -- a record update copies the fields it does not write, a
-            // record pattern binds the ones it names, and the seam walks every field of a record
-            // it converts. Counting the readers it can see admitted a take in `infer.dump_outcome`
-            // whose `unit` reached `fold` as its list. Five tests of the self-hosted front end
-            // said so; `examples/` and every smaller corpus passed throughout.
-            //
-            // What it was worth, measured on the kernel ADR 0034 cites -- a map read out of a
-            // record and handed to `map_insert` -- is 30.75ms against 30.90ms, three runs each,
-            // minimum. That is nothing, and it is the whole reason this is a deletion rather than
-            // a puzzle to solve: a correct version needs the last read in *emission* order, which
-            // is a real piece of work to buy half a percent.
+            // Read with a count of its own, never taken out of the record: ADR 0034 §"Done
+            // since" records the in-place take that was tried, the readers it could not see, and
+            // the half a percent it was worth.
             return Ok(V {
                 k: Kind::Boxed,
                 c: w.c,

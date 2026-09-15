@@ -2,8 +2,8 @@
 
 **Every decision is landed and every gate is green.** The machine runs on
 slot frames, a last use moves the value out of its slot, and
-`position_invariance_g1` passes on all five pairs — the fifth included, through
-a field-granular move the flat record representation enabled. A record update
+`position_invariance_g1` passes on all five pairs — the fifth through a
+field-granular move that was later found wrong and removed; §"Done since" records it. A record update
 whose base dies at the update writes into the base's record instead of building
 one, and the request path's allocation count moved for the first time since
 ADR 0024 — through that reuse and through the argument-vector and literal
@@ -392,8 +392,9 @@ Adopt drop-reuse for constructors and record literals. **The prerequisite is a
 flat record representation** — reuse recycles cells of known size and shape, and
 recycling a tree is neither easy nor worth much. Record types are structural and
 already printed sorted, so the layout is statically known wherever the type is,
-**and this is independently a win.** The fifth gate pair lands here too:
-field-granular liveness needs a field to be addressable.
+**and this is independently a win.** Field-granular liveness needs a field to
+be addressable, which this gives; the take built on it was tried and removed —
+§"Done since".
 
 **Landed for records, in the form the machine could reach without a shape
 analysis.** The lowering of a record update names its base — the binding a
@@ -586,10 +587,21 @@ rather than only the one that fails.**
 Done since: the flat record representation, and **slot frames themselves — the
 gate is green on all five pairs and the request path's allocation count did not
 move.** Three facts from the landing worth more than the plan that predicted
-them. The fifth pair fell to a **field-granular move** — a projection that is
-the last use of its *field* takes it out of the record in place, behind the
-same runtime uniqueness probe — not to the path-granular analysis ADR 0024
-declined; the probe is what keeps it a slow-never-wrong answer. A
+them. The fifth pair fell to a **field-granular move** — a projection that is the
+last use of its *field* took it out of the record in place, behind the same
+runtime uniqueness probe — not to the path-granular analysis ADR 0024 declined.
+**That move is gone, and the `OwnedField` mark that fed it with it.** The
+lowering marks the last use in its own order, and a field is read by more than
+`Field` nodes — a record update copies the fields it does not write, a record
+pattern binds the ones it names, and the seam walks every field it converts —
+so a take counted against the readers it could see handed `fold` a `unit` where
+a list had been, in the self-hosted front end's `infer`; five of its tests said
+so while `examples/` and every smaller corpus passed. On the kernel this ADR
+cites — a map read out of a record and handed to `map_insert` — it was worth
+30.75ms against 30.90ms, minimum of three runs. A correct take needs the last
+read in *emission* order, which is real work for half a percent, so the probe
+stays where the other pairs use it and the field is read with a count of its
+own. A
 **tail-resumptive capture costs no slot traffic at all**: the extent's windows
 stay where they are and the splice is the pointer work it always was, so the
 hot perform path never pays for the rewrite — only a general clause's capture

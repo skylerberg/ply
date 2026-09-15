@@ -29,9 +29,8 @@ fn the_machine_reports_what_it_reused() {
     let c = &v["counters"];
     assert_eq!(c["updates"], 200, "200 appends were made: {c}");
     // The tier reads `s.out` out of the state record with a count of its own rather than taking
-    // the field -- ADR 0034's `OwnedField`, which neither emitter makes yet -- so the list is held
-    // twice at each push and grows by copying a tail. The ratio is reported, and it is not the
-    // interpreter's 1.0.
+    // the field -- ADR 0034 records the take as tried and removed -- so the list is held twice at
+    // each push and grows by copying a tail. The ratio is reported, and it is not 1.0.
     let in_place = c["in_place"]
         .as_f64()
         .unwrap_or_else(|| panic!("the reuse ratio is reported: {c}"));

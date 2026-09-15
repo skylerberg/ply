@@ -1405,7 +1405,6 @@ fn dump_own(out: &mut String, own: ply_eval::rc::Own) {
     out.push(match own {
         ply_eval::rc::Own::Borrowed => 'b',
         ply_eval::rc::Own::Owned => 'o',
-        ply_eval::rc::Own::OwnedField => 'f',
     });
 }
 
