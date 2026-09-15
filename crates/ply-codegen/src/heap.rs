@@ -352,10 +352,14 @@ pub struct Heap {
     /// a program that builds a large string by appending would otherwise keep every version it
     /// let go until the entry ends.
     large: Vec<Vec<*mut Obj>>,
-    /// Dead blocks held back from the free lists, oldest first, with each one's block size, so
-    /// that a read through a stale word finds a dead header for a while yet rather than whatever
-    /// took the block. `quarantine` bounds it in bytes; at zero a dead block is reusable at once.
-    held: std::collections::VecDeque<(*mut Obj, usize)>,
+    /// Dead blocks held back from the free lists, oldest first, so that a read through a stale
+    /// word finds a dead header for a while yet rather than whatever took the block. The queue
+    /// is threaded through the dead blocks themselves -- the next pointer in the first payload
+    /// word, the block's size in the header's `layout` -- so holding one costs nothing the
+    /// allocation counts would see. `quarantine` bounds it in bytes; at zero a dead block is
+    /// reusable at once.
+    held_head: *mut Obj,
+    held_tail: *mut Obj,
     held_bytes: usize,
     quarantine: usize,
 }
@@ -424,15 +428,31 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             heap.free_list(object).push(o);
             return;
         }
-        heap.held.push_back((o, object));
+        (*o).layout = object as u32;
+        *held_next(o) = std::ptr::null_mut();
+        if heap.held_tail.is_null() {
+            heap.held_head = o;
+        } else {
+            *held_next(heap.held_tail) = o;
+        }
+        heap.held_tail = o;
         heap.held_bytes += object;
-        while heap.held_bytes > heap.quarantine
-            && let Some((old, bytes)) = heap.held.pop_front()
-        {
+        while heap.held_bytes > heap.quarantine {
+            let old = heap.held_head;
+            heap.held_head = *held_next(old);
+            if heap.held_head.is_null() {
+                heap.held_tail = std::ptr::null_mut();
+            }
+            let bytes = (*old).layout as usize;
             heap.held_bytes -= bytes;
             heap.free_list(bytes).push(old);
         }
     }
+}
+
+/// The quarantine's link through a dead block: its first payload word, which every block has.
+unsafe fn held_next(o: *mut Obj) -> *mut *mut Obj {
+    unsafe { (o as *mut u8).add(HEADER) as *mut *mut Obj }
 }
 
 impl Default for Heap {
@@ -462,7 +482,8 @@ impl Heap {
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
-            held: std::collections::VecDeque::new(),
+            held_head: std::ptr::null_mut(),
+            held_tail: std::ptr::null_mut(),
             held_bytes: 0,
             quarantine: QUARANTINE,
         }
@@ -864,7 +885,8 @@ impl Heap {
         for class in &mut self.large {
             class.clear();
         }
-        self.held.clear();
+        self.held_head = std::ptr::null_mut();
+        self.held_tail = std::ptr::null_mut();
         self.held_bytes = 0;
         for bits in &mut self.starts {
             bits.fill(0);
