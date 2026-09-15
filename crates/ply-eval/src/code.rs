@@ -895,7 +895,7 @@ fn lower_block(stmts: &[AstStmt], tail: Option<&Expr>, cx: &mut Cx) -> (Vec<Stmt
                 cx.live.union(
                     shadowed
                         .iter()
-                        .filter(|u| bound[i].contains(&u.name))
+                        .filter(|name| bound[i].contains(name))
                         .cloned()
                         .collect(),
                 );
