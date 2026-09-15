@@ -10,9 +10,9 @@
 # harness makes is checked by breaking the thing it watches and confirming the
 # comparison notices.
 #
-# Each mutation edits a copy of the six modules under a temp directory --
-# `PLY_PARSER_SRC` points the harness at it -- and the worktree is never
-# touched. Three outcomes, and the script distinguishes them because two of them
+# Each mutation edits a copy of the compiler's modules under a temp directory,
+# `stage` bootstraps that copy and `PLY_C_EMITTER` points the differential at
+# it -- the worktree is never touched. Three outcomes, and the script distinguishes them because two of them
 # look alike from the outside:
 #
 #   ARMED     the comparison reported a disagreement. What we want.
@@ -57,8 +57,7 @@ set -u
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
-ply="${PLY_BIN:-$root/target/release/ply}"
-[ -x "$ply" ] || { echo "no ply binary at $ply; cargo build -p ply-cli --bin ply --release" >&2; exit 2; }
+src="$root/crates/ply-compiler/ply"
 
 # Each entry: file | sed script | what it corrupts | which property watches it.
 #
@@ -98,13 +97,14 @@ trap 'rm -rf "$work"' EXIT
 
 run_suite() {                    # $1 source dir -> prints the suite's output
   ( cd "$root" \
-    && PLY_BIN="$ply" PLY_PARSER_SRC="$1" \
+    && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$1" >/dev/null \
+    && PLY_C_EMITTER="ply:$1" \
        cargo test --offline --test agreement -- --test-threads=2 2>&1 )
 }
 
 echo "==> the unmutated tree must be green before any mutation means anything"
 base="$work/base"; mkdir -p "$base"
-cp "$here"/{lexer,spine,types,patterns,exprs,items}.ply "$base/"
+cp "$src"/*.ply "$base/"
 out=$(run_suite "$base")
 if [[ "$out" == *"test result: ok"* && "$out" != *"disagree on"* ]]; then
   echo "    green"
@@ -126,7 +126,7 @@ for entry in "${mutations[@]}"; do
   what="${rest%%|*}";   watches="${rest#*|}"
 
   dir="$work/m$n"; rm -rf "$dir"; mkdir -p "$dir"
-  cp "$here"/{lexer,spine,types,patterns,exprs,items}.ply "$dir/"
+  cp "$src"/*.ply "$dir/"
   before=$(md5 -q "$dir/$file" 2>/dev/null || md5sum "$dir/$file" | cut -d' ' -f1)
   sed -i '' "$script" "$dir/$file" 2>/dev/null || sed -i "$script" "$dir/$file"
   after=$(md5 -q "$dir/$file" 2>/dev/null || md5sum "$dir/$file" | cut -d' ' -f1)

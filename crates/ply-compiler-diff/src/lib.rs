@@ -1867,11 +1867,15 @@ pub fn reference_emit_encoded(
         Box::leak(Box::new(resolved)),
         Box::leak(Box::new(check)),
     )));
-    for name in source.functions() {
-        if let Ok(enc) = ply_codegen::c::emit_body_encoded(source, &name, INLINING) {
-            out.insert(name, enc);
+    // The fragment, forced: the port is installed as the producer in the same process, and the
+    // reference is the side it is held against.
+    ply_codegen::c::producer::reference_only(|| {
+        for name in source.functions() {
+            if let Ok(enc) = ply_codegen::c::emit_body_encoded(source, &name, INLINING) {
+                out.insert(name, enc);
+            }
         }
-    }
+    });
     out
 }
 
@@ -1903,13 +1907,15 @@ pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
         Box::leak(Box::new(resolved)),
         Box::leak(Box::new(check)),
     )));
-    for name in source.functions() {
-        // A body the reference refuses is left out, exactly as a body the port has not reached is:
-        // what is compared is what both sides produced.
-        if let Ok(text) = ply_codegen::c::emit_body(source, &name, INLINING) {
-            out.push_str(&format!("f:{name};{text};"));
+    ply_codegen::c::producer::reference_only(|| {
+        for name in source.functions() {
+            // A body the reference refuses is left out, exactly as a body the port has not reached
+            // is: what is compared is what both sides produced.
+            if let Ok(text) = ply_codegen::c::emit_body(source, &name, INLINING) {
+                out.push_str(&format!("f:{name};{text};"));
+            }
         }
-    }
+    });
     out
 }
 
@@ -2007,5 +2013,61 @@ mod tests {
         let (tokens, diags) = ply_syntax::lexer::lex(SourceId(0), &source);
         assert!(diags.is_empty(), "{diags:?}");
         assert_eq!(tokens[0].kind, ply_syntax::lexer::TokenKind::Bytes(all));
+    }
+}
+
+/// The port, entered in-process: the self-hosted compiler as the binary carries it, compiled,
+/// each phase called with its input and answering the dump the reference side is compared to.
+///
+/// The bundle is the compiler, and the fixpoint test in `crates/ply-codegen-tests` is what says
+/// it was emitted from the sources in the tree; a working copy is entered through
+/// `PLY_C_EMITTER=ply:<dir>` once `stage` has bootstrapped it.
+pub mod port {
+    use ply_eval::{Fields, Value};
+    use ply_span::Symbol;
+    use std::sync::Arc;
+
+    /// Enters `name` -- `module.function`, as the sources spell it -- and answers the string it
+    /// returned. A raise, a missing entry or a non-string answer is the harness's own failure and
+    /// panics with the reason.
+    pub fn call(name: &str, args: &[Value]) -> String {
+        static REUSING: std::sync::Once = std::sync::Once::new();
+        // Emitting the compiler's own sources allocates two hundred million objects, and a debug
+        // heap that never reuses a block would need a runner it cannot have. This harness is not
+        // that check's oracle -- the audits are -- so, as the fixpoint test does, it reuses.
+        REUSING.call_once(|| ply_codegen::heap::reuse_by_default(true));
+        ply_codegen::c::producer::ensure_default();
+        match ply_codegen::c::producer::call(name, args) {
+            Ok(Value::Str(ref s)) => s.to_string(),
+            Ok(other) => panic!(
+                "`{name}` answered a {} rather than a string",
+                other.type_name()
+            ),
+            Err(e) => panic!("{e:#}"),
+        }
+    }
+
+    /// A phase over one input: `name(src: Bytes) -> String`.
+    pub fn dump(name: &str, src: &[u8]) -> String {
+        call(name, &[Value::bytes(src)])
+    }
+
+    /// `resolve.Source`, the module record every whole-program phase takes a list of.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub fn source(name: &str, src: &str) -> Value {
+        Value::Record(Arc::new(Fields::from_unsorted(vec![
+            (Symbol::new("name"), Value::bytes(name.as_bytes())),
+            (Symbol::new("src"), Value::bytes(src.as_bytes())),
+        ])))
+    }
+
+    /// A phase over a program: `name(sources: List<Source>) -> String`.
+    pub fn dump_program(name: &str, modules: &[(String, String)]) -> String {
+        let sources = modules.iter().map(|(n, s)| source(n, s)).collect();
+        call(name, &[Value::list(sources)])
+    }
+
+    pub fn bytes_list(items: &[String]) -> Value {
+        Value::list(items.iter().map(|s| Value::bytes(s.as_bytes())).collect())
     }
 }

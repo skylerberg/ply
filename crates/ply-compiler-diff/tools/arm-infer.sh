@@ -8,11 +8,9 @@
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
-ply="${PLY_BIN:-$root/target/release/ply}"
-[ -x "$ply" ] || ply="$root/target/debug/ply"
-[ -x "$ply" ] || { echo "no ply binary; run cargo build -p ply-cli --bin ply"; exit 2; }
+src="$root/crates/ply-compiler/ply"
 work="$(mktemp -d)"
-cp "$here"/{lexer,spine,types,patterns,exprs,items,rewrite,resolve,derive,tycore,infer}.ply "$work/"
+cp "$src"/*.ply "$work/"
 cp "$work/infer.ply" "$work/infer.orig"
 cp "$work/tycore.ply" "$work/tycore.orig"
 restore() { cp "$work/infer.orig" "$work/infer.ply"; cp "$work/tycore.orig" "$work/tycore.ply"; }
@@ -21,7 +19,8 @@ fails=0
 
 run_suite() {
   ( cd "$root" \
-    && PLY_BIN="$ply" PLY_PARSER_SRC="$work" \
+    && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
+    && PLY_C_EMITTER="ply:$work" \
        cargo test --offline --test infer -- --test-threads=2 \
          the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs \
          the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs \
