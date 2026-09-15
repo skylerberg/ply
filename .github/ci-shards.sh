@@ -43,13 +43,14 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 
 # How many jobs the partitioned tests are cut across. nextest's `slice:m/n`
 # deals tests round-robin after the filters, so tests of one binary spread
-# across partitions rather than landing in one. Raise it when the slowest
-# partition's run outlasts its slowest test by much; lower it when the
-# per-job overhead -- checkout, a C compiler, the archive -- is most of a leg,
-# or when the jobs after `build` outnumber what the account runs at once and
-# queue: with five solo jobs, fourteen partitions queued for longer than the
-# four fewer saved; with two, twelve fit.
-PARTITIONS=12
+# across partitions rather than landing in one.
+#
+# A runner arrives for each job about eight seconds after the last, so the
+# last partition starts some 8n seconds after `build` finishes, and each runs
+# the suite's remaining work over n plus half a minute of setup. That is
+# smallest near the square root of the work in seconds over eight: with the
+# suite at some five hundred seconds after #263, eight.
+PARTITIONS=8
 
 # Tests that get a runner of their own, as `id:package:target:test`. Each runs
 # the emitter over the compiler's own sources and, by `.config/nextest.toml`,
@@ -58,15 +59,16 @@ PARTITIONS=12
 # defined where the table says, and every solo job asserts that it ran exactly
 # one test.
 #
-# A test of one of these binaries that is *not* named here still runs, in a
+# A test beside one of these that is *not* named here still runs, in a
 # partition, alone within it: the override in `.config/nextest.toml` is on the
-# binary. Naming it here only moves it to a runner of its own, which is worth a
-# job once it is the longest thing a partition would hold; the other emitter
-# differentials came down to seconds when they stopped spawning `ply` (#244)
-# and went back to the partitions.
+# binary, or on the `emit_diff` module of the differentials' `suite`. Naming it
+# here only moves it to a runner of its own, which is worth a job once it is the
+# longest thing a partition would hold; the other emitter differentials came
+# down to seconds when they stopped spawning `ply` (#244) and went back to the
+# partitions.
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
-  "emit-diff-own-sources:ply-compiler-diff:emit_diff:the_port_resolves_its_own_sources_to_the_references_c"
+  "emit-diff-own-sources:ply-compiler-diff:suite:emit_diff::the_port_resolves_its_own_sources_to_the_references_c"
 )
 
 # The packages whose tests need a postgres server and cluster binaries. They

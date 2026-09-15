@@ -6,7 +6,7 @@ starts from the findings rather than rediscovering them.
 
 ## The two instruments, and what they say
 
-Both are in `harness/tests/`, both run from `./run.sh`, both ratchet.
+Both are in `crates/ply-compiler-diff/tests/suite/`, both run from `./run.sh`, both ratchet.
 
 | | |
 | --- | --- |
@@ -205,7 +205,7 @@ the named gaps.
 **A refusal carries its reason now.** `Em.refused` holds the first reason a body was refused;
 a refusal poisons the state and emission runs out, so no signature changed. `emit_fn_why`
 reads the reason, `emit_refusals_all` lists every refused body of a program, and the census
-test in `harness/tests/emit_diff.rs` aggregates them by reason over the bodies the reference
+test in `crates/ply-compiler-diff/tests/suite/emit_diff.rs` aggregates them by reason over the bodies the reference
 emits. Read that census before choosing what to build next: as this was written it put a
 nullary call of a definition first (the constant table wants the purity the checker
 publishes), then a field read over a shape the port cannot see, then a pattern it cannot
