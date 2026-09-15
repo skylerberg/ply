@@ -27,7 +27,7 @@ pub(super) const PROLOGUE: &str = "  if (ctx->fuel <= 0) { rt_no_fuel_p(ctx); re
      ctx->fuel -= 1;\n";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum Kind {
+pub enum Kind {
     Int,
     Bool,
     Boxed,
