@@ -143,11 +143,13 @@ port with the tier attached, and `run.sh` now names the bundle as the
 producer for them: with the reference producing, the port ran as C that
 released nothing, over its own sources, which is the memory the runner
 could not hold. One thing stood between the fixpoint
-and a runner even so: a debug build's heap never reuses a dead block, so
-that a read of one finds the marker, and that entry allocates two hundred
-million objects. `heap::reuse_by_default` turns reuse on for a process, the
-fixpoint test calls it, and the audits — release builds, and the check's
-real oracle — do not.
+and a runner even so: a debug build's heap kept every dead block until the
+entry's end, so that a read of one found the marker, and that entry
+allocates two hundred million objects. The net is now a bounded quarantine
+(`heap::QUARANTINE`): a dead block waits its turn behind a fixed number of
+bytes of others before it is reused, so a stale read still finds the marker
+for a while and no entry needs a runner larger than what it holds. Nothing
+switches it off, and no test has to know it is there.
 
 ## What would make this wrong
 
