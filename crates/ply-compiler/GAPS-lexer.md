@@ -314,7 +314,7 @@ the twelve fields it stops spelling are twelve it can no longer mispair.
 > thirteen fields are `Int`, so `max_body: state.limits.max_chunk_size`
 > type-checks and is a silently wrong bound in an HTTP server. That is what
 > record update removes structurally, and it is asserted at
-> `crates/ply-cli/tests/suite/stdlib.rs
+> `crates/ply-cli-tests/tests/suite/stdlib.rs
 > chunk_trailers_copies_every_limit_it_does_not_replace` — a test that goes red
 > on exactly that swap while `ply check` stays green.
 >
