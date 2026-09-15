@@ -97,6 +97,10 @@ pub mod bootstrap {
     /// this table and not in whatever table these sources have now.
     pub const CTORS: &str = include_str!("../bootstrap/unit.ctors");
 
+    /// What loading the unit needs from these sources -- arities, constants, the module count --
+    /// so that building the emitter from the bundle parses none of them.
+    pub const LOAD: &str = include_str!("../bootstrap/unit.load");
+
     /// The digest of the sources it was emitted from. The fixpoint test refuses a bundle whose
     /// digest is not these sources', and CI hands back a refreshed one as an artifact.
     pub const SOURCES: &str = include_str!("../bootstrap/SOURCES.digest");
