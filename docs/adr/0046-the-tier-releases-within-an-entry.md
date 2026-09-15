@@ -104,8 +104,8 @@ The oracle is the audit that pairs every test with the machine, run with
 the emitter in release mode producing the unit:
 
 ```sh
-./target/release/ply test examples --backend c --audit-backend --no-cache
-./target/release/ply test crates/ply-std/ply --backend c --audit-backend --no-cache
+./target/release/ply test examples --backend c --no-cache
+./target/release/ply test crates/ply-std/ply --backend c --no-cache
 PLY_TIER_ONLY=1 ./target/release/ply test examples --backend c --no-cache
 PLY_TIER_ONLY=1 ./target/release/ply test crates/ply-std/ply --backend c --no-cache
 ```

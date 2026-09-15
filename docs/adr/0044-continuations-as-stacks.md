@@ -128,7 +128,7 @@ input:
 
 ```sh
 PLY_C_CACHE=$(mktemp -d) PLY_C_REFUSALS=1 \
-  ./target/release/ply test examples --backend c --audit-backend --no-cache 2>&1 \
+  ./target/release/ply test examples --backend c --no-cache 2>&1 \
   | grep "c tier refused" | grep -E "task|not emit|answered by|credential"
 ```
 

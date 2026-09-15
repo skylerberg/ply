@@ -946,7 +946,6 @@ fn summary_of(attribution: crate::Attribution) -> Vec<String> {
         results: Vec::new(),
         warnings: Vec::new(),
         simulation: Default::default(),
-        audit: None,
     }
     .summary()
 }

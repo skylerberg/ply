@@ -309,12 +309,6 @@ caller threads the sink.
 slicing, so taking a sub-slice allocates. Response write counts and copies were
 **not measured**.
 
-**`--audit-backend` is not free.** `ply test --backend <spec>` attaches a
-compiled backend; `--audit-backend` runs each test without it as well, so that a
-divergence reported is the backend's and nothing else's. That costs two runs, so
-it is off by default. A run with a backend attached neither reads nor writes the
-result cache either way.
-
 Two backends ship. `reference` evaluates the body on a machine of its own over
 the scalar-signature fragment — not a code generator, and slower than entering
 none — and it exists so that a *wrong* backend can be caught before a fast one

@@ -177,7 +177,6 @@ impl RunReport {
             "isolated": self.parallelism.isolated,
             "parallelism": self.parallelism,
             "simulation": simulation_summary_json(&self.simulation),
-            "audit": self.audit,
             "tests": self.results.iter().map(test_json).collect::<Vec<_>>(),
             "failures": self.failures.iter().map(failure_json).collect::<Vec<_>>(),
             "warnings": self.warnings,
@@ -201,7 +200,6 @@ impl RunReport {
             ));
         }
         lines.extend(self.simulation.line());
-        lines.extend(self.audit.as_ref().and_then(|a| a.line()));
         for failure in &self.failures {
             lines.push(String::new());
             lines.push(failure.key.to_string());
@@ -310,7 +308,6 @@ fn test_json(result: &TestResult) -> Value {
         "diagnostic": result.failure,
         "simulation": result.simulation.as_ref().map(exploration_json),
         "cached": result.recorded.as_ref().map(|r| r.is_written()),
-        "audited": result.audited,
     })
 }
 

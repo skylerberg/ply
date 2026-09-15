@@ -147,10 +147,6 @@ impl<'a> Executor for TierExecutor<'a> {
         self.0.host_use(worker)
     }
 
-    fn audited(&self, worker: &Self::Worker) -> Option<bool> {
-        self.0.audited(worker)
-    }
-
     fn backend_use(&self, worker: &Self::Worker) -> Option<BackendUse> {
         self.0.backend_use(worker)
     }

@@ -80,9 +80,9 @@ fn ply(dir: &Path) -> Command {
     cmd
 }
 
-/// One `ply test --backend .. -j 1 --json` run. No `--audit-backend`: under tier-only (ADR 0048)
-/// its oracle arm is an evaluator-less machine that disagrees with every honest answer, so a
-/// corruption is caught by the corpus's own tests going red instead.
+/// One `ply test --backend .. -j 1 --json` run. There is no pairing flag: under tier-only
+/// (ADR 0048) its oracle arm would be an evaluator-less machine that disagrees with every honest
+/// answer, so a corruption is caught by the corpus's own tests going red instead.
 fn run(dir: &Path, backend: Option<&str>) -> Value {
     let mut cmd = ply(dir);
     cmd.arg("test").arg("-j").arg("1").arg("--json");
@@ -242,23 +242,6 @@ fn a_forged_answer_for_a_self_handled_definition_is_caught_by_ply_test() {
         caught.contains(&"m.a self handled effect still answers".to_string()),
         "{caught:?}"
     );
-}
-
-// --- The flag itself --------------------------------------------------------
-
-/// `--audit-backend` is accepted only alongside `--backend`; on its own it is a flag that would do
-/// nothing, which `CONTRIBUTING.md` §"The one rule" calls a defect, so the CLI refuses it.
-#[test]
-fn auditing_a_backend_that_was_not_asked_for_is_refused() {
-    let dir = project(CORPUS);
-    let out = ply(dir.path())
-        .arg("test")
-        .arg("--audit-backend")
-        .output()
-        .unwrap();
-    assert_ne!(out.status.code(), Some(0));
-    let text = String::from_utf8(out.stderr).unwrap();
-    assert!(text.contains("--backend"), "{text}");
 }
 
 #[test]

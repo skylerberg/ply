@@ -403,16 +403,6 @@ pub struct TestArgs {
     #[arg(long)]
     pub watch: bool,
 
-    /// Run each test twice — once with the backend attached and once without —
-    /// and fail the run on any disagreement.
-    ///
-    /// Off by default because it doubles what a run costs, which is what a
-    /// backend attached for *measurement* must not pay. A searched test and a
-    /// test that reaches a host handler are run once whatever this says, and
-    /// the run reports how many it could not pair.
-    #[arg(long, requires = "backend")]
-    pub audit_backend: bool,
-
     /// Bind the real host handlers. Off by default, and the default is the
     /// point: a suite that silently acquires a live dependency is the failure
     /// mode this language exists to prevent. A test that reaches a bound
