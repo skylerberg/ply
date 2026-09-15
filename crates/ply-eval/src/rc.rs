@@ -20,11 +20,6 @@ pub enum Own {
     /// The last use of a binding of the enclosing barrier: the read moves the value out of its
     /// slot, leaving the slot empty.
     Owned,
-    /// On a `Field` node whose base is a slot-resolved variable: the projection is the last use
-    /// of this *field*, while other fields of the binding are still read later. The machine takes
-    /// the field out of the record in place when the record is unshared — the fifth gate pair,
-    /// which no release keyed by a name can reach.
-    OwnedField,
 }
 
 /// Counters for the slot machine's capture-against-carry census. Diagnostics only.
@@ -287,31 +282,13 @@ fn reaches_cell(v: &Value, slot: Slot, depth: usize, budget: &mut u32) -> bool {
     }
 }
 
-/// One use the backward pass is still expecting to see, to the right of the point the walk has
-/// reached: a whole read of a binding, or a read of one field of it.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct Use {
-    pub name: Symbol,
-    /// `None` is a whole-value use; `Some(f)` a read of one field.
-    pub field: Option<Symbol>,
-    /// A record update's base read: the record's cells are read, but no field's value is — an
-    /// earlier projection of a field the update writes is still that field's last use.
-    pub cells: bool,
-}
-
-impl Use {
-    fn whole(name: &Symbol) -> Use {
-        Use {
-            name: name.clone(),
-            field: None,
-            cells: false,
-        }
-    }
-}
-
-/// The backward pass: what is still live to the right of the point the walk has reached.
+/// The backward pass: the bindings still read to the right of the point the walk has reached.
+///
+/// Keyed on the binding and nothing finer. A read through a field, or as a record update's base,
+/// is a read of the binding: ADR 0034 records the field-granular take that once distinguished
+/// them, and why it went.
 pub struct Live {
-    later: Vec<Use>,
+    later: Vec<Symbol>,
     /// One frame per barrier — a lambda, a handler clause, a `return` clause, a `simulate` body —
     /// holding every slot name of that barrier: captures, parameters and binders alike.
     ownable: Vec<Vec<Symbol>>,
@@ -326,88 +303,21 @@ impl Live {
     }
 
     fn any_later(&self, name: &Symbol) -> bool {
-        self.later.iter().any(|u| &u.name == name)
+        self.later.contains(name)
     }
 
-    fn push(&mut self, u: Use) {
-        if !self.later.contains(&u) {
-            self.later.push(u);
+    fn push(&mut self, name: &Symbol) {
+        if !self.later.contains(name) {
+            self.later.push(name.clone());
         }
     }
 
-    /// Records a whole-value read and answers whether the value may be moved rather than cloned.
+    /// Records a read of the binding and answers whether the value may be moved rather than
+    /// cloned.
     pub fn use_of(&mut self, name: &Symbol) -> Own {
         let tracked = self.tracked(name);
         let last = !self.any_later(name);
-        self.push(Use::whole(name));
-        if tracked {
-            bump(|s| {
-                s.dup_sites += 1;
-                s.dup_emitted += u64::from(!last);
-            });
-        }
-        if last && tracked {
-            Own::Owned
-        } else {
-            Own::Borrowed
-        }
-    }
-
-    /// Records a read of one field, and answers what the projection may take: the whole value when
-    /// nothing later reads the binding at all, the field alone when only *other* fields are read
-    /// later, and a clone otherwise.
-    pub fn use_field(&mut self, name: &Symbol, field: &Symbol) -> Own {
-        let tracked = self.tracked(name);
-        let whole_later = self
-            .later
-            .iter()
-            .any(|u| &u.name == name && u.field.is_none() && !u.cells);
-        let field_later = self
-            .later
-            .iter()
-            .any(|u| &u.name == name && u.field.as_ref() == Some(field));
-        let any_later = self.any_later(name);
-        let own = if !tracked {
-            Own::Borrowed
-        } else if !any_later {
-            Own::Owned
-        } else if !whole_later && !field_later {
-            Own::OwnedField
-        } else {
-            Own::Borrowed
-        };
-        self.push(Use {
-            name: name.clone(),
-            field: Some(field.clone()),
-            cells: false,
-        });
-        if tracked {
-            bump(|s| {
-                s.dup_sites += 1;
-                s.dup_emitted += u64::from(own == Own::Borrowed);
-            });
-        }
-        own
-    }
-
-    /// Records the read of a record update's base, which consumes the binding but reads only the
-    /// fields the update *keeps*: a written field's old value is dead, so a projection of it
-    /// inside the written expression is still that field's last use.
-    pub fn use_base(&mut self, name: &Symbol, kept: &[Symbol]) -> Own {
-        let tracked = self.tracked(name);
-        let last = !self.any_later(name);
-        self.push(Use {
-            name: name.clone(),
-            field: None,
-            cells: true,
-        });
-        for field in kept {
-            self.push(Use {
-                name: name.clone(),
-                field: Some(field.clone()),
-                cells: false,
-            });
-        }
+        self.push(name);
         if tracked {
             bump(|s| {
                 s.dup_sites += 1;
@@ -435,39 +345,39 @@ impl Live {
 
     /// Crossing a binder, backwards: reads further left mean an outer binding of the same name.
     pub fn kill(&mut self, name: &Symbol) {
-        self.later.retain(|u| &u.name != name);
+        self.later.retain(|u| u != name);
     }
 
     /// Enters a scope in which `binders` denote new bindings, answering the uses of an outer
     /// binding of one of those names that the rest of the activation still makes.
-    pub(crate) fn shadow(&mut self, binders: &[Symbol]) -> Vec<Use> {
-        let mut held = Vec::new();
-        for u in &self.later {
-            if binders.iter().any(|b| b == &u.name) && !held.contains(u) {
-                held.push(u.clone());
-            }
-        }
-        self.later.retain(|u| !binders.iter().any(|b| b == &u.name));
+    pub(crate) fn shadow(&mut self, binders: &[Symbol]) -> Vec<Symbol> {
+        let held: Vec<Symbol> = self
+            .later
+            .iter()
+            .filter(|u| binders.contains(u))
+            .cloned()
+            .collect();
+        self.later.retain(|u| !binders.contains(u));
         held
     }
 
-    pub(crate) fn snapshot(&self) -> Vec<Use> {
+    pub(crate) fn snapshot(&self) -> Vec<Symbol> {
         self.later.clone()
     }
 
-    pub(crate) fn restore(&mut self, uses: Vec<Use>) {
+    pub(crate) fn restore(&mut self, uses: Vec<Symbol>) {
         self.later = uses;
     }
 
     /// Unions a branch's live set into the current one.
-    pub(crate) fn union(&mut self, other: Vec<Use>) {
-        for u in other {
+    pub(crate) fn union(&mut self, other: Vec<Symbol>) {
+        for u in &other {
             self.push(u);
         }
     }
 
     /// Opens a barrier over `bound`, answering the live set to restore with [`Live::close`].
-    pub(crate) fn open(&mut self, bound: Vec<Symbol>) -> Vec<Use> {
+    pub(crate) fn open(&mut self, bound: Vec<Symbol>) -> Vec<Symbol> {
         self.ownable.push(bound);
         std::mem::take(&mut self.later)
     }
@@ -482,7 +392,7 @@ impl Live {
     /// clone.
     pub(crate) fn close_with_owns(
         &mut self,
-        outer: Vec<Use>,
+        outer: Vec<Symbol>,
         frees: &[Symbol],
         movable: bool,
     ) -> Vec<Own> {
@@ -499,7 +409,7 @@ impl Live {
                     s.dup_emitted += u64::from(!moved);
                 });
             }
-            self.push(Use::whole(name));
+            self.push(name);
         }
         owns
     }

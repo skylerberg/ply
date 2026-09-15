@@ -5,7 +5,7 @@
 //! computes each occurrence's ownership: the last use of a binding moves the value out of its
 //! slot rather than cloning it, which is ADR 0034's whole mechanism.
 
-use crate::rc::{Live, Own, Use};
+use crate::rc::{Live, Own};
 use crate::value::Value;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{
@@ -23,8 +23,7 @@ pub type Code = Rc<Node>;
 pub struct Node {
     pub kind: NodeKind,
     pub span: Span,
-    /// How a `Var` takes its value, and on a `Field` node whether the projection takes the field
-    /// out of the record in place ([`Own::OwnedField`]).
+    /// How a `Var` takes its value; every other node is [`Own::Borrowed`].
     pub own: Own,
 }
 
@@ -478,7 +477,7 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
         ExprKind::Match { scrutinee, arms } => {
             let after = cx.live.snapshot();
             let mut lowered: Vec<Arm> = Vec::with_capacity(arms.len());
-            let mut merged: Vec<Use> = Vec::new();
+            let mut merged: Vec<Symbol> = Vec::new();
             for arm in arms.iter().rev() {
                 cx.live.restore(after.clone());
                 lowered.push(lower_arm(arm, cx));
@@ -535,27 +534,20 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
              `no_try_survives_parse_module_anywhere_in_the_tree`"
         ),
         ExprKind::Field { base, field } => {
-            // A projection of a slot variable is where field-granular liveness lands: the last
-            // use of *this field* may take it out of the record in place even while other fields
-            // are still read later — the shape no release keyed by a name can free.
+            // A projection of a slot variable reads the whole record: its last read moves the
+            // record out, and the field is never taken out of it (ADR 0034).
             if let ExprKind::Var(q) = &base.kind
                 && q.is_bare()
                 && let Some((barrier, slot)) = cx.table.var(base)
             {
                 debug_assert_eq!(barrier, cx.barrier);
-                let own = cx.live.use_field(q.symbol(), &field.name);
-                let (base_own, field_own) = match own {
-                    Own::Owned => (Own::Owned, Own::Borrowed),
-                    Own::OwnedField => (Own::Borrowed, Own::OwnedField),
-                    Own::Borrowed => (Own::Borrowed, Own::Borrowed),
-                };
                 let base = Rc::new(Node {
                     kind: NodeKind::Var {
                         name: q.clone(),
                         slot: Some(slot),
                     },
                     span: base.span,
-                    own: base_own,
+                    own: cx.live.use_of(q.symbol()),
                 });
                 return Rc::new(Node {
                     kind: NodeKind::Field {
@@ -563,7 +555,7 @@ fn lower_node(e: &Expr, cx: &mut Cx) -> Code {
                         field: field.clone(),
                     },
                     span: e.span,
-                    own: field_own,
+                    own: Own::Borrowed,
                 });
             }
             NodeKind::Field {
@@ -720,10 +712,8 @@ fn lower_record_update(fields: &[(Ident, Expr)], cx: &mut Cx) -> Option<NodeKind
             .find_map(|(_, value)| projected_slot_var(value, cx))
     });
     let (b, q, (_, slot)) = base?;
-    // Reverse evaluation order: the base is read after every written field — and it reads only
-    // the copied fields, so a written field's expression may still take the old value's field.
-    let kept: Vec<Symbol> = copies.iter().map(|c| c.name.clone()).collect();
-    let own = cx.live.use_base(q.symbol(), &kept);
+    // Reverse evaluation order: the base is read after every written field.
+    let own = cx.live.use_of(q.symbol());
     let base = Rc::new(Node {
         kind: NodeKind::Var {
             name: q.clone(),
