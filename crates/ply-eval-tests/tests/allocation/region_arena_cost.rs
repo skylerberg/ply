@@ -88,11 +88,12 @@ fn nesting_costs_the_allocator_nothing_once_warm() {
 }
 
 /// Claim 2, as a number: a snapshot is one allocation for the values, one for the generations and
-/// one for the scope stack it has to put back, whatever the region holds.
+/// one for the scope stack it has to put back, whatever the region holds — and what a capture
+/// costs as a function of the region it crosses is the slots it copies, linear at every tenfold.
 #[test]
 fn a_snapshot_costs_three_allocations_and_is_linear_in_bytes() {
     let mut widths = Vec::new();
-    for size in [0usize, 1, 100, 1_000, 10_000] {
+    for size in [0usize, 1, 10, 100, 1_000, 10_000, 100_000] {
         let mut arena = Arena::new();
         let r = arena.open(RegionKind::Shared, Span::DUMMY);
         for i in 0..size {
@@ -108,6 +109,13 @@ fn a_snapshot_costs_three_allocations_and_is_linear_in_bytes() {
         assert_eq!(
             allocations, expected,
             "a snapshot of {size} slots took {allocations} allocations"
+        );
+        assert_eq!(arena.stats().snapshots, 1);
+        assert_eq!(
+            arena.stats().slots_copied,
+            size as u64,
+            "a snapshot of {size} slots copied {} of them",
+            arena.stats().slots_copied
         );
         widths.push((size, bytes));
         drop(snapshot);
@@ -147,55 +155,6 @@ fn restoring_a_snapshot_costs_the_allocator_nothing() {
 
     assert_eq!((allocations, bytes), (0, 0));
     arena.close(r);
-}
-
-/// The measurement the region model asks for: what a capture costs as a function of the region it crosses.
-#[test]
-fn snapshot_cost_as_a_function_of_region_size() {
-    const REPEATS: usize = 200;
-    let mut rows: Vec<(usize, f64)> = Vec::new();
-
-    println!("\n  slots   ns/snapshot   ns/slot");
-    for size in [1usize, 10, 100, 1_000, 10_000, 100_000] {
-        let mut arena = Arena::new();
-        let r = arena.open(RegionKind::Shared, Span::DUMMY);
-        for i in 0..size {
-            arena.alloc(Value::Int(i as i64));
-        }
-        // Warm the allocator, so the first snapshot's `Vec` growth is not the measurement.
-        drop(arena.snapshot(r));
-
-        let mut best = f64::MAX;
-        for _ in 0..5 {
-            let start = Instant::now();
-            for _ in 0..REPEATS {
-                let snapshot = arena.snapshot(r).expect("a shared region snapshots");
-                std::hint::black_box(snapshot.len());
-            }
-            best = best.min(start.elapsed().as_nanos() as f64 / REPEATS as f64);
-        }
-        println!("{size:>7}   {best:>11.1}   {:>7.2}", best / size as f64);
-        rows.push((size, best));
-        arena.close(r);
-    }
-
-    // Ten times the slots for at most twenty times the cost, at every step where the constant is
-    // not the whole measurement.
-    for pair in rows.windows(2) {
-        let (small, big) = (&pair[0], &pair[1]);
-        if small.0 < 100 {
-            continue;
-        }
-        let growth = big.1 / small.1;
-        assert!(
-            growth < 20.0,
-            "{} slots cost {:.1}ns and {} cost {:.1}ns — {growth:.1}x for 10x the region",
-            small.0,
-            small.1,
-            big.0,
-            big.1
-        );
-    }
 }
 
 /// What the allocator is worth on the workload it replaced.

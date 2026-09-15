@@ -5,36 +5,30 @@
 # The suite is built once, as a nextest archive of every workspace member, and
 # run by many short jobs at once: a fixed number of partitions that each take a
 # slice of the tests, one job per test that has to run alone on a runner of its
-# own, one for the tests that read a wall clock, one for the postgres suites,
-# and one for the scripts that drive a `ply` binary. A job's wall clock is the
-# archive's build plus the slowest test in it, so the tables here are cut on run
-# time, and the archive is what makes "every member is tested" a property of
-# `cargo nextest archive --workspace` rather than of a table.
+# own, one for the tests that have to be seen to run, one for the postgres
+# suites, and one for the scripts that drive a `ply` binary. A job's wall clock
+# is the archive's build plus the slowest test in it, so the tables here are cut
+# on run time, and the archive is what makes "every member is tested" a
+# property of `cargo nextest archive --workspace` rather than of a table.
 #
 # What a table can still get wrong is losing a *test* silently: a test named
 # here that nothing defines selects nothing and says nothing. `verify` fails on
-# that, on a crate no member reaches, on `.config/nextest.toml` disagreeing with
-# the deferred table, and on a probe with no required job.
+# that, on a crate no member reaches, and on a probe with no required job.
 #
 #   ci-shards.sh verify          every crate is a member or listed as not one,
 #                                every test named here exists where the table
-#                                says, `.config/nextest.toml` names exactly the
-#                                deferred tests, and every directory under
-#                                `probes/` is run by a named CI job that the
-#                                `ci` aggregate requires
+#                                says, and every directory under `probes/` is
+#                                run by a named CI job that the `ci` aggregate
+#                                requires
 #   ci-shards.sh partitions      the JSON matrix of partition slices
 #   ci-shards.sh solo-matrix     the JSON matrix of tests that run alone
 #   ci-shards.sh solo-filter ID  the nextest filterset selecting one solo test
 #   ci-shards.sh exclude-filter  the filterset a partition leaves to the other
-#                                jobs: the solo tests, the deferred tests, the
-#                                shutdown suite and the postgres packages
-#   ci-shards.sh gate-filter     the filterset the gates job runs: the deferred
-#                                tests, the shutdown suite and the tree checks
+#                                jobs: the solo tests, the shutdown suite and
+#                                the postgres packages
+#   ci-shards.sh gate-filter     the filterset the gates job runs: the shutdown
+#                                suite and the tree checks
 #   ci-shards.sh postgres-filter the filterset selecting the postgres packages
-#   ci-shards.sh deferred        one `package target test` line per deferred test
-#   ci-shards.sh deferred-filter the nextest filterset selecting exactly the
-#                                deferred tests; `.config/nextest.toml` carries
-#                                it verbatim and `verify` checks that it does
 #   ci-shards.sh tree-checks     one `package target test` line per tree check
 
 set -euo pipefail
@@ -92,64 +86,10 @@ W5_FILTER='binary_id(=ply-cli-tests::suite) & test(/^w5_shutdown::/)'
 declare -a KNOWN_OUTSIDE=(
 )
 
-# Tests whose assertion reads a wall clock, as `package:target:test`, where
-# `target` is an integration test binary or the literal `lib` for a unit test.
-#
-# Each passes or fails on how much CPU it was given rather than on what the code
-# does, so beside other tests is the wrong place for them. nextest runs them
-# last and alone: `.config/nextest.toml` gives exactly these tests every test
-# thread and the lowest priority, so each one starts only when the rest of the
-# job has finished and nothing else runs beside it. That file carries this
-# table's filterset verbatim (`deferred-filter`), and `verify` fails when the
-# two disagree, because a test that drops out of the override quietly goes back
-# to running under contention. What they print is shown, since a measurement
-# nobody can read is not a measurement. Names are matched exactly, so a unit
-# test is named by its full module path. The gates job runs them and asserts
-# that each appears in its log as run; the partitions leave them out.
-#
-# **This list is maintained by running the suite, not by surveying the tree.**
-# Two surveys have been done and each declared itself complete; each was proved
-# wrong by the next run, within the hour:
-#
-#   * A grep of `crates/*/tests` for `Instant::now` produced seven entries. The
-#     corpus shard then failed on
-#     `measure::every_resumption_costs_about_what_the_first_one_did` —
-#     *"the fourth resumption cost 5680.8965 us against 2196.552 us"*, against
-#     `four.marginal_micros < one.micros * 2.0` — a unit test, then in `src/`,
-#     which that grep could not see. Re-surveying `crates/*/src` took the list to 12.
-#   * The cli-eval shard then failed on
-#     `routing_a_path_of_escapes_costs_its_length_and_not_its_square`
-#     (`crates/ply-cli-tests/tests/suite/w3_http_audit.rs:714`) — *"four times the escapes
-#     cost 1655.9ms against 143.6ms for k, which is 11.5x"*, against
-#     `four <= one * 9.0`. The second survey missed it too: the test reads no
-#     Rust clock at all, it parses milliseconds out of `ply test`'s own output
-#     via a `duration_of` helper, so no timing vocabulary appears in it. Run
-#     alone it passes three times out of three at load 20.
-#
-# The list is never finished. When a job goes red on a ratio or a budget, the fix is usually
-# another row here — `payload::the_map_rows_survive_subtracting_the_fold_around_them` is
-# the most recent, and it is the third survey's blind spot: it subtracts a scaffold from a
-# measurement and asserts the remainder is positive, so contention does not slow it down, it
-# makes the answer negative.
-DEFERRED=(
-  "ply-eval-tests:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
-  "ply-eval-tests:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
-  "ply-cli-tests:suite:cli::a_simulated_sleep_is_a_jump_rather_than_a_wait"
-  "ply-test-tests:suite:region_fixture_cost::a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
-  "ply-test-tests:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"
-  "ply-test-tests:suite:region_fixture_cost::a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"
-  "ply-test-tests:suite:region_fixture_cost::a_group_with_no_fixture_opens_and_closes_in_constant_time"
-  "ply-corpus-tests:suite:unit::measure::every_resumption_costs_about_what_the_first_one_did"
-  "ply-corpus-tests:suite:unit::measure::capture_and_resume_are_flat_in_the_frames_they_move"
-  "ply-corpus-tests:suite:unit::measure::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real"
-  "ply-store-tests:suite:unit::store::opening_a_ten_thousand_definition_cache_is_under_the_budget"
-  "ply-store-tests:suite:unit::store::a_baseline_for_every_test_does_not_slow_the_open"
-  "ply-cli-tests:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
-  "ply-corpus-tests:suite:unit::payload::the_map_rows_survive_subtracting_the_fold_around_them"
-)
-
 # Tests that fail on a property of the *tree* rather than of a run, as
-# `package:target:test`, with the same three-field spelling as `DEFERRED`.
+# `package:target:test`, where `target` is an integration test binary or the
+# literal `lib` for a unit test. Names are matched exactly, so a unit test is
+# named by its full module path.
 #
 # Not "gates" in the sense §"There is CI" uses that word — those are
 # dependencies that make a suite skip silently. These are checks whose subject
@@ -229,7 +169,6 @@ triples() {
   done
 }
 
-cmd_deferred() { triples "${DEFERRED[@]}"; }
 cmd_tree_checks() { triples "${TREE_CHECKS[@]}"; }
 
 # `id package target test` per solo test.
@@ -250,11 +189,6 @@ filter_of() {
     first=0
     printf '(binary_id(=%s) & test(=%s))' "$(binary_id "$package" "$target")" "$test"
   done
-}
-
-cmd_deferred_filter() {
-  cmd_deferred | filter_of
-  printf '\n'
 }
 
 cmd_solo_filter() {
@@ -284,18 +218,17 @@ cmd_tree_check_filter() {
   printf '\n'
 }
 
-# What the gates job runs: the deferred tests, the shutdown suite, and the tree
-# checks by name. The tree checks run in a partition as well; here they are
-# asserted to have run.
+# What the gates job runs: the shutdown suite, and the tree checks by name. The
+# tree checks run in a partition as well; here they are asserted to have run.
 cmd_gate_filter() {
-  printf '%s | %s | %s\n' "$(cmd_deferred_filter)" "$W5_FILTER" "$(cmd_tree_check_filter)"
+  printf '%s | %s\n' "$W5_FILTER" "$(cmd_tree_check_filter)"
 }
 
 # What a partition leaves to the other jobs. The solo tests are excluded by
 # name, so a test that joins one of those binaries later is still run -- in a
 # partition, alone within it -- rather than lost.
 cmd_exclude_filter() {
-  printf '%s | %s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$(cmd_deferred_filter)" "$W5_FILTER" "$(cmd_postgres_filter)"
+  printf '%s | %s | %s\n' "$(cmd_solo | cut -d' ' -f2- | filter_of)" "$W5_FILTER" "$(cmd_postgres_filter)"
 }
 
 cmd_partitions() {
@@ -429,9 +362,6 @@ cmd_verify() {
 
   # --- tests named by a table ----------------------------------------------
   while read -r package target test; do
-    check_test_exists "deferred test" "$package" "$target" "$test" || failures=$((failures + 1))
-  done < <(cmd_deferred)
-  while read -r package target test; do
     check_test_exists "tree check" "$package" "$target" "$test" || failures=$((failures + 1))
   done < <(cmd_tree_checks)
   while read -r id package target test; do
@@ -453,16 +383,6 @@ cmd_verify() {
   # tests, and the suite that drives `ply` is in `ply-cli-tests`.
   if ! ls "$root"/crates/ply-cli/tests/*.rs >/dev/null 2>&1; then
     echo "FAIL: crates/ply-cli/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
-    failures=$((failures + 1))
-  fi
-
-  local nextest="$root/.config/nextest.toml" filter
-  filter=$(cmd_deferred_filter)
-  if [[ ! -f $nextest ]]; then
-    echo "FAIL: no $nextest, so nothing runs the deferred tests alone" >&2
-    failures=$((failures + 1))
-  elif [[ $(grep -cxF "filter = '$filter'" "$nextest") -ne 1 ]]; then
-    echo "FAIL: $nextest does not carry this table's deferred filter exactly once; paste the output of 'ci-shards.sh deferred-filter' into the override, single-quoted, on one line" >&2
     failures=$((failures + 1))
   fi
 
@@ -543,7 +463,7 @@ cmd_verify() {
     echo "$failures problem(s) in the CI tables" >&2
     return 1
   fi
-  echo "${#all_members[@]} workspace members; ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#DEFERRED[@]} deferred tests, ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions"
+  echo "${#all_members[@]} workspace members; ${#KNOWN_OUTSIDE[@]} crate(s) deliberately outside; ${#TREE_CHECKS[@]} tree checks and ${#SOLO[@]} solo tests, each present in the tree; ${#PROBE_JOBS[@]} probe(s) run by a required CI job; $PARTITIONS partitions"
 }
 
 case "${1:-}" in
@@ -554,12 +474,10 @@ case "${1:-}" in
   exclude-filter) cmd_exclude_filter ;;
   gate-filter) cmd_gate_filter ;;
   postgres-filter) cmd_postgres_filter ;;
-  deferred) cmd_deferred ;;
-  deferred-filter) cmd_deferred_filter ;;
   tree-checks) cmd_tree_checks ;;
   tree-check-filter) cmd_tree_check_filter ;;
   *)
-    echo "usage: ci-shards.sh {verify|partitions|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|deferred|deferred-filter|tree-checks|tree-check-filter}" >&2
+    echo "usage: ci-shards.sh {verify|partitions|solo-matrix|solo-filter ID|exclude-filter|gate-filter|postgres-filter|tree-checks|tree-check-filter}" >&2
     exit 2
     ;;
 esac
