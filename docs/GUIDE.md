@@ -1072,11 +1072,13 @@ threaded through a loop takes, and it allocates nothing per round.
 ```
 
 Lists are homogeneous. `push(xs, x)` appends and returns a new list; `len`,
-`list_at`, `map`, `filter`, `fold` and `range` are the rest of the surface
-(§13).
+`list_at`, `list_set`, `map`, `filter`, `fold` and `range` are the rest of the
+surface (§13).
 
 A list is indexed by position, and the index is **total**: it answers rather
-than raises.
+than raises. The update, `list_set(xs, i, v)`, is not: it answers the list with
+the element at `i` replaced, and an index the list does not hold raises `E0502`,
+because a write past the end is a defect rather than a lookup that may miss.
 
 ```ply
 fn third(xs: List<Int>) -> Option<Int> = list_at(xs, 2)
@@ -2310,15 +2312,16 @@ orders. `compare` is the same operation under a name you may shadow.
 | `len<a>(xs: List<a>) -> Int` | |
 | `push<a>(xs: List<a>, x: a) -> List<a>` | appends; in place when the caller is the last owner |
 | `list_at<a>(xs: List<a>, i: Int) -> Option<a>` | `None` for a negative index or one at or past the end; `list_at(xs, len(xs) - 1)` is the last element |
+| `list_set<a>(xs: List<a>, i: Int, v: a) -> List<a>` | the element at `i` replaced, the rest shared; **raises** `E0502` for a negative index or one at or past the end; in place when the caller is the last owner |
 | `map<a, b \| e>(xs: List<a>, f: (a) -> b / e) -> List<b> / e` | |
 | `filter<a \| e>(xs: List<a>, f: (a) -> Bool / e) -> List<a> / e` | |
 | `fold<a, b \| e>(xs: List<a>, init: b, f: (b, a) -> b / e) -> b / e` | visits every element |
 | `range(lo: Int, hi: Int) -> List<Int>` | `[lo, hi)`; empty when `hi <= lo` |
 | `iterate<a, b \| e>(seed: a, budget: Int, step: (a) -> Iter<a, b> / e) -> b / e` | the early-exit loop (§6.9) |
 
-There is one index and no defaulting variant. A `list_at_or(xs, i, default)`
-was designed alongside `list_at` and refused: it has to be spelled with a
-`match` instead,
+There is one index, one update, and no defaulting variant of the index. A
+`list_at_or(xs, i, default)` was designed alongside `list_at` and refused: it
+has to be spelled with a `match` instead,
 
 ```ply
 type Ctx = { toks: List<Int>, eof: Int }
@@ -2327,11 +2330,15 @@ fn kind_at(c: Ctx, pos: Int, n: Int) -> Int =
   match list_at(c.toks, pos + n) { Some(t) -> t, None -> c.eof }
 ```
 
-and the whole case for a second builtin was that this `match` costs something on
+and the whole case for a second index was that this `match` costs something on
 a hot path. It costs **0.34 µs per peek out of 1.66**, which is a 1.26× saving
 against a bar of 1.5× fixed before the number existed, so the second name was
-not worth it. ADR 0027 has the measurement.
+not worth it. ADR 0027 has the measurement. `list_set` is a builtin for a
+different reason: replacing one element of a trie while sharing every node off
+the path to it is not expressible from outside the trie (ADR 0050 §1b).
 
+`list_set` raises for an index the list does not hold, as `bytes_at` does,
+because a write past the end is a defect rather than a lookup that may miss.
 `list_at` does not raise, and where that shows up is the prover. A `law` over a
 function that peeks with `list_at` runs its randomized cases and reaches
 `property`; the same law over a `bytes_at` peek hits an out-of-range case, the
@@ -3451,12 +3458,14 @@ rather than left to be discovered.
   caller that keeps reading what it passed. Position in the enclosing
   expression decides nothing: `ply check --costs` names each copy's cause.
 * `string_find` raises when the needle is absent; guard with `string_contains`.
-* `bytes_at`, `bytes_u32_le` and `string_slice` **raise** out of range. `list_at` does not — it
-  answers `None`. The two containers are indexed by different conventions on
-  purpose; §13.2 and §13.6 say which is which, and
+* `bytes_at`, `bytes_u32_le`, `string_slice` and `list_set` **raise** out of
+  range. `list_at` does not — it answers `None`. The two containers are indexed
+  by different conventions on purpose, and a list *write* past the end is a
+  defect where a read may miss; §13.2 and §13.6 say which is which, and
   `docs/adr/0027-a-list-index.md` says why.
 * A negative list index is **absent**, not counted from the end:
-  `list_at(xs, -1)` is `None`, not the last element.
+  `list_at(xs, -1)` is `None`, not the last element, and `list_set(xs, -1, v)`
+  raises.
 * Slices and indices are never clamped — and a list index is not clamped either:
   an out-of-range one is absent, not the nearest element.
 

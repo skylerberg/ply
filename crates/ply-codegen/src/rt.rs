@@ -1269,6 +1269,13 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             heap::dec(*xs);
             Some(answer)
         }
+        (Builtin::ListSet, [xs, i, v]) if heap::kind(*xs) == KIND_LIST => {
+            let index = usize::try_from(heap::as_int(*i)?).ok()?;
+            if index >= list::len(obj(*xs)) {
+                return None;
+            }
+            Some(ctx.heap.list_set(*xs, index, *v))
+        }
         (Builtin::Range, [lo, hi]) => {
             let (a, b) = (heap::as_int(*lo)?, heap::as_int(*hi)?);
             if b - a > (1 << 20) {
@@ -2904,6 +2911,10 @@ fn unwrapped(ctx: &mut Ctx, answer: Word) -> Word {
 
 pub unsafe extern "C" fn rt_list_index(ctx: *mut Ctx, xs: i64, i: i64) -> i64 {
     direct(unsafe { &mut *ctx }, Builtin::ListAt, &[xs, i])
+}
+
+pub unsafe extern "C" fn rt_list_set(ctx: *mut Ctx, xs: i64, i: i64, v: i64) -> i64 {
+    direct(unsafe { &mut *ctx }, Builtin::ListSet, &[xs, i, v])
 }
 
 /// `list_at` for a `match` that unwraps its answer at once, like [`rt_map_lookup`].

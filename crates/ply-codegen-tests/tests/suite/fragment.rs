@@ -170,6 +170,12 @@ fn indexed(n: Int) -> Int = { let xs = map(range(0, n), |x: Int| x + 1); match l
 
 fn indexed_past(n: Int) -> Int = match list_at(map(range(0, n), |x: Int| x + 1), n + 5) { Some(_) -> 1, None -> 0 - 1 }
 
+fn replaced(n: Int) -> Int = { let xs = map(range(0, n), |x: Int| x + 1); match list_at(list_set(xs, 2, 100), 2) { Some(v) -> v, None -> 0 - 1 } }
+
+fn replaced_beside(n: Int) -> Int = { let xs = map(range(0, n), |x: Int| x + 1); let ys = list_set(xs, 2, 100); fold(ys, 0, |acc: Int, x: Int| acc + x) + (match list_at(xs, 2) { Some(v) -> v * 1000, None -> 0 - 1 }) }
+
+fn replaced_at(n: Int, i: Int) -> Int = len(list_set(map(range(0, n), |x: Int| x + 1), i, 0))
+
 fn ordered(a: Int, b: Int) -> Int = match compare(a, b) { Less -> 0 - 1, Equal -> 0, Greater -> 1 }
 
 fn grown_apart(n: Int) -> Int = { let a = push([], n); let b = push([], n + 1); let c = push(push([], n + 2), n + 3); len(a) * 100 + len(b) * 10 + len(c) + fold(a, 0, |acc: Int, x: Int| acc + x) + fold(b, 0, |acc: Int, x: Int| acc + x) }
@@ -554,6 +560,39 @@ fn a_native_closure_stays_inside_the_entry_that_made_it() {
     assert_eq!(
         call(unit, "m.added", &[Value::Int(1), Value::Int(2)]),
         Some(Value::Int(3))
+    );
+}
+
+/// `list_set` through the tier: the element replaced, the rest kept, the list it was given
+/// unchanged when it is still read, in the tail and below it in the trie; and an index the list
+/// does not hold declines as the interpreter's raise does.
+#[test]
+fn list_set_answers_the_replaced_list_and_declines_outside_it() {
+    let (_, unit) = unit(SHAPES);
+    for n in [5, 40] {
+        assert_eq!(
+            call(unit, "m.replaced", &[Value::Int(n)]),
+            Some(Value::Int(100)),
+            "replaced({n})"
+        );
+        let sum = n * (n + 1) / 2 - 3 + 100;
+        assert_eq!(
+            call(unit, "m.replaced_beside", &[Value::Int(n)]),
+            Some(Value::Int(sum + 3_000)),
+            "replaced_beside({n})"
+        );
+    }
+    assert_eq!(
+        call(unit, "m.replaced_at", &[Value::Int(3), Value::Int(2)]),
+        Some(Value::Int(3))
+    );
+    assert_eq!(
+        call(unit, "m.replaced_at", &[Value::Int(3), Value::Int(3)]),
+        None
+    );
+    assert_eq!(
+        call(unit, "m.replaced_at", &[Value::Int(3), Value::Int(-1)]),
+        None
     );
 }
 
