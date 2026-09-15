@@ -13,10 +13,10 @@
 //! Every object an entry allocates is logged, and [`Heap::end`] releases the log: a count that
 //! reaches zero dismantles its object then and there — its children let go, a bridged value
 //! dropped — and its memory goes back to the entry's free list for its size class, so an
-//! entry's memory is bounded by what it holds. A debug build holds a dead block back in a
-//! bounded quarantine first, oldest out, so a stale reference reads a `DEAD` header for a while
-//! rather than someone else's object: the net the suites run under, at a cost of the quarantine
-//! and never of everything the entry ever held.
+//! entry's memory is bounded by what it holds, in every build alike: a debug build's heap once
+//! kept dead blocks back so a stale reference read a `DEAD` header, and every form of that cost
+//! memory the entry never held (ADR 0049 item 2, ADR 0050 §1b). A stale reference is caught by
+//! the counts the audits assert and by the `DEAD` header a block keeps until it is taken.
 
 use crate::list;
 use crate::map;
@@ -352,32 +352,7 @@ pub struct Heap {
     /// a program that builds a large string by appending would otherwise keep every version it
     /// let go until the entry ends.
     large: Vec<Vec<*mut Obj>>,
-    /// Dead blocks held back from the free lists, oldest first, so that a read through a stale
-    /// word finds a dead header, and the payload as it was left, for a while yet rather than
-    /// whatever took the block. A ring of `quarantine` slots carved from the entry's own chunk,
-    /// so holding a block writes nothing into it and costs nothing the allocation counts see;
-    /// at zero a dead block is reusable at once.
-    ring: *mut Held,
-    ring_head: usize,
-    held: usize,
-    quarantine: usize,
 }
-
-/// One quarantined block and the size class it goes back to.
-#[derive(Clone, Copy)]
-struct Held {
-    block: *mut Obj,
-    object: usize,
-}
-
-/// How many dead blocks a heap holds back before recycling the oldest: a debug build keeps the
-/// net, a release build keeps nothing. Bounded, because a heap that kept every dead block until
-/// the entry's end needed a runner nothing here can have -- the emitter emitting its own sources
-/// allocates two hundred million objects in one entry -- and every test that entered it had to
-/// know to switch the net off. Bounded in blocks and kept short, because the oldest block is
-/// touched again when it leaves, and a queue that fits in cache costs a debug build little where
-/// one of tens of megabytes made `dismantle` the top of the compiled compiler's profile.
-pub const QUARANTINE: usize = if cfg!(debug_assertions) { 1024 } else { 0 };
 
 /// The size classes a dead object is kept in, in words; anything larger goes back only at the
 /// entry's end.
@@ -431,26 +406,7 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             return;
         }
         let object = Heap::object_size(size);
-        let heap = &mut *heap;
-        if heap.quarantine == 0 {
-            heap.free_list(object).push(o);
-            return;
-        }
-        if heap.ring.is_null() {
-            heap.ring = heap.carve(heap.quarantine * std::mem::size_of::<Held>()) as *mut Held;
-            heap.ring_head = 0;
-            heap.held = 0;
-        }
-        let cap = heap.quarantine;
-        if heap.held == cap {
-            let oldest = *heap.ring.add(heap.ring_head);
-            heap.ring_head = (heap.ring_head + 1) % cap;
-            heap.held -= 1;
-            heap.free_list(oldest.object).push(oldest.block);
-        }
-        let at = (heap.ring_head + heap.held) % cap;
-        *heap.ring.add(at) = Held { block: o, object };
-        heap.held += 1;
+        (*heap).free_list(object).push(o);
     }
 }
 
@@ -481,17 +437,7 @@ impl Heap {
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
-            ring: std::ptr::null_mut(),
-            ring_head: 0,
-            held: 0,
-            quarantine: QUARANTINE,
         }
-    }
-
-    /// How many dead blocks this heap holds back before recycling the oldest; zero recycles at
-    /// once, which is what a test of the recycling itself asks for.
-    pub fn set_quarantine(&mut self, blocks: usize) {
-        self.quarantine = blocks;
     }
 
     /// The free list a dead block of `object` bytes goes to: its size class, or the power of two
@@ -620,18 +566,6 @@ impl Heap {
     fn large_class(size: usize) -> Option<usize> {
         (size / 8 >= REUSE_CLASSES)
             .then(|| usize::BITS as usize - (size - 1).leading_zeros() as usize)
-    }
-
-    /// `bytes` of the entry's chunk memory, word-aligned, for the heap's own use: outside the
-    /// object count and the start bits, and given back with the chunks at the entry's end.
-    fn carve(&mut self, bytes: usize) -> *mut u8 {
-        let size = (bytes + 7) & !7;
-        if (self.end as usize).wrapping_sub(self.cur as usize) < size || self.cur.is_null() {
-            self.grow(size);
-        }
-        let p = self.cur;
-        self.cur = unsafe { self.cur.add(size) };
-        p
     }
 
     pub(crate) fn raw_alloc(
@@ -898,11 +832,6 @@ impl Heap {
         for class in &mut self.large {
             class.clear();
         }
-        // The ring was carved from the first chunk, which the bump pointer has just been put
-        // back to; it is carved again the next time a block dies.
-        self.ring = std::ptr::null_mut();
-        self.ring_head = 0;
-        self.held = 0;
         for bits in &mut self.starts {
             bits.fill(0);
         }
