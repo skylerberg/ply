@@ -758,7 +758,7 @@ impl<'a> InterpExecutor<'a> {
                 into.entries = into.entries.saturating_add(entries);
                 into.declines = into.declines.saturating_add(declines);
             }
-            let ours = match sim::interleaving_of(machine.as_ref(), &outcome) {
+            match sim::interleaving_of(machine.as_ref(), &outcome) {
                 Some(interleaving) => interleaving,
                 None => {
                     observed = false;
@@ -768,7 +768,6 @@ impl<'a> InterpExecutor<'a> {
                     }
                 }
             };
-            ours
         };
 
         let explored = if self.search.measure_reduction {
