@@ -5,8 +5,8 @@
 //! is taken, so a set that compiles cannot call out of itself.
 
 use super::Refused;
-use super::bundle::Load;
 use super::emit::{Emit, Unit, mangle};
+use super::exports::Exports;
 use super::load::{Library, compile_and_load};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_decls};
 use crate::heap::{Heap, Word, mark_immortal};
@@ -138,35 +138,13 @@ fn offered_set<'a>(names: &[&'a str]) -> (Vec<&'a str>, String) {
     (offered, fragment)
 }
 
-/// Everything the fixpoint settles on: the assembled source, the unit its tables ended in, the
+/// Everything the fixpoint settles on: every body's resolved C, the unit its tables ended in, the
 /// definitions it kept, and the ones it refused.
 struct Emitted {
-    text: String,
+    bodies: Vec<(String, String)>,
     unit: Unit,
     taken: Vec<String>,
     refusals: Vec<Refused>,
-}
-
-/// The whole unit as C, without compiling it.
-///
-/// What a bootstrap archives. `build` compiles and loads; this stops one step earlier and hands
-/// back the text, so a tree can keep its front end as a C file that any C compiler turns into a
-/// working front end -- the only form of "check in the compiler" that is neither a per-platform
-/// binary nor a dependency on the compiler being replaced.
-pub fn emit_unit(loaded: &'static Source, names: &[&str]) -> Result<(String, Vec<Refused>)> {
-    let ctors = loaded.ctors();
-    let ctors_digest = super::cache::ctors_digest(&ctors);
-    let (offered, fragment) = offered_set(names);
-    let how = super::toolchain::Profile::current().inlining().overridden();
-    let e = emit_all(
-        loaded,
-        &offered,
-        &fragment,
-        &ctors,
-        &ctors_digest,
-        (how.budget, how.depth),
-    )?;
-    Ok((e.text, e.refusals))
 }
 
 fn emit_all(
@@ -220,14 +198,6 @@ fn emit_all(
         })
         .collect();
 
-    let arities: Vec<(String, usize)> = taken
-        .iter()
-        .filter_map(|n| {
-            loaded
-                .definition(n)
-                .map(|(d, _)| (n.clone(), d.params.len()))
-        })
-        .collect();
     if std::env::var("PLY_C_REFUSALS").is_ok() {
         for r in &refusals {
             eprintln!("c tier refused `{}`: {}", r.function, r.construct);
@@ -249,7 +219,6 @@ fn emit_all(
             EMIT.load(Relaxed) / 1000
         );
     }
-    let text = assemble(&bodies, &arities);
     if let Ok(want) = std::env::var("PLY_C_DUMP") {
         if want == "*" {
             let mut sizes: Vec<(usize, &str)> = bodies
@@ -257,7 +226,8 @@ fn emit_all(
                 .map(|(n, b)| (b.lines().count(), n.as_str()))
                 .collect();
             sizes.sort_by(|a, b| b.0.cmp(&a.0));
-            eprintln!("unit: {} lines over {} bodies", text.len(), bodies.len());
+            let lines: usize = sizes.iter().map(|(n, _)| n).sum();
+            eprintln!("unit: {lines} lines over {} bodies", bodies.len());
             for (n, name) in sizes.iter().take(8) {
                 eprintln!("  {n:6} lines  {name}");
             }
@@ -269,19 +239,24 @@ fn emit_all(
         }
     }
     Ok(Emitted {
-        text,
+        bodies,
         unit,
         taken,
         refusals,
     })
 }
 
-/// Emit, compile and load `names` as one unit, with what it refused.
-/// The whole unit as C and the record `finish` rebuilds its tables from, without compiling it:
-/// what an artifact embeds, so that it runs from its own definitions with no source to re-parse.
+/// The whole unit as C, without compiling it, and what it says about itself.
+///
+/// What an artifact embeds and what a bootstrap archives: `build` compiles and loads; this stops
+/// one step earlier and hands back the text, so a tree can keep its front end as a C file that
+/// any C compiler turns into a working front end -- the only form of "check in the compiler" that
+/// is neither a per-platform binary nor a dependency on the compiler being replaced. The text
+/// carries `exports` as its last declaration, so it runs from its own definitions with no source
+/// to re-parse.
 pub struct Produced {
     pub text: String,
-    pub record: super::cache::UnitCache,
+    pub exports: Exports,
     pub refused: Vec<Refused>,
 }
 
@@ -309,8 +284,8 @@ fn produce_in(
     inlining: (usize, usize),
 ) -> Result<Produced> {
     let Emitted {
-        text,
-        mut unit,
+        bodies,
+        unit,
         taken,
         refusals,
     } = emit_all(loaded, offered, fragment, ctors, ctors_digest, inlining)?;
@@ -319,65 +294,83 @@ fn produce_in(
     if let Some(why) = super::producer::with_current(|p| p.failure(loaded)).flatten() {
         bail!("the Ply emitter failed over the program: {why}");
     }
-    // For its effect on the code table, whose rows are recorded just below: `finish` reads the
-    // same slots back out of the table this completes.
-    let _ = constants_of(&Load::of(loaded, &taken).constants, &mut unit);
-    // Everything about the unit that is not the object: what a worker would otherwise emit
-    // twenty-nine megabytes of C to rediscover. Recording it here, and building this run's
-    // `Native` out of it, keeps the cached door honest -- the two doors are one path, so a unit
-    // that will not reconstruct fails every test rather than only a warm one.
-    let record = super::cache::UnitCache {
-        object: super::load::object_key(&text),
-        taken,
-        refusals: refusals
-            .iter()
-            .map(|r| (r.function.clone(), r.construct.clone()))
-            .collect(),
-        shapes: unit.layouts.all_shape_names(),
-        consts: unit.consts,
-        fields: unit.fields,
-        builtins: unit.builtins,
-        lambdas: unit.lambdas,
-    };
+    let exports = describe(loaded, unit, taken, &refusals, ctors);
+    let text = assemble(&bodies, &exports);
     Ok(Produced {
         text,
-        record,
+        exports,
         refused: refusals,
     })
 }
 
-/// A unit produced elsewhere -- an artifact's -- compiled and finished against `loaded`, with the
-/// constructor table it was emitted against rather than the program's own, so the tags baked into
-/// its C still name its shapes.
-pub fn load_unit(
+/// What the unit says about itself, from the program it was emitted from: the only place a
+/// source is read for it. Everything a loader needs is in here, so that loading reads none.
+fn describe(
     loaded: &'static Source,
+    mut unit: Unit,
+    taken: Vec<String>,
+    refusals: &[Refused],
+    ctors: &[(Symbol, usize)],
+) -> Exports {
+    let arities: Vec<(String, usize)> = taken
+        .iter()
+        .map(|n| {
+            let arity = loaded.definition(n).map_or(0, |(d, _)| d.params.len());
+            (n.clone(), arity)
+        })
+        .collect();
+    // A nullary function whose published row says it is pure answers the same thing every time,
+    // so the seam remembers it rather than running it. Without this the gate's kernel rebuilds a
+    // sixty-five-kilobyte byte literal on every call.
+    let constants: Vec<String> = taken
+        .iter()
+        .filter(|n| {
+            loaded
+                .definition(n)
+                .is_some_and(|(d, _)| d.params.is_empty())
+                && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(n))
+        })
+        .cloned()
+        .collect();
+    // For its effect on the code table, whose rows are recorded just below: `finish` reads the
+    // same slots back out of the table this completes.
+    let _ = constants_of(&constants, &mut unit);
+    Exports {
+        ctors: ctors.to_vec(),
+        taken: arities,
+        constants,
+        modules: loaded.program.modules.len(),
+        refusals: refusals
+            .iter()
+            .map(|r| (r.function.clone(), r.construct.clone()))
+            .collect(),
+        consts: unit.consts,
+        fields: unit.fields,
+        builtins: unit.builtins,
+        shapes: unit.layouts.all_shape_names(),
+        lambdas: unit.lambdas,
+    }
+}
+
+/// A unit produced elsewhere -- an artifact's, a bundle's -- compiled, loaded and finished against
+/// what it says about itself: its constructor table rather than any program's, so the tags baked
+/// into its C still name its shapes, and no source at all. `sources` is the `SourceId` of each
+/// module it was emitted from, in module order, for the spans its bodies store; `None` numbers
+/// them from zero, which is what the bootstrap assigns.
+pub fn load_unit(
     text: &str,
-    record: super::cache::UnitCache,
-    ctors: Vec<(Symbol, usize)>,
+    sources: Option<Vec<SourceId>>,
     stem: &str,
 ) -> Result<(Native, Vec<Refused>)> {
-    let refused = refused_of(&record);
     let lib = compile_and_load(text, stem)?;
-    let native = finish(loaded, lib, record, ctors)?;
+    let exports = Exports::read(&lib)?;
+    let refused = refused_of(&exports);
+    let native = finish(lib, exports, sources)?;
     Ok((native, refused))
 }
 
-/// The same from a bundle, whose load record answers what `finish` would have read from a source.
-pub(super) fn load_unit_with(
-    text: &str,
-    record: super::cache::UnitCache,
-    ctors: Vec<(Symbol, usize)>,
-    load: &Load,
-    stem: &str,
-) -> Result<(Native, Vec<Refused>)> {
-    let refused = refused_of(&record);
-    let lib = compile_and_load(text, stem)?;
-    let native = finish_loaded(lib, record, ctors, load)?;
-    Ok((native, refused))
-}
-
-fn refused_of(record: &super::cache::UnitCache) -> Vec<Refused> {
-    record
+fn refused_of(exports: &Exports) -> Vec<Refused> {
+    exports
         .refusals
         .iter()
         .map(|(function, construct)| Refused {
@@ -385,6 +378,10 @@ fn refused_of(record: &super::cache::UnitCache) -> Vec<Refused> {
             construct: construct.clone(),
         })
         .collect()
+}
+
+fn sources_of(loaded: &Source) -> Vec<SourceId> {
+    loaded.program.modules.iter().map(|m| m.source).collect()
 }
 
 pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Refused>)> {
@@ -415,11 +412,12 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     );
     // A unit entry that will not reconstruct is a reason to build one, never to fail.
     if let Some(k) = &unit_key
-        && let Some(cached) = super::cache::read_unit(k)
-        && let Some(lib) = super::load::open_by_key(&cached.object)
+        && let Some(object) = super::cache::read_unit(k)
+        && let Some(lib) = super::load::open_by_key(&object)
+        && let Ok(exports) = Exports::read(&lib)
     {
-        let refused = refused_of(&cached);
-        if let Ok(native) = finish(loaded, lib, cached, ctors.clone()) {
+        let refused = refused_of(&exports);
+        if let Ok(native) = finish(lib, exports, Some(sources_of(loaded))) {
             super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if std::env::var("PLY_C_PHASES").is_ok() {
                 eprintln!(
@@ -432,17 +430,20 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     }
     let Produced {
         text,
-        record,
         refused: refusals,
+        ..
     } = produce_in(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
     let t_emit = started.elapsed();
     let t_assemble = started.elapsed();
     let lib = compile_and_load(&text, "unit")?;
     let t_cc = started.elapsed();
     if let Some(k) = &unit_key {
-        super::cache::write_unit(k, &record);
+        super::cache::write_unit(k, &super::load::object_key(&text));
     }
-    let native = finish(loaded, lib, record, ctors)?;
+    // Read back from the object rather than kept from the emit, so the two doors are one path: a
+    // unit whose table will not read back fails every test rather than only a warm one.
+    let exports = Exports::read(&lib)?;
+    let native = finish(lib, exports, Some(sources_of(loaded)))?;
     if std::env::var("PLY_C_PHASES").is_ok() {
         eprintln!(
             "phases: emit+resolve {}ms, assemble {}ms, cc+load {}ms, tables {}ms, source {}MB",
@@ -456,96 +457,53 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
     Ok((native, refusals))
 }
 
-/// A loaded object plus a unit's tables, made into the `Native` a caller can enter.
+/// A loaded object plus what it says about itself, made into the `Native` a caller can enter.
 ///
-/// Both doors reach it: the one that just emitted the unit and the one that found it in the cache.
-/// It takes a `UnitCache` from either, so the reconstruction is not a second implementation to be
-/// kept in step -- there is one, and every build exercises it.
+/// Every door reaches it -- the build that just emitted the unit, the whole-unit cache, an
+/// artifact, the bootstrap bundle -- with an `Exports` read from the object, so the reconstruction
+/// is not a second implementation to be kept in step: there is one, and every build exercises it.
 ///
 /// A `Unit` is exactly what this rebuilds: its consts, fields, builtins and lambdas are recorded
-/// as they are, its `functions` is the taken set, and its `Layouts` is `ctors` plus the shapes
-/// interned in id order. Nothing else is in a `Unit`, which is why a recording of those is
-/// faithful; if a field is ever added to one, it has to be added here too or the ids move.
-/// The unit's C and its record, emitted and not compiled: what a bootstrap bundle holds, and
-/// what the fixpoint compares.
-pub fn emit_unit_record(
-    loaded: &'static Source,
-    names: &[&str],
-) -> Result<(String, super::cache::UnitCache, Vec<Refused>)> {
-    let ctors = loaded.ctors();
-    let ctors_digest = super::cache::ctors_digest(&ctors);
-    let (offered, fragment) = offered_set(names);
-    let how = super::toolchain::Profile::current().inlining().overridden();
-    let inlining = (how.budget, how.depth);
-    let Emitted {
-        text,
-        mut unit,
+/// as they are, its `functions` is the taken set, and its `Layouts` is the constructor table plus
+/// the shapes interned in id order. Nothing else is in a `Unit`, which is why a recording of those
+/// is faithful; if a field is ever added to one, it has to be added to `Exports` too or the ids
+/// move.
+fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Result<Native> {
+    let Exports {
+        ctors,
         taken,
-        refusals,
-    } = emit_all(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
-    let _ = constants_of(&Load::of(loaded, &taken).constants, &mut unit);
-    let record = super::cache::UnitCache {
-        object: super::load::object_key(&text),
-        taken,
-        refusals: refusals
-            .iter()
-            .map(|r| (r.function.clone(), r.construct.clone()))
-            .collect(),
-        shapes: unit.layouts.all_shape_names(),
-        consts: unit.consts,
-        fields: unit.fields,
-        builtins: unit.builtins,
-        lambdas: unit.lambdas,
-    };
-    Ok((text, record, refusals))
-}
-
-pub(super) fn finish(
-    loaded: &'static Source,
-    lib: Library,
-    cached: super::cache::UnitCache,
-    ctors: Vec<(Symbol, usize)>,
-) -> Result<Native> {
-    let load = Load::of(loaded, &cached.taken);
-    let sources = loaded.program.modules.iter().map(|m| m.source).collect();
-    finish_with(lib, cached, ctors, &load, sources)
-}
-
-/// The same from a bundle's load record, with no source read: the modules are `SourceId(0..n)`,
-/// which is what the bootstrap assigns them.
-pub(super) fn finish_loaded(
-    lib: Library,
-    cached: super::cache::UnitCache,
-    ctors: Vec<(Symbol, usize)>,
-    load: &Load,
-) -> Result<Native> {
-    let sources = (0..load.modules).map(|i| SourceId(i as u32)).collect();
-    finish_with(lib, cached, ctors, load, sources)
-}
-
-fn finish_with(
-    lib: Library,
-    cached: super::cache::UnitCache,
-    ctors: Vec<(Symbol, usize)>,
-    load: &Load,
-    sources: Vec<SourceId>,
-) -> Result<Native> {
+        constants,
+        modules,
+        refusals: _,
+        consts,
+        fields,
+        builtins,
+        shapes,
+        lambdas,
+    } = exports;
+    // For the spans bodies store, by the index of the module they were emitted from. An
+    // artifact's program is rebuilt from its definitions, so its modules need not be the ones the
+    // unit was emitted from; a span then names the module at that index, or nothing.
+    let sources = sources.unwrap_or_else(|| (0..modules).map(|i| SourceId(i as u32)).collect());
     bind(&lib)?;
-    let mut unit = Unit::new(ctors.clone(), cached.taken);
-    unit.consts = cached.consts;
-    unit.fields = cached.fields;
-    unit.builtins = cached.builtins;
-    unit.lambdas = cached.lambdas;
+    let mut unit = Unit::new(
+        ctors.clone(),
+        taken.iter().map(|(n, _)| n.clone()).collect(),
+    );
+    unit.consts = consts;
+    unit.fields = fields;
+    unit.builtins = builtins;
+    unit.lambdas = lambdas;
     // In id order, so the numbers baked into the emitted C still name these shapes.
-    for (id, names) in cached.shapes.iter().enumerate() {
+    for (id, names) in shapes.iter().enumerate() {
         let got = unit.layouts.shape(names.clone());
         if got as usize != id {
-            bail!("a cached unit's shapes do not intern to the ids its C was emitted against");
+            bail!("a unit's shapes do not intern to the ids its C was emitted against");
         }
     }
     // Before the addresses, because it can add a row: a root nothing calls still needs a slot for
     // the seam to remember it in, and the slot is a row of the same table.
-    let constants = constants_of(&load.constants, &mut unit);
+    let constants = constants_of(&constants, &mut unit);
     let mut functions = Vec::with_capacity(unit.lambdas.len());
     for symbol in &unit.lambdas {
         let Some(p) = lib.symbol(symbol) else {
@@ -554,7 +512,7 @@ fn finish_with(
         functions.push(p as usize);
     }
     let mut entries = HashMap::new();
-    for (name, arity) in &load.arities {
+    for (name, arity) in &taken {
         let symbol = format!("{}_entry", mangle(name));
         let Some(p) = lib.symbol(&symbol) else {
             bail!("the unit the C tier built has no `{symbol}`");
@@ -591,7 +549,7 @@ fn finish_with(
 /// that answers a register is cheaper to call than to look up. A root listed here and not emitted
 /// against simply keeps a slot only the seam uses, which is what the in-process tier does too.
 ///
-/// Which roots are constants is [`Load::of`]'s answer, so that a bundle can carry it.
+/// Which roots are constants is `describe`'s answer, carried in the unit's `Exports`.
 fn constants_of(constants: &[String], unit: &mut Unit) -> HashMap<String, usize> {
     constants
         .iter()
@@ -847,12 +805,13 @@ fn resolve(text: &str, tables: &super::emit::Tables, unit: &mut Unit) -> String 
     out
 }
 
-/// The whole translation unit: the prelude, the runtime, every body's prototype, then the bodies.
-fn assemble(bodies: &[(String, String)], taken: &[(String, usize)]) -> String {
+/// The whole translation unit: the prelude, the runtime, every body's prototype, the bodies, and
+/// last what the unit says about itself.
+fn assemble(bodies: &[(String, String)], exports: &Exports) -> String {
     let mut out = String::from(PRELUDE);
     out.push_str(&runtime_decls());
     out.push_str("\n/* --- prototypes, so a call between two bodies resolves --- */\n");
-    for (name, arity) in taken {
+    for (name, arity) in &exports.taken {
         let params = std::iter::once("PlyCtx*".to_string())
             .chain((0..*arity).map(|_| "Word".to_string()))
             .collect::<Vec<_>>()
@@ -864,6 +823,7 @@ fn assemble(bodies: &[(String, String)], taken: &[(String, usize)]) -> String {
         out.push_str(text);
         out.push('\n');
     }
+    out.push_str(&exports.embed());
     out
 }
 

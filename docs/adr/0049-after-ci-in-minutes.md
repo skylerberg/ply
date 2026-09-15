@@ -42,21 +42,27 @@ the thing the seconds come from.
 
 ## The language and compiler
 
-### 1. A compiled unit describes its own exports
+### 1. A compiled unit describes its own exports — done
 
-`crates/ply-compiler/bootstrap/unit.load` carries the arities, the pure
-nullary constants and the module count the loader needs, so the bundle is
-entered without front-ending the compiler's sources. It is a side file
-produced by the emitter's driver, not by the unit, and only the bootstrap
-bundle has one. Any other compiled unit still has to be re-parsed to be
-linked against.
+The bootstrap bundle used to carry three side files beside the unit's C: the
+record the cache kept of its tables, the constructor table it was emitted
+against, and a load record of arities, pure nullary constants and the module
+count, so that the bundle could be entered without front-ending the
+compiler's sources. Only the bundle had them; an artifact carried its own
+copies in its own format, the whole-unit cache a third, and any other
+compiled unit had to be re-parsed to be linked against.
 
-**Fix.** The emitted C unit carries an export table the loader reads directly:
-the same facts, emitted by the emitter as part of the unit, with the record's
-digest inside it. `bundle.rs` reads it from the unit; `unit.load` is deleted,
-and the fixpoint test asserts the table rather than the record. This is the
-first piece of separate compilation, and it is what lets a program's
-dependencies be compiled units rather than sources.
+**Built.** The unit's C ends with `ply_exports`, a string carrying all of it:
+the constructor table, every function with its arity, the constants, the
+module count, the refusals and the five tables. `ply_codegen::c::Exports`
+encodes it at emission, the one place a source is read, and reads it back
+through `dlsym` once the object loads. Every door goes through that read,
+the fresh build included, so a table that will not read back fails every
+build rather than only a warm one. The bundle is the C and two digests, an
+artifact embeds the C alone, the whole-unit cache keeps an object key, and
+the fixpoint compares the C, table included. A unit can now be linked
+against with none of its sources present, which is the first piece of
+separate compilation.
 
 ### 2. The heap reuses in every profile
 

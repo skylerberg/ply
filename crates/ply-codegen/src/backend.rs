@@ -70,17 +70,9 @@ pub struct Unit {
     compiles: AtomicU64,
     /// Workers whose build failed after the pre-flight in [`Unit::over`] succeeded.
     poisoned: AtomicU64,
-    /// A unit produced elsewhere that this one loads rather than builds.
-    embedded: Option<Embedded>,
-}
-
-/// What an artifact carries of its compiled unit: the C, the record `finish` rebuilds the tables
-/// from as `cache::encode_unit` writes it, and the constructor table it was emitted against. The
-/// record stays encoded here because a decoded one holds `Value`s, which do not cross threads.
-pub struct Embedded {
-    pub text: String,
-    pub record: String,
-    pub ctors: Vec<(Symbol, usize)>,
+    /// The C of a unit produced elsewhere, an artifact's, that this one loads rather than builds.
+    /// The C describes itself (`c::Exports`), so the text is all an artifact carries of it.
+    embedded: Option<String>,
 }
 
 impl Unit {
@@ -161,22 +153,23 @@ impl Unit {
     }
 
     /// A unit produced elsewhere, which is what an artifact carries: its definitions are the ones
-    /// the record says it took, and nothing here asks a producer for anything.
+    /// its own table says it took, and nothing here asks a producer for anything. The C is
+    /// compiled and loaded once here to read that table; each `build` loads the same object
+    /// again from the cache.
     pub fn embedded(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
         check: &ply_core::CheckOutput,
-        embedded: Embedded,
+        text: String,
     ) -> Result<&'static Unit> {
-        let record = crate::c::cache::decode_unit(&embedded.record)
-            .ok_or_else(|| anyhow::anyhow!("the embedded unit's record does not decode"))?;
+        let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
         let origin = std::ptr::from_ref(program) as usize;
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static ply_syntax::resolve::Resolved =
             Box::leak(Box::new(resolved.clone()));
         let check: &'static ply_core::CheckOutput = Box::leak(Box::new(check.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::new(program, resolved, check)));
-        let compiled = record.taken.clone();
+        let compiled = exports.names();
         let members: BTreeSet<Symbol> = compiled
             .iter()
             .filter(|name| registers(source, name))
@@ -187,13 +180,13 @@ impl Unit {
             source,
             compiled,
             members,
-            refusals: record.refusals.clone(),
+            refusals: exports.refusals,
             counters: Counters::default(),
             analysis_nanos: 0,
             codegen_nanos: AtomicU64::new(0),
             compiles: AtomicU64::new(0),
             poisoned: AtomicU64::new(0),
-            embedded: Some(embedded),
+            embedded: Some(text),
         };
         Ok(Box::leak(Box::new(unit)))
     }
@@ -243,17 +236,15 @@ impl Unit {
     fn build(&'static self) -> Result<Bodies> {
         let started = std::time::Instant::now();
         let native = match &self.embedded {
-            Some(embedded) => {
-                let record = crate::c::cache::decode_unit(&embedded.record)
-                    .ok_or_else(|| anyhow::anyhow!("the embedded unit's record does not decode"))?;
-                crate::c::load_unit(
-                    self.source,
-                    &embedded.text,
-                    record,
-                    embedded.ctors.clone(),
-                    "artifact",
-                )?
-                .0
+            Some(text) => {
+                let modules = self
+                    .source
+                    .program
+                    .modules
+                    .iter()
+                    .map(|m| m.source)
+                    .collect();
+                crate::c::load_unit(text, Some(modules), "artifact")?.0
             }
             // Offered the same set the pre-flight was, so the unit's key is the pre-flight's and a
             // worker reads that unit back rather than emitting it again.

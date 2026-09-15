@@ -67,24 +67,22 @@ fn main() {
     ));
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (text, record, declined) =
-        ply_codegen::c::emit_unit_record(source, &refs).unwrap_or_else(|e| {
-            fail(&format!(
-                "the emitter could not emit {}: {e:#}",
-                dir.display()
-            ))
-        });
-    if !declined.is_empty() {
+    let produced = ply_codegen::c::produce(source, &refs).unwrap_or_else(|e| {
+        fail(&format!(
+            "the emitter could not emit {}: {e:#}",
+            dir.display()
+        ))
+    });
+    if !produced.refused.is_empty() {
         fail(&format!(
             "the emitter refused {} bodies of {}: {:?}",
-            declined.len(),
+            produced.refused.len(),
             dir.display(),
-            declined
+            produced.refused
         ));
     }
     let out = dir.join("bootstrap");
-    let load = ply_codegen::c::bundle::Load::of(source, &record.taken);
-    ply_codegen::c::bundle::write(&out, &text, &record, &source.ctors(), &load, &identity)
+    ply_codegen::c::bundle::write(&out, &produced.text, &identity)
         .unwrap_or_else(|e| fail(&format!("{}: {e:#}", out.display())));
     println!("{} staged as {identity}", out.display());
 }
