@@ -11,6 +11,7 @@ mod backend;
 mod bootstrap_archive;
 mod cli;
 mod config_cli;
+mod corpus;
 mod db_cli;
 mod derivation_audit;
 mod derivation_determinism_audit;

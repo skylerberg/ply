@@ -69,6 +69,7 @@ PARTITIONS=8
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
   "emit-diff-own-sources:ply-compiler-diff:suite:emit_diff::the_port_resolves_its_own_sources_to_the_references_c"
+  "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
 )
 
 # The packages whose tests need a postgres server and cluster binaries. They
