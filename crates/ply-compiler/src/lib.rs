@@ -87,18 +87,15 @@ pub fn sources() -> impl Iterator<Item = (&'static str, &'static str)> {
 /// what says the bundle serves: it was emitted from these sources, and the emitter built from it
 /// emits, for them, the C it was built from.
 pub mod bootstrap {
-    /// The unit's C, gzipped. It carries everything loading it needs -- the constructor table
-    /// its tags are positions in, its functions and their arities, its tables -- so building the
-    /// emitter from it parses none of these sources.
+    /// The unit's C, gzipped. It carries everything loading it needs -- the runtime helper table
+    /// it was emitted against, the constructor table its tags are positions in, its functions and
+    /// their arities, its tables -- so building the emitter from it parses none of these sources,
+    /// and it serves any runtime whose helper table starts with its own.
     pub const UNIT: &[u8] = include_bytes!("../bootstrap/unit.c.gz");
 
     /// The digest of the sources it was emitted from. The fixpoint test refuses a bundle whose
     /// digest is not these sources', and CI hands back a refreshed one as an artifact.
     pub const SOURCES: &str = include_str!("../bootstrap/SOURCES.digest");
-
-    /// The digest of the runtime its C calls into. A helper that changes shape leaves the bundle
-    /// calling the old one, which no digest of the sources would see.
-    pub const RUNTIME: &str = include_str!("../bootstrap/RUNTIME.digest");
 
     /// Where the bundle lives in the source tree, for the refresh that rewrites it.
     pub const DIR: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/bootstrap");

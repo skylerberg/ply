@@ -227,17 +227,19 @@ first stage's facade is therefore taken consumer by consumer, each switched
 to the tier-only engine with its own oracle, rather than as one wrapping
 pass before any of them.
 
-**Built, the runtime's digest.** A bundle's C calls the runtime's helpers
+**Built, the runtime's table.** A bundle's C calls the runtime's helpers
 by name and shape, and a helper that moves — an argument added — leaves the
 bundle calling the old shape, which no digest of the emitter's sources
 sees: the emitter it builds fails on the first body that reaches the
 helper, and the refresh, which builds its first emitter from the bundle,
-fails with it. `RUNTIME.digest` beside the bundle is the helper table's
-digest; a bundle emitted against another table does not serve, the
-reference builds the producer, and the refresh starts from the reference.
-The same digest is in the key of every cached body, since a body's C calls
-the helpers by shape too: the differential read back bodies emitted a run
-earlier, against the old shape, before it was.
+fails with it. The unit carries the helper table it was emitted against
+(ADR 0050 §1a); it serves a runtime whose table starts with its own, since
+the helpers are bound by position, and refuses any other, naming the
+helper, whereupon the reference builds the producer and the refresh starts
+from the reference. A digest of the whole table is in the key of every
+cached body, since a body's C calls the helpers by shape too: the
+differential read back bodies emitted a run earlier, against the old
+shape, before it was.
 
 **Built, for the judge and the prover.** §"The facade" said an expression in
 a scope is a definition, and it is: `Source` synthesises one per law guard

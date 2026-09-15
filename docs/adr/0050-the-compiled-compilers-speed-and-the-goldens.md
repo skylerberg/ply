@@ -54,14 +54,19 @@ That is the wrong rule. A unit emitted against the first `n` helpers binds
 the first `n` positions and reads no other; it serves against any table
 that starts with its own.
 
-**Built when.** `Exports` carries the helper table the unit was emitted
+**Built.** `Exports` carries the helper table the unit was emitted
 against, one line per helper with its name, its argument count and whether
-it answers. `finish` refuses a unit whose table the runtime's does not
-start with, naming the first helper that differs. `RUNTIME.digest` and
-`runtime_digest` go, from the bundle, from the artifact's unit section and
-from the fixpoint test's message; the body cache's key keeps a digest of
-the whole table, since a cache may be conservative. The measure is the
-next item: `list_set`'s helper is appended and the bundle in the tree
+it answers, first in the table so it is the first thing read. `finish`
+refuses a unit whose table the runtime's does not start with, naming the
+first helper that differs, as an `Unserved` the callers tell from a unit
+that is broken: the producer and the fixpoint test build the emitter with
+the reference on it, and `ply run` leaves an artifact's unit aside with the
+warning it gave before. `RUNTIME.digest` and `runtime_digest` are gone,
+from the bundle, from the artifact's unit section and from the fixpoint
+test's message; the body cache's key keeps a digest of the whole table,
+since a cache may be conservative. The bundle in the tree was given its
+table by transformation, and the fixpoint compares the C with it in. The
+measure is the next item: `list_set`'s helper is appended and this bundle
 still serves, so the fixpoint's refresh runs from it rather than from the
 reference.
 
