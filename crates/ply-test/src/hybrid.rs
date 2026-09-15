@@ -236,9 +236,8 @@ impl Hybrid for BodyHybrid<'_> {
             .tests
             .first()
             // `Engine::Evaluator` whatever the run around this one installed: the trial below
-            // runs the reference fragment, which emits the C the whole tier ran for an
-            // effect-free mixture, so what it proves is the evaluator's claim and belongs in
-            // the evaluator's namespace.
+            // runs the whole emitter over the mixture, so what it proves is the evaluator's claim
+            // and belongs in the evaluator's namespace.
             .map(|hash| result_key(*hash, seeded, &self.plan, &Engine::Evaluator));
         if let Some(hash) = hash
             && matches!(self.store.get(hash), Some(Outcome::Pass))
@@ -254,23 +253,25 @@ impl Hybrid for BodyHybrid<'_> {
             // question up to `Budget::max_trials` times, and a binding threaded in here would
             // answer each of them with a real packet.
             //
-            // A mixture is a reconstructed AST with no source text, so the whole Ply emitter — a
-            // front end that re-parses source — cannot produce its bodies. The reference emits from
-            // the AST directly, and for the effect-free programs a mixture reconstructs it emits the
-            // identical C, so the failure a mixture reproduces is the one the whole tier saw. An
-            // effectful mixture the reference cannot emit declines, and the trial is `Inconclusive`.
-            ply_codegen::c::producer::reference_only(|| {
-                let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
-                let unit = ply_codegen::Unit::over(&rebuilt.program, &resolved, &check)
+            // A mixture is a reconstructed AST with no source text, and the whole Ply emitter is
+            // a front end that reads text: it is handed the mixture printed back to source, and
+            // runs it as it runs everything else.
+            ply_codegen::c::producer::ensure_default();
+            let texts: std::collections::HashMap<String, String> =
+                ply_syntax::print::program(&rebuilt.program)
+                    .into_iter()
+                    .collect();
+            let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
+            let unit =
+                ply_codegen::Unit::over_with_texts(&rebuilt.program, &resolved, &check, texts)
                     .expect("this host has a C compiler");
-                let spec = ply_eval::BackendSpec {
-                    kind: ply_eval::BackendKind::C,
-                    ..Default::default()
-                };
-                machine.set_compiled(unit.attach(&spec));
-                seed_run(&mut machine, &plan.seeds()[0], plan.steps);
-                machine.eval_test(index)
-            })
+            let spec = ply_eval::BackendSpec {
+                kind: ply_eval::BackendKind::C,
+                ..Default::default()
+            };
+            machine.set_compiled(unit.attach(&spec));
+            seed_run(&mut machine, &plan.seeds()[0], plan.steps);
+            machine.eval_test(index)
         }));
         match outcome {
             Ok(Ok(())) => {

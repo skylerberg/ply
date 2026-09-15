@@ -3,6 +3,7 @@ pub mod defaults;
 mod effect_set;
 pub mod lexer;
 pub mod parser;
+pub mod print;
 mod record_update;
 pub mod resolve;
 mod try_op;
