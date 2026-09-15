@@ -181,7 +181,12 @@ read off a clock is not. The durations are measurements — `benches/`, the ADRs
 the `ignored` benchmarks — and nothing fails when they move. If you add a test
 whose question is "how long", assert the count behind it; where the only bound
 is on the process, a simulated sleep that must not be waited out,
-`.config/nextest.toml` carries a `slow-timeout` for that test.
+`.config/nextest.toml` carries a `slow-timeout` for that test. And a change
+made *for* speed cites a reading from one of the two instruments in the
+record that lands it, or it does not claim the speed:
+`.github/workflows/profile.yml`, a flat CPU profile of one differential on
+a runner by dispatch, and the build job's timings artifact. Two levers in
+ADR 0049 were guessed right and measured wrong (ADR 0050 §3).
 
 **A phase between two differentials, compared by neither.** The parser spike's
 third comparison covers the rewrites `Parser::run` applies and its fifth covers
