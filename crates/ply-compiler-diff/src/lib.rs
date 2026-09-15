@@ -2259,3 +2259,65 @@ pub mod golden {
         write!(file, "%%% {index}\n{text}\n").unwrap_or_else(|e| panic!("{}: {e}", path.display()));
     }
 }
+
+/// The compiled compiler's cost, held to `benches/compiled-compiler.json` (ADR 0051 §2): what
+/// its entries allocated and recycled, which do not vary with a machine, and the most chunk
+/// bytes one held, which varies with how the chunks grew.
+pub mod census {
+    use std::path::PathBuf;
+
+    pub const FILE: &str = "benches/compiled-compiler.json";
+
+    fn path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(std::path::Path::parent)
+            .expect("the crate lives two levels below the repository root")
+            .join(FILE)
+    }
+
+    /// Holds the thread's census since the last reset to the file's entry for `key`, within one
+    /// per cent on the counts and a quarter on the chunk bytes. A missing entry fails with the
+    /// reading, which is what the file is written from.
+    pub fn hold(key: &str, lines: usize) -> Result<(), String> {
+        let got = ply_codegen::c::producer::census();
+        let reading = serde_json::json!({
+            "entries": got.entries,
+            "allocated": got.allocated,
+            "recycled": got.recycled,
+            "chunk_bytes": got.chunk_bytes,
+            "source_lines": lines,
+        });
+        let text = std::fs::read_to_string(path()).unwrap_or_else(|_| "{}".to_string());
+        let file: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| format!("{} does not parse: {e}", path().display()))?;
+        let Some(want) = file.get(key) else {
+            return Err(format!(
+                "{} has no entry `{key}`; this reading, from the run that asked, is what it takes:\n  \"{key}\": {reading}",
+                path().display()
+            ));
+        };
+        let field = |name: &str| -> Result<f64, String> {
+            want.get(name)
+                .and_then(serde_json::Value::as_f64)
+                .ok_or_else(|| format!("`{key}` in {} has no `{name}`", path().display()))
+        };
+        for (name, measured, band) in [
+            ("entries", got.entries as f64, 0.0),
+            ("allocated", got.allocated as f64, 0.01),
+            ("recycled", got.recycled as f64, 0.01),
+            ("chunk_bytes", got.chunk_bytes as f64, 0.25),
+        ] {
+            let claimed = field(name)?;
+            let drift = (claimed - measured).abs() / measured.max(1.0);
+            if drift > band {
+                return Err(format!(
+                    "`{key}` in {} says {name} is {claimed:.0} and this tree reads {measured:.0}; re-take the entry from this reading if the change is meant:\n  \"{key}\": {reading}",
+                    path().display()
+                ));
+            }
+        }
+        println!("  {key}: {reading}");
+        Ok(())
+    }
+}
