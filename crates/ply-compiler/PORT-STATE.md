@@ -269,11 +269,14 @@ update of a local it projects from and an update's base resolved on a stack that
 away, which lost a lambda its capture; and the resolved-C one, where the port's own bodies are a
 ratchet of their own with floors and not yet an emptiness. The audit of the port's own tests
 under the tier is green. `crates/ply-compiler/bootstrap/` is the C the port emitted for itself,
-compressed, with the unit's record and the digest of the sources it came from; the CLI builds
-the producer from it rather than with the reference, `PLY_C_BOOTSTRAP=off` asks for the
-reference again, and `PLY_C_BOOTSTRAP_REFRESH=1 cargo test -p ply-codegen-tests --test bootstrap`
-rewrites the bundle from the fixpoint's own emission. The fixpoint test is the check: the emitter
-built from the bundle emits, for its sources, C that builds an emitter that emits the same C.
+compressed, with the unit's record, the constructor table it was emitted against and the digest
+of the sources it came from; the CLI builds the producer from it rather than with the reference,
+`PLY_C_BOOTSTRAP=off` asks for the reference again, and
+`PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap` rewrites the
+bundle from the fixpoint's own emission -- CI runs the same refresh when the fixpoint goes red and
+hands the bundle back as the `bootstrap-bundle` artifact. The fixpoint test is the check: the
+bundle was emitted from these sources, and the emitter built from it emits, for them, C that builds
+an emitter that emits the same C.
 
 The port's output is now built as lines joined once per body and frames joined once per dump,
 which the measurement in ADR 0045 §"What the fixpoint measured" showed was not where the

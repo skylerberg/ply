@@ -12,6 +12,15 @@ listed in `MODULES`, with the bootstrap bundle beside them in `bootstrap/` and
 `include_bytes!` putting it in the binary. Nothing here reads the file system, so
 a `ply` binary carries its own compiler wherever it is run from.
 
+**A change to any `ply/*.ply` needs the bundle refreshed in the same change.**
+The bundle is the emitter built from the sources it was emitted from, with its
+own constructor table; the fixpoint test in `crates/ply-codegen-tests` refuses
+one emitted from other sources, and CI then refreshes it and hands it back as
+the `bootstrap-bundle` artifact (`gh run download <run> -n bootstrap-bundle -D
+crates/ply-compiler/bootstrap`). Locally,
+`PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap`
+writes the same thing.
+
 `crates/ply-compiler-diff` holds the differentials — this compiler against the
 Rust one, phase by phase — and is a workspace member, so `cargo test --workspace`
 runs them.
