@@ -481,18 +481,10 @@ fn finish(lib: Library, exports: Exports, sources: Option<Vec<SourceId>>) -> Res
         shapes,
         lambdas,
     } = exports;
-    let sources = match sources {
-        Some(sources) => {
-            if sources.len() != modules {
-                bail!(
-                    "the unit was emitted from {modules} modules and is being loaded against {}",
-                    sources.len()
-                );
-            }
-            sources
-        }
-        None => (0..modules).map(|i| SourceId(i as u32)).collect(),
-    };
+    // For the spans bodies store, by the index of the module they were emitted from. An
+    // artifact's program is rebuilt from its definitions, so its modules need not be the ones the
+    // unit was emitted from; a span then names the module at that index, or nothing.
+    let sources = sources.unwrap_or_else(|| (0..modules).map(|i| SourceId(i as u32)).collect());
     bind(&lib)?;
     let mut unit = Unit::new(
         ctors.clone(),
