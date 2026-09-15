@@ -113,7 +113,7 @@ impl Op {
     }
 
     /// The registration.
-    fn declaration(self, path: &'static str) -> HostOp {
+    pub fn declaration(self, path: &'static str) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
@@ -258,9 +258,9 @@ pub fn registry(trace: Arc<Trace>) -> HostRegistry {
     registry
 }
 
-struct Operation {
-    op: Op,
-    trace: Arc<Trace>,
+pub struct Operation {
+    pub op: Op,
+    pub trace: Arc<Trace>,
 }
 
 impl HostHandler for Operation {
@@ -435,6 +435,3 @@ fn value_error(span: Span, what: &str, got: &ply_eval::Value) -> Diagnostic {
     .primary(span, "this perform reached the trace sink")
     .note("inference checks a perform's argument types, so reaching this means the evaluator was handed a module that was never checked")
 }
-
-#[cfg(test)]
-mod tests;

@@ -1229,6 +1229,3 @@ fn is_reserved(word: &str) -> bool {
                 | "outer"
         )
 }
-
-#[cfg(test)]
-mod tests;

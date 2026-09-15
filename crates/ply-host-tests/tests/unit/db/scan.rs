@@ -1,4 +1,5 @@
-use super::*;
+use ply_host::db::scan::*;
+use ply_span::{Diagnostic, Span, codes};
 
 fn ok(sql: &str) -> Scan {
     scan(sql, Span::DUMMY).unwrap_or_else(|d| panic!("`{sql}` was refused: {}", d.message))

@@ -237,6 +237,3 @@ fn describe(scan: &Scan) -> String {
         ),
     }
 }
-
-#[cfg(test)]
-mod tests;

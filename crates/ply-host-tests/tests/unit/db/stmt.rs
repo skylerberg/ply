@@ -1,4 +1,4 @@
-use super::*;
+use ply_host::db::stmt::*;
 use ply_span::{SourceId, Span};
 
 fn span(start: u32) -> Span {

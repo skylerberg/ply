@@ -1,6 +1,17 @@
-use super::*;
+mod handler;
+mod pool;
+mod scan;
+mod scope;
+mod stmt;
+mod types;
+mod value;
+
+use ply_core::ty::Footprint;
 use ply_core::ty::{EffectAtom, Resource};
+use ply_eval::HostResource;
 use ply_eval::{Determinism, Linearity};
+use ply_host::db::*;
+use ply_span::{Span, Symbol, codes};
 use ply_syntax::ast::Mode;
 
 fn label(name: &str) -> Resource {
@@ -16,7 +27,7 @@ fn row(atoms: impl IntoIterator<Item = EffectAtom>) -> Footprint {
 }
 
 fn scanned(sql: &str) -> Scan {
-    scan::scan(sql, Span::DUMMY).unwrap_or_else(|d| panic!("`{sql}`: {}", d.message))
+    ply_host::db::scan::scan(sql, Span::DUMMY).unwrap_or_else(|d| panic!("`{sql}`: {}", d.message))
 }
 
 /// Every column `ply hosts` prints is decided by the declaration, and each is a claim someone has

@@ -450,6 +450,3 @@ fn describe(owner: Owner) -> String {
         None => "the entry point".to_string(),
     }
 }
-
-#[cfg(test)]
-mod tests;

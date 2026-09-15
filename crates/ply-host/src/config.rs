@@ -382,7 +382,7 @@ impl Resolved {
 /// The frozen configuration of one run.
 #[derive(Clone, Default, PartialEq, Eq, Debug)]
 pub struct Snapshot {
-    values: BTreeMap<String, Resolved>,
+    pub values: BTreeMap<String, Resolved>,
     /// Only the keys a schema declared, so the `SSecret` gate can tell "declared as something else"
     /// from "not declared at all".
     declared: BTreeMap<String, Shape>,
@@ -483,7 +483,7 @@ impl Snapshot {
     }
 
     /// The plaintext behind `config.secret`, for the one caller that turns it into a `Secret`.
-    fn plaintext(&self, key: &str) -> Option<&str> {
+    pub fn plaintext(&self, key: &str) -> Option<&str> {
         let resolved = self.values.get(key)?;
         if self.has_spec && resolved.shape != Some(Shape::Secret) {
             return None;
@@ -723,6 +723,3 @@ fn err_undeclared(key: &str, source: &Source, spec: &Spec) -> Diagnostic {
     })
     .note("only `--set` and `--config` are checked: an environment is full of names that have nothing to do with this program")
 }
-
-#[cfg(test)]
-mod tests;
