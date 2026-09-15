@@ -45,8 +45,10 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # deals tests round-robin after the filters, so tests of one binary spread
 # across partitions rather than landing in one. Raise it when the slowest
 # partition's run outlasts its slowest test by much; lower it when the
-# per-job overhead -- checkout, a C compiler, the archive -- is most of a leg.
-PARTITIONS=14
+# per-job overhead -- checkout, a C compiler, the archive -- is most of a leg,
+# or when the jobs after `build` outnumber what the account runs at once and
+# queue: fourteen partitions queued for longer than the four fewer saved.
+PARTITIONS=10
 
 # Tests that get a runner of their own, as `id:package:target:test`. Each is
 # the longest thing in its binary and, by `.config/nextest.toml`, runs with
