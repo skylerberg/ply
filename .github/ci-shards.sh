@@ -46,7 +46,7 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # across partitions rather than landing in one. Raise it when the slowest
 # partition's run outlasts its slowest test by much; lower it when the
 # per-job overhead -- checkout, a C compiler, the archive -- is most of a leg.
-PARTITIONS=10
+PARTITIONS=14
 
 # Tests that get a runner of their own, as `id:package:target:test`. Each is
 # the longest thing in its binary and, by `.config/nextest.toml`, runs with
