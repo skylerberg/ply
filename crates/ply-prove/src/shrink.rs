@@ -1,8 +1,5 @@
 //! Shrinking a counterexample.
 
-#[cfg(test)]
-mod tests;
-
 use crate::property::{
     HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
 };

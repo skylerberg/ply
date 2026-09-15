@@ -1,7 +1,7 @@
 //! What `Float` and `Decimal` may and may not do to the `proved` tier.
 
-use super::tests::{attempt_for_test, fixture, not_proved, proof};
-use super::{Blocker, Decision};
+use super::{attempt_for_test, fixture, not_proved, proof};
+use ply_prove::prove::{Blocker, Decision};
 
 const FLOATS: &str = r#"
 law "a float equals itself" forall (x: Float) { x == x }
