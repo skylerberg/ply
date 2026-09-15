@@ -11,6 +11,7 @@
 //! the reference, which under tier-only can no longer emit it whole.
 
 use ply_codegen::Source;
+use ply_codegen::c::bundle::Load;
 use ply_codegen::c::producer::{self, PlyProducer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,7 +82,7 @@ static FROM: Mutex<Option<PathBuf>> = Mutex::new(None);
 fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProducer, String> {
     let (native, _) = match from.and_then(ply_codegen::c::bundle::from_dir) {
         Some(bundle) => {
-            ply_codegen::c::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?
+            ply_codegen::c::bundle::build(&bundle, || Ok(source)).map_err(|e| format!("{e:#}"))?
         }
         None => {
             let names: Vec<String> = source.functions();
@@ -181,7 +182,8 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         // A refresh writes the current emitter's own emission, once an emitter built from it has
         // emitted the same thing again: the bundle written is a fixpoint on the day it is written.
         let stage = scratch.join("stage1");
-        ply_codegen::c::bundle::write(&stage, &c1, &r1, &ctors, &identity).unwrap();
+        let load = Load::of(source, &r1.taken);
+        ply_codegen::c::bundle::write(&stage, &c1, &r1, &ctors, &load, &identity).unwrap();
         let (c2, r2, _) = emit_with(source, Some(&stage), &scratch);
         if !same(&c1, &r1, &c2, &r2) {
             differ(
@@ -191,7 +193,7 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
                 "the emitter built from one emission and the emitter built from its own emit different C",
             );
         }
-        ply_codegen::c::bundle::write(&bundle, &c2, &r2, &ctors, &identity).unwrap();
+        ply_codegen::c::bundle::write(&bundle, &c2, &r2, &ctors, &load, &identity).unwrap();
         eprintln!("bootstrap bundle written to {}", bundle.display());
     } else {
         // The bundle was emitted from these sources, so the emitter built from it emitting its own
@@ -208,6 +210,14 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
                 "the emitter built from the bundle emits other C for these sources than the bundle holds",
             );
         }
+        // The load record is the fixpoint's too: what the bundle says loading needs is what these
+        // sources say, or the bundle enters its functions at the wrong arities.
+        assert_eq!(
+            current.load(),
+            Some(&Load::of(source, &record.taken)),
+            "the bundle at {} does not carry the load record these sources derive; refresh it: PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap, or take CI's `bootstrap-bundle` artifact",
+            bundle.display()
+        );
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }

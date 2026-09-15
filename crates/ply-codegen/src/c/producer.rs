@@ -123,10 +123,31 @@ fn modules_of(src: &Sources) -> Vec<(String, String)> {
     modules
 }
 
-/// Build the emitter as a producer: parse and check its modules, then build the native emitter
-/// from the bootstrap bundle -- or, when `PLY_C_BOOTSTRAP=off` or the bundle does not serve, with
-/// the reference emitter, which is how a bundle is refreshed.
+/// Build the emitter as a producer: the native emitter from the bootstrap bundle, which reads none
+/// of its sources -- or, when `PLY_C_BOOTSTRAP=off` or the bundle does not serve, parsed and
+/// checked and emitted by the reference emitter, which is how a bundle is refreshed.
 fn build_from(src: &Sources) -> Result<PlyProducer, String> {
+    let bundle = (std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off"))
+        .then(|| super::bundle::of(src))
+        .flatten();
+    let (native, _refused) = match bundle {
+        Some(bundle) => {
+            super::bundle::build(&bundle, || front_end(src).map_err(anyhow::Error::msg))
+                .map_err(|e| format!("{e:#}"))?
+        }
+        None => {
+            let source = front_end(src)?;
+            let names: Vec<String> = source.functions();
+            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+            super::build(source, &refs).map_err(|e| format!("{e:#}"))?
+        }
+    };
+    PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+}
+
+/// The emitter's own program through the front end, keyed as the cache keys it, with the modules
+/// as `SourceId(0..n)` in `modules_of`'s order.
+fn front_end(src: &Sources) -> Result<&'static Source, String> {
     use ply_span::SourceId;
     let inputs: Vec<_> = modules_of(src)
         .into_iter()
@@ -158,20 +179,9 @@ fn build_from(src: &Sources) -> Result<PlyProducer, String> {
     let keys = ply_hash::hash_program(program, resolved, check)
         .map(|h| crate::source::emit_keys(program, &h))
         .unwrap_or_default();
-    let source: &'static Source =
-        Box::leak(Box::new(Source::keyed(program, resolved, check, keys)));
-    let bundle = (std::env::var("PLY_C_BOOTSTRAP").as_deref() != Ok("off"))
-        .then(|| super::bundle::of(src))
-        .flatten();
-    let (native, _refused) = match bundle {
-        Some(bundle) => super::bundle::build(source, &bundle).map_err(|e| format!("{e:#}"))?,
-        None => {
-            let names: Vec<String> = source.functions();
-            let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-            super::build(source, &refs).map_err(|e| format!("{e:#}"))?
-        }
-    };
-    PlyProducer::new(native).map_err(|e| format!("{e:#}"))
+    Ok(Box::leak(Box::new(Source::keyed(
+        program, resolved, check, keys,
+    ))))
 }
 
 pub fn reset_thread() {
