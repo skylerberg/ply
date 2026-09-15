@@ -67,9 +67,8 @@ pub fn encode_ctors(ctors: &[(Symbol, usize)]) -> String {
     out
 }
 
-/// `None` for an empty table: a bundle written before the table travelled with it has none, and
-/// [`build`] binds such a bundle to the program's own, which is right only while the sources are
-/// the ones it was emitted from.
+/// `None` for a line that is not `name arity`, and for an empty table, which no unit was ever
+/// emitted against.
 pub fn decode_ctors(s: &str) -> Option<Vec<(Symbol, usize)>> {
     let table: Vec<(Symbol, usize)> = s
         .lines()
@@ -81,6 +80,10 @@ pub fn decode_ctors(s: &str) -> Option<Vec<(Symbol, usize)>> {
     (!table.is_empty()).then_some(table)
 }
 
+fn ctors_in(dir: &Path) -> Option<Vec<(Symbol, usize)>> {
+    decode_ctors(&std::fs::read_to_string(dir.join(CTORS)).ok()?)
+}
+
 /// A bundle that serves: its C, its record, its constructor table, and the digest of the sources
 /// it came from.
 ///
@@ -89,7 +92,7 @@ pub fn decode_ctors(s: &str) -> Option<Vec<(Symbol, usize)>> {
 pub struct Bundle {
     unit: std::borrow::Cow<'static, [u8]>,
     record: String,
-    ctors: Option<Vec<(Symbol, usize)>>,
+    ctors: Vec<(Symbol, usize)>,
     sources: Option<String>,
 }
 
@@ -97,10 +100,13 @@ pub struct Bundle {
 pub fn of(src: &super::producer::Sources) -> Option<Bundle> {
     match src {
         super::producer::Sources::Embedded => {
-            (ply_compiler::bootstrap::RUNTIME.trim() == runtime_digest()).then(|| Bundle {
+            if ply_compiler::bootstrap::RUNTIME.trim() != runtime_digest() {
+                return None;
+            }
+            Some(Bundle {
                 unit: std::borrow::Cow::Borrowed(ply_compiler::bootstrap::UNIT),
                 record: ply_compiler::bootstrap::RECORD.to_string(),
-                ctors: decode_ctors(ply_compiler::bootstrap::CTORS),
+                ctors: decode_ctors(ply_compiler::bootstrap::CTORS)?,
                 sources: Some(ply_compiler::bootstrap::SOURCES.trim().to_string()),
             })
         }
@@ -116,7 +122,7 @@ pub fn from_dir(dir: &Path) -> Option<Bundle> {
     Some(Bundle {
         unit: std::borrow::Cow::Owned(std::fs::read(dir.join(UNIT)).ok()?),
         record: std::fs::read_to_string(dir.join(RECORD)).ok()?,
-        ctors: decode_ctors(&std::fs::read_to_string(dir.join(CTORS)).ok()?),
+        ctors: ctors_in(dir)?,
         sources: sources_digest(dir),
     })
 }
@@ -125,11 +131,6 @@ impl Bundle {
     /// The digest of the emitter sources this was emitted from.
     pub fn sources_digest(&self) -> Option<&str> {
         self.sources.as_deref()
-    }
-
-    /// Whether the constructor table its C was emitted against travels with it.
-    pub fn carries_its_ctors(&self) -> bool {
-        self.ctors.is_some()
     }
 }
 
@@ -167,7 +168,7 @@ pub fn sources_digest(dir: &Path) -> Option<String> {
 pub fn exists(dir: &Path) -> bool {
     dir.join(UNIT).is_file()
         && dir.join(RECORD).is_file()
-        && dir.join(CTORS).is_file()
+        && ctors_in(dir).is_some()
         && !stale_runtime(dir)
 }
 
@@ -178,6 +179,5 @@ pub fn build(loaded: &'static Source, bundle: &Bundle) -> Result<(Native, Vec<Re
     let text = text_of(bundle)?;
     let record = decode_unit(&bundle.record)
         .ok_or_else(|| anyhow!("the bootstrap bundle's record does not decode"))?;
-    let ctors = bundle.ctors.clone().unwrap_or_else(|| loaded.ctors());
-    super::build::load_unit(loaded, &text, record, ctors, "bootstrap")
+    super::build::load_unit(loaded, &text, record, bundle.ctors.clone(), "bootstrap")
 }

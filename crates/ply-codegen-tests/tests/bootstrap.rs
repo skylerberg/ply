@@ -139,11 +139,6 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     );
     if have && !refresh {
         let current = ply_codegen::c::bundle::from_dir(&bundle).expect("the bundle serves");
-        assert!(
-            current.carries_its_ctors(),
-            "the bundle at {} has no constructor table; refresh it: PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap, or take CI's `bootstrap-bundle` artifact",
-            bundle.display()
-        );
         assert_eq!(
             current.sources_digest(),
             Some(identity.as_str()),
