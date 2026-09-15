@@ -18,6 +18,7 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
+src="$root/crates/ply-compiler/ply"
 ply="${PLY_BIN:-$root/target/release/ply}"
 [ -x "$ply" ] || ply="$root/target/debug/ply"
 [ -x "$ply" ] || { echo "no ply binary; run cargo build -p ply-cli --bin ply"; exit 2; }
@@ -28,7 +29,7 @@ ply="${PLY_BIN:-$root/target/release/ply}"
 # a syntax error in an area still being written would otherwise read as the
 # spine going red and every mutation below would "arm" for the wrong reason.
 work="$(mktemp -d)"
-cp "$here/lexer.ply" "$here/spine.ply" "$work/"
+cp "$src/lexer.ply" "$src/spine.ply" "$work/"
 spine="$work/spine.ply"
 backup="$work/spine.ply.orig"
 cp "$spine" "$backup"
