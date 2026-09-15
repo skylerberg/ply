@@ -1,13 +1,16 @@
 //! What the socket handler claims, and whether it is telling the truth.
 
-use super::*;
 use ply_core::CheckOutput;
 use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::{Bound, HostBinding, Pending, Value};
+use ply_eval::{HostAnswer, HostRequest, HostRuntime, Linearity};
+use ply_host::tcp::*;
 use ply_span::SourceId;
+use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Mode, ModuleName};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
+use std::sync::Arc;
 
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";
 const RESPONSE: &[u8] = b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nply";
@@ -922,6 +925,6 @@ fn a_hermetic_run_names_the_tls_handler_it_did_not_bind() {
             &Symbol::new("listen_tls"),
             Some(&Symbol::new("listener")),
         ),
-        Some(crate::tls::HANDLER)
+        Some(ply_host::tls::HANDLER)
     );
 }

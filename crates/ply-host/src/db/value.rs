@@ -10,10 +10,10 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// The module `Json` ships in.
-const JSON_MODULE: &str = "std.json";
+pub const JSON_MODULE: &str = "std.json";
 
 /// A constructor of `module`, as the qualified symbol a `Value` carries.
-fn ctor(module: &str, name: &str) -> Symbol {
+pub fn ctor(module: &str, name: &str) -> Symbol {
     Symbol::new(format!("{module}.{name}"))
 }
 
@@ -259,6 +259,3 @@ fn malformed(wanted: &str, span: Span) -> Diagnostic {
     .note("inference checks a perform's argument types, so reaching this means the evaluator was handed a module that was never checked")
     .note("this is Ply's fault: report it with the program that produced it")
 }
-
-#[cfg(test)]
-mod tests;
