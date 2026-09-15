@@ -1,6 +1,6 @@
 //! What the reference-counting pass claims, checked against what a run does.
 
-use crate::build::*;
+use crate::unit::build::*;
 use ply_eval::rc::*;
 use ply_eval::{Machine, Value};
 use ply_span::Span;

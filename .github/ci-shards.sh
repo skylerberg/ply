@@ -136,13 +136,13 @@ DEFERRED=(
   "ply-test-tests:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"
   "ply-test-tests:suite:region_fixture_cost::a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"
   "ply-test-tests:suite:region_fixture_cost::a_group_with_no_fixture_opens_and_closes_in_constant_time"
-  "ply-corpus-tests:unit:measure::every_resumption_costs_about_what_the_first_one_did"
-  "ply-corpus-tests:unit:measure::capture_and_resume_are_flat_in_the_frames_they_move"
-  "ply-corpus-tests:unit:measure::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real"
-  "ply-store-tests:unit:store::opening_a_ten_thousand_definition_cache_is_under_the_budget"
-  "ply-store-tests:unit:store::a_baseline_for_every_test_does_not_slow_the_open"
+  "ply-corpus-tests:suite:unit::measure::every_resumption_costs_about_what_the_first_one_did"
+  "ply-corpus-tests:suite:unit::measure::capture_and_resume_are_flat_in_the_frames_they_move"
+  "ply-corpus-tests:suite:unit::measure::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real"
+  "ply-store-tests:suite:unit::store::opening_a_ten_thousand_definition_cache_is_under_the_budget"
+  "ply-store-tests:suite:unit::store::a_baseline_for_every_test_does_not_slow_the_open"
   "ply-cli-tests:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
-  "ply-corpus-tests:unit:payload::the_map_rows_survive_subtracting_the_fold_around_them"
+  "ply-corpus-tests:suite:unit::payload::the_map_rows_survive_subtracting_the_fold_around_them"
 )
 
 # Tests that fail on a property of the *tree* rather than of a run, as
@@ -207,7 +207,7 @@ test_source_file() {
     printf '%s\n' "$dir/$target.rs"
   elif [[ $test == *::* ]]; then
     modpath=${test%::*}
-    printf '%s\n' "$dir/$target/${modpath//::/\/}.rs"
+    printf '%s\n' "$dir/$target/${modpath//:://}.rs"
   else
     printf '%s\n' "$dir/$target/main.rs"
   fi

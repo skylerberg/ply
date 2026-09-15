@@ -40,7 +40,7 @@ fn the_callback_builtins_are_the_eight_this_module_knows() {
 /// hash-ordered collection or a clock.
 #[test]
 fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
-    let body = include_str!("../../../ply-eval/src/region_kind.rs");
+    let body = include_str!("../../../../ply-eval/src/region_kind.rs");
     for banned in [
         "HashMap",
         "HashSet",
