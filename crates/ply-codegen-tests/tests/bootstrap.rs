@@ -1,6 +1,6 @@
 //! The emitter written in Ply is built from a bootstrap bundle, the C it emitted for its own
 //! sources, and the bundle serves as long as it is a fixpoint: the emitter built from it emits,
-//! for those sources, C that builds an emitter that emits the same C. ADR 0045's second stage.
+//! for those sources, the bundle's own C. ADR 0045's second stage.
 //!
 //! The bundle has to be the one emitted from the sources in the tree: an older one still runs,
 //! since its constructor table travels with it, and is what the refresh builds the new one with,
@@ -158,15 +158,8 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     );
 
     // The emitter built from the bundle, or from the reference when there is none, emits itself.
-    // An old bundle's emitter may refuse what the current sources emit; only the emitter built
-    // from a current emission has to refuse nothing of itself.
     let first = have.then(|| bundle.clone());
-    let (c1, r1, _) = emit_with(source, first.as_deref(), &scratch);
-    let stage = scratch.join("stage1");
-    ply_codegen::c::bundle::write(&stage, &c1, &r1, &ctors, &identity).unwrap();
-
-    // The emitter built from that emission emits itself again.
-    let (c2, r2, refused) = emit_with(source, Some(&stage), &scratch);
+    let (c1, r1, refused) = emit_with(source, first.as_deref(), &scratch);
     assert!(
         refused.is_empty(),
         "the emitter refuses part of itself: {refused:?}"
@@ -177,30 +170,44 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
                 rb: &ply_codegen::c::cache::UnitCache| {
         a == b && ra.taken == rb.taken && ra.refusals == rb.refusals
     };
-    let differ = |label: &str, a: &str, b: &str| {
+    let differ = |label: &str, a: &str, b: &str, what: &str| {
         let pa = scratch.join(format!("{label}-a.c"));
         let pb = scratch.join(format!("{label}-b.c"));
         std::fs::write(&pa, a).unwrap();
         std::fs::write(&pb, b).unwrap();
-        panic!(
-            "the emitter built from one emission and the emitter built from its own emit different C: diff {} {}",
-            pa.display(),
-            pb.display()
-        );
+        panic!("{what}: diff {} {}", pa.display(), pb.display());
     };
     if refresh {
-        // A refresh writes the current emitter's own emission, once a third emitter built from it
-        // has emitted the same thing: the bundle written is a fixpoint on the day it is written.
-        let stage2 = scratch.join("stage2");
-        ply_codegen::c::bundle::write(&stage2, &c2, &r2, &ctors, &identity).unwrap();
-        let (c3, r3, _) = emit_with(source, Some(&stage2), &scratch);
-        if !same(&c2, &r2, &c3, &r3) {
-            differ("refresh", &c2, &c3);
+        // A refresh writes the current emitter's own emission, once an emitter built from it has
+        // emitted the same thing again: the bundle written is a fixpoint on the day it is written.
+        let stage = scratch.join("stage1");
+        ply_codegen::c::bundle::write(&stage, &c1, &r1, &ctors, &identity).unwrap();
+        let (c2, r2, _) = emit_with(source, Some(&stage), &scratch);
+        if !same(&c1, &r1, &c2, &r2) {
+            differ(
+                "refresh",
+                &c1,
+                &c2,
+                "the emitter built from one emission and the emitter built from its own emit different C",
+            );
         }
         ply_codegen::c::bundle::write(&bundle, &c2, &r2, &ctors, &identity).unwrap();
         eprintln!("bootstrap bundle written to {}", bundle.display());
-    } else if !same(&c1, &r1, &c2, &r2) {
-        differ("fixpoint", &c1, &c2);
+    } else {
+        // The bundle was emitted from these sources, so the emitter built from it emitting its own
+        // C -- the bundle's, byte for byte -- is the fixpoint stated directly, in one emission
+        // rather than the two it took to compare an emission with the emission of that emission.
+        let current = ply_codegen::c::bundle::from_dir(&bundle).expect("the bundle serves");
+        let text = ply_codegen::c::bundle::text_of(&current).expect("the bundle's C unpacks");
+        let record = ply_codegen::c::bundle::record(&bundle).expect("the bundle's record decodes");
+        if !same(&c1, &r1, &text, &record) {
+            differ(
+                "fixpoint",
+                &text,
+                &c1,
+                "the emitter built from the bundle emits other C for these sources than the bundle holds",
+            );
+        }
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }
