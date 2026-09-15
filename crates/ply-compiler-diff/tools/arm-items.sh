@@ -25,6 +25,7 @@
 set -u
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../../.." && pwd)
+src="$root/crates/ply-compiler/ply"
 ply="$root/target/debug/ply"
 [ -x "$ply" ] || ply="$root/target/release/ply"
 [ -x "$ply" ] || { echo "no ply binary; build ply-cli first" >&2; exit 2; }
@@ -32,7 +33,7 @@ work=${PLY_PARSER_WORKDIR:-/tmp/pitems}
 [ -f "$work/items.ply" ] || { echo "no assembled project at $work" >&2; exit 2; }
 diff_py="$here/diff-items.py"
 
-orig=$(mktemp); cp "$here/items.ply" "$orig"
+orig=$(mktemp); cp "$src/items.ply" "$orig"
 restore() { cp "$orig" "$work/items.ply"; }
 trap restore EXIT
 
