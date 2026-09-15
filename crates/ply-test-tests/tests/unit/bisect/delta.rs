@@ -1,15 +1,15 @@
 //! Delta construction over real programs: the `Edited`/`Derived` split, the fusion rule, and the
 //! classifier's refusals.
 
-use super::classify::{Classify, Unknown};
-use super::{
-    Baseline, Change, ChangeKind, DefKey, DepEdges, Diff, EraTable, Regression, Renormalizer, diff,
-};
 use ply_core::CheckOutput;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
+use ply_test::bisect::{
+    Baseline, Change, ChangeKind, Classify, DefKey, DepEdges, Diff, EraTable, Ns, Regression,
+    Renormalizer, StoreClassify, Unknown, diff,
+};
 use std::collections::BTreeMap;
 
 struct Compiled {
@@ -345,7 +345,7 @@ fn a_classifier_with_no_evidence_calls_everything_edited() {
 /// The witness is what makes a private copy of the hashing algorithm safe.
 #[test]
 fn the_renormalizer_reproduces_every_hash_ply_hash_published() {
-    for src in [CHAIN, include_str!("../../../../examples/ledger.ply")] {
+    for src in [CHAIN, include_str!("../../../../../examples/ledger.ply")] {
         let compiled = Compiled::new(src);
         let renormalizer = compiled.renormalizer();
         assert_eq!(
@@ -364,8 +364,8 @@ fn re_normalizing_against_the_current_table_is_the_identity() {
     let compiled = Compiled::new(CHAIN);
     let renormalizer = compiled.renormalizer();
     let table = renormalizer.era_table(&|key: &DefKey| match key.ns {
-        super::Ns::Value => compiled.hashes.defs.get(&key.name).copied(),
-        super::Ns::Decl => compiled.hashes.decls.get(&key.name).copied(),
+        Ns::Value => compiled.hashes.defs.get(&key.name).copied(),
+        Ns::Decl => compiled.hashes.decls.get(&key.name).copied(),
     });
     for (name, hash) in &compiled.hashes.defs {
         let key = DefKey::value(name.clone());
@@ -432,7 +432,7 @@ fn an_interface_preserving_edit_is_independent() {
 
     let baseline = before.baseline("totals");
     let renormalizer = after.renormalizer();
-    let mut classify = super::StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
 
     let scale = Symbol::new("scale");
     assert_eq!(
@@ -458,7 +458,7 @@ fn a_signature_change_is_not_independent() {
 
     let baseline = before.baseline("totals");
     let renormalizer = after.renormalizer();
-    let mut classify = super::StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
 
     let scale = Symbol::new("scale");
     assert_eq!(
@@ -478,7 +478,7 @@ fn an_interface_the_store_never_saw_is_a_refusal_rather_than_a_yes() {
 
     let baseline = before.baseline("totals");
     let renormalizer = after.renormalizer();
-    let mut classify = super::StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
 
     let scale = Symbol::new("scale");
     assert_eq!(
@@ -497,7 +497,7 @@ fn the_store_backed_classifier_produces_the_same_split() {
 
     let baseline = before.baseline("totals");
     let renormalizer = after.renormalizer();
-    let mut classify = super::StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
+    let mut classify = StoreClassify::new(&renormalizer, &baseline, &store, &after.check);
 
     let key = Symbol::new("totals");
     let regression = Regression {
