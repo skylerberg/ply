@@ -9,9 +9,11 @@
 # other job downloads that: `test` runs a slice of the suite, `solo` runs one
 # test that has to run alone on a runner of its own, `gates` runs the tests
 # that read a wall clock and the checks that have to be seen to run, and
-# `test-postgres` and `same-tests` run what needs a server or a binary. A green
-# run is the build plus the slowest of those, and the tables that cut them are
-# in `.github/ci-shards.sh`, where `verify` keeps them total.
+# `test-postgres` and `same-tests` run what needs a server or a binary. The
+# binary the differentials and the scripts drive is a release `ply`, built
+# beside the archive by `build-ply` (argued there). A green run is the build
+# plus the slowest of those, and the tables that cut them are in
+# `.github/ci-shards.sh`, where `verify` keeps them total.
 #
 # Each decision here is argued where it is made:
 #
@@ -227,19 +229,42 @@ jobs:
         with:
           tool: cargo-nextest@0.9.143
 
-      # Every test binary of every member, the `ply` binary the CLI suite and
-      # the differentials drive, and the build-script outputs, in one file.
+      # Every test binary of every member, the debug `ply` the CLI suite runs,
+      # and the build-script outputs, in one file.
       # The jobs below extract it to the same path it was built at, so a path
       # compiled into a test binary is still the path it names.
       - name: cargo nextest archive --workspace
         run: cargo nextest archive --locked --workspace --archive-file nextest.tar.zst
 
-      # The archive built `ply` for the CLI suite, but its dep-info stays under
-      # `deps/`: this is what uplifts `target/debug/ply.d`, which the freshness
-      # check and `same-tests.sh` read. Everything it needs is fresh, so it
-      # writes rather than compiles.
-      - name: cargo build -p ply-cli --bin ply
-        run: cargo build --locked -p ply-cli --bin ply
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-archive
+          path: nextest.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+  # The release `ply` the differentials and the corpus scripts drive. Not the
+  # archive's debug one, on purpose: a debug build's heap keeps every dead
+  # block so that a read of one is caught (`crates/ply-codegen/src/heap.rs`),
+  # and emitting the self-hosted front end through it allocates two hundred
+  # million objects -- a runner dies under that, and thirteen did.
+  build-ply:
+    name: cargo build --release -p ply-cli
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ply-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+      - name: cargo build --locked --release -p ply-cli --bin ply
+        run: cargo build --locked --release -p ply-cli --bin ply
 
       # The scripts in `same-tests` refuse a binary that is not built from the
       # tree, and a freshness check nobody has watched fail is the same defect
@@ -249,24 +274,18 @@ jobs:
       # compares clocks: a checkout made after this build would be newer than
       # the binary everywhere.
       - name: The freshness check can still go red
-        run: PLY_BIN=target/debug/ply .github/binary-is-current.sh --self-test
+        run: .github/binary-is-current.sh --self-test
       - name: The binary is built from this tree
-        run: .github/binary-is-current.sh target/debug/ply
+        run: .github/binary-is-current.sh target/release/ply
 
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: nextest-archive
-          path: nextest.tar.zst
-          retention-days: 1
-          if-no-files-found: error
       # The dep-info goes with it: `examples/same-tests.sh` checks the binary
       # against its own sources and refuses one with no `.d` beside it.
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ply
           path: |
-            target/debug/ply
-            target/debug/ply.d
+            target/release/ply
+            target/release/ply.d
           retention-days: 1
           if-no-files-found: error
 
@@ -277,7 +296,7 @@ jobs:
   # that.
   test:
     name: test ${{ matrix.slice }}
-    needs: [plan, build]
+    needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -322,7 +341,7 @@ jobs:
   # their sum.
   solo:
     name: test ${{ matrix.id }}
-    needs: [plan, build]
+    needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -386,7 +405,7 @@ jobs:
   # reducing what CI checks.
   gates:
     name: test gates
-    needs: [plan, build]
+    needs: [plan, build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
@@ -440,7 +459,7 @@ jobs:
 
   test-postgres:
     name: test ply-host (postgres)
-    needs: [build]
+    needs: [build, build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
 
@@ -591,11 +610,11 @@ jobs:
   # `build`'s, checked there against the tree it was built from.
   same-tests:
     name: examples/same-tests.sh
-    needs: [build]
+    needs: [build-ply]
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     env:
-      PLY_BIN: ${{ github.workspace }}/target/debug/ply
+      PLY_BIN: ${{ github.workspace }}/target/release/ply
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -605,7 +624,7 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: ply
-          path: target/debug
+          path: target/release
       # An artifact keeps neither the execute bit nor a clock the scripts can
       # compare: `same-tests.sh` refuses a binary older than the sources in its
       # dep-info, and this checkout is newer than `build`'s. Touched, the
@@ -811,6 +830,7 @@ jobs:
         fmt,
         clippy,
         build,
+        build-ply,
         test,
         solo,
         gates,
