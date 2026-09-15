@@ -2042,6 +2042,7 @@ pub mod port {
     }
 
     /// `resolve.Source`, the module record every whole-program phase takes a list of.
+    #[allow(clippy::arc_with_non_send_sync)]
     pub fn source(name: &str, src: &str) -> Value {
         Value::Record(Arc::new(Fields::from_unsorted(vec![
             (Symbol::new("name"), Value::bytes(name.as_bytes())),
