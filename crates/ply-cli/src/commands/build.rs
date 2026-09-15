@@ -230,7 +230,7 @@ fn row(label: String, names_of: &[String], _style: Style) {
     }
 }
 
-fn names(all: &[String]) -> String {
+pub fn names(all: &[String]) -> String {
     let shown: Vec<&str> = all.iter().take(SHOWN).map(String::as_str).collect();
     match all.len().checked_sub(SHOWN) {
         Some(rest) if rest > 0 => format!("{}, and {rest} more", shown.join(", ")),
@@ -348,7 +348,7 @@ fn arity(def: &DefInfo) -> usize {
 
 /// `desk.run` becomes `desk.plyx`: the module, not the function, because the module is what a
 /// deployment thinks it is shipping.
-fn default_output(entry: &Symbol) -> PathBuf {
+pub fn default_output(entry: &Symbol) -> PathBuf {
     let text = entry.as_str();
     let module = text.rsplit_once('.').map_or(text, |(m, _)| m);
     let leaf = module.rsplit('.').next().unwrap_or(module);
@@ -364,7 +364,7 @@ fn binary_bytes() -> Option<u64> {
         .ok()
 }
 
-fn human(bytes: u64) -> String {
+pub fn human(bytes: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     match bytes {
@@ -398,36 +398,4 @@ fn refuse_all(sources: &SourceMap, diagnostics: &[Diagnostic], json: bool, style
         print_diagnostics(diagnostics, sources, style);
     }
     EXIT_COMPILE_ERROR
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn the_default_output_is_named_after_the_entry_points_module() {
-        assert_eq!(
-            default_output(&Symbol::new("desk.run")),
-            PathBuf::from("desk.plyx")
-        );
-        assert_eq!(
-            default_output(&Symbol::new("store.orders.main")),
-            PathBuf::from("orders.plyx")
-        );
-    }
-
-    #[test]
-    fn a_long_name_list_is_counted_rather_than_printed_whole() {
-        let all: Vec<String> = (0..20).map(|i| format!("m.d{i}")).collect();
-        let line = names(&all);
-        assert!(line.ends_with("and 12 more"), "{line}");
-        assert_eq!(names(&all[..3]), "m.d0, m.d1, m.d2");
-    }
-
-    #[test]
-    fn sizes_read_as_sizes() {
-        assert_eq!(human(512), "512 B");
-        assert_eq!(human(2048), "2.0 KB");
-        assert_eq!(human(3 * 1024 * 1024), "3.0 MB");
-    }
 }
