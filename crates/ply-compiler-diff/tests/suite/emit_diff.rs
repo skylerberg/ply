@@ -36,7 +36,7 @@
 //! **The corpus here is hand-written and small, and that is deliberate.** The reference optimises
 //! before it lowers, so `1 + 2` reaches its emitter as `3` while this port's emitter sees the
 //! addition; a shipped corpus would report that difference on every foldable constant and the
-//! difference would be `opt.rs`'s rather than the emitter's. `tests/emit.rs` records the coupling.
+//! difference would be `opt.rs`'s rather than the emitter's. `emit.rs` beside this records the coupling.
 //! Widening this corpus is what porting `fold_literals` would buy.
 //!
 //! The port is entered in-process through `port`: the bundle the binary carries is the emitter

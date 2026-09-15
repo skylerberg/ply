@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The checker differential, armed: each mutation below is applied to a copy of
-# `infer.ply` or `tycore.ply` and the fast half of `harness/tests/infer.rs` (the
+# `infer.ply` or `tycore.ply` and the fast half of `crates/ply-compiler-diff/tests/suite/infer.rs` (the
 # hand-written programs, the resolver's programs, the standard library and the
 # reference checker's own inputs) must go red.
 #
@@ -21,13 +21,13 @@ run_suite() {
   ( cd "$root" \
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
     && PLY_C_EMITTER="ply:$work" \
-       cargo test --offline --test infer -- --test-threads=2 \
-         the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs \
-         the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs \
-         the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs \
-         the_ply_checker_agrees_with_ply_core_on_the_standard_library \
-         the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs \
-         the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_bundles 2>&1 )
+       cargo test --offline --test suite -- --test-threads=2 \
+         infer::the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs \
+         infer::the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs \
+         infer::the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs \
+         infer::the_ply_checker_agrees_with_ply_core_on_the_standard_library \
+         infer::the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs \
+         infer::the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_bundles 2>&1 )
 }
 
 mutate() {
