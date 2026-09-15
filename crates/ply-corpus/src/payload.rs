@@ -35,12 +35,12 @@ fn millis(d: Duration) -> f64 {
 }
 
 /// A checked project and a machine over it.
-struct Checked {
-    loaded: ply_cli::load::Loaded,
+pub struct Checked {
+    pub loaded: ply_cli::load::Loaded,
 }
 
 impl Checked {
-    fn open(root: &Path) -> Result<Checked> {
+    pub fn open(root: &Path) -> Result<Checked> {
         let loaded = driver::load_full(root).map_err(|e| {
             let shown: Vec<String> = e
                 .diagnostics
@@ -84,7 +84,7 @@ fn call(machine: &mut Machine<'_>, name: &str, args: Vec<Value>) -> Result<Value
         .map_err(|d| anyhow::anyhow!("`{name}` raised {}: {}", d.code, d.message))
 }
 
-fn write_project(files: &[(&str, String)]) -> Result<tempfile::TempDir> {
+pub fn write_project(files: &[(&str, String)]) -> Result<tempfile::TempDir> {
     let dir = tempfile::tempdir().context("a temp dir for a measurement project")?;
     for (name, source) in files {
         std::fs::write(dir.path().join(name), source)?;
@@ -95,7 +95,7 @@ fn write_project(files: &[(&str, String)]) -> Result<tempfile::TempDir> {
 /// An order with `lines` line items, which is the shape a payload benchmark should have: a record
 /// of scalars and a list of records, with a `String` needing escape analysis, an `Int`, a `Decimal`
 /// and a `Bool` in every element.
-const JSON_SRC: &str = r#"import std.json
+pub const JSON_SRC: &str = r#"import std.json
 
 pub type Line = { sku: String, qty: Int, unit_price: Decimal, note: String, active: Bool }
 
@@ -344,7 +344,7 @@ pub fn json_shape(
 }
 
 /// `loop_only` is the subtrahend, and it is why these rows are about `Map` and not about `fold`.
-const MAP_SRC: &str = r#"
+pub const MAP_SRC: &str = r#"
 fn key(i: Int) -> Int = (i * 2654435761) % 1000003
 
 pub fn loop_only(n: Int) -> Int = fold(range(0, n), 0, |a: Int, i: Int| a + key(i))
@@ -482,7 +482,7 @@ pub fn map_ops(sizes: &[usize], repeats: usize) -> Result<Vec<MapPoint>> {
 
 /// A program whose whole output is what `map_keys` answered, under three insertion orders that
 /// build one key set.
-const ORDER_SRC: &str = r#"
+pub const ORDER_SRC: &str = r#"
 fn key(i: Int) -> Int = (i * 2654435761) % 100003
 
 fn insert_all(order: List<Int>) -> Map<Int, Int> =
@@ -571,7 +571,7 @@ pub fn map_order(ply: &Path, processes: usize) -> Result<OrderCheck> {
 }
 
 /// One module of `types` record types, with or without a `derive` for each.
-fn derived_module(index: usize, types: usize, derived: bool) -> String {
+pub fn derived_module(index: usize, types: usize, derived: bool) -> String {
     let mut s = String::new();
     if derived {
         s.push_str("import std.json\n\n");
@@ -725,7 +725,7 @@ fn one_derivation_point(
 }
 
 /// Every test the *project* declares, which is what `ply test` runs.
-fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Duration> {
+pub fn run_tests(loaded: &ply_cli::load::Loaded, store: &mut Store) -> Result<Duration> {
     let started = Instant::now();
     let selection = ply_test::select(
         &loaded.check,
@@ -969,96 +969,4 @@ pub fn render(m: &Measurements) -> String {
     }
 
     s
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The three programs are the measurement, so a change that stops one of them compiling has to
-    /// fail here rather than at the moment somebody wants a number.
-    #[test]
-    fn every_measurement_program_compiles_and_its_own_test_passes() {
-        for (name, source) in [
-            ("payload.ply", JSON_SRC),
-            ("maps.ply", MAP_SRC),
-            ("order.ply", ORDER_SRC),
-        ] {
-            let dir = write_project(&[(name, source.to_string())]).unwrap();
-            let checked = Checked::open(dir.path())
-                .unwrap_or_else(|e| panic!("`{name}` does not compile: {e:#}"));
-            let mut store = Store::open(dir.path()).unwrap();
-            run_tests(&checked.loaded, &mut store)
-                .unwrap_or_else(|e| panic!("`{name}`'s own test failed: {e:#}"));
-        }
-    }
-
-    /// The subtraction has to leave something.
-    #[test]
-    fn the_map_rows_survive_subtracting_the_fold_around_them() {
-        for p in map_ops(&[256, 4_096], 2).unwrap() {
-            assert!(
-                p.insert_nanos > 0.0 && p.get_nanos > 0.0,
-                "at {} entries insert was {} ns and get {} ns above a {} ns scaffold",
-                p.entries,
-                p.insert_nanos,
-                p.get_nanos,
-                p.loop_nanos
-            );
-            assert!(p.keys_nanos_per_entry > 0.0 && p.fold_nanos_per_entry > 0.0);
-        }
-    }
-
-    /// The two axes have to move independently, or the table cannot separate a per-field cost from
-    /// a per-byte one — which is the only question it is there to answer.
-    #[test]
-    fn widening_a_field_grows_the_bytes_and_not_the_field_count() {
-        let points = json_shape(&[(2, 0), (2, 200), (8, 0)], 2, 1).unwrap();
-        let [narrow, wide, longer] = &points[..] else {
-            panic!("three points were asked for and {} came back", points.len());
-        };
-        assert_eq!(narrow.fields, wide.fields);
-        assert!(wide.payload_bytes > narrow.payload_bytes + 200);
-        assert!(longer.fields > narrow.fields && longer.payload_bytes > narrow.payload_bytes);
-        // Both halves are timed on their own, so each is a duration rather than a difference: a
-        // zero here means a half that did not run.
-        assert!(
-            narrow.parse_micros > 0.0 && narrow.codec_micros > 0.0,
-            "parse {} µs, codec {} µs of a {} µs decode",
-            narrow.parse_micros,
-            narrow.codec_micros,
-            narrow.decode_micros
-        );
-    }
-
-    /// Both variants have to be the same program in everything but the derivation, or the
-    /// comparison prices two projects rather than one feature.
-    #[test]
-    fn the_two_derivation_variants_declare_the_same_types_and_the_same_tests() {
-        let plain = derived_module(0, 3, false);
-        let derived = derived_module(0, 3, true);
-        for i in 0..3 {
-            let decl = format!("pub type T0x{i} = ");
-            assert!(plain.contains(&decl) && derived.contains(&decl));
-            assert!(plain.contains(&format!("t0x{i} round-trips")));
-            assert!(derived.contains(&format!("t0x{i} round-trips")));
-        }
-        assert!(!plain.contains("derive json"));
-        assert_eq!(derived.matches("derive json for").count(), 3);
-    }
-
-    /// Small, but it exercises the whole path — two projects, four timings, a cache measured —
-    /// which is what a table nobody can reproduce would hide.
-    #[test]
-    fn a_derivation_point_is_produced_for_both_variants() {
-        let points = derivation_cost(&[4], 4, 1).unwrap();
-        assert_eq!(points.len(), 2);
-        let derived = points.iter().find(|p| p.variant == "derived").unwrap();
-        let plain = points.iter().find(|p| p.variant == "plain").unwrap();
-        assert_eq!(derived.tests, plain.tests);
-        assert!(
-            derived.definitions > plain.definitions,
-            "a derivation that added no definition is not a derivation"
-        );
-    }
 }
