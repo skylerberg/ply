@@ -164,8 +164,12 @@ settings=(
 # too, and an unlocked build here would update the `Cargo.lock` that job's own
 # `--locked` step had just vouched for. Seen, with one `[[package]]` entry
 # deleted from the lock: this line rewrote the file and exited 0.
-cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-cli
-ply="$root/target/release/ply"
+if [ -n "${PLY_BIN:-}" ]; then
+  ply="$PLY_BIN"
+else
+  cargo build --locked --release --manifest-path "$root/Cargo.toml" -p ply-cli
+  ply="$root/target/release/ply"
+fi
 
 if [ "$memory" -eq 1 ]; then
   # No `--db`, and none is needed: `run_memory` discharges every `db` atom

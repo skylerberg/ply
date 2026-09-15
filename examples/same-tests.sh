@@ -5,9 +5,10 @@
 #     examples/same-tests.sh --db postgres://localhost/x  # uses one you name
 #     examples/same-tests.sh --db ... --reset             # drops its tables first
 #     examples/same-tests.sh --no-build                   # measure a binary you built
+#     PLY_BIN=target/debug/ply examples/same-tests.sh     # measure the binary you name
 #
-# It builds `target/release/ply` itself, and checks that binary against cargo's
-# own dep-info for it whether it built it or not. It used to do neither, and
+# It builds `target/release/ply` itself unless `PLY_BIN` names one, and checks
+# the binary against cargo's own dep-info for it whether it built it or not. It used to do neither, and
 # the entry this replaces in CONTRIBUTING.md §"Things known to be broken" said
 # so:
 #
@@ -72,12 +73,13 @@ set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(dirname "$here")"
-ply="$root/target/release/ply"
+ply="${PLY_BIN:-$root/target/release/ply}"
 
 db=""
 keep=0
 reset=0
 build=1
+if [ -n "${PLY_BIN:-}" ]; then build=0; fi
 mem_port="${PLY_MEM_PORT:-8231}"
 pg_port="${PLY_PG_PORT:-8232}"
 
@@ -180,7 +182,7 @@ if [ ! -x "$ply" ]; then
   fi
   exit 2
 fi
-dep="$root/target/release/ply.d"
+dep="$ply.d"
 if [ ! -f "$dep" ]; then
   echo "no dep-info at $dep, so $ply cannot be checked against its own sources" >&2
   exit 2

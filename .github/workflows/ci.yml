@@ -1,157 +1,111 @@
 # The three commands in CONTRIBUTING.md §"The loop", run on every pull request
 # and every push to `main`, with the gates that skip silently forced open.
 #
+# **The suite is built once and run by many jobs at once.** A run's wall clock
+# used to be one shard's compile plus ten minutes of that shard's tests, because
+# each shard compiled its own packages and then ran every test it had, and the
+# two longest held twenty tests of a minute or more each. Now `build` compiles
+# every workspace member into a nextest archive and the test binary, and every
+# other job downloads that: `test` runs a slice of the suite, `solo` runs one
+# test that has to run alone on a runner of its own, `gates` runs the tests
+# that read a wall clock and the checks that have to be seen to run, and
+# `test-postgres` and `same-tests` run what needs a server or a binary. The
+# binary the differentials and the scripts drive is a release `ply`, built
+# beside the archive by `build-ply` (argued there). A green run is the build
+# plus the slowest of those, and the tables that cut them are in
+# `.github/ci-shards.sh`, where `verify` keeps them total.
+#
 # Each decision here is argued where it is made:
 #
 #   * `fmt` and `clippy` do NOT gate the expensive jobs; everything starts at
-#     once and the `ci` aggregate is where lint is required.  They used to
-#     gate, so that a lint-red run *completed* in under a minute for a watcher
-#     that waits on the whole run, and the price was the whole of `fmt` and
-#     `clippy` on the critical path of every green run — about forty-five
-#     seconds warm, a fifth of a run now that a shard is a few minutes rather
-#     than the eleven the gate was priced against.  The same fast red comes
-#     from the watcher instead: `gh pr checks --watch --fail-fast` exits at the
-#     first failed check, so a formatting slip surfaces when `fmt` finishes,
-#     and the doomed run costs runner minutes rather than anyone's time until
-#     the fix is pushed and the concurrency group cancels it.  Rejected: a
-#     cancel-on-lint-failure step, which needs `actions: write`, a permission
-#     this file deliberately withholds, and buys nothing over `--fail-fast`.
+#     once and the `ci` aggregate is where lint is required. `gh pr checks
+#     --watch --fail-fast` exits at the first failed check, so a formatting
+#     slip surfaces when `fmt` finishes, and the doomed run costs runner minutes
+#     rather than anyone's time until the fix is pushed and the concurrency
+#     group cancels it. Rejected: a cancel-on-lint-failure step, which needs
+#     `actions: write`, a permission this file deliberately withholds.
 #
 #     Lint stays required either way: the `ci` job compares every `needs`
 #     result against `success` under `if: always()`, so a red or skipped `fmt`
 #     or `clippy` is a red check and never a green tick over nothing run.
 #   * `push` filtered to the default branch, so a commit on a PR branch runs CI
-#     once rather than twice.  Argued at the `on:` block, which is the only
-#     place the `concurrency` group below can be seen not to collapse the pair.
-#
+#     once rather than twice. Argued at the `on:` block.
 #   * `[profile.dev] opt-level = 2`, which is set in the root `Cargo.toml` and
-#     not here, but is the single largest thing deciding what this workflow
-#     costs.  That manifest's profile block carries the measurement, its
-#     provenance and what is still unmeasured about it; do not restate the
-#     figure here, where it would go stale on its own.
-#
+#     not here, is the single largest thing deciding what the build costs. That
+#     manifest's profile block carries the measurement and what was rejected.
 #   * every `rust-cache` key hashes the manifests, and that is a repair rather
-#     than a precaution.  `rust-cache` keys on `Cargo.lock`, which records
+#     than a precaution. `rust-cache` keys on `Cargo.lock`, which records
 #     dependency *versions* and not the `[profile]` blocks or the features a
-#     member asks for -- both of which are inputs to every dependency's
-#     fingerprint.  Change one and the key does not move, so the restore
-#     reports `full match: true`, hands back artifacts cargo then rejects as
-#     stale, and the post step sees a key that already exists and says `Cache
-#     up-to-date` without saving what was just rebuilt.  Nothing is left that
-#     can heal it: the cache stays poisoned until `Cargo.lock` happens to
-#     change for an unrelated reason.
-#
-#     **This had happened and had been running for hours.** `df32f9b` added
-#     `[profile.dev.package."*"] debug = false` -- a change whose whole purpose
-#     was to make builds cheaper -- and left `Cargo.lock` alone.  `test cli`
-#     went from compiling **14** crates to compiling **204**, on the identical
-#     cache key, `full match: true` in both.  Every job on `main` paid a cold
-#     dependency build from that commit until this one.
-#
-#     Hashing the manifests mints a new key when a profile or a feature moves,
-#     which costs one cold build and then saves it.  A stale-but-related cache
-#     is still restored by prefix, so the registry survives.
-#
-#   * `ubuntu-24.04`, and only that.  A Linux runner is what compiles
-#     `crates/ply-cli/tests/suite/w5_shutdown.rs` at all — it is `#![cfg(unix)]` — and
-#     service containers are Linux-only.  See the `test-postgres` job.
-#   * a postgres service container *and* postgres binaries on `PATH`.  Two
+#     member asks for -- both inputs to every dependency's fingerprint. Change
+#     one and the key does not move: the restore hands back artifacts cargo
+#     rejects as stale, and the post step sees a key that already exists and
+#     saves nothing. `df32f9b` added `[profile.dev.package."*"] debug = false`
+#     and every job on `main` paid a cold dependency build for hours. Hashing
+#     the manifests mints a new key when a profile or a feature moves; a
+#     stale-but-related cache is still restored by prefix.
+#   * `ubuntu-24.04`, and only that. A Linux runner is what compiles
+#     `crates/ply-cli/tests/suite/w5_shutdown.rs` at all — it is `#![cfg(unix)]` —
+#     and service containers are Linux-only. See the `test-postgres` job.
+#   * a postgres service container *and* postgres binaries on `PATH`. Two
 #     different gates want two different things and one does not satisfy the
-#     other.  See the `test-postgres` job.
-#   * the self-hosted compiler is a workspace member, so it needs no job of its
-#     own.  It had one for as long as it sat outside the workspace with its own
-#     `[workspace]` in `harness/Cargo.toml`, where `cargo build --workspace`,
-#     `cargo test --workspace` and `cargo clippy --workspace` reached not one
-#     line of it -- and it bit-rotted exactly as its own `README.md` had
-#     predicted in writing: four language features landed, its differential
-#     harness stopped compiling, and 28 of 763 corpus inputs disagreed with the
-#     reference for two days with nothing saying so.  That happened twice, to
-#     two directories, for the same reason.
-#
-#     `crates/ply-compiler` now ships the Ply sources and the bootstrap bundle
-#     the way `ply-std` ships the standard library, and
-#     `crates/ply-compiler-diff` holds the differentials.  Both are in
-#     `.github/ci-shards.sh`'s table like any other member, which is what makes
-#     a differential that stops running a red run rather than a quiet one.
+#     other. See the `test-postgres` job.
+#   * the self-hosted compiler and its differentials are workspace members --
+#     `crates/ply-compiler` and `crates/ply-compiler-diff` -- so the archive
+#     holds them like any other. They sat outside the workspace once, in no
+#     job at all, and the differential went red for two days with nothing
+#     saying so.
 #
 #     **What this workflow deliberately does NOT run:
 #     `crates/ply-compiler-diff/tools/arm.sh --arm`**, the twenty-two mutations
-#     that are the evidence the differential can go red at all.  Measured at
-#     **299s**, because each mutation re-runs the whole 766-input comparison and
-#     there are twenty-two of them: 5 minutes on a developer's machine and
-#     plausibly 15-25 on a two-core runner, for a property that changes only
-#     when the parser's shape or the mutation table does.  So it stays a by-hand
-#     obligation, listed in CONTRIBUTING.md §"The suite proves less than it
-#     looks like it proves" beside the others, and this comment is where the
-#     trade is written down.  If a mutation is ever found to have silently
+#     that are the evidence the differential can go red at all. Each mutation
+#     re-runs the whole comparison, for a property that changes only when the
+#     parser's shape or the mutation table does, so it stays a by-hand
+#     obligation listed in CONTRIBUTING.md §"The suite proves less than it
+#     looks like it proves". If a mutation is ever found to have silently
 #     stopped applying, that is the evidence this trade was wrong.
 #   * the suite runs under `cargo nextest`, one process per test over every
-#     binary in the shard, rather than under `cargo test`, which runs the
-#     binaries one after another and lets one long test hold a whole binary's
-#     tail while the runner idles.  `.config/nextest.toml` is the configuration
-#     and CONTRIBUTING.md §"The loop" names the same command for a developer.
-#     Doctests are the one thing nextest does not run, so each shard runs
-#     `cargo test --doc` over its packages as well.
-#   * fourteen tests run last and alone inside their shard, because their
-#     assertion is a wall clock.  `.github/ci-shards.sh` names them,
-#     `.config/nextest.toml` gives them every test thread and the lowest
-#     priority, and the `test` job asserts that each one in the shard's
-#     packages appears in the log as run — an exact name nothing defines any
-#     more selects nothing and says nothing.  Six of the fourteen were found by
-#     running a shard's own command on a loaded machine and watching it fail —
-#     twice, after two separate surveys had each declared the list complete.
-#   * seven tree checks run a second time, by name, in the `test` job.  They
-#     already ran inside `cargo nextest run -p ply-span`; running them again by
-#     exact name is how "this check still exists" becomes an exit code,
-#     because a check that stops running reports nothing and reporting nothing
-#     looks like passing.  See the `test` job's last step and
-#     `.github/ci-shards.sh`'s `TREE_CHECKS`.  "Tree check" rather than "gate":
-#     a gate in the sense used below is a dependency that makes a suite skip
-#     silently, which is a different thing.
-#   * `toolchain: "1.93.1"`, pinned.  The other side of the trade this block
-#     used to take, taken on 2026-08-28 after the predicted failure happened.
-#
-#     Withdrawn: "`toolchain: stable`, unpinned.  A new Rust release can add a
-#     clippy lint and turn the `clippy` job red with no change to the tree.
-#     That is deliberate: CONTRIBUTING.md §"The loop" says zero warnings is the
-#     gate and "if you introduce the first warning, that is a regression, not a
-#     baseline", so inheriting new lints is the behaviour the project asked for,
-#     and a developer running the outer loop on their own stable sees the same
-#     thing.  To take the other side of that trade, change `toolchain: stable`
-#     to an exact version — `toolchain: 1.94.0`, say — in the `fmt`, `clippy`,
-#     `test`, `test-postgres` and `same-tests` jobs."
-#
-#     What happened: `main` went red on 2026-08-25 at d88aae5 on
-#     `cargo clippy --locked --workspace --all-targets -- -D warnings`, with no
-#     change to the tree.  The identical command on the machine in
-#     docs/ONBOARDING.md §Provenance, rustc 1.93.1, exits 0 with zero warnings
-#     — so CI had moved to a newer stable and the developer running the outer
-#     loop did NOT see the same thing, which is the half of the rationale above
-#     that failed.  Pinning restores it.
-#
-#     The cost is the one the withdrawn text names and it is real: new lints no
-#     longer arrive on their own.  Raise this pin deliberately, and fix what the
-#     new toolchain reports in the same change.
-#
-#     Every job in this file is on "1.93.1" and this workflow installs exactly
-#     one toolchain.
+#     binary, rather than under `cargo test`, which runs the binaries one after
+#     another and lets one long test hold a whole binary's tail while the
+#     runner idles. `.config/nextest.toml` is the configuration and
+#     CONTRIBUTING.md §"The loop" names the same command for a developer.
+#     Doctests are the one thing nextest does not run, so `clippy` runs
+#     `cargo test --doc` over the workspace as well.
+#   * the tests that read a wall clock run in `gates`, last and alone, and the
+#     job asserts that each one appears in the log as run — an exact name
+#     nothing defines any more selects nothing and says nothing.
+#     `.github/ci-shards.sh` names them. Six of the fourteen were found by
+#     running the suite on a loaded machine and watching it fail — twice, after
+#     two separate surveys had each declared the list complete.
+#   * seven tree checks run a second time, by name, in `gates`. They already
+#     ran in a partition; running them again by exact name is how "this check
+#     still exists" becomes an exit code, because a check that stops running
+#     reports nothing and reporting nothing looks like passing. "Tree check"
+#     rather than "gate": a gate in the sense used below is a dependency that
+#     makes a suite skip silently, which is a different thing.
+#   * `toolchain: "1.93.1"`, pinned. `main` went red on 2026-08-25 on a clippy
+#     lint a newer stable had added, with no change to the tree, while the
+#     developer running the outer loop on 1.93.1 saw zero warnings. Pinning is
+#     what makes CI and the outer loop see the same thing. The cost is that new
+#     lints no longer arrive on their own: raise this pin deliberately, and fix
+#     what the new toolchain reports in the same change. Only `build`, `clippy`
+#     and `fmt` install a toolchain; the jobs that run the archive need none.
 #
 # What this workflow does NOT prove, stated here so nobody has to infer it from
 # a green check:
 #
-#   * Nothing about macOS or Windows.  A Windows leg would be green over an
+#   * Nothing about macOS or Windows. A Windows leg would be green over an
 #     empty binary, since the shutdown suite compiles to nothing there — the
-#     exact failure this project is worst at.  A macOS leg would be honest and
+#     exact failure this project is worst at. A macOS leg would be honest and
 #     is not here.
-#   * Nothing about the `ply-corpus w6` ladder.  That is re-measurement rather
-#     than verification, and `w6_report_integrity` already fails inside
-#     `cargo test` if the shipped ladder stops describing the tree.
-#   * Nothing about the prose.  One sentence of `README.md` is read by a test;
-#     the other ~24,500 lines are not, here or anywhere.
+#   * Nothing about the `ply-corpus w6` ladder. That is re-measurement rather
+#     than verification, and `w6_report_integrity` already fails inside the
+#     suite if the shipped ladder stops describing the tree.
+#   * Nothing about the prose. One sentence of `README.md` is read by a test;
+#     the rest is not, here or anywhere.
 #   * Nothing about whether a diagnostic the armed check calls "armed" can fire.
-#     `crates/ply-span-tests/tests/armed.rs` is lexical: it proves a construction site
-#     exists in production source, never that the site is reachable.  Its header
-#     lists what that leaves out.
+#     `crates/ply-span-tests/tests/armed.rs` is lexical: it proves a construction
+#     site exists in production source, never that the site is reachable. Its
+#     header lists what that leaves out.
 
 name: CI
 
@@ -160,16 +114,9 @@ name: CI
 # triggers, and the `concurrency` group below could not collapse them: it keys
 # on `github.ref`, which is `refs/heads/<branch>` for the push and
 # `refs/pull/<n>/merge` for the pull_request, so the two runs are in different
-# groups and neither cancels the other. Measured over the 20 runs before this
-# change: every branch commit had a matched pair — 21:55:33 push and 21:55:35
-# pull_request on `feat/try-operator`, 22:10:21 and 22:10:36 on
-# `fix/adr-0027-collision`, and so on down the list — each a full ~31
-# runner-minute run of the identical jobs over the identical tree.
-#
-# So this halves the compute per commit and loses no signal: what a branch push
-# checked, the pull_request run checks over the same commits. What it does give
-# up is CI on a branch with no PR open yet, which is the case the `pull_request`
-# trigger does not cover.
+# groups and neither cancels the other. Every branch commit ran the identical
+# jobs twice. What a branch push checked, the pull_request run checks over the
+# same commits; what this gives up is CI on a branch with no PR open yet.
 on:
   push:
     branches: [main]
@@ -193,31 +140,29 @@ env:
 
 jobs:
   plan:
-    name: shard table is total
+    name: CI tables are total
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      shards: ${{ steps.table.outputs.matrix }}
+      partitions: ${{ steps.tables.outputs.partitions }}
+      solo: ${{ steps.tables.outputs.solo }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      # The one thing a split test suite can get wrong without anyone noticing.
-      # Five corruptions were each watched to make it exit 1 -- a member in no
-      # shard, a member in two, a deferred test nothing defines, a tree check
-      # renamed, and a member named here and absent from the tree.
-      #
-      # It used to check `spikes/` as well, because two directories there held
-      # code no shard reached. There is no `spikes/`: the compiler written in
-      # Ply is `crates/ply-compiler`, its differentials are
-      # `crates/ply-compiler-diff`, and both are members like any other.
-      - name: Every workspace member is in exactly one shard
+      # The things a cut test suite can get wrong without anyone noticing: a
+      # crate no member reaches, a test named in a table that nothing defines,
+      # `.config/nextest.toml` disagreeing with the deferred table, a probe
+      # with no required job. Each was watched to exit 1.
+      - name: Every crate is built and every named test exists
         run: .github/ci-shards.sh verify
 
-      - name: Emit the matrix
-        id: table
-        run: echo "matrix=$(.github/ci-shards.sh matrix)" >> "$GITHUB_OUTPUT"
+      - name: Emit the matrices
+        id: tables
+        run: |
+          echo "partitions=$(.github/ci-shards.sh partitions)" >> "$GITHUB_OUTPUT"
+          echo "solo=$(.github/ci-shards.sh solo-matrix)" >> "$GITHUB_OUTPUT"
 
   fmt:
     name: cargo fmt --all --check
@@ -232,13 +177,6 @@ jobs:
           toolchain: "1.93.1"
           components: rustfmt
       # No cache: this compiles nothing.
-      #
-      # One workspace. There were three -- `crates/ply-codegen-spike` and the
-      # two spike harnesses each declared their own `[workspace]`, so
-      # `cargo fmt --all` at the root reached none of them, and a one-line
-      # formatting slip in one cost a full round trip to discover. All three
-      # are gone: the code that mattered is in the workspace, and the rest with
-      # it.
       - name: cargo fmt --all --check
         run: cargo fmt --all --check
 
@@ -263,248 +201,274 @@ jobs:
       # requirement would be enforced by whoever happened to read the log.
       - run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
-  test:
-    name: test ${{ matrix.shard }}
-    needs: [plan]
+      # nextest does not run doctests. There are none today, and this is what
+      # says so if one appears and would otherwise never run. Here rather than
+      # beside the archive because it is a second build of the libraries, and
+      # this job is off the critical path.
+      - name: cargo test --doc
+        run: cargo test --locked --doc --workspace
+
+  # The one compile. Everything below `test-postgres` inclusive runs what this
+  # built, so the run's wall clock is this job plus the slowest of them.
+  build:
+    name: cargo nextest archive
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix: ${{ fromJSON(needs.plan.outputs.shards) }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: tcc, the development profile's C compiler
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq tcc
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
         with:
           toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          key: test-${{ matrix.shard }}-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
+          key: build-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
           save-if: ${{ github.ref_name == github.event.repository.default_branch }}
       - uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
         with:
           tool: cargo-nextest@0.9.143
 
-      # Three things here are guards rather than plumbing, and all three are
-      # the same failure: a command that runs nothing and exits 0.
-      #
-      #   1. `packages` is assigned before use, not interpolated. An unknown
-      #      shard id has to fail the step rather than produce an empty list,
-      #      which cargo reads as "every default member".
-      #   2. The run has to have executed at least one test, read out of
-      #      nextest's own summary line. That is the backstop for anything that
-      #      silently filters the suite away.
-      #   3. Every deferred test in this shard's packages has to appear in the
-      #      log as run. `.config/nextest.toml` selects them by exact name so
-      #      they run last and alone, and an exact name that nothing defines any
-      #      more selects nothing and says nothing.
-      #
-      # **`gsub` first: cargo and nextest colour these lines**, and a pattern
-      # wanting a word followed by a space matches nothing when the next byte is
-      # an escape. Do not verify this against a log captured from a pipe — no
-      # colour is emitted there, so the fixture cannot contain the defect and
-      # cannot fail on it.
-      # The differentials shell out to a shipping `ply`: they run each phase of
-      # the self-hosted front end through it and compare what comes back against
-      # `crates/ply-syntax`. Nothing else in a shard needs a binary, so this is
-      # the one place that builds one, and it is release because the comparison
-      # runs it over every `.ply` in the tree.
-      - name: the binary the compiler shard's differentials drive
-        if: matrix.shard == 'compiler'
+      # Every test binary of every member, the debug `ply` the CLI suite runs,
+      # and the build-script outputs, in one file.
+      # The jobs below extract it to the same path it was built at, so a path
+      # compiled into a test binary is still the path it names.
+      - name: cargo nextest archive --workspace
+        run: cargo nextest archive --locked --workspace --archive-file nextest.tar.zst
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: nextest-archive
+          path: nextest.tar.zst
+          retention-days: 1
+          if-no-files-found: error
+
+  # The release `ply` the differentials and the corpus scripts drive. Not the
+  # archive's debug one, on purpose: a debug build's heap keeps every dead
+  # block so that a read of one is caught (`crates/ply-codegen/src/heap.rs`),
+  # and emitting the self-hosted front end through it allocates two hundred
+  # million objects -- a runner dies under that, and thirteen did.
+  build-ply:
+    name: cargo build --release -p ply-cli
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: "1.93.1"
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: ply-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
+          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+      - name: cargo build --locked --release -p ply-cli --bin ply
         run: cargo build --locked --release -p ply-cli --bin ply
 
+      # The scripts in `same-tests` refuse a binary that is not built from the
+      # tree, and a freshness check nobody has watched fail is the same defect
+      # one level up — so the check is driven red and green here, beside the
+      # binary it is about, before it is relied on. `--self-test` touches no
+      # tracked file. The check is here and not in `same-tests` because it
+      # compares clocks: a checkout made after this build would be newer than
+      # the binary everywhere.
+      - name: The freshness check can still go red
+        run: .github/binary-is-current.sh --self-test
+      - name: The binary is built from this tree
+        run: .github/binary-is-current.sh target/release/ply
+
+      # The dep-info goes with it: `examples/same-tests.sh` checks the binary
+      # against its own sources and refuses one with no `.d` beside it.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: ply
+          path: |
+            target/release/ply
+            target/release/ply.d
+          retention-days: 1
+          if-no-files-found: error
+
+  # A slice of the suite. nextest deals the tests after the filter round-robin
+  # across the partitions, so the long tests of one binary land in different
+  # jobs rather than the same one. What the filter leaves out runs in the jobs
+  # below, and `.github/ci-shards.sh exclude-filter` is the one statement of
+  # that.
+  test:
+    name: test ${{ matrix.slice }}
+    needs: [plan, build, build-ply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.partitions) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
+
+      # Two guards, both against a command that runs nothing and exits 0: the
+      # filter is assigned before use so an empty one fails the step rather
+      # than selecting everything, and the run has to have executed at least
+      # one test, read out of nextest's own summary line. **`gsub` first: cargo
+      # and nextest colour these lines**, and a pattern wanting a word followed
+      # by a space matches nothing when the next byte is an escape.
       - name: cargo nextest run
         env:
-          SHARD: ${{ matrix.shard }}
+          SLICE: ${{ matrix.slice }}
         run: |
           set -euo pipefail
-          packages_raw=$(.github/ci-shards.sh packages "$SHARD")
-          read -r -a packages <<<"$packages_raw"
-          [ "${#packages[@]}" -gt 0 ] || { echo "shard '$SHARD' names no packages" >&2; exit 1; }
-          cargo nextest run --locked --no-fail-fast "${packages[@]}" 2>&1 | tee /tmp/shard.log
+          exclude=$(.github/ci-shards.sh exclude-filter)
+          [ -n "$exclude" ] || { echo "the exclude filter is empty" >&2; exit 1; }
+          cargo-nextest nextest run \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --no-fail-fast --partition "slice:$SLICE" \
+            -E "not ($exclude)" 2>&1 | tee /tmp/partition.log
           ran=$(awk '
             { gsub(/\033\[[0-9;]*m/, "") }
             /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
             END { print n + 0 }
-          ' /tmp/shard.log)
-          echo "shard '$SHARD' ran $ran tests"
-          [ "$ran" -gt 0 ] || { echo "the shard ran no tests at all" >&2; exit 1; }
-          while read -r package target test; do
-            case " $packages_raw " in
-              *" -p $package "*) ;;
-              *) continue ;;
-            esac
-            if [ "$target" = lib ]; then id=$package; else id="$package::$target"; fi
-            awk -v id="$id" -v test="$test" '
-              { gsub(/\033\[[0-9;]*m/, "") }
-              $1 == "PASS" && $NF == test && $(NF - 1) == id { found = 1 }
-              END { exit !found }
-            ' /tmp/shard.log || {
-              echo "deferred test '$id $test' did not run in shard '$SHARD': the table names a test the binary does not have" >&2
-              exit 1
-            }
-            echo "deferred: $id $test ran"
-          done < <(.github/ci-shards.sh deferred)
+          ' /tmp/partition.log)
+          echo "partition $SLICE ran $ran tests"
+          [ "$ran" -gt 0 ] || { echo "the partition ran no tests at all" >&2; exit 1; }
 
-      # The bootstrap fixpoint went red -- an emitter source changed and the
-      # bundle is the old emitter's -- or something else in this shard did.
-      # Either way the refresh is worth an attempt here, where the build is
-      # already paid, and the result comes back as an artifact:
-      #
-      #   gh run download <run-id> -n bootstrap-bundle -D crates/ply-compiler/bootstrap
-      #
-      # The refresh is the fixpoint test itself, so a bundle it hands back is a
-      # fixpoint on the day it is written. Keyed on which shard holds
-      # `ply-codegen-tests` rather than on a shard name, as the steps below are.
-      - name: Refresh the bootstrap bundle
-        id: refresh
-        if: failure()
+  # One test on one runner. Each of these is the longest test of a binary that
+  # `.config/nextest.toml` runs with every thread and nothing beside it, so in
+  # a partition they would run one after another and the partition would be
+  # their sum.
+  solo:
+    name: test ${{ matrix.id }}
+    needs: [plan, build, build-ply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.solo) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
+
+      - name: cargo nextest run
         env:
-          SHARD: ${{ matrix.shard }}
+          ID: ${{ matrix.id }}
         run: |
           set -euo pipefail
-          packages_raw=$(.github/ci-shards.sh packages "$SHARD")
-          case " $packages_raw " in
-            *" ply-codegen-tests "*) ;;
-            *) echo "ply-codegen-tests is not in shard '$SHARD'; the shard that has it refreshes"; exit 0 ;;
-          esac
-          PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run --locked -p ply-codegen-tests --test bootstrap
+          filter=$(.github/ci-shards.sh solo-filter "$ID")
+          cargo-nextest nextest run \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            -E "$filter" 2>&1 | tee /tmp/solo.log
+          ran=$(awk '
+            { gsub(/\033\[[0-9;]*m/, "") }
+            /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
+            END { print n + 0 }
+          ' /tmp/solo.log)
+          [ "$ran" -eq 1 ] || { echo "solo test '$ID' selected $ran tests rather than one: the table names a test the binary does not have" >&2; exit 1; }
+
+      # The bootstrap fixpoint went red: an emitter source changed and the
+      # bundle is the old emitter's. The refresh is the fixpoint test itself,
+      # run again from the unpacked archive, and the bundle it writes comes
+      # back as an artifact so no local build is needed:
+      #
+      #   gh run download <run-id> -n bootstrap-bundle -D crates/ply-compiler/bootstrap
+      - name: Refresh the bootstrap bundle
+        id: refresh
+        if: failure() && matrix.id == 'bootstrap'
+        run: |
+          set -euo pipefail
+          filter=$(.github/ci-shards.sh solo-filter bootstrap)
+          PLY_C_BOOTSTRAP_REFRESH=1 cargo-nextest nextest run \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            -E "$filter"
           echo "refreshed=true" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         if: failure() && steps.refresh.outputs.refreshed == 'true'
         with:
           name: bootstrap-bundle
           path: crates/ply-compiler/bootstrap
+          retention-days: 7
           if-no-files-found: error
 
-      # nextest does not run doctests. There are none today, and this is what
-      # says so if one appears and would otherwise never run.
-      - name: cargo test --doc
-        env:
-          SHARD: ${{ matrix.shard }}
-        run: |
-          set -euo pipefail
-          packages_raw=$(.github/ci-shards.sh packages "$SHARD")
-          read -r -a packages <<<"$packages_raw"
-          [ "${#packages[@]}" -gt 0 ] || { echo "shard '$SHARD' names no packages" >&2; exit 1; }
-          cargo test --locked --doc "${packages[@]}"
+  # The tests that have to be *seen* to run: the wall-clock tests, last and
+  # alone by `.config/nextest.toml`; the unix-only shutdown suite, which on
+  # any other host compiles to nothing and says nothing; and the tree checks,
+  # by exact name. Each is asserted against nextest's own status lines, so a
+  # name nothing defines any more turns this job red rather than quietly
+  # reducing what CI checks.
+  gates:
+    name: test gates
+    needs: [plan, build, build-ply]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/suite
 
-      # ROADMAP.md's preamble table, gate three: this file is `#![cfg(unix)]`,
-      # and on a non-Unix host it is not compiled and prints nothing at all —
-      # the only one of the gates that gives no notice whatsoever. The runner is
-      # Linux, so it must have run; this is what says so if a future edit makes
-      # the binary vanish again.
-      #
-      # Keyed on which shard holds `ply-cli` rather than on a shard *name*: the
-      # names in `.github/ci-shards.sh` are a balance decision and they have
-      # already moved once, and an `if:` naming a shard that no longer exists is
-      # a check that silently never runs.
-      #
-      # Read out of the shard's own log rather than by running the binary a
-      # second time, which is what this step used to do.
-      #
-      # Two reasons, and the second is the one that matters. It is **cheaper**:
-      # the shard already ran this binary a moment ago. And it is **safer**,
-      # because the binary it re-ran is the one this repository's only known
-      # flake lives in: `free_port` hands `ply run --host` a port it has
-      # already released, and losing that race cost the full 60-second bind
-      # budget and a red run. Observed on `main` at 54a568d — one workspace
-      # run failed here after 60.02s and the same binary passed in 2.07s on
-      # the next. Running it twice per CI run doubled the exposure to that for
-      # no extra assurance whatsoever.
-      #
-      # `crates/ply-cli/tests/suite/w5_shutdown.rs` now retries the race rather than
-      # waiting it out, so the flake should be gone either way. This step not
-      # rolling the dice a second time is independent of that and stands on
-      # its own.
-      #
-      # The guarantee is unchanged and is in fact slightly stronger: what the
-      # comment above wants to know is that a `#![cfg(unix)]` target was
-      # compiled and executed, and asserting it against the shard's log says
-      # it ran **in the shard** rather than that it runs when invoked on its
-      # own.
-      - name: The unix-only shutdown suite really ran
-        env:
-          SHARD: ${{ matrix.shard }}
+      - name: cargo nextest run
         run: |
           set -euo pipefail
-          packages_raw=$(.github/ci-shards.sh packages "$SHARD")
-          case " $packages_raw " in
-            *" ply-cli "*) ;;
-            *) echo "ply-cli is not in shard '$SHARD'; the shard that has it runs this"; exit 0 ;;
-          esac
-          # nextest prints one status line per test, `PASS [ … ] <binary id>
-          # <module path>`, and the module prefix is the file the test came
-          # from, so `w5_shutdown::` is what a compiled-in `#![cfg(unix)]`
-          # module looks like in the log. `gsub` first, for the reason given on
-          # the step above.
-          ran=$(awk '
-            { gsub(/\033\[[0-9;]*m/, "") }
-            $1 == "PASS" && $(NF - 1) == "ply-cli::suite" && $NF ~ /^w5_shutdown::/ { n++ }
-            END { print n + 0 }
-          ' /tmp/shard.log)
-          [ "$ran" -gt 0 ] || {
-            echo "the shard log names no w5_shutdown test — #![cfg(unix)] compiled it away" >&2
-            exit 1
-          }
-          echo "w5_shutdown: $ran test(s) ran"
+          filter=$(.github/ci-shards.sh gate-filter)
+          cargo-nextest nextest run \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --no-fail-fast -E "$filter" 2>&1 | tee /tmp/gates.log
 
-      # The checks in `.github/ci-shards.sh`'s TREE_CHECKS table, by name.
-      #
-      # They already ran a moment ago inside `cargo nextest run -p ply-span`, so
-      # this step is not about executing them. It is about the one thing such a
-      # check cannot report for itself: a check that stops running says
-      # nothing, and saying nothing is indistinguishable from passing. An exact
-      # name plus `1 test run: 1 passed` turns "this named test ran and passed"
-      # into an exit code, so a rename, a deletion, or a stray filter fails the
-      # job. The colour codes are stripped first, for the reason given on the
-      # run step: the summary line is coloured on a runner and not in a pipe,
-      # and this grep was watched to miss it on a runner before the strip was
-      # added.
-      # `ci-shards.sh verify` in the `plan` job catches a rename earlier and
-      # more cheaply; this is the backstop for everything it cannot see.
-      #
-      # Keyed on which shard holds `ply-span` rather than on a shard *name*,
-      # for the reason given in the step above: the names are a balance
-      # decision and they have already moved once.
-      - name: The declared-but-never-constructed checks really ran
-        env:
-          SHARD: ${{ matrix.shard }}
+      # nextest prints one status line per test, `PASS [ … ] <binary id>
+      # <module path>`; the module prefix is the file the test came from, so
+      # `w5_shutdown::` is what a compiled-in `#![cfg(unix)]` module looks like
+      # in the log.
+      - name: Every deferred test, every tree check and the shutdown suite ran
         run: |
           set -euo pipefail
-          packages_raw=$(.github/ci-shards.sh packages "$SHARD")
-          case " $packages_raw " in
-            *" ply-span "*) ;;
-            *) echo "ply-span is not in shard '$SHARD'; the shard that has it runs this"; exit 0 ;;
-          esac
           ran=0
           while read -r package target test; do
-            [ -n "$test" ] || { echo "the tree-check table produced an empty name" >&2; exit 1; }
-            cargo nextest run --locked -p "$package" --test "$target" \
-              -E "binary_id(=$package::$target) & test(=$test)" 2>&1 | tee /tmp/gate.log
-            sed -E 's/\x1b\[[0-9;]*m//g' /tmp/gate.log | grep -Eq ' 1 test run: 1 passed' || {
-              echo "check '$test' did not run: cargo found no such test in $target" >&2
+            if [ "$target" = lib ]; then id=$package; else id="$package::$target"; fi
+            awk -v id="$id" -v test="$test" '
+              { gsub(/\033\[[0-9;]*m/, "") }
+              $1 == "PASS" && $NF == test && $(NF - 1) == id { found = 1 }
+              END { exit !found }
+            ' /tmp/gates.log || {
+              echo "'$id $test' did not run: the table names a test the binary does not have" >&2
               exit 1
             }
             ran=$((ran + 1))
-          done < <(.github/ci-shards.sh tree-checks)
-          echo "$ran tree check(s) ran"
-          [ "$ran" -gt 0 ] || { echo "the tree-check table is empty" >&2; exit 1; }
+          done < <(.github/ci-shards.sh deferred; .github/ci-shards.sh tree-checks)
+          echo "$ran deferred tests and tree checks ran"
+          [ "$ran" -gt 0 ] || { echo "the tables are empty" >&2; exit 1; }
+          w5=$(awk '
+            { gsub(/\033\[[0-9;]*m/, "") }
+            $1 == "PASS" && $(NF - 1) == "ply-cli::suite" && $NF ~ /^w5_shutdown::/ { n++ }
+            END { print n + 0 }
+          ' /tmp/gates.log)
+          [ "$w5" -gt 0 ] || {
+            echo "the log names no w5_shutdown test — #![cfg(unix)] compiled it away" >&2
+            exit 1
+          }
+          echo "w5_shutdown: $w5 test(s) ran"
 
   test-postgres:
     name: test ply-host (postgres)
+    needs: [build, build-ply]
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 20
 
     # Gate two of ROADMAP.md's table. Ten tests in
     # `crates/ply-host/src/db/scope/tests/live.rs` return early unless
     # `PLY_PG_URL` is set, and they return *passing*: cargo captures the skip
-    # notice, so `skipped:` occurs zero times in a whole `cargo test
-    # --workspace` log. Without this container CI would report ten green tests
-    # that never opened a connection.
+    # notice, so `skipped:` occurs zero times in a whole workspace run. Without
+    # this container CI would report ten green tests that never opened a
+    # connection.
     services:
       postgres:
         image: postgres:18.6
@@ -525,36 +489,17 @@ jobs:
       # A fifth gate, which ROADMAP.md's table of four did not list:
       # `crates/ply-host/src/db/pool/tests.rs` hides 26 pool tests behind
       # `PLY_TEST_DB` and, unlike every other gate here, prints *nothing at all*
-      # when it is unset. Measured on the machine in docs/ONBOARDING.md
-      # §Provenance, 2026-08-24, against a local postgres 18.3:
-      #
-      #   unset                    26 passed, 0.00s   <- silent, and green
-      #   set, server reachable    26 passed, 0.94s
-      #   set, server unreachable  20 FAILED, 0.02s   <- E0431, loudly
-      #
-      # That third row is the one worth knowing, and it is why this job is
-      # better guarded than "there is no notice to grep for" suggests. The
-      # harness does `Reactor::start(config).expect("the test database is
-      # reachable")` at tests.rs:41, so a set-but-wrong `PLY_TEST_DB` is a red
-      # build rather than a quiet skip. The only silent failure left is the
-      # variable going missing entirely, and the pre-flight below fails the job
-      # on exactly that with `test -n`.
+      # when it is unset. Set but unreachable, the harness's
+      # `Reactor::start(config).expect(..)` fails loudly, so the only silent
+      # failure left is the variable going missing entirely, and the pre-flight
+      # below fails the job on exactly that with `test -n`.
       PLY_TEST_DB: postgres://ply:ply@127.0.0.1:5432/ply
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
-        with:
-          toolchain: "1.93.1"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: test-postgres-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
-          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
-      - uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
-        with:
-          tool: cargo-nextest@0.9.143
+      - uses: ./.github/actions/suite
 
       # Gate one of ROADMAP.md's table is a *different* dependency and the
       # service container does not satisfy it: `cluster::available()` in
@@ -600,97 +545,54 @@ jobs:
           psql "$PLY_PG_URL" -c 'SELECT version()'
           psql "$PLY_TEST_DB" -c 'SELECT 1'
 
-      # The proof that gate two is open, run before the suite so a
-      # misconfiguration is one fast red step rather than a green 40-second run.
-      #
-      # `--no-capture` is load-bearing, and so is `2>&1`.
-      #
-      # The notice is an `eprintln!`, so it goes to **stderr**. `cargo nextest
-      # run | tee log` redirects only stdout, so the notice never reaches the
-      # file the grep reads, and the grep cannot fire whatever pattern it uses.
-      # Measured on the machine in docs/ONBOARDING.md §Provenance, with
-      # `PLY_PG_URL` unset: piping stdout alone puts **0** notices in the log,
-      # and `2>&1 | tee` puts **10** there. The `10 tests run: 10 passed`
-      # assertion below does not cover the difference — the ten tests return
-      # early and *pass*, so that line reads `10 passed` with no server
-      # anywhere.
-      #
-      # Both halves were wrong here once, in opposite directions, which is why
-      # this comment is long: an anchored `^skipped:` was written first and the
-      # stream was never captured. Either bug alone is a guard that cannot fire
-      # over a gate whose entire defect is that it silently never runs.
-      - name: The ten live postgres tests ran against the server
-        run: |
-          set -euo pipefail
-          cargo nextest run --locked -p ply-host --lib \
-            -E 'test(db::scope::tests::live::)' --no-capture 2>&1 | tee /tmp/live.log
-          if grep -Eq 'skipp(ed|ing): (PLY_PG_URL is unset|this machine has no)' /tmp/live.log; then
-            echo "a live test skipped itself: PLY_PG_URL did not reach the tests" >&2
-            exit 1
-          fi
-          sed -E 's/\x1b\[[0-9;]*m//g' /tmp/live.log | grep -Eq ' 10 tests run: 10 passed' || {
-            echo "expected 10 live tests; see the log above for what ran" >&2
-            exit 1
-          }
-
-      # The proof that gate one is open, by the same method. `host_park` is the
-      # cheapest cluster-gated module and it starts a real `initdb` cluster, so
-      # a pass here is evidence about all six of them rather than about `PATH`.
-      # The suite is `ply-host-tests`'s; `ply-host` keeps only its unit tests.
-      - name: A cluster-gated suite really started a cluster
-        run: |
-          set -euo pipefail
-          # 2>&1 for the same reason as the step above: the skip notice is an
-          # eprintln! and a bare pipe would not carry it.
-          cargo nextest run --locked -p ply-host-tests --test suite \
-            -E 'test(host_park::)' --no-capture 2>&1 | tee /tmp/park.log
-          if grep -Eq 'skipp(ed|ing): (PLY_PG_URL is unset|this machine has no)' /tmp/park.log; then
-            echo "cluster::available() was false: initdb/postgres are not where the tests look" >&2
-            exit 1
-          fi
-          sed -E 's/\x1b\[[0-9;]*m//g' /tmp/park.log | grep -Eq ' 2 tests run: 2 passed' || {
-            echo "expected 2 tests in host_park; see the log above" >&2
-            exit 1
-          }
-
-      # The same guards as the `test` job's run step, for the same reasons.
+      # `--success-output immediate` is load-bearing, and so is `2>&1`. The
+      # proof that a gate is open is the *absence* of the notice a skipped test
+      # prints, and the notice is an `eprintln!` in a test that passes: nextest
+      # shows a passing test's output only when asked, and a bare pipe carries
+      # only stdout. Piping stdout alone was measured to put **0** notices in
+      # the log with `PLY_PG_URL` unset, where `2>&1` put ten. The count of
+      # tests passed does not cover the difference — the ten return early and
+      # *pass*.
       - name: cargo nextest run
         run: |
           set -euo pipefail
-          packages_raw=$(.github/ci-shards.sh packages postgres)
-          read -r -a packages <<<"$packages_raw"
-          [ "${#packages[@]}" -gt 0 ] || { echo "the postgres shard names no packages" >&2; exit 1; }
-          cargo nextest run --locked --no-fail-fast "${packages[@]}" 2>&1 | tee /tmp/pg.log
+          filter=$(.github/ci-shards.sh postgres-filter)
+          cargo-nextest nextest run \
+            --binaries-metadata target/nextest/binaries-metadata.json \
+            --cargo-metadata target/nextest/cargo-metadata.json \
+            --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
+            --no-fail-fast --success-output immediate -E "$filter" 2>&1 | tee /tmp/pg.log
+
+      # Gate two: the ten live tests ran against the server. Gate one: a
+      # cluster-gated module really started a cluster — `host_park` is the
+      # cheapest of the six and it runs a real `initdb`, so its two tests
+      # passing without the notice is evidence about all six rather than about
+      # `PATH`.
+      - name: The live and cluster-gated tests ran against a server
+        run: |
+          set -euo pipefail
+          if grep -Eq 'skipp(ed|ing): (PLY_PG_URL is unset|this machine has no)' /tmp/pg.log; then
+            echo "a gated test skipped itself: the server or the cluster binaries did not reach the tests" >&2
+            exit 1
+          fi
+          count() {
+            awk -v id="$1" -v prefix="$2" '
+              { gsub(/\033\[[0-9;]*m/, "") }
+              $1 == "PASS" && $(NF - 1) == id && index($NF, prefix) == 1 { n++ }
+              END { print n + 0 }
+            ' /tmp/pg.log
+          }
+          live=$(count ply-host db::scope::tests::live::)
+          [ "$live" -eq 10 ] || { echo "expected 10 live tests to pass, saw $live" >&2; exit 1; }
+          park=$(count ply-host-tests::suite host_park::)
+          [ "$park" -eq 2 ] || { echo "expected 2 host_park tests to pass, saw $park" >&2; exit 1; }
           ran=$(awk '
             { gsub(/\033\[[0-9;]*m/, "") }
             /^ *Summary \[/ { for (i = 1; i <= NF; i++) if ($i == "tests" || $i == "test") { n = $(i - 1) } }
             END { print n + 0 }
           ' /tmp/pg.log)
-          echo "the postgres shard ran $ran tests"
-          [ "$ran" -gt 0 ] || { echo "the postgres shard ran no tests at all" >&2; exit 1; }
-          while read -r package target test; do
-            case " $packages_raw " in
-              *" -p $package "*) ;;
-              *) continue ;;
-            esac
-            if [ "$target" = lib ]; then id=$package; else id="$package::$target"; fi
-            awk -v id="$id" -v test="$test" '
-              { gsub(/\033\[[0-9;]*m/, "") }
-              $1 == "PASS" && $NF == test && $(NF - 1) == id { found = 1 }
-              END { exit !found }
-            ' /tmp/pg.log || {
-              echo "deferred test '$id $test' did not run in the postgres shard: the table names a test the binary does not have" >&2
-              exit 1
-            }
-            echo "deferred: $id $test ran"
-          done < <(.github/ci-shards.sh deferred)
-
-      - name: cargo test --doc
-        run: |
-          set -euo pipefail
-          packages_raw=$(.github/ci-shards.sh packages postgres)
-          read -r -a packages <<<"$packages_raw"
-          cargo test --locked --doc "${packages[@]}"
+          echo "the postgres packages ran $ran tests, $live live and $park on a cluster"
+          [ "$ran" -gt 0 ] || { echo "the postgres packages ran no tests at all" >&2; exit 1; }
 
   ucontext-probe:
     name: ./probes/ucontext/run.sh
@@ -703,23 +605,36 @@ jobs:
       - name: ./probes/ucontext/run.sh
         run: ./probes/ucontext/run.sh
 
+  # What needs a `ply` binary and no test harness: the code generator over the
+  # shipped corpora, the served example, and W4's exit criterion. The binary is
+  # `build`'s, checked there against the tree it was built from.
   same-tests:
     name: examples/same-tests.sh
+    needs: [build-ply]
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
+    env:
+      PLY_BIN: ${{ github.workspace }}/target/release/ply
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
       - name: tcc, the development profile's C compiler
         run: sudo apt-get update -qq && sudo apt-get install -y -qq tcc
-      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          toolchain: "1.93.1"
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-        with:
-          key: same-tests-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
-          save-if: ${{ github.ref_name == github.event.repository.default_branch }}
+          name: ply
+          path: target/release
+      # An artifact keeps neither the execute bit nor a clock the scripts can
+      # compare: `same-tests.sh` refuses a binary older than the sources in its
+      # dep-info, and this checkout is newer than `build`'s. Touched, the
+      # binary is what `build` proved it to be: built from this commit.
+      - name: The binary is runnable and newer than the checkout
+        run: |
+          chmod +x "$PLY_BIN"
+          touch "$PLY_BIN" "$PLY_BIN.d"
+          "$PLY_BIN" std --digest
+          echo "$(df -h / | awk 'NR == 2 { print $4 " free" }'), $(free -m | awk 'NR == 2 { print $7 " MB available" }')"
 
       # The script manages its own cluster with `initdb`/`pg_ctl` when it is not
       # given a `--db`, so this job needs the binaries and not a service.
@@ -745,82 +660,21 @@ jobs:
           fi
           echo "$bin" >> "$GITHUB_PATH"
 
-      # W4's exit criterion: the same `examples/desk.ply` endpoints answered by
-      # the in-memory twin and by real postgres, compared byte for byte. Nothing
-      # in `cargo test` covers it — the twin half is hermetic and the postgres
-      # half is behind the gates above — and CONTRIBUTING.md §"The suite proves
-      # less than it looks like it proves" lists running it by hand as the
-      # obligation this job takes over.
-      #
-      # The script builds `target/release/ply` itself since 2026-08-27, and
-      # refuses to run against a binary older than the sources in its own
-      # dep-info. This step is kept, and it is not redundant: a compile error
-      # fails a step named for it rather than fifty lines into the script's
-      # output, and this is where the release build's minutes are spent and
-      # named. The rationale it replaces was:
-      #
-      #   > The release build is the script's own requirement: step 1 runs
-      #   > `target/release/ply` before `serve.sh` gets a chance to build it.
-      #
-      # which was true of the script as it stood and is not true of it now.
-      #
-      # Half of the rationale that replaced *that* has gone the same way. This
-      # comment said:
-      #
-      #   > This step is kept, and it is not redundant: it is `--locked`, so a
-      #   > `Cargo.lock` that does not match the manifests fails here instead of
-      #   > being quietly updated by the script's build, and a compile error
-      #   > fails a step named for it rather than fifty lines into the script's
-      #   > output.
-      #
-      # The first half described a hole rather than a guarantee. `--locked` here
-      # bought nothing while the three builds that follow it in this job could
-      # each re-resolve the lock it had just checked: `same-tests.sh`'s own build,
-      # and `serve.sh`'s, which `same-tests.sh` starts twice. All three pass
-      # `--locked` since 2026-08-27, so this step is the first of four locked
-      # builds rather than the only one, and the flag stays here so that a lock
-      # failure fails a step named for the lock.
-      - name: cargo build --locked --release -p ply-cli
-        run: cargo build --locked --release -p ply-cli
-
-      # `same-tests.sh` refuses to run against a binary that is not this tree,
-      # and a freshness check nobody has watched fail is the same defect one
-      # level up — so the check is driven red and green here before it is
-      # relied on. `--self-test` touches no tracked file: it compares the
-      # binary against a corrupted *copy* of the stdlib and against a dep-info
-      # it writes under a scratch directory. CONTRIBUTING.md §"The binary is an
-      # instrument too" has the reproduction this replaces.
-      - name: The freshness check can still go red
-        run: .github/binary-is-current.sh --self-test
-
-      - name: The binary is built from this tree
-        run: .github/binary-is-current.sh target/release/ply
-
-      # M9's end-to-end check, and it is here rather than in `cargo test`
-      # because this is where a *verified-fresh release* binary already exists.
-      # `crates/ply-codegen-tests/tests/suite/fragment.rs` and
-      # `crates/ply-cli/tests/suite/backend.rs` run the code generator over
-      # corpora of five and nine definitions; this runs it over `examples/`,
-      # which is the shipped standard library at corpus scale.
-      #
-      # Under tier-only (ADR 0048) the compiled tier IS the evaluator, so this runs it green over
-      # `examples/` at corpus scale. A corrupt tier is caught by the program's own tests going red
-      # (`crates/ply-cli/tests/suite/backend.rs` proves that for every corruption), so the check
-      # here is that the honest tier is green AND not vacuous.
-      #
-      # The `entered`/`units` assertions are the half that stops it being vacuous. The
-      # compute-kernel record has a run reporting a 0.998x speedup over a backend that entered
-      # **nothing**, and a green run over a seam no call reached says nothing at all. A code
-      # generator whose fragment collapses to zero — one refused construct spreading through the
-      # fixpoint is enough — would pass every assertion here except these.
+      # Under tier-only (ADR 0048) the compiled tier IS the evaluator, so this
+      # runs it green over `examples/` at corpus scale. A corrupt tier is
+      # caught by the program's own tests going red
+      # (`crates/ply-cli/tests/suite/backend.rs` proves that for every
+      # corruption), so the check here is that the honest tier is green AND
+      # not vacuous: the `entered`/`units` assertions are what stops it being
+      # so. The compute-kernel record has a run reporting a 0.998x speedup over
+      # a backend that entered **nothing**.
       - name: The code generator runs examples/ green and enters the seam
         run: |
           set -uo pipefail
           # `set -e` is off for the run itself on purpose: `ply test` exits 1 when a test fails,
           # and letting the shell die there would skip the assertions below and report the failure
           # as "the command exited 1" rather than as which of them broke.
-          ./target/release/ply test examples --backend c \
-            --json > /tmp/backend.json || true
+          "$PLY_BIN" test examples --backend c --json > /tmp/backend.json || true
           set -e
           python3 - <<'PY'
           import json, sys
@@ -847,8 +701,7 @@ jobs:
           set -uo pipefail
           d=$(mktemp -d)
           cp crates/ply-compiler/ply/*.ply "$d/"
-          ./target/release/ply test "$d" --no-cache --backend c \
-            --json > /tmp/spike-c.json || true
+          "$PLY_BIN" test "$d" --no-cache --backend c --json > /tmp/spike-c.json || true
           set -e
           python3 - <<'PY'
           import json, sys
@@ -865,16 +718,14 @@ jobs:
       # ADR 0042's third step, and under tier-only (ADR 0048) the only one: the emitter written
       # in Ply produces the unit the tier runs. The count says it answered rather than falling
       # back to the reference, and the corpus running green over what it produced is the check
-      # that it produced correctly.
-      #
-      # In a cache of its own, or the count is vacuous: a step above already ran `examples` on
-      # this producer, and a unit that comes back whole from the object cache is a unit the
-      # emitter was never entered for. That is exactly what `PLY_C_CACHE` is for.
+      # that it produced correctly. In a cache of its own, or the count is vacuous: a step above
+      # already ran `examples` on this producer, and a unit that comes back whole from the object
+      # cache is a unit the emitter was never entered for.
       - name: The Ply emitter produces the unit, and examples/ runs green
         run: |
           set -uo pipefail
           PLY_C_CACHE=$(mktemp -d) PLY_C_REFUSALS=1 \
-            ./target/release/ply test examples --backend c --no-cache \
+            "$PLY_BIN" test examples --backend c --no-cache \
             --json > /tmp/whole.json 2> /tmp/whole.err || true
           set -e
           grep -E "ply emitter answered [1-9][0-9]* of" /tmp/whole.err || {
@@ -889,9 +740,9 @@ jobs:
       - name: The language corpus, on the default tier and tier-only
         run: |
           set -euo pipefail
-          ./target/release/ply test tests/lang --no-cache
-          PLY_TIER_ONLY=1 \
-            ./target/release/ply test tests/lang --backend c --no-cache
+          "$PLY_BIN" test tests/lang --no-cache
+          PLY_TIER_ONLY=1 "$PLY_BIN" test tests/lang --backend c --no-cache
+
       # ADR 0045's first stage for the judge: every law and spec clause is a root of the unit, and
       # `ply prove --backend c` enters them. Under tier-only the tier is the judge, so the corpus
       # must prove cleanly (nothing refuted) and the tier must have entered the propositions rather
@@ -901,7 +752,7 @@ jobs:
           set -euo pipefail
           for corpus in examples crates/ply-std/ply; do
             PLY_C_REFUSALS=1 PLY_C_PHASES=1 \
-              ./target/release/ply prove "$corpus" --no-cache --json --backend c \
+              "$PLY_BIN" prove "$corpus" --no-cache --json --backend c \
               > /tmp/prove-c.json 2> /tmp/prove-c.err
             entries=$(grep -c "^entry:" /tmp/prove-c.err || true)
             [ "$entries" -gt 0 ] || { echo "the tier entered nothing while proving $corpus"; exit 1; }
@@ -920,14 +771,13 @@ jobs:
         run: |
           set -euo pipefail
           for d in examples crates/ply-std/ply; do
-            PLY_TIER_ONLY=1 \
-              ./target/release/ply test "$d" --backend c --no-cache
+            PLY_TIER_ONLY=1 "$PLY_BIN" test "$d" --backend c --no-cache
           done
           d=$(mktemp -d)
           cp crates/ply-compiler/ply/*.ply "$d/"
-          PLY_TIER_ONLY=1 \
-            ./target/release/ply test "$d" --backend c --no-cache
+          PLY_TIER_ONLY=1 "$PLY_BIN" test "$d" --backend c --no-cache
           PLY_TIER_ONLY=1 .github/served-with-tier.sh
+
       # The tier shipped a wrong BLAKE3 digest on a 64KB input while every test it had passed ---
       # the input was the first one long enough for a loop to come round --- so this pairs the tier
       # against a hash long enough to build a tree, the shape that broke. The test hashes the same
@@ -954,12 +804,17 @@ jobs:
           }
           pub fn digest() -> Bytes = blake3(long())
           PLY
-          ./target/release/ply test "$d" --no-cache --backend c --json \
-            > /tmp/c-hash.json
+          "$PLY_BIN" test "$d" --no-cache --backend c --json > /tmp/c-hash.json
           python3 -c 'import json,sys; r=json.load(open("/tmp/c-hash.json")); \
             sys.exit(0 if r["ok"] and not r["summary"]["failed"] else \
               "the C tier hashes a long input inconsistently")'
 
+      # W4's exit criterion: the same `examples/desk.ply` endpoints answered by
+      # the in-memory twin and by real postgres, compared byte for byte. Nothing
+      # in the suite covers it — the twin half is hermetic and the postgres
+      # half is behind the gates above — and CONTRIBUTING.md §"The suite proves
+      # less than it looks like it proves" lists running it by hand as the
+      # obligation this job takes over.
       - name: examples/same-tests.sh
         run: ./examples/same-tests.sh
 
@@ -974,7 +829,11 @@ jobs:
         plan,
         fmt,
         clippy,
+        build,
+        build-ply,
         test,
+        solo,
+        gates,
         test-postgres,
         ucontext-probe,
         same-tests,
