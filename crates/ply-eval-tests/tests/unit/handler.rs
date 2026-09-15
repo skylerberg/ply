@@ -1,9 +1,11 @@
 //! Effect handlers end to end, on the machine that runs them.
 
-use super::*;
 use crate::build;
 use crate::build::{bin, block, callv, int, letv, list, var};
-use crate::evaluator::Machine;
+use ply_eval::Value;
+use ply_eval::evaluator::Machine;
+use ply_eval::handler::*;
+use ply_span::{Diagnostic, Span, codes};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{BinOp, Expr, HandleClause, Item, Mode};
 
