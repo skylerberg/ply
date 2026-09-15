@@ -223,28 +223,46 @@ them now says what it is: ADR 0017's fixture cost, ROADMAP.md's per-test
 figure and its `Store::open` row, and README.md's open time are measurements
 the records took, and no test asserts them.
 
-### 8. The build job's link time
+### 8. The build job's link time — measured, and rejected
 
-With sccache warm the build job's time is links: one suite binary per
-`-tests` package plus the two bins.
+With sccache warm the build job's time was thought to be links: one suite
+binary per `-tests` package plus the two bins, so a faster linker on the
+runner would move it.
 
-**Fix.** A faster linker on the runner, `mold` or `lld`, set through
-`RUSTFLAGS` in the build job so a developer's link is untouched. Measured on the build job's step
-time in `--timings`, kept only if it moves.
+**Measured.** `mold`, set through `RUSTFLAGS` in the build job alone, ran
+the job's `cargo test --no-run` step in 56 s on a warm second run against
+36 to 49 s on the docs-only pull-request runs in the same cache state, and
+cost 12 s to install. Rejected: whatever the warm step spends, it is not the
+link, and `--timings` is where the next reading of it starts.
 
-### 9. Clippy off the critical path
+### 9. Clippy off the critical path — done
 
-Once the build job is shorter than clippy, clippy is the run's pole. It runs
-the workspace with all targets plus the doc tests in one job.
+The `clippy` job ran the workspace with all targets and then `cargo test
+--doc`. Every crate has zero doc tests, so that second step was a second
+build of the workspace to run nothing, two minutes that kept the job above
+the build job it was meant to stay below.
 
-**Fix.** Doc tests move to their own job, and clippy is split by the same
-`-tests` boundary the build uses.
+**Built.** `cargo test --doc` runs in the build job beside the libraries it
+just built, where it costs the rustdoc pass alone and still runs a doc test
+the day one appears. The clippy job is the clippy step and its cache.
 
-### 10. The floor
+### 10. The floor — the timeline, and a decision this record leaves open
 
 Runner provisioning is a fixed cost per job, and below it only larger or
 self-hosted runners help. That is a spend decision and is taken last, with
 the run's timeline in hand.
+
+**The timeline, with items 1 to 9 landed.** A quiet run on `main` is the
+build job, then every downstream job starting within seconds of it, then
+the slowest of those. The slowest is the emitter over its own sources, the
+`solo` that enters the compiled compiler once more, with the bootstrap
+fixpoint and the postgres job close behind it; the partitions finish well
+inside it. So the pole is not provisioning and not the suite's shape any
+more: it is the compiled compiler's own running time, which item 3's
+profile names and its levers would move. A larger runner would shorten the
+build job and each solo in proportion to its cores only where the work is
+parallel, which the build is and a solo test is not. The decision to pay
+for one is the owner's, and this record does not make it.
 
 ## The goal, as set
 
