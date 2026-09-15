@@ -13,9 +13,9 @@ is also what the remaining suite time is made of.
 
 > **What this decides.** That a compiled Ply unit describes its own exports,
 > so the bundle's load record goes away. That the heap reuses dead blocks in
-> every profile, with no-reuse an explicit diagnostic. That the C emitter's
-> code for byte handling and tight loops is a performance target held to the
-> hasher. That the corpus, judged by the compiled tier, is the specification
+> every profile, with no-reuse an explicit diagnostic. That the compiled
+> compiler's time is held to a profile taken on a runner, and no emitter
+> change lands without one. That the corpus, judged by the compiled tier, is the specification
 > the differentials are retired into, in the order ADR 0042 fixed. That
 > figures a test reads live in a file the test and the prose both read. And
 > that `examples/same-tests.sh`'s steps, the deferred table, the build job's
@@ -30,9 +30,10 @@ is also what the remaining suite time is made of.
 
 ## Why the language first
 
-Each suite item below is bounded by a compiler item. The longest single test
-phase left is the hash differential, and its time is the ported hasher's own
-running time, so the C emitter's inner loops are the suite's tail. The
+Each suite item below is bounded by a compiler item. The longest single tests
+left are the differentials over the compiler's own sources, and their time is
+the compiled compiler's own running time, so how the emitter represents and
+reaches values is the suite's tail. The
 bundle's load record exists because a unit cannot say what it exports, and
 every consumer that wants to skip the front end will need the same trick until
 the unit can. The deferred table is mostly timing tests over allocation and
@@ -83,20 +84,39 @@ net the suites run under without a switch, so no test has to know it is
 there. The switch and every call to it are gone; `Heap::set_quarantine(0)`
 is what a test of the recycling itself asks for.
 
-### 3. The emitter's inner loops, held to the hasher
+### 3. The emitter's inner loops, held to the hasher — measured, and the premise was wrong
 
-`ply_compiler_diff`'s `hash` module is the slowest phase of the differentials
-and the time is inside the compiled hasher, not in the harness or the
-reference. The corpus timing tests point the same way. Byte handling and
-tight loops are where the C tier's code is weak: every byte read goes through
-a call, every loop iteration allocates its state.
+The record first said the hash differential was the slowest phase, its time
+inside the compiled hasher's byte loops, and that the emitter should turn
+those into local C loops. `.github/workflows/profile.yml`, the instrument
+this item built, says otherwise. A flat `perf` profile of the hash
+differential under tcc, taken 2026-09-15 on a hosted runner, has no byte
+loop near the top: the heaviest symbols are the runtime's `dismantle` and
+`raw_alloc`, then the hasher's own `at` and `set_at` over lists, then
+`rt_field`, `call_value`, `list::get` and the count traffic, none above six
+per cent, and the rest is a long tail of the compiled bodies. The same
+shape holds for the emitter over its own sources and for the checker. The
+compiled compiler is not slow in one place; it is slow in the way its
+values are represented and reached.
 
-**Fix.** Profile the ported hasher's C under `ply --backend c` on a long
-input, name the three most expensive shapes, and change the emitter so each
-becomes a local C loop over a raw pointer. The measure is the hash
-differential's own time and `probes/` gets a micro-probe for each shape,
-so the change is held to an instrument rather than a feeling. The
-allocation-attribution suites in `ply-corpus` are the regression guard.
+Two levers were then measured against the same test, at 19.9 s under tcc.
+Under `cc -O0` it ran in 18.1 s and under `cc -O1` in 9.6 s, so what a
+real optimiser does to the bodies is worth a factor of two, but `-O1`
+compiles the compiler's unit in seventy seconds where tcc takes one, which
+is not a trade the development loop can make. Rewriting the prelude's
+`static inline` helpers as macros, on the guess that tcc's calls to them
+were the tail, ran in 19.4 s: rejected, the calls are not where the time is.
+
+**What is left, and named for the next record.** The hasher's `set_at`,
+written as a `map` over `range` with a closure, is quadratic in the list
+and is used forty-four times across the compiler's sources; a `list_set`
+builtin over the trie is the one algorithmic lever the profile names, and
+it needs a runtime helper, which today re-keys the bundle out of service.
+Appending a helper should not: the unit's `exports` can carry the helper
+table it was emitted against, and a unit serves while the runtime's table
+starts with it. Below that lies the value model, ADR 0035's, where the
+counts and the field reads through the runtime come from. The
+allocation-attribution suites in `ply-corpus` remain the regression guard.
 
 ### 4. The corpus is the specification
 
