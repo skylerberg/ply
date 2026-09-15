@@ -1,0 +1,54 @@
+# A flat CPU profile of one differential test, on a runner: where the compiled compiler's time
+# goes under the development profile's C compiler. Run it by hand --
+#
+#   gh workflow run profile.yml -f test=<nextest name of a ply-compiler-diff suite test>
+#
+# -- and read the job log. `perf` samples the software clock, since a hosted runner exposes no
+# hardware counters; the unit compiled by tcc reports its exported bodies by name and its static
+# helpers by address. ADR 0049 item 3 is what it was built for and what it first found.
+name: profile
+on:
+  workflow_dispatch:
+    inputs:
+      test:
+        description: the test to profile, by its nextest name
+        default: hash::the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library_part_1_of_2
+        type: string
+permissions:
+  contents: read
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+jobs:
+  perf:
+    name: perf over one differential
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        with:
+          toolchain: stable
+      - name: tcc and perf
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tcc linux-tools-common linux-tools-generic "linux-tools-$(uname -r)" \
+            || sudo apt-get install -y -qq tcc linux-tools-common linux-tools-generic
+      - name: Build the differential suite
+        run: cargo test --locked -p ply-compiler-diff --test suite --no-run
+      - name: Profile
+        run: |
+          set -euo pipefail
+          BIN=$(cargo test --locked -p ply-compiler-diff --test suite --no-run --message-format=json 2>/dev/null \
+            | jq -r 'select(.executable != null and .target.name == "suite") | .executable')
+          PERF=$(command -v perf || ls /usr/lib/linux-tools/*/perf | head -1)
+          T="${{ inputs.test }}"
+          # Once to compile the unit into the object cache, so the profile is of the test alone.
+          echo "=== warm"
+          /usr/bin/time -v "$BIN" --exact "$T" 2>&1 | grep -E "Elapsed|Maximum resident|test result"
+          echo "=== profile"
+          sudo "$PERF" record -e cpu-clock -F 499 -o perf.data -- "$BIN" --exact "$T" >/dev/null 2>&1
+          sudo "$PERF" report -i perf.data --no-children --sort dso,sym --stdio --percent-limit 0.4 2>/dev/null \
+            | grep -v "^#" | grep -v "^$" | head -80 || true
