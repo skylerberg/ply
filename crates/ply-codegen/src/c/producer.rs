@@ -217,10 +217,9 @@ pub fn mode() -> &'static str {
 }
 
 /// Runs `f` with the reference emitter forced, whatever producer is installed: [`mode`] answers
-/// `ref` and the producer is not consulted or built. The bisection's mixtures are reconstructed
-/// ASTs with no source text, which the whole Ply emitter — a front end — cannot re-parse; the
-/// reference is an AST consumer and emits the identical C for the effect-free programs a mixture
-/// reconstructs. The thread-local is restored on unwind, so a panicking mixture leaves no residue.
+/// `ref` and the producer is not consulted or built. This is for the checks that hold the
+/// fragment against the whole emitter -- the differentials, and the emitter's own tests -- which
+/// need a unit the fragment emitted while the whole emitter is the default everywhere else.
 pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
     struct Guard(bool);
     impl Drop for Guard {
