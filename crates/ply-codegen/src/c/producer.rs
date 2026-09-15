@@ -437,9 +437,46 @@ impl PlyProducer {
             bail!("`{name}` raised: {why}");
         }
         let value = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        note_census(&ctx);
         ctx.end();
         Ok(value)
     }
+}
+
+/// What this thread's entries into the compiled compiler have cost since the census was last
+/// reset: the compiled compiler's own cost, apart from any harness or reference around it, in
+/// the units the value model is about (ADR 0051 §2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Census {
+    pub entries: usize,
+    pub allocated: usize,
+    pub recycled: usize,
+    /// The most chunk bytes any one entry held at its end.
+    pub chunk_bytes: usize,
+}
+
+thread_local! {
+    static CENSUS: Cell<Census> = const { Cell::new(Census { entries: 0, allocated: 0, recycled: 0, chunk_bytes: 0 }) };
+}
+
+fn note_census(ctx: &crate::rt::Ctx) {
+    CENSUS.with(|c| {
+        let mut census = c.get();
+        census.entries += 1;
+        census.allocated += ctx.heap.allocated();
+        census.recycled += ctx.heap.recycled();
+        census.chunk_bytes = census.chunk_bytes.max(ctx.heap.chunk_bytes());
+        c.set(census);
+    });
+}
+
+/// Starts this thread's census afresh, so a test reads only what it entered.
+pub fn reset_census() {
+    CENSUS.with(|c| c.set(Census::default()));
+}
+
+pub fn census() -> Census {
+    CENSUS.with(|c| c.get())
 }
 
 /// Enters `name` in this thread's compiled emitter, building it first when the thread has none.
