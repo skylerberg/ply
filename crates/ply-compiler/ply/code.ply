@@ -25,12 +25,12 @@ import exprs (HandleClause, MatchArm, Param, Expr, ELit, EVar, EBinary, EUnary, 
 import items (Module, Item, IFn, parse)
 import rewrite (expand)
 
-// How a read takes its value. `rc.rs`'s `Own`, with the same three cases and
+// How a read takes its value. `rc.rs`'s `Own`, with the same two cases and
 // the same one-letter spellings the oracle writes.
-pub type Own = | Borrowed | Owned | OwnedField
+pub type Own = | Borrowed | Owned
 
 pub fn own_tag(o: Own) -> Bytes =
-  match o { Borrowed -> b"b", Owned -> b"o", OwnedField -> b"f" }
+  match o { Borrowed -> b"b", Owned -> b"o" }
 
 // One lowered node: what it is, and how the read that produced it takes it.
 pub type Code = { own: Own, node: Node, span: Span }
@@ -545,7 +545,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
       Some(b) -> {
         let inner = st_top(b.st);
         Some({ code: { own: Borrowed, span: expr_span(e), node: NSim({ size: len(inner.names), caps: inner.caps,
-                                                   body: mark(b.code, [], [], []).code }) },
+                                                   body: mark(b.code, []).code }) },
                st: st_pop(b.st) })
       },
     },
@@ -572,7 +572,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
                       resource: match c.resource { Some(id) -> id.name, None -> b"" },
                       params: len(c.params), resume: match c.resume { Some(_) -> true, None -> false },
                       size: len(f.names), caps: f.caps,
-                      body: mark(cb.code, [], [], []).code }),
+                      body: mark(cb.code, []).code }),
                     st: st_pop(cb.st), ok: true }
                 },
               }
@@ -591,7 +591,7 @@ fn lower_in(e: Expr, st: Stack) -> Option<Out> =
                   Some({ code: { own: Borrowed, span: expr_span(e), node: NHandle({
                            body: b.code, clauses: cls.clauses,
                            ret: Some({ size: len(f.names), caps: f.caps,
-                                       body: mark(rb.code, [], [], []).code }) }) },
+                                       body: mark(rb.code, []).code }) }) },
                          st: st_pop(rb.st) })
                 },
               }
@@ -770,7 +770,7 @@ fn lam_of(params: List<Bytes>, b: Out) -> Out = {
   let inner = st_top(b.st);
   { code: { own: Borrowed, span: dummy_span(), node: NLambda({ params: len(params), size: len(inner.names),
                                            caps: inner.caps,
-                                           body: mark(b.code, [], [], []).code }) },
+                                           body: mark(b.code, []).code }) },
     st: st_pop(b.st) }
 }
 
@@ -920,13 +920,7 @@ fn binder_of(p: Pattern) -> Option<Bytes> =
 // The live set is slots, not names: a shadowed name is two slots and they die
 // at different points.
 
-type Marked = { code: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
-
-// One (slot, field) pair still to be read. `Own::OwnedField` is the mark for a
-// projection that is the last read of *this field* while the record it comes
-// out of is read again for another -- the case a live set keyed on the slot
-// alone cannot see, and the one `rc.rs` exists to answer.
-type FieldUse = { slot: Int, field: Bytes }
+type Marked = { code: Code, live: List<Int> }
 
 fn live_has(live: List<Int>, s: Int) -> Bool =
   fold(live, false, |acc: Bool, x: Int| acc || x == s)
@@ -940,252 +934,201 @@ fn live_union(a: List<Int>, b: List<Int>) -> List<Int> =
 fn live_drop(live: List<Int>, s: Int) -> List<Int> =
   filter(live, |x: Int| x != s)
 
-fn fuse_has(fs: List<FieldUse>, s: Int, f: Bytes) -> Bool =
-  fold(fs, false, |acc: Bool, u: FieldUse| acc || (u.slot == s && u.field == f))
-
-fn fuse_add(fs: List<FieldUse>, s: Int, f: Bytes) -> List<FieldUse> =
-  if fuse_has(fs, s, f) { fs } else { push(fs, { slot: s, field: f }) }
-
-fn fuse_union(a: List<FieldUse>, b: List<FieldUse>) -> List<FieldUse> =
-  fold(b, a, |acc: List<FieldUse>, u: FieldUse| fuse_add(acc, u.slot, u.field))
-
-fn live_drop_f(fs: List<FieldUse>, s: Int) -> List<FieldUse> =
-  filter(fs, |u: FieldUse| u.slot != s)
-
 // The slot a projection reads through, when its base is a bare variable.
 fn base_slot(c: Code) -> Option<Int> =
   match c.node { NVar(v) -> v.slot, _ -> None }
 
-pub fn mark(c: Code, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -> Marked =
+pub fn mark(c: Code, live: List<Int>) -> Marked =
   match c.node {
-    NLit(_) -> { code: c, live: live, livew: livew, livef: livef },
+    NLit(_) -> { code: c, live: live },
     NVar(v) -> match v.slot {
-      None -> { code: c, live: live, livew: livew, livef: livef },
+      None -> { code: c, live: live },
       Some(s) -> {
         code: { own: if live_has(live, s) { Borrowed } else { Owned }, node: c.node, span: c.span },
         live: live_add(live, s),
-        // A bare read is a read of the *whole* record, which is what stops a
-        // later projection being taken in place.
-        livew: live_add(livew, s),
-        livef: livef,
       },
     },
     // The base is read *after* every written field, so backwards it is marked
-    // first, and it reads only the copied fields: a whole read, and one per copy.
+    // first.
     NUpd(u) -> {
       let s = match base_slot(u.base) { Some(x) -> x, None -> -1 };
       let owned = s >= 0 && !live_has(live, s);
       let base = { own: if owned { Owned } else { Borrowed }, node: u.base.node, span: u.base.span };
-      let after = if s < 0 { { live: live, livew: livew, livef: livef } } else {
-        // The base's read is **not** a whole read: it takes only the copied
-        // fields, so a projection of an uncopied one earlier may still be taken
-        // in place. Adding it to `livew` blocked exactly those.
-        { live: live_add(live, s), livew: livew,
-          livef: fold(u.copies, livef, |acc: List<FieldUse>, n: Bytes|
-            push(acc, { slot: s, field: n })) }
-      };
-      let r = mark_seq(map(u.sets, |f: CField| f.value), after.live, after.livew, after.livef);
+      let after = if s < 0 { live } else { live_add(live, s) };
+      let r = mark_seq(map(u.sets, |f: CField| f.value), after);
       { code: { own: Borrowed, span: c.span, node: NUpd({ base: base, copies: u.copies,
           sets: map(range(0, len(u.sets)), |i: Int|
             { name: match list_at(u.sets, i) { Some(f) -> f.name, None -> b"" },
               value: nth(r.codes, i) }) }) },
-        live: r.live, livew: r.livew, livef: r.livef }
+        live: r.live }
     },
     NUnary(u) -> {
-      let o = mark(u.operand, live, livew, livef);
-      { code: { own: Borrowed, span: c.span, node: NUnary({ op: u.op, operand: o.code }) }, live: o.live, livew: o.livew, livef: o.livef }
+      let o = mark(u.operand, live);
+      { code: { own: Borrowed, span: c.span, node: NUnary({ op: u.op, operand: o.code }) }, live: o.live }
     },
     NBinary(b) -> {
-      let r = mark(b.rhs, live, livew, livef);
-      let l = mark(b.lhs, r.live, r.livew, r.livef);
+      let r = mark(b.rhs, live);
+      let l = mark(b.lhs, r.live);
       { code: { own: Borrowed, span: c.span, node: NBinary({ op: b.op, lhs: l.code, rhs: r.code }) },
-        live: l.live, livew: l.livew, livef: l.livef }
+        live: l.live }
     },
-    // The one mark a slot-keyed live set cannot make. A projection whose base is
-    // a bare variable is `OwnedField` when the record is read again -- so the
-    // record cannot be taken -- but *this field* of it is not.
-    // The one mark a slot-keyed live set cannot make. A projection whose base is
-    // a bare variable is `OwnedField` when the record is read again -- so the
-    // record itself cannot be taken -- but *this field* of it is not, and no
-    // later read wants the record whole.
-    //
-    // The base is marked here rather than through `mark`, because reading a
-    // record *to project from it* is not a read of the whole record, and routing
-    // it through the general case would put the slot in `livew` and stop every
-    // earlier projection being taken.
+    // A projection is a read of its base, marked here rather than through
+    // `mark` so the node itself stays `Borrowed`: the last read of a slot may
+    // move the record out, and a field is never taken out of it. ADR 0034
+    // records the take that was tried and why it went.
     NField(fd) -> match base_slot(fd.base) {
       None -> {
-        let b = mark(fd.base, live, livew, livef);
+        let b = mark(fd.base, live);
         { code: { own: Borrowed, span: c.span, node: NField({ base: b.code, field: fd.field }) },
-          live: b.live, livew: b.livew, livef: b.livef }
+          live: b.live }
       },
       Some(s) -> {
         let base = { own: if live_has(live, s) { Borrowed } else { Owned }, node: fd.base.node, span: fd.base.span };
-        let own =
-          if !live_has(live, s) { Borrowed }
-          else if live_has(livew, s) { Borrowed }
-          else if fuse_has(livef, s, fd.field) { Borrowed }
-          else { OwnedField };
-        { code: { own: own, span: c.span, node: NField({ base: base, field: fd.field }) },
-          live: live_add(live, s),
-          livew: livew,
-          livef: fuse_add(livef, s, fd.field) }
+        { code: { own: Borrowed, span: c.span, node: NField({ base: base, field: fd.field }) },
+          live: live_add(live, s) }
       },
     },
     // Every arm sees the same future, as the branches of an `if` do, and each
     // arm's binders die at the arm: nothing before the match can read a slot a
     // pattern wrote.
     NMatch(m) -> {
-      let marked = fold(m.arms, { arms: [], live: [], livew: [], livef: [] },
+      let marked = fold(m.arms, { arms: [], live: [] },
         |acc: ArmMark, a: CArm| {
-          let bound = pat_slots(a.pat);
-          let b = mark(a.body, live, livew, livef);
-          let after = fold(bound, { l: b.live, w: b.livew, f: b.livef },
-            |x: Dropped, s: Int| { l: live_drop(x.l, s), w: live_drop(x.w, s), f: live_drop_f(x.f, s) });
+          let b = mark(a.body, live);
+          let after = fold(pat_slots(a.pat), b.live, |x: List<Int>, s: Int| live_drop(x, s));
           { arms: push(acc.arms, { pat: a.pat, guard: None, body: b.code }),
-            live: live_union(acc.live, after.l),
-            livew: live_union(acc.livew, after.w),
-            livef: fuse_union(acc.livef, after.f) }
+            live: live_union(acc.live, after) }
         });
-      let sc = mark(m.scrutinee, marked.live, marked.livew, marked.livef);
+      let sc = mark(m.scrutinee, marked.live);
       { code: { own: Borrowed, span: c.span, node: NMatch({ scrutinee: sc.code, arms: marked.arms }) },
-        live: sc.live, livew: sc.livew, livef: sc.livef }
+        live: sc.live }
     },
     // A lambda's body is its own barrier and its marks were settled when it was
     // lowered. What happens *here* is the captures: each is a read of a slot of
     // this barrier, at the point the closure is made.
     NLambda(l) -> {
-      let w = mark_caps(l.caps, live, livew);
+      let w = mark_caps(l.caps, live);
       { code: { own: Borrowed, span: c.span, node: NLambda({ params: l.params, size: l.size,
                                                caps: w.caps, body: l.body }) },
-        live: w.live, livew: w.livew, livef: livef }
+        live: w.live }
     },
     // A barrier's captures are reads of *this* barrier, at the point the barrier
     // is entered, exactly as a lambda's are.
     NSim(sm) -> {
-      let w = mark_caps(sm.caps, live, livew);
+      let w = mark_caps(sm.caps, live);
       { code: { own: Borrowed, span: c.span, node: NSim({ size: sm.size, caps: w.caps, body: sm.body }) },
-        live: w.live, livew: w.livew, livef: livef }
+        live: w.live }
     },
     NHandle(h) -> {
-      let cls = fold(h.clauses, { caps: [], live: live, livew: livew },
+      let cls = fold(h.clauses, { caps: [], live: live },
         |acc: CapMark, c: CClause| {
-          let w = mark_caps(c.caps, acc.live, acc.livew);
-          { caps: acc.caps, live: w.live, livew: w.livew }
+          let w = mark_caps(c.caps, acc.live);
+          { caps: acc.caps, live: w.live }
         });
       let marked = map(h.clauses, |c: CClause| c);
-      let b = mark(h.body, cls.live, cls.livew, livef);
+      let b = mark(h.body, cls.live);
       { code: { own: Borrowed, span: c.span, node: NHandle({ body: b.code, clauses: marked, ret: h.ret }) },
-        live: b.live, livew: b.livew, livef: b.livef }
+        live: b.live }
     },
     NRegion(r) -> {
-      let b = mark(r.body, live, livew, livef);
+      let b = mark(r.body, live);
       { code: { own: Borrowed, span: c.span, node: NRegion({ body: b.code }) },
-        live: b.live, livew: b.livew, livef: b.livef }
+        live: b.live }
     },
     NPerform(p) -> {
-      let r = mark_seq(p.args, live, livew, livef);
+      let r = mark_seq(p.args, live);
       { code: { own: Borrowed, span: c.span, node: NPerform({ effect: p.effect, op: p.op, resource: p.resource,
                                                 args: r.codes }) },
-        live: r.live, livew: r.livew, livef: r.livef }
+        live: r.live }
     },
     // The binder dies at the `with_cell`, as a `let`'s does at its `let`.
     NCell(cl) -> {
-      let b = mark(cl.body, live, livew, livef);
-      let after = match cl.slot {
-        None -> { l: b.live, w: b.livew, f: b.livef },
-        Some(s) -> { l: live_drop(b.live, s), w: live_drop(b.livew, s), f: live_drop_f(b.livef, s) },
-      };
-      let i = mark(cl.init, after.l, after.w, after.f);
+      let b = mark(cl.body, live);
+      let after = match cl.slot { None -> b.live, Some(s) -> live_drop(b.live, s) };
+      let i = mark(cl.init, after);
       { code: { own: Borrowed, span: c.span, node: NCell({ resource: cl.resource, binder: cl.binder, slot: cl.slot,
                                              init: i.code, body: b.code }) },
-        live: i.live, livew: i.livew, livef: i.livef }
+        live: i.live }
     },
     NIf(i) -> {
-      let t = mark(i.then_branch, live, livew, livef);
-      let e = mark(i.else_branch, live, livew, livef);
-      let cnd = mark(i.cond, live_union(t.live, e.live), live_union(t.livew, e.livew),
-                     fuse_union(t.livef, e.livef));
+      let t = mark(i.then_branch, live);
+      let e = mark(i.else_branch, live);
+      let cnd = mark(i.cond, live_union(t.live, e.live));
       { code: { own: Borrowed, span: c.span, node: NIf({ cond: cnd.code, then_branch: t.code, else_branch: e.code }) },
-        live: cnd.live, livew: cnd.livew, livef: cnd.livef }
+        live: cnd.live }
     },
     NList(l) -> {
-      let r = mark_seq(l.items, live, livew, livef);
-      { code: { own: Borrowed, span: c.span, node: NList({ items: r.codes }) }, live: r.live, livew: r.livew, livef: r.livef }
+      let r = mark_seq(l.items, live);
+      { code: { own: Borrowed, span: c.span, node: NList({ items: r.codes }) }, live: r.live }
     },
     NRecord(rc) -> {
-      let r = mark_seq(map(rc.fields, |fd: CField| fd.value), live, livew, livef);
+      let r = mark_seq(map(rc.fields, |fd: CField| fd.value), live);
       { code: { own: Borrowed, span: c.span, node: NRecord({ fields: map(range(0, len(rc.fields)), |i: Int|
           { name: cfield_name(rc.fields, i), value: nth(r.codes, i) }) }) },
-        live: r.live, livew: r.livew, livef: r.livef }
+        live: r.live }
     },
     NApp(a) -> {
-      let args = mark_seq(a.args, live, livew, livef);
-      let fu = mark(a.func, args.live, args.livew, args.livef);
+      let args = mark_seq(a.args, live);
+      let fu = mark(a.func, args.live);
       { code: { own: Borrowed, span: c.span, node: NApp({ func: fu.code, args: args.codes }) },
-        live: fu.live, livew: fu.livew, livef: fu.livef }
+        live: fu.live }
     },
     NBlock(b) -> {
       let after = match b.tail {
-        None -> { code: { own: Borrowed, span: dummy_span(), node: NLit(LUnit) }, live: live, livew: livew, livef: livef },
-        Some(t) -> mark(t, live, livew, livef),
+        None -> { code: { own: Borrowed, span: dummy_span(), node: NLit(LUnit) }, live: live },
+        Some(t) -> mark(t, live),
       };
-      let walked = fold(rev_stmts(b.stmts), { codes: [], live: after.live, livew: after.livew, livef: after.livef },
+      let walked = fold(rev_stmts(b.stmts), { codes: [], live: after.live },
         |acc: Seq2, st: CStmt|
           match st {
-            CDo(d) -> { let m = mark(d.code, acc.live, acc.livew, acc.livef);
-                        { codes: push(acc.codes, CDo({ code: m.code })), live: m.live, livew: m.livew, livef: m.livef } },
-            // The binder dies at its `let`: nothing before it can read the slot,
-            // and nothing before it can read a field of it either.
-            CLet(l) -> { let m = mark(l.value, live_drop(acc.live, l.slot), live_drop(acc.livew, l.slot), live_drop_f(acc.livef, l.slot));
+            CDo(d) -> { let m = mark(d.code, acc.live);
+                        { codes: push(acc.codes, CDo({ code: m.code })), live: m.live } },
+            // The binder dies at its `let`: nothing before it can read the slot.
+            CLet(l) -> { let m = mark(l.value, live_drop(acc.live, l.slot));
                          { codes: push(acc.codes, CLet({ name: l.name, slot: l.slot, value: m.code })),
-                           live: m.live, livew: m.livew, livef: m.livef } },
+                           live: m.live } },
             CLetPat(l) -> {
-              let dropped = fold(pat_slots(l.pat), { l: acc.live, w: acc.livew, f: acc.livef },
-                |x: Dropped, sl: Int| { l: live_drop(x.l, sl), w: live_drop(x.w, sl), f: live_drop_f(x.f, sl) });
-              let m = mark(l.value, dropped.l, dropped.w, dropped.f);
+              let dropped = fold(pat_slots(l.pat), acc.live, |x: List<Int>, sl: Int| live_drop(x, sl));
+              let m = mark(l.value, dropped);
               { codes: push(acc.codes, CLetPat({ span: l.span, pat: l.pat, value: m.code })),
-                live: m.live, livew: m.livew, livef: m.livef } },
+                live: m.live } },
           });
       { code: { own: Borrowed, span: c.span, node: NBlock({ stmts: rev_stmts(walked.codes),
                                               tail: match b.tail { None -> None, Some(_) -> Some(after.code) } }) },
-        live: walked.live, livew: walked.livew, livef: walked.livef }
+        live: walked.live }
     },
   }
 
-type CapMark = { caps: List<Cap>, live: List<Int>, livew: List<Int> }
+type CapMark = { caps: List<Cap>, live: List<Int> }
 
 // Each capture is a read of the enclosing barrier's slot, `Owned` when nothing
 // after it wants that slot.
-fn mark_caps(caps: List<Cap>, live: List<Int>, livew: List<Int>) -> CapMark = {
-  let walked = fold(rev_caps(caps), { caps: [], live: live, livew: livew },
+fn mark_caps(caps: List<Cap>, live: List<Int>) -> CapMark = {
+  let walked = fold(rev_caps(caps), { caps: [], live: live },
     |acc: CapMark, cp: Cap|
       { caps: push(acc.caps, { src: cp.src, dst: cp.dst,
                                own: if live_has(acc.live, cp.src) { Borrowed } else { Owned } }),
-        live: live_add(acc.live, cp.src),
-        livew: live_add(acc.livew, cp.src) });
-  { caps: rev_caps(walked.caps), live: walked.live, livew: walked.livew }
+        live: live_add(acc.live, cp.src) });
+  { caps: rev_caps(walked.caps), live: walked.live }
 }
 
-type ArmMark = { arms: List<CArm>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+type ArmMark = { arms: List<CArm>, live: List<Int> }
 
-type Dropped = { l: List<Int>, w: List<Int>, f: List<FieldUse> }
-
-type Seq2 = { codes: List<CStmt>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+type Seq2 = { codes: List<CStmt>, live: List<Int> }
 
 fn cfield_name(fs: List<CField>, i: Int) -> Bytes =
   match list_at(fs, i) { Some(fd) -> fd.name, None -> b"" }
 
-fn mark_seq(xs: List<Code>, live: List<Int>, livew: List<Int>, livef: List<FieldUse>) -> MarkedSeq = {
-  let walked = fold(rev_codes(xs), { codes: [], live: live, livew: livew, livef: livef },
+fn mark_seq(xs: List<Code>, live: List<Int>) -> MarkedSeq = {
+  let walked = fold(rev_codes(xs), { codes: [], live: live },
     |acc: MarkedSeq, x: Code| {
-      let m = mark(x, acc.live, acc.livew, acc.livef);
-      { codes: push(acc.codes, m.code), live: m.live, livew: m.livew, livef: m.livef }
+      let m = mark(x, acc.live);
+      { codes: push(acc.codes, m.code), live: m.live }
     });
-  { codes: rev_codes(walked.codes), live: walked.live, livew: walked.livew, livef: walked.livef }
+  { codes: rev_codes(walked.codes), live: walked.live }
 }
 
-type MarkedSeq = { codes: List<Code>, live: List<Int>, livew: List<Int>, livef: List<FieldUse> }
+type MarkedSeq = { codes: List<Code>, live: List<Int> }
 
 // Reversal by index, because a `fold` that prepends needs `push_front` and this
 // corpus builds one per element type otherwise.
@@ -1215,7 +1158,7 @@ pub fn lower_fn(params: List<Bytes>, body: Expr) -> Option<{ code: Code, size: I
   let start = fold(params, { names: [], scope: [], caps: [], capnames: [] }, |f: Frame, p: Bytes| bind(f, p));
   match lower_in(body, { frames: [start] }) {
     None -> None,
-    Some(o) -> Some({ code: mark(o.code, [], [], []).code, size: len(st_top(o.st).names) }),
+    Some(o) -> Some({ code: mark(o.code, []).code, size: len(st_top(o.st).names) }),
   }
 }
 
