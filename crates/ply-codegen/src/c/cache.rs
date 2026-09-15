@@ -144,7 +144,7 @@ pub fn write(key: &str, text: &str, tables: &Tables) {
 }
 
 /// One body as lines: the tables it names, then its text.
-pub(super) fn encode(text: &str, t: &Tables) -> String {
+pub fn encode(text: &str, t: &Tables) -> String {
     let mut out = encode_tables(&t.consts, &t.builtins, &t.fields, &t.shapes, &t.lambdas);
     out.push_str(&format!("calls {}\n", t.calls.len()));
     for c in &t.calls {
@@ -289,7 +289,7 @@ fn line<'a>(s: &'a str, at: &mut usize) -> Option<&'a str> {
     Some(&rest[..end])
 }
 
-pub(super) fn decode(s: &str) -> Option<(String, Tables)> {
+pub fn decode(s: &str) -> Option<(String, Tables)> {
     let mut at = 0usize;
     let mut t = decode_tables(s, &mut at)?;
     let n = count(line(s, &mut at)?, "calls")?;
@@ -457,41 +457,4 @@ pub fn decode_unit(s: &str) -> Option<UnitCache> {
         shapes: t.shapes,
         lambdas: t.lambdas,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// A body goes to disk and comes back the same, tables and all.
-    ///
-    /// The tables hold names a program chose, so they can be spelled anything -- `text` included,
-    /// which is what a marker-terminated format gets wrong and why the text's start is an offset.
-    #[test]
-    fn a_body_round_trips_through_the_encoding() {
-        let mut t = Tables::default();
-        t.consts.push(Value::Unit);
-        t.consts.push(Value::str("hello\nworld"));
-        t.consts.push(Value::bytes([0u8, 255, 10]));
-        t.builtins.push(ply_eval::Builtin::BytesLen);
-        t.fields.push(Symbol::new("text"));
-        t.shapes.push(vec![Symbol::new("text"), Symbol::new("b")]);
-        t.calls.push("text".to_string());
-        t.lambdas.push("ply_m_f_lambda0".to_string());
-        let text = "Word f(void) {\n  return @@c1@@;\n}\ntext\n";
-
-        let (back, out) = decode(&encode(text, &t)).expect("the encoding round trips");
-        assert_eq!(back, text, "the text came back changed");
-        assert_eq!(out.fields, t.fields);
-        assert_eq!(out.shapes, t.shapes);
-        assert_eq!(out.calls, t.calls);
-        assert_eq!(out.lambdas, t.lambdas);
-        assert_eq!(out.builtins, t.builtins);
-        assert_eq!(out.consts.len(), 3);
-        assert!(matches!(out.consts[0], Value::Unit));
-        assert_eq!(
-            format!("{:?}", out.consts[1]),
-            format!("{:?}", Value::str("hello\nworld"))
-        );
-    }
 }
