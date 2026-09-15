@@ -1,8 +1,9 @@
 //! What the reference-counting pass claims, checked against what a run does.
 
-use super::*;
 use crate::build::*;
-use crate::{Machine, Value};
+use ply_eval::rc::*;
+use ply_eval::{Machine, Value};
+use ply_span::Span;
 use ply_span::codes;
 use ply_syntax::ast::{BinOp, Expr, Item};
 
@@ -154,8 +155,8 @@ fn an_ordinary_cell_write_reports_nothing() {
 }
 
 // The chain-level release and take-unique unit tests that stood here died with the chain: a moved
-// slot is [`crate::window::SlotVal::Moved`], its read is an internal error rather than an outer
-// binding of the same name, and both are pinned in `crate::window`'s own tests — a shadowed name
+// slot is [`ply_eval::window::SlotVal::Moved`], its read is an internal error rather than an outer
+// binding of the same name, and both are pinned in `ply_eval::window`'s own tests — a shadowed name
 // cannot be uncovered because the two bindings are two different slots.
 
 /// A binding read again after an inner scope reused its name.
