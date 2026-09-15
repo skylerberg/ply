@@ -58,15 +58,16 @@ PARTITIONS=12
 # defined where the table says, and every solo job asserts that it ran exactly
 # one test.
 #
-# A test of one of these binaries that is *not* named here still runs, in a
+# A test beside one of these that is *not* named here still runs, in a
 # partition, alone within it: the override in `.config/nextest.toml` is on the
-# binary. Naming it here only moves it to a runner of its own, which is worth a
-# job once it is the longest thing a partition would hold; the other emitter
-# differentials came down to seconds when they stopped spawning `ply` (#244)
-# and went back to the partitions.
+# binary, or on the `emit_diff` module of the differentials' `suite`. Naming it
+# here only moves it to a runner of its own, which is worth a job once it is the
+# longest thing a partition would hold; the other emitter differentials came
+# down to seconds when they stopped spawning `ply` (#244) and went back to the
+# partitions.
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
-  "emit-diff-own-sources:ply-compiler-diff:emit_diff:the_port_resolves_its_own_sources_to_the_references_c"
+  "emit-diff-own-sources:ply-compiler-diff:suite:emit_diff::the_port_resolves_its_own_sources_to_the_references_c"
 )
 
 # The packages whose tests need a postgres server and cluster binaries. They

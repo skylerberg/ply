@@ -987,7 +987,7 @@ honest price and it is item 5's job to keep saying so.
 > excused" — it is **all of them were**, and the set of diagnostics this
 > differential ever actually compared did not change by one.
 >
-> `harness/tests/agreement.rs`'s
+> `crates/ply-compiler-diff/tests/suite/agreement.rs`'s
 > `the_rewrites_this_comparison_gives_up_raise_exactly_these_diagnostics` pins
 > the 7 and prints the seven fixtures. **And it takes the half this section
 > could only state in lines of Rust**: the same three passes add **3,974 nodes**
@@ -1095,7 +1095,7 @@ byte-identical dump and the differential would pass.** That is the cheapest way
 to make a named argument agree, and nothing in this spike would notice it had
 been taken.
 
-**Why `harness/tests/fields.rs` did not catch it, which is the part worth
+**Why `crates/ply-compiler-diff/tests/suite/fields.rs` did not catch it, which is the part worth
 reading twice.** That test exists for exactly this class — its own header says
 *"a tree comparison that passes under a dropped field is worth nothing and this
 project has shipped that exact defect before"* — and it passes over `App::named`
@@ -1977,7 +1977,7 @@ writes the tables, the load order, the diagnostics with their module index and
 the post-defaults trees in one record encoding; `resolve_dump` writes the same
 from the port.
 
-**What agrees.** `harness/tests/resolve.rs`: the standard library as one
+**What agrees.** `crates/ply-compiler-diff/tests/suite/resolve.rs`: the standard library as one
 program, the standard library with each example, every multi-module program
 `resolve.rs`'s own tests build (`mine-programs.py`, `fixtures/reference-programs.corpus`)
 and a hand-written bundle of the error paths the tree never reaches
@@ -2036,7 +2036,7 @@ return-position walk through `if` and `match`, the `wrap` with its failure arm
 first, and the sweep that refuses what is left with `E0118` and `E0119`. The
 binders are numbered per item, as the reference's are.
 
-**What agrees.** `harness/tests/rewrite.rs`: `dump_expanded` against
+**What agrees.** `crates/ply-compiler-diff/tests/suite/rewrite.rs`: `dump_expanded` against
 `parse_recovering`'s dump over every example, the standard library, the
 hand-written fixtures and the reference's own inputs — which carry every
 diagnostic the three passes raise (§11R.D's re-take counted them). All four
@@ -2068,7 +2068,7 @@ region escape checks, and the internal-effect marking. `check_dump` writes what
 `check_program` publishes — every definition's scheme, footprint, performed row,
 constraints and internal-effect flag; every test's and law's footprint; every
 effect and constructor — or the diagnostics, deduplicated as the reference
-deduplicates them, and `harness/tests/infer.rs` compares it with
+deduplicates them, and `crates/ply-compiler-diff/tests/suite/infer.rs` compares it with
 `reference_check_dump`.
 
 **What agrees.** The standard library as one program, every example without a
@@ -2139,7 +2139,7 @@ a derivation, the syntactic walk that refuses a field before anything is
 generated, the emitter that writes a dictionary as Ply source, the parse of that
 source back through the same parser, the retargeting of every span in it to the
 `derive` item's, and the expander with its orphan, collision, missing-runtime and
-internal-error diagnostics. `harness/tests/derive.rs` compares `derive_dump` —
+internal-error diagnostics. `crates/ply-compiler-diff/tests/suite/derive.rs` compares `derive_dump` —
 each module expanded on its own, its generated sources byte for byte and its
 diagnostics — with `reference_derive_dump`, over a hand-written bundle of every
 shape the reference's own tests exercise (`fixtures/derive-programs.corpus`),
@@ -2173,7 +2173,7 @@ constraints), the hash table built dependency-first, a cyclic component hashed
 as a unit under a labelling refined until nothing splits, the tests, laws,
 own-form keys and spec keys under their domain tags, and the reference graph's
 transitive closure. The hash is `std.hash.blake3`, BLAKE3 written in Ply, over
-the same bytes. `harness/tests/hash.rs` compares every hash `hash_program_ast`
+the same bytes. `crates/ply-compiler-diff/tests/suite/hash.rs` compares every hash `hash_program_ast`
 publishes, record by record, with `reference_hash_dump`, over the standard
 library, every example with it, the resolver's programs, both hand-written
 bundles, the checker's mined inputs and the hasher's own (`mine-hashes.py`,

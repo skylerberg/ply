@@ -58,7 +58,7 @@ diagnostic for diagnostic** over every `.ply` file in the tree.
 
 | | |
 | --- | --- |
-| `ply/lexer.ply` | The lexer, with its own differential in `crates/ply-compiler-diff/tests/lexer_agreement.rs`. See below. |
+| `ply/lexer.ply` | The lexer, with its own differential in `crates/ply-compiler-diff/tests/suite/lexer_agreement.rs`. See below. |
 | `spine.ply` | Token access, the threaded state `P`, diagnostics, `comma_list`, `qname`, the dump encoder. |
 | `types.ply` | Type expressions, generics, effect rows, parameters. |
 | `patterns.ply` | Pattern forms and literals. |
@@ -70,7 +70,7 @@ diagnostic for diagnostic** over every `.ply` file in the tree.
 | `derive.ply` | The deriver: `crates/ply-derive` ported — the rules table, the syntactic walk, the emitter, the retargeting of every generated span, and the expander's diagnostics; `derive_dump` is the fifth differential's probe. `GAPS.md` §18. |
 | `infer.ply` | The checker: `infer.rs` ported — declarations, signatures, every expression form, rows, spec clauses, tests, laws, derivability, the comparison, simulation and region checks, the two passes over what expansion produced, and the restored path from a `Known`; `check_dump` publishes what `check_program` publishes, or its diagnostics. `GAPS.md` §17. |
 | `hash.ply` | The hasher: `crates/ply-hash` ported — the reference graph, the normalized encoding, the component hashing, the spec and own-form keys and the closure, over `std.hash.blake3`; `hash_dump` is the sixth differential's probe. `GAPS.md` §19. |
-| `harness/` | A separate cargo project: the reference-side dumper, the differential, `refdump`. It enters `ply_syntax` at `parse_unexpanded`, so the two sides are the same phase; `GAPS.md` §11R.D. `tests/resolve.rs` is the second differential, over whole programs. |
+| `harness/` | A separate cargo project: the reference-side dumper, the differential, `refdump`. It enters `ply_syntax` at `parse_unexpanded`, so the two sides are the same phase; `GAPS.md` §11R.D. `tests/suite/resolve.rs` is the second differential, over whole programs. |
 | `fixtures/` | Hand-written `.ply` files plus `reference-tests.corpus`, every string literal in the reference's own test file, re-mined by `mine-fixtures.py` whenever the reference grows syntax; the agreement test prints the count. For the resolve differential: `reference-programs.corpus`, every multi-module program `resolve.rs`'s tests build, mined by `mine-programs.py`, and `resolve-programs.corpus`, hand-written programs for the error paths. For the checker: `reference-checks.corpus`, every string literal in `crates/ply-core-tests/tests/suite/unit/infer.rs`, mined by `mine-checks.py`, and `check-programs.corpus`, hand-written programs for the outcomes nothing mined reaches. For the deriver: `derive-programs.corpus`, one module per shape `crates/ply-derive/src/tests.rs` exercises. For the hasher: `reference-hashes.corpus`, every string literal in `crates/ply-hash-tests/tests/suite/unit/hash.rs`, mined by `mine-hashes.py`. |
 | `GAPS.md` | **The point of the spike.** Consolidates the five area files below and takes the multiplier. |
 | `GAPS-{spine,types,exprs,items,harness}.md` | The per-area records, kept: each carries its own measurements and every run of them. |
@@ -257,7 +257,7 @@ corruption at the identical parser in its new home, so the property it watches �
 *every `Option` emits its presence* — is unchanged. The other fifteen anchors
 still apply as written.
 
-`harness/tests/fields.rs` covers what a dump-vs-dump comparison structurally
+`crates/ply-compiler-diff/tests/suite/fields.rs` covers what a dump-vs-dump comparison structurally
 cannot: it reads `ast.rs`, takes all **149 fields of the 30 parsed types**, and
 requires each to be named in the dumper (2 absent by design).
 
@@ -487,7 +487,7 @@ workspace command will notice. `run.sh` is the one command that would.
 > Between 2026-08-28 and 2026-08-30 four language features landed. The
 > `harness/src/lib.rs` `match` over `ExprKind` stopped compiling on two new
 > variants, exactly as written above; the differential went red on 28 of 763
-> inputs; `tests/fields.rs` began failing on a field the AST had gained; and
+> inputs; `tests/suite/fields.rs` began failing on a field the AST had gained; and
 > nothing said any of it, because **`run.sh` was in no CI job at all**.
 >
 > **There is a job now.** `.github/workflows/ci.yml`'s `parser-spike` runs
@@ -524,7 +524,7 @@ both covered by `.gitignore`.
   features the corpus contained none of.
 - Arming: **22 armed, 0 survived, 0 invalid**, 299 s. One of the original
   sixteen was replaced (its anchor moved with `param`) and six were added.
-- `harness/tests/fields.rs`: **2 passed** — the field test, and the test that
+- `crates/ply-compiler-diff/tests/suite/fields.rs`: **2 passed** — the field test, and the test that
   arms its comment-stripping repair.
 - The comparison is against `ply_syntax::parse_unexpanded`, a `#[doc(hidden)]`
   entry point added to a shipping crate for this spike. That is the single real

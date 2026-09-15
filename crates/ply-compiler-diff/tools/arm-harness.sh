@@ -99,7 +99,7 @@ run_suite() {                    # $1 source dir -> prints the suite's output
   ( cd "$root" \
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$1" >/dev/null \
     && PLY_C_EMITTER="ply:$1" \
-       cargo test --offline --test agreement -- --test-threads=2 2>&1 )
+       cargo test --offline --test suite -- agreement:: --test-threads=2 2>&1 )
 }
 
 echo "==> the unmutated tree must be green before any mutation means anything"
