@@ -542,6 +542,3 @@ pub mod schema {
         diagnostic
     }
 }
-
-#[cfg(test)]
-mod tests;

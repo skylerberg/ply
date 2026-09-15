@@ -100,29 +100,6 @@ pub fn run_on_tier(
     ply_test::run_with(selection, &loaded.check, &loaded.hashes, store, &executor)
 }
 
-/// The default tier attached to a machine over `loaded`'s program: what the commands build
-/// inline, for a test that makes a machine of its own.
-#[cfg(test)]
-pub(crate) fn attach_tier(
-    machine: &mut ply_eval::Machine<'_>,
-    loaded: &crate::load::Loaded,
-) -> Result<(), Diagnostic> {
-    let Some(spec) = backend_spec(None)? else {
-        return Ok(());
-    };
-    let texts = module_texts(&loaded.program, &loaded.sources);
-    let provider = build_backend(
-        &spec,
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        &loaded.hashes,
-        texts,
-    )?;
-    machine.set_compiled(provider.attach(&spec));
-    Ok(())
-}
-
 /// Each module's source text by name: what a second emitter reads the program from.
 pub fn module_texts(
     program: &ply_syntax::ast::Program,
@@ -454,48 +431,4 @@ pub fn counters_line(stats: &ply_eval::rc::Stats) -> String {
         stats.takes_attempted,
         pct(stats.elided()),
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use ply_span::codes;
-
-    #[test]
-    fn location_is_one_based_and_names_the_file() {
-        let mut sources = SourceMap::new();
-        let id = sources.add("src/ledger.ply", "fn f() = 1\nfn g() = 2\n");
-        assert_eq!(
-            location(&sources, Span::new(id, 11, 13)).unwrap(),
-            "src/ledger.ply:2:1"
-        );
-    }
-
-    #[test]
-    fn a_dummy_span_has_no_location_rather_than_a_made_up_one() {
-        let sources = SourceMap::new();
-        assert_eq!(location(&sources, Span::DUMMY), None);
-    }
-
-    #[test]
-    fn diagnostic_json_carries_positions_not_raw_offsets() {
-        let mut sources = SourceMap::new();
-        let id = sources.add("t.ply", "fn f() = 1 + true\n");
-        let d = Diagnostic::error(codes::TYPE_MISMATCH, "type mismatch")
-            .primary(Span::new(id, 13, 17), "expected Int, found Bool");
-        let v = diagnostic_json(&d, &sources);
-        assert_eq!(v["code"], "E0201");
-        assert_eq!(v["labels"][0]["start"]["line"], 1);
-        assert_eq!(v["labels"][0]["snippet"], "true");
-    }
-
-    #[test]
-    fn plurals_do_not_say_one_errors() {
-        assert_eq!(plural(1, "error"), "error");
-        assert_eq!(plural(0, "error"), "errors");
-        assert_eq!(plural(2, "group"), "groups");
-        assert_eq!(plural(1, "body"), "body");
-        assert_eq!(plural(0, "body"), "bodies");
-        assert_eq!(plural(2, "key"), "keys");
-    }
 }

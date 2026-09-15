@@ -13,7 +13,7 @@ pub const SCHEMA_VERSION: u32 = 1;
 
 pub struct Row {
     name: String,
-    definitions: usize,
+    pub definitions: usize,
     tests: usize,
     bytes: usize,
 }
@@ -86,7 +86,7 @@ fn report(diagnostics: &[Diagnostic], json: bool, style: Style) -> i32 {
 
 /// Counting definitions needs a parse, and a shipped module that does not parse is Ply's fault: the
 /// user cannot have caused it and cannot fix it.
-fn rows() -> Result<Vec<Row>, Vec<Diagnostic>> {
+pub fn rows() -> Result<Vec<Row>, Vec<Diagnostic>> {
     let mut out = Vec::new();
     let mut diagnostics = Vec::new();
     for (i, (name, source)) in ply_std::sources().enumerate() {
@@ -186,54 +186,4 @@ fn row_json(row: &Row) -> Value {
         "tests": row.tests,
         "bytes": row.bytes,
     })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cli::{Cli, Command};
-    use clap::Parser;
-
-    #[test]
-    fn the_flags_parse_and_default_to_the_listing() {
-        let args = match Cli::parse_from(["ply", "std"]).command {
-            Command::Std(args) => args,
-            other => panic!("expected `std`, got {other:?}"),
-        };
-        assert!(!args.json);
-        assert!(!args.digest);
-        assert_eq!(args.show, None);
-    }
-
-    /// `--digest` is the one-line form a CI check pins, so it may not also carry a table for a
-    /// machine.
-    #[test]
-    fn digest_and_json_cannot_both_be_asked_for() {
-        assert!(Cli::try_parse_from(["ply", "std", "--digest", "--json"]).is_err());
-    }
-
-    #[test]
-    fn the_listing_names_every_shipped_module_and_ends_with_the_digest() {
-        let rows = rows().expect("every shipped module parses");
-        assert_eq!(rows.len(), ply_std::MODULES.len());
-        let text = lines(&rows).join("\n");
-        for (name, _) in ply_std::sources() {
-            assert!(text.contains(name), "`{name}` is missing from:\n{text}");
-        }
-        assert!(
-            lines(&rows).last().unwrap().starts_with("digest: b3:"),
-            "{text}"
-        );
-        assert!(rows.iter().all(|r| r.definitions > 0), "a module is empty");
-    }
-
-    /// Two runs of one binary have to agree byte for byte, or pinning the digest in CI pins
-    /// nothing.
-    #[test]
-    fn the_listing_is_stable_across_runs() {
-        let once = lines(&rows().unwrap());
-        let twice = lines(&rows().unwrap());
-        assert_eq!(once, twice);
-        assert_eq!(ply_std::digest_short(), ply_std::digest_short());
-    }
 }
