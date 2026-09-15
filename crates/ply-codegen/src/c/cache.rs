@@ -39,7 +39,7 @@ pub fn key(def_hash: &str, ctors: &str, inlining: (usize, usize)) -> String {
     for part in [
         "ply-c-emit-3",
         &exe_stamp(),
-        &super::bundle::runtime_digest(),
+        &super::exports::helpers_digest(),
         &format!("{}:{}", inlining.0, inlining.1),
         ctors,
         def_hash,

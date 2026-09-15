@@ -7,9 +7,16 @@
 //! unit loads. A unit is then one file: the bootstrap bundle is its C, an artifact embeds its C,
 //! and the whole-unit cache keeps an object's key and nothing beside it. This is the first piece
 //! of separate compilation: a unit can be linked against with none of its sources present.
+//!
+//! **The helper table travels with the unit, and a unit serves while the runtime's table starts
+//! with it.** The C declares one pointer per runtime helper and `ply_bind` fills them by
+//! position, so a unit emitted against the first `n` helpers binds the first `n` positions and
+//! reads no other. A helper appended to the runtime leaves every unit before it serving; a
+//! helper changed or removed does not, and [`Exports::unserved`] says which (ADR 0050 §1a).
 
 use super::cache::{count, decode_tables, encode_tables, line};
 use super::load::Library;
+use super::prelude::HELPERS;
 use anyhow::{Result, anyhow};
 use ply_eval::Value;
 use ply_span::Symbol;
@@ -21,8 +28,54 @@ pub const SYMBOL: &str = "ply_exports";
 /// takes: a pooled byte constant is one line, and one line can be a hundred kilobytes of hex.
 const PIECE: usize = 2000;
 
+/// One runtime helper as a unit records it: its name, how many arguments it takes past the
+/// context, and whether it answers a word.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HelperShape {
+    pub name: String,
+    pub args: usize,
+    pub answers: bool,
+}
+
+/// The runtime's own table, in the shape a unit records.
+pub fn runtime_helpers() -> Vec<HelperShape> {
+    HELPERS
+        .iter()
+        .map(|h| HelperShape {
+            name: h.name.to_string(),
+            args: h.args,
+            answers: h.answers,
+        })
+        .collect()
+}
+
+/// A digest of the runtime's whole helper table, for a cache key: a cached body calls helpers by
+/// shape, and a cache may be conservative where a unit need not be.
+pub fn helpers_digest() -> String {
+    let mut h = blake3::Hasher::new();
+    for helper in HELPERS {
+        h.update(format!("{} {} {}\n", helper.name, helper.args, helper.answers).as_bytes());
+    }
+    h.finalize().to_hex().to_string()
+}
+
+/// Why a unit does not serve this runtime: the first helper of its table that the runtime's
+/// table does not carry at the same position with the same shape.
+#[derive(Debug)]
+pub struct Unserved(pub String);
+
+impl std::fmt::Display for Unserved {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "the unit does not serve this runtime: {}", self.0)
+    }
+}
+
+impl std::error::Error for Unserved {}
+
 #[derive(Clone)]
 pub struct Exports {
+    /// The runtime helpers the C was emitted against, in binding order.
+    pub helpers: Vec<HelperShape>,
     /// The table the C's tags are positions in, in tag order.
     pub ctors: Vec<(Symbol, usize)>,
     /// Every function the unit holds, with its arity, in the order the fixpoint took them.
@@ -47,8 +100,50 @@ impl Exports {
         self.taken.iter().map(|(n, _)| n.clone()).collect()
     }
 
+    /// `None` when the runtime's table starts with this unit's; otherwise the first helper of the
+    /// unit's table the runtime does not carry at that position with that shape.
+    pub fn unserved(&self) -> Option<Unserved> {
+        let runtime = runtime_helpers();
+        for (i, mine) in self.helpers.iter().enumerate() {
+            match runtime.get(i) {
+                Some(theirs) if theirs == mine => {}
+                Some(theirs) => {
+                    return Some(Unserved(format!(
+                        "helper {i} is `{}` taking {} and {}, and this runtime's is `{}` taking {} and {}",
+                        mine.name,
+                        mine.args,
+                        if mine.answers {
+                            "answering"
+                        } else {
+                            "answering nothing"
+                        },
+                        theirs.name,
+                        theirs.args,
+                        if theirs.answers {
+                            "answering"
+                        } else {
+                            "answering nothing"
+                        },
+                    )));
+                }
+                None => {
+                    return Some(Unserved(format!(
+                        "helper {i} is `{}`, past the {} this runtime has",
+                        mine.name,
+                        runtime.len()
+                    )));
+                }
+            }
+        }
+        None
+    }
+
     pub fn encode(&self) -> String {
-        let mut out = format!("ctors {}\n", self.ctors.len());
+        let mut out = format!("helpers {}\n", self.helpers.len());
+        for h in &self.helpers {
+            out.push_str(&format!("{} {} {}\n", h.name, h.args, u8::from(h.answers)));
+        }
+        out.push_str(&format!("ctors {}\n", self.ctors.len()));
         for (name, arity) in &self.ctors {
             out.push_str(&format!("{name} {arity}\n"));
         }
@@ -77,6 +172,23 @@ impl Exports {
 
     pub fn decode(s: &str) -> Option<Exports> {
         let mut at = 0usize;
+        let n = count(line(s, &mut at)?, "helpers")?;
+        let mut helpers = Vec::with_capacity(n);
+        for _ in 0..n {
+            let mut parts = line(s, &mut at)?.split(' ');
+            let name = parts.next()?.to_string();
+            let args = parts.next()?.parse().ok()?;
+            let answers = match parts.next()? {
+                "1" => true,
+                "0" => false,
+                _ => return None,
+            };
+            helpers.push(HelperShape {
+                name,
+                args,
+                answers,
+            });
+        }
         let n = count(line(s, &mut at)?, "ctors")?;
         let mut ctors = Vec::with_capacity(n);
         for _ in 0..n {
@@ -104,6 +216,7 @@ impl Exports {
         }
         let t = decode_tables(s, &mut at)?;
         Some(Exports {
+            helpers,
             ctors,
             taken,
             constants,

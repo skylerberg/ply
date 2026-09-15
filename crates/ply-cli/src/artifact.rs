@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The generation of the container below.
-pub const ARTIFACT_FORMAT: u32 = 2;
+pub const ARTIFACT_FORMAT: u32 = 3;
 
 /// The extension `ply run` recognises, and the reason it does not have to guess.
 pub const EXTENSION: &str = "plyx";
@@ -48,12 +48,11 @@ const KIND_SOURCES: u32 = 4;
 const KIND_UNIT: u32 = 5;
 
 /// The compiled unit the Ply emitter produced over an artifact's definitions: its C, compressed,
-/// which carries its own tables and constructor table (`ply_codegen::c::Exports`). `runtime` is
-/// the digest of the runtime's helper table the C was emitted for; a unit built for another is
-/// left aside.
+/// which carries its own tables, its constructor table and the runtime helper table it was
+/// emitted against (`ply_codegen::c::Exports`). A unit whose helpers this runtime's table does
+/// not start with is left aside.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct EmbeddedUnit {
-    pub runtime: String,
     pub text: Vec<u8>,
 }
 
@@ -150,7 +149,6 @@ impl Artifact {
                 payload.extend_from_slice(bytes);
             }
             let mut payload = Vec::new();
-            put(&mut payload, unit.runtime.as_bytes());
             put(&mut payload, &unit.text);
             sections.push((KIND_UNIT, 1, payload));
         }
@@ -340,11 +338,7 @@ fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
                     .note("a refused definition is entered from nothing at run time; make it one the emitter compiles"),
                 );
             }
-            let unit = EmbeddedUnit {
-                runtime: ply_codegen::c::bundle::runtime_digest(),
-                text,
-            };
-            (Some(unit), warnings)
+            (Some(EmbeddedUnit { text }), warnings)
         }
         Err(e) => (
             None,
@@ -593,11 +587,6 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
     if let Some(&(_, offset, len)) = payloads.get(&KIND_UNIT) {
         let end = offset + len;
         let mut at = offset;
-        let runtime_len = r.u32(at)? as usize;
-        let runtime = std::str::from_utf8(r.slice(at + 4, runtime_len)?)
-            .map_err(|_| invalid(path, "the unit's runtime digest is not valid UTF-8"))?
-            .to_string();
-        at += 4 + runtime_len;
         let text_len = r.u32(at)? as usize;
         let text = r.slice(at + 4, text_len)?.to_vec();
         at += 4 + text_len;
@@ -607,7 +596,7 @@ pub fn decode(bytes: &[u8], path: &Path) -> Result<(Artifact, Vec<Diagnostic>), 
                 format!("the unit section has {} bytes nothing claims", end - at),
             ));
         }
-        out.unit = Some(EmbeddedUnit { runtime, text });
+        out.unit = Some(EmbeddedUnit { text });
     }
 
     let computed = digest_of(bytes).ok_or_else(|| truncated(path, 0, OFF_SECTIONS, bytes.len()))?;
@@ -947,11 +936,20 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         Ok(opened) => opened,
         Err(diagnostics) => return refuse(&diagnostics),
     };
+    // Whether the unit serves this runtime is its own answer, given once it is compiled and its
+    // table read; the object is cached, so `evaluate` loading it again costs nothing. A unit that
+    // is broken rather than foreign is passed on, and refused loudly there.
     let unit = match &artifact.unit {
-        Some(unit) if unit.runtime == ply_codegen::c::bundle::runtime_digest() => Some(unit),
-        Some(_) => {
-            warnings.push(stale_unit());
-            None
+        Some(unit) => {
+            let served = ply_codegen::c::bundle::unpack(&unit.text)
+                .and_then(|text| ply_codegen::c::served(&text, "artifact"));
+            match served {
+                Err(e) if e.downcast_ref::<ply_codegen::c::Unserved>().is_some() => {
+                    warnings.push(stale_unit());
+                    None
+                }
+                _ => Some(unit),
+            }
         }
         None => None,
     };
