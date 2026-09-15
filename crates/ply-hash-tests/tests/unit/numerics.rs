@@ -1,7 +1,7 @@
 //! Canonical encoding of the numeric literals, and the round trip through the stored body.
 
-use crate::body::{BodySet, StoredBody, reconstruct};
-use crate::{DefHash, hash_program_with_bodies};
+use ply_hash::body::{BodySet, StoredBody, reconstruct};
+use ply_hash::{DefHash, hash_program_with_bodies};
 use ply_span::SourceId;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;

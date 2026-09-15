@@ -1,9 +1,10 @@
 //! The properties in CONTRACTS.md, plus the collision cases a normalizer is most likely to get
 //! wrong.
 
-use super::*;
-use ply_span::Span;
+use ply_hash::*;
+use ply_span::{Span, Symbol};
 use ply_syntax::ast::*;
+use std::collections::BTreeSet;
 
 fn id(name: &str) -> Ident {
     Ident::new(name, Span::DUMMY)
@@ -2323,8 +2324,9 @@ fn a_region_survives_a_body_round_trip() {
             })),
         }),
     )];
-    let (hashes, bodies) = crate::hash_ast_with_bodies(&module(items)).expect("module should hash");
-    let rebuilt = crate::body::reconstruct(&bodies).expect("bodies should reconstruct");
+    let (hashes, bodies) =
+        ply_hash::hash_ast_with_bodies(&module(items)).expect("module should hash");
+    let rebuilt = ply_hash::body::reconstruct(&bodies).expect("bodies should reconstruct");
 
     let f = rebuilt
         .program
@@ -2341,7 +2343,7 @@ fn a_region_survives_a_body_round_trip() {
     };
     assert_eq!(region.name.as_str(), "r");
 
-    let (again, _) = crate::hash_ast_with_bodies(&rebuilt.program.modules[0].clone())
+    let (again, _) = ply_hash::hash_ast_with_bodies(&rebuilt.program.modules[0].clone())
         .expect("rebuilt module should hash");
     assert_eq!(
         again.defs.values().collect::<Vec<_>>(),
@@ -2354,8 +2356,9 @@ fn a_region_survives_a_body_round_trip() {
 #[test]
 fn a_constraint_survives_a_body_round_trip() {
     let items = constrained("a", &[(Deriver::Ord, "a"), (Deriver::Json, "a")]);
-    let (hashes, bodies) = crate::hash_ast_with_bodies(&module(items)).expect("module should hash");
-    let rebuilt = crate::body::reconstruct(&bodies).expect("bodies should reconstruct");
+    let (hashes, bodies) =
+        ply_hash::hash_ast_with_bodies(&module(items)).expect("module should hash");
+    let rebuilt = ply_hash::body::reconstruct(&bodies).expect("bodies should reconstruct");
 
     let f = rebuilt
         .program
@@ -2373,7 +2376,7 @@ fn a_constraint_survives_a_body_round_trip() {
         "constraints come back sorted, which is how they were written down"
     );
 
-    let (again, _) = crate::hash_ast_with_bodies(&rebuilt.program.modules[0].clone())
+    let (again, _) = ply_hash::hash_ast_with_bodies(&rebuilt.program.modules[0].clone())
         .expect("rebuilt module should hash");
     assert_eq!(
         again.defs.values().collect::<Vec<_>>(),
