@@ -85,7 +85,7 @@ impl Program {
         })
     }
 
-    fn full(&self, simple: &str) -> Result<String> {
+    pub fn full(&self, simple: &str) -> Result<String> {
         self.check
             .defs
             .values()
@@ -104,7 +104,7 @@ impl Program {
 
     /// One call over a hermetic machine: no host at all, which is what the `bare` and `twin` rungs
     /// run on.
-    fn call_pure(&self, simple: &str, n: i64) -> Result<(Duration, Value)> {
+    pub fn call_pure(&self, simple: &str, n: i64) -> Result<(Duration, Value)> {
         let name = self.full(simple)?;
         let mut machine = self.machine();
         let started = Instant::now();
@@ -116,7 +116,7 @@ impl Program {
 
     /// One call with a real `trace` binding, which is the whole of what the bound rungs add: a
     /// `perform` that leaves the program and a sink that answers it.
-    fn call_traced(
+    pub fn call_traced(
         &self,
         host: &ply_host::Host,
         simple: &str,
@@ -210,7 +210,7 @@ pub struct EventPoint {
 
 /// Which sink a rung installs, and what it is called in the table.
 #[derive(Clone, Copy)]
-enum Rung {
+pub enum Rung {
     /// The same loop with no perform in it.
     Bare,
     /// `--trace off`: the shipped `ply_host::trace::discard`.
@@ -227,7 +227,7 @@ enum Rung {
 }
 
 impl Rung {
-    fn label(self) -> &'static str {
+    pub fn label(self) -> &'static str {
         match self {
             Rung::Bare => "bare (no perform)",
             Rung::Discard => "discard",
@@ -333,7 +333,7 @@ fn point(rung: Rung, operation: &'static str, operations: u32, per: f64, floor: 
     }
 }
 
-fn sink_for(rung: Rung, dir: &Path) -> Result<Arc<Trace>> {
+pub fn sink_for(rung: Rung, dir: &Path) -> Result<Arc<Trace>> {
     let s: Arc<dyn sink::Sink> = match rung {
         Rung::Discard => Arc::new(sink::Discard),
         Rung::Filtered => Arc::new(sink::Json::new(Level::Warn)),
@@ -1375,76 +1375,4 @@ pub fn render(m: &Measurements) -> String {
         );
     }
     out
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The program every row of [`events`] runs has to be a program, and the rows it publishes have
-    /// to be the ones the substitution rests on.
-    #[test]
-    fn the_bench_program_checks_and_publishes_one_channel() {
-        let program = Program::parse().expect("the bench program checks");
-        for simple in [
-            "bare",
-            "events",
-            "debug_events",
-            "spans",
-            "counters",
-            "twin_events",
-            "twin_spans",
-            "twin_counters",
-        ] {
-            program
-                .full(simple)
-                .unwrap_or_else(|e| panic!("`{simple}` is missing: {e}"));
-        }
-        assert_eq!(program.footprint("bare").unwrap().to_string(), "{}");
-        assert_eq!(
-            program.footprint("events").unwrap().to_string(),
-            "{std.trace.trace.write[bench]}"
-        );
-    }
-
-    /// The twin discharges every `trace` atom, which is what makes the `twin` rung a rung rather
-    /// than a stub: it runs on a machine with no host at all.
-    #[test]
-    fn a_twin_entry_point_reaches_nothing() {
-        let program = Program::parse().unwrap();
-        for simple in ["twin_events", "twin_spans", "twin_counters"] {
-            assert_eq!(
-                program.footprint(simple).unwrap().to_string(),
-                "{}",
-                "`{simple}` publishes a row, so it is not hermetic"
-            );
-        }
-    }
-
-    /// Every rung answers the same count, which is the whole of what makes a difference between two
-    /// rows the operation rather than the work.
-    #[test]
-    fn every_rung_runs_the_same_loop() {
-        let program = Program::parse().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let (_, bare) = program.call_pure("bare", 32).unwrap();
-        assert_eq!(bare, Value::Int(64));
-        for simple in ["twin_events", "twin_spans", "twin_counters"] {
-            assert_eq!(program.call_pure(simple, 32).unwrap().1, Value::Int(64));
-        }
-        for (rung, entry) in [
-            (Rung::Discard, "events"),
-            (Rung::Discard, "spans"),
-            (Rung::Discard, "counters"),
-            (Rung::JsonNull, "events"),
-        ] {
-            let host = ply_host::Host::new().traced(sink_for(rung, dir.path()).unwrap());
-            assert_eq!(
-                program.call_traced(&host, entry, 32).unwrap().1,
-                Value::Int(64),
-                "`{entry}` under `{}`",
-                rung.label()
-            );
-        }
-    }
 }
