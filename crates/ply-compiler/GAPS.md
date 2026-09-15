@@ -2074,7 +2074,7 @@ deduplicates them, and `harness/tests/infer.rs` compares it with
 **What agrees.** The standard library as one program, every example without a
 `derive` checked together with it, the resolver's programs, a hand-written
 bundle for the checker (`fixtures/check-programs.corpus`), and every input
-`mine-checks.py` mines from `crates/ply-core/src/tests.rs` the way
+`mine-checks.py` mines from `crates/ply-core-tests/tests/unit/infer.rs` the way
 `mine-fixtures.py` mines the parser's — most of those are error paths, so that
 is where the diagnostics are compared code by code and label by label. The one
 thing that stood between the first run and agreement over the green programs

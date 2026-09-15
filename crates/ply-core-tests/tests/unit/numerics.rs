@@ -1,11 +1,11 @@
 //! Inference over the three numeric types, and the prelude's ADTs.
 
-use crate::check_program;
-use crate::print::print_scheme;
+use ply_core::check_program;
+use ply_core::print::print_scheme;
 use ply_span::{Diagnostic, SourceId, codes};
 use ply_syntax::ast::ModuleName;
 
-fn check(source: &str) -> Result<crate::CheckOutput, Vec<Diagnostic>> {
+fn check(source: &str) -> Result<ply_core::CheckOutput, Vec<Diagnostic>> {
     let mut program =
         ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
             .unwrap_or_else(|d| panic!("did not parse: {d:#?}"));
@@ -15,7 +15,7 @@ fn check(source: &str) -> Result<crate::CheckOutput, Vec<Diagnostic>> {
 }
 
 #[track_caller]
-fn ok(source: &str) -> crate::CheckOutput {
+fn ok(source: &str) -> ply_core::CheckOutput {
     check(source).unwrap_or_else(|d| {
         panic!(
             "expected a clean check, got {:#?}",
