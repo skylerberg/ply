@@ -1,10 +1,10 @@
 //! Drawing and shrinking `Float` and `Decimal`.
 
-use crate::property::{EDGE_CASES, GenStream, TypeWorld, generatable, generate};
-use crate::shrink::{candidates, minimal, size};
 use ply_core::Type;
 use ply_eval::{Decimal, Value};
 use ply_hash::DefHash;
+use ply_prove::property::{EDGE_CASES, GenStream, TypeWorld, generatable, generate};
+use ply_prove::shrink::{candidates, minimal, size};
 
 fn world() -> TypeWorld {
     TypeWorld::new(&[])

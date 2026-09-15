@@ -1,9 +1,10 @@
-use super::*;
-use crate::property::tests::{Fixture, Fn2, binder, ints, key};
-use crate::property::{GenStream, TypeWorld, generate};
-use crate::{Counterexample, Discharge, ProvePlan};
-use ply_core::{LawBinder, Row};
-use ply_span::{Span, Symbol};
+use crate::property::{Fixture, Fn2, binder, ints, key};
+use ply_core::{LawBinder, Row, Type};
+use ply_eval::Value;
+use ply_prove::property::{GenStream, Judge, TypeWorld, generate, run_property};
+use ply_prove::shrink::{Target, candidates, minimal, shrink, size};
+use ply_prove::{Counterexample, DEFAULT_SHRINK_BUDGET, Discharge, ProvePlan};
+use ply_span::{Diagnostic, Span, Symbol};
 
 const ADTS: &str = r#"
 type Opt = Nothing | Just(Int)
@@ -29,7 +30,7 @@ fn plan() -> ProvePlan {
         cases: 200,
         roots: vec![0],
         prove_budget: 10,
-        shrink_budget: crate::DEFAULT_SHRINK_BUDGET,
+        shrink_budget: DEFAULT_SHRINK_BUDGET,
         sim: Default::default(),
     }
 }
@@ -75,8 +76,7 @@ where
         body,
         accepted: Vec::new(),
     };
-    let discharge =
-        crate::property::run_property(key(5), binders, world, &plan(), Span::DUMMY, &mut judge);
+    let discharge = run_property(key(5), binders, world, &plan(), Span::DUMMY, &mut judge);
     let Discharge::Refuted(counterexample) = discharge else {
         panic!("expected a refutation, got {discharge:?}");
     };
@@ -433,7 +433,7 @@ fn two_walks_over_one_failure_agree_byte_for_byte() {
             &world,
             &mut judge,
             Target::Falsifies,
-            crate::DEFAULT_SHRINK_BUDGET,
+            DEFAULT_SHRINK_BUDGET,
         );
         (
             shrunk.values.iter().map(|v| v.render()).collect::<Vec<_>>(),
@@ -471,7 +471,7 @@ fn an_already_minimal_first_hit_reports_no_steps() {
         &world,
         &mut judge,
         Target::Falsifies,
-        crate::DEFAULT_SHRINK_BUDGET,
+        DEFAULT_SHRINK_BUDGET,
     );
     assert_eq!(shrunk.steps, 0);
     assert_eq!(shrunk.evaluations, 0);
@@ -673,7 +673,7 @@ fn every_accepted_raising_candidate_still_raises() {
         &world,
         &mut judge,
         Target::Raises,
-        crate::DEFAULT_SHRINK_BUDGET,
+        DEFAULT_SHRINK_BUDGET,
     );
     let value: i64 = shrunk.values[0].render().parse().unwrap();
     assert!(value.unsigned_abs() > 100, "{value} stopped raising");
@@ -687,7 +687,7 @@ fn every_accepted_raising_candidate_still_raises() {
 fn every_shrink_budget_reports_a_legal_witness() {
     let world = TypeWorld::default();
     let types = vec![Type::int()];
-    for budget in [0u32, 1, 3, 17, crate::DEFAULT_SHRINK_BUDGET] {
+    for budget in [0u32, 1, 3, 17, DEFAULT_SHRINK_BUDGET] {
         let mut judge = Fn2::new(
             |v: &[Value]| Ok(ints(v)[0] % 7 == 0),
             |v: &[Value]| Ok(ints(v)[0].unsigned_abs() < 70),

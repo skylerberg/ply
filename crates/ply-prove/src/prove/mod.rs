@@ -1,18 +1,11 @@
 //! The static proof tier: a decision procedure for the decidable fragment's fragment.
 
-mod arith;
+pub mod arith;
 mod context;
-mod egraph;
+pub mod egraph;
 mod lower;
 mod solve;
-mod term;
-
-#[cfg(test)]
-mod bits;
-#[cfg(test)]
-mod numerics;
-#[cfg(test)]
-mod tests;
+pub mod term;
 
 pub use context::Context;
 pub use lower::Blocker;
