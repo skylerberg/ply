@@ -2552,8 +2552,8 @@ impl<'a> Emit<'a> {
     /// and 19 `filter` sites, and `call_value` is the largest item in its profile.
     ///
     /// The attempt fused both, inlining the lambda the way `fused_iterate` already does, and took
-    /// the sites from 273 and 19 down to 5 and 2. The whole Rust suite passed, both corpora passed
-    /// under `--audit-backend`, and the self-hosted front end's *check* phase went from 0.52s to
+    /// the sites from 273 and 19 down to 5 and 2. The whole Rust suite passed, both corpora passed,
+    /// and the self-hosted front end's *check* phase went from 0.52s to
     /// 2.4s -- because it was aborting partway with `a word of kind 255 was read after its object
     /// died`, and no corpus in this tree reaches the shape that does it.
     ///
