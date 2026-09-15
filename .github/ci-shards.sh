@@ -73,11 +73,11 @@ SOLO=(
 # has both and asserts the gates are open.
 POSTGRES_PACKAGES=(ply-host ply-host-tests)
 
-# `crates/ply-cli/tests/suite/w5_shutdown.rs` is `#![cfg(unix)]`: on any other
-# host it compiles to nothing and prints nothing. The gates job runs it by name
-# and asserts the log names it, which a partition could not do for a module
+# `crates/ply-cli-tests/tests/suite/w5_shutdown.rs` is `#![cfg(unix)]`: on any
+# other host it compiles to nothing and prints nothing. The gates job runs it by
+# name and asserts the log names it, which a partition could not do for a module
 # dealt across ten of them.
-W5_FILTER='binary_id(=ply-cli::suite) & test(/^w5_shutdown::/)'
+W5_FILTER='binary_id(=ply-cli-tests::suite) & test(/^w5_shutdown::/)'
 
 # Crate directories that are deliberately not workspace members, and why. A
 # crate in neither this list nor `members` is an accident: nothing builds it and
@@ -115,7 +115,7 @@ declare -a KNOWN_OUTSIDE=(
 #     that grep could not see. Re-surveying `crates/*/src` took the list to 12.
 #   * The cli-eval shard then failed on
 #     `routing_a_path_of_escapes_costs_its_length_and_not_its_square`
-#     (`crates/ply-cli/tests/suite/w3_http_audit.rs:714`) — *"four times the escapes
+#     (`crates/ply-cli-tests/tests/suite/w3_http_audit.rs:714`) — *"four times the escapes
 #     cost 1655.9ms against 143.6ms for k, which is 11.5x"*, against
 #     `four <= one * 9.0`. The second survey missed it too: the test reads no
 #     Rust clock at all, it parses milliseconds out of `ply test`'s own output
@@ -130,7 +130,7 @@ declare -a KNOWN_OUTSIDE=(
 DEFERRED=(
   "ply-eval-tests:allocation:region_arena_cost::snapshot_cost_as_a_function_of_region_size"
   "ply-eval-tests:allocation:fixture_open_cost::a_seeded_fixture_opens_per_test_in_microseconds"
-  "ply-cli:suite:cli::a_simulated_sleep_is_a_jump_rather_than_a_wait"
+  "ply-cli-tests:suite:cli::a_simulated_sleep_is_a_jump_rather_than_a_wait"
   "ply-test-tests:suite:region_fixture_cost::a_region_scoped_fixture_costs_the_fixture_and_never_the_test"
   "ply-test-tests:suite:region_fixture_cost::discarding_a_tests_own_cells_costs_nothing"
   "ply-test-tests:suite:region_fixture_cost::a_group_amortizes_the_build_up_to_a_ceiling_the_open_decides"
@@ -140,7 +140,7 @@ DEFERRED=(
   "ply-corpus:lib:measure::tests::opening_a_fixture_beats_rebuilding_it_once_the_fixture_is_real"
   "ply-store:lib:tests::opening_a_ten_thousand_definition_cache_is_under_the_budget"
   "ply-store:lib:tests::a_baseline_for_every_test_does_not_slow_the_open"
-  "ply-cli:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
+  "ply-cli-tests:suite:w3_http_audit::routing_a_path_of_escapes_costs_its_length_and_not_its_square"
   "ply-corpus:lib:payload::tests::the_map_rows_survive_subtracting_the_fold_around_them"
 )
 
@@ -441,8 +441,14 @@ cmd_verify() {
       failures=$((failures + 1))
     fi
   done < <(cmd_solo)
-  if [[ ! -f $(test_source_file ply-cli suite w5_shutdown::x) ]]; then
-    echo "FAIL: W5_FILTER names crates/ply-cli/tests/suite/w5_shutdown.rs, which does not exist" >&2
+  if [[ ! -f $(test_source_file ply-cli-tests suite w5_shutdown::x) ]]; then
+    echo "FAIL: W5_FILTER names crates/ply-cli-tests/tests/suite/w5_shutdown.rs, which does not exist" >&2
+    failures=$((failures + 1))
+  fi
+  # Cargo builds a package's binaries only for that package's own integration
+  # tests, and the suite that drives `ply` is in `ply-cli-tests`.
+  if ! ls "$root"/crates/ply-cli/tests/*.rs >/dev/null 2>&1; then
+    echo "FAIL: crates/ply-cli/tests/ has no .rs file, so cargo builds no 'ply' for ply-cli-tests' suite to run" >&2
     failures=$((failures + 1))
   fi
 
