@@ -79,43 +79,57 @@ fn the_shipped_allocation_evidence_still_describes_this_request_path() {
     );
 }
 
-/// What `README.md` says a request allocates, against what one does.
-#[test]
-fn the_readme_still_describes_this_request_path() {
-    let text = std::fs::read_to_string(repo().join("README.md")).expect("the repository ships one");
-    let marker = "One `/health` request makes";
-    let at = text.find(marker).unwrap_or_else(|| {
-        panic!(
-            "`README.md` no longer contains \"{marker}\", so the sentence this guards was moved \
-             or reworded. Point this test at wherever the request-path allocation count now \
-             lives, or delete it and say in `docs/ONBOARDING.md` §7 that no test reads a prose \
-             document again."
-        )
-    });
-    let claimed_allocs = number_before(&text[at..], " allocations")
-        .expect("the sentence states an allocation count before the word `allocations`");
-    let claimed_bytes = number_before(&text[at..], " bytes")
-        .expect("the sentence states a byte count before the word `bytes`");
+/// The figures `w6-alloc` wrote, which `README.md`'s sentence is rendered from.
+fn shipped_figures() -> ply_corpus::w6_run::Allocation {
+    let path = repo().join(ply_corpus::w6_run::ALLOCATION_FILE);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("{} is the request-path figure: {e}", path.display()));
+    serde_json::from_str(&text)
+        .unwrap_or_else(|e| panic!("{} is what `w6-alloc --out` writes: {e}", path.display()))
+}
 
+const RETAKE: &str = "Re-take it in one command, which rewrites `README.md`'s sentence too: \
+                      `./target/release/w6-alloc --repo . --requests 200 --out benches/w6-alloc.json`.";
+
+/// What the shipped figures say a request allocates, against what one does.
+#[test]
+fn the_shipped_figures_still_describe_this_request_path() {
+    let figures = shipped_figures();
     let (allocs, bytes) = per_request();
     println!(
-        "`README.md` says {claimed_allocs:.0} allocations and {claimed_bytes:.0} bytes per \
-         /health request; this tree makes {allocs:.2} and {bytes:.2}"
+        "`{}` says {:.2} allocations and {:.2} bytes per {} request; this tree makes {allocs:.2} \
+         and {bytes:.2}",
+        ply_corpus::w6_run::ALLOCATION_FILE,
+        figures.allocations_per_request,
+        figures.bytes_per_request,
+        figures.route
     );
-
     for (what, claimed, measured) in [
-        ("allocations", claimed_allocs, allocs),
-        ("bytes", claimed_bytes, bytes),
+        ("allocations", figures.allocations_per_request, allocs),
+        ("bytes", figures.bytes_per_request, bytes),
     ] {
         let drift = (claimed - measured).abs() / measured;
         assert!(
             drift <= 0.01,
-            "`README.md` §\"Where this is not competitive\" says one /health request makes \
-             {claimed:.0} {what} and this tree \
-             makes {measured:.2} — {:.1}% apart. That sentence is present tense about this tree \
-             and it has gone stale twice, the second time inside the block correcting the first. \
-             Re-take it: `./target/release/w6-alloc --repo . --requests 200`.",
+            "`{}` says one {} request makes {claimed:.2} {what} and this tree makes \
+             {measured:.2} — {:.1}% apart. {RETAKE}",
+            ply_corpus::w6_run::ALLOCATION_FILE,
+            figures.route,
             drift * 100.0
         );
     }
+}
+
+/// `README.md` carries the sentence the shipped figures render, so a figure in prose is never
+/// typed by hand: the file moves, the sentence moves with it, and this is what says they did.
+#[test]
+fn the_readme_sentence_is_the_one_the_shipped_figures_render() {
+    let text = std::fs::read_to_string(repo().join("README.md")).expect("the repository ships one");
+    let want = shipped_figures().readme_sentence();
+    let flat = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flat(&text).contains(&flat(&want)),
+        "`README.md` does not carry the sentence `{}` renders:\n  {want}\n{RETAKE}",
+        ply_corpus::w6_run::ALLOCATION_FILE
+    );
 }

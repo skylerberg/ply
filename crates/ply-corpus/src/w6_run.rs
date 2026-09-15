@@ -46,6 +46,61 @@ pub fn head() -> Vec<u8> {
     w3::request("GET", ROUTE, None, false, 0, 0)
 }
 
+/// Where `w6-alloc` writes what one request allocates, relative to the repository root. The
+/// file is the figure; `README.md`'s sentence is rendered from it, and the test that reads both
+/// holds them together, so a hand never re-types a number.
+pub const ALLOCATION_FILE: &str = "benches/w6-alloc.json";
+
+/// What one served request allocates, in a window of `requests`.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct Allocation {
+    pub route: String,
+    pub requests: usize,
+    pub response_bytes: usize,
+    pub allocations_per_request: f64,
+    pub bytes_per_request: f64,
+}
+
+impl Allocation {
+    /// The sentence `README.md` carries: allocations to the unit, bytes to the hundred.
+    pub fn readme_sentence(&self) -> String {
+        let bytes = (self.bytes_per_request / 100.0).round() as i64 * 100;
+        format!(
+            "One `{}` request makes **{} allocations and {} bytes** to produce a {}-byte response.",
+            self.route,
+            self.allocations_per_request.round() as i64,
+            grouped(bytes),
+            self.response_bytes
+        )
+    }
+
+    /// `text` with its sentence replaced by this one, or `None` when it carries none.
+    pub fn rewrite_readme(&self, text: &str) -> Option<String> {
+        let opening = format!("One `{}` request makes", self.route);
+        let closing = "-byte response.";
+        let start = text.find(&opening)?;
+        let end = start + text[start..].find(closing)? + closing.len();
+        Some(format!(
+            "{}{}{}",
+            &text[..start],
+            self.readme_sentence(),
+            &text[end..]
+        ))
+    }
+}
+
+fn grouped(n: i64) -> String {
+    let digits = n.abs().to_string();
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    if n < 0 { format!("-{out}") } else { out }
+}
+
 /// The four in-Ply loops rungs 2, 3 and 4 are read off, and the empty one that says what the loop
 /// itself costs.
 const DRIVER: &str = r#"

@@ -162,16 +162,19 @@ checks belong in the same frame and need no reference at all: a printer
 round trip over the corpus, or an optimisation pass held to the corpus's
 outcomes, is the first to add once a Ply printer exists.
 
-### 5. Figures live where tests read them
+### 5. Figures live where tests read them — done
 
-`README.md`'s request-path allocation figure is read by a test with a tight
-band. It drifted during the CI work and was retaken by hand. The
-test is right to exist; the hand step is not.
+`README.md`'s request-path allocation figure was read by a test with a tight
+band. It drifted during this record's first two items and was retyped by
+hand. The test is right to exist; the hand step is not.
 
-**Fix.** The figure goes into a `benches/*.json` the test reads, and the
-README's sentence is generated from the same file by the tool that takes the
-measurement. `CONTRIBUTING.md` §"Before you open a change" then names one
-command rather than one sentence.
+**Built.** `w6-alloc --out benches/w6-alloc.json` writes the figure as a
+file and rewrites the README's sentence from it in the same command, through
+`ply_corpus::w6_run::Allocation`, the one rendering both share. Two tests
+replace the one: the file is held to a freshly counted window within one per
+cent, and the README is held to carry exactly the sentence the file renders.
+A number in that sentence is never typed again; `CONTRIBUTING.md` §"Before
+you open a change" names the command.
 
 ## The suite
 

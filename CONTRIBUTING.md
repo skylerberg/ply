@@ -217,18 +217,20 @@ differentials can go red at all. It is recorded in §"Things known to be broken"
    it. `grep -rn` the guarantee's words across `README.md`, `DESIGN.md`,
    `ROADMAP.md`, `CONTRACTS.md` and `docs/adr/`. **One sentence of that whole
    prose surface is read by a test** — `README.md`'s request-path allocation
-   count, by `w6_report_allocations::the_readme_still_describes_this_request_path`,
-   added after that sentence went stale twice. **For everything else you are the
-   only check.** (Re-take the figure rather than quoting it; `docs/ONBOARDING.md`
-   §7 gives the command.)
+   sentence, which `w6-alloc` renders from `benches/w6-alloc.json` and
+   `w6_report_allocations::the_readme_sentence_is_the_one_the_shipped_figures_render`
+   holds to the file, added after that sentence went stale twice by hand.
+   **For everything else you are the only check.**
 4. If you changed something the shipped measurement files describe, re-take
    them. The command is in `docs/adr/0011-the-web-track.md` §"Provenance"; the
-   three tests that will fail otherwise are
+   tests that will fail otherwise are
    `w6_report_integrity::the_shipped_ladder_still_describes_the_tree_it_ships_in`,
    `w6_report_allocations::the_shipped_allocation_evidence_still_describes_this_request_path`
    and — if you moved what a request allocates at all —
-   `w6_report_allocations::the_readme_still_describes_this_request_path`, whose
-   band is 1% rather than a factor of two.
+   `w6_report_allocations::the_shipped_figures_still_describe_this_request_path`,
+   whose band is 1% rather than a factor of two. That one is re-taken by
+   `./target/release/w6-alloc --repo . --requests 200 --out benches/w6-alloc.json`,
+   which writes the file and the README's sentence together.
 5. If you deleted or renamed a public type, `grep` `CONTRACTS.md` for it. It is
    a construction document written ahead of the code and it goes stale silently;
    `World` occurs in it **37 times on 33 lines**, and the `ply_eval` type of that
@@ -639,7 +641,7 @@ re-arguable. Name the files; see the warning in the gate table above.
 | `crates/ply-test/src/schedule.rs` `group_by_conflict` (`:216`) | same; `parallelism()` at `:172` is what reports it |
 | `crates/ply-eval/src/code.rs` | Nothing outside the workspace any more. `crates/ply-codegen-spike` used to be here and bit-rotted this way twice — `Stmt::Expr` becoming a struct variant, then `NodeKind::Lit` widening to `Lit(Lit, Value)` under R4 — which is the argument for the shipping code generator being a workspace member. `cargo test --workspace` reaches every consumer of this file now |
 | how a `Value` is built or shared | `crates/ply-corpus-tests/tests/r4_value_construction.rs`, the attribution ADR 0019's thresholds are fractions of. Two traps: **its attribution needs full debuginfo** — `[profile.dev] debug = "line-tables-only"` was measured on 2026-08-31 and takes unattributed from 8.5% to 98.7%, which the root `Cargo.toml` records as the reason that profile knob is not taken — and its rule table is matched against a **three-frame window whose contents differ by profile** — a rule verified only in release can leave the same allocation unattributed in debug and fail the residue ceiling there. Check both. ADR 0019 is the worked example |
-| the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `README.md`'s one guarded sentence — re-take it with `./target/release/w6-alloc --repo . --requests 200`, which reads **773.4** on this tree |
+| the request path | `benches/w6-ladder.json` and the two integrity tests, and the M9 verdict that reads it. Also `benches/w6-alloc.json` and the `README.md` sentence rendered from it — re-take both with `./target/release/w6-alloc --repo . --requests 200 --out benches/w6-alloc.json` |
 | `Value::cmp`, `values_equal`, or how a `Map` key is stored | the four guarantees the note on `ply_eval::Map` lists. `cmp` is deliberately **coarser** than rendering at `Decimal` (`1.50m` and `1.5m` are one key and two strings), so a key is reduced to one representative per class by `ply_eval::value::canonical_key` before it is stored — `ply_eval::value::insert_key` is the single site, and adding a second one re-opens a defect that made `map_keys` a function of insertion history for four milestones. Any new coarseness in `cmp` needs a matching arm there. `map_order.rs`, `value_semantics_audit.rs` §5 and `derivation_determinism_audit::a_decimal_keyed_map_encodes_one_body_whichever_spelling_was_written_last` are what fail; `docs/adr/0019-value-representation.md` §7 is the write-up |
 | `collect_refs_inner` in `crates/ply-core/src/infer.rs` | the compiled seam's effect gate, silently. It is one walk answering two questions — the names a body mentions, and whether the body is written with `perform` or `handle` — and `Checker::mark_internal_effects` propagates the second to a fixpoint over the first. Widen the name set and definitions stop being enterable; narrow it and a definition that performs becomes enterable, which is `CONTRIBUTING.md` item 11 again. The `match` is exhaustive with no wildcard on purpose, so a **new** `ExprKind` fails to compile here rather than defaulting to "pure" — do not add a `_ =>` arm |
 | the `Builtin` enum in `crates/ply-eval/src/builtins.rs` | **four checks at once, by omission.** `every_builtin_is_reachable_by_the_name_it_reports`, `exactly_the_callback_builtins_are_higher_order`, `evaluator::every_builtin_checks_its_argument_count` and `region_kind::the_callback_builtins_are_the_eight_this_module_knows` (both in `crates/ply-eval-tests/tests/suite/unit/`) all *iterate* `Builtin::all()`, so a variant left out of `all()` is never named and therefore never checked by any of them — the suite stays green over a builtin nothing has looked at. Deleting `Builtin::ListAt` from `all()` was run against the reachability test on exactly that assumption and it stayed green. `builtin_all_is_complete_and_lists_each_name_once` was written for it; it pins the whole name list, so adding a builtin means adding its name there, and that is the point rather than the cost |
