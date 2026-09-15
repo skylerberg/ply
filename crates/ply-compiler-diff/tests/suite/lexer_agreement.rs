@@ -6,6 +6,7 @@
 //! copy `stage` has bootstrapped. There used to be a copy of the lexer beside this file, and the
 //! one not in the front end is the one that went stale.
 
+use ply_compiler_diff::golden;
 use ply_compiler_diff::port;
 use ply_compiler_diff::tokens::{floats_to_bits, records, reference_dump};
 use std::path::{Path, PathBuf};
@@ -61,11 +62,13 @@ fn check_agreement(path: &Path) {
         .unwrap_or_else(|e| panic!("{} is not UTF-8: {e}", path.display()));
     let reference = reference_dump(&text);
     let actual = floats_to_bits(&ply_dump(&bytes));
-    if let Some(diff) = first_difference(&reference, &actual) {
-        panic!(
-            "the Ply lexer and `ply_syntax::lexer` disagree on {}:\n{diff}",
-            path.display()
-        );
+    let name = path
+        .strip_prefix(repo_root())
+        .unwrap_or(path)
+        .display()
+        .to_string();
+    if let Err(report) = golden::check("lexer", &name, &reference, &actual, first_difference) {
+        panic!("{report}");
     }
     // Printed under `--nocapture` so that a file the loop silently skipped is visible: a comparison
     // over an empty corpus passes.

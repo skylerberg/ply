@@ -4,7 +4,9 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
-use ply_compiler_diff::{bundle, node_count, port, records, reference_dump, uses_effect_sets};
+use ply_compiler_diff::{
+    bundle, golden, node_count, port, records, reference_dump, uses_effect_sets,
+};
 use std::path::{Path, PathBuf};
 
 fn repo_root() -> PathBuf {
@@ -81,11 +83,9 @@ fn check_all(inputs: &[(String, Vec<u8>)]) -> Tally {
         let text =
             String::from_utf8(bytes.clone()).unwrap_or_else(|e| panic!("{name} is not UTF-8: {e}"));
         let want = reference_dump(&text);
-        match first_difference(&want, &got) {
-            None => tally.add(bytes, &want),
-            Some(diff) => failures.push(format!(
-                "the Ply parser and `ply_syntax` disagree on {name}:\n{diff}"
-            )),
+        match golden::check("parser", name, &want, &got, first_difference) {
+            Ok(()) => tally.add(bytes, &want),
+            Err(report) => failures.push(report),
         }
     }
     if !failures.is_empty() {
@@ -244,11 +244,9 @@ fn the_one_file_that_used_to_need_a_projection_is_now_compared_whole() {
     let desk = std::fs::read(&using[0]).expect("desk.ply");
     let want = reference_dump(&String::from_utf8(desk.clone()).expect("UTF-8"));
     let got = port::dump("items.dump", &desk);
-    assert!(
-        first_difference(&want, &got).is_none(),
-        "{}",
-        first_difference(&want, &got).unwrap_or_default()
-    );
+    if let Err(report) = golden::check("parser", "desk", &want, &got, first_difference) {
+        panic!("{report}");
+    }
 }
 
 /// **The cost of `../GAPS.md` §11R.D, taken here rather than asserted there.**
