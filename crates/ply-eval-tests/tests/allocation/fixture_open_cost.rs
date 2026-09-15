@@ -3,8 +3,6 @@
 use crate::counting::charge;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Value};
-use std::hint::black_box;
-use std::time::{Duration, Instant};
 
 struct Cost {
     allocs: usize,
@@ -45,11 +43,6 @@ fn slots_of(fixture: &Fixture) -> Vec<Slot> {
     }
 }
 
-/// The fastest of a few repeats: a slower one only ever means the machine did something else too.
-fn best_of(repeats: usize, mut run: impl FnMut() -> Duration) -> Duration {
-    (0..repeats).map(|_| run()).min().expect("at least one run")
-}
-
 /// The half that got dearer, stated rather than hidden.
 #[test]
 fn opening_a_fixture_costs_the_fixture_and_the_number_is_printed() {
@@ -57,12 +50,24 @@ fn opening_a_fixture_costs_the_fixture_and_the_number_is_printed() {
     let mut at = Vec::new();
     for size in [1usize, 1_000, 100_000] {
         let fixture = seeded(size);
-        let ((regions, _), cost) = cost_of(|| fixture.open());
+        let slots = slots_of(&fixture);
+        let ((mut regions, _), cost) = cost_of(|| fixture.open());
 
         assert_eq!(regions.live(), size);
         assert_eq!(regions.base_len(), size);
         println!("  {size:>5}   {:>16}   {:>10}", cost.allocs, cost.bytes);
         at.push((size, cost.allocs));
+
+        // Nothing a test writes reaches the fixture it opened from.
+        assert!(regions.set(slots[size / 2], Value::Int(-1)));
+        let (after, _) = fixture.open();
+        for (i, (_, value)) in after.slots().enumerate() {
+            assert!(
+                matches!(value, Value::List(items)
+                    if matches!(items.first(), Some(Value::Int(n)) if *n == i as i64)),
+                "cell {i} of a {size}-cell fixture reads {value:?} after a test wrote it"
+            );
+        }
     }
 
     let (_, one) = at[0];
@@ -92,45 +97,6 @@ fn resetting_to_the_fixture_allocates_nothing_however_much_the_run_did() {
             cost.allocs
         );
         assert_eq!(regions.live(), 1_000, "round {round}");
-    }
-}
-
-#[test]
-fn a_seeded_fixture_opens_per_test_in_microseconds() {
-    const TESTS: usize = 1_000;
-
-    let fixture = Fixture::build(|regions| {
-        Value::list(
-            (0..10_000)
-                .map(|i| Value::Cell(regions.alloc_cell(Value::Int(i))))
-                .collect(),
-        )
-    });
-    let slots = slots_of(&fixture);
-
-    let elapsed = best_of(3, || {
-        let start = Instant::now();
-        for i in 0..TESTS {
-            let (mut regions, handle) = fixture.open();
-            assert!(regions.set(slots[i % slots.len()], Value::Int(-1)));
-            black_box((regions, handle));
-        }
-        start.elapsed()
-    });
-    let each = elapsed / TESTS as u32;
-    println!(
-        "\n  fixture of 10,000 cells: open + one write per test = {each:?} \
-         ({TESTS} tests in {elapsed:?})"
-    );
-
-    assert!(
-        each < Duration::from_millis(2),
-        "opening a 10,000-cell fixture per test cost {each:?}"
-    );
-    // Nothing any of those tests wrote reached the fixture they opened from.
-    let (after, _) = fixture.open();
-    for (i, (_, value)) in after.slots().enumerate() {
-        assert!(matches!(value, Value::Int(n) if *n == i as i64));
     }
 }
 

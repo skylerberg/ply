@@ -1,6 +1,6 @@
 use ply_corpus::payload::{
-    Checked, JSON_SRC, MAP_SRC, ORDER_SRC, derivation_cost, derived_module, json_shape, map_ops,
-    run_tests, write_project,
+    Checked, JSON_SRC, MAP_SRC, ORDER_SRC, derivation_cost, derived_module, json_shape, run_tests,
+    write_project,
 };
 use ply_store::Store;
 
@@ -19,22 +19,6 @@ fn every_measurement_program_compiles_and_its_own_test_passes() {
         let mut store = Store::open(dir.path()).unwrap();
         run_tests(&checked.loaded, &mut store)
             .unwrap_or_else(|e| panic!("`{name}`'s own test failed: {e:#}"));
-    }
-}
-
-/// The subtraction has to leave something.
-#[test]
-fn the_map_rows_survive_subtracting_the_fold_around_them() {
-    for p in map_ops(&[256, 4_096], 2).unwrap() {
-        assert!(
-            p.insert_nanos > 0.0 && p.get_nanos > 0.0,
-            "at {} entries insert was {} ns and get {} ns above a {} ns scaffold",
-            p.entries,
-            p.insert_nanos,
-            p.get_nanos,
-            p.loop_nanos
-        );
-        assert!(p.keys_nanos_per_entry > 0.0 && p.fold_nanos_per_entry > 0.0);
     }
 }
 

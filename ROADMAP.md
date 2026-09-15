@@ -151,13 +151,13 @@ trade R2 took is only legible with both:
   0017 rather than verified here.*
 - What replaced it is not free. Opening a 10,000-cell region-scoped fixture and
   writing one cell costs **about 100 µs per test**: ADR 0017 published
-  95.7 µs, and this audit re-ran
-  `crates/ply-eval-tests/tests/allocation/fixture_open_cost.rs` and measured **105.8 µs**. Read it
-  as an order of magnitude — the test *prints* the figure and asserts only a
-  2 ms ceiling, about twenty times the reading, deliberately, so it is a
-  staleness guard and not a performance gate. It is paid per test rather than per
-  group. At 100,000 cells an open is **800 allocations and 4.45 MB**, which the
-  same run reproduced exactly. All of it is a projection about a construct still
+  95.7 µs and this audit measured **105.8 µs**. Read it as an order of
+  magnitude, and as a measurement rather than a suite claim: no test asserts
+  the time. What `crates/ply-eval-tests/tests/allocation/fixture_open_cost.rs`
+  asserts is the count — an open is charged for the fixture, and nothing a test
+  writes reaches it — and what it prints is the allocation: at 100,000 cells an
+  open is **800 allocations and 4.45 MB**, which the same run reproduced
+  exactly. It is paid per test rather than per group. All of it is a projection about a construct still
   not writable in Ply: every Ply program in this repository opens an empty
   fixture, where `GroupRegion::open` and `close` are both no-ops and the cost is
   nothing at all.
@@ -876,7 +876,7 @@ Re-run rather than assumed. Every row is a command whose output was read.
 | `ply prove` reports honest tiers | 7 obligations · 2 proved · 5 property · 0 example, **7 held** |
 | `ply hosts --host` lists the TCB | 25 host handlers · 47 operations |
 | postgres transactions commit and roll back | `examples/same-tests.sh`: **29 requests byte for byte identical**, committed 201 with orders 3→4, rolled back 409 with the sequence still consumed |
-| `Store::open` under 5 ms at 10,000 definitions | **1.79 ms** over 4,841 results, 9,821 definitions seen |
+| `Store::open` at 10,000 definitions, a reading rather than a suite assertion | **1.79 ms** over 4,841 results, 9,821 definitions seen |
 | simulation seed rate | **5,331–7,107 seeds/s** over 5 trials on a `--concurrent-tests` corpus; every exploration exhaustive, 54 interleavings after reduction from ≥4,096 (`ply-corpus sim`). That a seeded replay is *exact* is asserted by the suite, not by this row |
 | the two-resumption trace cell reads 2 | `region_meaning_audit` (11 tests) and `resumption_semantics_audit` (11) all pass. The cell is pinned literally: `assert_eq(cell_get(c), 2)` at `crates/ply-eval-tests/tests/suite/region_meaning_audit.rs:167`, inside `two_resumptions_thread_one_state_rather_than_branching_it`, with the handle answering 21 |
 
