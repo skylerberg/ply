@@ -1,9 +1,6 @@
 //! The property tier: drawing a value of every Ply type from a seed, running an obligation's cases
 //! against its guard, and reporting what the guard let through.
 
-#[cfg(test)]
-pub(crate) mod tests;
-
 use crate::shrink::{self, Target};
 use crate::{
     Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan, Vacuity,
