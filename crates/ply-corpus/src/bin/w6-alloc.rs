@@ -30,12 +30,16 @@ fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let mut repo = PathBuf::from(".");
     let mut requests = 200usize;
+    let mut out: Option<PathBuf> = None;
     while let Some(flag) = args.next() {
         match flag.as_str() {
             "--repo" => repo = PathBuf::from(args.next().unwrap_or_default()),
             "--requests" => requests = args.next().unwrap_or_default().parse().unwrap_or(200),
+            "--out" => out = Some(PathBuf::from(args.next().unwrap_or_default())),
             other => {
-                anyhow::bail!("`{other}` is not a flag of w6-alloc; it takes --repo and --requests")
+                anyhow::bail!(
+                    "`{other}` is not a flag of w6-alloc; it takes --repo, --requests and --out"
+                )
             }
         }
     }
@@ -50,18 +54,30 @@ fn main() -> anyhow::Result<()> {
     ALLOCS.with(|c| c.set(0));
     BYTES.with(|c| c.set(0));
     loaded.over_sim(script)?;
-    let allocations = ALLOCS.with(Cell::get) as f64 / requests as f64;
-    let bytes = BYTES.with(Cell::get) as f64 / requests as f64;
+    let figures = ply_corpus::w6_run::Allocation {
+        route: "/health".to_string(),
+        requests,
+        response_bytes: response.len(),
+        allocations_per_request: ALLOCS.with(Cell::get) as f64 / requests as f64,
+        bytes_per_request: BYTES.with(Cell::get) as f64 / requests as f64,
+    };
 
-    println!(
-        "{}",
-        serde_json::json!({
-            "route": "/health",
-            "requests": requests,
-            "response_bytes": response.len(),
-            "allocations_per_request": allocations,
-            "bytes_per_request": bytes,
-        })
-    );
+    let rendered = format!("{}\n", serde_json::to_string_pretty(&figures)?);
+    print!("{rendered}");
+    // The file is the figure and the README's sentence is rendered from it, in one command, so
+    // the two cannot be re-taken apart.
+    if let Some(out) = out {
+        std::fs::write(&out, rendered)?;
+        let readme = repo.join("README.md");
+        let text = std::fs::read_to_string(&readme)?;
+        let Some(text) = figures.rewrite_readme(&text) else {
+            anyhow::bail!(
+                "{} carries no request-path sentence to rewrite",
+                readme.display()
+            );
+        };
+        std::fs::write(&readme, text)?;
+        eprintln!("wrote {} and {}", out.display(), readme.display());
+    }
     Ok(())
 }
