@@ -13,7 +13,7 @@ is also what the remaining suite time is made of.
 
 > **What this decides.** That a compiled Ply unit describes its own exports,
 > so the bundle's load record goes away. That the heap reuses dead blocks in
-> every profile, with no-reuse an explicit diagnostic. That the compiled
+> every profile, at once. That the compiled
 > compiler's time is held to a profile taken on a runner, and no emitter
 > change lands without one. That the corpus, judged by the compiled tier, is the specification
 > the differentials are retired into, in the order ADR 0042 fixed. That
@@ -65,7 +65,7 @@ the fixpoint compares the C, table included. A unit can now be linked
 against with none of its sources present, which is the first piece of
 separate compilation.
 
-### 2. The heap reuses in every profile — done, as a bounded quarantine
+### 2. The heap reuses in every profile — done
 
 `crates/ply-codegen/src/heap.rs` reused dead blocks in a release build and
 not in a debug one, so that a read of a dead object in a debug build found
@@ -75,14 +75,19 @@ the runner. A run's worth of CI jobs died that way before it was understood,
 and the workaround was `heap::reuse_by_default(true)` at the top of every
 test that enters the bundle, which is a thing a contributor had to know.
 
-**Built.** Every build reuses. A debug build holds a dead block in a
-quarantine first, oldest out, bounded by `heap::QUARANTINE` bytes, so a
-stale read still finds the marker for a while and an entry's memory is what
-it holds plus the bound, never what it ever held. The record first said
-reuse everywhere with no-reuse as an explicit mode; the quarantine keeps the
-net the suites run under without a switch, so no test has to know it is
-there. The switch and every call to it are gone; `Heap::set_quarantine(0)`
-is what a test of the recycling itself asks for.
+**Built.** Every build reuses a dead block at once, as a release build
+always did. The switch and every call to it are gone, and no test has to
+know anything. This item first landed as a quarantine, a debug build
+holding dead blocks back for a while so a stale read still found the
+marker, and ADR 0050 §1b's instruments took it out again: threaded through
+the dead blocks and bounded by tens of megabytes it put the heap's
+`dismantle` at a quarter of the compiled compiler's time, and in both that
+form and a ring of a thousand slots kept outside the blocks, the memory of
+the emitter over its own sources grew far past what immediate reuse holds,
+for a reason the readings did not find. What immediate reuse gives up is a
+stale read finding a dead header after the block is taken; a stale read is
+caught by the counts the audits assert and by the header a block keeps
+until then.
 
 ### 3. The emitter's inner loops, held to the hasher — measured, and the premise was wrong
 
