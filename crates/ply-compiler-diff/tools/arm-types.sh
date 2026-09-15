@@ -18,12 +18,13 @@ set -uo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
+src="$root/crates/ply-compiler/ply"
 ply="${PLY_BIN:-$root/target/release/ply}"
 [ -x "$ply" ] || ply="$root/target/debug/ply"
 [ -x "$ply" ] || { echo "no ply binary; run cargo build -p ply-cli --bin ply"; exit 2; }
 
 work="$(mktemp -d)"
-cp "$here/lexer.ply" "$here/spine.ply" "$here/types.ply" "$here/patterns.ply" "$work/"
+cp "$src/lexer.ply" "$src/spine.ply" "$src/types.ply" "$src/patterns.ply" "$work/"
 cp "$work/types.ply" "$work/types.orig"
 cp "$work/patterns.ply" "$work/patterns.orig"
 restore() { cp "$work/types.orig" "$work/types.ply"; cp "$work/patterns.orig" "$work/patterns.ply"; }

@@ -118,20 +118,49 @@ starts with it. Below that lies the value model, ADR 0035's, where the
 counts and the field reads through the runtime come from. The
 allocation-attribution suites in `ply-corpus` remain the regression guard.
 
-### 4. The corpus is the specification
+### 4. The corpus is the specification — inventoried, and sequenced after the reference retires
 
 The differentials compare the ported compiler against the Rust reference,
 module by module. They are scaffolding: ADR 0042 orders the reference's
 retirement, and a differential with no reference is nothing. What already
-stands without a reference is the bootstrap fixpoint and the corpus
-specifications judged by the compiled tier.
+stands without a reference is the bootstrap fixpoint, the compiler's own
+`test` blocks in `crates/ply-compiler/ply`, the language corpus under
+`tests/lang` on both tiers, the propositions `ply prove --backend c` judges,
+and the wrong-backend, hazard and producer suites.
 
-**Fix.** Every behaviour a differential asserts today that the corpus does
-not state gets a corpus program with an expected outcome. When a module's
-behaviours are all stated, that module's differential is deleted; the
-`ply-compiler-diff` package ends as the fixpoint test plus the arming
-scripts. Metamorphic checks belong in the same frame: an optimisation pass
-is held to the corpus's outcomes, not to a second implementation of it.
+**What the inventory found, 2026-09-15.** The record first said each
+differential should be replaced by corpus programs with expected outcomes
+and then deleted. Two things make that wrong today. First, the Rust front
+end is still the one every `ply` command parses and checks with; while both
+front ends ship, the differential is the only statement that they are one
+language, which is the programme's fourth goal, so it retires with the
+reference and not before. Second, a corpus program can say what an
+expression evaluates to and what a test raises; it cannot say what a tree,
+a span, a scheme or a hash is, and those are what the differentials assert:
+token spans over every real file, tree and diagnostic equality over some
+eight hundred inputs with error recovery, load order and cycle rotation
+over the real module graph, every scheme and footprint over the standard
+library and the restore-from-published-interfaces round trip, generated
+source byte for byte, every published hash and the reference graph, and
+slot numbers with ownership marks over the lowered bodies. The compiler's
+own modules already show the form those take without a reference: a `dump`
+of the phase asserted against a literal. The mined `.corpus` bundles are
+the inputs; what they lack is the expected dump beside each one.
+
+**What lands now, and what waits.** The four arming scripts for the parser
+modules copied the sources from a directory they had moved out of and could
+not run; they read `crates/ply-compiler/ply` again. The package's harness,
+which enters the compiled compiler in-process, is a runner and not a second
+implementation, and it stays. When ADR 0042's retirement of the Rust front
+end is reached, each bundle takes the reference's dump beside every input
+before the reference goes, the harness compares the port against the file
+rather than against Rust, the whole-file comparisons over `examples/` and
+the standard library become the same with their dumps under `tests/`, and
+the arming scripts are re-pointed at those. A dump the reference never
+produced is stated by hand, as the compiler's own tests are. Metamorphic
+checks belong in the same frame and need no reference at all: a printer
+round trip over the corpus, or an optimisation pass held to the corpus's
+outcomes, is the first to add once a Ply printer exists.
 
 ### 5. Figures live where tests read them
 
