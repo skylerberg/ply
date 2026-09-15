@@ -1,6 +1,12 @@
 //! What the emitted C must agree with, checked rather than commented.
 
-use super::*;
+mod cache;
+mod sweep;
+mod toolchain;
+
+use ply_codegen::c::{
+    HELPERS, Native, PRELUDE, compile_and_load, emit_one, helper_addresses, runtime_decls,
+};
 
 /// Every helper the prelude declares has an address, and the two tables are the same length: a
 /// declaration with no address is a null call at run time, which is a crash rather than a decline.
@@ -17,17 +23,21 @@ fn every_declared_helper_has_an_address() {
 /// answer, not a slow one.
 #[test]
 fn the_prelude_agrees_with_the_layouts_it_mirrors() {
-    assert_eq!(crate::heap::HEADER, 16, "PLY_HEADER");
-    assert_eq!(std::mem::size_of::<crate::heap::Obj>(), 16, "PlyObj");
-    assert_eq!(crate::heap::FLAT, 1, "PLY_FLAT");
+    assert_eq!(ply_codegen::heap::HEADER, 16, "PLY_HEADER");
+    assert_eq!(std::mem::size_of::<ply_codegen::heap::Obj>(), 16, "PlyObj");
+    assert_eq!(ply_codegen::heap::FLAT, 1, "PLY_FLAT");
     assert_eq!(
-        std::mem::offset_of!(crate::rt::Ctx, failed),
+        std::mem::offset_of!(ply_codegen::rt::Ctx, failed),
         0,
         "PlyCtx.failed"
     );
-    assert_eq!(std::mem::offset_of!(crate::rt::Ctx, fuel), 8, "PlyCtx.fuel");
     assert_eq!(
-        std::mem::offset_of!(crate::rt::Ctx, stack_floor),
+        std::mem::offset_of!(ply_codegen::rt::Ctx, fuel),
+        8,
+        "PlyCtx.fuel"
+    );
+    assert_eq!(
+        std::mem::offset_of!(ply_codegen::rt::Ctx, stack_floor),
         16,
         "PlyCtx.stack_floor"
     );
@@ -47,7 +57,7 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
 }
 "#,
     );
-    let lib = match load::compile_and_load(&src, "probe") {
+    let lib = match compile_and_load(&src, "probe") {
         Ok(l) => l,
         // A machine with no C compiler is a machine this tier is not for; the test says so
         // rather than failing the suite for everyone.
@@ -62,10 +72,10 @@ Word ply_probe(PlyCtx *ctx, const Word *args) {
     let probe = lib
         .symbol("ply_probe")
         .expect("the unit exports `ply_probe`");
-    let probe: crate::rt::Entry = unsafe { std::mem::transmute(probe) };
-    let args = [crate::heap::imm(20), crate::heap::imm(22)];
+    let probe: ply_codegen::rt::Entry = unsafe { std::mem::transmute(probe) };
+    let args = [ply_codegen::heap::imm(20), ply_codegen::heap::imm(22)];
     let answer = unsafe { probe(std::ptr::null_mut(), args.as_ptr()) };
-    assert_eq!(crate::heap::imm_value(answer), 42);
+    assert_eq!(ply_codegen::heap::imm_value(answer), 42);
 }
 
 /// The whole tier on a real program: emit, compile, load, and answer what the interpreter answers.
@@ -97,16 +107,16 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
         ("m.shaped", vec![4], 45),
     ];
     for (name, args, want) in cases {
-        let entry: crate::rt::Entry = native
+        let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
         ctx.fuel = 10_000;
-        let words: Vec<i64> = args.iter().map(|a| crate::heap::imm(*a)).collect();
+        let words: Vec<i64> = args.iter().map(|a| ply_codegen::heap::imm(*a)).collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised");
         assert_eq!(
-            crate::heap::imm_value(answer),
+            ply_codegen::heap::imm_value(answer),
             *want,
             "`{name}{args:?}` answered wrongly"
         );
@@ -114,8 +124,6 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
     let _ = loaded;
 }
 
-/// Loading a module the way the tests need it: parse, resolve, check, then build a unit over
-/// every function in it. `None` on a machine with no C compiler, which this tier is not for.
 /// Process-wide state a build reads or writes, which a test binary shares between its threads.
 ///
 /// Two kinds. `PLY_C_CACHE` and `PLY_C_SKIP` are read from the environment on whichever thread
@@ -129,11 +137,11 @@ pub fn shaped(n: Int) -> Int = { let r = {x: n, y: n + 1}; r.x * 10 + r.y }
 ///
 /// So: a test that changes the environment, or counts what a build did, takes [`CONFIG`] for
 /// writing; every other build here takes it for reading.
-pub(super) static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
+static CONFIG: std::sync::RwLock<()> = std::sync::RwLock::new(());
 
 pub mod tests_support {
-    use crate::c::Native;
-    use crate::source::Source;
+    use ply_codegen::c::Native;
+    use ply_codegen::source::Source;
     use ply_syntax::ast::ModuleName;
 
     pub fn unit(text: &str) -> Option<(&'static Source, Native)> {
@@ -143,11 +151,11 @@ pub mod tests_support {
     /// A machine over `source` with the default tier attached, so what the reference fragment
     /// answers is checked against what the whole emitter answers.
     pub fn machine(source: &'static Source, text: &str) -> ply_eval::Machine<'static> {
-        crate::c::producer::ensure_default();
+        ply_codegen::c::producer::ensure_default();
         let texts = std::collections::HashMap::from([("m".to_string(), text.to_string())]);
         let unit = {
             let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
-            crate::Unit::over_with_texts(source.program, source.resolved, source.check, texts)
+            ply_codegen::Unit::over_with_texts(source.program, source.resolved, source.check, texts)
                 .expect("this host has a C compiler")
         };
         let mut machine = ply_eval::Machine::new(source.program, source.resolved, source.check);
@@ -191,7 +199,9 @@ pub mod tests_support {
         ))))
     }
 
-    pub fn with_refusals(text: &str) -> Option<(&'static Source, Native, Vec<super::Refused>)> {
+    pub fn with_refusals(
+        text: &str,
+    ) -> Option<(&'static Source, Native, Vec<ply_codegen::c::Refused>)> {
         let mut sources = ply_span::SourceMap::new();
         let owned: &'static str = Box::leak(text.to_string().into_boxed_str());
         let id = sources.add("m.ply", owned.to_string());
@@ -207,7 +217,7 @@ pub mod tests_support {
         let names = source.functions();
         let refs: Vec<&str> = names.iter().map(String::as_str).collect();
         let _config = super::CONFIG.read().unwrap_or_else(|e| e.into_inner());
-        match crate::c::producer::reference_only(|| crate::c::build(source, &refs)) {
+        match ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(source, &refs)) {
             Ok((native, refused)) => Some((source, native, refused)),
             Err(e) if e.to_string().contains("could not run") => None,
             Err(e) => panic!("{e}"),
@@ -278,19 +288,19 @@ pub fn looped(n: Int) -> Int =
         let want = machine
             .call(name, args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let entry: crate::rt::Entry = native
+        let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
         ctx.fuel = 100_000;
-        let layouts_ptr: *const crate::heap::Layouts = &native.tables().layouts;
+        let layouts_ptr: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args
             .iter()
             .map(|a| ctx.heap.to_word(unsafe { &*layouts_ptr }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
-        let got = crate::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
         assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
     }
 }
@@ -316,7 +326,7 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
     };
     let mut machine = tests_support::machine(loaded, source);
     for name in ["m.wide", "m.narrow"] {
-        let entry: crate::rt::Entry = native
+        let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         // `-7` is the machine raising -- `u64_of_int` refuses a negative -- and the tier has to
@@ -325,7 +335,7 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
             let want = machine.call(name, vec![ply_eval::Value::Int(n)], ply_span::Span::DUMMY);
             let mut ctx = native.context();
             ctx.fuel = 1_000;
-            let layouts_ptr: *const crate::heap::Layouts = &native.tables().layouts;
+            let layouts_ptr: *const ply_codegen::heap::Layouts = &native.tables().layouts;
             let word = ctx
                 .heap
                 .to_word(unsafe { &*layouts_ptr }, &ply_eval::Value::Int(n));
@@ -333,7 +343,7 @@ pub fn narrow(n: Int) -> Int = int_of_u32(rotr(wrap_mul(u32_of_int(n), 265443576
             match want {
                 Ok(want) => {
                     assert_eq!(ctx.failed, 0, "`{name}({n})` raised in the C tier");
-                    let got = crate::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
+                    let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
                     assert_eq!(
                         got, want,
                         "`{name}({n})`: the tier and the machine disagree"
@@ -391,17 +401,17 @@ fn noted(p: P, x: Int) -> P = {{ pos: p.pos, depth: p.depth, diags: push(p.diags
         let want = machine
             .call("m.probe", args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{which}` raised in the machine: {}", d.message));
-        let entry: crate::rt::Entry = native.entry("m.probe").expect("compiled");
+        let entry: ply_codegen::rt::Entry = native.entry("m.probe").expect("compiled");
         let mut ctx = native.context();
         ctx.fuel = 100_000;
-        let layouts_ptr: *const crate::heap::Layouts = &native.tables().layouts;
+        let layouts_ptr: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args
             .iter()
             .map(|a| ctx.heap.to_word(unsafe { &*layouts_ptr }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{which}` raised in the C tier");
-        let got = crate::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts_ptr }, answer);
         assert_eq!(got, want, "`{which}`: the tiers disagree");
     }
 }
@@ -463,19 +473,19 @@ pub fn named(b: Bytes) -> Int = code(TName(b))
         let want = machine
             .call(name, args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let entry: crate::rt::Entry = native
+        let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
         ctx.fuel = 100_000;
-        let layouts: *const crate::heap::Layouts = &native.tables().layouts;
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args
             .iter()
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
-        let got = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
     }
 }
@@ -534,19 +544,19 @@ pub fn used_twice(n: Int, x: Int) -> Int = { let f = adder(n); f(x) + f(x) }
         let want = machine
             .call(name, args.clone(), ply_span::Span::DUMMY)
             .unwrap_or_else(|d| panic!("`{name}` raised in the machine: {}", d.message));
-        let entry: crate::rt::Entry = native
+        let entry: ply_codegen::rt::Entry = native
             .entry(name)
             .unwrap_or_else(|| panic!("`{name}` was not compiled"));
         let mut ctx = native.context();
         ctx.fuel = 100_000;
-        let layouts: *const crate::heap::Layouts = &native.tables().layouts;
+        let layouts: *const ply_codegen::heap::Layouts = &native.tables().layouts;
         let words: Vec<i64> = args
             .iter()
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised in the C tier");
-        let got = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
+        let got = ply_codegen::heap::Heap::to_value(unsafe { &*layouts }, answer);
         assert_eq!(got, want, "`{name}{args:?}`: the tiers disagree");
     }
 }
@@ -585,17 +595,18 @@ pub fn alone(n: Int) -> Int = twice(n)
     let all: Vec<&str> = all.iter().map(String::as_str).collect();
 
     let answer = |native: &Native, name: &str, n: i64| -> Option<i64> {
-        let entry: crate::rt::Entry = native.entry(name)?;
+        let entry: ply_codegen::rt::Entry = native.entry(name)?;
         let mut ctx = native.context();
         ctx.fuel = 10_000;
-        let words = [crate::heap::imm(n)];
+        let words = [ply_codegen::heap::imm(n)];
         let w = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised");
-        Some(crate::heap::imm_value(w))
+        Some(ply_codegen::heap::imm_value(w))
     };
 
     let (wide, _) =
-        crate::c::producer::reference_only(|| crate::c::build(loaded, &all)).expect("builds");
+        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &all))
+            .expect("builds");
     assert_eq!(answer(&wide, "m.both", 5), Some(25));
     drop(wide);
 
@@ -604,7 +615,8 @@ pub fn alone(n: Int) -> Int = twice(n)
     // the same digest, and the refusals below land under the wider run's key.
     unsafe { std::env::set_var("PLY_C_SKIP", "m.thrice") };
     let (narrowed, refused) =
-        crate::c::producer::reference_only(|| crate::c::build(loaded, &all)).expect("builds");
+        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &all))
+            .expect("builds");
     assert!(
         refused.iter().any(|r| r.function == "m.both"),
         "`m.both` calls a definition this build was not offered: {refused:?}"
@@ -615,7 +627,8 @@ pub fn alone(n: Int) -> Int = twice(n)
     unsafe { std::env::remove_var("PLY_C_SKIP") };
     // The one that used to come back wrong.
     let (again, refused) =
-        crate::c::producer::reference_only(|| crate::c::build(loaded, &all)).expect("builds");
+        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &all))
+            .expect("builds");
     assert!(
         refused.is_empty(),
         "the wider build was served the narrower one's refusals: {refused:?}"
@@ -678,16 +691,18 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
             .unwrap_or_else(|| panic!("`{name}` was refused"));
         let mut ctx = native.context();
         ctx.fuel = 10_000;
-        let words: Vec<crate::heap::Word> = args.iter().map(|a| crate::heap::imm(*a)).collect();
+        let words: Vec<ply_codegen::heap::Word> =
+            args.iter().map(|a| ply_codegen::heap::imm(*a)).collect();
         let w = unsafe { entry(&mut ctx, words.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised");
-        crate::heap::imm_value(w)
+        ply_codegen::heap::imm_value(w)
     };
 
     // Writing: `UNITS_REUSED` below counts every build in the process, not just these two.
     let _config = CONFIG.write().unwrap_or_else(|e| e.into_inner());
-    let (built, _) = crate::c::producer::reference_only(|| crate::c::build(loaded, &names))
-        .expect("the first build");
+    let (built, _) =
+        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &names))
+            .expect("the first build");
     let first = (
         ask(&built, "m.both", &[3, 4]),
         ask(&built, "m.tagged", &[7]),
@@ -700,11 +715,12 @@ pub fn tagged(n: Int) -> Int = label(if n > 0 {{ TB(n) }} else {{ TA }})
     );
     drop(built);
 
-    let reused = super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
-    let (again, _) = crate::c::producer::reference_only(|| crate::c::build(loaded, &names))
-        .expect("the second build");
+    let reused = ply_codegen::c::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed);
+    let (again, _) =
+        ply_codegen::c::producer::reference_only(|| ply_codegen::c::build(loaded, &names))
+            .expect("the second build");
     assert_eq!(
-        super::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed),
+        ply_codegen::c::cache::UNITS_REUSED.load(std::sync::atomic::Ordering::Relaxed),
         reused + 1,
         "the second build emitted a unit instead of reading back the one the first build wrote"
     );
@@ -754,13 +770,13 @@ pub fn probe(n: Int) -> Int = fold(range(0, n), 0, |acc: Int, _x: Int| acc + len
         "something was remembered before the root ever ran"
     );
 
-    let entry: crate::rt::Entry = native.entry("m.probe").expect("`probe` was refused");
+    let entry: ply_codegen::rt::Entry = native.entry("m.probe").expect("`probe` was refused");
     let mut ctx = native.context();
     ctx.fuel = 100_000;
-    let args = [crate::heap::imm(64)];
+    let args = [ply_codegen::heap::imm(64)];
     let answer = unsafe { entry(&mut ctx, args.as_ptr()) };
     assert_eq!(ctx.failed, 0, "`probe` raised");
-    assert_eq!(crate::heap::imm_value(answer), 32 * 64);
+    assert_eq!(ply_codegen::heap::imm_value(answer), 32 * 64);
     assert!(
         native.tables().memoized(slot).is_some(),
         "`probe` called the root directly instead of asking the runtime for its answer"
@@ -794,11 +810,11 @@ pub fn with_wide(n: Int) -> Int = fold(range(0, n), {i: 0, tag: b"z"}, wide).i
     };
     let rounds = 500i64;
     let allocations = |name: &str| -> usize {
-        let entry: crate::rt::Entry = native.entry(name).expect("compiled");
+        let entry: ply_codegen::rt::Entry = native.entry(name).expect("compiled");
         let mut ctx = native.context();
         ctx.fuel = 1_000_000;
         let before = ctx.heap.allocated();
-        let args = [crate::heap::imm(rounds)];
+        let args = [ply_codegen::heap::imm(rounds)];
         let w = unsafe { entry(&mut ctx, args.as_ptr()) };
         assert_eq!(ctx.failed, 0, "`{name}` raised");
         let _ = w;
@@ -836,10 +852,10 @@ pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
         return;
     };
     let ctors = loaded.ctors();
-    let digest = super::cache::ctors_digest(&ctors);
-    let mut unit = super::emit::Unit::new(ctors, vec!["m.wrap".to_string()]);
-    let inlining = crate::opt::Inlining::EMITTED;
-    let (text, _) = super::build::emit_one(
+    let digest = ply_codegen::c::cache::ctors_digest(&ctors);
+    let mut unit = ply_codegen::c::emit::Unit::new(ctors, vec!["m.wrap".to_string()]);
+    let inlining = ply_codegen::opt::Inlining::EMITTED;
+    let (text, _) = emit_one(
         loaded,
         &mut unit,
         "m.wrap",
