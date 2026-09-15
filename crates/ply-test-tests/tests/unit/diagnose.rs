@@ -1,14 +1,14 @@
 //! The five situations a failure can be in, driven end to end through [`diagnose`].
 
-use super::{Evidence, Options, diagnose};
-use crate::bisect::{
-    Baseline, ChangeKind, Classify, Confidence, DefKey, Delta, DepEdges, Hybrid, Mode, Skipped,
-    Trial, TrialOutcome, Unresolved, Verdict,
-};
-use crate::slice::{CausalSlice, Entered, Frame, Tracing};
 use ply_core::Footprint;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Span, Symbol};
+use ply_test::bisect::{
+    Baseline, ChangeKind, Classify, Confidence, DefKey, Delta, DepEdges, Hybrid, Mode, Skipped,
+    Trial, TrialOutcome, Unresolved, Verdict,
+};
+use ply_test::diagnose::{Evidence, Options, diagnose};
+use ply_test::slice::{CausalSlice, Entered, Frame, Tracing};
 use std::collections::{BTreeMap, BTreeSet};
 
 fn sym(s: &str) -> Symbol {
@@ -178,7 +178,7 @@ impl Case {
         hybrid: Option<&mut dyn Hybrid>,
         situation: Situation,
         slice: Option<CausalSlice>,
-    ) -> crate::Attribution {
+    ) -> ply_test::Attribution {
         let base = baseline(&self.defs_before, self.test_before);
         let hashes = hashes(&self.defs_after, self.test_after);
         let mut classify = Told::new(base.clone(), hash(self.test_after));
@@ -214,7 +214,7 @@ impl Case {
     }
 }
 
-fn simple(case: &Case, culprits: &mut Culprits) -> crate::Attribution {
+fn simple(case: &Case, culprits: &mut Culprits) -> ply_test::Attribution {
     case.run(
         &Options::default(),
         |_| {},
@@ -692,7 +692,7 @@ fn two_runs_over_one_failure_agree_exactly() {
         let mut hybrid = Culprits::new(&["c", "e"]);
         let out = simple(&case, &mut hybrid);
         (
-            crate::report::failure_json(&crate::Failure {
+            ply_test::report::failure_json(&ply_test::Failure {
                 name: "a regression".to_string(),
                 key: sym(KEY),
                 diagnostic: ply_span::Diagnostic::error(ply_span::codes::ASSERTION_FAILED, "x"),
@@ -719,7 +719,7 @@ fn a_spent_budget_downgrades_confidence_and_keeps_the_cause() {
     let mut hybrid = Culprits::new(&["d7"]);
     let out = case.run(
         &Options {
-            budget: crate::Budget::new(2),
+            budget: ply_test::Budget::new(2),
             ..Options::default()
         },
         |_| {},
@@ -742,7 +742,7 @@ fn always_waives_the_budget_but_not_the_preconditions() {
     let out = case.run(
         &Options {
             bisect: Mode::Always,
-            budget: crate::Budget::new(2),
+            budget: ply_test::Budget::new(2),
             ..Options::default()
         },
         |_| {},
@@ -916,8 +916,8 @@ fn the_trial_outcomes_are_distinguishable_in_the_artifact() {
     );
 }
 
-fn failure_with(attribution: crate::Attribution) -> crate::Failure {
-    crate::Failure {
+fn failure_with(attribution: ply_test::Attribution) -> ply_test::Failure {
+    ply_test::Failure {
         name: "a regression".to_string(),
         key: sym(KEY),
         diagnostic: ply_span::Diagnostic::error(
@@ -934,9 +934,9 @@ fn failure_with(attribution: crate::Attribution) -> crate::Failure {
     }
 }
 
-fn summary_of(attribution: crate::Attribution) -> Vec<String> {
-    crate::RunReport {
-        engine: crate::Engine::Evaluator,
+fn summary_of(attribution: ply_test::Attribution) -> Vec<String> {
+    ply_test::RunReport {
+        engine: ply_test::Engine::Evaluator,
         passed: 0,
         failed: 1,
         cached: 0,
@@ -993,7 +993,7 @@ fn a_failure_with_no_culprit_names_nobody() {
 fn the_json_artifact_leads_with_the_verdict() {
     let case = Case::edits(&["a", "b"], &["a"]);
     let mut hybrid = Culprits::new(&["a"]);
-    let json = crate::report::failure_json(&failure_with(simple(&case, &mut hybrid)));
+    let json = ply_test::report::failure_json(&failure_with(simple(&case, &mut hybrid)));
 
     let culprit = &json["culprit"];
     assert_eq!(culprit["verdict"], "sole");
@@ -1023,7 +1023,7 @@ fn a_skipped_bisection_says_why_in_the_json() {
         },
         None,
     );
-    let json = crate::report::failure_json(&failure_with(out));
+    let json = ply_test::report::failure_json(&failure_with(out));
     assert_eq!(json["culprit"]["verdict"], "not_attempted");
     assert_eq!(json["culprit"]["skipped"], "never_passed");
     assert_eq!(json["culprit"]["confidence"], "none");
