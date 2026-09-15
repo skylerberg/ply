@@ -1,5 +1,5 @@
 use crate::build::*;
-use crate::{Machine, Value};
+use ply_eval::{Machine, Value};
 use ply_span::{Diagnostic, codes};
 use ply_syntax::ast::{BinOp, Expr, Item, Mode, UnOp};
 
@@ -335,8 +335,8 @@ fn a_deeply_nested_expression_evaluates_on_a_one_mebibyte_thread_stack() {
 #[test]
 fn a_value_the_call_bound_permits_compares_and_drops_on_a_small_stack() {
     assert!(on_a_small_stack(|| {
-        let deep = crate::MAX_VALUE_DEPTH - 1;
-        crate::values_equal(&chain(deep), &chain(deep), sp()).expect("a legal value compares")
+        let deep = ply_eval::MAX_VALUE_DEPTH - 1;
+        ply_eval::values_equal(&chain(deep), &chain(deep), sp()).expect("a legal value compares")
     }));
 }
 
@@ -344,8 +344,8 @@ fn a_value_the_call_bound_permits_compares_and_drops_on_a_small_stack() {
 #[test]
 fn a_value_past_the_bound_is_a_diagnostic_and_not_an_abort() {
     let (code, message) = on_a_small_stack(|| {
-        let deep = crate::MAX_VALUE_DEPTH + 2;
-        let d = crate::values_equal(&chain(deep), &chain(deep), sp())
+        let deep = ply_eval::MAX_VALUE_DEPTH + 2;
+        let d = ply_eval::values_equal(&chain(deep), &chain(deep), sp())
             .expect_err("past the bound is an error");
         (d.code, d.message)
     });
@@ -359,14 +359,14 @@ fn a_value_past_the_bound_is_a_diagnostic_and_not_an_abort() {
 #[test]
 fn the_first_difference_of_two_deep_values_is_found_on_a_small_stack() {
     let found = on_a_small_stack(|| {
-        let deep = crate::MAX_VALUE_DEPTH - 1;
+        let deep = ply_eval::MAX_VALUE_DEPTH - 1;
         let mut other = Value::ctor("End", Vec::new());
         for _ in 0..deep {
             other = Value::ctor("Link", vec![other]);
         }
         let actual = chain(deep);
-        assert!(!crate::values_equal(&actual, &other, sp()).expect("they compare"));
-        crate::first_difference(&actual, &other)
+        assert!(!ply_eval::values_equal(&actual, &other, sp()).expect("they compare"));
+        ply_eval::first_difference(&actual, &other)
     });
     let (path, expected, actual) = found.expect("the difference is located");
     assert!(path.ends_with(".Link.0"), "{path}");
@@ -1465,7 +1465,7 @@ fn panic_carries_its_message() {
 
 #[test]
 fn every_builtin_checks_its_argument_count() {
-    for b in crate::Builtin::all() {
+    for b in ply_eval::Builtin::all() {
         let (min, max) = b.arity();
         // `map_new` is nullary — Ply has no top-level constants, so the empty map is a call — and
         // there is no such thing as too few arguments for one.

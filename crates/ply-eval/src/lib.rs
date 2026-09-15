@@ -11,7 +11,7 @@ pub mod backend;
 pub mod builtins;
 pub mod census;
 pub mod code;
-mod compiled;
+pub mod compiled;
 pub mod cont;
 pub mod costs;
 pub mod differential;
@@ -31,7 +31,7 @@ pub mod rc;
 pub mod region;
 pub mod region_kind;
 pub mod sched;
-mod semantics;
+pub mod semantics;
 pub mod sim;
 pub mod slots;
 pub mod task_regions;
@@ -92,10 +92,3 @@ pub use value::{
     constant_time_eq, first_difference, values_equal,
 };
 pub use window::{SlotVal, Windows};
-
-#[cfg(test)]
-mod build;
-#[cfg(test)]
-mod numerics;
-#[cfg(test)]
-mod tests;

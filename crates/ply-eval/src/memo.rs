@@ -50,25 +50,3 @@ pub fn pure_by_published_row(check: Option<&CheckOutput>, name: &Symbol) -> bool
         .and_then(|check| check.defs.get(name))
         .is_some_and(|def| def.footprint.is_empty() && def.constraints.is_empty())
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn nested(levels: usize, bottom: Value) -> Value {
-        (0..levels).fold(bottom, |inner, _| Value::Ctor {
-            name: Symbol::new("Node"),
-            args: std::sync::Arc::new(vec![Value::list(vec![inner])]),
-        })
-    }
-
-    /// A parsed program is a constant far deeper than any recursion budget; the walk must
-    /// reach its bottom either way, since what is there decides the answer.
-    #[test]
-    fn a_constant_is_judged_by_its_leaves_however_deep_they_lie() {
-        assert!(world_independent(&nested(2_000, Value::Unit)));
-        let mut regions: crate::TaskRegions = crate::TaskRegions::new();
-        let cell = Value::Cell(regions.alloc_cell(Value::Unit));
-        assert!(!world_independent(&nested(2_000, cell)));
-    }
-}

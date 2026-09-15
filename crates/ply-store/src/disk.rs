@@ -480,7 +480,7 @@ pub(crate) fn temp_path(dir: &Path, stem: &str) -> PathBuf {
     ))
 }
 
-pub(crate) fn sweep_temps(dir: &Path, max_age: Option<Duration>) {
+pub fn sweep_temps(dir: &Path, max_age: Option<Duration>) {
     let Ok(read) = fs::read_dir(dir) else { return };
     for entry in read.flatten() {
         let name = entry.file_name();
@@ -520,17 +520,17 @@ const LOCK_STALE_AGE: Duration = Duration::from_secs(30);
 /// Serializes the read-merge-write in `Store::flush` across processes, which rename alone cannot
 /// do: two writers can otherwise read the same cache and the second rename drops the first one's
 /// entries.
-pub(crate) struct Lock {
+pub struct Lock {
     path: PathBuf,
-    pub(crate) held: bool,
+    pub held: bool,
 }
 
 impl Lock {
-    pub(crate) fn acquire(dir: &Path) -> Lock {
+    pub fn acquire(dir: &Path) -> Lock {
         Lock::acquire_within(dir, LOCK_WAIT)
     }
 
-    pub(crate) fn acquire_within(dir: &Path, wait: Duration) -> Lock {
+    pub fn acquire_within(dir: &Path, wait: Duration) -> Lock {
         let path = dir.join(LOCK_FILE);
         let deadline = Instant::now() + wait;
         loop {
@@ -558,7 +558,7 @@ impl Drop for Lock {
     }
 }
 
-pub(crate) fn is_older_than(path: &Path, age: Duration) -> bool {
+pub fn is_older_than(path: &Path, age: Duration) -> bool {
     fs::metadata(path)
         .and_then(|m| m.modified())
         .map(|m| m.elapsed().map(|elapsed| elapsed >= age).unwrap_or(false))

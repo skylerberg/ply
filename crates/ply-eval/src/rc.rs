@@ -419,6 +419,3 @@ impl Live {
         bump(|s| s.drop_sites += count as u64);
     }
 }
-
-#[cfg(test)]
-mod tests;

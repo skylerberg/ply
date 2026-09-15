@@ -1,8 +1,8 @@
 //! Evaluating `Float` and `Decimal`.
 
 use crate::build::*;
-use crate::value::{Decimal, values_equal};
-use crate::{Machine, Value};
+use ply_eval::{Decimal, values_equal};
+use ply_eval::{Machine, Value};
 use ply_span::{Diagnostic, Span, codes};
 use ply_syntax::ast::{BinOp, Expr, ExprKind, Ident, Lit, QName, UnOp};
 
