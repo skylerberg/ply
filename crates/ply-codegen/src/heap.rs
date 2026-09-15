@@ -136,7 +136,77 @@ pub fn imm_value(w: Word) -> i64 {
 
 pub fn obj(w: Word) -> *mut Obj {
     debug_assert!(!is_imm(w) && w != 0);
+    if poisoning() {
+        poison::check(w);
+    }
     w as *mut Obj
+}
+
+/// Whether every heap is in the diagnostic mode ADR 0051 §1 built: a dead block is never
+/// reused, its payload is poisoned at release, and a read of it through the runtime fails at
+/// the body's site. `PLY_HEAP_POISON=1` turns it on for a process; nothing ships with it.
+pub fn poisoning() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PLY_HEAP_POISON").is_some())
+}
+
+/// The diagnostic mode's pieces: the word a dead payload is filled with, the check every object
+/// read passes through, and the site the check names.
+pub mod poison {
+    use super::{IMMORTAL, KIND_DEAD, Obj, Word, is_imm};
+
+    /// What a poisoned payload word points at: an object that is dead by its header and immortal
+    /// by its count, so a read through it is caught by the header and never counted.
+    static POISONED: Obj = Obj {
+        rc: IMMORTAL,
+        kind: KIND_DEAD,
+        flags: 0,
+        aux: 0,
+        len: 0,
+        layout: 0,
+    };
+
+    pub fn word() -> Word {
+        &raw const POISONED as Word
+    }
+
+    thread_local! {
+        /// The running entry's `site_module`, `site_start` and `site_end`, three `i64`s in a row
+        /// inside its `Ctx`, so a failure here can say where the body was.
+        static SITE: std::cell::Cell<*const i64> = const { std::cell::Cell::new(std::ptr::null()) };
+    }
+
+    pub fn enter(site: *const i64) {
+        SITE.with(|s| s.set(site));
+    }
+
+    pub fn leave() {
+        SITE.with(|s| s.set(std::ptr::null()));
+    }
+
+    /// Fails, naming the body's site, when `w` is the poison word or points at a dead header.
+    /// The failure is a panic: it reaches the log through whatever `extern "C"` frame is above,
+    /// which is loud and is what a diagnostic mode is for.
+    pub fn check(w: Word) {
+        if is_imm(w) || w == 0 {
+            return;
+        }
+        let why = if w == word() {
+            "a payload word poisoned when its object died"
+        } else if unsafe { (*(w as *const Obj)).kind } == KIND_DEAD {
+            "an object that has died"
+        } else {
+            return;
+        };
+        let site = SITE.with(|s| s.get());
+        let at = if site.is_null() {
+            "outside any entry".to_string()
+        } else {
+            let (m, start, end) = unsafe { (*site, *site.add(1), *site.add(2)) };
+            format!("module {m} bytes {start}..{end}")
+        };
+        panic!("a stale read: {why}, at {at}");
+    }
 }
 
 /// The payload words after a header.
@@ -406,6 +476,13 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             return;
         }
         let object = Heap::object_size(size);
+        if poisoning() {
+            let words = (object - HEADER) / 8;
+            for i in 0..words {
+                set_word(o, i, poison::word());
+            }
+            return;
+        }
         (*heap).free_list(object).push(o);
     }
 }
