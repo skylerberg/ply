@@ -3236,6 +3236,7 @@ fn direct_helper(b: Builtin, args: usize) -> Option<&'static str> {
         (Builtin::BytesScan, 4) => "rt_bytes_scan_p",
         (Builtin::BytesScanUntil, 4) => "rt_bytes_scan_until_p",
         (Builtin::ListAt, 2) => "rt_list_index_p",
+        (Builtin::ListSet, 3) => "rt_list_set_p",
         _ => return None,
     })
 }

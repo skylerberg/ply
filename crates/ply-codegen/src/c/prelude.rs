@@ -188,6 +188,7 @@ helpers![
     ("rt_handle_detached", 4, true),
     ("rt_region", 1, true),
     ("rt_region_close", 1, false),
+    ("rt_list_set", 3, true),
 ];
 
 /// The declarations, the function-pointer table and the exported binder, generated from

@@ -111,6 +111,19 @@ fn insert(node: &mut Arc<Node>, shift: u32, index: usize, leaf: Arc<Node>, copie
     }
 }
 
+fn set_in(node: &mut Arc<Node>, shift: u32, index: usize, v: Value, copied: &mut Copied) {
+    match writable(node, copied) {
+        Node::Branch(kids) => set_in(
+            &mut kids[(index >> shift) & MASK],
+            shift - BITS,
+            index,
+            v,
+            copied,
+        ),
+        Node::Leaf(items) => items[index & MASK] = v,
+    }
+}
+
 impl List {
     pub fn len(&self) -> usize {
         (self.len - self.start) as usize
@@ -201,6 +214,29 @@ impl List {
         tail.push(x);
         self.tail = Arc::new(tail);
         self.len += 1;
+        copied
+    }
+
+    /// Replaces the element at `i`, which must be in range, sharing every array off the path to
+    /// it; answers what the write copied, as `push` does: nothing when the path was uniquely
+    /// held, and otherwise the tail or one array per level.
+    pub fn set(&mut self, i: usize, v: Value) -> Copied {
+        debug_assert!(i < self.len());
+        let mut copied = None;
+        let index = self.start as usize + i;
+        let tail_offset = self.tail_offset();
+        if index >= tail_offset {
+            if Arc::get_mut(&mut self.tail).is_none() {
+                add(&mut copied, self.tail.len());
+            }
+            Arc::make_mut(&mut self.tail)[index - tail_offset] = v;
+            return copied;
+        }
+        let root = self
+            .root
+            .as_mut()
+            .expect("an index below the tail is in the trie");
+        set_in(root, shift_for(tail_offset), index, v, &mut copied);
         copied
     }
 
