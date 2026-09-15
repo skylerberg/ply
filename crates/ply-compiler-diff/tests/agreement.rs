@@ -208,7 +208,7 @@ fn the_ply_parser_agrees_with_ply_syntax_on_the_reference_own_test_inputs() {
         .collect();
     let tally = check_all(&inputs);
     assert_eq!(tally.inputs, inputs.len());
-    tally.report("mined from crates/ply-syntax/src/tests.rs");
+    tally.report("mined from crates/ply-syntax-tests/tests/unit/parser.rs");
 }
 
 // --- what the comparison does not reach ------------------------------------

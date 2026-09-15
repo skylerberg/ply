@@ -652,7 +652,7 @@ out to be **0.15% error paths** as the thing not to repeat. Here:
 That is a 21x improvement on the lexer spike's ratio and it is still the weaker
 half of the corpus by volume. It is deliberate: `fixtures/reference-tests.corpus`
 is **every one of the 716 distinct string literals in
-`crates/ply-syntax/src/tests.rs`**, extracted mechanically by
+`crates/ply-syntax-tests/tests/unit/parser.rs`**, extracted mechanically by
 `mine-fixtures.py` with no filter, because a filter is a place to quietly drop
 the fixture that would have gone red. Some of those 716 are expected-output
 strings rather than inputs; they are kept, counted, and not distinguished, and

@@ -528,7 +528,7 @@ both covered by `.gitignore`.
   arms its comment-stripping repair.
 - The comparison is against `ply_syntax::parse_unexpanded`, a `#[doc(hidden)]`
   entry point added to a shipping crate for this spike. That is the single real
-  cost of the decision and `crates/ply-syntax/src/tests.rs`'s
+  cost of the decision and `crates/ply-syntax-tests/tests/unit/parser.rs`'s
   `parse_unexpanded_is_reached_by_no_shipping_caller` is what keeps it to one
   caller; it was watched to fail by naming the function in `ply-eval`.
 - **In CI**: `parser-spike`, required through the `ci` job's `needs:`. Local

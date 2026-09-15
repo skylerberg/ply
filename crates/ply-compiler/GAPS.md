@@ -1163,7 +1163,7 @@ first item of work this phase hands on.
 corpus contains **zero** named arguments and **zero** default parameters — every
 call parsed to `named.len() == 0` and every `Param.default` to `None`. So the
 blindness is currently free, and it will not stay free: re-mining
-`crates/ply-syntax/src/tests.rs` with this spike's own `mine-fixtures.py` yields
+`crates/ply-syntax-tests/tests/unit/parser.rs` with this spike's own `mine-fixtures.py` yields
 **889 fixtures against the checked-in 716** (33,826 bytes against 22,737), and
 **2 of the 173 new ones carry 6 `NamedArg` nodes and 2 carry 3 `Param.default`s**
 — including `tests.rs`'s own `f(x, m: 1)`. The corpus is frozen at the moment
@@ -1225,7 +1225,7 @@ English sentence (§11R.N) is not a boundary; it is a coin.
 covers 144 `.rs` and all eight `crates/ply-std/ply/*.ply`, which is what it
 claims. But nothing anywhere checks that
 `fixtures/reference-tests.corpus` is current with respect to
-`crates/ply-syntax/src/tests.rs`, which `mine-fixtures.py` generates it from.
+`crates/ply-syntax-tests/tests/unit/parser.rs`, which `mine-fixtures.py` generates it from.
 `agreement.rs` asserts only `fixtures.len() > 700`. It is 716; re-mining today
 gives 889 (§11R.N). **The corpus is a checked-in artifact of a generator with no
 freshness gate, in a spike with no CI job** — the same class as the binary this
@@ -1318,7 +1318,7 @@ read into a binding and never pushed to the output is green here, and
 
 #### Two things found by running the generator, neither of them the parser
 
-**`mine-fixtures.py` requires every string literal in `crates/ply-syntax/src/tests.rs`
+**`mine-fixtures.py` requires every string literal in `crates/ply-syntax-tests/tests/unit/parser.rs`
 to be printable ASCII, and nothing said so until one was not.** Adding
 `parse_unexpanded_is_reached_by_no_shipping_caller` with an em dash in its
 assertion message stopped the corpus generator with a bare `AssertionError`
