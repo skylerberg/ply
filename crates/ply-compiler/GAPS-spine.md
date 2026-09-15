@@ -36,7 +36,7 @@ the 102 extra functions decompose exactly:
 | `P` constructors `at_pos` .. `fresh_item` | 8 | no record update, and the field-order tax (§S5) |
 | diagnostic-code functions `unexpected` .. `unknown_deriver` | 6 | no constants; Rust has `ply_span::codes` |
 | `max_depth` | 1 | a `const` in Rust |
-| the dump encoder `num` .. `hex` | 16 | **no counterpart on the reference side** — `crates/ply-syntax/src/tests.rs:1038 dump_module` is `#[cfg(test)]` and prints no spans, so the Ply side has to carry its own |
+| the dump encoder `num` .. `hex` | 16 | **no counterpart on the reference side** — `crates/ply-syntax-tests/tests/unit/parser.rs`'s `dump_module` is test-only and prints no spans, so the Ply side has to carry its own |
 | `Span`/`Ident`/`QName` helpers | 7 | Rust has them in `ply_span` and `ast.rs` |
 | the rest (`tok_index`, `bump`, `is_ident`, `is_str`, `diag1/2`, `eof_token`, `hex1/2`, …) | ~15 | §S1, §S4, §S9 |
 

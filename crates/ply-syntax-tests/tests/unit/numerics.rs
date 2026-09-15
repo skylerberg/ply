@@ -1,9 +1,9 @@
 //! Lexing and parsing the two numeric literals W2 adds.
 
-use crate::ast::{Expr, ExprKind, Lit, Pattern, PatternKind, render_float};
-use crate::lexer::{TokenKind, lex, render_decimal};
-use crate::parser::{parse, parse_expr};
 use ply_span::SourceId;
+use ply_syntax::ast::{Expr, ExprKind, Lit, Pattern, PatternKind, render_float};
+use ply_syntax::lexer::{TokenKind, lex, render_decimal};
+use ply_syntax::parser::{parse, parse_expr};
 
 const SRC: SourceId = SourceId(0);
 
@@ -148,7 +148,7 @@ fn literals_parse_into_the_expression_and_the_pattern_grammar() {
     )
     .expect("parses");
     let arms = match &module.items[0] {
-        crate::ast::Item::Fn(def) => match &def.body.kind {
+        ply_syntax::ast::Item::Fn(def) => match &def.body.kind {
             ExprKind::Match { arms, .. } => arms.clone(),
             other => panic!("expected a match: {other:?}"),
         },
@@ -173,7 +173,7 @@ fn a_negative_decimal_pattern_is_one_literal() {
     )
     .expect("parses");
     let arms = match &module.items[0] {
-        crate::ast::Item::Fn(def) => match &def.body.kind {
+        ply_syntax::ast::Item::Fn(def) => match &def.body.kind {
             ExprKind::Match { arms, .. } => arms.clone(),
             other => panic!("expected a match: {other:?}"),
         },

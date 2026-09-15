@@ -1,9 +1,9 @@
 //! The dumper at the bottom exists so a test asserts the *whole* shape of a parse rather than
 //! poking at one field; a wrong nesting anywhere shows up as a string diff.
 
-use crate::ast::*;
-use crate::parser::{parse, parse_program, parse_recovering};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+use ply_syntax::ast::*;
+use ply_syntax::parser::{parse, parse_program, parse_recovering};
 use std::path::Path;
 
 const SRC: SourceId = SourceId(0);
@@ -481,7 +481,7 @@ fn a_clause_may_bind_its_continuation() {
 /// `resume` is a keyword only between a clause's `)` and its `->`.
 #[test]
 fn resume_is_contextual_and_stays_an_ordinary_identifier_elsewhere() {
-    assert!(crate::lexer::is_ident("resume"));
+    assert!(ply_syntax::lexer::is_ident("resume"));
     assert_eq!(expr("resume(1)"), "(call resume 1)");
     assert_eq!(
         expr("handle f() with { st.get() -> resume }"),
@@ -1703,7 +1703,7 @@ fn a_qualified_name_never_collides_with_one_a_module_could_declare() {
     // `.` cannot be lexed inside an identifier, so no source-writable name can equal a qualified
     // one.
     let qualified = ModuleName::from_dotted("store.orders").qualify(&Symbol::new("place"));
-    assert!(!crate::lexer::is_ident(qualified.as_str()));
+    assert!(!ply_syntax::lexer::is_ident(qualified.as_str()));
 }
 
 #[test]
@@ -1744,7 +1744,7 @@ fn pub_does_not_stop_error_recovery_from_finding_the_next_item() {
 
 #[test]
 fn a_double_colon_lexes_as_one_token_rather_than_two_colons() {
-    use crate::lexer::{TokenKind, lex};
+    use ply_syntax::lexer::{TokenKind, lex};
     let (tokens, diags) = lex(SRC, "a::b : c");
     assert!(diags.is_empty());
     let kinds: Vec<_> = tokens.iter().map(|t| t.kind.clone()).collect();
@@ -2912,7 +2912,7 @@ fn a_module_that_imports_ok_or_err_unqualified_refuses_every_try() {
     let lib = "pub type Weird<a, e> = Err(e) | Fine(a)\n";
     for name in ["Ok", "Err", "Some", "None"] {
         let app = format!("import lib ({name})\n{PRE}fn f(n: Int) -> Result<Int, E> = Ok(g(n)?)");
-        let diags = crate::parse_program(vec![
+        let diags = ply_syntax::parse_program(vec![
             (SRC, ModuleName::from_dotted("lib"), lib),
             (SourceId(1), ModuleName::from_dotted("app"), app.as_str()),
         ])
@@ -2925,7 +2925,7 @@ fn a_module_that_imports_ok_or_err_unqualified_refuses_every_try() {
     }
     // The module binder alone captures nothing: `lib::Err` is qualified.
     let app = format!("import lib\n{PRE}fn f(n: Int) -> Result<Int, E> = Ok(g(n)?)");
-    crate::parse_program(vec![
+    ply_syntax::parse_program(vec![
         (SRC, ModuleName::from_dotted("lib"), lib),
         (SourceId(1), ModuleName::from_dotted("app"), app.as_str()),
     ])
@@ -3175,7 +3175,7 @@ law \"l\" forall (n: Int) { g(n)? == n }
 /// `parse_expr` has no `fn` around it and so no written return type.
 #[test]
 fn parse_expr_refuses_a_try_rather_than_leaking_one() {
-    let d = crate::parser::parse_expr(SRC, "g(1)?")
+    let d = ply_syntax::parser::parse_expr(SRC, "g(1)?")
         .expect_err("a bare expression has no return type to read a mode off");
     assert!(d.iter().any(|d| d.code == codes::TRY_SCOPE), "{d:#?}");
 }
@@ -3305,7 +3305,7 @@ law \"c\" forall (l: L) where g({..l, a: 1}).a == 1 { g({..l, b: 2}).b == 2 }
 /// `parse_expr` has no module around it and so no shape to resolve.
 #[test]
 fn parse_expr_refuses_a_record_update_rather_than_leaking_one() {
-    let d = crate::parser::parse_expr(SRC, "{..s, a: 1}")
+    let d = ply_syntax::parser::parse_expr(SRC, "{..s, a: 1}")
         .expect_err("a bare expression has no shape for the base");
     assert!(
         d.iter().any(|d| d.code == codes::RECORD_UPDATE_SHAPE),
@@ -3457,7 +3457,7 @@ fn the_brace_disambiguation_is_unchanged() {
 /// was never matched against a call.
 fn has_named_argument(m: &Module) -> bool {
     fn e(x: &Expr) -> bool {
-        crate::effect_set::grow(|| match &x.kind {
+        ply_syntax::effect_set::grow(|| match &x.kind {
             ExprKind::App { func, args, named } => {
                 !named.is_empty() || e(func) || args.iter().any(e)
             }
@@ -3556,7 +3556,7 @@ test \"t\" { assert_eq(a(), \"helloada!\") }
             saw_the_syntax = true;
         }
         let mut program = Program::single(module);
-        let Ok(_) = crate::resolve(&mut program) else {
+        let Ok(_) = ply_syntax::resolve(&mut program) else {
             continue;
         };
         for module in &program.modules {
@@ -3586,7 +3586,7 @@ fn an_omitted_argument_is_filled_with_the_default() {
     )
     .expect("it parses");
     let mut program = Program::single(module);
-    crate::resolve(&mut program).expect("it resolves");
+    ply_syntax::resolve(&mut program).expect("it resolves");
     let items = &program.modules[0].items;
     let Item::Fn(a) = &items[1] else {
         panic!("expected `a`")
@@ -3617,7 +3617,7 @@ fn parse_unexpanded_is_reached_by_no_shipping_caller() {
     let allowed = [
         crates.join("ply-syntax/src/parser.rs"),
         crates.join("ply-syntax/src/lib.rs"),
-        crates.join("ply-syntax/src/tests.rs"),
+        crates.join("ply-syntax-tests/tests/unit/parser.rs"),
         crates.join("ply-compiler-diff/src/lib.rs"),
     ];
 
@@ -3750,15 +3750,16 @@ fn printing_a_module_reads_back_to_the_same_tree() {
     assert!(files.len() > 10, "the corpora moved");
     for path in files {
         let text = std::fs::read_to_string(&path).unwrap();
-        let (before, diags) = crate::parser::parse_unexpanded(SRC, ModuleName::anonymous(), &text);
+        let (before, diags) =
+            ply_syntax::parser::parse_unexpanded(SRC, ModuleName::anonymous(), &text);
         assert!(
             diags.is_empty(),
             "{}: does not parse:\n{diags:#?}",
             path.display()
         );
-        let printed = crate::print::module(&before);
+        let printed = ply_syntax::print::module(&before);
         let (after, diags) =
-            crate::parser::parse_unexpanded(SRC, ModuleName::anonymous(), &printed);
+            ply_syntax::parser::parse_unexpanded(SRC, ModuleName::anonymous(), &printed);
         assert!(
             diags.is_empty(),
             "{}: the printed module does not parse:\n{diags:#?}\n---\n{printed}",
@@ -3771,7 +3772,7 @@ fn printing_a_module_reads_back_to_the_same_tree() {
             path.display()
         );
         assert_eq!(
-            crate::print::module(&after),
+            ply_syntax::print::module(&after),
             printed,
             "{}: printing is not a fixpoint",
             path.display()
