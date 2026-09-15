@@ -24,7 +24,7 @@ crate="$(cd "$here/.." && pwd)"
 root="$(cd "$crate/../.." && pwd)"
 
 
-echo "==> building target/release/ply (the harness shells out to it)"
+echo "==> building target/release/ply (the parser's own tests in Ply run through it)"
 cargo build --manifest-path "$root/Cargo.toml" --release -p ply-cli --bin ply
 
 echo
@@ -66,7 +66,7 @@ echo "==> the differential: this parser against crates/ply-syntax"
 # comparison that never ran, and this is the only place in CI the comparison
 # runs at all. `pipefail` is set above, so `cargo test`'s own failure still
 # fails the script; this catches the case where it succeeds vacuously.
-PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test agreement -- --nocapture --test-threads=2 |
+cargo test -p ply-compiler-diff --test agreement -- --nocapture --test-threads=2 |
   tee /tmp/ply-parser-agreement.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-agreement.log || {
   echo "the differential ran no tests at all -- see the note above this check" >&2
@@ -75,7 +75,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-agreement.log ||
 
 echo
 echo "==> the second differential: resolve.ply against crates/ply-syntax's resolve"
-PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test resolve -- --nocapture --test-threads=2 |
+cargo test -p ply-compiler-diff --test resolve -- --nocapture --test-threads=2 |
   tee /tmp/ply-parser-resolve.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-resolve.log || {
   echo "the resolve differential ran no tests at all -- see the note above" >&2
@@ -84,7 +84,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-resolve.log || {
 
 echo
 echo "==> the third differential: rewrite.ply against crates/ply-syntax's three rewrites"
-PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test rewrite -- --nocapture --test-threads=2 |
+cargo test -p ply-compiler-diff --test rewrite -- --nocapture --test-threads=2 |
   tee /tmp/ply-parser-rewrite.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-rewrite.log || {
   echo "the rewrite differential ran no tests at all -- see the note above" >&2
@@ -93,7 +93,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-rewrite.log || {
 
 echo
 echo "==> the fourth differential: infer.ply against crates/ply-core's checker"
-PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test infer -- --nocapture --test-threads=2 |
+cargo test -p ply-compiler-diff --test infer -- --nocapture --test-threads=2 |
   tee /tmp/ply-parser-infer.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-infer.log || {
   echo "the checker differential ran no tests at all -- see the note above" >&2
@@ -102,7 +102,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-infer.log || {
 
 echo
 echo "==> the fifth differential: derive.ply against crates/ply-derive"
-PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test derive -- --nocapture --test-threads=2 |
+cargo test -p ply-compiler-diff --test derive -- --nocapture --test-threads=2 |
   tee /tmp/ply-parser-derive.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-derive.log || {
   echo "the derive differential ran no tests at all -- see the note above" >&2
@@ -111,7 +111,7 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-derive.log || {
 
 echo
 echo "==> the sixth differential: hash.ply against crates/ply-hash"
-PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test hash -- --nocapture --test-threads=2 |
+cargo test -p ply-compiler-diff --test hash -- --nocapture --test-threads=2 |
   tee /tmp/ply-parser-hash.log
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-hash.log || {
   echo "the hash differential ran no tests at all -- see the note above" >&2
@@ -123,7 +123,7 @@ echo "==> the seventh differential: code.ply's lowering against ply_eval::code"
 # The first comparison for a stage *after* the front end. It compares only what the port claims to
 # lower -- `lower` answers `None` for a node kind it has not reached -- and asserts the share it
 # reaches, so a port that quietly lowered nothing would fail rather than agree with itself.
-PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test lower_diff -- --nocapture --test-threads=2 |
+PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" cargo test -p ply-compiler-diff --test lower_diff -- --nocapture --test-threads=2 |
   grep -E "input\(s\)|reaches|^test result|^error|panicked" || true
 
 echo
@@ -141,7 +141,7 @@ cargo test -p ply-compiler-diff --test effects -- --nocapture
 echo
 echo "==> the eighth differential: emit.ply's C against crates/ply-codegen's,"
 echo "    on shapes chosen per node and then on the shipped corpus"
-PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" PLY_BIN="$root/target/release/ply" cargo test -p ply-compiler-diff --test emit_diff -- --nocapture --test-threads=1 |
+PLY_C_EMITTER="ply:$root/crates/ply-compiler/ply" cargo test -p ply-compiler-diff --test emit_diff -- --nocapture --test-threads=1 |
   tee /tmp/ply-parser-emit.log | grep -E "agreeing|^test result|^error|panicked"
 grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-emit.log || {
   echo "the emitter differential is red or ran nothing -- see the log above" >&2
@@ -152,5 +152,5 @@ grep -Eq 'test result: ok\. [1-9][0-9]* passed' /tmp/ply-parser-emit.log || {
 if [ "${1:-}" = "--arm" ]; then
   echo
   echo "==> arming it: twenty-two corruptions of the Ply parser, each seen to go red"
-  PLY_BIN="$root/target/release/ply" "$here/arm-harness.sh"
+  "$here/arm-harness.sh"
 fi
