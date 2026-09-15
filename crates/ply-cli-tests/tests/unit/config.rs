@@ -1,8 +1,11 @@
-use super::*;
-use crate::cli::{Cli, Command};
 use clap::Parser;
+use ply_cli::cli::{Cli, Command};
+use ply_cli::config::*;
 use ply_eval::Value;
-use ply_span::SourceId;
+use ply_host::config::{Key, Shape, Snapshot, Sources, Spec};
+use ply_span::{SourceId, Symbol, codes};
+use std::path::PathBuf;
+use std::sync::Arc;
 
 // --- the command line -------------------------------------------------------
 

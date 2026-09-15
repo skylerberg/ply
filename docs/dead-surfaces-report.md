@@ -493,9 +493,9 @@ $ grep -rn 'causal_slice"\].is_null\|assertion"\].is_null\|observed"\].is_null\|
 crates/ply-cli-tests/tests/suite/cli.rs:1643:    assert!(f["footprint"]["observed"].is_null());
 crates/ply-cli-tests/tests/suite/cli.rs:1644:    assert!(f["assertion"].is_null());
 crates/ply-cli-tests/tests/suite/cli.rs:1645:    assert!(f["causal_slice"].is_null());
-crates/ply-cli/src/commands/test.rs:2008:            f["assertion"].is_null(),        # "the evaluator carries no payload yet"
-crates/ply-cli/src/commands/test.rs:2017:        assert!(f["causal_slice"].is_null(), "nothing traced this run");
-crates/ply-cli/src/commands/test.rs:2020:            f["footprint"]["observed"].is_null(),
+crates/ply-cli-tests/tests/unit/commands/test.rs:540:        f["assertion"].is_null(),        # "the evaluator carries no payload yet"
+crates/ply-cli-tests/tests/unit/commands/test.rs:547:    assert!(f["causal_slice"].is_null(), "nothing traced this run");
+crates/ply-cli-tests/tests/unit/commands/test.rs:550:        f["footprint"]["observed"].is_null(),
 crates/ply-test/src/tests.rs:1835:    assert!(failure.attribution.slice.is_none());
 crates/ply-test/src/tests.rs:2010:    assert!(failure["causal_slice"].is_null());
 crates/ply-test/src/tests.rs:2011:    assert!(failure["assertion"].is_null());
@@ -974,7 +974,7 @@ values live in the evaluator, at the point the assertion failed.
 | set the field | `crates/ply-test/src/lib.rs:1530` | one line, last |
 
 **Tests that go red:** three — `crates/ply-cli-tests/tests/suite/cli.rs:1644`,
-`crates/ply-cli/src/commands/test.rs:2008` (whose message *"the evaluator carries
+`crates/ply-cli-tests/tests/unit/commands/test.rs:540` (whose message *"the evaluator carries
 no payload yet"* is a direct statement of this gap), and
 `crates/ply-test/src/tests.rs:2011`.
 
