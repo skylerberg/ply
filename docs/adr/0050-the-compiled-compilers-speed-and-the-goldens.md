@@ -103,18 +103,29 @@ the oracle is gone. The dumps it produces today are the specification the
 Ply compiler is held to; they should be in the tree as files before that
 day, with the harness able to read them.
 
-**Built when.** Beside each mined bundle sits a golden file with one dump
-per record, in the record order, written by the harness from the
-reference. For the whole-file corpora the goldens live under the harness's
-`fixtures/goldens/`, one per input per phase. `PLY_DIFF_BLESS=1` rewrites
-the goldens from the reference; without it, each differential asserts the
-port against the golden **and** the reference against the golden, so a
-golden that drifts from either is red, and the port-against-golden half is
-what survives the reference. `first_difference` reports where, as now. The
-arming scripts run the port-against-golden tests. The size of the goldens
-is measured before they are committed and the record says what it was;
-a phase whose goldens are too large to review is stored as the digest of
-each dump beside the dump's first line, and the record says which phases.
+**Built.** `ply_compiler_diff::golden::check` holds every comparison to a
+file under the harness's `fixtures/goldens/<phase>/`: a bundle's records
+share one file, one record per `%%% <i>` line, and every whole-file input
+has a file of its own. `PLY_DIFF_BLESS=1` writes the goldens from the
+reference, and `.github/workflows/bless.yml` does that on a runner for a
+named branch and hands them back as an artifact, since the reference is
+what CI runs. Without it, each differential asserts the reference against
+the golden **and** the port against the golden, so a golden that drifts
+from either is red, and the port-against-golden half is what survives the
+reference; each phase's own first-difference report says where. The
+arming scripts run the same tests, so a mutant is caught against the
+golden. The emit and lower differentials are not held to goldens: the
+bootstrap bundle is theirs.
+
+Measured on the first bless, 2026-09-15: the goldens as text weighed 50 MB,
+of which the resolver's were 27 MB and the hasher's 11 MB, because each of
+those dumps the standard library again for every example. Those two phases
+keep the digest of each dump over its first record instead
+(`golden::DIGESTED`), and a mismatch there is read against the reference's
+dump while there is one. The rest is text, 13 MB in all: the parser's,
+the rewrites', the checker's and the lexer's between two and four
+megabytes each, the deriver's and the published-interface round trip's
+under a quarter of one.
 
 ## 3. The instruments stay honest
 
