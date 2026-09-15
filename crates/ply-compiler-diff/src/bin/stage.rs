@@ -83,7 +83,8 @@ fn main() {
         ));
     }
     let out = dir.join("bootstrap");
-    ply_codegen::c::bundle::write(&out, &text, &record, &source.ctors(), &identity)
+    let load = ply_codegen::c::bundle::Load::of(source, &record.taken);
+    ply_codegen::c::bundle::write(&out, &text, &record, &source.ctors(), &load, &identity)
         .unwrap_or_else(|e| fail(&format!("{}: {e:#}", out.display())));
     println!("{} staged as {identity}", out.display());
 }

@@ -5,6 +5,7 @@
 //! is taken, so a set that compiles cannot call out of itself.
 
 use super::Refused;
+use super::bundle::Load;
 use super::emit::{Emit, Unit, mangle};
 use super::load::{Library, compile_and_load};
 use super::{HELPERS, PRELUDE, helper_addresses, runtime_decls};
@@ -14,7 +15,7 @@ use crate::rt::{Ctx, Tables};
 use crate::source::Source;
 use anyhow::{Result, bail};
 use ply_eval::code::lower_fn;
-use ply_span::Symbol;
+use ply_span::{SourceId, Symbol};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -320,7 +321,7 @@ fn produce_in(
     }
     // For its effect on the code table, whose rows are recorded just below: `finish` reads the
     // same slots back out of the table this completes.
-    let _ = constants_of(loaded, &mut unit);
+    let _ = constants_of(&Load::of(loaded, &taken).constants, &mut unit);
     // Everything about the unit that is not the object: what a worker would otherwise emit
     // twenty-nine megabytes of C to rediscover. Recording it here, and building this run's
     // `Native` out of it, keeps the cached door honest -- the two doors are one path, so a unit
@@ -345,9 +346,9 @@ fn produce_in(
     })
 }
 
-/// A unit produced elsewhere -- the bootstrap bundle's, or an artifact's -- compiled and finished
-/// against `loaded`, with the constructor table it was emitted against rather than the program's
-/// own, so the tags baked into its C still name its shapes.
+/// A unit produced elsewhere -- an artifact's -- compiled and finished against `loaded`, with the
+/// constructor table it was emitted against rather than the program's own, so the tags baked into
+/// its C still name its shapes.
 pub fn load_unit(
     loaded: &'static Source,
     text: &str,
@@ -355,17 +356,35 @@ pub fn load_unit(
     ctors: Vec<(Symbol, usize)>,
     stem: &str,
 ) -> Result<(Native, Vec<Refused>)> {
-    let refused = record
+    let refused = refused_of(&record);
+    let lib = compile_and_load(text, stem)?;
+    let native = finish(loaded, lib, record, ctors)?;
+    Ok((native, refused))
+}
+
+/// The same from a bundle, whose load record answers what `finish` would have read from a source.
+pub(super) fn load_unit_with(
+    text: &str,
+    record: super::cache::UnitCache,
+    ctors: Vec<(Symbol, usize)>,
+    load: &Load,
+    stem: &str,
+) -> Result<(Native, Vec<Refused>)> {
+    let refused = refused_of(&record);
+    let lib = compile_and_load(text, stem)?;
+    let native = finish_loaded(lib, record, ctors, load)?;
+    Ok((native, refused))
+}
+
+fn refused_of(record: &super::cache::UnitCache) -> Vec<Refused> {
+    record
         .refusals
         .iter()
         .map(|(function, construct)| Refused {
             function: function.clone(),
             construct: construct.clone(),
         })
-        .collect();
-    let lib = compile_and_load(text, stem)?;
-    let native = finish(loaded, lib, record, ctors)?;
-    Ok((native, refused))
+        .collect()
 }
 
 pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Refused>)> {
@@ -399,14 +418,7 @@ pub fn build(loaded: &'static Source, names: &[&str]) -> Result<(Native, Vec<Ref
         && let Some(cached) = super::cache::read_unit(k)
         && let Some(lib) = super::load::open_by_key(&cached.object)
     {
-        let refused: Vec<Refused> = cached
-            .refusals
-            .iter()
-            .map(|(function, construct)| Refused {
-                function: function.clone(),
-                construct: construct.clone(),
-            })
-            .collect();
+        let refused = refused_of(&cached);
         if let Ok(native) = finish(loaded, lib, cached, ctors.clone()) {
             super::cache::UNITS_REUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if std::env::var("PLY_C_PHASES").is_ok() {
@@ -471,7 +483,7 @@ pub fn emit_unit_record(
         taken,
         refusals,
     } = emit_all(loaded, &offered, &fragment, &ctors, &ctors_digest, inlining)?;
-    let _ = constants_of(loaded, &mut unit);
+    let _ = constants_of(&Load::of(loaded, &taken).constants, &mut unit);
     let record = super::cache::UnitCache {
         object: super::load::object_key(&text),
         taken,
@@ -494,6 +506,30 @@ pub(super) fn finish(
     cached: super::cache::UnitCache,
     ctors: Vec<(Symbol, usize)>,
 ) -> Result<Native> {
+    let load = Load::of(loaded, &cached.taken);
+    let sources = loaded.program.modules.iter().map(|m| m.source).collect();
+    finish_with(lib, cached, ctors, &load, sources)
+}
+
+/// The same from a bundle's load record, with no source read: the modules are `SourceId(0..n)`,
+/// which is what the bootstrap assigns them.
+pub(super) fn finish_loaded(
+    lib: Library,
+    cached: super::cache::UnitCache,
+    ctors: Vec<(Symbol, usize)>,
+    load: &Load,
+) -> Result<Native> {
+    let sources = (0..load.modules).map(|i| SourceId(i as u32)).collect();
+    finish_with(lib, cached, ctors, load, sources)
+}
+
+fn finish_with(
+    lib: Library,
+    cached: super::cache::UnitCache,
+    ctors: Vec<(Symbol, usize)>,
+    load: &Load,
+    sources: Vec<SourceId>,
+) -> Result<Native> {
     bind(&lib)?;
     let mut unit = Unit::new(ctors.clone(), cached.taken);
     unit.consts = cached.consts;
@@ -509,7 +545,7 @@ pub(super) fn finish(
     }
     // Before the addresses, because it can add a row: a root nothing calls still needs a slot for
     // the seam to remember it in, and the slot is a row of the same table.
-    let constants = constants_of(loaded, &mut unit);
+    let constants = constants_of(&load.constants, &mut unit);
     let mut functions = Vec::with_capacity(unit.lambdas.len());
     for symbol in &unit.lambdas {
         let Some(p) = lib.symbol(symbol) else {
@@ -517,12 +553,8 @@ pub(super) fn finish(
         };
         functions.push(p as usize);
     }
-    let taken = unit.functions.clone();
     let mut entries = HashMap::new();
-    for name in &taken {
-        let Some((def, _)) = loaded.definition(name) else {
-            continue;
-        };
+    for (name, arity) in &load.arities {
         let symbol = format!("{}_entry", mangle(name));
         let Some(p) = lib.symbol(&symbol) else {
             bail!("the unit the C tier built has no `{symbol}`");
@@ -531,13 +563,13 @@ pub(super) fn finish(
             name.clone(),
             (
                 unsafe { std::mem::transmute::<*mut std::ffi::c_void, Entry>(p) },
-                def.params.len(),
+                *arity,
             ),
         );
     }
     let mut tables = tables_of(unit, &ctors);
     tables.functions = functions;
-    tables.sources = loaded.program.modules.iter().map(|m| m.source).collect();
+    tables.sources = sources;
     Ok(Native {
         lib,
         entries,
@@ -558,19 +590,16 @@ pub(super) fn finish(
 /// The emitter's own test is narrower -- it also asks that the answer be a handle, since a root
 /// that answers a register is cheaper to call than to look up. A root listed here and not emitted
 /// against simply keeps a slot only the seam uses, which is what the in-process tier does too.
-fn constants_of(loaded: &'static Source, unit: &mut Unit) -> HashMap<String, usize> {
-    let mut constants = HashMap::new();
-    for name in &unit.functions.clone() {
-        if loaded
-            .definition(name)
-            .is_some_and(|(d, _)| d.params.is_empty())
-            && ply_eval::memo::pure_by_published_row(Some(loaded.check), &Symbol::new(name))
-        {
-            let slot = unit.lambda(&format!("{}_entry", mangle(name)));
-            constants.insert(name.clone(), slot);
-        }
-    }
+///
+/// Which roots are constants is [`Load::of`]'s answer, so that a bundle can carry it.
+fn constants_of(constants: &[String], unit: &mut Unit) -> HashMap<String, usize> {
     constants
+        .iter()
+        .map(|name| {
+            let slot = unit.lambda(&format!("{}_entry", mangle(name)));
+            (name.clone(), slot)
+        })
+        .collect()
 }
 
 /// PROBE: where the emit's time goes, in microseconds.
