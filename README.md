@@ -34,9 +34,10 @@ refining when the paradigm is what needed changing.
 
 Two numbers here are *armed* rather than asserted, and they are the exception
 that shows the rule: `w6_report_integrity::the_shipped_ladder_still_describes_the_tree_it_ships_in`
-and `w6_report_allocations::the_readme_still_describes_this_request_path` fail
-when this file stops describing the tree. A number worth keeping in prose is one
-a test will notice going stale.
+fails when this file stops describing the tree, and the request-path sentence
+below is rendered from `benches/w6-alloc.json` by the tool that measures it,
+with `w6_report_allocations` holding the file to the tree and the sentence to
+the file. A number worth keeping in prose is one a test will notice going stale.
 
 ## The loop
 
@@ -328,8 +329,7 @@ more per run than entering saves. [ADR 0026](docs/adr/0026-a-reachable-backend.m
 and [ADR 0030](docs/adr/0030-compiled-code-on-the-front-end.md) carry the series
 and the conditions; do not re-derive the ratios here, and do not read a loss on
 one workload as a bound on the idea.
-**The request-path allocation count is large.** One `/health` request makes
-**342 allocations and 43,100 bytes** to produce a 107-byte response.
+**The request-path allocation count is large.** One `/health` request makes **342 allocations and 43,100 bytes** to produce a 107-byte response.
 
 **The profile has a −7.8% residue.** The layer table above sums to 638.96µs
 against a measured total of 592.64µs, because six of the rungs are taken in
