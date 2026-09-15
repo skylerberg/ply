@@ -121,7 +121,16 @@ fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_librar
 
 #[test]
 fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library_part_1_of_2() {
+    ply_codegen::c::producer::reset_census();
     the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library(0, 2);
+    // The hasher's cost over this half of the corpus, the standard library counted once per
+    // program as it is hashed once per program (ADR 0051 §2).
+    let lines: usize = std_modules().iter().map(|(_, t)| t.lines().count()).sum();
+    if let Err(report) =
+        ply_compiler_diff::census::hold("hasher-over-std-and-examples-part-1", lines)
+    {
+        panic!("{report}");
+    }
 }
 
 #[test]
