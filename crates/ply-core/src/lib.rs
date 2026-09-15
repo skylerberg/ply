@@ -3,14 +3,9 @@ pub mod env;
 pub mod infer;
 pub mod prelude;
 pub mod print;
-mod scc;
+pub mod scc;
 pub mod ty;
 pub mod unify;
-
-#[cfg(test)]
-mod numerics;
-#[cfg(test)]
-mod tests;
 
 use indexmap::IndexMap;
 use ply_span::{Diagnostic, SourceId, Span, Symbol};

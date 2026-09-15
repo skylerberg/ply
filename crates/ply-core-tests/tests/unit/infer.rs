@@ -1,8 +1,8 @@
 //! The parser lands in a sibling crate on its own schedule, so these build the AST directly.
 
-use crate::infer::check_module;
-use crate::print::print_scheme;
-use crate::{CheckOutput, DefInfo, Footprint, Known, KnownDef};
+use ply_core::infer::check_module;
+use ply_core::print::print_scheme;
+use ply_core::{CheckOutput, DefInfo, Footprint, Known, KnownDef};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::*;
 
@@ -2185,7 +2185,7 @@ fn check_files(files: &[(&str, &str)]) -> CheckOutput {
     let mut program = parse_program(files);
     let resolved = ply_syntax::resolve(&mut program)
         .unwrap_or_else(|d| panic!("expected resolution to succeed: {}", render(&d)));
-    match crate::check_program(&program, &resolved) {
+    match ply_core::check_program(&program, &resolved) {
         Ok(out) => out,
         Err(diags) => panic!("expected success, got: {}", render(&diags)),
     }
@@ -2195,7 +2195,7 @@ fn check_files_err(files: &[(&str, &str)]) -> Vec<Diagnostic> {
     let mut program = parse_program(files);
     match ply_syntax::resolve(&mut program) {
         Err(diags) => diags,
-        Ok(resolved) => match crate::check_program(&program, &resolved) {
+        Ok(resolved) => match ply_core::check_program(&program, &resolved) {
             Ok(_) => panic!("expected failure, but the program checked"),
             Err(diags) => diags,
         },
@@ -2757,7 +2757,7 @@ fn a_region_discharges_nothing_a_user_declared() {
 /// Cells are world state.
 #[test]
 fn a_region_discharges_the_five_simulated_atoms_and_no_cell() {
-    let handled: Vec<String> = crate::prelude::simulated_atoms()
+    let handled: Vec<String> = ply_core::prelude::simulated_atoms()
         .iter()
         .map(|a| a.to_string())
         .collect();
@@ -3354,7 +3354,7 @@ fn a_law_carries_its_binders_its_guard_and_a_pure_footprint() {
     let binders: Vec<String> = law
         .binders
         .iter()
-        .map(|b| format!("{}: {}", b.name, crate::print::print_type(&b.ty)))
+        .map(|b| format!("{}: {}", b.name, ply_core::print::print_type(&b.ty)))
         .collect();
     assert_eq!(binders, ["a: Int", "n: Int"]);
 }
@@ -3374,7 +3374,7 @@ fn a_law_quantifies_over_function_values() {
     let tys: Vec<String> = out.laws[0]
         .binders
         .iter()
-        .map(|b| crate::print::print_type(&b.ty))
+        .map(|b| ply_core::print::print_type(&b.ty))
         .collect();
     assert_eq!(tys, ["(Int) -> Int", "Int"]);
 }
@@ -3383,7 +3383,7 @@ fn a_law_quantifies_over_function_values() {
 fn a_law_binder_may_carry_a_type_variable() {
     let out = check_src("law \"length agrees\" forall (xs: List<a>) { len(xs) == len(xs) }");
     assert_eq!(
-        crate::print::print_type(&out.laws[0].binders[0].ty),
+        ply_core::print::print_type(&out.laws[0].binders[0].ty),
         "List<a>"
     );
 }
@@ -3548,7 +3548,7 @@ fn a_restored_definition_still_has_its_clauses_typed() {
     let src = "fn withdraw(a: Int, n: Int) -> Int requires n > 0 ensures result == a - n = a - n";
     let mut program = parse_program(&[("ledger", src)]);
     let resolved = ply_syntax::resolve(&mut program).expect("resolves");
-    let first = crate::check_program(&program, &resolved).expect("checks");
+    let first = ply_core::check_program(&program, &resolved).expect("checks");
 
     let known = Known {
         defs: first
@@ -3568,7 +3568,7 @@ fn a_restored_definition_still_has_its_clauses_typed() {
         tests: Default::default(),
     };
     let restored =
-        crate::check_program_with(&program, &resolved, &known).expect("checks from interfaces");
+        ply_core::check_program_with(&program, &resolved, &known).expect("checks from interfaces");
     let spec = &def(&restored, "ledger.withdraw").spec;
     assert_eq!(spec.len(), 2);
     assert!(spec.iter().all(|s| s.footprint.is_empty()));
@@ -3578,7 +3578,7 @@ fn a_restored_definition_still_has_its_clauses_typed() {
     let broken = "fn withdraw(a: Int, n: Int) -> Int ensures result == \"x\" = a - n";
     let mut program = parse_program(&[("ledger", broken)]);
     let resolved = ply_syntax::resolve(&mut program).expect("resolves");
-    let diags = crate::check_program_with(&program, &resolved, &known)
+    let diags = ply_core::check_program_with(&program, &resolved, &known)
         .expect_err("a clause comparing Int to String is a mismatch");
     assert!(has_code(&diags, codes::TYPE_MISMATCH), "{}", render(&diags));
 }
@@ -3627,7 +3627,7 @@ fn every_law_and_clause_in_the_example_corpus_is_pure() {
             );
         }
     }
-    let seed = Footprint::from_atoms([crate::prelude::seed_atom()]);
+    let seed = Footprint::from_atoms([ply_core::prelude::seed_atom()]);
     for law in &out.laws {
         // A `law/host` is the one law whose body may carry any row, and it says so in its own
         // declaration.
