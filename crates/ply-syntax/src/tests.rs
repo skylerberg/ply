@@ -3725,3 +3725,56 @@ fn a_keyword_field_cannot_be_punned() {
         );
     }
 }
+
+/// What the printer writes, the parser reads back to the same tree: every surface file in the
+/// tree, through the unexpanded entry, since an expanded tree carries names -- `?0` -- that are
+/// not identifiers. Compared by the dumper, and then as a fixpoint of the printer's own output,
+/// which is what covers the fields the dumper leaves out: a default, a named argument,
+/// `law/host`, an effect set's members, a row's aliases.
+#[test]
+fn printing_a_module_reads_back_to_the_same_tree() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let mut files = Vec::new();
+    for dir in ["examples", "crates/ply-std/ply", "tests/lang"] {
+        let Ok(entries) = std::fs::read_dir(root.join(dir)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().is_some_and(|e| e == "ply") {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    assert!(files.len() > 10, "the corpora moved");
+    for path in files {
+        let text = std::fs::read_to_string(&path).unwrap();
+        let (before, diags) = crate::parser::parse_unexpanded(SRC, ModuleName::anonymous(), &text);
+        assert!(
+            diags.is_empty(),
+            "{}: does not parse:\n{diags:#?}",
+            path.display()
+        );
+        let printed = crate::print::module(&before);
+        let (after, diags) =
+            crate::parser::parse_unexpanded(SRC, ModuleName::anonymous(), &printed);
+        assert!(
+            diags.is_empty(),
+            "{}: the printed module does not parse:\n{diags:#?}\n---\n{printed}",
+            path.display()
+        );
+        assert_eq!(
+            dump_module(&after),
+            dump_module(&before),
+            "{}: the printed module reads back as a different tree:\n---\n{printed}",
+            path.display()
+        );
+        assert_eq!(
+            crate::print::module(&after),
+            printed,
+            "{}: printing is not a fixpoint",
+            path.display()
+        );
+    }
+}

@@ -307,8 +307,8 @@ pub fn build(
 /// Every project file, keyed by its path relative to the project root.
 /// The whole unit over the artifact's definitions, produced by the Ply emitter and embedded so
 /// that `ply run` enters the program as it was built rather than rebuilding what it can from
-/// bodies alone: a `perform` the reference fragment cannot compile runs from an artifact only
-/// this way. A production that fails leaves the artifact without one, and says so.
+/// bodies alone, which costs an emit and a C compile at every run. A production that fails leaves
+/// the artifact without one, and says so.
 fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<Diagnostic>) {
     ply_codegen::c::producer::ensure_default();
     // Definitions only: the closure also names the effect and resource declarations it reaches,
@@ -366,7 +366,7 @@ fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
                     codes::BACKEND_UNAVAILABLE,
                     format!("no compiled unit could be produced for the artifact: {e:#}"),
                 )
-                .note("the artifact runs the pure fragment the reference emitter rebuilds from its bodies; a `perform` in it will not reach the host"),
+                .note("the artifact's bodies are printed back to source and compiled at each run instead"),
             ],
         ),
     }
@@ -378,7 +378,7 @@ fn stale_unit() -> Diagnostic {
         codes::ARTIFACT_VERSION,
         "the artifact's compiled unit was built for another runtime and is left aside",
     )
-    .note("the run enters the pure fragment the reference emitter rebuilds from the artifact's bodies; a `perform` in it will not reach the host")
+    .note("the artifact's bodies are printed back to source and compiled at this run instead")
     .note("rebuild the artifact with this `ply` to carry a unit it can enter")
 }
 
@@ -1067,7 +1067,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
                 if unit.is_some() {
                     "compiled unit embedded"
                 } else {
-                    "no compiled unit: the pure fragment only"
+                    "no compiled unit: compiled from its bodies at each run"
                 }
             ))
         );
@@ -1226,28 +1226,27 @@ fn evaluate(
         configure(&mut machine);
         return machine.call(name, Vec::new(), span);
     }
-    // Without a unit, a decoded artifact is an AST with no source text, so the whole Ply emitter
-    // -- a front end that re-parses source -- cannot produce its bodies; the reference emitter
-    // emits from the AST directly, as it does for a bisection's reconstructed program (ADR 0048).
-    // A `perform` the reference cannot compile declines.
-    ply_codegen::c::producer::reference_only(|| {
-        let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
-        if let Some(spec) = crate::commands::common::backend_spec(backend)? {
-            // No hashes here, so nothing is kept between runs: an artefact is opened once and the
-            // emit is not the cost that matters.
-            let provider = crate::commands::common::build_backend(
-                &spec,
-                &opened.program,
-                &opened.resolved,
-                &opened.check,
-                &Default::default(),
-                Default::default(),
-            )?;
-            machine.set_compiled(provider.attach(&spec));
-        }
-        configure(&mut machine);
-        machine.call(name, Vec::new(), span)
-    })
+    // Without a unit, a decoded artifact is an AST with no source text, and the whole Ply emitter
+    // is a front end that reads text: it is handed the program printed back to source.
+    let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+    if let Some(spec) = crate::commands::common::backend_spec(backend)? {
+        // No hashes here, so nothing is kept between runs: an artefact is opened once and the
+        // emit is not the cost that matters.
+        let texts = ply_syntax::print::program(&opened.program)
+            .into_iter()
+            .collect();
+        let provider = crate::commands::common::build_backend(
+            &spec,
+            &opened.program,
+            &opened.resolved,
+            &opened.check,
+            &Default::default(),
+            texts,
+        )?;
+        machine.set_compiled(provider.attach(&spec));
+    }
+    configure(&mut machine);
+    machine.call(name, Vec::new(), span)
 }
 
 // --- diagnostics -------------------------------------------------------------
