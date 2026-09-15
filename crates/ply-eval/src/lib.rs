@@ -57,9 +57,7 @@ pub use cont::{
     Continuation, Delimiter, Extent, Frame, Handled, Next, Prompt, Segment, SimId, Stack, Target,
 };
 pub use costs::{Cause as CostCause, Costs, DefKind as CostDefKind, Verdict as CostVerdict};
-pub use differential::{
-    Compared, Detail, Divergence, Evaluator, Report, compare_answers, compare_outcomes,
-};
+pub use differential::{Compared, Detail, Divergence, Evaluator, Report, compare_answers};
 pub use escape::{Boundary, Escapee, Handle};
 pub use host::{
     Bound, Determinism, HostAnswer, HostBinding, HostHandler, HostListing, HostOp, HostRegistry,

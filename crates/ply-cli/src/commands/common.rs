@@ -29,8 +29,8 @@ pub fn backend_spec(flag: Option<&String>) -> Result<Option<ply_eval::BackendSpe
 ///
 /// Not part of `Engine`'s variant, and the rule for that is `Provider::variant`'s own: what
 /// belongs there is a knob that changes *which* definitions run natively. This one changes how the
-/// same set is compiled, and the two profiles are required to answer identically -- which is what
-/// `--audit-backend` checks and what a namespaced result cache would hide rather than prove.
+/// same set is compiled, and the two profiles are required to answer identically -- which the
+/// corpus is what checks, and which a namespaced result cache would hide rather than prove.
 pub fn select_profile(flag: &str) -> Result<(), Diagnostic> {
     let Some(profile) = ply_codegen::Profile::parse(flag) else {
         return Err(Diagnostic::error(
