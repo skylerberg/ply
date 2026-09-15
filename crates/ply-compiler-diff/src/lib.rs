@@ -2078,3 +2078,142 @@ pub fn part<T: Clone>(items: &[T], index: usize, of: usize) -> Vec<T> {
         .map(|(_, item)| item.clone())
         .collect()
 }
+
+/// The reference's dump beside every input, as files under `fixtures/goldens/<phase>/`, so that
+/// the day the Rust reference retires the specification the port is held to is already in the
+/// tree (ADR 0050 §2).
+///
+/// With `PLY_DIFF_BLESS` set, [`golden::check`] writes the reference's dump as the golden and
+/// still compares the port against it. Without it, the golden has to exist, the reference has to
+/// agree with it -- a golden that drifts from the reference is red, not silently rewritten -- and
+/// the port has to agree with it. The last of the three is what survives the reference.
+pub mod golden {
+    use std::collections::HashSet;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex;
+
+    pub fn dir() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("fixtures/goldens")
+    }
+
+    pub fn blessing() -> bool {
+        std::env::var_os("PLY_DIFF_BLESS").is_some()
+    }
+
+    /// Where `phase`'s golden for `name` lives, and which record of it: a bundle's records,
+    /// named `<bundle>#<i>`, share one file, `<phase>/<bundle>.dumps`, one record per `%%% <i>`
+    /// line; every other input has `<phase>/<name>.dump` to itself. Characters a file name cannot
+    /// carry portably are written as `_`.
+    pub fn place(phase: &str, name: &str) -> (PathBuf, Option<usize>) {
+        let safe = |s: &str| -> String {
+            s.chars()
+                .map(|c| {
+                    if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+                        c
+                    } else {
+                        '_'
+                    }
+                })
+                .collect()
+        };
+        let base = dir().join(safe(phase));
+        match name.rsplit_once('#') {
+            Some((bundle, index)) if index.bytes().all(|b| b.is_ascii_digit()) => (
+                base.join(format!("{}.dumps", safe(bundle))),
+                Some(index.parse().expect("digits")),
+            ),
+            _ => (base.join(format!("{}.dump", safe(name))), None),
+        }
+    }
+
+    /// Holds `reference` and `port` to the golden, or writes it when blessing. `diff` is the
+    /// phase's own first-difference report, `diff(want, got)`.
+    pub fn check(
+        phase: &str,
+        name: &str,
+        reference: &str,
+        port: &str,
+        diff: impl Fn(&str, &str) -> Option<String>,
+    ) -> Result<(), String> {
+        let (path, index) = place(phase, name);
+        if blessing() {
+            write(&path, index, reference);
+            return match diff(reference, port) {
+                Some(report) => Err(format!(
+                    "the port disagrees with the reference on {name}:\n{report}"
+                )),
+                None => Ok(()),
+            };
+        }
+        let Some(golden) = read(&path, index) else {
+            return Err(format!(
+                "no golden for {name} at {}; run this test with PLY_DIFF_BLESS=1 to write it from the reference",
+                path.display()
+            ));
+        };
+        if let Some(report) = diff(&golden, reference) {
+            return Err(format!(
+                "the reference has drifted from the golden for {name} at {}; bless it deliberately with PLY_DIFF_BLESS=1 if the change is meant:\n{report}",
+                path.display()
+            ));
+        }
+        if let Some(report) = diff(&golden, port) {
+            return Err(format!(
+                "the port disagrees with the golden on {name}:\n{report}"
+            ));
+        }
+        Ok(())
+    }
+
+    fn read(path: &Path, index: Option<usize>) -> Option<String> {
+        let text = std::fs::read_to_string(path).ok()?;
+        let Some(index) = index else {
+            return Some(text);
+        };
+        let mut found: Option<String> = None;
+        for line in text.split_inclusive('\n') {
+            if let Some(n) = line.strip_prefix("%%% ") {
+                if found.is_some() {
+                    break;
+                }
+                if n.trim().parse::<usize>().ok() == Some(index) {
+                    found = Some(String::new());
+                }
+            } else if let Some(f) = found.as_mut() {
+                f.push_str(line);
+            }
+        }
+        found.map(|mut f| {
+            if f.ends_with('\n') {
+                f.pop();
+            }
+            f
+        })
+    }
+
+    /// The first record a bless writes to a bundle's file in this process starts it afresh, and
+    /// the rest append, so a bless is the run's own order and nothing older survives in it.
+    fn write(path: &Path, index: Option<usize>, text: &str) {
+        static STARTED: Mutex<Option<HashSet<PathBuf>>> = Mutex::new(None);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap_or_else(|e| panic!("{}: {e}", parent.display()));
+        }
+        let Some(index) = index else {
+            std::fs::write(path, text).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+            return;
+        };
+        let mut started = STARTED.lock().unwrap();
+        let fresh = started
+            .get_or_insert_with(HashSet::new)
+            .insert(path.to_path_buf());
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(!fresh)
+            .truncate(fresh)
+            .open(path)
+            .unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+        use std::io::Write as _;
+        write!(file, "%%% {index}\n{text}\n").unwrap_or_else(|e| panic!("{}: {e}", path.display()));
+    }
+}
