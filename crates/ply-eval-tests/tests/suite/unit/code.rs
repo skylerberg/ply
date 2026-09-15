@@ -1,4 +1,4 @@
-use crate::build::{
+use crate::unit::build::{
     at, bin, block, callv, discard, fn_def, int, lam, record, spanned, standalone, var,
 };
 use ply_eval::Own;
@@ -51,7 +51,7 @@ fn a_record_keeps_its_fields_in_source_order() {
 #[test]
 fn a_lambda_captures_its_free_variable_into_its_own_window() {
     let e = block(
-        vec![crate::build::letv("n", int(1))],
+        vec![crate::unit::build::letv("n", int(1))],
         Some(lam(&["y"], bin(BinOp::Add, var("y"), var("n")))),
     );
     let lowered = lower(&e);

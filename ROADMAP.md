@@ -8,9 +8,9 @@
 > | gate | where | when it skips | says so? |
 > | --- | --- | --- | --- |
 > | `cluster::available()` | `crates/ply-host-tests/tests/support/cluster.rs:38` | no `initdb`/`postgres` on the machine | yes, on stderr of a passing test |
-> | `PLY_PG_URL` | `crates/ply-host-tests/tests/unit/db/scope/live.rs:75` | the variable is unset — nothing sets it on a stock local checkout, and **CI sets it** | yes, on stderr of a passing test |
+> | `PLY_PG_URL` | `crates/ply-host-tests/tests/suite/unit/db/scope/live.rs:75` | the variable is unset — nothing sets it on a stock local checkout, and **CI sets it** | yes, on stderr of a passing test |
 > | `#![cfg(unix)]` | `crates/ply-cli-tests/tests/suite/w5_shutdown.rs:18` | non-Unix host | **no — the file is not compiled and nothing is printed** |
-> | `PLY_TEST_DB` | `crates/ply-host-tests/tests/unit/db/pool.rs:12` | the variable is unset | **no — nothing is printed at all, on either stream** |
+> | `PLY_TEST_DB` | `crates/ply-host-tests/tests/suite/unit/db/pool.rs:12` | the variable is unset | **no — nothing is printed at all, on either stream** |
 >
 > **This table describes a stock local checkout, not CI.** All five gates are
 > supplied in CI and the first four are *asserted* open — the run fails if any of

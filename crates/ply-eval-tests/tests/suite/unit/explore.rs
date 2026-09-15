@@ -1026,7 +1026,7 @@ fn a_failure_only_the_unpruned_search_reaches_is_reported() {
 /// *named* is greppable.
 #[test]
 fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
-    let body = include_str!("../../../ply-eval/src/explore.rs");
+    let body = include_str!("../../../../ply-eval/src/explore.rs");
     for banned in [
         "HashMap",
         "HashSet",

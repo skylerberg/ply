@@ -1,6 +1,6 @@
 //! Evaluating `Float` and `Decimal`.
 
-use crate::build::*;
+use crate::unit::build::*;
 use ply_eval::{Decimal, values_equal};
 use ply_eval::{Machine, Value};
 use ply_span::{Diagnostic, Span, codes};

@@ -623,7 +623,7 @@ fn a_task_cannot_hold_two_timers() {
 /// *named* is greppable.
 #[test]
 fn this_module_names_no_hash_based_collection_and_reads_no_clock() {
-    let body = include_str!("../../../ply-eval/src/sim.rs");
+    let body = include_str!("../../../../ply-eval/src/sim.rs");
     for banned in [
         "HashMap",
         "HashSet",

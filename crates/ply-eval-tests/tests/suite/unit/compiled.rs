@@ -1,4 +1,4 @@
-use crate::build::*;
+use crate::unit::build::*;
 use ply_core::{CheckOutput, check_program};
 use ply_eval::Value;
 /// Doubles, because nothing in this workspace implements [`Compiled`].
@@ -116,7 +116,7 @@ impl Checked {
 }
 
 /// The same thing from source, because the argument gate is now a question about *declared
-/// types* and `crate::build`'s `fn_def` cannot write one.
+/// types* and `crate::unit::build`'s `fn_def` cannot write one.
 fn checked_source(source: &str) -> Checked {
     let mut program = ply_syntax::parse_program(vec![(
         ply_span::SourceId(0),
@@ -424,7 +424,7 @@ fn an_entered_subtree_is_refused_for_an_effect_two_hops_down_that_it_would_hide(
     );
 }
 
-/// A record `Value` from a list of fields, which no helper in [`crate::build`] answers because
+/// A record `Value` from a list of fields, which no helper in [`crate::unit::build`] answers because
 /// that module builds `Expr`s.
 /// A backend that holds only test roots, and ends every entry the one way it is told to.
 struct Roots {
