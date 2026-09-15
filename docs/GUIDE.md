@@ -1759,11 +1759,9 @@ diagnostic with spans and snippets, the expected/actual pair, the footprint at
 the point of failure, the suspect set, the culprit with its search statistics,
 and the replay command.
 
-### 9.7 Auditing a compiled backend
+### 9.7 Choosing a compiled backend
 
-`--backend` attaches a compiled backend (§17). `--audit-backend` runs each test
-twice — once with it and once without — and fails the run on any disagreement
-(`E0503`). It is off by default because it doubles what a run costs.
+`--backend` attaches a compiled backend (§17).
 
 The flag takes a value. `reference` is a nested machine over the same fragment,
 which is what the seam is checked against rather than a way to go faster.
@@ -1817,11 +1815,8 @@ runs in the memory of one iteration; `PLY_C_PHASES=1` prints what an entry
 allocated, recycled and left live. The unit also holds every law's guard and
 body and every `requires` and `ensures` clause as a root (§11.5), which is
 what `ply prove --backend` enters. A simulated test
-the tier takes is scheduled by the runtime over the same seeded scheduler the
-machine drives, so a seed names one interleaving on either engine; under
-`--audit-backend` every seed the tier ran is run again on the machine alone and
-the two schedules must agree step for step, task, enabled set, choice and
-footprint, or the test fails with `E0503`.
+the tier takes is scheduled by the runtime over the same seeded scheduler, so a
+seed names one interleaving.
 
 A run with a backend attached does use the result cache, in a namespace of its
 own. A stored pass names the engine that earned it, so a backed run selects
@@ -3109,7 +3104,6 @@ is `E0127` with exit code 2 (§6.7).
 | `--trace auto\|always\|never` | record which definitions a failing test entered |
 | `--backend BACKEND` | attach a compiled backend: `reference`, `interp`, `c` or `combined` (§9.7), or `<backend>:wrong:<mutation>` to corrupt it on purpose |
 | `--profile PROFILE` | which toolchain the C tier compiles with: `development` (the default — the fastest compiler on the machine, inlining off) or `release` (`cc -O2`, inlining on). Requires `--backend`; the two profiles are required to answer identically, so this decides what a run costs and not what it means |
-| `--audit-backend` | also run each test without the backend and fail on any disagreement |
 | `--host` | bind the real host handlers |
 | `--std` | also select the tests the shipped modules declare |
 | `--seed`, `--sim`, `--seeds`, `--sim-budget`, `--sim-steps`, `--measure-reduction` | §10.4 |

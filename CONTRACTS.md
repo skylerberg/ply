@@ -250,13 +250,13 @@ impl<'a> Machine<'a> {
     pub fn new(program: &'a Program, resolved: &'a Resolved, check: &'a CheckOutput) -> Self;
 }
 
-// ply-test — three later parameters have been appended; the shipped signature is
-// what is written here. `audit_backend` came with `--audit-backend`, `search`
-// with M7's plan and `hosts` with W1's binding, each of which a caller has to
-// state per run rather than per crate.
+// ply-test — two later parameters have been appended; the shipped signature is
+// what is written here. `search` came with M7's plan and `hosts` with W1's
+// binding, each of which a caller has to state per run rather than per crate.
+// A third, `audit_backend`, went with `--audit-backend` under ADR 0048.
 pub fn run(selection: &Selection, program: &Program, resolved: &Resolved,
            check: &CheckOutput, hashes: &HashOutput, store: &mut Store,
-           audit_backend: bool, search: Search, hosts: Hosting<'_>) -> RunReport;
+           search: Search, hosts: Hosting<'_>) -> RunReport;
 ```
 
 `CheckOutput` gained `modules: IndexMap<Symbol, ModuleInfo>`. `DefInfo`,
@@ -2073,61 +2073,12 @@ world comparison covers them. `Evaluator::observed_footprint` and
 
 ```
 --backend <spec>       attach a compiled backend to the machine
---audit-backend        also run each test without it, and compare
 ```
 
-On `ply test`. `--audit-backend` runs each test twice — once with the backend
-attached and once without — and compares, per test:
-
-- the `Result<(), Diagnostic>` by **full JSON serialization** — code, severity,
-  message, every label with its span, every note. Not "both failed";
-- the observed footprint from the tracer;
-- the final cell state, as the `(Slot, rendered Value)` sequence from
-  `Arena::slots` **and** the two arenas' reclamation, which
-  `differential::compare_outcomes` checks beside the contents.
-
-A mismatch **fails the run** with a diagnostic naming the test and both outcomes,
-and the blame is the backend's: `Machine::compiled_answer` hands it no route back
-into the machine, so a wrong answer is the only thing it can contribute. Never a
-warning: a wrong answer is made sticky by the cache.
-
-Three codes partition a failing run, and confusing any two of them costs
-something specific:
-
-| code | whose fault | what `ply-test` does |
-| --- | --- | --- |
-| `E0501` / `E0502` | the program's — an assertion, `panic`, division by zero, the recursion limit, a value past `MAX_VALUE_DEPTH` | attributes it: suspects, bisection, culprit |
-| `E0503` `ENGINE_DIVERGENCE` | Ply's — a compiled backend and the machine disagree | `Status::Panicked`, `Skipped::Panicked`, no bisection |
-| `E0505` `INTERNAL_ERROR` | Ply's — an evaluator invariant broke | `Status::Panicked`, `Skipped::Panicked`, no bisection |
-
-`Failure::defect` is the observed answer wherever there is one to observe: a run
-that watched the evaluator unwind knows something no diagnostic carries. Reading
-it off `RUNTIME_ERROR` instead is what made a runaway recursion — a documented
-limit, and as bisectable a regression as any assertion — report itself as a
-defect in Ply and switch M5 off for the whole class.
-
-`E0503` is the one exception, and only because there is nothing to observe: the
-divergence is a comparison the audit *made*, handed back as an ordinary `Err`
-rather than as an unwind. Bisecting it would name whichever definition the
-disagreement happened to run through.
-
-`--backend` implies `--no-cache` in both directions: a `Pass` in the store is a
-claim about what the evaluator answered on its own, and a run that entered
-compiled code may neither read nor write one.
-
-`ply test` also prints `isolated: n of m` in its summary.
-
-**`--audit-backend` reports its own coverage.** The oracle cannot compare every
-test. A searched test is replayed per interleaving on machines built for the
-schedule, so the pair never runs on it; and a test that reaches a host handler is
-run once on purpose, because a handler is not a function and a second machine
-would send the packet twice. Both exclusions are correct; leaving them uncounted
-is not, because `0 failed, n passed` with a backend attached reads as the backend
-having answered correctly for *n* tests. So `RunReport` carries
-`audit: Option<AuditSummary>` — `{ compared, unaudited }` — and `TestResult`
-carries `audited: Option<bool>`, both **absent rather than zeroed** when no
-oracle ran. `ply test` prints `audited n of m · k ran unpaired`, and `--json`
-carries the same under `audit` and `tests[].audited`.
+On `ply test`. There is no pairing flag: under tier-only (ADR 0048) a machine
+with no backend holds no evaluator, so there is no second engine to compare
+against. The tier is held to its answers by the corpus running green on it and
+by the two emitters compared body for body.
 
 ### Deleted with the tree-walker
 

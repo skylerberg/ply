@@ -227,14 +227,12 @@ pub fn audit_state(left: &mut dyn Evaluator, right: &mut dyn Evaluator) {
     right.cells_mut().journal();
 }
 
-/// What one subject's audit produced.
-pub enum Compared {
-    Agreed,
-    Diverged(Divergence),
-}
-
 /// Compares two evaluators that have each already answered the same question.
-pub fn compare_outcomes(
+///
+/// Not public: `--audit-backend` was the caller outside this module, and under tier-only (ADR
+/// 0048) there is no second engine for it to pair. What is left is [`compare_test`], which is how
+/// the reference fragment and the compiled tier are held to the same answers.
+fn compare_outcomes(
     left: &dyn Evaluator,
     right: &dyn Evaluator,
     subject: &str,
@@ -253,6 +251,12 @@ pub fn compare_outcomes(
             left: a,
             right: b,
         })
+}
+
+/// What one subject's comparison produced.
+pub enum Compared {
+    Agreed,
+    Diverged(Divergence),
 }
 
 pub fn compare_answers(

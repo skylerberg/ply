@@ -324,7 +324,6 @@ fn iterate(
     };
     let mut run = || {
         let mut executor = ply_test::InterpExecutor::new(run_program, run_resolved, &loaded.check)
-            .with_backend_audit(args.audit_backend)
             .with_search(simulation.clone())
             .with_hosts(hosting(&hosts, &runtime));
         if let (Some(provider), Some(spec)) = (provider, backend.clone()) {
@@ -930,19 +929,6 @@ fn print_human(
     }
     if let Some(line) = report.simulation.line() {
         println!("{IND}{}", style.bold(&line));
-    }
-    // `--audit-backend` is the differential oracle, and a green run under it reads as "the backend
-    // agreed about every test".
-    if let Some(audit) = &report.audit
-        && let Some(line) = audit.line()
-    {
-        println!("{IND}{}", style.bold(&line));
-        if audit.unaudited > 0 {
-            println!(
-                "{IND}{}",
-                style.dim("those ran once, so no disagreement was possible")
-            );
-        }
     }
     // What the backend was asked and what it did with it, printed whether or not anything went
     // wrong.
@@ -1625,9 +1611,6 @@ fn report_json(
                 // explored count of zero from a test that never simulated anything.
                 "simulation": r.simulation.as_ref().map(ply_test::report::exploration_json),
                 "cached": r.recorded.as_ref().map(|record| record.is_written()),
-                // Absent outside `--audit-backend`, where there is no oracle whose coverage this
-                // could describe.
-                "audited": r.audited,
             })
         })
         .collect();
@@ -1669,7 +1652,6 @@ fn report_json(
             "bisect": args.bisect.as_str(),
             "bisect_budget": args.bisect_budget,
             "trace": args.trace.as_str(),
-            "audit_backend": args.audit_backend,
             // The whole plan, because every field of it is in a seeded test's cache key and a
             // consumer comparing two runs needs to see which one searched more.
             "sim": {
@@ -1690,7 +1672,6 @@ fn report_json(
             "failed": report.simulation.failed,
         },
         // What the differential oracle actually covered.
-        "audit": report.audit,
         // What a compiled backend was asked and what it did with it.
         "backend": backend.installed().then(|| json!({
             "spec": args.backend,
@@ -1997,7 +1978,6 @@ test \"pure arithmetic\" { assert_eq(1 + 1, 2) }
             db: crate::db::DbOptions::default(),
             config: crate::config::ConfigOptions::default(),
             std: false,
-            audit_backend: false,
             simulation: crate::cli::SimOptions {
                 seed: None,
                 sim: crate::cli::SimArg::default(),
@@ -2718,7 +2698,6 @@ test \"stuck\" {
             failure: None,
             simulation: None,
             recorded: None,
-            audited: None,
             backend: None,
         };
         let plain = result_line(&result, &result.name, 44, Style::plain());
@@ -2752,7 +2731,6 @@ test \"stuck\" {
                     ..Default::default()
                 }),
                 recorded: None,
-                audited: None,
                 backend: None,
             })
             .expect("a simulated test has a line")
@@ -2786,7 +2764,6 @@ test \"stuck\" {
             failure: None,
             simulation: None,
             recorded: None,
-            audited: None,
             backend: None,
         };
         let column = |status| {
@@ -2881,7 +2858,6 @@ test \"stuck\" {
             failure: None,
             simulation: None,
             recorded,
-            audited: None,
             backend: None,
         }
     }
@@ -2931,7 +2907,6 @@ test \"stuck\" {
             results,
             warnings: Vec::new(),
             simulation: ply_test::SimSummary::default(),
-            audit: None,
         }
     }
 
@@ -3024,7 +2999,6 @@ test \"stuck\" {
                 failure: None,
                 simulation: None,
                 recorded: Some(Record::Under(vec![hashes.tests[index]])),
-                audited: None,
                 backend: None,
             }])
         };
@@ -3123,7 +3097,6 @@ test \"stuck\" {
             failure: None,
             simulation: None,
             recorded: Some(Record::Under(vec![hashes.tests[index]])),
-            audited: None,
             backend: None,
         }]);
         let view = HostView::of(&hosts, &plan, &loaded.check, &recorded);
