@@ -10,7 +10,7 @@ pub mod fs;
 /// Not `pub`: a blocking pool is how a facility answers, never something a
 /// caller composes. `tcp` and `fs` each own one, and the token ranges they mint
 /// in are disjoint so a composed runtime can tell whose answer a token is.
-mod pool;
+pub mod pool;
 pub mod registry;
 pub mod sched;
 pub mod signal;

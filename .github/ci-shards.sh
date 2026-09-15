@@ -71,7 +71,7 @@ SOLO=(
 # The packages whose tests need a postgres server and cluster binaries. They
 # skip -- passing -- without them, so the partitions leave them to the job that
 # has both and asserts the gates are open.
-POSTGRES_PACKAGES=(ply-host ply-host-tests)
+POSTGRES_PACKAGES=(ply-host-tests)
 
 # `crates/ply-cli-tests/tests/suite/w5_shutdown.rs` is `#![cfg(unix)]`: on any
 # other host it compiles to nothing and prints nothing. The gates job runs it by

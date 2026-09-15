@@ -1,8 +1,16 @@
 //! What the TLS handler claims, and whether it is telling the truth.
 
-use super::*;
+use ply_host::tls::*;
+use ply_span::{Diagnostic, Span, codes};
+use rustls::crypto::CryptoProvider;
+use rustls::server::ServerConfig;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::{Error as TlsError, PeerIncompatible, StreamOwned};
+use std::io::{self, Read, Write};
+use std::net::TcpListener;
 use std::net::TcpStream;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 const REQUEST: &[u8] = b"GET / HTTP/1.1\r\nhost: localhost\r\n\r\n";

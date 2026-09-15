@@ -459,7 +459,7 @@ impl Op {
         }
     }
 
-    fn declaration(self) -> HostOp {
+    pub fn declaration(self) -> HostOp {
         HostOp {
             effect: Symbol::new(EFFECT),
             op: Symbol::new(self.name()),
@@ -519,6 +519,3 @@ fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
-
-#[cfg(test)]
-mod tests;

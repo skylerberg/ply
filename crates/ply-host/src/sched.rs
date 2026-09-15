@@ -94,6 +94,3 @@ fn err_hermetic(span: Span, binding: &HostBinding) -> Diagnostic {
     }
     diagnostic
 }
-
-#[cfg(test)]
-mod tests;

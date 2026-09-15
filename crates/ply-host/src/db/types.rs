@@ -494,7 +494,7 @@ pub fn bind(params: &[Param], types: &[Type], span: Span) -> Result<Vec<Bound>, 
     Ok(out)
 }
 
-fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result<Bound, BindError> {
+pub fn bind_one(param: &Param, ty: &Type, position: usize, span: Span) -> Result<Bound, BindError> {
     let value = match (param, ty) {
         (Param::Null, _) => BoundValue::Null,
         (Param::Bool(v), &Type::BOOL) => BoundValue::Bool(*v),
@@ -611,7 +611,7 @@ fn out_of_range(value: i64, what: &str, position: usize) -> DbError {
     )
 }
 
-fn parse_uuid(text: &str) -> Option<[u8; 16]> {
+pub fn parse_uuid(text: &str) -> Option<[u8; 16]> {
     let hex: Vec<u8> = text
         .bytes()
         .filter(|b| *b != b'-')
@@ -833,6 +833,3 @@ pub fn advice(ty: &Type) -> Option<&'static str> {
         _ => None,
     }
 }
-
-#[cfg(test)]
-mod tests;

@@ -1304,6 +1304,3 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 fn wait<'a, T>(condvar: &Condvar, guard: MutexGuard<'a, T>) -> MutexGuard<'a, T> {
     condvar.wait(guard).unwrap_or_else(|e| e.into_inner())
 }
-
-#[cfg(test)]
-mod tests;

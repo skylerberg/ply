@@ -70,12 +70,12 @@ pub fn registry(driver: Arc<dyn Driver>) -> HostRegistry {
     registry
 }
 
-struct Operation {
-    op: Op,
-    driver: Arc<dyn Driver>,
+pub struct Operation {
+    pub op: Op,
+    pub driver: Arc<dyn Driver>,
     /// Shared across the operations, because a table set is a function of the statement text and of
     /// nothing else — including of which operation performed it.
-    cache: Arc<super::stmt::Cache>,
+    pub cache: Arc<super::stmt::Cache>,
 }
 
 impl HostHandler for Operation {
@@ -130,6 +130,3 @@ fn arity(op: Op, got: usize, span: Span) -> Diagnostic {
     .primary(span, "this perform reached the database driver")
     .note("inference checks a perform's arity, so reaching this means the evaluator was handed a module that was never checked")
 }
-
-#[cfg(test)]
-mod tests;

@@ -264,6 +264,3 @@ pub fn label(resource: &Resource) -> &str {
         Resource::Singleton => "",
     }
 }
-
-#[cfg(test)]
-mod tests;
