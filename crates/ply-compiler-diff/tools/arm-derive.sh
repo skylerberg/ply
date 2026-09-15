@@ -6,11 +6,9 @@
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
-ply="${PLY_BIN:-$root/target/release/ply}"
-[ -x "$ply" ] || ply="$root/target/debug/ply"
-[ -x "$ply" ] || { echo "no ply binary; run cargo build -p ply-cli --bin ply"; exit 2; }
+src="$root/crates/ply-compiler/ply"
 work="$(mktemp -d)"
-cp "$here"/{lexer,spine,types,patterns,exprs,items,rewrite,resolve,derive}.ply "$work/"
+cp "$src"/*.ply "$work/"
 cp "$work/derive.ply" "$work/derive.orig"
 restore() { cp "$work/derive.orig" "$work/derive.ply"; }
 trap 'rm -rf "$work"' EXIT
@@ -18,7 +16,8 @@ fails=0
 
 run_suite() {
   ( cd "$root" \
-    && PLY_BIN="$ply" PLY_PARSER_SRC="$work" \
+    && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
+    && PLY_C_EMITTER="ply:$work" \
        cargo test --offline --test derive -- --test-threads=2 2>&1 )
 }
 

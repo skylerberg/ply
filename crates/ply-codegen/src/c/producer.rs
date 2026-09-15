@@ -382,6 +382,25 @@ impl PlyProducer {
                 .collect(),
         );
         let args = [Value::list(names), Value::list(srcs), ctors, builtins];
+        let value = self.call(ENTRY, &args)?;
+        let Value::Str(dump) = &value else {
+            bail!("the emitter answered something that is not a string");
+        };
+        parse(dump).context("reading the emitter's answer")
+    }
+
+    /// Enters any function of the unit -- `module.name`, as the emitter's sources spell it -- with
+    /// `args` as values, in a context of its own, and answers what it returned.
+    ///
+    /// This is how the differentials hold the self-hosted front end to the reference: the same
+    /// unit that emits every program's C also parses, resolves, checks and hashes, and each of
+    /// those phases dumps its answer as a string. Entering it here, once per input, is what
+    /// replaced generating a program around every input and running `ply` over it.
+    pub fn call(&self, name: &str, args: &[Value]) -> Result<Value> {
+        let entry = self
+            .native
+            .entry(name)
+            .ok_or_else(|| anyhow!("the unit has no `{name}`"))?;
         let mut ctx = self.native.context();
         ctx.begin(i64::MAX / 2);
         let layouts: *const crate::heap::Layouts = &self.native.tables().layouts;
@@ -389,10 +408,6 @@ impl PlyProducer {
             .iter()
             .map(|a| ctx.heap.to_word(unsafe { &*layouts }, a))
             .collect();
-        let entry = self
-            .native
-            .entry(ENTRY)
-            .ok_or_else(|| anyhow!("no entry"))?;
         let answer = unsafe { entry(&mut ctx, words.as_ptr()) };
         if ctx.failed != 0 {
             let why = ctx
@@ -400,15 +415,18 @@ impl PlyProducer {
                 .map(|d| d.message)
                 .unwrap_or_else(|| "no diagnostic".to_string());
             ctx.end();
-            bail!("the emitter raised: {why}");
+            bail!("`{name}` raised: {why}");
         }
         let value = crate::heap::Heap::to_value(unsafe { &*layouts }, answer);
         ctx.end();
-        let Value::Str(dump) = &value else {
-            bail!("the emitter answered something that is not a string");
-        };
-        parse(dump).context("reading the emitter's answer")
+        Ok(value)
     }
+}
+
+/// Enters `name` in this thread's compiled emitter, building it first when the thread has none.
+pub fn call(name: &str, args: &[Value]) -> Result<Value> {
+    with_current(|p| p.call(name, args))
+        .unwrap_or_else(|| bail!("no Ply emitter serves on this thread: none is installed, it is being built, or the reference is forced"))
 }
 
 /// `body <name> <n>\n` and then exactly `n` bytes, repeated: the tables in the cache's encoding,
