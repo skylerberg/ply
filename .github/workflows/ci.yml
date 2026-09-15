@@ -9,8 +9,8 @@
 # other job downloads that: `test` runs a slice of the suite, `solo` runs one
 # test that has to run alone on a runner of its own, `gates` runs the tests
 # that read a wall clock and the checks that have to be seen to run, and
-# `test-postgres` and `same-tests` run what needs a server or a binary. The
-# binary the corpus scripts drive is a release `ply`, built beside the archive
+# `test-postgres` runs what needs a server, `examples/same-tests.sh` among it.
+# The binary that script drives is a release `ply`, built beside the archive
 # by `build-ply` (argued there). A green run is the build
 # plus the slowest of those, and the tables that cut them are in
 # `.github/ci-shards.sh`, where `verify` keeps them total.
@@ -360,6 +360,19 @@ jobs:
           mkdir tcc
           cp /var/cache/apt/archives/*.deb tcc/
           ls tcc
+      - name: tcc, for the measurement below
+        run: sudo dpkg -i tcc/*.deb
+      - name: What compiling a fresh trivial program costs, with the binary just built
+        run: |
+          set -euo pipefail
+          d=$(mktemp -d)
+          printf 'fn one() -> Int = 1\ntest "one" { assert_eq(one(), 1) }\n' > "$d/m.ply"
+          "$GITHUB_WORKSPACE/target/release/ply" test "$d" --no-cache --json > /dev/null
+          for n in 11 12 13; do
+            printf 'fn one() -> Int = %s\ntest "one" { assert_eq(one(), %s) }\n' "$n" "$n" > "$d/m.ply"
+            /usr/bin/time -f "%es wall, %MkB peak" "$GITHUB_WORKSPACE/target/release/ply" test "$d" --no-cache --json > /tmp/one.json
+          done
+          python3 -c 'import json; r = json.load(open("/tmp/one.json")); print(json.dumps(r.get("backend"), indent=1))'
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: tcc
@@ -367,11 +380,11 @@ jobs:
           retention-days: 1
           if-no-files-found: error
 
-      # The scripts in `same-tests` refuse a binary that is not built from the
+      # `examples/same-tests.sh` refuses a binary that is not built from the
       # tree, and a freshness check nobody has watched fail is the same defect
       # one level up — so the check is driven red and green here, beside the
       # binary it is about, before it is relied on. `--self-test` touches no
-      # tracked file. The check is here and not in `same-tests` because it
+      # tracked file. The check is here and not in `test-postgres` because it
       # compares clocks: a checkout made after this build would be newer than
       # the binary everywhere.
       - name: The freshness check can still go red
@@ -717,6 +730,19 @@ jobs:
           ' /tmp/pg.log)
           echo "the postgres packages ran $ran tests, $live live and $park on a cluster"
           [ "$ran" -gt 0 ] || { echo "the postgres packages ran no tests at all" >&2; exit 1; }
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: ply
+          path: target/release
+      # W4's exit criterion, against the job's server: the same source on the twin
+      # and on postgres, byte for byte. It manages its own tables and needs the
+      # cluster binaries this job already put on PATH.
+      - name: examples/same-tests.sh
+        run: |
+          set -euo pipefail
+          chmod +x target/release/ply
+          touch target/release/ply target/release/ply.d
+          PLY_BIN="$GITHUB_WORKSPACE/target/release/ply" ./examples/same-tests.sh --db "$PLY_TEST_DB" --reset --no-build
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         if: github.ref == 'refs/heads/main'
         with:
@@ -734,256 +760,7 @@ jobs:
       - name: ./probes/ucontext/run.sh
         run: ./probes/ucontext/run.sh
 
-  # What needs a `ply` binary and no test harness: the code generator over the
-  # shipped corpora, the served example, and W4's exit criterion. The binary is
-  # `build`'s, checked there against the tree it was built from.
-  same-tests:
-    name: examples/same-tests.sh
-    needs: [build-ply]
-    runs-on: ubuntu-24.04
-    timeout-minutes: 20
-    env:
-      PLY_BIN: ${{ github.workspace }}/target/release/ply
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: tcc
-          path: tcc
-      - name: tcc, the development profile's C compiler
-        run: sudo dpkg -i tcc/*.deb
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: ply
-          path: target/release
-      # An artifact keeps neither the execute bit nor a clock the scripts can
-      # compare: `same-tests.sh` refuses a binary older than the sources in its
-      # dep-info, and this checkout is newer than `build`'s. Touched, the
-      # binary is what `build` proved it to be: built from this commit.
-      - name: The binary is runnable and newer than the checkout
-        run: |
-          chmod +x "$PLY_BIN"
-          touch "$PLY_BIN" "$PLY_BIN.d"
-          "$PLY_BIN" std --digest
-          echo "$(df -h / | awk 'NR == 2 { print $4 " free" }'), $(free -m | awk 'NR == 2 { print $7 " MB available" }')"
-      # What one process costs to compile a program nobody has compiled before:
-      # a one-test program with a fresh constant each time, after one run has
-      # put the bundle's own object in the cache. The CLI suite spawns the
-      # binary some fifteen hundred times a run over programs of its own, and
-      # this is the fixed cost each of those pays; the JSON's `backend` block
-      # says where it went.
-      - name: What compiling a fresh trivial program costs
-        run: |
-          set -euo pipefail
-          d=$(mktemp -d)
-          printf 'fn one() -> Int = 1\ntest "one" { assert_eq(one(), 1) }\n' > "$d/m.ply"
-          "$PLY_BIN" test "$d" --no-cache --json > /dev/null
-          for n in 11 12 13; do
-            printf 'fn one() -> Int = %s\ntest "one" { assert_eq(one(), %s) }\n' "$n" "$n" > "$d/m.ply"
-            /usr/bin/time -f "%es wall, %MkB peak" "$PLY_BIN" test "$d" --no-cache --json > /tmp/one.json
-          done
-          python3 -c 'import json; r = json.load(open("/tmp/one.json")); print(json.dumps(r.get("backend"), indent=1))'
 
-      # The object cache the last run of this job left on `main`; the steps that
-      # want a cold one set `PLY_C_CACHE` to a directory of their own.
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: /tmp/ply-c-cache
-          key: ply-c-cache-same-tests-${{ github.run_id }}
-          restore-keys: ply-c-cache-same-tests-
-
-      # The script manages its own cluster with `initdb`/`pg_ctl` when it is not
-      # given a `--db`, so this job needs the binaries and not a service.
-      - name: Put initdb, pg_ctl and psql on PATH, or fail
-        run: |
-          set -euo pipefail
-          find_bin() {
-            for candidate in /usr/lib/postgresql/*/bin; do
-              if [ -x "$candidate/initdb" ] && [ -x "$candidate/pg_ctl" ] && [ -x "$candidate/psql" ]; then
-                echo "$candidate"
-              fi
-            done | tail -n 1
-          }
-          bin=$(find_bin)
-          if [ -z "$bin" ]; then
-            sudo apt-get update
-            sudo apt-get install --yes --no-install-recommends postgresql postgresql-client
-            bin=$(find_bin)
-          fi
-          if [ -z "$bin" ]; then
-            echo "same-tests.sh needs initdb, pg_ctl and psql and this runner has none" >&2
-            exit 1
-          fi
-          echo "$bin" >> "$GITHUB_PATH"
-
-      # Under tier-only (ADR 0048) the compiled tier IS the evaluator, so this
-      # runs it green over `examples/` at corpus scale. A corrupt tier is
-      # caught by the program's own tests going red
-      # (`crates/ply-cli-tests/tests/suite/backend.rs` proves that for every
-      # corruption), so the check here is that the honest tier is green AND
-      # not vacuous: the `entered`/`units` assertions are what stops it being
-      # so. The compute-kernel record has a run reporting a 0.998x speedup over
-      # a backend that entered **nothing**.
-      - name: The code generator runs examples/ green and enters the seam
-        run: |
-          set -uo pipefail
-          # `set -e` is off for the run itself on purpose: `ply test` exits 1 when a test fails,
-          # and letting the shell die there would skip the assertions below and report the failure
-          # as "the command exited 1" rather than as which of them broke.
-          "$PLY_BIN" test examples --backend c --json > /tmp/backend.json || true
-          set -e
-          python3 - <<'PY'
-          import json, sys
-          r = json.load(open("/tmp/backend.json"))
-          b = r.get("backend") or {}
-          print(json.dumps(b, indent=2))
-          if not r["ok"] or r["summary"]["failed"]:
-              sys.exit("the code generator is red over examples/")
-          if b.get("name") != "c":
-              sys.exit(f"a run asked for c installed {b.get('name')!r}")
-          if not b.get("entered"):
-              sys.exit("the code generator entered nothing, so the run above is green over a "
-                       "seam no call reached")
-          if not b.get("units"):
-              sys.exit("no unit was compiled, so `c` is not a code generator here")
-          PY
-
-      # `examples/` is small. The self-hosted front end is thirteen thousand lines of Ply and it
-      # is where this tier's ownership rules actually get exercised: it freed a parser's whole
-      # state under the seam because a record was read again after a field read let it go, and
-      # every test the tier had passed while it did. This is the workload that says otherwise.
-      - name: The C tier runs the self-hosted front end green and enters the seam
-        run: |
-          set -uo pipefail
-          d=$(mktemp -d)
-          cp crates/ply-compiler/ply/*.ply "$d/"
-          "$PLY_BIN" test "$d" --no-cache --backend c --json > /tmp/spike-c.json || true
-          set -e
-          python3 - <<'PY'
-          import json, sys
-          r = json.load(open("/tmp/spike-c.json"))
-          b = r.get("backend") or {}
-          print(json.dumps(b, indent=2))
-          if not r["ok"] or r["summary"]["failed"]:
-              sys.exit("the C tier is red over the self-hosted front end")
-          if not b.get("entered"):
-              sys.exit("the C tier entered nothing, so the run above is green over a "
-                       "seam no call reached")
-          PY
-
-      # ADR 0042's third step, and under tier-only (ADR 0048) the only one: the emitter written
-      # in Ply produces the unit the tier runs. The count says it answered rather than falling
-      # back to the reference, and the corpus running green over what it produced is the check
-      # that it produced correctly. In a cache of its own, or the count is vacuous: a step above
-      # already ran `examples` on this producer, and a unit that comes back whole from the object
-      # cache is a unit the emitter was never entered for.
-      - name: The Ply emitter produces the unit, and examples/ runs green
-        run: |
-          set -uo pipefail
-          PLY_C_CACHE=$(mktemp -d) PLY_C_REFUSALS=1 \
-            "$PLY_BIN" test examples --backend c --no-cache \
-            --json > /tmp/whole.json 2> /tmp/whole.err || true
-          set -e
-          grep -E "ply emitter answered [1-9][0-9]* of" /tmp/whole.err || {
-            echo "the Ply emitter answered nothing, or was never asked:"; cat /tmp/whole.err | tail -20; exit 1; }
-          python3 -c 'import json,sys; r=json.load(open("/tmp/whole.json")); \
-            sys.exit(0 if r["ok"] and not r["summary"]["failed"] else \
-              "with the chain entered whole, the C tier is red over examples/")'
-
-      # ADR 0045's fourth stage: the language's own claims, sorted out of the Rust suites into a
-      # corpus `ply test` runs. Green on the default tier, and green with the tier pinned as the
-      # only engine -- or the claim is about an engine and not the language.
-      - name: The language corpus, on the default tier and tier-only
-        run: |
-          set -euo pipefail
-          "$PLY_BIN" test tests/lang --no-cache
-          PLY_TIER_ONLY=1 "$PLY_BIN" test tests/lang --backend c --no-cache
-
-      # ADR 0045's first stage for the judge: every law and spec clause is a root of the unit, and
-      # `ply prove --backend c` enters them. Under tier-only the tier is the judge, so the corpus
-      # must prove cleanly (nothing refuted) and the tier must have entered the propositions rather
-      # than the run being green over a seam no proposition reached.
-      - name: The compiled tier judges the corpus specifications
-        run: |
-          set -euo pipefail
-          for corpus in examples crates/ply-std/ply; do
-            PLY_C_REFUSALS=1 PLY_C_PHASES=1 \
-              "$PLY_BIN" prove "$corpus" --no-cache --json --backend c \
-              > /tmp/prove-c.json 2> /tmp/prove-c.err
-            entries=$(grep -c "^entry:" /tmp/prove-c.err || true)
-            [ "$entries" -gt 0 ] || { echo "the tier entered nothing while proving $corpus"; exit 1; }
-            python3 - <<'PY'
-          import json, sys
-          r = json.load(open("/tmp/prove-c.json"))
-          s = r["summary"]
-          print("  prove:", json.dumps(s))
-          if not r["ok"] or s["obligations"] == 0 or s["refuted"]:
-              sys.exit("the tier did not judge the corpus specifications cleanly")
-          PY
-          done
-      - name: A served example with the tier holding its accept loop
-        run: .github/served-with-tier.sh
-      - name: The compiled tier as the only engine, over every corpus and the served example
-        run: |
-          set -euo pipefail
-          for d in examples crates/ply-std/ply; do
-            PLY_TIER_ONLY=1 "$PLY_BIN" test "$d" --backend c --no-cache
-          done
-          d=$(mktemp -d)
-          cp crates/ply-compiler/ply/*.ply "$d/"
-          PLY_TIER_ONLY=1 "$PLY_BIN" test "$d" --backend c --no-cache
-          PLY_TIER_ONLY=1 .github/served-with-tier.sh
-
-      # The tier shipped a wrong BLAKE3 digest on a 64KB input while every test it had passed ---
-      # the input was the first one long enough for a loop to come round --- so this pairs the tier
-      # against a hash long enough to build a tree, the shape that broke. The test hashes the same
-      # input twice and asserts the digests are equal, so a tier that held a record back part way
-      # through the loop is caught by its own answer changing.
-      - name: The C tier hashes a long input consistently
-        run: |
-          set -e
-          d=$(mktemp -d)
-          python3 - "$d/input.ply" <<'PY'
-          import sys
-          data = bytes((i % 251) for i in range(65536))
-          lit = 'b"' + ''.join(('\\x%02x' % b) if (b < 0x20 or b >= 0x7f or b in (0x22, 0x5c))
-                               else chr(b) for b in data) + '"'
-          open(sys.argv[1], "w").write("pub fn long() -> Bytes = %s\n" % lit)
-          PY
-          cat > "$d/h.ply" <<'PLY'
-          import std.hash (blake3)
-          import input (long)
-          // Sixty-four chunks: the tree path, and long enough that every loop in the
-          // hash comes round with a record its tier may have held back.
-          test "a long input hashes to a stable digest" {
-            assert_eq(blake3(long()), blake3(long()))
-          }
-          pub fn digest() -> Bytes = blake3(long())
-          PLY
-          "$PLY_BIN" test "$d" --no-cache --backend c --json > /tmp/c-hash.json
-          python3 -c 'import json,sys; r=json.load(open("/tmp/c-hash.json")); \
-            sys.exit(0 if r["ok"] and not r["summary"]["failed"] else \
-              "the C tier hashes a long input inconsistently")'
-
-      # W4's exit criterion: the same `examples/desk.ply` endpoints answered by
-      # the in-memory twin and by real postgres, compared byte for byte. Nothing
-      # in the suite covers it — the twin half is hermetic and the postgres
-      # half is behind the gates above — and CONTRIBUTING.md §"The suite proves
-      # less than it looks like it proves" lists running it by hand as the
-      # obligation this job takes over.
-      - name: examples/same-tests.sh
-        run: ./examples/same-tests.sh
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main'
-        with:
-          path: /tmp/ply-c-cache
-          key: ply-c-cache-same-tests-${{ github.run_id }}
-
-  # Every job, in one required check. Without this, a matrix that produced no
-  # legs — or a job skipped because something it needed was skipped — reports a
-  # green tick over nothing run at all.
   ci:
     name: CI
     if: always()
@@ -999,7 +776,6 @@ jobs:
         gates,
         test-postgres,
         ucontext-probe,
-        same-tests,
       ]
     runs-on: ubuntu-24.04
     timeout-minutes: 5
