@@ -70,8 +70,7 @@ fn assert_program_error(failure: &Value, what: &str) {
 
 // --- every language-defined runtime failure is the program's ----------------
 
-#[test]
-fn every_language_defined_runtime_failure_is_a_program_error() {
+fn every_language_defined_runtime_failure_is_a_program_error(index: usize, of: usize) {
     let cases: &[(&str, &str, &str)] = &[
         (
             "a runaway recursion",
@@ -150,7 +149,9 @@ fn every_language_defined_runtime_failure_is_a_program_error() {
         ),
     ];
 
-    for (what, source, needle) in cases {
+    // One round-robin part of the table per test: each case runs the binary to a resource
+    // limit, and CI's partitions are bounded by their slowest single test.
+    for (what, source, needle) in cases.iter().skip(index).step_by(of) {
         let dir = project(source);
         let failure = sole_failure(&dir);
         assert_program_error(&failure, what);
@@ -162,6 +163,21 @@ fn every_language_defined_runtime_failure_is_a_program_error() {
             "{what}: expected a message containing {needle:?}, got {message:?}"
         );
     }
+}
+
+#[test]
+fn every_language_defined_runtime_failure_is_a_program_error_part_1_of_3() {
+    every_language_defined_runtime_failure_is_a_program_error(0, 3);
+}
+
+#[test]
+fn every_language_defined_runtime_failure_is_a_program_error_part_2_of_3() {
+    every_language_defined_runtime_failure_is_a_program_error(1, 3);
+}
+
+#[test]
+fn every_language_defined_runtime_failure_is_a_program_error_part_3_of_3() {
+    every_language_defined_runtime_failure_is_a_program_error(2, 3);
 }
 
 /// A clause body is ordinary code that happens to run under a `handle`.

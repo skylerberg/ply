@@ -2071,3 +2071,15 @@ pub mod port {
         Value::list(items.iter().map(|s| Value::bytes(s.as_bytes())).collect())
     }
 }
+
+/// The items at positions `index`, `index + of`, `index + 2·of`, …: one round-robin part of a
+/// corpus, for a differential too long to be one test. CI's partitions are bounded by their
+/// slowest single test, and dealing a corpus this way keeps every part the same shape.
+pub fn part<T: Clone>(items: &[T], index: usize, of: usize) -> Vec<T> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| i % of == index)
+        .map(|(_, item)| item.clone())
+        .collect()
+}

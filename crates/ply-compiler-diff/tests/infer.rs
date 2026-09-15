@@ -8,6 +8,7 @@
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
 
+use ply_compiler_diff::part;
 use ply_compiler_diff::{
     port, programs, records, reference_check_dump, reference_check_dump_known,
 };
@@ -145,8 +146,10 @@ fn the_ply_checker_agrees_with_ply_core_on_the_standard_library() {
     );
 }
 
-#[test]
-fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library() {
+fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(
+    index: usize,
+    of: usize,
+) {
     let std = std_modules();
     let inputs: Vec<(String, Vec<(String, String)>)> = examples()
         .into_iter()
@@ -156,7 +159,22 @@ fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_libra
             (format!("std + examples/{name}.ply"), program)
         })
         .collect();
-    compare("examples", &inputs);
+    compare("examples", &part(&inputs, index, of));
+}
+
+#[test]
+fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library_part_1_of_3() {
+    the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(0, 3);
+}
+
+#[test]
+fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library_part_2_of_3() {
+    the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(1, 3);
+}
+
+#[test]
+fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library_part_3_of_3() {
+    the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(2, 3);
 }
 
 #[test]
