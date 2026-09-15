@@ -1255,6 +1255,7 @@ fn builtin_all_is_complete_and_lists_each_name_once() {
             "iterate",
             "len",
             "list_at",
+            "list_set",
             "map",
             "map_contains",
             "map_entries",
@@ -1303,6 +1304,47 @@ fn builtin_all_is_complete_and_lists_each_name_once() {
         "a builtin was added to or removed from the enum without `Builtin::all()` being \
          updated — every table driven by `all()` silently skips it until this list agrees"
     );
+}
+
+/// `list_set` answers the list with one element replaced and leaves the list it was given as it
+/// was, whether the write lands in the tail or below it in the trie; an index the list does not
+/// hold raises where `list_at` would answer `None`.
+#[test]
+fn list_set_replaces_one_element_keeps_the_original_and_raises_outside_the_list() {
+    let xs = ints(&[10, 20, 30]);
+    let ys = done(
+        Builtin::ListSet,
+        vec![xs.clone(), Value::Int(1), Value::Int(99)],
+    )
+    .unwrap();
+    assert_eq!(ys, ints(&[10, 99, 30]));
+    assert_eq!(xs, ints(&[10, 20, 30]), "the list given is unchanged");
+
+    let long: Vec<i64> = (0..100).collect();
+    let big = ints(&long);
+    let set = done(
+        Builtin::ListSet,
+        vec![big.clone(), Value::Int(40), Value::Int(-1)],
+    )
+    .unwrap();
+    let mut want = long.clone();
+    want[40] = -1;
+    assert_eq!(set, ints(&want));
+    assert_eq!(big, ints(&long), "a write below the tail shares the trie");
+
+    for i in [-1, 3] {
+        let d = done(
+            Builtin::ListSet,
+            vec![xs.clone(), Value::Int(i), Value::Int(0)],
+        )
+        .unwrap_err();
+        assert_eq!(d.code, codes::RUNTIME_ERROR, "list_set(xs, {i}, 0)");
+        assert!(
+            d.message.contains("outside a value of 3 elements"),
+            "{}",
+            d.message
+        );
+    }
 }
 
 /// The low word rotated: bits leaving the right come back on the left of a thirty-two-bit

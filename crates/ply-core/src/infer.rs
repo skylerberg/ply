@@ -706,6 +706,17 @@ impl<'a> Checker<'a> {
                     Row::empty(),
                 ),
             ),
+            // The list update, which the trie's path copy makes logarithmic (ADR 0050 §1b).
+            (
+                "list_set",
+                poly(
+                    vec![a],
+                    vec![],
+                    vec![Type::list(ta.clone()), Type::int(), ta.clone()],
+                    Type::list(ta.clone()),
+                    Row::empty(),
+                ),
+            ),
             (
                 "map",
                 poly(

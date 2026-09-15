@@ -1,4 +1,4 @@
-//! The list index's type surface, at the source level.
+//! The list index's and the list update's type surface, at the source level.
 
 use crate::fixture::compile;
 use ply_core::{CheckOutput, print_type};
@@ -96,6 +96,48 @@ fn loud(xs: List<Int>) -> Option<Int> = list_at(xs, { tell.say[out]("x"); 0 })
 fn a_negative_index_is_a_type_error_nowhere() {
     ok("fn go(xs: List<Int>) -> Option<Int> = list_at(xs, 0 - 1)\n");
     ok("fn go(xs: List<Int>, i: Int) -> Option<Int> = list_at(xs, i)\n");
+}
+
+/// `list_set` takes the list, an `Int` and an element at the list's type, answers the list's
+/// type, refuses any other count of arguments, and is pure.
+#[test]
+fn list_set_has_the_type_the_contract_states_and_is_pure() {
+    let want = "(List<a>, Int, a) -> List<a>";
+    let out = ok(&format!("fn probe_set<a>() -> {want} = list_set\n"));
+    assert_eq!(sig(&out, "probe_set"), format!("() -> {want}"));
+
+    let d = errors("fn bad(xs: List<Int>) -> List<Int> = list_set(xs, 0, \"s\")\n");
+    assert!(
+        d.iter().any(|d| d.code == codes::TYPE_MISMATCH),
+        "an element at the wrong type must not check: {d:#?}"
+    );
+    let d = errors("fn bad(xs: List<Int>) -> List<Int> = list_set(xs, 0)\n");
+    assert!(
+        !d.is_empty(),
+        "`list_set` ran without an element, so its scheme and its arity table disagree"
+    );
+    let d = errors("fn bad(xs: List<Int>) -> List<Int> = list_set(xs, 0, 1, 2)\n");
+    assert!(
+        !d.is_empty(),
+        "`list_set` took a fourth argument, so its scheme and its arity table disagree"
+    );
+
+    let out = ok(r#"
+effect tell { write say[out](what: String) -> Unit }
+
+fn quiet(xs: List<Int>) -> List<Int> = list_set(xs, 0, 1)
+fn loud(xs: List<Int>) -> List<Int> = list_set(xs, { tell.say[out]("x"); 0 }, 1)
+"#);
+    assert_eq!(
+        footprint(&out, "quiet"),
+        "{}",
+        "`list_set` performs nothing of its own"
+    );
+    assert_eq!(
+        footprint(&out, "loud"),
+        "{m.tell.write[out]}",
+        "an argument's row is the call's"
+    );
 }
 
 /// The name is not reserved.

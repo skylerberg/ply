@@ -27,6 +27,8 @@ pub enum Builtin {
     Push,
     /// The list index, and the whole of it.
     ListAt,
+    /// One element replaced, sharing the rest; raises where `list_at` answers `None`.
+    ListSet,
     Map,
     Filter,
     Fold,
@@ -163,6 +165,7 @@ impl Builtin {
             "len" => Builtin::Len,
             "push" => Builtin::Push,
             "list_at" => Builtin::ListAt,
+            "list_set" => Builtin::ListSet,
             "map" => Builtin::Map,
             "filter" => Builtin::Filter,
             "fold" => Builtin::Fold,
@@ -250,6 +253,7 @@ impl Builtin {
             Builtin::Len => "len",
             Builtin::Push => "push",
             Builtin::ListAt => "list_at",
+            Builtin::ListSet => "list_set",
             Builtin::Map => "map",
             Builtin::Filter => "filter",
             Builtin::Fold => "fold",
@@ -436,6 +440,7 @@ impl Builtin {
             | Builtin::Range => (2, 2),
             Builtin::Fold
             | Builtin::Iterate
+            | Builtin::ListSet
             | Builtin::BytesSlice
             | Builtin::BytesIndexOfFrom
             | Builtin::BytesPosition
@@ -509,6 +514,7 @@ impl Builtin {
             Builtin::Len,
             Builtin::Push,
             Builtin::ListAt,
+            Builtin::ListSet,
             Builtin::Map,
             Builtin::Filter,
             Builtin::Fold,
@@ -640,6 +646,24 @@ fn push(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
     Ok(Step::Done(xs))
 }
 
+/// `list_set`, taking the list out of its arguments the way `push` does, so the last holder
+/// writes in place.
+fn list_set(args: &mut Vec<Value>, span: Span) -> Result<Step, Diagnostic> {
+    let v = args.pop().expect("arity checked");
+    let index = args.pop().expect("arity checked");
+    let mut xs = args.pop().expect("arity checked");
+    let Value::List(list) = &mut xs else {
+        return Err(type_error(span, "`list_set`", "List", &xs));
+    };
+    let i = index.as_int(span, "`list_set`")?;
+    let Some(at) = usize::try_from(i).ok().filter(|at| *at < list.len()) else {
+        return Err(out_of_range(span, "list_set", i, list.len(), "elements"));
+    };
+    let copied = list.set(at, v);
+    crate::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), span);
+    Ok(Step::Done(xs))
+}
+
 /// `cells` is the run's live arena, threaded rather than snapshotted: `cell_get` must observe every
 /// write made before this call, including one a handler clause made before resuming.
 ///
@@ -704,6 +728,8 @@ fn call_with(
             let i = args[1].as_int(span, "`list_at`")?;
             Ok(Step::Done(option(at(xs, i).cloned())))
         }
+
+        Builtin::ListSet => list_set(args, span),
 
         Builtin::Map => {
             let items = args[0].as_list(span, "`map`")?.clone();
@@ -894,7 +920,7 @@ fn call_with(
             let i = args[1].as_int(span, "`bytes_at`")?;
             match usize::try_from(i).ok().and_then(|i| b.get(i)) {
                 Some(byte) => Ok(Step::Done(Value::Int(i64::from(*byte)))),
-                None => Err(out_of_range(span, "bytes_at", i, b.len())),
+                None => Err(out_of_range(span, "bytes_at", i, b.len(), "bytes")),
             }
         }
 
@@ -912,7 +938,7 @@ fn call_with(
                 )))),
                 // Reported against the last index it would have read, since that is the one past
                 // the end and the one the caller has to move.
-                None => Err(out_of_range(span, "bytes_u32_le", i + 3, b.len())),
+                None => Err(out_of_range(span, "bytes_u32_le", i + 3, b.len(), "bytes")),
             }
         }
 
@@ -1829,10 +1855,10 @@ fn not_utf8(span: Span, b: &[u8], e: &std::str::Utf8Error) -> Diagnostic {
 }
 
 #[cold]
-fn out_of_range(span: Span, what: &str, index: i64, len: usize) -> Diagnostic {
+fn out_of_range(span: Span, what: &str, index: i64, len: usize, unit: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
-        format!("`{what}` index {index} is outside a value of {len} bytes"),
+        format!("`{what}` index {index} is outside a value of {len} {unit}"),
     )
     .primary(span, "this index does not exist")
     .note(format!(

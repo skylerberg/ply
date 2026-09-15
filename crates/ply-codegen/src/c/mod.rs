@@ -145,6 +145,7 @@ pub fn helper_addresses() -> Vec<*mut std::ffi::c_void> {
             "rt_alloc" => rt::rt_alloc as *const (),
             "rt_list_index" => rt::rt_list_index as *const (),
             "rt_nullary" => rt::rt_nullary as *const (),
+            "rt_list_set" => rt::rt_list_set as *const (),
             other => unreachable!("no address for the helper `{other}`"),
         };
         out.push(p as *mut std::ffi::c_void);

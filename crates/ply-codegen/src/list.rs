@@ -256,6 +256,53 @@ impl Heap {
         o as Word
     }
 
+    /// `xs` with its element at `i`, which must be in range, replaced by `v`, sharing every node
+    /// off the path to it. Takes both: a list held by nobody else writes in place, and any other
+    /// copies at most a tail or one node per level. The old element is released.
+    pub fn list_set(&mut self, xs: Word, i: usize, v: Word) -> Word {
+        let mut o = obj(xs);
+        debug_assert!(i < len(o));
+        let mut copied: Option<usize> = None;
+        if !is_unique(xs) {
+            copied = Some(tail_len(o));
+            let copy = self.clone_list(o, cap(o));
+            dec(xs);
+            o = copy;
+        }
+        let p = start(o) + i;
+        let offset = tail_offset(o);
+        let (node, at) = if p >= offset {
+            (o, TAIL + p - offset)
+        } else {
+            let r = self.owned(root(o), &mut copied);
+            unsafe { set_word(o, ROOT, r) };
+            let mut node = obj(r);
+            let mut shift = shift_for(offset);
+            while shift > 0 {
+                let k = (p >> shift) & MASK;
+                let child = self.owned(unsafe { word_at(node, k) }, &mut copied);
+                unsafe { set_word(node, k, child) };
+                node = obj(child);
+                shift -= BITS;
+            }
+            (node, p & MASK)
+        };
+        let old = unsafe { word_at(node, at) };
+        unsafe { set_word(node, at, v) };
+        dec(old);
+        ply_eval::rc::note_update_of(copied.is_none(), copied.unwrap_or(0), ply_span::Span::DUMMY);
+        o as Word
+    }
+
+    /// [`Heap::writable`], counting the children a shared node was copied for.
+    fn owned(&mut self, node: Word, copied: &mut Option<usize>) -> Word {
+        if !is_unique(node) {
+            let n = unsafe { (*obj(node)).len } as usize;
+            *copied = Some(copied.unwrap_or(0) + n);
+        }
+        self.writable(node)
+    }
+
     /// The list without its first `k` elements, sharing the trie with `xs` and copying at most
     /// the tail; once the dropped prefix covers the trie the tail is the list, so a chain of
     /// `rest`s over a long list holds only the leaf it is reading. Reads `xs`.
