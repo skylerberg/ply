@@ -142,9 +142,10 @@ pub fn obj(w: Word) -> *mut Obj {
     w as *mut Obj
 }
 
-/// Whether every heap is in the diagnostic mode ADR 0051 §1 built: a dead block is never
-/// reused, its payload is poisoned at release, and a read of it through the runtime fails at
-/// the body's site. `PLY_HEAP_POISON=1` turns it on for a process; nothing ships with it.
+/// Whether every heap is in the diagnostic mode ADR 0051 §1 built: a dead block's payload is
+/// poisoned at release, and a read of it through the runtime, before the block is taken again,
+/// fails at the body's site. `PLY_HEAP_POISON=1` turns it on for a process; nothing ships with
+/// it.
 pub fn poisoning() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("PLY_HEAP_POISON").is_some())
@@ -476,12 +477,14 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             return;
         }
         let object = Heap::object_size(size);
+        // Poisoned and still reused: a heap that kept every dead block over the emitter's own
+        // sources needed more memory than a runner has, so the net is the poison a stale read
+        // meets until the block is taken again, not the block waiting.
         if poisoning() {
             let words = (object - HEADER) / 8;
             for i in 0..words {
                 set_word(o, i, poison::word());
             }
-            return;
         }
         (*heap).free_list(object).push(o);
     }
