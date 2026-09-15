@@ -586,12 +586,15 @@ that stops running reports nothing, and reporting nothing is indistinguishable
 from passing — which is the failure this whole section is organised around.
 ### Exactly one test reads a prose document
 
-`crates/ply-corpus-tests/tests/allocation/w6_report_allocations.rs`'s
-`the_readme_still_describes_this_request_path` reads `README.md`'s *"One
-`/health` request makes N allocations and M bytes"* and compares both numbers
-against a freshly counted window, within 1%. Run it with
-`cargo test -p ply-corpus-tests --test allocation -- w6_report_allocations --nocapture` and it
-prints both sides. The count does not vary with the build profile.
+`crates/ply-corpus-tests/tests/allocation/w6_report_allocations.rs` reads
+`README.md`'s *"One `/health` request makes N allocations and M bytes"* and
+asserts it is the sentence `benches/w6-alloc.json` renders; a second test
+holds that file to a freshly counted window, within 1%. The figure lives in the
+file, the sentence is a rendering of it, and one command re-takes both:
+`./target/release/w6-alloc --repo . --requests 200 --out benches/w6-alloc.json`.
+Run the tests with
+`cargo test -p ply-corpus-tests --test allocation -- w6_report_allocations --nocapture` and they
+print both sides. The count does not vary with the build profile.
 
 Nothing else. No test opens `DESIGN.md`, `ROADMAP.md`, `CONTRACTS.md` or any
 ADR, and no other sentence of `README.md` is read.
