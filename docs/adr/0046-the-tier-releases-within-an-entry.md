@@ -145,11 +145,9 @@ released nothing, over its own sources, which is the memory the runner
 could not hold. One thing stood between the fixpoint
 and a runner even so: a debug build's heap kept every dead block until the
 entry's end, so that a read of one found the marker, and that entry
-allocates two hundred million objects. The net is now a bounded quarantine
-(`heap::QUARANTINE`): a dead block waits its turn behind a fixed number of
-others before it is reused, so a stale read still finds the marker for a
-while and no entry needs a runner larger than what it holds. Nothing
-switches it off, and no test has to know it is there.
+allocates two hundred million objects. Every build now reuses a dead block
+at once (ADR 0049 item 2, ADR 0050 §1b): no entry needs a runner larger
+than what it holds, nothing switches it off, and no test has to know.
 
 ## What would make this wrong
 
