@@ -546,7 +546,9 @@ impl Heap {
                     }
                     let e = tally.entry(kind).or_insert((0, 0));
                     e.0 += 1;
-                    e.1 += size;
+                    // A kind the header does not size -- a bridge, a singleton -- counts its
+                    // header alone; `usize::MAX` is `payload_bytes`'s "not recyclable", not a size.
+                    e.1 += if size == usize::MAX { HEADER } else { size };
                 }
             }
         }
