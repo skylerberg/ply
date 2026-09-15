@@ -89,8 +89,8 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
     )));
     let names: Vec<String> = src.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
-    let (text, refused) = match ply_codegen::c::emit_unit(src, &refs) {
-        Ok(pair) => pair,
+    let (text, refused) = match ply_codegen::c::produce(src, &refs) {
+        Ok(produced) => (produced.text, produced.refused),
         Err(e) => {
             eprintln!("the front end could not be emitted: {e:#}");
             return EXIT_COMPILE_ERROR;
