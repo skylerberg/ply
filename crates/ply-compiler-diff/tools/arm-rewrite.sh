@@ -7,11 +7,9 @@
 set -uo pipefail
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 root="$(cd "$here/../../.." && pwd)"
-ply="${PLY_BIN:-$root/target/release/ply}"
-[ -x "$ply" ] || ply="$root/target/debug/ply"
-[ -x "$ply" ] || { echo "no ply binary; run cargo build -p ply-cli --bin ply"; exit 2; }
+src="$root/crates/ply-compiler/ply"
 work="$(mktemp -d)"
-cp "$here"/{lexer,spine,types,patterns,exprs,items,rewrite}.ply "$work/"
+cp "$src"/*.ply "$work/"
 cp "$work/rewrite.ply" "$work/rewrite.orig"
 restore() { cp "$work/rewrite.orig" "$work/rewrite.ply"; }
 trap 'rm -rf "$work"' EXIT
@@ -19,7 +17,8 @@ fails=0
 
 run_suite() {
   ( cd "$root" \
-    && PLY_BIN="$ply" PLY_PARSER_SRC="$work" \
+    && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
+    && PLY_C_EMITTER="ply:$work" \
        cargo test --offline --test rewrite -- --test-threads=2 \
          the_rewrites_agree_with_ply_syntax_on_the_hand_written_fixtures \
          the_rewrites_agree_with_ply_syntax_on_the_reference_own_test_inputs 2>&1 )
