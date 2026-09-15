@@ -39,9 +39,7 @@ fn an_embedded_unit_survives_encoding() {
     let mut artifact = sample();
     artifact.unit = Some(EmbeddedUnit {
         runtime: "rt-digest".to_string(),
-        ctors: vec![("m.Colour".to_string(), 0), ("m.Pair".to_string(), 2)],
         text: vec![1, 2, 3, 4],
-        record: "record".to_string(),
     });
     let bytes = artifact.encode();
     let (decoded, _) = decode(&bytes, Path::new("x.plyx")).expect("decodes");

@@ -164,7 +164,7 @@ pub fn encode(text: &str, t: &Tables) -> String {
 }
 
 /// The five tables a body and a whole unit both name, in one encoding, so the two cannot drift.
-fn encode_tables(
+pub(super) fn encode_tables(
     consts: &[Value],
     builtins: &[ply_eval::Builtin],
     fields: &[Symbol],
@@ -211,7 +211,7 @@ fn encode_tables(
 }
 
 /// The same five, read back. Leaves the cursor after them.
-fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
+pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
     let mut t = Tables::default();
     let n = count(line(s, at)?, "consts")?;
     for _ in 0..n {
@@ -282,7 +282,7 @@ fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
 /// Read one line and step the cursor past it, so that the text's start is a byte offset rather
 /// than a search for a marker: a field, a call or a shape can be spelled anything at all, `text`
 /// included, and a marker they can spell is a marker that splits the file in the wrong place.
-fn line<'a>(s: &'a str, at: &mut usize) -> Option<&'a str> {
+pub(super) fn line<'a>(s: &'a str, at: &mut usize) -> Option<&'a str> {
     let rest = s.get(*at..)?;
     let end = rest.find('\n')?;
     *at += end + 1;
@@ -310,7 +310,7 @@ pub fn decode(s: &str) -> Option<(String, Tables)> {
     Some((s.get(at..)?.to_string(), t))
 }
 
-fn count(line: &str, label: &str) -> Option<usize> {
+pub(super) fn count(line: &str, label: &str) -> Option<usize> {
     line.strip_prefix(label)?.trim().parse().ok()
 }
 
@@ -335,28 +335,6 @@ fn unhex(s: &str) -> Option<Vec<u8>> {
         out.push((hi * 16 + lo) as u8);
     }
     Some(out)
-}
-
-/// Everything a worker needs to put a unit back together without emitting it.
-///
-/// A body cache saves the *emitting*, which is most of one worker's time and none of the other
-/// ten's: each still walks fourteen hundred cached bodies, substitutes their placeholders and
-/// assembles twenty-nine megabytes of C, only to hand it to an object cache that already had the
-/// answer. Sharing the built unit in process is not available -- `ply_eval::Value` holds `Rc`,
-/// so nothing containing one crosses a rayon worker -- so what is shared is this, through the
-/// same file system the objects already live on.
-pub struct UnitCache {
-    /// The object the assembled source hashes to, recorded so no source is needed to find it.
-    pub object: String,
-    pub taken: Vec<String>,
-    /// What the fixpoint dropped and why, so a unit read back reports the same refusals as the
-    /// build that wrote it.
-    pub refusals: Vec<(String, String)>,
-    pub consts: Vec<Value>,
-    pub fields: Vec<Symbol>,
-    pub builtins: Vec<ply_eval::Builtin>,
-    pub shapes: Vec<Vec<Symbol>>,
-    pub lambdas: Vec<String>,
 }
 
 /// What a unit is a function of: every offered definition and its hash, the constructor table,
@@ -396,65 +374,30 @@ pub fn unit_key(
 /// two apart by asking. This is what it asks instead.
 pub static UNITS_REUSED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-pub fn read_unit(key: &str) -> Option<UnitCache> {
-    decode_unit(&std::fs::read_to_string(dir().join(format!("{key}.unit"))).ok()?)
+/// The object a unit key was built as. The object carries its own table (`exports.rs`), so a
+/// worker that finds this has no reason to assemble the C to learn the name of an object it
+/// already has, and nothing else to read.
+///
+/// A body cache saves the *emitting*, which is most of one worker's time and none of the other
+/// ten's: each would still walk fourteen hundred cached bodies, substitute their placeholders and
+/// assemble twenty-nine megabytes of C, only to hand it to an object cache that already had the
+/// answer. Sharing the built unit in process is not available -- `ply_eval::Value` holds `Rc`,
+/// so nothing containing one crosses a rayon worker -- so what is shared is this, through the
+/// same file system the objects already live on.
+pub fn read_unit(key: &str) -> Option<String> {
+    let s = std::fs::read_to_string(dir().join(format!("{key}.unit"))).ok()?;
+    let object = s.trim();
+    (!object.is_empty() && object.bytes().all(|b| b.is_ascii_hexdigit()))
+        .then(|| object.to_string())
 }
 
-pub fn write_unit(key: &str, u: &UnitCache) {
+pub fn write_unit(key: &str, object: &str) {
     let d = dir();
     if std::fs::create_dir_all(&d).is_err() {
         return;
     }
     let tmp = d.join(format!("{key}.{}.utmp", std::process::id()));
-    if std::fs::write(&tmp, encode_unit(u)).is_ok() {
+    if std::fs::write(&tmp, format!("{object}\n")).is_ok() {
         let _ = std::fs::rename(&tmp, d.join(format!("{key}.unit")));
     }
-}
-
-pub fn encode_unit(u: &UnitCache) -> String {
-    let mut out = format!("object {}\n", u.object);
-    out.push_str(&format!("taken {}\n", u.taken.len()));
-    for t in &u.taken {
-        out.push_str(&format!("{t}\n"));
-    }
-    out.push_str(&format!("refused {}\n", u.refusals.len()));
-    for (function, construct) in &u.refusals {
-        out.push_str(&format!("{function}\n{construct}\n"));
-    }
-    out.push_str(&encode_tables(
-        &u.consts,
-        &u.builtins,
-        &u.fields,
-        &u.shapes,
-        &u.lambdas,
-    ));
-    out
-}
-
-pub fn decode_unit(s: &str) -> Option<UnitCache> {
-    let mut at = 0usize;
-    let object = line(s, &mut at)?.strip_prefix("object ")?.to_string();
-    let n = count(line(s, &mut at)?, "taken")?;
-    let mut taken = Vec::with_capacity(n);
-    for _ in 0..n {
-        taken.push(line(s, &mut at)?.to_string());
-    }
-    let n = count(line(s, &mut at)?, "refused")?;
-    let mut refusals = Vec::with_capacity(n);
-    for _ in 0..n {
-        let function = line(s, &mut at)?.to_string();
-        let construct = line(s, &mut at)?.to_string();
-        refusals.push((function, construct));
-    }
-    let t = decode_tables(s, &mut at)?;
-    Some(UnitCache {
-        object,
-        taken,
-        refusals,
-        consts: t.consts,
-        fields: t.fields,
-        builtins: t.builtins,
-        shapes: t.shapes,
-        lambdas: t.lambdas,
-    })
 }

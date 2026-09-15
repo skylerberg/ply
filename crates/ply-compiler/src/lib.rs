@@ -87,19 +87,10 @@ pub fn sources() -> impl Iterator<Item = (&'static str, &'static str)> {
 /// what says the bundle serves: it was emitted from these sources, and the emitter built from it
 /// emits, for them, the C it was built from.
 pub mod bootstrap {
-    /// The unit's C, gzipped.
+    /// The unit's C, gzipped. It carries everything loading it needs -- the constructor table
+    /// its tags are positions in, its functions and their arities, its tables -- so building the
+    /// emitter from it parses none of these sources.
     pub const UNIT: &[u8] = include_bytes!("../bootstrap/unit.c.gz");
-
-    /// The record the cache keeps beside a built unit.
-    pub const RECORD: &str = include_str!("../bootstrap/unit.record");
-
-    /// The constructor table the C was emitted against: the tags baked into it are positions in
-    /// this table and not in whatever table these sources have now.
-    pub const CTORS: &str = include_str!("../bootstrap/unit.ctors");
-
-    /// What loading the unit needs from these sources -- arities, constants, the module count --
-    /// so that building the emitter from the bundle parses none of them.
-    pub const LOAD: &str = include_str!("../bootstrap/unit.load");
 
     /// The digest of the sources it was emitted from. The fixpoint test refuses a bundle whose
     /// digest is not these sources', and CI hands back a refreshed one as an artifact.
