@@ -1867,11 +1867,15 @@ pub fn reference_emit_encoded(
         Box::leak(Box::new(resolved)),
         Box::leak(Box::new(check)),
     )));
-    for name in source.functions() {
-        if let Ok(enc) = ply_codegen::c::emit_body_encoded(source, &name, INLINING) {
-            out.insert(name, enc);
+    // The fragment, forced: the port is installed as the producer in the same process, and the
+    // reference is the side it is held against.
+    ply_codegen::c::producer::reference_only(|| {
+        for name in source.functions() {
+            if let Ok(enc) = ply_codegen::c::emit_body_encoded(source, &name, INLINING) {
+                out.insert(name, enc);
+            }
         }
-    }
+    });
     out
 }
 
@@ -1903,13 +1907,15 @@ pub fn reference_emit_dump(modules: &[(String, String)]) -> String {
         Box::leak(Box::new(resolved)),
         Box::leak(Box::new(check)),
     )));
-    for name in source.functions() {
-        // A body the reference refuses is left out, exactly as a body the port has not reached is:
-        // what is compared is what both sides produced.
-        if let Ok(text) = ply_codegen::c::emit_body(source, &name, INLINING) {
-            out.push_str(&format!("f:{name};{text};"));
+    ply_codegen::c::producer::reference_only(|| {
+        for name in source.functions() {
+            // A body the reference refuses is left out, exactly as a body the port has not reached
+            // is: what is compared is what both sides produced.
+            if let Ok(text) = ply_codegen::c::emit_body(source, &name, INLINING) {
+                out.push_str(&format!("f:{name};{text};"));
+            }
         }
-    }
+    });
     out
 }
 
@@ -2025,6 +2031,11 @@ pub mod port {
     /// returned. A raise, a missing entry or a non-string answer is the harness's own failure and
     /// panics with the reason.
     pub fn call(name: &str, args: &[Value]) -> String {
+        static REUSING: std::sync::Once = std::sync::Once::new();
+        // Emitting the compiler's own sources allocates two hundred million objects, and a debug
+        // heap that never reuses a block would need a runner it cannot have. This harness is not
+        // that check's oracle -- the audits are -- so, as the fixpoint test does, it reuses.
+        REUSING.call_once(|| ply_codegen::heap::reuse_by_default(true));
         ply_codegen::c::producer::ensure_default();
         match ply_codegen::c::producer::call(name, args) {
             Ok(Value::Str(ref s)) => s.to_string(),
