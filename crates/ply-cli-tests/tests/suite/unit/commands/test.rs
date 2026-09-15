@@ -996,7 +996,7 @@ fn a_stored_failure_is_re_run_rather_than_believed() {
 /// A binding over the fixture's `db.all[users]`, which is the residual atom of the two reading
 /// tests and of neither of the others.
 fn bound(loaded: &Loaded) -> Hosts {
-    use crate::hosts::fixture::{deterministic, named, op, registry};
+    use crate::unit::hosts::fixture::{deterministic, named, op, registry};
     Hosts::bind(
         registry(vec![deterministic(op(
             "db",
@@ -1207,7 +1207,7 @@ fn a_cached_pass_over_the_host_fails_the_run_that_wrote_it() {
 /// by every later hermetic run.
 #[test]
 fn a_database_backed_test_is_host_backed_never_cached_and_says_which_database() {
-    use crate::hosts::fixture::{deterministic, named, op, registry};
+    use crate::unit::hosts::fixture::{deterministic, named, op, registry};
     let (_dir, loaded, hashes, plan) = plan_for(None);
     let config = ply_cli::db::DbOptions {
         url: Some("postgres://ply:hunter2@127.0.0.1:5433/desk".to_string()),

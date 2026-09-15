@@ -37,6 +37,7 @@ mod stdlib;
 mod text;
 mod tiers;
 mod tls_cli;
+mod unit;
 mod w2_derivation_audit;
 mod w2_prover_audit;
 mod w2_stdlib_audit;

@@ -739,7 +739,7 @@ fn suspending_with_nothing_running_is_refused_rather_than_silently_applied() {
 /// *named* is greppable.
 #[test]
 fn this_module_names_nothing_a_seeded_run_may_not_depend_on() {
-    let body = include_str!("../../../ply-eval/src/sched.rs");
+    let body = include_str!("../../../../ply-eval/src/sched.rs");
     for banned in [
         "HashMap",
         "HashSet",
