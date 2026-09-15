@@ -76,13 +76,16 @@ and the workaround was `heap::reuse_by_default(true)` at the top of every
 test that enters the bundle, which is a thing a contributor had to know.
 
 **Built.** Every build reuses. A debug build holds a dead block in a
-quarantine first, oldest out, bounded by `heap::QUARANTINE` bytes, so a
+quarantine first, oldest out, bounded by `heap::QUARANTINE` blocks, so a
 stale read still finds the marker for a while and an entry's memory is what
 it holds plus the bound, never what it ever held. The record first said
 reuse everywhere with no-reuse as an explicit mode; the quarantine keeps the
 net the suites run under without a switch, so no test has to know it is
 there. The switch and every call to it are gone; `Heap::set_quarantine(0)`
-is what a test of the recycling itself asks for.
+is what a test of the recycling itself asks for. The bound was first tens
+of megabytes; ADR 0050 §1b's profile put the heap's `dismantle` at a
+quarter of the compiled compiler's time with the oldest block touched cold
+on every eviction, and the bound is a short count that stays in cache.
 
 ### 3. The emitter's inner loops, held to the hasher — measured, and the premise was wrong
 

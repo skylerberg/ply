@@ -356,20 +356,22 @@ pub struct Heap {
     /// word finds a dead header for a while yet rather than whatever took the block. The queue
     /// is threaded through the dead blocks themselves -- the next pointer in the first payload
     /// word, the block's size in the header's `layout` -- so holding one costs nothing the
-    /// allocation counts would see. `quarantine` bounds it in bytes; at zero a dead block is
+    /// allocation counts would see. `quarantine` bounds it in blocks; at zero a dead block is
     /// reusable at once.
     held_head: *mut Obj,
     held_tail: *mut Obj,
-    held_bytes: usize,
+    held: usize,
     quarantine: usize,
 }
 
-/// How many bytes of dead blocks a heap holds back before recycling the oldest: a debug build
-/// keeps the net, a release build keeps nothing. Bounded, because a heap that kept every dead
-/// block until the entry's end needed a runner nothing here can have -- the emitter emitting its
-/// own sources allocates two hundred million objects in one entry -- and every test that entered
-/// it had to know to switch the net off.
-pub const QUARANTINE: usize = if cfg!(debug_assertions) { 64 << 20 } else { 0 };
+/// How many dead blocks a heap holds back before recycling the oldest: a debug build keeps the
+/// net, a release build keeps nothing. Bounded, because a heap that kept every dead block until
+/// the entry's end needed a runner nothing here can have -- the emitter emitting its own sources
+/// allocates two hundred million objects in one entry -- and every test that entered it had to
+/// know to switch the net off. Bounded in blocks and kept short, because the oldest block is
+/// touched again when it leaves, and a queue that fits in cache costs a debug build little where
+/// one of tens of megabytes made `dismantle` the top of the compiled compiler's profile.
+pub const QUARANTINE: usize = if cfg!(debug_assertions) { 1024 } else { 0 };
 
 /// The size classes a dead object is kept in, in words; anything larger goes back only at the
 /// entry's end.
@@ -436,15 +438,15 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
             *held_next(heap.held_tail) = o;
         }
         heap.held_tail = o;
-        heap.held_bytes += object;
-        while heap.held_bytes > heap.quarantine {
+        heap.held += 1;
+        while heap.held > heap.quarantine {
             let old = heap.held_head;
             heap.held_head = *held_next(old);
             if heap.held_head.is_null() {
                 heap.held_tail = std::ptr::null_mut();
             }
+            heap.held -= 1;
             let bytes = (*old).layout as usize;
-            heap.held_bytes -= bytes;
             heap.free_list(bytes).push(old);
         }
     }
@@ -484,15 +486,15 @@ impl Heap {
             large: Vec::new(),
             held_head: std::ptr::null_mut(),
             held_tail: std::ptr::null_mut(),
-            held_bytes: 0,
+            held: 0,
             quarantine: QUARANTINE,
         }
     }
 
-    /// How many bytes of dead blocks this heap holds back before recycling the oldest; zero
-    /// recycles at once, which is what a test of the recycling itself asks for.
-    pub fn set_quarantine(&mut self, bytes: usize) {
-        self.quarantine = bytes;
+    /// How many dead blocks this heap holds back before recycling the oldest; zero recycles at
+    /// once, which is what a test of the recycling itself asks for.
+    pub fn set_quarantine(&mut self, blocks: usize) {
+        self.quarantine = blocks;
     }
 
     /// The free list a dead block of `object` bytes goes to: its size class, or the power of two
@@ -889,7 +891,7 @@ impl Heap {
         }
         self.held_head = std::ptr::null_mut();
         self.held_tail = std::ptr::null_mut();
-        self.held_bytes = 0;
+        self.held = 0;
         for bits in &mut self.starts {
             bits.fill(0);
         }
