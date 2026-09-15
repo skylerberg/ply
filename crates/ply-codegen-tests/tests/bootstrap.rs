@@ -2,9 +2,13 @@
 //! sources, and the bundle serves as long as it is a fixpoint: the emitter built from it emits,
 //! for those sources, C that builds an emitter that emits the same C. ADR 0045's second stage.
 //!
+//! The bundle has to be the one emitted from the sources in the tree: an older one still runs,
+//! since its constructor table travels with it, and is what the refresh builds the new one with,
+//! but what it emits is the old emitter's C and the caches would key it as the new one's.
 //! `PLY_C_BOOTSTRAP_REFRESH=1` rewrites `crates/ply-compiler/bootstrap` with the fixpoint's own
-//! emission, which is how the bundle is refreshed after a change the old one cannot build; with
-//! no bundle at all, the refresh builds the first emitter with the reference.
+//! emission; CI does the same when this test goes red and hands the result back as the
+//! `bootstrap-bundle` artifact. With no bundle at all, the refresh builds the first emitter with
+//! the reference, which under tier-only can no longer emit it whole.
 
 use ply_codegen::Source;
 use ply_codegen::c::producer::{self, PlyProducer};
@@ -133,6 +137,16 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
             ""
         }
     );
+    if have && !refresh {
+        let current = ply_codegen::c::bundle::from_dir(&bundle).expect("the bundle serves");
+        assert_eq!(
+            current.sources_digest(),
+            Some(identity.as_str()),
+            "the bundle at {} was emitted from other sources than these; refresh it: PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap, or take CI's `bootstrap-bundle` artifact",
+            bundle.display()
+        );
+    }
+    let ctors = source.ctors();
     let scratch = std::env::temp_dir().join(format!("ply-bootstrap-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
     producer::install(
@@ -149,7 +163,7 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     let first = have.then(|| bundle.clone());
     let (c1, r1, _) = emit_with(source, first.as_deref(), &scratch);
     let stage = scratch.join("stage1");
-    ply_codegen::c::bundle::write(&stage, &c1, &r1, &identity).unwrap();
+    ply_codegen::c::bundle::write(&stage, &c1, &r1, &ctors, &identity).unwrap();
 
     // The emitter built from that emission emits itself again.
     let (c2, r2, refused) = emit_with(source, Some(&stage), &scratch);
@@ -178,22 +192,15 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         // A refresh writes the current emitter's own emission, once a third emitter built from it
         // has emitted the same thing: the bundle written is a fixpoint on the day it is written.
         let stage2 = scratch.join("stage2");
-        ply_codegen::c::bundle::write(&stage2, &c2, &r2, &identity).unwrap();
+        ply_codegen::c::bundle::write(&stage2, &c2, &r2, &ctors, &identity).unwrap();
         let (c3, r3, _) = emit_with(source, Some(&stage2), &scratch);
         if !same(&c2, &r2, &c3, &r3) {
             differ("refresh", &c2, &c3);
         }
-        ply_codegen::c::bundle::write(&bundle, &c2, &r2, &identity).unwrap();
+        ply_codegen::c::bundle::write(&bundle, &c2, &r2, &ctors, &identity).unwrap();
         eprintln!("bootstrap bundle written to {}", bundle.display());
     } else if !same(&c1, &r1, &c2, &r2) {
         differ("fixpoint", &c1, &c2);
-    }
-    if let Some(recorded) = ply_codegen::c::bundle::sources_digest(&bundle)
-        && recorded != identity
-    {
-        eprintln!(
-            "the bundle was emitted from sources {recorded} and these are {identity}; it still serves, and PLY_C_BOOTSTRAP_REFRESH=1 would bring it up to date"
-        );
     }
     let _ = std::fs::remove_dir_all(&scratch);
 }
