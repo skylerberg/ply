@@ -1,4 +1,4 @@
-"""Mines `crates/ply-syntax/src/resolve.rs` for the multi-module programs its tests build and
+"""Mines `crates/ply-syntax-tests/tests/unit/resolve.rs` for the multi-module programs its tests build and
 writes them as a program bundle for the resolve differential.
 
     python3 crates/ply-compiler-diff/tools/mine-programs.py
@@ -12,8 +12,8 @@ dotted name.
 import pathlib
 import re
 
-root = pathlib.Path(__file__).resolve().parents[2]
-src = (root / "crates/ply-syntax/src/resolve.rs").read_text()
+root = pathlib.Path(__file__).resolve().parents[3]
+src = (root / "crates/ply-syntax-tests/tests/unit/resolve.rs").read_text()
 
 STRING = re.compile(r'"((?:[^"\\]|\\.)*)"', re.S)
 
@@ -73,7 +73,7 @@ for p in programs:
 
 out = pathlib.Path(__file__).resolve().parent / "fixtures/reference-programs.corpus"
 with out.open("w") as f:
-    f.write("Mined from crates/ply-syntax/src/resolve.rs by mine-programs.py. Do not edit.\n")
+    f.write("Mined from crates/ply-syntax-tests/tests/unit/resolve.rs by mine-programs.py. Do not edit.\n")
     for p in unique:
         f.write("\n%%%\n")
         f.write("\n%%\n".join(f"{name}\n{text}" for name, text in p))

@@ -500,7 +500,7 @@ fn walk_expr(e: &mut Expr, f: &mut impl FnMut(&mut RowExpr)) {
     })
 }
 
-pub(crate) fn grow<T>(f: impl FnOnce() -> T) -> T {
+pub fn grow<T>(f: impl FnOnce() -> T) -> T {
     const RED_ZONE: usize = 256 * 1024;
     const NEW_SEGMENT: usize = 2 * 1024 * 1024;
     stacker::maybe_grow(RED_ZONE, NEW_SEGMENT, f)

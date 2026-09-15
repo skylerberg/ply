@@ -7879,7 +7879,7 @@ pub enum ExprKind {
 ```
 
 **No crate downstream of `ply-syntax` can observe this variant**, and that is
-checked rather than argued: `crates/ply-syntax/src/tests.rs
+checked rather than argued: `crates/ply-syntax-tests/tests/unit/parser.rs
 no_record_update_survives_parse_module_anywhere_in_the_tree` parses every `.ply`
 file in the repository plus a file that uses the syntax, through both
 `Module`-returning entry points, and asserts none survives. `ply-hash`,
@@ -7907,7 +7907,7 @@ because of that guard.
   (position decides nothing since ADR 0034). Sorted **by name and not by length** is a
   separate claim and is pinned separately, because a suite written in
   one-character field names orders identically under either comparator and says
-  nothing. Each of `crates/ply-syntax/src/tests.rs
+  nothing. Each of `crates/ply-syntax-tests/tests/unit/parser.rs
   copies_are_sorted_by_name_and_not_by_length`,
   `record_update_hashes_as_its_expansion` and
   `a_projected_base_hashes_as_its_expansion` therefore carries **two**
@@ -7918,7 +7918,7 @@ because of that guard.
   > **One pair was not enough, and the gap had the same shape as the defect it was
   > written to close.** The sentence above ended:
   >
-  > > : `crates/ply-syntax/src/tests.rs
+  > > : `crates/ply-syntax-tests/tests/unit/parser.rs
   > > copies_are_sorted_by_name_and_not_by_length` reads the emitted order off the
   > > tree, and `record_update_hashes_as_its_expansion` and
   > > `a_projected_base_hashes_as_its_expansion` both carry field names whose

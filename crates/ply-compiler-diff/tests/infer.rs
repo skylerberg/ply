@@ -240,7 +240,7 @@ fn the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs() 
 }
 
 /// The reference checker's own test inputs, each as a one-module program named `m`, the way
-/// `crates/ply-core/src/tests.rs` checks them. Most are error paths: this is where the port's
+/// `crates/ply-core-tests/tests/unit/infer.rs` checks them. Most are error paths: this is where the port's
 /// diagnostics are compared, code by code and label by label.
 #[test]
 fn the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs() {
