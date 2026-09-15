@@ -84,8 +84,8 @@ pub fn sources() -> impl Iterator<Item = (&'static str, &'static str)> {
 /// A compiler written in the language it compiles has to come from somewhere, and this is where:
 /// the unit is loaded from these bytes rather than emitted by the Rust fragment, which could not
 /// emit it anyway -- the fragment refuses `perform`. `crates/ply-codegen-tests`'s fixpoint test is
-/// what says the bundle still serves: the emitter built from it emits, for these sources, the C it
-/// was built from.
+/// what says the bundle serves: it was emitted from these sources, and the emitter built from it
+/// emits, for them, the C it was built from.
 pub mod bootstrap {
     /// The unit's C, gzipped.
     pub const UNIT: &[u8] = include_bytes!("../bootstrap/unit.c.gz");
@@ -93,7 +93,12 @@ pub mod bootstrap {
     /// The record the cache keeps beside a built unit.
     pub const RECORD: &str = include_str!("../bootstrap/unit.record");
 
-    /// The digest of the sources it was emitted from, which is how a stale bundle is noticed.
+    /// The constructor table the C was emitted against: the tags baked into it are positions in
+    /// this table and not in whatever table these sources have now.
+    pub const CTORS: &str = include_str!("../bootstrap/unit.ctors");
+
+    /// The digest of the sources it was emitted from. The fixpoint test refuses a bundle whose
+    /// digest is not these sources', and CI hands back a refreshed one as an artifact.
     pub const SOURCES: &str = include_str!("../bootstrap/SOURCES.digest");
 
     /// The digest of the runtime its C calls into. A helper that changes shape leaves the bundle
