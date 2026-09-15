@@ -40,9 +40,13 @@ typedef struct {
 /* Where the body is, stored before a call that can fail so what the runtime raises is placed. */
 #define PLY_SITE(ctx, m, s, e) ((ctx)->site_module = (m), (ctx)->site_start = (s), (ctx)->site_end = (e))
 
-static inline Word *ply_words(Word w) { return (Word *)((char *)(intptr_t)w + PLY_HEADER); }
-static inline PlyObj *ply_obj(Word w) { return (PlyObj *)(intptr_t)w; }
-static inline int ply_is_imm(Word w) { return (w & 1) != 0; }
+/* Macros rather than static inline functions, because the development profile's compiler never
+   inlines: under tcc every one of these was a call, tens of thousands of times over a unit, and
+   a fifth of the compiled compiler's time. Every argument the emitters pass is a temporary or a
+   literal, so an operand read twice is read once. */
+#define ply_words(w) ((Word *)((char *)(intptr_t)(w) + PLY_HEADER))
+#define ply_obj(w) ((PlyObj *)(intptr_t)(w))
+#define ply_is_imm(w) (((w) & 1) != 0)
 /* Four bytes read least-significant-first, whatever this machine's order is. */
 static inline uint32_t ply_le32(uint32_t v) {
 #if defined(__BYTE_ORDER__) && __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
@@ -80,33 +84,30 @@ static inline int ply_sub_ov(int64_t a, int64_t b, int64_t *r) {
 }
 #endif
 
-static inline Word ply_imm(int64_t v) { return (Word)(((uint64_t)v << 1) | 1); }
-static inline int64_t ply_imm_value(Word w) { return w >> 1; }
-static inline int ply_fits_imm(int64_t v) { return ((v << 1) >> 1) == v; }
+#define ply_imm(v) ((Word)(((uint64_t)(int64_t)(v) << 1) | 1))
+#define ply_imm_value(w) ((int64_t)(w) >> 1)
+#define ply_fits_imm(v) (((int64_t)((uint64_t)(int64_t)(v) << 1) >> 1) == (int64_t)(v))
 
 /* An immortal object carries `rc == UINT32_MAX` and is never counted, exactly as `heap.rs` says. */
 /* A record dying at a count of one, with no children to let go of, becomes the token the next
    record of its size takes. That is the whole of `heap::reset` for the shape the kernel builds,
    and inlining it here is what keeps a record's death off the call boundary --- the profile put
    `heap::reset` beside `round` itself, all of it the sixteen-child walk a FLAT record skips. */
-static inline Word ply_reset_flat(Word w) {
-  if (ply_is_imm(w) || w == 0) return 0;
+static inline Word ply_reset_flat_obj(Word w) {
   PlyObj *o = ply_obj(w);
   if (o->kind != 3 || o->rc != 1 || !(o->flags & 1)) return 0;
   o->len = 0;
   return w;
 }
+#define ply_reset_flat(w) ((ply_is_imm(w) || (w) == 0) ? 0 : ply_reset_flat_obj(w))
 
-static inline void ply_inc(Word w) {
-  if (!ply_is_imm(w) && w != 0) {
-    PlyObj *o = ply_obj(w);
-    if (o->rc != UINT32_MAX) o->rc += 1;
-  }
-}
-
-/* The word a field holds, at a statically known offset. */
-static inline Word ply_field_at(Word base, int at) { return ply_words(base)[at]; }
-static inline void ply_set_field(Word base, int at, Word v) { ply_words(base)[at] = v; }
+#define ply_inc(w) do { \
+  Word ply_w_ = (w); \
+  if (!ply_is_imm(ply_w_) && ply_w_ != 0) { \
+    PlyObj *ply_o_ = ply_obj(ply_w_); \
+    if (ply_o_->rc != UINT32_MAX) ply_o_->rc += 1; \
+  } \
+} while (0)
 "#;
 
 /// One runtime helper the emitted C may call: its name, how many arguments it takes past the
@@ -213,13 +214,15 @@ pub fn runtime_decls() -> String {
     // `fold(xs, 0, add) + len(xs)` read a freed list. Three lines of Ply, and it had been in the
     // tier from its first commit.
     out.push_str(
-        "\nstatic inline void ply_dec(PlyCtx *ctx, Word w) {\n\
-         \x20 if (ply_is_imm(w) || w == 0) return;\n\
-         \x20 PlyObj *o = ply_obj(w);\n\
-         \x20 if (o->rc == UINT32_MAX) return;\n\
-         \x20 if (o->rc > 1) { o->rc -= 1; return; }\n\
-         \x20 rt_dec_p(ctx, w);\n\
-         }\n",
+        "\n#define ply_dec(ctx, w) do { \\\n\
+         \x20 Word ply_w_ = (w); \\\n\
+         \x20 if (!ply_is_imm(ply_w_) && ply_w_ != 0) { \\\n\
+         \x20   PlyObj *ply_o_ = ply_obj(ply_w_); \\\n\
+         \x20   if (ply_o_->rc != UINT32_MAX) { \\\n\
+         \x20     if (ply_o_->rc > 1) ply_o_->rc -= 1; else rt_dec_p((ctx), ply_w_); \\\n\
+         \x20   } \\\n\
+         \x20 } \\\n\
+         } while (0)\n",
     );
     // The three singletons, bound rather than baked. They are heap addresses, so writing them into
     // the source made the source different in every process -- which is invisible while a unit is
