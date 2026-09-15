@@ -11,8 +11,7 @@
 //!
 //! `crates/ply-corpus-tests/tests/allocation/counting.rs` is the same file. Integration
 //! tests in different crates cannot share a module, so closing that last seam
-//! would mean a workspace member existing only to hold this — a member
-//! `ci-shards.sh verify` would then require a shard for. Two copies is the
+//! would mean a workspace member existing only to hold this. Two copies is the
 //! cheaper end of that trade; thirteen was not.
 
 use std::alloc::{GlobalAlloc, Layout, System};

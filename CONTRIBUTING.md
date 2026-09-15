@@ -142,21 +142,24 @@ turns the required check red rather than reporting green over nothing run.
 
 **`fmt` and `clippy` run alongside the test jobs, not ahead of them.** They are
 required by the `ci` aggregate, so a lint slip is still a red check; what they
-no longer do is hold every shard back by their own wall clock on a green run.
+no longer do is hold every test job back by their own wall clock on a green run.
 Watch a run with `gh pr checks <n> --watch --fail-fast`, which exits at the
 first failed check, so a formatting slip surfaces when `fmt` finishes rather
-than when the last shard does.
+than when the last job does.
 
-**The test job is sharded**, because one runner running everything is too slow.
-`.github/ci-shards.sh` holds the partition and `verify` fails if a workspace
-member is in no shard, in two shards, or named and absent from the tree — a
-partition is a chance to lose a package silently, and a package nothing builds
-is this repository's most expensive defect class. The same check covers
-the workspace, which `crates/ply-compiler` joined after sitting in **no CI job at all**
-while its differential went red for two days, and `.config/nextest.toml`, which
-must name exactly the wall-clock tests the script's table names: each shard
-runs those last and alone and asserts, by exact name, that each one in its
-packages ran.
+**The suite is built once and run by many jobs at once**, because one runner
+running everything is too slow and one runner per package group was bounded by
+its longest tests. `build` archives every workspace member's tests with `cargo
+nextest archive --workspace`; the partitions each run a slice of it, the tests
+that must run alone get a runner each, and the wall-clock tests, the shutdown
+suite and the tree checks run in a job that asserts, by exact name, that each
+one ran. `.github/ci-shards.sh` holds those tables and `verify` fails when a
+name in them is not defined where the table says, when a crate under `crates/`
+is no member, or when `.config/nextest.toml` does not name exactly the
+wall-clock tests — a table is a chance to lose a test silently, and a crate
+nothing builds is this repository's most expensive defect class:
+`crates/ply-compiler` sat in **no CI job at all** while its differential went
+red for two days.
 
 One thing CI deliberately does not run, recorded in §"Things known to be
 broken": `./crates/ply-compiler-diff/tools/arm.sh --arm`.
@@ -172,9 +175,9 @@ when unset, so a green run is indistinguishable from a run against a database.
 
 **Wall-clock assertions.** Some tests assert on elapsed time and run by default.
 `.github/ci-shards.sh`'s `DEFERRED` table lists them, CI runs each alone and
-single-threaded, and the parallel shards skip them. **That table is maintained by
-running the shards, not by surveying the tree** — two surveys declared themselves
-complete and each was proved wrong within the hour by a shard going red on a test
+single-threaded, and the partitions skip them. **That table is maintained by
+running the suite, not by surveying the tree** — two surveys declared themselves
+complete and each was proved wrong within the hour by a run going red on a test
 neither had found. One of them reads no Rust clock at all: it parses milliseconds
 out of `ply test`'s own output, so no timing vocabulary appears in it.
 
