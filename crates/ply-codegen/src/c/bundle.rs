@@ -181,7 +181,7 @@ pub struct Bundle {
     unit: std::borrow::Cow<'static, [u8]>,
     record: String,
     ctors: Vec<(Symbol, usize)>,
-    load: Option<Load>,
+    load: Load,
     sources: Option<String>,
 }
 
@@ -196,7 +196,7 @@ pub fn of(src: &super::producer::Sources) -> Option<Bundle> {
                 unit: std::borrow::Cow::Borrowed(ply_compiler::bootstrap::UNIT),
                 record: ply_compiler::bootstrap::RECORD.to_string(),
                 ctors: decode_ctors(ply_compiler::bootstrap::CTORS)?,
-                load: Load::decode(ply_compiler::bootstrap::LOAD),
+                load: Load::decode(ply_compiler::bootstrap::LOAD)?,
                 sources: Some(ply_compiler::bootstrap::SOURCES.trim().to_string()),
             })
         }
@@ -213,7 +213,7 @@ pub fn from_dir(dir: &Path) -> Option<Bundle> {
         unit: std::borrow::Cow::Owned(std::fs::read(dir.join(UNIT)).ok()?),
         record: std::fs::read_to_string(dir.join(RECORD)).ok()?,
         ctors: ctors_in(dir)?,
-        load: load_in(dir),
+        load: load_in(dir)?,
         sources: sources_digest(dir),
     })
 }
@@ -225,8 +225,8 @@ impl Bundle {
     }
 
     /// `None` for a bundle written before `unit.load` travelled with it.
-    pub fn load(&self) -> Option<&Load> {
-        self.load.as_ref()
+    pub fn load(&self) -> &Load {
+        &self.load
     }
 }
 
@@ -265,6 +265,7 @@ pub fn exists(dir: &Path) -> bool {
     dir.join(UNIT).is_file()
         && dir.join(RECORD).is_file()
         && ctors_in(dir).is_some()
+        && load_in(dir).is_some()
         && !stale_runtime(dir)
 }
 
@@ -272,18 +273,15 @@ pub fn exists(dir: &Path) -> bool {
 /// the table it was emitted with, and its record and load record stand in for what emitting would
 /// have recorded. Nothing is emitted and nothing is parsed.
 ///
-/// `source` is asked for the emitter's parsed program only by a bundle with no load record.
-pub fn build(
-    bundle: &Bundle,
-    source: impl FnOnce() -> Result<&'static Source>,
-) -> Result<(Native, Vec<Refused>)> {
+pub fn build(bundle: &Bundle) -> Result<(Native, Vec<Refused>)> {
     let text = text_of(bundle)?;
     let record = decode_unit(&bundle.record)
         .ok_or_else(|| anyhow!("the bootstrap bundle's record does not decode"))?;
-    let load = match &bundle.load {
-        Some(load) => load.clone(),
-        // Goes once the tree's bundle carries `unit.load`.
-        None => Load::of(source()?, &record.taken),
-    };
-    super::build::load_unit_with(&text, record, bundle.ctors.clone(), &load, "bootstrap")
+    super::build::load_unit_with(
+        &text,
+        record,
+        bundle.ctors.clone(),
+        &bundle.load,
+        "bootstrap",
+    )
 }

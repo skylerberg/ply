@@ -81,9 +81,7 @@ static FROM: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProducer, String> {
     let (native, _) = match from.and_then(ply_codegen::c::bundle::from_dir) {
-        Some(bundle) => {
-            ply_codegen::c::bundle::build(&bundle, || Ok(source)).map_err(|e| format!("{e:#}"))?
-        }
+        Some(bundle) => ply_codegen::c::bundle::build(&bundle).map_err(|e| format!("{e:#}"))?,
         None => {
             let names: Vec<String> = source.functions();
             let refs: Vec<&str> = names.iter().map(String::as_str).collect();
@@ -213,8 +211,8 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         // The load record is the fixpoint's too: what the bundle says loading needs is what these
         // sources say, or the bundle enters its functions at the wrong arities.
         assert_eq!(
-            current.load(),
-            Some(&Load::of(source, &record.taken)),
+            *current.load(),
+            Load::of(source, &record.taken),
             "the bundle at {} does not carry the load record these sources derive; refresh it: PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap, or take CI's `bootstrap-bundle` artifact",
             bundle.display()
         );

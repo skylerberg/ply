@@ -131,10 +131,7 @@ fn build_from(src: &Sources) -> Result<PlyProducer, String> {
         .then(|| super::bundle::of(src))
         .flatten();
     let (native, _refused) = match bundle {
-        Some(bundle) => {
-            super::bundle::build(&bundle, || front_end(src).map_err(anyhow::Error::msg))
-                .map_err(|e| format!("{e:#}"))?
-        }
+        Some(bundle) => super::bundle::build(&bundle).map_err(|e| format!("{e:#}"))?,
         None => {
             let source = front_end(src)?;
             let names: Vec<String> = source.functions();
