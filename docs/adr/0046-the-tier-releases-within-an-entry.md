@@ -114,7 +114,7 @@ All four are green. `crates/ply-codegen/src/heap.rs` refuses to read a word
 whose object died, and under the audit that refusal is what turned each
 ownership defect into a named failure rather than a wrong answer; it
 caught the double release above and the two-pass hazard. The ratchet
-`crates/ply-compiler-diff/tests/emit_diff.rs` compares the port's
+`crates/ply-compiler-diff/tests/suite/emit_diff.rs` compares the port's
 reference mode, which is unchanged, and the port's own tests pass under both
 engines.
 

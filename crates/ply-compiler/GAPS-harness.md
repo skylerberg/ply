@@ -12,7 +12,7 @@ this tree, by a command that is named, and nothing is approximated.
 
 ## §H1 The corpus figure
 
-`crates/ply-compiler-diff/tests/agreement.rs`, run by `./run.sh`. Every number
+`crates/ply-compiler-diff/tests/suite/agreement.rs`, run by `./run.sh`. Every number
 is printed by the run; none is claimed.
 
 | | inputs | bytes | dump records | nodes | diagnostics |
@@ -134,7 +134,7 @@ areas were written against `parser.rs` by hand and they were right.
    not emitted — and, unlike item 6, **not excused**: `fields.rs` fails on it
    today, which is why `../run.sh` stops before the differential (§11R.S).
 
-That list is enforced, not remembered: `harness/tests/fields.rs` reads `ast.rs`,
+That list is enforced, not remembered: `crates/ply-compiler-diff/tests/suite/fields.rs` reads `ast.rs`,
 takes every field of every type the parser builds, and requires each to be named
 in the reference dumper. Deleting `self.boolean(o.resource_param)` from the
 dumper was seen to fail it.

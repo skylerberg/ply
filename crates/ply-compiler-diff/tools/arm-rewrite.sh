@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The rewrite differential, armed: each mutation below is applied to a copy of
-# `rewrite.ply` and the fast half of `harness/tests/rewrite.rs` (the hand-written
+# `rewrite.ply` and the fast half of `crates/ply-compiler-diff/tests/suite/rewrite.rs` (the hand-written
 # fixtures and the reference's own inputs) must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-rewrite.sh
@@ -19,9 +19,9 @@ run_suite() {
   ( cd "$root" \
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
     && PLY_C_EMITTER="ply:$work" \
-       cargo test --offline --test rewrite -- --test-threads=2 \
-         the_rewrites_agree_with_ply_syntax_on_the_hand_written_fixtures \
-         the_rewrites_agree_with_ply_syntax_on_the_reference_own_test_inputs 2>&1 )
+       cargo test --offline --test suite -- --test-threads=2 \
+         rewrite::the_rewrites_agree_with_ply_syntax_on_the_hand_written_fixtures \
+         rewrite::the_rewrites_agree_with_ply_syntax_on_the_reference_own_test_inputs 2>&1 )
 }
 
 mutate() {
