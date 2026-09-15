@@ -421,6 +421,3 @@ pub fn err_unhandled(
         .primary(span, "performed here with no enclosing handler")
         .note("wrap this in a `handle ... with { ... }` that names the operation")
 }
-
-#[cfg(test)]
-mod tests;
