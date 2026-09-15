@@ -293,7 +293,9 @@ impl Printer {
             TypeExpr::Var(i) => self.push(i.name.as_str()),
             TypeExpr::Con { name, args, .. } => {
                 self.push(&name.to_string());
-                if !args.is_empty() {
+                // A bare lowercase name reads back as a type variable, so a reconstructed
+                // program's `d…` types keep their argument list even when it is empty.
+                if !args.is_empty() || (name.is_bare() && !is_ctor_name(name.symbol())) {
                     self.push("<");
                     self.sep(args, |p, a| p.ty(a));
                     self.push(">");
