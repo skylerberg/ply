@@ -18,6 +18,8 @@
 //! | `PLY_C_DUMP` | print one body's emitted C by name, or `*` for the unit's size and its largest bodies | `build.rs` |
 //! | `PLY_C_SPLIT` | print where the emit's time went: optimise-and-lower against emit | `build.rs` |
 //! | `PLY_C_PHASES` | print where a whole build's time went -- emit-and-resolve, assemble, compile-and-load, tables, and the source's size -- or that the unit came back whole from the cache; and at every entry's end what it allocated, recycled and still held, by kind | `build.rs`, `rt.rs` |
+//! | `PLY_HEAP_POISON` | the diagnostic mode of the heap: a dead block's payload is poisoned at release and a read of it before the block is taken again fails at the body's site. Set it to anything; nothing ships with it | `heap.rs` |
+//! | `PLY_HEAP_DELAY` | the other one: a dead block waits this many releases before an allocation may take it, so the chunk bytes at an entry's end read what building a value by copying the whole of it each step costs | `heap.rs` |
 //! | `PLY_C_CACHE` | where compiled objects and emitted bodies are kept. A directory of its own is what makes one measurement independent of the last | `load.rs` |
 //! | `PLY_C_CACHE_MAX` | how many bytes that directory may hold. The sweep runs at the start of a build, oldest entry first; `0` is no bound | `sweep.rs` |
 //! | `PLY_C_KEEP` | keep the emitted `.c` beside the object, which the cache otherwise throws away | `load.rs` |

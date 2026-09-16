@@ -113,13 +113,34 @@ lever ahead of the others. Three levers, in the order the readings say
 they pay:
 
 1. **The accumulator appended in place.** §1 found the compiler's byte
-   accumulators held twice at the append and copied whole each step. The
-   heap already appends in place to a value held once; the lever is
-   whatever holds the second count, in the emitted C's ownership or in the
-   sources' shape, so that the dumps every phase hands to the next are
-   built by one buffer growing. The census is its measure: the chunk bytes
-   under a delayed reuse of a thousand blocks, which today read fifty times
-   immediate reuse's, and the objects allocated.
+   accumulators copied whole each step. The heap already appends in place
+   to a value held once; the lever is the join the dumps go through, so
+   that the dumps every phase hands to the next are built by one buffer
+   growing. The census is its measure: the chunk bytes under a delayed
+   reuse of a thousand blocks, and the objects allocated.
+
+   **Built, 2026-09-15.** The second count was never held: the emitted C
+   compiles `bytes_concat_all([acc, ..])` to `rt_bytes_join` over the
+   pieces alone, and that join allocated a fresh buffer for the whole every
+   time, whoever held the pieces. It now hands a first piece held once to
+   `Heap::append`, which writes after it with room doubling, and copies
+   the other pieces once each; the interpreter's list arm does the same
+   when the list alone holds its first piece. The heap gained the other
+   diagnostic mode the measure needs, `PLY_HEAP_DELAY=<n>`: a dead block
+   waits `n` releases before an allocation may take it.
+
+   **Measured, 2026-09-15.** Under a delay of a thousand, the emitter over
+   its own sources held 16.5 GB of chunks and 15.4 GB resident before, and
+   334 MB of chunks and 0.75 GB resident after: the same as immediate
+   reuse, which is what a value built by one buffer growing looks like
+   under any reuse policy. The objects allocated moved by a tenth of a per
+   cent, on the emitter and on the hasher alike, because the join was a
+   few hundred thousand of two hundred million allocations; the census
+   file carries the new counts. The own-sources solo's test ran in 35–43 s
+   against 52 s on main in the same hour, and the hasher's first part in
+   11 s against 16 s, both from single runs in a band that is wide. The
+   lever is kept for the delayed-reuse figure, which was the one that
+   named it; the allocation count is the other two levers' to move.
 2. **Records with unboxed scalar fields**, so a record of `Int`s and
    `Bool`s is built without a count on each field and read without a
    helper per field; the emitter already knows a `FLAT` record and the
