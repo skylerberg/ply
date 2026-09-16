@@ -7,8 +7,8 @@ use crate::idx::{
     KIND_DECL, KIND_DEF, KIND_SOURCE, Located,
 };
 use crate::{ContentHash, DefBody, Pruned, disk};
-use ply_hash::DefHash;
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
+use ply_ty::DefHash;
 use ply_ty::Mode;
 use ply_ty::{Footprint, Scheme, Type};
 use serde::{Deserialize, Serialize};

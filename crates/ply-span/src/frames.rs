@@ -91,11 +91,7 @@ fn module_index(span: Span, sources: &[SourceId], index: usize) -> Result<u32, S
 /// a field key or a code the protocol does not know is an error naming it, and so is a frame or a
 /// field that ends before its length says.
 pub fn read_diagnostics(dump: &str, sources: &[SourceId]) -> Result<Vec<Diagnostic>, String> {
-    let mut frames = Cursor {
-        bytes: dump.as_bytes(),
-        at: 0,
-        what: "frame",
-    };
+    let mut frames = Cursor::new(dump.as_bytes(), "frame");
     let mut out = Vec::new();
     while !frames.done() {
         let index = out.len();
@@ -116,11 +112,7 @@ pub fn read_diagnostics(dump: &str, sources: &[SourceId]) -> Result<Vec<Diagnost
 }
 
 fn read_one(payload: &[u8], sources: &[SourceId], index: usize) -> Result<Diagnostic, String> {
-    let mut fields = Cursor {
-        bytes: payload,
-        at: 0,
-        what: "field",
-    };
+    let mut fields = Cursor::new(payload, "field");
     let (mut code, mut severity, mut message) = (None, None, None);
     let mut labels = Vec::new();
     let mut notes = Vec::new();
@@ -213,20 +205,31 @@ fn label(text: &str, sources: &[SourceId], index: usize) -> Result<Label, String
     })
 }
 
-/// Reads `<words...> <length>\n<bytes>` units off a byte string.
-struct Cursor<'a> {
+/// Reads `<words...> <length>\n<bytes>` units off a byte string: the frames of a dump, and the
+/// fields of a frame's payload. Shared with the readers of the other protocols framed this way.
+pub struct Cursor<'a> {
     bytes: &'a [u8],
     at: usize,
     what: &'static str,
 }
 
 impl<'a> Cursor<'a> {
-    fn done(&self) -> bool {
+    /// `what` names a unit in errors: `frame`, `field`.
+    pub fn new(bytes: &'a [u8], what: &'static str) -> Self {
+        Cursor { bytes, at: 0, what }
+    }
+
+    pub fn done(&self) -> bool {
         self.at >= self.bytes.len()
     }
 
+    /// The byte offset the next unit starts at.
+    pub fn at(&self) -> usize {
+        self.at
+    }
+
     /// The next unit's header words, without its length, and the bytes the length framed.
-    fn unit(&mut self) -> Result<(Vec<&'a str>, &'a [u8]), String> {
+    pub fn unit(&mut self) -> Result<(Vec<&'a str>, &'a [u8]), String> {
         let rest = &self.bytes[self.at..];
         let Some(nl) = rest.iter().position(|b| *b == b'\n') else {
             return Err(format!(

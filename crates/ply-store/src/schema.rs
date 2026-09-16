@@ -43,8 +43,8 @@ fn sym(s: &str) -> Symbol {
     Symbol::new(s)
 }
 
-fn h(n: u8) -> ply_hash::DefHash {
-    ply_hash::DefHash([n; 32])
+fn h(n: u8) -> ply_ty::DefHash {
+    ply_ty::DefHash([n; 32])
 }
 
 fn atom(effect: &str, resource: Resource, mode: Mode) -> EffectAtom {

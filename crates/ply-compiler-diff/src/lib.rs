@@ -261,6 +261,116 @@ fn reference_diagnostics(modules: &[(String, String)]) -> Vec<Diagnostic> {
     }
 }
 
+/// The reference's whole front-end answer over a program, for the third differential ADR 0052 §1
+/// names: the chain [`reference_diag_dump`] runs, and when nothing raised, the checker's output,
+/// the hashes with the stored bodies, the load order and the item ordinals, written as
+/// `ply_ty::front` writes them, a span's module being its position in `modules`.
+pub fn reference_front_dump(modules: &[(String, String)]) -> String {
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    ply_ty::write_front(&reference_front(modules), &ids)
+        .unwrap_or_else(|e| panic!("the reference's front end does not encode: {e}"))
+}
+
+fn reference_front(modules: &[(String, String)]) -> ply_ty::Front {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    let mut diags = Vec::new();
+    for (i, (name, text)) in modules.iter().enumerate() {
+        match ply_syntax::parse_module(SourceId(i as u32), ModuleName::from_dotted(name), text) {
+            Ok(mut module) => {
+                diags.append(&mut ply_derive::expand_module(&mut module));
+                program.modules.push(module);
+            }
+            Err(mut d) => diags.append(&mut d),
+        }
+    }
+    let raised = |diagnostics: Vec<Diagnostic>| ply_ty::Front {
+        diagnostics,
+        ..ply_ty::Front::default()
+    };
+    if !diags.is_empty() {
+        return raised(diags);
+    }
+    let resolved = match ply_syntax::resolve::resolve(&mut program) {
+        Ok(r) => r,
+        Err(d) => return raised(d),
+    };
+    let (hashes, bodies) = match ply_hash::hash_program_with_bodies(&program, &resolved) {
+        Ok(hashed) => hashed,
+        Err(d) => return raised(d),
+    };
+    let check = match ply_core::check_program(&program, &resolved) {
+        Ok(check) => check,
+        Err(d) => return raised(d),
+    };
+
+    let order = resolved
+        .order
+        .iter()
+        .map(|&i| program.modules[i].name.as_symbol().clone())
+        .collect();
+    // What `ply_codegen::source::emit_keys` walks: every module in program order, its keyable
+    // items in source order.
+    let ordinals = program
+        .modules
+        .iter()
+        .map(|module| {
+            let items = module
+                .items
+                .iter()
+                .filter_map(|item| match item {
+                    Item::Fn(d) => Some(ply_ty::Ordinal::Fn(
+                        module.name.qualify(&d.name.name),
+                        d.spec.iter().map(|c| c.kind).collect(),
+                    )),
+                    Item::Test(d) => Some(ply_ty::Ordinal::Test(
+                        module.name.qualify(&ply_span::Symbol::new(&d.name)),
+                    )),
+                    Item::Law(d) => Some(ply_ty::Ordinal::Law(
+                        module.name.qualify(&ply_span::Symbol::new(&d.name)),
+                    )),
+                    Item::Type(_) | Item::Effect(_) | Item::Derive(_) | Item::EffectSet(_) => None,
+                })
+                .collect();
+            (module.name.as_symbol().clone(), items)
+        })
+        .collect();
+    let stored = |name: &ply_span::Symbol, hash: ply_hash::DefHash| {
+        let body = bodies
+            .get(hash)
+            .unwrap_or_else(|| panic!("`{name}` hashed to `{hash}` and stored no body"));
+        (name.clone(), body.as_bytes().to_vec())
+    };
+    // The hasher's item order, which `deps` keeps: a name in two namespaces has a body in each.
+    let stored_bodies = hashes
+        .deps
+        .keys()
+        .flat_map(|name| {
+            hashes
+                .defs
+                .get(name)
+                .into_iter()
+                .chain(hashes.decls.get(name))
+                .map(|h| stored(name, *h))
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ply_ty::Front {
+        diagnostics: Vec::new(),
+        order,
+        bodies: stored_bodies,
+        test_bodies: bodies
+            .tests()
+            .iter()
+            .map(|b| b.as_bytes().to_vec())
+            .collect(),
+        check,
+        hashes,
+        ordinals,
+    }
+}
+
 /// Every definition's interface and every test's footprint, as the driver would restore them.
 fn known_of(check: &ply_core::CheckOutput) -> ply_core::Known {
     let mut known = ply_core::Known::default();

@@ -3,6 +3,9 @@
 //! Pinned: concurrent crates are written against these shapes.
 
 pub mod decl;
+pub mod front;
+pub mod hash;
+pub mod parse;
 pub mod print;
 pub mod ty;
 
@@ -10,6 +13,9 @@ use indexmap::IndexMap;
 use ply_span::{SourceId, Span, Symbol};
 
 pub use decl::{Deriver, ModuleName, SpecKind, is_ident, is_ident_continue, is_ident_start};
+pub use front::{Front, Ordinal, read_front, write_front};
+pub use hash::{DefHash, HashOutput, interface_hash, spec_hash};
+pub use parse::{parse_atom, parse_footprint, parse_row, parse_scheme, parse_type};
 pub use print::{print_row, print_scheme, print_type};
 pub use ty::*;
 
