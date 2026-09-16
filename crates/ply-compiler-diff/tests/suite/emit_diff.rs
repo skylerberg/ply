@@ -338,6 +338,7 @@ fn resolved_against_reference(
     label: &str,
     inputs: Vec<(String, String)>,
 ) -> (usize, usize, Vec<String>) {
+    the_bundle_is_the_sources();
     let expected = ply_compiler_diff::reference_emit_encoded(&inputs);
     assert!(
         expected.len() > 500,

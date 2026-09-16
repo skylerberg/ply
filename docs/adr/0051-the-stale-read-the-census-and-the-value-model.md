@@ -89,18 +89,20 @@ them to `benches/compiled-compiler.json`, within one per cent on the
 counts and a quarter on the bytes. The file was written from a runner's
 first reading, and a change to the value model is held to it from here.
 
-**Measured, 2026-09-15.** The emitter over its own sources, one entry over
-the compiler's and the standard library's twenty-eight thousand lines:
-two hundred million objects allocated, ninety-eight per cent of them
-recycled within the entry, and 334 MB of chunks at the end. That is seven
-thousand objects and twelve kilobytes of chunk per source line. The hasher
-over the standard library and half the examples, seven entries of some
-nine and a half thousand lines each: fifty-five million objects, ninety-four
-per cent recycled, 32 MB of chunks, about eight hundred objects per line
-per entry. For the same lines, as magnitudes, rustc and clang are in the
-low hundreds of objects and a few kilobytes per line, and a lean compiler
-in the tens of objects and under a kilobyte; the emitter is an order of
-magnitude past the heavy ones and two past the lean, in objects, and the
+**Measured, 2026-09-16, after §3's four levers.** The emitter over its
+own sources, one entry over the compiler's and the standard library's
+twenty-eight thousand lines: ninety-seven million objects allocated,
+ninety-six per cent of them recycled within the entry, and 334 MB of
+chunks at the end. That is three and a half thousand objects and twelve
+kilobytes of chunk per source line, from seven thousand objects per line
+when this record was opened. The hasher over the standard library and
+half the examples, seven entries of some nine and a half thousand lines
+each: thirty-two million objects, ninety per cent recycled, 32 MB of
+chunks, about five hundred objects per line per entry. For the same
+lines, as magnitudes, rustc and clang are in the low hundreds of objects
+and a few kilobytes per line, and a lean compiler in the tens of objects
+and under a kilobyte; the emitter is an order of magnitude past the heavy
+ones in objects and the hasher within a few times of them, and the
 recycling is what keeps the chunks to hundreds of megabytes rather than
 gigabytes. The allocation count, not the resident memory, is the figure
 the value model is held to.
@@ -222,6 +224,23 @@ deferred, behind what the census weighs. The levers, in its order:
    `match`; the parser's loops are `match`-tailed, so they build the
    constructor and peel it. The lever is `fusable_step` descending through
    `match` in both emitters; the measure is the `Stop` line.
+
+   **Built, 2026-09-16.** Both emitters fuse a step whose match has no
+   guards and fusable arm bodies, the arms keeping the general path's
+   shape and each body writing the loop's own variables; the match
+   machinery became one subject, the scrutinee or the element a lookup
+   answered, and one walk of the arms over a body emitter, shared by the
+   expression match and the fused step. The differential's corpus arms a
+   match on the state, one nested in an `if` at a block's tail, one over
+   `list_at`, and a step that must still fall to the built-then-peeled
+   path.
+
+   **Measured, 2026-09-16.** The emitter over its own sources allocated
+   97.4 million objects against 107.9 million, a tenth fewer; `Stop` left
+   the census, and the constructors fell from a fifth of the whole to an
+   eighth. The hasher's first part allocated 31.6 million against 32.1
+   million, its loops being few. The chunk bytes and the resident memory
+   did not move. The census file carries the new counts.
 
 5. **A named function passed to `map` or `filter` without a closure.**
    The emitter boxes a named function into a closure over nothing at every
