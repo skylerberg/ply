@@ -230,6 +230,16 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         // builds it, and calling one through a name is `rt_call_p`. Neither
         // fuses: `apply` takes the closure as a value.
         "fn apply(f: (Int) -> Int, n: Int) -> Int = f(n)\nfn mkl(k: Int) -> Int = apply(|x: Int| x + k, k)\n",
+        // `iterate` is the loop, and a step whose every exit is a written `Stop` or `Continue`
+        // is written into the loop's own variables with no constructor built: through a `match`
+        // on the state, through an `if` whose arm is a `match` at a block's tail, and through
+        // the lookup peephole, where the arms test the element the helper answered. A step with
+        // an exit that is not written -- a call through a closure -- is built and then peeled.
+        // A guard refuses the whole body in both emitters, so it is not here.
+        "type S = | Go(Int) | Halt(Int)\nfn cnt(n: Int) -> Int = iterate(Go(0), n, |s: S| match s { Go(k) -> if k < 3 { Continue(Go(k + 1)) } else { Stop(k) }, Halt(k) -> Stop(k) })\n",
+        "type S = | Go(Int) | Halt(Int)\nfn blk(n: Int) -> Int = iterate(Go(0), n, |s: S| {\n  let d = n - 1;\n  if d < 0 { Stop(0) } else { match s { Go(k) -> Continue(Halt(k + d)), Halt(k) -> Stop(k) } }\n})\n",
+        "fn sum(xs: List<Int>) -> Int = iterate({ i: 0, acc: 0 }, len(xs) + 1, |s: { i: Int, acc: Int }| match list_at(xs, s.i) { Some(x) -> Continue({ i: s.i + 1, acc: s.acc + x }), None -> Stop(s.acc) })\n",
+        "type S = | Go(Int) | Halt(Int)\nfn thru(n: Int, f: (Int) -> Iter<S, Int>) -> Int = iterate(Go(0), n, |s: S| match s { Go(k) -> Continue(Halt(k + 1)), Halt(k) -> f(k) })\n",
         // Deliberately absent, and worth saying why: a record built in both arms
         // of an `if` is *deferred* by the reference -- neither arm builds one,
         // and the join carries the fields as separate temporaries. A record of
