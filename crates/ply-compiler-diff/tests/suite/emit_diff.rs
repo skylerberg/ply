@@ -199,6 +199,13 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "type T = | A(Int) | B\nfn nb() -> T = B\n",
         "type T = | A(Int) | B\nfn rd(t: T) -> Int = match t { A(x) -> x, B -> 0 }\n",
         "type P = | P2(Int, Int)\nfn both(a: Int, b: Int) -> Int = match P2(a, b) { P2(x, y) -> x + y }\n",
+        // A `match` over `list_at` or `map_get` that unwraps at once is one lookup helper and
+        // no `Some`: in either arm order, binding a name or nothing, and not when the name is
+        // this module's own definition rather than the builtin.
+        "fn at(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }\n",
+        "fn has(xs: List<Int>, i: Int) -> Bool = match list_at(xs, i) { None -> false, Some(_) -> true }\n",
+        "fn get(m: Map<Int, Int>, k: Int) -> Int = match map_get(m, k) { Some(v) -> v + 1, None -> 0 }\n",
+        "fn list_at(xs: List<Int>, i: Int) -> Option<Int> = None\nfn own(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }\n",
         // A lambda is a closure *and* a function written after the one that
         // builds it, and calling one through a name is `rt_call_p`. Neither
         // fuses: `apply` takes the closure as a value.
