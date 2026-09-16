@@ -1569,7 +1569,11 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool, span: Span) 
       None -> None,
       Some(i0) -> match expr(notail(em), b0, params) {
         None -> None,
-        Some(bv) -> match expr(notail(bv.em), i0, params) {
+        // The bytes are read before the index and bound after it: `bytes_at(b, bytes_len(b) - 1)`
+        // reads `b` in the index at its last use, and a slot moved there is null here.
+        Some(bv0) -> {
+          let bv = secure_across(bv0.em, bv0.v, i0, params);
+          match expr(notail(bv.em), i0, params) {
           None -> None,
           // The kind-tested arm reads one byte; `bytes_u32_le` over bytes the declaration does
           // not fix is the runtime's call, which reads four.
@@ -1600,6 +1604,7 @@ fn inline_at(em: Em, args: List<Code>, params: List<P>, wide: Bool, span: Span) 
             }
           }
           },
+        }
         },
       },
     },
@@ -2934,6 +2939,28 @@ fn secure(em: Em, v: V) -> Out =
 
 fn secured(o: Option<Out>) -> Option<Out> =
   match o { None -> None, Some(x) -> Some(secure(x.em, x.v)) }
+
+// `secure` for a value consumed only after `later` is evaluated, held once more only when a
+// read in `later` can move it: the same guard `move_read` applies, over the slots `later`
+// reads. The inline family reads `bytes_at(b, i)` per byte inside pinned loops, where nothing
+// moves and a count taken per byte would be the cost the family exists to avoid.
+fn secure_across(em: Em, v: V, later: Code, params: List<P>) -> Out =
+  if !em.release || v.k != KBoxed || spendable(em, v.c) { { em: em, v: v } } else {
+    let r = root_of(em, v.c);
+    let moved = fold(slots_read(later), false, |acc: Bool, s: Int| acc ||
+      match local_of(em, params, s) {
+        Some(c) -> is_made(em, c) && !is_pinned(em, c) && root_of(em, c) == r,
+        None -> false,
+      });
+    if moved { secure(em, v) } else { { em: em, v: v } }
+  }
+
+// The local a slot reads as: the window's, or a parameter the prologue did not open.
+fn local_of(em: Em, params: List<P>, s: Int) -> Option<Bytes> =
+  match conv_of(em, s) {
+    Some(cv) -> Some(cv.c),
+    None -> match list_at(params, s) { Some(_) -> Some(bytes_concat(b"p", num(s))), None -> None },
+  }
 
 fn bytes_join(xs: List<Bytes>, sep: Bytes) -> Bytes =
   fold(range(0, len(xs)), b"", |acc: Bytes, i: Int|

@@ -3,6 +3,7 @@
 
 mod agreement;
 mod derive;
+mod diag;
 mod effects;
 mod emit;
 mod emit_diff;

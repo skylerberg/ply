@@ -1,0 +1,128 @@
+// diag.ply — every diagnostic the port's front end raises, with the text the reference renders,
+// in the order the reference's driver reports them and in a length-framed protocol the CLI can
+// read without a delimiter any payload byte could collide with.
+//
+// The driver's order (`crates/ply-cli/src/driver.rs`): parse and derive every file, and stop if
+// any file reported; resolve, and stop; hash, and stop; check. A file whose parse reported is not
+// derived, as `parse_module` answers `Err` before `expand_module` runs.
+
+import spine (PDiag, Label, num)
+import items (parse)
+import rewrite (expand)
+import derive (Expansion, expand_derives)
+import resolve (Source, Mod, Diag, Outcome, Resolved_, Failed, resolve_modules)
+import hash (build_index)
+import infer (check_diagnostics)
+
+fn at<a>(xs: List<a>, i: Int) -> a =
+  match list_at(xs, i) { Some(x) -> x, None -> panic("an index the list does not hold") }
+
+fn append<a>(a: List<a>, b: List<a>) -> List<a> = fold(b, a, |acc: List<a>, x: a| push(acc, x))
+
+// A parser diagnostic placed in its module.
+fn placed(module: Int, d: PDiag) -> Diag =
+  { code: d.code, notes: d.notes,
+    labels: map(d.labels, |l: Label| { module: module, start: l.start, end: l.end, primary: l.primary, text: l.text }),
+    text: b"", message: d.message, notes_text: d.notes_text, severity: d.severity }
+
+type Parsed = { name: Bytes, module: Mod, diags: List<Diag> }
+
+fn parse_all(sources: List<Source>) -> List<Parsed> =
+  map(range(0, len(sources)), |i: Int| {
+    let s = at(sources, i);
+    let r = parse(s.src);
+    let x = expand(r.node, r.p.uses_sets, r.p.diags);
+    let front = map(x.diags, |d: PDiag| placed(i, d));
+    if len(front) > 0 { { name: s.name, module: { name: s.name, module: x.module, derived: [] }, diags: front } }
+    else {
+      let d: Expansion = expand_derives(i, x.module);
+      { name: s.name, module: { name: s.name, module: d.module, derived: d.derived }, diags: d.diags }
+    }
+  })
+
+pub fn diagnostics(sources: List<Source>) -> List<Diag> = {
+  let parsed = parse_all(sources);
+  let front = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  if len(front) > 0 { front } else {
+    let later = match resolve_modules(map(parsed, |p: Parsed| p.module)) {
+      Failed(ds) -> ds,
+      Resolved_(x) -> {
+        let built = build_index(x.mods, x.r);
+        if len(built.diags) > 0 { built.diags } else { check_diagnostics(x.r, x.mods) }
+      },
+    };
+    map(later, outside_every_module)
+  }
+}
+
+// The module index of a span outside every module, as the reference writes `Span::DUMMY`.
+fn no_module() -> Int = 4294967295
+
+// The port's `dummy_span` stands for the reference's `Span::DUMMY` wherever a stage after the
+// parser labels it: a spliced default, a prelude declaration. The parser never labels one (its
+// only zero-width token, the end of file, sits at the source's length), and the one later
+// diagnostic at a real `(source, 0, 0)` is the module-name clash, which `start_of` places.
+fn outside_every_module(d: Diag) -> Diag =
+  if d.code == b"E0105" && bytes_starts_with(d.message, b"two files claim") { d } else {
+    { code: d.code, notes: d.notes,
+      labels: map(d.labels, |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+        if l.start == 0 && l.end == 0 { { module: no_module(), start: 0, end: 0, primary: l.primary, text: l.text } } else { l }),
+      text: d.text, message: d.message, notes_text: d.notes_text, severity: d.severity }
+  }
+
+// --- The frames -------------------------------------------------------------
+//
+//   diag <index> <payload length>\n<payload>
+//
+// where the payload is a run of `<key> <length>\n<bytes>` fields with no separator after the
+// bytes: `code`, `severity`, `message`, one `label` per label in the reference's order with
+// `<module> <start> <end> <0|1 primary>\n<text>` as its bytes, then one `note` per note.
+
+fn field(key: Bytes, payload: Bytes) -> Bytes =
+  bytes_concat_all([key, b" ", num(bytes_len(payload)), b"\n", payload])
+
+fn flag(b: Bool) -> Bytes = if b { b"1" } else { b"0" }
+
+pub fn frame(index: Int, d: Diag) -> Bytes = {
+  let head = [field(b"code", d.code), field(b"severity", d.severity), field(b"message", d.message)];
+  let labels = map(d.labels, |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+    field(b"label", bytes_concat_all([num(l.module), b" ", num(l.start), b" ", num(l.end), b" ", flag(l.primary), b"\n", l.text])));
+  let notes = map(d.notes_text, |n: Bytes| field(b"note", n));
+  let payload = bytes_concat_all(append(append(head, labels), notes));
+  bytes_concat_all([b"diag ", num(index), b" ", num(bytes_len(payload)), b"\n", payload])
+}
+
+// One concatenation over the finished frames, never an accumulator appended to per frame.
+pub fn diag_dump(sources: List<Source>) -> String = {
+  let ds = diagnostics(sources);
+  string_of_bytes(bytes_concat_all(map(range(0, len(ds)), |i: Int| frame(i, at(ds, i)))))
+}
+
+// --- Tests ------------------------------------------------------------------
+//
+// Each expected frame is the reference's text for the same program, framed by hand.
+
+test "a parser diagnostic names what it expected and the token it found" {
+  let out = diag_dump([{ name: b"m", src: b"fn f() -> Int = )" }]);
+  assert_eq(out, "diag 0 113\ncode 5\nE0001severity 5\nerrormessage 33\nexpected an expression, found `)`label 32\n0 16 17 1\nexpected an expression")
+}
+
+test "a resolve diagnostic carries the reference's note" {
+  let out = diag_dump([{ name: b"m", src: b"import missing\nfn f() -> Int = 1" }]);
+  assert_eq(out, "diag 0 201\ncode 5\nE0106severity 5\nerrormessage 41\nno module named `missing` in this programlabel 18\n0 7 14 1\nnot foundnote 86\na module is a file: `store/orders.ply` is `store.orders`, relative to the project root")
+}
+
+test "a check diagnostic prints the two types the way the reference does" {
+  let out = diag_dump([{ name: b"m", src: b"fn f() -> Int = \"x\"" }]);
+  assert_eq(out, "diag 0 121\ncode 5\nE0201severity 5\nerrormessage 33\ntype mismatch: function body typelabel 40\n0 16 19 1\nexpected `Int`, found `String`")
+}
+
+test "a check diagnostic with a note frames it after the labels" {
+  let out = diag_dump([{ name: b"m", src: b"fn f() -> Int = 1(2)" }]);
+  assert_eq(out, "diag 0 137\ncode 5\nE0204severity 5\nerrormessage 22\nthis is not a functionlabel 24\n0 16 17 1\nhas type `Int`note 35\nonly function values can be applied")
+}
+
+test "a secondary label follows the primary, in the reference's order" {
+  let out = diag_dump([{ name: b"m", src: b"fn g(x: Int) -> Int = x\nfn f() -> Int = g(1, 2)" }]);
+  assert_eq(out, "diag 0 180\ncode 5\nE0202severity 5\nerrormessage 51\nthis function takes 1 argument, but 2 were suppliedlabel 29\n0 40 47 1\nexpected 1, found 2label 43\n0 40 41 0\nthis is the function being called")
+}

@@ -124,17 +124,15 @@ pub fn qualified(m: Ident, n: Ident) -> QName =
 
 // --- Diagnostics ------------------------------------------------------------
 
-// `ply_span::Diagnostic` carries `severity`, `code`, `message`, `labels` and
-// `notes`. Severity is `Error` at all 45 parser sites and message text is not
-// compared (see `harness/`), so what survives here is the **structural**
-// signature: the code, every label's span and primary flag, and how many notes
-// there are. That is wider than the lexer spike's code-plus-span, deliberately:
-// 45 diagnostic sites in `parser.rs` and almost every one of them is
-// `codes::UNEXPECTED_TOKEN`, so code and span alone is a weak signature for a
-// parser in a way it was not for a lexer.
-pub type Label = { start: Int, end: Int, primary: Bool }
+// `ply_span::Diagnostic`, one file: the code, the message, every label with its
+// span, primary flag and text, the notes, and the severity. `notes` is the
+// count `dump_diag` prints and is always `len(notes_text)`; the structural
+// signature the dump compares is unchanged by the texts, which `diag.ply`
+// answers.
+pub type Label = { start: Int, end: Int, primary: Bool, text: Bytes }
 
-pub type PDiag = { code: Bytes, notes: Int, labels: List<Label> }
+pub type PDiag = { code: Bytes, notes: Int, labels: List<Label>, message: Bytes,
+                   notes_text: List<Bytes>, severity: Bytes }
 
 pub fn unexpected() -> Bytes = b"E0001"
 pub fn unterminated() -> Bytes = b"E0002"
@@ -151,14 +149,20 @@ pub fn default_not_allowed() -> Bytes = b"E0120"
 pub fn unknown_argument_name() -> Bytes = b"E0123"
 pub fn argument_order() -> Bytes = b"E0124"
 
-pub fn diag1(code: Bytes, at: Span, notes: Int) -> PDiag =
-  { code: code, notes: notes,
-    labels: [{start: at.start, end: at.end, primary: true}] }
+pub fn plabel(at: Span, primary: Bool, text: Bytes) -> Label =
+  { start: at.start, end: at.end, primary: primary, text: text }
 
-pub fn diag2(code: Bytes, at: Span, also: Span, notes: Int) -> PDiag =
-  { code: code, notes: notes,
-    labels: [{start: at.start, end: at.end, primary: true},
-             {start: also.start, end: also.end, primary: false}] }
+// `Diagnostic::error(code, message)` with its labels and notes already added.
+pub fn pdiag(code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>) -> PDiag =
+  { code: code, notes: len(notes), labels: labels, message: message, notes_text: notes,
+    severity: b"error" }
+
+pub fn diag1(code: Bytes, at: Span, message: Bytes, label: Bytes, notes: List<Bytes>) -> PDiag =
+  pdiag(code, message, [plabel(at, true, label)], notes)
+
+pub fn diag2(code: Bytes, at: Span, message: Bytes, label: Bytes, also: Span, also_text: Bytes,
+             notes: List<Bytes>) -> PDiag =
+  pdiag(code, message, [plabel(at, true, label), plabel(also, false, also_text)], notes)
 
 // `Diagnostic::primary_span` (`ply_span/src/lib.rs:658`): the first primary
 // label, else the first label at all. The fallback is dead for every
@@ -256,10 +260,9 @@ pub fn start(src: Bytes) -> Start = {
   let lx = lexer::lex(src);
   // Every diagnostic `ply_syntax::lexer` raises is built at one site
   // (`lexer.rs:818`) as `Diagnostic::error(code, message).primary(span, label)`:
-  // exactly one primary label and no notes. `lexer.ply` carries only the code
-  // and the span, which is all that shape needs.
+  // exactly one primary label and no notes.
   let d = map(lx.diags,
-    |x: lexer::Diag| diag1(x.code, {start: x.start, end: x.end}, 0));
+    |x: lexer::Diag| diag1(x.code, {start: x.start, end: x.end}, x.message, x.label, []));
   { c: { ntok: len(lx.toks), src: src, toks: lx.toks },
     p: { pos: 0, no_brace: false, no_pipe: false, depth: 0, gt_split: -1,
          uses_sets: false, diags: d } }
@@ -437,18 +440,108 @@ pub fn eat(c: Ctx, p: P, k: lexer::Tok) -> Ate =
   if at(c, p, k) { { p: advance(c, p).p, ok: true } }
   else { { p: p, ok: false } }
 
-// `what` is the message the reference formats into the diagnostic. It is
-// carried at every site and never read: message text is not compared (see
-// `harness/`), and `TokenKind::describe`'s ~40 arms are the other half of what
-// building it would need. Carrying it is what makes turning messages on a
-// change to `error_here` alone rather than a rewrite of ~120 call sites.
+// `TokenKind::describe`: how a diagnostic names the token it found.
+pub fn describe(t: lexer::Tok) -> Bytes =
+  match t {
+    lexer::TIdent(n) -> bytes_concat_all([b"identifier `", n, b"`"]),
+    lexer::TInt(v) -> bytes_concat_all([b"integer `", num(v), b"`"]),
+    lexer::TFixed(ty, v) -> bytes_concat_all([b"`", ty, b"` literal `", num(v), b"`"]),
+    lexer::TFloat(txt) -> bytes_concat_all([b"float `", float_display(txt), b"`"]),
+    lexer::TDec(m, sc) -> bytes_concat_all([b"decimal `", render_decimal(m, sc), b"`"]),
+    lexer::TStr(_) -> b"string literal",
+    lexer::TBytes(_) -> b"byte-string literal",
+    lexer::TKw(k) -> bytes_concat_all([b"keyword `", k, b"`"]),
+    lexer::TEof -> b"end of file",
+    lexer::TPunct(name) -> bytes_concat_all([b"`", punct_text(name), b"`"]),
+  }
+
+// A table folded over rather than a chain of thirty-five `else if`s: the compiled emitter
+// recurses once per nested `if`, and its frames are large enough that the chain trips the
+// native-stack guard when the emitter compiles itself.
+fn punct_text(name: Bytes) -> Bytes = {
+  let table = [
+    { n: b"lparen", t: b"(" }, { n: b"rparen", t: b")" }, { n: b"lbrace", t: b"{" },
+    { n: b"rbrace", t: b"}" }, { n: b"lbracket", t: b"[" }, { n: b"rbracket", t: b"]" },
+    { n: b"comma", t: b"," }, { n: b"semi", t: b";" }, { n: b"colon", t: b":" },
+    { n: b"coloncolon", t: b"::" }, { n: b"dot", t: b"." }, { n: b"dotdot", t: b".." },
+    { n: b"underscore", t: b"_" }, { n: b"arrow", t: b"->" }, { n: b"eq", t: b"=" },
+    { n: b"eqeq", t: b"==" }, { n: b"bang", t: b"!" }, { n: b"bangeq", t: b"!=" },
+    { n: b"lt", t: b"<" }, { n: b"le", t: b"<=" }, { n: b"gt", t: b">" }, { n: b"ge", t: b">=" },
+    { n: b"plus", t: b"+" }, { n: b"plusplus", t: b"++" }, { n: b"minus", t: b"-" },
+    { n: b"star", t: b"*" }, { n: b"slash", t: b"/" }, { n: b"percent", t: b"%" },
+    { n: b"amp", t: b"&" }, { n: b"ampamp", t: b"&&" }, { n: b"caret", t: b"^" },
+    { n: b"pipe", t: b"|" }, { n: b"pipepipe", t: b"||" }, { n: b"tilde", t: b"~" },
+    { n: b"question", t: b"?" },
+  ];
+  fold(table, b"", |acc: Bytes, e: { n: Bytes, t: Bytes }| if e.n == name { e.t } else { acc })
+}
+
+// `render_decimal`: the mantissa's digits with the point `scale` places from the end.
+pub fn render_decimal(digits: Bytes, scale: Int) -> Bytes =
+  if scale == 0 { digits } else {
+    let padded = if bytes_len(digits) <= scale {
+      bytes_concat(bytes_concat_all(map(range(0, scale - bytes_len(digits) + 1), |_i: Int| b"0")), digits)
+    } else { digits };
+    let point = bytes_len(padded) - scale;
+    bytes_concat_all([bytes_slice(padded, 0, point), b".", bytes_slice(padded, point, bytes_len(padded))])
+  }
+
+// `f64`'s `Display` over a literal `lexer.ply` carries as text: the shortest digits that
+// round-trip, with no exponent. For a literal of at most seventeen significant digits that is
+// the literal itself with its zeros trimmed and its exponent applied, which is what this
+// computes; a longer literal prints here with every digit it was written with.
+pub fn float_display(txt: Bytes) -> Bytes = {
+  let n = bytes_len(txt);
+  let e_at = match bytes_index_of(txt, b"e") { Some(i) -> i, None -> n };
+  let mantissa = bytes_slice(txt, 0, e_at);
+  let exp = if e_at == n { 0 } else { int_of_signed(bytes_slice(txt, e_at + 1, n)) };
+  let dot = match bytes_index_of(mantissa, b".") { Some(i) -> i, None -> bytes_len(mantissa) };
+  let whole = bytes_slice(mantissa, 0, dot);
+  let frac = if dot == bytes_len(mantissa) { b"" } else { bytes_slice(mantissa, dot + 1, bytes_len(mantissa)) };
+  let digits = bytes_concat(whole, frac);
+  // The point sits `point` digits into `digits`, exponent applied.
+  let point = bytes_len(whole) + exp;
+  let lead = bytes_scan(digits, 0, b"0", bytes_len(digits));
+  let trail = trailing_zeros(digits);
+  if lead == bytes_len(digits) { b"0" } else {
+    let sig = bytes_slice(digits, lead, bytes_len(digits) - trail);
+    let p = point - lead;
+    if p <= 0 {
+      bytes_concat_all([b"0.", bytes_concat_all(map(range(0, 0 - p), |_i: Int| b"0")), sig])
+    } else if p >= bytes_len(sig) {
+      bytes_concat(sig, bytes_concat_all(map(range(0, p - bytes_len(sig)), |_i: Int| b"0")))
+    } else {
+      bytes_concat_all([bytes_slice(sig, 0, p), b".", bytes_slice(sig, p, bytes_len(sig))])
+    }
+  }
+}
+
+fn trailing_zeros(b: Bytes) -> Int =
+  fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int|
+    if bytes_at(b, bytes_len(b) - 1 - i) == 48 && acc == i { acc + 1 } else { acc })
+
+fn int_of_signed(b: Bytes) -> Int =
+  if bytes_len(b) == 0 { 0 }
+  else if bytes_at(b, 0) == 45 { 0 - int_of_digits(bytes_slice(b, 1, bytes_len(b))) }
+  else if bytes_at(b, 0) == 43 { int_of_digits(bytes_slice(b, 1, bytes_len(b))) }
+  else { int_of_digits(b) }
+
+fn int_of_digits(d: Bytes) -> Int =
+  fold(range(0, bytes_len(d)), 0, |a: Int, i: Int| a * 10 + (bytes_at(d, i) - 48))
+
+// `Parser::error_here`: `expected {what}, found {found}`, with `expected {what}` on the token.
 pub fn error_here(c: Ctx, p: P, what: Bytes) -> P =
-  push_diag(p, diag1(unexpected(), cur_span(c, p), 0))
+  push_diag(p, diag1(unexpected(), cur_span(c, p),
+                     bytes_concat_all([b"expected ", what, b", found ", describe(kind(c, p))]),
+                     bytes_concat(b"expected ", what), []))
 
 // `Parser::unclosed` (`parser.rs:166`): primary at the offending token,
 // secondary at the opening delimiter.
 pub fn unclosed(c: Ctx, p: P, open: Span, what: Bytes) -> P =
-  push_diag(p, diag2(unexpected(), cur_span(c, p), open, 0))
+  push_diag(p, diag2(unexpected(), cur_span(c, p),
+                     bytes_concat_all([b"expected ", what, b", found ", describe(kind(c, p))]),
+                     bytes_concat(b"expected ", what),
+                     open, b"unclosed delimiter opened here", []))
 
 pub fn expect(c: Ctx, p: P, k: lexer::Tok, what: Bytes) -> Result<R<Span>, P> =
   if at(c, p, k) { Ok(advance(c, p)) }
@@ -485,7 +578,10 @@ pub fn expect_field_name(c: Ctx, p: P, what: Bytes) -> Result<R<{ name: Ident, k
 
 // `Parser::keyword_pun_refusal`: `E0001` at the name, one note.
 pub fn keyword_pun_refusal(p: P, name: Ident) -> P =
-  push_diag(p, diag1(unexpected(), name.span, 1))
+  push_diag(p, diag1(unexpected(), name.span,
+                     bytes_concat_all([b"`", name.name, b"` names a field here, and a bare field also names a variable"]),
+                     b"a keyword cannot name a variable",
+                     [bytes_concat_all([b"write `", name.name, b": ", name.name, b"_` with a name of your own on the right"])]))
 
 // `Parser::expect_gt` (`parser.rs:187`). The `Ge` arm answers the first byte as
 // the `>` and leaves `pos` where it is, having rewritten the token under it to
@@ -507,7 +603,11 @@ pub fn max_depth() -> Int = 128
 pub fn deeper(c: Ctx, p: P) -> Result<P, P> = {
   let q = with_depth(p, p.depth + 1);
   if q.depth <= max_depth() { Ok(q) }
-  else { Err(push_diag(q, diag1(unexpected(), cur_span(c, q), 1))) }
+  else {
+    Err(push_diag(q, diag1(unexpected(), cur_span(c, q), b"input is nested too deeply to parse",
+                           bytes_concat_all([b"more than ", num(max_depth()), b" levels of nesting"]),
+                           [b"split this into smaller definitions"])))
+  }
 }
 
 pub fn shallower(p: P) -> P = with_depth(p, p.depth - 1)
@@ -560,7 +660,9 @@ pub fn qname(c: Ctx, p: P, what: Bytes) -> Result<R<QName>, P> = {
   else {
     let {p, node: second} = expect_ident(c, cc.p, b"a name after `::`")?;
     if at(c, p, t_coloncolon()) {
-      Err(push_diag(p, diag1(unexpected(), cur_span(c, p), 1)))
+      Err(push_diag(p, diag1(unexpected(), cur_span(c, p), b"a qualified name has at most one `::`",
+                             b"unexpected `::`",
+                             [b"a module binder is a single name: `import store.orders` binds `orders`, so write `orders::place`"])))
     } else {
       Ok({ p: p, node: qualified(first, second) })
     }
@@ -793,11 +895,11 @@ test "expect_gt splits a `>=` into `>` and leaves an `=` where it stood" {
 test "two diagnostics with the same code and primary span collapse to one" {
   let s = probe(b"fn f");
   let a = error_here(s.c, s.p, b"one");
-  let b = push_diag(a, diag1(unexpected(), cur_span(s.c, s.p), 0));
+  let b = push_diag(a, diag1(unexpected(), cur_span(s.c, s.p), b"", b"", []));
   assert_eq(len(b.diags), 1);
-  let c2 = push_diag(a, diag1(unexpected(), sp(9, 9), 0));
+  let c2 = push_diag(a, diag1(unexpected(), sp(9, 9), b"", b"", []));
   assert_eq(len(c2.diags), 2);
-  let d = push_diag(a, diag1(unterminated(), cur_span(s.c, s.p), 0));
+  let d = push_diag(a, diag1(unterminated(), cur_span(s.c, s.p), b"", b"", []));
   assert_eq(len(d.diags), 2);
 }
 
@@ -809,11 +911,11 @@ test "the dedup rule sees the last lexer diagnostic, not only parser ones" {
   assert_eq(len(s.p.diags), 1);
   let last = match list_at(s.p.diags, len(s.p.diags) - 1) {
     Some(l) -> l,
-    None -> diag1(b"", dummy_span(), 0),
+    None -> diag1(b"", dummy_span(), b"", b"", []),
   };
   assert_eq(last.code, b"E0001");
   assert_eq(primary_span_of(last).start, 0);
-  let q = push_diag(s.p, diag1(unexpected(), sp(0, 1), 0));
+  let q = push_diag(s.p, diag1(unexpected(), sp(0, 1), b"", b"", []));
   assert_eq(len(q.diags), 1);
 }
 
@@ -904,13 +1006,33 @@ test "span_to covers both spans whichever order they arrive in" {
 }
 
 test "the primary span is the first primary label, not the first label" {
-  let two = {code: unexpected(), notes: 0,
-             labels: [{start: 7, end: 8, primary: false},
-                      {start: 1, end: 2, primary: true}]};
+  let two = pdiag(unexpected(), b"", [plabel(sp(7, 8), false, b""), plabel(sp(1, 2), true, b"")], []);
   assert_eq(primary_span_of(two), sp(1, 2));
-  let none = {code: unexpected(), notes: 0,
-              labels: [{start: 7, end: 8, primary: false}]};
+  let none = pdiag(unexpected(), b"", [plabel(sp(7, 8), false, b"")], []);
   assert_eq(primary_span_of(none), sp(7, 8));
+}
+
+test "a diagnostic names the token it found the way the reference does" {
+  let s = probe(b"fn 1.50 255u8 1.5m \"s\" b\"b\" ) x");
+  assert_eq(describe(kind_at(s.c, s.p, 0)), b"keyword `fn`");
+  assert_eq(describe(kind_at(s.c, s.p, 1)), b"float `1.5`");
+  assert_eq(describe(kind_at(s.c, s.p, 2)), b"`U8` literal `255`");
+  assert_eq(describe(kind_at(s.c, s.p, 3)), b"decimal `1.5`");
+  assert_eq(describe(kind_at(s.c, s.p, 4)), b"string literal");
+  assert_eq(describe(kind_at(s.c, s.p, 5)), b"byte-string literal");
+  assert_eq(describe(kind_at(s.c, s.p, 6)), b"`)`");
+  assert_eq(describe(kind_at(s.c, s.p, 7)), b"identifier `x`");
+  assert_eq(describe(kind_at(s.c, s.p, 8)), b"end of file");
+  assert_eq(float_display(b"1e9"), b"1000000000");
+  assert_eq(float_display(b"2.5e-3"), b"0.0025");
+  assert_eq(float_display(b"007.50"), b"7.5");
+  assert_eq(float_display(b"0.0"), b"0");
+  assert_eq(render_decimal(b"5", 3), b"0.005");
+  assert_eq(render_decimal(b"150", 2), b"1.50");
+  let e = error_here(s.c, s.p, b"a type");
+  let d = match list_at(e.diags, 0) { Some(x) -> x, None -> pdiag(b"", b"", [], []) };
+  assert_eq(d.message, b"expected a type, found keyword `fn`");
+  assert_eq(match list_at(d.labels, 0) { Some(l) -> l.text, None -> b"" }, b"expected a type");
 }
 
 // `law`, `derive`, `as`, `with_cell`, `with_region`, `simulate` and `resume`

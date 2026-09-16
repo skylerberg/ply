@@ -220,6 +220,47 @@ pub fn reference_hash_dump(modules: &[(String, String)]) -> String {
     out
 }
 
+/// The reference's diagnostics over a program, for the differential ADR 0052 §1 opens with: the
+/// chain the CLI driver runs, stopping where it stops -- every module parsed and its derives
+/// expanded, and nothing past a module that raised; then the resolver, the hasher and the checker,
+/// each ending the chain with what it raised -- written as `ply_span::frames` writes them, a
+/// label's module being its position in `modules`.
+pub fn reference_diag_dump(modules: &[(String, String)]) -> String {
+    let ids: Vec<SourceId> = (0..modules.len()).map(|i| SourceId(i as u32)).collect();
+    ply_span::frames::write_diagnostics(&reference_diagnostics(modules), &ids)
+        .unwrap_or_else(|e| panic!("the reference's diagnostics do not encode: {e}"))
+}
+
+fn reference_diagnostics(modules: &[(String, String)]) -> Vec<Diagnostic> {
+    let mut program = Program {
+        modules: Vec::new(),
+    };
+    let mut diags = Vec::new();
+    for (i, (name, text)) in modules.iter().enumerate() {
+        match ply_syntax::parse_module(SourceId(i as u32), ModuleName::from_dotted(name), text) {
+            Ok(mut module) => {
+                diags.append(&mut ply_derive::expand_module(&mut module));
+                program.modules.push(module);
+            }
+            Err(mut d) => diags.append(&mut d),
+        }
+    }
+    if !diags.is_empty() {
+        return diags;
+    }
+    let resolved = match ply_syntax::resolve::resolve(&mut program) {
+        Ok(r) => r,
+        Err(d) => return d,
+    };
+    if let Err(d) = ply_hash::hash_program_with_bodies(&program, &resolved) {
+        return d;
+    }
+    match ply_core::check_program(&program, &resolved) {
+        Ok(_) => Vec::new(),
+        Err(d) => d,
+    }
+}
+
 /// Every definition's interface and every test's footprint, as the driver would restore them.
 fn known_of(check: &ply_core::CheckOutput) -> ply_core::Known {
     let mut known = ply_core::Known::default();
@@ -2004,6 +2045,42 @@ mod tests {
         // and empty.
         let text = "header\nlines\n%%\nfn f() = 1\n%%\nfn g() = 2\n\n%%\n\n";
         assert_eq!(bundle(text), vec!["fn f() = 1", "fn g() = 2\n", ""]);
+    }
+
+    #[test]
+    fn the_reference_diag_dump_reads_back_and_stops_where_the_driver_stops() {
+        let ids = [SourceId(0), SourceId(1)];
+        // A parse error in one module ends the chain before the type error in the other is seen.
+        let dump = reference_diag_dump(&[
+            ("a".to_string(), "fn f() -> Int = 1 + true\n".to_string()),
+            ("b".to_string(), "fn g() -> Int = (\n".to_string()),
+        ]);
+        let diags = ply_span::frames::read_diagnostics(&dump, &ids).expect("reads back");
+        assert!(!diags.is_empty(), "{dump}");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code == ply_span::codes::UNEXPECTED_TOKEN),
+            "{dump}"
+        );
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.labels.iter().all(|l| l.span.source == SourceId(1))),
+            "{dump}"
+        );
+
+        let dump =
+            reference_diag_dump(&[("a".to_string(), "fn f() -> Int = 1 + true\n".to_string())]);
+        let diags = ply_span::frames::read_diagnostics(&dump, &ids[..1]).expect("reads back");
+        assert!(!diags.is_empty(), "{dump}");
+        assert!(
+            diags
+                .iter()
+                .all(|d| d.code == ply_span::codes::TYPE_MISMATCH),
+            "{dump}"
+        );
+        assert!(diags.iter().all(|d| !d.message.is_empty()), "{dump}");
     }
 
     #[test]
