@@ -155,7 +155,7 @@ fn corpora(root: &Path) -> Vec<Corpus> {
 type Loaded = (
     &'static Program,
     &'static Resolved,
-    &'static ply_core::CheckOutput,
+    &'static ply_ty::CheckOutput,
 );
 
 /// A corpus and its program, parsed once per process and leaked, so that every backend over one

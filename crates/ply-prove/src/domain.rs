@@ -2,10 +2,10 @@
 
 use crate::ENUMERATION_BOUND;
 use crate::property::TypeWorld;
-use ply_core::ty::IntTy;
-use ply_core::{LawBinder, Type};
 use ply_eval::{Fixed, Value};
 use ply_span::Symbol;
+use ply_ty::IntTy;
+use ply_ty::{LawBinder, Type};
 use std::collections::BTreeMap;
 
 /// A domain small enough to walk, and how to walk it.

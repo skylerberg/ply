@@ -1,7 +1,7 @@
-use ply_core::{Footprint, Resource, Type};
 use ply_store::schema::*;
 use ply_store::{BODY_ENCODING, ContentHash, DeclBody, DefKind, FRONTEND_VERSION, Outcome};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{Footprint, Resource, Type};
 
 mod variant {
     use super::*;

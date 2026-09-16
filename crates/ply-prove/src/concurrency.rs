@@ -4,9 +4,9 @@ use crate::{
     Binding, CaseReport, Certificate, Counterexample, Discharge, Evidence, Gap, Obligation, Rule,
     Vacuity, VacuityKind,
 };
-use ply_core::Type;
 use ply_eval::{Exploration, Interleaving, Machine, Plan, Seed, Value, Verdict, explore};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::Type;
 
 /// How much of a law's value domain the points it was run at cover.
 #[derive(Clone, PartialEq, Eq, Debug)]

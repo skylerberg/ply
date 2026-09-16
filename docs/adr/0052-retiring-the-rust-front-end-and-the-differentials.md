@@ -96,6 +96,16 @@ are the reference's.
 **Built when.** Each step lands as its own pull request; the differentials
 and the Ply-side gates are green on each.
 
+**Built, 2026-09-16: the vocabulary.** `crates/ply-ty` holds the types,
+the effect rows and atoms, the footprints and schemes, the printer, the
+integer widths and the declaration kinds that were `ply-syntax`'s, and
+the checker's output shape (`CheckOutput` and what it names); it depends
+on `ply-span` alone. `ply-core` re-exports all of it and keeps the
+checker. `ply-hash`, `ply-store` and `ply-host` no longer depend on
+`ply-core`; the runtime, the prover and the test runner read `ply-ty` and
+call `ply-core` only for the checker itself and the prelude's constructor
+table, which move when the port answers them.
+
 ## 2. Delete the Rust front end, its test crates and the differentials
 
 In the order the goldens allow: `ply-derive`; `ply-syntax`'s rewrites,
@@ -137,6 +147,16 @@ builds. `.github/ci-shards.sh`'s tables shrink with the crates, with
 `verify` still true. The wall clock of the run that merged each pull
 request is the reading, from the run itself, and the record says where the
 time went.
+
+**Built, 2026-09-16: main reuses the pull request's build.** A pull
+request's run uploads its archive and its release binary by tree hash,
+and a push to main whose tree a run already built takes them instead of
+compiling; the object cache is keyed by what decides a unit's contents,
+so a run that changed none of it skips the save. The run that merged it
+read 127 s wall against 282 s: both build jobs 18 s, the longest
+partition 94 s and the postgres job 88 s, which are the poles now. A pull
+request's run pays the upload, nine seconds, and stays near four minutes
+with its own release build as its pole.
 
 ## 4. The loop that is O(the change)
 

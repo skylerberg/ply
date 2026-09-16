@@ -33,7 +33,7 @@ fn repo() -> PathBuf {
 struct Loaded {
     program: &'static Program,
     resolved: &'static ply_syntax::resolve::Resolved,
-    check: &'static ply_core::CheckOutput,
+    check: &'static ply_ty::CheckOutput,
     texts: HashMap<String, String>,
 }
 

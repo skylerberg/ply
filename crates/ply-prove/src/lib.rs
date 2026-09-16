@@ -11,10 +11,10 @@ pub mod property;
 pub mod prove;
 pub mod shrink;
 
-use ply_core::{Footprint, LawBinder, Resource, Type};
 use ply_eval::{Plan, Race, Seed};
 use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
+use ply_ty::{Footprint, LawBinder, Resource, Type};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -268,7 +268,7 @@ pub enum Frame {
 pub fn frame_of(footprint: &Footprint) -> Frame {
     let writes: BTreeSet<(Symbol, Resource)> = footprint
         .atoms()
-        .filter(|a| a.mode == ply_syntax::ast::Mode::Write)
+        .filter(|a| a.mode == ply_ty::Mode::Write)
         .map(|a| (a.effect.clone(), a.resource.clone()))
         .collect();
     if writes.is_empty() {

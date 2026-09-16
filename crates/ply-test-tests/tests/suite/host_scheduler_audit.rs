@@ -1,7 +1,6 @@
 //! Adversarial audit of the scheduler split, and of what re-execution does to a host operation.
 
 use crate::fixture::TierExecutor;
-use ply_core::CheckOutput;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
@@ -13,6 +12,7 @@ use ply_store::Store;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
 use ply_test::{Hosting, InterpExecutor, RunReport, Search, Selection, select};
+use ply_ty::CheckOutput;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};

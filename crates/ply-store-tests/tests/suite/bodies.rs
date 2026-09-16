@@ -94,7 +94,7 @@ fn a_stored_definition_set_rebuilds_into_a_program_that_checks() {
     assert_eq!(info.footprint.atoms().count(), 1);
     assert_eq!(
         info.footprint.atoms().next().unwrap().resource,
-        ply_core::Resource::Named(Symbol::new("users"))
+        ply_ty::Resource::Named(Symbol::new("users"))
     );
 }
 

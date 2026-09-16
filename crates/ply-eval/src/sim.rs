@@ -1,9 +1,9 @@
 //! Deterministic simulation: the seed, the plan, the dependence relation, and the seeded handlers
 //! for `clock` and `random`.
 
-use ply_core::ty::{EffectAtom, Resource, Type};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Resource, Type};
 use std::collections::BTreeSet;
 use std::fmt;
 

@@ -1,9 +1,9 @@
 //! The facts about a program that the prover reads, indexed once per run.
 
-use ply_core::{CheckOutput, CtorInfo, TyVar, Type};
 use ply_span::Symbol;
 use ply_syntax::ast::{Expr, ExprKind, FnDef, Item, Program, QName, Stmt, TypeDefBody};
 use ply_syntax::resolve::{Namespace, Resolved};
+use ply_ty::{CheckOutput, CtorInfo, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 /// A definition the prover may inline.
@@ -129,7 +129,7 @@ impl<'a> Context<'a> {
         })
     }
 
-    pub fn scheme(&self, name: &Symbol) -> Option<&'a ply_core::Scheme> {
+    pub fn scheme(&self, name: &Symbol) -> Option<&'a ply_ty::Scheme> {
         self.check.defs.get(name).map(|d| &d.scheme)
     }
 

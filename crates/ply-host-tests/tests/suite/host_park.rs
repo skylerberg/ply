@@ -1,7 +1,6 @@
 //! A park that holds two facilities has to wake for either of them.
 
 use crate::support::cluster::{self, Cluster};
-use ply_core::ty::Resource;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
 use ply_host::db::scope::Owner;
 use ply_host::db::{self, Driver, Op, Postgres, Statement};
@@ -9,6 +8,7 @@ use ply_host::tcp::Net;
 use ply_host::tls::Credentials;
 use ply_host::{Host, db::PoolConfig};
 use ply_span::{Span, Symbol};
+use ply_ty::Resource;
 use std::time::{Duration, Instant};
 
 const ALONE: Owner = (MachineId(0), None);

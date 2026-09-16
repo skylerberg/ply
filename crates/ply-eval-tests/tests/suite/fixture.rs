@@ -5,11 +5,12 @@
 //! so it is a parameter here rather than a constant, and [`Compiled::new`] fixes only the `m` that
 //! most of them want.
 
-use ply_core::{CheckOutput, check_program};
+use ply_core::check_program;
 use ply_eval::{Machine, Provider};
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
+use ply_ty::CheckOutput;
 use std::collections::HashMap;
 
 pub struct Compiled {

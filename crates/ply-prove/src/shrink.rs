@@ -3,10 +3,11 @@
 use crate::property::{
     HARD_GEN_DEPTH, Judge, Outcome, TypeWorld, Ungeneratable, const_fn, fn_size, judge_case,
 };
-use ply_core::ty::IntTy;
-use ply_core::{Type, prelude};
+use ply_core::prelude;
 use ply_eval::{Decimal, Fixed, List, Value};
 use ply_span::{Diagnostic, Symbol};
+use ply_ty::IntTy;
+use ply_ty::Type;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::collections::BTreeMap;
@@ -227,7 +228,7 @@ fn minimal_at(ty: &Type, world: &TypeWorld, depth: u32) -> Result<Value, Ungener
             "Map" => Ok(Value::empty_map()),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
-            _ if name.as_str() == ply_core::ty::SECRET => Err(Ungeneratable::Secret),
+            _ if name.as_str() == ply_ty::SECRET => Err(Ungeneratable::Secret),
             _ => {
                 let Some((variant, fields)) = shallowest(name, args, world) else {
                     return Err(Ungeneratable::Uninhabited(name.clone()));

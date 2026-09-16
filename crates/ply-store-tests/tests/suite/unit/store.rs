@@ -621,8 +621,8 @@ fn concurrent_stores_union_their_definitions() {
     assert!(reopened.knows_definition(hash(2)));
 }
 
-use ply_core::{EffectAtom, Footprint, Resource, Row, Scheme, TyVar, Type};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Footprint, Resource, Row, Scheme, TyVar, Type};
 
 fn content(n: u8) -> ContentHash {
     ContentHash::of(&[n, n.wrapping_add(1), n.wrapping_mul(3)])
@@ -1904,11 +1904,11 @@ fn a_fingerprint_is_only_believed_against_the_bytes_that_produced_it() {
 fn counted_scheme(a: u32, e: u32) -> Scheme {
     Scheme {
         ty_vars: vec![TyVar(a)],
-        row_vars: vec![ply_core::RowVar(e)],
+        row_vars: vec![ply_ty::RowVar(e)],
         ty: Type::Fn {
             params: vec![Type::Var(TyVar(a))],
             ret: Box::new(Type::Var(TyVar(a))),
-            effects: Row::open(ply_core::RowVar(e)),
+            effects: Row::open(ply_ty::RowVar(e)),
         },
     }
 }
