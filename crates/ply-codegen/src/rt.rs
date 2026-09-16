@@ -1141,6 +1141,20 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
         let xs = ctx.heap.list_from(pieces);
         return builtin_over_values(ctx, Builtin::BytesConcatAll, &[xs]);
     }
+    // The fold that builds a dump appends to its accumulator through
+    // `bytes_concat_all([acc, ...])`, and the accumulator arrives here held once: it grows in
+    // place, with room doubling, and the other pieces are copied once each. A fresh buffer for
+    // them all is a copy of the accumulator per step, quadratic in the dump (ADR 0051 §3).
+    if let Some((&first, rest)) = pieces.split_first()
+        && heap::is_unique(first)
+    {
+        let mut out = first;
+        for w in rest {
+            out = ctx.heap.append(out, unsafe { bytes_of(obj(*w)) });
+            heap::dec(*w);
+        }
+        return out;
+    }
     let total: usize = pieces
         .iter()
         .map(|w| unsafe { (*obj(*w)).len } as usize)
@@ -1334,6 +1348,25 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
             });
             if !all_bytes {
                 return None;
+            }
+            // As `rt_bytes_join`: a first piece the list alone holds, in a list nobody else
+            // holds, grows in place.
+            if heap::is_unique(*xs) {
+                let items = list::to_vec(o);
+                if let Some(&first) = items.first()
+                    && heap::is_unique(first)
+                {
+                    for &w in &items {
+                        heap::inc(w);
+                    }
+                    heap::dec(*xs);
+                    let mut out = first;
+                    for &w in &items[1..] {
+                        out = ctx.heap.append(out, unsafe { bytes_of(obj(w)) });
+                        heap::dec(w);
+                    }
+                    return Some(out);
+                }
             }
             let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
             let mut at = 0;
