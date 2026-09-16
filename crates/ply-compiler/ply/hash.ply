@@ -888,9 +888,19 @@ pub fn spec_hash(owner: Bytes, kind: Int, index: Int, normalized: Bytes) -> Byte
 // A member of a component, given the component's own hash.
 fn member_hash(component: Bytes, class: Int) -> Bytes = blake3(bytes_concat(component, u32_le(class)))
 
+// `bodies` and `test_bodies` are the reference's `BodySet`: each definition's and each test's
+// stored body, the bytes its hash is taken over in `body.rs`'s self-checking envelope.
 pub type HashOutput = { defs: List<{ name: Bytes, hash: Bytes }>, own: List<{ name: Bytes, hash: Bytes }>, decls: List<{ name: Bytes, hash: Bytes }>,
                         tests: List<Bytes>, laws: List<Bytes>, specs: List<{ name: Bytes, hashes: List<Bytes> }>, spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
-                        law_texts: List<Bytes>, deps: List<{ name: Bytes, names: List<Bytes> }>, closure: List<{ name: Bytes, names: Names }> }
+                        law_texts: List<Bytes>, deps: List<{ name: Bytes, names: List<Bytes> }>, closure: List<{ name: Bytes, names: Names }>,
+                        bodies: List<{ name: Bytes, body: Bytes }>, test_bodies: List<Bytes> }
+
+// `StoredBody::solo`: a kind byte, then the normalized bytes `blake3` keys the body by.
+fn solo_body(encoding: Bytes) -> Bytes = bytes_concat(b"\x00", encoding)
+
+// `StoredBody::member`: the kind byte, the member's class, then the whole component's packed
+// bytes, so the cycle can be rebuilt from any member.
+fn member_body(packed: Bytes, class: Int) -> Bytes = bytes_concat_all([b"\x01", u32_le(class), packed])
 
 type Sccs = { component_of: List<Int>, orders: List<List<Int>> }
 
@@ -976,8 +986,11 @@ fn ints_lt(a: List<Int>, b: List<Int>) -> Bool = match compare_values(a, b) { Le
 
 type Forms = { own: List<{ name: Bytes, hash: Bytes }>, specs: List<{ name: Bytes, hashes: List<Bytes> }>, spec_texts: List<{ name: Bytes, hashes: List<Bytes> }> }
 
-type Hashed = { hashes: Map<Int, Bytes>, tests: List<Bytes>, test_refs: List<List<Int>>, laws: List<Bytes>, law_refs: List<List<Int>>, law_texts: List<Bytes>,
+type Hashed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, tests: List<Bytes>, test_bodies: List<Bytes>, test_refs: List<List<Int>>,
+                laws: List<Bytes>, law_refs: List<List<Int>>, law_texts: List<Bytes>,
                 own: List<{ name: Bytes, hash: Bytes }>, specs: List<{ name: Bytes, hashes: List<Bytes> }>, spec_texts: List<{ name: Bytes, hashes: List<Bytes> }> }
+
+type Keyed = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes> }
 
 pub fn hash_index(index: Index) -> HashOutput = {
   let n = len(index.nodes);
@@ -1001,21 +1014,26 @@ pub fn hash_index(index: Index) -> HashOutput = {
     push(acc, fold(members, [], |o: List<Int>, v: Int| effect_order(index, at(edges, v), scc, Some(ci), o)))
   });
   let scc = { component_of: component_of, orders: orders };
-  let hashes = fold(range(0, len(components)), map_new(), |acc: Map<Int, Bytes>, ci: Int| {
+  let keyed = fold(range(0, len(components)), { hashes: map_new(), bodies: map_new() }, |acc: Keyed, ci: Int| {
     let component = at(components, ci);
     let effects = slots(at(orders, ci));
     if is_cyclic(component, edges) {
-      let refined: Refined = hash_component(index, component, acc, effects);
-      fold(refined.members, acc, |a: Map<Int, Bytes>, m: { node: Int, hash: Bytes }| map_insert(a, m.node, m.hash))
+      let refined: Refined = hash_component(index, component, acc.hashes, effects);
+      fold(refined.members, acc, |a: Keyed, m: { node: Int, hash: Bytes }| {
+        let class = match map_get(refined.classes, m.node) { Some(c) -> c, None -> 0 };
+        { hashes: map_insert(a.hashes, m.node, m.hash), bodies: map_insert(a.bodies, m.node, member_body(refined.packed, class)) }
+      })
     } else {
       let v = at(component, 0);
       let node = at(index.nodes, v);
-      map_insert(acc, v, blake3(finish(normalize_node(new_nz(index, node.module, acc, map_new(), effects), node.body)).bytes))
+      let encoding = finish(normalize_node(new_nz(index, node.module, acc.hashes, map_new(), effects), node.body)).bytes;
+      { hashes: map_insert(acc.hashes, v, blake3(encoding)), bodies: map_insert(acc.bodies, v, solo_body(encoding)) }
     }
   });
-  let tests = fold(index.tests, { hashes: [], refs: [] }, |acc: { hashes: List<Bytes>, refs: List<List<Int>> }, t: TestNode| {
+  let hashes = keyed.hashes;
+  let tests = fold(index.tests, { hashes: [], bodies: [], refs: [] }, |acc: { hashes: List<Bytes>, bodies: List<Bytes>, refs: List<List<Int>> }, t: TestNode| {
     let f: Finished = encode_item(index, t.module, scc, hashes, false, |z: Nz| test_def(z, t.def));
-    { hashes: push(acc.hashes, blake3(f.bytes)), refs: push(acc.refs, f.refs) }
+    { hashes: push(acc.hashes, blake3(f.bytes)), bodies: push(acc.bodies, solo_body(f.bytes)), refs: push(acc.refs, f.refs) }
   });
   let laws = fold(index.laws, { hashes: [], refs: [], texts: [] }, |acc: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, l: LawNode| {
     let f: Finished = encode_item(index, l.module, scc, hashes, false, |z: Nz| law_def(z, l.def));
@@ -1052,7 +1070,8 @@ pub fn hash_index(index: Index) -> HashOutput = {
       },
       _ -> acc,
     });
-  assemble(index, components, edges, { hashes: hashes, tests: tests.hashes, test_refs: tests.refs, laws: laws.hashes, law_refs: laws.refs, law_texts: laws.texts,
+  assemble(index, components, edges, { hashes: hashes, bodies: keyed.bodies, tests: tests.hashes, test_bodies: tests.bodies, test_refs: tests.refs,
+                                        laws: laws.hashes, law_refs: laws.refs, law_texts: laws.texts,
                                         own: forms.own, specs: forms.specs, spec_texts: forms.spec_texts })
 }
 
@@ -1077,16 +1096,21 @@ fn assemble(index: Index, components: List<List<Int>>, edges: List<List<Int>>, h
     }));
     push(acc, reached)
   });
-  let empty: HashOutput = { defs: [], own: h.own, decls: [], tests: h.tests, laws: h.laws, specs: h.specs, spec_texts: h.spec_texts, law_texts: h.law_texts, deps: [], closure: [] };
+  let empty: HashOutput = { defs: [], own: h.own, decls: [], tests: h.tests, laws: h.laws, specs: h.specs, spec_texts: h.spec_texts, law_texts: h.law_texts, deps: [], closure: [],
+                            bodies: [], test_bodies: h.test_bodies };
   fold(index.order, empty, |out: HashOutput, e: Entry|
     match e {
       EDef(v) -> {
         let node = at(index.nodes, v);
-        let keyed: HashOutput = match map_get(h.hashes, v) {
+        let bodied: HashOutput = match map_get(h.bodies, v) {
           None -> out,
+          Some(body) -> {..out, bodies: push(out.bodies, { name: node.name, body: body })},
+        };
+        let keyed: HashOutput = match map_get(h.hashes, v) {
+          None -> bodied,
           Some(hash) -> match node.body {
-            NFn(_) -> {..out, defs: push(out.defs, { name: node.name, hash: hash })},
-            _ -> {..out, decls: push(out.decls, { name: node.name, hash: hash })},
+            NFn(_) -> {..bodied, defs: push(bodied.defs, { name: node.name, hash: hash })},
+            _ -> {..bodied, decls: push(bodied.decls, { name: node.name, hash: hash })},
           },
         };
         let deps = map(at(edges, v), |r: Int| at(index.nodes, r).name);
