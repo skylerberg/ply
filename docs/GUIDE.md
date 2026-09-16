@@ -1765,20 +1765,7 @@ and the replay command.
 
 `--backend` attaches a compiled backend (§17).
 
-The flag takes a value. `interp` is the interpreted front end (ADR 0047): it walks the same lowered
-code the `c` tier compiles, over the same runtime, with no C compiler in the
-path, and answers what the machine answers on every body it reaches. It
-carries the first-order language, `with_cell`, and a `handle`/`perform` whose
-clauses are tail-resumptive (the common case), recording each performed atom
-so its footprint matches; it declines — for the machine to run — a clause that
-binds `resume`, `simulate` and a region's tasks, whose continuations live on
-the tier's stacks and are its next increment. `combined` is the two front
-ends together: it interprets what `interp` carries and compiles — through
-`c` — what `interp` declines, so between them they answer every body with no
-machine, which is what makes the machine deletable; `PLY_COMBINED_AUDIT=1` runs a body
-both ways and fails on any disagreement, the oracle that replaces pairing
-against the machine once the machine is gone. `c` is the code
-generator: it emits the fragment as C,
+`c`, the one value the flag takes, is the code generator: it emits the fragment as C,
 hands it to `cc`, and loads the result. Its bodies carry symbols, so a sampling
 profiler and a disassembler can both read what a definition became.
 `PLY_C_KEEP=1` leaves the `.c` and the shared object behind for that;
