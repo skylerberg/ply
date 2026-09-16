@@ -40,11 +40,12 @@ pub type Bindings = { values: List<Binding>, types: List<Binding>, effects: List
                       by_value: Map<Bytes, Binding>, by_type: Map<Bytes, Binding>, by_effect: Map<Bytes, Binding> }
 pub type ModBind = { binder: Bytes, target: Int, span: Span }
 pub type Scope = { module: Bytes, modules: List<ModBind>, selective: List<ModBind>, bound: Bindings }
-pub type Label = { module: Int, start: Int, end: Int, primary: Bool }
-// `text` is what the reference's message and label texts add to the identity of a
-// diagnostic beyond its code, spans and note count: `deduplicated` keeps two apart by it,
-// and the dump does not print it.
-pub type Diag = { code: Bytes, notes: Int, labels: List<Label>, text: Bytes }
+pub type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+// `ply_span::Diagnostic` with each label's module. `notes` is the count the dump prints and is
+// always `len(notes_text)`; `text` is the checker's dedup key for the two mismatch printers,
+// kept beside the message the reference renders from the same printers.
+pub type Diag = { code: Bytes, notes: Int, labels: List<Label>, text: Bytes, message: Bytes,
+                  notes_text: List<Bytes>, severity: Bytes }
 type Edge = { from: Int, target: Int, span: Span }
 pub type Entry = { name: Bytes, at: Int }
 pub type Resolved = { names: List<Entry>, scopes: List<Scope>, declarations: List<Decls>,
@@ -154,18 +155,46 @@ fn binder_span(d: ImportDecl) -> Span =
   }
 
 // --- Diagnostics ---------------------------------------------------------------
-//
-// Codes, label spans (with the module each lies in) and note counts: what the
-// comparison sees. The prose is the reference's alone.
 
-pub fn lab(m: Int, s: Span, primary: Bool) -> Label =
-  { module: m, start: s.start, end: s.end, primary: primary }
+pub fn lab(m: Int, s: Span, primary: Bool, text: Bytes) -> Label =
+  { module: m, start: s.start, end: s.end, primary: primary, text: text }
 
-pub fn diag1(code: Bytes, m: Int, s: Span, notes: Int) -> Diag =
-  { code: code, notes: notes, labels: [lab(m, s, true)], text: b"" }
+// `Diagnostic::error(code, message)` with its labels and notes already added.
+pub fn diag(code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>) -> Diag =
+  { code: code, notes: len(notes), labels: labels, text: b"", message: message, notes_text: notes,
+    severity: b"error" }
 
-pub fn diag2(code: Bytes, m: Int, s: Span, m2: Int, also: Span, notes: Int) -> Diag =
-  { code: code, notes: notes, labels: [lab(m, s, true), lab(m2, also, false)], text: b"" }
+pub fn diag1(code: Bytes, m: Int, s: Span, message: Bytes, label: Bytes, notes: List<Bytes>) -> Diag =
+  diag(code, message, [lab(m, s, true, label)], notes)
+
+pub fn diag2(code: Bytes, m: Int, s: Span, message: Bytes, label: Bytes, m2: Int, also: Span,
+             also_text: Bytes, notes: List<Bytes>) -> Diag =
+  diag(code, message, [lab(m, s, true, label), lab(m2, also, false, also_text)], notes)
+
+// "`a`, `b`": names in backticks, joined.
+pub fn backticked(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| {
+    let x = bytes_concat_all([b"`", at(xs, i), b"`"]);
+    if i == 0 { x } else { bytes_concat_all([acc, sep, x]) }
+  })
+
+// `defaults::list`: "nothing", "`a`", "`a` and `b`", "`a`, `b` and `c`".
+pub fn list_names(xs: List<Bytes>) -> Bytes =
+  if len(xs) == 0 { b"nothing" } else {
+    fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| {
+      let x = bytes_concat_all([b"`", at(xs, i), b"`"]);
+      if i == 0 { x } else { bytes_concat_all([acc, if i + 1 == len(xs) { b" and " } else { b", " }, x]) }
+    })
+  }
+
+pub fn ns_describe(ns: Ns) -> Bytes = match ns { NValue -> b"definition", NType -> b"type", NEffect -> b"effect" }
+
+pub fn ns_keyword(ns: Ns) -> Bytes = match ns { NValue -> b"fn", NType -> b"type", NEffect -> b"effect" }
+
+// Every public name a module declares, across the three namespaces in the reference's order.
+pub fn exported_names(d: Decls) -> List<Bytes> =
+  fold(spaces(), [], |acc: List<Bytes>, ns: Ns|
+    fold(space(d, ns), acc, |a: List<Bytes>, x: Declared| if x.public { push(a, x.name) } else { a }))
 
 // --- Declarations ---------------------------------------------------------------
 
@@ -252,7 +281,18 @@ fn target(w: World, i: Int, b: Builder, d: ImportDecl) -> Option<Int> = {
 fn target_or_report(w: World, i: Int, b: Builder, d: ImportDecl) -> { b: Builder, t: Option<Int> } =
   match target(w, i, b, d) {
     Some(t) -> { b: b, t: Some(t) },
-    None -> { b: {..b, diags: push(b.diags, diag1(b"E0106", i, path_span(d), 1))}, t: None },
+    None -> {
+      let name = import_module_name(d);
+      let near = fold(w.names, [], |acc: List<Bytes>, e: Entry|
+        if bytes_len(e.name) > 0 && bytes_ends_with(e.name, default_binder(name)) { push(acc, e.name) } else { acc });
+      let note = if len(near) == 0 {
+        b"a module is a file: `store/orders.ply` is `store.orders`, relative to the project root"
+      } else { bytes_concat(b"modules with that last segment: ", backticked(near, b", ")) };
+      { b: {..b, diags: push(b.diags, diag1(b"E0106", i, path_span(d),
+                                            bytes_concat_all([b"no module named `", name, b"` in this program"]),
+                                            b"not found", [note]))},
+        t: None }
+    },
   }
 
 fn bind_module(w: World, i: Int, b: Builder, d: ImportDecl, t: Int) -> Builder =
@@ -261,8 +301,15 @@ fn bind_module(w: World, i: Int, b: Builder, d: ImportDecl, t: Int) -> Builder =
     Some(binder) -> {
       let s = binder_span(d);
       match find_modbind(b.scope.modules, binder) {
-        Some(first) ->
-          {..b, diags: push(b.diags, diag2(b"E0110", i, s, i, first.span, 1))},
+        Some(first) -> {
+          let name = import_module_name(d);
+          {..b, diags: push(b.diags, diag2(b"E0110", i, s,
+                     bytes_concat_all([b"two imports bind the module name `", binder, b"`"]),
+                     bytes_concat_all([b"`", name, b"` would also be `", binder, b"`"]),
+                     i, first.span,
+                     bytes_concat_all([b"`", at(w.mods, first.target).name, b"` is already bound as `", binder, b"`"]),
+                     [bytes_concat_all([b"rename one of them: `import ", name, b" as <other>`"])]))}
+        },
         None ->
           {..b, scope: {..b.scope, modules: push(b.scope.modules, { binder: binder, target: t, span: s })}},
       }
@@ -271,9 +318,16 @@ fn bind_module(w: World, i: Int, b: Builder, d: ImportDecl, t: Int) -> Builder =
 
 fn bind_name(w: World, i: Int, b: Builder, t: Int, name: Ident) -> Builder = {
   let decls = at(w.declarations, t);
+  let module = at(w.mods, t).name;
   let found = filter(spaces(), |ns: Ns| match dlookup(decls, ns, name.name) { Some(_) -> true, None -> false });
   if len(found) == 0 {
-    {..b, diags: push(b.diags, diag1(b"E0101", i, name.span, 1))}
+    let exported = exported_names(decls);
+    let note = if len(exported) == 0 {
+      bytes_concat_all([b"`", module, b"` exports nothing; mark an item `pub` to export it"])
+    } else { bytes_concat_all([b"`", module, b"` exports: ", backticked(exported, b", ")]) };
+    {..b, diags: push(b.diags, diag1(b"E0101", i, name.span,
+                                     bytes_concat_all([b"module `", module, b"` declares no `", name.name, b"`"]),
+                                     bytes_concat_all([b"not found in `", module, b"`"]), [note]))}
   } else {
     let public = filter(found, |ns: Ns|
       match dlookup(decls, ns, name.name) { Some(x) -> x.public, None -> false });
@@ -282,25 +336,41 @@ fn bind_name(w: World, i: Int, b: Builder, t: Int, name: Ident) -> Builder = {
         Some(x) -> x,
         None -> panic("just found"),
       };
-      {..b, diags: push(b.diags, diag2(b"E0107", i, name.span, t, declared.span, 2))}
+      {..b, diags: push(b.diags, private_name(i, name.span, t, declared.span, at(found, 0), name.name, module))}
     } else {
       fold(public, b, |acc: Builder, ns: Ns| bind_one(w, i, acc, t, name, ns))
     }
   }
 }
 
+// `Resolved::private`: the same words at an import and at a qualified reference.
+pub fn private_name(m: Int, at_: Span, owner: Int, declared: Span, ns: Ns, name: Bytes, module: Bytes) -> Diag =
+  diag2(b"E0107", m, at_, bytes_concat_all([b"`", name, b"` is private to module `", module, b"`"]),
+        b"not exported", owner, declared, b"declared here, without `pub`",
+        [bytes_concat_all([b"write `pub ", ns_keyword(ns), b" ", name, b"` in `", module, b"` to export it"]),
+         b"items are private by default"])
+
 fn bind_one(w: World, i: Int, b: Builder, t: Int, name: Ident, ns: Ns) -> Builder = {
   let binding = match lookup(at(w.declared, t), ns, name.name) {
     Some(x) -> x,
     None -> panic("a public declaration always has a binding"),
   };
+  let module = at(w.mods, t).name;
   match dlookup(b.local, ns, name.name) {
     // Local-wins was rejected deliberately: adding a local beside an import would silently
     // steal every existing call site.
-    Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0108", i, name.span, i, prev.span, 2))},
+    Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0108", i, name.span,
+      bytes_concat_all([b"the ", ns_describe(ns), b" `", name.name, b"` is both imported and defined in `", b.scope.module, b"`"]),
+      bytes_concat_all([b"imported from `", module, b"` here"]),
+      i, prev.span, bytes_concat_all([b"`", name.name, b"` is also defined here"]),
+      [bytes_concat_all([b"drop it from the import list and write `import ", module, b"`, then `", default_binder(module), b"::", name.name, b"` where you mean the imported one"]),
+       b"neither one silently wins: a call site would change meaning without changing"]))},
     None ->
       match dlookup(b.imported, ns, name.name) {
-        Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0110", i, name.span, i, prev.span, 1))},
+        Some(prev) -> {..b, diags: push(b.diags, diag2(b"E0110", i, name.span,
+          bytes_concat_all([b"the ", ns_describe(ns), b" `", name.name, b"` is imported twice"]),
+          b"imported again here", i, prev.span, b"first imported here",
+          [bytes_concat_all([b"remove one import, or import the module and write `<module>::", name.name, b"`"])]))},
         None -> {
           let imported = dpush(b.imported, ns, { name: name.name, qualified: binding.qualified, public: true, span: name.span });
           let bound = bpush(b.scope.bound, ns, { name: name.name, qualified: binding.qualified, owner: t, span: name.span });
@@ -367,9 +437,20 @@ fn canonical(nodes: List<Int>) -> List<Int> =
     map(range(0, len(nodes)), |i: Int| at(nodes, (least + i) % len(nodes)))
   }
 
-fn cycle_diag(c: Cycle) -> Diag =
-  if len(c.nodes) == 1 { diag1(b"E0109", c.closing.from, c.closing.span, 1) }
-  else { diag1(b"E0109", c.closing.from, c.closing.span, 2) }
+fn cycle_diag(mods: List<Mod>, c: Cycle) -> Diag = {
+  let names = map(c.nodes, |i: Int| at(mods, i).name);
+  let first = if len(names) == 0 { b"" } else { at(names, 0) };
+  if len(c.nodes) == 1 {
+    diag1(b"E0109", c.closing.from, c.closing.span, bytes_concat_all([b"module `", first, b"` imports itself"]),
+          b"a module cannot import itself", [b"every name a module declares is already in scope in its own file"])
+  } else {
+    diag1(b"E0109", c.closing.from, c.closing.span,
+          bytes_concat_all([b"module cycle: ", backticked(names, b" -> "), b" -> `", first, b"`"]),
+          b"this import closes the cycle",
+          [b"each of these has to be checked before the next, and the last before the first, so there is no order to check them in",
+           b"move what they share into a module that all of them import"])
+  }
+}
 
 // --- `find`: what a name denotes in a module -----------------------------------------
 
@@ -500,7 +581,11 @@ fn qexpr(r: Resolved, q: Qual, e: Expr) -> QOut =
           None -> { q: q, e: e },
           Some(b) ->
             if b.owner == q.owner && q.public && !decl_public(r, q.owner, v.name.name.name) {
-              { q: {..q, diags: push(q.diags, diag1(b"E0122", q.owner, v.name.span, 1))}, e: e }
+              { q: {..q, diags: push(q.diags, diag1(b"E0122", q.owner, v.name.span,
+                        bytes_concat_all([b"a default on a `pub fn` cannot mention `", v.name.name.name, b"`"]),
+                        b"not exported by this module",
+                        [b"the default is copied into every call site that omits the argument, and a caller in another module may not name this"]))},
+                e: e }
             } else {
               let module = at(r.scopes, b.owner).module;
               let imports = match find_modbind(q.imports, module) {
@@ -645,10 +730,18 @@ fn collect_fn(r: Resolved, mods: List<Mod>, m: Int, c: Collected, f: FnDef) -> C
 
 fn admissible(m: Int, e: Expr, names: List<Bytes>, diags: List<Diag>) -> { ok: Bool, diags: List<Diag> } =
   if !is_default_expr(e) {
-    { ok: false, diags: push(diags, diag1(b"E0121", m, expr_span(e), 2)) }
+    { ok: false, diags: push(diags, diag1(b"E0121", m, expr_span(e), b"a parameter default must be a pure, closed expression",
+        b"this runs, rather than being a value",
+        [b"the default is copied into every call that omits the argument, so a call                  or a `perform` in it would run at the caller and not here",
+         b"a literal, a constructor applied to literals, a record or a list is fine"])) }
   } else {
     let mentioned = mentions(e, names, [], []);
-    if len(mentioned) > 0 { { ok: false, diags: push(diags, diag1(b"E0121", m, expr_span(e), 1)) } }
+    if len(mentioned) > 0 {
+      { ok: false, diags: push(diags, diag1(b"E0121", m, expr_span(e),
+          bytes_concat_all([b"a parameter default cannot mention `", at(mentioned, 0), b"`"]),
+          b"names a parameter of this same signature",
+          [b"a call site has no such binding for the default to be copied into"])) }
+    }
     else { { ok: true, diags: diags } }
   }
 
@@ -832,7 +925,10 @@ fn fill(f: Filling, cx: Cx, a: App) -> COut =
       // No signature in hand: a call through a value, a constructor, or a name that does not
       // resolve. A named argument then names no parameter.
       let diags = fold(a.named, cx.diags, |ds: List<Diag>, n: NamedArg|
-        push(ds, diag1(b"E0123", cx.module, n.name.span, 1)));
+        push(ds, diag1(b"E0123", cx.module, n.name.span,
+                       bytes_concat_all([b"`", n.name.name, b"` names no parameter here"]),
+                       b"no signature to match this against",
+                       [b"a named argument needs a callee reached by name; a call through a value, a lambda or a constructor is positional"])));
       { cx: {..cx, diags: diags}, e: EApp({..a, named: []}) }
     },
     Some(sig) ->
@@ -847,21 +943,27 @@ fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut = {
   let start = map(range(0, len(sig.params)), |i: Int| list_at(a.args, i));
   let placed: { cx: Cx, slots: List<Option<Expr>> } = fold(a.named, { cx: cx, slots: start }, |acc: { cx: Cx, slots: List<Option<Expr>> }, n: NamedArg|
     match param_index(sig, n.name.name) {
-      None -> {..acc, cx: {..acc.cx, diags: push(acc.cx.diags, diag1(b"E0123", cx.module, n.name.span, 1))}},
+      None -> {..acc, cx: {..acc.cx, diags: push(acc.cx.diags, diag1(b"E0123", cx.module, n.name.span,
+                 bytes_concat_all([b"`", n.name.name, b"` names no parameter of this function"]), b"not a parameter",
+                 [bytes_concat(b"the parameters are ", list_names(map(sig.params, |p: PInfo| p.name)))]))}},
       Some(i) ->
         match at(acc.slots, i) {
-          Some(_) -> {..acc, cx: {..acc.cx, diags: push(acc.cx.diags, diag1(b"E0123", cx.module, n.name.span, 0))}},
+          Some(_) -> {
+            let already = if i < filled_positionally { b"already filled by a positional argument" } else { b"already given by name" };
+            {..acc, cx: {..acc.cx, diags: push(acc.cx.diags, diag1(b"E0123", cx.module, n.name.span,
+                       bytes_concat_all([b"`", n.name.name, b"` is ", already]), b"given twice", []))}}
+          },
           None -> {..acc, slots: set_at(acc.slots, i, Some(n.value))},
         },
     });
-  let out: { cx: Cx, xs: List<Expr>, missing: Int } = fold(range(0, len(sig.params)), { cx: placed.cx, xs: [], missing: 0 },
-    |acc: { cx: Cx, xs: List<Expr>, missing: Int }, i: Int|
+  let out: { cx: Cx, xs: List<Expr>, missing: List<Bytes> } = fold(range(0, len(sig.params)), { cx: placed.cx, xs: [], missing: [] },
+    |acc: { cx: Cx, xs: List<Expr>, missing: List<Bytes> }, i: Int|
       match at(placed.slots, i) {
         Some(written) -> {..acc, xs: push(acc.xs, written)},
         None -> {
           let p = at(sig.params, i);
           match p.default {
-            None -> {..acc, missing: acc.missing + 1},
+            None -> {..acc, missing: push(acc.missing, p.name)},
             Some(d) -> {
               // The default may name something in the module that wrote it, and this one may
               // never have imported that module.
@@ -872,9 +974,14 @@ fn fill_slots(cx: Cx, a: App, sig: Sig) -> COut = {
           }
         },
       });
-  if out.missing > 0 {
+  if len(out.missing) > 0 {
     // A call with no names in it that leaves a hole is under-applied, which is `E0202`'s.
-    let cx2 = if was_named { {..out.cx, diags: push(out.cx.diags, diag1(b"E0125", cx.module, a.span, 1))} } else { out.cx };
+    let cx2 = if was_named {
+      {..out.cx, diags: push(out.cx.diags, diag1(b"E0125", cx.module, a.span,
+                   bytes_concat_all([b"this call leaves ", list_names(out.missing), b" unfilled"]),
+                   b"no argument and no default",
+                   [b"pass it positionally, or by name as `<parameter>: <value>`"]))}
+    } else { out.cx };
     { cx: cx2, e: EApp({..a, named: []}) }
   } else {
     { cx: out.cx, e: EApp({..a, args: out.xs, named: []}) }
@@ -960,7 +1067,10 @@ fn resolve_with(mods: List<Mod>, defaults: Bool) -> Outcome = {
     match index_of(acc.names, name) {
       None -> {..acc, names: push(acc.names, { name: name, at: i })},
       Some(_) -> if bytes_len(name) == 0 { acc }
-                 else { {..acc, diags: push(acc.diags, diag1(b"E0105", i, dummy_span(), 1))} },
+                 else { {..acc, diags: push(acc.diags, diag1(b"E0105", i, dummy_span(),
+                          bytes_concat_all([b"two files claim the module name `", name, b"`"]),
+                          b"loaded a second time under this name",
+                          [b"one file is one module, and a module name is derived from its path"]))} },
     }
   });
   let declarations = map(mods, declarations_of);
@@ -971,7 +1081,7 @@ fn resolve_with(mods: List<Mod>, defaults: Bool) -> Outcome = {
   let edges = map(built, |b: Builder| b.edges);
   let diags1 = fold(built, indexed.diags, |acc: List<Diag>, b: Builder| bytes_concat_diags(acc, b.diags));
   let dfs = traverse(edges);
-  let diags2 = fold(dfs.cycles, diags1, |acc: List<Diag>, c: Cycle| push(acc, cycle_diag(c)));
+  let diags2 = fold(dfs.cycles, diags1, |acc: List<Diag>, c: Cycle| push(acc, cycle_diag(mods, c)));
   // Only with a consistent set of tables: expansion resolves names through them.
   if len(diags2) > 0 { Failed(diags2) } else {
     let r = { names: indexed.names, scopes: scopes, declarations: declarations, declared: declared, order: dfs.order };

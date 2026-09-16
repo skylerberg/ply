@@ -519,6 +519,7 @@ impl fmt::Display for Diagnostic {
 
 impl std::error::Error for Diagnostic {}
 
+pub mod frames;
 pub mod render;
 
 pub type Result<T> = std::result::Result<T, Vec<Diagnostic>>;
