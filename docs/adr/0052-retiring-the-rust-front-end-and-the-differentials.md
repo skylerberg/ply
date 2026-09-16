@@ -106,6 +106,36 @@ checker. `ply-hash`, `ply-store` and `ply-host` no longer depend on
 call `ply-core` only for the checker itself and the prelude's constructor
 table, which move when the port answers them.
 
+**Built, 2026-09-16: the message channel.** The port's diagnostics carried
+a code, spans, a label count and a note count; they now carry the
+reference's message, label texts, notes and severity at every site, and
+one entry, `diag.diag_dump`, answers every diagnostic a program raises in
+the driver's order as length-framed text: `diag <i> <n>` frames of
+`<key> <n>` fields, so that no payload byte is a delimiter. `ply-span`
+reads that text back into its own `Diagnostic`, naming each of the
+forty-seven codes the port raises with a literal constructor so the
+armed-code check holds them after the reference goes, and writes one
+from a `Diagnostic` so the two forms cannot drift. The differential
+holds the port's dump to the reference chain's over the mined corpora,
+the standard library, the examples, the compiler's own sources and the
+fixtures, the first comparison of messages this tree has had; the
+existing dumps and their goldens did not move. One code stays the
+driver's: `E0111`, a module name derived from a file path the port never
+sees. What the reference prints from data the port lacks is recorded in
+`crates/ply-compiler/GAPS.md` §11.
+
+**Found on the way, by the tier gate and by nothing else.** The
+compiler's own tests, run by the compiled compiler, aborted on one new
+function, `bytes_at(b, bytes_len(b) - 1 - i)`: the port's release mode
+(ADR 0046) spends a value at its last read, and the inline `bytes_at`
+path evaluated its index, which held that last read, before it bound its
+buffer, so the buffer read handed zero to the runtime. The Rust reference
+has no release mode and the differential compares the port with release
+off, so no byte comparison could see it, and the fixpoint was green over
+it. The behavioural gate caught it, which is the witness §2 says survives
+the reference; the shape is in the language corpus on both tiers now, in
+four forms.
+
 ## 2. Delete the Rust front end, its test crates and the differentials
 
 In the order the goldens allow: `ply-derive`; `ply-syntax`'s rewrites,
