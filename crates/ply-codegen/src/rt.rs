@@ -569,6 +569,24 @@ impl Ctx {
             for (kind, n) in kinds.into_iter().filter(|(_, n)| *n > 0) {
                 eprintln!("  allocated: kind {kind}: {n} objects");
             }
+            let layouts = &self.tables.layouts;
+            for ((kind, key), n) in self.heap.allocated_by_layout().into_iter().take(24) {
+                let what = match kind {
+                    heap::KIND_CTOR => format!("`{}`", layouts.ctors[key as usize].0),
+                    heap::KIND_RECORD => format!(
+                        "{{{}}}",
+                        layouts
+                            .shape_names(key)
+                            .iter()
+                            .map(|s| s.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    heap::KIND_BYTES => format!("bytes under {key}"),
+                    _ => format!("str under {key}"),
+                };
+                eprintln!("  allocated: {n} of {what}");
+            }
             let live = self.heap.live_by_kind();
             if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
                 for (kind, n, bytes) in live {
