@@ -173,6 +173,56 @@ pub fn delay() -> usize {
     })
 }
 
+/// A bytes value of one byte or none, laid out as the heap lays one out: the header, then the
+/// payload where `bytes_ptr` looks for it.
+#[repr(C)]
+struct SmallBytes {
+    obj: Obj,
+    payload: [u8; 8],
+}
+
+const fn small_bytes_object(len: u32) -> Obj {
+    Obj {
+        rc: IMMORTAL,
+        kind: KIND_BYTES,
+        flags: 0,
+        aux: 0,
+        len,
+        layout: len,
+    }
+}
+
+static EMPTY_BYTES: SmallBytes = SmallBytes {
+    obj: small_bytes_object(0),
+    payload: [0; 8],
+};
+
+static ONE_BYTE: [SmallBytes; 256] = {
+    let mut out = [const {
+        SmallBytes {
+            obj: small_bytes_object(1),
+            payload: [0; 8],
+        }
+    }; 256];
+    let mut i = 0;
+    while i < 256 {
+        out[i].payload[0] = i as u8;
+        i += 1;
+    }
+    out
+};
+
+/// The immortal bytes value holding `b`, when `b` is a byte or none: the compiler's sources
+/// make tens of millions of these, as the empty literal a fold starts from and as the one
+/// character a lexer step keeps, and none of them needs a block of its own (ADR 0051 §3).
+pub fn small_bytes(b: &[u8]) -> Option<Word> {
+    match b {
+        [] => Some(&raw const EMPTY_BYTES.obj as Word),
+        [one] => Some(&raw const ONE_BYTE[*one as usize].obj as Word),
+        _ => None,
+    }
+}
+
 /// The diagnostic mode's pieces: the word a dead payload is filled with, the check every object
 /// read passes through, and the site the check names.
 pub mod poison {
@@ -823,6 +873,12 @@ impl Heap {
     /// capacity.
     fn joined(&mut self, kind: u8, a: &[u8], b: &[u8], room: usize) -> *mut Obj {
         let len = a.len() + b.len();
+        if kind == KIND_BYTES
+            && len <= 1
+            && let Some(w) = small_bytes(if a.is_empty() { b } else { a })
+        {
+            return obj(w);
+        }
         let o = self.alloc_bytes(kind, room.max(len) as u32);
         unsafe {
             std::ptr::copy_nonoverlapping(a.as_ptr(), bytes_ptr(o), a.len());

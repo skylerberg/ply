@@ -1183,6 +1183,15 @@ pub unsafe extern "C" fn rt_bytes_join(ctx: *mut Ctx, args: *const i64, n: i64) 
         .iter()
         .map(|w| unsafe { (*obj(*w)).len } as usize)
         .sum();
+    if total <= 1 {
+        let one = pieces
+            .iter()
+            .find_map(|w| unsafe { bytes_of(obj(*w)) }.first().copied());
+        for w in pieces {
+            heap::dec(*w);
+        }
+        return ctx.heap.bytes(one.as_slice());
+    }
     let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
     let mut at = 0;
     for w in pieces {
@@ -1391,6 +1400,14 @@ fn native_builtin(ctx: &mut Ctx, which: Builtin, args: &[Word]) -> Option<Word> 
                     }
                     return Some(out);
                 }
+            }
+            if total <= 1 {
+                let mut one = None;
+                list::for_each(o, &mut |w| {
+                    one = one.or(unsafe { bytes_of(obj(w)) }.first().copied());
+                });
+                heap::dec(*xs);
+                return Some(ctx.heap.bytes(one.as_slice()));
             }
             let out = ctx.heap.alloc_bytes(KIND_BYTES, total as u32);
             let mut at = 0;
