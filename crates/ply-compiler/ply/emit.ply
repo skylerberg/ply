@@ -249,6 +249,10 @@ pub type P = { name: Bytes, k: Kind, ty: Ty }
 
 pub type Out = { em: Em, v: V }
 
+// What a `match` arm's body becomes: an assignment to the match's answer local, or the loop's
+// own control when the match is a fused `iterate` step (`emit_step`).
+pub type Sink = | ToValue(Bytes) | ToLoop({ state: Bytes, answer: Bytes, stop: Int, go: Int, depth: Int })
+
 // A line is pushed, and a body's text joined once: appending to one string would copy the
 // body so far for every line, which is quadratic in a heap that keeps what an entry lets go.
 fn line(em: Em, text: Bytes) -> Em =
@@ -1215,6 +1219,7 @@ fn fusable_step(em: Em, c: Code) -> Bool =
     },
     NIf(i) -> fusable_step(em, i.then_branch) && fusable_step(em, i.else_branch),
     NBlock(b) -> match b.tail { Some(t) -> fusable_step(em, t), None -> false },
+    NMatch(m) -> fold(m.arms, true, |acc: Bool, a: CArm| acc && a.guard == None && fusable_step(em, a.body)),
     _ -> false,
   }
 
@@ -1261,6 +1266,11 @@ fn emit_step(em: Em, c: Code, state: Bytes, answer: Bytes, stop: Int, go: Int, p
         None -> None,
         Some(after) -> emit_step(rescope(after, after.conv), t, state, answer, stop, go, params, depth),
       },
+    },
+    NMatch(m) -> match match_subject(em, m.scrutinee, m.arms, params) {
+      None -> None,
+      Some(s) -> match_arms(s.em, s.subj, s.lookup, m.arms, params,
+                            ToLoop({ state: state, answer: answer, stop: stop, go: go, depth: depth }), c.span, em.tail),
     },
     _ -> None,
   }
@@ -2540,24 +2550,15 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     },
     // A `match` is arms in order over one flag: each arm runs only if no earlier
     // one matched, and a body that falls off the end raises rather than answering.
-    NMatch(m) -> match lookup_of(em, m.scrutinee, m.arms) {
-      Some(l) -> lookup_match(em, l.helper, l.args, m.arms, params, m.scrutinee.span, c.span),
-      None -> match expr(notail(em), m.scrutinee, params) {
-        None -> None,
-        Some(sc) -> {
-          let sw = word_of(sc.em, sc.v);
-          let subj = bind_keeping(sw.em, KBoxed, sc.v.ty, sw.c);
-          let ans = fresh(subj.em);
-          let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
-          let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
-          match arms(withtail(opened, em.tail), m.arms, params, 0, subj.v, ans.name, flag.name, opened.made, [], None) {
-            None -> None,
-            Some(after) -> Some({
-              em: note_holder(line(site(after, c.span), bytes_concat_all([b"if (!", flag.name,
-                                                            b") { rt_no_match_p(ctx); return 0; }"])), ans.name),
-              v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
-          }
-        },
+    NMatch(m) -> match match_subject(em, m.scrutinee, m.arms, params) {
+      None -> None,
+      Some(s) -> {
+        let ans = fresh(s.em);
+        let declared = line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"]));
+        match match_arms(declared, s.subj, s.lookup, m.arms, params, ToValue(ans.name), c.span, em.tail) {
+          None -> None,
+          Some(after) -> Some({ em: note_holder(after, ans.name), v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
+        }
       },
     },
     NIf(i) -> match expr(notail(em), i.cond, params) {
@@ -2985,9 +2986,10 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
 
 // The arms, in order. Each is guarded by the flag rather than by an `else`, so
 // an arm's own test is written at one depth whatever the arm before it did.
-// `held` is the local a lookup answered, whose arms test and bind it directly.
-fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, flag: Bytes,
-        base: List<Made>, seen: List<Made>, held: Option<Bytes>)
+// Under `lookup` the subject is the local a lookup answered, which the arms test and bind
+// directly.
+fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, sink: Sink, flag: Bytes,
+        base: List<Made>, seen: List<Made>, lookup: Bool)
     -> Option<Em> =
   if i >= len(xs) { Some(with_made(em, if i == 0 { em.made } else { seen })) } else {
     match list_at(xs, i) {
@@ -2996,28 +2998,21 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
       // reach one yet.
       Some(a) -> if a.guard != None { Some(poison(em, b"a match guard")) } else {
         let guarded = indent(line(with_made(em, base), bytes_concat_all([b"if (!", flag, b") {"])));
-        match (match held {
-                 Some(h) -> Some({ em: guarded, c: lookup_test(a.pat, h) }),
-                 None -> pat_test(a.pat, subj, guarded),
-               }) {
+        match (if lookup { Some({ em: guarded, c: lookup_test(a.pat, subj.c) }) }
+               else { pat_test(a.pat, subj, guarded) }) {
           None -> Some(poison(em, b"a pattern this port cannot test")),
           Some(t) -> {
             let opened = line(t.em, bytes_concat_all([b"if (", t.c, b") {"]));
             let inner = indent(opened);
-            let bound = match held {
-              Some(_) -> lookup_bind(inner, a.pat, subj),
-              None -> pat_bind(inner, a.pat, subj),
-            };
-            match expr(bound, a.body, params) {
+            let bound = if lookup { lookup_bind(inner, a.pat, subj) } else { pat_bind(inner, a.pat, subj) };
+            match arm_body(bound, sink, a.body, params) {
               None -> None,
               Some(o) -> {
-                let w = word_of(o.em, o.v);
-                let done = line(assign_owned(line(w.em, bytes_concat_all([ans, b" = ", w.c, b";"])), ans, w.c),
-                                bytes_concat_all([flag, b" = 1;"]));
+                let done = line(o, bytes_concat_all([flag, b" = 1;"]));
                 let closed = close(close(done));
                 // The next arm is a tail when this one was: the body's own nodes cleared the flag.
-                arms(withtail(rescope(closed, em.conv), em.tail), xs, params, i + 1, subj, ans, flag,
-                     base, union_made(seen, closed.made), held)
+                arms(withtail(rescope(closed, em.conv), em.tail), xs, params, i + 1, subj, sink, flag,
+                     base, union_made(seen, closed.made), lookup)
               },
             }
           },
@@ -3025,6 +3020,57 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
       },
     }
   }
+
+// An arm's body, into its sink: the word assigned to the match's answer, or the loop's own
+// assignments for a step that answers `Stop` or `Continue`.
+fn arm_body(em: Em, sink: Sink, body: Code, params: List<P>) -> Option<Em> =
+  match sink {
+    ToValue(ans) -> match expr(em, body, params) {
+      None -> None,
+      Some(o) -> {
+        let w = word_of(o.em, o.v);
+        Some(assign_owned(line(w.em, bytes_concat_all([ans, b" = ", w.c, b";"])), ans, w.c))
+      },
+    },
+    ToLoop(l) -> emit_step(em, body, l.state, l.answer, l.stop, l.go, params, l.depth),
+  }
+
+// What a `match` tests, held in a local. For the match `lookup_of` recognised that is the element
+// held once more, or zero, straight from the runtime, with no `Some` built and taken apart
+// between; the failure check has to come before zero is read as `None`, because a call that
+// failed answers zero too.
+fn match_subject(em: Em, scrutinee: Code, xs: List<CArm>, params: List<P>) -> Option<{ em: Em, subj: V, lookup: Bool }> =
+  match lookup_of(em, scrutinee, xs) {
+    Some(l) -> match args_owned_at(notail(em), l.args, params, scrutinee.span) {
+      None -> None,
+      Some(w) -> {
+        let held = bind(w.em, KBoxed, bytes_concat_all([
+          l.helper, b"(ctx",
+          fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])), b")"]));
+        Some({ em: check(held.em), subj: held.v, lookup: true })
+      },
+    },
+    None -> match expr(notail(em), scrutinee, params) {
+      None -> None,
+      Some(sc) -> {
+        let sw = word_of(sc.em, sc.v);
+        let subj = bind_keeping(sw.em, KBoxed, sc.v.ty, sw.c);
+        Some({ em: subj.em, subj: subj.v, lookup: false })
+      },
+    },
+  }
+
+// The arms over one flag, after the subject: each runs only if no earlier one matched, and a
+// body that falls off the end raises rather than answering. `tail` is the match's own position,
+// which the subject's evaluation cleared.
+fn match_arms(em: Em, subj: V, lookup: Bool, xs: List<CArm>, params: List<P>, sink: Sink, span: Span, tail: Bool) -> Option<Em> = {
+  let flag = fresh(em);
+  let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
+  match arms(withtail(opened, tail), xs, params, 0, subj, sink, flag.name, opened.made, [], lookup) {
+    None -> None,
+    Some(after) -> Some(line(site(after, span), bytes_concat_all([b"if (!", flag.name, b") { rt_no_match_p(ctx); return 0; }"]))),
+  }
+}
 
 // `match list_at(xs, i) { Some(x) -> .., None -> .. }` and the same over `map_get`, when the
 // scrutinee names the builtin, both arms are unguarded, and the `Some` arm binds one name or
@@ -3077,30 +3123,6 @@ fn unwraps(em: Em, p: CPat) -> Option<Bool> =
       else if c.name == b"None" && len(c.args) == 0 { Some(false) }
       else { None },
     _ -> None,
-  }
-
-// The match `lookup_of` recognised: the element held once more, or zero, straight from the
-// runtime, with no `Some` built and taken apart between. The failure check has to come before
-// zero is read as `None`, because a call that failed answers zero too.
-fn lookup_match(em: Em, helper: Bytes, args: List<Code>, xs: List<CArm>, params: List<P>,
-                call: Span, span: Span) -> Option<Out> =
-  match args_owned_at(notail(em), args, params, call) {
-    None -> None,
-    Some(w) -> {
-      let held = bind(w.em, KBoxed, bytes_concat_all([
-        helper, b"(ctx",
-        fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])), b")"]));
-      let ans = fresh(check(held.em));
-      let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
-      let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
-      match arms(withtail(opened, em.tail), xs, params, 0, held.v, ans.name, flag.name, opened.made, [], Some(held.v.c)) {
-        None -> None,
-        Some(after) -> Some({
-          em: note_holder(line(site(after, span), bytes_concat_all([b"if (!", flag.name,
-                                                      b") { rt_no_match_p(ctx); return 0; }"])), ans.name),
-          v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
-      }
-    },
   }
 
 // A lookup's arm tests the answer itself: an element for `Some`, zero for `None`.
