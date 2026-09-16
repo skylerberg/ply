@@ -4,8 +4,7 @@
 tier is the language's one evaluator, and the unit it runs is emitted by
 `ply/emit.ply` here. The Rust emitter in `crates/ply-codegen` is a *fragment* —
 it compiles no `perform`, no handler and no `simulate` — kept as the oracle this
-is checked against byte for byte, and as the `--backend reference` fallback for
-a host with no C compiler.
+is checked against byte for byte.
 
 The sources ship the way `ply-std`'s modules do: `include_str!` in `src/lib.rs`,
 listed in `MODULES`, with the bootstrap bundle beside them in `bootstrap/` and

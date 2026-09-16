@@ -311,13 +311,11 @@ caller threads the sink.
 slicing, so taking a sub-slice allocates. Response write counts and copies were
 **not measured**.
 
-Two backends ship. `reference` evaluates the body on a machine of its own over
-the scalar-signature fragment — not a code generator, and slower than entering
-none — and it exists so that a *wrong* backend can be caught before a fast one
-is argued about:
-`--backend wrong:<mutation>` installs one of eight deliberately wrong backends.
-`c` is the code generator: the fragment emitted as C, compiled by the C compiler
-on the machine, and loaded. ADR 0042 records why it is the only one.
+One backend ships. `c` is the code generator: the program emitted as C, compiled
+by the C compiler on the machine, and loaded; ADR 0042 records why it is the only
+one. So that a *wrong* backend can be caught before a fast one is argued about,
+`--backend wrong:<mutation>` installs one of eight deliberately wrong backends
+around it.
 
 **It wins narrowly on the front end and loses on the request path, and that is
 the finding.** On a compute loop, which is almost entirely inside the fragment,

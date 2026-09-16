@@ -3,13 +3,17 @@
 //! Pinned: concurrent crates are written against these shapes.
 
 pub mod decl;
+pub mod expr;
 pub mod print;
 pub mod ty;
 
 use indexmap::IndexMap;
 use ply_span::{SourceId, Span, Symbol};
 
-pub use decl::{Deriver, ModuleName, SpecKind, is_ident, is_ident_continue, is_ident_start};
+pub use decl::{
+    Deriver, ModuleName, SpecKind, Visibility, is_ident, is_ident_continue, is_ident_start,
+};
+pub use expr::{BinOp, Lit, UnOp, render_float};
 pub use print::{print_row, print_scheme, print_type};
 pub use ty::*;
 

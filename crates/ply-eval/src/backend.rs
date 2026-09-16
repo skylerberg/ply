@@ -1,32 +1,12 @@
 //! A backend a shipping command can attach, and eight ways of being wrong.
 
 use crate::compiled::Compiled;
-use crate::evaluator::Machine;
 use crate::value::Value;
-use ply_span::{Span, Symbol};
+use ply_span::Symbol;
 use ply_syntax::ast::Program;
-use ply_syntax::resolve::Resolved;
-use ply_ty::CheckOutput;
 use std::cell::RefCell;
-use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
-
-/// One run's backend: the program it answers for, the definitions it has bodies for, and the
-/// counters every worker's backend adds to.
-pub struct Fragment {
-    /// The address of the `Program` the machine is running, for [`Compiled::describes`].
-    origin: usize,
-    program: &'static Program,
-    resolved: &'static Resolved,
-    check: &'static CheckOutput,
-    /// The carried-signature definitions, by program-wide name.
-    members: BTreeSet<Symbol>,
-    counters: Counters,
-    /// The seam's own table, built once here and read on every answer.
-    types: crate::compiled::CarriedTypes,
-}
 
 /// What one run's backend was asked, summed over every worker.
 #[derive(Default)]
@@ -132,72 +112,6 @@ pub struct Offers {
     pub converted_out: u64,
 }
 
-impl Fragment {
-    /// The scalar-signature fragment of `program`, over a copy of it.
-    pub fn over(program: &Program, resolved: &Resolved, check: &CheckOutput) -> &'static Fragment {
-        let origin = std::ptr::from_ref(program) as usize;
-        let copy: &'static Program = Box::leak(Box::new(program.clone()));
-        let resolved: &'static Resolved = Box::leak(Box::new(resolved.clone()));
-        let check: &'static CheckOutput = Box::leak(Box::new(check.clone()));
-        Fragment::build(origin, copy, resolved, check)
-    }
-
-    /// The same fragment over a program that is already `'static`, with no copy at all.
-    pub fn over_static(
-        program: &'static Program,
-        resolved: &'static Resolved,
-        check: &'static CheckOutput,
-    ) -> &'static Fragment {
-        Fragment::build(
-            std::ptr::from_ref(program) as usize,
-            program,
-            resolved,
-            check,
-        )
-    }
-
-    fn build(
-        origin: usize,
-        program: &'static Program,
-        resolved: &'static Resolved,
-        check: &'static CheckOutput,
-    ) -> &'static Fragment {
-        let types = crate::compiled::CarriedTypes::over(Some(check));
-        let members = registry(check, &types, restriction());
-        Box::leak(Box::new(Fragment {
-            origin,
-            program,
-            resolved,
-            check,
-            members,
-            counters: Counters::default(),
-            types,
-        }))
-    }
-
-    /// How many definitions this backend has a body for.
-    pub fn len(&self) -> usize {
-        self.members.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.members.is_empty()
-    }
-
-    pub fn holds(&self, name: &Symbol) -> bool {
-        self.members.contains(name)
-    }
-
-    pub fn offers(&self) -> Offers {
-        self.counters.offers()
-    }
-
-    /// A backend for one worker's machine, built on that worker's own thread.
-    pub fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
-        wrap(Rc::new(Reference::new(self)), spec)
-    }
-}
-
 /// A run's source of backends: one per run, shared by every worker, and the only route a shipping
 /// command has to install one.
 pub trait Provider: Send + Sync {
@@ -233,24 +147,6 @@ pub trait Provider: Send + Sync {
     /// Workers this provider could not build a backend for.
     fn unbuilt(&self) -> u64 {
         0
-    }
-}
-
-impl Provider for Fragment {
-    fn attach(&'static self, spec: &Spec) -> Rc<dyn Compiled> {
-        Fragment::attach(self, spec)
-    }
-
-    fn name(&self) -> &'static str {
-        "reference"
-    }
-
-    fn len(&self) -> usize {
-        Fragment::len(self)
-    }
-
-    fn offers(&self) -> Offers {
-        Fragment::offers(self)
     }
 }
 
@@ -291,142 +187,6 @@ pub fn wrap(inner: Rc<dyn Policed>, spec: &Spec) -> Rc<dyn Compiled> {
             target: spec.target.clone(),
             previous: RefCell::new(None),
         }),
-    }
-}
-
-/// The definitions this backend has a body for: every one whose declared signature the seam
-/// carries, intersected with `only` when a measurement has narrowed the registry.
-pub fn registry(
-    check: &CheckOutput,
-    types: &crate::compiled::CarriedTypes,
-    only: Option<&BTreeSet<Symbol>>,
-) -> BTreeSet<Symbol> {
-    check
-        .defs
-        .keys()
-        .filter(|name| carried_signature(types, name))
-        .filter(|name| only.is_none_or(|only| only.contains(*name)))
-        .cloned()
-        .collect()
-}
-
-/// Measurement scaffolding: a registry narrowed to a named set, off unless `PLY_BACKEND_ONLY` is
-/// set in the environment.
-fn restriction() -> Option<&'static BTreeSet<Symbol>> {
-    static ONLY: OnceLock<Option<BTreeSet<Symbol>>> = OnceLock::new();
-    ONLY.get_or_init(|| {
-        std::env::var("PLY_BACKEND_ONLY")
-            .ok()
-            .map(|list| names_in(&list))
-    })
-    .as_ref()
-}
-
-/// A comma-separated list of program-wide names, as a set.
-pub fn names_in(list: &str) -> BTreeSet<Symbol> {
-    list.split(',')
-        .map(str::trim)
-        .filter(|name| !name.is_empty())
-        .map(Symbol::new)
-        .collect()
-}
-
-/// Every position of the declared signature carried by `compiled::CarriedTypes` — which is the
-/// machine's own two tests read off a definition instead of off a call.
-pub(crate) fn carried_signature(types: &crate::compiled::CarriedTypes, name: &Symbol) -> bool {
-    types.signature_carried(name)
-}
-
-/// A backend whose compiled code is a nested [`Machine`], not an independent oracle.
-pub struct Reference {
-    fragment: &'static Fragment,
-    inner: RefCell<Machine<'static>>,
-}
-
-impl Reference {
-    fn new(fragment: &'static Fragment) -> Reference {
-        Reference {
-            fragment,
-            inner: RefCell::new(Machine::new(
-                fragment.program,
-                fragment.resolved,
-                fragment.check,
-            )),
-        }
-    }
-
-    /// The body with an arbitrary bound, whatever the registry says.
-    fn run(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
-        let mut inner = self.inner.try_borrow_mut().ok()?;
-        inner.set_max_calls(fuel);
-        // `call_within` and not `call`: a compiled entry is not an entry point, and the entry-point
-        // spelling walks every argument looking for a handle the seam has already refused — an
-        // O(value) walk per entry, which is the cost the type gate exists to avoid.
-        let answer = inner.call_within(name.as_str(), args.to_vec(), Span::DUMMY);
-        // The machine's own answer test, asked here so the two cannot disagree: a backend that
-        // answered a kind `compiled_answer` will go on to refuse would run a whole body for nothing
-        // and have it evaluated again.
-        match answer {
-            Ok(value) if self.fragment.types.answer_crosses(name, &value) => {
-                match &value {
-                    Value::Bytes(_) => {
-                        self.fragment.counters.note_bytes_out();
-                    }
-                    Value::Str(_) => {
-                        self.fragment.counters.note_str_out();
-                    }
-                    Value::List(_) | Value::Map(_) | Value::Record(_) | Value::Ctor { .. } => {
-                        self.fragment.counters.note_container_out();
-                    }
-                    _ => {}
-                }
-                Some(value)
-            }
-            // A registry hit whose body raised, or answered something this boundary does not carry.
-            _ => None,
-        }
-    }
-}
-
-impl Policed for Reference {
-    fn counters(&self) -> &'static Counters {
-        &self.fragment.counters
-    }
-
-    fn holds(&self, name: &Symbol) -> bool {
-        self.fragment.holds(name)
-    }
-
-    /// The honest answer: the body, run under exactly the machine's remaining call budget, or
-    /// `None` for a registry miss, a non-scalar answer, or a body that raised — including the body
-    /// that raised *because* it outran the budget, which is the decline the machine's own bound
-    /// depends on.
-    fn answer(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        if !self.fragment.holds(name) {
-            return None;
-        }
-        self.run(name, args, budget)
-    }
-
-    fn run_with_fuel(&self, name: &Symbol, args: &[Value], fuel: usize) -> Option<Value> {
-        self.run(name, args, fuel)
-    }
-}
-
-impl Compiled for Reference {
-    fn describes(&self, program: &Program) -> bool {
-        self.fragment.origin == std::ptr::from_ref(program) as usize
-    }
-
-    fn enter(&self, name: &Symbol, args: &[Value], budget: usize) -> Option<Value> {
-        self.fragment.counters.note_offer(args);
-        let answer = Policed::answer(self, name, args, budget);
-        // Measurement scaffolding, off unless `PLY_SEAM_CENSUS` is set.
-        if crate::census::enabled() && answer.is_some() {
-            let label = name.as_str().to_string();
-            crate::census::with(|c| *c.entered_names.entry(label).or_default() += 1);
-        }
-        answer
     }
 }
 
@@ -488,18 +248,15 @@ impl Mutation {
 /// Which of the backends a command can install.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Kind {
-    /// [`Reference`]: a nested machine over the carried-signature fragment.
+    /// `ply_codegen::c`: the program emitted as C and handed to `cc` — under tier-only, the one
+    /// evaluator.
     #[default]
-    Reference,
-    /// `ply_codegen::c`: the same fragment emitted as C and handed to `cc` — under tier-only, the
-    /// one evaluator.
     C,
 }
 
 impl Kind {
     pub fn as_str(self) -> &'static str {
         match self {
-            Kind::Reference => "reference",
             Kind::C => "c",
         }
     }
@@ -531,27 +288,18 @@ impl Spec {
 /// Parses a `--backend` argument.
 pub fn parse(spec: &str) -> Result<Spec, String> {
     // A bare backend name, honest.
-    match spec {
-        "reference" => return Ok(Spec::honest()),
-        "c" => {
-            return Ok(Spec {
-                kind: Kind::C,
-                ..Spec::honest()
-            });
-        }
-        _ => {}
+    if spec == "c" {
+        return Ok(Spec::honest());
     }
     let (backend, rest) = match spec.split_once(':') {
         Some(("c", rest)) => (Kind::C, rest),
-        Some(("reference", rest)) => (Kind::Reference, rest),
-        _ => (Kind::Reference, spec),
+        _ => (Kind::C, spec),
     };
     let Some(rest) = rest.strip_prefix("wrong:") else {
         return Err(format!(
-            "unknown backend `{spec}`; one of `reference`, `c`, or \
-             `[<backend>:]wrong:<mutation>` where <mutation> is off-by-one, inverted, stale, \
-             wrong-type, unoffered, handle, exceeds-budget[={{k}}] or answers={{int}}, each optionally \
-             @<definition>"
+            "unknown backend `{spec}`; one of `c` or `[c:]wrong:<mutation>` where <mutation> is \
+             off-by-one, inverted, stale, wrong-type, unoffered, handle, exceeds-budget[={{k}}] or \
+             answers={{int}}, each optionally @<definition>"
         ));
     };
     let (head, target) = match rest.split_once('@') {

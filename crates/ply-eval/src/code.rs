@@ -9,9 +9,10 @@ use crate::rc::{Live, Own};
 use crate::value::Value;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{
-    BinOp, Expr, ExprKind, HandleClause, Ident, Lit, MatchArm, Pattern, PatternKind, Program,
-    QName, ReturnClause, Stmt as AstStmt, UnOp,
+    Expr, ExprKind, HandleClause, Ident, MatchArm, Pattern, PatternKind, Program, QName,
+    ReturnClause, Stmt as AstStmt,
 };
+use ply_ty::{BinOp, Lit, UnOp};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::marker::PhantomData;

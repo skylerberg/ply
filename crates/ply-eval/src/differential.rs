@@ -231,7 +231,7 @@ pub fn audit_state(left: &mut dyn Evaluator, right: &mut dyn Evaluator) {
 ///
 /// Not public: `--audit-backend` was the caller outside this module, and under tier-only (ADR
 /// 0048) there is no second engine for it to pair. What is left is [`compare_test`], which is how
-/// the reference fragment and the compiled tier are held to the same answers.
+/// two machines over one program are held to the same answers.
 fn compare_outcomes(
     left: &dyn Evaluator,
     right: &dyn Evaluator,

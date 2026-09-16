@@ -174,6 +174,20 @@ impl fmt::Display for Deriver {
     }
 }
 
+/// `pub` exports an item.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum Visibility {
+    #[default]
+    Private,
+    Public,
+}
+
+impl Visibility {
+    pub fn is_public(self) -> bool {
+        self == Visibility::Public
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SpecKind {
     Requires,

@@ -84,9 +84,6 @@ pub struct Counts {
     /// removed, so the two halves of `Gate::ArgumentShape` and `Gate::ArgumentType` can be
     /// separated.
     pub type_gated_shipping: u64,
-    /// Calls a backend actually *entered*, by name — the subset of `admitted_names` whose name the
-    /// backend's registry also holds.
-    pub entered_names: BTreeMap<String, u64>,
 }
 
 /// The widening ladder, coarsest last.
@@ -131,12 +128,6 @@ fn cell() -> &'static Mutex<Counts> {
     C.get_or_init(|| Mutex::new(Counts::default()))
 }
 
-pub(crate) fn with<F: FnOnce(&mut Counts)>(f: F) {
-    if let Ok(mut c) = cell().lock() {
-        f(&mut c);
-    }
-}
-
 /// The whole census, as lines on stderr.
 pub fn report() -> String {
     let Ok(c) = cell().lock() else {
@@ -155,7 +146,7 @@ pub fn report() -> String {
         pct(c.admitted, c.body_calls)
     ));
     out.push_str(&format!(
-        "  of which carried-sig    {}  ({:.4}% of body calls)  <- what `Reference` would answer\n\
+        "  of which carried-sig    {}  ({:.4}% of body calls)  <- what a carried-signature seam would answer\n\
          \x20 carried-sig by walk   {}  (equal = {})\n\
          \x20 offered and declined  {}  <- admitted, but the declared RETURN type is not carried\n",
         c.admitted_carried_sig,
@@ -230,12 +221,6 @@ pub fn report() -> String {
     }
     out.push_str("top admitted definitions:\n");
     out.push_str(&top(&c.admitted_names, 20));
-    out.push_str(&format!(
-        "definitions a backend actually ENTERED ({} distinct, {} entries):\n",
-        c.entered_names.len(),
-        c.entered_names.values().sum::<u64>()
-    ));
-    out.push_str(&top(&c.entered_names, 25));
     out.push_str("top refusals (name @ gate):\n");
     out.push_str(&top(&c.refused_names, 25));
     out.push_str("top builtins called:\n");
