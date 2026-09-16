@@ -189,6 +189,8 @@ helpers![
     ("rt_region", 1, true),
     ("rt_region_close", 1, false),
     ("rt_list_set", 3, true),
+    ("rt_list_lookup", 2, true),
+    ("rt_map_lookup", 2, true),
 ];
 
 /// The declarations, the function-pointer table and the exported binder, generated from
