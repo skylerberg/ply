@@ -158,7 +158,7 @@ pub fn spec_hash(owner: DefHash, kind: SpecKind, index: u32, normalized: &[u8]) 
 pub fn hash_program(
     program: &Program,
     resolved: &Resolved,
-    _check: &ply_core::CheckOutput,
+    _check: &ply_ty::CheckOutput,
 ) -> Result<HashOutput, Vec<Diagnostic>> {
     hash_program_ast(program, resolved)
 }
@@ -188,7 +188,7 @@ pub fn hash_program_with_bodies(
 /// One module with nothing imported: a snippet, an editor buffer, a test.
 pub fn hash_module(
     module: &Module,
-    _check: &ply_core::CheckOutput,
+    _check: &ply_ty::CheckOutput,
 ) -> Result<HashOutput, Vec<Diagnostic>> {
     hash_ast(module)
 }

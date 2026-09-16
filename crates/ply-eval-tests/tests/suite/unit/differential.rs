@@ -1,11 +1,11 @@
 use crate::unit::build::*;
-use ply_core::ty::Footprint;
 use ply_eval::differential::*;
 use ply_eval::{Arena, Fixture, Machine, Value};
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::Expr;
 use ply_syntax::ast::{BinOp, Item, Mode, Program};
 use ply_syntax::resolve::Resolved;
+use ply_ty::Footprint;
 
 /// A machine except where a test asks it not to be.
 struct Perturbed<'a> {

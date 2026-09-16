@@ -283,7 +283,7 @@ fn refused<T>(outcome: Result<T, Diagnostic>, why: &str) -> Diagnostic {
     }
 }
 
-fn check(source: &str) -> ply_core::CheckOutput {
+fn check(source: &str) -> ply_ty::CheckOutput {
     let module = ply_syntax::parse(SourceId(0), source).expect("the fixture parses");
     ply_core::check_module(&module).expect("the fixture typechecks")
 }

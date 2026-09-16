@@ -1,8 +1,8 @@
 //! The dynamic half of a failure: which definitions actually ran.
 
-use ply_core::{EffectAtom, Footprint};
 use ply_hash::DefHash;
 use ply_span::{Span, Symbol};
+use ply_ty::{EffectAtom, Footprint};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Clone, Debug, PartialEq, Eq)]

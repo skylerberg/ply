@@ -1,6 +1,6 @@
 //! Canonical form for a stored interface.
 
-use ply_core::{Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{Row, RowVar, Scheme, TyVar, Type};
 use std::collections::HashMap;
 
 use crate::frontend::{CachedCtor, CachedOp, DeclBody};

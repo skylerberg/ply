@@ -1,8 +1,8 @@
-use ply_core::{CtorInfo, LawBinder, Scheme, Type};
 use ply_eval::Value;
 use ply_prove::domain::{cardinality, finite};
 use ply_prove::property::TypeWorld;
 use ply_span::{Span, Symbol};
+use ply_ty::{CtorInfo, LawBinder, Scheme, Type};
 
 fn con(name: &str) -> Type {
     Type::Con(Symbol::new(name), Vec::new())
@@ -56,7 +56,7 @@ fn a_nullary_enum_and_bool_are_finite_and_everything_unbounded_is_not() {
 /// An uninterpreted sort has no cardinality.
 #[test]
 fn a_type_variable_is_never_finite() {
-    assert_eq!(cardinality(&Type::Var(ply_core::TyVar(0)), &kinds()), None);
+    assert_eq!(cardinality(&Type::Var(ply_ty::TyVar(0)), &kinds()), None);
 }
 
 /// A type in a constructor cycle has values of every nesting depth, so it has no finite domain

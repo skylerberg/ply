@@ -471,15 +471,16 @@ effectful) · 5000 tests (157 nondet) · 4748 KiB of source*.
 
 ## 6. Where things live
 
-Thirteen workspace crates, ~160k lines of Rust. The dependency order is roughly
+The workspace crates. The dependency order is roughly
 the order below.
 
 | crate | lines | what it owns |
 | --- | --- | --- |
 | `ply-span` | 1.0k | spans, `Symbol`, **the diagnostic-code registry** |
+| `ply-ty` | — | the type vocabulary: types, **effect rows and atoms**, the checker's output shape |
 | `ply-syntax` | 8.7k | lexer, parser, `ast` |
 | `ply-derive` | 1.8k | derived codecs (JSON etc.) |
-| `ply-core` | 12.2k | types, **effect rows and atoms**, inference |
+| `ply-core` | 12.2k | inference |
 | `ply-hash` | 6.7k | **content addressing**: normalization, the def graph, `DefHash` |
 | `ply-eval` | 31.1k | the control-stack machine, regions, simulation |
 | `ply-store` | 8.8k | on-disk cache, obligations |
@@ -496,10 +497,10 @@ Every crate above is a workspace member; none is outside it — see §1.
 
 **Where footprint conflict grouping is decided.** Three files, in this order:
 
-- `crates/ply-core/src/ty.rs:52` — `EffectAtom::conflicts_with`. The whole
+- `crates/ply-ty/src/ty.rs:65` — `EffectAtom::conflicts_with`. The whole
   basis, and it is five lines: *same effect, same resource, and at least one
   writes.*
-- `crates/ply-core/src/ty.rs:171` — `Footprint::conflicts_with`, the lift to
+- `crates/ply-ty/src/ty.rs:180` — `Footprint::conflicts_with`, the lift to
   sets.
 - `crates/ply-test/src/schedule.rs:216` — **`group_by_conflict`**, which is
   the grouping proper: greedy colouring, a test joining the first class that

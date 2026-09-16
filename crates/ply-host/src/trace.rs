@@ -9,13 +9,13 @@ pub use sink::{
 };
 pub use spans::{Owner, Spans};
 
-use ply_core::ty::Resource;
 use ply_eval::host::MachineId;
 use ply_eval::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::Resource;
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};

@@ -509,7 +509,7 @@ pub fn innermost_is_seeded(c: &Ctx) -> bool {
 /// The access a cell builtin makes, for the running step's footprint.
 pub fn cell_access(ctx: &Ctx, b: ply_eval::Builtin, args: &[Word]) -> Option<Access> {
     use ply_eval::Builtin;
-    use ply_syntax::ast::Mode;
+    use ply_ty::Mode;
     let mode = match b {
         Builtin::CellGet => Mode::Read,
         Builtin::CellSet | Builtin::CellUpdate => Mode::Write,

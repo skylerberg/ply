@@ -6,8 +6,8 @@ use super::egraph::{Classes, conflict, shape_of};
 use super::term::{Arm, ArmTest, CmpOp, Node, Poly, TermId, Terms};
 use super::{RuleLog, arith};
 use crate::Rule;
-use ply_core::Type;
 use ply_span::Symbol;
+use ply_ty::Type;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

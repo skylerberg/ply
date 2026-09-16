@@ -1,4 +1,3 @@
-use ply_core::{EffectAtom, Footprint, Resource};
 use ply_eval::{Exploration, Plan, Seed, SimMode};
 use ply_hash::DefHash;
 use ply_prove::{
@@ -7,7 +6,8 @@ use ply_prove::{
     VacuityKind, frame_of, interleaving_proves,
 };
 use ply_span::Span;
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Footprint, Resource};
 use std::time::Duration;
 
 fn cases(kept: u32) -> Evidence {

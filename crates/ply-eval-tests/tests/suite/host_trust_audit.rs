@@ -1,14 +1,14 @@
 //! What a **hostile** host handler can do, and what — if anything — notices.
 
 use crate::fixture::Compiled;
-use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
 };
 use ply_eval::{Machine, TaskId, Value};
 use ply_span::{Diagnostic, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Footprint, Resource};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 

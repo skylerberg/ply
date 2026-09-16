@@ -2,9 +2,9 @@
 //! stacks opened from one fixture observe each other's writes.**
 
 use crate::fixture::Compiled;
-use ply_core::Footprint;
 use ply_eval::arena::Slot;
 use ply_eval::{Fixture, Machine, TaskRegions, Value};
+use ply_ty::Footprint;
 use std::marker::PhantomData;
 
 impl Compiled {

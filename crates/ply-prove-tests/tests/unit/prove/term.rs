@@ -1,6 +1,6 @@
-use ply_core::Type;
 use ply_prove::prove::term::{Node, Terms};
 use ply_span::Symbol;
+use ply_ty::Type;
 
 #[test]
 fn a_linear_combination_is_canonical() {

@@ -4,9 +4,9 @@ use crate::arena::Arena;
 use crate::evaluator::Machine;
 use crate::task_regions::Fixture;
 use crate::value::Value;
-use ply_core::ty::Footprint;
 use ply_span::{Diagnostic, Label, Severity, Span, Symbol, codes};
 use ply_syntax::ast::Expr;
+use ply_ty::Footprint;
 use std::fmt;
 
 /// What the harness needs of an engine.

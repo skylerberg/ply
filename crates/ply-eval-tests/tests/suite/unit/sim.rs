@@ -1,9 +1,9 @@
-use ply_core::ty::EffectAtom;
 use ply_eval::Value;
 use ply_eval::arena::Slot;
 use ply_eval::sim::*;
 use ply_span::{Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::EffectAtom;
+use ply_ty::Mode;
 
 #[test]
 fn a_seed_round_trips_through_its_text_form() {
@@ -109,7 +109,7 @@ fn below_rejects_only_above_the_limit() {
 }
 
 fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
-    use ply_core::Resource;
+    use ply_ty::Resource;
     EffectAtom::new(
         effect,
         resource

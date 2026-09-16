@@ -3,7 +3,6 @@
 //! region *label* two tests both write is one piece of state and colours them apart.
 
 use crate::fixture::{Compiled, TierExecutor};
-use ply_core::Footprint;
 use ply_eval::{Plan, TaskRegions, Value};
 use ply_span::SourceId;
 use ply_store::Store;
@@ -11,6 +10,7 @@ use ply_test::{
     GroupRegion, Isolation, contends_only_over_regions, group_by_conflict, is_region_scoped,
     region_isolated, shared_footprint,
 };
+use ply_ty::Footprint;
 use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};

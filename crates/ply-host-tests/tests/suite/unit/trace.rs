@@ -1,7 +1,5 @@
 mod spans;
 
-use ply_core::ty::EffectAtom;
-use ply_core::ty::Resource;
 use ply_eval::TaskId;
 use ply_eval::host::MachineId;
 use ply_eval::host::Pending;
@@ -11,7 +9,9 @@ use ply_eval::{
 use ply_host::trace::sink::{Kept, Recording};
 use ply_host::trace::*;
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::EffectAtom;
+use ply_ty::Mode;
+use ply_ty::Resource;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicU64, Ordering};
