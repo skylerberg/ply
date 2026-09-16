@@ -6,13 +6,13 @@ mod stmt;
 mod types;
 mod value;
 
-use ply_core::ty::Footprint;
-use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::HostResource;
 use ply_eval::{Determinism, Linearity};
 use ply_host::db::*;
 use ply_span::{Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Footprint;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Resource};
 
 fn label(name: &str) -> Resource {
     Resource::Named(Symbol::new(name))

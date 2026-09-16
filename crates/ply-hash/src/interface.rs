@@ -1,6 +1,6 @@
 //! What a *caller* can observe about a definition, hashed.
 
-use ply_core::{DefConstraint, EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
+use ply_ty::{DefConstraint, EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use rustc_hash::FxHashMap;
 
 use crate::DefHash;

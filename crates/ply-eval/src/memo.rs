@@ -1,8 +1,8 @@
 //! What a nullary pure definition evaluated to, remembered for the run.
 
 use crate::value::{ClosureKind, Value};
-use ply_core::CheckOutput;
 use ply_span::Symbol;
+use ply_ty::CheckOutput;
 
 /// Whether the value means the same thing in a world it was not produced in — what a
 /// remembered constant must be, whichever engine produced it.

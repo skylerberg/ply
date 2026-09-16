@@ -1,6 +1,6 @@
-use ply_core::Footprint;
 use ply_span::{SourceId, Span, Symbol};
 use ply_test::slice::{CausalSlice, Entered, Event, Frame, SliceBuilder};
+use ply_ty::Footprint;
 
 fn frame(name: &str) -> Frame {
     Frame {
@@ -133,9 +133,9 @@ fn hitting_the_cap_truncates_the_roster_and_not_the_stack() {
 
 #[test]
 fn only_performed_atoms_are_observed() {
-    let atom = ply_core::EffectAtom::new(
+    let atom = ply_ty::EffectAtom::new(
         "db",
-        ply_core::Resource::Named(Symbol::new("users")),
+        ply_ty::Resource::Named(Symbol::new("users")),
         ply_syntax::ast::Mode::Read,
     );
     let mut b = built(&[enter("f"), Event::Perform(atom.clone())]);

@@ -1,7 +1,6 @@
 //! The postgres driver against a real postgres.
 
 use crate::support::cluster::{self, Cluster};
-use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
 use ply_host::db::pool::{self, Cleanup, Outcome, PoolConfig, Reactor};
@@ -11,6 +10,7 @@ use ply_host::db::types::{Datum, Json, Param};
 use ply_host::db::{self, Op};
 use ply_host::db::{Driver, Postgres, Statement};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::{EffectAtom, Footprint, Resource};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 
@@ -568,7 +568,7 @@ fn scan_for(sql: &str) -> ply_host::db::Scan {
 
 fn driver_run(db: &Postgres, op: Op, sql: &str, params: Vec<Param>) -> Value {
     let scanned = scan_for(sql);
-    let at = ply_core::ty::Resource::Named(ply_span::Symbol::new("item"));
+    let at = ply_ty::Resource::Named(ply_span::Symbol::new("item"));
     let touched = ply_host::db::check_footprint(&scanned, op, &at, None, Span::DUMMY)
         .expect("the footprint is the label's");
     settle(

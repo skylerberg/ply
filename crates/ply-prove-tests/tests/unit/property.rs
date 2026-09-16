@@ -1,4 +1,4 @@
-use ply_core::{CheckOutput, EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type, prelude};
+use ply_core::prelude;
 use ply_eval::interp::Pure;
 use ply_eval::{DEFAULT_MAX_CALLS, Value};
 use ply_hash::DefHash;
@@ -13,6 +13,7 @@ use ply_prove::{
 use ply_span::{Diagnostic, SourceId, Span, Symbol};
 use ply_syntax::ast::{Mode, Program};
 use ply_syntax::resolve::Resolved;
+use ply_ty::{CheckOutput, EffectAtom, LawBinder, Resource, Row, RowVar, TyVar, Type};
 use std::collections::BTreeSet;
 
 /// A compiled fixture, so the generator is exercised against the type information the checker

@@ -982,7 +982,7 @@ fn a_slice_that_did_not_reproduce_annotates_nothing() {
             hash: None,
             call_site: Span::DUMMY,
         }],
-        observed: ply_core::Footprint::empty(),
+        observed: ply_ty::Footprint::empty(),
         truncated: false,
     };
     let mut hashes = HashOutput::default();

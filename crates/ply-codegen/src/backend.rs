@@ -80,7 +80,7 @@ impl Unit {
     pub fn over(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_core::CheckOutput,
+        check: &ply_ty::CheckOutput,
     ) -> Result<&'static Unit> {
         // The keys make a test or a law a root the unit compiles (ADR 0045/0048); without them the
         // tier holds no `test#N` to enter. `over` derives them so a caller that has no hashes of
@@ -95,7 +95,7 @@ impl Unit {
     pub fn over_with_texts(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_core::CheckOutput,
+        check: &ply_ty::CheckOutput,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         let keys = ply_hash::hash_program(program, resolved, check)
@@ -110,7 +110,7 @@ impl Unit {
     pub fn keyed(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_core::CheckOutput,
+        check: &ply_ty::CheckOutput,
         keys: HashMap<String, String>,
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
@@ -120,7 +120,7 @@ impl Unit {
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static ply_syntax::resolve::Resolved =
             Box::leak(Box::new(resolved.clone()));
-        let check: &'static ply_core::CheckOutput = Box::leak(Box::new(check.clone()));
+        let check: &'static ply_ty::CheckOutput = Box::leak(Box::new(check.clone()));
         let source: &'static Source = Box::leak(Box::new(
             Source::keyed(program, resolved, check, keys).with_texts(texts),
         ));
@@ -159,7 +159,7 @@ impl Unit {
     pub fn embedded(
         program: &Program,
         resolved: &ply_syntax::resolve::Resolved,
-        check: &ply_core::CheckOutput,
+        check: &ply_ty::CheckOutput,
         text: String,
     ) -> Result<&'static Unit> {
         let exports = crate::c::Exports::read(&crate::c::compile_and_load(&text, "artifact")?)?;
@@ -167,7 +167,7 @@ impl Unit {
         let program: &'static Program = Box::leak(Box::new(program.clone()));
         let resolved: &'static ply_syntax::resolve::Resolved =
             Box::leak(Box::new(resolved.clone()));
-        let check: &'static ply_core::CheckOutput = Box::leak(Box::new(check.clone()));
+        let check: &'static ply_ty::CheckOutput = Box::leak(Box::new(check.clone()));
         let source: &'static Source = Box::leak(Box::new(Source::new(program, resolved, check)));
         let compiled = exports.names();
         let members: BTreeSet<Symbol> = compiled
@@ -636,7 +636,7 @@ impl ply_eval::Compiled for Bodies {
 
     // An entry that arrives while another is running finds the context borrowed: `run` declines
     // it, so there is nothing to seed, take or read for it.
-    fn take_performed(&self) -> Vec<ply_core::ty::EffectAtom> {
+    fn take_performed(&self) -> Vec<ply_ty::EffectAtom> {
         self.ctx
             .try_borrow_mut()
             .map(|mut ctx| std::mem::take(&mut ctx.performed))
@@ -667,7 +667,7 @@ impl ply_eval::Compiled for Bodies {
         }
     }
 
-    fn set_declared(&self, declared: Option<ply_core::Footprint>) {
+    fn set_declared(&self, declared: Option<ply_ty::Footprint>) {
         if let Ok(mut ctx) = self.ctx.try_borrow_mut() {
             ctx.declared = declared;
         }

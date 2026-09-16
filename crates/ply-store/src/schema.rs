@@ -5,9 +5,9 @@ use crate::frontend::{
     ImportEdge, Member, NameRef, SourceFingerprint,
 };
 use crate::{BODY_ENCODING, ContentHash, DefBody, FRONTEND_FORMAT, Outcome};
-use ply_core::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Footprint, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::BTreeMap;
 
 /// Every variant name the exemplars below must between them mention.

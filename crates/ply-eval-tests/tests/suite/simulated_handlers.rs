@@ -1,11 +1,12 @@
 //! The seeded handlers against the signatures they claim.
 
-use ply_core::{CheckOutput, EffectInfo, Type, check_program};
+use ply_core::check_program;
 use ply_eval::{Answer, Handlers, SEEDED_OPS, SimTy, TaskId, Value};
 use ply_span::{SourceId, Span, Symbol};
 use ply_syntax::ast::{ExprKind, Item, ModuleName, Program};
 use ply_syntax::parse_module;
 use ply_syntax::resolve::resolve;
+use ply_ty::{CheckOutput, EffectInfo, Type};
 use std::path::{Path, PathBuf};
 
 /// The prelude effect declarations's declaration of the two effects the seeded handlers answer, plus a hand-written

@@ -9,13 +9,14 @@
 //! so a fixture that is *run* — as opposed to only scheduled — carries its module source texts and
 //! hands them to the whole Ply emitter through [`Compiled::tier`].
 
-use ply_core::{CheckOutput, check_program};
+use ply_core::check_program;
 use ply_eval::{Exploration, host::HostUse};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
 use ply_test::{BackendUse, Engine, Executor, InterpExecutor, Worker};
+use ply_ty::CheckOutput;
 use std::collections::HashMap;
 
 pub struct Compiled {
@@ -88,7 +89,7 @@ impl Compiled {
     }
 
     /// Every test's footprint, owned, so a caller may take one from a temporary.
-    pub fn footprints(&self) -> Vec<ply_core::Footprint> {
+    pub fn footprints(&self) -> Vec<ply_ty::Footprint> {
         self.check
             .tests
             .iter()

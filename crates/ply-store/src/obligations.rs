@@ -1,7 +1,7 @@
 //! What an obligation was discharged with, on disk.
 
-use ply_core::Type;
 use ply_span::Symbol;
+use ply_ty::Type;
 use serde::{Deserialize, Serialize};
 
 /// One inference rule a certificate names.

@@ -2,6 +2,8 @@
 
 use crate::ast::IntTy;
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
+pub use ply_ty::is_ident;
+use ply_ty::{is_ident_continue, is_ident_start};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Kw {
@@ -246,21 +248,6 @@ struct Lexer<'a> {
     source: SourceId,
     pos: usize,
     diags: Vec<Diagnostic>,
-}
-
-/// Public because module names are derived from file and directory names, which never pass through
-/// the lexer.
-pub fn is_ident(s: &str) -> bool {
-    let mut chars = s.chars();
-    chars.next().is_some_and(is_ident_start) && chars.all(is_ident_continue)
-}
-
-fn is_ident_start(c: char) -> bool {
-    c.is_alphabetic() || c == '_'
-}
-
-fn is_ident_continue(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
 }
 
 impl<'a> Lexer<'a> {

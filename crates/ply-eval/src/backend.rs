@@ -3,10 +3,10 @@
 use crate::compiled::Compiled;
 use crate::evaluator::Machine;
 use crate::value::Value;
-use ply_core::CheckOutput;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
+use ply_ty::CheckOutput;
 use std::cell::RefCell;
 use std::collections::BTreeSet;
 use std::rc::Rc;
@@ -646,7 +646,7 @@ impl Compiled for Mutant {
         self.inner.describes(program)
     }
 
-    fn take_performed(&self) -> Vec<ply_core::ty::EffectAtom> {
+    fn take_performed(&self) -> Vec<ply_ty::EffectAtom> {
         self.inner.take_performed()
     }
 
@@ -666,7 +666,7 @@ impl Compiled for Mutant {
         self.inner.set_host(binding, runtime);
     }
 
-    fn set_declared(&self, declared: Option<ply_core::Footprint>) {
+    fn set_declared(&self, declared: Option<ply_ty::Footprint>) {
         self.inner.set_declared(declared);
     }
 

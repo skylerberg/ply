@@ -1,10 +1,10 @@
 //! Pinned: downstream crates are written against these shapes concurrently, so changing a variant
 //! is a cross-crate breaking change.
 
-use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
-use serde::{Deserialize, Serialize};
+use ply_span::{SourceId, Span, Symbol};
 use std::fmt;
-use std::path::Path;
+
+pub use ply_ty::{Deriver, INT_TYPES, IntTy, Mode, ModuleName, SpecKind};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ident {
@@ -73,99 +73,6 @@ impl fmt::Display for QName {
     }
 }
 
-/// A module's dotted name, derived from its file's path relative to the project root:
-/// `store/orders.ply` is `store.orders`.
-#[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub struct ModuleName(Symbol);
-
-impl Default for ModuleName {
-    fn default() -> Self {
-        ModuleName::anonymous()
-    }
-}
-
-impl ModuleName {
-    /// The module of source that has no project root: a snippet handed to [`crate::parse`].
-    pub fn anonymous() -> ModuleName {
-        ModuleName(Symbol::new(""))
-    }
-
-    pub fn is_anonymous(&self) -> bool {
-        self.0.as_str().is_empty()
-    }
-
-    /// Every directory component and the file stem must be a Ply identifier; anything else is
-    /// [`codes::INVALID_MODULE_PATH`].
-    pub fn from_relative_path(path: &Path) -> Result<ModuleName, Diagnostic> {
-        let invalid = |what: &str| {
-            Diagnostic::error(
-                codes::INVALID_MODULE_PATH,
-                format!("`{}` cannot be a module: {what}", path.display()),
-            )
-            .primary(Span::DUMMY, "this file is not addressable as a module")
-            .note("rename it so every directory and the file stem is a plain identifier")
-        };
-
-        let stem = path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .ok_or_else(|| invalid("its file name is not valid UTF-8"))?;
-
-        let mut segments: Vec<&str> = Vec::new();
-        for component in path.parent().into_iter().flat_map(|p| p.components()) {
-            let text = component
-                .as_os_str()
-                .to_str()
-                .ok_or_else(|| invalid("a directory name is not valid UTF-8"))?;
-            segments.push(text);
-        }
-        segments.push(stem);
-
-        for segment in &segments {
-            if !crate::lexer::is_ident(segment) {
-                return Err(invalid(&format!("`{segment}` is not an identifier")));
-            }
-        }
-        Ok(ModuleName(Symbol::new(segments.join("."))))
-    }
-
-    /// Trusts the caller that every segment is an identifier.
-    pub fn from_dotted(name: impl AsRef<str>) -> ModuleName {
-        ModuleName(Symbol::new(name.as_ref()))
-    }
-
-    pub fn as_symbol(&self) -> &Symbol {
-        &self.0
-    }
-
-    pub fn as_str(&self) -> &str {
-        self.0.as_str()
-    }
-
-    pub fn segments(&self) -> impl Iterator<Item = &str> {
-        self.0.as_str().split('.')
-    }
-
-    /// The name a bare `import` binds this module as: its last segment.
-    pub fn default_binder(&self) -> Symbol {
-        Symbol::new(self.0.as_str().rsplit('.').next().unwrap_or(""))
-    }
-
-    /// This module's `place` under its program-wide name, `store.orders.place`.
-    pub fn qualify(&self, name: &Symbol) -> Symbol {
-        if self.is_anonymous() {
-            return name.clone();
-        }
-        Symbol::new(format!("{}.{}", self.0, name))
-    }
-}
-
-impl fmt::Display for ModuleName {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.0.as_str())
-    }
-}
-
 /// `pub` exports an item.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum Visibility {
@@ -177,22 +84,6 @@ pub enum Visibility {
 impl Visibility {
     pub fn is_public(self) -> bool {
         self == Visibility::Public
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Mode {
-    Read,
-    Write,
-}
-
-impl Mode {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Mode::Read => "read",
-            Mode::Write => "write",
-        }
     }
 }
 
@@ -362,68 +253,6 @@ pub struct EffectSetDef {
     pub span: Span,
 }
 
-/// The derivations the language defines.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum Deriver {
-    Json,
-    Eq,
-    Ord,
-}
-
-impl Deriver {
-    pub const ALL: &'static [Deriver] = &[Deriver::Json, Deriver::Eq, Deriver::Ord];
-
-    pub fn from_name(name: &str) -> Option<Deriver> {
-        Some(match name {
-            "json" => Deriver::Json,
-            "eq" => Deriver::Eq,
-            "ord" => Deriver::Ord,
-            _ => return None,
-        })
-    }
-
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Deriver::Json => "json",
-            Deriver::Eq => "eq",
-            Deriver::Ord => "ord",
-        }
-    }
-
-    /// The dictionary type a derivation of this kind produces.
-    pub fn dictionary(self) -> &'static str {
-        match self {
-            Deriver::Json => "JsonCodec",
-            Deriver::Eq => "EqDict",
-            Deriver::Ord => "OrdDict",
-        }
-    }
-
-    /// Distinguishes derivers in a definition hash and in a stored body.
-    pub fn tag(self) -> u8 {
-        match self {
-            Deriver::Json => 1,
-            Deriver::Eq => 2,
-            Deriver::Ord => 3,
-        }
-    }
-
-    pub fn from_tag(tag: u8) -> Option<Deriver> {
-        Some(match tag {
-            1 => Deriver::Json,
-            2 => Deriver::Eq,
-            3 => Deriver::Ord,
-            _ => return None,
-        })
-    }
-}
-
-impl fmt::Display for Deriver {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// `derive json for Order`.
 #[derive(Clone, Debug)]
 pub struct DeriveDef {
@@ -497,29 +326,6 @@ pub struct FnDef {
     pub reuse: Option<Span>,
     pub body: Expr,
     pub span: Span,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SpecKind {
-    Requires,
-    Ensures,
-}
-
-impl SpecKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            SpecKind::Requires => "requires",
-            SpecKind::Ensures => "ensures",
-        }
-    }
-
-    /// Distinguishes the two in a spec hash.
-    pub fn tag(self) -> u8 {
-        match self {
-            SpecKind::Requires => 1,
-            SpecKind::Ensures => 2,
-        }
-    }
 }
 
 /// `requires amount > 0`, `ensures result.balance == acct.balance - amount`.
@@ -1055,158 +861,4 @@ pub fn is_default_expr(e: &Expr) -> bool {
 /// The grammar's constructor rule: a leading uppercase letter.
 pub fn is_ctor_name(name: &Symbol) -> bool {
     name.as_str().chars().next().is_some_and(char::is_uppercase)
-}
-
-/// A fixed-width integer type: eight of them, the widths the machine has.
-///
-/// `Int` is not one of these and is not a member of the family. It is the type a program counts
-/// and indexes with, and it stays exactly what it was — sixty-four bits, signed, checked. These
-/// exist for the algorithms that are *written* in a width: a hash's thirty-two-bit word, a byte,
-/// a wire format's field. Arithmetic on them is checked as `Int`'s is; `wrap_add` and its siblings
-/// are how a program says it meant the wrap.
-#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug, Serialize, Deserialize)]
-pub enum IntTy {
-    U8,
-    U16,
-    U32,
-    U64,
-    I8,
-    I16,
-    I32,
-    I64,
-}
-
-/// Every fixed-width integer type, in the order the guide lists them.
-pub const INT_TYPES: [IntTy; 8] = [
-    IntTy::U8,
-    IntTy::U16,
-    IntTy::U32,
-    IntTy::U64,
-    IntTy::I8,
-    IntTy::I16,
-    IntTy::I32,
-    IntTy::I64,
-];
-
-impl IntTy {
-    pub fn name(self) -> &'static str {
-        match self {
-            IntTy::U8 => "U8",
-            IntTy::U16 => "U16",
-            IntTy::U32 => "U32",
-            IntTy::U64 => "U64",
-            IntTy::I8 => "I8",
-            IntTy::I16 => "I16",
-            IntTy::I32 => "I32",
-            IntTy::I64 => "I64",
-        }
-    }
-
-    pub fn from_name(name: &str) -> Option<IntTy> {
-        INT_TYPES.into_iter().find(|t| t.name() == name)
-    }
-
-    /// `u32_of_int`, and its seven siblings.
-    pub fn of_int_name(self) -> &'static str {
-        match self {
-            IntTy::U8 => "u8_of_int",
-            IntTy::U16 => "u16_of_int",
-            IntTy::U32 => "u32_of_int",
-            IntTy::U64 => "u64_of_int",
-            IntTy::I8 => "i8_of_int",
-            IntTy::I16 => "i16_of_int",
-            IntTy::I32 => "i32_of_int",
-            IntTy::I64 => "i64_of_int",
-        }
-    }
-
-    /// `int_of_u32`, and its seven siblings.
-    pub fn to_int_name(self) -> &'static str {
-        match self {
-            IntTy::U8 => "int_of_u8",
-            IntTy::U16 => "int_of_u16",
-            IntTy::U32 => "int_of_u32",
-            IntTy::U64 => "int_of_u64",
-            IntTy::I8 => "int_of_i8",
-            IntTy::I16 => "int_of_i16",
-            IntTy::I32 => "int_of_i32",
-            IntTy::I64 => "int_of_i64",
-        }
-    }
-
-    pub fn of_int_from_name(name: &str) -> Option<IntTy> {
-        INT_TYPES.into_iter().find(|t| t.of_int_name() == name)
-    }
-
-    pub fn to_int_from_name(name: &str) -> Option<IntTy> {
-        INT_TYPES.into_iter().find(|t| t.to_int_name() == name)
-    }
-
-    pub fn bits(self) -> u32 {
-        match self {
-            IntTy::U8 | IntTy::I8 => 8,
-            IntTy::U16 | IntTy::I16 => 16,
-            IntTy::U32 | IntTy::I32 => 32,
-            IntTy::U64 | IntTy::I64 => 64,
-        }
-    }
-
-    pub fn signed(self) -> bool {
-        matches!(self, IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64)
-    }
-
-    /// The largest value, as the `u64` the representation carries.
-    pub fn max(self) -> u64 {
-        if self.signed() {
-            (1u64 << (self.bits() - 1)) - 1
-        } else {
-            u64::MAX >> (64 - self.bits())
-        }
-    }
-
-    /// The smallest value, as an `i128` so that a signed minimum and an unsigned zero are one
-    /// vocabulary.
-    pub fn min(self) -> i128 {
-        if self.signed() {
-            -(1i128 << (self.bits() - 1))
-        } else {
-            0
-        }
-    }
-
-    /// Whether `v` — a literal's value, or an `Int` being converted — is one of this type's.
-    pub fn holds(self, v: i128) -> bool {
-        v >= self.min() && v <= self.max() as i128
-    }
-
-    /// `bits` reduced to this width and then extended the way this type reads it: zero-extended
-    /// when unsigned, sign-extended when signed. Every `Fixed` in the tree is in this form, so
-    /// two of one type compare, hash and render as that type orders them.
-    pub fn normalize(self, bits: u64) -> u64 {
-        let w = self.bits();
-        if w == 64 {
-            return bits;
-        }
-        let low = bits & (u64::MAX >> (64 - w));
-        if self.signed() && low >> (w - 1) == 1 {
-            low | (u64::MAX << w)
-        } else {
-            low
-        }
-    }
-
-    /// The mathematical value the bits stand for.
-    pub fn value(self, bits: u64) -> i128 {
-        if self.signed() {
-            (bits as i64) as i128
-        } else {
-            bits as i128
-        }
-    }
-}
-
-impl std::fmt::Display for IntTy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.name())
-    }
 }

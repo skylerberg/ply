@@ -1,6 +1,5 @@
 //! The five situations a failure can be in, driven end to end through [`diagnose`].
 
-use ply_core::Footprint;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Span, Symbol};
 use ply_test::bisect::{
@@ -9,6 +8,7 @@ use ply_test::bisect::{
 };
 use ply_test::diagnose::{Evidence, Options, diagnose};
 use ply_test::slice::{CausalSlice, Entered, Frame, Tracing};
+use ply_ty::Footprint;
 use std::collections::{BTreeMap, BTreeSet};
 
 fn sym(s: &str) -> Symbol {

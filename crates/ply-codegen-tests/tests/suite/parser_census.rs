@@ -6,7 +6,7 @@ use ply_syntax::ast::{ModuleName, Program};
 struct Loaded {
     program: &'static Program,
     resolved: &'static ply_syntax::resolve::Resolved,
-    check: &'static ply_core::CheckOutput,
+    check: &'static ply_ty::CheckOutput,
 }
 
 /// The shipped standard library plus every `.ply` module in `dir`, each named by its file stem —

@@ -91,8 +91,8 @@ pub enum CTy {
 
 impl CTy {
     /// The type the checker published, as much of it as the emitter uses.
-    pub fn of(t: &ply_core::ty::Type) -> CTy {
-        use ply_core::ty::Type;
+    pub fn of(t: &ply_ty::Type) -> CTy {
+        use ply_ty::Type;
         match t {
             Type::Con(name, args) if args.is_empty() => match name.as_str() {
                 "Int" => CTy::Int,
@@ -1045,7 +1045,7 @@ impl<'a> Emit<'a> {
 
     /// The type the checker published for a definition's answer.
     pub fn declared_ret(&self, full: &str) -> CTy {
-        use ply_core::ty::Type;
+        use ply_ty::Type;
         match self
             .src
             .check
@@ -1356,7 +1356,7 @@ impl<'a> Emit<'a> {
         let n = self.as_int(r);
         let bound = width.map_or(64, |t| i64::from(t.bits()));
         let which = width
-            .and_then(|t| ply_syntax::ast::INT_TYPES.iter().position(|x| *x == t))
+            .and_then(|t| ply_ty::INT_TYPES.iter().position(|x| *x == t))
             .map_or(-1, |i| i as i64);
         let count = self.bind(Kind::Int, n);
         self.line(format!(
