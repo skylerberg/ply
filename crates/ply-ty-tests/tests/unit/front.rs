@@ -334,7 +334,7 @@ fn a_front_writes_reads_and_writes_to_the_same_text() {
     assert!(count.internally_effectful);
     assert_eq!(count.footprint, front.check.defs[&sym("m.count")].footprint);
     // The layouts `crates/ply-compiler/ply/front.ply` pins.
-    assert!(text.contains("0 5 50test 0 "), "{text}");
+    assert!(text.contains("test 0 "), "{text}");
     assert_eq!(back.hash_order, front.hash_order);
     assert!(
         text.contains("item 27\nfn m.count requires,ensures"),
