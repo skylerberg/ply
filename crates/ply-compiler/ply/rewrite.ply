@@ -6,10 +6,10 @@
 // with the diagnostics appended in the order the reference appends them; the
 // third differential (`harness/tests/rewrite.rs`) compares the two.
 
-import spine (Span, Ident, QName, PDiag, span_to, dummy_span, bare, diag1, diag2, dump_diags)
+import spine (Span, Ident, QName, PDiag, Label, span_to, dummy_span, bare, num, diag1, diag2, pdiag, plabel, dump_diags)
 import types (TypeExpr, TVar, TCon, TFn, TRecord, TUnit, TBad, RowExpr, AtomExpr, Mode, MRead, MWrite, MBad)
 import items (Module, Item, IFn, IType, IEffect, ITest, ILaw, IDerive, IEffectSet,
-              FnDef, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause,
+              FnDef, TypeDef, TypeDefBody, TDAlias, TDSum, VariantDef, SpecClause, SRequires, SEnsures,
               EffectSetDef, ImportDecl, ImportKind, INames, Binder, OpDef, EffectDef,
               TestDef, LawDef, parse, dump_module)
 import exprs (Expr, ELit, EVar, EBinary, EUnary, ELambda, EApp, EIf, EMatch, EBlock,
@@ -94,7 +94,10 @@ fn sets_collect(m: Module, diags: List<PDiag>) -> Sets =
         IEffectSet(d) ->
           match set_index(s, d.name.name) {
             Some(first) ->
-              {..s, diags: push(s.diags, diag2(b"E0105", d.name.span, at(s.defs, first).name.span, 1))},
+              {..s, diags: push(s.diags, diag2(b"E0105", d.name.span,
+                                               bytes_concat_all([b"duplicate effect set `", d.name.name, b"`"]),
+                                               b"redefined here", at(s.defs, first).name.span, b"first defined here",
+                                               [b"rename one of them; every effect set in a module needs a distinct name"]))},
             None -> {..s, by_name: push(s.by_name, { name: d.name.name, at: len(s.defs) }),
                           defs: push(s.defs, d), edges: push(s.edges, []), cyclic: push(s.cyclic, false)},
           },
@@ -104,17 +107,43 @@ fn sets_collect(m: Module, diags: List<PDiag>) -> Sets =
 // `Sets::lookup`: a set named from this module, or one of two `E0114`s.
 fn set_lookup(s: Sets, q: QName) -> { s: Sets, at: Option<Int> } =
   if !is_bare(q) {
-    { s: {..s, diags: push(s.diags, diag1(b"E0114", q.span, 2))}, at: None }
+    let written = match q.module { Some(m) -> bytes_concat_all([m.name, b"::", q.name.name]), None -> q.name.name };
+    { s: {..s, diags: push(s.diags, diag1(b"E0114", q.span,
+        bytes_concat_all([b"an `effect set` cannot be named from another module: `", written, b"`"]),
+        b"sets are module-local",
+        [bytes_concat_all([b"declare `effect set ", q.name.name, b"` in this file and write `", q.name.name, b"`"]),
+         b"a set that expanded across a module boundary would let an edit in the declaring module change this file's published row while this file's bytes never moved, and the skipped recheck would leave a footprint that under-reports"]))},
+      at: None }
   } else {
     match set_index(s, q.name.name) {
       Some(i) -> if at(s.cyclic, i) { { s: s, at: None } } else { { s: s, at: Some(i) } },
       None -> {
-        let is_effect = fold(s.effect_names, false, |acc: Bool, n: Bytes| acc || n == q.name.name);
-        let notes = if is_effect { 3 } else { 1 };
-        { s: {..s, diags: push(s.diags, diag1(b"E0114", q.span, notes))}, at: None }
+        let n = q.name.name;
+        let is_effect = fold(s.effect_names, false, |acc: Bool, x: Bytes| acc || x == n);
+        let effect_notes = if is_effect {
+          [bytes_concat_all([b"`", n, b"` is an effect, and a member of a set is an atom: write `", n, b".read[..]` or `", n, b".write[..]`"]),
+           b"a whole effect is every resource label anywhere in the program, so naming one would let an unrelated module change this row and therefore this definition's hash"]
+        } else { [] };
+        let declared = if len(s.by_name) == 0 {
+          b"this module declares no `effect set`; a set is module-local and cannot be imported"
+        } else {
+          bytes_concat_all([b"this module declares ", join_backticked(map(s.by_name, |e: SetEntry| e.name), b", "),
+                            b"; a set is module-local and cannot be imported"])
+        };
+        { s: {..s, diags: push(s.diags, diag1(b"E0114", q.span,
+            bytes_concat_all([b"no `effect set` named `", n, b"` in this module"]), b"not declared here",
+            push(effect_notes, declared)))},
+          at: None }
       },
     }
   }
+
+// "`a`, `b`": names in backticks, joined.
+fn join_backticked(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| {
+    let x = bytes_concat_all([b"`", at(xs, i), b"`"]);
+    if i == 0 { x } else { bytes_concat_all([acc, sep, x]) }
+  })
 
 fn sets_resolve_includes(s: Sets) -> Sets =
   fold(range(0, len(s.defs)), s, |acc: Sets, i: Int| {
@@ -174,12 +203,15 @@ fn position(xs: List<Int>, v: Int) -> Option<Int> =
 fn cycle_report(s: Sets, cycle: List<Int>) -> PDiag = {
   let head = at(s.defs, at(cycle, 0));
   let others = drop(cycle, 1);
-  { code: b"E0115", notes: 2,
-    labels: fold(others, [{ start: head.name.span.start, end: head.name.span.end, primary: true }],
-                 |ls: List<{ start: Int, end: Int, primary: Bool }>, n: Int| {
-                   let d = at(s.defs, n);
-                   push(ls, { start: d.name.span.start, end: d.name.span.end, primary: false })
-                 }) }
+  let names = push(map(cycle, |n: Int| at(s.defs, n).name.name), head.name.name);
+  let primary = if len(cycle) == 1 { b"this set names itself" } else {
+    bytes_concat_all([b"expands through ", join_backticked(map(others, |n: Int| at(s.defs, n).name.name), b", "), b" and back"])
+  };
+  pdiag(b"E0115", bytes_concat_all([b"effect set `", head.name.name, b"` contains itself"]),
+        fold(others, [plabel(head.name.span, true, primary)],
+             |ls: List<Label>, n: Int| push(ls, plabel(at(s.defs, n).name.span, false, b"on the cycle"))),
+        [bytes_concat(b"the cycle is ", join_backticked(names, b" -> ")),
+         b"expansion is a fixed point, and a cycle has none: break it by inlining the atoms one of these sets needs"])
 }
 
 fn mode_key(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
@@ -481,45 +513,74 @@ type Bound = { name: Bytes, ty: Option<TypeExpr> }
 type RuCx = { types: List<TypeDef>, scope: List<Bound>, diags: List<PDiag> }
 type RuOut = { cx: RuCx, e: Expr }
 
-type Shape = | Fields(List<{ name: Ident, ty: TypeExpr }>) | NoShape
+// `NoShape` carries `Why::note`: the reason the base has no field list this file can name.
+type Shape = | Fields(List<{ name: Ident, ty: TypeExpr }>) | NoShape(Bytes)
 
 fn ru_lookup(cx: RuCx, name: Bytes) -> Option<Option<TypeExpr>> =
   fold(cx.scope, None, |acc: Option<Option<TypeExpr>>, b: Bound|
     if b.name == name { Some(b.ty) } else { acc })
 
+fn too_deep() -> Bytes = bytes_concat_all([b"more than ", num(max_alias_depth()), b" type aliases deep"])
+
 // `type_of_path`: the written type of a base that is a local, or a field path from one.
-fn type_of_path(cx: RuCx, e: Expr) -> Option<TypeExpr> =
+fn type_of_path(cx: RuCx, e: Expr) -> Result<TypeExpr, Bytes> =
   match e {
-    EVar(v) -> if !is_bare(v.name) { None } else {
-      match ru_lookup(cx, v.name.name.name) { Some(Some(t)) -> Some(t), _ -> None }
+    EVar(v) -> if !is_bare(v.name) { Err(ru_cross_module()) } else {
+      let n = v.name.name.name;
+      match ru_lookup(cx, n) {
+        Some(bound) -> match bound {
+          Some(t) -> Ok(t),
+          None -> Err(bytes_concat_all([b"`", n, b"` has no written type here; annotate the binder, as in `let ", n, b": T = ...`"])),
+        },
+        None -> Err(bytes_concat_all([b"`", n, b"` is not a local binder with a written type \xe2\x80\x94 a record update reads only annotations written in this file"])),
+      }
     },
-    EField(f) ->
-      match type_of_path(cx, f.base) {
-        None -> None,
-        Some(outer) ->
-          match record_of(cx, outer, 0) {
-            NoShape -> None,
-            Fields(fs) -> fold(fs, None, |acc: Option<TypeExpr>, x: { name: Ident, ty: TypeExpr }|
-                            match acc { Some(_) -> acc, None -> if x.name.name == f.field.name { Some(x.ty) } else { None } }),
+    EField(f) -> {
+      let outer = type_of_path(cx, f.base)?;
+      match record_of(cx, outer, 0) {
+        NoShape(why) -> Err(why),
+        Fields(fs) ->
+          match fold(fs, None, |acc: Option<TypeExpr>, x: { name: Ident, ty: TypeExpr }|
+                     match acc { Some(_) -> acc, None -> if x.name.name == f.field.name { Some(x.ty) } else { None } }) {
+            Some(t) -> Ok(t),
+            None ->
+              if len(fs) == 0 { Err(bytes_concat_all([b"no field `", f.field.name, b"`; the record has no fields"])) }
+              else {
+                Err(bytes_concat_all([b"no field `", f.field.name, b"`; available fields: ",
+                                      join_backticked(map(fs, |x: { name: Ident, ty: TypeExpr }| x.name.name), b", ")]))
+              },
           },
-      },
-    _ -> None,
+      }
+    },
+    _ -> Err(b"the base is not a record"),
   }
 
+fn ru_cross_module() -> Bytes =
+  b"the base and its type must both be named in this file; a shape read across a module boundary would go stale without this file changing"
+
+fn ru_generic() -> Bytes = b"a generic type has no field list until it is applied; write the fields out"
+
 fn record_of(cx: RuCx, t: TypeExpr, depth: Int) -> Shape =
-  if depth > max_alias_depth() { NoShape } else {
+  if depth > max_alias_depth() { NoShape(too_deep()) } else {
     match t {
       TRecord(r) -> Fields(r.fields),
+      TVar(_) -> NoShape(ru_generic()),
       TCon(c) ->
-        if !is_bare(c.name) || len(c.args) > 0 { NoShape } else {
-          match find_type(cx.types, c.name.name.name) {
-            None -> NoShape,
-            Some(d) -> if len(d.params) > 0 { NoShape } else {
-              match d.body { TDSum(_) -> NoShape, TDAlias(inner) -> record_of(cx, inner, depth + 1) }
+        if !is_bare(c.name) { NoShape(ru_cross_module()) }
+        else if len(c.args) > 0 { NoShape(ru_generic()) }
+        else {
+          let n = c.name.name.name;
+          match find_type(cx.types, n) {
+            None -> NoShape(bytes_concat_all([b"`", n, b"` is not a `type` declared in this file, so its fields are not known here"])),
+            Some(d) -> if len(d.params) > 0 { NoShape(ru_generic()) } else {
+              match d.body {
+                TDSum(_) -> NoShape(bytes_concat_all([b"`", n, b"` is a sum type, and only a record has fields to update"])),
+                TDAlias(inner) -> record_of(cx, inner, depth + 1),
+              }
             },
           }
         },
-      _ -> NoShape,
+      _ -> NoShape(b"the base is not a record"),
     }
   }
 
@@ -543,14 +604,22 @@ fn ru_truncate(cx: RuCx, mark: Int) -> RuCx = {..cx, scope: take(cx.scope, mark)
 // `expand_update`: the literal an update stands for, or the written fields alone with a diagnostic.
 fn expand_update(cx: RuCx, span: Span, base: Expr, written: List<RecField>) -> RuOut = {
   let base_span = expr_span(base);
-  let shape = match type_of_path(cx, base) { None -> NoShape, Some(t) -> record_of(cx, t, 0) };
+  let shape = match type_of_path(cx, base) { Err(why) -> NoShape(why), Ok(t) -> record_of(cx, t, 0) };
   match shape {
-    NoShape ->
-      { cx: {..cx, diags: push(cx.diags, diag1(b"E0116", base_span, 1))}, e: ERecord({ span: span, fields: written }) },
+    NoShape(why) ->
+      { cx: {..cx, diags: push(cx.diags, diag1(b"E0116", base_span,
+                                               b"the record being updated has no field list this file can name",
+                                               b"no record shape here", [why]))},
+        e: ERecord({ span: span, fields: written }) },
     Fields(fs) -> {
+      let known = join_backticked(map(fs, |f: { name: Ident, ty: TypeExpr }| f.name.name), b", ");
       let bad = fold(written, { cx: cx, bad: false }, |acc: { cx: RuCx, bad: Bool }, w: RecField|
         if fold(fs, false, |b: Bool, f: { name: Ident, ty: TypeExpr }| b || f.name.name == w.name.name) { acc }
-        else { { cx: {..acc.cx, diags: push(acc.cx.diags, diag2(b"E0117", w.name.span, base_span, 1))}, bad: true } });
+        else { { cx: {..acc.cx, diags: push(acc.cx.diags, diag2(b"E0117", w.name.span,
+                   bytes_concat_all([b"the record being updated has no field `", w.name.name, b"`"]),
+                   b"not a field of the base", base_span, b"this is the record being updated",
+                   [bytes_concat(b"an update replaces fields, it does not add them; available fields: ", known)]))},
+                 bad: true } });
       if bad.bad { { cx: bad.cx, e: ERecord({ span: span, fields: written }) } } else {
         let copies = filter(map(fs, |f: { name: Ident, ty: TypeExpr }| f.name.name), |n: Bytes|
           !fold(written, false, |b: Bool, w: RecField| b || w.name.name == n));
@@ -722,11 +791,9 @@ pub fn expand_record_updates(m: Module, diags: List<PDiag>) -> { module: Module,
 
 type TryMode = | MResult | MOption
 
-// Why a `?` has no meaning where it is written; only the count of notes reaches the comparison,
-// and every reason carries one.
-type Why = | WNone
-
-type TryCx = { types: List<TypeDef>, shadowed: Bool, diags: List<PDiag>, mode: Option<TryMode>, fresh: Int }
+// `shadowed` is `Why::note` for a module whose own `Ok`/`Err`/`Some`/`None` would capture the
+// expansion; a scope reason and a barrier are carried the same way, as the note they print.
+type TryCx = { types: List<TypeDef>, shadowed: Option<Bytes>, diags: List<PDiag>, mode: Option<TryMode>, fresh: Int }
 
 type Lift = { operand: Expr, binder: Ident, at: Span }
 type Scan = | SFound(Lift) | SPure | SImpure
@@ -736,34 +803,82 @@ type TryOut = { cx: TryCx, e: Expr }
 fn is_expansion_name(name: Bytes) -> Bool =
   name == b"Ok" || name == b"Err" || name == b"Some" || name == b"None"
 
-fn shadowing_ctor(m: Module) -> Bool = {
-  let imported = fold(m.imports, false, |acc: Bool, d: ImportDecl|
-    acc || (match d.kind { INames(ns) -> fold(ns, false, |b: Bool, n: Ident| b || is_expansion_name(n.name)), _ -> false }));
-  imported || fold(m.items, false, |acc: Bool, it: Item|
-    acc || (match it {
-      IType(d) -> match d.body { TDSum(vs) -> fold(vs, false, |b: Bool, v: VariantDef| b || is_expansion_name(v.name.name)), _ -> false },
-      _ -> false,
-    }))
+fn shadowing_ctor(m: Module) -> Option<Bytes> = {
+  let imported = fold(m.imports, None, |acc: Option<Bytes>, d: ImportDecl|
+    match acc {
+      Some(_) -> acc,
+      None -> match d.kind {
+        INames(ns) -> fold(ns, None, |b: Option<Bytes>, n: Ident|
+          match b { Some(_) -> b, None -> if is_expansion_name(n.name) {
+            Some(bytes_concat_all([b"this module imports `", n.name, b"` unqualified, which would capture the `match` `?` expands to; import the module instead and qualify the name, or write the `match` out"]))
+          } else { None } }),
+        _ -> None,
+      },
+    });
+  match imported {
+    Some(_) -> imported,
+    None -> fold(m.items, None, |acc: Option<Bytes>, it: Item|
+      match acc {
+        Some(_) -> acc,
+        None -> match it {
+          IType(d) -> match d.body {
+            TDSum(vs) -> fold(vs, None, |b: Option<Bytes>, v: VariantDef|
+              match b { Some(_) -> b, None -> if is_expansion_name(v.name.name) {
+                Some(bytes_concat_all([b"this module declares its own `", v.name.name, b"`, which would capture the `match` `?` expands to; rename it, or write the `match` out"]))
+              } else { None } }),
+            _ -> None,
+          },
+          _ -> None,
+        },
+      }),
+  }
 }
 
-fn mode_of(cx: TryCx, t: TypeExpr, depth: Int) -> Option<TryMode> =
-  if depth > max_alias_depth() { None } else {
+fn unreadable() -> Bytes =
+  b"the return type has no head constructor this file can read: a type parameter and a generic alias have none until they are applied"
+
+fn not_result_or_option(head: Bytes) -> Bytes =
+  bytes_concat_all([b"this function returns `", head, b"`; `?` binds a `Result` inside a function returning `Result`, or an `Option` inside one returning `Option`, because those are the constructors it expands to"])
+
+fn no_return_type() -> Bytes =
+  b"this function writes no `->`, and `?` reads which constructors to name off the written return type; write one"
+
+fn not_in_a_function(what: Bytes) -> Bytes =
+  bytes_concat(what, b" has no written return type, and `?` needs one")
+
+// `Cx::mode_of`: the head constructor of a written return type, or `Why::note` for why it has none.
+fn mode_of(cx: TryCx, t: TypeExpr, depth: Int) -> Result<TryMode, Bytes> =
+  if depth > max_alias_depth() { Err(too_deep()) } else {
     match t {
       TCon(c) ->
-        if !is_bare(c.name) { None }
-        else if c.name.name.name == b"Result" { Some(MResult) }
-        else if c.name.name.name == b"Option" { Some(MOption) }
+        if !is_bare(c.name) {
+          Err(b"the return type is named through another module, and `?` reads only this file \xe2\x80\x94 a meaning read across a module boundary would go stale in a file that never changed")
+        }
+        else if c.name.name.name == b"Result" { Ok(MResult) }
+        else if c.name.name.name == b"Option" { Ok(MOption) }
         else {
-          match find_type(cx.types, c.name.name.name) {
-            None -> None,
-            Some(d) -> if len(d.params) > 0 { None } else {
-              match d.body { TDSum(_) -> None, TDAlias(inner) -> mode_of(cx, inner, depth + 1) }
+          let n = c.name.name.name;
+          match find_type(cx.types, n) {
+            None -> Err(not_result_or_option(n)),
+            Some(d) -> if len(d.params) > 0 { Err(unreadable()) } else {
+              match d.body { TDSum(_) -> Err(not_result_or_option(n)), TDAlias(inner) -> mode_of(cx, inner, depth + 1) }
             },
           }
         },
-      _ -> None,
+      _ -> Err(unreadable()),
     }
   }
+
+// The mode a written return type gives `?`, or the reason it gives none.
+fn mode_for(cx: TryCx, ret: Option<TypeExpr>) -> Result<TryMode, Bytes> =
+  match cx.shadowed {
+    Some(why) -> Err(why),
+    None -> match ret { None -> Err(no_return_type()), Some(ty) -> mode_of(cx, ty, 0) },
+  }
+
+// `barrier.or(Some(what))`: the outermost barrier is the one named.
+fn under(barrier: Option<Bytes>, what: Bytes) -> Option<Bytes> =
+  match barrier { Some(_) -> barrier, None -> Some(what) }
 
 fn fresh_binder(cx: TryCx, span: Span) -> { cx: TryCx, b: Ident } =
   { cx: {..cx, fresh: cx.fresh + 1}, b: { name: bytes_concat(b"?", bytes_of_string(int_to_string(cx.fresh))), span: span } }
@@ -998,7 +1113,9 @@ fn take_stmt(cx: TryCx, st: Stmt) -> Taken =
           match l.ty {
             // `let x: T = e?;` has no `let` left to carry `T` on after the split.
             Some(_) -> {
-              let d = diag2(b"E0119", t.span, l.span, 1);
+              let d = diag2(b"E0119", t.span, b"a `?` on a `let` with a written type",
+                            b"this `?` would discard the annotation", l.span, b"the type is written here",
+                            [b"`?` splits the block at this statement and the `let` is gone, so there is nothing left to carry the annotation. Write `let x = e?;`, or annotate the value being unwrapped instead"]);
               { cx: {..cx, diags: push(cx.diags, d)}, stmt: SLet({ span: l.span, pat: l.pat, ty: l.ty, value: t.operand }), take: None }
             },
             None -> {
@@ -1046,21 +1163,32 @@ fn take_try(cx: TryCx, operand: Expr, span: Span, pat: Pattern) -> TryTaken = {
   }
 }
 
-// `sweep`: refuses every `?` left in `e` and unwraps it. `scope` is `true` when the enclosing
-// function gives `?` no meaning, `barrier` when a lambda, handler, cell, region or `simulate` sits
+// `sweep`: refuses every `?` left in `e` and unwraps it. `scope` is why the enclosing function
+// gives `?` no meaning, `barrier` names the lambda, handler, cell, region or `simulate` that sits
 // between; both are `E0118`, and a `?` neither reason excuses is `E0119`.
-fn sweep(cx: TryCx, e: Expr, scope: Bool, barrier: Bool) -> TryOut = {
+fn sweep(cx: TryCx, e: Expr, scope: Option<Bytes>, barrier: Option<Bytes>) -> TryOut = {
   let refused = match e {
     ETry(t) -> {
-      let code = if scope || barrier { b"E0118" } else { b"E0119" };
-      { cx: {..cx, diags: push(cx.diags, diag1(code, t.span, 1))}, e: t.operand }
+      let d = match barrier {
+        Some(what) -> diag1(b"E0118", t.span, b"this file gives `?` no meaning here",
+                            b"no `Result` or `Option` to expand this into",
+                            [bytes_concat_all([b"this `?` is inside ", what, b", which has no written return type of its own. `?` exits the expression it is written in and never a lambda, a handler or a region: name a function with a written `->` and call it"])]),
+        None -> match scope {
+          Some(why) -> diag1(b"E0118", t.span, b"this file gives `?` no meaning here",
+                             b"no `Result` or `Option` to expand this into", [why]),
+          None -> diag1(b"E0119", t.span, b"this `?` is not in a position it can be expanded from",
+                        b"`?` cannot exit from here",
+                        [b"`?` lifts what it unwraps to the head of the statement, or of the return position, it is written in \xe2\x80\x94 so nothing conditional may sit between the two, and everything evaluated before it must be pure. Bind it first: `let a = e?;`"]),
+        },
+      };
+      { cx: {..cx, diags: push(cx.diags, d)}, e: t.operand }
     },
     _ -> { cx: cx, e: e },
   };
   sweep_inner(refused.cx, refused.e, scope, barrier)
 }
 
-fn sweep_inner(cx: TryCx, e: Expr, scope: Bool, barrier: Bool) -> TryOut =
+fn sweep_inner(cx: TryCx, e: Expr, scope: Option<Bytes>, barrier: Option<Bytes>) -> TryOut =
   match e {
     ETry(t) -> { let o = sweep(cx, t.operand, scope, barrier); { cx: o.cx, e: ETry({ span: t.span, operand: o.e }) } },
     EBinary(b) -> {
@@ -1071,19 +1199,17 @@ fn sweep_inner(cx: TryCx, e: Expr, scope: Bool, barrier: Bool) -> TryOut =
     EUnary(u) -> { let o = sweep(cx, u.operand, scope, barrier); { cx: o.cx, e: EUnary({ span: u.span, op: u.op, operand: o.e }) } },
     ELambda(l) ->
       match l.ret {
-        None -> { let o = sweep(cx, l.body, scope, true); { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: None }) } },
-        Some(ty) -> {
-          let mode = if cx.shadowed { None } else { mode_of(cx, ty, 0) };
-          match mode {
-            None -> { let o = sweep(cx, l.body, true, false); { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: Some(ty) }) } },
-            Some(m) -> {
+        None -> { let o = sweep(cx, l.body, scope, under(barrier, b"a lambda")); { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: None }) } },
+        Some(ty) ->
+          match mode_for(cx, Some(ty)) {
+            Err(why) -> { let o = sweep(cx, l.body, Some(why), None); { cx: o.cx, e: ELambda({ span: l.span, body: o.e, params: l.params, ret: Some(ty) }) } },
+            Ok(m) -> {
               let saved = cx.mode;
               let r = ret({..cx, mode: Some(m)}, l.body);
-              let s: TryOut = sweep(r.cx, r.e, false, false);
+              let s: TryOut = sweep(r.cx, r.e, None, None);
               { cx: {..s.cx, mode: saved}, e: ELambda({ span: l.span, body: s.e, params: l.params, ret: Some(ty) }) }
             },
-          }
-        },
+          },
       },
     EApp(a) -> {
       let f = sweep(cx, a.func, scope, barrier);
@@ -1128,31 +1254,31 @@ fn sweep_inner(cx: TryCx, e: Expr, scope: Bool, barrier: Bool) -> TryOut =
     EList(l) -> { let o = sweep_all(cx, l.items, scope, barrier); { cx: o.cx, e: EList({ span: l.span, items: o.xs }) } },
     EPerform(p) -> { let o = sweep_all(cx, p.args, scope, barrier); { cx: o.cx, e: EPerform({ span: p.span, eff: p.eff, op: p.op, resource: p.resource, args: o.xs }) } },
     EHandle(h) -> {
-      let b = sweep(cx, h.body, scope, true);
+      let b = sweep(cx, h.body, scope, under(barrier, b"a `handle` body"));
       let cs = fold(h.clauses, { cx: b.cx, cs: [] }, |acc: { cx: TryCx, cs: List<HandleClause> }, c: HandleClause| {
-        let o = sweep(acc.cx, c.body, scope, true);
+        let o = sweep(acc.cx, c.body, scope, under(barrier, b"a `handle` clause"));
         { cx: o.cx, cs: push(acc.cs, { eff: c.eff, op: c.op, resource: c.resource, resume: c.resume, body: o.e, span: c.span, params: c.params }) }
       });
-      let r = match h.ret { None -> { cx: cs.cx, r: None }, Some(rc) -> { let o = sweep(cs.cx, rc.body, scope, true); { cx: o.cx, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) } } };
+      let r = match h.ret { None -> { cx: cs.cx, r: None }, Some(rc) -> { let o = sweep(cs.cx, rc.body, scope, under(barrier, b"a `handle` return clause")); { cx: o.cx, r: Some({ binder: rc.binder, body: o.e, span: rc.span }) } } };
       { cx: r.cx, e: EHandle({ span: h.span, body: b.e, ret: r.r, clauses: cs.cs }) }
     },
     EWithCell(c) -> {
       let i = sweep(cx, c.init, scope, barrier);
-      let b = sweep(i.cx, c.body, scope, true);
+      let b = sweep(i.cx, c.body, scope, under(barrier, b"a `with_cell` body"));
       { cx: b.cx, e: EWithCell({ span: c.span, resource: c.resource, init: i.e, binder: c.binder, body: b.e }) }
     },
-    EWithRegion(w) -> { let o = sweep(cx, w.body, scope, true); { cx: o.cx, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
-    ESimulate(x) -> { let o = sweep(cx, x.body, scope, true); { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) } },
+    EWithRegion(w) -> { let o = sweep(cx, w.body, scope, under(barrier, b"a `with_region` body")); { cx: o.cx, e: EWithRegion({ span: w.span, region: w.region, body: o.e }) } },
+    ESimulate(x) -> { let o = sweep(cx, x.body, scope, under(barrier, b"a `simulate` body")); { cx: o.cx, e: ESimulate({ span: x.span, body: o.e }) } },
     _ -> { cx: cx, e: e },
   }
 
-fn sweep_all(cx: TryCx, xs: List<Expr>, scope: Bool, barrier: Bool) -> { cx: TryCx, xs: List<Expr> } =
+fn sweep_all(cx: TryCx, xs: List<Expr>, scope: Option<Bytes>, barrier: Option<Bytes>) -> { cx: TryCx, xs: List<Expr> } =
   fold(xs, { cx: cx, xs: [] }, |acc: { cx: TryCx, xs: List<Expr> }, x: Expr| {
     let o = sweep(acc.cx, x, scope, barrier);
     { cx: o.cx, xs: push(acc.xs, o.e) }
   })
 
-fn sweep_fields(cx: TryCx, fs: List<RecField>, scope: Bool, barrier: Bool) -> { cx: TryCx, fs: List<RecField> } =
+fn sweep_fields(cx: TryCx, fs: List<RecField>, scope: Option<Bytes>, barrier: Option<Bytes>) -> { cx: TryCx, fs: List<RecField> } =
   fold(fs, { cx: cx, fs: [] }, |acc: { cx: TryCx, fs: List<RecField> }, f: RecField| {
     let o = sweep(acc.cx, f.value, scope, barrier);
     { cx: o.cx, fs: push(acc.fs, { name: f.name, value: o.e }) }
@@ -1163,25 +1289,26 @@ fn try_item(cx0: TryCx, it: Item) -> { cx: TryCx, it: Item } = {
   match it {
     IFn(d) -> {
       let spec: { cx: TryCx, xs: List<SpecClause> } = fold(d.spec, { cx: cx, xs: [] }, |acc: { cx: TryCx, xs: List<SpecClause> }, c: SpecClause| {
-        let o = sweep(acc.cx, c.expr, true, false);
+        let what = match c.kind { SRequires -> b"a `requires` clause", SEnsures -> b"an `ensures` clause" };
+        let o = sweep(acc.cx, c.expr, Some(not_in_a_function(what)), None);
         { cx: o.cx, xs: push(acc.xs, { kind: c.kind, expr: o.e, span: c.span }) }
       });
-      let mode = if cx.shadowed { None } else { match d.ret { None -> None, Some(ty) -> mode_of(cx, ty, 0) } };
-      let body = match mode {
-        None -> sweep(spec.cx, d.body, true, false),
-        Some(m) -> {
+      let body = match mode_for(cx, d.ret) {
+        Err(why) -> sweep(spec.cx, d.body, Some(why), None),
+        Ok(m) -> {
           let r = ret({..spec.cx, mode: Some(m)}, d.body);
-          let s: TryOut = sweep(r.cx, r.e, false, false);
+          let s: TryOut = sweep(r.cx, r.e, None, None);
           { cx: {..s.cx, mode: None}, e: s.e }
         },
       };
       { cx: body.cx, it: IFn({ vis: d.vis, name: d.name, generics: d.generics, params: d.params, ret: d.ret, effects: d.effects,
                                constraints: d.constraints, spec: spec.xs, reuse: d.reuse, body: body.e, span: d.span }) }
     },
-    ITest(d) -> { let o = sweep(cx, d.body, true, false); { cx: o.cx, it: ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: o.e, span: d.span }) } },
+    ITest(d) -> { let o = sweep(cx, d.body, Some(not_in_a_function(b"a `test`")), None); { cx: o.cx, it: ITest({ name: d.name, name_span: d.name_span, is_nondet: d.is_nondet, body: o.e, span: d.span }) } },
     ILaw(d) -> {
-      let g = match d.guard { None -> { cx: cx, e: None }, Some(x) -> { let o = sweep(cx, x, true, false); { cx: o.cx, e: Some(o.e) } } };
-      let b = sweep(g.cx, d.body, true, false);
+      let why = not_in_a_function(b"a `law`");
+      let g = match d.guard { None -> { cx: cx, e: None }, Some(x) -> { let o = sweep(cx, x, Some(why), None); { cx: o.cx, e: Some(o.e) } } };
+      let b = sweep(g.cx, d.body, Some(why), None);
       { cx: b.cx, it: ILaw({ name: d.name, name_span: d.name_span, host: d.host, binders: d.binders, guard: g.e, body: b.e, span: d.span }) }
     },
     _ -> { cx: cx, it: it },

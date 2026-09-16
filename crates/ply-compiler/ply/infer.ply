@@ -37,13 +37,14 @@ import tycore (Resource, RNamed, RSingleton, Atom, Row, Type, TyVar, TyCon, TyFn
                env_lookup, env_depth_of, env_locals, instantiate_with, instantiate, rename_scheme,
                generalize, region_prefix, region_of, atom_text, scheme_text, type_text, row_text,
                printer_new, print_ty, print_row)
-import resolve (Mod, Source, Resolved, Scope, Binding, Diag, Label, Ns, NValue, NType, NEffect,
-                resolve_modules, Resolved_, Failed, Expanded, find, lookup, dlookup,
-                qualify, default_binder, dump_diags, diag1, diag2, lab, is_bare,
-                is_ctor_name)
+import resolve (Mod, Source, Resolved, Scope, Binding, ModBind, Declared, Diag, Label, Ns, NValue, NType, NEffect,
+                resolve_modules, Resolved_, Failed, Expanded, find, lookup, dlookup, space,
+                qualify, default_binder, dump_diags, diag, diag1, diag2, lab, is_bare,
+                is_ctor_name, backticked, ns_describe, private_name)
 import rewrite (expand)
 import derive (Why, WFunction, WHandle, WFloatIsNotOrdered, WUnconstrained, WNullInsideOption, WSecret,
-               ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name, Expansion, expand_derives)
+               ConShape, Leaf, Structural, Refused, Nominal, con_shape, null_encoded_name, Expansion, expand_derives,
+               refusal_note, secret_reason, null_in_option_note)
 
 // --- What the checker keeps ----------------------------------------------------------
 
@@ -69,13 +70,17 @@ type Sig = { ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, fn_ty: Ty
              ret: Type, declared: Option<Row>, published_row: Row, scope: Int }
 type Assumed = { deriver: Deriver, vars: List<Int> }
 type SpawnSite = { span: Span, ty: Type }
-type OpenRegion = { name: Bytes, with_cell: Bool, span: Span, simulate_depth: Int, spawns: List<SpawnSite>, handoffs: List<SpawnSite> }
+// `op` is `sink.put`, for the diagnostic.
+type HandoffSite = { span: Span, ty: Type, op: Bytes }
+type OpenRegion = { name: Bytes, with_cell: Bool, span: Span, simulate_depth: Int, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 type OuterBinding = { name: Bytes, ty: Type, site: Span }
 type RegionSite = { module: Int, name: Bytes, with_cell: Bool, span: Span, body_span: Span, body_ty: Type, exits: List<Span>,
-                    outer: List<OuterBinding>, spawns: List<SpawnSite>, handoffs: List<SpawnSite> }
+                    outer: List<OuterBinding>, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 type Simulation = { module: Int, span: Span, body_span: Span, body_ty: Type, body_row: Row }
-type MapKeySite = { module: Int, span: Span, scope: Int, key: Type, assumed: List<Int> }
-type ConstraintSite = { module: Int, span: Span, deriver: Deriver, ty: Type, callee_at: Loc, assumed: List<Int> }
+// `params` names the signature's rigid type parameters, so a refusal can say which to constrain.
+type RigidParam = { name: Bytes, v: Int }
+type MapKeySite = { module: Int, span: Span, scope: Int, key: Type, assumed: List<Int>, params: List<RigidParam> }
+type ConstraintSite = { module: Int, span: Span, deriver: Deriver, ty: Type, callee: Bytes, callee_at: Loc, assumed: List<Int>, params: List<RigidParam> }
 type SpecEnv = { name: Bytes, ty_params: Map<Bytes, Type>, row_params: Map<Bytes, Int>, params: List<Type>, ret: Type }
 
 // `Known`: the interfaces the driver hands in for definitions whose bodies it need not walk
@@ -158,13 +163,25 @@ fn scope_of(cx: Cx) -> Scope = at(cx.r.scopes, cx.module)
 
 fn report(cx: Cx, d: Diag) -> Cx = {..cx, diags: push(cx.diags, d)}
 
-fn err1(cx: Cx, code: Bytes, s: Span, notes: Int) -> Cx = report(cx, diag1(code, cx.module, s, notes))
+fn err1(cx: Cx, code: Bytes, s: Span, message: Bytes, label: Bytes, notes: List<Bytes>) -> Cx =
+  report(cx, diag1(code, cx.module, s, message, label, notes))
 
-fn err2(cx: Cx, code: Bytes, s: Span, also: Loc, notes: Int) -> Cx =
-  report(cx, diag2(code, cx.module, s, also.module, also.span, notes))
+fn err2(cx: Cx, code: Bytes, s: Span, message: Bytes, label: Bytes, also: Loc, also_text: Bytes, notes: List<Bytes>) -> Cx =
+  report(cx, diag2(code, cx.module, s, message, label, also.module, also.span, also_text, notes))
 
-fn err_labels(cx: Cx, code: Bytes, labels: List<Label>, notes: Int) -> Cx =
-  report(cx, { code: code, notes: notes, labels: labels, text: b"" })
+fn err_labels(cx: Cx, code: Bytes, message: Bytes, labels: List<Label>, notes: List<Bytes>) -> Cx =
+  report(cx, diag(code, message, labels, notes))
+
+fn tick(x: Bytes) -> Bytes = bytes_concat_all([b"`", x, b"`"])
+
+fn qname_text(q: QName) -> Bytes =
+  match q.module { Some(m) -> bytes_concat_all([m.name, b"::", q.name.name]), None -> q.name.name }
+
+fn plural(n: Int) -> Bytes = if n == 1 { b"" } else { b"s" }
+
+fn supplied(n: Int) -> Bytes = if n == 1 { b"1 was supplied" } else { bytes_concat(num(n), b" were supplied") }
+
+fn what_of(d: Deriver) -> Bytes = match d { DJson -> b"JSON encoding", DEq -> b"structural equality", DOrd -> b"order" }
 
 fn deriver_tag(d: Deriver) -> Int = match d { DJson -> 0, DEq -> 1, DOrd -> 2 }
 
@@ -430,13 +447,24 @@ fn global(cx: Cx, ns: Ns, q: QName) -> { cx: Cx, name: Option<Bytes> } =
   } else {
     match find(cx.r, cx.module, ns, q) {
       Some(b) -> { cx: cx, name: Some(b.qualified) },
-      None -> { cx: match cx.derived { Some(_) -> unresolved_in_derived(cx, q), None -> lookup_failure(cx, ns, q) }, name: None },
+      None -> { cx: match cx.derived {
+                      Some(_) -> unresolved_in_derived(cx, q, match ns { NType -> b"type", _ -> b"definition" }),
+                      None -> lookup_failure(cx, ns, q),
+                    },
+                name: None },
     }
   }
 
 // A name a generated body cannot see is the field type's missing `derive`, not a bug in the
 // user's code: `E0206` at the name, with the two notes that say so.
-fn unresolved_in_derived(cx: Cx, q: QName) -> Cx = err1(cx, b"E0206", q.span, 2)
+fn unresolved_in_derived(cx: Cx, q: QName, what: Bytes) -> Cx = {
+  let d = match cx.derived { Some(d) -> d, None -> panic("only a generated body reaches this") };
+  let dv = deriver_text(d.deriver);
+  err1(cx, b"E0206", q.span, bytes_concat_all([b"`", dv, b"` cannot be derived for `", d.target, b"`"]),
+       bytes_concat_all([b"the generated body needs the ", what, b" `", qname_text(q), b"`, which is not in scope"]),
+       [bytes_concat_all([b"a derivation composes through named types by calling their own dictionaries, so every field type needs `derive ", dv, b" for` it in the module that declares it"]),
+        bytes_concat_all([b"`", qname_text(q), b"` is what `derive ", dv, b" for <that type>` generates"])])
+}
 
 // `Resolved::lookup`'s diagnostics for a qualified name that does not resolve.
 fn lookup_failure(cx: Cx, ns: Ns, q: QName) -> Cx =
@@ -450,16 +478,35 @@ fn lookup_failure(cx: Cx, ns: Ns, q: QName) -> Cx =
         None -> {
           let selective = fold(scope.selective, None, |acc: Option<{ binder: Bytes, target: Int, span: Span }>, mb: { binder: Bytes, target: Int, span: Span }|
             match acc { Some(_) -> acc, None -> if mb.binder == binder.name { Some(mb) } else { None } });
+          let message = bytes_concat_all([b"no module is imported as `", binder.name, b"`"]);
+          let label = b"not a module imported by this file";
           match selective {
-            Some(sel) -> err_labels(cx, b"E0106", [lab(cx.module, binder.span, true), lab(cx.module, sel.span, false)], 1),
-            None -> err1(cx, b"E0106", binder.span, 1),
+            Some(sel) -> {
+              let module = at(cx.r.scopes, sel.target).module;
+              err_labels(cx, b"E0106", message,
+                         [lab(cx.module, binder.span, true, label),
+                          lab(cx.module, sel.span, false, bytes_concat_all([b"this import brings in names from `", module, b"`"]))],
+                         [bytes_concat_all([b"a selective import binds no module name: add `import ", module, b"` as well, or write `", q.name.name, b"` unqualified"])])
+            },
+            None -> err1(cx, b"E0106", binder.span, message, label,
+                         [bytes_concat(b"modules imported here: ", backticked(map(scope.modules, |mb: { binder: Bytes, target: Int, span: Span }| mb.binder), b", "))]),
           }
         },
-        Some(owner) ->
-          match dlookup(at(cx.r.declarations, owner), ns, q.name.name) {
-            None -> err1(cx, b"E0101", q.span, 1),
-            Some(d) -> if !d.public { err2(cx, b"E0107", q.span, { module: owner, span: d.span }, 2) } else { cx },
-          },
+        Some(owner) -> {
+          let decls = at(cx.r.declarations, owner);
+          let module = at(cx.r.scopes, owner).module;
+          match dlookup(decls, ns, q.name.name) {
+            None -> {
+              let exported = fold(space(decls, ns), [], |acc: List<Bytes>, x: Declared| if x.public { push(acc, x.name) } else { acc });
+              err1(cx, b"E0101", q.span,
+                   bytes_concat_all([b"module `", module, b"` has no ", ns_describe(ns), b" `", q.name.name, b"`"]),
+                   bytes_concat_all([b"not declared in `", module, b"`"]),
+                   [if len(exported) == 0 { bytes_concat_all([b"`", module, b"` exports no ", ns_describe(ns), b"s"]) }
+                    else { bytes_concat_all([b"`", module, b"` exports: ", backticked(exported, b", ")]) }])
+            },
+            Some(d) -> if !d.public { report(cx, private_name(cx.module, q.span, owner, d.span, ns, q.name.name, module)) } else { cx },
+          }
+        },
       }
     },
   }
@@ -554,14 +601,22 @@ fn edit_distance(a: Bytes, b: Bytes) -> Int = {
 }
 
 fn unknown_name(cx: Cx, q: QName) -> Cx =
-  match cx.derived { Some(_) -> unresolved_in_derived(cx, q), None -> unknown_name_here(cx, q) }
+  match cx.derived { Some(_) -> unresolved_in_derived(cx, q, b"definition"), None -> unknown_name_here(cx, q) }
 
 fn unknown_name_here(cx: Cx, q: QName) -> Cx = {
-  let near = match nearest_name(cx, q.name.name) { Some(_) -> 1, None -> 0 };
-  let exported = if is_bare(q) { match exporter(cx, NValue, q.name.name) { Some(_) -> 1, None -> 0 } } else { 0 };
+  let n = q.name.name;
   let in_requires = match cx.spec_kind { Some(SRequires) -> true, _ -> false };
-  let result = if is_bare(q) && q.name.name == result_name() && in_requires { 1 } else { 0 };
-  err1(cx, b"E0101", q.span, result + near + exported)
+  let result = if is_bare(q) && n == result_name() && in_requires {
+    [b"`result` is bound only in an `ensures`: a precondition that could name the result would be a claim about a value the call has not produced yet"]
+  } else { [] };
+  let near = match nearest_name(cx, n) { Some(x) -> push(result, bytes_concat_all([b"a name in scope looks similar: `", x, b"`"])), None -> result };
+  let exported = if is_bare(q) {
+    match exporter(cx, NValue, n) {
+      Some(i) -> push(near, bytes_concat_all([b"module `", module_name(cx, i), b"` exports it: add `import ", module_name(cx, i), b" (", n, b")`"])),
+      None -> near,
+    }
+  } else { near };
+  err1(cx, b"E0101", q.span, bytes_concat_all([b"unknown name `", n, b"`"]), b"not found in this scope", exported)
 }
 
 // --- Types from type expressions ----------------------------------------------------------
@@ -574,7 +629,8 @@ fn type_param(cx: Cx, id: Ident) -> { cx: Cx, t: Type } =
         let o: WithTy = new_ty(cx);
         { cx: {..o.cx, ty_params: map_insert(o.cx.ty_params, id.name, o.t)}, t: o.t }
       } else {
-        let o: WithTy = new_ty(err1(cx, b"E0102", id.span, 1));
+        let o: WithTy = new_ty(err1(cx, b"E0102", id.span, bytes_concat_all([b"unknown type variable `", id.name, b"`"]), b"not declared",
+                                    [bytes_concat_all([b"add `", id.name, b"` to the generic list, e.g. `fn f<", id.name, b">(..)`"])]));
         o
       },
   }
@@ -606,7 +662,12 @@ fn conv_types(cx: Cx, ts: List<TypeExpr>) -> { cx: Cx, ts: List<Type> } =
     { cx: o.cx, ts: push(acc.ts, o.t) }
   })
 
-fn arity_error(cx: Cx, span: Span) -> Cx = err1(cx, b"E0202", span, 0)
+// `Checker::arity_error`: `what` loses its `s` when one was expected.
+fn arity_error(cx: Cx, span: Span, name: Bytes, expected: Int, found: Int, what: Bytes) -> Cx = {
+  let w = if expected == 1 { bytes_slice(what, 0, bytes_len(what) - 1) } else { what };
+  err1(cx, b"E0202", span, bytes_concat_all([b"`", name, b"` takes ", num(expected), b" ", w, b", but ", supplied(found)]),
+       bytes_concat_all([b"expected ", num(expected), b", found ", num(found)]), [])
+}
 
 fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, t: Type } =
   if is_bare(name) && len(args) == 0 && map_contains(cx.ty_params, name.name.name) {
@@ -616,7 +677,7 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
     let cx1: Cx = converted.cx;
     match (if is_bare(name) { builtin_type_arity(name.name.name) } else { None }) {
       Some(arity) ->
-        if len(converted.ts) != arity { new_ty(arity_error(cx1, span)) }
+        if len(converted.ts) != arity { new_ty(arity_error(cx1, span, name.name.name, arity, len(converted.ts), b"type arguments")) }
         else if name.name.name == b"Cell" {
           let region: WithTy = new_ty(cx1);
           { cx: region.cx, t: TyCon({ name: b"Cell", args: [region.t, at(converted.ts, 0)] }) }
@@ -636,12 +697,15 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
             match map_get(g.cx.types, qualified) {
               None -> new_ty(g.cx),
               Some(decl) ->
-                if len(converted.ts) != len(decl.params) { new_ty(arity_error(g.cx, span)) }
+                if len(converted.ts) != len(decl.params) { new_ty(arity_error(g.cx, span, name.name.name, len(decl.params), len(converted.ts), b"type arguments")) }
                 else {
                   match decl.alias {
                     None -> { cx: g.cx, t: TyCon({ name: qualified, args: converted.ts }) },
                     Some(alias) ->
-                      if contains_bytes(g.cx.alias_stack, qualified) { new_ty(err1(g.cx, b"E0102", name.span, 1)) }
+                      if contains_bytes(g.cx.alias_stack, qualified) {
+                        new_ty(err1(g.cx, b"E0102", name.span, bytes_concat_all([b"type alias `", name.name.name, b"` expands into itself"]),
+                                    b"cyclic alias", [b"break the cycle, or make this a `type` with variants"]))
+                      }
                       else {
                         let saved = g.cx.ty_params;
                         let bound: Map<Bytes, Type> = fold(range(0, len(decl.params)), map_new(), |m: Map<Bytes, Type>, i: Int| map_insert(m, at(decl.params, i), at(converted.ts, i)));
@@ -659,17 +723,26 @@ fn conv_con(cx: Cx, name: QName, args: List<TypeExpr>, span: Span) -> { cx: Cx, 
 
 fn unknown_type(cx: Cx, q: QName) -> Cx =
   match cx.derived {
-    Some(_) -> unresolved_in_derived(cx, q),
+    Some(_) -> unresolved_in_derived(cx, q, b"type"),
     None -> {
-      let exported = if is_bare(q) { match exporter(cx, NType, q.name.name) { Some(_) -> 1, None -> 0 } } else { 0 };
-      err1(cx, b"E0102", q.span, 1 + exported)
+      let n = q.name.name;
+      let notes = [b"declare it with `type`, or check the spelling"];
+      let exported = if is_bare(q) {
+        match exporter(cx, NType, n) {
+          Some(i) -> push(notes, bytes_concat_all([b"module `", module_name(cx, i), b"` exports it: `import ", module_name(cx, i), b" (", n, b")`"])),
+          None -> notes,
+        }
+      } else { notes };
+      err1(cx, b"E0102", q.span, bytes_concat_all([b"unknown type `", n, b"`"]), b"not found", exported)
     },
   }
 
 fn row_param(cx: Cx, id: Ident) -> { cx: Cx, v: Option<Int> } =
   match map_get(cx.row_params, id.name) {
     Some(v) -> { cx: cx, v: Some(v) },
-    None -> { cx: err1(cx, b"E0301", id.span, 1), v: None },
+    None -> { cx: err1(cx, b"E0301", id.span, bytes_concat_all([b"unknown effect variable `", id.name, b"`"]), b"not declared",
+                       [bytes_concat_all([b"declare it in the generic list, e.g. `fn f<| ", id.name, b">(..) / {| ", id.name, b"}`"])]),
+              v: None },
   }
 
 fn conv_row(cx: Cx, row: RowExpr) -> { cx: Cx, r: Row } = {
@@ -695,7 +768,15 @@ fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
           None -> true,
         };
         if !declares_mode {
-          let reported: Cx = err1(e.cx, b"E0104", a.span, 1);
+          let info = match effect_of(e.cx, eff) { Some(i) -> i, None -> panic("just looked up") };
+          let known = fold(info.ops, [], |acc: List<Bytes>, op: OpInfo| {
+            let k = bytes_concat_all([info.simple_name, b".", mode_key(op.mode)]);
+            if contains_bytes(acc, k) { acc } else { push(acc, k) }
+          });
+          let reported: Cx = err1(e.cx, b"E0104", a.span,
+            bytes_concat_all([b"effect `", eff, b"` declares no `", mode_key(a.mode), b"` operation"]),
+            bytes_concat_all([b"no `", mode_key(a.mode), b"` operation to perform"]),
+            [bytes_concat_all([b"`", eff, b"` can perform: ", join_with(known, b", ")])]);
           { cx: {..reported, refused_atoms: push(reported.refused_atoms, a.span)}, atom: None }
         } else { { cx: e.cx, atom: Some({ effect: eff, resource: resource, mode: a.mode }) } }
       },
@@ -703,6 +784,8 @@ fn conv_atom(cx: Cx, a: AtomExpr) -> { cx: Cx, atom: Option<Atom> } =
   }
 
 fn mode_eq(a: Mode, b: Mode) -> Bool = match a { MRead -> (match b { MRead -> true, _ -> false }), MWrite -> (match b { MWrite -> true, _ -> false }), MBad -> false }
+
+fn mode_key(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
 
 fn effect_name(cx: Cx, q: QName) -> { cx: Cx, name: Option<Bytes> } =
   if is_bare(q) && q.name.name == cell() { { cx: cx, name: Some(cell()) } } else {
@@ -716,24 +799,38 @@ fn effect_name(cx: Cx, q: QName) -> { cx: Cx, name: Option<Bytes> } =
     }
   }
 
-fn unknown_effect(cx: Cx, q: QName) -> Cx =
-  if is_bare(q) && (match env_depth_of(cx.env, q.name.name) { Some(_) -> true, None -> false }) { err1(cx, b"E0103", q.span, 2) }
-  else {
-    let exported = match exporter(cx, NEffect, q.name.name) { Some(_) -> 1, None -> 0 };
-    err1(cx, b"E0103", q.span, 1 + exported)
+fn unknown_effect(cx: Cx, q: QName) -> Cx = {
+  let n = q.name.name;
+  let message = bytes_concat_all([b"unknown effect `", n, b"`"]);
+  if is_bare(q) && (match env_depth_of(cx.env, n) { Some(_) -> true, None -> false }) {
+    err1(cx, b"E0103", q.span, message, b"not declared",
+         [bytes_concat_all([b"`", n, b"` is a value in scope, so this looks like a field call rather than a perform: write `(", n, b".<field>)(..)` to call a function held in a record"]),
+          b"`a.b(c)` is an effect operation; parentheses make it a field access"])
+  } else {
+    let known = map(scope_of(cx).bound.effects, |b: Binding| b.name);
+    let first = if len(known) == 0 { b"declare it with `effect <name> { .. }`" } else { bytes_concat(b"effects in scope: ", backticked(known, b", ")) };
+    let notes = match exporter(cx, NEffect, n) {
+      Some(i) -> [first, bytes_concat_all([b"module `", module_name(cx, i), b"` declares it: `import ", module_name(cx, i), b"` and write `", default_binder(module_name(cx, i)), b"::", n, b"`"])],
+      None -> [first],
+    };
+    err1(cx, b"E0103", q.span, message, b"not declared", notes)
   }
+}
 
 // --- Declarations ------------------------------------------------------------------------
 
-fn duplicate(cx: Cx, name: Ident, prev: Loc) -> Cx = err2(cx, b"E0105", name.span, prev, 1)
+fn duplicate(cx: Cx, name: Ident, prev: Loc, what: Bytes) -> Cx =
+  err2(cx, b"E0105", name.span, bytes_concat_all([what, b" `", name.name, b"` is defined more than once"]), b"redefined here",
+       prev, b"first defined here", [b"rename one of them"])
 
 fn record_type(cx: Cx, m: Mod, def: TypeDef) -> Cx = {
   let name = qualify(m.name, def.name.name);
   match map_get(cx.types, name) {
-    Some(prev) -> duplicate(cx, def.name, { module: prev.owner, span: prev.span }),
+    Some(prev) -> duplicate(cx, def.name, { module: prev.owner, span: prev.span }, b"type"),
     None ->
       match builtin_type_arity(def.name.name) {
-        Some(_) -> err1(cx, b"E0105", def.name.span, 1),
+        Some(_) -> err1(cx, b"E0105", def.name.span, bytes_concat_all([b"`", def.name.name, b"` is a builtin type"]), b"cannot be redefined",
+                        [b"choose a different name for this type"]),
         None -> {
           let alias = match def.body { TDAlias(t) -> Some(t), TDSum(_) -> None };
           {..cx, types: map_insert(cx.types, name, { params: map(def.params, |p: Ident| p.name), alias: alias, owner: cx.module, span: def.span })}
@@ -755,31 +852,42 @@ fn mentions_cell(t: Type) -> Bool =
 
 fn ty_expr_span(t: TypeExpr) -> Span = ty_span(t)
 
-fn reject_declared_cell(cx: Cx, t: Type, span: Span) -> Cx =
-  if mentions_cell(t) { err1(cx, b"E0446", span, 2) } else { cx }
+fn reject_declared_cell(cx: Cx, t: Type, span: Span, owner: Bytes, what: Bytes) -> Cx =
+  if mentions_cell(t) {
+    err1(cx, b"E0446", span, bytes_concat_all([b"`", owner, b"` declares ", what, b" that mentions a `Cell`"]),
+         b"a declaration is outside every region there is",
+         [b"a declared type is fixed once for the whole program, so the region a cell that reached it came from would be pinned by whichever value got there first, and no later check could tell that the cell had outlived it",
+          b"take the cell as a type parameter instead, so the region stays in the type argument and the escape check can see it"])
+  } else { cx }
 
 fn collect_effects(cx: Cx, m: Mod) -> Cx =
   fold(m.module.items, cx, |c: Cx, it: Item|
     match it {
       IEffect(def) -> {
         let name = qualify(m.name, def.name.name);
-        if def.name.name == cell() { err1(c, b"E0105", def.name.span, 1) }
-        else if is_prelude_effect(name) { err1(c, b"E0105", def.name.span, 2) }
+        if def.name.name == cell() {
+          err1(c, b"E0105", def.name.span, b"`cell` is a builtin effect", b"reserved for `with_cell` regions", [b"rename this effect"])
+        }
+        else if is_prelude_effect(name) {
+          err1(c, b"E0105", def.name.span, bytes_concat_all([b"`", name, b"` is a prelude effect"]), b"declared by the language",
+               [b"the language declares `task`, `clock`, `random` and `sim`; `simulate { .. }` handles the first three",
+                bytes_concat_all([b"rename this effect, or put it in a named module, where its program-wide name would be `<module>.", def.name.name, b"` and would shadow the prelude"])])
+        }
         else {
           match effect_of(c, name) {
-            Some(prev) -> duplicate(c, def.name, prev.at),
+            Some(prev) -> duplicate(c, def.name, prev.at, b"effect"),
             None -> {
               let ops = fold(def.ops, { cx: c, ops: [] }, |acc: { cx: Cx, ops: List<OpInfo> }, op: OpDef|
                 if fold(acc.ops, false, |b: Bool, o: OpInfo| b || o.name == op.name.name) {
                   let prev = fold(acc.ops, dummy_span(), |s: Span, o: OpInfo| if o.name == op.name.name { o.at.span } else { s });
-                  { cx: duplicate(acc.cx, op.name, { module: acc.cx.module, span: prev }), ops: acc.ops }
+                  { cx: duplicate(acc.cx, op.name, { module: acc.cx.module, span: prev }, b"operation"), ops: acc.ops }
                 } else {
                   let c1: Cx = {..acc.cx, ty_params: map_new(), auto_ty_params: true};
                   let ps: WithTys = conv_types(c1, op.params);
                   let r: WithTy = conv_type(ps.cx, op.ret);
                   let c2: Cx = {..r.cx, auto_ty_params: false, ty_params: map_new()};
-                  let c3: Cx = fold(range(0, len(ps.ts)), c2, |cc: Cx, i: Int| reject_declared_cell(cc, at(ps.ts, i), ty_expr_span(at(op.params, i))));
-                  let c4 = reject_declared_cell(c3, r.t, ty_expr_span(op.ret));
+                  let c3: Cx = fold(range(0, len(ps.ts)), c2, |cc: Cx, i: Int| reject_declared_cell(cc, at(ps.ts, i), ty_expr_span(at(op.params, i)), op.name.name, b"a parameter"));
+                  let c4 = reject_declared_cell(c3, r.t, ty_expr_span(op.ret), op.name.name, b"a result");
                   { cx: c4, ops: push(acc.ops, { name: op.name.name, mode: op.mode, resource_param: op.resource_param, params: ps.ts, ret: r.t, at: here(c4, op.span), scheme: None }) }
                 });
               add_effect(ops.cx, { name: name, module: m.name, simple_name: def.name.name, nondet: def.is_nondet, ops: ops.ops, at: here(ops.cx, def.span) })
@@ -811,10 +919,10 @@ fn collect_ctors(cx: Cx, m: Mod) -> Cx =
                   let variant = at(variants, index);
                   let ctor = qualify(m.name, variant.name.name);
                   match ctor_of(cc, ctor) {
-                    Some(prev) -> duplicate(cc, variant.name, prev.at),
+                    Some(prev) -> duplicate(cc, variant.name, prev.at, b"constructor"),
                     None -> {
                       let fs: WithTys = conv_types(cc, variant.fields);
-                      let checked: Cx = fold(range(0, len(fs.ts)), fs.cx, |c3: Cx, i: Int| reject_declared_cell(c3, at(fs.ts, i), ty_expr_span(at(variant.fields, i))));
+                      let checked: Cx = fold(range(0, len(fs.ts)), fs.cx, |c3: Cx, i: Int| reject_declared_cell(c3, at(fs.ts, i), ty_expr_span(at(variant.fields, i)), variant.name.name, b"a field"));
                       let ty = if len(fs.ts) == 0 { result } else { t_fn(fs.ts, result, row_empty()) };
                       let sc = { ty_vars: vars.vars, row_vars: [], ty: ty };
                       add_ctor({..checked, env: env_bind_global(checked.env, ctor, sc)},
@@ -844,7 +952,16 @@ fn check_value_namespace(cx: Cx, m: Mod) -> Cx = {
         match p { Some(_) -> p, None -> if s.name == x.name.name { Some(s) } else { None } });
       match prev {
         None -> {..a, seen: push(a.seen, { name: x.name.name, span: x.name.span, is_fn: x.is_fn })},
-        Some(first) -> if first.is_fn == x.is_fn { a } else { {..a, cx: err2(a.cx, b"E0105", x.name.span, { module: a.cx.module, span: first.span }, 2)} },
+        Some(first) -> if first.is_fn == x.is_fn { a } else {
+          let later = if x.is_fn { b"function" } else { b"constructor" };
+          let earlier = if x.is_fn { b"constructor" } else { b"function" };
+          let where_ = if bytes_len(m.name) == 0 { b"" } else { bytes_concat_all([b" in module `", m.name, b"`"]) };
+          {..a, cx: err2(a.cx, b"E0105", x.name.span, bytes_concat_all([b"`", x.name.name, b"` is defined twice", where_]),
+                         bytes_concat_all([b"redefined here as a ", later]), { module: a.cx.module, span: first.span },
+                         bytes_concat_all([b"first defined here as a ", earlier]),
+                         [bytes_concat_all([b"functions and constructors share one namespace: nothing written `", x.name.name, b"` could say which of the two it means"]),
+                          b"rename one of them"])}
+        },
       }
     })
   });
@@ -870,7 +987,14 @@ fn assume(xs: List<Assumed>, d: Deriver, v: Int) -> List<Assumed> = {
 
 fn check_where(cx: Cx, def: FnDef) -> Cx =
   fold(def.constraints, cx, |c: Cx, k: Constraint|
-    if map_contains(c.ty_params, k.param.name) { c } else { err1(c, b"E0102", k.param.span, 1) })
+    if map_contains(c.ty_params, k.param.name) { c } else {
+      let bound = map(def.generics.types, |g: Ident| g.name);
+      err1(c, b"E0102", k.param.span, bytes_concat_all([b"`", k.param.name, b"` is not a type parameter of this signature"]),
+           b"not bound by the generic list",
+           [if len(bound) == 0 {
+              bytes_concat_all([b"`", def.name.name, b"` takes no type parameters, and a constraint on a concrete type is either already true or already an error"])
+            } else { bytes_concat(b"this signature binds ", backticked(bound, b", ")) }])
+    })
 
 fn signature(cx0: Cx, def: FnDef) -> { cx: Cx, sig: Sig } = {
   let cx: Cx = {..cx0, scope: cx0.scope + 1, ty_params: map_new(), row_params: map_new()};
@@ -941,18 +1065,28 @@ fn report_unify(cx: Cx, e: UnifyError, span: Span, context: Bytes) -> Cx =
     Mismatch(m) -> {
       let pe = print_ty(printer_new(), resolve(cx, m.expected));
       let pf = print_ty(pe.p, resolve(cx, m.found));
-      report_text(cx, b"E0201", span, 0, bytes_concat_all([context, b"|", pe.s, b"|", pf.s]))
+      report_text(cx, b"E0201", span, bytes_concat_all([context, b"|", pe.s, b"|", pf.s]),
+                  bytes_concat(b"type mismatch: ", context),
+                  bytes_concat_all([b"expected `", pe.s, b"`, found `", pf.s, b"`"]), [])
     },
-    Arity(a) -> report_text(cx, b"E0202", span, 0, bytes_concat_all([context, b"|", num(a.expected), b"|", num(a.found)])),
+    Arity(a) -> report_text(cx, b"E0202", span, bytes_concat_all([context, b"|", num(a.expected), b"|", num(a.found)]),
+                            bytes_concat(b"function arity mismatch: ", context),
+                            bytes_concat_all([b"expected ", num(a.expected), b" parameter(s), found ", num(a.found)]), []),
     OccursTy(o) -> {
       let pv = print_ty(printer_new(), TyVar(o.v));
       let pt = print_ty(pv.p, o.ty);
-      report_text(cx, b"E0203", span, 1, bytes_concat_all([context, b"|", pv.s, b"|", pt.s]))
+      report_text(cx, b"E0203", span, bytes_concat_all([context, b"|", pv.s, b"|", pt.s]),
+                  bytes_concat(b"infinite type: ", context),
+                  bytes_concat_all([b"`", pv.s, b"` would have to equal `", pt.s, b"`"]),
+                  [b"this usually means a recursive value is missing a constructor"])
     },
     OccursRow(o) -> {
       let pv = print_row(printer_new(), row_open(o.v));
       let pr = print_row(pv.p, o.row);
-      report_text(cx, b"E0203", span, 1, bytes_concat_all([context, b"|", pv.s, b"|", pr.s]))
+      report_text(cx, b"E0203", span, bytes_concat_all([context, b"|", pv.s, b"|", pr.s]),
+                  bytes_concat(b"infinite effect row: ", context),
+                  bytes_concat_all([b"`", pv.s, b"` would have to equal `", pr.s, b"`"]),
+                  [b"an effect row cannot contain itself"])
     },
     RowMismatch(m) -> {
       let expected = resolve_r(cx, m.expected);
@@ -960,12 +1094,16 @@ fn report_unify(cx: Cx, e: UnifyError, span: Span, context: Bytes) -> Cx =
       let extra = atoms_difference(found.atoms, expected.atoms);
       let pe = print_row(printer_new(), expected);
       let pf = print_row(pe.p, found);
-      report_text(cx, b"E0302", span, if len(extra) > 0 { 1 } else { 0 }, bytes_concat_all([context, b"|", pe.s, b"|", pf.s]))
+      report_text(cx, b"E0302", span, bytes_concat_all([context, b"|", pe.s, b"|", pf.s]),
+                  bytes_concat(b"effect row mismatch: ", context),
+                  bytes_concat_all([b"expected ", pe.s, b", found ", pf.s]),
+                  if len(extra) > 0 { [bytes_concat(b"not permitted here: ", backticked(map(extra, atom_text), b", "))] } else { [] })
     },
   }
 
-fn report_text(cx: Cx, code: Bytes, span: Span, notes: Int, text: Bytes) -> Cx =
-  report(cx, { code: code, notes: notes, labels: [lab(cx.module, span, true)], text: text })
+fn report_text(cx: Cx, code: Bytes, span: Span, text: Bytes, message: Bytes, label: Bytes, notes: List<Bytes>) -> Cx =
+  report(cx, { code: code, notes: len(notes), labels: [lab(cx.module, span, true, label)], text: text,
+               message: message, notes_text: notes, severity: b"error" })
 
 fn bits_text(op: Bytes) -> Bytes =
   if op == b"bitand" { b"&" } else if op == b"bitor" { b"|" } else if op == b"bitxor" { b"^" }
@@ -987,16 +1125,24 @@ fn settle_bit_ops(cx: Cx) -> Cx = {
   fold(entries, {..cx, bit_ops: []}, |c: Cx, entry: BitOp| {
     let ty = resolve(c, entry.ty);
     match ty {
-      TyVar(_) -> err1(c, b"E0210", entry.span, 2),
-      TyCon(k) ->
-        if len(k.args) != 0 { err1(c, b"E0201", entry.span, 1) }
-        else if is_int_name(k.name) { c }
-        else if k.name == b"Bool" { err1(c, b"E0201", entry.span, 2) }
-        else { err1(c, b"E0201", entry.span, 1) },
-      _ -> err1(c, b"E0201", entry.span, 1),
+      TyVar(_) -> err1(c, b"E0210", entry.span, bytes_concat_all([b"the integer type of ", entry.what, b" is not determined"]),
+                       b"nothing here says which integer type this is",
+                       [b"`Int` and the eight fixed-width types are the integer types", b"annotate the operand, or write a literal that pins it"]),
+      TyCon(k) -> if len(k.args) == 0 && is_int_name(k.name) { c } else { bits_mismatch(c, entry, ty) },
+      _ -> bits_mismatch(c, entry, ty),
     }
   })
 }
+
+fn bits_mismatch(cx: Cx, entry: BitOp, ty: Type) -> Cx = {
+  let name = type_text(ty);
+  let notes = [b"`Int` and the eight fixed-width types are the integer types"];
+  err1(cx, b"E0201", entry.span, bytes_concat_all([entry.what, b" is not defined on `", name, b"`"]),
+       bytes_concat_all([b"has type `", name, b"`"]),
+       if name == b"Bool" { push(notes, bool_bits_note()) } else { notes })
+}
+
+fn bool_bits_note() -> Bytes = b"`Bool` has `&&`, `||` and `!`; the bit operators are integers only"
 
 fn expect_bits(cx: Cx, span: Span, found: Type, context: Bytes) -> Cx = {
   let o: Expected = expect(cx, span, t_int(), found, context);
@@ -1010,8 +1156,9 @@ fn expect_bits(cx: Cx, span: Span, found: Type, context: Bytes) -> Cx = {
 fn add_note_to_last(cx: Cx) -> Cx = {
   let n = len(cx.diags);
   if n == 0 { cx } else {
-    let last = at(cx.diags, n - 1);
-    {..cx, diags: set_at(cx.diags, n - 1, { code: last.code, notes: last.notes + 1, labels: last.labels, text: last.text })}
+    let last: Diag = at(cx.diags, n - 1);
+    {..cx, diags: set_at(cx.diags, n - 1, { code: last.code, notes: last.notes + 1, labels: last.labels, text: last.text, message: last.message,
+                                           notes_text: push(last.notes_text, bool_bits_note()), severity: last.severity })}
   }
 }
 
@@ -1091,9 +1238,19 @@ fn infer(cx: Cx, e: Expr) -> Inferred =
         TyRecord(fs) ->
           match field_get(fs, f.field.name) {
             Some(t) -> { cx: b.cx, ty: t, row: b.row },
-            None -> { let o: WithTy = new_ty(err1(b.cx, b"E0101", f.field.span, 1)); { cx: o.cx, ty: o.t, row: b.row } },
+            None -> {
+              let known = map(fs, |x: Field| x.name);
+              let o: WithTy = new_ty(err1(b.cx, b"E0101", f.field.span, bytes_concat_all([b"no field `", f.field.name, b"` on this record"]), b"unknown field",
+                                          [if len(known) == 0 { b"the record has no fields" } else { bytes_concat(b"available fields: ", backticked(known, b", ")) }]));
+              { cx: o.cx, ty: o.t, row: b.row }
+            },
           },
-        _ -> { let o: WithTy = new_ty(err1(b.cx, b"E0201", expr_span(f.base), 1)); { cx: o.cx, ty: o.t, row: b.row } },
+        other -> {
+          let o: WithTy = new_ty(err1(b.cx, b"E0201", expr_span(f.base), bytes_concat_all([b"cannot read field `", f.field.name, b"` here"]),
+                                      bytes_concat_all([b"this has type `", type_text(other), b"`, not a record"]),
+                                      [b"annotate the value so its record type is known"]));
+          { cx: o.cx, ty: o.t, row: b.row }
+        },
       }
     },
     EList(l) -> {
@@ -1118,7 +1275,8 @@ fn infer_var(cx: Cx, q: QName) -> Inferred = {
     None -> { let o: WithTy = new_ty(k.cx); { cx: o.cx, ty: o.t, row: row_empty() } },
     Some(key) ->
       if key.prelude && is_cell_builtin(key.name) {
-        let o: WithTy = new_ty(err1(k.cx, b"E0304", q.span, 1));
+        let o: WithTy = new_ty(err1(k.cx, b"E0304", q.span, bytes_concat_all([b"`", key.name, b"` must be called directly"]), b"used as a value",
+                                    [b"the atom it performs names the region of the cell it is given, so it cannot be passed around as a first-class function"]));
         { cx: o.cx, ty: o.t, row: row_empty() }
       } else {
         match env_lookup(k.cx.env, key.name) {
@@ -1229,7 +1387,11 @@ fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferr
   match resolve(c, f.ty) {
     TyFn(fn_) ->
       if len(fn_.params) != len(args) {
-        let reported: Cx = err_labels(c, b"E0202", [lab(c.module, span, true), lab(c.module, expr_span(func), false)], 0);
+        let n = len(fn_.params);
+        let reported: Cx = err_labels(c, b"E0202",
+          bytes_concat_all([b"this function takes ", num(n), b" argument", plural(n), b", but ", supplied(len(args))]),
+          [lab(c.module, span, true, bytes_concat_all([b"expected ", num(n), b", found ", num(len(args))])),
+           lab(c.module, expr_span(func), false, b"this is the function being called")], []);
         let j: WithRow = join(reported, span, j0.r, fn_.effects);
         { cx: j.cx, ty: fn_.ret, row: j.r }
       } else {
@@ -1254,14 +1416,23 @@ fn infer_app_general(cx: Cx, span: Span, func: Expr, args: List<Expr>) -> Inferr
       let j: WithRow = join(x.cx, span, j0.r, eff.r);
       { cx: j.cx, ty: ret.t, row: j.r }
     },
-    _ -> { let o: WithTy = new_ty(err1(c, b"E0204", expr_span(func), 1)); { cx: o.cx, ty: o.t, row: j0.r } },
+    other -> {
+      let o: WithTy = new_ty(err1(c, b"E0204", expr_span(func), b"this is not a function",
+                                  bytes_concat_all([b"has type `", type_text(other), b"`"]), [b"only function values can be applied"]));
+      { cx: o.cx, ty: o.t, row: j0.r }
+    },
   }
 }
+
+fn cell_form_name(form: CellForm) -> Bytes = match form { CGet -> b"cell_get", CSet -> b"cell_set", CUpdate -> b"cell_update" }
 
 fn infer_cell_op(cx: Cx, span: Span, args: List<Expr>, form: CellForm) -> Inferred = {
   let expected = match form { CGet -> 1, CSet -> 2, CUpdate -> 2 };
   let as_: { cx: Cx, tys: List<Type>, row: Row } = infer_all(cx, args, span);
-  if len(args) != expected { let o: WithTy = new_ty(arity_error(as_.cx, span)); { cx: o.cx, ty: o.t, row: as_.row } } else {
+  if len(args) != expected {
+    let o: WithTy = new_ty(arity_error(as_.cx, span, cell_form_name(form), expected, len(args), b"arguments"));
+    { cx: o.cx, ty: o.t, row: as_.row }
+  } else {
     let region: WithTy = new_ty(as_.cx);
     let elem: WithTy = new_ty(region.cx);
     let cell_ty = TyCon({ name: b"Cell", args: [region.t, elem.t] });
@@ -1279,7 +1450,11 @@ fn infer_cell_op(cx: Cx, span: Span, args: List<Expr>, form: CellForm) -> Inferr
     };
     let ret = match form { CGet -> elem.t, _ -> t_unit() };
     match region_of(resolve(after.cx, region.t)) {
-      None -> { cx: err1(after.cx, b"E0304", expr_span(at(args, 0)), 1), ty: ret, row: after.row },
+      None -> { cx: err1(after.cx, b"E0304", expr_span(at(args, 0)),
+                         bytes_concat_all([b"cannot tell which `with_cell` region `", cell_form_name(form), b"` acts on"]),
+                         b"this cell's region is unknown here",
+                         [b"call it on the binder introduced by `with_cell[r](..) { c -> .. }`, so the `cell.read[r]` / `cell.write[r]` atoms can be discharged at the region boundary"]),
+                ty: ret, row: after.row },
       Some(resource) -> {
         let modes = match form { CGet -> [MRead], CSet -> [MWrite], CUpdate -> [MRead, MWrite] };
         let out = fold(modes, { cx: after.cx, row: after.row }, |acc: { cx: Cx, row: Row }, m: Mode| {
@@ -1309,15 +1484,32 @@ fn bind_pattern(cx: Cx, p: Pattern, scrutinee: Type, out: List<{ name: Bytes, ty
       match info {
         None ->
           if is_bare(c.name) || (match declared_value(n.cx, c.name) { Some(_) -> true, None -> false }) {
-            let builtin = match builtin_type_arity(c.name.name.name) { Some(_) -> if c.name.name.name == b"Secret" { 3 } else { 1 }, None -> 0 };
-            { cx: err1(n.cx, b"E0101", c.name.span, 1 + builtin), out: out }
+            let nm = c.name.name.name;
+            let base = [b"constructors come from a `type` declaration with variants"];
+            let notes = match builtin_type_arity(nm) {
+              None -> base,
+              Some(_) -> {
+                let with_builtin = push(base, bytes_concat_all([b"`", nm, b"` is a builtin type and declares none"]));
+                if nm == b"Secret" {
+                  push(push(with_builtin, b"that is deliberate: a pattern binding the payload would be a one-line escape from every guarantee `Secret` makes"),
+                       b"use `secret_verify` to check a candidate, `secret_is_empty` to check presence, or hand the whole `Secret` to a handler clause")
+                } else { with_builtin }
+              },
+            };
+            { cx: err1(n.cx, b"E0101", c.name.span, bytes_concat_all([b"unknown constructor `", nm, b"`"]), b"not found", notes), out: out }
           } else { { cx: n.cx, out: out } },
         Some(ci) -> {
           let inst = instantiate(ci.scheme, n.cx.fresh);
           let c1: Cx = {..n.cx, fresh: inst.f};
           let shape = match inst.ty { TyFn(f) -> { fields: f.params, result: f.ret }, other -> { fields: [], result: other } };
           let c2: Cx = expect(c1, c.span, scrutinee, shape.result, b"pattern constructor").cx;
-          if len(shape.fields) != len(c.args) { { cx: err2(c2, b"E0202", c.span, ci.at, 0), out: out } }
+          let nf = len(shape.fields);
+          if nf != len(c.args) {
+            { cx: err2(c2, b"E0202", c.span,
+                       bytes_concat_all([b"constructor `", ci.name, b"` takes ", num(nf), b" field", plural(nf), b", but the pattern binds ", num(len(c.args))]),
+                       bytes_concat_all([b"expected ", num(nf), b" fields"]), ci.at, b"declared here", []),
+              out: out }
+          }
           else {
             fold(range(0, len(c.args)), { cx: c2, out: out }, |acc: Bound, i: Int| bind_pattern(acc.cx, at(c.args, i), at(shape.fields, i), acc.out))
           }
@@ -1336,16 +1528,25 @@ fn bind_pattern(cx: Cx, p: Pattern, scrutinee: Type, out: List<{ name: Bytes, ty
           let bound: Bound = fold(r.fields, { cx: cx, out: out }, |acc: Bound, f: { name: Ident, pat: Pattern }|
             match field_get(known, f.name.name) {
               Some(t) -> bind_pattern(acc.cx, f.pat, t, acc.out),
-              None -> { cx: err1(acc.cx, b"E0101", f.name.span, 0), out: acc.out },
+              None -> { cx: err1(acc.cx, b"E0101", f.name.span, bytes_concat_all([b"no field `", f.name.name, b"` on this record"]), b"unknown field", []), out: acc.out },
             });
           if r.rest { bound } else {
             let named = map(r.fields, |f: { name: Ident, pat: Pattern }| f.name.name);
             let omitted = filter(known, |k: Field| !contains_bytes(named, k.name));
-            if len(omitted) > 0 { { cx: err1(bound.cx, b"E0201", r.span, 1), out: bound.out } } else { bound }
+            if len(omitted) > 0 {
+              { cx: err1(bound.cx, b"E0201", r.span, b"record pattern does not name every field",
+                         bytes_concat(b"missing: ", backticked(map(omitted, |k: Field| k.name), b", ")),
+                         [b"add the missing fields, or end the pattern with `..`"]),
+                out: bound.out }
+            } else { bound }
           }
         },
         _ ->
-          if r.rest { { cx: err1(cx, b"E0201", r.span, 1), out: out } } else {
+          if r.rest {
+            { cx: err1(cx, b"E0201", r.span, b"cannot infer the record type of this pattern",
+                       b"a `..` pattern needs the record type to be known", [b"annotate the matched value"]),
+              out: out }
+          } else {
             let fs = fold(r.fields, { cx: cx, fs: [], out: out }, |acc: { cx: Cx, fs: List<Field>, out: List<{ name: Bytes, ty: Type }> }, f: { name: Ident, pat: Pattern }| {
               let t: WithTy = new_ty(acc.cx);
               let b: Bound = bind_pattern(t.cx, f.pat, t.t, acc.out);
@@ -1397,28 +1598,31 @@ fn check_exhaustive(cx: Cx, span: Span, scrutinee: Type, arms: List<MatchArm>) -
         else if c.name == b"Bool" {
           let covered = map(filter(unguarded, |a: MatchArm| match a.pat { PLit(l) -> (match l.lit { LBool(_) -> true, _ -> false }), _ -> false }),
                             |a: MatchArm| match a.pat { PLit(l) -> (match l.lit { LBool(b) -> b, _ -> false }), _ -> false });
-          filter([true, false], |b: Bool| !fold(covered, false, |acc: Bool, x: Bool| acc || x == b))
+          map(filter([true, false], |b: Bool| !fold(covered, false, |acc: Bool, x: Bool| acc || x == b)),
+              |b: Bool| if b { b"`true`" } else { b"`false`" })
         } else {
           let variants = filter(cx.ctors, |k: CtorInfo| k.type_name == c.name);
-          if len(variants) == 0 { [true] } else {
+          if len(variants) == 0 { [b"other values"] } else {
             let covered = fold(unguarded, [], |acc: List<Bytes>, a: MatchArm|
               match a.pat {
                 PCtor(pc) -> if fold(pc.args, true, |b: Bool, x: Pattern| b && is_irrefutable(x)) {
                                match covered_ctor(cx, pc.name) { Some(n) -> push(acc, n), None -> acc } } else { acc },
                 _ -> acc,
               });
-            map(filter(variants, |k: CtorInfo| !contains_bytes(covered, k.name)), |k: CtorInfo| true)
+            map(filter(variants, |k: CtorInfo| !contains_bytes(covered, k.name)), |k: CtorInfo| tick(k.simple_name))
           }
         },
-      _ -> [true],
+      _ -> [b"other values"],
     };
-    if len(missing) == 0 { cx } else { err1(cx, b"E0205", span, 1) }
+    if len(missing) == 0 { cx } else {
+      err1(cx, b"E0205", span, b"match does not cover every case", bytes_concat(b"not covered: ", join_with(missing, b", ")),
+           [b"add the missing arms, or a `_` arm"])
+    }
   }
 }
 
-// `missing_list_lengths`: the lengths the arms leave uncovered, as a list of flags — only its
-// emptiness reaches the diagnostic.
-fn missing_list_lengths(arms: List<MatchArm>) -> List<Bool> = {
+// `missing_list_lengths`: the lengths the arms leave uncovered, named as the reference names them.
+fn missing_list_lengths(arms: List<MatchArm>) -> List<Bytes> = {
   let shapes = fold(arms, { exact: [], rest_from: 0 - 1 }, |acc: { exact: List<Int>, rest_from: Int }, a: MatchArm|
     match a.pat {
       PList(l) ->
@@ -1430,12 +1634,12 @@ fn missing_list_lengths(arms: List<MatchArm>) -> List<Bool> = {
         } else { acc },
       _ -> acc,
     });
-  if shapes.rest_from < 0 { [true] } else {
-    lengths_to_flags(filter(range(0, shapes.rest_from), |n: Int| !contains_int(shapes.exact, n)))
-  }
+  let longest = fold(shapes.exact, 0, |acc: Int, n: Int| max(acc, n + 1));
+  let bound = if shapes.rest_from < 0 { longest } else { shapes.rest_from };
+  let below = map(filter(range(0, bound), |n: Int| !contains_int(shapes.exact, n)), |n: Int|
+    if n == 0 { b"the empty list" } else if n == 1 { b"lists of 1 element" } else { bytes_concat_all([b"lists of ", num(n), b" elements"]) });
+  if shapes.rest_from < 0 { push(below, bytes_concat(b"lists longer than ", num(max(longest - 1, 0)))) } else { below }
 }
-
-fn lengths_to_flags(xs: List<Int>) -> List<Bool> = map(xs, |x: Int| true)
 
 // --- Effects ----------------------------------------------------------------------------------
 
@@ -1445,20 +1649,63 @@ fn resolve_op(cx: Cx, eff: QName, op: Ident) -> { cx: Cx, hit: Option<{ info: Ef
     None -> { cx: e.cx, hit: None },
     Some(name) ->
       match effect_of(e.cx, name) {
-        None -> if name == cell() { { cx: err1(e.cx, b"E0103", eff.span, 1), hit: None } } else { { cx: e.cx, hit: None } },
+        None -> if name == cell() {
+                  { cx: err1(e.cx, b"E0103", eff.span, b"`cell` is a builtin effect and cannot be performed directly", b"not a declared effect",
+                             [b"read and write a region's cell with `cell_get(c)` and `cell_set(c, v)` inside `with_cell[r](..) { c -> .. }`"]),
+                    hit: None }
+                } else { { cx: e.cx, hit: None } },
         Some(info) ->
           match fold(info.ops, None, |acc: Option<OpInfo>, o: OpInfo| match acc { Some(_) -> acc, None -> if o.name == op.name { Some(o) } else { None } }) {
             Some(o) -> { cx: e.cx, hit: Some({ info: info, op: o }) },
-            None -> { cx: err2(e.cx, b"E0104", op.span, info.at, 1), hit: None },
+            None -> {
+              let known = map(info.ops, |o: OpInfo| o.name);
+              { cx: err2(e.cx, b"E0104", op.span, bytes_concat_all([b"effect `", eff.name.name, b"` has no operation `", op.name, b"`"]), b"not declared",
+                         info.at, bytes_concat_all([b"`", info.name, b"` is declared here"]),
+                         [if len(known) == 0 { bytes_concat_all([b"`", info.name, b"` declares no operations"]) }
+                          else { bytes_concat_all([b"operations of `", info.name, b"`: ", backticked(known, b", ")]) }]),
+                hit: None }
+            },
           },
       },
   }
 }
 
+// `as_written`: the effect as this module can write it, for a suggestion that has to parse.
+fn as_written(cx: Cx, eff: Bytes) -> Bytes = {
+  let scope = scope_of(cx);
+  match fold(scope.bound.effects, None, |acc: Option<Bytes>, b: Binding| match acc { Some(_) -> acc, None -> if b.qualified == eff { Some(b.name) } else { None } }) {
+    Some(n) -> n,
+    None -> {
+      let simple = match effect_of(cx, eff) { Some(info) -> info.simple_name, None -> eff };
+      match fold(scope.modules, None, |acc: Option<Bytes>, mb: ModBind|
+                 match acc {
+                   Some(_) -> acc,
+                   None -> match dlookup(at(cx.r.declarations, mb.target), NEffect, simple) {
+                     Some(d) -> if d.qualified == eff { Some(bytes_concat_all([mb.binder, b"::", simple])) } else { None },
+                     None -> None,
+                   },
+                 }) {
+        Some(w) -> w,
+        None -> simple,
+      }
+    },
+  }
+}
+
 fn resource_for(cx: Cx, info: EffectInfo, op: OpInfo, resource: Option<Ident>, span: Span) -> { cx: Cx, res: Option<Resource> } =
   match resource {
-    Some(r) -> if op.resource_param { { cx: cx, res: Some(RNamed(r.name)) } } else { { cx: err2(cx, b"E0304", r.span, op.at, 1), res: None } },
-    None -> if op.resource_param { { cx: err2(cx, b"E0304", span, op.at, 1), res: None } } else { { cx: cx, res: Some(RSingleton) } },
+    Some(r) -> if op.resource_param { { cx: cx, res: Some(RNamed(r.name)) } } else {
+      { cx: err2(cx, b"E0304", r.span, bytes_concat_all([b"`", info.name, b".", op.name, b"` is not resource-parameterized"]),
+                 b"unexpected resource label", op.at, b"declared without `[r]`",
+                 [bytes_concat_all([b"drop the label, or declare it as `", mode_key(op.mode), b" ", op.name, b"[r](..)`"])]),
+        res: None }
+    },
+    None -> if op.resource_param {
+      { cx: err2(cx, b"E0304", span, bytes_concat_all([b"`", info.name, b".", op.name, b"` is declared with a resource parameter"]),
+                 b"missing the `[resource]` label", op.at, bytes_concat_all([b"declared as `", op.name, b"[r](..)`"]),
+                 [bytes_concat_all([b"write `", as_written(cx, info.name), b".", op.name, b"[<resource>](..)`; the label is what lets two tests be scheduled together"])]),
+        res: None }
+    } else { { cx: cx, res: Some(RSingleton) } },
   }
 
 fn op_free_vars(op: OpInfo) -> List<Int> = {
@@ -1496,11 +1743,15 @@ fn infer_perform(cx: Cx, span: Span, eff: QName, op: Ident, resource: Option<Ide
         Some(resource_) -> {
           let shape: OpShape = instantiate_op(res.cx, hit.op);
           if len(shape.params) != len(args) {
-            { cx: err2(shape.cx, b"E0202", span, hit.op.at, 0), ty: shape.ret, row: as_.row }
+            let n = len(shape.params);
+            { cx: err2(shape.cx, b"E0202", span,
+                       bytes_concat_all([b"`", hit.info.simple_name, b".", hit.op.name, b"` takes ", num(n), b" argument", plural(n), b", but ", supplied(len(args))]),
+                       bytes_concat_all([b"expected ", num(n), b", found ", num(len(args))]), hit.op.at, b"declared here", []),
+              ty: shape.ret, row: as_.row }
           } else {
             let checked: Cx = fold(range(0, len(args)), shape.cx, |c: Cx, i: Int| expect(c, expr_span(at(args, i)), at(shape.params, i), at(as_.tys, i), b"operation argument").cx);
             let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
-            let noted: Cx = note_handoff(note_spawn(checked, hit.info, hit.op, args, as_.tys), hit.info, args, as_.tys);
+            let noted: Cx = note_handoff(note_spawn(checked, hit.info, hit.op, args, as_.tys), hit.info, hit.op, args, as_.tys);
             let c1: Cx = record_site(noted, atom, span, true);
             let op_row = resolve_r(c1, shape.row);
             let c2: Cx = fold(op_row.atoms, c1, |c: Cx, a: Atom| record_site(c, a, span, false));
@@ -1532,11 +1783,21 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
           None -> {..acc, cx: res.cx},
           Some(resource_) -> {
             let shape: OpShape = instantiate_op_for_clause(res.cx, hit.op);
-            if len(shape.params) != len(clause.params) { {..acc, cx: err2(shape.cx, b"E0202", clause.span, hit.op.at, 0)} } else {
+            if len(shape.params) != len(clause.params) {
+              let bound = len(clause.params);
+              {..acc, cx: err2(shape.cx, b"E0202", clause.span,
+                 bytes_concat_all([b"the clause for `", hit.info.name, b".", hit.op.name, b"` binds ", num(bound), b" parameter", plural(bound), b", but the operation takes ", num(len(shape.params))]),
+                 bytes_concat_all([b"expected ", num(len(shape.params)), b" parameters"]), hit.op.at, b"declared here", [])}
+            } else {
               let atom = { effect: hit.info.name, resource: resource_, mode: hit.op.mode };
               let key = { effect: hit.info.name, op: hit.op.name, res: resource_ };
               let dup = fold(acc.selected, false, |d: Bool, k: { effect: Bytes, op: Bytes, res: Resource }| d || k == key);
-              let c0: Cx = if dup { err1(shape.cx, b"E0105", clause.span, 1) } else { shape.cx };
+              let c0: Cx = if dup {
+                let res_text = match clause.resource { Some(r) -> bytes_concat_all([b"[", r.name, b"]"]), None -> b"" };
+                report(shape.cx, { code: b"E0105", notes: 1, labels: [lab(shape.cx.module, clause.span, true, b"this clause is unreachable")], text: b"",
+                                   message: bytes_concat_all([b"`", hit.info.name, b".", hit.op.name, res_text, b"` is handled more than once"]),
+                                   notes_text: [b"the first matching clause wins at run time"], severity: b"warning" })
+              } else { shape.cx };
               let pushed: Cx = {..c0, env: env_push(c0.env)};
               let bound: Cx = fold(range(0, len(clause.params)), pushed, |c: Cx, i: Int| {..c, env: env_bind(c.env, at(clause.params, i).name, mono(at(shape.params, i)))});
               let with_resume: Cx = match clause.resume {
@@ -1554,7 +1815,7 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
                                   b"a clause that binds a continuation returns the `handle`'s result").cx,
                 None -> {
                   let x: Expected = expect(popped, expr_span(clause.body), shape.ret, body_.ty, b"a handler clause returns the operation's result");
-                  if !x.ok && len(op_free_vars(hit.op)) > 0 { note_universal_clause(x.cx, hit.op) } else { x.cx }
+                  if !x.ok && len(op_free_vars(hit.op)) > 0 { note_universal_clause(x.cx, hit.info, hit.op) } else { x.cx }
                 },
               };
               let j: WithRow = join(checked, span, acc.clause_rows, body_.row);
@@ -1583,12 +1844,16 @@ fn infer_handle(cx: Cx, span: Span, body: Expr, clauses: List<HandleClause>, ret
   { cx: solved, ty: returned.ty, row: j2.r }
 }
 
-// The mismatch just reported gains a secondary at the declaration and two notes.
-fn note_universal_clause(cx: Cx, op: OpInfo) -> Cx = {
+// The mismatch just reported gains a secondary at the declaration and three notes.
+fn note_universal_clause(cx: Cx, info: EffectInfo, op: OpInfo) -> Cx = {
   let n = len(cx.diags);
   if n == 0 { cx } else {
-    let last = at(cx.diags, n - 1);
-    {..cx, diags: set_at(cx.diags, n - 1, { code: last.code, notes: last.notes + 3, labels: push(last.labels, lab(op.at.module, op.at.span, false)), text: last.text })}
+    let last: Diag = at(cx.diags, n - 1);
+    let notes = [bytes_concat_all([b"`", as_written(cx, info.name), b".", op.name, b"` is declared with a type variable, so a clause for it has to answer every type a perform site could ask for"]),
+                 b"a row carries atoms and no types, so the `handle` cannot see which type a perform site picked \xe2\x80\x94 answering a concrete one would be a value of a type the caller never asked for",
+                 b"declare the operation at the type it actually answers, or produce the result from one of the clause's own parameters"];
+    {..cx, diags: set_at(cx.diags, n - 1, { code: last.code, notes: last.notes + 3, labels: push(last.labels, lab(op.at.module, op.at.span, false, b"declared here")),
+                                           text: last.text, message: last.message, notes_text: append(last.notes_text, notes), severity: last.severity })}
   }
 }
 
@@ -1605,7 +1870,7 @@ fn open_region_span(cx: Cx, name: Bytes) -> Option<Span> =
 fn open_region(cx: Cx, name: Bytes, with_cell: Bool, span: Span) -> Cx =
   {..cx, open_regions: push(cx.open_regions, { name: name, with_cell: with_cell, span: span, simulate_depth: cx.simulate_depth, spawns: [], handoffs: [] })}
 
-type ClosedRegion = { cx: Cx, spawns: List<SpawnSite>, handoffs: List<SpawnSite> }
+type ClosedRegion = { cx: Cx, spawns: List<SpawnSite>, handoffs: List<HandoffSite> }
 
 fn close_region(cx: Cx) -> ClosedRegion = {
   let n = len(cx.open_regions);
@@ -1625,9 +1890,11 @@ fn note_spawn(cx: Cx, info: EffectInfo, op: OpInfo, args: List<Expr>, tys: List<
 
 // Every argument of a user-declared operation, against every open region: its handler can be
 // installed anywhere.
-fn note_handoff(cx: Cx, info: EffectInfo, args: List<Expr>, tys: List<Type>) -> Cx =
+fn note_handoff(cx: Cx, info: EffectInfo, op: OpInfo, args: List<Expr>, tys: List<Type>) -> Cx =
   if info.name == b"task" || len(cx.open_regions) == 0 { cx } else {
-    {..cx, open_regions: map(cx.open_regions, |r: OpenRegion| {..r, handoffs: append(r.handoffs, sites_of(args, tys))})}
+    let name = bytes_concat_all([info.simple_name, b".", op.name]);
+    let sites = map(range(0, len(args)), |i: Int| { span: expr_span(at(args, i)), ty: at(tys, i), op: name });
+    {..cx, open_regions: map(cx.open_regions, |r: OpenRegion| {..r, handoffs: append(r.handoffs, sites)})}
   }
 
 // The bindings a region could store into: what is in scope when it opens, paired with where its
@@ -1695,7 +1962,11 @@ fn infer_with_cell(cx: Cx, span: Span, resource: Ident, init: Expr, binder: Iden
 
 fn infer_with_region(cx: Cx, region: Ident, body: Expr) -> Inferred = {
   let c0: Cx = match open_region_span(cx, region.name) {
-    Some(open) -> err2(cx, b"E0447", region.span, { module: cx.module, span: open }, 2),
+    Some(open) -> err2(cx, b"E0447", region.span, bytes_concat_all([b"region `", region.name, b"` is already open here"]),
+                       b"a second region under the same name", { module: cx.module, span: open },
+                       bytes_concat_all([b"`", region.name, b"` opens here and is still open"]),
+                       [b"the brand is the name, so the two regions' values would have one type and closing the inner one would free what the outer one still holds",
+                        b"give the inner region a different name"]),
     None -> cx,
   };
   let outer = outer_bindings(c0, body);
@@ -1820,9 +2091,16 @@ fn check_fns(cx: Cx, m: Mod) -> Cx = {
       IFn(def) ->
         if contains_bytes(acc.names, def.name.name) {
           let prev = fold(acc.fns, dummy_span(), |s: Span, f: FnDef| if f.name.name == def.name.name { f.name.span } else { s });
-          {..acc, cx: duplicate(acc.cx, def.name, { module: acc.cx.module, span: prev })}
-        } else if is_cell_builtin(def.name.name) { {..acc, cx: err1(acc.cx, b"E0105", def.name.span, 1)} }
-        else if def.name.name == compare_values_name() { {..acc, cx: err1(acc.cx, b"E0105", def.name.span, 2)} }
+          {..acc, cx: duplicate(acc.cx, def.name, { module: acc.cx.module, span: prev }, b"function")}
+        } else if is_cell_builtin(def.name.name) {
+          {..acc, cx: err1(acc.cx, b"E0105", def.name.span, bytes_concat_all([b"`", def.name.name, b"` is a builtin"]), b"cannot be redefined",
+                           [b"region-scoped cell access is a call form, not an ordinary function"])}
+        }
+        else if def.name.name == compare_values_name() {
+          {..acc, cx: err1(acc.cx, b"E0105", def.name.span, b"`compare_values` is a builtin", b"cannot be redefined",
+                           [b"it is the order `Map` iterates in, and `derive ord` builds a dictionary out of it \xe2\x80\x94 a module that could redefine it would give one type two orders",
+                            b"`compare` is the same operation under a name you may shadow"])}
+        }
         else { { cx: acc.cx, fns: push(acc.fns, def), names: push(acc.names, def.name.name) } },
       _ -> acc,
     });
@@ -1991,9 +2269,14 @@ fn check_upper_bound(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx = {
   let dec = resolve_r(cx, declared);
   let extra = atoms_difference(inf.atoms, dec.atoms);
   let c1: Cx = if len(extra) == 0 { cx } else {
-    let sites = fold(extra, [], |acc: List<Label>, a: Atom| match site_for(cx, a) { Some(s) -> push(acc, lab(s.module, s.span, true)), None -> acc });
-    let primaries = if len(sites) == 0 { [lab(cx.module, expr_span(def.body), true)] } else { sites };
-    err_labels(cx, b"E0302", push(primaries, lab(cx.module, ann_span, false)), 1)
+    let names = backticked(map(extra, atom_text), b", ");
+    let sites = fold(extra, [], |acc: List<Label>, a: Atom|
+      match site_for(cx, a) { Some(s) -> push(acc, lab(s.module, s.span, true, bytes_concat_all([b"performs `", atom_text(a), b"`"]))), None -> acc });
+    let primaries = if len(sites) == 0 { [lab(cx.module, expr_span(def.body), true, b"this body performs more than it declares")] } else { sites };
+    err_labels(cx, b"E0302",
+               bytes_concat_all([b"effect", plural(len(extra)), b" not permitted by the signature of `", def.name.name, b"`: ", names]),
+               push(primaries, lab(cx.module, ann_span, false, bytes_concat(b"declared row is ", row_text(dec)))),
+               [bytes_concat_all([b"add ", names, b" to the `/ {..}` annotation, or handle ", if len(extra) == 1 { b"it" } else { b"them" }, b" inside `", def.name.name, b"`"])])
   };
   match inf.tail {
     None -> c1,
@@ -2002,7 +2285,11 @@ fn check_upper_bound(cx: Cx, def: FnDef, declared: Row, inferred: Row) -> Cx = {
         let u = unify_row(c1.subst, c1.fresh, { atoms: [], tail: dec.tail }, row_open(v));
         let c2: Cx = with_unified(c1, u);
         match u.err {
-          Some(_) -> err_labels(c2, b"E0302", [lab(c2.module, expr_span(def.body), true), lab(c2.module, ann_span, false)], 1),
+          Some(_) -> err_labels(c2, b"E0302",
+                       bytes_concat_all([b"the signature of `", def.name.name, b"` does not permit the effects its body forwards"]),
+                       [lab(c2.module, expr_span(def.body), true, bytes_concat(b"body has row ", row_text(inf))),
+                        lab(c2.module, ann_span, false, b"declared row cannot absorb it")],
+                       [b"add the missing effect variable to the generic list, or widen the annotation"]),
           None -> c2,
         }
       },
@@ -2013,21 +2300,71 @@ fn settle_numerics(cx: Cx) -> Cx = {
   let entries = cx.numerics;
   fold(entries, {..cx, numerics: []}, |c: Cx, entry: Numeric| {
     let ty = resolve(c, entry.ty);
+    let what = if is_ordered(entry.op) { b"ordered comparison" } else { b"arithmetic" };
     match ty {
-      TyVar(_) -> err1(c, b"E0210", entry.span, 2),
+      TyVar(_) -> err1(c, b"E0210", entry.span, bytes_concat_all([b"the numeric type of this ", what, b" is not determined"]),
+                       b"nothing here says which numeric type this is",
+                       [b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`, and there is no tower",
+                        b"annotate the operand, or write a literal that pins it (`1`, `1.0`, `1m`)"]),
       TyCon(k) ->
-        if len(k.args) != 0 { err1(c, b"E0201", entry.span, 1) }
+        if len(k.args) != 0 { numeric_mismatch(c, entry, ty, what) }
         else if is_int_name(k.name) || k.name == b"Float" { c }
-        else if k.name == b"Decimal" { if entry.op == b"div" { err1(c, b"E0209", entry.span, 2) } else { c } }
-        else { err1(c, b"E0201", entry.span, 1) },
-      _ -> err1(c, b"E0201", entry.span, 1),
+        else if k.name == b"Decimal" {
+          if entry.op == b"div" {
+            err1(c, b"E0209", entry.span, b"`/` is not defined on `Decimal`", b"the exact quotient of two decimals is not a decimal",
+                 [b"an operator would have to round, and a rounding nobody wrote down is the defect `Decimal` exists to prevent",
+                  b"call `decimal_div(a, b, 2, HalfEven)` and say how to round"])
+          } else { c }
+        }
+        else { numeric_mismatch(c, entry, ty, what) },
+      _ -> numeric_mismatch(c, entry, ty, what),
     }
   })
 }
 
+fn op_text(op: Bytes) -> Bytes =
+  if op == b"add" { b"+" } else if op == b"sub" { b"-" } else if op == b"mul" { b"*" } else if op == b"div" { b"/" }
+  else if op == b"rem" { b"%" } else if op == b"lt" { b"<" } else if op == b"le" { b"<=" } else if op == b"gt" { b">" }
+  else if op == b"ge" { b">=" } else { op }
+
+fn numeric_mismatch(cx: Cx, entry: Numeric, ty: Type, what: Bytes) -> Cx =
+  err1(cx, b"E0201", entry.span, bytes_concat_all([b"`", op_text(entry.op), b"` is not defined on `", type_text(ty), b"`"]),
+       bytes_concat(what, b" here"), [b"the numeric types are `Int`, the eight fixed-width integers, `Float` and `Decimal`"])
+
+// `writable`: the resolved type, rendered, when every variable left in it is one the signature's
+// generic list binds — so the author can paste it.
+fn writable(cx: Cx, sig: Sig, t: Type) -> Option<Bytes> = {
+  let resolved = resolve(cx, t);
+  let bound = map_fold(sig.ty_params, [], |acc: List<Int>, k: Bytes, p: Type| match resolve(cx, p) { TyVar(v) -> push(acc, v), _ -> acc });
+  let found = free_vars(subst_new(), resolved, { tys: [], rows: [] }).tys;
+  if fold(found, false, |b: Bool, v: Int| b || !contains_int(bound, v)) { None } else { Some(type_text(resolved)) }
+}
+
 fn require_written_signature(cx: Cx, def: FnDef, sig: Sig) -> Cx = {
-  let params = fold(def.params, cx, |c: Cx, p: Param| match p.ty { Some(_) -> c, None -> err1(c, b"E0126", p.span, 1) });
-  match def.ret { Some(_) -> params, None -> err1(params, b"E0126", def.name.span, 1) }
+  let why = b"a signature is a claim about what a definition means, so it is written rather than inferred; the effect row is the exception and stays inferred";
+  let params = fold(range(0, len(def.params)), cx, |c: Cx, i: Int| {
+    let p = at(def.params, i);
+    match p.ty {
+      Some(_) -> c,
+      None -> {
+        let label = match writable(c, sig, at(sig.params, i)) {
+          Some(shown) -> bytes_concat_all([b"write `", p.name.name, b": ", shown, b"`"]),
+          None -> b"write a type here",
+        };
+        err1(c, b"E0126", p.span, bytes_concat_all([b"parameter `", p.name.name, b"` has no written type"]), label, [why])
+      },
+    }
+  });
+  match def.ret {
+    Some(_) -> params,
+    None -> {
+      let label = match writable(params, sig, sig.ret) {
+        Some(shown) -> bytes_concat_all([b"write `-> ", shown, b"`"]),
+        None -> b"write a return type here",
+      };
+      err1(params, b"E0126", def.name.span, bytes_concat_all([b"`", def.name.name, b"` has no written return type"]), label, [why])
+    },
+  }
 }
 
 fn close_unreachable_row(cx: Cx, sig: Sig) -> Cx =
@@ -2087,10 +2424,35 @@ fn check_determinism(cx: Cx, def: TestDef, footprint: List<Atom>) -> Cx =
         if !info.nondet { c } else {
           let site = site_for(c, atom);
           let (span, direct) = match site { Some(s) -> (s.span, s.direct), None -> (expr_span(def.body), false) };
-          let notes = if direct { 2 } else { 3 };
-          err_labels(c, b"E0412", [lab(c.module, span, true), lab(c.module, def.name_span, false)], notes)
+          let a = atom_text(atom);
+          let remedy = if contains_bytes(simulated_names(), atom.effect) { b"handle it here, e.g. `simulate { <body> }`" }
+                       else { bytes_concat_all([b"handle it here, e.g. `handle <body> with { ", example_clause(c, info, atom), b" }`"]) };
+          let indirect = if direct { [] } else { [bytes_concat_all([b"`", a, b"` is performed inside something this expression calls"])] };
+          err_labels(c, b"E0412", b"nondeterministic effect in a deterministic test",
+                     [lab(c.module, span, true, bytes_concat_all([if direct { b"performs `" } else { b"reaches `" }, a, b"`, and `", atom.effect, b"` is declared `nondet`"])),
+                      lab(c.module, def.name_span, false, bytes_concat_all([b"test `", def.name, b"` is deterministic"]))],
+                     append(indirect, [remedy, b"or declare this `test/nondet`, which opts out of the cache and re-runs every time"]))
         },
     })
+
+// `example_clause`: a clause the reader could paste, for the operation the atom names.
+fn example_clause(cx: Cx, info: EffectInfo, atom: Atom) -> Bytes = {
+  let written = as_written(cx, info.name);
+  let named = match atom.resource { RNamed(_) -> true, RSingleton -> false };
+  let first = |ok: (OpInfo) -> Bool| fold(info.ops, None, |acc: Option<OpInfo>, o: OpInfo| match acc { Some(_) -> acc, None -> if ok(o) { Some(o) } else { None } });
+  let op = match first(|o: OpInfo| mode_eq(o.mode, atom.mode) && named == o.resource_param) {
+    Some(o) -> Some(o),
+    None -> match first(|o: OpInfo| mode_eq(o.mode, atom.mode)) { Some(o) -> Some(o), None -> list_at(info.ops, 0) },
+  };
+  match op {
+    Some(o) -> {
+      let resource = match atom.resource { RNamed(r) -> if o.resource_param { bytes_concat_all([b"[", r, b"]"]) } else { b"" }, RSingleton -> b"" };
+      let args = join_with(map(range(0, len(o.params)), |i: Int| bytes_concat(b"a", num(i))), b", ");
+      bytes_concat_all([written, b".", o.name, resource, b"(", args, b") -> <value>"])
+    },
+    None -> bytes_concat(written, b".<op>() -> <value>"),
+  }
+}
 
 fn check_laws(cx: Cx, m: Mod) -> Cx = {
   let walked = fold(m.module.items, { cx: cx, labels: [] }, |acc: { cx: Cx, labels: List<{ name: Bytes, span: Span }> }, it: Item|
@@ -2098,7 +2460,9 @@ fn check_laws(cx: Cx, m: Mod) -> Cx = {
       ILaw(def) -> {
         let c: Cx = {..acc.cx, scope: acc.cx.scope + 1};
         match fold(acc.labels, None, |p: Option<Span>, l: { name: Bytes, span: Span }| match p { Some(_) -> p, None -> if l.name == def.name { Some(l.span) } else { None } }) {
-          Some(first) -> {..acc, cx: err2(c, b"E0105", def.name_span, { module: c.module, span: first }, 1)},
+          Some(first) -> {..acc, cx: err2(c, b"E0105", def.name_span, bytes_concat_all([b"two laws are labelled ", debug_quoted(def.name)]),
+                                          b"relabelled here", { module: c.module, span: first }, b"first labelled here",
+                                          [b"a law is keyed `<module>.<label>`, so one label names one claim"])},
           None -> { cx: check_law(c, m, def), labels: push(acc.labels, { name: def.name, span: def.name_span }) },
         }
       },
@@ -2106,6 +2470,15 @@ fn check_laws(cx: Cx, m: Mod) -> Cx = {
     });
   walked.cx
 }
+
+// `{:?}` over a label: quoted, with `"` and `\` escaped.
+fn debug_quoted(s: Bytes) -> Bytes =
+  bytes_concat_all([b"\"",
+    bytes_concat_all(map(range(0, bytes_len(s)), |i: Int| {
+      let c = bytes_at(s, i);
+      if c == 34 { b"\\\"" } else if c == 92 { b"\\\\" } else if c == 10 { b"\\n" } else if c == 9 { b"\\t" } else { bytes_slice(s, i, i + 1) }
+    })),
+    b"\""])
 
 fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
   let cx: Cx = {..cx0, ty_params: map_new(), row_params: map_new(), performs: [], auto_ty_params: true};
@@ -2122,14 +2495,14 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
     Some(g) -> {
       let o: Inferred = infer({..bound, performs: []}, g);
       let c: Cx = expect(o.cx, expr_span(g), t_bool(), o.ty, b"a `where` guard states a proposition").cx;
-      check_spec_purity(c, [], false, expr_span(g), resolve_r(c, o.row))
+      check_spec_purity(c, SSWhere, [], expr_span(g), resolve_r(c, o.row))
     },
     None -> bound,
   };
   let body: Inferred = infer({..guarded, performs: []}, def.body);
   let c2: Cx = expect(body.cx, expr_span(def.body), t_bool(), body.ty, b"a law states a proposition").cx;
   let row = resolve_r(c2, body.row);
-  let c3: Cx = if def.host { c2 } else { check_spec_purity(c2, [seed_atom()], true, expr_span(def.body), row) };
+  let c3: Cx = if def.host { c2 } else { check_spec_purity(c2, SSLawBody, [seed_atom()], expr_span(def.body), row) };
   let popped: Cx = {..c3, env: env_pop(c3.env)};
   let binders = map(range(0, len(def.binders)), |i: Int| { name: at(def.binders, i).name.name, ty: resolve(popped, at(types.ts, i)) });
   {..popped, ty_params: map_new(), row_params: map_new(),
@@ -2141,13 +2514,32 @@ fn check_law(cx0: Cx, m: Mod, def: LawDef) -> Cx = {
 // would perform or quantify over rows, and a `Cell`, `Task` or `Secret` has no generator.
 fn law_binder(cx: Cx, b: Binder) -> { cx: Cx, t: Type } =
   match handler_mention(cx, b.ty) {
-    Some(span) -> new_ty(err1(cx, b"E0418", span, 3)),
+    Some(span) -> new_ty(err1(cx, b"E0418", span, b"`forall` cannot quantify over a handler", b"a handler is syntax, not a value",
+                              [b"`handle body with { .. }` is an expression form: there is no type a handler inhabits and no value for a binder to range over",
+                               b"a handler-parametric law would take a handler type, a `Value::Handler`, a normalization story and a generator, and the evidence such a law could produce is too weak to be worth that yet",
+                               b"quantify over the values the handler would answer with instead"])),
     None ->
-      if written_row_reason(b.ty) { new_ty(err1(cx, b"E0418", ty_span(b.ty), 1)) } else {
-        let o: WithTy = conv_type(cx, b.ty);
-        if ungeneratable(o.cx, o.t, []) { { cx: err1(o.cx, b"E0418", ty_span(b.ty), 1), t: o.t } } else { o }
+      match written_row_reason(b.ty) {
+        Some(reason) -> new_ty(unquantifiable(cx, b, reason)),
+        None -> {
+          let o: WithTy = conv_type(cx, b.ty);
+          match ungeneratable(o.cx, o.t, []) { Some(reason) -> { cx: unquantifiable(o.cx, b, reason), t: o.t }, None -> o }
+        },
       },
   }
+
+fn unquantifiable(cx: Cx, b: Binder, reason: Bytes) -> Cx =
+  err1(cx, b"E0418", ty_span(b.ty), bytes_concat_all([b"`forall` cannot quantify over `", b.name.name, b"`"]), reason,
+       [b"a law over a type nothing can produce is a claim nothing can ever check, so it is refused here rather than reported as a gap at discharge time"])
+
+// `Row`'s `Display`: the raw variable, not the printer's letter.
+fn row_display(r: Row) -> Bytes = {
+  let atoms = join_with(map(r.atoms, atom_text), b", ");
+  match r.tail {
+    None -> bytes_concat_all([b"{", atoms, b"}"]),
+    Some(v) -> if len(r.atoms) == 0 { bytes_concat_all([b"{| e", num(v), b"}"]) } else { bytes_concat_all([b"{", atoms, b" | e", num(v), b"}"]) },
+  }
+}
 
 fn handler_named(cx: Cx, name: Bytes, span: Span) -> Option<Span> = {
   let is_handler = name == b"Handler" || name == b"handler";
@@ -2171,46 +2563,85 @@ fn handler_mention(cx: Cx, te: TypeExpr) -> Option<Span> =
 fn first_handler_mention(cx: Cx, ts: List<TypeExpr>) -> Option<Span> =
   fold(ts, None, |acc: Option<Span>, t: TypeExpr| match acc { Some(_) -> acc, None -> handler_mention(cx, t) })
 
-fn written_row_reason(te: TypeExpr) -> Bool =
+fn first_reason<a>(xs: List<a>, f: (a) -> Option<Bytes>) -> Option<Bytes> =
+  fold(xs, None, |acc: Option<Bytes>, x: a| match acc { Some(_) -> acc, None -> f(x) })
+
+fn written_row_reason(te: TypeExpr) -> Option<Bytes> =
   match te {
-    TVar(_) -> false,
-    TUnit(_) -> false,
-    TBad(_) -> false,
-    TCon(c) -> fold(c.args, false, |b: Bool, a: TypeExpr| b || written_row_reason(a)),
-    TRecord(r) -> fold(r.fields, false, |b: Bool, f: { name: Ident, ty: TypeExpr }| b || written_row_reason(f.ty)),
+    TVar(_) -> None,
+    TUnit(_) -> None,
+    TBad(_) -> None,
+    TCon(c) -> first_reason(c.args, written_row_reason),
+    TRecord(r) -> first_reason(r.fields, |f: { name: Ident, ty: TypeExpr }| written_row_reason(f.ty)),
     TFn(f) -> {
-      let own = match f.effects { Some(row) -> (match row.tail { Some(_) -> true, None -> len(row.atoms) > 0 }), None -> false };
-      own || fold(f.params, false, |b: Bool, p: TypeExpr| b || written_row_reason(p)) || written_row_reason(f.ret)
+      let own = match f.effects {
+        Some(row) -> match row.tail {
+          Some(_) -> Some(b"an effect variable has no binder here, and a law quantifies over values rather than over rows"),
+          None -> match list_at(row.atoms, 0) {
+            Some(a) -> Some(bytes_concat_all([b"applying this inside the body would perform `", qname_text(a.eff), b"`, and a law body is pure"])),
+            None -> None,
+          },
+        },
+        None -> None,
+      };
+      match own { Some(_) -> own, None -> match first_reason(f.params, written_row_reason) { Some(r) -> Some(r), None -> written_row_reason(f.ret) } }
     },
   }
 
-fn ungeneratable(cx: Cx, ty: Type, seen: List<Bytes>) -> Bool =
+fn ungeneratable(cx: Cx, ty: Type, seen: List<Bytes>) -> Option<Bytes> =
   match ty {
-    TyVar(_) -> false,
+    TyVar(_) -> None,
     TyCon(c) ->
-      if c.name == b"Cell" || c.name == b"Task" || c.name == b"Secret" { true }
-      else if fold(c.args, false, |b: Bool, a: Type| b || ungeneratable(cx, a, seen)) { true }
-      else if contains_bytes(seen, c.name) { false }
+      if c.name == b"Cell" { Some(b"a `Cell` is created by `with_cell` and exists only inside its region") }
+      else if c.name == b"Task" { Some(b"a `Task` is a key into the scheduler of the `simulate` region that spawned it") }
+      else if c.name == b"Secret" { Some(b"a `Secret` is a credential: quantifying over one would have the generator mint credentials and the shrinker print counterexamples") }
       else {
-        let inner = push(seen, c.name);
-        fold(cx.ctors, false, |b: Bool, k: CtorInfo|
-          b || (k.type_name == c.name && fold(k.fields, false, |bb: Bool, f: Type| bb || ungeneratable(cx, f, inner))))
+        match first_reason(c.args, |a: Type| ungeneratable(cx, a, seen)) {
+          Some(r) -> Some(r),
+          None ->
+            if contains_bytes(seen, c.name) { None } else {
+              let inner = push(seen, c.name);
+              first_reason(filter(cx.ctors, |k: CtorInfo| k.type_name == c.name), |k: CtorInfo| first_reason(k.fields, |f: Type| ungeneratable(cx, f, inner)))
+            },
+        }
       },
     TyFn(f) ->
-      if !row_is_pure(f.effects) { true }
-      else { fold(f.params, false, |b: Bool, p: Type| b || ungeneratable(cx, p, seen)) || ungeneratable(cx, f.ret, seen) },
-    TyRecord(fs) -> fold(fs, false, |b: Bool, f: Field| b || ungeneratable(cx, f.ty, seen)),
+      if !row_is_pure(f.effects) { Some(bytes_concat_all([b"a function with row ", row_display(f.effects), b" cannot be applied inside a pure body"])) }
+      else { match first_reason(f.params, |p: Type| ungeneratable(cx, p, seen)) { Some(r) -> Some(r), None -> ungeneratable(cx, f.ret, seen) } },
+    TyRecord(fs) -> first_reason(fs, |f: Field| ungeneratable(cx, f.ty, seen)),
   }
 
+type SpecSite = | SSRequires | SSEnsures | SSWhere | SSLawBody
+
+fn site_phrase(s: SpecSite) -> Bytes =
+  match s { SSRequires -> b"a `requires` clause", SSEnsures -> b"an `ensures` clause", SSWhere -> b"a `where` guard", SSLawBody -> b"a law body" }
+
+fn site_short(s: SpecSite) -> Bytes =
+  match s { SSRequires -> b"`requires`", SSEnsures -> b"`ensures`", SSWhere -> b"`where` guard", SSLawBody -> b"law body" }
+
 // `check_spec_purity`: every atom past the allowed set is `E0417`, and an open row too.
-fn check_spec_purity(cx: Cx, allowed: List<Atom>, law_body: Bool, at_: Span, row: Row) -> Cx = {
-  let extra = if law_body { 1 } else { 0 };
+fn check_spec_purity(cx: Cx, site: SpecSite, allowed: List<Atom>, at_: Span, row: Row) -> Cx = {
+  let law_body = match site { SSLawBody -> true, _ -> false };
   let c1: Cx = fold(atoms_difference(row.atoms, allowed), cx, |c: Cx, atom: Atom| {
-    let site = site_for(c, atom);
-    let (span, direct) = match site { Some(s) -> (s.span, s.direct), None -> (at_, false) };
-    err_labels(c, b"E0417", [lab(c.module, span, true), lab(c.module, at_, false)], 3 + len(allowed) + extra)
+    let found = site_for(c, atom);
+    let (span, direct) = match found { Some(s) -> (s.span, s.direct), None -> (at_, false) };
+    let fixed = [b"a claim that can perform an effect can change what it observes: an obligation that writes to the resource it judges reports the post-state it caused",
+                 b"and a discharge evaluates it hundreds of times, against a world nothing set up"];
+    let carried = fold(allowed, fixed, |acc: List<Bytes>, a: Atom|
+      push(acc, bytes_concat_all([b"a law body may carry `", atom_text(a), b"` \xe2\x80\x94 the seed a `simulate` region reads \xe2\x80\x94 and nothing else"])));
+    let hosted = if law_body { push(carried, b"a law whose body reaches the world is written `law/host`, which declares the relaxation rather than taking it silently, and can never be `proved`") } else { carried };
+    err_labels(c, b"E0417", bytes_concat(site_phrase(site), b" cannot perform an effect"),
+               [lab(c.module, span, true, bytes_concat_all([if direct { b"performs `" } else { b"reaches `" }, atom_text(atom), b"`"])),
+                lab(c.module, at_, false, bytes_concat_all([b"this ", site_short(site), b" must be pure"]))],
+               push(hosted, bytes_concat_all([b"compute this with a pure function, or handle `", atom.effect, b"` inside the definition and state a claim about its result"])))
   });
-  match row.tail { Some(_) -> err1(c1, b"E0417", at_, 2), None -> c1 }
+  match row.tail {
+    Some(_) -> err1(c1, b"E0417", at_, bytes_concat_all([b"the row of this ", site_short(site), b" is not known to be empty"]),
+                    bytes_concat(b"has row ", row_text(row)),
+                    [b"an effect variable is pure for some instantiations and not for others, and a claim has to hold for every one",
+                     b"call something whose row is closed and empty here"]),
+    None -> c1,
+  }
 }
 
 // --- Spec clauses ------------------------------------------------------------------------------
@@ -2257,7 +2688,7 @@ fn check_clause(cx: Cx, def: FnDef, clause: SpecClause, env: SpecEnv) -> Cx = {
   let o: Inferred = infer({..with_result, spec_kind: Some(clause.kind)}, clause.expr);
   let popped: Cx = {..o.cx, spec_kind: outer, env: env_pop(o.cx.env)};
   let c1: Cx = expect(popped, expr_span(clause.expr), t_bool(), o.ty, b"a spec clause states a proposition").cx;
-  check_spec_purity(c1, [], false, clause.span, resolve_r(c1, o.row))
+  check_spec_purity(c1, match clause.kind { SRequires -> SSRequires, SEnsures -> SSEnsures }, [], clause.span, resolve_r(c1, o.row))
 }
 
 // `result` is introduced beside the parameters, so a definition that has both is reported.
@@ -2265,7 +2696,12 @@ fn check_result_shadow(cx: Cx, def: FnDef) -> Cx =
   match fold(def.spec, None, |acc: Option<Span>, c: SpecClause| match acc { Some(_) -> acc, None -> match c.kind { SEnsures -> Some(c.span), SRequires -> None } }) {
     None -> cx,
     Some(ensures) -> fold(def.params, cx, |c: Cx, p: Param|
-      if p.name.name != result_name() { c } else { err_labels(c, b"E0105", [lab(c.module, p.name.span, true), lab(c.module, ensures, false)], 1) }),
+      if p.name.name != result_name() { c } else {
+        err_labels(c, b"E0105", bytes_concat_all([b"`result` is bound twice on `", def.name.name, b"`"]),
+                   [lab(c.module, p.name.span, true, b"this parameter is named `result`"),
+                    lab(c.module, ensures, false, b"`ensures` binds `result` to the return value")],
+                   [b"rename the parameter; a definition with no `ensures` may still call one `result`"])
+      }),
   }
 
 // --- Derivability ------------------------------------------------------------------------------
@@ -2329,11 +2765,40 @@ fn derivable(d: Deriver, ty: Type, adts: List<AdtShape>, assumed: List<Int>, vis
 // A flexible variable is a type argument nothing pinned rather than one that is wrong.
 fn skipped_flexible(cx: Cx, b: Blocked) -> Bool = match b.why { WUnconstrained(v) -> !is_rigid_ty(cx.subst, v), _ -> false }
 
-fn why_notes_for_map_key(w: Why) -> Int =
-  match w { WFloatIsNotOrdered -> 2, WFunction -> 1, WHandle -> 1, WNullInsideOption -> 0, WSecret -> 2, WUnconstrained(_) -> 1 }
+// `secret_notes`: the refusal's reason and its advice.
+fn secret_notes(d: Deriver) -> List<Bytes> =
+  match refusal_note(WSecret, d) { Some(n) -> [secret_reason(d), n], None -> [secret_reason(d)] }
 
-fn why_notes_for_constraint(w: Why) -> Int =
-  match w { WFunction -> 1, WHandle -> 1, WFloatIsNotOrdered -> 2, WNullInsideOption -> 2, WSecret -> 2, WUnconstrained(_) -> 1 }
+// The simple name of the handle type a `WHandle` refused: `Cell` or `Task`.
+fn handle_what(t: Type) -> Bytes = match t { TyCon(c) -> c.name, _ -> b"" }
+
+// The parameter name a refused rigid variable was declared under, else the rendered variable.
+fn param_name(params: List<RigidParam>, v: Int, fallback: Bytes) -> Bytes =
+  fold(params, fallback, |acc: Bytes, p: RigidParam| if p.v == v { p.name } else { acc })
+
+fn why_notes_for_map_key(w: Why, b: Blocked, blocker: Bytes, params: List<RigidParam>) -> List<Bytes> =
+  match w {
+    WFloatIsNotOrdered -> [b"`Float` has no total order: `NaN` is not equal to itself, so a key would have no position the next lookup could find it at",
+                           b"use `Decimal` for exact numbers, or key on something else"],
+    WFunction -> [b"a function has no order to sort keys by"],
+    WHandle -> [bytes_concat_all([b"a `", handle_what(b.ty), b"` names a location rather than a value, so two of them have no order"])],
+    WNullInsideOption -> [],
+    WSecret -> secret_notes(DOrd),
+    WUnconstrained(v) -> [bytes_concat_all([b"add `where derivable(ord, ", param_name(params, v, blocker), b")` to this signature; the body may then                          assume it"])],
+  }
+
+fn why_notes_for_constraint(w: Why, d: Deriver, b: Blocked, blocker: Bytes, params: List<RigidParam>) -> List<Bytes> =
+  match w {
+    WFunction -> [bytes_concat_all([b"`", blocker, b"` is a function, and a function has no ", what_of(d)])],
+    WHandle -> [bytes_concat_all([b"a `", handle_what(b.ty), b"` names a location rather than a value, so it has no encoding"])],
+    WFloatIsNotOrdered -> [b"`Float` has no total order: `NaN` is not equal to itself", b"use `Decimal` for exact numbers"],
+    WNullInsideOption -> [bytes_concat_all([b"`", blocker, b"` writes `None` and its payload alike"]), null_in_option_note()],
+    WSecret -> secret_notes(d),
+    WUnconstrained(v) -> [bytes_concat_all([b"add `where derivable(", deriver_text(d), b", ", param_name(params, v, blocker), b")` to the signature this call sits in; the body may then assume it"])],
+  }
+
+fn rigid_params(cx: Cx) -> List<RigidParam> =
+  map_fold(cx.ty_params, [], |acc: List<RigidParam>, k: Bytes, t: Type| match t { TyVar(v) -> push(acc, { name: k, v: v }), _ -> acc })
 
 fn assumed_for(cx: Cx, d: Deriver) -> List<Int> =
   fold(cx.assumed, [], |acc: List<Int>, a: Assumed| if same_deriver(a.deriver, d) { a.vars } else { acc })
@@ -2354,7 +2819,8 @@ fn note_map_keys(cx: Cx, span: Span, ty: Type) -> Cx = {
   let found = map_key_types(ty, []);
   if len(found) == 0 { cx } else {
     let assumed = assumed_for(cx, DOrd);
-    {..cx, map_keys: append(cx.map_keys, map(found, |k: Type| { module: cx.module, span: span, scope: cx.scope, key: k, assumed: assumed }))}
+    let params = rigid_params(cx);
+    {..cx, map_keys: append(cx.map_keys, map(found, |k: Type| { module: cx.module, span: span, scope: cx.scope, key: k, assumed: assumed, params: params }))}
   }
 }
 
@@ -2365,9 +2831,10 @@ fn note_constraints(cx: Cx, span: Span, callee: Bytes, args: List<Type>) -> Cx =
     Some(cs) ->
       if len(cs) == 0 { cx } else {
         let callee_at = match def_of(cx, callee) { Some(d) -> d.at, None -> { module: cx.module, span: span } };
+        let params = rigid_params(cx);
         let sites = fold(cs, [], |acc: List<ConstraintSite>, c: DefConstraint|
           if c.param >= len(args) { acc }
-          else { push(acc, { module: cx.module, span: span, deriver: c.deriver, ty: at(args, c.param), callee_at: callee_at, assumed: assumed_for(cx, c.deriver) }) });
+          else { push(acc, { module: cx.module, span: span, deriver: c.deriver, ty: at(args, c.param), callee: callee, callee_at: callee_at, assumed: assumed_for(cx, c.deriver), params: params }) });
         {..cx, constrained_uses: append(cx.constrained_uses, sites)}
       },
   }
@@ -2380,10 +2847,15 @@ fn check_map_keys(cx: Cx) -> Cx = {
       None -> acc,
       Some(blocked) ->
         if skipped_flexible(acc.cx, blocked) { acc } else {
-          let rendered = type_text(key);
+          let pr = print_ty(printer_new(), key);
+          let rendered = pr.s;
           let dup = fold(acc.seen, false, |b: Bool, s: { scope: Int, text: Bytes }| b || (s.scope == site.scope && s.text == rendered));
           if dup { acc } else {
-            { cx: report(acc.cx, diag1(b"E0206", site.module, site.span, why_notes_for_map_key(blocked.why))),
+            let blocker = print_ty(pr.p, blocked.ty).s;
+            { cx: report(acc.cx, diag1(b"E0206", site.module, site.span,
+                     bytes_concat_all([b"`", blocker, b"` is not an ordered type, so it cannot be a `Map` key"]),
+                     bytes_concat_all([b"this map's key type is `", rendered, b"`"]),
+                     why_notes_for_map_key(blocked.why, blocked, blocker, site.params))),
               seen: push(acc.seen, { scope: site.scope, text: rendered }) }
           }
         },
@@ -2401,11 +2873,18 @@ fn check_constraints(cx: Cx) -> Cx = {
         None -> acc,
         Some(blocked) ->
           if skipped_flexible(acc.cx, blocked) { acc } else {
-            let rendered = type_text(ty);
+            let pr = print_ty(printer_new(), ty);
+            let rendered = pr.s;
             let tag = deriver_tag(site.deriver);
             let dup = fold(acc.seen, false, |b: Bool, s: { span: Span, text: Bytes, tag: Int }| b || (s.span == site.span && s.text == rendered && s.tag == tag));
             if dup { acc } else {
-              { cx: err_labels(acc.cx, b"E0206", [lab(site.module, site.span, true), lab(site.callee_at.module, site.callee_at.span, false)], why_notes_for_constraint(blocked.why)),
+              let blocker = print_ty(pr.p, blocked.ty).s;
+              let callee = default_binder(site.callee);
+              let dv = deriver_text(site.deriver);
+              { cx: err_labels(acc.cx, b"E0206", bytes_concat_all([b"`", rendered, b"` cannot be derived for `", dv, b"`"]),
+                               [lab(site.module, site.span, true, bytes_concat_all([b"`", callee, b"` requires `derivable(", dv, b", \xc2\xb7)` here"])),
+                                lab(site.callee_at.module, site.callee_at.span, false, bytes_concat_all([b"`", callee, b"` declares the constraint on its signature"]))],
+                               why_notes_for_constraint(blocked.why, site.deriver, blocked, blocker, site.params)),
                 seen: push(acc.seen, { span: site.span, text: rendered, tag: tag }) }
             }
           },
@@ -2440,8 +2919,15 @@ fn derive_target(cx: Cx, m: Mod, target: Bytes) -> Option<WithTy> = {
   }
 }
 
-fn why_notes_for_derive(w: Why) -> Int =
-  match w { WNullInsideOption -> 2, WFloatIsNotOrdered -> 1, WFunction -> 1, WHandle -> 1, WSecret -> 2, WUnconstrained(_) -> 0 }
+fn why_notes_for_derive(w: Why, d: Deriver, b: Blocked, blocker: Bytes) -> List<Bytes> =
+  match w {
+    WNullInsideOption -> [bytes_concat_all([b"`", blocker, b"` writes `None` and its payload alike"]), null_in_option_note()],
+    WFloatIsNotOrdered -> [b"`Float` has no total order: `NaN` is not equal to itself"],
+    WFunction -> [b"a function has no encoding to derive"],
+    WHandle -> [bytes_concat_all([b"a `", handle_what(b.ty), b"` names a location rather than a value, so it has no encoding"])],
+    WSecret -> secret_notes(d),
+    WUnconstrained(_) -> [],
+  }
 
 // `derivable(D, T)` over each `derive`'s target as a **solved** type.
 fn check_derives(cx: Cx) -> Cx = {
@@ -2460,7 +2946,14 @@ fn check_derives(cx: Cx) -> Cx = {
                   Some(blocked) ->
                     match blocked.why {
                       WUnconstrained(_) -> o.cx,
-                      _ -> report(o.cx, diag1(b"E0206", i, def.span, why_notes_for_derive(blocked.why) + 1)),
+                      _ -> {
+                        let blocker = type_text(blocked.ty);
+                        let dv = deriver_text(def.deriver);
+                        report(o.cx, diag1(b"E0206", i, def.span, bytes_concat_all([b"`", dv, b"` cannot be derived for `", def.target.name, b"`"]),
+                                           bytes_concat_all([b"`", blocker, b"` has no ", what_of(def.deriver)]),
+                                           push(why_notes_for_derive(blocked.why, def.deriver, blocked, blocker),
+                                                bytes_concat_all([b"write the dictionary for `", def.target.name, b"` by hand, or change the field"]))))
+                      },
                     },
                 }
             }
@@ -2473,12 +2966,17 @@ fn check_derives(cx: Cx) -> Cx = {
 // Anything a generated definition failed on, other than a name it could not see, is Ply's fault.
 fn attribute_generated(cx: Cx) -> Cx = {
   let spans = fold(range(0, len(cx.mods)), [], |acc: List<Label>, i: Int|
-    fold(at(cx.mods, i).derived, acc, |a: List<Label>, d: Derived| push(a, lab(i, d.span, true))));
+    fold(at(cx.mods, i).derived, acc, |a: List<Label>, d: Derived| push(a, lab(i, d.span, true, b""))));
   if len(spans) == 0 { cx } else {
     {..cx, diags: map(cx.diags, |d: Diag| {
       let primary = fold(d.labels, None, |acc: Option<Label>, l: Label| match acc { Some(_) -> acc, None -> if l.primary { Some(l) } else { None } });
       let generated = match primary { Some(p) -> fold(spans, false, |b: Bool, s: Label| b || (s.module == p.module && s.start == p.start && s.end == p.end)), None -> false };
-      if d.code == b"E0206" || !generated { d } else { { code: b"E0505", notes: d.notes + 2, labels: d.labels, text: d.text } }
+      if d.code == b"E0206" || !generated { d } else {
+        { code: b"E0505", notes: d.notes + 2, labels: d.labels, text: d.text, message: b"a derived definition does not typecheck",
+          notes_text: push(push_front_bytes(bytes_concat(b"this is a compiler bug in the deriver: ", d.message), d.notes_text),
+                           b"derivation is total, so a generated body that fails to check is Ply's fault rather than yours"),
+          severity: d.severity }
+      }
     })}
   }
 }
@@ -2493,9 +2991,16 @@ fn contains_fn(t: Type) -> Bool =
     TyVar(_) -> false,
   }
 
+fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> = fold(xs, [x], |acc: List<Bytes>, y: Bytes| push(acc, y))
+
 fn check_comparisons(cx: Cx) -> Cx =
-  fold(cx.comparisons, {..cx, comparisons: []}, |c: Cx, site: { module: Int, span: Span, ty: Type }|
-    if contains_fn(resolve(c, site.ty)) { report(c, diag1(b"E0201", site.module, site.span, 1)) } else { c })
+  fold(cx.comparisons, {..cx, comparisons: []}, |c: Cx, site: { module: Int, span: Span, ty: Type }| {
+    let resolved = resolve(c, site.ty);
+    if contains_fn(resolved) {
+      report(c, diag1(b"E0201", site.module, site.span, b"functions cannot be compared for equality",
+                      bytes_concat_all([b"both sides have type `", type_text(resolved), b"`"]), [b"compare the results of calling them instead"]))
+    } else { c }
+  })
 
 fn mentions_task(t: Type) -> Bool =
   match t {
@@ -2515,7 +3020,13 @@ fn check_simulations(cx: Cx) -> Cx = {
   let sites = cx.simulations;
   fold(sites, {..cx, simulations: []}, |c: Cx, site: Simulation| {
     let nested: Cx = if atoms_contains(resolve_r(c, site.body_row).atoms, seed) { nested_simulation(c, site, sites) } else { c };
-    if mentions_task(resolve(nested, site.body_ty)) { report(nested, diag1(b"E0413", site.module, site.body_span, 2)) } else { nested }
+    let ty = resolve(nested, site.body_ty);
+    if mentions_task(ty) {
+      report(nested, diag1(b"E0413", site.module, site.body_span, b"a task escapes the `simulate` region that spawned it",
+                           bytes_concat_all([b"this has type `", type_text(ty), b"`"]),
+                           [b"a `Task` is a key into the region's scheduler, and the scheduler ends with the region",
+                            b"`join` the task inside the region and return its value instead"]))
+    } else { nested }
   })
 }
 
@@ -2525,9 +3036,13 @@ fn nested_simulation(cx: Cx, site: Simulation, sites: List<Simulation>) -> Cx = 
       Some(_) -> acc,
       None -> if other.module == site.module && other.span != site.span && encloses(site.body_span, other.span) { Some(other) } else { None },
     });
+  let message = b"a `simulate` region inside another `simulate` region";
+  let primary = lab(site.module, site.span, true, b"this region's body reaches `sim.read`");
+  let tail = [b"two schedulers means two notions of `runnable`, and a task in the inner region blocking the outer one",
+              b"hoist the inner region out, or drop it and let the outer one schedule"];
   match inner {
-    Some(o) -> err_labels(cx, b"E0416", [lab(site.module, site.span, true), lab(o.module, o.span, false)], 2),
-    None -> report(cx, diag1(b"E0416", site.module, site.span, 3)),
+    Some(o) -> err_labels(cx, b"E0416", message, [primary, lab(o.module, o.span, false, b"the region it reaches is here")], tail),
+    None -> report(cx, diag(b"E0416", message, [primary], push_front_bytes(b"something this body calls carries `sim.read`, so it enters a region too", tail))),
   }
 }
 
@@ -2560,28 +3075,66 @@ fn check_regions(cx: Cx) -> Cx =
 fn check_region_exits(cx: Cx, site: RegionSite) -> Cx = {
   let ty = resolve(cx, site.body_ty);
   if !brand_in(ty, site.name) { cx } else {
+    let n = site.name;
     let spans = if len(site.exits) == 0 { [site.body_span] } else { site.exits };
-    let primaries = map(spans, |s: Span| lab(site.module, s, true));
-    let carries = if carries_brand_in_row(ty, site.name) { 1 } else { 0 };
-    if site.with_cell { err_labels(cx, b"E0201", primaries, carries + 1) }
-    else { err_labels(cx, b"E0446", push(primaries, lab(site.module, site.span, false)), carries + 1) }
+    let shown = type_text(ty);
+    let primaries = map(spans, |s: Span| lab(site.module, s, true, bytes_concat_all([b"this has type `", shown, b"`"])));
+    if site.with_cell {
+      let carries = if carries_brand_in_row(ty, n) {
+        [bytes_concat_all([b"the closure's row still carries `cell.read[", n, b"]` or `cell.write[", n, b"]`, so it reads or writes a cell the region frees"])]
+      } else { [] };
+      err_labels(cx, b"E0201", bytes_concat_all([b"the cell escapes its `with_cell[", n, b"]` region"]), primaries,
+                 push(carries, b"read the cell inside the region and return the value instead"))
+    } else {
+      let carries = if carries_brand_in_row(ty, n) {
+        [bytes_concat_all([b"the closure's row still carries `cell.read[", n, b"]` or `cell.write[", n, b"]`, so it reads or writes a value the region frees"])]
+      } else { [] };
+      err_labels(cx, b"E0446", bytes_concat_all([b"a value allocated in region `", n, b"` escapes the region"]),
+                 push(primaries, lab(site.module, site.span, false, bytes_concat_all([b"`", n, b"` opens here, and everything allocated in it is freed at the region's `}`"]))),
+                 push(carries, bytes_concat_all([b"read the value inside the region and answer with something that does not mention `", n, b"`"])))
+    }
   }
 }
 
+fn opens_here(n: Bytes) -> Bytes = bytes_concat_all([b"`", n, b"` opens here and is freed at its `}`"])
+
 fn check_region_stores(cx: Cx, site: RegionSite) -> Cx =
-  fold(site.outer, cx, |c: Cx, b: OuterBinding|
-    if brand_in(resolve(c, b.ty), site.name) { err_labels(c, b"E0446", [lab(site.module, b.site, true), lab(site.module, site.span, false)], 1) } else { c })
+  fold(site.outer, cx, |c: Cx, b: OuterBinding| {
+    let ty = resolve(c, b.ty);
+    if brand_in(ty, site.name) {
+      err_labels(c, b"E0446", bytes_concat_all([b"a value allocated in region `", site.name, b"` is stored where it outlives the region"]),
+                 [lab(site.module, b.site, true, bytes_concat_all([b"`", b.name, b"` has type `", type_text(ty), b"`, and it was bound before `", site.name, b"` opened"])),
+                  lab(site.module, site.span, false, opens_here(site.name))],
+                 [bytes_concat_all([b"storing into `", b.name, b"` outlives the region, so what is stored may not mention `", site.name, b"`"])])
+    } else { c }
+  })
 
 fn check_region_spawns(cx: Cx, site: RegionSite) -> Cx =
-  fold(site.spawns, cx, |c: Cx, s: SpawnSite|
-    if brand_in(resolve(c, s.ty), site.name) { err_labels(c, b"E0446", [lab(site.module, s.span, true), lab(site.module, site.span, false)], 2) } else { c })
+  fold(site.spawns, cx, |c: Cx, s: SpawnSite| {
+    let ty = resolve(c, s.ty);
+    if brand_in(ty, site.name) {
+      err_labels(c, b"E0446", bytes_concat_all([b"a value allocated in region `", site.name, b"` is sent to another task"]),
+                 [lab(site.module, s.span, true, bytes_concat_all([b"this has type `", type_text(ty), b"`"])),
+                  lab(site.module, site.span, false, opens_here(site.name))],
+                 [b"the scheduler that runs the task was installed outside the region, so the task can still be running when the region's memory is gone",
+                  bytes_concat_all([b"open the `simulate` region inside `with_region[", site.name, b"]`, or pass the task something that does not mention `", site.name, b"`"])])
+    } else { c }
+  })
 
 fn check_region_handoffs(cx: Cx, site: RegionSite) -> Cx =
-  fold(site.handoffs, cx, |c: Cx, h: SpawnSite| {
+  fold(site.handoffs, cx, |c: Cx, h: HandoffSite| {
     let ty = resolve(c, h.ty);
     if !brand_in(ty, site.name) { c } else {
-      let carries = if carries_brand_in_row(ty, site.name) { 1 } else { 0 };
-      err_labels(c, b"E0446", [lab(site.module, h.span, true), lab(site.module, site.span, false)], carries + 2)
+      let n = site.name;
+      let carries = if carries_brand_in_row(ty, n) {
+        [bytes_concat_all([b"the closure's row still carries `cell.read[", n, b"]` or `cell.write[", n, b"]`, so whoever handles the operation can read or write a value the region frees"])]
+      } else { [] };
+      err_labels(c, b"E0446", bytes_concat_all([b"a value allocated in region `", n, b"` is handed to `", h.op, b"`"]),
+                 [lab(site.module, h.span, true, bytes_concat_all([b"this has type `", type_text(ty), b"`"])),
+                  lab(site.module, site.span, false, opens_here(n))],
+                 append(carries,
+                   [bytes_concat_all([b"`", h.op, b"` is declared outside every region, so its type cannot say the value belongs to `", n, b"`, and the handler \xe2\x80\x94 which may be installed anywhere, and may outlive the region \xe2\x80\x94 receives it at a type variable that mentions no region at all"]),
+                    bytes_concat_all([b"read the value inside the region and perform the operation with something that does not mention `", n, b"`"])]))
     }
   })
 
@@ -2647,6 +3200,13 @@ fn fresh_cx(r: Resolved, mods: List<Mod>, known: Known) -> Cx =
 type Checked = { cx: Cx, ok: Bool }
 
 pub fn check_program(r: Resolved, mods: List<Mod>) -> Checked = check_program_with(r, mods, no_known())
+
+// The driver's `Err`: every diagnostic, deduplicated, when any is an error — a warning alone is
+// not one, and `CheckOutput` carries none.
+pub fn check_diagnostics(r: Resolved, mods: List<Mod>) -> List<Diag> = {
+  let out = check_program(r, mods);
+  if fold(out.cx.diags, false, |b: Bool, d: Diag| b || d.severity == b"error") { dedup_diags(out.cx.diags) } else { [] }
+}
 
 // The program-wide names of the definitions the checker publishes as pure -- an empty footprint
 // and no constraint -- or nothing when the program does not check. What the emitter's constant

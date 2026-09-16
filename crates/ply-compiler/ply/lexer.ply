@@ -89,7 +89,9 @@ pub type Token = { start: Int, end: Int, tok: Tok }
 // `E0001` UNEXPECTED_TOKEN or `E0002` UNTERMINATED_STRING. `X0001` is this
 // lexer's own, for the one thing it refuses that the Rust lexer decides with a
 // Unicode table — README §"Where this disagrees on purpose".
-pub type Diag = { start: Int, end: Int, code: Bytes }
+// `message` and `label` are the two texts `Lexer::error` takes: every lexer diagnostic is
+// `Diagnostic::error(code, message).primary(span, label)`.
+pub type Diag = { start: Int, end: Int, code: Bytes, message: Bytes, label: Bytes }
 
 pub type Lexed = { toks: List<Token>, diags: List<Diag> }
 
@@ -116,10 +118,15 @@ fn emit(s: Scan, start: Int, fin: Int, t: Tok) -> Scan =
     diags: s.diags,
     toks: push(s.toks, {start: start, end: fin, tok: t}) }
 
-fn err(s: Scan, start: Int, fin: Int, code: Bytes) -> Scan =
+fn err(s: Scan, start: Int, fin: Int, code: Bytes, message: Bytes, label: Bytes) -> Scan =
   { pos: s.pos,
     toks: s.toks,
-    diags: push(s.diags, {start: start, end: fin, code: code}) }
+    diags: push(s.diags, {start: start, end: fin, code: code, message: message, label: label}) }
+
+fn bad_suffix(s: Scan, start: Int, fin: Int, suffix: Bytes) -> Scan =
+  err(s, start, fin, unexpected(),
+      bytes_concat_all([b"invalid suffix `", suffix, b"` on a numeric literal"]),
+      b"the suffixes are `m` for a `Decimal` and a width \xe2\x80\x94 `u8`, `i32` and the six others; separate a name with a space")
 
 fn seek(s: Scan, p: Int) -> Scan =
   { pos: p, diags: s.diags, toks: s.toks }
@@ -217,7 +224,9 @@ fn token_at(src: Bytes, s: Scan, start: Int) -> Scan = {
     string_lit(src, s, start, start + 1, b"")
   } else if c >= 128 {
     // The Rust lexer asks `char::is_alphabetic` here. Ply cannot.
-    err(seek(s, start + utf8_len(c)), start, start + utf8_len(c), non_ascii())
+    err(seek(s, start + utf8_len(c)), start, start + utf8_len(c), non_ascii(),
+        bytes_concat_all([b"unexpected character `", bytes_slice(src, start, start + utf8_len(c)), b"`"]),
+        b"this character has no meaning in Ply source")
   } else {
     punct(src, s, start, c)
   }
@@ -281,19 +290,22 @@ fn hex_literal(src: Bytes, s: Scan, start: Int) -> Scan = {
   let fin = scan(src, start + 2, b"0123456789abcdefABCDEF_");
   let digits = strip_us(bytes_slice(src, start + 2, fin));
   if bytes_len(digits) == 0 {
-    emit(err(s, start, fin, unexpected()), start, fin, TInt(0))
+    emit(err(s, start, fin, unexpected(), b"hex literal with no digits",
+             b"write at least one digit after `0x`, as in `0xFF`"), start, fin, TInt(0))
   } else {
     let sufe = if is_ident_start(at(src, fin)) { scan(src, fin, ident_chars()) } else { fin };
     let suffix = bytes_slice(src, fin, sufe);
     match width_named(suffix) {
       // A hex literal is a bit pattern, so its bound is the width rather than the type's range:
       // `0xFFu8` is 255 and `0xFFFF_FFFF_FFFF_FFFFu64` is the largest `U64`.
-      Some(w) -> hex_fixed(s, start, sufe, strip_zeros(digits), w),
+      Some(w) -> hex_fixed(s, start, sufe, digits, w),
       None -> {
-        let s1 = if sufe > fin { err(s, start, sufe, unexpected()) } else { s };
+        let s1 = if sufe > fin { bad_suffix(s, start, sufe, suffix) } else { s };
         let d = strip_zeros(digits);
         if bytes_len(d) > 16 {
-          emit(err(s1, start, fin, unexpected()), start, fin, TInt(0))
+          emit(err(s1, start, fin, unexpected(),
+                   bytes_concat_all([b"hex literal `0x", digits, b"` does not fit in `Int`"]),
+                   b"`Int` is 64 bits, so a hex literal has at most 16 digits"), start, fin, TInt(0))
         } else {
           emit(s1, start, fin, TInt(hex_of_digits(d)))
         }
@@ -302,12 +314,17 @@ fn hex_literal(src: Bytes, s: Scan, start: Int) -> Scan = {
   }
 }
 
-fn hex_fixed(s: Scan, start: Int, fin: Int, d: Bytes, w: Width) -> Scan =
+fn hex_fixed(s: Scan, start: Int, fin: Int, digits: Bytes, w: Width) -> Scan = {
+  let d = strip_zeros(digits);
   if bytes_len(d) > 16 || (w.bits < 64 && bytes_len(d) * 4 > w.bits && hex_over(d, w)) {
-    emit(err(s, start, fin, out_of_range()), start, fin, TFixed(width_upper(w), 0))
+    emit(err(s, start, fin, out_of_range(),
+             bytes_concat_all([b"`0x", digits, b"` does not fit in `", width_upper(w), b"`"]),
+             bytes_concat_all([b"a `", width_upper(w), b"` is ", num(w.bits), b" bits"])),
+         start, fin, TFixed(width_upper(w), 0))
   } else {
     emit(s, start, fin, TFixed(width_upper(w), width_normalize(w, hex_of_digits(d))))
   }
+}
 
 // Whether the pattern needs more than `bits` bits, decided on the digit string so no `Int`
 // arithmetic has to hold it.
@@ -365,7 +382,7 @@ fn number_tail(src: Bytes, s: Scan, m: Num) -> Scan =
     // is read and then refused with everything else that follows a fraction or an exponent.
     match (if m.hasf || m.hase { None } else { width_named(bytes_slice(src, m.cur, fin)) }) {
       Some(w) -> fixed_value(s, m, fin, w),
-      None -> number_value(err(s, m.start, fin, unexpected()), m, fin),
+      None -> number_value(bad_suffix(s, m.start, fin, bytes_slice(src, m.cur, fin)), m, fin),
     }
   } else {
     number_value(s, m, m.cur)
@@ -377,7 +394,10 @@ fn fixed_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan = {
   let k = bytes_len(d);
   let too_long = k > 19 || (k == 19 && compare(d, int_max()) == Greater);
   if too_long || over_width(d, w) {
-    emit(err(s, m.start, fin, out_of_range()), m.start, fin, TFixed(width_upper(w), 0))
+    emit(err(s, m.start, fin, out_of_range(),
+             bytes_concat_all([b"`", m.whole, b"` is not a value of `", width_upper(w), b"`"]),
+             bytes_concat_all([b"`", width_upper(w), b"` holds ", width_range(w)])),
+         m.start, fin, TFixed(width_upper(w), 0))
   } else {
     emit(s, m.start, fin, TFixed(width_upper(w), width_normalize(w, int_of_digits(d))))
   }
@@ -388,6 +408,16 @@ fn fixed_value(s: Scan, m: Num, fin: Int, w: Width) -> Scan = {
 // bound there — which is exact for `I64` and one value short for `U64`.
 fn over_width(d: Bytes, w: Width) -> Bool =
   if w.bits == 64 { false } else { int_of_digits(d) > width_max(w) }
+
+// `{ty.min()} to {ty.max()}`, written out because neither sixty-four-bit bound is an `Int` here.
+fn width_range(w: Width) -> Bytes =
+  if w.bits == 64 {
+    if w.signed { b"-9223372036854775808 to 9223372036854775807" } else { b"0 to 18446744073709551615" }
+  } else if w.signed {
+    bytes_concat_all([b"-", num(two_to(w.bits - 1)), b" to ", num(width_max(w))])
+  } else {
+    bytes_concat_all([b"0 to ", num(width_max(w))])
+  }
 
 fn number_value(s: Scan, m: Num, fin: Int) -> Scan =
   if !m.hasf && !m.hase {
@@ -422,7 +452,9 @@ fn int_value(s: Scan, m: Num, fin: Int) -> Scan = {
   let d = strip_zeros(m.whole);
   let k = bytes_len(d);
   if k > 19 || (k == 19 && compare(d, int_max()) == Greater) {
-    emit(err(s, m.start, fin, unexpected()), m.start, fin, TInt(0))
+    emit(err(s, m.start, fin, unexpected(),
+             bytes_concat_all([b"integer literal `", m.whole, b"` does not fit in `Int`"]),
+             b"`Int` is a 64-bit signed integer; use a smaller value"), m.start, fin, TInt(0))
   } else {
     emit(s, m.start, fin, TInt(int_of_digits(d)))
   }
@@ -488,14 +520,18 @@ fn zero_dec() -> Tok = TDec(b"0", 0)
 
 fn decimal(s: Scan, m: Num, fin: Int) -> Scan =
   if m.hase {
-    emit(err(s, m.start, fin, unexpected()), m.start, fin, zero_dec())
+    emit(err(s, m.start, fin, unexpected(), b"a `Decimal` literal has no exponent",
+             b"write the digits out, or drop the `m` for a `Float`"), m.start, fin, zero_dec())
   } else if bytes_len(m.frac) > 28 {
-    emit(err(s, m.start, fin, unexpected()), m.start, fin, zero_dec())
+    emit(err(s, m.start, fin, unexpected(),
+             bytes_concat_all([b"a `Decimal` literal has at most 28 decimal places, not ", num(bytes_len(m.frac))]),
+             b"round the literal, or use `Float`"), m.start, fin, zero_dec())
   } else {
     let d = strip_zeros(bytes_concat(m.whole, m.frac));
     let k = bytes_len(d);
     if k > 29 || (k == 29 && compare(d, dec_max()) == Greater) {
-      emit(err(s, m.start, fin, unexpected()), m.start, fin, zero_dec())
+      emit(err(s, m.start, fin, unexpected(), b"a `Decimal` literal has at most 96 bits of mantissa",
+               b"the largest is 79228162514264337593543950335"), m.start, fin, zero_dec())
     } else {
       emit(s, m.start, fin, TDec(d, bytes_len(m.frac)))
     }
@@ -514,7 +550,8 @@ fn string_lit(src: Bytes, s: Scan, open: Int, i: Int, acc: Bytes) -> Scan = {
   let so_far = bytes_concat(acc, bytes_slice(src, i, stop));
   let c = at(src, stop);
   if c < 0 || c == 10 {
-    emit(err(s, open, stop, unterminated()), open, stop, TStr(so_far))
+    emit(err(s, open, stop, unterminated(), b"unterminated string literal",
+             b"add a closing `\"`; a string may not span a line break"), open, stop, TStr(so_far))
   } else if c == 34 {
     emit(s, open, stop + 1, TStr(so_far))
   } else {
@@ -522,11 +559,17 @@ fn string_lit(src: Bytes, s: Scan, open: Int, i: Int, acc: Bytes) -> Scan = {
   }
 }
 
+fn unknown_escape(src: Bytes, s: Scan, stop: Int, w: Int, valid: Bytes) -> Scan =
+  err(s, stop, stop + 1 + w, unexpected(),
+      bytes_concat_all([b"unknown escape sequence `\\", bytes_slice(src, stop + 1, stop + 1 + w), b"`"]),
+      valid)
+
 fn string_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Scan = {
   let n = bytes_len(src);
   let c = at(src, stop + 1);
   if c < 0 {
-    emit(err(s, open, n, unterminated()), open, n, TStr(so_far))
+    emit(err(s, open, n, unterminated(), b"unterminated string literal", b"add a closing `\"`"),
+         open, n, TStr(so_far))
   } else if c == 110 {
     string_lit(src, s, open, stop + 2, bytes_concat(so_far, b"\n"))
   } else if c == 116 {
@@ -555,7 +598,7 @@ fn string_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Sc
     let w = utf8_len(c);
     string_lit(
       src,
-      err(s, stop, stop + 1 + w, unexpected()),
+      unknown_escape(src, s, stop, w, b"valid escapes are \\n \\t \\r \\0 \\\\ and \\\""),
       open,
       stop + 1 + w,
       bytes_concat(so_far, bytes_slice(src, stop + 1, stop + 1 + w)))
@@ -574,14 +617,21 @@ fn bytes_body(src: Bytes, s: Scan, open: Int, i: Int, acc: Bytes) -> Scan = {
   let so_far = bytes_concat(acc, bytes_slice(src, i, stop));
   let c = at(src, stop);
   if c < 0 || c == 10 {
-    emit(err(s, open, stop, unterminated()), open, stop, TBytes(so_far))
+    emit(err(s, open, stop, unterminated(), b"unterminated byte-string literal",
+             b"add a closing `\"`; a literal may not span a line break"), open, stop, TBytes(so_far))
   } else if c == 34 {
     emit(s, open, stop + 1, TBytes(so_far))
   } else if c == 92 {
     bytes_escape(src, s, open, stop, so_far)
   } else {
     let w = utf8_len(c);
-    bytes_body(src, err(s, stop, stop + w, unexpected()), open, stop + w, so_far)
+    let ch = bytes_slice(src, stop, stop + w);
+    let encoded = bytes_concat_all(map(range(0, w), |i: Int| bytes_concat(b"\\x", hex2(bytes_at(ch, i)))));
+    bytes_body(src,
+               err(s, stop, stop + w, unexpected(),
+                   bytes_concat_all([b"`", ch, b"` is not an ASCII character, so it has no place in `b\"...\"`"]),
+                   bytes_concat_all([b"write `", encoded, b"` instead"])),
+               open, stop + w, so_far)
   }
 }
 
@@ -589,7 +639,8 @@ fn bytes_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Sca
   let n = bytes_len(src);
   let c = at(src, stop + 1);
   if c < 0 {
-    emit(err(s, open, n, unterminated()), open, n, TBytes(so_far))
+    emit(err(s, open, n, unterminated(), b"unterminated byte-string literal", b"add a closing `\"`"),
+         open, n, TBytes(so_far))
   } else if c == 110 {
     bytes_body(src, s, open, stop + 2, bytes_concat(so_far, b"\n"))
   } else if c == 116 {
@@ -607,7 +658,8 @@ fn bytes_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Sca
   } else {
     // Unlike a string's unknown escape, this one contributes no byte.
     let w = utf8_len(c);
-    bytes_body(src, err(s, stop, stop + 1 + w, unexpected()), open, stop + 1 + w, so_far)
+    bytes_body(src, unknown_escape(src, s, stop, w, b"valid escapes are \\n \\t \\r \\0 \\\\ \\\" and \\xNN"),
+               open, stop + 1 + w, so_far)
   }
 }
 
@@ -623,7 +675,8 @@ fn hex_escape(src: Bytes, s: Scan, open: Int, stop: Int, so_far: Bytes) -> Scan 
     let taken = if hi >= 0 { stop + 3 } else { stop + 2 };
     bytes_body(
       src,
-      err(s, stop, taken, unexpected()),
+      err(s, stop, taken, unexpected(), b"`\\x` needs exactly two hex digits",
+          b"write two hex digits, as in `\\x0d`"),
       open,
       taken,
       bytes_concat(so_far, b"\x00"))
@@ -670,7 +723,9 @@ fn punct(src: Bytes, s: Scan, start: Int, c: Int) -> Scan =
   else if c == 94 { emit(s, start, start + 1, TPunct(b"caret")) }
   else if c == 126 { emit(s, start, start + 1, TPunct(b"tilde")) }
   else {
-    err(seek(s, start + 1), start, start + 1, unexpected())
+    err(seek(s, start + 1), start, start + 1, unexpected(),
+        bytes_concat_all([b"unexpected character `", bytes_slice(src, start, start + 1), b"`"]),
+        b"this character has no meaning in Ply source")
   }
 
 fn pair(s: Scan, src: Bytes, start: Int, second: Int, both: Bytes, single: Bytes) -> Scan =

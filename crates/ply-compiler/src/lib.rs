@@ -43,6 +43,9 @@ pub const INFER: &str = include_str!("../ply/infer.ply");
 /// The derivers.
 pub const DERIVE: &str = include_str!("../ply/derive.ply");
 
+/// Every diagnostic with its message, framed for the CLI.
+pub const DIAG: &str = include_str!("../ply/diag.ply");
+
 /// Content addressing: a definition's hash over its normalized form.
 pub const HASH: &str = include_str!("../ply/hash.ply");
 
@@ -61,6 +64,7 @@ pub const EMIT: &str = include_str!("../ply/emit.ply");
 pub const MODULES: &[(&str, &str)] = &[
     ("code", CODE),
     ("derive", DERIVE),
+    ("diag", DIAG),
     ("emit", EMIT),
     ("exprs", EXPRS),
     ("hash", HASH),
