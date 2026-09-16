@@ -151,6 +151,21 @@ pub fn poisoning() -> bool {
     *ON.get_or_init(|| std::env::var_os("PLY_HEAP_POISON").is_some())
 }
 
+/// How many releases a dead block waits before an allocation may take it: zero, unless
+/// `PLY_HEAP_DELAY=<n>` says otherwise for a process. The other diagnostic mode, for reading
+/// what a program's allocation pattern costs when a block is not reused at once: a value built
+/// by copying the whole of it each step keeps `n` copies alive under a delay of `n`, and the
+/// chunk bytes at the entry's end say so (ADR 0051 §3). Nothing ships with it.
+pub fn delay() -> usize {
+    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *N.get_or_init(|| {
+        std::env::var("PLY_HEAP_DELAY")
+            .ok()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// The diagnostic mode's pieces: the word a dead payload is filled with, the check every object
 /// read passes through, and the site the check names.
 pub mod poison {
@@ -423,6 +438,8 @@ pub struct Heap {
     /// a program that builds a large string by appending would otherwise keep every version it
     /// let go until the entry ends.
     large: Vec<Vec<*mut Obj>>,
+    /// Dead blocks not yet on a free list, oldest first, under `delay()`.
+    delayed: std::collections::VecDeque<(*mut Obj, usize)>,
 }
 
 /// The size classes a dead object is kept in, in words; anything larger goes back only at the
@@ -486,7 +503,17 @@ unsafe fn recycle(o: *mut Obj, heap: *mut Heap) {
                 set_word(o, i, poison::word());
             }
         }
-        (*heap).free_list(object).push(o);
+        let delay = delay();
+        if delay == 0 {
+            (*heap).free_list(object).push(o);
+            return;
+        }
+        (*heap).delayed.push_back((o, object));
+        if (*heap).delayed.len() > delay
+            && let Some((o, object)) = (*heap).delayed.pop_front()
+        {
+            (*heap).free_list(object).push(o);
+        }
     }
 }
 
@@ -517,6 +544,7 @@ impl Heap {
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
+            delayed: std::collections::VecDeque::new(),
         }
     }
 
