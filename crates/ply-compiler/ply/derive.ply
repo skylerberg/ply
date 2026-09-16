@@ -48,9 +48,6 @@ fn runtime_module(d: Deriver) -> Option<Bytes> = match d { DJson -> Some(b"std.j
 
 fn runtime_path(d: Deriver) -> List<Bytes> = match d { DJson -> [b"std", b"json"], _ -> [] }
 
-// The `Secret` refusal is the one that carries advice beyond its reason.
-fn refusal_has_note(w: Why) -> Bool = match w { WSecret -> true, _ -> false }
-
 fn is_upper_b(c: Int) -> Bool = c >= 65 && c <= 90
 fn is_lower_b(c: Int) -> Bool = c >= 97 && c <= 122
 fn is_digit_b(c: Int) -> Bool = c >= 48 && c <= 57
@@ -84,9 +81,9 @@ fn join(xs: List<Bytes>, sep: Bytes) -> Bytes =
 
 // --- `walk.rs`: the syntactic half of `derivable(D, t)` ----------------------------------------
 
-// Where to point, and what the diagnostic adds beyond its reason: the `Secret` advice, and
-// the variant a blocking field sits in.
-type Blocker = { span: Span, has_note: Bool, variant: Option<Bytes> }
+// `walk::Blocker`: where to point, the reason that completes the label there, the advice a
+// `Secret` refusal adds, and the variant a blocking field sits in.
+type Blocker = { span: Span, reason: Bytes, note: Option<Bytes>, variant: Option<Bytes> }
 
 fn check_decl(d: Deriver, def: TypeDef) -> Option<Blocker> =
   match def.body {
@@ -95,11 +92,49 @@ fn check_decl(d: Deriver, def: TypeDef) -> Option<Blocker> =
       match acc {
         Some(_) -> acc,
         None -> match first_blocked_te(d, v.fields) {
-          Some(b) -> Some({ span: b.span, has_note: b.has_note, variant: Some(v.name.name) }),
+          Some(b) -> Some({ span: b.span, reason: b.reason, note: b.note, variant: Some(v.name.name) }),
           None -> None,
         },
       }),
   }
+
+// `rules::function_refusal`.
+fn function_refusal(d: Deriver) -> Bytes =
+  match d { DJson -> b"a function has no JSON encoding", DEq -> b"functions cannot be compared for equality", DOrd -> b"functions cannot be ordered" }
+
+// `Refusal::reason`, completing "…^^^^ {reason}".
+pub fn refusal_reason(w: Why, d: Deriver, simple: Bytes) -> Bytes =
+  match w {
+    WFloatIsNotOrdered -> b"`Float` is not ordered: `NaN != NaN`",
+    WHandle -> bytes_concat_all([b"a `", simple, b"` names a location rather than a value"]),
+    WSecret -> secret_reason(d),
+    _ -> b"",
+  }
+
+// `secret_reason`: what a derivation of `d` would have had to do with a credential.
+pub fn secret_reason(d: Deriver) -> Bytes =
+  match d {
+    DJson -> b"a derived codec would write the credential into the document",
+    DOrd -> b"a credential has no order",
+    DEq -> b"a credential has no structural equality to derive",
+  }
+
+// `Refusal::note`: the advice only a `Secret` refusal carries.
+pub fn refusal_note(w: Why, d: Deriver) -> Option<Bytes> =
+  match w {
+    WSecret -> match d {
+      DOrd -> Some(b"an ordering over a credential leaks a bit of position per comparison and recovers the value in calls proportional to its length; `derive eq` is available, and `secret_verify` is the check a program actually wants"),
+      _ -> Some(b"move the `Secret` field out of the type being derived, or write the codec by hand over the fields that are not credentials \xe2\x80\x94 there is no way to encode a `Secret`, which is the guarantee"),
+    },
+    _ -> None,
+  }
+
+pub fn null_in_option_note() -> Bytes =
+  b"wrap the inner value in a record or a one-field variant \xe2\x80\x94 both are tagged, and a tagged encoding has no `null` to collide with"
+
+// `rules::null_in_option`.
+pub fn null_in_option(inner: Bytes) -> Bytes =
+  bytes_concat_all([b"`", inner, b"` encodes as `null`, which is how an `Option` writes `None`, so `Some` and `None` are the same document"])
 
 fn first_blocked_te(d: Deriver, ts: List<TypeExpr>) -> Option<Blocker> =
   fold(ts, None, |acc: Option<Blocker>, t: TypeExpr| match acc { Some(_) -> acc, None -> check_te(d, t) })
@@ -113,25 +148,33 @@ fn check_te(d: Deriver, te: TypeExpr) -> Option<Blocker> =
     TVar(_) -> None,
     TUnit(_) -> None,
     TBad(_) -> None,
-    TFn(f) -> Some({ span: f.span, has_note: false, variant: None }),
+    TFn(f) -> Some({ span: f.span, reason: function_refusal(d), note: None, variant: None }),
     TRecord(r) -> fold(r.fields, None, |acc: Option<Blocker>, f: { name: Ident, ty: TypeExpr }|
       match acc {
         Some(_) -> acc,
         None -> match check_te(d, f.ty) {
-          Some(b) -> Some({ span: span_to(f.name.span, ty_span(f.ty)), has_note: b.has_note, variant: b.variant }),
+          Some(b) -> Some({ span: span_to(f.name.span, ty_span(f.ty)), reason: b.reason, note: b.note, variant: b.variant }),
           None -> None,
         },
       }),
     TCon(c) -> {
       let simple = c.name.name.name;
       match con_shape(d, simple) {
-        Refused(why) -> Some({ span: c.span, has_note: refusal_has_note(why), variant: None }),
+        Refused(why) -> Some({ span: c.span,
+                               reason: bytes_concat_all([refusal_reason(why, d, simple), b", so `", simple, b"` has no derivation"]),
+                               note: refusal_note(why, d), variant: None }),
         _ ->
           if same_deriver(d, DJson) && simple == b"Option" && len(c.args) > 0 && null_encoded_te(at(c.args, 0)) {
-            Some({ span: c.span, has_note: false, variant: None })
+            let inner = match at(c.args, 0) { TCon(k) -> k.name.name.name, _ -> b"Unit" };
+            Some({ span: c.span, reason: null_in_option(inner), note: None, variant: None })
           } else {
             // A `Map`'s key type must be ordered whichever deriver is walking.
-            let key = if simple == b"Map" && len(c.args) > 0 { check_te(DOrd, at(c.args, 0)) } else { None };
+            let key = if simple == b"Map" && len(c.args) > 0 {
+              match check_te(DOrd, at(c.args, 0)) {
+                Some(b) -> Some({ span: b.span, reason: bytes_concat(b.reason, b", and a `Map` key type must be ordered"), note: b.note, variant: b.variant }),
+                None -> None,
+              }
+            } else { None };
             match key { Some(b) -> Some(b), None -> first_blocked_te(d, c.args) }
           },
       }
@@ -456,7 +499,7 @@ fn one(ex: Ex, def: DeriveDef) -> Ex =
     Some(target) -> {
       let name = generated_name(def.deriver, def.target.name);
       match find_claimed(ex.claimed, name) {
-        Some(prev) -> collision(ex, def, prev),
+        Some(prev) -> collision(ex, def, prev, name),
         None ->
           match check_decl(def.deriver, target) {
             Some(blocker) -> not_derivable(ex, def, blocker),
@@ -468,7 +511,7 @@ fn one(ex: Ex, def: DeriveDef) -> Ex =
                 Some(prefix) -> {
                   let source = emit_item(emitter(def.deriver, prefix, target.params, ex1.aliases), target);
                   match parse_generated(source, def.span) {
-                    None -> internal(ex1, def),
+                    None -> internal(ex1, def, source),
                     Some(generated) ->
                       {..ex1, claimed: push(ex1.claimed, { name: name, def: def }),
                         generated: push(ex1.generated, { source: source, def: generated, derived: { deriver: def.deriver, target: def.target.name, span: def.span } })},
@@ -498,7 +541,11 @@ fn runtime_prefix(ex: Ex, def: DeriveDef) -> WithPrefix =
         Some(r) -> { ex: ex, prefix: Some(r.prefix) },
         None ->
           match find_import(ex.module.imports, wanted) {
-            None -> { ex: report(ex, diag1(b"E0206", ex.m, def.span, 1)), prefix: None },
+            None -> { ex: report(ex, diag1(b"E0206", ex.m, def.span,
+                        bytes_concat_all([b"`", deriver_text(def.deriver), b"` cannot be derived here: this module does not import `", wanted, b"`"]),
+                        bytes_concat_all([b"needs `", wanted, b"`"]),
+                        [bytes_concat_all([b"add `import ", wanted, b"` \xe2\x80\x94 the dictionary type and the codecs a derivation composes with ship there"])])),
+                      prefix: None },
             Some(decl) -> {
               let bound: { binder: Bytes, added: Option<ImportDecl> } = match import_binder(decl) {
                 Some(b) -> { binder: b, added: None },
@@ -527,18 +574,41 @@ fn free_binder(ex: Ex, d: Deriver) -> Bytes = {
 }
 
 fn orphan(ex: Ex, def: DeriveDef) -> Ex = {
-  let near = fold(ex.types, false, |acc: Bool, t: TypeDef| acc || eq_ignore_case(t.name.name, def.target.name));
-  report(ex, diag1(b"E0208", ex.m, def.target.span, if near { 2 } else { 1 }))
+  let near = fold(ex.types, None, |acc: Option<Bytes>, t: TypeDef|
+    match acc { Some(_) -> acc, None -> if eq_ignore_case(t.name.name, def.target.name) { Some(t.name.name) } else { None } });
+  let notes = [b"a `derive` may only name a type its own module declares, so that one type has one canonical encoding rather than one per module that thought of it"];
+  report(ex, diag1(b"E0208", ex.m, def.target.span,
+                   bytes_concat_all([b"`", def.target.name, b"` is not a type this module declares"]),
+                   b"declared in another module, or not at all",
+                   match near { Some(n) -> push(notes, bytes_concat_all([b"this module declares `", n, b"`"])), None -> notes }))
 }
 
-fn collision(ex: Ex, def: DeriveDef, prev: DeriveDef) -> Ex = report(ex, diag2(b"E0105", ex.m, def.span, ex.m, prev.span, 1))
+fn collision(ex: Ex, def: DeriveDef, prev: DeriveDef, name: Bytes) -> Ex = {
+  let note = if prev.target.name == def.target.name {
+    bytes_concat_all([b"`derive ", deriver_text(def.deriver), b" for ", def.target.name, b"` is already written above; remove one"])
+  } else {
+    bytes_concat_all([b"`", prev.target.name, b"` and `", def.target.name, b"` both name `", name, b"`; rename one of the types"])
+  };
+  report(ex, diag2(b"E0105", ex.m, def.span, bytes_concat_all([b"`", name, b"` is generated twice"]),
+                   b"this derivation generates it", ex.m, prev.span, b"and so does this one", [note]))
+}
 
 fn not_derivable(ex: Ex, def: DeriveDef, b: Blocker) -> Ex = {
-  let notes = 2 + (if b.has_note { 1 } else { 0 }) + (match b.variant { Some(_) -> 1, None -> 0 });
-  report(ex, diag2(b"E0206", ex.m, b.span, ex.m, def.span, notes))
+  let head = bytes_concat_all([b"`derive ", deriver_text(def.deriver), b" for ", def.target.name, b"` requires every field to be derivable"]);
+  let with_note = match b.note { Some(n) -> [head, n], None -> [head] };
+  let with_variant = match b.variant { Some(v) -> push(with_note, bytes_concat_all([b"the field is in variant `", v, b"`"])), None -> with_note };
+  let notes = push(with_variant, bytes_concat_all([b"remove the field from `", def.target.name, b"`, or write the dictionary by hand"]));
+  report(ex, diag2(b"E0206", ex.m, b.span,
+                   bytes_concat_all([b"`", deriver_text(def.deriver), b"` cannot be derived for `", def.target.name, b"`"]),
+                   b.reason, ex.m, def.span, b"required by this derivation", notes))
 }
 
-fn internal(ex: Ex, def: DeriveDef) -> Ex = report(ex, diag1(b"E0505", ex.m, def.span, 2))
+fn internal(ex: Ex, def: DeriveDef, source: Bytes) -> Ex =
+  report(ex, diag1(b"E0505", ex.m, def.span,
+                   bytes_concat_all([b"the `", deriver_text(def.deriver), b"` deriver generated a definition that does not parse"]),
+                   b"this derivation",
+                   [b"this is a compiler bug: derivation is total, so generation cannot fail",
+                    bytes_concat(b"it generated: ", source)]))
 
 // `expand_module`: the generated definitions and any import a runtime module needed, appended.
 pub fn expand_derives(m: Int, module: Module) -> Expansion =

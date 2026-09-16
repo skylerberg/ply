@@ -226,6 +226,10 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "fn has(xs: List<Int>, i: Int) -> Bool = match list_at(xs, i) { None -> false, Some(_) -> true }\n",
         "fn get(m: Map<Int, Int>, k: Int) -> Int = match map_get(m, k) { Some(v) -> v + 1, None -> 0 }\n",
         "fn list_at(xs: List<Int>, i: Int) -> Option<Int> = None\nfn own(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }\n",
+        // `bytes_at` whose index reads the buffer again: the buffer is read first and bound
+        // after the index, and under release the index's read is the buffer's last use.
+        "fn last(b: Bytes) -> Int = bytes_at(b, bytes_len(b) - 1)\n",
+        "fn trailing_zeros(b: Bytes) -> Int =\n  fold(range(0, bytes_len(b)), 0, |acc: Int, i: Int|\n    if bytes_at(b, bytes_len(b) - 1 - i) == 48 && acc == i { acc + 1 } else { acc })\n",
         // A lambda is a closure *and* a function written after the one that
         // builds it, and calling one through a name is `rt_call_p`. Neither
         // fuses: `apply` takes the closure as a value.

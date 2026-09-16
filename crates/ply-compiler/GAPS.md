@@ -733,16 +733,23 @@ the thing below it is fixed.**
 Three silences, all sized rather than adjectival. `GAPS-harness.md` §H2 is the
 enforced list; this is the ranking of it.
 
-1. **Diagnostic message text and severity.** `error_here`, `unclosed`, `expect`,
-   `expect_ident` and `expect_gt` all carry a `what: Bytes` naming what was
-   expected and **never read it** — **134 call sites** in the reference, and
-   `GAPS-items.md` §P10 counts 105 literals written for it in one area alone. The
-   parameter is carried anyway so that turning messages on is a change to
-   `error_here` alone rather than a rewrite of 134 call sites: *the literals are
-   paid, the table is not.* Turning it on additionally needs
-   `TokenKind::describe`'s ~40 arms — one more ~40-arm `match` returning `Bytes`.
-   Severity is dropped because every parser diagnostic is `Severity::Error`; a
-   warning added to the parser would be invisible.
+1. **Diagnostic message text and severity — carried, but not compared.** Every
+   diagnostic the port raises now carries the reference's `message`, each label's
+   text, every note's text and a `severity` (`spine.ply`'s `PDiag` and `Label`,
+   `resolve.ply`'s `Diag` and `Label`, `lexer.ply`'s `Diag`), and `diag.ply`'s
+   `diag_dump` answers them in the driver's order as length-framed
+   `diag <i> <n>\n<payload>` frames. `error_here` reads its `what` through
+   `spine.ply`'s `describe`, the port of `TokenKind::describe`. The dumps the
+   differentials compare are unchanged and still compare none of it, so the text
+   is held only by `diag.ply`'s five tests and by reading. What still cannot be
+   reproduced: a `float` token's name goes through `float_display`, which trims
+   and shifts the literal rather than printing the shortest round-tripping
+   double, so a literal of more than seventeen significant digits names itself
+   differently from `f64`'s `Display`; `lexer.ply`'s own `X0001` for a non-ASCII
+   token start prints the reference's `unexpected character` text although the
+   reference would lex an alphabetic one as an identifier; and `E0418`'s
+   *"a function with row {row}"* prints the row's variable by the port's own
+   numbering, which is the reference's only while the two allocate in step.
 2. **`effect_set::expand` is not ported** — 521 lines. §H4 prices the hole
    exactly: 1 of 21 corpus files (**21.2% of corpus bytes**), 20 of 716 mined
    fixtures, **0 trees still disagreeing**, 7 inputs where a diagnostic differs.
