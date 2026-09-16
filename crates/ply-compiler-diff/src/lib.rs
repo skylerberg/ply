@@ -342,23 +342,44 @@ fn reference_front(modules: &[(String, String)]) -> ply_ty::Front {
             .unwrap_or_else(|| panic!("`{name}` hashed to `{hash}` and stored no body"));
         (name.clone(), body.as_bytes().to_vec())
     };
-    // The hasher's item order, which `deps` keeps: a name in two namespaces has a body in each.
-    let stored_bodies = hashes
-        .deps
-        .keys()
-        .flat_map(|name| {
-            hashes
-                .defs
-                .get(name)
-                .into_iter()
-                .chain(hashes.decls.get(name))
-                .map(|h| stored(name, *h))
-                .collect::<Vec<_>>()
-        })
-        .collect();
+    // The hasher's item order, as `ProgramIndex::of_program` walks it: every module in program
+    // order, its items in source order; a name in two namespaces is hashed once and has a body in
+    // each.
+    let mut hash_order = Vec::new();
+    let mut stored_bodies = Vec::new();
+    let mut named: std::collections::BTreeSet<ply_span::Symbol> = Default::default();
+    let (mut tests, mut laws) = (0, 0);
+    for module in &program.modules {
+        for item in &module.items {
+            let (name, table) = match item {
+                Item::Fn(d) => (module.name.qualify(&d.name.name), &hashes.defs),
+                Item::Type(d) => (module.name.qualify(&d.name.name), &hashes.decls),
+                Item::Effect(d) => (module.name.qualify(&d.name.name), &hashes.decls),
+                Item::Test(_) => {
+                    hash_order.push(ply_ty::Hashed::Test(tests));
+                    tests += 1;
+                    continue;
+                }
+                Item::Law(_) => {
+                    hash_order.push(ply_ty::Hashed::Law(laws));
+                    laws += 1;
+                    continue;
+                }
+                Item::Derive(_) | Item::EffectSet(_) => continue,
+            };
+            if named.insert(name.clone()) {
+                hash_order.push(ply_ty::Hashed::Def(name.clone()));
+            }
+            let hash = table
+                .get(&name)
+                .unwrap_or_else(|| panic!("`{name}` was declared and not hashed"));
+            stored_bodies.push(stored(&name, *hash));
+        }
+    }
     ply_ty::Front {
         diagnostics: Vec::new(),
         order,
+        hash_order,
         bodies: stored_bodies,
         test_bodies: bodies
             .tests()
