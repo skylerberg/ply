@@ -58,6 +58,13 @@ impl V {
     }
 }
 
+/// What a `match` tests: the scrutinee's word, or the element a lookup answered (`lookup_of`),
+/// whose arms test it against zero and bind it directly.
+enum Subject {
+    Value(V),
+    Lookup(V),
+}
+
 /// What the emitter keeps of a type the checker published, carried by value, since a record's
 /// field list is short and there is no module to hold a table for.
 #[derive(Clone, PartialEq, Debug)]
@@ -2749,6 +2756,9 @@ impl<'a> Emit<'a> {
             NodeKind::Block {
                 tail: Some(tail), ..
             } => self.fusable_step(tail),
+            NodeKind::Match { arms, .. } => arms
+                .iter()
+                .all(|a| a.guard.is_none() && self.fusable_step(&a.body)),
             _ => false,
         }
     }
@@ -2809,6 +2819,12 @@ impl<'a> Emit<'a> {
                 )?;
                 self.scope.truncate(mark);
                 Ok(())
+            }
+            NodeKind::Match { scrutinee, arms } => {
+                let subject = self.match_subject(scrutinee, arms)?;
+                self.match_arms(&subject, arms, code.span, &mut |this, body| {
+                    this.emit_step(body, state, answer, stop, go)
+                })
             }
             _ => unreachable!("checked by `fusable_step`"),
         }
@@ -2983,71 +2999,41 @@ impl<'a> Emit<'a> {
         (unwraps(&a.pat)? != unwraps(&b.pat)?).then_some((helper, args))
     }
 
-    /// The match `lookup_of` recognised: the element held once more, or zero, straight from the
-    /// runtime, with no `Some` built and taken apart between. The failure check has to come
-    /// before zero is read as `None`, because a call that failed answers zero too.
-    fn lookup_match(
-        &mut self,
-        helper: &str,
-        args: &[Code],
-        arms: &[Arm],
-        call: Span,
-        span: Span,
-    ) -> Result<V> {
-        let mut vals = Vec::with_capacity(args.len());
-        for a in args {
-            vals.push(self.expr(a)?);
-        }
-        self.site(call);
-        let mut ws = Vec::with_capacity(vals.len());
-        for v in &vals {
-            ws.push(self.owned(v));
-        }
-        let held = self.bind(Kind::Boxed, format!("{helper}(ctx, {})", ws.join(", ")));
-        self.check();
-        let out = self.fresh();
-        self.line(format!("Word {out} = 0;"));
-        let done = self.fresh();
-        self.line(format!("int {done} = 0;"));
-        for arm in arms {
-            self.line(format!("if (!{done}) {{"));
-            self.depth += 1;
-            let (test, sub) = match &arm.pat {
-                Pat::Ctor { args: fields, .. } if fields.len() == 1 => {
-                    (format!("({} != 0)", held.c), Some(&fields[0]))
-                }
-                _ => (format!("({} == 0)", held.c), None),
-            };
-            self.line(format!("if ({test}) {{"));
-            self.depth += 1;
-            let mark = self.scope.len();
-            if let Some(sub) = sub {
-                self.bind_pattern(sub, &held)?;
-            }
-            let body = self.expr(&arm.body)?;
-            let bw = self.word(&body);
-            self.line(format!("{out} = {bw};"));
-            self.line(format!("{done} = 1;"));
-            self.scope.truncate(mark);
-            self.depth -= 1;
-            self.line("}");
-            self.depth -= 1;
-            self.line("}");
-        }
-        self.site(span);
-        self.line(format!("if (!{done}) {{ rt_no_match_p(ctx); return 0; }}"));
-        Ok(V::boxed(out))
-    }
-
-    fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], span: Span) -> Result<V> {
+    /// What a `match` tests, held in a local. For the match `lookup_of` recognised that is the
+    /// element held once more, or zero, straight from the runtime, with no `Some` built and
+    /// taken apart between; the failure check has to come before zero is read as `None`, because
+    /// a call that failed answers zero too.
+    fn match_subject(&mut self, scrutinee: &Code, arms: &[Arm]) -> Result<Subject> {
         if let Some((helper, args)) = self.lookup_of(scrutinee, arms) {
-            return self.lookup_match(helper, args, arms, scrutinee.span, span);
+            let mut vals = Vec::with_capacity(args.len());
+            for a in args {
+                vals.push(self.expr(a)?);
+            }
+            self.site(scrutinee.span);
+            let mut ws = Vec::with_capacity(vals.len());
+            for v in &vals {
+                ws.push(self.owned(v));
+            }
+            let held = self.bind(Kind::Boxed, format!("{helper}(ctx, {})", ws.join(", ")));
+            self.check();
+            return Ok(Subject::Lookup(held));
         }
         let s = self.expr(scrutinee)?;
         let sw = self.word(&s);
-        let held = self.bind(Kind::Boxed, sw);
-        let out = self.fresh();
-        self.line(format!("Word {out} = 0;"));
+        Ok(Subject::Value(self.bind(Kind::Boxed, sw)))
+    }
+
+    /// The arms, in order, over one flag: each runs only if no earlier one matched, and a body
+    /// that falls off the end raises rather than answering. `body` is what an arm's body becomes,
+    /// which is an assignment to the match's answer for an expression and the loop's own control
+    /// for a fused step.
+    fn match_arms(
+        &mut self,
+        subject: &Subject,
+        arms: &[Arm],
+        span: Span,
+        body: &mut dyn FnMut(&mut Self, &Code) -> Result<()>,
+    ) -> Result<()> {
         let done = self.fresh();
         self.line(format!("int {done} = 0;"));
         for arm in arms {
@@ -3056,14 +3042,22 @@ impl<'a> Emit<'a> {
             }
             self.line(format!("if (!{done}) {{"));
             self.depth += 1;
-            let test = self.test(&arm.pat, &held)?;
+            let (held, test, bind) = match subject {
+                Subject::Value(held) => (held, self.test(&arm.pat, held)?, Some(&arm.pat)),
+                Subject::Lookup(held) => match &arm.pat {
+                    Pat::Ctor { args: fields, .. } if fields.len() == 1 => {
+                        (held, format!("({} != 0)", held.c), Some(&fields[0]))
+                    }
+                    _ => (held, format!("({} == 0)", held.c), None),
+                },
+            };
             self.line(format!("if ({test}) {{"));
             self.depth += 1;
             let mark = self.scope.len();
-            self.bind_pattern(&arm.pat, &held)?;
-            let body = self.expr(&arm.body)?;
-            let bw = self.word(&body);
-            self.line(format!("{out} = {bw};"));
+            if let Some(pat) = bind {
+                self.bind_pattern(pat, held)?;
+            }
+            body(self, &arm.body)?;
             self.line(format!("{done} = 1;"));
             self.scope.truncate(mark);
             self.depth -= 1;
@@ -3073,6 +3067,19 @@ impl<'a> Emit<'a> {
         }
         self.site(span);
         self.line(format!("if (!{done}) {{ rt_no_match_p(ctx); return 0; }}"));
+        Ok(())
+    }
+
+    fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], span: Span) -> Result<V> {
+        let subject = self.match_subject(scrutinee, arms)?;
+        let out = self.fresh();
+        self.line(format!("Word {out} = 0;"));
+        self.match_arms(&subject, arms, span, &mut |this, body| {
+            let v = this.expr(body)?;
+            let w = this.word(&v);
+            this.line(format!("{out} = {w};"));
+            Ok(())
+        })?;
         Ok(V::boxed(out))
     }
 
