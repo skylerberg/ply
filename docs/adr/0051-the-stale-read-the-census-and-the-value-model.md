@@ -196,6 +196,25 @@ deferred, behind what the census weighs. The levers, in its order:
    before it reads zero as `None`. The measure is the `Some` line of the
    census and the objects allocated.
 
+   **Built, 2026-09-16.** Both emitters compile the match to the helper,
+   the `Some` arm binding the answer itself with no increment and the arms
+   keeping the general path's shape; the two helpers joined the table at
+   its end; the emit differential's corpus arms either arm order, a name
+   or a wildcard, and a module's own `list_at` that must not take the
+   path. Two traps on the way are now closed: the differential entered the
+   port through the checked-in bundle, which served the old emitter as
+   long as the new helper table extended the old, so it asserts first
+   that the bundle was emitted from the tree's sources; and the bundle
+   refresh converged in one round, which a change to what the emitter
+   emits cannot do, so it emits from each emission until two agree.
+
+   **Measured, 2026-09-16.** The emitter over its own sources allocated
+   107.9 million objects against 167.6 million, a third fewer; `Some` fell
+   from 62 million to 2 million, and the constructors from two fifths of
+   the whole to a fifth. The hasher's first part allocated 32.1 million
+   against 46.5 million. The chunk bytes and the resident memory did not
+   move. The census file carries the new counts.
+
 4. **The loop step's `Stop` and `Continue` unwrapped through `match`.**
    `fused_iterate` writes a step's payload straight into the loop's
    variables when every exit is a written `Stop(..)` or `Continue(..)`,
