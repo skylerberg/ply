@@ -80,8 +80,28 @@ fn by_name(dump: &str) -> std::collections::BTreeMap<String, String> {
     out
 }
 
+/// The port under test is the bootstrap bundle, and a bundle emitted from other sources than the
+/// tree's is the *old* emitter: a disagreement it reports says nothing about `emit.ply`. A working
+/// copy named by `PLY_C_EMITTER`, or an emitter the reference builds, is never stale.
+fn the_bundle_is_the_sources() {
+    if std::env::var_os("PLY_C_EMITTER").is_some()
+        || std::env::var("PLY_C_BOOTSTRAP").as_deref() == Ok("off")
+    {
+        return;
+    }
+    ply_codegen::c::producer::ensure_default();
+    assert_eq!(
+        ply_compiler::bootstrap::SOURCES.trim(),
+        ply_codegen::c::producer::identity(),
+        "the bootstrap bundle was emitted from other sources than crates/ply-compiler/ply, so the \
+         port under test is the old emitter; refresh it first (PLY_C_BOOTSTRAP_REFRESH=1 on \
+         ply-codegen-tests' bootstrap test, or CI's `bootstrap-bundle` artifact)"
+    );
+}
+
 /// Every body the port emitted is the body the reference emits.
 fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize) {
+    the_bundle_is_the_sources();
     let builtins = bytes_list(&ply_compiler_diff::reference_builtins());
     let mut failures: Vec<String> = Vec::new();
     let (mut reached, mut available) = (0usize, 0usize);
