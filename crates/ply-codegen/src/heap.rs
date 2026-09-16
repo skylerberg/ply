@@ -151,6 +151,13 @@ pub fn poisoning() -> bool {
     *ON.get_or_init(|| std::env::var_os("PLY_HEAP_POISON").is_some())
 }
 
+/// Whether allocations are also tallied by layout, which `PLY_C_PHASES` prints at an entry's
+/// end and costs a map insert per allocation.
+fn census_by_layout() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("PLY_C_PHASES").is_some())
+}
+
 /// How many releases a dead block waits before an allocation may take it: zero, unless
 /// `PLY_HEAP_DELAY=<n>` says otherwise for a process. The other diagnostic mode, for reading
 /// what a program's allocation pattern costs when a block is not reused at once: a value built
@@ -430,6 +437,9 @@ pub struct Heap {
     /// Objects allocated since the last reset, and the same by kind.
     count: usize,
     by_kind: [usize; 16],
+    /// Under `PLY_C_PHASES`: constructors and records by their layout, and bytes and strings by
+    /// the power of two their length rounds up to, keyed by kind.
+    by_layout: HashMap<(u8, u32), usize>,
     recycled: usize,
     /// Dead objects by size class, for an allocation of that class to take before the bump
     /// pointer moves: what keeps an entry's memory bounded by what it holds rather than by what
@@ -543,6 +553,7 @@ impl Heap {
             persistent: false,
             count: 0,
             by_kind: [0; 16],
+            by_layout: HashMap::new(),
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
@@ -623,6 +634,16 @@ impl Heap {
     /// which is what a change to the value model is aimed by.
     pub fn allocated_by_kind(&self) -> [usize; 16] {
         self.by_kind
+    }
+
+    /// Under `PLY_C_PHASES`, the constructors and records allocated by layout and the bytes and
+    /// strings by length class, most first: which constructors and which shapes a program is
+    /// made of.
+    pub fn allocated_by_layout(&self) -> Vec<((u8, u32), usize)> {
+        let mut out: Vec<((u8, u32), usize)> =
+            self.by_layout.iter().map(|(k, n)| (*k, *n)).collect();
+        out.sort_by_key(|(k, n)| (std::cmp::Reverse(*n), *k));
+        out
     }
 
     /// Allocations served from the free list rather than from fresh memory.
@@ -726,6 +747,17 @@ impl Heap {
         self.mark_start(p as usize);
         self.count += 1;
         self.by_kind[kind as usize & 15] += 1;
+        if census_by_layout() {
+            let key = match kind {
+                KIND_CTOR | KIND_RECORD => Some(layout),
+                // Bytes arrive with `len` zero and the room in the payload; the class is the room.
+                KIND_BYTES | KIND_STR => Some((payload_bytes as u32).next_power_of_two()),
+                _ => None,
+            };
+            if let Some(key) = key {
+                *self.by_layout.entry((kind, key)).or_insert(0) += 1;
+            }
+        }
         p
     }
 
@@ -943,6 +975,7 @@ impl Heap {
         self.chunk = 0;
         self.count = 0;
         self.by_kind = [0; 16];
+        self.by_layout.clear();
         self.recycled = 0;
         for class in &mut self.free {
             class.clear();
