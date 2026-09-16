@@ -128,6 +128,8 @@ concurrency:
 
 permissions:
   contents: read
+  # `gh run download` of another run's artifact, for a push whose tree a pull request built.
+  actions: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -223,23 +225,51 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: The tree this run builds
+        id: tree
+        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+      # A push to main whose tree a pull request's run already built has nothing to
+      # compile: that run's archive, uploaded by tree, is this run's. The trees match
+      # whenever main did not move between the pull request's last run and its merge,
+      # which a merge waited on CI for is. Main cannot read a pull request's cache, so
+      # the archive travels as an artifact.
+      - name: The archive a pull request's run built for this tree
+        id: reuse
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="nextest-archive-${{ steps.tree.outputs.tree }}"
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=10" \
+            -q '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [ -z "$run" ]; then echo "no run has built this tree; building"; exit 0; fi
+          gh run download "$run" -n "$name"
+          test -f nextest.tar.zst
+          echo "reused=true" >> "$GITHUB_OUTPUT"
+          echo "the archive run $run built for tree ${{ steps.tree.outputs.tree }}"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        if: steps.reuse.outputs.reused != 'true'
         with:
           toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.reuse.outputs.reused != 'true'
         with:
           key: build-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
           save-if: ${{ github.ref_name == github.event.repository.default_branch }}
       - uses: taiki-e/install-action@0758d235715de2f3551eacc980d9ae8fce9342c3 # v2.87.3
+        if: steps.reuse.outputs.reused != 'true'
         with:
           tool: cargo-nextest@0.9.143
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: steps.reuse.outputs.reused != 'true'
 
       # The same build the archive packages, with cargo's own account of where
       # its time went: `target/cargo-timings/cargo-timing.html`, one row per
       # unit, comes back as the `build-timings` artifact. This job is the run's
       # long pole, and a lever on it is worth taking only where the time is.
       - name: cargo test --workspace --no-run --timings
+        if: steps.reuse.outputs.reused != 'true'
         run: cargo test --locked --workspace --no-run --timings
       # Doctests are the one thing nextest does not run. There are none today,
       # and this is what runs one if it appears. Here it costs the rustdoc pass
@@ -247,12 +277,15 @@ jobs:
       # `clippy` it was a second build of the workspace, two minutes that were
       # off the critical path only while this job was slower than that one.
       - name: cargo test --doc
+        if: steps.reuse.outputs.reused != 'true'
         run: cargo test --locked --doc --workspace
       # What sccache answered from the cache and what it compiled: the reading
       # that says whether a change to a leaf crate paid for the whole workspace.
       - name: sccache --show-stats
+        if: steps.reuse.outputs.reused != 'true'
         run: sccache --show-stats
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.reuse.outputs.reused != 'true'
         with:
           name: build-timings
           path: target/cargo-timings/cargo-timing.html
@@ -267,6 +300,7 @@ jobs:
       # made: what a panic prints, the assertion's own file and line, is in
       # the message and not the DWARF, and a backtrace keeps its symbol names.
       - name: Strip the debug info no test reads
+        if: steps.reuse.outputs.reused != 'true'
         run: |
           set -euo pipefail
           cargo nextest list --locked --workspace --list-type binaries-only --message-format json > /tmp/binaries.json
@@ -293,6 +327,7 @@ jobs:
       # extract it to the same path it was built at, so a path compiled into a
       # test binary is still the path it names.
       - name: cargo nextest archive --workspace
+        if: steps.reuse.outputs.reused != 'true'
         run: cargo nextest archive --locked --workspace --archive-file nextest.tar.zst
 
       # The archive is forty-odd binaries that each carry the same libraries'
@@ -301,6 +336,7 @@ jobs:
       # the whole tree, the copies deduplicate. Every job that unpacks it has to
       # say `--long=30` too: the window is part of the format.
       - name: Recompress the archive with a whole-tree window
+        if: steps.reuse.outputs.reused != 'true'
         run: |
           set -euo pipefail
           before=$(stat -c %s nextest.tar.zst)
@@ -314,6 +350,13 @@ jobs:
       # parallel chunks. Keyed by run, so a job restores exactly this build;
       # an old run's archive is never asked for again and is the first thing
       # the cache's eviction takes.
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          name: nextest-archive-${{ steps.tree.outputs.tree }}
+          path: nextest.tar.zst
+          retention-days: 2
+          if-no-files-found: error
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: nextest.tar.zst
@@ -333,17 +376,42 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+      - name: The tree this run builds
+        id: tree
+        run: echo "tree=$(git rev-parse 'HEAD^{tree}')" >> "$GITHUB_OUTPUT"
+      # As the archive: the release binary a pull request's run built for this tree.
+      - name: The binary a pull request's run built for this tree
+        id: reuse
+        if: github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          name="ply-${{ steps.tree.outputs.tree }}"
+          run=$(gh api "repos/$GITHUB_REPOSITORY/actions/artifacts?name=$name&per_page=10" \
+            -q '[.artifacts[] | select(.expired == false)] | sort_by(.created_at) | last | .workflow_run.id // empty')
+          if [ -z "$run" ]; then echo "no run has built this tree; building"; exit 0; fi
+          gh run download "$run" -n "$name" -D target/release
+          chmod +x target/release/ply
+          touch target/release/ply target/release/ply.d
+          echo "reused=true" >> "$GITHUB_OUTPUT"
+          echo "the binary run $run built for tree ${{ steps.tree.outputs.tree }}"
       - uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+        if: steps.reuse.outputs.reused != 'true'
         with:
           toolchain: "1.93.1"
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        if: steps.reuse.outputs.reused != 'true'
         with:
           key: ply-${{ hashFiles('Cargo.toml', 'crates/*/Cargo.toml') }}
           save-if: ${{ github.ref_name == github.event.repository.default_branch }}
       - uses: mozilla-actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
+        if: steps.reuse.outputs.reused != 'true'
       - name: cargo build --locked --release -p ply-cli --bin ply
+        if: steps.reuse.outputs.reused != 'true'
         run: cargo build --locked --release -p ply-cli --bin ply
       - name: sccache --show-stats
+        if: steps.reuse.outputs.reused != 'true'
         run: sccache --show-stats
 
       # tcc, the development profile's C compiler, fetched once for every job
@@ -362,6 +430,7 @@ jobs:
       - name: tcc, for the measurement below
         run: sudo dpkg -i tcc/*.deb
       - name: What compiling a fresh trivial program costs, with the binary just built
+        if: steps.reuse.outputs.reused != 'true'
         run: |
           set -euo pipefail
           d=$(mktemp -d)
@@ -401,6 +470,15 @@ jobs:
             target/release/ply.d
           retention-days: 1
           if-no-files-found: error
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: github.event_name == 'pull_request'
+        with:
+          name: ply-${{ steps.tree.outputs.tree }}
+          path: |
+            target/release/ply
+            target/release/ply.d
+          retention-days: 2
+          if-no-files-found: error
 
   # A slice of the suite. nextest deals the tests after the filter round-robin
   # across the partitions, so the long tests of one binary land in different
@@ -420,6 +498,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+        id: suite
         with:
           slot: part-${{ strategy.job-index }}
 
@@ -450,10 +529,10 @@ jobs:
           echo "partition $SLICE ran $ran tests"
           [ "$ran" -gt 0 ] || { echo "the partition ran no tests at all" >&2; exit 1; }
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
         with:
           path: /tmp/ply-c-cache
-          key: ply-c-cache-part-${{ strategy.job-index }}-${{ github.run_id }}
+          key: ${{ steps.suite.outputs.objects-key }}
 
   # One test on one runner. Each of these is the longest test of a binary that
   # `.config/nextest.toml` runs with every thread and nothing beside it, so in
@@ -472,6 +551,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+        id: suite
         with:
           slot: solo-${{ matrix.id }}
 
@@ -493,10 +573,10 @@ jobs:
           ' /tmp/solo.log)
           [ "$ran" -eq 1 ] || { echo "solo test '$ID' selected $ran tests rather than one: the table names a test the binary does not have" >&2; exit 1; }
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
         with:
           path: /tmp/ply-c-cache
-          key: ply-c-cache-solo-${{ matrix.id }}-${{ github.run_id }}
+          key: ${{ steps.suite.outputs.objects-key }}
 
       # The bootstrap fixpoint went red: an emitter source changed and the
       # bundle is the old emitter's. The refresh is the fixpoint test itself,
@@ -539,6 +619,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+        id: suite
         with:
           slot: gates
 
@@ -585,10 +666,10 @@ jobs:
           }
           echo "w5_shutdown: $w5 test(s) ran"
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
         with:
           path: /tmp/ply-c-cache
-          key: ply-c-cache-gates-${{ github.run_id }}
+          key: ${{ steps.suite.outputs.objects-key }}
 
   test-postgres:
     name: test ply-host (postgres)
@@ -633,6 +714,7 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/suite
+        id: suite
         with:
           slot: postgres
 
@@ -742,10 +824,10 @@ jobs:
           touch target/release/ply target/release/ply.d
           PLY_BIN="$GITHUB_WORKSPACE/target/release/ply" ./examples/same-tests.sh --db "$PLY_TEST_DB" --reset --no-build
       - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: github.ref == 'refs/heads/main'
+        if: github.ref == 'refs/heads/main' && steps.suite.outputs.objects-hit != 'true'
         with:
           path: /tmp/ply-c-cache
-          key: ply-c-cache-postgres-${{ github.run_id }}
+          key: ${{ steps.suite.outputs.objects-key }}
 
   ucontext-probe:
     name: ./probes/ucontext/run.sh
