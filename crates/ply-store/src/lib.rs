@@ -15,8 +15,8 @@ pub mod reviews;
 pub mod schema;
 
 use anyhow::Context;
-use ply_hash::DefHash;
 use ply_span::{Diagnostic, Symbol};
+use ply_ty::DefHash;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};

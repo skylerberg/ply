@@ -13,7 +13,7 @@
 use ply_compiler_diff::{bundle, part, port, programs, reference_diag_dump};
 use std::path::{Path, PathBuf};
 
-fn repo_root() -> PathBuf {
+pub(crate) fn repo_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
         .ancestors()
         .nth(2)
@@ -22,13 +22,13 @@ fn repo_root() -> PathBuf {
 }
 
 /// This crate's own directory, which is where the mined corpora live.
-fn here() -> PathBuf {
+pub(crate) fn here() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }
 
 /// The first line the two dumps disagree on, and then both texts whole, since a diagnostics dump
 /// is short enough to read and the message is what a frame carries.
-fn first_difference(reference: &str, actual: &str) -> Option<String> {
+pub(crate) fn first_difference(reference: &str, actual: &str) -> Option<String> {
     if reference == actual {
         return None;
     }
@@ -82,7 +82,7 @@ fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
     );
 }
 
-fn ply_files(dir: &Path, prefix: &str) -> Vec<(String, String)> {
+pub(crate) fn ply_files(dir: &Path, prefix: &str) -> Vec<(String, String)> {
     let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
         .unwrap_or_else(|e| panic!("{}: {e}", dir.display()))
         .flatten()
@@ -103,13 +103,13 @@ fn ply_files(dir: &Path, prefix: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-fn std_modules() -> Vec<(String, String)> {
+pub(crate) fn std_modules() -> Vec<(String, String)> {
     ply_files(&repo_root().join("crates/ply-std/ply"), "std.")
 }
 
 /// Each file under `dir` as its own program on top of the standard library, named `m` as the
 /// driver names a lone file.
-fn each_with_std(dir: &str) -> Vec<(String, Vec<(String, String)>)> {
+pub(crate) fn each_with_std(dir: &str) -> Vec<(String, Vec<(String, String)>)> {
     let std = std_modules();
     ply_files(&repo_root().join(dir), "")
         .into_iter()

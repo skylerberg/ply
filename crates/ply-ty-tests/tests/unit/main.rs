@@ -2,5 +2,7 @@
 //! opt-level 0 against the optimised rlib. The module tree mirrors
 //! `crates/ply-ty/src`.
 
+mod front;
+mod parse;
 mod print;
 mod ty;
