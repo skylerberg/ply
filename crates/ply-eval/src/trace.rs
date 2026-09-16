@@ -1,6 +1,6 @@
 //! What an engine actually did, as against what its type said it might.
 
-use ply_core::ty::{EffectAtom, Footprint};
+use ply_ty::{EffectAtom, Footprint};
 
 /// The count is kept because a row is a set: an engine that performed one atom three times and an
 /// engine that performed it once agree on the footprint and have not done the same thing.

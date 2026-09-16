@@ -728,9 +728,7 @@ pub fn emit_one(
         .get(&ply_span::Symbol::new(name))
         .map(|d| &d.scheme.ty)
     {
-        Some(ply_core::ty::Type::Fn { params, .. }) => {
-            params.iter().map(super::emit::CTy::of).collect()
-        }
+        Some(ply_ty::Type::Fn { params, .. }) => params.iter().map(super::emit::CTy::of).collect(),
         _ => vec![super::emit::CTy::Unknown; params.len()],
     };
     for (i, p) in params.iter().enumerate() {

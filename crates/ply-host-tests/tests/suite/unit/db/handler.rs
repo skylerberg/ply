@@ -1,5 +1,3 @@
-use ply_core::ty::Resource;
-use ply_core::ty::{EffectAtom, Footprint};
 use ply_eval::Value;
 use ply_eval::host::{Determinism, HostOp, Linearity};
 use ply_eval::host::{HostAnswer, HostHandler, HostRequest, HostRuntime};
@@ -9,6 +7,8 @@ use ply_host::db::types::Datum;
 use ply_host::db::{Op, value};
 use ply_span::Symbol;
 use ply_span::{Diagnostic, Span, codes};
+use ply_ty::Resource;
+use ply_ty::{EffectAtom, Footprint};
 use std::sync::Arc;
 
 /// A `std.db` constructor, qualified as a `Value` carries one.

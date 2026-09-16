@@ -1,6 +1,5 @@
-use ply_core::ty::*;
 use ply_span::Symbol;
-use ply_syntax::ast::Mode;
+use ply_ty::*;
 use std::collections::BTreeSet;
 
 fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {

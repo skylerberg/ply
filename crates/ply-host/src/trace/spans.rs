@@ -1,10 +1,10 @@
 //! Which spans each performer has open, and what closes one.
 
 use super::Outcome;
-use ply_core::ty::Resource;
 use ply_eval::TaskId;
 use ply_eval::host::MachineId;
 use ply_span::{Diagnostic, Span, codes};
+use ply_ty::Resource;
 use std::collections::BTreeMap;
 
 /// Who a span belongs to: the machine that opened it and the task inside it, if any.

@@ -5,7 +5,6 @@
 // carries.
 #![allow(clippy::arc_with_non_send_sync)]
 
-use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::host::{
     HostAnswer, HostOp, HostRegistry, HostRequest, HostRuntime, MachineId, Pending,
 };
@@ -16,7 +15,8 @@ use ply_host::tcp::{Net, TcpHost};
 use ply_host::trace::sink::Recording;
 use ply_host::trace::{Clock, Kept, Kind, Level, Op, Outcome, Sink, Trace};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Resource};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};

@@ -1,6 +1,5 @@
 //! Selecting, caching and reporting obligations.
 
-use ply_core::CheckOutput;
 use ply_hash::{DefHash, HashOutput};
 use ply_prove::key::{prove_key, result_key};
 use ply_prove::{
@@ -12,6 +11,7 @@ use ply_store::{
     CachedCases, CachedCertificate, CachedEvidence, CachedObligation, CachedRule, ReviewRecord,
     Store,
 };
+use ply_ty::CheckOutput;
 use rayon::prelude::*;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};

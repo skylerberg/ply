@@ -2,9 +2,9 @@
 //! function into the handler for a Ply-declared operation.
 
 use crate::value::Value;
-use ply_core::ty::{EffectAtom, Footprint, Resource};
-use ply_core::{CheckOutput, EffectInfo};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::{CheckOutput, EffectInfo};
+use ply_ty::{EffectAtom, Footprint, Resource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;

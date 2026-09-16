@@ -6,7 +6,6 @@ mod egraph;
 mod numerics;
 mod term;
 
-use ply_core::{CheckOutput, LawBinder, TyVar, Type};
 use ply_prove::prove::{
     Blocker, Context, Decision, Goal, Limits, Proof, Reason, decide, decide_and_diagnose,
 };
@@ -14,6 +13,7 @@ use ply_prove::{Rule, UNFOLD_DEPTH};
 use ply_span::{SourceId, Span, Symbol};
 use ply_syntax::ast::{Expr, Item, LawDef, Program, TypeExpr};
 use ply_syntax::resolve::Resolved;
+use ply_ty::{CheckOutput, LawBinder, TyVar, Type};
 use std::collections::BTreeMap;
 
 const SRC: SourceId = SourceId(0);
@@ -80,7 +80,7 @@ fn resolve_type(ty: &TypeExpr, vars: &mut BTreeMap<Symbol, TyVar>) -> Type {
         TypeExpr::Fn { params, ret, .. } => Type::Fn {
             params: params.iter().map(|p| resolve_type(p, vars)).collect(),
             ret: Box::new(resolve_type(ret, vars)),
-            effects: ply_core::Row::empty(),
+            effects: ply_ty::Row::empty(),
         },
         TypeExpr::Record { fields, .. } => Type::Record(
             fields

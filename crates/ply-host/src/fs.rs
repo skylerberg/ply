@@ -1,13 +1,13 @@
 //! The filesystem, as nine operations over roots the run names.
 
 use crate::pool::{Done, FS_FIRST_TOKEN, Pool};
-use ply_core::ty::Resource;
 use ply_eval::host::{
     Determinism, HostAnswer, HostHandler, HostOp, HostRegistry, HostRequest, HostResource,
     HostRuntime, Linearity,
 };
 use ply_eval::{Pending, Value};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::Resource;
 use std::collections::BTreeMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;

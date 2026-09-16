@@ -1,8 +1,8 @@
 //! The prover's term language: one hash-consed DAG per obligation.
 
-use ply_core::Type;
-use ply_core::ty::IntTy;
 use ply_span::Symbol;
+use ply_ty::IntTy;
+use ply_ty::Type;
 use std::collections::HashMap;
 
 pub type TermId = usize;

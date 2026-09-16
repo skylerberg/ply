@@ -1,4 +1,3 @@
-use ply_core::{EffectAtom, Resource};
 use ply_eval::Value;
 use ply_eval::arena::Slot;
 use ply_eval::cont::{Continuation, SimId};
@@ -10,7 +9,8 @@ use ply_eval::sim::{Access, Clock, DEFAULT_STEPS, Seed, StepFootprint, TaskId};
 use ply_eval::sim::{Answer, Handlers, signature};
 use ply_span::Symbol;
 use ply_span::{Diagnostic, Span, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Resource};
 use std::rc::Rc;
 
 type Sched = Scheduler<Continuation, Value>;

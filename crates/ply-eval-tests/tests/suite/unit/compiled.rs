@@ -1,5 +1,5 @@
 use crate::unit::build::*;
-use ply_core::{CheckOutput, check_program};
+use ply_core::check_program;
 use ply_eval::Value;
 /// Doubles, because nothing in this workspace implements [`Compiled`].
 use ply_eval::compiled::*;
@@ -9,6 +9,7 @@ use ply_span::Symbol;
 use ply_span::{Diagnostic, codes};
 use ply_syntax::ast::{BinOp, Expr, Item, Program};
 use ply_syntax::resolve::Resolved;
+use ply_ty::CheckOutput;
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::rc::Rc;
@@ -304,7 +305,7 @@ fn a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type() {
     let types = c.types();
     for name in ["holds_cell", "holds_secret", "holds_fn"] {
         let ty = &c.check.defs[&Symbol::new(name)].scheme.ty;
-        let ply_core::ty::Type::Fn { params, .. } = ty else {
+        let ply_ty::Type::Fn { params, .. } = ty else {
             panic!("{name} publishes no function type");
         };
         assert!(
@@ -313,8 +314,7 @@ fn a_world_handle_typed_parameter_is_refused_though_it_is_a_nominal_type() {
             params[0]
         );
     }
-    let ply_core::ty::Type::Fn { params, .. } = &c.check.defs[&Symbol::new("holds_int")].scheme.ty
-    else {
+    let ply_ty::Type::Fn { params, .. } = &c.check.defs[&Symbol::new("holds_int")].scheme.ty else {
         panic!("holds_int publishes no function type");
     };
     assert!(

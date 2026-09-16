@@ -11,9 +11,9 @@ pub use context::Context;
 pub use lower::Blocker;
 
 use crate::{Certificate, DEFAULT_PROVE_BUDGET, Rule, UNFOLD_DEPTH};
-use ply_core::{LawBinder, TyVar, Type};
 use ply_span::Symbol;
 use ply_syntax::ast::Expr;
+use ply_ty::{LawBinder, TyVar, Type};
 use std::collections::BTreeSet;
 
 /// How deep the case analysis nests before the answer becomes `Unknown`.
@@ -419,7 +419,7 @@ fn conjunction(terms: &mut term::Terms, guards: &[term::TermId]) -> Option<term:
             None => *guard,
             Some(previous) => terms.mk(
                 term::Node::And(previous, *guard),
-                Some(ply_core::Type::bool()),
+                Some(ply_ty::Type::bool()),
             ),
         });
     }

@@ -225,7 +225,7 @@ pub(super) fn decode_tables(s: &str, at: &mut usize) -> Option<Tables> {
             "f" => {
                 let (ty, bits) = rest.split_once(' ')?;
                 let n: u8 = ty.parse().ok()?;
-                let ty = ply_core::ty::INT_TYPES.iter().find(|t| **t as u8 == n)?;
+                let ty = ply_ty::INT_TYPES.iter().find(|t| **t as u8 == n)?;
                 // Written unsigned by the reference and as the wrapped `Int` by the emitter in
                 // Ply, whose integers are signed: one bit pattern either way.
                 let bits: u64 = match bits.parse::<u64>() {

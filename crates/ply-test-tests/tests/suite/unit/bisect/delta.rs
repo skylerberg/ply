@@ -1,7 +1,6 @@
 //! Delta construction over real programs: the `Edited`/`Derived` split, the fusion rule, and the
 //! classifier's refusals.
 
-use ply_core::CheckOutput;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::Program;
@@ -10,6 +9,7 @@ use ply_test::bisect::{
     Baseline, Change, ChangeKind, Classify, DefKey, DepEdges, Diff, EraTable, Ns, Regression,
     Renormalizer, StoreClassify, Unknown, diff,
 };
+use ply_ty::CheckOutput;
 use std::collections::BTreeMap;
 
 struct Compiled {
