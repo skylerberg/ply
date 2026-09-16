@@ -2540,21 +2540,24 @@ fn expr(em: Em, c: Code, params: List<P>) -> Option<Out> =
     },
     // A `match` is arms in order over one flag: each arm runs only if no earlier
     // one matched, and a body that falls off the end raises rather than answering.
-    NMatch(m) -> match expr(notail(em), m.scrutinee, params) {
-      None -> None,
-      Some(sc) -> {
-        let sw = word_of(sc.em, sc.v);
-        let subj = bind_keeping(sw.em, KBoxed, sc.v.ty, sw.c);
-        let ans = fresh(subj.em);
-        let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
-        let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
-        match arms(withtail(opened, em.tail), m.arms, params, 0, subj.v, ans.name, flag.name, opened.made, []) {
-          None -> None,
-          Some(after) -> Some({
-            em: note_holder(line(site(after, c.span), bytes_concat_all([b"if (!", flag.name,
-                                                          b") { rt_no_match_p(ctx); return 0; }"])), ans.name),
-            v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
-        }
+    NMatch(m) -> match lookup_of(em, m.scrutinee, m.arms) {
+      Some(l) -> lookup_match(em, l.helper, l.args, m.arms, params, m.scrutinee.span, c.span),
+      None -> match expr(notail(em), m.scrutinee, params) {
+        None -> None,
+        Some(sc) -> {
+          let sw = word_of(sc.em, sc.v);
+          let subj = bind_keeping(sw.em, KBoxed, sc.v.ty, sw.c);
+          let ans = fresh(subj.em);
+          let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
+          let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
+          match arms(withtail(opened, em.tail), m.arms, params, 0, subj.v, ans.name, flag.name, opened.made, [], None) {
+            None -> None,
+            Some(after) -> Some({
+              em: note_holder(line(site(after, c.span), bytes_concat_all([b"if (!", flag.name,
+                                                            b") { rt_no_match_p(ctx); return 0; }"])), ans.name),
+              v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
+          }
+        },
       },
     },
     NIf(i) -> match expr(notail(em), i.cond, params) {
@@ -2982,8 +2985,9 @@ fn stmts(em: Em, xs: List<CStmt>, params: List<P>, i: Int) -> Option<Em> =
 
 // The arms, in order. Each is guarded by the flag rather than by an `else`, so
 // an arm's own test is written at one depth whatever the arm before it did.
+// `held` is the local a lookup answered, whose arms test and bind it directly.
 fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, flag: Bytes,
-        base: List<Made>, seen: List<Made>)
+        base: List<Made>, seen: List<Made>, held: Option<Bytes>)
     -> Option<Em> =
   if i >= len(xs) { Some(with_made(em, if i == 0 { em.made } else { seen })) } else {
     match list_at(xs, i) {
@@ -2991,12 +2995,19 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
       // A guard is a second test after the pattern binds, and this port does not
       // reach one yet.
       Some(a) -> if a.guard != None { Some(poison(em, b"a match guard")) } else {
-        match pat_test(a.pat, subj, indent(line(with_made(em, base), bytes_concat_all([b"if (!", flag, b") {"])))) {
+        let guarded = indent(line(with_made(em, base), bytes_concat_all([b"if (!", flag, b") {"])));
+        match (match held {
+                 Some(h) -> Some({ em: guarded, c: lookup_test(a.pat, h) }),
+                 None -> pat_test(a.pat, subj, guarded),
+               }) {
           None -> Some(poison(em, b"a pattern this port cannot test")),
           Some(t) -> {
             let opened = line(t.em, bytes_concat_all([b"if (", t.c, b") {"]));
             let inner = indent(opened);
-            let bound = pat_bind(inner, a.pat, subj);
+            let bound = match held {
+              Some(_) -> lookup_bind(inner, a.pat, subj),
+              None -> pat_bind(inner, a.pat, subj),
+            };
             match expr(bound, a.body, params) {
               None -> None,
               Some(o) -> {
@@ -3006,13 +3017,106 @@ fn arms(em: Em, xs: List<CArm>, params: List<P>, i: Int, subj: V, ans: Bytes, fl
                 let closed = close(close(done));
                 // The next arm is a tail when this one was: the body's own nodes cleared the flag.
                 arms(withtail(rescope(closed, em.conv), em.tail), xs, params, i + 1, subj, ans, flag,
-                     base, union_made(seen, closed.made))
+                     base, union_made(seen, closed.made), held)
               },
             }
           },
         }
       },
     }
+  }
+
+// `match list_at(xs, i) { Some(x) -> .., None -> .. }` and the same over `map_get`, when the
+// scrutinee names the builtin, both arms are unguarded, and the `Some` arm binds one name or
+// nothing: the helper that answers the element or zero, and the call's arguments.
+fn lookup_of(em: Em, scrutinee: Code, xs: List<CArm>) -> Option<{ helper: Bytes, args: List<Code> }> =
+  match scrutinee.node {
+    NApp(a) -> match a.func.node {
+      NVar(fv) -> if fv.slot != None || len(a.args) != 2 || len(xs) != 2
+                     || fold(em.here, false, |acc: Bool, h: Def| acc || h.name == fv.name) { None } else {
+        match (if fv.name == b"list_at" { Some(b"rt_list_lookup_p") }
+               else if fv.name == b"map_get" { Some(b"rt_map_lookup_p") }
+               else { None }) {
+          None -> None,
+          Some(h) -> match list_at(xs, 0) {
+            None -> None,
+            Some(x) -> match list_at(xs, 1) {
+              None -> None,
+              Some(y) -> if x.guard != None || y.guard != None { None } else {
+                match unwraps(em, x.pat) {
+                  None -> None,
+                  Some(ux) -> match unwraps(em, y.pat) {
+                    None -> None,
+                    Some(uy) -> if ux != uy { Some({ helper: h, args: a.args }) } else { None },
+                  },
+                }
+              },
+            },
+          },
+        }
+      },
+      _ -> None,
+    },
+    _ -> None,
+  }
+
+// `true` for `Some(x)` or `Some(_)`, `false` for `None`, and nothing for any other pattern.
+fn unwraps(em: Em, p: CPat) -> Option<Bool> =
+  match p {
+    PxCtor(c) -> if tag_of(em, c.name) == None { None }
+      else if c.name == b"Some" && len(c.args) == 1 {
+        match list_at(c.args, 0) {
+          Some(sub) -> match sub {
+            PxWild -> Some(true),
+            PxVar(v) -> if v.slot != None { Some(true) } else { None },
+            _ -> None,
+          },
+          None -> None,
+        }
+      }
+      else if c.name == b"None" && len(c.args) == 0 { Some(false) }
+      else { None },
+    _ -> None,
+  }
+
+// The match `lookup_of` recognised: the element held once more, or zero, straight from the
+// runtime, with no `Some` built and taken apart between. The failure check has to come before
+// zero is read as `None`, because a call that failed answers zero too.
+fn lookup_match(em: Em, helper: Bytes, args: List<Code>, xs: List<CArm>, params: List<P>,
+                call: Span, span: Span) -> Option<Out> =
+  match args_owned_at(notail(em), args, params, call) {
+    None -> None,
+    Some(w) -> {
+      let held = bind(w.em, KBoxed, bytes_concat_all([
+        helper, b"(ctx",
+        fold(w.names, b"", |acc: Bytes, nm: Bytes| bytes_concat_all([acc, b", ", nm])), b")"]));
+      let ans = fresh(check(held.em));
+      let flag = fresh(line(ans.em, bytes_concat_all([b"Word ", ans.name, b" = 0;"])));
+      let opened = line(flag.em, bytes_concat_all([b"int ", flag.name, b" = 0;"]));
+      match arms(withtail(opened, em.tail), xs, params, 0, held.v, ans.name, flag.name, opened.made, [], Some(held.v.c)) {
+        None -> None,
+        Some(after) -> Some({
+          em: note_holder(line(site(after, span), bytes_concat_all([b"if (!", flag.name,
+                                                      b") { rt_no_match_p(ctx); return 0; }"])), ans.name),
+          v: { k: KBoxed, c: ans.name, ty: TyOpen } }),
+      }
+    },
+  }
+
+// A lookup's arm tests the answer itself: an element for `Some`, zero for `None`.
+fn lookup_test(p: CPat, held: Bytes) -> Bytes =
+  match p {
+    PxCtor(c) -> if len(c.args) == 1 { bytes_concat_all([b"(", held, b" != 0)"]) }
+                 else { bytes_concat_all([b"(", held, b" == 0)"]) },
+    _ -> bytes_concat_all([b"(", held, b" == 0)"]),
+  }
+
+// A lookup's `Some` binds its one name to the answer itself: the helper handed back a count,
+// so there is no increment to add.
+fn lookup_bind(em: Em, p: CPat, subj: V) -> Em =
+  match p {
+    PxCtor(c) -> match list_at(c.args, 0) { Some(sub) -> pat_bind(em, sub, subj), None -> em },
+    _ -> em,
   }
 
 // The C condition an arm's pattern is. `1` where the pattern cannot fail.
