@@ -360,17 +360,15 @@ pub struct TestArgs {
     /// Attach a compiled backend to the machine, so a call it accepts is
     /// entered natively instead of evaluated.
     ///
-    /// `c` is the code generator: it emits the carried fragment as C, compiles
-    /// it at startup and the machine drops into it at the leaves.
-    /// `reference` answers correctly by evaluating the body on a machine of its
-    /// own, and is what runs where there is no code generator.
+    /// `c` is the code generator: it emits the program as C, compiles it at
+    /// startup and the machine drops into it at the leaves.
     ///
-    /// `[<backend>:]wrong:<mutation>` is a backend that is wrong on purpose, so
+    /// `[c:]wrong:<mutation>` is a backend that is wrong on purpose, so
     /// that a green run can be read as evidence — one of `off-by-one`,
     /// `inverted`, `stale`, `wrong-type`, `unoffered`, `handle`,
     /// `exceeds-budget[={k}]` or
-    /// `answers={int}`, each optionally `@<definition>`. A bare `wrong:` wraps
-    /// `reference`. Never reads or writes the result cache.
+    /// `answers={int}`, each optionally `@<definition>`. Never reads or writes
+    /// the result cache.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
@@ -506,8 +504,8 @@ pub struct ProveArgs {
 
     /// Attach a compiled backend, so that a law's guard and body and a
     /// definition's `requires` and `ensures` clauses are entered as roots of
-    /// the compiled unit rather than evaluated; `c` or `reference`, as
-    /// `ply test --backend` takes it. A root the unit does not hold is
+    /// the compiled unit rather than evaluated; `c` or a `wrong:` corruption,
+    /// as `ply test --backend` takes it. A root the unit does not hold is
     /// evaluated as before.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
@@ -620,8 +618,7 @@ pub struct RunArgs {
     pub shutdown: ShutdownOptions,
 
     /// Attach a compiled backend to the machine, as `ply test --backend` does:
-    /// `c`, `reference`, or a `wrong:` corruption. A `.plyx` runs under
-    /// it the same way.
+    /// `c` or a `wrong:` corruption. A `.plyx` runs under it the same way.
     #[arg(long, value_name = "BACKEND")]
     pub backend: Option<String>,
 
