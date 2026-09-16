@@ -2937,7 +2937,112 @@ impl<'a> Emit<'a> {
         }))
     }
 
+    /// `match list_at(xs, i) { Some(x) -> .., None -> .. }` and the same over `map_get`, when
+    /// the scrutinee names the builtin, both arms are unguarded, and the `Some` arm binds one
+    /// name or nothing: the helper `lookup_of` names, and the two argument expressions.
+    fn lookup_of<'c>(
+        &self,
+        scrutinee: &'c Code,
+        arms: &[Arm],
+    ) -> Option<(&'static str, &'c [Code])> {
+        let NodeKind::App { func, args } = &scrutinee.kind else {
+            return None;
+        };
+        let NodeKind::Var { name: q, .. } = &func.kind else {
+            return None;
+        };
+        if args.len() != 2 || !q.is_bare() || self.resolve_q(q).is_some() {
+            return None;
+        }
+        let helper = match Builtin::from_name(q.symbol())? {
+            Builtin::ListAt => "rt_list_lookup_p",
+            Builtin::MapGet => "rt_map_lookup_p",
+            _ => return None,
+        };
+        let [a, b] = arms else {
+            return None;
+        };
+        if a.guard.is_some() || b.guard.is_some() {
+            return None;
+        }
+        let unwraps = |pat: &Pat| {
+            let Pat::Ctor { name, args } = pat else {
+                return None;
+            };
+            if !name.is_bare() {
+                return None;
+            }
+            match (name.symbol().as_str(), args.as_slice(), self.ctor_of(name)) {
+                ("Some", [Pat::Wildcard | Pat::Var { slot: Some(_), .. }], Some((_, 1))) => {
+                    Some(true)
+                }
+                ("None", [], Some((_, 0))) => Some(false),
+                _ => None,
+            }
+        };
+        (unwraps(&a.pat)? != unwraps(&b.pat)?).then_some((helper, args))
+    }
+
+    /// The match `lookup_of` recognised: the element held once more, or zero, straight from the
+    /// runtime, with no `Some` built and taken apart between. The failure check has to come
+    /// before zero is read as `None`, because a call that failed answers zero too.
+    fn lookup_match(
+        &mut self,
+        helper: &str,
+        args: &[Code],
+        arms: &[Arm],
+        call: Span,
+        span: Span,
+    ) -> Result<V> {
+        let mut vals = Vec::with_capacity(args.len());
+        for a in args {
+            vals.push(self.expr(a)?);
+        }
+        self.site(call);
+        let mut ws = Vec::with_capacity(vals.len());
+        for v in &vals {
+            ws.push(self.owned(v));
+        }
+        let held = self.bind(Kind::Boxed, format!("{helper}(ctx, {})", ws.join(", ")));
+        self.check();
+        let out = self.fresh();
+        self.line(format!("Word {out} = 0;"));
+        let done = self.fresh();
+        self.line(format!("int {done} = 0;"));
+        for arm in arms {
+            self.line(format!("if (!{done}) {{"));
+            self.depth += 1;
+            let (test, sub) = match &arm.pat {
+                Pat::Ctor { args: fields, .. } if fields.len() == 1 => {
+                    (format!("({} != 0)", held.c), Some(&fields[0]))
+                }
+                _ => (format!("({} == 0)", held.c), None),
+            };
+            self.line(format!("if ({test}) {{"));
+            self.depth += 1;
+            let mark = self.scope.len();
+            if let Some(sub) = sub {
+                self.bind_pattern(sub, &held)?;
+            }
+            let body = self.expr(&arm.body)?;
+            let bw = self.word(&body);
+            self.line(format!("{out} = {bw};"));
+            self.line(format!("{done} = 1;"));
+            self.scope.truncate(mark);
+            self.depth -= 1;
+            self.line("}");
+            self.depth -= 1;
+            self.line("}");
+        }
+        self.site(span);
+        self.line(format!("if (!{done}) {{ rt_no_match_p(ctx); return 0; }}"));
+        Ok(V::boxed(out))
+    }
+
     fn match_expr(&mut self, scrutinee: &Code, arms: &[Arm], span: Span) -> Result<V> {
+        if let Some((helper, args)) = self.lookup_of(scrutinee, arms) {
+            return self.lookup_match(helper, args, arms, scrutinee.span, span);
+        }
         let s = self.expr(scrutinee)?;
         let sw = self.word(&s);
         let held = self.bind(Kind::Boxed, sw);

@@ -165,21 +165,38 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     // arities and constants -- is its last declaration, so a bundle whose table differs from what
     // these sources derive differs here.
     if refresh {
-        // A refresh writes the current emitter's own emission, once an emitter built from it has
-        // emitted the same thing again: the bundle written is a fixpoint on the day it is written.
-        let stage = scratch.join("stage1");
-        ply_codegen::c::bundle::write(&stage, &p1.text, &identity).unwrap();
-        let p2 = emit_with(source, Some(&stage), &scratch);
-        if p1.text != p2.text {
-            differ(
-                "refresh",
-                &p1.text,
-                &p2.text,
-                "the emitter built from one emission and the emitter built from its own emit different C",
+        // A refresh writes an emission an emitter built from it emits again: a fixpoint on the
+        // day it is written. The first emission is the old bundle's emitter over the new sources,
+        // so a change to what the emitter emits shows only in the second, and the rounds go on
+        // from each emission until two agree.
+        let mut last = p1;
+        let mut written = false;
+        for round in 1..=3 {
+            let stage = scratch.join(format!("stage{round}"));
+            ply_codegen::c::bundle::write(&stage, &last.text, &identity).unwrap();
+            let next = emit_with(source, Some(&stage), &scratch);
+            assert!(
+                next.refused.is_empty(),
+                "the emitter built from its own emission refuses part of itself: {:?}",
+                next.refused
             );
+            if last.text == next.text {
+                ply_codegen::c::bundle::write(&bundle, &next.text, &identity).unwrap();
+                eprintln!("bootstrap bundle written to {}", bundle.display());
+                written = true;
+                break;
+            }
+            if round == 3 {
+                differ(
+                    "refresh",
+                    &last.text,
+                    &next.text,
+                    "the emitter built from one emission and the emitter built from its own emit different C after three rounds",
+                );
+            }
+            last = next;
         }
-        ply_codegen::c::bundle::write(&bundle, &p2.text, &identity).unwrap();
-        eprintln!("bootstrap bundle written to {}", bundle.display());
+        assert!(written);
     } else {
         // The bundle was emitted from these sources, so the emitter built from it emitting its own
         // C -- the bundle's, byte for byte -- is the fixpoint stated directly, in one emission

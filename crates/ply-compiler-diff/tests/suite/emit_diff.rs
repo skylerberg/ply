@@ -80,8 +80,28 @@ fn by_name(dump: &str) -> std::collections::BTreeMap<String, String> {
     out
 }
 
+/// The port under test is the bootstrap bundle, and a bundle emitted from other sources than the
+/// tree's is the *old* emitter: a disagreement it reports says nothing about `emit.ply`. A working
+/// copy named by `PLY_C_EMITTER`, or an emitter the reference builds, is never stale.
+fn the_bundle_is_the_sources() {
+    if std::env::var_os("PLY_C_EMITTER").is_some()
+        || std::env::var("PLY_C_BOOTSTRAP").as_deref() == Ok("off")
+    {
+        return;
+    }
+    ply_codegen::c::producer::ensure_default();
+    assert_eq!(
+        ply_compiler::bootstrap::SOURCES.trim(),
+        ply_codegen::c::producer::identity(),
+        "the bootstrap bundle was emitted from other sources than crates/ply-compiler/ply, so the \
+         port under test is the old emitter; refresh it first (PLY_C_BOOTSTRAP_REFRESH=1 on \
+         ply-codegen-tests' bootstrap test, or CI's `bootstrap-bundle` artifact)"
+    );
+}
+
 /// Every body the port emitted is the body the reference emits.
 fn compare(label: &str, inputs: &[(String, Vec<u8>)]) -> (usize, usize) {
+    the_bundle_is_the_sources();
     let builtins = bytes_list(&ply_compiler_diff::reference_builtins());
     let mut failures: Vec<String> = Vec::new();
     let (mut reached, mut available) = (0usize, 0usize);
@@ -199,6 +219,13 @@ fn the_emitter_agrees_with_ply_codegen_wherever_the_port_reaches() {
         "type T = | A(Int) | B\nfn nb() -> T = B\n",
         "type T = | A(Int) | B\nfn rd(t: T) -> Int = match t { A(x) -> x, B -> 0 }\n",
         "type P = | P2(Int, Int)\nfn both(a: Int, b: Int) -> Int = match P2(a, b) { P2(x, y) -> x + y }\n",
+        // A `match` over `list_at` or `map_get` that unwraps at once is one lookup helper and
+        // no `Some`: in either arm order, binding a name or nothing, and not when the name is
+        // this module's own definition rather than the builtin.
+        "fn at(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }\n",
+        "fn has(xs: List<Int>, i: Int) -> Bool = match list_at(xs, i) { None -> false, Some(_) -> true }\n",
+        "fn get(m: Map<Int, Int>, k: Int) -> Int = match map_get(m, k) { Some(v) -> v + 1, None -> 0 }\n",
+        "fn list_at(xs: List<Int>, i: Int) -> Option<Int> = None\nfn own(xs: List<Int>, i: Int) -> Int = match list_at(xs, i) { Some(x) -> x, None -> 0 }\n",
         // A lambda is a closure *and* a function written after the one that
         // builds it, and calling one through a name is `rt_call_p`. Neither
         // fuses: `apply` takes the closure as a value.
