@@ -10,7 +10,8 @@
 use crate::handler::OpDecl;
 use crate::value::{Closure, ClosureKind, Decimal, Fixed, Value, type_error, values_equal};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::{BinOp, Ident, Lit, Mode, QName, UnOp};
+use ply_syntax::ast::{Ident, QName};
+use ply_ty::{BinOp, Lit, Mode, UnOp};
 use rustc_hash::FxHashMap;
 use std::cell::RefCell;
 use std::sync::Arc;

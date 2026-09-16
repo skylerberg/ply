@@ -1387,10 +1387,9 @@ fn limits(
 
 fn not_measured(stack: &InProcess, levers: &Levers) -> Vec<String> {
     let mut out = vec![
- "Anything the reference fragment (`--backend reference`) would answer differently: every rung \
-  is taken on the whole emitter, which compiles performs, handlers, host calls and \
-  continuations; the fragment is the oracle and the cc-free fallback, and no row here is taken \
-  on it."
+ "Anything the reference fragment would answer differently: every rung is taken on the whole \
+  emitter, which compiles performs, handlers, host calls and continuations; the fragment is the \
+  oracle, and no row here is taken on it."
             .to_string(),
  "Rungs 1-6 are taken on /health, not /items: a pure call to the /items handler needs a store, \
   and the only one available in process is std.db's memory engine, whose SQL scanner is on no \

@@ -136,11 +136,42 @@ it. The behavioural gate caught it, which is the witness §2 says survives
 the reference; the shape is in the language corpus on both tiers now, in
 four forms.
 
+**The switch, in stages.** A survey of every reader of the syntax tree
+and the resolver after loading found the driver is not the only one.
+The backend's tables (`Source::ctors`, `functions`, `emit_keys`, the
+producer's `bodies_of`) are the module order, the ordinals and the hashes
+the port answers, and take them first while the Rust chain still runs,
+held green by the emitted C not moving a byte. Five readers need a frame
+the port does not answer yet, each one small: item visibility with the
+`reuse` marker and a type's arity for the store's fingerprint; parameter
+names and spans for the prover's obligations; `effect set` expansions
+for `ply check --explain`; the literals a law's guard mentions, the
+prover's witness seed; and the normalized bodies. Then the driver enters
+the port once and its two gates, `Resume`, the restored interfaces and
+`check_program_with` go. Two readers remain the interpreter's: `Pure`
+evaluating a configuration or database schema constant, and the prover's
+claims, whose bodies the e-graph lowers from the tree; those become
+frames the port answers, or stay fed by one, in the record's last step
+of §1. One prerequisite is not on §2's list and is done first: the
+operator, literal and visibility vocabulary leaves `ply-syntax`'s tree
+for `ply-ty`, so the runtime and the tools stop naming the parser's
+crate.
+
+**What the driver loses.** Its gates decided per file not to parse and
+per definition not to re-infer, keyed on the store's fingerprints; a run
+that enters the port whole parses and checks every module every time.
+`ply test`'s result cache, keyed on the hashes the port answers, still
+runs only what an edit touched, but `ply check`, `ply hash`, `ply prove`
+and `ply build` have no cache and paid whole-program cost only through
+the gates. The switch carries the marginal-change bench's reading in its
+description, and a regression there is the item after it, as §3 treats
+the clock.
+
 ## 2. Delete the Rust front end, its test crates and the differentials
 
 In the order the goldens allow: `ply-derive`; `ply-syntax`'s rewrites,
-resolver, parser and lexer; `ply-core`; `ply-hash`; then `ply-eval`'s
-lowering with `opt.rs` and `c/emit.rs` last; with `ply-derive-tests`,
+resolver, parser, lexer and printer; `ply-core`; `ply-hash`; then
+`ply-eval`'s lowering with `opt.rs` and `c/emit.rs` last; with `ply-derive-tests`,
 `ply-syntax-tests`, `ply-core-tests`, `ply-hash-tests`,
 `ply-compiler-diff` and the `tools/mine-*.py` scripts. Before each
 deletion its differential retires into what survives: `golden::check`
@@ -152,6 +183,19 @@ bootstrap fixpoint and the behavioural gates. Before `c/emit.rs` goes,
 this record names the bodies the port still emits differently and why each
 is a missing fast path rather than a wrong rule, because a wrong rule the
 port applies to itself is a fixpoint.
+
+Two things the survey found do not go with the parser. The tree's
+types are the interpreter's value model: a closure holds an expression,
+the prover synthesizes expressions at run time for its higher-order
+properties, and `Pure` walks them for a schema constant. They move to a
+kept crate when the parser goes; the parser, the printer and the
+resolver are what is deleted. And two paths rebuild a program from the
+store's normalized bodies, print it as source and hand the text to the
+port: opening an artifact built without its sources, and `ply test`'s
+failure bisection. This record decides the first by removing the case,
+an artifact carries its sources, and the second retires with `ply-hash`
+into a frame the port answers, the port already holding the bytes it
+hashed.
 
 The bundle becomes the only way to build the language. This record says
 how a fresh clone builds it — the bundle's C, `cc`, `dlopen`, nothing
@@ -192,9 +236,11 @@ with its own release build as its pole.
 
 Once the compiler's tests are Ply tests, `ply test`'s content addressing
 re-runs only what an edit touched, which ADR 0042 said would fall out of
-step six rather than be built. The record takes what a one-line edit to
-`emit.ply` costs, locally and in CI, before and after, from the tool's own
-output.
+step six rather than be built. That is true of running the tests and
+not of checking the program: the port checks every module every run
+where the gates checked what an edit touched. The record takes what a
+one-line edit to `emit.ply` costs, locally and in CI, before and after,
+from the tool's own output, and the marginal-change bench beside it.
 
 ## The order, and why
 
@@ -217,10 +263,12 @@ C runtime exists over libc behind the same helper table, which is
 ## What would make this wrong
 
 - **If the port's answers cannot be taken without a value bridge.** ADR 0042
-  step 3 said no Rust would read a Ply value; the port's diagnostics,
-  hashes and tables have to cross as bytes in a form `ply-span` and the
-  store already read. If a value bridge is the only way, step 1 is a design
-  record before it is code.
+  step 3 said no Rust would read a Ply value, and the port's diagnostics,
+  hashes and tables cross as length-framed text that `ply-span` and
+  `ply-ty` read into the structs the tools already hold. The converse is
+  the live risk: a Ply value holds an expression, so the tree's types
+  outlive the parser, and a step that deletes them with it stalls on the
+  runtime.
 - **If the fixpoint hides a wrong rule.** The fixpoint proves the emitter
   agrees with itself, not with the language; the behavioural gates are the
   witness after the reference goes, and a body they do not reach is
