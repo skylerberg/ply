@@ -427,8 +427,9 @@ pub struct Heap {
     /// Bridged values allocated since the last reset, whose interpreter value must be dropped.
     bridges: Vec<*mut Obj>,
     persistent: bool,
-    /// Objects allocated since the last reset.
+    /// Objects allocated since the last reset, and the same by kind.
     count: usize,
+    by_kind: [usize; 16],
     recycled: usize,
     /// Dead objects by size class, for an allocation of that class to take before the bump
     /// pointer moves: what keeps an entry's memory bounded by what it holds rather than by what
@@ -541,6 +542,7 @@ impl Heap {
             bridges: Vec::new(),
             persistent: false,
             count: 0,
+            by_kind: [0; 16],
             recycled: 0,
             free: Vec::new(),
             large: Vec::new(),
@@ -615,6 +617,12 @@ impl Heap {
 
     pub fn allocated(&self) -> usize {
         self.count
+    }
+
+    /// The same by kind, indexed by the `KIND_*` constants: which values a program is made of,
+    /// which is what a change to the value model is aimed by.
+    pub fn allocated_by_kind(&self) -> [usize; 16] {
+        self.by_kind
     }
 
     /// Allocations served from the free list rather than from fresh memory.
@@ -717,6 +725,7 @@ impl Heap {
         }
         self.mark_start(p as usize);
         self.count += 1;
+        self.by_kind[kind as usize & 15] += 1;
         p
     }
 
@@ -933,6 +942,7 @@ impl Heap {
         }
         self.chunk = 0;
         self.count = 0;
+        self.by_kind = [0; 16];
         self.recycled = 0;
         for class in &mut self.free {
             class.clear();

@@ -563,6 +563,12 @@ impl Ctx {
                 self.heap.recycled(),
                 self.heap.chunk_bytes() / 1_000_000
             );
+            let by_kind = self.heap.allocated_by_kind();
+            let mut kinds: Vec<(usize, usize)> = (0..16).map(|k| (k, by_kind[k])).collect();
+            kinds.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            for (kind, n) in kinds.into_iter().filter(|(_, n)| *n > 0) {
+                eprintln!("  allocated: kind {kind}: {n} objects");
+            }
             let live = self.heap.live_by_kind();
             if live.iter().map(|(_, n, _)| n).sum::<usize>() > 1000 {
                 for (kind, n, bytes) in live {
