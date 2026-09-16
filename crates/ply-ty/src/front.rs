@@ -49,11 +49,14 @@
 //! `effect.mode[resource]`, the resource omitted for a singleton. A span is `<module> <start>
 //! <end>`, the module its position in the source list and `4294967295` outside every module. A
 //! module name is its dotted form, empty for the anonymous module. Tests and laws are numbered by
-//! their position in `CheckOutput::tests` and `::laws`, which is the position their hashes hold.
-//! The `hash`, `testhash` and `lawhash` frames, and the bodies, follow the hasher's item order,
-//! which is the key order of `HashOutput::deps`: a name declared in two namespaces has one `hash`
-//! frame and one body per namespace. A fn's ordinal names its clauses' kinds in source order,
-//! so a clause root can be numbered without the source.
+//! their position in `CheckOutput::tests` and `::laws`, which is the position their hashes hold,
+//! and the `test` and `law` frames come in that order. The `hash`, `testhash` and `lawhash`
+//! frames follow the hasher's item order — every module in program order, its items in source
+//! order, a name declared in two namespaces once — which [`Front::hash_order`] records, so a
+//! `testhash` may sit between two `hash` frames; the reader takes them in any order by their
+//! index and requires each index once. The bodies follow the same walk, one per declaration, so
+//! a name in two namespaces has two. A fn's ordinal names its clauses' kinds in source order, so
+//! a clause root can be numbered without the source.
 
 use crate::hash::{DefHash, HashOutput};
 use crate::parse::{parse_footprint, parse_scheme, parse_type};
@@ -82,6 +85,17 @@ pub enum Ordinal {
     Law(Symbol),
 }
 
+/// One entry of the hasher's item order: what a `hash`, `testhash` or `lawhash` frame is about.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Hashed {
+    /// A `fn`, `type` or `effect`, by program-wide name; one entry for a name in two namespaces.
+    Def(Symbol),
+    /// A test, by its position in `CheckOutput::tests`.
+    Test(usize),
+    /// A law, by its position in `CheckOutput::laws`.
+    Law(usize),
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Front {
     pub diagnostics: Vec<Diagnostic>,
@@ -89,6 +103,8 @@ pub struct Front {
     pub order: Vec<Symbol>,
     pub check: CheckOutput,
     pub hashes: HashOutput,
+    /// The hasher's item order: every hashed name, test and law, as the `hash` frames are written.
+    pub hash_order: Vec<Hashed>,
     /// Per module in program order, its keyable items in source order.
     pub ordinals: Vec<(Symbol, Vec<Ordinal>)>,
     /// Every `fn`'s, `type`'s and `effect`'s stored body, by program-wide name, in the hasher's
@@ -285,9 +301,9 @@ pub fn write_front(front: &Front, sources: &[SourceId]) -> Result<String, String
     Ok(out)
 }
 
-/// The hasher's item order is `HashOutput::deps`'s key order: a definition's frame where its name
-/// first appears, a test's or a law's where its key does. A test whose key is also a definition's
-/// name shares the reach that key holds, as the hasher merged it.
+/// One frame per entry of [`Front::hash_order`], each carrying what every map of `HashOutput`
+/// holds under its key; a test whose key is also a definition's name shares the reach that key
+/// holds, as the hasher merged it.
 fn write_hashes(front: &Front, out: &mut String) -> Result<(), String> {
     let h = &front.hashes;
     for (table, keys) in [
@@ -329,51 +345,85 @@ fn write_hashes(front: &Front, out: &mut String) -> Result<(), String> {
             p.field("closure", c.as_str());
         }
     };
-    let positions = |keys: &mut dyn Iterator<Item = &Symbol>, name: &Symbol| -> Vec<usize> {
-        keys.enumerate()
-            .filter(|(_, k)| *k == name)
-            .map(|(i, _)| i)
-            .collect()
-    };
-    for name in h.deps.keys() {
-        let tests = positions(&mut front.check.tests.iter().map(|t| &t.key), name);
-        let laws = positions(&mut front.check.laws.iter().map(|l| &l.key), name);
-        let declared = h.defs.contains_key(name) || h.decls.contains_key(name);
-        if declared || (tests.is_empty() && laws.is_empty()) {
-            let mut p = Payload::default();
-            if let Some(hash) = h.defs.get(name) {
-                p.field("def", &hash.to_hex());
+    let mut named: BTreeSet<&Symbol> = BTreeSet::new();
+    let mut tests: BTreeSet<usize> = BTreeSet::new();
+    let mut laws: BTreeSet<usize> = BTreeSet::new();
+    for entry in &front.hash_order {
+        match entry {
+            Hashed::Def(name) => {
+                if !h.deps.contains_key(name) {
+                    return Err(format!(
+                        "the hash order names `{name}`, which was not hashed"
+                    ));
+                }
+                if !named.insert(name) {
+                    return Err(format!("the hash order names `{name}` twice"));
+                }
+                let mut p = Payload::default();
+                if let Some(hash) = h.defs.get(name) {
+                    p.field("def", &hash.to_hex());
+                }
+                if let Some(hash) = h.own.get(name) {
+                    p.field("own", &hash.to_hex());
+                }
+                if let Some(hash) = h.decls.get(name) {
+                    p.field("decl", &hash.to_hex());
+                }
+                for hash in h.specs.get(name).into_iter().flatten() {
+                    p.field("spec", &hash.to_hex());
+                }
+                for hash in h.spec_texts.get(name).into_iter().flatten() {
+                    p.field("spec_text", &hash.to_hex());
+                }
+                reach(&mut p, name);
+                p.frame(out, "hash", name.as_str());
             }
-            if let Some(hash) = h.own.get(name) {
-                p.field("own", &hash.to_hex());
+            Hashed::Test(i) => {
+                let t =
+                    front.check.tests.get(*i).ok_or_else(|| {
+                        format!("the hash order names test {i}, which there is not")
+                    })?;
+                if !tests.insert(*i) {
+                    return Err(format!("the hash order names test {i} twice"));
+                }
+                let mut p = Payload::default();
+                p.field("key", t.key.as_str());
+                p.field("hash", &h.tests[*i].to_hex());
+                reach(&mut p, &t.key);
+                p.frame(out, "testhash", &i.to_string());
             }
-            if let Some(hash) = h.decls.get(name) {
-                p.field("decl", &hash.to_hex());
+            Hashed::Law(i) => {
+                let l =
+                    front.check.laws.get(*i).ok_or_else(|| {
+                        format!("the hash order names law {i}, which there is not")
+                    })?;
+                if !laws.insert(*i) {
+                    return Err(format!("the hash order names law {i} twice"));
+                }
+                let mut p = Payload::default();
+                p.field("key", l.key.as_str());
+                p.field("hash", &h.laws[*i].to_hex());
+                p.field("text", &h.law_texts[*i].to_hex());
+                reach(&mut p, &l.key);
+                p.frame(out, "lawhash", &i.to_string());
             }
-            for hash in h.specs.get(name).into_iter().flatten() {
-                p.field("spec", &hash.to_hex());
-            }
-            for hash in h.spec_texts.get(name).into_iter().flatten() {
-                p.field("spec_text", &hash.to_hex());
-            }
-            reach(&mut p, name);
-            p.frame(out, "hash", name.as_str());
         }
-        for i in tests {
-            let mut p = Payload::default();
-            p.field("key", name.as_str());
-            p.field("hash", &h.tests[i].to_hex());
-            reach(&mut p, name);
-            p.frame(out, "testhash", &i.to_string());
+    }
+    for name in h.defs.keys().chain(h.decls.keys()).chain(h.own.keys()) {
+        if !named.contains(name) {
+            return Err(format!(
+                "`{name}` is hashed but the hash order never names it"
+            ));
         }
-        for i in laws {
-            let mut p = Payload::default();
-            p.field("key", name.as_str());
-            p.field("hash", &h.laws[i].to_hex());
-            p.field("text", &h.law_texts[i].to_hex());
-            reach(&mut p, name);
-            p.frame(out, "lawhash", &i.to_string());
-        }
+    }
+    if tests.len() != front.check.tests.len() || laws.len() != front.check.laws.len() {
+        return Err(format!(
+            "the hash order names {} of {} tests and {} of {} laws",
+            tests.len(),
+            front.check.tests.len(),
+            laws.len(),
+            front.check.laws.len()
+        ));
     }
     Ok(())
 }
@@ -449,6 +499,9 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
     let mut frames = Cursor::new(dump.as_bytes(), "frame");
     let mut front = Front::default();
     let r = Reader { sources };
+    // Filled by index, since the hasher's order interleaves these with the `hash` frames.
+    let mut test_hashes: Vec<Option<DefHash>> = Vec::new();
+    let mut law_hashes: Vec<Option<(DefHash, DefHash)>> = Vec::new();
 
     // The diagnostics lead, and `ply_span::frames` reads them as one text.
     let mut diag_end = 0;
@@ -544,33 +597,30 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
                 let ctor = r.ctor(name, payload, &what)?;
                 front.check.ctors.insert(Symbol::new(name), ctor);
             }
-            "hash" => r.hash(name, payload, &what, &mut front.hashes)?,
+            "hash" => {
+                r.hash(name, payload, &what, &mut front.hashes)?;
+                front.hash_order.push(Hashed::Def(Symbol::new(name)));
+            }
             "testhash" => {
-                let i = front.hashes.tests.len();
-                r.numbered(name, i, &what)?;
-                let declared = front
-                    .check
-                    .tests
-                    .get(i)
-                    .map(|t| &t.key)
-                    .ok_or_else(|| format!("{what} names a test no `test` frame declared"))?;
-                let (hash, _) = r.item_hash(payload, &what, declared, false, &mut front.hashes)?;
-                front.hashes.tests.push(hash);
+                let i = r.item_index(name, front.check.tests.len(), "test", &what)?;
+                let key = &front.check.tests[i].key;
+                let (hash, _) = r.item_hash(payload, &what, key, false, &mut front.hashes)?;
+                test_hashes.resize(front.check.tests.len(), None);
+                if test_hashes[i].replace(hash).is_some() {
+                    return Err(format!("{what} is written twice"));
+                }
+                front.hash_order.push(Hashed::Test(i));
             }
             "lawhash" => {
-                let i = front.hashes.laws.len();
-                r.numbered(name, i, &what)?;
-                let declared = front
-                    .check
-                    .laws
-                    .get(i)
-                    .map(|l| &l.key)
-                    .ok_or_else(|| format!("{what} names a law no `law` frame declared"))?;
-                let (hash, text) =
-                    r.item_hash(payload, &what, declared, true, &mut front.hashes)?;
+                let i = r.item_index(name, front.check.laws.len(), "law", &what)?;
+                let key = &front.check.laws[i].key;
+                let (hash, text) = r.item_hash(payload, &what, key, true, &mut front.hashes)?;
                 let text = text.ok_or_else(|| format!("{what} has no `text`"))?;
-                front.hashes.laws.push(hash);
-                front.hashes.law_texts.push(text);
+                law_hashes.resize(front.check.laws.len(), None);
+                if law_hashes[i].replace((hash, text)).is_some() {
+                    return Err(format!("{what} is written twice"));
+                }
+                front.hash_order.push(Hashed::Law(i));
             }
             "ordinal" => {
                 let mut items = Vec::new();
@@ -603,31 +653,26 @@ pub fn read_front(dump: &str, sources: &[SourceId]) -> Result<Front, String> {
         return Ok(front);
     }
 
-    let parallel = |what: &str, len: usize, of: &str, want: usize| {
-        if len == want {
-            Ok(())
-        } else {
-            Err(format!("{len} {what} frames beside {want} {of}"))
-        }
-    };
-    parallel(
-        "testhash",
-        front.hashes.tests.len(),
-        "tests",
-        front.check.tests.len(),
-    )?;
-    parallel(
-        "lawhash",
-        front.hashes.laws.len(),
-        "laws",
-        front.check.laws.len(),
-    )?;
-    parallel(
-        "testbody",
-        front.test_bodies.len(),
-        "tests",
-        front.check.tests.len(),
-    )?;
+    test_hashes.resize(front.check.tests.len(), None);
+    law_hashes.resize(front.check.laws.len(), None);
+    for (i, hash) in test_hashes.into_iter().enumerate() {
+        front
+            .hashes
+            .tests
+            .push(hash.ok_or_else(|| format!("test {i} has no `testhash` frame"))?);
+    }
+    for (i, hashes) in law_hashes.into_iter().enumerate() {
+        let (hash, text) = hashes.ok_or_else(|| format!("law {i} has no `lawhash` frame"))?;
+        front.hashes.laws.push(hash);
+        front.hashes.law_texts.push(text);
+    }
+    if front.test_bodies.len() != front.check.tests.len() {
+        return Err(format!(
+            "{} testbody frames beside {} tests",
+            front.test_bodies.len(),
+            front.check.tests.len()
+        ));
+    }
     Ok(front)
 }
 
@@ -770,6 +815,25 @@ impl Reader<'_> {
                 "{what} is numbered out of order; frame {want} was expected"
             ))
         }
+    }
+
+    /// The test or law a `testhash` / `lawhash` frame is about, which an earlier frame declared.
+    fn item_index(
+        &self,
+        name: &str,
+        declared: usize,
+        of: &str,
+        what: &str,
+    ) -> Result<usize, String> {
+        let i: usize = name
+            .parse()
+            .map_err(|_| format!("{what} is not numbered"))?;
+        if i >= declared {
+            return Err(format!(
+                "{what} names {of} {i}, and only {declared} were declared"
+            ));
+        }
+        Ok(i)
     }
 
     fn span(&self, text: &str, what: &str) -> Result<Span, String> {

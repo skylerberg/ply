@@ -266,6 +266,14 @@ fn sample() -> Front {
         order: vec![sym("std.db"), sym("m")],
         check,
         hashes,
+        hash_order: vec![
+            Hashed::Def(sym("std.db.Db")),
+            Hashed::Def(sym("std.db.query")),
+            Hashed::Def(sym("m.Shape")),
+            Hashed::Def(sym("m.count")),
+            Hashed::Test(0),
+            Hashed::Law(0),
+        ],
         ordinals: vec![
             (
                 sym("std.db"),
@@ -326,7 +334,8 @@ fn a_front_writes_reads_and_writes_to_the_same_text() {
     assert!(count.internally_effectful);
     assert_eq!(count.footprint, front.check.defs[&sym("m.count")].footprint);
     // The layouts `crates/ply-compiler/ply/front.ply` pins.
-    assert!(text.contains("\ntest 0 "), "{text}");
+    assert!(text.contains("0 5 50test 0 "), "{text}");
+    assert_eq!(back.hash_order, front.hash_order);
     assert!(
         text.contains("item 27\nfn m.count requires,ensures"),
         "{text}"
@@ -392,12 +401,12 @@ fn the_reader_names_what_it_refuses() {
     assert!(err.contains("unknown frame kind `defn`"), "{err}");
 
     let err = read_front(
-        &text.replace("simple_name 5\ncount", "simplename 5\ncount"),
+        &text.replace("simple_name 5\ncount", "simple_nane 5\ncount"),
         &SOURCES,
     )
     .unwrap_err();
     assert!(
-        err.contains("def `m.count`: unknown field `simplename`"),
+        err.contains("def `m.count`: unknown field `simple_nane`"),
         "{err}"
     );
 
@@ -412,7 +421,28 @@ fn the_reader_names_what_it_refuses() {
 
     let err = read_front(&text.replace("testhash 0 ", "testhash 1 "), &SOURCES).unwrap_err();
     assert!(
-        err.contains("testhash `1` is numbered out of order"),
+        err.contains("testhash `1` names test 1, and only 1 were declared"),
+        "{err}"
+    );
+
+    let err = read_front(&text.replace("lawhash 0 ", "lawhash 1 "), &SOURCES).unwrap_err();
+    assert!(
+        err.contains("lawhash `1` names law 1, and only 1 were declared"),
+        "{err}"
+    );
+
+    // The `testhash 0` frame whole, once more: its header line, then as many bytes as it says.
+    let at = text.find("testhash 0 ").unwrap();
+    let header_end = at + text[at..].find('\n').unwrap();
+    let length: usize = text[at + "testhash 0 ".len()..header_end].parse().unwrap();
+    let frame = &text[at..header_end + 1 + length];
+    let twice = format!("{}{frame}{}", &text[..at], &text[at..]);
+    let err = read_front(&twice, &SOURCES).unwrap_err();
+    assert!(err.contains("testhash `0` is written twice"), "{err}");
+
+    let err = read_front(&text.replace("testbody 0 ", "testbody 1 "), &SOURCES).unwrap_err();
+    assert!(
+        err.contains("testbody `1` is numbered out of order"),
         "{err}"
     );
 
@@ -453,6 +483,16 @@ fn the_writer_refuses_a_front_the_protocol_cannot_carry() {
     front.hashes.defs.insert(sym("m.orphan"), hash(99));
     let err = write_front(&front, &SOURCES).unwrap_err();
     assert!(err.contains("`m.orphan` is in the hashes' `defs`"), "{err}");
+
+    let mut front = sample();
+    front.hash_order.pop();
+    let err = write_front(&front, &SOURCES).unwrap_err();
+    assert!(err.contains("names 1 of 1 tests and 0 of 1 laws"), "{err}");
+
+    let mut front = sample();
+    front.hash_order.push(Hashed::Def(sym("m.count")));
+    let err = write_front(&front, &SOURCES).unwrap_err();
+    assert!(err.contains("names `m.count` twice"), "{err}");
 
     let mut front = sample();
     front.check.modules[&sym("m")].source = SourceId(7);
