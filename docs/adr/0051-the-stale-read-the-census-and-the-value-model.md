@@ -41,18 +41,37 @@ end so a stale read found a `DEAD` header, caught reads through the
 runtime's counted paths and nothing else, and it is gone. What is needed is
 a net that names the site.
 
-**Built when.** `PLY_HEAP_POISON=1`, read once, puts every heap made after
-it into the mode: a dead block goes to no free list, its payload words are
-overwritten with a word that is not an immediate and points at a static
-poison object whose header is `DEAD`, and every runtime helper that takes
-an object checks its header first and fails, in this mode, with a
-diagnostic placed at the body's stored site and naming the helper. The
-emitted C's own guards fall to the runtime on a `DEAD` kind already. The
-mode is run over the own-sources solo and the hash differential through
-`profile.yml -f ref=<branch>`, with the variable passed by a new input, and
-what it names is fixed; the record carries the site and the mechanism. If
-it names nothing on either test, the record says so, says what was tried,
-and the question stays open in ADR 0050 §1b where it was raised.
+**Built.** `PLY_HEAP_POISON=1`, read once, puts every heap made after it
+into the mode: a dead block's payload words are overwritten at release
+with a word that points at a static object whose header is `DEAD`, and
+every object read through `heap::obj` fails, naming the body's stored site
+as module and byte range, when it meets that word or a dead header. The
+mode as first built also kept every dead block; over the emitter's own
+sources that is two hundred million blocks, the runner sent its shutdown
+signal before anything was read, and the mode now lets a poisoned block
+be reused, so the net is the window before the block is taken again.
+`profile.yml` took an `env` input to run it, and prints a failing run's
+last lines whole, since twice the reading was on the line its filter
+dropped. Under the mode the hasher and the emitter over its own sources
+both pass, in the memory immediate reuse holds; the mode names nothing,
+and it stays, its cost being one cached flag test per object read.
+
+**Found, 2026-09-15: there is no stale read.** The census settled it. A
+plain queue that holds each dead block back behind a thousand others
+reproduces the reading exactly: the emitter over its own sources ends with
+16.5 GB of chunks against 334 MB under immediate reuse, and recycles the
+same number of objects, 195.7 million either way. Every delayed block
+comes back; what grows is the size of the allocations that miss. That is
+the shape of a value built by appending, where each step frees a buffer of
+size S and allocates one a little larger: under immediate reuse the freed
+buffer is the next allocation's, and under a delay of N there are N copies
+of it live at once, and for the emitted unit's own text S is sixteen
+megabytes. `Heap::append` already writes in place, doubling its room, when
+the value is held by nobody else; so somewhere the compiler's accumulators
+are held twice at the append and copied whole each step, which is a
+quadratic copy hidden by reuse, not a defect of the heap. Where they are
+held twice is §3's first lever to find, and the question opened in ADR
+0050 §1b is closed with that.
 
 ## 2. Measure the compiled compiler alone
 
@@ -89,19 +108,25 @@ the value model is held to.
 ## 3. The value model, measured
 
 Every profile of the compiled compiler ends at `dismantle`, `raw_alloc`,
-`rt_field`, `call_value` and the count traffic. Three levers the profiles
-name, in the order the readings suggest they pay:
+`rt_field`, `call_value` and the count traffic, and §1's finding puts one
+lever ahead of the others. Three levers, in the order the readings say
+they pay:
 
-1. **Records with unboxed scalar fields**, so a record of `Int`s and
+1. **The accumulator appended in place.** §1 found the compiler's byte
+   accumulators held twice at the append and copied whole each step. The
+   heap already appends in place to a value held once; the lever is
+   whatever holds the second count, in the emitted C's ownership or in the
+   sources' shape, so that the dumps every phase hands to the next are
+   built by one buffer growing. The census is its measure: the chunk bytes
+   under a delayed reuse of a thousand blocks, which today read fifty times
+   immediate reuse's, and the objects allocated.
+2. **Records with unboxed scalar fields**, so a record of `Int`s and
    `Bool`s is built without a count on each field and read without a
    helper per field; the emitter already knows a `FLAT` record and the
    shape table already says which fields are scalar.
-2. **A growable array beside the trie**, for the build-then-read shape most
+3. **A growable array beside the trie**, for the build-then-read shape most
    of the compiler's lists have: pushed to once, indexed many times, never
    shared while being built. The trie stays for what is shared.
-3. **A byte builder** that appends into one buffer, for the dumps every
-   phase of the compiler hands to the next as bytes and today assembles
-   through thousands of intermediate concatenations.
 
 **Built when.** Each lever lands on its own branch, in two pull requests
 where it adds a builtin or a helper (the bundle before the sources that
@@ -111,8 +136,9 @@ record says what each one moved.
 
 ## The order, and why
 
-1 before everything, because a stale read is a defect in the heap, and the
-value model is a change to the heap. 2 before 3, because a lever without a
-figure is a feeling, and ADR 0050 §3 says a change made for speed cites a
-reading. 3 in the order the profiles weigh the levers, one at a time, so
-each reading is one lever's.
+1 before everything, because a stale read would have been a defect in the
+heap, and the value model is a change to the heap; it was not one, and the
+finding ordered §3. 2 before 3, because a lever without a figure is a
+feeling, and ADR 0050 §3 says a change made for speed cites a reading. 3
+in the order the readings weigh the levers, one at a time, so each reading
+is one lever's.
