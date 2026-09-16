@@ -46,6 +46,10 @@ pub const DERIVE: &str = include_str!("../ply/derive.ply");
 /// Every diagnostic with its message, framed for the CLI.
 pub const DIAG: &str = include_str!("../ply/diag.ply");
 
+/// The front end's whole answer -- diagnostics, order, modules, the checker's tables, the hashes
+/// and the bodies -- framed for the driver.
+pub const FRONT: &str = include_str!("../ply/front.ply");
+
 /// Content addressing: a definition's hash over its normalized form.
 pub const HASH: &str = include_str!("../ply/hash.ply");
 
@@ -67,6 +71,7 @@ pub const MODULES: &[(&str, &str)] = &[
     ("diag", DIAG),
     ("emit", EMIT),
     ("exprs", EXPRS),
+    ("front", FRONT),
     ("hash", HASH),
     ("infer", INFER),
     ("items", ITEMS),

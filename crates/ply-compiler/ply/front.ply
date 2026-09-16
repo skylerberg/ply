@@ -1,0 +1,346 @@
+// front.ply — the front end's whole answer, for the driver: what `diag.ply` frames, and when
+// nothing was reported, everything the driver takes from the resolver, the checker and the
+// hasher — the module order, each module's items, every definition, test, law, effect and
+// constructor, every hash, each module's ordinals and every stored body — in `diag.ply`'s
+// length-framed protocol, so a reader needs no delimiter a payload byte could collide with.
+//
+// The chain is `diag.diagnostics`'s: parse and derive every file, and stop if any reported;
+// resolve, and stop; index for the hasher, and stop; check, and stop on an error. The tables
+// follow only when no stage raised.
+
+import spine (Span, Ident, num)
+import lexer (byte_of)
+import items (Item, IFn, IType, IEffect, ITest, ILaw, TDSum, VariantDef, SpecClause, SpecKind, SRequires, SEnsures, ImportDecl)
+import types (Mode, MRead, MWrite, MBad)
+import tycore (Atom, Type, atom_text, scheme_text, type_text, at, append)
+import resolve (Source, Mod, Diag, Resolved_, Failed, resolve_modules, qualify)
+import hash (Index, Entry, EDef, ETest, ELaw, HashOutput, build_index, hash_index, hex)
+import infer (Front, Loc, DefInfo, DefConstraint, SpecInfo, TestInfo, LawInfo, LawBinder, EffectInfo, OpInfo, CtorInfo,
+              check_front, deriver_text)
+import diag (Parsed, parse_all, outside_every_module, frame, field, flag)
+import std.hash (blake3)
+
+fn cat(parts: List<List<Bytes>>) -> List<Bytes> = fold(parts, [], |acc: List<Bytes>, p: List<Bytes>| append(acc, p))
+
+fn join(xs: List<Bytes>, sep: Bytes) -> Bytes =
+  fold(range(0, len(xs)), b"", |acc: Bytes, i: Int| if i == 0 { at(xs, i) } else { bytes_concat_all([acc, sep, at(xs, i)]) })
+
+fn atoms_text(atoms: List<Atom>) -> Bytes = join(map(atoms, atom_text), b",")
+
+fn mode_text(m: Mode) -> Bytes = match m { MRead -> b"read", MWrite -> b"write", MBad -> b"" }
+
+fn kind_text(k: SpecKind) -> Bytes = match k { SRequires -> b"requires", SEnsures -> b"ensures" }
+
+// The module index of a span outside every module, as the reference writes `Span::DUMMY`; the
+// checker's prelude entries carry the port's `dummy_span`, the one zero-width span at 0.
+fn no_module() -> Int = 4294967295
+
+fn span_text(module: Int, s: Span) -> Bytes =
+  bytes_concat_all([num(if s.start == 0 && s.end == 0 { no_module() } else { module }), b" ", num(s.start), b" ", num(s.end)])
+
+fn loc_text(l: Loc) -> Bytes = span_text(l.module, l.span)
+
+// --- The frames -------------------------------------------------------------
+//
+//   <kind> <name> <payload length>\n<payload>
+//
+// where the payload is a run of `<key> <length>\n<bytes>` fields, as `diag.ply` frames one
+// diagnostic. A test or a law is named by its index rather than its key: a key carries the label
+// as written, which may hold a space or a newline, so it travels as a `key` field instead.
+
+fn framed(kind: Bytes, name: Bytes, fields: List<Bytes>) -> Bytes = {
+  let payload = bytes_concat_all(fields);
+  bytes_concat_all([kind, b" ", name, b" ", num(bytes_len(payload)), b"\n", payload])
+}
+
+fn diag_frames(ds: List<Diag>) -> List<Bytes> = map(range(0, len(ds)), |i: Int| frame(i, at(ds, i)))
+
+// `order _`: one `module` per module, dependency-first, as the resolver ordered them.
+fn order_frame(order: List<Int>, mods: List<Mod>) -> Bytes =
+  framed(b"order", b"_", map(order, |i: Int| field(b"module", at(mods, i).name)))
+
+// `module <name>`: `index`, then `ModuleInfo.items` — the program-wide name of every item that
+// has one, a sum type's variants after the type — and the imports, each module once.
+fn module_frame(i: Int, m: Mod) -> Bytes = {
+  let items = fold(m.module.items, [], |acc: List<Bytes>, it: Item|
+    match it {
+      IFn(d) -> push(acc, field(b"item", qualify(m.name, d.name.name))),
+      IType(d) -> {
+        let named = push(acc, field(b"item", qualify(m.name, d.name.name)));
+        match d.body {
+          TDSum(vs) -> fold(vs, named, |a: List<Bytes>, v: VariantDef| push(a, field(b"item", qualify(m.name, v.name.name)))),
+          _ -> named,
+        }
+      },
+      IEffect(d) -> push(acc, field(b"item", qualify(m.name, d.name.name))),
+      _ -> acc,
+    });
+  let imports = fold(m.module.imports, [], |acc: List<Bytes>, d: ImportDecl| {
+    let name = join(map(d.path, |x: Ident| x.name), b".");
+    if fold(acc, false, |b: Bool, x: Bytes| b || x == name) { acc } else { push(acc, name) }
+  });
+  framed(b"module", m.name, cat([[field(b"index", num(i))], items, map(imports, |n: Bytes| field(b"import", n))]))
+}
+
+fn def_frame(d: DefInfo) -> Bytes =
+  framed(b"def", d.name, cat([
+    [field(b"module", d.module), field(b"simple_name", d.simple_name), field(b"scheme", scheme_text(d.scheme)),
+     field(b"footprint", atoms_text(d.footprint)), field(b"performed", atoms_text(d.performed))],
+    map(d.constraints, |c: DefConstraint| field(b"constraint", bytes_concat_all([deriver_text(c.deriver), b" ", num(c.param)]))),
+    [field(b"internally_effectful", flag(d.internally_effectful))],
+    map(d.row_aliases, |a: Bytes| field(b"row_alias", a)),
+    map(d.spec, |s: SpecInfo| field(b"spec", bytes_concat_all([kind_text(s.kind), b" ", num(s.index), b" ", atoms_text(s.footprint), b"\n", span_text(d.at.module, s.span)]))),
+    [field(b"span", loc_text(d.at))]]))
+
+fn test_frame(t: TestInfo) -> Bytes =
+  framed(b"test", num(t.index),
+    [field(b"key", t.key), field(b"name", t.name), field(b"module", t.module), field(b"index", num(t.index)),
+     field(b"nondet", flag(t.nondet)), field(b"footprint", atoms_text(t.footprint)), field(b"span", loc_text(t.at))])
+
+fn law_frame(l: LawInfo) -> Bytes =
+  framed(b"law", num(l.index), cat([
+    [field(b"key", l.key), field(b"name", l.name), field(b"module", l.module), field(b"index", num(l.index))],
+    map(l.binders, |b: LawBinder| field(b"binder", bytes_concat_all([b.name, b" ", span_text(l.at.module, b.span), b"\n", type_text(b.ty)]))),
+    [field(b"has_guard", flag(l.has_guard)), field(b"host", flag(l.host)), field(b"footprint", atoms_text(l.footprint)),
+     field(b"span", loc_text(l.at))]]))
+
+// An operation: one line of `<name> <mode> <resource param> <param count> <has scheme> <span>`,
+// one line per parameter type, the return type's line, and the scheme's when it has one.
+fn op_text(module: Int, o: OpInfo) -> Bytes = {
+  let has_scheme = match o.scheme { Some(_) -> true, None -> false };
+  bytes_concat_all([o.name, b" ", mode_text(o.mode), b" ", flag(o.resource_param), b" ", num(len(o.params)), b" ", flag(has_scheme), b" ",
+                    span_text(module, o.at.span), b"\n",
+                    bytes_concat_all(map(o.params, |p: Type| bytes_concat(type_text(p), b"\n"))),
+                    type_text(o.ret), b"\n",
+                    match o.scheme { Some(sc) -> bytes_concat(scheme_text(sc), b"\n"), None -> b"" }])
+}
+
+fn effect_frame(e: EffectInfo) -> Bytes =
+  framed(b"effect", e.name, cat([
+    [field(b"module", e.module), field(b"simple_name", e.simple_name), field(b"nondet", flag(e.nondet))],
+    map(e.ops, |o: OpInfo| field(b"op", op_text(e.at.module, o))),
+    [field(b"span", loc_text(e.at))]]))
+
+fn ctor_frame(k: CtorInfo) -> Bytes =
+  framed(b"ctor", k.name, cat([
+    [field(b"module", k.module), field(b"simple_name", k.simple_name), field(b"type_name", k.type_name),
+     field(b"index", num(k.index)), field(b"arity", num(k.arity))],
+    map(k.fields, |t: Type| field(b"field", type_text(t))),
+    [field(b"scheme", scheme_text(k.scheme)), field(b"span", loc_text(k.at))]]))
+
+// --- The hashes ---------------------------------------------------------------
+//
+// One frame per entry of the hasher's order: `hash <name>` for a definition or a declaration,
+// `testhash <index>` and `lawhash <index>` for a test and a law, each carrying what every map of
+// `HashOutput` holds under that key. A name declared twice — a `fn` and an `effect` alike —
+// is one frame, as the maps merged it.
+
+fn by_name_one(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<Bytes, Bytes> =
+  fold(xs, map_new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| map_insert(acc, x.name, x.hash))
+
+fn by_name_many(xs: List<{ name: Bytes, hashes: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
+  fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }| map_insert(acc, x.name, x.hashes))
+
+fn by_name_names(xs: List<{ name: Bytes, names: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
+  fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }| map_insert(acc, x.name, x.names))
+
+// A closure is a set kept as a map; its keys come back in byte order, as the reference's
+// `BTreeSet` iterates.
+fn by_name_closure(xs: List<{ name: Bytes, names: Map<Bytes, Bool> }>) -> Map<Bytes, List<Bytes>> =
+  fold(xs, map_new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: Map<Bytes, Bool> }|
+    map_insert(acc, x.name, map_fold(x.names, [], |ns: List<Bytes>, k: Bytes, v: Bool| push(ns, k))))
+
+type Tables = { defs: Map<Bytes, Bytes>, own: Map<Bytes, Bytes>, decls: Map<Bytes, Bytes>,
+                specs: Map<Bytes, List<Bytes>>, spec_texts: Map<Bytes, List<Bytes>>,
+                deps: Map<Bytes, List<Bytes>>, closure: Map<Bytes, List<Bytes>> }
+
+fn tables_of(h: HashOutput) -> Tables =
+  { defs: by_name_one(h.defs), own: by_name_one(h.own), decls: by_name_one(h.decls),
+    specs: by_name_many(h.specs), spec_texts: by_name_many(h.spec_texts),
+    deps: by_name_names(h.deps), closure: by_name_closure(h.closure) }
+
+fn hex_field(key: Bytes, m: Map<Bytes, Bytes>, name: Bytes) -> List<Bytes> =
+  match map_get(m, name) { Some(h) -> [field(key, hex(h))], None -> [] }
+
+fn hex_fields(key: Bytes, m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> =
+  match map_get(m, name) { Some(hs) -> map(hs, |h: Bytes| field(key, hex(h))), None -> [] }
+
+fn name_fields(key: Bytes, m: Map<Bytes, List<Bytes>>, name: Bytes) -> List<Bytes> =
+  match map_get(m, name) { Some(ns) -> map(ns, |n: Bytes| field(key, n)), None -> [] }
+
+fn reach_fields(t: Tables, name: Bytes) -> List<Bytes> =
+  append(name_fields(b"dep", t.deps, name), name_fields(b"closure", t.closure, name))
+
+fn def_hash_frame(t: Tables, name: Bytes) -> Bytes =
+  framed(b"hash", name, cat([hex_field(b"def", t.defs, name), hex_field(b"own", t.own, name), hex_field(b"decl", t.decls, name),
+                             hex_fields(b"spec", t.specs, name), hex_fields(b"spec_text", t.spec_texts, name), reach_fields(t, name)]))
+
+fn hash_frames(index: Index, h: HashOutput) -> List<Bytes> = {
+  let t = tables_of(h);
+  let walked = fold(index.order, { seen: map_new(), frames: [] }, |acc: { seen: Map<Bytes, Bool>, frames: List<Bytes> }, e: Entry|
+    match e {
+      EDef(v) -> {
+        let name = at(index.nodes, v).name;
+        match map_get(acc.seen, name) {
+          Some(_) -> acc,
+          None -> { seen: map_insert(acc.seen, name, true), frames: push(acc.frames, def_hash_frame(t, name)) },
+        }
+      },
+      ETest(i) -> {
+        let key = at(index.tests, i).key;
+        {..acc, frames: push(acc.frames, framed(b"testhash", num(i), cat([[field(b"key", key), field(b"hash", hex(at(h.tests, i)))], reach_fields(t, key)])))}
+      },
+      ELaw(i) -> {
+        let key = at(index.laws, i).key;
+        {..acc, frames: push(acc.frames, framed(b"lawhash", num(i), cat([[field(b"key", key), field(b"hash", hex(at(h.laws, i))), field(b"text", hex(at(h.law_texts, i)))],
+                                                                          reach_fields(t, key)])))}
+      },
+    });
+  walked.frames
+}
+
+// `body <name>` and `testbody <index>`: the stored body — `body.rs`'s envelope over the bytes
+// the hash is taken over — in hex, the one payload that is not text.
+//
+// `ordinal <module>`: every `fn`, `test` and `law` in source order, which is what `emit_keys`
+// counts; a `fn` also names its clauses' kinds in order, so each clause's root can be keyed.
+fn ordinal_frame(m: Mod) -> Bytes =
+  framed(b"ordinal", m.name, fold(m.module.items, [], |acc: List<Bytes>, it: Item|
+    match it {
+      IFn(d) -> {
+        let kinds = if len(d.spec) == 0 { b"" } else { bytes_concat(b" ", join(map(d.spec, |c: SpecClause| kind_text(c.kind)), b",")) };
+        push(acc, field(b"item", bytes_concat_all([b"fn ", qualify(m.name, d.name.name), kinds])))
+      },
+      ITest(d) -> push(acc, field(b"item", bytes_concat(b"test ", qualify(m.name, d.name)))),
+      ILaw(d) -> push(acc, field(b"item", bytes_concat(b"law ", qualify(m.name, d.name)))),
+      _ -> acc,
+    }))
+
+fn tables(mods: List<Mod>, order: List<Int>, c: Front, index: Index, h: HashOutput) -> List<Bytes> =
+  cat([[order_frame(order, mods)],
+       map(range(0, len(mods)), |i: Int| module_frame(i, at(mods, i))),
+       map(c.defs, def_frame), map(c.tests, test_frame), map(c.laws, law_frame),
+       map(c.effects, effect_frame), map(c.ctors, ctor_frame),
+       hash_frames(index, h),
+       map(mods, ordinal_frame),
+       map(h.bodies, |b: { name: Bytes, body: Bytes }| framed(b"body", b.name, [hex(b.body)])),
+       map(range(0, len(h.test_bodies)), |i: Int| framed(b"testbody", num(i), [hex(at(h.test_bodies, i))]))])
+
+fn front(sources: List<Source>) -> List<Bytes> = {
+  let parsed = parse_all(sources);
+  let early = fold(parsed, [], |acc: List<Diag>, p: Parsed| append(acc, p.diags));
+  if len(early) > 0 { diag_frames(early) } else {
+    match resolve_modules(map(parsed, |p: Parsed| p.module)) {
+      Failed(ds) -> diag_frames(map(ds, outside_every_module)),
+      Resolved_(x) -> {
+        let built = build_index(x.mods, x.r);
+        if len(built.diags) > 0 { diag_frames(map(built.diags, outside_every_module)) } else {
+          let checked: Front = check_front(x.r, x.mods);
+          if !checked.ok { diag_frames(map(checked.diags, outside_every_module)) }
+          else { tables(x.mods, x.r.order, checked, built.index, hash_index(built.index)) }
+        }
+      },
+    }
+  }
+}
+
+// One concatenation over the finished frames.
+pub fn front_dump(sources: List<Source>) -> String = string_of_bytes(bytes_concat_all(front(sources)))
+
+// --- Tests ------------------------------------------------------------------
+//
+// Each expected frame is framed by hand from the reference's values for the same program.
+
+fn program() -> List<Source> =
+  [{ name: b"m", src: b"effect log { write emit(Bytes) -> Unit }\ntype Shape = | Dot | Line(Int)\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\ntest \"says\" { say(b\"x\") }" }]
+
+fn holds(dump: String, frame_text: Bytes) -> Bool =
+  match bytes_index_of(bytes_of_string(dump), frame_text) { Some(_) -> true, None -> false }
+
+// The index just past `head` in the dump.
+fn past(d: Bytes, head: Bytes) -> Int =
+  match bytes_index_of(d, head) { Some(i) -> i + bytes_len(head), None -> panic("the dump holds the frame") }
+
+test "a diagnostic ends the dump where diag_dump would" {
+  assert_eq(front_dump([{ name: b"m", src: b"fn f() -> Int = \"x\"" }]),
+            "diag 0 121\ncode 5\nE0201severity 5\nerrormessage 33\ntype mismatch: function body typelabel 40\n0 16 19 1\nexpected `Int`, found `String`")
+}
+
+test "the order and the module frame come first" {
+  assert(bytes_starts_with(bytes_of_string(front_dump(program())),
+    b"order _ 10\nmodule 1\nmmodule m 72\nindex 1\n0item 5\nm.logitem 7\nm.Shapeitem 5\nm.Dotitem 6\nm.Lineitem 5\nm.saydef m.say "))
+}
+
+test "a definition frames its scheme, footprint and span" {
+  assert(holds(front_dump(program()),
+    b"def m.say 155\nmodule 1\nmsimple_name 3\nsayscheme 31\n(Bytes) -> Unit / {m.log.write}footprint 11\nm.log.writeperformed 11\nm.log.writeinternally_effectful 1\n1span 8\n0 72 126"))
+}
+
+test "a test is framed by its index and carries its key" {
+  assert(holds(front_dump(program()),
+    b"test 0 92\nkey 6\nm.saysname 4\nsaysmodule 1\nmindex 1\n0nondet 1\n0footprint 11\nm.log.writespan 9\n0 127 152"))
+}
+
+test "an effect frames each operation on its own lines" {
+  assert(holds(front_dump(program()),
+    b"effect m.log 92\nmodule 1\nmsimple_name 3\nlognondet 1\n0op 36\nemit write 0 1 0 0 13 38\nBytes\nUnit\nspan 6\n0 0 40"))
+}
+
+test "a prelude effect is placed outside every module and its operations carry a scheme" {
+  assert(holds(front_dump(program()),
+    b"effect sim 109\nmodule 0\nsimple_name 3\nsimnondet 1\n0op 45\nseed read 0 0 1 4294967295 0 0\nInt\n() -> Int\nspan 14\n4294967295 0 0"))
+}
+
+test "a constructor frames its fields and its scheme" {
+  assert(holds(front_dump(program()),
+    b"ctor m.Line 116\nmodule 1\nmsimple_name 4\nLinetype_name 7\nm.Shapeindex 1\n1arity 1\n1field 3\nIntscheme 16\n(Int) -> m.Shapespan 7\n0 62 71"))
+}
+
+test "a hash record carries the definition's hash, its own form and its reach, and the body hashes to it" {
+  let d = bytes_of_string(front_dump(program()));
+  let def_at = past(d, b"hash m.say 183\ndef 64\n");
+  let def_hash = bytes_slice(d, def_at, def_at + 64);
+  assert_eq(bytes_slice(d, def_at + 64, def_at + 71), b"own 64\n");
+  assert_eq(bytes_slice(d, def_at + 135, def_at + 135 + 52), b"dep 5\nm.logclosure 5\nm.logclosure 5\nm.saytesthash 0 ");
+  // A solo body is the kind byte and then exactly the bytes the definition's hash is taken over.
+  let body_at = past(d, b"body m.say ");
+  let body_end = match bytes_index_of_from(d, b"testbody 0 ", body_at) { Some(i) -> i, None -> panic("the test body follows") };
+  let line_end = match bytes_index_of_from(d, b"\n", body_at) { Some(i) -> i, None -> panic("a frame head ends its line") };
+  let body = unhex(bytes_slice(d, line_end + 1, body_end));
+  assert_eq(bytes_at(body, 0), 0);
+  assert_eq(hex(blake3(bytes_slice(body, 1, bytes_len(body)))), def_hash)
+}
+
+fn unhex(h: Bytes) -> Bytes = {
+  let digit = |c: Int| if c >= 97 { c - 87 } else { c - 48 };
+  bytes_concat_all(map(range(0, bytes_len(h) / 2), |i: Int| byte_of(digit(bytes_at(h, 2 * i)) * 16 + digit(bytes_at(h, 2 * i + 1)))))
+}
+
+test "the ordinals list every fn, test and law in source order" {
+  assert(holds(front_dump(program()), b"ordinal m 34\nitem 8\nfn m.sayitem 11\ntest m.says"))
+}
+
+fn specified() -> List<Source> =
+  [{ name: b"m", src: b"effect log { write emit(Bytes) -> Unit }\neffect set Io = {log.write}\nfn say(b: Bytes) -> Unit / {Io} = log.emit(b)\nfn inc(x: Int) -> Int requires x > 0 ensures result > x = x + 1\nlaw \"inc grows\" forall (x: Int) where x > 0 { inc(x) > x }" }]
+
+test "a definition frames its row aliases and each clause with its kind, index and span" {
+  let out = front_dump(specified());
+  assert(holds(out, b"internally_effectful 1\n1row_alias 2\nIospan 8\n0 69 114"));
+  assert(holds(out, b"def m.inc 170\nmodule 1\nmsimple_name 3\nincscheme 12\n(Int) -> Intfootprint 0\nperformed 0\ninternally_effectful 1\n0spec 21\nrequires 0 \n0 137 151spec 20\nensures 1 \n0 152 170span 9\n0 115 178"));
+  assert(holds(out, b"ordinal m 71\nitem 8\nfn m.sayitem 25\nfn m.inc requires,ensuresitem 15\nlaw m.inc grows"))
+}
+
+test "a law frames its binders with their spans and types, and its hashes carry the sentence" {
+  let out = front_dump(specified());
+  assert(holds(out, b"law 0 127\nkey 11\nm.inc growsname 9\ninc growsmodule 1\nmindex 1\n0binder 15\nx 0 203 209\nInthas_guard 1\n1host 1\n0footprint 0\nspan 9\n0 179 237"));
+  let d = bytes_of_string(out);
+  let hash_at = past(d, b"lawhash 0 210\nkey 11\nm.inc growshash 64\n");
+  assert_eq(bytes_slice(d, hash_at + 64, hash_at + 72), b"text 64\n");
+  assert_eq(bytes_slice(d, hash_at + 136, hash_at + 136 + 48), b"dep 5\nm.incclosure 5\nm.incclosure 11\nm.inc grows");
+  // Two clauses: two obligation keys and two sentence keys, in source order.
+  let spec_at = past(d, b"hash m.inc 455\ndef 64\n");
+  assert_eq(bytes_slice(d, spec_at + 64, spec_at + 71), b"own 64\n");
+  assert_eq(bytes_slice(d, spec_at + 135, spec_at + 143), b"spec 64\n");
+  assert_eq(bytes_slice(d, spec_at + 207, spec_at + 215), b"spec 64\n");
+  assert_eq(bytes_slice(d, spec_at + 279, spec_at + 292), b"spec_text 64\n")
+}
