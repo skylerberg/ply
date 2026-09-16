@@ -750,7 +750,8 @@ impl Heap {
         if census_by_layout() {
             let key = match kind {
                 KIND_CTOR | KIND_RECORD => Some(layout),
-                KIND_BYTES | KIND_STR => Some(len.next_power_of_two()),
+                // Bytes arrive with `len` zero and the room in the payload; the class is the room.
+                KIND_BYTES | KIND_STR => Some((payload_bytes as u32).next_power_of_two()),
                 _ => None,
             };
             if let Some(key) = key {
