@@ -108,9 +108,31 @@ the value model is held to.
 ## 3. The value model, measured
 
 Every profile of the compiled compiler ends at `dismantle`, `raw_alloc`,
-`rt_field`, `call_value` and the count traffic, and §1's finding puts one
-lever ahead of the others. Three levers, in the order the readings say
-they pay:
+`rt_field`, `call_value` and the count traffic, and that profile is flat:
+no lever is in it, so the levers are aimed by what the compiler allocates
+rather than by where its time goes.
+
+**Read, 2026-09-15: what the emitter is made of.** `PLY_C_PHASES` says,
+at an entry's end, how many objects of each kind it allocated and, one
+level down, which constructors, which record shapes and which sizes of
+bytes. Over the emitter's own sources, of two hundred million objects:
+the constructor `Some` alone is three tenths; bytes with room for one
+byte or none, the empty literal a fold starts from and the one character
+a lexer step keeps, a sixth; closures an eighth; records a tenth, the two
+largest shapes inference's `{name, ty}` and `{args, name}` at under three
+per cent each; list headers a tenth and the trie's nodes one in a hundred;
+`Stop` a twentieth; `tycore.TyCon` three per cent. The hasher reads the
+same shape: `Some` three tenths, the small bytes a quarter, records a fifth
+with its own `{a, b, c, d}` state a tenth of the whole, lists an eighth.
+`None` and every other nullary constructor is a singleton already.
+
+The three levers this record first named were the profile's, and the
+census re-aims two of them. Records with unboxed scalar fields change no
+allocation: a scalar is an immediate or an immortal already, every count
+helper returns on one before touching memory, and a record is one object
+whatever its fields are. A growable array beside the trie addresses the
+trie's nodes, one object in a hundred. Both stay below, measured and
+deferred, behind what the census weighs. The levers, in its order:
 
 1. **The accumulator appended in place.** §1 found the compiler's byte
    accumulators copied whole each step. The heap already appends in place
@@ -135,19 +157,71 @@ they pay:
    reuse, which is what a value built by one buffer growing looks like
    under any reuse policy. The objects allocated moved by a tenth of a per
    cent, on the emitter and on the hasher alike, because the join was a
-   few hundred thousand of two hundred million allocations; the census
-   file carries the new counts. The own-sources solo's test ran in 35–43 s
-   against 52 s on main in the same hour, and the hasher's first part in
-   11 s against 16 s, both from single runs in a band that is wide. The
-   lever is kept for the delayed-reuse figure, which was the one that
-   named it; the allocation count is the other two levers' to move.
-2. **Records with unboxed scalar fields**, so a record of `Int`s and
-   `Bool`s is built without a count on each field and read without a
-   helper per field; the emitter already knows a `FLAT` record and the
-   shape table already says which fields are scalar.
-3. **A growable array beside the trie**, for the build-then-read shape most
-   of the compiler's lists have: pushed to once, indexed many times, never
-   shared while being built. The trie stays for what is shared.
+   few hundred thousand of two hundred million allocations. The own-sources
+   solo's test ran in 35–43 s against 52 s on main in the same hour, and
+   the hasher's first part in 11 s against 16 s, both from single runs in
+   a band that is wide. The lever is kept for the delayed-reuse figure,
+   which was the one that named it.
+
+2. **A bytes value of one byte or none is an immortal singleton.** The
+   census named it: a sixth of the emitter's objects and a quarter of the
+   hasher's were bytes with room for one byte or none.
+
+   **Built, 2026-09-15.** The heap holds a static empty bytes object and
+   one per byte value, immortal by their count, and answers every such
+   value from them: at `Heap::bytes`, at every join, and at
+   `bytes_concat_all` over pieces that total one byte or none. An append
+   to one copies into a fresh buffer, as an append to any shared value
+   does; a fold that starts from `b""` therefore allocates once more than
+   it did and copies nothing more.
+
+   **Measured, 2026-09-15.** The emitter over its own sources allocated
+   167.6 million objects against 199.4 million, a sixth fewer, and the
+   hasher's first part 46.5 million against 54.6 million; the chunk bytes
+   and the resident memory did not move, because the blocks were recycled
+   before. The census file carries the new counts.
+
+3. **`Option` answered without its `Some`.** Nine builtins answer
+   `Option`, and the compiler's sources unwrap `list_at` and `map_get` at
+   once in some six hundred places: seven copies of one helper, `at(xs,
+   i)`, that matches `list_at` and panics on `None`, the direct calls, and
+   the map reads. Each builds a constructor that the next line takes apart
+   and nobody releases. The runtime has `rt_list_lookup` and
+   `rt_map_lookup`, which answer the element held once more, or zero for
+   none, with no constructor between; neither is in the helper table, so
+   no emitted C reaches them. The lever is a fused `match` on a `list_at`
+   or `map_get` call whose arms are `Some(x)` and `None`, in both
+   emitters, over those two helpers; the sentinel is zero, which is also
+   what a failed call answers, so the fused site checks `ctx->failed`
+   before it reads zero as `None`. The measure is the `Some` line of the
+   census and the objects allocated.
+
+4. **The loop step's `Stop` and `Continue` unwrapped through `match`.**
+   `fused_iterate` writes a step's payload straight into the loop's
+   variables when every exit is a written `Stop(..)` or `Continue(..)`,
+   and `fusable_step` sees through `if` and a block but not through
+   `match`; the parser's loops are `match`-tailed, so they build the
+   constructor and peel it. The lever is `fusable_step` descending through
+   `match` in both emitters; the measure is the `Stop` line.
+
+5. **A named function passed to `map` or `filter` without a closure.**
+   The emitter boxes a named function into a closure over nothing at every
+   `map` and `filter` call so that `rt_map` can enter it, one object per
+   call; `fold` and `iterate` are fused and pay nothing. The recorded
+   attempt to fuse `map` and `filter` (the note above `fused_fold`) freed
+   a list a name still read, and the next needs the release keyed on the
+   object; the census weighs this lever an eighth and the record leaves it
+   named, not scheduled.
+
+6. **Records with unboxed scalar fields**, measured and deferred: no
+   allocation to move, and the count helpers already return on an
+   immediate. What remains of it is a helper call per `Bool` field read
+   and a walk of every field at release for a record that mixes scalars
+   with boxed fields, which is nearly every record the compiler has.
+
+7. **A growable array beside the trie**, measured and deferred: the trie's
+   nodes are one object in a hundred. The list headers, a tenth, are one
+   per list value however it is stored.
 
 **Built when.** Each lever lands on its own branch, in two pull requests
 where it adds a builtin or a helper (the bundle before the sources that
@@ -161,5 +235,6 @@ record says what each one moved.
 heap, and the value model is a change to the heap; it was not one, and the
 finding ordered §3. 2 before 3, because a lever without a figure is a
 feeling, and ADR 0050 §3 says a change made for speed cites a reading. 3
-in the order the readings weigh the levers, one at a time, so each reading
-is one lever's.
+in the order the census weighs the levers, one at a time, so each reading
+is one lever's; the profile could not order them, being flat, and the
+census by name could.
