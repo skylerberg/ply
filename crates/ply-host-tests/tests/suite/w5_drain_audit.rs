@@ -1,7 +1,6 @@
 //! The drain's remaining questions, against a real postgres.
 
 use crate::support::cluster::{self, Cluster};
-use ply_core::ty::Resource;
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
 use ply_host::db::scope::{Access, Isolation, Owner};
@@ -11,6 +10,7 @@ use ply_host::signal::{Bounds, Shutdown, Signal, Transactions};
 use ply_host::tls::Credentials;
 use ply_host::{Host, db::PoolConfig};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::Resource;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 

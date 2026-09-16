@@ -2,8 +2,8 @@
 //! other half of "an alias is annotation-only".
 
 use crate::fixture::Compiled;
-use ply_core::Footprint;
 use ply_test::{group_by_conflict, shared_footprint};
+use ply_ty::Footprint;
 
 impl Compiled {
     fn groups(&self) -> Vec<Vec<usize>> {

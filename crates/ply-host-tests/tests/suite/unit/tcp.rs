@@ -1,13 +1,13 @@
 //! What the socket handler claims, and whether it is telling the truth.
 
-use ply_core::CheckOutput;
-use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::{Bound, HostBinding, Pending, Value};
 use ply_eval::{HostAnswer, HostRequest, HostRuntime, Linearity};
 use ply_host::tcp::*;
 use ply_span::SourceId;
 use ply_span::{Diagnostic, Span, Symbol, codes};
 use ply_syntax::ast::{Mode, ModuleName};
+use ply_ty::CheckOutput;
+use ply_ty::{EffectAtom, Resource};
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpStream};
 use std::sync::Arc;

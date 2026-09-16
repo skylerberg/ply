@@ -6,7 +6,5 @@
 mod env;
 mod infer;
 mod numerics;
-mod print;
 mod scc;
-mod ty;
 mod unify;

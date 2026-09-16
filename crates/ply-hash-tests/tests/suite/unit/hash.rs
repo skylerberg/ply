@@ -2456,8 +2456,8 @@ fn renaming_a_callee_moves_its_callers_own_hash_and_no_identity() {
 
 /// `fn f<..>(p0, p1) -> ret / e`, over whatever variable numbers a run's counter
 /// handed out and whatever order it collected the quantifiers in.
-fn poly(params: [u32; 2], ret: u32, e: u32, quantifiers: [u32; 2]) -> ply_core::Scheme {
-    use ply_core::{Row, RowVar, Scheme, TyVar, Type};
+fn poly(params: [u32; 2], ret: u32, e: u32, quantifiers: [u32; 2]) -> ply_ty::Scheme {
+    use ply_ty::{Row, RowVar, Scheme, TyVar, Type};
     Scheme {
         ty_vars: quantifiers.into_iter().map(TyVar).collect(),
         row_vars: vec![RowVar(e)],
@@ -2474,7 +2474,7 @@ fn poly(params: [u32; 2], ret: u32, e: u32, quantifiers: [u32; 2]) -> ply_core::
 /// the wrong variable.
 #[test]
 fn a_constraint_follows_its_quantifier_rather_than_its_position() {
-    use ply_core::{DefConstraint, Footprint};
+    use ply_ty::{DefConstraint, Footprint};
     let empty = Footprint::empty();
     let eq = |param| {
         [DefConstraint {
@@ -2504,7 +2504,7 @@ fn a_constraint_follows_its_quantifier_rather_than_its_position() {
 /// fire once.
 #[test]
 fn an_interface_hash_survives_alpha_renaming_of_its_quantifiers() {
-    let empty = ply_core::Footprint::empty();
+    let empty = ply_ty::Footprint::empty();
     assert_eq!(
         interface_hash(&poly([0, 1], 0, 0, [0, 1]), &empty, &[]),
         interface_hash(&poly([41, 7], 41, 19, [41, 7]), &empty, &[]),
@@ -2521,7 +2521,7 @@ fn an_interface_hash_survives_alpha_renaming_of_its_quantifiers() {
 /// definition a caller can observe which early cutoff must keep propagating.
 #[test]
 fn an_interface_hash_separates_the_footprint_from_the_scheme() {
-    use ply_core::{EffectAtom, Footprint, Resource, Row, Scheme, Type};
+    use ply_ty::{EffectAtom, Footprint, Resource, Row, Scheme, Type};
     let scheme = Scheme::mono(Type::Fn {
         params: Vec::new(),
         ret: Box::new(Type::int()),
@@ -2551,7 +2551,7 @@ fn an_interface_hash_separates_the_footprint_from_the_scheme() {
 /// that position names rather than in the position.
 #[test]
 fn an_interface_hash_pins_which_quantifier_a_constraint_names() {
-    use ply_core::{DefConstraint, Footprint};
+    use ply_ty::{DefConstraint, Footprint};
     let empty = Footprint::empty();
     let eq = |param| {
         [DefConstraint {

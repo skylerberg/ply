@@ -1,12 +1,12 @@
 //! The program a unit compiles out of, in the three pieces the machine already holds.
 
-use ply_core::CheckOutput;
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::{
     Expr, FnDef, Generics, Ident, Item, Param, Program, QName, SpecKind, TestDef, TypeExpr,
     Visibility,
 };
 use ply_syntax::resolve::Resolved;
+use ply_ty::CheckOutput;
 use std::collections::HashMap;
 
 /// A checked program, borrowed for as long as the unit compiled from it lives.

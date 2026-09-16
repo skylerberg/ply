@@ -3,12 +3,12 @@
 //! nothing serves nothing, two handlers bound to one atom serve whichever, and a nondeterministic
 //! handler under a `det` declaration turns a flakiness guarantee off without saying so.
 
-use ply_core::CheckOutput;
-use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_eval::host::*;
 use ply_span::SourceId;
 use ply_span::{Diagnostic, Symbol, codes};
 use ply_syntax::ast::ModuleName;
+use ply_ty::CheckOutput;
+use ply_ty::{EffectAtom, Footprint, Resource};
 use std::sync::Arc;
 
 struct Never;

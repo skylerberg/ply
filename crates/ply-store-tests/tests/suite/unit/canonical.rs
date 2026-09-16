@@ -1,7 +1,7 @@
-use ply_core::{EffectAtom, Resource, Row, RowVar, Scheme, TyVar, Type};
 use ply_span::Symbol;
 use ply_store::{CachedCtor, CachedOp, DeclBody, canonicalize_decl_body, canonicalize_scheme};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Resource, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::BTreeMap;
 
 fn var(n: u32) -> Type {

@@ -13,12 +13,12 @@ use crate::heap::{
 };
 use crate::list;
 use crate::map;
-use ply_core::ty::{EffectAtom, Resource};
 use ply_eval::arena::Slot;
 use ply_eval::builtins::{cell_in_update, no_such_cell};
 use ply_eval::{Builtin, Closure, ClosureKind, Step, Value, values_equal};
 use ply_span::{Diagnostic, SourceId, Span, Symbol, codes};
 use ply_syntax::ast::{BinOp, Mode};
+use ply_ty::{EffectAtom, Resource};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -453,7 +453,7 @@ pub struct Ctx {
     /// The host boundary: what a `perform` nothing on the stack answers reaches.
     pub(crate) binding: Arc<ply_eval::HostBinding>,
     pub(crate) runtime: Option<Rc<dyn ply_eval::HostRuntime>>,
-    pub(crate) declared: Option<ply_core::Footprint>,
+    pub(crate) declared: Option<ply_ty::Footprint>,
     pub(crate) re_executed: bool,
     pub(crate) host_use: ply_eval::host::HostUse,
     pub(crate) host_ops: u64,
@@ -1059,10 +1059,10 @@ pub unsafe extern "C" fn rt_overflow(ctx: *mut Ctx, what: i64) {
 }
 
 /// An `Int` that is not one of the target width's values, reported as the interpreter's builtin
-/// reports it. `which` indexes [`ply_syntax::ast::INT_TYPES`].
+/// reports it. `which` indexes [`ply_ty::INT_TYPES`].
 pub unsafe extern "C" fn rt_not_that_width(ctx: *mut Ctx, which: i64, value: i64) {
     let ctx = unsafe { &mut *ctx };
-    let t = ply_syntax::ast::INT_TYPES[which as usize];
+    let t = ply_ty::INT_TYPES[which as usize];
     let d = error(format!(
         "`{}` was given {value}: `{t}` holds {} to {}",
         t.of_int_name(),
@@ -2634,12 +2634,12 @@ pub unsafe extern "C" fn rt_not_a_list(ctx: *mut Ctx, which: i64, value: i64) {
 
 /// A shift count outside `0..64`, which the interpreter refuses too.
 /// A shift count outside the word, reported as the machine reports it: `which` indexes
-/// [`ply_syntax::ast::INT_TYPES`], and is `-1` for `Int`.
+/// [`ply_ty::INT_TYPES`], and is `-1` for `Int`.
 pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     let ctx = unsafe { &mut *ctx };
     let (ty, width) = match usize::try_from(which)
         .ok()
-        .and_then(|i| ply_syntax::ast::INT_TYPES.get(i))
+        .and_then(|i| ply_ty::INT_TYPES.get(i))
     {
         Some(t) => (t.name(), i64::from(t.bits())),
         None => ("Int", 64),

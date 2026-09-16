@@ -1,13 +1,14 @@
 //! Definition bodies: the third element of `Hash -> (Definition, Type, Footprint)`.
 
 use indexmap::IndexMap;
-use ply_core::ty::{EffectAtom, Footprint, Row, RowVar, Scheme, TyVar, Type};
-use ply_core::{CheckOutput, check_program};
+use ply_core::check_program;
 use ply_hash::body::{BodySet, ItemKind, reconstruct};
 use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{SourceId, Symbol};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
+use ply_ty::CheckOutput;
+use ply_ty::{EffectAtom, Footprint, Row, RowVar, Scheme, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 
 struct Checked {

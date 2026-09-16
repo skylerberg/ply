@@ -4,9 +4,9 @@ use super::{
     Handles, Net, Op, no_connection_scripted, not_a_listener, not_a_stream, unknown_handle,
 };
 use crate::tls;
-use ply_core::ty::Resource;
 use ply_eval::{HostAnswer, HostRuntime, Pending, Value};
 use ply_span::{Diagnostic, Span, codes};
+use ply_ty::Resource;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;

@@ -577,7 +577,7 @@ pub struct FoundTest {
     pub hash: DefHash,
     pub name: String,
     pub nondet: bool,
-    pub footprint: ply_core::Footprint,
+    pub footprint: ply_ty::Footprint,
     pub path: PathBuf,
     pub span: FileSpan,
 }

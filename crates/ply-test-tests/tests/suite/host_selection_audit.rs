@@ -1,7 +1,6 @@
 //! What decides whether a host-backed test runs at all.
 
 use crate::fixture::{Compiled, TierExecutor};
-use ply_core::ty::Resource;
 use ply_eval::host::{
     Determinism, HostAnswer, HostBinding, HostHandler, HostOp, HostRegistry, HostRequest,
     HostResource, HostRuntime, Linearity,
@@ -10,6 +9,7 @@ use ply_eval::{Plan, Value};
 use ply_span::{Diagnostic, Symbol};
 use ply_store::Store;
 use ply_test::{Hosting, InterpExecutor, Reason, Search, select};
+use ply_ty::Resource;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -41,7 +41,7 @@ impl Drop for TempRoot {
 }
 
 impl Compiled {
-    fn footprint_of_test(&self, name: &str) -> &ply_core::Footprint {
+    fn footprint_of_test(&self, name: &str) -> &ply_ty::Footprint {
         &self
             .check
             .tests

@@ -3,9 +3,9 @@
 use super::RuleLog;
 use super::context::{Context, Unfoldable};
 use super::term::{self, Arm, ArmTest, CmpOp, Node, TermId, Terms};
-use ply_core::{CtorInfo, Scheme, TyVar, Type};
 use ply_span::Symbol;
 use ply_syntax::ast::{BinOp, Expr, ExprKind, Lit, Param, Pattern, PatternKind, QName, Stmt, UnOp};
+use ply_ty::{CtorInfo, Scheme, TyVar, Type};
 use std::collections::BTreeMap;
 
 /// The size past which unfolding stops.

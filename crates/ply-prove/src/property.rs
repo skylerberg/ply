@@ -6,13 +6,14 @@ use crate::{
     Binding, CaseReport, Counterexample, Discharge, Evidence, GEN_DEPTH, Gap, ProvePlan, Vacuity,
     VacuityKind,
 };
-use ply_core::ty::IntTy;
-use ply_core::{CtorInfo, Row, TyVar, Type};
-use ply_core::{LawBinder, prelude};
+use ply_core::prelude;
 use ply_eval::{Closure, ClosureKind, Decimal, Fixed, Value};
 use ply_hash::DefHash;
 use ply_span::{Diagnostic, Span, Symbol};
 use ply_syntax::ast::{BinOp, Expr, ExprKind, Ident, QName};
+use ply_ty::IntTy;
+use ply_ty::LawBinder;
+use ply_ty::{CtorInfo, Row, TyVar, Type};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::sync::Arc;
@@ -258,7 +259,7 @@ impl TypeWorld {
                 "List" | "Map" => Some(0),
                 "Cell" => None,
                 _ if name.as_str() == prelude::TASK_TYPE => None,
-                _ if name.as_str() == ply_core::ty::SECRET => None,
+                _ if name.as_str() == ply_ty::SECRET => None,
                 _ => self.types.get(name).and_then(|d| d.depth),
             },
         }
@@ -390,7 +391,7 @@ pub fn generatable(ty: &Type, world: &TypeWorld) -> Result<(), Ungeneratable> {
             "List" | "Map" => args.iter().try_for_each(|a| generatable(a, world)),
             "Cell" => Err(Ungeneratable::Cell),
             _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
-            _ if name.as_str() == ply_core::ty::SECRET => Err(Ungeneratable::Secret),
+            _ if name.as_str() == ply_ty::SECRET => Err(Ungeneratable::Secret),
             _ => {
                 let Some(decl) = world.types.get(name) else {
                     return Err(Ungeneratable::Unknown(name.clone()));
@@ -508,7 +509,7 @@ impl Gen<'_> {
                 }
                 "Cell" => Err(Ungeneratable::Cell),
                 _ if name.as_str() == prelude::TASK_TYPE => Err(Ungeneratable::Task),
-                _ if name.as_str() == ply_core::ty::SECRET => Err(Ungeneratable::Secret),
+                _ if name.as_str() == ply_ty::SECRET => Err(Ungeneratable::Secret),
                 _ => self.adt(name, args, depth),
             },
         }

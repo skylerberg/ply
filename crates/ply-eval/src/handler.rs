@@ -7,9 +7,9 @@ use crate::semantics::arity_error;
 use crate::task_regions::TaskRegions;
 use crate::value::Value;
 use crate::window::Windows;
-use ply_core::ty::{EffectAtom, Resource};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Resource};
 use std::rc::Rc;
 
 /// The machine's own state has these same three shapes plus `Halt`, which no handler transition can

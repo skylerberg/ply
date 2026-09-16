@@ -1,6 +1,5 @@
 //! The obligation cache, coverage, and the review baseline.
 
-use ply_core::{CheckOutput, DefInfo, Footprint, LawBinder, Scheme, Type};
 use ply_hash::{DefHash, HashOutput};
 use ply_prove::key::prove_key;
 use ply_prove::{
@@ -11,6 +10,7 @@ use ply_span::{Span, Symbol};
 use ply_store::{CachedCases, CachedEvidence, CachedObligation, ReviewRecord, Store};
 use ply_syntax::ast::ModuleName;
 use ply_test::obligation::{self, Discharger, Laws, Moved, Reason};
+use ply_ty::{CheckOutput, DefInfo, Footprint, LawBinder, Scheme, Type};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Mutex;

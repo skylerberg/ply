@@ -1,7 +1,6 @@
 //! The hybrid engine on real programs: assembling a mixed definition graph from stored bodies,
 //! checking it, and running the failing test against it.
 
-use ply_core::CheckOutput;
 use ply_eval::Provider;
 use ply_hash::HashOutput;
 use ply_hash::body::BodySet;
@@ -14,6 +13,7 @@ use ply_test::bisect::{
     Verdict, bisect, diff,
 };
 use ply_test::{BodyHybrid, Signature, hybrid};
+use ply_ty::CheckOutput;
 use std::collections::BTreeMap;
 
 fn sym(s: &str) -> Symbol {
