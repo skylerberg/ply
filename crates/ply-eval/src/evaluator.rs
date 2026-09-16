@@ -63,9 +63,6 @@ pub struct Machine<'a> {
     runtime: Option<Rc<dyn HostRuntime>>,
     /// The compiled front end, for the bodies the interpreter declines.
     compiled: Option<Rc<dyn Compiled>>,
-    /// The compiled tier is the only engine: a body the interpreter declines and the tier does not
-    /// hold is a failure.
-    tier_only: bool,
     compiled_entries: Cell<u64>,
     compiled_declines: Cell<u64>,
     compiled_refusals: Cell<u64>,
@@ -129,7 +126,6 @@ impl<'a> Machine<'a> {
             binding: Arc::new(HostBinding::hermetic()),
             runtime: None,
             compiled: None,
-            tier_only: false,
             compiled_entries: Cell::new(0),
             compiled_declines: Cell::new(0),
             compiled_refusals: Cell::new(0),
@@ -266,14 +262,9 @@ impl<'a> Machine<'a> {
     /// Attach the compiled front end: the source of the bodies the interpreter declines.
     pub fn set_compiled(&mut self, compiled: Rc<dyn Compiled>) {
         if compiled.describes(self.program) {
-            self.tier_only = compiled.tier_only();
             self.compiled = Some(compiled);
             self.share_host();
         }
-    }
-
-    pub fn set_tier_only(&mut self, tier_only: bool) {
-        self.tier_only = tier_only;
     }
 
     pub fn compiled_counts(&self) -> (u64, u64) {
@@ -448,17 +439,6 @@ impl<'a> Machine<'a> {
         self.begin_entry();
         // Tier-only: an entry point is run on the compiled tier.
         self.tier_call(&sym, args, span)
-    }
-
-    /// The same call a nested engine is handed mid-run; the entry-point escape check is the same
-    /// one `call` runs, and a nested engine's arguments have already been admitted.
-    pub(crate) fn call_within(
-        &mut self,
-        name: &str,
-        args: Vec<Value>,
-        span: Span,
-    ) -> Result<Value, Diagnostic> {
-        self.call(name, args, span)
     }
 
     fn tier_call(

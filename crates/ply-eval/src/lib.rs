@@ -47,8 +47,8 @@ pub use arena::{Arena, RegionKind};
 // crate serves.
 pub use argv::CLASSES as ARGUMENT_VECTOR_CLASSES;
 pub use backend::{
-    Compilation, Counters, Fragment, Kind as BackendKind, Mutant, Mutation, Offers, Policed,
-    Provider, Reference, Spec as BackendSpec,
+    Compilation, Counters, Kind as BackendKind, Mutant, Mutation, Offers, Policed, Provider,
+    Spec as BackendSpec,
 };
 pub use builtins::{Builtin, Step, assert_failure, assertion_failure};
 pub use code::{Captures, Code, Lowered, Lowering, Node, NodeKind, Pat, lower};

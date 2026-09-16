@@ -80,7 +80,10 @@ const EXPECTED_ABSENT: [(&str, &str); 2] = [("Lit", "mantissa"), ("Lit", "scale"
 
 #[test]
 fn every_field_of_every_parsed_ast_type_is_named_in_the_reference_dumper() {
-    let ast = code_only(&read("crates/ply-syntax/src/ast.rs"));
+    // The literal lives in `ply-ty` with the rest of the tree's vocabulary; its fields are parsed.
+    let ast = code_only(&read("crates/ply-syntax/src/ast.rs"))
+        + "\n"
+        + &code_only(&read("crates/ply-ty/src/expr.rs"));
     let dumper = code_only(&read("crates/ply-compiler-diff/src/lib.rs"));
     let fields = fields_of_ast(&ast);
     assert!(
