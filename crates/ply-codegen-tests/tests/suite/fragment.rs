@@ -10,7 +10,7 @@ use std::collections::HashMap;
 pub struct Loaded {
     pub program: &'static Program,
     pub resolved: &'static ply_syntax::resolve::Resolved,
-    pub check: &'static ply_core::CheckOutput,
+    pub check: &'static ply_ty::CheckOutput,
     /// Each module's text by name: what the whole Ply emitter re-parses to produce.
     pub texts: HashMap<String, String>,
 }

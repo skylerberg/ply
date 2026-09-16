@@ -12,7 +12,6 @@ pub mod schedule;
 pub mod sim;
 pub mod slice;
 
-use ply_core::{CheckOutput, Footprint};
 use ply_eval::explore::{Interleaving, explore, measure_reduction};
 use ply_eval::host::{HostBinding, HostRuntime};
 use ply_eval::{Arena, Exploration, Lowering, Machine, Plan, Race, Seed, TaskRegions, Value};
@@ -21,6 +20,7 @@ use ply_span::{Diagnostic, Symbol, codes};
 use ply_store::{Outcome, PassRecord, Store};
 use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
+use ply_ty::{CheckOutput, Footprint};
 use serde::Serialize;
 use std::any::Any;
 use std::collections::{BTreeMap, BTreeSet};

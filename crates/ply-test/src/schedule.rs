@@ -1,6 +1,6 @@
 //! Which selected tests may run at the same time.
 
-use ply_core::{EffectAtom, Footprint};
+use ply_ty::{EffectAtom, Footprint};
 use serde::Serialize;
 
 /// Effects whose atoms name a region label.

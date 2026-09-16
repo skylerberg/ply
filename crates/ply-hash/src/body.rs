@@ -1428,7 +1428,7 @@ impl Decoder<'_> {
             }
             tag::LIT_FIXED => {
                 let which = self.c.u8()?;
-                let ty = *ply_syntax::ast::INT_TYPES
+                let ty = *ply_ty::INT_TYPES
                     .get(which as usize)
                     .ok_or_else(|| bad(format!("{which} is not a fixed-width integer type")))?;
                 let bits = self.c.i64()? as u64;

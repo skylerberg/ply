@@ -1,10 +1,10 @@
 use crate::property::{Fixture, Fn2, binder, ints, key};
-use ply_core::{LawBinder, Row, Type};
 use ply_eval::Value;
 use ply_prove::property::{GenStream, Judge, TypeWorld, generate, run_property};
 use ply_prove::shrink::{Target, candidates, minimal, shrink, size};
 use ply_prove::{Counterexample, DEFAULT_SHRINK_BUDGET, Discharge, ProvePlan};
 use ply_span::{Diagnostic, Span, Symbol};
+use ply_ty::{LawBinder, Row, Type};
 
 const ADTS: &str = r#"
 type Opt = Nothing | Just(Int)

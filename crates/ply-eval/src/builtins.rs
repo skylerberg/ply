@@ -7,8 +7,8 @@ use crate::semantics::arity_error;
 use crate::value::{
     Decimal, Fixed, IntTy, List, Value, first_difference, type_error, values_equal,
 };
-use ply_core::ty::INT_TYPES;
 use ply_span::{Diagnostic, Span, codes};
+use ply_ty::INT_TYPES;
 use rust_decimal::RoundingStrategy;
 use rust_decimal::prelude::ToPrimitive;
 use std::fmt;

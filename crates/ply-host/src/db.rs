@@ -17,9 +17,9 @@ pub use scope::{Access, Isolation, Owner, ScopeTable, Step};
 pub use stmt::{Answer, Cache, Prepared};
 pub use types::{Datum, DbError, Json, Param};
 
-use ply_core::ty::Footprint;
 use ply_eval::{Determinism, HostOp, HostResource, Linearity};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::Footprint;
 
 /// The Ply declaration the registrations below are checked against: the source of the module
 /// `std.db`, which ships with the compiler.
@@ -114,7 +114,7 @@ impl Op {
                 // Whichever tables the program uses.
                 HostResource::Any
             } else {
-                HostResource::Only(ply_core::ty::Resource::Singleton)
+                HostResource::Only(ply_ty::Resource::Singleton)
             },
             determinism: Determinism::Nondeterministic,
             linearity: Linearity::AtMostOnce,
@@ -131,12 +131,12 @@ impl Op {
 pub fn check_footprint(
     scan: &Scan,
     op: Op,
-    label: &ply_core::ty::Resource,
+    label: &ply_ty::Resource,
     declared: Option<&Footprint>,
     span: Span,
 ) -> Result<Footprint, Diagnostic> {
-    use ply_core::ty::{EffectAtom, Resource};
-    use ply_syntax::ast::Mode;
+    use ply_ty::Mode;
+    use ply_ty::{EffectAtom, Resource};
 
     // The statement's own kind, and any data-modifying CTE inside it: a `select` whose `with` holds
     // a `delete` changes rows, and a `read` atom for it would put it in a concurrency group with

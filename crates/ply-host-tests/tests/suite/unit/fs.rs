@@ -1,6 +1,6 @@
-use ply_core::ty::Resource;
 use ply_host::fs::*;
 use ply_span::{Span, Symbol, codes};
+use ply_ty::Resource;
 
 fn root() -> tempfile::TempDir {
     tempfile::tempdir().expect("a temporary directory")

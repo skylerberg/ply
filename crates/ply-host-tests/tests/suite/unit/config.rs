@@ -609,8 +609,8 @@ fn a_report_lists_only_the_declared_keys() {
 
 #[test]
 fn two_configuration_readers_never_conflict() {
-    use ply_core::ty::{EffectAtom, Footprint, Resource};
-    use ply_syntax::ast::Mode;
+    use ply_ty::Mode;
+    use ply_ty::{EffectAtom, Footprint, Resource};
 
     let effect = Symbol::new(EFFECT);
     let atom = |namespace: &str| {

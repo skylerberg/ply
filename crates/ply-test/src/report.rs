@@ -5,9 +5,9 @@ use crate::schedule::{Isolation, Parallelism, shared_footprint};
 use crate::sim::SimSummary;
 use crate::slice::{Assertion, CausalSlice};
 use crate::{Attribution, Failure, Reason, RunReport, Selection, Status, Suspect, TestResult};
-use ply_core::{CheckOutput, Footprint};
 use ply_eval::{Exploration, Race, RaceSite};
 use ply_hash::HashOutput;
+use ply_ty::{CheckOutput, Footprint};
 use serde_json::{Value, json};
 use std::time::Duration;
 
@@ -57,9 +57,7 @@ impl Selection {
             let footprint = group
                 .iter()
                 .filter_map(|&i| check.tests.get(i))
-                .fold(ply_core::Footprint::empty(), |acc, t| {
-                    acc.union(&t.footprint)
-                });
+                .fold(ply_ty::Footprint::empty(), |acc, t| acc.union(&t.footprint));
             lines.push(format!(
                 "group {g}: {} test(s) {} — combined footprint {footprint}",
                 group.len(),

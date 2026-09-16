@@ -1,7 +1,6 @@
 //! An adversarial audit of transactions, the pool and parameter safety, against a real postgres.
 
 use crate::support::cluster::{self, Cluster};
-use ply_core::ty::{EffectAtom, Footprint, Resource};
 use ply_eval::Value;
 use ply_eval::host::{HostAnswer, MachineId, Pending};
 use ply_eval::sim::TaskId;
@@ -11,6 +10,7 @@ use ply_host::db::stmt::{self, Answer};
 use ply_host::db::types::{Datum, Param};
 use ply_host::db::{self, Driver, Op, Postgres, Statement};
 use ply_span::{Diagnostic, Span, Symbol, codes};
+use ply_ty::{EffectAtom, Footprint, Resource};
 use rust_decimal::Decimal;
 use std::str::FromStr;
 use std::sync::Arc;

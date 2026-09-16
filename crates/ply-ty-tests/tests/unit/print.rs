@@ -1,7 +1,6 @@
-use ply_core::print::*;
-use ply_core::ty::{EffectAtom, Resource, Row, RowVar, Scheme, TyVar, Type};
 use ply_span::Symbol;
-use ply_syntax::ast::Mode;
+use ply_ty::print::*;
+use ply_ty::{EffectAtom, Mode, Resource, Row, RowVar, Scheme, TyVar, Type};
 
 #[test]
 fn variables_are_renamed_per_item_starting_at_a() {

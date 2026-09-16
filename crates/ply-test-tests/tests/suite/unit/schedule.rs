@@ -1,10 +1,10 @@
-use ply_core::{EffectAtom, Footprint, Resource};
 use ply_span::Symbol;
-use ply_syntax::ast::Mode;
 use ply_test::schedule::{
     Isolation, SIM_EFFECT, contends_only_over_regions, group_by_conflict, is_seeded, parallelism,
     region_isolated, shared_footprint,
 };
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Footprint, Resource};
 
 fn atom(effect: &str, resource: Option<&str>, mode: Mode) -> EffectAtom {
     EffectAtom::new(

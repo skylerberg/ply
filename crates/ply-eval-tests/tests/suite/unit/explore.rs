@@ -1,4 +1,3 @@
-use ply_core::{EffectAtom, Resource};
 use ply_eval::arena::Slot;
 use ply_eval::cont::SimId;
 use ply_eval::explore::*;
@@ -6,7 +5,8 @@ use ply_eval::sched::{Stamp, happens_before};
 use ply_eval::sim::{Access, Domain, Stream};
 use ply_eval::sim::{Naive, Plan, Seed, StepFootprint, TaskId};
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Resource};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// A model scheduler: enough of the scheduler on the control stack to exercise the search, and none of the machine.

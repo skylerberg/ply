@@ -1,4 +1,3 @@
-use ply_core::{EffectAtom, Footprint, LawBinder, Resource, Type};
 use ply_eval::arena::Slot;
 use ply_eval::explore::Step;
 use ply_eval::{
@@ -16,7 +15,8 @@ use ply_prove::{
     Rule, Tier, Vacuity, VacuityKind, interleaving_proves,
 };
 use ply_span::{Diagnostic, Span, Symbol, codes};
-use ply_syntax::ast::Mode;
+use ply_ty::Mode;
+use ply_ty::{EffectAtom, Footprint, LawBinder, Resource, Type};
 
 fn body_was_false(span: Span) -> Diagnostic {
     Diagnostic::error(

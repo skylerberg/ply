@@ -1,14 +1,14 @@
-use ply_core::{CheckOutput, EffectAtom, Footprint, Resource};
 use ply_eval::Plan;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, Symbol};
 use ply_store::{Outcome, Store};
-use ply_syntax::ast::Mode;
 use ply_syntax::resolve::Resolved;
 use ply_test::{
     Executor, Hosting, InterpExecutor, Isolation, Parallelism, Reason, Search, Selection, Status,
     group_by_conflict, run_with, select,
 };
+use ply_ty::Mode;
+use ply_ty::{CheckOutput, EffectAtom, Footprint, Resource};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};

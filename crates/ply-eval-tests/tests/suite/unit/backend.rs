@@ -1,4 +1,3 @@
-use ply_core::CheckOutput;
 /// The registry narrowing, which is measurement scaffolding and is therefore the easiest thing in
 /// this file to get quietly wrong.
 use ply_eval::backend::*;
@@ -7,6 +6,7 @@ use ply_syntax::ast::ModuleName;
 use ply_syntax::ast::Program;
 use ply_syntax::resolve::Resolved;
 use ply_syntax::resolve::resolve;
+use ply_ty::CheckOutput;
 
 fn checked(text: &str) -> (Program, Resolved, CheckOutput) {
     let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), text)];

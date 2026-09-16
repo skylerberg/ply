@@ -1,12 +1,12 @@
 //! The stop flag, the phase machine, and the one thing that gets a parked `accept` to return.
 
-use ply_core::ty::Resource;
 use ply_eval::HostAnswer;
 use ply_eval::{Determinism, HostHandler, HostOp, HostRequest, HostRuntime, Linearity, Value};
 use ply_host::signal::*;
 use ply_host::tcp::{Net, TcpHost};
 use ply_span::Symbol;
 use ply_span::{Diagnostic, Span, codes};
+use ply_ty::Resource;
 use std::io::Read;
 use std::net::TcpListener;
 use std::net::TcpStream;
@@ -338,14 +338,14 @@ fn the_handler_answers_the_flag_and_the_clock() {
     let handlers = registrations(Some(&shutdown));
     let stopping = &handlers[0].1;
     let deadline = &handlers[1].1;
-    let atom = ply_core::ty::EffectAtom::new(
+    let atom = ply_ty::EffectAtom::new(
         Symbol::new(EFFECT),
         Resource::Singleton,
         ply_syntax::ast::Mode::Read,
     );
     let declaration = Op::Stopping.declaration();
     fn request<'a>(
-        atom: &ply_core::ty::EffectAtom,
+        atom: &ply_ty::EffectAtom,
         declaration: &'a HostOp,
         args: &'a [Value],
     ) -> HostRequest<'a> {

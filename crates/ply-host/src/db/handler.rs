@@ -3,9 +3,9 @@
 use super::scope::{Access, Isolation, Owner};
 use super::value;
 use super::{Op, Scan, check_footprint};
-use ply_core::ty::{Footprint, Resource};
 use ply_eval::host::{HostAnswer, HostHandler, HostRegistry, HostRequest, HostRuntime};
 use ply_span::{Diagnostic, Span, codes};
+use ply_ty::{Footprint, Resource};
 use std::sync::Arc;
 
 /// What a `db` implementation has to answer.
