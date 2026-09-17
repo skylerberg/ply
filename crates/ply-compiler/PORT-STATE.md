@@ -281,8 +281,7 @@ away, which lost a lambda its capture; and the resolved-C one, where the port's 
 ratchet of their own with floors and not yet an emptiness. The audit of the port's own tests
 under the tier is green. `crates/ply-compiler/bootstrap/` is the C the port emitted for itself,
 compressed, with the unit's record, the constructor table it was emitted against and the digest
-of the sources it came from; the CLI builds the producer from it rather than with the reference,
-`PLY_C_BOOTSTRAP=off` asks for the reference again, and
+of the sources it came from; the CLI builds the producer from it rather than with the reference, and
 `PLY_C_BOOTSTRAP_REFRESH=1 cargo nextest run -p ply-codegen-tests --test bootstrap` rewrites the
 bundle from the fixpoint's own emission -- CI runs the same refresh when the fixpoint goes red and
 hands the bundle back as the `bootstrap-bundle` artifact. The fixpoint test is the check: the
