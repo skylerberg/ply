@@ -22,12 +22,12 @@ run_suite() {
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
     && PLY_C_EMITTER="ply:$work" \
        cargo test --offline -p ply-codegen-tests --test goldens -- --test-threads=2 \
-         infer::the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs \
-         infer::the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs \
-         infer::the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs \
-         infer::the_ply_checker_agrees_with_ply_core_on_the_standard_library \
-         infer::the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs \
-         infer::the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_bundles 2>&1 )
+         infer::the_ply_checker_matches_its_golden_on_the_resolvers_hand_written_programs \
+         infer::the_ply_checker_matches_its_golden_on_the_checkers_hand_written_programs \
+         infer::the_ply_checker_matches_its_golden_on_the_resolvers_reference_programs \
+         infer::the_ply_checker_matches_its_golden_on_the_standard_library \
+         infer::the_ply_checker_matches_its_golden_on_the_references_own_inputs \
+         infer::the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_bundles 2>&1 )
 }
 
 mutate() {

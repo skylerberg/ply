@@ -21,9 +21,9 @@ run_suite() {
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
     && PLY_C_EMITTER="ply:$work" \
        cargo test --offline -p ply-codegen-tests --test goldens -- --test-threads=2 \
-         resolve::the_ply_resolver_agrees_with_ply_syntax_on_the_hand_written_programs \
-         resolve::the_ply_resolver_agrees_with_ply_syntax_on_the_references_own_programs \
-         resolve::the_ply_resolver_agrees_with_ply_syntax_on_the_standard_library 2>&1 )
+         resolve::the_ply_resolver_matches_its_golden_on_the_hand_written_programs \
+         resolve::the_ply_resolver_matches_its_golden_on_the_references_own_programs \
+         resolve::the_ply_resolver_matches_its_golden_on_the_standard_library 2>&1 )
 }
 
 mutate() {

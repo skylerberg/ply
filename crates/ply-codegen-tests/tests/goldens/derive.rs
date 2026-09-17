@@ -1,6 +1,6 @@
-//! The fifth differential: `derive.ply` against `crates/ply-derive`. Every module is expanded on
-//! its own, and the source each derivation generates is compared byte for byte, with the
-//! diagnostics expansion raises.
+//! The fifth comparison: `derive.ply`'s expansion of every module on its own — the source
+//! each derivation generates, byte for byte, with the diagnostics expansion raises — against
+//! a blessed golden.
 //!
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
@@ -88,7 +88,7 @@ fn ply_files(dir: &Path, prefix: &str) -> Vec<(String, String)> {
 }
 
 #[test]
-fn the_ply_deriver_agrees_with_ply_derive_on_the_hand_written_modules() {
+fn the_ply_deriver_matches_its_golden_on_the_hand_written_modules() {
     let text = std::fs::read_to_string(here().join("fixtures/derive-programs.corpus"))
         .expect("the hand-written derive modules");
     let inputs: Vec<(String, Vec<(String, String)>)> = crate::harness::bundle(&text)
@@ -109,7 +109,7 @@ fn the_ply_deriver_agrees_with_ply_derive_on_the_hand_written_modules() {
 }
 
 #[test]
-fn the_ply_deriver_agrees_with_ply_derive_on_every_example_and_the_standard_library() {
+fn the_ply_deriver_matches_its_golden_on_every_example_and_the_standard_library() {
     let mut inputs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (name, text) in ply_files(&repo_root().join("examples"), "examples/") {
         inputs.push((name.clone(), vec![(name, text)]));

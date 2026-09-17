@@ -1,6 +1,6 @@
-//! The sixth differential: `hash.ply` against `crates/ply-hash`. Every hash the reference
-//! publishes for a program — each definition's, each declaration's, each test's and law's, the
-//! own-form and spec keys — and the reference graph beside them, compared record by record.
+//! The sixth comparison: every hash `hash.ply` publishes for a program — each definition's,
+//! each declaration's, each test's and law's, the own-form and spec keys — and the reference
+//! graph beside them, compared record by record against a blessed golden.
 //!
 //! The port is entered in-process through `port`: the bundle the binary carries is the compiler
 //! under test, and `PLY_C_EMITTER=ply:<dir>` enters a working copy `stage` has bootstrapped.
@@ -95,14 +95,14 @@ fn std_modules() -> Vec<(String, String)> {
 }
 
 #[test]
-fn the_ply_hasher_agrees_with_ply_hash_on_the_standard_library() {
+fn the_ply_hasher_matches_its_golden_on_the_standard_library() {
     compare(
         "std",
         &[("the standard library".to_string(), std_modules())],
     );
 }
 
-fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library(
+fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(
     index: usize,
     of: usize,
 ) {
@@ -119,9 +119,9 @@ fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_librar
 }
 
 #[test]
-fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library_part_1_of_2() {
+fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_1_of_2() {
     ply_codegen::c::producer::reset_census();
-    the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library(0, 2);
+    the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(0, 2);
     // The hasher's cost over this half of the corpus, the standard library counted once per
     // program as it is hashed once per program (ADR 0051 §2).
     let lines: usize = std_modules().iter().map(|(_, t)| t.lines().count()).sum();
@@ -132,12 +132,12 @@ fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_librar
 }
 
 #[test]
-fn the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library_part_2_of_2() {
-    the_ply_hasher_agrees_with_ply_hash_on_every_example_with_the_standard_library(1, 2);
+fn the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library_part_2_of_2() {
+    the_ply_hasher_matches_its_golden_on_every_example_with_the_standard_library(1, 2);
 }
 
 #[test]
-fn the_ply_hasher_agrees_with_ply_hash_on_the_bundles() {
+fn the_ply_hasher_matches_its_golden_on_the_bundles() {
     let mut inputs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (file, label) in [
         ("fixtures/resolve-programs.corpus", "resolve-programs"),
