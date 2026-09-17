@@ -275,8 +275,8 @@ fn copying_a_shipped_module_into_a_project_produces_identical_hashes() {
     );
 }
 
-/// The pseudo-path is what lets gate 1 key an embedded module on the bytes it was compiled from,
-/// with no new mechanism and no file on disk.
+/// The pseudo-path is what lets the store key an embedded module on the bytes it was compiled
+/// from, with no new mechanism and no file on disk.
 #[test]
 fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
     let dir = tempfile::tempdir().unwrap();
@@ -294,21 +294,7 @@ fn a_shipped_module_is_fingerprinted_under_its_pseudo_path() {
     assert_eq!(
         fingerprint.content_hash,
         ContentHash::of(ply_std::NET.as_bytes()),
-        "gate 1 must key on the embedded source bytes"
-    );
-
-    // Gate 1 then fires for it on the next run, exactly as for a file.
-    let second = driver::load_incremental(dir.path(), &mut store).unwrap();
-    let report = second
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.module.as_str() == "std.net")
-        .expect("the shipped module is reported like any other");
-    assert!(
-        !report.parsed,
-        "the shipped module was parsed again: {:?}",
-        report.refusal
+        "the fingerprint must key on the embedded source bytes"
     );
 }
 
@@ -630,21 +616,6 @@ fn compaction_keeps_the_shipped_modules_it_loaded() {
             .fingerprint(&path)
             .is_some(),
         "compaction dropped a module this binary still ships"
-    );
-
-    // And the run after it still skips: the point of keeping the entry.
-    let mut store = Store::open(dir.path()).unwrap();
-    let loaded = driver::load_incremental(dir.path(), &mut store).unwrap();
-    let report = loaded
-        .frontend
-        .files
-        .iter()
-        .find(|f| f.module.as_str() == "std.net")
-        .expect("the shipped module is in the run");
-    assert!(
-        !report.parsed,
-        "reparsed after compaction: {:?}",
-        report.refusal
     );
 }
 

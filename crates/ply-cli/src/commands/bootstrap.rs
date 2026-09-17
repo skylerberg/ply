@@ -47,7 +47,9 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
         Ok(loaded) => loaded,
         Err(err) => return report_load_error("bootstrap", &err, args.json, style),
     };
-    let hashes = match loaded.hashes() {
+    // The call is the guard: it reports the hashing's diagnostics and stops, and the archive
+    // reads its hashes from the load's own answer below.
+    let _hashes = match loaded.hashes() {
         Ok(hashes) => hashes,
         Err(diagnostics) => {
             if args.json {
@@ -65,12 +67,10 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
     };
     let program = Box::leak(Box::new(loaded.program.clone()));
     let resolved = Box::leak(Box::new(loaded.resolved.clone()));
-    let check = Box::leak(Box::new(loaded.check.clone()));
-    // The Rust chain's answer: this command installs no producer, so the reference fragment emits
-    // the archive and the front end that answers for it is the reference's too.
-    let front = Box::leak(Box::new(ply_codegen::front_of(
-        program, resolved, check, hashes, None,
-    )));
+    // The load's own answer, which is the port's: asking for another would be a second front end
+    // in one invocation, and the emitter that answers for the archive is the one the load
+    // installed.
+    let front = Box::leak(Box::new(loaded.front.clone()));
 
     // The definition hashes, in name order, are the version. Sorted rather than in load order so
     // that moving a definition between files does not rename the compiler.
@@ -90,12 +90,13 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
     }
     let source_digest = h.finalize().to_hex().to_string();
 
-    let src: &'static ply_codegen::Source = Box::leak(Box::new(ply_codegen::Source::from_front(
-        program,
-        resolved,
-        front,
-        emit_keys(front),
-    )));
+    // The port is a front end: it reads the module texts, and a source without them is one it
+    // answers no body for, which is an archive holding none of the program it was made from.
+    let src: &'static ply_codegen::Source = Box::leak(Box::new(
+        ply_codegen::Source::from_front(program, resolved, front, emit_keys(front)).with_texts(
+            crate::commands::common::module_texts(&loaded.program, &loaded.sources),
+        ),
+    ));
     let names: Vec<String> = src.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
     let (text, refused) = match ply_codegen::c::produce(src, &refs) {

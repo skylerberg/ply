@@ -493,9 +493,11 @@ const FRONT: &str = "front.front_dump";
 /// The port's whole answer over a program — `ids` naming the source each module's spans point
 /// into, in the same order the modules are handed over.
 ///
-/// **An error here is a disagreement, not a user's diagnostic.** The driver has already run the
-/// Rust chain over this program and accepted it, so a refusal from the port is two front ends
-/// differing, and it is raised rather than reported as the program's fault.
+/// **A refusal of the program is in the answer, not in the `Err`.** The driver asks this before it
+/// has an opinion of its own, so a type error is `front.diagnostics` and reaches the terminal like
+/// any other; `Err` is the seam failing — no emitter on this thread, a dump that does not read.
+/// A caller that has already accepted the program holds the two apart itself; [`front_agreeing`]
+/// is that caller's door.
 pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
     if sources.len() != ids.len() {
         bail!(
@@ -520,8 +522,14 @@ pub fn front(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
             answer.type_name()
         );
     };
-    let front =
-        read_front(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))?;
+    read_front(dump, ids).map_err(|e| anyhow!("the front end's answer does not read: {e}"))
+}
+
+/// [`front`] for a caller that has already run a front end over this program and accepted it: an
+/// error diagnostic is then two front ends differing rather than the program's fault, so it is
+/// raised rather than handed back as an answer.
+pub fn front_agreeing(sources: &[(String, String)], ids: &[SourceId]) -> Result<Front> {
+    let front = front(sources, ids)?;
     if let Some(d) = front
         .diagnostics
         .iter()

@@ -4,8 +4,8 @@ use super::common::{IND, diagnostics_json, emit_json, plural, print_diagnostics}
 use crate::cli::StdArgs;
 use crate::style::Style;
 use crate::{EXIT_COMPILE_ERROR, EXIT_OK};
-use ply_span::{Diagnostic, SourceId, SourceMap, Span, codes};
-use ply_syntax::ast::{Item, ModuleName};
+use ply_span::{Diagnostic, Severity, SourceId, SourceMap, Span, Symbol, codes};
+use ply_syntax::ast::ModuleName;
 use serde_json::{Value, json};
 
 /// The `--json` object's shape.
@@ -84,43 +84,66 @@ fn report(diagnostics: &[Diagnostic], json: bool, style: Style) -> i32 {
     EXIT_COMPILE_ERROR
 }
 
-/// Counting definitions needs a parse, and a shipped module that does not parse is Ply's fault: the
-/// user cannot have caused it and cannot fix it.
+/// Counting definitions needs a front end, so this command goes through the same one every other
+/// does — the port, asked once over the shipped modules together (ADR 0052 §1). A shipped module
+/// the compiler's own front end refuses is Ply's fault: the user cannot have caused it and cannot
+/// fix it.
 pub fn rows() -> Result<Vec<Row>, Vec<Diagnostic>> {
-    let mut out = Vec::new();
-    let mut diagnostics = Vec::new();
-    for (i, (name, source)) in ply_std::sources().enumerate() {
-        let module = ModuleName::from_dotted(name);
-        match ply_syntax::parse_module(SourceId(i as u32), module, source) {
-            Ok(parsed) => out.push(Row {
-                name: name.to_string(),
-                definitions: parsed
-                    .items
+    let sources: Vec<(String, String)> = ply_std::sources()
+        .map(|(name, source)| (name.to_string(), source.to_string()))
+        .collect();
+    let ids: Vec<SourceId> = (0..sources.len()).map(|i| SourceId(i as u32)).collect();
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&sources, &ids)
+        .map_err(|e| vec![shipped_refused(&format!("{e:#}"))])?;
+    if let Some(d) = front
+        .diagnostics
+        .iter()
+        .find(|d| d.severity == Severity::Error)
+    {
+        return Err(vec![shipped_refused(&format!("{} {}", d.code, d.message))]);
+    }
+
+    Ok(sources
+        .iter()
+        .map(|(name, source)| {
+            let module = Symbol::new(name);
+            // `ModuleInfo::items` names every declaration a reference could reach and, for a sum
+            // type, its constructors beside it — and a constructor is reached through its type
+            // rather than declared on its own.
+            let items = front
+                .check
+                .modules
+                .get(&module)
+                .map_or(0, |m| m.items.len());
+            let ctors = front
+                .check
+                .ctors
+                .values()
+                .filter(|c| c.module.as_symbol() == &module)
+                .count();
+            Row {
+                name: name.clone(),
+                definitions: items.saturating_sub(ctors),
+                tests: front
+                    .check
+                    .tests
                     .iter()
-                    .filter(|item| item.name().is_some())
-                    .count(),
-                tests: parsed
-                    .items
-                    .iter()
-                    .filter(|item| matches!(item, Item::Test(_)))
+                    .filter(|t| t.module.as_symbol() == &module)
                     .count(),
                 bytes: source.len(),
-            }),
-            Err(_) => diagnostics.push(
-                Diagnostic::error(
-                    codes::INTERNAL_ERROR,
-                    format!("the shipped module `{name}` does not parse"),
-                )
-                .note("this is a defect in the compiler's own sources, not in this program")
-                .note("please report it with the version of `ply` that produced it"),
-            ),
-        }
-    }
-    if diagnostics.is_empty() {
-        Ok(out)
-    } else {
-        Err(diagnostics)
-    }
+            }
+        })
+        .collect())
+}
+
+fn shipped_refused(why: &str) -> Diagnostic {
+    Diagnostic::error(
+        codes::INTERNAL_ERROR,
+        format!("the shipped modules do not compile: {why}"),
+    )
+    .note("this is a defect in the compiler's own sources, not in this program")
+    .note("please report it with the version of `ply` that produced it")
 }
 
 const HEADERS: [&str; 4] = ["MODULE", "DEFINITIONS", "TESTS", "BYTES"];

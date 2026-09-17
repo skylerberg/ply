@@ -1,6 +1,7 @@
 use super::common::{
-    IND, backend_spec, build_backend, counters_json, describe_schema, diagnostic_json, emit_json,
-    location, plural, print_diagnostics, report_bind_error, report_load_error, select_profile,
+    IND, backend_spec, build_backend_over, counters_json, describe_schema, diagnostic_json,
+    emit_json, location, plural, print_diagnostics, report_bind_error, report_load_error,
+    select_profile,
 };
 use crate::cli::RunArgs;
 use crate::hosts::Hosts;
@@ -425,11 +426,11 @@ pub fn compiled_backend(
     let Some(spec) = backend_spec(flag)? else {
         return Ok(None);
     };
-    let provider = build_backend(
+    let provider = build_backend_over(
         &spec,
         &loaded.program,
         &loaded.resolved,
-        &loaded.check,
+        &loaded.front,
         super::common::module_texts(&loaded.program, &loaded.sources),
     )?;
     Ok(Some(provider.attach(&spec)))

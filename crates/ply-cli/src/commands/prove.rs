@@ -129,16 +129,13 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
             return report_bind_error("prove", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
-    let (engine, engine_warning) = crate::engine::of(
+    let engine = crate::engine::of(
         &loaded.program,
         &loaded.resolved,
         &loaded.check,
-        loaded.complete,
-        obligations.len(),
         hosting,
         backend,
     );
-    warnings.extend(engine_warning);
     let (pool, _workers) = build_pool(args.jobs, &mut warnings);
     let discharge = || {
         obligation::prove(
@@ -197,7 +194,8 @@ pub fn execute(args: &ProveArgs, style: Style) -> i32 {
     }
 }
 
-/// Every module parsed, because a clause the run did not read is a claim nobody checked.
+/// The project, with every module parsed — which every load gives, because a clause the run did
+/// not read is a claim nobody checked.
 pub(crate) fn load_complete(
     path: &std::path::Path,
     incremental: bool,
@@ -212,25 +210,10 @@ pub(crate) fn load_complete(
     } else {
         load(path)
     };
-    let loaded = match first {
-        Ok(loaded) => loaded,
-        Err(err) => return Err(report_load_error(command, &err, json, style)),
-    };
-    warnings.extend(store.take_warnings());
-    if loaded.complete {
-        return Ok(loaded);
-    }
-
-    let needed: Vec<ply_syntax::ast::ModuleName> = loaded
-        .check
-        .modules
-        .values()
-        .map(|m| m.name.clone())
-        .collect();
-    match driver::load_to_evaluate(path, store, &needed) {
-        Ok(full) => {
+    match first {
+        Ok(loaded) => {
             warnings.extend(store.take_warnings());
-            Ok(full)
+            Ok(loaded)
         }
         Err(err) => Err(report_load_error(command, &err, json, style)),
     }

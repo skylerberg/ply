@@ -99,12 +99,24 @@ impl Unit {
         texts: HashMap<String, String>,
     ) -> Result<&'static Unit> {
         // The front end's answer, once for the whole unit: every table the emitter is offered is
-        // read from it, and so are the keys that make a test or a law a root (ADR 0052 §1). The
-        // port answers it where it can, which is why this is not free and is not paid twice.
-        let front = Box::leak(Box::new(
-            crate::source::front_for(program, resolved, check, &texts)
-                .context("the front end's answer over this program")?,
-        ));
+        // read from it, and so are the keys that make a test or a law a root (ADR 0052 §1). A
+        // caller that already holds one — the driver, which entered the port once for the whole
+        // invocation — hands it over through `over_front` instead, so it is not paid twice.
+        let front = crate::source::front_for(program, resolved, check, &texts)
+            .context("the front end's answer over this program")?;
+        Unit::over_front(program, resolved, &front, texts)
+    }
+
+    /// [`Unit::over_with_texts`] over a front end's answer the caller already has. This is the door
+    /// the CLI uses: the driver enters the port once per load (ADR 0052 §1), and a unit built here
+    /// runs no front end of its own.
+    pub fn over_front(
+        program: &Program,
+        resolved: &ply_syntax::resolve::Resolved,
+        front: &ply_ty::Front,
+        texts: HashMap<String, String>,
+    ) -> Result<&'static Unit> {
+        let front: &'static ply_ty::Front = Box::leak(Box::new(front.clone()));
         let keys = crate::source::emit_keys(front);
         // The copy is what the compiled bodies are generated from, so a unit shares no state at all
         // with the machine's program.
