@@ -450,6 +450,27 @@ from six places including `ci.yml`, `CONTRIBUTING.md` and source in
 `diff-items.py` is cited nowhere at all. So the directory outlives the
 differential, and the broken paths are a thing to fix rather than to delete.
 
+**Read, 2026-09-17: the parser corpus is stale, and re-mining it is a larger
+change than it looks.** Its header still says it came from
+`spikes/ply-parser/mine-fixtures.py` reading `crates/ply-syntax/src/tests.rs`,
+and neither path has existed for some time — a corpus frozen because nothing
+could regenerate it, now that the generator's own path is fixed. Re-mining was
+tried here and reverted.
+
+The reason is what it drags. `README.md` and `GAPS-harness.md` each carry a table
+of the corpora with six columns — inputs, bytes, dump records, nodes,
+diagnostics, and totals — and the mined row reads 716 inputs where the script now
+yields 1,028. Editing one cell would leave the other five wrong and the totals
+wronger, and taking them honestly means a harness run whose instrument is the
+differential this record is retiring. A known-stale artifact is better than a
+silently wrong table.
+
+`GAPS.md` reached this before: nothing checks the corpus against
+`parser.rs`, `agreement.rs` asserts only `fixtures.len() > 700`, and re-mining
+then gave 889 where it now gives 1,028. The diagnosis there is the one to keep —
+"a checked-in artifact of a generator with no freshness gate" — and the gate is
+what the change wants, alongside the tables, rather than a quiet re-mine.
+
 **Read, 2026-09-17: the blessing path works, and a dispatch is what says so.**
 Moving the golden suites broke `bless.yml` — it cleared and re-blessed only the
 differential crate's tree, so the five moved phases could not be blessed at all,
@@ -807,7 +828,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s and 140 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s and 136 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
