@@ -2315,24 +2315,6 @@ pub mod golden {
         std::env::var_os("PLY_DIFF_BLESS").is_some()
     }
 
-    /// The phases whose dumps are too large to review as text -- the resolver's and the hasher's
-    /// repeat the standard library's records for every example -- and are kept as the digest of
-    /// each dump over its first record, so a change is noticed where it cannot be read.
-    pub const DIGESTED: &[&str] = &["resolve", "hash"];
-
-    fn digested(phase: &str) -> bool {
-        DIGESTED.contains(&phase)
-    }
-
-    /// A dump as a digested golden keeps it: its digest, then its first record for the eye.
-    fn digest_of(dump: &str) -> String {
-        let first = dump.split(';').next().unwrap_or("");
-        format!(
-            "blake3 {}\n{first};\n",
-            blake3::hash(dump.as_bytes()).to_hex()
-        )
-    }
-
     /// Where `phase`'s golden for `name` lives, and which record of it: a bundle's records,
     /// named `<bundle>#<i>`, share one file, `<phase>/<bundle>.dumps`, one record per `%%% <i>`
     /// line; every other input has `<phase>/<name>.dump` to itself. Characters a file name cannot
@@ -2370,12 +2352,7 @@ pub mod golden {
     ) -> Result<(), String> {
         let (path, index) = place(phase, name);
         if blessing() {
-            let kept = if digested(phase) {
-                digest_of(reference)
-            } else {
-                reference.to_string()
-            };
-            write(&path, index, &kept);
+            write(&path, index, reference);
             return match diff(reference, port) {
                 Some(report) => Err(format!(
                     "the port disagrees with the reference on {name}:\n{report}"
@@ -2389,25 +2366,6 @@ pub mod golden {
                 path.display()
             ));
         };
-        if digested(phase) {
-            // The reference's own dump is what a digest mismatch is read against, while there is
-            // a reference to read it against.
-            if golden != digest_of(reference) {
-                return Err(format!(
-                    "the reference has drifted from the golden for {name} at {}; bless it deliberately with PLY_DIFF_BLESS=1 if the change is meant",
-                    path.display()
-                ));
-            }
-            if golden != digest_of(port) {
-                return Err(format!(
-                    "the port disagrees with the golden on {name}:\n{}",
-                    diff(reference, port).unwrap_or_else(|| {
-                        "the dumps agree with each other but not with the golden".to_string()
-                    })
-                ));
-            }
-            return Ok(());
-        }
         if let Some(report) = diff(&golden, reference) {
             return Err(format!(
                 "the reference has drifted from the golden for {name} at {}; bless it deliberately with PLY_DIFF_BLESS=1 if the change is meant:\n{report}",
