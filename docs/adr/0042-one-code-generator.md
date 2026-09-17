@@ -163,11 +163,22 @@ behind an instrument that already exists.
    signatures of six crates that survive the front end. So what goes is the
    parser, the printer and the resolver, and the types they build move to a
    crate the runtime keeps. The order inverts too: `ply-hash` reads the parser's
-   syntax tree, so it goes *before* `ply-syntax` rather than after it. And the
-   crate deletions wait on the first half of this step, because `expand_program`
-   has four surviving non-test callers — the driver, the artifact path, the code
-   generator's producer and the corpus harness — none of which can lose it until
-   the port answers derive expansion on their behalf.
+   syntax tree, so it goes *before* `ply-syntax` rather than after it, and
+   `ply-derive` expands *inside* `parse_module`, so it leaves with the parser at
+   the end rather than first. None of the four is a whole-crate deletion:
+   `ply-core` keeps `ty`, `prelude`, `DefInfo` and `Front` while its checker
+   goes, and `ply-hash` keeps `DefHash` and the body envelope while its
+   hash-from-tree half goes.
+
+   **And the step is bounded by the runtime, not by the front end** (ADR 0052
+   §1, §2, §4). The driver enters the port once and the checker and hasher are
+   off its load path; what holds them alive is `front_for`'s default, which
+   answers a unit's tables from the Rust chain unless `PLY_FRONT=port` is set.
+   Retiring that means a port front end per unit, and ADR 0052 §4 prices it:
+   three quadratics removed, the front end proportional, and a constant factor
+   of about a hundred and forty left between it and the chain. A constant factor
+   is the object model. So this step finishes in the record that takes the heap
+   on — BOOTSTRAP-PATH step 4 — and not before.
 
 The loop that is O(the change) for the *language itself* falls out of step 6
 rather than being built: once the compiler's tests are Ply tests, content
