@@ -1628,10 +1628,29 @@ hazard the first attempt tripped over, so it is for a caller that owns its
 process. A handover still wins over both, since `with_current` reads `HANDED`
 first.
 
-What this does not do is migrate the crate, and this entry does not claim it.
-The mechanism lands against `ply-codegen-tests`' nineteen `reference_only`
-sites, which are its regression surface and which caught the first attempt; the
-migration that shows the workers reading `ref` is the next step.
+What this does not do is migrate the crate. The mechanism lands against
+`ply-codegen-tests`' nineteen `reference_only` sites, which are its regression
+surface and which caught the first attempt. The migration was tried next, on
+`unit/runner.rs`, and it does not work -- for a reason of its own rather than
+the one above.
+
+The crate needs both answers at once. `compile` asks the port for its check, so
+the producer has to be reachable; `run` holds the tier to the reference, so it
+has to be denied. A switch that holds for the process cannot be both, and under
+`cargo test` one test's `run` denies another test's `compile`: serially all
+sixty-five pass, and at the default thread count forty fail, every one at the
+`front` call with `no Ply emitter serves on this thread ... the reference is
+forced`. Under `cargo nextest` a test is a process and it would have passed, so
+CI would have been green while `cargo test` broke.
+
+One hypothesis on the way was checked and dropped: that taking `hashes` from the
+port rather than from the hasher was the fault. It is not -- forty failed either
+way.
+
+So two ways out are left, and the second reads better now than it did: teach the
+port to emit what this fixture needs, or give the harness its check without
+installing a producer at all. The conflict is the installation itself, which is
+what the second removes.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
