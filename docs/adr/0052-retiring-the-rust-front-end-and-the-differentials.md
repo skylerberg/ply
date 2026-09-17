@@ -613,6 +613,61 @@ suites define their own `first_difference` and eight their own `repo_root`, so
 The duplication is why this looked shared and was not. So what moves to a
 surviving crate is the goldens, `golden::check` and `port`, and nothing else.
 
+**Built, 2026-09-17: the goldens outlive the crate, and are copied rather than
+moved.** The five golden suites that read the port alone — `derive`, `hash`,
+`infer`, `resolve`, `rewrite` — and 44 MB of their fixtures now live in
+`ply-codegen-tests`, which already enters the port in three of its own suites and
+carries every dependency they need. `agreement`, `lexer_agreement` and `fields`
+stay in `ply-compiler-diff` with the `lexer` and `parser` goldens, 6.3 MB,
+because all three read the Rust chain and retire with `ply-syntax`. So that crate
+is not deleted by this step; what this step buys is that deleting it later no
+longer deletes the gate.
+
+They sit in a binary of their own, `tests/goldens/`, not in that crate's `suite`.
+Put beside `suite`'s tests they broke three of them: everything in `suite` shares
+one process and runs in parallel, and these enter the port for every program of
+every corpus. `suite/main.rs` already names that hazard for `ply_eval::census`
+and the allocator; this is the same one, and a *run* found it where a compile
+could not — twenty failures, then three once the suites moved out, then the one
+`parser_census` failure that main has too.
+
+The harness is **copied**, not moved, and that is a correctness requirement
+rather than untidiness. `golden::dir()` resolves against `CARGO_MANIFEST_DIR`, so
+a single shared copy could only ever point at one crate's fixtures; each side
+needs its own, pointing at its own. The duplicate is seven small items —
+`golden`, `port`, `part`, `programs`, `records`, `bundle`, `census`, plus
+`strip_one_newline` — and it ends when `ply-compiler-diff` does.
+
+Three things the survey missed, each found by a different instrument, and all
+three the same mistake: asking what a name *is* rather than what reaches it.
+`records` is called inside `lib.rs` itself, so the helpers are shared between what
+moves and what stays rather than belonging to the movers — the compiler found
+that. "Self-contained" was checked against `crate::`, the reference dumpers and
+the front-end crates, but not against *private siblings in the same file*, so
+`bundle`'s call to `strip_one_newline` went unseen, as did three suites reaching
+`bundle` and `census::hold` fully qualified rather than through an import — the
+compiler found those too. The third only a run could find: the suites read their
+**inputs** through a manifest-relative `here()` exactly as the goldens resolve
+through a manifest-relative `dir()`, so moving the suites moved what `here()`
+means and the corpora stayed behind. One targeted test caught it; no compile
+could have.
+
+**And a golden's identity is its absolute path, which is why this moved 32 file
+names.** `golden::place` sanitises the whole input path into the file name, so a
+golden blessed in CI is named `_home_runner_work_ply_ply_crates_…`. The 32
+`rewrite` goldens that come from `here()/fixtures` therefore had to be renamed to
+the new crate's segment; the 23 that come from `repo_root()` did not, because
+that path is the same from either crate, and the corpus-named goldens of
+`derive`, `hash`, `infer` and `resolve` are stable by construction.
+
+The same naming makes these suites **CI-only**: locally the paths are a
+developer's checkout, so the goldens are never found and the tests fail wherever
+they live. That is true on main today — the three `rewrite` tests fail identically
+in `ply-compiler-diff` before this change and in `ply-codegen-tests` after it — so
+it is a property of the goldens, not of the move. Worth a note beside the claim
+because the first reaction to a red `rewrite` run is to look for a regression that
+is not there.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -676,7 +731,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s and 324 s, each reusing by tree the same way and for the same reason. Three of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the third is 324 s, which the paragraph after it takes and which the tree did not cause. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s and 130 s, each reusing by tree the same way and for the same reason. Three of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the third is 324 s, which the paragraph after it takes and which the tree did not cause. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
