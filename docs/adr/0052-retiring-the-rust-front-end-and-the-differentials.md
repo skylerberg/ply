@@ -250,7 +250,15 @@ last; with `ply-derive-tests`, `ply-syntax-tests`, `ply-core-tests`,
 `ply-hash-tests`, `ply-compiler-diff` and the `tools/mine-*.py` scripts.
 `ply-hash` goes ahead of `ply-syntax`, not after it: its normalizer, its
 body store and its graph all read the parser's syntax tree, so a deletion
-of `ply-syntax` first is not a deletion that can be carried out. Before each
+of `ply-syntax` first is not a deletion that can be carried out. The same
+holds for the reference emitter, for the same reason and one level down:
+`Source::from_front` hands `synthesized`'s `&FnDef`s — the parser's own
+function definitions — to `opt.rs` and `c/emit.rs`, and outside those two the
+backend reads the parsed program and the resolver's output in exactly one
+place of its own, `region_kind::infer`. So the emitter and the optimiser go
+*before* `ply-syntax` as well, and the order this record first wrote, which
+put them last of all, would have left the parser's trees with a live reader at
+the moment it deleted them. Before each
 deletion its differential retires into what survives: `golden::check`
 drops its reference arm and holds the port to the golden alone; the
 digested goldens are re-blessed as text first, since a digest mismatch
