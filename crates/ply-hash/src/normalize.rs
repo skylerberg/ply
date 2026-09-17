@@ -143,12 +143,7 @@ pub(crate) fn unop_byte(op: UnOp) -> u8 {
     }
 }
 
-pub(crate) fn mode_byte(mode: Mode) -> u8 {
-    match mode {
-        Mode::Read => 0,
-        Mode::Write => 1,
-    }
-}
+pub(crate) use ply_ty::hash::mode_byte;
 
 /// How a reference to a member of the component currently being hashed is written.
 pub type ComponentIndices = FxHashMap<usize, u32>;
