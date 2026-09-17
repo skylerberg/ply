@@ -155,12 +155,32 @@ behind an instrument that already exists.
    An interpreter rewritten in Ply would keep two implementations of the
    semantics forever, checked against each other by the seam this record is
    working to remove.
-6. **Delete the Rust front end**, since nothing reads the syntax tree.
+6. **Delete the Rust front end.** Written here as "since nothing reads the
+   syntax tree", which is not so, and ADR 0052 §1's survey is where it broke.
+   The tree types are the interpreter's and the prover's value model: a closure
+   holds an expression, and the prover synthesises expressions at run time for
+   its higher-order properties. `resolve::Resolved` stands in the public
+   signatures of six crates that survive the front end. So what goes is the
+   parser, the printer and the resolver, and the types they build move to a
+   crate the runtime keeps. The order inverts too: `ply-hash` reads the parser's
+   syntax tree, so it goes *before* `ply-syntax` rather than after it. And the
+   crate deletions wait on the first half of this step, because `expand_program`
+   has four surviving non-test callers — the driver, the artifact path, the code
+   generator's producer and the corpus harness — none of which can lose it until
+   the port answers derive expansion on their behalf.
 
 The loop that is O(the change) for the *language itself* falls out of step 6
 rather than being built: once the compiler's tests are Ply tests, content
 addressing re-runs only what an edit touched. A Rust test suite cannot have that
 property.
+
+**Measured 2026-09-17** (ADR 0052 §4), and it holds. Over the compiler's own 187
+tests, an edit to a definition nothing calls re-runs nothing and an edit at the
+emitter's centre re-runs exactly the two tests that depend on it — the same on
+both sides of the driver switch, so the property belongs to content addressing
+and not to which front end runs. What the switch moves is the floor rather than
+the slope: a warm run with nothing changed costs 343 ms through the Rust chain
+and its gates, and 17.2 s through the port.
 
 ## What would make this wrong
 

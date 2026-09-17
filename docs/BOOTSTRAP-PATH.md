@@ -259,7 +259,17 @@ measurement is confounded until the earlier one has moved.
    its prediction for the wrong reason). The whole front end is still well
    over an order of magnitude from the Rust front end over the same files,
    which is not the small factor the rule asked for, so the driver is not the
-   lever. What is: the runtime's cost per value on the callback path. A
+   lever. **Re-read 2026-09-17, under ADR 0052 §1, and the decision stands for
+   a sharper reason.** Three quadratics came out of the port's front end that
+   session — a name list in the checker, a signature list in the resolver, two
+   association lists in the hasher, each a list searched by name inside a
+   per-item loop — and with them the front end became proportional to the
+   program, its cost per four times the project falling from 5.5 and 7.7 to 4.3
+   and 3.7. What was left was not a growth term but a constant: over the
+   compiler's own sources a warm run with nothing changed costs 343 ms through
+   the Rust chain and its gates against 17.2 s through the port. So the distance
+   is a factor, not a curve, and the lever this step already names — the
+   runtime's cost per value on the callback path — is the one that remains. What is: the runtime's cost per value on the callback path. A
    profile of the compiled check row
    (`benches/front-end-whole/profile-check-wide.txt`) puts its time under the
    runtime's callback loops — `fold`, `map`, `iterate` calling the compiled
