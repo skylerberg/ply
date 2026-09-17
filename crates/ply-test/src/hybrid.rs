@@ -214,13 +214,25 @@ impl Hybrid for BodyHybrid<'_> {
         let Ok(resolved) = ply_syntax::resolve(&mut rebuilt.program) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
-        let Ok(rehashed) = ply_hash::hash_program_ast(&rebuilt.program, &resolved) else {
+        // A mixture is a reconstructed AST with no source text, and the whole front end reads
+        // text: it is printed back to source once, and that one answer is what checks it here and
+        // what the unit below is built from (ADR 0052 §2).
+        ply_codegen::c::producer::ensure_default();
+        let printed = ply_syntax::print::program(&rebuilt.program);
+        // Fresh ids rather than the tree's: a reconstructed module carries `Span::DUMMY.source`,
+        // so every module would share one id and the answer's module positions — which the
+        // protocol writes as positions in this very list — would fold onto it.
+        let ids: Vec<ply_span::SourceId> = (0..printed.len())
+            .map(|i| ply_span::SourceId(i as u32))
+            .collect();
+        let Ok(front) = ply_codegen::c::producer::front(&printed, &ids) else {
             return Trial::unresolved(Unresolved::DoesNotCheck);
         };
-
-        let Ok(check) = ply_core::check_program(&rebuilt.program, &resolved) else {
+        if front.has_error() {
             return Trial::unresolved(Unresolved::DoesNotCheck);
-        };
+        }
+        let check = &front.check;
+        let rehashed = &front.hashes;
         let Some(index) = rebuilt
             .test_keys
             .first()
@@ -252,19 +264,11 @@ impl Hybrid for BodyHybrid<'_> {
             // Hermetic, always, whatever the run around it was configured with: a search asks this
             // question up to `Budget::max_trials` times, and a binding threaded in here would
             // answer each of them with a real packet.
-            //
-            // A mixture is a reconstructed AST with no source text, and the whole Ply emitter is
-            // a front end that reads text: it is handed the mixture printed back to source, and
-            // runs it as it runs everything else.
-            ply_codegen::c::producer::ensure_default();
             let texts: std::collections::HashMap<String, String> =
-                ply_syntax::print::program(&rebuilt.program)
-                    .into_iter()
-                    .collect();
-            let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, &check);
-            let unit =
-                ply_codegen::Unit::over_with_texts(&rebuilt.program, &resolved, &check, texts)
-                    .expect("this host has a C compiler");
+                printed.iter().cloned().collect();
+            let mut machine = ply_eval::Machine::new(&rebuilt.program, &resolved, check);
+            let unit = ply_codegen::Unit::over_front(&rebuilt.program, &resolved, &front, texts)
+                .expect("this host has a C compiler");
             let spec = ply_eval::BackendSpec {
                 kind: ply_eval::BackendKind::C,
                 ..Default::default()

@@ -533,6 +533,47 @@ a port: it already prints its reconstructed program back to source and hands the
 text to the emitter forty lines below where it runs the Rust chain over the same
 tree.
 
+**Built, 2026-09-17: the hybrid's trial asks the port, and the checker has no
+genuine caller left.** It was a hoist, not a port: the trial already printed its
+reconstructed mixture back to source and handed the text to the emitter, forty
+lines below where it ran `resolve`, `hash_program_ast` and `check_program` over
+the same tree. The print moves above them, the check and the hashes come from
+that one answer, and the answer itself goes to `Unit::over_front` rather than
+`over_with_texts` — so the trial stops deriving a second front end as well.
+`resolve` stays, because the machine and the unit both read `Resolved` and
+`ply-syntax` outlives this record. `ply-test` drops `ply-core` from its manifest
+in the same change, which is what "no genuine caller" looks like when it is true
+rather than asserted: nothing warns about a dependency a crate has stopped
+using, so the claim is only worth as much as the line removed to back it.
+
+Two details decide whether it is correct. The mixture is handed **fresh
+sequential** source ids rather than the tree's: a reconstructed module carries
+`Span::DUMMY.source`, so the tree's ids are all one id, and the protocol writes a
+span's module as its position in the very list handed over, which would fold
+every module onto that one. And a mixture reconstructs with a non-empty relink
+map, which is exactly the case `reconstruct_with` skips `Reconstruction::verify`
+for — so the trial's re-hash was never that self-check, and removing it removes
+the last external caller of `hash_program_ast` rather than a verification.
+
+What would have made this silent is worth naming, because it is the shape of
+failure this whole section keeps meeting: a port that refused mixtures would send
+every trial to `Unresolved::DoesNotCheck`, the bisection would report that
+nothing could be mixed, and the suite would stay green. It does not, because the
+hybrid suite asserts outcomes rather than the absence of errors — a verdict, the
+named culprits, `search.evaluated > 0`, and a logarithmic budget.
+
+**Read, 2026-09-17: what is left of the hasher, counted.** `hash_ast`,
+`hash_ast_with_bodies` and `hash_module` have no non-test caller at all and
+twenty-five test ones, so three of `ply-hash`'s seven public entries exist for
+`ply-hash-tests`, which leaves with the crate. `hash_program` keeps three — the
+seed path, the differential's stage binary, and `ply-corpus`'s pipeline — and
+`hash_program_with_bodies` keeps `ply-codegen`'s default arm and the corpus. So
+after this the hasher is held open by the seed path, the corpus harnesses and the
+differential crate, every one of which §2 already retires, plus the two
+structural holds named above: the bisection renormalizer, which re-normalizes per
+node against empty tables for an identity no `Front` carries, and `front_for`'s
+per-unit default.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -596,7 +637,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s and 140 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s and 153 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
