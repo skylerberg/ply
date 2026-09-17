@@ -424,6 +424,27 @@ and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
+**Read, 2026-09-17: the switch put the clock over, and the tables are spent.**
+The merge that made the port the only front end read 224 s. Both build legs
+still reused by tree, so the cost was tests, and the per-test figures named it:
+two archive tests at 135 s and 90 s, two incremental sessions at 86 s and 78 s,
+out of 1,118 s of `ply-cli-tests` spread over eight partitions. Each of them
+drives the real command many times in one session, and since the switch every
+invocation pays a whole front-end pass where the gates cost milliseconds.
+
+Moving the two archive tests into the solo table took the next run to 184 s,
+still over, and showed why that lever is nearly spent. A partition runs its
+tests in parallel: the heaviest held 347 s of tests and finished in 141 s of
+wall. A solo job holds one test and cannot do that, so those two archive tests
+became jobs of 128 s and 136 s and are now the pole themselves. Moving the two
+incremental sessions out as well leaves the longest job at 136 s, near 176 s of
+wall, which clears the bound by four seconds and by arithmetic rather than by
+design.
+
+So §3's remaining lever is not `ci-shards.sh`. What sets the clock now is what
+one `ply` invocation costs, which is §1's front end, and the two parts have
+converged on the same work.
+
 ## 4. The loop that is O(the change)
 
 Once the compiler's tests are Ply tests, `ply test`'s content addressing
