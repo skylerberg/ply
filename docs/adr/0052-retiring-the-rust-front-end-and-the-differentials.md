@@ -626,11 +626,11 @@ named culprits, `search.evaluated > 0`, and a logarithmic budget.
 **Read, 2026-09-17: what is left of the hasher, counted.** `hash_ast`,
 `hash_ast_with_bodies` and `hash_module` have no non-test caller at all and
 twenty-five test ones, so three of `ply-hash`'s seven public entries exist for
-`ply-hash-tests`, which leaves with the crate. `hash_program` keeps three — the
-seed path, the differential's stage binary, and `ply-corpus`'s pipeline — and
+`ply-hash-tests`, which leaves with the crate. `hash_program` keeps two — the
+seed path and `ply-corpus`'s pipeline — and
 `hash_program_with_bodies` keeps `ply-codegen`'s default arm and the corpus. So
-after this the hasher is held open by the seed path, the corpus harnesses and the
-differential crate, every one of which §2 already retires, plus the two
+after this the hasher is held open by the seed path and the corpus harnesses,
+both of which §2 already retires, plus the two
 structural holds named above: the bisection renormalizer, which re-normalizes per
 node against empty tables for an identity no `Front` carries, and `front_for`'s
 per-unit default.
@@ -778,10 +778,10 @@ before. A sweep for callers is what finds them, and a sweep is what this record
 should have run when the differential went.
 
 What it costs the chain is the point. `ply-compiler-diff` held five calls to
-`check_program` and three to `hash_program`; it now holds one of each, both in
-`stage.rs`, the binary that bootstraps a working copy. Tree-wide the checker has
-eight non-test callers left: the seed path in `ply-codegen`, `stage.rs`, and six
-in `ply-corpus`.
+`check_program` and three to `hash_program`; it now holds neither. The last of
+each was `stage.rs`'s, the binary that bootstraps a working copy, which the entry
+below takes. Tree-wide the checker had eight non-test callers at that point: the
+seed path in `ply-codegen`, `stage.rs`, and six in `ply-corpus`.
 
 **So the paragraph above overstated the bound, and this corrects it.** It says
 every remaining caller sits behind `front_for`'s per-unit default and that the
@@ -916,6 +916,37 @@ total at 2.12 MB each. Three comment lines do not buy that. They go with the nex
 emitter change that refreshes the bundle anyway, and until then this paragraph is
 where a reader learns the comments are wrong.
 
+**Built, 2026-09-17: the staging binary asks the port, and the checker is down
+to two callers.** `stage.rs` bootstraps a working copy of the emitter, and it was
+never blocked — only unexamined. It already installs the emitter at the top with
+`producer::ensure_default()`, already holds its modules as `(name, text)` pairs in
+exactly the shape `producer::front` takes, and its `SourceMap` hands out ids
+`0..n` in that same order, which is the order the protocol reads a span's module
+as a position in. What it did with all that was `check_program` → `hash_program`
+→ `front_of`: a second front end assembled from the chain, for an answer the port
+gives in one call.
+
+It asks the port now. The parse, the expansion and the resolve stay, because
+`Source::from_front` still takes the syntax tree and the resolution beside the
+`Front` — that is the object model §4 prices, not a front end running twice for
+its answers. Nothing else in the binary read the `CheckOutput`, so the three calls
+came out whole.
+
+That leaves `check_program` with two non-test callers in the tree and
+`hash_program` with the same two: the seed path in `ply-codegen` and
+`pipeline.rs` in `ply-corpus`. Neither is a program a user runs. The seed path is
+the one §2 cannot delete before the bundle migration exists, for the reason given
+above — `build_from` falls back to `from_reference()` when a unit is unserved, and
+ADR 0050 §1a chose that deliberately.
+
+`pipeline.rs` is deliberately not a third, and the reason is worth stating because
+it would otherwise read as an oversight. Its `check_program` sits in
+`Phase::Typecheck` and its `hash_program` in `Phase::Hash`, and those rows are
+what the marginal-change bench sums into the front-end figures §4 cites. Pointing
+them at the port would move numbers this record depends on without saying so: it
+would report the port's cost under the chain's name. It retires with the chain it
+times, which is the rule the differentials retired under.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -979,7 +1010,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s and 149 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s and 153 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
