@@ -8,7 +8,6 @@
 
 mod arena;
 mod argv;
-mod backend;
 mod build;
 mod builtins;
 mod code;
