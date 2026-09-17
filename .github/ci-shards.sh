@@ -63,7 +63,6 @@ PARTITIONS=8
 SOLO=(
   "bootstrap:ply-codegen-tests:bootstrap:the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds"
   "compiler-on-the-tier:ply-cli-tests:suite:corpus::the_compiled_tier_runs_the_compilers_own_tests_as_the_only_engine"
-  "front-own-sources:ply-compiler-diff:suite:front::the_ports_front_end_agrees_with_the_references_on_the_compilers_own_sources"
   "archive-round-trip:ply-cli-tests:suite:bootstrap_archive::an_archive_is_written_and_verifies_against_the_tree_it_came_from"
   "archive-tree-moved:ply-cli-tests:suite:bootstrap_archive::an_archive_stops_describing_a_tree_that_moved"
   "corpus-session:ply-cli-tests:suite:incremental::the_example_corpus_agrees_across_a_session"
