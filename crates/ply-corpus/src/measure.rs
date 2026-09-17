@@ -295,12 +295,7 @@ test "the shapes all evaluate" {
 fn load(
     name: &str,
     src: &str,
-) -> Result<(
-    Program,
-    Resolved,
-    ply_core::Front,
-    ply_span::SourceMap,
-)> {
+) -> Result<(Program, Resolved, ply_core::Front, ply_span::SourceMap)> {
     let mut map = SourceMap::new();
     let id: SourceId = map.add(format!("{name}.ply"), src.to_string());
     let mut program = parse_program([(id, ModuleName::from_dotted(name), src)])

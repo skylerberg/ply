@@ -174,7 +174,9 @@ pub fn front(root: &Path) -> Result<Front> {
         .map(|(&id, name)| {
             (
                 name.to_string(),
-                sources.get(id).map_or(String::new(), |f| f.text.to_string()),
+                sources
+                    .get(id)
+                    .map_or(String::new(), |f| f.text.to_string()),
             )
         })
         .collect();
