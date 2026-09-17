@@ -433,17 +433,29 @@ drives the real command many times in one session, and since the switch every
 invocation pays a whole front-end pass where the gates cost milliseconds.
 
 Moving the two archive tests into the solo table took the next run to 184 s,
-still over, and showed why that lever is nearly spent. A partition runs its
-tests in parallel: the heaviest held 347 s of tests and finished in 141 s of
-wall. A solo job holds one test and cannot do that, so those two archive tests
-became jobs of 128 s and 136 s and are now the pole themselves. Moving the two
-incremental sessions out as well leaves the longest job at 136 s, near 176 s of
-wall, which clears the bound by four seconds and by arithmetic rather than by
-design.
+still over, and moving the two corpus sessions out as well took it to 149 s,
+under, with the longest partition at 114 s and no outlier.
 
-So §3's remaining lever is not `ci-shards.sh`. What sets the clock now is what
-one `ply` invocation costs, which is §1's front end, and the two parts have
-converged on the same work.
+A draft of this paragraph read the first of those runs as proof that the lever
+was nearly spent, and predicted a 136 s pole and some 176 s of wall. Both were
+wrong, and how they were wrong is the part worth keeping. Those 128 s and 136 s
+archive jobs were measuring a **cold per-slot object cache**: a solo row creates
+a job identifier that has never run, so its cache is empty and every fixture
+program is compiled from scratch once. The same test reads 113.9 s on that first
+run and **0.104 s** on the next, its job 15 s. Both jobs ran one test in both
+runs, so nothing was lost — the first run was paying for the cache the second
+reused. **Read a new solo job's first run as its setup, never as its cost.**
+
+So isolating a heavy test costs one expensive run and is nearly free after it,
+and `ci-shards.sh` has a great deal left in it. What remains true from that
+draft is the mechanism it started from and not the conclusion: a partition runs
+its tests in parallel, the heaviest holding 347 s of tests and finishing in
+141 s of wall, where a solo job holds one test and cannot.
+
+That said, the clock is still set by what one `ply` invocation costs, because
+every test in this list drives the real command repeatedly. That is §1's front
+end, and the two parts do converge on it — by the size of the work rather than
+by the shard tables running out.
 
 ## 4. The loop that is O(the change)
 
