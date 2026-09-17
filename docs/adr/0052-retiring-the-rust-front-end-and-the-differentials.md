@@ -1127,6 +1127,71 @@ platform-side, and it is the fourth such observation here. The alternative is ke
 because it is the one a reader would reach for next, and the reason it fails is the
 evidence: the reuse succeeded in both runs.
 
+**Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
+This record has said, more than once, that the seed path cannot go before a
+textual migration of an unserved bundle exists. That is true and it is not the
+binding constraint, which matters because the two imply different work.
+
+`build_from` falls back to `from_reference()` in two cases: `PLY_C_BOOTSTRAP=off`
+or no bundle for these sources, and a bundle whose helper table this runtime's
+does not start with -- `Exports::unserved` walks the unit's helpers by position
+and names the first one that differs in name, arity or whether it answers. And
+`from_reference()` is not only the Rust front end. It is `front_end(src)`
+*followed by* `super::build`, which is `c/build.rs`, which imports
+`super::emit::{Emit, Unit, mangle}` and calls `crate::opt::optimize`. The seed
+path needs the Rust **emitter**.
+
+`crates/ply-codegen/src/c/emit.rs` and `crates/ply-codegen/src/opt.rs` are what
+this record's closing exclusion keeps until a C runtime exists. So `ply-core`
+cannot leave while the seed path stands, the seed path cannot stand without the
+emitter, and the emitter is deferred by this record's own terms. Building the
+bundle migration would not change that: the migrated bundle would still be built
+by the emitter the exclusion keeps. The migration is worth building for what §2
+promised a reader -- how a broken bundle is recovered -- and not as a way to reach
+a deletion.
+
+**So the terminal position, stated once.** The checker has three non-test callers.
+The seed path is bounded by the emitter exclusion above. `pipeline.rs` times the
+chain that §4's front-end figures are summed from, so it retires *with* its
+subject rather than standing before it -- pointing it at the port would report the
+port's cost under the chain's name. `benches/value-model/ply-arm` parses, resolves
+and checks to build a `Source`, then compiles it through the tier's own emitter and
+times the kernel entry; its front end is setup, so it too retires with the chain.
+Two of the three are not obstacles at all, and the third is one the goal already
+defers.
+
+`ply-syntax` and `ply-derive` are held by a different thing again: `Program` and
+`Resolved` stand in the public signatures of the crates that survive, which is the
+object model §4 prices at a residual constant factor and which this record
+explicitly does not decide. And `ply-eval` splits where the goal says it does --
+the lowering is `code.rs`, while the value, builtin, host, region and simulation
+layer around it is what `ply-codegen` reads as `Value`, `Compiled`, `Builtin`,
+`HostRuntime`, `HostBinding`, `region::Record` and `sim::TASK_OPS`, and stays.
+
+What §2 therefore finished is the part that was reachable, stated without
+flattering it: every package that held a front-end crate *only* for vocabulary has
+dropped the dependency. `ply-eval`, `ply-prove` and `ply-cli` read `ply-ty`
+directly; `ply-compiler-diff` declared two crates it had stopped using at all.
+`ply-codegen` and `ply-corpus` keep theirs for work -- the seed path and the
+marginal-change bench -- and still spell some vocabulary through the older name:
+two `ply_core::prelude` sites in the first and twenty-one type uses in the second.
+Those are left deliberately. Re-pointing them would drop no edge, since the seed
+path and `pipeline.rs` hold both crates regardless, and this record has declined
+that same trade twice already -- for `ply_core::prelude`'s other readers, and for
+the sixty-eight type-only `ply_hash` sites across five crates. The older name goes
+when the crate does.
+
+**What §2 moved, measured.** `cargo metadata` over the workspace: the checker's
+crate fell from seven packages declaring it as a dependency to three -- `ply-arm`,
+`ply-codegen`, `ply-corpus` -- with its eleven dev-dependents unchanged, because the
+test crates still check their fixtures and that is not vocabulary. The hasher's fell
+from seven to five, and its dev-dependents from six to five. `ply-syntax` and
+`ply-derive` did not move at all, at twelve and six, which is the paragraph above
+restated as a number: nothing here touched the object model.
+
+What remains is held by three things this record names and defers: the emitter, the
+object model, and the harnesses that time the chain.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1190,7 +1255,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s and 133 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s and 134 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
