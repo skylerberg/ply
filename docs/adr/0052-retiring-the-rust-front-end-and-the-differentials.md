@@ -511,6 +511,28 @@ same place it was spent. `build_backend` survives for `ply-corpus`'s bench, whic
 calls it while timing the compile phase and holds only its own chain-derived
 check: another of this record's "deletions" that is a split.
 
+**Built, 2026-09-17: `ply test`'s fresh bodies come from the port.** The
+bisection re-hashed the whole program to get this run's normalized bytes, which
+is half of what the load had already asked the port for and thrown away.
+`ply_hash::body::of_front` is the inverse of `ply_codegen::source`'s
+`fill_bodies`: that writes each body as `StoredBody::as_bytes`, and
+`from_bytes` reads the same envelope back, so `key()` re-derives the hash a body
+is filed under rather than being told it. `diagnose_failures` takes the whole
+`Front` in place of the `CheckOutput` and `HashOutput` it carries both of, and
+that is `ply-test`'s last call to `hash_program_with_bodies`.
+
+The fixtures that drive it keep the bodies their hasher already produced. A
+`Front` without them is not a smaller answer but a wrong one: `bodies_available`
+reads false, the bisection reports that no mixture could be built, and every
+hybrid stops running while the suite stays green. The shared fixture hashed with
+`hash_program` and dropped them, so it hashes with `hash_program_with_bodies`
+now and answers with a `Front` of its own.
+
+What is left of the checker is the hybrid's trial, which is a hoist rather than
+a port: it already prints its reconstructed program back to source and hands the
+text to the emitter forty lines below where it runs the Rust chain over the same
+tree.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -574,7 +596,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s and 147 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s and 140 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
