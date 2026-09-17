@@ -486,6 +486,36 @@ in the hundreds across its sources. The same accumulate-then-test idiom
 appears elsewhere in `infer.ply`, which is a candidate and not yet a
 finding, since nothing has measured those. The bench goes either side.
 
+**Read, 2026-09-17: what the index bought, and what it did not.** The same
+five-size curve over the fix, two passes agreeing within a percent. The
+port's answer falls at every size and falls by more the larger the project:
+807 ms, 1,586 ms, 4,113 ms, 9,459 ms and 27,239 ms, against 855, 1,762,
+4,804, 12,163 and 38,213. That is 6% at 250 definitions and 29% at 4,000,
+with the standard library alone down a tenth. A saving that grows with the
+input is a growth term removed rather than a constant shaved, which is what
+the change was for.
+
+The doubling ratios fall at every step — 2.1, 2.7, 2.5 and 3.1 become 2.0,
+2.6, 2.3 and 2.9 — and they do not fall to two. Across the range the
+exponent moves from about 1.37 to about 1.27. One quadratic is gone and the
+curve is still superlinear, so the other accumulate-then-test sites this
+record named as candidates are where to look next, and they are candidates
+still: nothing has measured them.
+
+**The switch stays held on this.** A warm run over a four-thousand-definition
+project with nothing changed now spends 27 seconds in the port rather than
+38, against 93 ms for the chain it replaces. That is real progress and it is
+not the two orders of magnitude this needs.
+
+**And an instrument is retired here.** The differential's warm wall clock
+cannot answer a question like this and no reading of it belongs in this
+record: four runs gave 32.4 s and 36.5 s for one tree and 37.0 s and 21.5 s
+for the other, a 72% spread between two runs of the *same* tree, because a
+whole-unit `tcc` compile sits inside the timed region on a contended runner.
+Read it for the profile's shares and never for its clock. The five-size
+curve is the fit instrument: two passes inside one run agree to half a
+percent, and two runs on different runners agreed to one.
+
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
 this one was taken at a single size over a single program, which is the
