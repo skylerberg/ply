@@ -68,11 +68,21 @@ fn load(dir: &Path) -> Result<Loaded, Vec<ply_span::Diagnostic>> {
         .iter()
         .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
         .collect();
+    let named: Vec<(String, String)> = inputs
+        .iter()
+        .map(|(_, module, text)| (module.to_string(), (*text).to_string()))
+        .collect();
+    let ids: Vec<_> = inputs.iter().map(|(id, _, _)| *id).collect();
     let mut ast = ply_syntax::parse_program(inputs).map_err(|d| d.to_vec())?;
     let expanded = ply_derive::expand_program(&mut ast);
     assert!(expanded.is_empty(), "{expanded:?}");
     let resolved = ply_syntax::resolve::resolve(&mut ast).map_err(|d| d.to_vec())?;
-    let check = ply_core::check_program(&ast, &resolved).map_err(|d| d.to_vec())?;
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&named, &ids).expect("the port answers");
+    if !front.diagnostics.is_empty() {
+        return Err(front.diagnostics);
+    }
+    let check = front.check;
     Ok(Loaded {
         program: Box::leak(Box::new(ast)),
         resolved: Box::leak(Box::new(resolved)),
@@ -97,12 +107,20 @@ struct Harness {
 }
 
 fn harness(loaded: &'static Loaded) -> Harness {
-    let unit: &'static Unit = Unit::over_with_texts(
-        loaded.program,
-        loaded.resolved,
-        loaded.check,
-        loaded.texts.clone(),
-    )
+    // This arm is named `whole` and has always been the reference: nothing in this binary
+    // installed a producer, so `mode()` answered `ref` and `over_with_texts` built the fragment.
+    // `load` installs one now, to answer the check, so the reference is asked for here explicitly
+    // rather than by accident. Dropping this makes the comparison real, and the first thing it
+    // reports is that the port carries no body for `raced.raced` -- a `simulate` region over two
+    // spawned tasks, which §2 has not reached.
+    let unit: &'static Unit = ply_codegen::c::producer::reference_only(|| {
+        Unit::over_with_texts(
+            loaded.program,
+            loaded.resolved,
+            loaded.check,
+            loaded.texts.clone(),
+        )
+    })
     .expect("this host has a C compiler");
     let bodies = unit.bodies().expect("the unit builds");
     let oracle = ply_codegen::c::producer::reference_only(|| {

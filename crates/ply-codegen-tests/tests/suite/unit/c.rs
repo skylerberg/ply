@@ -179,7 +179,15 @@ pub mod tests_support {
         let mut ast =
             ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
         let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        let check = ply_core::check_program(&ast, &resolved).expect("checks");
+        ply_codegen::c::producer::ensure_default();
+        let front = ply_codegen::c::producer::front(&[("m".to_string(), owned.to_string())], &[id])
+            .expect("the port answers");
+        assert!(
+            front.diagnostics.is_empty(),
+            "checks: {:?}",
+            front.diagnostics
+        );
+        let check = front.check;
         let bare = Source::new(
             Box::leak(Box::new(ast)),
             Box::leak(Box::new(resolved)),
@@ -208,7 +216,15 @@ pub mod tests_support {
         let mut ast =
             ply_syntax::parse_program([(id, ModuleName::from_dotted("m"), owned)]).expect("parses");
         let resolved = ply_syntax::resolve::resolve(&mut ast).expect("resolves");
-        let check = ply_core::check_program(&ast, &resolved).expect("checks");
+        ply_codegen::c::producer::ensure_default();
+        let front = ply_codegen::c::producer::front(&[("m".to_string(), owned.to_string())], &[id])
+            .expect("the port answers");
+        assert!(
+            front.diagnostics.is_empty(),
+            "checks: {:?}",
+            front.diagnostics
+        );
+        let check = front.check;
         let source: &'static Source = Box::leak(Box::new(Source::new(
             Box::leak(Box::new(ast)),
             Box::leak(Box::new(resolved)),
@@ -855,14 +871,19 @@ pub fn wrap(n: Int) -> List<Bytes> = [byte_of_int(n)]
     let digest = ply_codegen::c::cache::ctors_digest(&ctors);
     let mut unit = ply_codegen::c::emit::Unit::new(ctors, vec!["m.wrap".to_string()]);
     let inlining = ply_codegen::opt::Inlining::EMITTED;
-    let (text, _) = emit_one(
-        loaded,
-        &mut unit,
-        "m.wrap",
-        &digest,
-        (inlining.budget, inlining.depth),
-        "",
-    )
+    // This test reads the reference emitter's own C. `keyed` installs the default producer so the
+    // check can be answered, and without this that producer is asked for the body and answers
+    // none, since the source it was keyed from carries no texts.
+    let (text, _) = ply_codegen::c::producer::reference_only(|| {
+        emit_one(
+            loaded,
+            &mut unit,
+            "m.wrap",
+            &digest,
+            (inlining.budget, inlining.depth),
+            "",
+        )
+    })
     .expect("`wrap` emits");
     assert!(
         text.contains("rt_byte_of_int_p") && text.contains("rt_list_p"),
