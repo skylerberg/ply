@@ -39,11 +39,16 @@ root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 # deals tests round-robin after the filters, so tests of one binary spread
 # across partitions rather than landing in one.
 #
-# A runner arrives for each job about eight seconds after the last, so the
-# last partition starts some 8n seconds after `build` finishes, and each runs
-# the suite's remaining work over n plus half a minute of setup. That is
-# smallest near the square root of the work in seconds over eight: with the
-# suite at some five hundred seconds after #263, eight.
+# Eight was chosen when a runner arrived for each job about eight seconds after
+# the last, which put the last partition some 8n seconds after `build` and made
+# the wall smallest near the square root of the work over eight.
+#
+# Two runs measured on 2026-09-17 do not show that arrival: every job but one
+# started within two seconds of the others, and the one that did not started
+# 35 s late and set the wall by itself. The constant is kept -- two runs are not
+# enough to move a tuning number -- but what bounds it now is the half minute of
+# setup and the 28 s object-cache restore each job pays, not the arrivals. ADR
+# 0052 §3 holds the readings.
 PARTITIONS=8
 
 # Tests that get a runner of their own, as `id:package:target:test`. Each runs
