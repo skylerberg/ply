@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The hash differential, armed: each mutation below is applied to a copy of
-# `hash.ply` and the fast half of `crates/ply-compiler-diff/tests/suite/hash.rs` (the bundles and the
+# `hash.ply` and the fast half of `crates/ply-codegen-tests/tests/goldens/hash.rs` (the bundles and the
 # standard library) must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-hash.sh
@@ -19,7 +19,7 @@ run_suite() {
   ( cd "$root" \
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
     && PLY_C_EMITTER="ply:$work" \
-       cargo test --offline --test suite -- --test-threads=2 \
+       cargo test --offline -p ply-codegen-tests --test goldens -- --test-threads=2 \
          hash::the_ply_hasher_agrees_with_ply_hash_on_the_bundles \
          hash::the_ply_hasher_agrees_with_ply_hash_on_the_standard_library 2>&1 )
 }
