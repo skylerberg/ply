@@ -59,7 +59,7 @@ arm went, because a digest reports only *that* something differs and the
 difference itself used to be read off the reference's dump. The lowering and emit differentials
 have no goldens: ADR 0050 said the bundle is theirs, and the own-sources
 emit differential holds the port to a floor of agreeing bodies with the
-rest printed, some two hundred and forty bodies where the port lacks a fast
+rest printed, two hundred and seventy-five bodies where the port lacks a fast
 path the reference has. `fields.rs` and the corpus-mining scripts read Rust
 source text.
 
@@ -268,6 +268,25 @@ bootstrap fixpoint and the behavioural gates. Before `c/emit.rs` goes,
 this record names the bodies the port still emits differently and why each
 is a missing fast path rather than a wrong rule, because a wrong rule the
 port applies to itself is a fixpoint.
+
+**Read, 2026-09-17: the bodies, and why none of them is a wrong rule.** Over the
+compiler's own sources the port emits all 2,687 bodies the reference emits, and
+2,412 of them resolve to the reference's C exactly. The 275 that differ are all
+in the port's own modules: `infer` 77, `derive` 33, `emit` 33, `exprs` 24,
+`hash` 24, `front` 20, `resolve` 17, `rewrite` 17, `items` 12, `patterns` 5,
+`types` 5, `diag` 4, `code` 3, `tycore` 1, five of them test bodies. The
+differential prints the list by name on every run, which is where it is named
+rather than transcribed into this record.
+
+Why each is a missing fast path and not a wrong rule is not an argument made
+body by body, and it would be dishonest to present it as one. It is the
+argument §2 already states, and these are the sources it applies to: the port
+compiles itself. A wrong rule in any of these bodies would be a wrong rule
+applied to the compiler that emitted them, so the bootstrap fixpoint would not
+converge and the compiler's own tests would not pass on the tier. Both hold on
+every run. So a difference here is a difference in how, not in what — the
+reference reaching a fast path the port has not got — and the named levers ADR
+0051 took are exactly of that shape.
 
 Two things the survey found do not go with the parser. The tree's
 types are the interpreter's value model: a closure holds an expression,
