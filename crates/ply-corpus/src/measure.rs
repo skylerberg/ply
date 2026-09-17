@@ -307,8 +307,7 @@ fn load(
         .map_err(|ds| anyhow::anyhow!("the measurement program must parse: {ds:#?}"))?;
     let resolved =
         resolve(&mut program).map_err(|ds| anyhow::anyhow!("it must also resolve: {ds:#?}"))?;
-    let check = ply_core::check_program(&program, &resolved)
-        .map_err(|ds| anyhow::anyhow!("it must also check: {ds:#?}"))?;
+    let check = crate::port_check(&[(name.to_string(), src.to_string())], &[id])?;
     Ok((program, resolved, check, map))
 }
 
