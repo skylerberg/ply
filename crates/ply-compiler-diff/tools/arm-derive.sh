@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The derive differential, armed: each mutation below is applied to a copy of
-# `derive.ply` and `crates/ply-compiler-diff/tests/suite/derive.rs` must go red.
+# `derive.ply` and `crates/ply-codegen-tests/tests/goldens/derive.rs` must go red.
 #
 #   ./crates/ply-compiler-diff/tools/arm-derive.sh
 set -uo pipefail
@@ -18,7 +18,7 @@ run_suite() {
   ( cd "$root" \
     && cargo run --offline -q -p ply-compiler-diff --bin stage -- "$work" >/dev/null \
     && PLY_C_EMITTER="ply:$work" \
-       cargo test --offline --test suite -- derive:: --test-threads=2 2>&1 )
+       cargo test --offline -p ply-codegen-tests --test goldens -- derive:: --test-threads=2 2>&1 )
 }
 
 # The pattern is quoted literally; the replacement is perl's, so a `\"` in it is written `\\"`.
