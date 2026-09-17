@@ -297,8 +297,7 @@ fn iterate(
         &mut report,
         run_program,
         run_resolved,
-        &loaded.check,
-        &hashes,
+        &loaded.front,
         &mut cache.store,
         &diagnosis_options(args),
     ));

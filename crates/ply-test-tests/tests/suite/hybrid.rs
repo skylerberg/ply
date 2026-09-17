@@ -53,6 +53,16 @@ impl Compiled {
         }
     }
 
+    fn front(&self) -> ply_ty::Front {
+        ply_codegen::source::front_of(
+            &self.program,
+            &self.resolved,
+            &self.check,
+            self.hashes.clone(),
+            Some(&self.bodies),
+        )
+    }
+
     fn test_index(&self, key: &str) -> usize {
         self.check
             .tests
@@ -421,8 +431,7 @@ test "doubles" { assert_eq(scale(2) + other(0), 5) }
         &mut report,
         &after.program,
         &after.resolved,
-        &after.check,
-        &after.hashes,
+        &after.front(),
         &mut store,
         &ply_test::Options::default(),
     );

@@ -24,6 +24,9 @@ pub struct Compiled {
     pub resolved: Resolved,
     pub check: CheckOutput,
     pub hashes: HashOutput,
+    /// Kept rather than dropped: a `Front` without them disables every hybrid silently, since
+    /// `bodies_available` answers false and the bisection reports no mixture instead of failing.
+    pub bodies: ply_hash::body::BodySet,
     /// Each module's source text, keyed by `m.name.to_string()` — what the whole Ply emitter
     /// re-parses to produce bodies, since it is a front end rather than an AST consumer.
     pub texts: HashMap<String, String>,
@@ -77,15 +80,27 @@ impl Compiled {
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
         let check = check_program(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
-        let hashes = ply_hash::hash_program(&program, &resolved, &check)
+        let (hashes, bodies) = ply_hash::hash_program_with_bodies(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {
             program,
             resolved,
             check,
             hashes,
+            bodies,
             texts,
         }
+    }
+
+    /// The Rust chain's answer as a [`ply_ty::Front`], which is what `diagnose_failures` takes.
+    pub fn front(&self) -> ply_ty::Front {
+        ply_codegen::source::front_of(
+            &self.program,
+            &self.resolved,
+            &self.check,
+            self.hashes.clone(),
+            Some(&self.bodies),
+        )
     }
 
     /// Every test's footprint, owned, so a caller may take one from a temporary.

@@ -985,11 +985,12 @@ pub fn diagnose_failures(
     report: &mut RunReport,
     program: &Program,
     resolved: &Resolved,
-    check: &CheckOutput,
-    hashes: &HashOutput,
+    front: &ply_ty::Front,
     store: &mut Store,
     options: &Options,
 ) -> Vec<Diagnostic> {
+    let check = &front.check;
+    let hashes = &front.hashes;
     if report.failures.is_empty() {
         return Vec::new();
     }
@@ -1004,10 +1005,9 @@ pub fn diagnose_failures(
         };
     let edges = DepEdges::from(hashes);
 
-    // This run's own normalized bytes.
-    let fresh = ply_hash::hash_program_with_bodies(program, resolved)
-        .map(|(_, bodies)| bodies)
-        .unwrap_or_default();
+    // This run's own normalized bytes, out of the answer the load already took from the port
+    // rather than hashed a second time here (ADR 0052 §2).
+    let fresh = ply_hash::body::of_front(front);
 
     // A hybrid that went green is a true claim about exactly its own closure, so it may be cached —
     // but only after the borrow the search holds on the store has ended.
