@@ -63,9 +63,19 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
             return EXIT_COMPILE_ERROR;
         }
     };
+    let program = Box::leak(Box::new(loaded.program.clone()));
+    let resolved = Box::leak(Box::new(loaded.resolved.clone()));
+    let check = Box::leak(Box::new(loaded.check.clone()));
+    // The Rust chain's answer: this command installs no producer, so the reference fragment emits
+    // the archive and the front end that answers for it is the reference's too.
+    let front = Box::leak(Box::new(ply_codegen::front_of(
+        program, resolved, check, hashes, None,
+    )));
+
     // The definition hashes, in name order, are the version. Sorted rather than in load order so
     // that moving a definition between files does not rename the compiler.
-    let mut pairs: Vec<(String, String)> = hashes
+    let mut pairs: Vec<(String, String)> = front
+        .hashes
         .defs
         .iter()
         .map(|(name, h)| (name.to_string(), h.to_hex()))
@@ -80,12 +90,11 @@ pub fn execute(args: &BootstrapArgs, style: Style) -> i32 {
     }
     let source_digest = h.finalize().to_hex().to_string();
 
-    let program = Box::leak(Box::new(loaded.program.clone()));
-    let resolved = Box::leak(Box::new(loaded.resolved.clone()));
-    let check = Box::leak(Box::new(loaded.check.clone()));
-    let keys = emit_keys(program, &hashes);
-    let src: &'static ply_codegen::Source = Box::leak(Box::new(ply_codegen::Source::keyed(
-        program, resolved, check, keys,
+    let src: &'static ply_codegen::Source = Box::leak(Box::new(ply_codegen::Source::from_front(
+        program,
+        resolved,
+        front,
+        emit_keys(front),
     )));
     let names: Vec<String> = src.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();

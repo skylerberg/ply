@@ -188,6 +188,17 @@ partition 94 s and the postgres job 88 s, which are the poles now. A pull
 request's run pays the upload, nine seconds, and stays near four minutes
 with its own release build as its pole.
 
+**Read, 2026-09-16: where the time went.** With the message and the table
+differentials in, a quiet main run reads 153 s. The build is no longer
+the pole: the archive takes 14 s and the release binary 27 s, against a
+longest partition of 113 s. Inside that partition, one comparison of the
+port's diagnostics over the compiler's own sources takes 48 s and one of
+its tables over half the examples 37 s; the same comparison of the tables
+over the compiler's own sources takes 43 s in the next partition. The two
+most expensive tests in the suite are now the two that hold the port to
+the reference, which is what §2 retires, so the bound and the deletions
+pull the same way.
+
 ## 4. The loop that is O(the change)
 
 Once the compiler's tests are Ply tests, `ply test`'s content addressing
