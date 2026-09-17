@@ -8,11 +8,14 @@
 //! tables. Their differences are what a stage costs. `hash.hash_dump` is printed beside them and
 //! not subtracted, because it is the hasher's own dump rather than a prefix of the front entry.
 //!
-//! **A program is handed to the port on top of the standard library.** A generated corpus imports
-//! `std.json` and friends, and a program passed without them resolves nothing, so every entry
-//! returns diagnostics instead of a dump. That is fast, so it reads as four wonderfully quick
-//! stages: the first run of this probe timed exactly that, and the tell was three phases returning
-//! byte-identical dumps. Hence the head of every dump is printed, not just a flag on one entry.
+//! **A program is handed to the port on top of the standard library, and its modules are named the
+//! way the driver names them.** Two ways to get this wrong, both of which this probe did, and both
+//! of which read as four wonderfully quick stages because a refusal is fast. A generated corpus
+//! imports `std.json` and friends, so a program passed without them resolves nothing. And a module
+//! is named by its path relative to the project root, dots for separators, which the port says
+//! itself when it raises `E0106`: `store/orders.ply` is `store.orders`. A bare file stem loses the
+//! directory and every sibling import fails. Hence the head of every dump is printed: the first
+//! failure was legible only as three phases returning byte-identical dumps.
 //!
 //! Read the raw columns, not only the differences: the nesting is a claim about the port's
 //! sources, and an entry that short-circuits would make every subtraction wrong while still
@@ -28,10 +31,25 @@ fn std_modules() -> Vec<(String, String)> {
         .collect()
 }
 
-/// Every `.ply` under `dir`, in the same shape.
-fn modules_of(dir: &Path) -> Vec<(String, String)> {
+/// A module's name: its path below the root, separators as dots, without the extension.
+fn module_name(root: &Path, path: &Path) -> String {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let mut parts: Vec<String> = relative
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().to_string())
+        .collect();
+    if let Some(last) = parts.last_mut()
+        && let Some(stem) = last.strip_suffix(".ply")
+    {
+        *last = stem.to_string();
+    }
+    parts.join(".")
+}
+
+/// Every `.ply` under `root`, in the same shape.
+fn modules_of(root: &Path) -> Vec<(String, String)> {
     let mut out = Vec::new();
-    let mut stack = vec![dir.to_path_buf()];
+    let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&d) else {
             continue;
@@ -41,12 +59,8 @@ fn modules_of(dir: &Path) -> Vec<(String, String)> {
             if path.is_dir() {
                 stack.push(path);
             } else if path.extension().is_some_and(|x| x == "ply") {
-                let name = path
-                    .file_stem()
-                    .map(|s| s.to_string_lossy().to_string())
-                    .unwrap_or_default();
                 match std::fs::read_to_string(&path) {
-                    Ok(src) => out.push((name, src)),
+                    Ok(src) => out.push((module_name(root, &path), src)),
                     Err(e) => eprintln!("  cannot read {}: {e}", path.display()),
                 }
             }
