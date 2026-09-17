@@ -574,6 +574,45 @@ structural holds named above: the bisection renormalizer, which re-normalizes pe
 node against empty tables for an identity no `Front` carries, and `front_for`'s
 per-unit default.
 
+**Read, 2026-09-17: `diag` and `front` had no stated retirement, and now they
+do.** §2's clause above covers three cases — `golden::check` drops its reference
+arm, `fields.rs` goes with the parser, and the lowering and emit differentials
+retire into the fixpoint and the behavioural gates. The two widest front-end
+differentials are in none of them. `diag` compares every diagnostic a program
+raises, `front` the whole front-end answer, and both run over the same seven
+corpora: the standard library, every example, the compiler's own sources, the
+language fixtures, the parser's fixtures, the mined single modules and the
+program bundles. Neither has a golden.
+
+They retire into the behavioural gates, not into goldens, and the cost is why.
+Blessing them would add two new phases over those seven corpora, where the front
+dump is the widest frame the protocol has — every diagnostic, the load order, the
+check output, the hashes, the bodies, the ordinals — against a `resolve` phase
+that is already 27 MB across sixteen files. That weight lands in every checkout
+of every job, and §3's bound is held by eight partitions running 82–111 s with no
+pole left to absorb it. Part 1 says what to do instead: the differentials are the
+instrument *one last time*. They run over the corpus, std, examples and the
+compiler's own sources, this record says they agreed, and then they go.
+
+**And the goldens outlive the crate that holds them.** They are 50 MB under
+`crates/ply-compiler-diff/fixtures/goldens/` — resolve 27M, hash 11M, parser
+3.8M, rewrite 3.4M, infer 2.7M, lexer 2.5M, derive 108K — beside 69 KB of mined
+corpora, and `golden::check` and `port::dump*` are modules of that same crate.
+This record lists those goldens under what holds the port without the reference,
+so deleting the crate around them would delete the gate, not retire it. The seven
+golden suites, their harness and their fixtures move to a crate that survives
+before `ply-compiler-diff` goes; the deletion is of the reference arm and its
+oracles, which are already gone from those seven, and of `diag`, `front`,
+`effects`, `agreement` and `lexer_agreement`, which still read the Rust chain.
+
+A draft of this change kept `diag.rs` for its corpus helpers, on the reasoning
+that the golden suites read the same corpora and would want them. The compiler
+said otherwise: with `front.rs` gone all six were dead. Seven of the surviving
+suites define their own `first_difference` and eight their own `repo_root`, so
+`diag.rs`'s copies had exactly one consumer — the differential that left with it.
+The duplication is why this looked shared and was not. So what moves to a
+surviving crate is the goldens, `golden::check` and `port`, and nothing else.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -637,7 +676,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s and 153 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s and 164 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
