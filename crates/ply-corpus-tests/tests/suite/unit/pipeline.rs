@@ -6,7 +6,7 @@ fn timings_accumulate_rather_than_replace() {
     let mut t = Timings::default();
     t.record(Phase::Parse, Duration::from_millis(3));
     t.record(Phase::Parse, Duration::from_millis(4));
-    t.record(Phase::Hash, Duration::from_millis(1));
+    t.record(Phase::Compile, Duration::from_millis(1));
     assert_eq!(t.get(Phase::Parse), Duration::from_millis(7));
     assert_eq!(t.total(), Duration::from_millis(8));
     assert_eq!(t.get(Phase::Execute), Duration::ZERO);
