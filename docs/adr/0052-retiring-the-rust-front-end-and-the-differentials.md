@@ -291,6 +291,30 @@ this record names the bodies the port still emits differently and why each
 is a missing fast path rather than a wrong rule, because a wrong rule the
 port applies to itself is a fixpoint.
 
+**Built, 2026-09-17: the emit and lowering differentials are retired.** Both are
+gone, with the two oracle files that tested the reference dumpers rather than
+the port, the solo row that ran the heavy one alone, the nextest override that
+kept it off a shared process after it killed a hosted runner twice at 4.2 GB
+resident, and the blessing run's two skips that named modules which no longer
+exist.
+
+What witnesses the emitter now is what §2 said would: the bootstrap fixpoint,
+and six behavioural gates that are each real and green — the compiler's own
+tests on the tier and the standard library and examples, all in
+`ply-cli-tests`'s `corpus` suite, which also drives `ply test tests/lang` under
+each engine; the raising fixtures in `lang_fixtures`; and `examples/same-tests.sh`
+with its own job.
+
+**And the census goes with them, which is a real loss and not a tidy one.** The
+test that produced the count of differing bodies took the reference's emission,
+the reference's lowering and the port's own, and classified the difference by
+lowered node tag. Every input to it is a reference dumper this record deletes,
+so the report cannot outlive the reference. The 275 named above, on 2,687
+bodies with 2,412 identical, is its final reading. After this the fixpoint says
+the port agrees with itself and the gates say it agrees with the language, and
+nothing says any more which bodies differ from a reference that is no longer
+there to differ from.
+
 **Read, 2026-09-17: the bodies, and why none of them is a wrong rule.** Over the
 compiler's own sources the port emits all 2,687 bodies the reference emits, and
 2,412 of them resolve to the reference's C exactly. The 275 that differ are all
@@ -434,7 +458,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s and 148 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s and 149 s, each reusing by tree the same way and for the same reason. Two of those went over, both on the merge that made the port the only front end and the first attempt to answer it, and the paragraph below takes them. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
