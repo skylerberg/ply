@@ -179,10 +179,12 @@ crate.
 derives from it what it read from the tree: the constructor table, the
 root list, the cache keys, each root's arity, the module count, and the
 arguments the producer hands the port. `ply bootstrap`'s source digest
-and the artifact's stored bodies come from it too. The port answers it
-wherever a unit has its module texts and a producer is installed, and the
-Rust chain answers it otherwise, because the producer is built before it
-can be asked and `ply bootstrap` installs none. The tree is still read
+and the artifact's stored bodies come from it too. The Rust chain answers it
+while it still runs, because asking the port is a second front end over
+the program and the standard library for every unit; `PLY_FRONT=port`
+asks the port instead, one gate runs with it set, and the port becomes
+the only answer when the chain goes. The producer is also built before it
+can be asked, and `ply bootstrap` installs none. The tree is still read
 for the reference emitter's bodies, which §2 deletes. Two things this
 found. The checker fills its constructor table in load order where the
 tree walk filled it in program order, and a unit names its tags by
@@ -191,7 +193,27 @@ unit's C a function of the import graph; the table is rebuilt in program
 order from the ordinals. And the narrow register offer reads the checked
 scheme now rather than the written type, so an alias for `Int` counts as
 scalar where the written form did not, which changes what that offer
-holds and not what a body computes.
+holds and not what a body computes. The request path's shipped allocation
+figures moved with the stage and were re-taken from the command that
+writes them: a `/health` request allocates 328 objects where it allocated
+343. The count is reset after one warm request, but a fixed cost outlives
+that: read at twenty requests and at two hundred, a request's marginal
+cost is about 178 allocations on both sides, and what differs is some
+three thousand allocations the window counts once. The offered set is the
+same on both, 1066 definitions and every one answered by the port, so
+what the service computes per request did not change.
+
+**Built, 2026-09-17: a float literal's text.** The port carries a float
+literal as its text, and had no way to the double the reference's lexer
+produced: it went through `Decimal`, which cannot hold `1.0e-30` or
+`1.0e300`, so the hasher gave up on exactly the literals a shipped test
+writes, and it gave up the moment the backend started asking the port for
+the whole front end's answer. `float_of_string` is the builtin that reads
+one, published as `(String) -> Option<Float>` beside `decimal_of_string`,
+answering nothing for any text a literal cannot spell and saturating to
+infinity where the lexer saturates. It lands before anything written in
+Ply calls it, because the bundle must know a builtin before the
+compiler's own sources may use it, and the hasher calls it now.
 
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
@@ -278,6 +300,18 @@ over the compiler's own sources takes 43 s in the next partition. The two
 most expensive tests in the suite are now the two that hold the port to
 the reference, which is what §2 retires, so the bound and the deletions
 pull the same way.
+
+**Read, 2026-09-17: the bound, and what crossed it.** The stage's first
+shape asked the port for every unit's tables, which is a second front end
+per unit: a main run read 254 s against 144 s, every partition grown and
+one of them 218 s, with the build reused in 12 s and no test slower for
+any other reason. The chain answers by default now and a gate keeps the
+port's own path exercised, which is the bound and the proof kept together
+rather than traded. That left 190 s, still over, and the next reading
+said where: the longest job was 44 s of setup, 69 s of tests and 35 s
+saving its object cache, and of those 69 s one comparison of the port's
+tables over the compiler's own sources took 51. It runs alone now, as
+this tree's three other heavy tests do, so no partition waits on it.
 
 ## 4. The loop that is O(the change)
 
