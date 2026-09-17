@@ -1311,6 +1311,39 @@ for and the census still pays it; its own runner only stops it setting the wall.
 When §2 shrinks what the spike compiles, this is the entry to come back to and
 ask whether the job is still worth a runner.
 
+**Read, 2026-09-17: the runner was late, and the entry above was not wrong about
+the work.** `ac42ebdb` ran 190 s, the third reading over the bound and the worst
+of them. The fix did what it was aimed at: the solo job ran its one test in
+24.564 s, 5/8 fell from 102.7 s to 41.9 s, the partitions came out at 75.3,
+60.3, 76.5, 86.2, 41.9, 75.9, 44.3 and 60.1 s, and the pole's job fell from
+151 s to 129 s.
+
+The wall did not follow, and the job starts say why. Every test job in that run
+started 26 s in except `test 3/8`, which started at 61 s and ended at 184 s,
+with the gate closing five seconds after it. Its 123 s is ordinary beside 6/8's
+122 s and 4/8's 129 s. Had it started with the rest it would have ended near
+149 s and the wall near 155 s, which is the figure the entry above predicted. So
+the mechanism held and the number did not, and what defeated it was a late
+runner rather than the work.
+
+Two things that entry implied are wrong, measured here. A ninth job does not
+push the last start back: the solo runner started at 26 s with everything else.
+And runners do not arrive eight seconds apart, which is what `ci-shards.sh` says
+and what sets `PARTITIONS` -- in this run every job but one started within two
+seconds of the others, and in `29f0dbc0` they all started between 29 s and 31 s.
+That comment is corrected there. The constant is left alone, because two runs
+are not enough to move a tuning number.
+
+The work itself is unchanged, as that entry said it would be: the partitions
+summed 547.1 s before the census moved and 520.5 s after, with the census's
+24.6 s beside them.
+
+So the readings say a run without a straggler is about 26 s of archive, a 129 s
+pole and a four-second gate: near 159 s, under the bound with twenty seconds to
+spare. Three of the last four excursions were the runner rather than the tree --
+188 s from a pre-suite that went from 5 s to 45 s, and 190 s from a 35 s late
+start -- against 187 s, which was the census and is fixed.
+
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
 textual migration of an unserved bundle exists. That is true and it is not the
