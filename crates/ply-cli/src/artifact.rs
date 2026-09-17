@@ -2,7 +2,7 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
-use ply_core::{CheckOutput, DefInfo, Front};
+use ply_core::{DefInfo, Front};
 use ply_hash::body::StoredBody;
 use ply_hash::{DefHash, HashOutput};
 use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
@@ -690,7 +690,9 @@ pub struct Opened {
     pub sources: SourceMap,
     pub program: Program,
     pub resolved: Resolved,
-    pub check: CheckOutput,
+    /// The port's whole answer over the artifact's own sources. The unit a run builds is built
+    /// from *this* rather than from a front end derived a second time (ADR 0052 §1).
+    pub front: Front,
     /// The name the entry point answers to *in this program*.
     pub entry: Symbol,
 }
@@ -872,7 +874,7 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
         sources,
         program,
         resolved,
-        check: front.check,
+        front,
         entry,
     })
 }
@@ -994,6 +996,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         }
     };
     let declared = opened
+        .front
         .check
         .defs
         .get(&opened.entry)
@@ -1003,7 +1006,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     let (configuration, config_warnings) = match crate::config::Configuration::open(
         &opened.program,
         &opened.resolved,
-        &opened.check,
+        &opened.front.check,
         args.host,
         &args.config,
     ) {
@@ -1031,7 +1034,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
         );
     }
     let hosts = match crate::hosts::Hosts::open_stopping(
-        &opened.check,
+        &opened.front.check,
         args.host,
         &args.tls.tls,
         &args.fs.fs,
@@ -1081,6 +1084,7 @@ pub fn run(args: &crate::cli::RunArgs, style: crate::style::Style) -> i32 {
     }
 
     let span = opened
+        .front
         .check
         .defs
         .get(&opened.entry)
@@ -1199,28 +1203,32 @@ fn evaluate(
             )
         };
         let text = ply_codegen::c::bundle::unpack(&unit.text).map_err(|e| unit_error(&e))?;
-        let provider =
-            ply_codegen::Unit::embedded(&opened.program, &opened.resolved, &opened.check, text)
-                .map_err(|e| unit_error(&e))?;
-        let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+        let provider = ply_codegen::Unit::embedded(
+            &opened.program,
+            &opened.resolved,
+            &opened.front.check,
+            text,
+        )
+        .map_err(|e| unit_error(&e))?;
+        let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.front.check);
         machine.set_compiled(ply_eval::Provider::attach(provider, &spec));
         configure(&mut machine);
         return machine.call(name, Vec::new(), span);
     }
     // Without a unit, the whole Ply emitter is a front end that reads text, and it is handed the
     // program printed back to source rather than the artifact's own files.
-    let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.check);
+    let mut machine = Machine::new(&opened.program, &opened.resolved, &opened.front.check);
     if let Some(spec) = crate::commands::common::backend_spec(backend)? {
-        // No hashes here, so nothing is kept between runs: an artefact is opened once and the
-        // emit is not the cost that matters.
+        // The hashes are the port's, so the unit's emit cache keys are this program's rather
+        // than absent.
         let texts = ply_syntax::print::program(&opened.program)
             .into_iter()
             .collect();
-        let provider = crate::commands::common::build_backend(
+        let provider = crate::commands::common::build_backend_over(
             &spec,
             &opened.program,
             &opened.resolved,
-            &opened.check,
+            &opened.front,
             texts,
         )?;
         machine.set_compiled(provider.attach(&spec));
