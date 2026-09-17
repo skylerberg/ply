@@ -142,15 +142,18 @@ if process:
         fe = r.get("warm_front_end")
         if fe:
             ph = fe["phases"]
-            line += (f"   front end {ph['total']:.1f}ms"
-                     + " ("
-                     + " ".join(
-                         f"{k.replace('_', '-')} {v:.1f}"
-                         for k, v in ph.items()
-                         if k != "total"
-                     )
-                     + ")"
-                     ("   rechecked %s, cached %s" % (fe["rechecked"], fe["cached"]) if "rechecked" in fe else ""))
+            line += f"   front end {ph['total']:.1f}ms"
+            line += (
+                " ("
+                + " ".join(
+                    f"{k.replace('_', '-')} {v:.1f}"
+                    for k, v in ph.items()
+                    if k != "total"
+                )
+                + ")"
+            )
+            if "rechecked" in fe and "cached" in fe:
+                line += f"   rechecked {fe['rechecked']}, cached {fe['cached']}"
         print(line)
     fits = [(definitions(r["size"]), r["warm_front_end"]["phases"]["total"])
             for r in process if r.get("warm_front_end")]
