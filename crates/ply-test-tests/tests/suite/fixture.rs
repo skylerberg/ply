@@ -9,7 +9,6 @@
 //! so a fixture that is *run* — as opposed to only scheduled — carries its module source texts and
 //! hands them to the whole Ply emitter through [`Compiled::tier`].
 
-use ply_core::check_program;
 use ply_eval::{Exploration, host::HostUse};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId};
@@ -78,8 +77,28 @@ impl Compiled {
     fn of(mut program: Program, texts: HashMap<String, String>) -> Compiled {
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        // Each module under the name it was parsed with, in the program's own order: `anonymous`
+        // keeps the empty name `ply_syntax::parse` gives it and `modules` keeps `m`, which is the
+        // distinction this file's header names and the reason the two are not interchangeable.
+        let named: Vec<(String, String)> = program
+            .modules
+            .iter()
+            .map(|m| {
+                let name = m.name.to_string();
+                let text = texts.get(&name).cloned().unwrap_or_default();
+                (name, text)
+            })
+            .collect();
+        let ids: Vec<_> = (0..named.len()).map(|i| SourceId(i as u32)).collect();
+        ply_codegen::c::producer::ensure_default();
+        let front = ply_codegen::c::producer::front(&named, &ids)
+            .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+        assert!(
+            front.diagnostics.is_empty(),
+            "the fixture must typecheck: {:#?}",
+            front.diagnostics
+        );
+        let check = front.check;
         let (hashes, bodies) = ply_hash::hash_program_with_bodies(&program, &resolved)
             .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {

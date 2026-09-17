@@ -25,8 +25,16 @@ impl Compiled {
         let mut program = Program::single(module);
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        ply_codegen::c::producer::ensure_default();
+        let front =
+            ply_codegen::c::producer::front(&[(String::new(), src.to_string())], &[SourceId(0)])
+                .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+        assert!(
+            front.diagnostics.is_empty(),
+            "the fixture must typecheck: {:#?}",
+            front.diagnostics
+        );
+        let check = front.check;
         let hashes = ply_hash::hash_program(&program, &resolved, &check)
             .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
         Compiled {
@@ -525,8 +533,25 @@ fn compiled_program(modules: &[(&str, &str)]) -> Compiled {
     let mut program = ply_syntax::parse_program(inputs).expect("the fixture must parse");
     let resolved = ply_syntax::resolve(&mut program)
         .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-    let check = ply_core::check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+    let named: Vec<(String, String)> = modules
+        .iter()
+        .map(|(name, src)| {
+            (
+                ModuleName::from_dotted(name).to_string(),
+                (*src).to_string(),
+            )
+        })
+        .collect();
+    let ids: Vec<_> = (0..named.len()).map(|i| SourceId(i as u32)).collect();
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&named, &ids)
+        .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+    assert!(
+        front.diagnostics.is_empty(),
+        "the fixture must typecheck: {:#?}",
+        front.diagnostics
+    );
+    let check = front.check;
     let hashes = ply_hash::hash_program(&program, &resolved, &check)
         .unwrap_or_else(|d| panic!("the fixture must hash: {d:#?}"));
     Compiled {

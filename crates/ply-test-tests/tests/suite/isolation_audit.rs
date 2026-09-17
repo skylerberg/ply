@@ -48,9 +48,14 @@ impl Compiled {
         let Ok(resolved) = ply_syntax::resolve(&mut program) else {
             return Vec::new();
         };
-        ply_core::check_program(&program, &resolved)
-            .err()
-            .unwrap_or_default()
+        // The resolve guard above stays: a program that does not resolve reported nothing here
+        // before, and `front` would answer the resolver's diagnostics as well as the checker's.
+        let _ = resolved;
+        ply_codegen::c::producer::ensure_default();
+        let front =
+            ply_codegen::c::producer::front(&[(String::new(), src.to_string())], &[SourceId(0)])
+                .expect("the port answers for the fixture");
+        front.diagnostics
     }
 
     fn scheduled(&self) -> Vec<(usize, Footprint)> {

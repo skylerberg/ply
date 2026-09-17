@@ -53,8 +53,16 @@ impl Program {
         let mut program = ply_syntax::ast::Program::single(module);
         let resolved = ply_syntax::resolve(&mut program)
             .unwrap_or_else(|d| panic!("the fixture must resolve: {d:#?}"));
-        let check = ply_core::check_program(&program, &resolved)
-            .unwrap_or_else(|d| panic!("the fixture must typecheck: {d:#?}"));
+        ply_codegen::c::producer::ensure_default();
+        let front =
+            ply_codegen::c::producer::front(&[(String::new(), src.to_string())], &[SourceId(0)])
+                .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+        assert!(
+            front.diagnostics.is_empty(),
+            "the fixture must typecheck: {:#?}",
+            front.diagnostics
+        );
+        let check = front.check;
         let hashes = ply_hash::hash_program(&program, &resolved, &check)
             .unwrap_or_else(|d| panic!("hash: {d:#?}"));
         Program {

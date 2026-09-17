@@ -76,8 +76,16 @@ fn compile(source: &str) -> Compiled {
     let inputs = vec![(SourceId(0), ModuleName::from_dotted("m"), source)];
     let mut program = ply_syntax::parse_program(inputs).expect("the fixture parses");
     let resolved = ply_syntax::resolve(&mut program).expect("the fixture resolves");
-    let check = ply_core::check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("the fixture typechecks: {d:#?}"));
+    ply_codegen::c::producer::ensure_default();
+    let front =
+        ply_codegen::c::producer::front(&[("m".to_string(), source.to_string())], &[SourceId(0)])
+            .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+    assert!(
+        front.diagnostics.is_empty(),
+        "the fixture typechecks: {:#?}",
+        front.diagnostics
+    );
+    let check = front.check;
     let hashes = ply_hash::hash_program(&program, &resolved, &check).expect("the fixture hashes");
     Compiled {
         program,
