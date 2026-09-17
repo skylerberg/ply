@@ -342,7 +342,7 @@ fn a_front_writes_reads_and_writes_to_the_same_text() {
     );
     assert!(
         text.contains(
-            "op 72\nspawn write 0 0 1 4294967295 0 0\nUnit\n<a | e>(() -> a / e) -> Unit / e\n"
+            "op 71\nspawn write 0 0 1 4294967295 0 0\nUnit\n<a | e>(() -> a / e) -> Unit / e\n"
         ),
         "{text}"
     );

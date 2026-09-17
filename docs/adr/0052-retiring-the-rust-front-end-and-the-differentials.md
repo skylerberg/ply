@@ -124,6 +124,24 @@ driver's: `E0111`, a module name derived from a file path the port never
 sees. What the reference prints from data the port lacks is recorded in
 `crates/ply-compiler/GAPS.md` §11.
 
+**Built, 2026-09-16: the tables.** `front.front_dump` answers, after the
+diagnostics, the module order, each module's items and imports, every
+definition's scheme, footprints, constraints, row aliases, specs and
+span, the tests and laws with their names and spans, the effects with
+their operations, the constructors with their fields, every hash the
+hasher publishes, the ordinals the cache keys are numbered by, and the
+normalized bytes the store files. `ply-ty` reads them back into the
+`CheckOutput` and `HashOutput` the tools already hold, through a parser
+for the printed type forms, so a scheme crosses as the text the printer
+and the checker already agree on rather than as a second encoding; the
+hash vocabulary moved there with it. Two shapes the frames take from the
+data rather than from the draft: a test is headed by its index, because
+a label may hold a space or a newline and a header may not, and a body
+travels as hex, because the dump is text and the bytes are not. The
+differential holds the port's answer to the reference chain's over the
+same corpora as the diagnostics, after the reference's own answer
+round-trips through the reader.
+
 **Found on the way, by the tier gate and by nothing else.** The
 compiler's own tests, run by the compiled compiler, aborted on one new
 function, `bytes_at(b, bytes_len(b) - 1 - i)`: the port's release mode
