@@ -766,6 +766,37 @@ outlive them have moved to a crate that survives, and what remains —
 `agreement`, `lexer_agreement`, `fields` — holds the *parser*, which this record
 defers for the same reason it defers the checker's last mile.
 
+**Built, 2026-09-17: the emit oracles were dead, and the bound was not where
+this record put it.** Retiring the emit differential left four entries in
+`ply-compiler-diff` with no caller — `reference_ctors`, `reference_builtins`,
+`reference_emit_encoded`, `reference_emit_dump` — and with them the whole
+lowered-form dump machinery they fed: `dump_code` and its eleven helpers, 535
+lines, along with the `INLINING` constant the emit differential pinned. None of
+it warned, because a `pub` item in a library has no dead-code gate — the same
+asymmetry that hid four unused `reference_*` functions from this record once
+before. A sweep for callers is what finds them, and a sweep is what this record
+should have run when the differential went.
+
+What it costs the chain is the point. `ply-compiler-diff` held five calls to
+`check_program` and three to `hash_program`; it now holds one of each, both in
+`stage.rs`, the binary that bootstraps a working copy. Tree-wide the checker has
+eight non-test callers left: the seed path in `ply-codegen`, `stage.rs`, and six
+in `ply-corpus`.
+
+**So the paragraph above overstated the bound, and this corrects it.** It says
+every remaining caller sits behind `front_for`'s per-unit default and that the
+default cannot move because asking the port for every unit's tables took a quiet
+main run from 144 s to 254 s. That measurement was taken when *every* unit build
+asked — including the driver's, on every invocation in every CLI test. It no
+longer describes this tree. The artifact path went to `Unit::over_front` and the
+hybrid's trial with it, so nothing on a user's path enters `front_for` at all:
+its Rust arm is reached from five places, and all five are `ply-corpus`. What is
+left is therefore not one immovable cost but three ordinary pieces of work — the
+corpus harnesses onto the port's door, and the two bootstrap paths that §2
+already means to retire when the bundle becomes the only way to build the
+language. The object model bounds how *fast* the port answers, not whether these
+callers can stop asking the chain.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -829,7 +860,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s and 140 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s and 127 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
