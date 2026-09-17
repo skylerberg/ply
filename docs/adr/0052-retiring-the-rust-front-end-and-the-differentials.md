@@ -1182,6 +1182,27 @@ platform-side, and it is the fourth such observation here. The alternative is ke
 because it is the one a reader would reach for next, and the reason it fails is the
 evidence: the reuse succeeded in both runs.
 
+**Read, 2026-09-17: a record-only merge rebuilt the world, and the reuse script
+asked the wrong parent.** That merge ran 274 s against a bound of 180, and the
+shape says cold: the partitions began at 151 s rather than 30, the archive leg
+took 149 s and the release binary 100, while the `ply-c-cache` entries were
+reused untouched. The tree it landed, `cc4be30f`, had not been built -- the
+branch predated the merge before it, so its own run built `32662799` -- and that
+is the case `artifact-for-this-tree.sh` exists for.
+
+It refused, correctly, on the question it was asked. It compares the merge's
+*second* parent, the pull request's head, against the merge; what moved there
+was the previous merge's `producer.rs` and two of its tests, which reach a
+compiler, so the pull request's build was genuinely stale. What it never asked
+is the first parent. Against main that merge added one file -- this record --
+and main's own archive and binary for tree `0c240634` were both sitting there
+unexpired. Either parent can answer; only one was asked.
+
+So it asks both now, the pull request's first and main's after, and a merge that
+adds only a record takes main's build rather than standing a compiler up. The
+cost when neither answers is one extra pair of API calls, on a merge that was
+going to rebuild anyway.
+
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
 textual migration of an unserved bundle exists. That is true and it is not the
