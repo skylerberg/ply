@@ -562,6 +562,26 @@ them. The stage breakdown therefore comes from outside, timing the separate
 entries the differentials already call, which needs no change to the port and
 no bundle refresh.
 
+**Read, 2026-09-17: there is no guilty stage.** The port's phases timed over
+corpora at five sizes, two readings each agreeing within a percent, in
+milliseconds: parse and resolve 1,355 / 1,838 / 3,145 / 6,187 / 15,688; with
+checking 2,240 / 2,829 / 4,573 / 7,979 / 18,650; the hasher 2,583 / 3,495 /
+5,952 / 11,802 / 30,137; the whole front end 3,949 / 5,054 / 8,198 / 14,828 /
+35,285. The last doubling multiplies them by 2.54, 2.34, 2.55 and 2.38.
+
+Every stage grows at the same rate, and parsing and resolving alone are 15.7 s
+of the front end's 35.3 s at the largest size. A growth term that is equally
+present in parsing, in resolving, in checking and in hashing is not a rule
+inside any of them, which is the same thing the flat profile said and the
+reason the name index bought a fifth rather than the whole gap. The remaining
+cost is the object model the port runs on, not an algorithm in the front end,
+so ADR 0051's levers are the ones that bear on it.
+
+What separates those two readings is whether the *allocations* grow
+superlinearly or only the clock does: the first would put it back in the
+port's own code, the second in the runtime beneath it. That is the next
+measurement, and the census already exists to take it.
+
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
 this one was taken at a single size over a single program, which is the
