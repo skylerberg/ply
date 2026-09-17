@@ -363,7 +363,11 @@ build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
 and not yet exercised. The merge after it, carrying §2's first deletion,
-read 126 s and reused by tree the same way, for the same reason.
+read 126 s and reused by tree the same way, for the same reason, and the one
+after that 130 s. Three merges running have hit the lookup directly, because
+none of them moved main while another pull request sat behind it, so the
+fallback this paragraph describes is still unproven in the case it was
+written for.
 
 ## 4. The loop that is O(the change)
 
