@@ -1,11 +1,11 @@
 //! One pass of the compiler over a directory, with a stopwatch between phases.
 
 use anyhow::{Context, Result, bail};
-use ply_core::CheckOutput;
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceMap};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
+use ply_ty::CheckOutput;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -102,7 +102,7 @@ pub struct Front {
     /// The port's whole answer, for the tier this program is run on. `check` and `hashes` above
     /// stay the Rust chain's, because timing their phases is what this harness reports — the two
     /// answer different questions and only one of them is a measurement (ADR 0052 §2).
-    pub port: ply_core::Front,
+    pub port: ply_ty::Front,
     pub timings: Timings,
     /// This program's region kinds.
     region_kinds: ply_eval::region_kind::Kinds,

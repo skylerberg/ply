@@ -1,13 +1,13 @@
 //! What one request costs, and which layer it was spent in.
 
 use anyhow::{Context, Result, bail};
-use ply_core::CheckOutput;
-use ply_core::ty::Footprint;
 use ply_eval::host::HostRuntime;
 use ply_eval::{Machine, Value};
 use ply_host::tcp::{Net, SimNet};
 use ply_span::Span;
 use ply_syntax::ast::ModuleName;
+use ply_ty::CheckOutput;
+use ply_ty::ty::Footprint;
 use serde::Serialize;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -421,7 +421,7 @@ pub struct Program {
     check: CheckOutput,
     /// The port's whole answer, so the tier is built from it rather than from a second front end
     /// derived inside `over_with_texts` (ADR 0052 §2).
-    port: ply_core::Front,
+    port: ply_ty::Front,
     /// One answer about this program's regions for every rung below, rather than one per rung's
     /// machine.
     region_kinds: ply_eval::region_kind::Kinds,

@@ -1,13 +1,13 @@
 //! What W3 costs: a multi-route service, real framing, keep-alive and TLS.
 
 use anyhow::{Context, Result, bail};
-use ply_core::CheckOutput;
-use ply_core::ty::Footprint;
 use ply_eval::{Machine, Provider, Value};
 use ply_hash::DefHash;
 use ply_host::tcp::{Net, SimNet};
 use ply_span::{Span, Symbol};
 use ply_syntax::ast::ModuleName;
+use ply_ty::CheckOutput;
+use ply_ty::ty::Footprint;
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 use serde::Serialize;
@@ -304,7 +304,7 @@ pub struct Loaded {
     pub check: CheckOutput,
     /// The port's whole answer, so the tier is built from it rather than from a second front end
     /// derived inside `over_with_texts` (ADR 0052 §2).
-    pub port: ply_core::Front,
+    pub port: ply_ty::Front,
     /// This program's region kinds, shared by every machine below rather than inferred once per
     /// machine.
     region_kinds: ply_eval::region_kind::Kinds,

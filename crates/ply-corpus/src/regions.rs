@@ -2,11 +2,11 @@
 
 use crate::rng::Rng;
 use anyhow::{Context, Result, bail};
-use ply_core::{EffectAtom, Footprint};
 use ply_eval::Plan;
 use ply_span::Symbol;
 use ply_store::Store;
 use ply_syntax::ast::Mode;
+use ply_ty::{EffectAtom, Footprint};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -427,7 +427,7 @@ pub fn hypothetical(h: Hypothetical) -> Corpus {
     fn atom(effect: &str, label: usize, mode: Mode) -> EffectAtom {
         EffectAtom::new(
             effect,
-            ply_core::Resource::Named(Symbol::new(format!("r{label}"))),
+            ply_ty::Resource::Named(Symbol::new(format!("r{label}"))),
             mode,
         )
     }
