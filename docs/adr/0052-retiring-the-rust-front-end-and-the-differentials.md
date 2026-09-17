@@ -422,8 +422,7 @@ leaf, 53 ms, 18 ms and 210 ms for a hub. The switch replaces the restore
 with the port checking and hashing every module every run, so the warm
 front-end row is the one to read again beside it.
 
-**Read, 2026-09-17: what it costs after the switch, and why this does not
-merge yet.** Two runners agree to within one percent, both at a load under
+**Read, 2026-09-17: what it cost after the switch, before the front end's three scans were removed.** Two runners agree to within one percent, both at a load under
 the gate. A warm `ply test` with nothing changed now takes 0.93 s, 5.2 s
 and 39.6 s at the three sizes, against 0.01 s, 0.09 s and 0.41 s before
 it; the front end is 923 ms, 5,094 ms and 39,713 ms against 2.7 ms, 22.5
@@ -662,6 +661,32 @@ run before it, which makes it an accidental control and means absolute figures
 from different runs are not comparable. A uniformly slower machine scales
 everything, so the doubling ratios survive it and the wall clocks do not. That
 is why the criterion was a ratio.
+
+**Read, 2026-09-17: the front end is proportional now, and the rest is not this
+record's to fix.** The marginal-change bench, one machine, one process, both
+sides of it: a warm `ply test` with nothing changed takes 0.84 s, 3.56 s and
+13.14 s at 250, 1,000 and 4,000 definitions, where before the three scans came
+out it took 0.93 s, 5.17 s and 40.0 s, and where the Rust chain with its gates
+takes 0.01 s, 0.09 s and 0.41 s. The front end is 824 ms, 3,501 ms and 12,963
+ms. This reading is comparable to the earlier one because the bench's
+in-process rows time the Rust engine, which nothing here touched, and they read
+660 ms against 638 ms: the machine did not move.
+
+The shape is what changed. The front end's cost per four times the project was
+5.5 and then 7.7; it is now 4.3 and 3.7. It is proportional to the program, and
+the superlinearity was those three scans and nothing else. At 250 definitions
+the gain is almost nothing, which is the same fact seen from the other end: a
+constant dominates there and always did.
+
+**So part 1 cannot finish inside this record.** What is left between 13.14 s and
+0.41 s is a constant factor of about a hundred and forty, and a constant factor
+is the object model — which this record says in its own opening that it does not
+decide, reserving it for the record after this one. Three quadratics were the
+whole of what the front end's own algorithms had to give. The driver switch
+stays held, and what would unhold it is now a runtime question rather than a
+front-end one: either this record widens to take the heap on, or the switch
+waits for the record that does. That is a decision about scope, so it is put
+here rather than taken here.
 
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
