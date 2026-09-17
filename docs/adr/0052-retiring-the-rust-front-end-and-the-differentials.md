@@ -1466,6 +1466,30 @@ producer to use. That reaches `reference_only`, `reset_thread` and every
 dependency on `ply-core`, and it is an architecture decision rather than a
 deletion -- which is why this record names it instead of attempting it twice.
 
+**Read, 2026-09-17: the handover was attempted, and the canary threw away the
+evidence.** The entry above names what taking the seed path out would require, and
+it was built: `with_producer` hands an emitter over, consulted before the
+`BUILDING` and `REFERENCE_ONLY` guards, carrying the identity its bodies key
+under, so the committed emitter could stand up a working copy. It compiled, it
+took `ply-core` to no production dependent, and it failed in CI twice on the same
+test -- `lang_fixtures`, in four partitions each time.
+
+What the log rules out is worth keeping, because both were the obvious guesses.
+**Not thread crossing**: the handover is a `thread_local!`, but `build.rs` spawns
+nothing and uses no rayon -- the only mentions of workers are comments on why
+`ply_eval::Value` holding `Rc` keeps emission off it. **Not a missing bundle**:
+`bundle::of(&Sources::Embedded)` returns an ungated `include_str!` constant, so
+there is always a committed bundle to start from. And the child printed none of
+the producer's error strings, so the emitter built. The panic is at
+`.expect("a failures array")`, *after* the line above it parsed the JSON, so
+`ply test --json` ran and answered an error shape. The cause is downstream of the
+emitter and this record cannot name it.
+
+It cannot name it because the canary discarded it: `cmd.output()` read `stdout`
+and dropped `stderr`, and the `expect` threw away the report it did get. That is
+fixed here, and it is the thing to do *before* attempting the handover a third
+time. Two attempts were spent learning what one readable failure would have said.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1529,7 +1553,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s and 168 s, each reusing by tree the same way and for the same reason. Seven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s and the seventh 381 s, which the entries closing this section take. None of those five was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s, 153 s, 199 s, 381 s, 139 s, 168 s and 167 s, each reusing by tree the same way and for the same reason. Seven of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, the sixth 199 s and the seventh 381 s, which the entries closing this section take. None of those five was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
