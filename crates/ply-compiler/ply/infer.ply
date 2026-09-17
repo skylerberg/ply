@@ -4,8 +4,10 @@
 // the reference reads `parse_recovering`'s and `resolve`'s, and publishes what
 // `check_program` publishes: every definition's scheme, footprint and constraints,
 // every test's and law's footprint, every effect and constructor. `check_dump`
-// writes those in the encoding `harness/src/lib.rs`'s `reference_check_dump`
-// writes, and `harness/tests/infer.rs` compares the two.
+// writes those in the encoding the goldens under
+// `crates/ply-compiler-diff/fixtures/goldens/infer.check_dump/` fix. Those
+// goldens are the specification now: the reference dumper that used to define
+// this encoding is gone, and the differential holds this side to the files.
 //
 // Not yet here: the derive expansion (`ply_derive::expand_program` runs before
 // the reference checker, so `check_derives` and `attribute_generated` have
@@ -3180,9 +3182,26 @@ fn check_region_handoffs(cx: Cx, site: RegionSite) -> Cx =
 // --- Internal effects ---------------------------------------------------------------------------------
 
 fn mark_internal_effects(cx: Cx) -> Cx = {
-  let names = fold(range(0, len(cx.mods)), [], |acc: List<Bytes>, mi: Int|
-    fold(at(cx.mods, mi).module.items, acc, |a: List<Bytes>, it: Item|
-      match it { IFn(def) -> { let n = qualify(module_name(cx, mi), def.name.name); if contains_bytes(a, n) { a } else { push(a, n) } }, _ -> a }));
+  // The list and its index are built in one pass. Every use of this list was a scan: the
+  // membership test that grew it, and `position_bytes` below, once per definition and again per
+  // call edge. Over a list holding every qualified name in the program that is quadratic before
+  // anything reads it.
+  let indexed = fold(range(0, len(cx.mods)), { names: [], index: map_new() },
+    |acc: { names: List<Bytes>, index: Map<Bytes, Int> }, mi: Int|
+      fold(at(cx.mods, mi).module.items, acc,
+        |a: { names: List<Bytes>, index: Map<Bytes, Int> }, it: Item|
+          match it {
+            IFn(def) -> {
+              let nm = qualify(module_name(cx, mi), def.name.name);
+              match map_get(a.index, nm) {
+                Some(_) -> a,
+                None -> { names: push(a.names, nm), index: map_insert(a.index, nm, len(a.names)) },
+              }
+            },
+            _ -> a,
+          }));
+  let names = indexed.names;
+  let index = indexed.index;
   let n = len(names);
   let seeded = fold(range(0, len(cx.mods)), { cx: cx, effects: map(range(0, n), |i: Int| false), callers: map(range(0, n), |i: Int| []) },
     |acc: { cx: Cx, effects: List<Bool>, callers: List<List<Int>> }, mi: Int| {
@@ -3190,7 +3209,7 @@ fn mark_internal_effects(cx: Cx) -> Cx = {
       fold(at(c.mods, mi).module.items, {..acc, cx: c}, |a: { cx: Cx, effects: List<Bool>, callers: List<List<Int>> }, it: Item|
         match it {
           IFn(def) -> {
-            let at_ = position_bytes(names, qualify(module_name(a.cx, mi), def.name.name));
+            let at_ = match map_get(index, qualify(module_name(a.cx, mi), def.name.name)) { Some(i) -> i, None -> 0 - 1 };
             if at_ < 0 { a } else {
               let refs = refs_of(def.body);
               let flagged = if refs.effects { set_at(a.effects, at_, true) } else { a.effects };
@@ -3199,7 +3218,7 @@ fn mark_internal_effects(cx: Cx) -> Cx = {
                 if is_bare(q) && contains_bytes(params, q.name.name) { cs } else {
                   match declared_value(a.cx, q) {
                     None -> cs,
-                    Some(callee) -> { let to = position_bytes(names, callee); if to < 0 { cs } else { set_at(cs, to, push(at(cs, to), at_)) } },
+                    Some(callee) -> { let to = match map_get(index, callee) { Some(i) -> i, None -> 0 - 1 }; if to < 0 { cs } else { set_at(cs, to, push(at(cs, to), at_)) } },
                   }
                 });
               { cx: a.cx, effects: flagged, callers: callers }
