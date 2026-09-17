@@ -15,7 +15,6 @@ use ply_codegen::c::Produced;
 use ply_codegen::c::producer::{self, PlyProducer};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 fn repo() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -76,9 +75,6 @@ fn emitter_source() -> (&'static Source, String) {
     (source, identity)
 }
 
-/// Where the recipe builds the emitter from; changed between the fixpoint's two emissions.
-static FROM: Mutex<Option<PathBuf>> = Mutex::new(None);
-
 fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProducer, String> {
     let from_reference = || {
         let names: Vec<String> = source.functions();
@@ -103,14 +99,25 @@ fn build_from(source: &'static Source, from: Option<&Path>) -> Result<PlyProduce
 
 /// Emits the emitter's own unit with the producer built from `from`, into a cache of its own so
 /// nothing an earlier emission wrote is read back.
-fn emit_with(source: &'static Source, from: Option<&Path>, scratch: &Path) -> Produced {
-    *FROM.lock().unwrap() = from.map(Path::to_path_buf);
+fn emit_with(
+    source: &'static Source,
+    from: Option<&Path>,
+    scratch: &Path,
+    identity: &str,
+) -> Produced {
     producer::reset_thread();
     let cache = scratch.join(format!("cache-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&cache);
     unsafe { std::env::set_var("PLY_C_CACHE", &cache) };
     let names: Vec<String> = source.functions();
     let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+    // This round's emitter is handed over rather than installed. A `OnceLock` would keep the
+    // first round's emitter for the second, and the difference between those two emissions is
+    // the whole of what the fixpoint compares.
+    let _held = producer::hand_over(
+        build_from(source, from).expect("the emitter builds"),
+        identity.to_string(),
+    );
     ply_codegen::c::produce(source, &refs).expect("the emitter's unit emits")
 }
 
@@ -138,17 +145,9 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
     }
     let scratch = std::env::temp_dir().join(format!("ply-bootstrap-{}", std::process::id()));
     std::fs::create_dir_all(&scratch).unwrap();
-    producer::install(
-        std::sync::Arc::new(move || {
-            let from = FROM.lock().unwrap().clone();
-            build_from(source, from.as_deref())
-        }),
-        identity.clone(),
-    );
-
     // The emitter built from the bundle, or from the reference when there is none, emits itself.
     let first = have.then(|| bundle.clone());
-    let p1 = emit_with(source, first.as_deref(), &scratch);
+    let p1 = emit_with(source, first.as_deref(), &scratch, &identity);
     assert!(
         p1.refused.is_empty(),
         "the emitter refuses part of itself: {:?}",
@@ -174,7 +173,7 @@ fn the_bootstrap_bundle_is_a_fixpoint_of_the_emitter_it_builds() {
         for round in 1..=3 {
             let stage = scratch.join(format!("stage{round}"));
             ply_codegen::c::bundle::write(&stage, &last.text, &identity).unwrap();
-            let next = emit_with(source, Some(&stage), &scratch);
+            let next = emit_with(source, Some(&stage), &scratch, &identity);
             assert!(
                 next.refused.is_empty(),
                 "the emitter built from its own emission refuses part of itself: {:?}",

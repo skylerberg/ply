@@ -311,14 +311,24 @@ pub fn reference_only<R>(f: impl FnOnce() -> R) -> R {
 /// so a body emitted here is filed under the emitter that emitted it rather than the one being
 /// built (ADR 0052 §2).
 pub fn with_producer<R>(p: PlyProducer, identity: String, f: impl FnOnce() -> R) -> R {
-    struct Guard(Option<(PlyProducer, String)>);
-    impl Drop for Guard {
-        fn drop(&mut self) {
-            HANDED.with(|h| *h.borrow_mut() = self.0.take());
-        }
-    }
-    let _guard = Guard(HANDED.with(|h| h.borrow_mut().replace((p, identity))));
+    let _held = hand_over(p, identity);
     f()
+}
+
+/// The same handover held by a guard rather than wrapped around a closure, for a caller whose
+/// body is a test rather than an expression. `p` is this thread's producer until [`Handed`]
+/// drops, and what was handed over before comes back then -- so two handovers nest the way
+/// [`with_producer`] does, and neither is a `OnceLock` that a second caller loses to.
+pub fn hand_over(p: PlyProducer, identity: String) -> Handed {
+    Handed(HANDED.with(|h| h.borrow_mut().replace((p, identity))))
+}
+
+pub struct Handed(Option<(PlyProducer, String)>);
+
+impl Drop for Handed {
+    fn drop(&mut self) {
+        HANDED.with(|h| *h.borrow_mut() = self.0.take());
+    }
 }
 
 /// The mode with the emitter's identity, as the caches key on it.
