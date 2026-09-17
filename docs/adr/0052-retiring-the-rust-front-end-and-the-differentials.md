@@ -1282,7 +1282,7 @@ this record. Where `ply-ty` was already present nothing re-points, because it
 owns `CheckOutput`, `DefInfo` and `ty` outright and `ply-core` only re-exported
 them.
 
-**`ply-store-tests` cannot go, and it is one of three.** Its second
+**`ply-store-tests` cannot go, and it is one of four.** Its second
 site typechecks a program *reconstructed from the store*: `reconstruct` hands
 back a syntax tree and there is no source text anywhere, which is the crate's
 whole thesis -- what a run writes comes back out as a program that checks,
@@ -1343,6 +1343,29 @@ to police, so the cheap answer costs the test some of its point. The note above
 saw the shape and stopped at the fact -- `prelude_arity` stays with the checker
 -- without the consequence, which is that one test stays with it until one of
 those two moves is made.
+
+**`ply-test-tests` cannot go either, and the fourth reason is the hasher.** Its
+seven sites migrate cleanly under the rule above -- three keep the names they
+gave `from_dotted`, four keep the empty name -- and `ply-test`'s own obligation
+API is indifferent to which, because it takes its names from `check.defs.keys()`
+and looks them up in `hashes.defs`, both from the same front end. That is not
+where it breaks.
+
+`unit/runner.rs` computes `ply_hash::hash_program(&program, &resolved, &check)`:
+a Rust-parsed program and resolve together with the port's check. Those hashes
+are what the store keys on and what selection reads, so any difference between
+the two front ends' answers -- an ordering in `check.tests`, a footprint, a
+definition one records and the other does not -- moves a hash, and a warm cache
+stops being warm. The run said so plainly: `a_warm_cache_selects_nothing`
+selected three, `renaming_a_definition_selects_nothing` selected three, and a
+ran-to-skipped count came back `(0, 4)` where `(4, 0)` was expected, which is
+what shifted test indices look like.
+
+So the port's check is safe to hand a machine, a binding or an assertion, and not
+yet safe to hand the hasher beside an AST that hasher also reads. *Which* of the
+two answers differs is not established here, and this record does not guess: the
+attempt was withdrawn whole rather than halved, because reverting the one file
+would leave the dependency standing anyway.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
