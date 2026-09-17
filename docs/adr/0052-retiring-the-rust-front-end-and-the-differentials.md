@@ -263,6 +263,36 @@ the gates. The switch carries the marginal-change bench's reading in its
 description, and a regression there is the item after it, as §3 treats
 the clock.
 
+**Built, 2026-09-17: every code the port can raise, counted, because §1 had only
+asserted it.** This section says every front-end diagnostic code reaches the user
+from the port, and that codes it cannot raise are deleted. Neither half had been
+checked here.
+
+`ply-span`'s registry declares ninety-one codes, each a named constant. The port's
+own sources raise forty-seven of them, spelled as byte-string literals at `diag1`,
+`diag2` and `report`; `diag.ply` passes a code through and synthesises none, so
+that is the whole of what the port can raise. The other forty-four are raised by
+the runtime and the tools -- `ply-eval`, `ply-host`, `ply-cli`, `ply-test`,
+`ply-codegen`, `ply-ty`, `ply-std`, `ply-prove`, `ply-store` -- and **none** by
+`ply-core`, `ply-syntax` or `ply-derive`. So there is no front-end code the port
+cannot raise, and the clause about deleting such codes has nothing to act on.
+`docs/GUIDE.md` §18 is total over the registry in both directions, ninety-one
+against ninety-one: no code missing from the guide, none documented that the
+registry no longer declares.
+
+**The method earns a line, because three attempts at it were confidently wrong.**
+Searching for the literal `"E0111"` finds only the registry, since a raiser names
+the constant and never the string. Searching `crates/*/src/` and taking the first
+match answers `ply-span` for every code, since the declaration is a match. And an
+earlier sweep in this record used `--include=*.rs` unquoted, which lets the shell
+expand the glob before grep sees it and silently stops the filter. What exposed the
+second of those was not care but an armed test: `every_registered_code_is_
+constructed_in_production` sits in `ci-shards.sh`'s `TREE_CHECKS` and was green
+throughout, while the sweep claimed forty-four codes were constructed nowhere. A
+cheap grep that contradicts a green armed test is the thing that is wrong. That is
+the cheapest instrument in this repository and it is worth reaching for before
+trusting a result that arrives without one.
+
 ## 2. Delete the Rust front end, its test crates and the differentials
 
 In the order the goldens and the crates together allow: `ply-core`'s
@@ -1070,9 +1100,20 @@ of the thirty-two members and has never seen `ply-arm`. That file's own comment
 says a crate in neither `KNOWN_OUTSIDE` nor `members` is an accident, "nothing
 builds it and no job tests it" -- and the second half does not follow here, because
 `cargo clippy --locked --workspace --all-targets` compiles the arm on every push.
-So the coverage is real and the accounting is blind, which is the smaller defect
-and still a defect: the guard cannot say what it claims to say. Per §"Do not state
-a guarantee you have not armed": **not enforced.**
+So the coverage is real and the accounting is narrower than it reads.
+
+**Corrected after reading `cmd_verify`, because the sentence above framed this as
+an oversight with a one-line fix.** The `"crates/NAME"` pattern is deliberate and
+load-bearing: four checks downstream of `members()` are all `crates/`-shaped -- the
+`-tests` loop reading `crates/$member/src` and its `[profile.dev.package]`
+override, the accident sweep walking `crates/*/`, the `KNOWN_OUTSIDE` validation,
+and `check_test_exists`. Widening the pattern would feed `ply-arm` into loops that
+then demand a `crates/ply-arm/src` and a profile override that must not exist,
+turning a narrow gap into a failing guard. The actual defect is two smaller things:
+the summary line reports its count as "workspace members" when it means members
+under `crates/`, and nothing asserts that a member outside `crates/` is covered by
+any job. The fix is a separate assertion and honest wording, not a wider regex. Per
+§"Do not state a guarantee you have not armed": **not enforced.**
 
 **Built, 2026-09-17: the differential crate's dead edges, and the arm scripts
 that lost their tests.** Two unrelated pieces of staleness in one crate, both left
@@ -1255,7 +1296,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s and 134 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s and 143 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
