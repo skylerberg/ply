@@ -1356,6 +1356,40 @@ what would let §2 delete `c/emit.rs`**; until that exists the deletion would re
 on prose, and this record has spent the day learning what prose-sized estimates
 are worth.
 
+**Built, 2026-09-17: `whole()` builds under the port it documents.**
+`fragment.rs`'s `whole()` is documented as "the same program under the whole Ply
+emitter", and `number_types.rs`'s `the_two_emitters_answer_the_same_at_each_width`
+compares its answers against `unit()`'s. Neither claim held.
+
+Whether the port emits depends on `producer::mode()`, which answers `"ref"` unless
+a producer is installed, and nothing on `whole()`'s path installs one:
+`Unit::over_with_texts` calls `front_for` and then `over_front`, and
+`ensure_default()` has no call site anywhere in `ply-codegen` outside its own
+definition. `.config/nextest.toml` makes that decisive rather than probable --
+"one process per test" -- so the single `ensure_default()` in this binary, in
+`unit/c.rs`, cannot reach another test's process.
+
+So both units were emitted by the reference, and what that test compared was two
+ways of obtaining a `Front`, not two emitters. Its constant checks were always
+real: they hold the fragment emitter to a hand-written answer at each width. The
+cross-check was not, and the second loop -- `round_trip` and `mixed`, which carry
+no constants and are "checked against the whole emitter alone" -- proved nothing
+at all.
+
+One line in the helper repairs every caller, and the ratchet §2 prescribes would
+have needed it too: written without it, that gate would have censused the
+reference emitter exactly as this test compared it with itself.
+
+**This is also the first time a gate makes the port emit these bodies**, which is
+why the reading matters beyond the repair. `emit.ply` has the widths --
+`wrap_add` and its family, `u8_of_int` and the seven beside it, `int_of_u8` and
+its seven, shift precedence and constant folding -- and its two width-shaped
+refusals are narrow: a fixed-width literal whose name has no known width, and a
+shift over a value the fragment leaves `TyOpaque`. If this run is green the two
+emitters agree at every width in the test. If it is red, the failure names the
+width construct the port refuses, and that is the empirical census §2 asked for
+and that this record has said no test measures.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -1419,7 +1453,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s and 203 s, each reusing by tree the same way and for the same reason. Five of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, which the entry closing this section takes. None of those three was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s, 140 s, 203 s and 153 s, each reusing by tree the same way and for the same reason. Five of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; two more are 324 s and 223 s, and the paragraphs after it take them; the fifth is 203 s, which the entry closing this section takes. None of those three was caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
@@ -1533,6 +1567,11 @@ corrected for exactly that error, calling one from four partitions in a single
 run -- and the next merge's longest partition is the reading that would say
 otherwise. What §3 asks for here is that the run be read and recorded, not that a
 number be moved.
+
+**And the next merge answered it: 153 s, longest partition 117 s.** So the
+203 s was variance and not a step, which is what the paragraph above said the next
+reading would settle. The bound holds without anything being done to the tree,
+which is the outcome a diagnosis pointing entirely at the platform predicts.
 
 ## 4. The loop that is O(the change)
 
