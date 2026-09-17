@@ -93,7 +93,7 @@ impl<'p> Interpreter<'p> {
     fn build(program: &'p Program, resolved: &'p Resolved) -> Interpreter<'p> {
         let mut defs = FxHashMap::default();
         let mut ctors: FxHashMap<Symbol, usize> =
-            ply_core::prelude::ctor_arities().into_iter().collect();
+            ply_ty::prelude::ctor_arities().into_iter().collect();
         let mut ops = crate::semantics::OpTable::default();
         let mut members = BTreeSet::new();
         for (module, m) in program.modules.iter().enumerate() {

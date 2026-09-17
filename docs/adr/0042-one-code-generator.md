@@ -166,9 +166,9 @@ behind an instrument that already exists.
    syntax tree, so it goes *before* `ply-syntax` rather than after it, and
    `ply-derive` expands *inside* `parse_module`, so it leaves with the parser at
    the end rather than first. None of the four is a whole-crate deletion:
-   `ply-core` keeps `ty`, `prelude`, `DefInfo` and `Front` while its checker
-   goes, and `ply-hash` keeps `DefHash` and the body envelope while its
-   hash-from-tree half goes.
+   `ply-core` is the checker alone now — `ty`, `DefInfo` and `Front` were always
+   `ply-ty`'s, and the prelude joined them — and `ply-hash` keeps `DefHash` and
+   the body envelope while its hash-from-tree half goes.
 
    **And the step is bounded by the runtime, not by the front end** (ADR 0052
    §1, §2, §4). The driver enters the port once and the checker and hasher are

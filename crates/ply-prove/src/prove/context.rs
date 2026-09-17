@@ -187,7 +187,7 @@ fn drop_incomplete(program: &Program, sums: &mut BTreeMap<Symbol, Vec<Symbol>>) 
     let mut declared: BTreeMap<Symbol, usize> = BTreeMap::new();
     // The prelude's ADTs are declared by the *language* rather than by a file, so the check below —
     // which reads the program's `type` items — would drop them and refuse to split on an `Option`.
-    for adt in ply_core::prelude::ADTS {
+    for adt in ply_ty::prelude::ADTS {
         declared.insert(Symbol::new(adt.name), adt.variants.len());
     }
     for module in &program.modules {
