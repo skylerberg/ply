@@ -34,10 +34,17 @@ fn fixture(source: &str) -> Fixture {
         Ok(resolved) => resolved,
         Err(diagnostics) => panic!("resolve: {:?}", messages(&diagnostics)),
     };
-    let check = match ply_core::check_program(&program, &resolved) {
-        Ok(check) => check,
-        Err(diagnostics) => panic!("check: {:?}", messages(&diagnostics)),
-    };
+    // The module stays anonymous. `ply_syntax::parse` names it `ModuleName::anonymous()`, and an
+    // anonymous module qualifies nothing on either side -- `ModuleName::qualify` returns the bare
+    // name and `resolve.ply`'s `qualify` returns it for a zero-length module -- so the checker's
+    // keys are the bare ones this crate and `ply-prove`'s own API are written against.
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&[(String::new(), source.to_string())], &[SRC])
+        .unwrap_or_else(|e| panic!("the port answers for the fixture: {e:#}"));
+    if !front.diagnostics.is_empty() {
+        panic!("check: {:?}", messages(&front.diagnostics));
+    }
+    let check = front.check;
     Fixture {
         program,
         resolved,
@@ -66,7 +73,7 @@ impl Fixture {
     }
 }
 
-/// A law binder's declared type, resolved the way `ply-core` will resolve it.
+/// A law binder's declared type, resolved the way the front end does.
 fn resolve_type(ty: &TypeExpr, vars: &mut BTreeMap<Symbol, TyVar>) -> Type {
     match ty {
         TypeExpr::Var(name) => {
