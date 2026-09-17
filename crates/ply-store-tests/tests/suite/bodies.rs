@@ -1,7 +1,7 @@
 //! Definition bodies through the store: what a run writes comes back out as a program that checks,
 //! and bytes that are not the ones their key names never become a definition.
 
-use ply_core::check_program;
+use ply_codegen::c::producer;
 use ply_hash::body::BodySet;
 use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
 use ply_span::{SourceId, Symbol};
@@ -53,7 +53,14 @@ fn compile(source: &str) -> (HashOutput, BodySet) {
         ply_syntax::parse_program([(SourceId(0), ModuleName::from_dotted("m"), source)])
             .expect("it should parse");
     let resolved = ply_syntax::resolve(&mut program).expect("it should resolve");
-    check_program(&program, &resolved).expect("it should check");
+    producer::ensure_default();
+    let front = producer::front(&[("m".to_string(), source.to_string())], &[SourceId(0)])
+        .expect("the port answers for the fixture");
+    assert!(
+        front.diagnostics.is_empty(),
+        "it should check: {:?}",
+        front.diagnostics
+    );
     hash_program_with_bodies(&program, &resolved).expect("it should hash")
 }
 
