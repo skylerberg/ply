@@ -1788,10 +1788,23 @@ This is the first excursion here the tree accounts for, and the mechanism is the
 handover §2 records. `from_reference` left `produced` false, so the *reference*
 emitted every body when an emitter was stood up from a working copy;
 `from_committed` hands an emitter over, which makes `mode()` "ply" and `produced`
-true, so the port emits them instead. The work did not appear -- it moved to the
-implementation this record exists to reach. So this is a cost to place, not a
-regression to revert, and by §3's own rule placing it is the next item before any
-other.
+true, so the port emits them instead.
+
+One test names the whole of it.
+`lang_fixtures::the_shift_and_overflow_raises_are_the_same_on_both_engines` ran
+**8.468 s** on the merge before and **99.104 s** here, crossing nextest's slow
+threshold it had never approached. It is one of four that pass
+`PLY_C_EMITTER=ply:<dir>`, which has no bundle by construction, so each stands an
+emitter up from the committed bundle and emits the port's own sources through it;
+there is one in each of partitions 1, 3, 4 and 5, and three of the four longest
+jobs are among them. The shape of the cost is eager: `bodies_of` asks
+`emit_unit_all` for the whole unit, where the reference emitted one body at a
+time as `emit_one` asked for it. `--no-cache` is not the lever -- it points `ply
+test`'s store at a scratch directory and never reaches the C unit cache.
+
+The work did not appear -- it moved to the implementation this record exists to
+reach. So this is a cost to place, not a regression to revert, and by §3's own
+rule placing it is the next item before any other.
 
 **Why each of these got written at all.** The scripts that append a reading assert
 `wall < 173`; an over-bound one fails them and takes a different entry point that
