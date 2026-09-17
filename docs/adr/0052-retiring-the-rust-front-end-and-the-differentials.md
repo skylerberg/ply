@@ -323,6 +323,20 @@ an artifact carries its sources, and the second retires with `ply-hash`
 into a frame the port answers, the port already holding the bytes it
 hashed.
 
+**Built, 2026-09-17: an artifact carries its sources, and three things follow.**
+`--sources` was opt-in and off, so the rebuild was what nearly every artifact
+took rather than an exceptional branch; removing it takes `ply_syntax::resolve`
+and `ply_core::check_program` out of the command crate. Opening now parses the
+shipped text, pulls the standard library to a fixed point and expands derives,
+which reconstructs the whole program. So: the digest no longer follows the
+reachable closure, because an edit to a definition nothing reaches ships its
+text and moves it; the disclosure is total, tests, laws and unreached code
+travelling as readable source; and the closure no longer decides what a deployed
+artifact can *name*, so a schema not given at build time is reachable anyway and
+refuses on its missing key rather than on an unreadable source. The last of
+those is what a test caught, and it is recorded here rather than absorbed as an
+updated expectation.
+
 The bundle becomes the only way to build the language. This record says
 how a fresh clone builds it — the bundle's C, `cc`, `dlopen`, nothing
 parsed — how a broken or unserved bundle is recovered with no Rust emitter
