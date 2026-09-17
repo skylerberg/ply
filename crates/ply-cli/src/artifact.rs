@@ -235,25 +235,9 @@ pub fn build(
     sources: bool,
 ) -> Result<Built, Vec<Diagnostic>> {
     // The front end's whole answer over the program: the hashes the artifact is keyed by and the
-    // bodies it carries, from the port wherever it can serve one (ADR 0052 §1).
-    let front = ply_codegen::front_for(
-        &loaded.program,
-        &loaded.resolved,
-        &loaded.check,
-        &crate::commands::common::module_texts(&loaded.program, &loaded.sources),
-    )
-    .map_err(|e| {
-        vec![
-            Diagnostic::error(
-                codes::ARTIFACT_INVALID,
-                format!("the front end answered nothing for this program: {e:#}"),
-            )
-            .primary(
-                Span::DUMMY,
-                "nothing could be hashed, so nothing could be built",
-            ),
-        ]
-    })?;
+    // bodies it carries. The load already obtained it from the port, so a build asks nothing
+    // again (ADR 0052 §1).
+    let front = &loaded.front;
     let hashes = &front.hashes;
     // The bytes are the envelope the hasher wrote, so they are wrapped rather than re-hashed. Only
     // a name declared in two namespaces — a `fn` and a `type` of one name — has two bodies, and
@@ -358,7 +342,7 @@ fn embedded_unit(loaded: &Loaded, names: &[&str]) -> (Option<EmbeddedUnit>, Vec<
         .collect();
     let texts = crate::commands::common::module_texts(&loaded.program, &loaded.sources);
     let produced =
-        ply_codegen::Unit::over_with_texts(&loaded.program, &loaded.resolved, &loaded.check, texts)
+        ply_codegen::Unit::over_front(&loaded.program, &loaded.resolved, &loaded.front, texts)
             .and_then(|unit| unit.produce(&names))
             .and_then(|produced| {
                 let text = ply_codegen::c::bundle::pack(&produced.text)?;

@@ -17,7 +17,7 @@ const TYPES_INDENT: usize = IND.len() + 2;
 
 pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     let mut warnings = Vec::new();
-    let (mut loaded, mut store) = match check(args, &mut warnings) {
+    let (loaded, _store) = match check(args, &mut warnings) {
         Ok(pair) => pair,
         Err(err) => return report_load_error("check", &err, args.json, style),
     };
@@ -25,13 +25,8 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     let warnings = once_each(warnings);
 
     if loaded.promised {
-        // The promise is whole-program, so it needs every body; the gates' report is kept as they
-        // fired, so `--explain` still says what the run decided rather than what the check needed.
-        let frontend = loaded.frontend.clone();
-        if let Err(err) = complete_parse(args, &mut loaded, store.as_mut()) {
-            return report_load_error("check", &err, args.json, style);
-        }
-        loaded.frontend = frontend;
+        // The promise is whole-program, and every module is parsed on every load, so the check has
+        // everything it needs already.
         let broken = crate::costs::promises(&loaded.program, &loaded.resolved);
         if !broken.is_empty() {
             let err = crate::load::LoadError {
@@ -44,12 +39,7 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
 
     if args.json {
         let mut report = report_json(&loaded, &warnings);
-        // After `front_end` is recorded, so that completing the parse cannot rewrite the report of
-        // what the gates decided.
         if args.explain {
-            if let Err(err) = complete_parse(args, &mut loaded, store.as_mut()) {
-                return report_load_error("check", &err, args.json, style);
-            }
             attach_provenance(&mut report, &loaded);
         }
         emit_json(&report);
@@ -69,51 +59,15 @@ pub fn execute(args: &CheckArgs, style: Style) -> i32 {
     print_warnings(&warnings, style);
 
     if args.explain {
-        print_explain(&loaded, style);
+        super::common::print_phases(&loaded.frontend.phases, style);
     }
-    if args.types || args.costs {
-        // Only now, so that `print_explain` above still reports the gates as they actually fired.
-        // `--costs` needs every AST either way: a module gate 1 skipped has no lowered `Code`, so a
-        // partial parse would report an append-free program rather than an unanswered one.
-        if (args.explain || args.costs)
-            && let Err(err) = complete_parse(args, &mut loaded, store.as_mut())
-        {
-            return report_load_error("check", &err, args.json, style);
-        }
-        if args.types {
-            print_types(&loaded, args.explain, style);
-        }
-        if args.costs {
-            print_costs(&loaded, style);
-        }
+    if args.types {
+        print_types(&loaded, args.explain, style);
+    }
+    if args.costs {
+        print_costs(&loaded, style);
     }
     EXIT_OK
-}
-
-/// Parses whatever gate 1 skipped.
-fn complete_parse(
-    args: &CheckArgs,
-    loaded: &mut Loaded,
-    store: Option<&mut Store>,
-) -> Result<(), crate::load::LoadError> {
-    let missing: Vec<ModuleName> = loaded
-        .modules()
-        .iter()
-        .filter(|m| !loaded.has_ast(m.name))
-        .map(|m| m.name.clone())
-        .collect();
-    if missing.is_empty() {
-        return Ok(());
-    }
-    *loaded = match store {
-        Some(store) => {
-            let full = driver::load_to_evaluate(&args.path, store, &missing);
-            let _ = store.take_warnings();
-            full?
-        }
-        None => load(&args.path)?,
-    };
-    Ok(())
 }
 
 /// A cache that cannot be opened is never a reason to refuse to typecheck: the front end degrades
@@ -142,34 +96,6 @@ fn check(
         }
         Err(_) => Ok((load(&args.path)?, None)),
     }
-}
-
-fn print_explain(loaded: &Loaded, style: Style) {
-    println!();
-    println!("{IND}{}", style.bold("front end"));
-    for file in &loaded.frontend.files {
-        let state = if !file.parsed {
-            style.green("skipped")
-        } else if file.rechecked {
-            style.yellow("checked")
-        } else {
-            style.dim("parsed")
-        };
-        println!(
-            "{IND}  {state:<9} {} {}",
-            file.path.display(),
-            style.dim(&file.refusal.describe())
-        );
-    }
-    for def in &loaded.frontend.defs {
-        let state = if def.cached {
-            style.green("cached")
-        } else {
-            style.yellow("rechecked")
-        };
-        println!("{IND}  {state:<9} {}", def.name);
-    }
-    super::common::print_phases(&loaded.frontend.phases, style);
 }
 
 /// the ownership design: for every `push`, whether it grows its list in place or copies it.
@@ -417,19 +343,7 @@ pub fn report_json(loaded: &Loaded, warnings: &[Diagnostic]) -> Value {
         "effects": effects,
         "front_end": json!({
             "incremental": loaded.frontend.incremental,
-            "parsed": loaded.frontend.parsed(),
-            "skipped": loaded.frontend.skipped(),
-            "cached": loaded.frontend.cached(),
-            "rechecked": loaded.frontend.rechecked(),
-            "reused": loaded.frontend.reused,
             "phases": super::common::phases_json(&loaded.frontend.phases),
-            "files": loaded.frontend.files.iter().map(|f| json!({
-                "file": f.path.display().to_string(),
-                "module": f.module.as_str(),
-                "parsed": f.parsed,
-                "rechecked": f.rechecked,
-                "reason": f.refusal.describe(),
-            })).collect::<Vec<_>>(),
         }),
         "diagnostics": super::common::diagnostics_json(warnings, &loaded.sources),
     })

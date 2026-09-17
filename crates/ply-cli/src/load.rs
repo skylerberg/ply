@@ -1,7 +1,7 @@
 //! Turning a path into a checked [`Program`].
 
 use crate::driver::FrontEnd;
-use ply_core::{CheckOutput, DefInfo, ModuleInfo, TestInfo};
+use ply_core::{CheckOutput, DefInfo, Front, ModuleInfo, TestInfo};
 use ply_hash::HashOutput;
 use ply_span::{Diagnostic, SourceId, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
@@ -15,38 +15,25 @@ pub struct Loaded {
     /// One entry per module, in load order — paths sorted.
     pub files: Vec<PathBuf>,
     pub sources: SourceMap,
-    /// Only the modules this run actually parsed.
+    /// Every module of the program, the shipped ones included.
     pub program: Program,
     pub resolved: Resolved,
-    /// The program to *run*, when it differs: `program` plus the modules a selected test needs the
-    /// bodies of and which nothing asked to re-derive.
+    /// The front end's whole answer over this program, as the port gave it (ADR 0052 §1): the
+    /// checker's output and the hashes below, and beside them the load order, the item ordinals,
+    /// the normalized bodies and what each declaration's source wrote.
     ///
-    /// Separate from `program` rather than replacing it, because `program` is what this run
-    /// checked, and every command that reports on what it checked — `prove`'s obligations, the
-    /// cost report — must go on seeing that and not the larger set. Only the runner and the
-    /// backend it installs use this one, and they must use the same one as each other: a backend
-    /// answers only for the program it was built over.
-    pub run: Option<(Program, Resolved)>,
-    /// Every module, whether it was checked or restored from the cache.
+    /// A command that needs a compiled tier hands **this** to `ply_codegen::Unit::over_front`, so
+    /// that one invocation runs one front end.
+    pub front: Front,
+    /// [`Front::check`], which nearly everything downstream reads.
     pub check: CheckOutput,
+    /// [`Front::hashes`].
     pub hashes: HashOutput,
-    pub complete: bool,
     pub frontend: FrontEnd,
     /// Whether any module — parsed this run or restored from the cache — declares a `reuse fn`,
     /// so a command knows whether the promise check has anything to check before it parses
     /// everything the check needs.
     pub promised: bool,
-}
-
-impl Loaded {
-    /// The program the runner and its backend work over: what was checked, plus the modules a
-    /// selected test needs the bodies of.
-    pub fn to_run(&self) -> (&Program, &Resolved) {
-        match &self.run {
-            Some((program, resolved)) => (program, resolved),
-            None => (&self.program, &self.resolved),
-        }
-    }
 }
 
 /// Carries the [`SourceMap`] even on failure: a parse error is useless without the text its spans
@@ -85,11 +72,6 @@ impl Loaded {
 
     pub fn module_count(&self) -> usize {
         self.check.modules.len()
-    }
-
-    /// Whether this module was parsed.
-    pub fn has_ast(&self, module: &ModuleName) -> bool {
-        self.program.modules.iter().any(|m| &m.name == module)
     }
 
     pub fn modules(&self) -> Vec<ModuleView<'_>> {
