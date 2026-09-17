@@ -1,5 +1,5 @@
 //! The second comparison: `resolve.ply`'s resolution of a whole program — the tables, the load
-//! order, the diagnostics and the post-defaults trees — against `ply_syntax::resolve`'s, over the
+//! order, the diagnostics and the post-defaults trees — against a blessed golden, over the
 //! standard library, the standard library with each example, the hand-written programs beside
 //! this file, and every program the reference's own tests build.
 //!
@@ -112,14 +112,14 @@ fn compare(label: &str, inputs: &[(String, Vec<(String, String)>)]) {
 }
 
 #[test]
-fn the_ply_resolver_agrees_with_ply_syntax_on_the_standard_library() {
+fn the_ply_resolver_matches_its_golden_on_the_standard_library() {
     compare(
         "std",
         &[("the standard library".to_string(), std_modules())],
     );
 }
 
-fn the_ply_resolver_agrees_with_ply_syntax_on_every_example_with_the_standard_library(
+fn the_ply_resolver_matches_its_golden_on_every_example_with_the_standard_library(
     index: usize,
     of: usize,
 ) {
@@ -136,19 +136,17 @@ fn the_ply_resolver_agrees_with_ply_syntax_on_every_example_with_the_standard_li
 }
 
 #[test]
-fn the_ply_resolver_agrees_with_ply_syntax_on_every_example_with_the_standard_library_part_1_of_2()
-{
-    the_ply_resolver_agrees_with_ply_syntax_on_every_example_with_the_standard_library(0, 2);
+fn the_ply_resolver_matches_its_golden_on_every_example_with_the_standard_library_part_1_of_2() {
+    the_ply_resolver_matches_its_golden_on_every_example_with_the_standard_library(0, 2);
 }
 
 #[test]
-fn the_ply_resolver_agrees_with_ply_syntax_on_every_example_with_the_standard_library_part_2_of_2()
-{
-    the_ply_resolver_agrees_with_ply_syntax_on_every_example_with_the_standard_library(1, 2);
+fn the_ply_resolver_matches_its_golden_on_every_example_with_the_standard_library_part_2_of_2() {
+    the_ply_resolver_matches_its_golden_on_every_example_with_the_standard_library(1, 2);
 }
 
 #[test]
-fn the_ply_resolver_agrees_with_ply_syntax_on_the_references_own_programs() {
+fn the_ply_resolver_matches_its_golden_on_the_references_own_programs() {
     let text = std::fs::read_to_string(here().join("fixtures/reference-programs.corpus"))
         .expect("the mined programs; run mine-programs.py");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
@@ -161,7 +159,7 @@ fn the_ply_resolver_agrees_with_ply_syntax_on_the_references_own_programs() {
 }
 
 #[test]
-fn the_ply_resolver_agrees_with_ply_syntax_on_the_hand_written_programs() {
+fn the_ply_resolver_matches_its_golden_on_the_hand_written_programs() {
     let text = std::fs::read_to_string(here().join("fixtures/resolve-programs.corpus"))
         .expect("the hand-written programs");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)

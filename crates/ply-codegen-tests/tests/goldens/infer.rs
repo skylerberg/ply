@@ -124,14 +124,14 @@ fn compare_through(entry: &str, label: &str, inputs: &[(String, Vec<(String, Str
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_the_standard_library() {
+fn the_ply_checker_matches_its_golden_on_the_standard_library() {
     compare(
         "std",
         &[("the standard library".to_string(), std_modules())],
     );
 }
 
-fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(
+fn the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library(
     index: usize,
     of: usize,
 ) {
@@ -148,22 +148,22 @@ fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_libra
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library_part_1_of_3() {
-    the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(0, 3);
+fn the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library_part_1_of_3() {
+    the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library(0, 3);
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library_part_2_of_3() {
-    the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(1, 3);
+fn the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library_part_2_of_3() {
+    the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library(1, 3);
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library_part_3_of_3() {
-    the_ply_checker_agrees_with_ply_core_on_every_example_with_the_standard_library(2, 3);
+fn the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library_part_3_of_3() {
+    the_ply_checker_matches_its_golden_on_every_example_with_the_standard_library(2, 3);
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs() {
+fn the_ply_checker_matches_its_golden_on_the_resolvers_reference_programs() {
     let text = std::fs::read_to_string(here().join("fixtures/reference-programs.corpus"))
         .expect("the mined programs; run mine-programs.py");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
@@ -176,7 +176,7 @@ fn the_ply_checker_agrees_with_ply_core_on_the_resolvers_reference_programs() {
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs() {
+fn the_ply_checker_matches_its_golden_on_the_resolvers_hand_written_programs() {
     let text = std::fs::read_to_string(here().join("fixtures/resolve-programs.corpus"))
         .expect("the hand-written programs");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
@@ -194,7 +194,7 @@ fn the_ply_checker_agrees_with_ply_core_on_the_resolvers_hand_written_programs()
 /// The restored path: the reference and the port each check a program, hand what it published
 /// back in as `Known`, check again from those interfaces, and must publish the same thing.
 #[test]
-fn the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_standard_library() {
+fn the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_standard_library() {
     compare_known(
         "std, restored",
         &[("the standard library".to_string(), std_modules())],
@@ -202,7 +202,7 @@ fn the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_
 }
 
 #[test]
-fn the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_bundles() {
+fn the_ply_checker_restored_from_its_own_interfaces_matches_its_golden_on_the_bundles() {
     let mut inputs: Vec<(String, Vec<(String, String)>)> = Vec::new();
     for (file, label) in [
         ("fixtures/resolve-programs.corpus", "resolve-programs"),
@@ -227,7 +227,7 @@ fn the_ply_checker_restored_from_its_own_interfaces_agrees_with_ply_core_on_the_
 }
 
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs() {
+fn the_ply_checker_matches_its_golden_on_the_checkers_hand_written_programs() {
     let text = std::fs::read_to_string(here().join("fixtures/check-programs.corpus"))
         .expect("the hand-written checker programs");
     let inputs: Vec<(String, Vec<(String, String)>)> = programs(&text)
@@ -246,7 +246,7 @@ fn the_ply_checker_agrees_with_ply_core_on_the_checkers_hand_written_programs() 
 /// `crates/ply-core-tests/tests/suite/unit/infer.rs` checks them. Most are error paths: this is where the port's
 /// diagnostics are compared, code by code and label by label.
 #[test]
-fn the_ply_checker_agrees_with_ply_core_on_the_references_own_inputs() {
+fn the_ply_checker_matches_its_golden_on_the_references_own_inputs() {
     let text = std::fs::read_to_string(here().join("fixtures/reference-checks.corpus"))
         .expect("the mined checker inputs; run mine-checks.py");
     let inputs: Vec<(String, Vec<(String, String)>)> = crate::harness::bundle(&text)
