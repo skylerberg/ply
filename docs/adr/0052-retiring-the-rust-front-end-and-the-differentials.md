@@ -201,6 +201,18 @@ three thousand allocations the window counts once. The offered set is the
 same on both, 1066 definitions and every one answered by the port, so
 what the service computes per request did not change.
 
+**Built, 2026-09-17: a float literal's text.** The port carries a float
+literal as its text, and had no way to the double the reference's lexer
+produced: it went through `Decimal`, which cannot hold `1.0e-30` or
+`1.0e300`, so the hasher gave up on exactly the literals a shipped test
+writes, and it gave up the moment the backend started asking the port for
+the whole front end's answer. `float_of_string` is the builtin that reads
+one, published as `(String) -> Option<Float>` beside `decimal_of_string`,
+answering nothing for any text a literal cannot spell and saturating to
+infinity where the lexer saturates. It lands before anything written in
+Ply calls it, because the bundle must know a builtin before the
+compiler's own sources may use it, and the hasher calls it now.
+
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
 that enters the port whole parses and checks every module every time.
