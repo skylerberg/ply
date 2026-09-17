@@ -613,6 +613,32 @@ resolve entry rather than the whole front end, because the run kept only the
 first block at each size. And chunk bytes are a high-water mark, not live
 bytes, so they bound the heap rather than describe it.
 
+**Read, 2026-09-17: what the signature index bought.** The same corpora, the
+same two instruments, and the port's output byte for byte what it was, so only
+the clock moved. Its answer under `ply check`, in milliseconds: 424, 801,
+1,973, 3,957 and 9,994, against 807, 1,586, 4,113, 9,459 and 27,239. That is
+47% off at 250 definitions, rising to 63% off at 4,000.
+
+The test set before the reading was the resolver's *own* growth rather than the
+total, since that is what the change claimed. Its entry falls from 1,355,
+1,838, 3,145, 6,187 and 15,688 ms to 503, 636, 954, 1,445 and 2,627, and its
+last doubling from 2.54 to 1.82 — below linear, which is what a phase looks
+like once the quadratic is gone and a constant dominates it. The whole front
+end's ratios fall with it, 1.97, 2.59, 2.30 and 2.88 becoming 1.89, 2.46, 2.01
+and 2.53, and the exponent over the range from about 1.27 to about 1.14.
+
+The golden-backed differentials passing is the other half of the result. The
+fold this replaced answered with the first matching signature where a map keeps
+the last, so a program carrying two of a name would resolve differently; the
+resolve golden did not move, so first-writer-wins survived the change.
+
+**Hashing is the worst stage now**, at 2.31 for its last doubling against the
+resolver's 1.82, and it is where the same method points next. **The switch
+stays held.** A warm run over four thousand definitions with nothing changed
+spends 10.0 s in the port where the chain it replaces spends 0.093 s. Two
+quadratics have been found and removed, and what remains is a hundredfold gap
+rather than a fixed one.
+
 The lesson for the instrument is worth keeping: a flat profile is evidence
 about where time goes, not about whether an algorithm is quadratic, and
 this one was taken at a single size over a single program, which is the
