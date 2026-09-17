@@ -895,6 +895,27 @@ before the migration is built. So the order §2 gives — the bundle becomes the
 only way, then the Rust emitter goes — has a step inside it that this record had
 not named: the migration comes first, or the seed path stays.
 
+**Read, 2026-09-17: three comments in the port name oracles that are gone, and
+fixing them costs more than they are worth today.** `emit.ply:4` and `code.ply:8`
+each say "the oracle is `reference_…_dump` in `harness/src/lib.rs`", and
+`code.ply:101` names `reference_lower_dump` without the path. Both functions were
+deleted by this record — the lowering dumper with the effect census, the emit
+dumper with the dead oracles — and `harness/src/lib.rs` has not existed for longer
+than either. What holds those files now is what §2 retired their differentials
+into: the goldens for `code.ply`'s dump, the bootstrap fixpoint and the
+behavioural gates for `emit.ply`.
+
+The fix is one line each and it is not being made here, which is a judgement
+rather than an oversight. Editing any byte of `crates/ply-compiler/ply/*.ply`
+moves `SOURCES.digest`, and the bundle is then the old emitter's: the first run
+fails its bootstrap job, uploads a `bootstrap-bundle` artifact, and the landing
+takes a second commit. That is two CI rounds and a new object in history, and the
+object is measured rather than guessed — the bundle has been refreshed eighteen
+times, every refresh a distinct blob because a gzip does not dedupe, 38.2 MB in
+total at 2.12 MB each. Three comment lines do not buy that. They go with the next
+emitter change that refreshes the bundle anyway, and until then this paragraph is
+where a reader learns the comments are wrong.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
@@ -958,7 +979,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s and 138 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s and 149 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
