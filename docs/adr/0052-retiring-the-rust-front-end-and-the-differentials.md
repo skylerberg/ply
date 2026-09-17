@@ -1329,11 +1329,20 @@ that a builtin the prelude does not type cannot be called at all, so the two
 tables have to cover the same set. Sourcing both sides from `ply-eval` would
 leave it comparing a table with itself, which is a green that tests nothing.
 
-The path is the move this record already made for the rest of the prelude: the
-builtin schemes join `ply-ty` as the ADTs, the effects and the constructor
-arities did. The note above saw the shape of this and stopped at the fact --
-`prelude_arity` stays with the checker -- without the consequence, which is that
-one test stays with it until the schemes move.
+The path is the move this record already made for the rest of the prelude, and it
+is not the same size. The ADTs, the effect names and the constructor arities
+moved as `const` data. `install_prelude` does not hold data: it *builds* its
+schemes against the checker's own variable supply -- `fresh.ty_var`,
+`fresh.row_var`, a `Row::open` for the effectful ones -- so moving the schemes
+moves that machinery with them.
+
+What `prelude_arity` asks for is narrower than a scheme: a name and a count. A
+table of those could sit beside the ADTs tomorrow, at the price of a second thing
+to keep in step with the schemes -- which is the coupling this very test exists
+to police, so the cheap answer costs the test some of its point. The note above
+saw the shape and stopped at the fact -- `prelude_arity` stays with the checker
+-- without the consequence, which is that one test stays with it until one of
+those two moves is made.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
