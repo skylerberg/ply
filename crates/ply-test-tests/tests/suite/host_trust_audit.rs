@@ -521,8 +521,7 @@ test "the regression" { assert_eq(ask(1), expected()) }
         &mut report,
         &after.program,
         &after.resolved,
-        &after.check,
-        &after.hashes,
+        &after.front(),
         &mut store,
         &ply_test::Options::default(),
     );
