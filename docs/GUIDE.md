@@ -1845,12 +1845,10 @@ What an iteration costs today:
   the loop and most saves change one file or none: a read of the files whose
   timestamps moved, and no front end at all. The front end is a function of the
   bytes, so bytes that did not change have the front end they had.
-- **A save that changed something.** The files that changed are re-read and
-  re-parsed; the rest keep the syntax trees this process already has. Only what
-  the edit reached is re-derived — a test that must run is given its modules'
-  bodies without anything about them being checked or hashed again, so a project
-  with nondeterministic tests costs what one without them costs. ADR 0038 carries
-  the reading.
+- **A save that changed something.** The project is read and its front end
+  derived again, whole. What the iteration still does not pay for is the
+  compiled unit: a definition that still says what it said is not re-emitted, so
+  an edit costs a front end and the code generation its own change reached.
 
 Under `--json` each iteration prints one report, so a stream of them is a
 stream of objects. `Ctrl-C` ends the loop; anything the caches learned that has
@@ -3081,15 +3079,14 @@ and then emits exactly one JSON object on stdout and nothing else.
 
 ### `ply check [path]`
 
-A program that declares a `reuse fn` is checked whole: every module is parsed
-whatever the front-end cache says, and a promise the cost checker cannot show
-is `E0127` with exit code 2 (§6.7).
+A promise a `reuse fn` makes and the cost checker cannot show is `E0127` with
+exit code 2 (§6.7); the check is whole-program, which every load is.
 
 | flag | meaning |
 | --- | --- |
 | `--types` | print the inferred signature and footprint of every definition |
 | `--costs` | for every `push`, whether it grows its list in place or copies it, and what would remove the copy (§6.7) |
-| `--explain` | which files were parsed and which definitions rechecked, with the reason a skip was refused |
+| `--explain` | where the front end's time went; with `--types`, each module's `effect set` table and each signature's provenance |
 | `--no-incremental` | neither read nor write the front-end cache |
 | `--json` | |
 

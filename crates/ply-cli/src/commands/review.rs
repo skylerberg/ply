@@ -87,18 +87,15 @@ pub fn execute(args: &ReviewArgs, style: Style) -> i32 {
             return report_bind_error("review", &[diagnostic], &loaded.sources, args.json, style);
         }
     };
-    let (engine, engine_warning) = crate::engine::of(
+    let engine = crate::engine::of(
         &loaded.program,
         &loaded.resolved,
         &loaded.check,
-        loaded.complete,
-        collected.obligations.len(),
         // `ply review` reports what moved; it binds nothing, so a `law/host` is a gap here exactly
         // as it is under a hermetic `ply prove`.
         None,
         backend,
     );
-    warnings.extend(engine_warning);
     let mut proved = obligation::prove(
         collected.obligations,
         &scoped,

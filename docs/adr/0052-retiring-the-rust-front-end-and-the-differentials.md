@@ -231,6 +231,28 @@ at all. Nothing is rewired onto them yet, and the writer refuses a front
 whose syntax tables are missing, so the Rust chain's assembler cannot
 answer empty ones where the port answers real ones.
 
+**Built, 2026-09-17: the driver asks the port.** A load reads the files,
+parses and expands them with the Rust parser, resolves them, and asks the
+port once for everything else: the diagnostics it reports, the checker's
+output, the hashes, the load order, the ordinals, and the bodies the
+store writes. The Rust checker and the Rust hasher no longer run on a
+user's program. Both gates went with them, and with the gates the refusal
+report, the restored interfaces, the trees a warm process resumed,
+`Loaded`'s second program, and the reloads that existed because a gate
+might have skipped a file. `ply check --explain` loses the per-file
+skipped-and-parsed block and the per-definition cached-and-rechecked
+list; it keeps its time breakdown and, with `--types`, the effect sets
+and the provenance. The backend builds over the driver's answer rather
+than deriving one of its own, so an invocation runs one front end. One
+order had to be put back: the port answers definitions in the checker's
+own order, which is dependency-first, where a reader of `ply check
+--json` is promised the run's files and each file's items as written, so
+the driver publishes that order from the ordinals it was given. What
+still runs the Rust chain is an artifact opened without its sources,
+which rebuilds a program from stored bodies and has no text to hand over;
+§2 decides it. `CONTRACTS.md` describes the gates still, and is pinned by
+its own header, so that description is historical now.
+
 **What the driver loses.** Its gates decided per file not to parse and
 per definition not to re-infer, keyed on the store's fingerprints; a run
 that enters the port whole parses and checks every module every time.
@@ -357,6 +379,24 @@ saving its object cache, and of those 69 s one comparison of the port's
 tables over the compiler's own sources took 51. It runs alone now, as
 this tree's three other heavy tests do, so no partition waits on it.
 
+**Built, 2026-09-17: a merge takes the pull request's build.** Reuse looks
+the build up by the tree it is standing on, and a merge stands on a tree
+no run has built whenever main moved under the pull request between its
+last run and its merge, which is every second merge of a pair. A
+records-only merge paid for exactly that: 370 s wall, 266 s of it
+archiving the tests and 165 s linking the binary, for a change no
+compiler reads. The lookup now falls back to the second parent's tree
+when every file the comparison names is a record, a bench or a workflow,
+and refuses a comparison of three hundred files or more, where GitHub
+stops listing them and the file that reaches the compiler would be the
+one left off the end. The run that merged the fallback read 145 s: both
+build legs took their artifacts back, in 21 s and 18 s, and the longest
+jobs are four test partitions at 75–80 s. That run hit the lookup
+directly, main not having moved under it, so the fallback is built here
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s and 129 s, each reusing by tree the same way and for the same reason. The last is twelve seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's 38 MB of text goldens landed. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Seven running have hit the lookup directly, because none of them moved main while
+another pull request sat behind it, so the fallback this paragraph describes
+is still unproven in the case it was written for.
+
 ## 4. The loop that is O(the change)
 
 Once the compiler's tests are Ply tests, `ply test`'s content addressing
@@ -381,6 +421,313 @@ leaf or a hub much the same — and far smaller under the code generator:
 leaf, 53 ms, 18 ms and 210 ms for a hub. The switch replaces the restore
 with the port checking and hashing every module every run, so the warm
 front-end row is the one to read again beside it.
+
+**Read, 2026-09-17: what it cost after the switch, before the front end's three scans were removed.** Two runners agree to within one percent, both at a load under
+the gate. A warm `ply test` with nothing changed now takes 0.93 s, 5.2 s
+and 39.6 s at the three sizes, against 0.01 s, 0.09 s and 0.41 s before
+it; the front end is 923 ms, 5,094 ms and 39,713 ms against 2.7 ms, 22.5
+ms and 92.6 ms. Reading, parsing, resolving and writing back are
+unchanged and account for 211 ms of the largest figure. The port's own
+answer is the rest: 39,502 ms.
+
+Two different things are inside that number and reading them as one would
+misplace the work. The gates are gone, so where the reference rechecked
+nothing the port checks and hashes every definition on every run. The
+in-process rows price that full work for the reference at the same size:
+141.8 ms to typecheck and 100.8 ms to hash. So the port is charging about
+a hundred and sixty times what the reference charges for the same
+checking and hashing, and the deleted gates account for about three of
+the four hundred and twenty-seven-fold rise in the warm row. The port's
+own speed is the term that matters.
+
+That is why this record holds the switch rather than merging it green.
+The commonest act in the loop is asking a project that has not changed
+whether it is still good, and the switch makes that act a hundred times
+slower at the smallest size and a hundred times slower at the largest.
+§4's subject is precisely that loop. The port needs either the gates'
+answer — an incremental front end, which is what §4 says falls out of
+content addressing — or its own speed, before the reference stops
+running. A 39-second no-op is not a front end a person can develop
+against, and no CI reading catches it, because CI's programs are the
+compiler's own sources and the corpora, not a four-thousand-definition
+project asked the same question twice.
+
+**Read, 2026-09-17: the shape of it, at five sizes.** `ply check` over
+generated projects of 250, 500, 1,000, 2,000 and 4,000 definitions, two
+passes agreeing within half a percent, puts the port's answer at 855 ms,
+1,761 ms, 4,804 ms, 12,163 ms and 38,213 ms. Reading, parsing, resolving
+and writing back stay linear and stay small: 98 ms of parsing at the
+largest size against 38 seconds of answering. The standard library
+checked alone as a project is 4,653 ms.
+
+Per definition that is 3.4 ms, 3.5 ms, 4.8 ms, 6.1 ms and 9.6 ms, so the
+cost of one definition nearly triples across the range, and doubling the
+project multiplies the answer by 2.1, 2.7, 2.5 and 3.1 where linear would
+be 2. Two separate faults are in that, and a fix for either alone leaves
+the other. There is a constant factor: at the smallest size, where the
+superlinear term has barely started, the port already charges about
+fifty-five times the reference per definition. And there is a term that
+grows with the project, which is what turns fifty-five into a hundred and
+sixty by 4,000 definitions. The candidate for the second is the one ADR
+0049's profile already named in the emitter, a linear scan standing where
+a lookup belongs, and the next reading is a flat profile of the port's
+own front end rather than another point on this curve.
+
+**Read, 2026-09-17: the profile is flat, which is the answer.** A CPU
+profile of the port's front end over the compiler's own sources finds no
+hotspot to remove. Reference counting and allocation lead it — `heap::inc`
+at 5.7%, `dismantle` at 4.6%, `raw_alloc` at 3.4%, `dec` at 1.8%,
+`offset_by_index` at 1.7% — so about a sixth of the time is spent keeping
+objects rather than computing anything. `list::get`, the linear scan the
+paragraph above nominated, is 2.8%: present, and not the reason. Nothing
+the port itself compiles reaches 2%; its largest body is `infer`'s
+`position_bytes` at 1.8%, then `tycore.at` at 1.3% and `resolve.find_sig`
+at 1.3%.
+
+This is the shape ADR 0049 found for the emitter, now found again for the
+front end, and for the constant factor it says what the fix is: the object
+model, by ADR 0051's levers, fewer allocations for the same work, rather
+than one hot rule.
+
+**It does not say that about the term that grows, and reading the source
+does.** `infer.position_bytes` folds over a whole `List<Bytes>` to return
+the index of one name, carrying the answer forward instead of stopping at
+it, and the checker's call-graph seeding calls it once for every function
+definition and again for every edge out of one, against `names`, which
+holds every qualified function name in the program. The list it scans is
+itself built by pushing each name after a `contains_bytes` over what is
+already there, so it is quadratic before anything reads it. That is the
+term the curve shows and the profile hides, because its cost lands in
+`list::get`, `heap::inc` and `raw_alloc` rather than in a body of its own.
+
+`hash.ply` holds a fold of the same shape and it is **not** the same
+finding: it scans the deduplicated encodings of one cyclic component,
+which is small, not a list the size of the program. Saying the two
+together, as an earlier draft of this paragraph did, overstates what was
+found. The checker's is the quadratic; the hasher's is a scan.
+
+A name index built once is the first thing to try, and it is a small
+change rather than a new mechanism: the port already keys maps by `Bytes`
+throughout `front.ply`, and `map_new`, `map_insert` and `map_get` are used
+in the hundreds across its sources. The same accumulate-then-test idiom
+appears elsewhere in `infer.ply`, which is a candidate and not yet a
+finding, since nothing has measured those. The bench goes either side.
+
+**Read, 2026-09-17: what the index bought, and what it did not.** The same
+five-size curve over the fix, two passes agreeing within a percent. The
+port's answer falls at every size and falls by more the larger the project:
+807 ms, 1,586 ms, 4,113 ms, 9,459 ms and 27,239 ms, against 855, 1,762,
+4,804, 12,163 and 38,213. That is 6% at 250 definitions and 29% at 4,000,
+with the standard library alone down a tenth. A saving that grows with the
+input is a growth term removed rather than a constant shaved, which is what
+the change was for.
+
+The doubling ratios fall at every step — 2.1, 2.7, 2.5 and 3.1 become 2.0,
+2.6, 2.3 and 2.9 — and they do not fall to two. Across the range the
+exponent moves from about 1.37 to about 1.27. One quadratic is gone and the
+curve is still superlinear.
+
+The two candidates this record named are **not** it, and reading them costs
+less than measuring them. One folds over a single effect's operations; the
+other over a single module's items, so it is quadratic in functions per
+module rather than per program. Both are the shape without the size, which
+is the same test that kept the hasher's fold out of this. The record says so
+rather than leaving a reader to rediscover it.
+
+**The switch stays held on this.** A warm run over a four-thousand-definition
+project with nothing changed now spends 27 seconds in the port rather than
+38, against 93 ms for the chain it replaces. That is real progress and it is
+not the two orders of magnitude this needs.
+
+**And an instrument is retired here.** The differential's warm wall clock
+cannot answer a question like this and no reading of it belongs in this
+record: four runs gave 32.4 s and 36.5 s for one tree and 37.0 s and 21.5 s
+for the other, a 72% spread between two runs of the *same* tree, because a
+whole-unit `tcc` compile sits inside the timed region on a contended runner.
+Read it for the profile's shares and never for its clock. The five-size
+curve is the fit instrument: two passes inside one run agree to half a
+percent, and two runs on different runners agreed to one.
+
+**And the port cannot time itself.** The obvious next instrument is the curve
+with the port's five stages resolved, since `front` is one number covering
+parse, resolve, index, check, and hash with the tables. It cannot be built
+inside the port. The language does declare a clock, as a prelude effect whose
+`now` is nondeterministic, so reading it inside `front` would put that effect
+in the front end's row and carry it up every signature above — contaminating
+the purity the differentials and the bootstrap fixpoint rest on, to measure
+them. The stage breakdown therefore comes from outside, timing the separate
+entries the differentials already call, which needs no change to the port and
+no bundle refresh.
+
+**Read, 2026-09-17: there is no guilty stage.** The port's phases timed over
+corpora at five sizes, two readings each agreeing within a percent, in
+milliseconds: parse and resolve 1,355 / 1,838 / 3,145 / 6,187 / 15,688; with
+checking 2,240 / 2,829 / 4,573 / 7,979 / 18,650; the hasher 2,583 / 3,495 /
+5,952 / 11,802 / 30,137; the whole front end 3,949 / 5,054 / 8,198 / 14,828 /
+35,285. The last doubling multiplies them by 2.54, 2.34, 2.55 and 2.38.
+
+Every stage grows at the same rate, and parsing and resolving alone are 15.7 s
+of the front end's 35.3 s at the largest size. A growth term that is equally
+present in parsing, in resolving, in checking and in hashing is not a rule
+inside any of them, which is the same thing the flat profile said and the
+reason the name index bought a fifth rather than the whole gap. The remaining
+cost is the object model the port runs on, not an algorithm in the front end,
+so ADR 0051's levers are the ones that bear on it.
+
+What separates those two readings is whether the *allocations* grow
+superlinearly or only the clock does: the first would put it back in the
+port's own code, the second in the runtime beneath it. That is the next
+measurement, and the census already exists to take it.
+
+**Read, 2026-09-17: it is the runtime, not the compiler's allocation count.**
+The census beside the clock, over parse and resolve at 250, 1,000 and 4,000
+definitions: 4.38 M, 8.29 M and 22.16 M objects allocated; 66 MB, 133 MB and
+267 MB of chunks; 1,355 ms, 3,145 ms and 15,688 ms. Over the last step the
+project quadruples, allocations grow 2.67-fold, chunk bytes grow 2.01-fold,
+and the clock grows 4.99-fold. Time per allocation is 0.31 µs, 0.38 µs and
+0.71 µs.
+
+The port is not allocating quadratically. An earlier draft of this paragraph
+read that as each allocation costing more inside the runtime, and that was
+wrong. Time outrunning allocations means work that does not allocate at all,
+and the profile at two sizes says what it is: between 250 and 4,000
+definitions the heap's own share *falls*, `dismantle`, `raw_alloc` and `dec`
+together going from 9.4% to 6.3%, while `resolve.find_sig` climbs from 2.6%
+to 8.9% and the list primitives under it climb with it, `list::get` from 2.3%
+to 5.4% and `rt_list_at` from 1.6% to 3.1%.
+
+**`resolve.find_sig` is the second quadratic, and it explains the rest of the
+shape.** It folds over the whole list of the program's signatures to find one
+by name, and the defaults pass calls it once for every call expression in the
+program. It sits in the resolver, which is a prefix of all four entries, so a
+quadratic there makes every stage superlinear at once — which is exactly why
+no stage looked guilty, why parse and resolve alone are 15.7 s of the front
+end's 35.3 s, and why the flat profile localised nothing. A signature index
+built once is the same fix as the name index, in the phase below it.
+
+Two limits on the census reading, both worth keeping. It is the parse and
+resolve entry rather than the whole front end, because the run kept only the
+first block at each size. And chunk bytes are a high-water mark, not live
+bytes, so they bound the heap rather than describe it.
+
+**Read, 2026-09-17: what the signature index bought.** The same corpora, the
+same two instruments, and the port's output byte for byte what it was, so only
+the clock moved. Its answer under `ply check`, in milliseconds: 424, 801,
+1,973, 3,957 and 9,994, against 807, 1,586, 4,113, 9,459 and 27,239. That is
+47% off at 250 definitions, rising to 63% off at 4,000.
+
+The test set before the reading was the resolver's *own* growth rather than the
+total, since that is what the change claimed. Its entry falls from 1,355,
+1,838, 3,145, 6,187 and 15,688 ms to 503, 636, 954, 1,445 and 2,627, and its
+last doubling from 2.54 to 1.82 — below linear, which is what a phase looks
+like once the quadratic is gone and a constant dominates it. The whole front
+end's ratios fall with it, 1.97, 2.59, 2.30 and 2.88 becoming 1.89, 2.46, 2.01
+and 2.53, and the exponent over the range from about 1.27 to about 1.14.
+
+The golden-backed differentials passing is the other half of the result. The
+fold this replaced answered with the first matching signature where a map keeps
+the last, so a program carrying two of a name would resolve differently; the
+resolve golden did not move, so first-writer-wins survived the change.
+
+**Hashing is the worst stage now**, at 2.31 for its last doubling against the
+resolver's 1.82, and it is where the same method points next. **The switch
+stays held.** A warm run over four thousand definitions with nothing changed
+spends 10.0 s in the port where the chain it replaces spends 0.093 s. Two
+quadratics have been found and removed, and what remains is a hundredfold gap
+rather than a fixed one.
+
+**Read, 2026-09-17: the third scan, in the hasher.** A profile taken at two
+project sizes is what found it, after a single-size profile localised nothing
+and reading the source guessed wrong twice. Between 250 and 4,000 definitions
+the allocator's share *falls*, 11.1% to 8.8%, while three of the hasher's own
+bodies appear from nowhere and the list primitives climb with them,
+`rt_list_lookup` to 4.1% and `list::get` from 1.6% to 3.5%. `record` searched
+the accumulated dependency list and the accumulated closure list for the name
+it was recording, and `assemble` calls it once per definition, test and law.
+
+The lists stay, because `dump_hashes` maps over both in order and that order is
+the specification; what is added is where each name sits in them, carried in
+`assemble`'s own accumulator rather than in the public `HashOutput`. The hash
+golden not moving is the proof that neither which entry wins nor where it lands
+changed.
+
+The criterion, set before the reading, was the hasher's own growth: its last
+doubling falls from 2.31 to 1.77, below linear, and the whole front end's from
+2.16 to 1.75.
+
+**Ratios, not clocks, because the machine moved.** The resolver's entry is
+untouched by this change and reads about 30% higher at every size than in the
+run before it, which makes it an accidental control and means absolute figures
+from different runs are not comparable. A uniformly slower machine scales
+everything, so the doubling ratios survive it and the wall clocks do not. That
+is why the criterion was a ratio.
+
+**Read, 2026-09-17: the front end is proportional now, and the rest is not this
+record's to fix.** The marginal-change bench, one machine, one process, both
+sides of it: a warm `ply test` with nothing changed takes 0.84 s, 3.56 s and
+13.14 s at 250, 1,000 and 4,000 definitions, where before the three scans came
+out it took 0.93 s, 5.17 s and 40.0 s, and where the Rust chain with its gates
+takes 0.01 s, 0.09 s and 0.41 s. The front end is 824 ms, 3,501 ms and 12,963
+ms. This reading is comparable to the earlier one because the bench's
+in-process rows time the Rust engine, which nothing here touched, and they read
+660 ms against 638 ms: the machine did not move.
+
+The shape is what changed. The front end's cost per four times the project was
+5.5 and then 7.7; it is now 4.3 and 3.7. It is proportional to the program, and
+the superlinearity was those three scans and nothing else. At 250 definitions
+the gain is almost nothing, which is the same fact seen from the other end: a
+constant dominates there and always did.
+
+**So part 1 cannot finish inside this record.** What is left between 13.14 s and
+0.41 s is a constant factor of about a hundred and forty, and a constant factor
+is the object model — which this record says in its own opening that it does not
+decide, reserving it for the record after this one. Three quadratics were the
+whole of what the front end's own algorithms had to give. The driver switch
+stays held, and what would unhold it is now a runtime question rather than a
+front-end one: either this record widens to take the heap on, or the switch
+waits for the record that does. That is a decision about scope, so it is put
+here rather than taken here.
+
+**Read, 2026-09-17: what one edit to `emit.ply` costs, before and after.** Two
+edits, because one would answer half the question. The leaf is a string in
+`emit.covers()`, which nothing in the tree calls, so it propagates nowhere. The
+hub is the refusal message in `emit.expr`, which has forty-nine call sites. Both
+are message text, so neither can change a byte of emitted C. Over the compiler's
+own 187 tests, on a runner, from the tool's own output:
+
+| | warm, nothing changed | the leaf edit | the hub edit |
+| --- | --- | --- | --- |
+| the Rust chain and its gates | 343 ms | 1,001 ms | 20,675 ms |
+| the port as the front end | 17,197 ms | 17,291 ms | 38,377 ms |
+| tests re-run | 0 | 0 | 2 |
+
+**Selection is identical on both sides.** An edit that reaches nothing re-runs
+nothing; an edit at the emitter's centre re-runs exactly the two tests that
+depend on it. ADR 0042's promise that `ply test` re-runs only what an edit
+touched holds, and the switch neither improves nor harms it.
+
+**What the switch moves is the floor, not the slope.** Asking an unchanged
+project whether it is still good costs fifty times more. The marginal cost of
+an edit that propagates nowhere is seven times *less*, 94 ms against 658, for
+the reason the floor is high: everything is checked every run, so one more
+changed definition is nearly free. And an edit that propagates everywhere costs
+the same either way, 21.2 s against 20.3, because that cost is re-emitting what
+depends on it and both sides pay it alike.
+
+So §4's loop is not what the switch is waiting on. The loop works. The floor is
+the constant factor §1 has run out of front-end ways to lower, which is the same
+conclusion the curve reached from the other direction.
+
+**One half of this is missing and is not going to be taken here.** The record
+asked for the cost locally as well as in CI. Running the compiler's own suite is
+exactly the heavy local load this machine is not to be given, so these are
+runner figures only, and the record says which half it has rather than passing
+one off as both.
+
+The lesson for the instrument is worth keeping: a flat profile is evidence
+about where time goes, not about whether an algorithm is quadratic, and
+this one was taken at a single size over a single program, which is the
+reading it could least afford to be.
 
 ## The order, and why
 

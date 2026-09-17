@@ -189,15 +189,14 @@ fn a_held_unit_is_dropped_when_a_test_moves() {
 
 fn fake_loaded(root: &std::path::Path, files: &[&str]) -> Loaded {
     Loaded {
-        run: None,
         root: root.to_path_buf(),
         files: files.iter().map(|f| root.join(f)).collect(),
         sources: ply_span::SourceMap::new(),
         program: Default::default(),
         resolved: Default::default(),
+        front: Default::default(),
         check: Default::default(),
         hashes: Default::default(),
-        complete: true,
         frontend: Default::default(),
         promised: false,
     }

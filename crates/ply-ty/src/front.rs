@@ -1389,7 +1389,7 @@ impl Reader<'_> {
         let (mut module, mut simple, mut type_name, mut index, mut arity) =
             (None, None, None, None, None);
         let (mut scheme, mut span) = (None, None);
-        let mut fields = Vec::new();
+        let mut declared = 0usize;
         for (key, text) in f.all() {
             match key {
                 "module" => f.once(&mut module, key, text)?,
@@ -1399,9 +1399,25 @@ impl Reader<'_> {
                 "arity" => f.once(&mut arity, key, text)?,
                 "scheme" => f.once(&mut scheme, key, text)?,
                 "span" => f.once(&mut span, key, text)?,
-                "field" => fields.push(self.ty(text, what)?),
+                "field" => declared += 1,
                 other => return Err(unknown_field(what, other)),
             }
+        }
+        let scheme = self.scheme(f.required(scheme, "scheme")?, what)?;
+        // A field's type and the constructor's answer share one numbering or they mean different
+        // things: `Err`'s field of `Result<a, b>` is the second variable, and read on its own it
+        // is the first variable there is, so a caller substituting the type's arguments by
+        // position fills it with the wrong one. The scheme carries them together, so the fields
+        // are its parameters and the `field` lines are read only to check the count.
+        let fields: Vec<crate::Type> = match &scheme.ty {
+            crate::Type::Fn { params, .. } => params.clone(),
+            _ => Vec::new(),
+        };
+        if fields.len() != declared {
+            return Err(format!(
+                "{what}: {declared} field(s) written and {} in the scheme",
+                fields.len()
+            ));
         }
         Ok(CtorInfo {
             name: Symbol::new(name),
@@ -1411,7 +1427,7 @@ impl Reader<'_> {
             index: f.number(f.required(index, "index")?, "index")?,
             arity: f.number(f.required(arity, "arity")?, "arity")?,
             fields,
-            scheme: self.scheme(f.required(scheme, "scheme")?, what)?,
+            scheme,
             span: self.span(f.required(span, "span")?, what)?,
         })
     }

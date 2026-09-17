@@ -1,5 +1,5 @@
 use super::common::{
-    IND, backend_spec, build_backend, build_pool, describe_schema, diagnostic_json,
+    IND, backend_spec, build_backend_over, build_pool, describe_schema, diagnostic_json,
     diagnostics_json, emit_json, exit_code, location, millis, once_each, phases_json, plural,
     print_diagnostics, print_phases, print_warnings, report_bind_error, report_load_error,
     select_profile,
@@ -128,22 +128,14 @@ fn iterate(
     let (held, reuse) = warm.take(&project_root(&args.path));
     let loaded = match held {
         Some(loaded) => Ok(loaded),
-        // Resumed rather than reloaded: the trees for files that still say what they said are the
-        // ones this process already parsed, and parsing them again is work about nothing.
-        None if incremental => driver::run_resumed(
-            &args.path,
-            driver::Mode::Incremental,
-            Some(&mut cache.store),
-            &[],
-            Some(&mut warm.resume),
-        ),
+        None if incremental => driver::load_incremental(&args.path, &mut cache.store),
         None => load(&args.path),
     };
-    let mut loaded = match loaded {
+    let loaded = match loaded {
         Ok(mut loaded) => {
             if reuse == crate::warm::Reuse::Whole {
-                // Nothing was read, parsed, hashed or restored this iteration, and the report says
-                // so rather than repeating what the iteration that did the work spent.
+                // Nothing was read, parsed or derived this iteration, and the report says so
+                // rather than repeating what the iteration that did the work spent.
                 loaded.frontend.phases = driver::Phases::default();
             }
             loaded
@@ -153,57 +145,13 @@ fn iterate(
     warnings.extend(cache.store.take_warnings());
     warnings.extend(loaded.frontend.warnings.iter().cloned());
 
-    let mut hashes = loaded.hashes.clone();
+    let hashes = loaded.hashes.clone();
     // Half of what a simulated test is cached under, so it is decided before selection and never
     // after it.
     let search = crate::simulation::plan(&args.simulation);
     let selected = ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
-    let mut plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
+    let plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
 
-    // Evaluation needs an AST, and gate 1 may have skipped the file a selected test lives in.
-    let mut needed: Vec<ply_syntax::ast::ModuleName> = Vec::new();
-    for test in plan
-        .selection
-        .to_run
-        .iter()
-        .filter_map(|&i| loaded.check.tests.get(i))
-    {
-        if !needed.contains(&test.module) {
-            needed.push(test.module.clone());
-        }
-    }
-    if needed.iter().any(|m| !loaded.has_ast(m)) {
-        let unparsed = needed;
-        // Resumed like the load above, and for the same reason: this is the load that parses what
-        // the selected tests need to run, so it is where most of a warm iteration's parsing is.
-        let reloaded = if incremental {
-            // `bodies` rather than `needed`: running a test wants its modules' bodies, and nothing
-            // about them re-derived. ADR 0038 carries what that is worth.
-            driver::run_with(
-                &args.path,
-                driver::Mode::Incremental,
-                Some(&mut cache.store),
-                &[],
-                &unparsed,
-                Some(&mut warm.resume),
-            )
-        } else {
-            load(&args.path)
-        };
-        match reloaded {
-            Ok(full) => {
-                if disagrees(&hashes, &full.hashes) {
-                    warnings.push(cache_lied());
-                }
-                loaded = full;
-                hashes = loaded.hashes.clone();
-                let selected =
-                    ply_test::select(&loaded.check, &hashes, &cache.store, &search, engine);
-                plan = Plan::new(selected, &loaded.check, args.filter.as_deref(), args.std);
-            }
-            Err(err) => return report_load_error("test", &err, args.json, style),
-        }
-    }
     if let Some(err) = broken_promises(&loaded) {
         return report_load_error("test", &err, args.json, style);
     }
@@ -273,10 +221,9 @@ fn iterate(
     // no test has nothing to enter, so it builds nothing — which is what makes a warm loop under a
     // backend cost the edit rather than the project.
     let nothing_to_run = plan.selection.to_run.is_empty();
-    // The program the runner works over, which is `loaded.program` plus whatever a selected test
-    // needs the bodies of. The backend is built over the same one: it answers only for the program
-    // it was built over, and the machine checks that before installing it.
-    let (run_program, run_resolved) = loaded.to_run();
+    // The backend is built over the same program the runner works over: it answers only for the
+    // program it was built over, and the machine checks that before installing it.
+    let (run_program, run_resolved) = (&loaded.program, &loaded.resolved);
     // The unit the last iteration compiled, when every definition still says what it said. The
     // front end was already held across iterations and the unit was not, so a warm run under a
     // backend recompiled the whole project each time -- which for the emitted tier is tens of
@@ -290,11 +237,11 @@ fn iterate(
         .filter(|_| !nothing_to_run)
         .filter(|_| held_unit.is_none())
         .map(|spec| {
-            build_backend(
+            build_backend_over(
                 spec,
                 run_program,
                 run_resolved,
-                &loaded.check,
+                &loaded.front,
                 super::common::module_texts(run_program, &loaded.sources),
             )
         }) {
@@ -823,24 +770,6 @@ impl Drop for Cache {
     }
 }
 
-/// The front-end cache authorized a skip and a real parse then disagreed with it.
-fn disagrees(cached: &HashOutput, parsed: &HashOutput) -> bool {
-    cached
-        .defs
-        .iter()
-        .any(|(name, hash)| parsed.defs.get(name).is_some_and(|fresh| fresh != hash))
-        || cached.tests != parsed.tests
-}
-
-fn cache_lied() -> Diagnostic {
-    Diagnostic::warning(
-        codes::CACHE_CORRUPT,
-        "the front-end cache disagreed with a fresh parse; this run ignored it",
-    )
-    .note("every file was parsed and every definition rechecked")
-    .note("run `ply cache clear` if it happens again")
-}
-
 fn scratch_failed(dir: &Path, cause: &str) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
@@ -1318,21 +1247,6 @@ fn print_explain(
 ) {
     let check = &loaded.check;
     println!();
-    for file in &loaded.frontend.files {
-        let state = if !file.parsed {
-            style.green("skipped")
-        } else if file.rechecked {
-            style.yellow("checked")
-        } else {
-            style.dim("parsed")
-        };
-        println!(
-            "{IND}{state:<9} {} {}",
-            file.path.display(),
-            style.dim(&file.refusal.describe())
-        );
-    }
-    println!();
     for &index in &plan.visible {
         let Some(test) = check.tests.get(index) else {
             continue;
@@ -1630,11 +1544,6 @@ pub fn report_json(
         "schema_version": ply_test::report::SCHEMA_VERSION,
         "front_end": json!({
             "incremental": loaded.frontend.incremental,
-            "parsed": loaded.frontend.parsed(),
-            "skipped": loaded.frontend.skipped(),
-            "cached": loaded.frontend.cached(),
-            "rechecked": loaded.frontend.rechecked(),
-            "reused": loaded.frontend.reused,
             "phases": phases_json(&loaded.frontend.phases),
         }),
         "ok": ok,
