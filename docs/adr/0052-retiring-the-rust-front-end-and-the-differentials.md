@@ -1225,6 +1225,59 @@ taking the archive. Every job grew with it, partition 6/8 from 87 s to 126 s and
 headroom at 180 s is about two seconds on a bad draw, and the next reading over
 it may have no change to blame.
 
+**Read, 2026-09-17: a cache that did not save turned one warning into sixteen
+failures.** `09ad8ad7` went red with every test job failing inside half a
+minute, while build, clippy, fmt and the archive itself all passed. The archive
+job had reused the pull request's artifact correctly and then could not store
+it: `actions/cache/save` failed to reserve `nextest-archive-<run id>` under a
+cache API rate limit. A save that cannot reserve its key is a *warning*, so that
+job reported success having written nothing, and the sixteen jobs that restore
+the archive with `fail-on-cache-miss: true` each failed in seconds.
+`bootstrap`'s `No such file or directory` for `cargo-metadata.json` is the same
+fault one step further on.
+
+The re-run settles the cause. Same tree, same artifact taken back from the same
+pull request run, and this time `Cache saved with key: ...` and a green run.
+Only the save differed.
+
+So `09ad8ad7` has no wall clock. It was re-run, and what the API reports as that
+run's duration spans the failed attempt and the second one; entering it as a
+reading would be recording a number for a run that did not happen that way.
+
+The archive job asks for its own key back now, `lookup-only`, so a save that did
+not happen fails where it happened and says so. Exactly one restore in the tree
+carries `fail-on-cache-miss` -- this archive's -- so that is the only place it
+matters; a lost object cache degrades to a rebuild rather than a failure.
+
+The alternative was to upload the archive on pushes too, as pull requests
+already do, so main could fall back rather than fail. It is rejected, and the
+reason is worth keeping: the store held 973 entries and 10.23 GiB when this
+happened, over the ceiling, and a rate limit is what a store under that pressure
+does. Adding objects to it to survive the symptom would feed the cause.
+
+**Read, 2026-09-17: the next reading is over the bound, and what grew is not
+what it looks like.** `7b710288` ran 188 s against 180, warm: the archive came
+back from its own pull request's run and saved cleanly, so none of the fault
+above is in it. The wall is the archive leg plus the slowest partition, and 7/8
+took 151 s against 84 s at `33c32ce0`.
+
+Inside that job the time splits three ways, and only one of them is the suite.
+Before the suite action runs at all -- checkout, the toolchain, the tcc
+packages -- 5 s became 45 s. The object cache restore, 436 MB, is a fixed 27 to
+29 s in both. `nextest` itself went from about 43 s to 66 s, and reported 430
+tests passed with none marked slow.
+
+That last figure is not the same tests getting slower, and this record should
+not say it is. Partitions are cut with `--partition slice:m/n`, which is
+positional over the sorted test list, and the merge before this one renamed
+thirty-one tests. 7/8 held 430 tests in both runs and not the same 430.
+
+So the excursion is real and its cause is not attributed. What is measured is
+narrower and more useful: the largest controllable cost inside a partition is
+the 28 s object-cache restore rather than the tests, and the largest single
+movement was 40 s of provisioning that no change here touches. Neither is the
+lever §3 assumed, which is that the deletions shrink the shards.
+
 **Read, 2026-09-17: where §2 ends, and why it is not the bundle migration.**
 This record has said, more than once, that the seed path cannot go before a
 textual migration of an unserved bundle exists. That is true and it is not the
