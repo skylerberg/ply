@@ -336,6 +336,21 @@ where the gates checked what an edit touched. The record takes what a
 one-line edit to `emit.ply` costs, locally and in CI, before and after,
 from the tool's own output, and the marginal-change bench beside it.
 
+**Read, 2026-09-17: what one edit costs before the switch.** The bench's
+three sizes are 250, 1,000 and 4,000 definitions. A warm `ply test`, with
+nothing changed, takes 0.01 s, 0.09 s and 0.41 s, of which the front end
+is 2.7 ms, 22.5 ms and 92.6 ms; at the largest size that is 46.9 ms of
+parsing, 33.9 ms restoring published interfaces and 7.2 ms writing back,
+and nothing was rechecked at any size. That figure is the gates' whole
+purpose priced: what it costs to establish that nothing changed. An
+edit's marginal cost over that warm run is proportional to the project
+under the interpreter — a rename 635 ms, 3.3 s and 24.1 s, an edit to a
+leaf or a hub much the same — and far smaller under the code generator:
+0.2 ms, 2.6 ms and 25 ms for a rename, 4.4 ms, 16.3 ms and 62.6 ms for a
+leaf, 53 ms, 18 ms and 210 ms for a hub. The switch replaces the restore
+with the port checking and hashing every module every run, so the warm
+front-end row is the one to read again beside it.
+
 ## The order, and why
 
 3 first, because every pull request of this record is read by its run's
