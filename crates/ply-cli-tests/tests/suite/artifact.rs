@@ -773,13 +773,14 @@ pub fn spec() -> config::ConfigSpec = {keys: required_keys()}
 fn main() -> Int = 1
 "#;
 
-/// **A `.plyx` has to be able to carry its own `--config-schema`.**
+/// **A `.plyx` applies a config schema whether or not it was named at build time.**
 #[test]
-fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
+fn a_plyx_applies_a_config_schema_named_at_build_time_or_not() {
     let dir = project(WITH_SCHEMA);
 
-    // Without the flag, the schema is outside the closure and naming it is a refusal — the
-    // behaviour that made the deployed form lose its guarantee.
+    // An artifact carries its sources and is opened from them, so the closure no longer decides
+    // what a deployed artifact can name: a schema not named at build time is reachable all the
+    // same, and the refusal is the missing key rather than an unreadable source.
     ply(dir.path())
         .args(["build", "-o", "bare.plyx"])
         .assert()
@@ -799,7 +800,7 @@ fn a_config_schema_named_at_build_time_is_in_the_artifact_and_still_refuses() {
     assert_eq!(bare_run["ok"], false, "{bare_run}");
     assert_eq!(
         bare_run["diagnostics"][0]["code"],
-        codes::CONFIG_UNAVAILABLE,
+        codes::CONFIG_MISSING,
         "{bare_run}"
     );
 
