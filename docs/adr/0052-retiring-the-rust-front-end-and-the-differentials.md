@@ -1314,14 +1314,44 @@ argument made checkable: a wrong rule would not appear as a refusal, it would
 appear as a fixpoint that does not close, and that is the property this test
 watches.
 
-**What is not armed, and is the real precondition for deleting the emitter.**
-Nothing asserts the port answers every body it is asked for. The producer's counts
-are read in one place, `ply-codegen-tests/tests/producer.rs`, and asserted only
-`answered > 0` -- "the Ply emitter answered nothing of {asked} asked, so nothing
-below is about it", which is a liveness check. `parser_census.rs` and
-`fragment.rs`'s census over the standard library print refusals by construct and
-assert nothing about how many. So the port's coverage over std and the corpus is
-printed nowhere a gate reads. **Arming `answered == asked` over a named corpus is
+**What is not armed, and is the real precondition for deleting the emitter --
+corrected, because the first statement of it named the wrong gate and the wrong
+corpus.** Nothing asserts the port answers every body it is asked for. The
+producer's counts are read in one place, `ply-codegen-tests/tests/producer.rs`,
+and asserted only `answered > 0` -- "the Ply emitter answered nothing of {asked}
+asked, so nothing below is about it", which is a liveness check.
+
+But `answered == asked` is not the gate to arm, and this record said it was. The
+counts are `Cell<u64>` accumulated over a thread's life and never reset, and
+`body()` increments `asked` before returning `None` for an out-of-range module
+index -- so the pair counts calls, not bodies the port was expected to emit, and
+an equality over them would be armed in name only. `producer.rs`'s own header says
+what the instrument is: "the count of what it answered is the ratchet."
+
+And the corpus was wrong too. `fragment.rs`'s census is named for the standard
+library and does load it -- `load()` collects `ply_std::sources()` and appends the
+fixture as module `m` -- but it builds through `unit()`, which wraps
+`producer::reference_only(...)`. That forces `mode() == "ref"`, so the **reference**
+emitter produces every body and the port is never consulted. The refusals it
+counts are the tier's under the Rust emitter, ADR 0030's ranked roots, not the
+port's. `parser_census.rs` is the same shape. `whole()` is the helper that builds
+under the port, and it has one caller, `number_types.rs`, which does not census
+anything.
+
+**So no test censuses the port's refusals over std, and the gap is one test wide.**
+Over the port's own sources the question is already settled and armed -- the
+bootstrap fixpoint asserts no refusals at all. Over std and the corpus nothing
+measures it. What that test looks like is not open: build through `whole()` so the
+port produces, census `unit.refusals()` by construct, and hold the count in the
+idiom `benches/compiled-compiler.json` already uses -- **not** through
+`census::hold` itself, which holds `entries`, `allocated`, `recycled` and
+`chunk_bytes` from `producer::census()` and cannot carry a refusal count. What
+transfers is the shape: a `benches/*.json` entry the test compares against, whose
+missing entry fails with the reading printed for pasting, so the figure is blessed
+from a run rather than guessed. That is why this is reachable without the heavy
+local load this machine is not to be given: CI computes it and its failure hands
+over the line. **Writing that
+ratchet is
 what would let §2 delete `c/emit.rs`**; until that exists the deletion would rest
 on prose, and this record has spent the day learning what prose-sized estimates
 are worth.
@@ -1389,7 +1419,7 @@ one left off the end. The run that merged the fallback read 145 s: both
 build legs took their artifacts back, in 21 s and 18 s, and the longest
 jobs are four test partitions at 75–80 s. That run hit the lookup
 directly, main not having moved under it, so the fallback is built here
-and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s and 140 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
+and not yet exercised. The merges after it read 126 s, 130 s, 142 s, 168 s, 163 s, 129 s, 224 s, 157 s, 184 s, 149 s, 148 s, 158 s, 149 s, 156 s, 173 s, 140 s, 147 s, 140 s, 153 s, 164 s, 324 s, 130 s, 139 s, 223 s, 140 s, 136 s, 140 s, 127 s, 145 s, 142 s, 138 s, 149 s, 153 s, 150 s, 147 s, 166 s, 133 s, 134 s, 143 s, 145 s, 140 s and 140 s, each reusing by tree the same way and for the same reason. Four of those went over. Two were the merge that made the port the only front end and the first attempt to answer it, which the paragraph below takes; the other two are 324 s and 223 s, and the paragraphs after it take them, neither caused by the tree. The highest of them, 173 s, is seven seconds under the bound, which reads as a drift and is not one: over the last nine green runs the longest partition has been 88, 91, 97, 101, 101, 102, 110, 113 and 120 s, a band with no step where §2's text goldens landed, 50 MB of them at the time. A draft of this sentence called it a trend, from four partitions in one run's longest-five rather than from the series. Eleven running have hit the lookup directly, because none of them moved main while
 another pull request sat behind it, so the fallback this paragraph describes
 is still unproven in the case it was written for.
 
