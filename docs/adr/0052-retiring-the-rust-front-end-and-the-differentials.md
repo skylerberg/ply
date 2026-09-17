@@ -1409,6 +1409,37 @@ constraint this record works within. And it could not have been written a day ag
 `whole` did not install a producer, so both units were the reference, and a
 comparison like this one could not have failed.
 
+**Read, 2026-09-17: the seed path cannot go, and attempting it is what showed
+why.** This record has twice named the seed path as the last thing holding the
+Rust front end into `ply-codegen`, and twice implied it was a matter of writing
+the recovery down. It is not. Deleting `from_reference` takes `ply test` with it
+for any working copy, and the reason is structural rather than an oversight.
+
+`PLY_C_EMITTER=ply:<dir>` is the documented way to run an emitter change before it
+is bootstrapped, so that directory has **no bundle by construction** --
+`bundle::of` returns `None` for it, and `from_reference` is what built an emitter
+from those sources. Remove it and `ply test` produces no report at all;
+`lang_fixtures` caught it in four partitions.
+
+The obvious repair does not work either. To build an emitter *from source* you
+need a `Source`, which needs a front end, and the port cannot be that front end
+here: `mode()` answers `"ref"` whenever `BUILDING` is set, because this runs while
+the producer's own unit is being built. The port cannot answer for the program it
+is compiled from. Building it instead from the *committed* bundle and using that
+emitter to emit the working copy is the way out, and it is a two-stage producer --
+a restructure, not a fallback removed.
+
+Falling back to the embedded bundle would make the fixture pass while silently
+emitting with the committed emitter rather than the working copy's, which is a
+green that tests the wrong thing. That is the trap worth recording: the failing
+test was the honest answer.
+
+What this pull request keeps is the part that was genuinely removable:
+`PLY_C_BOOTSTRAP=off`, which nothing set -- no test, no workflow, no script, only
+four documents advertising it, which move here. `from_reference` stays, reached
+now by the two cases that are real: sources with no bundle, and a bundle whose
+helper table this runtime's does not start with.
+
 **Built when.** One deletion per pull request, each with its differential's
 retirement in the same change or the one before it.
 
