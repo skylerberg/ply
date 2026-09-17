@@ -1,10 +1,10 @@
 //! What one head costs `std.http.parse_head`, and what the cost is a function of.
 
-use ply_core::CheckOutput;
 use ply_eval::{Machine, Value};
 use ply_span::Span;
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::{Resolved, resolve};
+use ply_ty::CheckOutput;
 use std::time::{Duration, Instant};
 
 /// The caller `parse_head` is measured through: one call, one `Bytes` argument, and an answer small
@@ -48,16 +48,23 @@ impl Bench {
         let diags = ply_derive::expand_program(&mut program);
         assert!(diags.is_empty(), "{diags:#?}");
         let resolved = resolve(&mut program).expect("the shipped modules resolve");
-        let check = match ply_core::check_program(&program, &resolved) {
-            Ok(check) => check,
-            Err(d) => {
-                let errors: Vec<_> = d
-                    .iter()
-                    .filter(|d| d.code.starts_with("E0") && d.severity == ply_span::Severity::Error)
-                    .collect();
-                panic!("they check: {errors:#?}")
-            }
-        };
+        let modules: Vec<(String, String)> = sources
+            .iter()
+            .map(|(name, src)| (name.to_string(), src.clone()))
+            .collect();
+        let ids: Vec<_> = (0..modules.len())
+            .map(|i| ply_span::SourceId(i as u32))
+            .collect();
+        ply_codegen::c::producer::ensure_default();
+        let front = ply_codegen::c::producer::front(&modules, &ids)
+            .unwrap_or_else(|e| panic!("the port answers for the shipped modules: {e:#}"));
+        let errors: Vec<_> = front
+            .diagnostics
+            .iter()
+            .filter(|d| d.code.starts_with("E0") && d.severity == ply_span::Severity::Error)
+            .collect();
+        assert!(errors.is_empty(), "they check: {errors:#?}");
+        let check = front.check;
         Bench {
             program,
             resolved,
@@ -226,8 +233,22 @@ fn a_whole_request_through_the_host_boundary() {
     let mut program = ply_syntax::parse_program(inputs).expect("it parses");
     assert!(ply_derive::expand_program(&mut program).is_empty());
     let resolved = resolve(&mut program).expect("it resolves");
-    let check = ply_core::check_program(&program, &resolved)
-        .unwrap_or_else(|d| panic!("{:#?}", d.iter().take(3).collect::<Vec<_>>()));
+    let modules: Vec<(String, String)> = sources
+        .iter()
+        .map(|(name, src)| (name.to_string(), src.clone()))
+        .collect();
+    let ids: Vec<_> = (0..modules.len())
+        .map(|i| ply_span::SourceId(i as u32))
+        .collect();
+    ply_codegen::c::producer::ensure_default();
+    let front = ply_codegen::c::producer::front(&modules, &ids)
+        .unwrap_or_else(|e| panic!("the port answers: {e:#}"));
+    assert!(
+        front.diagnostics.is_empty(),
+        "{:#?}",
+        front.diagnostics.iter().take(3).collect::<Vec<_>>()
+    );
+    let check = front.check;
 
     let mut best = f64::MAX;
     for _ in 0..3 {
