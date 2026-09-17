@@ -2,10 +2,10 @@
 //! content-addressed store already holds.
 
 use crate::load::Loaded;
-use ply_core::{CheckOutput, DefInfo};
+use ply_core::{CheckOutput, DefInfo, Front};
 use ply_hash::body::StoredBody;
-use ply_hash::{DefHash, HashOutput, hash_program_with_bodies};
-use ply_span::{Diagnostic, SourceMap, Span, Symbol, codes};
+use ply_hash::{DefHash, HashOutput};
+use ply_span::{Diagnostic, Severity, SourceMap, Span, Symbol, codes};
 use ply_syntax::ast::{ModuleName, Program};
 use ply_syntax::resolve::Resolved;
 use std::collections::{BTreeMap, BTreeSet};
@@ -238,33 +238,7 @@ pub fn build(
     // again (ADR 0052 §1).
     let front = &loaded.front;
     let hashes = &front.hashes;
-    // The bytes are the envelope the hasher wrote, so they are wrapped rather than re-hashed. Only
-    // a name declared in two namespaces — a `fn` and a `type` of one name — has two bodies, and
-    // that is the one case a body has to say which of the two hashes it is filed under.
-    let bodies: BTreeMap<DefHash, StoredBody> = {
-        let mut by_name: BTreeMap<&Symbol, Vec<StoredBody>> = BTreeMap::new();
-        for (name, bytes) in &front.bodies {
-            if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
-                by_name.entry(name).or_default().push(body);
-            }
-        }
-        let mut out = BTreeMap::new();
-        for (name, stored) in by_name {
-            for hash in [hashes.defs.get(name), hashes.decls.get(name)]
-                .into_iter()
-                .flatten()
-            {
-                let found = match stored.as_slice() {
-                    [only] => Some(only),
-                    many => many.iter().find(|b| b.verify(*hash)),
-                };
-                if let Some(body) = found {
-                    out.insert(*hash, body.clone());
-                }
-            }
-        }
-        out
-    };
+    let bodies = bodies_by_hash(front);
     let Some(entry_hash) = hashes.defs.get(&entry.name).copied() else {
         return Err(vec![missing_entry(&entry.name)]);
     };
@@ -737,6 +711,72 @@ pub fn open(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>>
     open_sources(artifact, path)
 }
 
+/// The port's bodies, keyed by the hash each is filed under.
+///
+/// The bytes are the envelope the hasher wrote, so they are wrapped rather than re-hashed. Only a
+/// name declared in two namespaces — a `fn` and a `type` of one name — has two bodies, and that is
+/// the one case a body has to say which of the two hashes it is filed under.
+fn bodies_by_hash(front: &Front) -> BTreeMap<DefHash, StoredBody> {
+    let hashes = &front.hashes;
+    let mut by_name: BTreeMap<&Symbol, Vec<StoredBody>> = BTreeMap::new();
+    for (name, bytes) in &front.bodies {
+        if let Some(body) = StoredBody::from_bytes(bytes.clone()) {
+            by_name.entry(name).or_default().push(body);
+        }
+    }
+    let mut out = BTreeMap::new();
+    for (name, stored) in by_name {
+        for hash in [hashes.defs.get(name), hashes.decls.get(name)]
+            .into_iter()
+            .flatten()
+        {
+            let found = match stored.as_slice() {
+                [only] => Some(only),
+                many => many.iter().find(|b| b.verify(*hash)),
+            };
+            if let Some(body) = found {
+                out.insert(*hash, body.clone());
+            }
+        }
+    }
+    out
+}
+
+/// The port's whole answer over these module texts: the one front end opening an artifact runs.
+///
+/// An artifact carries its own sources and pulls in the shipped modules it imports, so the texts
+/// handed over are the whole program and the answer is complete (ADR 0052 §1).
+fn ask_the_port(
+    inputs: &[(ply_span::SourceId, ModuleName, String)],
+) -> Result<Front, Vec<Diagnostic>> {
+    ply_codegen::c::producer::ensure_default();
+    let sources: Vec<(String, String)> = inputs
+        .iter()
+        .map(|(_, name, text)| (name.to_string(), text.clone()))
+        .collect();
+    let ids: Vec<ply_span::SourceId> = inputs.iter().map(|(id, _, _)| *id).collect();
+    let front = ply_codegen::c::producer::front(&sources, &ids).map_err(|e| {
+        vec![
+            Diagnostic::error(
+                codes::INTERNAL_ERROR,
+                format!("the front end could not answer for this program: {e:#}"),
+            )
+            .note("this is Ply's fault: the compiler's own front end is what failed here"),
+        ]
+    })?;
+    let errors: Vec<Diagnostic> = front
+        .diagnostics
+        .iter()
+        .filter(|d| d.severity == Severity::Error)
+        .cloned()
+        .collect();
+    if errors.is_empty() {
+        Ok(front)
+    } else {
+        Err(errors)
+    }
+}
+
 fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnostic>> {
     let mut sources = SourceMap::new();
     let mut inputs: Vec<(ply_span::SourceId, ModuleName, String)> = Vec::new();
@@ -786,16 +826,20 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
         return Err(diags);
     }
     let resolved = ply_syntax::resolve(&mut program)?;
-    let check = ply_core::check_program(&program, &resolved)?;
+
+    // The whole front end's answer over these very texts: the check the evaluator runs on and the
+    // hashes the artifact is keyed by both come from the one ask (ADR 0052 §1).
+    let front = ask_the_port(&inputs)?;
 
     // The sources are believed only if they build the artifact they arrived in.
-    let (hashes, bodies) = hash_program_with_bodies(&program, &resolved)?;
+    let hashes = &front.hashes;
+    let bodies = bodies_by_hash(&front);
     let mut rebuilt: BTreeMap<DefHash, StoredBody> = BTreeMap::new();
     for (name, hash) in &artifact.names {
         let symbol = Symbol::new(name);
         let known =
             hashes.defs.get(&symbol) == Some(hash) || hashes.decls.get(&symbol) == Some(hash);
-        match bodies.get(*hash) {
+        match bodies.get(hash) {
             Some(body) if known => {
                 rebuilt.insert(*hash, body.clone());
             }
@@ -828,7 +872,7 @@ fn open_sources(artifact: &Artifact, path: &Path) -> Result<Opened, Vec<Diagnost
         sources,
         program,
         resolved,
-        check,
+        check: front.check,
         entry,
     })
 }
