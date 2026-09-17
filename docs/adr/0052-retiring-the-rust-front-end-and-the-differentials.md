@@ -1282,7 +1282,7 @@ this record. Where `ply-ty` was already present nothing re-points, because it
 owns `CheckOutput`, `DefInfo` and `ty` outright and `ply-core` only re-exported
 them.
 
-**`ply-store-tests` cannot go, and it is one of two.** Its second
+**`ply-store-tests` cannot go, and it is one of four.** Its second
 site typechecks a program *reconstructed from the store*: `reconstruct` hands
 back a syntax tree and there is no source text anywhere, which is the crate's
 whole thesis -- what a run writes comes back out as a program that checks,
@@ -1310,6 +1310,62 @@ rather than by a `OnceLock` -- that is what let the handover stand one emitter u
 inside another -- and the same mechanism could replace `install` in those two
 harnesses. That is a restructure of the fixpoint test rather than a migration, so
 it is named here instead of attempted alongside the others.
+
+**`ply-eval-tests` cannot go either, and its reason is a third kind.** Thirteen
+of its fourteen sites are ordinary: the two corpus harnesses need only the `load`
+above to return the texts it already reads, and the rest parse from source under
+names of their own. The one that stops the crate is `unit/builtins.rs`'s
+`ply_core::prelude_arity`, which is not a check at all.
+
+It reads the checker's prelude environment -- `infer::prelude_arity` builds an
+empty `Checker` and looks the name up in `c.env` -- and that table is
+`install_prelude`'s, which lives in `infer.rs` and goes when the checker goes.
+`ply-ty`'s `prelude.rs` carries the ADTs, the effect names, `ctors` and
+`ctor_arities`, but no builtin schemes, so nothing that survives can answer it.
+
+Nor can the test answer it from what it already holds. It exists to check the
+evaluator's builtin arity table against the *type system's*, on the stated ground
+that a builtin the prelude does not type cannot be called at all, so the two
+tables have to cover the same set. Sourcing both sides from `ply-eval` would
+leave it comparing a table with itself, which is a green that tests nothing.
+
+The path is the move this record already made for the rest of the prelude, and it
+is not the same size. The ADTs, the effect names and the constructor arities
+moved as `const` data. `install_prelude` does not hold data: it *builds* its
+schemes against the checker's own variable supply -- `fresh.ty_var`,
+`fresh.row_var`, a `Row::open` for the effectful ones -- so moving the schemes
+moves that machinery with them.
+
+What `prelude_arity` asks for is narrower than a scheme: a name and a count. A
+table of those could sit beside the ADTs tomorrow, at the price of a second thing
+to keep in step with the schemes -- which is the coupling this very test exists
+to police, so the cheap answer costs the test some of its point. The note above
+saw the shape and stopped at the fact -- `prelude_arity` stays with the checker
+-- without the consequence, which is that one test stays with it until one of
+those two moves is made.
+
+**`ply-test-tests` cannot go either, and the fourth reason is the hasher.** Its
+seven sites migrate cleanly under the rule above -- three keep the names they
+gave `from_dotted`, four keep the empty name -- and `ply-test`'s own obligation
+API is indifferent to which, because it takes its names from `check.defs.keys()`
+and looks them up in `hashes.defs`, both from the same front end. That is not
+where it breaks.
+
+`unit/runner.rs` computes `ply_hash::hash_program(&program, &resolved, &check)`:
+a Rust-parsed program and resolve together with the port's check. Those hashes
+are what the store keys on and what selection reads, so any difference between
+the two front ends' answers -- an ordering in `check.tests`, a footprint, a
+definition one records and the other does not -- moves a hash, and a warm cache
+stops being warm. The run said so plainly: `a_warm_cache_selects_nothing`
+selected three, `renaming_a_definition_selects_nothing` selected three, and a
+ran-to-skipped count came back `(0, 4)` where `(4, 0)` was expected, which is
+what shifted test indices look like.
+
+So the port's check is safe to hand a machine, a binding or an assertion, and not
+yet safe to hand the hasher beside an AST that hasher also reads. *Which* of the
+two answers differs is not established here, and this record does not guess: the
+attempt was withdrawn whole rather than halved, because reverting the one file
+would leave the dependency standing anyway.
 
 **Built, 2026-09-17: `verify` sees the member it could not see, and the count
 says what it counts.** This record described the gap twice and fixed it neither
